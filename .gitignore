@@ -1,0 +1,20 @@
+# Cargo build output (added now so it is never committed by accident)
+/target
+
+# mdBook build output
+/book
+
+# Per CLAUDE.md §8.3 — intermediate results, benchmark output,
+# query plans, Parquet footers etc. live here and must not be committed.
+/scratch
+
+# macOS cruft
+.DS_Store
+
+# Editor leftovers
+*.rs.bk
+*.swp
+*~
+
+# Cargo.lock is NOT ignored — Ourios is a binary (CLAUDE.md §1) and its
+# lockfile is part of the reproducible-build contract.

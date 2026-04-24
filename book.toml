@@ -1,0 +1,18 @@
+[book]
+title = "Ourios"
+description = "A log storage and query backend built on Parquet, Drain-derived template mining, and DataFusion."
+authors = ["Jens Holdgaard Pedersen"]
+language = "en"
+multilingual = false
+src = "docs"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/jensholdgaard/ourios"
+edit-url-template = "https://github.com/jensholdgaard/ourios/edit/main/{path}"
+site-url = "/ourios/"
+
+[output.html.fold]
+enable = true
+level = 1

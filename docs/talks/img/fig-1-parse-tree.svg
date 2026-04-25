@@ -17,6 +17,9 @@
              marker-end: url(#arrow1); }
   </style>
 
+  <!-- Canvas: keep a light background so the figure reads on any book theme. -->
+  <rect width="100%" height="100%" fill="#fafaf9"/>
+
   <!-- Root -->
   <rect class="box root" x="350" y="20" width="100" height="46" rx="6"/>
   <text class="label" x="400" y="46">root</text>

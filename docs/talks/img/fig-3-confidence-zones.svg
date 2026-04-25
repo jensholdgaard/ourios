@@ -24,6 +24,9 @@
              marker-end: url(#arrow3); }
   </style>
 
+  <!-- Canvas: keep a light background so the figure reads on any book theme. -->
+  <rect width="100%" height="100%" fill="#fafaf9"/>
+
   <!-- Title row: "confidence →" -->
   <text class="label" x="40" y="36" text-anchor="start">confidence</text>
   <path class="arrow" d="M 145 32 L 200 32"/>

@@ -70,6 +70,27 @@ sake of the template.
 4. **Rejected** — closed PR or status flipped to `rejected`. The file
    is kept for the record.
 
+## Diagrams
+
+When an RFC needs a diagram (state machine, sequence flow, schema
+relationship, decision tree), it is authored in **Mermaid**, embedded
+as a fenced ` ```mermaid ` block in the markdown. Mermaid is chosen
+for the same reasons we chose markdown over a binary doc format:
+text-based source is reviewable in PR diffs, version-controllable,
+and lets the RFC itself remain a single self-contained file.
+
+Lectures (`docs/talks/`) use a different convention: hand-drawn
+SVGs (Excalidraw export, or hand-authored to match) committed under
+`docs/talks/img/`. Lectures benefit from a "manuscript / blackboard"
+aesthetic that Mermaid does not provide; RFCs benefit from the
+diff-ability that Excalidraw does not provide. Do not mix the two
+conventions.
+
+The mdBook build does not yet have the `mdbook-mermaid` preprocessor
+enabled — it will be added the first time an RFC actually needs a
+diagram, at which point local builds and the CI workflow both gain
+the preprocessor in the same change.
+
 ## Relationship to architecture docs
 
 An accepted RFC is a contract for how something will be built. Once

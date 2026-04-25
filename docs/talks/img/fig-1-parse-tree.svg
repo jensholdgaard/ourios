@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 460"
+     font-family="'Caveat', 'Patrick Hand', 'Comic Sans MS', cursive"
+     font-size="22">
+  <defs>
+    <marker id="arrow1" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1e1e1e"/>
+    </marker>
+  </defs>
+  <style>
+    .box   { fill: #fefefe; stroke: #1e1e1e; stroke-width: 2.5;
+             stroke-linejoin: round; }
+    .root  { fill: #fef3c7; }
+    .label { fill: #1e1e1e; text-anchor: middle; dominant-baseline: middle; }
+    .arrow { stroke: #1e1e1e; stroke-width: 2; fill: none;
+             marker-end: url(#arrow1); }
+  </style>
+
+  <!-- Root -->
+  <rect class="box root" x="350" y="20" width="100" height="46" rx="6"/>
+  <text class="label" x="400" y="46">root</text>
+
+  <!-- Root → length -->
+  <path class="arrow" d="M 400 66 L 180 122"/>
+  <path class="arrow" d="M 400 66 L 400 122"/>
+  <path class="arrow" d="M 400 66 L 620 122"/>
+
+  <!-- Length nodes -->
+  <rect class="box" x="120" y="124" width="120" height="46" rx="6"/>
+  <text class="label" x="180" y="150">len = 5</text>
+
+  <rect class="box" x="340" y="124" width="120" height="46" rx="6"/>
+  <text class="label" x="400" y="150">len = 7</text>
+
+  <rect class="box" x="560" y="124" width="120" height="46" rx="6"/>
+  <text class="label" x="620" y="150">len = 11</text>
+
+  <!-- Length → token-prefix -->
+  <path class="arrow" d="M 180 170 L 110 224"/>
+  <path class="arrow" d="M 180 170 L 250 224"/>
+  <path class="arrow" d="M 400 170 L 400 224"/>
+  <path class="arrow" d="M 620 170 L 620 224"/>
+
+  <!-- Token prefix nodes -->
+  <rect class="box" x="50"  y="226" width="120" height="60" rx="6"/>
+  <text class="label" x="110" y="248">tok₀ =</text>
+  <text class="label" x="110" y="272">"INFO"</text>
+
+  <rect class="box" x="190" y="226" width="120" height="60" rx="6"/>
+  <text class="label" x="250" y="248">tok₀ =</text>
+  <text class="label" x="250" y="272">"ERROR"</text>
+
+  <rect class="box" x="340" y="226" width="120" height="60" rx="6"/>
+  <text class="label" x="400" y="248">tok₀ =</text>
+  <text class="label" x="400" y="272">"ERROR"</text>
+
+  <text class="label" x="620" y="262" font-size="34">. . .</text>
+
+  <!-- Token → leaf -->
+  <path class="arrow" d="M 110 286 L 110 346"/>
+  <path class="arrow" d="M 250 286 L 250 346"/>
+  <path class="arrow" d="M 400 286 L 400 346"/>
+
+  <!-- Leaf labels -->
+  <text class="label" x="110" y="368" font-size="20">[ leaf</text>
+  <text class="label" x="110" y="392" font-size="20">log groups ]</text>
+
+  <text class="label" x="250" y="368" font-size="20">[ leaf</text>
+  <text class="label" x="250" y="392" font-size="20">log groups ]</text>
+
+  <text class="label" x="400" y="368" font-size="20">[ leaf</text>
+  <text class="label" x="400" y="392" font-size="20">log groups ]</text>
+</svg>

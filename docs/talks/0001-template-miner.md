@@ -125,28 +125,7 @@ Let me draw the tree.
 
 ### Figure 1 — The Drain parse tree
 
-```
-                         ┌─────────────┐
-                         │    root     │
-                         └──────┬──────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              │                 │                 │
-        ┌─────▼─────┐     ┌─────▼─────┐     ┌─────▼─────┐
-        │  len = 5  │     │  len = 7  │     │  len = 11 │
-        └─────┬─────┘     └─────┬─────┘     └─────┬─────┘
-              │                 │                 │
-      ┌───────┴──────┐          │                 │
-      │              │          │                ...
-  ┌───▼───┐      ┌───▼───┐  ┌───▼───┐
-  │ tok₀= │      │ tok₀= │  │ tok₀= │
-  │"INFO" │      │"ERROR"│  │"ERROR"│
-  └───┬───┘      └───┬───┘  └───┬───┘
-      │              │          │
-    [ leaf         [ leaf     [ leaf
-      log            log        log
-      groups ]       groups ]   groups ]
-```
+![Drain parse tree: a root node branching to three length-group children (len=5, len=7, len=11); each length child branches further to token-prefix children keyed on the first token; each prefix node points to a list of leaf log groups.](./img/fig-1-parse-tree.svg)
 
 Three levels matter here. The root has a child per distinct token
 count — Drain assumes that two log lines of different length are
@@ -277,19 +256,7 @@ Ourios handles this with a three-zone model.
 
 ### Figure 3 — The three-zone confidence model
 
-```
-confidence →
-0 ───────── floor ───────── threshold ──────────── 1
-                │                │
-                ▼                ▼
-┌──────────────┐┌───────────────┐┌──────────────────┐
-│ parse_failed ││ lossy match   ││ clean match      │
-│              ││               ││                  │
-│ retain body, ││ retain body + ││ template + params│
-│ count error  ││ template, set ││ only; body opt.  │
-│              ││ lossy_flag    ││                  │
-└──────────────┘└───────────────┘└──────────────────┘
-```
+![Three-zone confidence model: a horizontal axis from 0 to 1 with dashed verticals marking the floor and the threshold. The axis splits into three labelled zones — parse_failed (retain body, count error), lossy match (retain body and template, set lossy_flag), and clean match (template plus params only; body optional).](./img/fig-3-confidence-zones.svg)
 
 Three zones, three behaviours. Above the threshold, the happy path:
 store the template id and the parameters. Below the threshold but
@@ -398,15 +365,7 @@ makes the invariants concrete.
 
 ### Figure 5 — The Ourios log record
 
-```
-┌──────────────┬──────────────────┬─────────────────┐
-│ tenant_id    │ template_id      │ template_ver    │
-├──────────────┼──────────────────┼─────────────────┤
-│ params[]     │ body?            │ confidence      │
-├──────────────┼──────────────────┼─────────────────┤
-│ lossy_flag   │ timestamp        │ service         │
-└──────────────┴──────────────────┴─────────────────┘
-```
+![The Ourios log record: a 3×3 grid of fields. Row 1: tenant_id, template_id, template_version. Row 2: params[], body?, confidence. Row 3: lossy_flag, timestamp, service. tenant_id is highlighted as the partition key, confidence and lossy_flag are highlighted as honesty-contract fields.](./img/fig-5-record-shape.svg)
 
 Every field on that diagram is a commitment:
 

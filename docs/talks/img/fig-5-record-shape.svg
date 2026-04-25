@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 280"
+     font-family="'Caveat', 'Patrick Hand', 'Comic Sans MS', cursive"
+     font-size="22">
+  <style>
+    .cell { fill: #fefefe; stroke: #1e1e1e; stroke-width: 2.5;
+            stroke-linejoin: round; }
+    .key  { fill: #fef3c7; }
+    .conf { fill: #d1fae5; }
+    .lossy{ fill: #fed7aa; }
+    .label { fill: #1e1e1e; text-anchor: middle; dominant-baseline: middle; }
+  </style>
+
+  <!-- Row 1 -->
+  <rect class="cell key" x="40"  y="30"  width="220" height="60" rx="6"/>
+  <text class="label" x="150" y="60">tenant_id</text>
+
+  <rect class="cell" x="260" y="30"  width="240" height="60"/>
+  <text class="label" x="380" y="60">template_id</text>
+
+  <rect class="cell" x="500" y="30"  width="220" height="60" rx="6"/>
+  <text class="label" x="610" y="60">template_version</text>
+
+  <!-- Row 2 -->
+  <rect class="cell" x="40"  y="90"  width="220" height="60" rx="6"/>
+  <text class="label" x="150" y="120">params[]</text>
+
+  <rect class="cell" x="260" y="90"  width="240" height="60"/>
+  <text class="label" x="380" y="120">body?</text>
+
+  <rect class="cell conf" x="500" y="90"  width="220" height="60" rx="6"/>
+  <text class="label" x="610" y="120">confidence</text>
+
+  <!-- Row 3 -->
+  <rect class="cell lossy" x="40"  y="150" width="220" height="60" rx="6"/>
+  <text class="label" x="150" y="180">lossy_flag</text>
+
+  <rect class="cell" x="260" y="150" width="240" height="60"/>
+  <text class="label" x="380" y="180">timestamp</text>
+
+  <rect class="cell" x="500" y="150" width="220" height="60" rx="6"/>
+  <text class="label" x="610" y="180">service</text>
+</svg>

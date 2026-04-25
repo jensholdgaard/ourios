@@ -140,8 +140,7 @@ produce the same Rust code.* Include:
   stores alongside the template).
 - Reconstruction function signature and guarantees.
 - The `lossy_flag` — when it is set, and how the reader surfaces it.
-- Property test pseudocode: `∀ line ∈ corpus. reconstruct(mine(line)) =
-  line ∨ mine(line).lossy_flag`.
+- Property test pseudocode: \\(\forall\\, \mathtt{line} \in \mathtt{corpus}.\\; \mathtt{reconstruct}(\mathtt{mine}(\mathtt{line})) = \mathtt{line} \lor \mathtt{mine}(\mathtt{line}).\mathtt{lossy\\_flag}\\).
 
 ### 6.7 Template versioning and drift `[§3.5]`, hazard 5
 

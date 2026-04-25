@@ -11,6 +11,7 @@ preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/jensholdgaard/ourios"
 edit-url-template = "https://github.com/jensholdgaard/ourios/edit/main/{path}"
 site-url = "/ourios/"
+mathjax-support = true
 
 [output.html.fold]
 enable = true

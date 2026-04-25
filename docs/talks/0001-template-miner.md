@@ -465,12 +465,13 @@ to the user.
 
 ### Figure 6 — The reconstruction invariant
 
-```
-   ∀ line ∈ corpus :
-       reconstruct ( mine(line) )  ≡  line
-       ∨
-       mine(line).lossy_flag  =  true
-```
+\\[
+\begin{aligned}
+&\forall\\, \mathtt{line} \in \mathtt{corpus}: \\\\
+&\quad \mathtt{reconstruct}(\mathtt{mine}(\mathtt{line})) \equiv \mathtt{line} \\\\
+&\quad \lor\\;\\; \mathtt{mine}(\mathtt{line}).\mathtt{lossy\\_flag} = \mathtt{true}
+\end{aligned}
+\\]
 
 In English: for every log line we ingest, either we can reproduce
 the exact bytes the customer's application wrote, or we flag the row

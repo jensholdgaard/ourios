@@ -270,6 +270,63 @@ acceptable, lying to the user is not.
 
 ---
 
+## H8 — Replication-induced dedup under clock drift
+
+> *Forward-looking hazard.* Ourios does not currently replicate at
+> ingest, so this hazard is dormant. It is recorded here so that
+> any future RFC proposing replication starts with the failure
+> mode already understood.
+
+**Failure mode.** A multi-ingester replication design quietly
+introduces a storage multiplier if dedup is keyed on filename and
+a time window. Even sub-second clock drift between replicas causes
+the dedup pass to miss duplicates: each replica writes "the same"
+record under a slightly different filename or window, the dedup
+miss is invisible to any single replica's logs, and the user pays
+for redundancy they thought they had bought once. A widely-deployed
+log backend was found in 2026 to be carrying a ~2.3× storage
+multiplier from exactly this failure mode, motivating a full
+re-architecture of its durability layer.
+
+**Mitigation.**
+- *Currently:* not a concern. Ourios does not replicate at ingest.
+  Per `CLAUDE.md` §3.4, durability is per-ingester fsync on the
+  WAL; per §3.6, object storage is the long-term truth.
+  Replication, if introduced later, is "in addition to the WAL,
+  not instead of it."
+- *When replication is proposed:* dedup MUST be content-keyed,
+  never time-windowed. The producer (or the OTLP layer) supplies
+  an idempotency key — a content hash combined with a producer
+  identifier and a sequence number. Ingesters treat the key as
+  opaque. Clock drift becomes irrelevant to dedup correctness.
+- *Time-window dedup is rejected by default*, regardless of how
+  cheap or convenient it appears. An RFC proposing it must read
+  this hazard and address it explicitly.
+
+**Detection.**
+- `bytes_stored / bytes_received` per tenant: must hover near 1
+  on a single-replica deployment. A multiplier > 1 + ε on a
+  single-replica deployment indicates double-writing somewhere
+  upstream.
+- On a future replicated deployment: this ratio should remain near
+  1 *after* dedup; a sudden rise indicates clocks drifted and the
+  dedup pass is missing duplicates.
+- A "dedup hit rate" metric on the dedup pass — a sudden drop
+  signals that something is masking what should be visible
+  duplicates.
+
+**Escalation.** Replication proposed → RFC must explicitly address
+this hazard. Time-window dedup proposed → block, redirect to a
+content-keyed approach. Storage multiplier > 1.05 on a single-
+replica deployment → P0 investigation, something is double-writing.
+
+**See also.** `CLAUDE.md` §3.4 (WAL durability), §3.6 (object
+storage as truth). Cautionary tale: Grafana Loki's 2026
+re-architecture replacing replicate-at-ingest with
+Kafka-as-durability (InfoQ news, April 2026).
+
+---
+
 ## Adding a new hazard
 
 A new hazard belongs in this document if **all** of the following

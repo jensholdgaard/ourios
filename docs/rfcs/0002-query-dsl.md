@@ -512,6 +512,13 @@ question is the prior decision; the rest are downstream.*
       will scan 400 GB" before running?
 - [ ] Is the DSL rendered identically in the CLI and in the UI,
       or does the UI add affordances the spec does not dictate?
+- [ ] Is the DSL designed to be **agent-friendly** — callable from
+      a CLI with stable, machine-parseable output schemas (JSON,
+      JSONL) suitable for consumption by Claude Code, Cursor,
+      Grafana's GCX, or comparable agentic tools? This is a UX
+      layer question that does not change the A/B predicate-branch
+      decision, but should be answered before §9 user research
+      because the answer changes who counts as a "user".
 
 The DSL is the most user-facing surface in the project. More open
 questions here is healthier than fewer.

@@ -5,8 +5,8 @@
 # Architecture
 
 - [Overview]()
-- [Hazards]()
-- [Glossary]()
+- [Hazards](./hazards.md)
+- [Glossary](./glossary.md)
 
 # Benchmarks
 

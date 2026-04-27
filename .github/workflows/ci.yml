@@ -1,9 +1,9 @@
 name: CI
 
-# Mirrors the verification list in CLAUDE.md §6.6.
-# Cargo jobs are guarded by `if: hashFiles('Cargo.toml') != ''` so they
-# skip cleanly until the first crate lands; the mdBook job runs on
-# every PR so doc-affecting changes can never silently break the build.
+# Mirrors the verification list in CLAUDE.md §6.6. Runs on every PR
+# and push to main. Cargo jobs operate on the workspace Cargo.toml at
+# repo root (currently empty `members = []` until the first crate lands;
+# cargo handles this cleanly).
 
 on:
   pull_request:
@@ -18,7 +18,6 @@ jobs:
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
-    if: hashFiles('Cargo.toml') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +28,6 @@ jobs:
   clippy:
     name: cargo clippy
     runs-on: ubuntu-latest
-    if: hashFiles('Cargo.toml') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,7 +39,6 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
-    if: hashFiles('Cargo.toml') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

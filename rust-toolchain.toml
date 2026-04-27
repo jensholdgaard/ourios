@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned per CLAUDE.md §6.1 ("Rust stable, pinned in rust-toolchain.toml.
+# MSRV documented."). This file is the source of truth for the toolchain
+# used by every contributor and by CI.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

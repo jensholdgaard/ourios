@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = []
+
+# Members will be added as crates land (CLAUDE.md §7 layout):
+#   crates/ourios-core
+#   crates/ourios-miner
+#   crates/ourios-wal
+#   crates/ourios-parquet
+#   crates/ourios-ingester
+#   crates/ourios-querier
+#   crates/ourios-server
+#   crates/ourios-bench
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/jensholdgaard/ourios"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }

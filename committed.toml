@@ -1,0 +1,4 @@
+style = "conventional"
+subject_capitalize = "never"
+subject_not_punctuated = true
+imperative_subject = true

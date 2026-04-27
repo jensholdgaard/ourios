@@ -43,6 +43,10 @@ book-serve:
 bench:
     cargo bench
 
+# Lint commit message (requires `committed`: cargo install committed).
+lint-commits:
+    committed --commit-file .git/COMMIT_EDITMSG
+
 # Clean build artefacts (cargo target + mdBook output).
 clean:
     cargo clean || true

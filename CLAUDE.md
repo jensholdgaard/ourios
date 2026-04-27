@@ -249,10 +249,31 @@ A task is not done until you have run, locally:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-features`
 - Any benchmarks touching changed hot paths
+- `mdbook build` for any change under `docs/` or `book.toml`, and
+  visually verify any new SVG, Mermaid, or LaTeX actually renders
 
 "The bytes hit disk" ≠ "the code compiles" ≠ "the code is correct."
 State which checks you ran. If a check is not set up yet, say so
 explicitly instead of claiming green.
+
+### 6.7 Documentation site
+Docs are an mdBook (`book.toml` at repo root, `docs/` is the source
+tree). The first-class artefacts are the architecture set
+(`docs/architecture/`), RFCs (`docs/rfcs/`), hazards
+(`docs/hazards.md`), the benchmarks / thesis-gates doc
+(`docs/benchmarks.md`), the glossary (`docs/glossary.md`), and
+lectures (`docs/talks/`).
+
+GitHub Pages deployment is **deferred** until the first shipping
+milestone (the `ourios-wal` crash-recovery test landing). The
+workflow at `.github/workflows/pages.yml` is intentionally
+`workflow_dispatch`-only until that gate clears. When Pages is
+enabled, the public URL is `https://jensholdgaard.github.io/ourios/`.
+
+Diagram conventions (Mermaid for RFCs, Excalidraw-style SVG for
+lectures) are written in `docs/rfcs/README.md`. That file is the
+source of truth — do not duplicate it here, do not improvise around
+it.
 
 ---
 
@@ -260,6 +281,7 @@ explicitly instead of claiming green.
 
 ```
 ourios/
+├── book.toml                 # mdBook config; docs/ is the source tree
 ├── crates/
 │   ├── ourios-core/          # shared types, tenant, IDs, errors
 │   ├── ourios-miner/         # Drain-derived template miner
@@ -272,8 +294,13 @@ ourios/
 ├── deploy/
 │   └── helm/                 # Helm chart
 ├── docs/
+│   ├── SUMMARY.md            # mdBook navigation
+│   ├── introduction.md       # mdBook landing page
 │   ├── architecture/
-│   ├── rfcs/
+│   ├── rfcs/                 # design RFCs; see rfcs/README.md
+│   ├── talks/                # lecture-length explanations
+│   │   └── img/              # SVG figures (hand-authored / Excalidraw)
+│   ├── benchmarks.md         # thesis-gate measurements
 │   ├── hazards.md
 │   └── glossary.md
 ├── testdata/
@@ -349,5 +376,8 @@ the wrong thing.
 
 ---
 
-*Last updated: project inception, 2026-04-23. This document is load-bearing;
-changes require a `meta:` RFC and majority maintainer approval.*
+*Last updated: 2026-04-26. Original draft 2026-04-23; this revision aligns
+§7 with the present-day repo and adds §6.7 (Documentation site) and an
+mdBook entry to §6.6, codifying decisions made in commits
+1c806f5..84eed86. This document is load-bearing; further changes require
+a `meta:` RFC and majority maintainer approval.*

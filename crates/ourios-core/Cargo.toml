@@ -1,0 +1,12 @@
+[package]
+name = "ourios-core"
+version = "0.0.0"
+description = "Foundational types for Ourios — tenant IDs, log records, errors."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

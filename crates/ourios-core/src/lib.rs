@@ -1,0 +1,1 @@
+//! Foundational types for Ourios.

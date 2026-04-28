@@ -1,7 +1,7 @@
 [package]
 name = "ourios-core"
 version = "0.0.0"
-description = "Foundational types for Ourios — tenant IDs, log records, errors."
+description = "Foundational types for Ourios."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

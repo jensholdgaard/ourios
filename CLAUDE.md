@@ -197,6 +197,13 @@ spec than any English description of it.
 "Yes", "do it", "go", "ship it" are execution triggers. Do not re-summarise
 the plan. The context is loaded; the word is just the go signal.
 
+### 5.6 Verification process
+The path from invariant or hazard to passing test is described in
+`docs/verification.md`. Acceptance criteria live in RFC §5;
+`docs/rfcs/README.md` defines the maturity stages an RFC moves
+through. The shortest version of the rule: *if a criterion cannot be
+turned into a test, the RFC has a gap.*
+
 ---
 
 ## 6. Code quality

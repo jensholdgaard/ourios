@@ -1,7 +1,7 @@
 ---
 rfc: 0002
 title: Query DSL — prior decision (borrow from OTTL or distance?) and candidate designs
-status: draft
+status: drafted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24

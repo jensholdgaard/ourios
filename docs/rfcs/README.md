@@ -32,7 +32,7 @@ When in doubt, assume RFC.
 ---
 rfc: NNNN
 title: Short descriptive title
-status: draft | accepted | rejected | superseded
+status: drafted | specified | red | green | validated | accepted | rejected | superseded
 author: Name <email>
 drafting-assistance: Claude   # omit if no LLM drafted
 created: YYYY-MM-DD
@@ -40,6 +40,11 @@ supersedes: —                 # or RFC NNNN
 superseded-by: —              # or RFC NNNN
 ---
 ```
+
+The maturity stages (`drafted` through `validated`) are gates an RFC
+moves through before it becomes binding; `accepted` is the terminal
+post-maintainer-signoff state; `rejected` and `superseded` are the
+off-ramps. See `docs/verification.md` §3.
 
 ## Required sections
 
@@ -51,9 +56,17 @@ Every RFC has at least:
    produce the same implementation.
 4. **Alternatives considered** — one paragraph each. "I have not
    heard of it" is not acceptable.
-5. **Testing strategy** — mapped to `CLAUDE.md` §6.2.
-6. **Open questions** — everything unresolved, as a checklist.
-7. **References** — paper citations, related RFCs, `CLAUDE.md`
+5. **Acceptance criteria** — normative scenarios, one per invariant
+   or hazard the RFC touches. Format: structured prose with
+   `Given / When / Then / And` leading clauses; each scenario carries
+   an id of the form `H1.1`, `§3.4.2`, or `RFC<NNNN>.<m>`, referenced
+   from the test code so the mapping is greppable. See
+   `docs/verification.md` §2.
+6. **Testing strategy** — mapped to `CLAUDE.md` §6.2; references the
+   §5 scenario ids and names the technique (`proptest`, corpus,
+   `criterion`) for each.
+7. **Open questions** — everything unresolved, as a checklist.
+8. **References** — paper citations, related RFCs, `CLAUDE.md`
    sections constrained.
 
 Additional sections are welcome when they clarify. Do not pad for the
@@ -61,14 +74,32 @@ sake of the template.
 
 ## Lifecycle
 
-1. **Draft** — PR opened with status `draft`. Discussion happens in PR
-   review. The RFC is not yet binding.
-2. **Accepted** — maintainer approval, status flipped to `accepted` in
-   the same or a follow-up PR. Implementation may begin.
-3. **Superseded** — a later RFC replaces part or all of this one. Both
-   frontmatters are updated. The superseded RFC is not deleted.
-4. **Rejected** — closed PR or status flipped to `rejected`. The file
-   is kept for the record.
+The five-stage maturity model. An RFC moves through these stages
+before becoming binding; the `status:` frontmatter field tracks the
+current stage so reviewers and tooling see it without reading the
+body.
+
+1. **Drafted** — PR opened with status `drafted`. Sections §§1–4 and
+   §§7–8 are filled. Discussion happens in PR review.
+2. **Specified** — §5 acceptance criteria are written, every
+   invariant and hazard the RFC touches has at least one scenario,
+   and review has confirmed the criteria are testable in principle.
+3. **Red** — test stubs exist and fail. Implementation may begin.
+4. **Green** — all acceptance criteria pass; unit + property + corpus
+   tests green.
+5. **Validated** — thesis-gates in `docs/benchmarks.md` §7 pass on
+   representative corpora. Maintainer flips status to `accepted`.
+
+A regression detected after `Validated` either reopens the RFC (if a
+criterion is invalidated) or spawns a tuning RFC per `benchmarks.md`
+§7 (if a thesis-gate degrades). See `docs/verification.md` §3.
+
+Two terminals reachable from any stage:
+
+- **Superseded** — a later RFC replaces part or all of this one.
+  Both frontmatters are updated. The superseded RFC is not deleted.
+- **Rejected** — closed PR or status flipped to `rejected`. The
+  file is kept for the record.
 
 ## Diagrams
 

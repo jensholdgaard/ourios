@@ -6,6 +6,7 @@
 
 - [Overview]()
 - [Hazards](./hazards.md)
+- [Verification](./verification.md)
 - [Glossary](./glossary.md)
 
 # Benchmarks

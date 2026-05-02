@@ -701,6 +701,8 @@ The metrics enumerated in `[§3.1]` are mandatory. Full set:
 | `template_count` | gauge | `tenant_id` | `[§3.1]` |
 | `merges_total` | counter | `tenant_id`, `event_type` | `[§3.1]`, H1 |
 | `confidence` | histogram | `tenant_id`, `service` | `[§3.1]`, §6.3 |
+| `confidence_p50` | gauge | `tenant_id`, `service` | `[§3.1]` |
+| `confidence_p01` | gauge | `tenant_id`, `service` | `[§3.1]` |
 | `body_retention_ratio` | gauge | `tenant_id` | `[§3.1]`, `[§3.3]` |
 | `parse_failures_total` | counter | `tenant_id`, `service` | `[§3.1]` |
 | `params_overflow_total` | counter | `tenant_id`, `service` | `[§3.2]`, H2 |
@@ -708,10 +710,19 @@ The metrics enumerated in `[§3.1]` are mandatory. Full set:
 | `template_version_changes_total` | counter | `tenant_id` | `[§3.5]`, H5 |
 | `miner_latency_seconds` | histogram | `tenant_id` | hot-path budget (D1) |
 
-`confidence_p50` and `confidence_p01` from `[§3.1]` are derived from
-the `confidence` histogram via standard Prometheus quantile rules,
-not separate metrics. The histogram bucket boundaries are tuned to
-straddle the decision boundary at 1.0 (see §6.3): default buckets
+**`confidence_p50` and `confidence_p01`.** The `confidence`
+histogram is the source of truth; the two gauges are convenient
+named views derived from it in-process. The miner recomputes them
+on a short ticker (default 10 s, configurable; the cost is one
+quantile evaluation over the histogram per tenant per service per
+tick — negligible relative to the hot path) and caches the value
+between ticks so a Prometheus scrape never blocks on
+recomputation. The gauges exist so alerting rules and runbooks can
+name them directly per `[§3.1]` rather than spelling out a
+`histogram_quantile(...)` expression at every reference.
+
+The histogram bucket boundaries are tuned to straddle the decision
+boundary at 1.0 (see §6.3): default buckets
 `[0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0, +Inf]`.
 
 ### 6.9 Persistence and recovery

@@ -40,8 +40,14 @@ operator never knows.
 - Lowering the threshold below 0.7 requires an RFC, not a config
   change.
 - Three-zone confidence model: clean match (≥ threshold) / lossy
-  match (floor ≤ x < threshold, retain body, set `lossy_flag`) /
-  parse failure (< floor, retain body, increment counter).
+  match (floor ≤ x < threshold, retain body — reconstruction still
+  succeeds, so `lossy_flag` is **not** set) / parse failure
+  (< floor, retain body, increment counter). `lossy_flag` is
+  reserved for the H7 case (genuine tokenizer / preprocessing
+  failure where `reconstruct(record) != ingested_bytes` is
+  possible); it is not a low-confidence signal. See
+  `docs/rfcs/0001-template-miner.md` §6.6 for the precise
+  definition.
 - Every template-widening event is audited: the audit record names
   the old template, the new template, tenant, timestamp, and reason.
 

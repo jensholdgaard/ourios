@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Template miner (Drain-derived online log parsing)
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -12,14 +12,14 @@ superseded-by: —
 # RFC 0001 — Template miner
 
 > **How to read this document.** §§1–4 are the design contract — the
-> *what* and the *why*. §5 (Acceptance criteria) is reserved per
-> `docs/rfcs/README.md` and is added in the PR that moves this RFC
-> from Drafted to Specified; while in Drafted the section is a
-> placeholder. §6 is the precise specification the `ourios-miner`
+> *what* and the *why*. §5 lists the normative `Given / When / Then`
+> scenarios — the contract — grouped by parent (hazard, invariant,
+> RFC-internal). §6 is the precise specification the `ourios-miner`
 > crate is implemented against; its opening paragraphs name the
 > gaps between the published algorithm and a production miner that
 > §6.1–§6.9 then close. §7 records the alternatives we evaluated
-> and rejected.
+> and rejected. §8 maps each §5 scenario to the technique that
+> tests it.
 >
 > Cross-references to `CLAUDE.md` sections are in square brackets,
 > e.g. `[§3.1]`, and name the invariant the section must preserve.
@@ -244,22 +244,287 @@ runtime decision per leaf.
 
 ## 5. Acceptance criteria
 
-*Reserved.* Per `docs/rfcs/README.md` ("Required sections"), every
-RFC's §5 carries the normative `Given / When / Then / And`
-scenarios that operationalise the commitments in §6. This RFC is
-at the Drafted gate; the Acceptance criteria are added in the PR
-that moves it to Specified. Scenario ids will follow the conventions in
-`docs/verification.md` §2: `H1.x`, `H2.x`, `H5.x`, `H7.x` for the
-hazards this RFC mitigates; `§3.1.y`, `§3.2.y`, `§3.3.y`, `§3.5.y`,
-`§3.7.y` for the invariants it preserves; `RFC0001.x` for
-design-internal scenarios with no invariant or hazard parent.
+Per `docs/verification.md` §§2–3, every CLAUDE.md §3 invariant and
+every `docs/hazards.md` hazard this RFC touches has at least one
+numbered scenario below. Scenarios use the bold-leading-clause
+format (verification.md §2.1) and the id grammars (§2.2):
+`H<n>.<m>` for hazard-rooted, `§3.<n>.<m>` for invariant-rooted,
+`RFC0001.<m>` for design-internal commitments. Test code carries
+each id in a doc comment per §2.3 so `grep -R "H1.1" .` resolves
+bidirectionally between RFC and tests.
+
+The hazards in scope are H1, H2, H5, H7; the invariants are §3.1,
+§3.2, §3.3, §3.5, §3.7. H3 (WAL durability) and H4 (small files)
+are owned by the `ourios-wal` and `ourios-parquet` RFCs; H6 (DSL)
+is owned by RFC 0002; §3.4 (WAL-before-ack) and §3.6
+(object-storage-as-truth) are touched only via §6.9's persistence
+direction and the primary obligation lives in those other RFCs.
+
+### 5.1 Hazards
+
+> **Scenario H1.1 — Semantically distinct templates do not silently merge**
+> - **Given** a corpus containing `user logged in <*>` and
+>   `user logged out <*>`
+> - **When** similarity threshold is 0.7 (the default)
+> - **Then** the two remain distinct `template_id`s
+> - **And** any widening produces an audit event recording both old
+>   and new templates
+
+> **Scenario H1.2 — Lossy-zone match retains body**
+> - **Given** a line whose best match has confidence in the lossy
+>   zone (`floor ≤ x < threshold`)
+> - **When** the line is ingested
+> - **Then** the `body` column contains the original line bytes
+> - **And** the row carries `lossy_flag = false` (the flag is
+>   reserved for tokenizer / preprocessing failure per §6.6 — the
+>   lossy *zone* retains the body but reconstruction still
+>   succeeds)
+
+> **Scenario H1.3 — Every widening emits an audit event**
+> - **Given** any sequence of inputs that triggers a template
+>   widening
+> - **When** the widening completes
+> - **Then** an audit event exists naming the old template, the
+>   new template, the tenant id, the timestamp, and the
+>   `event_type`
+
+> **Scenario H2.1 — Oversized parameter triggers OVERFLOW marker and forced body retention**
+> - **Given** a tenant configured with the default 256 B
+>   per-parameter byte limit
+> - **And** a log line whose masked parameter value exceeds 256 B
+>   (e.g. an embedded stack trace)
+> - **When** the line is ingested
+> - **Then** the corresponding `Param` entry has
+>   `type_tag = OVERFLOW` carrying `(length, sha256_prefix)`
+>   instead of the original value
+> - **And** the `body` column contains the original line bytes
+>   regardless of `lossy_flag`
+> - **And** `params_overflow_total{tenant_id, service}` increments
+
+> **Scenario H2.2 — Per-service overflow rate above 1% raises an alert**
+> - **Given** the `params_overflow_ratio{tenant_id, service}`
+>   gauge for some service
+> - **When** the rolling rate exceeds `0.01`
+> - **Then** the documented alert rule fires (the rule ships
+>   alongside §6.5's metric definition)
+
+> **Scenario H5.1 — Wildcard widening increments template_version and emits template_widened**
+> - **Given** a leaf at `(template_id = X, template_version = V)`
+> - **When** an attach widens a previously-fixed token at position
+>   `i` into `<*>`
+> - **Then** the leaf's `template_version` becomes `V + 1`
+> - **And** an audit event with
+>   `event_type = template_widened` is emitted naming the new
+>   wildcard position(s)
+
+> **Scenario H5.2 — Type expansion increments template_version and emits template_type_expanded**
+> - **Given** a leaf whose wildcard slot `s` has
+>   `slot_types[s] = {NUM}`
+> - **When** an attach maps a typed parameter of `type = STR`
+>   into slot `s`
+> - **Then** `slot_types[s]` becomes `{NUM, STR}`
+> - **And** `template_version` increments
+> - **And** an audit event with
+>   `event_type = template_type_expanded` is emitted naming the
+>   slot and the newly-added `ParamType`
+
+> **Scenario H5.3 — Drift query returns templates that gained a version in window**
+> - **Given** the `template_audit` event stream contains
+>   `template_widened` and `template_type_expanded` events for
+>   templates A and B in the window `[t1, t2]`
+> - **When** the §6.7 drift query runs against `[t1, t2]`
+> - **Then** the result includes both A and B with their widening
+>   counts
+
+> **Scenario H7.1 — Reconstruction property holds across the corpus**
+> - **Given** the committed `testdata/corpus/` (anonymised, fixed)
+> - **When** every line is ingested through the miner
+> - **Then** for every emitted record `r` where
+>   `r.lossy_flag = false`, `reconstruct(r) == r.ingested_bytes`
+>   holds byte-for-byte
+> - **And** property failure is a build break, not a regression
+
+> **Scenario H7.2 — Tokenizer failure sets lossy_flag = true and retains body**
+> - **Given** a line containing an embedded NUL byte (or another
+>   tokenizer-failure mode listed in §6.6)
+> - **When** the line is ingested
+> - **Then** a parse-failure record is emitted
+> - **And** the record's `lossy_flag` is `true`
+> - **And** the record's `body` column contains the original line
+>   bytes
+
+> **Scenario H7.3 — Reader emits body verbatim when lossy_flag is true**
+> - **Given** a record with `lossy_flag = true`
+> - **When** the reader renders the row
+> - **Then** the rendered output is the `body` column verbatim
+>   with the §6.6 warning marker
+> - **And** `reconstruct()` is NOT called for that row
+
+> **Scenario H7.4 — Widened literal slot reconstructs via STR fallback**
+> - **Given** a leaf whose template gains a new `<*>` slot at
+>   position `i` via the §6.2 widening of an originally-literal
+>   token
+> - **When** the triggering line is attached
+> - **Then** the line's record carries
+>   `params[slot_for_i] = { type_tag: STR, value: L_tok[i] }`
+> - **And** `reconstruct(record) == ingested_bytes` holds
+
+### 5.2 Invariants
+
+> **Scenario §3.1.1 — Default similarity threshold is 0.7**
+> - **Given** a tenant configuration with no threshold override
+> - **When** the miner is initialised for that tenant
+> - **Then** the effective threshold is `0.7`
+
+> **Scenario §3.1.2 — Mandatory metric set is exposed**
+> - **Given** a running miner
+> - **When** the Prometheus registry is enumerated
+> - **Then** it contains every metric named in §6.8's table
+>   (`template_count`, `merges_total`, `confidence`,
+>   `confidence_p50`, `confidence_p01`, `body_retention_ratio`,
+>   `parse_failures_total`, `params_overflow_total`,
+>   `params_overflow_ratio`, `template_version_changes_total`,
+>   `miner_latency_seconds`) with the types and labels listed
+>   there
+
+> **Scenario §3.2.1 — Default per-parameter byte limit is 256**
+> - **Given** a tenant configuration with no per-parameter byte
+>   limit override
+> - **When** the miner is initialised for that tenant
+> - **Then** the effective limit is `256` bytes
+
+> **Scenario §3.2.2 — Configured limit above 1 KiB is rejected at startup**
+> - **Given** a tenant configuration with
+>   `param_byte_limit > 1024`
+> - **When** the miner is initialised
+> - **Then** initialisation fails with an error citing the §3.2
+>   ceiling
+> - **And** the process refuses to start serving that tenant
+
+> **Scenario §3.3.1 — Separators array captured on every successful tokenization**
+> - **Given** a line that tokenizes successfully
+> - **When** the line is ingested
+> - **Then** the emitted record's
+>   `separators.len() == tokens.len() + 1`
+> - **And** the per-row precondition for H7.1 holds (the
+>   reconstruction proptest then asserts byte equality)
+
+> **Scenario §3.5.1 — Snapshot format carries a leading version byte**
+> - **Given** a serialised snapshot artefact written by the miner
+> - **When** the artefact is inspected
+> - **Then** byte 0 is the snapshot format version
+
+> **Scenario §3.5.2 — Unknown snapshot version triggers full WAL replay**
+> - **Given** a snapshot artefact whose leading version byte is
+>   unknown to the running miner
+> - **When** the miner loads the snapshot at startup
+> - **Then** the snapshot is rejected
+> - **And** the miner falls back to full WAL replay rather than
+>   misinterpreting the bytes
+
+> **Scenario §3.7.1 — Tenants' template trees never cross-pollinate**
+> - **Given** a `MinerCluster` ingesting interleaved lines from
+>   synthetic tenants A and B
+> - **When** the corpus is fully ingested
+> - **Then** no template mined under tenant A appears in tenant
+>   B's tree
+> - **And** no template mined under tenant B appears in tenant
+>   A's tree
+> - (Implements `docs/benchmarks.md` E2.)
+
+> **Scenario §3.7.2 — Same structural template in two tenants gets distinct template_ids**
+> - **Given** tenants A and B independently emit the structurally
+>   identical template `user <NUM> logged in from <IP>`
+> - **When** both are ingested
+> - **Then** tenant A's `template_id` for that template differs
+>   from tenant B's `template_id`
+> - **And** no `template_id` is shared across tenants
+
+### 5.3 RFC-internal design commitments
+
+> **Scenario RFC0001.1 — Fresh-leaf creation does not emit an audit event**
+> - **Given** a parent prefix node with no leaves yet
+> - **When** a line creates the first leaf at that node
+> - **Then** no event is appended to the audit stream for that
+>   creation
+> - **And** `template_count` increments to reflect the new leaf
+
+> **Scenario RFC0001.2 — Degenerate-template guard rejects fully-wildcard widening**
+> - **Given** a leaf whose template, after a candidate widening,
+>   would have zero non-wildcard tokens
+> - **When** the candidate widening is attempted
+> - **Then** the widening is rejected
+> - **And** the line is treated as a parse failure
+>   (`confidence = 0`, body retained, `parse_failures_total`
+>   increments)
+> - **And** an audit event with
+>   `event_type = template_widening_rejected_degenerate` records
+>   the rejection
+
+> **Scenario RFC0001.3 — Tokenizer is Unicode whitespace only; punctuation stays in tokens**
+> - **Given** a line `key=value, other=42` (no whitespace
+>   adjacent to the punctuation)
+> - **When** the line is tokenized
+> - **Then** it produces two tokens (`key=value,` and `other=42`)
+> - **And** no token boundary is introduced at `=`, `,`, `:`,
+>   `;`, `[`, `]`, `(`, or `)`
+
+> **Scenario RFC0001.4 — Confidence ratio = simSeq / threshold; decision boundary at 1.0**
+> - **Given** a tenant with `threshold = 0.7`
+> - **And** a line whose `simSeq` against the best candidate is
+>   `0.7`
+> - **When** the line is ingested
+> - **Then** the emitted record's `confidence == 1.0`
+> - **And** the line takes the clean-attach branch
+> - **And** the same `simSeq` under `threshold = 0.5` would
+>   yield `confidence == 1.4` (the ratio reframes
+>   scale-invariantly across tenants)
+
+> **Scenario RFC0001.5 — Bare `template_id = X` spans all versions of leaf X**
+> - **Given** leaf X with versions 1, 2, 3 attached over time
+> - **When** a query runs `where template_id = X`
+> - **Then** the result includes rows attached against `(X, 1)`,
+>   `(X, 2)`, and `(X, 3)`
+> - **And** no alias resolution is involved (this is
+>   by-construction, since `template_id` is stable across
+>   widenings of one leaf)
+
+> **Scenario RFC0001.6 — Bare `template_id = X` does NOT follow alias chains**
+> - **Given** two distinct leaves X and Y that the alias index
+>   records as semantically equivalent
+> - **When** a query runs `where template_id = X`
+> - **Then** only rows whose `template_id == X` are returned;
+>   rows with `template_id == Y` are NOT included
+> - **And** `where template_id.resolves_to(X)` (RFC 0002 §5.4) is
+>   the explicit form that includes Y's rows
+
+> **Scenario RFC0001.7 — Combined widening + type-expansion increments version twice and emits two events in order**
+> - **Given** a leaf at version `V` where a single attach both
+>   introduces a new wildcard slot AND introduces a
+>   previously-unseen `ParamType` into an existing slot
+> - **When** the attach completes
+> - **Then** the leaf's `template_version == V + 2`
+> - **And** the audit stream contains two events for this attach:
+>   a `template_widened` event for the new wildcard, immediately
+>   followed by a `template_type_expanded` event for the type
+>   expansion (in that order)
+
+> **Scenario RFC0001.8 — confidence_p50 and confidence_p01 are emitted as gauges**
+> - **Given** a running miner with a non-empty `confidence`
+>   histogram for some `(tenant_id, service)`
+> - **When** the Prometheus registry is scraped
+> - **Then** `confidence_p50{tenant_id, service}` and
+>   `confidence_p01{tenant_id, service}` are present as gauges
+> - **And** each value matches the corresponding quantile of the
+>   same-labelled histogram (computed in-process on a short
+>   ticker per §6.8)
 
 ## 6. Proposed design
 
 The Ourios miner in detail. This is the section that the
 `ourios-miner` crate is implemented against; §5's Acceptance
-criteria (added at the Specified gate) operationalise the
-commitments here.
+criteria operationalise the commitments here, and §8 maps each
+§5 scenario to the technique that tests it.
 
 **Why §6 exists.** Published Drain (§3) and Drain3 (§4) do not
 address the properties Ourios requires. Each row below is a gap
@@ -863,42 +1128,103 @@ follow-up RFC if and when reconciliation becomes a real concern.
 
 ## 8. Testing strategy
 
-Mapping to `[§6.2]`. Acceptance criteria scenario ids (added in the
-Specified-gate PR) will be referenced from the corresponding test
-doc-comments per `docs/verification.md` §2.3.
+Mapping to `[§6.2]`. Each technique below names the §5 scenarios
+it operationalises; the test code carries the matching id in a doc
+comment per `docs/verification.md` §2.3 so `grep -R "H1.1" .`
+resolves bidirectionally between RFC and tests.
 
 - **Unit tests** for tree operations: `tokenize`, `mask`,
-  `descend`, `simSeq`, `widen`, `attach`. Each operation tested in
-  isolation against fabricated inputs.
+  `descend`, `simSeq`, `widen`, `attach`, `build_params`. Each
+  operation tested in isolation against fabricated inputs.
+  *Covers:* RFC0001.3 (tokenizer whitespace-only),
+  RFC0001.4 (confidence ratio + decision boundary),
+  RFC0001.7 (combined widening + type-expansion in one attach).
+
 - **`proptest`** for §6.6 reconstruction: for every generated line
   shape (length, separator distribution, masking outcome),
   `reconstruct(mine(line)) == line` or `mine(line).lossy_flag ==
   true`. Property failure blocks merge.
+  *Covers:* H7.1, H7.4, §3.3.1.
+
 - **Corpus tests** on `testdata/corpus/` (fixed, anonymised; see
   `docs/benchmarks.md` §1): assert bounds on `template_count`,
   `merges_total`, reconstruction accuracy, parameter overflow
   rate. Regressions are build failures, not warnings.
+  *Covers:* H1.1 (login/logout corpus arm), H7.1 (corpus arm).
+
 - **Confidence calibration test**: on a labelled subset of the
   corpus, verify the three-zone classification in §6.3 against the
   human labels.
-- **Merge-audit assertion** (negative test): no widening completes
-  without an audit event; assertion runs on every corpus pass.
+  *Covers:* H1.2.
+
+- **Merge-audit assertion** (negative + positive): no widening or
+  type-expansion completes without a matching audit event, and
+  fresh-leaf creation does *not* emit one. Runs on every corpus
+  pass and on the synthetic widening fixtures.
+  *Covers:* H1.3, H5.1, H5.2, RFC0001.1 (negative — no event on
+  creation), RFC0001.2 (rejection event for degenerate widening),
+  RFC0001.7 (event ordering arm).
+
 - **Multi-tenant isolation** (negative test): interleave lines from
   two synthetic tenants through a single `MinerCluster`; assert that
   templates mined under tenant A never appear in tenant B's tree
   and vice versa. Implements `docs/benchmarks.md` E2.
+  *Covers:* §3.7.1, §3.7.2.
+
 - **Drift detection test**: ingest a corpus where a template
   deliberately drifts mid-stream; assert that the drift query in
   §6.7 returns the drifted template within the expected window.
+  *Covers:* H5.3.
+
 - **Crash recovery test (snapshot + WAL replay)**: SIGKILL the
   ingester between snapshot writes; assert that recovery
   reconstructs the same tree state that was acknowledged before
-  the kill. This is `[§3.4]`'s crash-recovery test extended to
-  cover the miner's persistence layer.
+  the kill. Also corrupt the snapshot's leading version byte and
+  assert WAL fallback. This is `[§3.4]`'s crash-recovery test
+  extended to cover the miner's persistence layer.
+  *Covers:* §3.5.1, §3.5.2.
+
+- **Configuration tests**: assert default values and the rejection
+  of out-of-bounds settings at startup.
+  *Covers:* §3.1.1 (default threshold = 0.7),
+  §3.2.1 (default param byte limit = 256),
+  §3.2.2 (limit > 1 KiB rejected).
+
+- **Metrics registry test**: enumerate the Prometheus registry on
+  a freshly-initialised miner; assert the names, types, and labels
+  in §6.8's table are all present, and that the
+  `confidence_p50` / `confidence_p01` gauges track the
+  same-labelled `confidence` histogram quantiles.
+  *Covers:* §3.1.2, RFC0001.8.
+
+- **Data-model contract tests**: small unit tests against the
+  `template_id` query semantics that RFC 0002's DSL compiles to.
+  These cover the cross-version vs. cross-alias distinction at the
+  data-model layer; the DSL surface itself is tested in RFC 0002.
+  *Covers:* RFC0001.5, RFC0001.6.
+
+- **Reader behaviour test**: assert the §6.6 reader emits the
+  `body` column verbatim (with the warning marker) for
+  `lossy_flag = true` rows, and calls `reconstruct()` for the
+  rest. The reader never silently substitutes one for the other.
+  *Covers:* H7.3.
+
+- **Overflow-path tests**: synthesize a parameter exceeding the
+  configured byte limit; assert the `OVERFLOW` marker, forced
+  body retention, and metric increments. Wire the alert-rule
+  fixture for the >1% rate trigger.
+  *Covers:* H2.1, H2.2.
+
+- **Tokenizer-failure tests**: feed lines with embedded NULs,
+  malformed UTF-8, and over-cap lengths; assert the parse-failure
+  path retains the body and sets `lossy_flag = true`.
+  *Covers:* H7.2.
+
 - **Benchmark (`criterion`)**: per-line miner latency (target:
   median ≤ 10 µs/line on the §1 hardware baseline), ingest
   throughput (target: ≥ 100k lines/s/core, per `docs/benchmarks.md`
-  D1).
+  D1). No §5 scenario; satisfies thesis-gate D1 directly at the
+  *Validated* stage.
 
 ## 9. Open questions
 

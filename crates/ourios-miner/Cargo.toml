@@ -1,0 +1,12 @@
+[package]
+name = "ourios-miner"
+version = "0.0.0"
+description = "Drain-derived online template miner for Ourios."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

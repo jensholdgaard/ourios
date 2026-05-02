@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Template miner (Drain-derived online log parsing)
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24

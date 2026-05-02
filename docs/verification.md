@@ -363,8 +363,11 @@ The *Specified* gate adds a new §5 to RFC 0001:
 > - **Given** a line whose best match has confidence in the lossy
 >   zone (`floor ≤ x < threshold`)
 > - **When** the line is ingested
-> - **Then** the row carries `lossy_flag = true`
-> - **And** the `body` column contains the original line bytes
+> - **Then** the `body` column contains the original line bytes
+> - **And** the row carries `lossy_flag = false`
+>   (`lossy_flag` is reserved for tokenizer / preprocessing failure
+>   per `docs/rfcs/0001-template-miner.md` §6.6 — the lossy
+>   *zone* retains the body but reconstruction still succeeds)
 >
 > **Scenario H1.3 — Every merge emits an audit event**
 > - **Given** any sequence of inputs that triggers a template
@@ -415,8 +418,10 @@ Implementation lands across `ourios-miner` (and supporting types in
 `ourios-core`). The three stubs become real tests: H1.1 ingests the
 two-template corpus, asserts two distinct `template_id`s, and queries
 the audit log for absence of merge events. H1.2 ingests a line whose
-token similarity falls in the lossy zone and asserts the row's
-`lossy_flag` and `body`. H1.3 ingests a sequence that provokes a
+token similarity falls in the lossy zone and asserts that the
+row's `body` carries the original bytes and `lossy_flag` is
+`false` (the flag is reserved for the H7 reconstruction-failure
+case; see RFC 0001 §6.6). H1.3 ingests a sequence that provokes a
 widening and asserts the audit event's structure.
 
 `cargo test --all-features` passes. Reviewers confirm each H1.x id

@@ -293,9 +293,12 @@ Where:
 
 - `Param` = `{ type_tag: ParamType, value: Bytes }`. `ParamType` is
   one of `IP, UUID, NUM, HEX, TS, PATH, STR, OVERFLOW`. `STR` is
-  the unmasked-wildcard fallback; `OVERFLOW` carries `(length:
+  the unmasked-wildcard fallback — used when a slot was created by
+  template widening of a previously-fixed literal token (the literal
+  itself becomes the param value); `OVERFLOW` carries `(length:
   u32, sha256_prefix: [u8; 8])` instead of the original value
-  (§6.5).
+  (§6.5). `params.len() == count(<*> in template)`, always; §6.2
+  enforces this when a widening introduces new wildcard slots.
 - `Separator` is a small inline byte string (typically 1–3 bytes
   in practice). Encoding in Parquet is an implementation detail
   that does not affect this RFC.
@@ -379,6 +382,8 @@ For each ingested line `L_raw`:
         # widening events whose semantics need cross-referencing.
         leaf = new Leaf(template = L_masked)
         parent.leaves.push(leaf)
+        # On fresh-leaf creation the template is L_masked verbatim,
+        # so every <*> in it came from mask(); params == typed_params.
         attach(L_masked, typed_params, separators, leaf,
                confidence = 1.0, lossy_flag = false)
         return
@@ -387,7 +392,13 @@ For each ingested line `L_raw`:
     confidence = similarity / threshold
 
     if similarity >= threshold:
-        # clean or lossy attach; widen the template if needed
+        # clean or lossy attach; widen the template if needed.
+        # widen() returns:
+        #   widened           — the new template (existing fixed
+        #                       positions that mismatched L_masked
+        #                       become <*>)
+        #   new_wildcards     — the set of positions that just
+        #                       became <*> (the audit payload)
         widened, new_wildcards = widen(candidate.template, L_masked)
         if new_wildcards > 0:
             candidate.template = widened
@@ -398,6 +409,20 @@ For each ingested line `L_raw`:
                        positions_widened = new_wildcards.positions,
                        ...)
             merges_total.inc()
+
+        # Build the params array. One entry per <*> in the (possibly
+        # just-widened) template, in template order. For each slot:
+        #   - if the slot existed before this attach AND mask() emitted
+        #     a typed_params entry for it, use that entry verbatim.
+        #   - if the slot is a fresh wildcard from this widening (the
+        #     position held a literal token in candidate.template before
+        #     the widen call), the original literal at that position in
+        #     L_tok is captured as { type_tag: STR, value: L_tok[pos] }.
+        # Without this step §6.1's "one entry per <*> slot" invariant
+        # is violated and §6.6's reconstruct() has no value to insert
+        # at the freshly-widened position.
+        params = build_params(candidate.template, typed_params,
+                              L_tok, new_wildcards)
 
         # Type-expansion: if any wildcard slot now sees a typed param
         # whose type tag is not already in that slot's observed-type
@@ -413,7 +438,7 @@ For each ingested line `L_raw`:
                        slots_expanded = new_types,
                        ...)
 
-        attach(L_masked, typed_params, separators, candidate,
+        attach(L_masked, params, separators, candidate,
                confidence,
                lossy_flag = false)  # §6.6: lossy_flag is set only on
                                     # tokenizer/preprocessing failure,
@@ -426,6 +451,8 @@ For each ingested line `L_raw`:
         # Body retention is unconditional in this branch.
         leaf = new Leaf(template = L_masked)
         parent.leaves.push(leaf)
+        # As in the candidate-is-None branch, the new leaf's template
+        # is L_masked verbatim, so params == typed_params.
         attach(L_masked, typed_params, separators, leaf,
                confidence,
                lossy_flag = false,
@@ -657,19 +684,30 @@ and parameter-type expansions accrue. Each change increments
 `template_widened` or `template_type_expanded`.
 `template_version_changes_total` counts these.
 
-**Alias semantics — by-default-broad, version-pinned-on-request.**
-A query that says `template_id = X` is interpreted as "rows whose
-`template_id == X`, any version" — i.e. follow the alias chain
-across all versions. This is the common case (operators usually
-mean "show me this template's events," not "show me this exact
-structural snapshot of the template"). A query that says
-`(template_id, template_version) = (X, V)` returns only rows from
-that exact state.
+**Two distinct cross-cutting questions.** "Same leaf, different
+structural snapshots" and "different leaves that mean the same
+thing" are separate problems, with separate query forms:
 
-The DSL surface for this is RFC 0002 §5.4 (`template_id.resolves_to(X)`
-is the explicit cross-version form; bare `template_id = X` is the
-implicit form). The data model in §6.1 supports both shapes
-unambiguously.
+- *Cross-version (within one leaf).* A leaf's `template_id` is
+  stable across every widening of that leaf (§6.1, "Template
+  identity"); only `template_version` advances. So a literal
+  predicate `where template_id = X` already returns rows from
+  every version of leaf X by construction — no alias resolution
+  required. To pin to a single structural snapshot, query
+  `where (template_id, template_version) = (X, V)`.
+- *Cross-alias (across leaves).* When a deploy changes a log line
+  enough that the miner allocates a new leaf instead of widening
+  the existing one, the operator has two `template_id`s for what
+  is semantically the same template. Resolving "all rows for the
+  thing X represents" then requires walking an alias set that
+  spans leaves. RFC 0002 §5.4 exposes this as
+  `where template_id.resolves_to(X)`; bare `where template_id = X`
+  does **not** follow alias chains.
+
+The data model in §6.1 supports both shapes: cross-version is free
+because `template_id` is stable across widenings; cross-alias is
+served by the audit stream and the alias index that
+`template_widened` events feed.
 
 **Drift detection as a first-class query.** "Templates that gained
 a new version in the window `[t1, t2]`" is a query against the

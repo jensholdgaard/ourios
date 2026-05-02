@@ -12,13 +12,14 @@ superseded-by: —
 # RFC 0001 — Template miner
 
 > **How to read this document.** §§1–4 are the design contract — the
-> *what* and the *why*. §5 enumerates the gaps between the published
-> algorithm and a production miner; §6 is the precise specification
-> the `ourios-miner` crate is implemented against. §7 records the
-> alternatives we evaluated and rejected. Acceptance criteria (§5 of
-> a Specified RFC, per `docs/rfcs/README.md`) are not in this
-> document yet — they are added in the PR that moves this RFC from
-> Drafted to Specified.
+> *what* and the *why*. §5 (Acceptance criteria) is reserved per
+> `docs/rfcs/README.md` and is added in the PR that moves this RFC
+> from Drafted to Specified; while in Drafted the section is a
+> placeholder. §6 is the precise specification the `ourios-miner`
+> crate is implemented against; its opening paragraphs name the
+> gaps between the published algorithm and a production miner that
+> §6.1–§6.9 then close. §7 records the alternatives we evaluated
+> and rejected.
 >
 > Cross-references to `CLAUDE.md` sections are in square brackets,
 > e.g. `[§3.1]`, and name the invariant the section must preserve.
@@ -168,10 +169,10 @@ B walks the same path. The candidate leaf has `simSeq(B, T_A) =
 
 C walks the same path. The candidate leaf has `simSeq(C, T_A) =
 5/6 ≈ 0.833`. With `st = 0.7` (Ourios default, §6.3),
-`0.833 ≥ 0.7`, so C attaches. The template position 3 (`in` vs
-`out`) becomes `<*>`. The template widens to
-`user <NUM> logged <*> from <IP>`. This is a *template widening*
-event and must emit an audit record per §6.4.
+`0.833 ≥ 0.7`, so C attaches. Token position 4 (`in` vs `out`,
+1-indexed against the masked sequence) becomes `<*>`. The template
+widens to `user <NUM> logged <*> from <IP>`. This is a *template
+widening* event and must emit an audit record per §6.4.
 
 ## 4. Background: Drain3 extensions (not in the paper)
 
@@ -203,7 +204,7 @@ pairs; the tree walk treats the type tag as the token (so `<NUM>`
 matches `<NUM>` for tree-routing purposes) while the
 `original_bytes` flow into `params` so reconstruction can recover
 the line exactly. Paper-pure Drain loses the original token; Ourios
-retains it as a parameter. This is what makes §3.3 reconstruction
+retains it as a parameter. This is what makes `[§3.3]` reconstruction
 possible at all.
 
 ### 4.3 Variable-length wildcards — `adopt with constraint`
@@ -241,27 +242,37 @@ runtime decision per leaf.
   Ourios masks once, at ingest, deterministically. Retroactive
   masking would invalidate already-written Parquet files.
 
-## 5. What the paper and Drain3 do not address
+## 5. Acceptance criteria
 
-The gap list. Each gap is the reason an Ourios invariant exists.
-
-| Gap in published Drain | Ourios invariant that fills it |
-|---|---|
-| No confidence score on a match | `[§3.1]` body retention below threshold |
-| No audit trail on group merges | `[§3.1]` merge audit events |
-| No inter-token whitespace preservation | `[§3.3]` bit-identical reconstruction |
-| No per-parameter byte bound | `[§3.2]` param length limit, overflow to `body` |
-| No multi-tenant scoping of the tree | `[§3.7]` per-tenant template trees |
-| No template versioning / drift story | `[§3.5]`, hazard 5 |
+*Reserved.* Per `docs/rfcs/README.md` ("Required sections"), every
+RFC's §5 carries the normative `Given / When / Then / And`
+scenarios that operationalise the commitments in §6. This RFC is
+at the Drafted gate; the Acceptance criteria are added in the PR
+that moves it to Specified. Scenario ids will follow the conventions in
+`docs/verification.md` §2: `H1.x`, `H2.x`, `H5.x`, `H7.x` for the
+hazards this RFC mitigates; `§3.1.y`, `§3.2.y`, `§3.3.y`, `§3.5.y`,
+`§3.7.y` for the invariants it preserves; `RFC0001.x` for
+design-internal scenarios with no invariant or hazard parent.
 
 ## 6. Proposed design
 
 The Ourios miner in detail. This is the section that the
-`ourios-miner` crate is implemented against. Acceptance criteria
-(scenario ids `H1.x`, `H2.x`, `H5.x`, `H7.x`, plus invariant-rooted
-`§3.x.y` and RFC-internal `RFC0001.x`) operationalise the
-commitments here; they are added in the PR that moves this RFC from
-Drafted to Specified.
+`ourios-miner` crate is implemented against; §5's Acceptance
+criteria (added at the Specified gate) operationalise the
+commitments here.
+
+**Why §6 exists.** Published Drain (§3) and Drain3 (§4) do not
+address the properties Ourios requires. Each row below is a gap
+this section closes:
+
+| Gap in published Drain | Ourios invariant that fills it | §6 subsection |
+|---|---|---|
+| No confidence score on a match | `[§3.1]` body retention below threshold | §6.3 |
+| No audit trail on group merges | `[§3.1]` merge audit events | §6.4 |
+| No inter-token whitespace preservation | `[§3.3]` bit-identical reconstruction | §6.6 |
+| No per-parameter byte bound | `[§3.2]` param length limit, overflow to `body` | §6.5 |
+| No multi-tenant scoping of the tree | `[§3.7]` per-tenant template trees | §6.1 |
+| No template versioning / drift story | `[§3.5]`, hazard H5 | §6.7 |
 
 ### 6.1 Data model
 
@@ -307,7 +318,11 @@ template is created and increments by 1 on every widening event:
 either a new wildcard slot opens (a previously fixed token at
 position `i` becomes `<*>`), or an existing wildcard's typed
 parameter set changes (e.g. a `<NUM>` slot starts seeing `<STR>`
-values). The pair `(template_id, template_version)` uniquely
+values). To detect the second case, every leaf carries — alongside
+its template — a `slot_types: Vec<HashSet<ParamType>>` indexed by
+wildcard slot, recording every `ParamType` observed in that slot.
+A type expansion is the addition of a `ParamType` to one of these
+sets. The pair `(template_id, template_version)` uniquely
 identifies one structural state of a template. Queries against
 `template_id = X` return all versions; queries against
 `(template_id, template_version) = (X, V)` return only the named
@@ -330,8 +345,16 @@ For each ingested line `L_raw`:
 
 ```
 1.  L_tok, separators = tokenize(L_raw)
-        # tokenize splits on whitespace and known separators,
-        # capturing the inter-token bytes into `separators`.
+        # tokenize splits on Unicode whitespace only — every
+        # codepoint matching `char::is_whitespace()` (ASCII space,
+        # tab, CR, LF, plus the broader Unicode whitespace classes
+        # U+0085, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029,
+        # U+202F, U+205F, U+3000). Every other byte (including
+        # punctuation such as `=`, `:`, `,`, `;`, `[`, `]`, `(`,
+        # `)`) stays inside a token; structured separators are the
+        # masking layer's responsibility (§4.2 / step 2). The
+        # captured whitespace runs go into `separators` so that
+        # reconstruction (§6.6) is byte-identical.
         # On failure (malformed UTF-8, embedded NUL, line longer
         # than max-line-bytes): emit a parse-failure record and
         # increment parse_failures_total. Skip the rest.
@@ -350,10 +373,12 @@ For each ingested line `L_raw`:
 4.  candidate = argmax over leaf in parent.leaves of
                   simSeq(L_masked, leaf.template)
     if candidate is None:
-        # no leaves under parent yet; create one
+        # no leaves under parent yet; create one. Creation does not
+        # emit an audit event — `template_count` already reflects
+        # leaf allocation, and §6.4 reserves the audit stream for
+        # widening events whose semantics need cross-referencing.
         leaf = new Leaf(template = L_masked)
         parent.leaves.push(leaf)
-        emit_audit(template_created, ...)
         attach(L_masked, typed_params, separators, leaf,
                confidence = 1.0, lossy_flag = false)
         return
@@ -367,12 +392,32 @@ For each ingested line `L_raw`:
         if new_wildcards > 0:
             candidate.template = widened
             candidate.version += 1
-            emit_audit(template_widened, candidate.id,
-                       old_version, candidate.version, ...)
+            emit_audit(event_type = template_widened,
+                       template_id = candidate.id,
+                       old_version, new_version = candidate.version,
+                       positions_widened = new_wildcards.positions,
+                       ...)
             merges_total.inc()
+
+        # Type-expansion: if any wildcard slot now sees a typed param
+        # whose type tag is not already in that slot's observed-type
+        # set, widen the slot's type set, bump the version, and
+        # audit. The leaf carries `slot_types: Vec<HashSet<ParamType>>`
+        # alongside its template (data model in §6.1).
+        new_types = update_slot_types(candidate, typed_params)
+        if not new_types.is_empty():
+            candidate.version += 1
+            emit_audit(event_type = template_type_expanded,
+                       template_id = candidate.id,
+                       old_version, new_version = candidate.version,
+                       slots_expanded = new_types,
+                       ...)
+
         attach(L_masked, typed_params, separators, candidate,
                confidence,
-               lossy_flag = (confidence < 1.0 ? <see §6.6> : false))
+               lossy_flag = false)  # §6.6: lossy_flag is set only on
+                                    # tokenizer/preprocessing failure,
+                                    # not on confidence < 1.0
         return
 
     if similarity >= floor:
@@ -402,8 +447,17 @@ Branching invariants:
 - A leaf is *widened* (wildcards introduced) when a clean attach
   would otherwise mismatch positions. Every widening emits an audit
   event (§6.4).
-- The leaf's `template_version` only increments on widening, not on
-  attach.
+- A leaf's wildcard slot is *type-expanded* when an attach maps a
+  typed parameter whose `ParamType` is not already in that slot's
+  `slot_types[slot]` set. Type expansion increments
+  `template_version` and emits a `template_type_expanded` audit
+  event (§6.4).
+- A single attach can trigger both wildcard-widening and
+  type-expansion in the same leaf; in that case `template_version`
+  increments twice and two audit events are emitted, in that
+  order.
+- The leaf's `template_version` only increments on widening or
+  type-expansion, not on a clean attach.
 
 ### 6.3 Confidence scoring `[§3.1]`
 
@@ -447,6 +501,10 @@ the schema:
 
 ```
 {
+  event_type: AuditEventType,  # enum:
+                               #   template_widened
+                               #   template_type_expanded
+                               #   template_widening_rejected_degenerate
   tenant_id: TenantId,
   template_id: u64,
   old_version: u32,
@@ -456,15 +514,22 @@ the schema:
   triggering_line_hash: [u8; 16],  # blake3 of L_raw, for cross-ref
   triggering_line_sample: Option<String>,  # first 256 B of L_raw
   positions_widened: Vec<u16>, # token positions that became <*>
-  reason: WideningReason,      # enum: NewWildcard | ExpandedType
+                               # (empty for template_type_expanded)
+  slots_expanded: Vec<SlotExpansion>,
+                               # slot index + newly added ParamType(s)
+                               # (empty for template_widened)
   timestamp: SystemTime,
 }
 ```
 
-`merges_total` increments on every widening. The audit stream is
-written to the same WAL as the data records and ends up in a
-dedicated audit Parquet file per tenant per compaction window
-(schema in `ourios-parquet`'s RFC, not this one).
+`event_type` is the field §6.7's drift-detection query filters on.
+`merges_total` increments on every event whose `event_type` is
+`template_widened` or `template_type_expanded` (the two structural
+widenings); `template_widening_rejected_degenerate` is recorded but
+does not increment `merges_total`. The audit stream is written to
+the same WAL as the data records and ends up in a dedicated audit
+Parquet file per tenant per compaction window (schema in
+`ourios-parquet`'s RFC, not this one).
 
 **Default policy: strict.** Widening is permitted whenever the
 clean-attach path in §6.2 would otherwise mismatch positions. The
@@ -477,9 +542,10 @@ H1.
 template with zero non-wildcard tokens (the entire template becomes
 `<*> <*> … <*>`), the widening is rejected, the line is treated as
 a parse failure (`confidence = 0`, retain body, increment
-`parse_failures_total`), and an audit event records the rejection.
-A fully-wildcard template provides no parsing value and would
-swallow arbitrary lines.
+`parse_failures_total`), and an audit event with `event_type =
+template_widening_rejected_degenerate` records the rejection. A
+fully-wildcard template provides no parsing value and would swallow
+arbitrary lines.
 
 ### 6.5 Parameter handling `[§3.2]`
 
@@ -633,7 +699,7 @@ The metrics enumerated in `[§3.1]` are mandatory. Full set:
 | Metric | Type | Labels | Source invariant / hazard |
 |---|---|---|---|
 | `template_count` | gauge | `tenant_id` | `[§3.1]` |
-| `merges_total` | counter | `tenant_id`, `reason` | `[§3.1]`, H1 |
+| `merges_total` | counter | `tenant_id`, `event_type` | `[§3.1]`, H1 |
 | `confidence` | histogram | `tenant_id`, `service` | `[§3.1]`, §6.3 |
 | `body_retention_ratio` | gauge | `tenant_id` | `[§3.1]`, `[§3.3]` |
 | `parse_failures_total` | counter | `tenant_id`, `service` | `[§3.1]` |

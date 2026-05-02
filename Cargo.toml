@@ -1,9 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/ourios-core"]
+members = ["crates/ourios-core", "crates/ourios-miner"]
 
 # Remaining members per CLAUDE.md §7 layout will be added as crates land:
-#   crates/ourios-miner
 #   crates/ourios-wal
 #   crates/ourios-parquet
 #   crates/ourios-ingester

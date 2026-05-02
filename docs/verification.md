@@ -235,7 +235,7 @@ The Red signal lives at two granularities, deliberately:
   so the Red-stage PR lands cleanly through branch protection
   rather than fighting it. CI's signal that the Red gate is
   satisfied is structural: stubs compile, every §5 scenario has
-  an `#[ignore]`'d test with a matching id, and `cargo test
+  an `#[ignore]`'d test with a matching id, and `cargo test --
   --include-ignored` exits non-zero on each. (The greppability
   contract in §2.3 makes the per-scenario coverage check
   mechanical — `grep -R "H1.1"` returning both the RFC line and
@@ -248,7 +248,7 @@ populated with the work that needs doing.
 
 The gate is mechanical: every scenario in §5 has at least one
 stub with a matching id, the stub is tagged `#[ignore]`, and
-`cargo test --include-ignored` exits non-zero on each.
+`cargo test -- --include-ignored` exits non-zero on each.
 
 **Green.** Implementation lands. Every stub becomes a real test;
 unit, property, and corpus tests cover their scenarios as
@@ -387,25 +387,26 @@ The *Specified* gate adds a new §5 to RFC 0001:
 > - **And** any widening produces an audit event recording both old
 >   and new templates
 >
-> **Scenario H1.2 — Lossy match retains body**
+> **Scenario H1.2 — Lossy-zone match retains body**
 > - **Given** a line whose best match has confidence in the lossy
 >   zone (`floor ≤ x < threshold`)
 > - **When** the line is ingested
 > - **Then** the `body` column contains the original line bytes
-> - **And** the row carries `lossy_flag = false`
->   (`lossy_flag` is reserved for tokenizer / preprocessing failure
->   per `docs/rfcs/0001-template-miner.md` §6.6 — the lossy
->   *zone* retains the body but reconstruction still succeeds)
+> - **And** the row carries `lossy_flag = false` (the flag is
+>   reserved for tokenizer / preprocessing failure per
+>   `docs/rfcs/0001-template-miner.md` §6.6 — the lossy *zone*
+>   retains the body but reconstruction still succeeds)
 >
-> **Scenario H1.3 — Every merge emits an audit event**
+> **Scenario H1.3 — Every widening emits an audit event**
 > - **Given** any sequence of inputs that triggers a template
 >   widening
-> - **When** the merge completes
-> - **Then** an audit event exists naming the old template, the new
->   template, the tenant id, the timestamp, and the reason
+> - **When** the widening completes
+> - **Then** an audit event exists naming the old template, the
+>   new template, the tenant id, the timestamp, and the
+>   `event_type`
 
 Three scenarios cover §3.1's three rules: do not merge across
-semantics, retain bodies on low confidence, audit every merge.
+semantics, retain bodies on low confidence, audit every widening.
 Reviewers ratify that this is exhaustive against `CLAUDE.md` §3.1 and
 H1; they do not catalogue every edge-case test the implementation
 will write.
@@ -423,19 +424,19 @@ fn h1_1_login_and_logout_remain_distinct_at_default_threshold() {
     todo!("RFC 0001 §6.4");
 }
 
-/// Scenario H1.2 — Lossy match retains body.
+/// Scenario H1.2 — Lossy-zone match retains body.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 #[ignore = "RFC 0001 Red gate — implementation pending"]
-fn h1_2_lossy_match_retains_body() {
+fn h1_2_lossy_zone_match_retains_body() {
     todo!("RFC 0001 §6.6");
 }
 
-/// Scenario H1.3 — Every merge emits an audit event.
+/// Scenario H1.3 — Every widening emits an audit event.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 #[ignore = "RFC 0001 Red gate — implementation pending"]
-fn h1_3_every_merge_emits_an_audit_event() {
+fn h1_3_every_widening_emits_an_audit_event() {
     todo!("RFC 0001 §6.4");
 }
 ```
@@ -450,7 +451,7 @@ satisfied; implementation may begin.
 Implementation lands across `ourios-miner` (and supporting types in
 `ourios-core`). The three stubs become real tests: H1.1 ingests the
 two-template corpus, asserts two distinct `template_id`s, and queries
-the audit log for absence of merge events. H1.2 ingests a line whose
+the audit log for absence of widening events. H1.2 ingests a line whose
 token similarity falls in the lossy zone and asserts that the
 row's `body` carries the original bytes and `lossy_flag` is
 `false` (the flag is reserved for the H7 reconstruction-failure

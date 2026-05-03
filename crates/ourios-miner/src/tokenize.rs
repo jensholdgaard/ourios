@@ -23,12 +23,14 @@ pub struct Tokenized<'a> {
 /// Split `line` on Unicode whitespace.
 ///
 /// Whitespace is every codepoint matching [`char::is_whitespace`]:
-/// ASCII space / tab / CR / LF, plus the broader Unicode
-/// whitespace classes (U+0085, U+00A0, U+1680, U+2000–U+200A,
-/// U+2028, U+2029, U+202F, U+205F, U+3000). Every other byte —
-/// including punctuation such as `=`, `:`, `,`, `;`, `[`, `]`,
-/// `(`, `)` — stays inside the token; structured separators are
-/// the masking layer's responsibility (RFC 0001 §4.2).
+/// the full ASCII whitespace set (space U+0020, tab U+0009, LF
+/// U+000A, VT U+000B, FF U+000C, CR U+000D), plus the broader
+/// Unicode whitespace classes (U+0085, U+00A0, U+1680,
+/// U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000). Every
+/// other byte — including punctuation such as `=`, `:`, `,`, `;`,
+/// `[`, `]`, `(`, `)` — stays inside the token; structured
+/// separators are the masking layer's responsibility (RFC 0001
+/// §4.2).
 #[must_use]
 pub fn tokenize(line: &str) -> Tokenized<'_> {
     let mut tokens = Vec::new();
@@ -55,7 +57,7 @@ pub fn tokenize(line: &str) -> Tokenized<'_> {
     let end = line.len();
     if let Some(start) = tok_start {
         tokens.push(&line[start..end]);
-        separators.push("");
+        separators.push(&line[end..end]);
     } else {
         separators.push(&line[sep_start..end]);
     }

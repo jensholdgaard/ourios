@@ -29,9 +29,35 @@ fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
 /// Scenario RFC0001.3 — Tokenizer is Unicode whitespace only; punctuation stays in tokens.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_3_tokenizer_is_unicode_whitespace_only() {
-    todo!("RFC 0001 §6.2");
+    use ourios_miner::tokenize::tokenize;
+
+    let r = tokenize("key=value, other=42");
+    assert_eq!(r.tokens, vec!["key=value,", "other=42"]);
+    assert_eq!(
+        r.separators.len(),
+        r.tokens.len() + 1,
+        "separators contract: len == tokens.len() + 1",
+    );
+
+    for line in ["a=b", "a:b", "a,b", "a;b", "a[b", "a]b", "a(b", "a)b"] {
+        let r = tokenize(line);
+        assert_eq!(
+            r.tokens.len(),
+            1,
+            "punctuation in {line:?} introduced a token boundary",
+        );
+    }
+
+    let r = tokenize("hello world");
+    assert_eq!(r.tokens, vec!["hello", "world"]);
+
+    let r = tokenize("hello\u{00A0}world");
+    assert_eq!(
+        r.tokens,
+        vec!["hello", "world"],
+        "U+00A0 (non-breaking space) is Unicode whitespace and must split",
+    );
 }
 
 /// Scenario RFC0001.4 — Confidence ratio = simSeq / threshold; decision boundary at 1.0.

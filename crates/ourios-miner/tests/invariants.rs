@@ -121,15 +121,94 @@ fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
 /// Scenario §3.7.1 — Tenants' template trees never cross-pollinate.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
-    todo!("RFC 0001 §6.1, §6.2");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — two tenants emitting *different* template
+    // shapes so the cross-pollination question is testable. A's
+    // lines exercise the "user <NUM> logged in" shape; B's
+    // lines exercise the "GET <PATH> <NUM>" shape (the path
+    // differs between B's two lines so each B line is its own
+    // template under exact-match templating, but neither
+    // matches anything in A's set).
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let a = TenantId::new("tenant-a");
+    let b = TenantId::new("tenant-b");
+    let a_lines = ["user 42 logged in", "user 17 logged in"];
+    let b_lines = ["GET /home 200", "GET /api 200"];
+
+    // Act — interleave the two streams to make any tree
+    // sharing observable: a single shared store would
+    // accumulate all four shapes regardless of which tenant
+    // emitted which line.
+    for (la, lb) in a_lines.iter().zip(b_lines.iter()) {
+        cluster.ingest(&a, la);
+        cluster.ingest(&b, lb);
+    }
+
+    // Assert — A's templates contain only A-shaped tokens
+    // (`user`, `<NUM>`, `logged`, `in`); B's contain only
+    // B-shaped tokens (`GET`, the literal paths, `<NUM>`).
+    // Cross-pollination would mean either set contained tokens
+    // that originated in the other tenant's input.
+    let a_templates = cluster.templates_for(&a);
+    let b_templates = cluster.templates_for(&b);
+
+    let a_token_set: std::collections::HashSet<&str> = a_templates
+        .iter()
+        .flat_map(|(t, _)| t.iter().map(String::as_str))
+        .collect();
+    let b_token_set: std::collections::HashSet<&str> = b_templates
+        .iter()
+        .flat_map(|(t, _)| t.iter().map(String::as_str))
+        .collect();
+
+    assert!(
+        a_token_set.contains("user") && a_token_set.contains("logged"),
+        "A's tree must hold the A-shape tokens, got {a_token_set:?}",
+    );
+    assert!(
+        b_token_set.contains("GET"),
+        "B's tree must hold the B-shape tokens, got {b_token_set:?}",
+    );
+    assert!(
+        !a_token_set.contains("GET"),
+        "A's tree must NOT contain B-shape tokens (cross-pollination), got {a_token_set:?}",
+    );
+    assert!(
+        !b_token_set.contains("user") && !b_token_set.contains("logged"),
+        "B's tree must NOT contain A-shape tokens (cross-pollination), got {b_token_set:?}",
+    );
 }
 
 /// Scenario §3.7.2 — Same structural template in two tenants gets distinct `template_id`s.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_7_2_same_template_two_tenants_distinct_template_ids() {
-    todo!("RFC 0001 §6.1");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — two tenants emit the structurally identical
+    // line. After masking they produce the same token sequence
+    // (`user <NUM> logged in from <IP>`).
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let a = TenantId::new("tenant-a");
+    let b = TenantId::new("tenant-b");
+    let line = "user 42 logged in from 10.0.0.1";
+
+    // Act — same line, different tenants.
+    let id_a = cluster.ingest(&a, line);
+    let id_b = cluster.ingest(&b, line);
+
+    // Assert — RFC 0001 §6.1's per-tenant `template_id`
+    // allocator gives each tenant its own monotonic id space,
+    // so the two ids are distinct by construction (each starts
+    // at 1).
+    assert_ne!(
+        id_a, id_b,
+        "structurally identical templates must get distinct template_ids across tenants",
+    );
 }

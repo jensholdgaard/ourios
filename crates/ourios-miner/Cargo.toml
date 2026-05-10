@@ -8,5 +8,8 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dev-dependencies]
+ourios-core = { path = "../ourios-core" }
+
 [lints]
 workspace = true

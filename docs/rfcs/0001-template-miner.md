@@ -830,6 +830,25 @@ proceeds without one. Code paths that would emit a widening without
 emitting an audit event are blocked at PR review per `hazards.md`
 H1.
 
+**WAL durability ordering of audit events.** A single `attach`
+may emit two audit events in order (RFC0001.7: `template_widened`
+immediately followed by `template_type_expanded`) and one data
+record. The contract this RFC requires from the future
+`ourios-wal` RFC is an *ordering-plus-durability-barrier*: a
+data record carrying `template_version = V` must not become
+durable before every audit event justifying the leaf's
+progression to V is durable. Crash recovery may then observe
+some prefix of `[event_1, event_2, …, data_record]`, but never
+a state in which the data record exists without the events that
+caused its version stamp. Any framing strategy that satisfies
+this — a composite multi-record frame, batched-fsync ordering, a
+two-phase write-then-link, anything else — is acceptable; the
+framing is `ourios-wal`'s choice, the ordering barrier is this
+RFC's requirement. Without it, replay would bump
+`template_version` fewer times than the in-memory leaf did and
+the surviving data records would reference a version the audit
+stream cannot substantiate.
+
 **Degenerate template guard.** If a widening would leave the
 template with zero non-wildcard tokens (the entire template becomes
 `<*> <*> … <*>`), the widening is rejected, the line is treated as
@@ -971,8 +990,25 @@ thing" are separate problems, with separate query forms:
 
 The data model in §6.1 supports both shapes: cross-version is free
 because `template_id` is stable across widenings; cross-alias is
-served by the audit stream and the alias index that
-`template_widened` events feed.
+served by a separate alias index that maps a representative
+`template_id` to the equivalence class of `template_id`s the
+operator (or a future inference layer) considers semantically the
+same template.
+
+**Alias index lifecycle.** Cross-alias is structurally distinct
+from cross-version: widening is intra-leaf and increments
+`template_version` (one `template_id`, several versions);
+aliasing is inter-leaf and groups `template_id`s the miner allocated
+separately (different `template_id`s, the operator asserts they
+mean the same thing). `template_widened` events therefore do **not**
+populate the alias index — they live on the cross-version axis. The
+alias index has no creation event in this RFC: the candidate
+writers (operator-driven, automatic-inference, deferred entirely)
+and the shape of the write API they would expose are open
+questions in §9. Until those questions resolve, RFC 0002's
+`template_id.resolves_to(X)` operates against an alias index
+whose contents are produced out of band; this RFC does not
+specify how.
 
 **Drift detection as a first-class query.** "Templates that gained
 a new version in the window `[t1, t2]`" is a query against the
@@ -1041,6 +1077,29 @@ from the WAL: a cold start with no snapshot replays the WAL in
 order through the miner and reconstructs the trees. This is
 correct but slow at scale; the snapshot mechanism is an
 optimisation on top.
+
+**Replay mode.** Cold-start replay re-walks `attach`, `widen`, and
+`expand_slot_types` against the same code path live ingest uses.
+Doing so naively would re-fire every counter increment, every
+histogram observation, and every gauge update for the entire
+replay window, polluting steady-state metrics for the post-restart
+horizon (a 10-minute replay on a high-volume tenant could shift
+`merges_total` by orders of magnitude in a few seconds). The miner
+therefore runs in **replay mode** until the WAL cursor reaches the
+live tip: domain events are processed and tree state is mutated
+exactly as in live ingest, but updates to the §6.8 metrics are
+suppressed (counters do not increment, histograms do not observe,
+gauges retain their previous value or, if the miner has never
+served live traffic, their zero / empty initialisation value). The
+metrics themselves remain registered and visible to scrapes —
+§3.1.2's invariant that the registry exposes the full §6.8 set
+holds across replay; only the *update* path is gated, not the
+*registration* path. A single `wal_replay_progress` gauge
+(labelled `tenant_id`, value: fraction of the tenant's replay
+window completed in `[0.0, 1.0]`) is exposed during replay so
+operators can see the cold-start curve and confirm replay finished.
+This metric is replay-only and is not part of the §3.1 mandatory
+set; it is documented here, not in §6.8's table.
 
 **Snapshot mechanism (direction).** Periodically, the per-tenant
 trees are serialised to a snapshot artefact. Recovery on ingester
@@ -1272,6 +1331,51 @@ RFC's status flips to `accepted`.
       single-line. Ourios position: deferred to RFC TBD on the
       OTLP receiver, since multi-line reassembly happens before
       the miner sees the line.
+
+**Multi-tenancy and operational lifecycle.**
+
+- [ ] **Tenant lifecycle.** §3.7 commits to per-tenant trees but
+      does not name when a tree is allocated (lazily on first
+      ingest? eagerly via a control-plane command?), nor whether
+      tenants can be paused, evicted under memory pressure, or
+      deleted. Likely deferred to a future operator-console RFC,
+      but the bookend events (`TenantInitialised`, `TenantPaused`,
+      `TenantDeleted`) need to exist somewhere before §3.7 is
+      operationally complete.
+- [ ] **Per-tenant fairness and back-pressure.** A noisy tenant can
+      monopolise WAL bandwidth, blow up the tree, and starve
+      well-behaved tenants. RFC 0001 has no rate-limit or
+      back-pressure event in scope; this overlaps with the OTLP
+      receiver's responsibility and likely lives in a future
+      `ourios-ingester` RFC.
+- [ ] **Alias index creation mechanism (from §6.7).** Three
+      candidates surfaced: operator-driven (manual "these two
+      leaves are the same"), automatic-inference (post-deploy
+      heuristic that proposes aliases from `template_widened`
+      bursts), or deferred entirely. The choice gates RFC 0002's
+      `template_id.resolves_to(X)` semantics; until it resolves,
+      the alias index has no specified write path.
+
+**Cross-RFC contracts pending.**
+
+- [ ] **Querier ↔ live template registry (from §6.6).**
+      Reconstruction's `lookup(template_id, template_version)`
+      is called by `ourios-querier`, which runs in a separate
+      process from the ingester that owns the live tree.
+      Candidates: querier reads snapshots from object storage
+      (eventually consistent with live), querier asks the
+      ingester via RPC at query time (couples query latency to
+      ingester health), or templates ride a separate Parquet
+      side-stream alongside records (eventually consistent, no
+      RPC, new data plane). RFC 0002 needs the answer before its
+      DSL can compile; this RFC names the seam.
+- [ ] **Audit-event Parquet schema (from §6.4).** The Rust audit
+      struct is specified in §6.4; the on-disk Parquet column
+      layout for `template_audit` belongs to a future
+      `ourios-parquet` RFC. The §6.7 drift query assumes the
+      schema exposes `event_type`, `template_id`, `old_version`,
+      `new_version`, and `timestamp` as columns suitable for
+      predicate pushdown.
 
 **Deferred to follow-up RFCs.**
 

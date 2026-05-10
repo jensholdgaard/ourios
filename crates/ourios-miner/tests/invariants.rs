@@ -65,11 +65,29 @@ fn invariant_3_2_2_param_limit_above_1_kib_rejected_at_startup() {
     // Act
     let r = MinerConfig::try_new(0.7, over_ceiling);
 
-    // Assert
+    // Assert — variant equality pins the failure mode and the
+    // offending value.
     assert_eq!(
         r,
         Err(MinerConfigError::ParamByteLimitTooLarge(over_ceiling)),
     );
+
+    // And the rendered message pins §3.2.2's "with an error
+    // citing the §3.2 ceiling" clause (PR #11 review): a
+    // regression that drops the citation from the Display impl
+    // would still pass the variant assertion above but fail
+    // these. Two separate asserts so each pin gets its own
+    // diagnostic on failure.
+    let rendered = r.unwrap_err().to_string();
+    assert!(
+        rendered.contains("§3.2"),
+        "error must cite the §3.2 ceiling, got: {rendered}",
+    );
+    assert!(
+        rendered.contains("1024"),
+        "error must cite the 1024-byte limit, got: {rendered}",
+    );
+
     // §3.2.2's "the process refuses to start serving that tenant"
     // is the consequence of try_new returning Err; refusal is the
     // call site's responsibility (future ingester PR), not a

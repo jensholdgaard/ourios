@@ -203,10 +203,12 @@ fn invariant_3_7_2_same_template_two_tenants_distinct_template_ids() {
     let id_a = cluster.ingest(&a, line);
     let id_b = cluster.ingest(&b, line);
 
-    // Assert — RFC 0001 §6.1's per-tenant `template_id`
-    // allocator gives each tenant its own monotonic id space,
-    // so the two ids are distinct by construction (each starts
-    // at 1).
+    // Assert — RFC 0001 §6.1's `template_id` allocator is
+    // cluster-wide unique (the id space is shared across tenants
+    // so the same `u64` value never refers to two different
+    // leaves), so even when two tenants ingest the same masked
+    // shape the second call pulls the *next* monotonic id rather
+    // than reusing the first tenant's id.
     assert_ne!(
         id_a, id_b,
         "structurally identical templates must get distinct template_ids across tenants",

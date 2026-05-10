@@ -2,9 +2,11 @@
 //!
 //! Holds one [`TenantState`] per [`TenantId`] (`[CLAUDE.md §3.7]`):
 //! every ingested line is keyed on its tenant, and per-tenant
-//! state is intrinsically isolated — no shared template store,
-//! no shared `template_id` allocator. RFC 0001 §6.1's
-//! per-tenant monotonic `template_id` falls out of construction.
+//! template *stores* are isolated — no template ever crosses
+//! tenants. The `template_id` allocator, by contrast, is
+//! **cluster-wide** so the same `u64` value never refers to two
+//! different leaves (RFC 0001 §6.1, §5 §3.7.2); each tenant
+//! sees a monotonic *subsequence* of the shared id space.
 //!
 //! What this module is NOT (yet):
 //!

@@ -439,6 +439,8 @@ direction and the primary obligation lives in those other RFCs.
 > - **Then** tenant A's `template_id` for that template differs
 >   from tenant B's `template_id`
 > - **And** no `template_id` is shared across tenants
+> - **And** template IDs are guaranteed unique across the entire
+>   cluster (not just per tenant)
 
 ### 5.3 RFC-internal design commitments
 
@@ -568,9 +570,14 @@ Where:
   in practice). Encoding in Parquet is an implementation detail
   that does not affect this RFC.
 
-**Template identity.** `template_id` is a per-tenant monotonic
-`u64`, allocated when a new leaf is created and never reused or
-reassigned. Cross-tenant identity is intentionally not guaranteed
+**Template identity.** `template_id` is a cluster-wide unique
+monotonic `u64` (with each tenant seeing a monotonic
+subsequence), allocated when a new leaf is created and never
+reused or reassigned. The id space is shared across tenants so
+that the same `u64` value never refers to two different leaves;
+the per-tenant subsequence guarantee preserves `[§3.7]` by
+making each tenant's allocation order observable in isolation.
+Cross-tenant identity is intentionally not guaranteed
 — two tenants emitting the structurally identical template will
 have different `template_id`s. This preserves `[§3.7]` (per-tenant
 template trees) by construction; cross-tenant analytics that need

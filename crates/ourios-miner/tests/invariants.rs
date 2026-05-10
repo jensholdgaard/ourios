@@ -13,9 +13,20 @@
 /// Scenario §3.1.1 — Default similarity threshold is 0.7.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_1_1_default_threshold_is_0_7() {
-    todo!("RFC 0001 §6.3");
+    use ourios_core::config::MinerConfig;
+
+    // Arrange — no override; tenant config is left at defaults.
+
+    // Act
+    let cfg = MinerConfig::default();
+
+    // Assert
+    assert!(
+        (cfg.similarity_threshold - 0.7_f32).abs() < f32::EPSILON,
+        "default similarity_threshold must be 0.7, got {}",
+        cfg.similarity_threshold,
+    );
 }
 
 /// Scenario §3.1.2 — Mandatory metric set is exposed.
@@ -29,17 +40,58 @@ fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
 /// Scenario §3.2.1 — Default per-parameter byte limit is 256.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_2_1_default_param_byte_limit_is_256() {
-    todo!("RFC 0001 §6.5");
+    use ourios_core::config::MinerConfig;
+
+    // Arrange — no override; tenant config is left at defaults.
+
+    // Act
+    let cfg = MinerConfig::default();
+
+    // Assert
+    assert_eq!(cfg.param_byte_limit, 256);
 }
 
 /// Scenario §3.2.2 — Configured limit above 1 KiB is rejected at startup.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_2_2_param_limit_above_1_kib_rejected_at_startup() {
-    todo!("RFC 0001 §6.5");
+    use ourios_core::config::{MinerConfig, MinerConfigError};
+
+    // Arrange — explicit attempt to set the limit one byte above
+    // the §3.2 ceiling (1024 B).
+    let over_ceiling: u32 = 1025;
+
+    // Act
+    let r = MinerConfig::try_new(0.7, over_ceiling);
+
+    // Assert — variant equality pins the failure mode and the
+    // offending value.
+    assert_eq!(
+        r,
+        Err(MinerConfigError::ParamByteLimitTooLarge(over_ceiling)),
+    );
+
+    // And the rendered message pins §3.2.2's "with an error
+    // citing the §3.2 ceiling" clause (PR #11 review): a
+    // regression that drops the citation from the Display impl
+    // would still pass the variant assertion above but fail
+    // these. Two separate asserts so each pin gets its own
+    // diagnostic on failure.
+    let rendered = r.unwrap_err().to_string();
+    assert!(
+        rendered.contains("§3.2"),
+        "error must cite the §3.2 ceiling, got: {rendered}",
+    );
+    assert!(
+        rendered.contains("1024"),
+        "error must cite the 1024-byte limit, got: {rendered}",
+    );
+
+    // §3.2.2's "the process refuses to start serving that tenant"
+    // is the consequence of try_new returning Err; refusal is the
+    // call site's responsibility (future ingester PR), not a
+    // property of MinerConfig itself.
 }
 
 /// Scenario §3.3.1 — Separators array captured on every successful tokenization.

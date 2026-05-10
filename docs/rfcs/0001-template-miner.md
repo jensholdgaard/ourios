@@ -439,8 +439,8 @@ direction and the primary obligation lives in those other RFCs.
 > - **Then** tenant A's `template_id` for that template differs
 >   from tenant B's `template_id`
 > - **And** no `template_id` is shared across tenants
-> - **And** template IDs are guaranteed unique across the entire
->   cluster (not just per tenant)
+> - **And** `template_id`s are guaranteed unique across the
+>   entire cluster (not just per tenant)
 
 ### 5.3 RFC-internal design commitments
 
@@ -577,11 +577,16 @@ reused or reassigned. The id space is shared across tenants so
 that the same `u64` value never refers to two different leaves;
 the per-tenant subsequence guarantee preserves `[§3.7]` by
 making each tenant's allocation order observable in isolation.
-Cross-tenant identity is intentionally not guaranteed
+Cross-tenant *content* identity is intentionally not guaranteed
 — two tenants emitting the structurally identical template will
-have different `template_id`s. This preserves `[§3.7]` (per-tenant
-template trees) by construction; cross-tenant analytics that need
-identity (deduplication across tenants for storage savings, shared
+have different `template_id`s, so a `template_id` alone never
+links structurally-equivalent templates across tenants. (The
+`u64` value itself is cluster-wide unique, per the previous
+paragraph; what is not guaranteed is that *the same template*
+across two tenants resolves to the same id.) This preserves
+`[§3.7]` (per-tenant template trees) by construction;
+cross-tenant analytics that need content identity (deduplication
+across tenants for storage savings, shared
 template dashboards) are an opt-in concern and are not provided by
 the miner. A future `template_fingerprint` side column may carry a
 canonical content hash for opt-in cross-tenant use; the gate for

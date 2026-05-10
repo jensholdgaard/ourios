@@ -830,18 +830,24 @@ proceeds without one. Code paths that would emit a widening without
 emitting an audit event are blocked at PR review per `hazards.md`
 H1.
 
-**WAL framing of audit events.** A single `attach` may emit two
-audit events in order (RFC0001.7: `template_widened` immediately
-followed by `template_type_expanded`). Both events, together with
-the line's data record, must be written to the WAL as a single
-framing unit so that crash recovery cannot observe one event without
-the other — otherwise replay would bump `template_version` fewer
-times than the in-memory leaf did, leaving the recovered tree in a
-state the data records reference but the audit stream does not
-substantiate. This atomicity is a contract on the future
-`ourios-wal` RFC; this RFC merely names it. A WAL implementation
-that cannot offer multi-record atomicity must hold the data record
-back until both audit events are durable.
+**WAL durability ordering of audit events.** A single `attach`
+may emit two audit events in order (RFC0001.7: `template_widened`
+immediately followed by `template_type_expanded`) and one data
+record. The contract this RFC requires from the future
+`ourios-wal` RFC is an *ordering-plus-durability-barrier*: a
+data record carrying `template_version = V` must not become
+durable before every audit event justifying the leaf's
+progression to V is durable. Crash recovery may then observe
+some prefix of `[event_1, event_2, …, data_record]`, but never
+a state in which the data record exists without the events that
+caused its version stamp. Any framing strategy that satisfies
+this — a composite multi-record frame, batched-fsync ordering, a
+two-phase write-then-link, anything else — is acceptable; the
+framing is `ourios-wal`'s choice, the ordering barrier is this
+RFC's requirement. Without it, replay would bump
+`template_version` fewer times than the in-memory leaf did and
+the surviving data records would reference a version the audit
+stream cannot substantiate.
 
 **Degenerate template guard.** If a widening would leave the
 template with zero non-wildcard tokens (the entire template becomes
@@ -996,12 +1002,13 @@ aliasing is inter-leaf and groups `template_id`s the miner allocated
 separately (different `template_id`s, the operator asserts they
 mean the same thing). `template_widened` events therefore do **not**
 populate the alias index — they live on the cross-version axis. The
-alias index has no creation event in this RFC: the candidate writers
-(operator-driven, automatic-inference, deferred entirely) and the
-shape of the corresponding `RecordAlias` command are listed in §9
-as an open question. Until that question resolves, RFC 0002's
-`template_id.resolves_to(X)` operates against an alias index whose
-contents are produced out of band; this RFC does not specify how.
+alias index has no creation event in this RFC: the candidate
+writers (operator-driven, automatic-inference, deferred entirely)
+and the shape of the write API they would expose are open
+questions in §9. Until those questions resolve, RFC 0002's
+`template_id.resolves_to(X)` operates against an alias index
+whose contents are produced out of band; this RFC does not
+specify how.
 
 **Drift detection as a first-class query.** "Templates that gained
 a new version in the window `[t1, t2]`" is a query against the
@@ -1080,8 +1087,14 @@ horizon (a 10-minute replay on a high-volume tenant could shift
 `merges_total` by orders of magnitude in a few seconds). The miner
 therefore runs in **replay mode** until the WAL cursor reaches the
 live tip: domain events are processed and tree state is mutated
-exactly as in live ingest, but the counters / histograms / gauges
-in §6.8 are suppressed. A single `wal_replay_progress` gauge
+exactly as in live ingest, but updates to the §6.8 metrics are
+suppressed (counters do not increment, histograms do not observe,
+gauges retain their previous value or, if the miner has never
+served live traffic, their zero / empty initialisation value). The
+metrics themselves remain registered and visible to scrapes —
+§3.1.2's invariant that the registry exposes the full §6.8 set
+holds across replay; only the *update* path is gated, not the
+*registration* path. A single `wal_replay_progress` gauge
 (labelled `tenant_id`, value: fraction of the tenant's replay
 window completed in `[0.0, 1.0]`) is exposed during replay so
 operators can see the cold-start curve and confirm replay finished.

@@ -6,19 +6,22 @@
 //! walk routes against the type tag; reconstruction (§6.6) walks
 //! the parallel `typed_params` to recover the original line bytes.
 //!
-//! This PR ships the minimal default rule set the tree walk needs
-//! to start working: UUID, IPv4, NUM. The other RFC §6.1 variants
-//! (`Hex`, `Ts`, `Path`, `Str`, `Overflow`) are reserved on the
-//! enum because the Parquet record schema (§6.1) is the data
-//! contract, but they have no `mask()` emitter yet — `Str` is
-//! added by the widening PR (§6.2 step 5b), `Overflow` by the
+//! Default rule set: UUID, IPv4, NUM. The other RFC §6.1
+//! variants (`Hex`, `Ts`, `Path`, `Str`, `Overflow`) are reserved
+//! on `ParamType` because the Parquet record schema (§6.1) is
+//! the data contract, but they have no `mask()` emitter — `Str`
+//! is added by the widening PR (§6.2 step 5b), `Overflow` by the
 //! byte-limit PR (§6.5), and `Hex` / `Ts` / `Path` by future
-//! masking-rule PRs.
+//! masking-rule PRs. Internally the masking-emit subset is the
+//! private `MaskTag` enum, kept separate from `ParamType` so its
+//! tag-string and `ParamType` mappings are exhaustive total
+//! functions the compiler will hold us to.
 
 /// The type assigned to a masked parameter slot.
 ///
 /// Matches RFC 0001 §6.1's `ParamType`. Not every variant has a
-/// `mask()` emitter in this PR (see module docs).
+/// `mask()` emitter (see module docs); the masking-emit subset
+/// is the private `MaskTag` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamType {
     Ip,
@@ -68,10 +71,10 @@ pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
     let mut out_tokens = Vec::with_capacity(tokens.len());
     let mut typed_params = Vec::new();
     for &tok in tokens {
-        if let Some((type_tag, tag_str)) = classify(tok) {
-            out_tokens.push(tag_str);
+        if let Some(tag) = classify(tok) {
+            out_tokens.push(tag.as_str());
             typed_params.push(TypedParam {
-                type_tag,
+                type_tag: tag.into(),
                 value: tok,
             });
         } else {
@@ -84,13 +87,55 @@ pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
     }
 }
 
-fn classify(token: &str) -> Option<(ParamType, &'static str)> {
+/// The subset of [`ParamType`] variants that `mask()` can emit
+/// with a tag string.
+///
+/// Splitting this from `ParamType` lets [`MaskTag::as_str`] and
+/// [`From<MaskTag> for ParamType`] both be exhaustive total
+/// functions: the compiler refuses to add a new `MaskTag`
+/// variant without a tag and a `ParamType` mapping. Variants
+/// reserved by RFC 0001 §6.1 but not emitted by `mask()`
+/// (`Hex`, `Ts`, `Path`, `Str`, `Overflow`) live only on
+/// `ParamType`, where they belong — `Str` is added by widening
+/// (§6.2 step 5b), `Overflow` by the byte-limit check (§6.5),
+/// `Hex` / `Ts` / `Path` by future masking-rule PRs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MaskTag {
+    Uuid,
+    Ip,
+    Num,
+}
+
+impl MaskTag {
+    /// The tag string this variant emits in the masked-token
+    /// sequence (`<UUID>`, `<IP>`, `<NUM>`). Total — every
+    /// `MaskTag` has a tag by construction.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Uuid => "<UUID>",
+            Self::Ip => "<IP>",
+            Self::Num => "<NUM>",
+        }
+    }
+}
+
+impl From<MaskTag> for ParamType {
+    fn from(t: MaskTag) -> Self {
+        match t {
+            MaskTag::Uuid => Self::Uuid,
+            MaskTag::Ip => Self::Ip,
+            MaskTag::Num => Self::Num,
+        }
+    }
+}
+
+fn classify(token: &str) -> Option<MaskTag> {
     if is_uuid(token) {
-        Some((ParamType::Uuid, "<UUID>"))
+        Some(MaskTag::Uuid)
     } else if is_ipv4(token) {
-        Some((ParamType::Ip, "<IP>"))
+        Some(MaskTag::Ip)
     } else if is_num(token) {
-        Some((ParamType::Num, "<NUM>"))
+        Some(MaskTag::Num)
     } else {
         None
     }
@@ -262,5 +307,33 @@ mod tests {
 
         // Assert
         assert!(!r);
+    }
+
+    // Regression for the `MaskTag` split: pin the canonical tag
+    // strings so a future rename of the &'static str literals in
+    // `MaskTag::as_str` would fail loudly here rather than silently
+    // change the on-the-wire masked-token sequence the tree walk
+    // routes against.
+    #[test]
+    fn mask_tag_as_str_pins_canonical_strings() {
+        // Arrange — the three currently-emitted variants
+
+        // Act + Assert
+        assert_eq!(MaskTag::Uuid.as_str(), "<UUID>");
+        assert_eq!(MaskTag::Ip.as_str(), "<IP>");
+        assert_eq!(MaskTag::Num.as_str(), "<NUM>");
+    }
+
+    // Regression for the `MaskTag` split: pin the From mapping so
+    // a refactor that swapped two arms would still type-check but
+    // would silently mis-attribute typed-param data on the wire.
+    #[test]
+    fn param_type_from_mask_tag_pins_mapping() {
+        // Arrange — the three currently-emitted variants
+
+        // Act + Assert
+        assert_eq!(ParamType::from(MaskTag::Uuid), ParamType::Uuid);
+        assert_eq!(ParamType::from(MaskTag::Ip), ParamType::Ip);
+        assert_eq!(ParamType::from(MaskTag::Num), ParamType::Num);
     }
 }

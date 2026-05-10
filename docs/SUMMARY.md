@@ -12,6 +12,7 @@
 # Benchmarks
 
 - [Goals and thesis gates](./benchmarks.md)
+- [Roadmap to MVP](./roadmap.md)
 
 # RFCs
 

@@ -230,6 +230,17 @@ turned into a test, the RFC has a gap.*
   verify no acknowledged data is lost.
 - **Benchmarks** (`criterion`) for the hot path: OTLP → WAL, WAL →
   Parquet, Parquet → query result. Regressions block merges.
+- **Tests are specifications, not friction.** A passing test must not
+  be weakened or deleted without explicit approval. If a refactor or
+  new feature makes an existing test inconvenient to keep working, the
+  right move is to add a new test for the new behaviour alongside; if
+  the old test now asserts something we no longer want, that is a
+  contract change — stop, surface it explicitly, get approval, then
+  change the test. "I edited the test to make it pass" is a code smell
+  that silently rots the safety net. The risk is doubly large in a
+  project that is intentionally fully AI-assisted: AI editors are
+  prone to deleting or weakening inconvenient tests rather than
+  diagnosing the underlying drift, and that pattern must not land here.
 
 ### 6.3 Observability of ourselves
 Ourios is a telemetry backend. It must be excellently observable itself.
@@ -383,8 +394,11 @@ the wrong thing.
 
 ---
 
-*Last updated: 2026-04-26. Original draft 2026-04-23; this revision aligns
-§7 with the present-day repo and adds §6.7 (Documentation site) and an
-mdBook entry to §6.6, codifying decisions made in commits
-1c806f5..84eed86. This document is load-bearing; further changes require
-a `meta:` RFC and majority maintainer approval.*
+*Last updated: 2026-05-13. Original draft 2026-04-23. 2026-04-26 revision
+aligned §7 with the present-day repo and added §6.7 + an mdBook entry to
+§6.6 (commits 1c806f5..84eed86). 2026-05-13 revision adds the "Tests are
+specifications, not friction" bullet to §6.2, codifying a discipline
+called out by Dave Farley as a recurring AI-assisted-development failure
+mode (informal `meta:` RFC waiver per maintainer discussion of the same
+date; precedent: b50067d). This document is load-bearing; further changes
+require a `meta:` RFC and majority maintainer approval.*

@@ -78,15 +78,23 @@ impl OwnedToken {
 #[derive(Debug, Clone)]
 pub struct Leaf {
     pub template: Vec<OwnedToken>,
-    pub id: u64,
+    /// Cluster-wide unique identifier per RFC 0001 §6.1 — the
+    /// `template_id` allocated by [`crate::cluster::MinerCluster`]
+    /// when the leaf was first created. Field name matches RFC
+    /// language so future `template_version`, slot-id, and
+    /// alias-id additions stay disambiguated.
+    pub template_id: u64,
 }
 
 /// Internal node at a prefix-token level (or the per-length root).
 ///
 /// `children` is keyed on the masked token at this level. `leaves`
-/// holds the leaf list reached at the deepest prefix level for
-/// the (length, prefix-tokens) shape; intermediate nodes carry an
-/// empty `leaves` vector by construction.
+/// holds the candidate set at the deepest prefix level reached
+/// by [`Tree::descend_mut`]. By **convention** intermediate nodes
+/// carry an empty `leaves` — the type does not enforce this; the
+/// field is `pub` so the upcoming integration PR can push into
+/// the node `descend_mut` returns. Pushing into an intermediate
+/// node would be a caller bug.
 #[derive(Debug, Default)]
 pub struct PrefixNode {
     pub children: HashMap<String, PrefixNode>,
@@ -128,8 +136,8 @@ impl Tree {
     /// will run [`crate::sim_seq::sim_seq`] over (in the
     /// integration PR). When `masked.len() < prefix_depth` the
     /// walk stops early — the entire line is consumed as path,
-    /// and short lines naturally cluster at deeper paths than
-    /// long ones. This matches the Drain paper.
+    /// so short lines bottom out at a **shallower** prefix level
+    /// than long ones. This matches the Drain paper.
     ///
     /// # Panics
     ///
@@ -162,12 +170,29 @@ impl Tree {
 /// stable borrow checker's well-known sub-borrow extension issue
 /// (Polonius would solve it; until then recursion is the
 /// safe-code idiom).
+///
+/// Hot-path allocation: the steady state once a tenant's templates
+/// settle is that every prefix child already exists. Looking the
+/// child up via `&str` `contains_key` first lets us call
+/// [`String::to_string`] only on first-observation of a prefix
+/// shape. `std::collections::HashMap`'s `Entry` API requires an
+/// owned key, so the lookup-then-insert is the standard workaround
+/// on stable; the second `get_mut` is one extra hash, never an
+/// extra allocation.
 fn descend_recursively<'t>(node: &'t mut PrefixNode, path: &[&str]) -> &'t mut PrefixNode {
     if path.is_empty() {
         return node;
     }
     let (head, tail) = path.split_first().expect("non-empty by guard above");
-    let child = node.children.entry((*head).to_string()).or_default();
+
+    if !node.children.contains_key(*head) {
+        node.children
+            .insert((*head).to_string(), PrefixNode::default());
+    }
+    let child = node
+        .children
+        .get_mut(*head)
+        .expect("just inserted above if missing");
     descend_recursively(child, tail)
 }
 
@@ -238,7 +263,7 @@ mod tests {
             let parent = tree.descend_mut(&line_a, DEFAULT_PREFIX_DEPTH);
             parent.leaves.push(Leaf {
                 template: [OwnedToken::Fixed("marker".to_string())].into(),
-                id: 99,
+                template_id: 99,
             });
             std::ptr::from_ref(&parent.leaves)
         };
@@ -250,7 +275,7 @@ mod tests {
         // from call 2.
         assert_eq!(leaves_addr_a, leaves_addr_b);
         assert_eq!(parent_b.leaves.len(), 1);
-        assert_eq!(parent_b.leaves[0].id, 99);
+        assert_eq!(parent_b.leaves[0].template_id, 99);
     }
 
     #[test]

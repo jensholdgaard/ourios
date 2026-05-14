@@ -32,11 +32,12 @@ The Ourios OTLP receiver accepts OpenTelemetry log batches over
 gRPC and HTTP, decodes them per the official `opentelemetry-proto`
 schema, derives a `tenant_id` per `ResourceLogs` group via an
 operator-configured rule (RFC 0001 §6.1 *Tenant derivation*),
-canonicalises every `LogRecord.body` whose
-`body.kind != AnyValue::String` to its OTLP-canonical JSON
-encoding (string bodies pass through as `L_raw` per RFC 0001
-§6.2 step 0), fans the batch out into per-tenant streams of
-`OtlpLogRecord`, hands each stream to `ourios-miner`, and
+materialises each `LogRecord.body` into the
+`Body::String(String) | Body::Structured(AnyValue)` fork (the
+decoded `AnyValue` rides through verbatim — canonicalisation
+is deferred to the storage layer per the amended §6.4), fans
+the batch out into per-tenant streams of `OtlpLogRecord`, hands
+each stream to `ourios-miner`, and
 acknowledges the OTLP request only after the WAL-before-ack
 invariant `[§3.4]` is satisfied. The default wire stack is
 `tonic` (gRPC) + `axum`/`hyper` (HTTP) against the official
@@ -80,10 +81,12 @@ load-bearing decision: the receiver is where:
   *Tenant derivation*) and the batch fans out into per-tenant
   streams.
 - `body.kind = Structured` records have their `AnyValue` body
-  canonicalised to OTLP-canonical JSON (RFC 0001 §6.1 *Body
-  representation*) so the round-trip
-  `stored_bytes ↔ AnyValue` is well-defined and the
-  `lossy_flag = false` promise is meetable.
+  carried verbatim into `Body::Structured(AnyValue)` — the
+  amended §6.4 defers OTLP-canonical JSON conversion to the
+  storage layer (Parquet writer), where the round-trip
+  `stored_bytes ↔ AnyValue` per RFC 0001 §6.1 *Body
+  representation* makes the `lossy_flag = false` promise
+  meetable.
 - The acknowledgement-after-durability sequencing (`[§3.4]`)
   is enforced.
 
@@ -250,14 +253,19 @@ touches):
 - **RFC0003.5** — gRPC and HTTP/protobuf transports produce the
   identical in-memory `ExportLogsServiceRequest` for a
   byte-equal payload.
-- **RFC0003.6** — HTTP/JSON canonicalisation: a valid OTLP/JSON
-  request with whitespace and field-ordering variation produces
-  the same canonical body bytes that the same logical record
-  produces over gRPC + protobuf.
-- **RFC0003.7** — `body.kind = Structured` records carry the
-  OTLP-canonical JSON encoding of their `AnyValue` body when
-  they reach the miner, regardless of the request transport
-  (RFC 0001 §6.1 *Body representation*).
+- **RFC0003.6** — HTTP/JSON ↔ gRPC/protobuf decode equivalence:
+  a valid OTLP/JSON request with whitespace and field-ordering
+  variation produces the same in-memory `AnyValue` tree (per
+  proto3-JSON decoding) that the same logical record produces
+  over gRPC + protobuf. Body bytes are not yet canonicalised at
+  this layer (canonicalisation is owned by the storage layer
+  per §6.4); equivalence is asserted at the `AnyValue` level.
+- **RFC0003.7** — `body.kind = Structured` records reach the
+  miner as `Body::Structured(AnyValue)` carrying the decoded
+  `AnyValue` verbatim, regardless of the request transport
+  (per the §6.4 amendment; RFC 0001 §6.1 *Body representation*
+  governs how the storage layer later canonicalises the
+  `AnyValue` to JSON bytes at write time).
 - **RFC0003.8** — `body.kind = String` records reach the miner
   with the unwrapped string as `L_raw` (RFC 0001 §6.2 step 0).
 - **RFC0003.9** — `severity_number = 0` (UNSPECIFIED) and
@@ -290,10 +298,12 @@ decoded `ExportLogsServiceRequest` and:
    `Resource` attributes and the `InstrumentationScope` name
    and version as fields, so downstream code never needs to
    walk back up the OTLP hierarchy.
-3. For each `LogRecord` whose `body.kind != AnyValue::String`,
-   canonicalises the body to OTLP-canonical JSON before the
-   `OtlpLogRecord` is materialised — the miner sees only
-   canonical bytes, never raw protobuf-decoded `AnyValue` trees.
+3. For each `LogRecord`, materialises `body` into the
+   `Body::String(String) | Body::Structured(AnyValue)` fork
+   per `ourios-core::otlp::Body::from_any_value`. No
+   canonicalisation runs at the receiver — the structured
+   branch carries the decoded `AnyValue` verbatim per the
+   amended §6.4.
 4. Hands each per-tenant stream to `ourios-miner` (one
    `MinerCluster` per process; the cluster routes internally
    per `tenant_id`).
@@ -310,8 +320,12 @@ decoded `ExportLogsServiceRequest` and:
   - `application/x-protobuf` → `prost::Message::decode` into
     the same `ExportLogsServiceRequest` type the gRPC path
     produces.
-  - `application/json` → proto3-JSON decode + canonicalisation
-    pass.
+  - `application/json` → proto3-JSON decode into
+    `ExportLogsServiceRequest`. The decode handles whitespace
+    and field-ordering variation natively (proto3-JSON spec);
+    no separate canonicalisation pass — the
+    `Body::Structured(AnyValue)` carried downstream is
+    transport-agnostic at the `AnyValue` level.
 - Both listeners spawn off the same tokio runtime, share a
   single instance of the business-logic layer, and bind on
   operator-configured ports (defaults TBD, likely 4317 for
@@ -334,28 +348,48 @@ batch** with a transport-level error naming the failing
 Resource and the missing attribute. Per-Resource partial
 acceptance is reserved for a future RFC (see §9).
 
-### 6.4 AnyValue canonicalisation boundary
+### 6.4 AnyValue canonicalisation is deferred to the storage layer
 
-The receiver — not the miner — performs the AnyValue → OTLP-
-canonical JSON conversion for `body.kind != AnyValue::String`
-records. Rationale:
+> **Amendment (PR introducing `ourios-core::otlp::OtlpLogRecord`).**
+> This subsection originally pinned the receiver as the place
+> that canonicalises structured `AnyValue` bodies into
+> OTLP-canonical JSON, with the in-memory record carrying
+> pre-cached `Bytes`. The amended position carries the
+> `AnyValue` *itself* on the in-memory record and defers
+> canonicalisation to the storage layer (Parquet writer,
+> when it lands). Rationale below.
 
-- The miner's signature
-  (`MinerCluster::ingest(record: &OtlpLogRecord)`) takes a
-  ready-to-template record. Pushing the canonicalisation
-  upstream keeps the miner's hot path off any
-  serialisation/canonicalisation work.
-- The two transports (gRPC + protobuf vs HTTP + JSON) need
-  different canonicalisation strategies (re-serialise from
-  decoded `AnyValue` vs normalise existing JSON). The receiver
-  knows which transport delivered the record; the miner
-  shouldn't.
-- Storing canonicalised JSON in the in-memory `OtlpLogRecord`
-  makes the structured-Body short-circuit in RFC 0001 §6.2
-  step 0 a constant-time write.
+The receiver hands the miner an `OtlpLogRecord` whose body, when
+present and structured, carries the decoded `AnyValue` verbatim
+(`Body::Structured(AnyValue)`). The miner runs the §6.2 step-0
+short-circuit on the discriminator alone; it does not walk the
+`AnyValue` tree. Canonicalisation to OTLP-canonical JSON
+(per RFC 0001 §6.1 *Body representation*) happens once, at
+Parquet-write time.
 
-For `body.kind = AnyValue::String`, no canonicalisation is
-needed; the unwrapped string is passed through as `L_raw`.
+Rationale:
+
+- **Optionality.** RFC 0001 §6.1 reserves a future "mine inner
+  field" mode (e.g. mine `body.kvlist["msg"]` as the line if
+  present) gated on corpus evidence. That mode needs the
+  structured tree, not pre-cached bytes. Carrying `AnyValue`
+  preserves the option without committing to the design.
+- **Single canonicalisation pass.** Whether the body arrived
+  as gRPC-protobuf or HTTP-JSON, the storage layer performs
+  exactly one canonicalisation step at write time. The
+  receiver no longer has to know two canonicalisation
+  strategies (re-serialise vs normalise); the storage layer
+  owns the one canonical mapping per RFC 0001 §6.1.
+- **Miner hot path is unchanged.** The §6.2 step-0
+  short-circuit only inspects the discriminator
+  (`Body::Structured(_)` vs `Body::String(_)`); no
+  `AnyValue` walking, no allocation in the structured branch.
+  The hot-path argument that originally favoured pre-caching
+  was speculative — until corpus benchmarks say otherwise,
+  carrying the tree costs nothing the miner cares about.
+
+For `Body::String(s)`, no canonicalisation is ever needed; the
+unwrapped string is passed through as `L_raw`.
 
 ### 6.5 WAL-before-ack sequencing
 
@@ -365,7 +399,8 @@ after every record is durably written. Concrete contract:
 1. Receiver accepts the request and decodes to
    `ExportLogsServiceRequest`.
 2. Receiver fans out to per-tenant `OtlpLogRecord` streams
-   (§6.3) and canonicalises bodies as needed (§6.4).
+   (§6.3); body canonicalisation does not happen here, per the
+   amended §6.4.
 3. Receiver appends every record to the WAL.
 4. Receiver fsyncs the WAL segment(s) touched.
 5. Receiver hands records to the miner for templating.
@@ -394,9 +429,18 @@ violate `[§3.4]`.
 
 ### 6.6 The `OtlpLogRecord` in-memory shape
 
+> **Amendment (PR introducing `ourios-core::otlp::OtlpLogRecord`).**
+> Body now carries the decoded `AnyValue` rather than its
+> OTLP-canonical JSON encoding (see amended §6.4).
+> `body_kind` is derived from `body` rather than stored on
+> the record, since the §6.2 step-0 fork only needs to read
+> the discriminator.
+
 The receiver materialises each wire-level `LogRecord` (plus its
 inherited `Resource` and `InstrumentationScope` context) into a
-single owned struct:
+single owned struct. The authoritative definition lives in the
+`ourios-core::otlp` module; the sketch below mirrors that
+module:
 
 ```text
 struct OtlpLogRecord {
@@ -410,24 +454,36 @@ struct OtlpLogRecord {
     severity_text: Option<String>,
     scope_name: Option<String>,
     scope_version: Option<String>,
-    attributes: Vec<KeyValue>,
+    attributes: Vec<KeyValue>,            // opentelemetry-proto KeyValue
     dropped_attributes_count: u32,
-    resource_attributes: Vec<KeyValue>,
+    resource_attributes: Vec<KeyValue>,   // opentelemetry-proto KeyValue
     trace_id: Option<[u8; 16]>,
     span_id: Option<[u8; 8]>,
     flags: u32,
     event_name: Option<String>,
 
-    // Body (already canonicalised per §6.4)
-    body_kind: BodyKind,         // String | Structured
-    body: BodyPayload,           // String(String) | Structured(Bytes)
+    // Body — None when the wire delivered no body
+    body: Option<Body>,
 }
+
+enum Body {
+    String(String),
+    Structured(AnyValue),                 // opentelemetry-proto AnyValue
+}
+
+// `body_kind()` is a method on OtlpLogRecord that returns
+// `Option<BodyKind>` derived from `body`; the discriminator
+// is never stored.
+enum BodyKind { String, Structured }
 ```
 
 The Rust types are informal here; the precise definition lives
-in the `ourios-ingester` crate. The shape mirrors RFC 0001
-§6.1 column-for-column so the Parquet writer can serialise a
-slice of these directly without a translation layer.
+in the `ourios-core::otlp` module — owning the type in
+`ourios-core` (rather than `ourios-ingester`) lets the miner
+take it without depending on the receiver crate, since the
+receiver doesn't yet exist. The shape mirrors RFC 0001 §6.1
+column-for-column so the Parquet writer can serialise a slice
+of these directly without a translation layer.
 
 ### 6.7 Backpressure (deferred)
 
@@ -540,19 +596,32 @@ compliant subset of OTLP and forces a class of operators to
 front Ourios with a converter (e.g., the Collector) — which
 re-introduces the WAL-before-ack problem of §7.2.
 
-### 7.5 Synchronous AnyValue canonicalisation in the miner instead of the receiver
+### 7.5 Synchronous AnyValue canonicalisation in the miner or the receiver
 
-Pushing the structured-Body canonicalisation step into the
-miner rather than the receiver. **Rejected** because:
+Two related alternatives evaluated together:
 
-- The miner's hot path benefits from a constant-time
-  body-write in the `body_kind = Structured` short-circuit
-  (RFC 0001 §6.2 step 0); doing canonicalisation there moves
-  variable-cost serialisation work onto every structured
-  record.
-- The two transports need different canonicalisation logic
-  (re-serialise vs normalise). The miner would need to know
-  the source transport, which is a layering inversion.
+**(a) Canonicalise in the miner.** **Rejected** because the
+miner's hot path benefits from a constant-time write in the
+`body_kind = Structured` short-circuit (RFC 0001 §6.2 step 0);
+doing serialisation work there scales with body size on every
+structured record. The miner would also need to know the
+source transport (the two transports need different
+canonicalisation strategies), which is a layering inversion.
+
+**(b) Canonicalise in the receiver before materialising
+`OtlpLogRecord`.** This was the original §6.4 stance and was
+the basis on which §7.5(a) was rejected. **Reversed** by the
+§6.4 amendment: receiver-side canonicalisation forecloses
+the future "mine inner field" mode (RFC 0001 §6.1) which
+needs the structured tree, not pre-cached bytes; it also
+splits canonicalisation knowledge across two transports
+unnecessarily. The current commitment is **canonicalise at
+the storage layer** (Parquet writer), where the OTel
+JSON-encoding overrides (hex IDs, base64 bytes) live in one
+place and run once per record at write time.
+
+The miner-as-canonicaliser variant (a) remains rejected on
+its original grounds.
 
 ## 8. Testing strategy
 
@@ -574,13 +643,17 @@ mapping is filled when the §5 scenarios are specified):
   property test asserting that a batch of
   `ExportLogsServiceRequest` payloads, serialised to gRPC +
   protobuf, HTTP + protobuf, and HTTP + JSON, round-trips
-  through each transport and produces byte-identical canonical
-  body bytes for the same logical records.
-- **Body canonicalisation** (RFC0003.7, RFC0003.8):
-  table-driven tests over the seven `AnyValue` variants, each
-  asserting the canonical-JSON output matches the OTLP spec's
-  expected encoding. String-Body test asserts the unwrapped
-  string is what reaches the miner.
+  through each transport and produces equal in-memory
+  `AnyValue` trees for the same logical records.
+  Byte-level canonical-JSON equivalence is asserted in the
+  Parquet writer's tests, not here, per the §6.4 amendment.
+- **Body fork** (RFC0003.7, RFC0003.8): table-driven tests
+  over the seven `AnyValue` variants, each asserting that
+  `Body::from_any_value` routes `string_value` to
+  `Body::String` and every other variant to
+  `Body::Structured(AnyValue)` with the inner `oneof` moved,
+  not cloned. String-Body test asserts the unwrapped string is
+  what reaches the miner.
 - **Edge OTLP cases** (RFC0003.9, RFC0003.10): hand-curated
   records with `severity_number = 0`, `scope_name = None`,
   non-zero `dropped_attributes_count`. Assert pass-through
@@ -620,12 +693,13 @@ get implementations as the receiver crate is built.
   URL → attribute key mapping), `OtlpLogRecord` and the
   Parquet schema will need the two fields added. Tracked here
   so a future RFC does not re-derive the question.
-- [ ] **Where exactly does canonicalisation cost land?**
-  Synchronously per record at receive time (simple, predictable
-  latency), or batched async (higher throughput, more memory,
-  cancellation semantics get harder). §6 commits to
-  synchronous; the open question is whether any deployment
-  sees this as a bottleneck.
+- [x] ~~**Where exactly does canonicalisation cost land?**~~
+  *Resolved by the §6.4 amendment:* canonicalisation runs at
+  the storage layer (Parquet writer) at write time. The
+  receiver carries the decoded `AnyValue` verbatim; the miner
+  doesn't canonicalise. Whether the storage layer batches
+  canonicalisation or runs it per record is a Parquet-writer
+  RFC concern, not a receiver concern.
 - [ ] **`dropped_attributes_count` semantics on truncation.**
   Preserve verbatim from the wire (current §6 design), sum
   across records, or recompute if the receiver itself drops

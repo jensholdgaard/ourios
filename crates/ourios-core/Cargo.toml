@@ -8,5 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+# OTLP proto types (RFC 0003 §4.1 pins this crate as the wire-stack
+# default; carrying it on `OtlpLogRecord` keeps the in-memory record
+# faithful to the spec — no hand-rolled re-implementation that could
+# drift from the OTel `AnyValue`/`KeyValue` semantics).
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+
 [lints]
 workspace = true

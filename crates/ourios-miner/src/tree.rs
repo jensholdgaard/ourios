@@ -70,8 +70,13 @@ impl OwnedToken {
 
 /// One entry in a [`PrefixNode`]'s leaf list.
 ///
-/// Carries the [`OwnedToken`] template and its `template_id`. The
-/// follow-up integration PR will add `version`, `slot_types`,
+/// Carries the [`OwnedToken`] template, its `template_id`, and the
+/// `(severity_number, scope_name)` half of the §6.1 *Template-key
+/// composition* tuple — without those two fields, two records that
+/// share masked tokens but differ in severity or scope would
+/// silently coalesce, violating H1.4 / H1.5.
+///
+/// The follow-up integration PR will add `version`, `slot_types`,
 /// retained-body counts, and the rest of the §6.1 leaf payload;
 /// they are deliberately absent here so the skeleton stays
 /// reviewable.
@@ -84,6 +89,15 @@ pub struct Leaf {
     /// language so future `template_version`, slot-id, and
     /// alias-id additions stay disambiguated.
     pub template_id: u64,
+    /// `LogRecord.severity_number` half of the template key per
+    /// RFC 0001 §6.1 *Template-key composition*. `0` =
+    /// `UNSPECIFIED` is its own bucket (RFC0001.11), distinct from
+    /// any specified severity.
+    pub severity_number: u8,
+    /// `InstrumentationScope.name` half of the template key. `None`
+    /// is its own bucket (RFC0001.11), distinct from any specified
+    /// scope.
+    pub scope_name: Option<String>,
 }
 
 /// Internal node at a prefix-token level (or the per-length root).
@@ -336,6 +350,8 @@ mod tests {
             parent.leaves.push(Leaf {
                 template: [OwnedToken::Fixed("marker".to_string())].into(),
                 template_id: 99,
+                severity_number: 0,
+                scope_name: None,
             });
             std::ptr::from_ref(&parent.leaves)
         };
@@ -499,6 +515,8 @@ mod tests {
                 ]
                 .into(),
                 template_id: 7,
+                severity_number: 0,
+                scope_name: None,
             });
         }
 
@@ -552,6 +570,8 @@ mod tests {
                 ]
                 .into(),
                 template_id: 1,
+                severity_number: 0,
+                scope_name: None,
             });
         }
         {
@@ -564,6 +584,8 @@ mod tests {
                 ]
                 .into(),
                 template_id: 2,
+                severity_number: 0,
+                scope_name: None,
             });
             p.leaves.push(Leaf {
                 template: [
@@ -573,6 +595,8 @@ mod tests {
                 ]
                 .into(),
                 template_id: 3,
+                severity_number: 0,
+                scope_name: None,
             });
         }
 
@@ -596,6 +620,8 @@ mod tests {
                 ]
                 .into(),
                 template_id: 10,
+                severity_number: 0,
+                scope_name: None,
             });
         }
         {
@@ -608,6 +634,8 @@ mod tests {
                 ]
                 .into(),
                 template_id: 20,
+                severity_number: 0,
+                scope_name: None,
             });
         }
 

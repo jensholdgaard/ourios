@@ -123,6 +123,7 @@ fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
 #[test]
 fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
 
@@ -132,20 +133,30 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     // lines exercise the "GET <PATH> <NUM>" shape (the path
     // differs between B's two lines so each B line is its own
     // template under exact-match templating, but neither
-    // matches anything in A's set).
+    // matches anything in A's set). Both tenants use default
+    // severity (UNSPECIFIED) and scope (None), so the §6.1
+    // template-key tuple's discriminator is constant — what
+    // varies (and what the cross-pollination question pivots on)
+    // is only the masked tokens.
     let mut cluster = MinerCluster::new(MinerConfig::default());
     let a = TenantId::new("tenant-a");
     let b = TenantId::new("tenant-b");
     let a_lines = ["user 42 logged in", "user 17 logged in"];
     let b_lines = ["GET /home 200", "GET /api 200"];
 
+    let make = |tenant: &TenantId, text: &str| OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
     // Act — interleave the two streams to make any tree
     // sharing observable: a single shared store would
     // accumulate all four shapes regardless of which tenant
     // emitted which line.
     for (la, lb) in a_lines.iter().zip(b_lines.iter()) {
-        cluster.ingest(&a, la);
-        cluster.ingest(&b, lb);
+        cluster.ingest(&make(&a, la));
+        cluster.ingest(&make(&b, lb));
     }
 
     // Assert — A's templates contain only A-shaped tokens
@@ -188,20 +199,29 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
 #[test]
 fn invariant_3_7_2_same_template_two_tenants_distinct_template_ids() {
     use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
 
     // Arrange — two tenants emit the structurally identical
     // line. After masking they produce the same token sequence
-    // (`user <NUM> logged in from <IP>`).
+    // (`user <NUM> logged in from <IP>`). Default severity
+    // (UNSPECIFIED) and scope (None) for both — the question is
+    // about cross-tenant id distinctness, not about the
+    // severity/scope discriminator.
     let mut cluster = MinerCluster::new(MinerConfig::default());
     let a = TenantId::new("tenant-a");
     let b = TenantId::new("tenant-b");
     let line = "user 42 logged in from 10.0.0.1";
+    let record_for = |tenant: &TenantId| OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        body: Some(Body::String(line.to_string())),
+        ..Default::default()
+    };
 
     // Act — same line, different tenants.
-    let id_a = cluster.ingest(&a, line);
-    let id_b = cluster.ingest(&b, line);
+    let id_a = cluster.ingest(&record_for(&a));
+    let id_b = cluster.ingest(&record_for(&b));
 
     // Assert — RFC 0001 §6.1's `template_id` allocator is
     // cluster-wide unique (the id space is shared across tenants

@@ -291,6 +291,31 @@ direction and the primary obligation lives in those other RFCs.
 >   new template, the tenant id, the timestamp, and the
 >   `event_type`
 
+> **Scenario H1.4 — `severity_number` is part of the template key (no INFO/ERROR silent merge)**
+> - **Given** two `OtlpLogRecord`s with identical `body_kind = String`
+>   bodies and identical `scope_name`, but `severity_number = 9`
+>   (`INFO`) and `severity_number = 17` (`ERROR`)
+> - **When** both are ingested via `MinerCluster::ingest`
+> - **Then** the emitted records carry distinct `template_id`s
+> - **And** no widening or merge ever produces a single
+>   `template_id` covering both severity buckets
+> - (Operationalises the §6.1 *Template-key composition*
+>   commitment that `severity_number` is part of the key
+>   regardless of `body_kind`.)
+
+> **Scenario H1.5 — `scope_name` is part of the template key (no cross-scope silent merge)**
+> - **Given** two `OtlpLogRecord`s with identical
+>   `body_kind = String` bodies and identical `severity_number`,
+>   but `scope_name = Some("lib.auth")` and
+>   `scope_name = Some("lib.payments")`
+> - **When** both are ingested
+> - **Then** the emitted records carry distinct `template_id`s
+> - **And** no widening or merge ever produces a single
+>   `template_id` covering both scopes
+> - **And** a third record with `scope_name = None` shares a
+>   `template_id` with neither (it lives in the
+>   `(severity, None)` bucket per §6.1)
+
 > **Scenario H2.1 — Oversized parameter triggers OVERFLOW marker and forced body retention**
 > - **Given** a tenant configured with the default 256 B
 >   per-parameter byte limit
@@ -445,6 +470,21 @@ direction and the primary obligation lives in those other RFCs.
 > - **And** `template_id`s are guaranteed unique across the
 >   entire cluster (not just per tenant)
 
+> **Scenario §3.7.3 — Tenant derivation runs per `ResourceLogs`, not per export batch**
+> - **Given** a single OTLP `ExportLogsServiceRequest` carrying
+>   two `ResourceLogs` whose `Resource.attributes` resolve to
+>   distinct tenants A and B under the configured derivation rule
+> - **When** the receiver fans the batch out per RFC 0003 §6.3
+>   and the miner ingests both per-tenant streams
+> - **Then** every `LogRecord` under `ResourceLogs[0]` is mined
+>   under tenant A
+> - **And** every `LogRecord` under `ResourceLogs[1]` is mined
+>   under tenant B
+> - **And** no record ever appears in the wrong tenant's tree
+> - (Operationalises the §6.1 *Tenant derivation* commitment
+>   that the derivation rule runs once per inherited Resource,
+>   not once per export batch.)
+
 ### 5.3 RFC-internal design commitments
 
 > **Scenario RFC0001.1 — Fresh-leaf creation does not emit an audit event**
@@ -523,6 +563,51 @@ direction and the primary obligation lives in those other RFCs.
 > - **And** each value matches the corresponding quantile of the
 >   same-labelled histogram (computed in-process on a short
 >   ticker per §6.8)
+
+> **Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id**
+> - **Given** an `OtlpLogRecord` whose `body` is `AnyValue::Kvlist`
+>   (or any non-`String` `AnyValue` variant)
+> - **When** the record is ingested
+> - **Then** the §6.2 algorithm skips tokenize/mask/descend per
+>   step 0 and allocates or reuses the structured-template id
+>   for `(severity_number, scope_name, BodyKind::Structured)`
+> - **And** the emitted record has `body_kind = Structured`
+> - **And** the `body` column carries the OTLP-canonical JSON
+>   encoding produced upstream per RFC 0003 §6.4
+> - **And** `params` and `separators` are empty
+> - **And** `confidence == 1.0` (the §6.1 sentinel)
+> - **And** `lossy_flag == false`
+
+> **Scenario RFC0001.10 — `time_unix_nano` is preserved verbatim from the wire**
+> - **Given** an `OtlpLogRecord` with
+>   `time_unix_nano = 1_715_700_000_000_000_000`
+> - **When** the record is ingested and committed to Parquet
+> - **Then** the emitted row has
+>   `time_unix_nano == 1_715_700_000_000_000_000`
+> - **And** a query
+>   `WHERE time_unix_nano BETWEEN 1_715_600_000_000_000_000 AND 1_715_800_000_000_000_000`
+>   returns the row
+> - (Gates `docs/benchmarks.md` B1 — time-range queries — by
+>   making the underlying column measurable.)
+
+> **Scenario RFC0001.11 — `severity_number = 0` and `scope_name = None` are distinct key buckets**
+> - **Given** four `OtlpLogRecord`s with identical
+>   `body_kind = String` body, varying only in
+>   `(severity_number, scope_name)` across
+>   `(0, None)`, `(0, Some("lib.x"))`, `(9, None)`,
+>   `(9, Some("lib.x"))`
+> - **When** all four are ingested
+> - **Then** four distinct `template_id`s are emitted, one per
+>   key bucket
+> - **And** no widening or merge ever coalesces the
+>   `severity_number = 0` (`UNSPECIFIED`) bucket with any
+>   specified-severity bucket
+> - **And** no widening or merge ever coalesces the
+>   `scope_name = None` bucket with any
+>   `scope_name = Some(_)` bucket
+> - (Locks the §6.1 explicit edge-case rules: `0 = UNSPECIFIED`
+>   is a valid OTLP severity that gets its own bucket, and
+>   absent scope is its own bucket.)
 
 ## 6. Proposed design
 

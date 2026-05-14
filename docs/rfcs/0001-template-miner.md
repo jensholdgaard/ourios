@@ -554,11 +554,13 @@ this section closes:
 > [`docs/architecture/otlp-log-format.md`](../architecture/otlp-log-format.md).
 > The pre-amendment schema treated logs as raw text strings; the
 > amended schema treats every log as a structured OTLP record from
-> the moment it enters the system. The §6.2 algorithm text below
-> is **not** rewritten in this amendment — its
-> `tokenize(L_raw)` framing now applies only to the
-> `body.kind = String` branch; the structured-Body fork and the
-> updated ingest signature land in a follow-up amendment to §6.2.
+> the moment it enters the system. §6.2's algorithm and its ingest
+> signature were aligned to this amendment in a companion edit
+> the same day (see §6.2's amendment note below): the `body.kind`
+> fork is at the top of the algorithm, the descent step
+> incorporates the §6.1 template-key tuple, and the
+> `MinerCluster::ingest` signature now takes a structured
+> `OtlpLogRecord` rather than a raw `&str`.
 
 The miner emits one record per ingested OTLP `LogRecord`. The
 record shape mirrors the wire shape of OTLP logs (the
@@ -863,25 +865,71 @@ template_version)` as a meaningful compound key.
 
 ### 6.2 Algorithm
 
-> **Amendment 2026-05-13.** The pseudocode below describes the
-> mining algorithm for the `body_kind = String` branch only —
-> i.e. when `LogRecord.body` is `AnyValue::String` and the
-> miner treats the unwrapped string as `L_raw`. The
-> `body_kind = Structured` branch (kvlist, array, int, double,
-> bool, bytes) bypasses this algorithm entirely per §6.1's
-> *Body representation* subsection; the structured body is
-> stored verbatim in the record's `body` column with no
-> template/params/separators emitted. The full §6.2 rewrite —
-> including the new ingest signature
-> (`ingest(record: &OtlpLogRecord)` rather than
-> `ingest(_, raw: &str)`) and the explicit fork on
-> `body.kind` — is a follow-up amendment scheduled alongside
-> RFC 0003 (OTLP receiver). This stub keeps the existing
-> algorithm text valid under its now-narrower precondition.
+> **Amendment 2026-05-13.** Rewritten to take a structured OTLP
+> `LogRecord` rather than a raw `&str`, in line with the §6.1
+> amendment. The algorithm now opens with the `body.kind` fork
+> from §6.1's *Body representation*: `AnyValue::String` runs the
+> Drain mining steps (the prior algorithm, preserved verbatim
+> below); every other `AnyValue` variant short-circuits to the
+> structured emit per §6.1's *Template-key composition* fork.
+> Step 3's descent now incorporates `(severity_number,
+> scope_name)` into the tree key, again per §6.1 — the
+> implementation choice (extra prefix layers, tuple-keyed leaf
+> lists, separate trees per `(severity, scope)`) stays in §6.2
+> as the algorithm's responsibility, but the semantic key is
+> pinned by §6.1. The ingest signature on `MinerCluster` becomes
+> `ingest(record: &OtlpLogRecord)`; pre-amendment callers were
+> `ingest(tenant_id, raw: &str)`.
 
-For each ingested line `L_raw`:
+The miner sees an already-tenant-resolved `(tenant_id,
+record: OtlpLogRecord)` pair. The receiver (RFC 0003) is
+responsible for resolving `tenant_id` per `ResourceLogs` and
+fanning records into per-tenant streams before the miner
+sees them; §6.1's *Tenant derivation* pins that contract.
+
+For each ingested OTLP `LogRecord`:
 
 ```
+0.  match record.body.kind:
+
+      AnyValue::String(s):
+          # Continue with the Drain mining algorithm in steps
+          # 1–5 below, treating `s` as the `L_raw` of the prior
+          # spec. body_kind = String.
+
+      AnyValue::Bool | Int | Double | Bytes | Array | KVList:
+          # Structured short-circuit per §6.1 *Body
+          # representation*. The miner does NOT run the Drain
+          # mining steps. body_kind = Structured.
+          encoded = canonicalise_to_otlp_json(record.body)
+              # OTLP-canonical JSON encoding per the OTLP HTTP/JSON
+              # binding (proto3 JSON mapping with OTLP-specific
+              # overrides — hex trace_id/span_id, base64 bytes).
+              # For records arriving over OTLP/gRPC the receiver
+              # decodes protobuf and re-serialises here; for
+              # records arriving over OTLP/HTTP+JSON it
+              # canonicalises the incoming bytes (whitespace,
+              # field-ordering, int64-as-string normalisation).
+              # Without canonicalisation the lossy_flag = false
+              # promise is unmeetable — see §6.1 for the why.
+          template_id = allocate_or_reuse_structured_template_id(
+              record.severity_number,
+              record.scope_name,
+          )
+              # Per §6.1 *Template-key composition*, the
+              # structured-Body key is (severity_number,
+              # scope_name, BodyKind::Structured). All structured
+              # records sharing a (severity, scope) share one
+              # template_id. The leaf the id points at carries the
+              # `Structured` marker and an empty body_template.
+          attach_structured(record, encoded, template_id,
+                            confidence = 1.0,
+                            lossy_flag = false)
+              # confidence = 1.0 sentinel; lossy_flag = false
+              # because the canonicalised body is authoritative,
+              # nothing is reconstructed from a template.
+          return
+
 1.  L_tok, separators = tokenize(L_raw)
         # tokenize splits on Unicode whitespace only — every
         # codepoint matching `char::is_whitespace()` (ASCII space,
@@ -896,6 +944,12 @@ For each ingested line `L_raw`:
         # On failure (malformed UTF-8, embedded NUL, line longer
         # than max-line-bytes): emit a parse-failure record and
         # increment parse_failures_total. Skip the rest.
+        # Note: an empty-after-whitespace string (the AnyValue
+        # carries `""` or only whitespace) is not a parse failure
+        # — it has zero tokens and the miner short-circuits with
+        # the cluster's `NO_TEMPLATE` sentinel rather than
+        # descending the tree. The pre-amendment cluster code
+        # already routes this case; the spec just records it.
 
 2.  L_masked, typed_params = mask(L_tok)
         # mask applies the configured masking rules in order;
@@ -904,8 +958,24 @@ For each ingested line `L_raw`:
         # into typed_params with that tag. Unmasked tokens
         # remain literal.
 
-3.  parent = tree.descend(len(L_masked), L_masked[0..d-1])
-        # descend through root → length node → prefix nodes.
+3.  parent = tree.descend(record.severity_number,
+                           record.scope_name,
+                           len(L_masked),
+                           L_masked[0..d-1])
+        # Per §6.1 *Template-key composition*, the discriminator
+        # for "is this the same template?" is the tuple
+        # (severity_number, scope_name, masked_body_tokens).
+        # Step 3 incorporates severity_number and scope_name into
+        # the descent key alongside the masked-token prefix used
+        # by published Drain. The implementation may layer extra
+        # prefix levels above the length-N node, key leaf lists
+        # by (severity, scope), or maintain separate trees per
+        # (severity, scope) — the choice is cardinality-driven
+        # and revisitable from corpus observations. The
+        # severity_number = 0 (UNSPECIFIED) and scope_name = None
+        # cases are valid distinct key positions; they cluster as
+        # their own buckets, never coalesced with any specified
+        # severity or named scope.
         # if a node along the path does not exist, create it.
 
 4.  candidate = argmax over leaf in parent.leaves of
@@ -1002,8 +1072,17 @@ For each ingested line `L_raw`:
 
 Branching invariants:
 
-- The tree only deepens on first observation of a `(length, prefix
-  tokens)` shape.
+- Step 0's structured short-circuit never enters the Drain
+  mining steps (1–5). Structured-Body records do not widen, do
+  not emit `template_widened` or `template_type_expanded` audit
+  events, do not contribute to `merges_total`, and never carry
+  `params`/`separators`. The structured branch's `[§3.1]`
+  preservation is vacuous: no template merge happens, so no
+  silent merge is possible.
+- The tree only deepens on first observation of a
+  `(severity_number, scope_name, length, prefix tokens)` shape
+  (the §6.1 template-key tuple, anchored at this section's
+  step 3).
 - Leaves are split (new leaf created) when the best candidate is in
   the lossy zone; they are never split when the candidate is clean.
 - A leaf is *widened* (wildcards introduced) when a clean attach
@@ -1019,7 +1098,9 @@ Branching invariants:
   increments twice and two audit events are emitted, in that
   order.
 - The leaf's `template_version` only increments on widening or
-  type-expansion, not on a clean attach.
+  type-expansion, not on a clean attach. Structured-Body leaves
+  are never widened or type-expanded; their `template_version`
+  stays at 1 for the lifetime of the leaf.
 
 ### 6.3 Confidence scoring `[§3.1]`
 

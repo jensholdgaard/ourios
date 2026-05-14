@@ -147,7 +147,7 @@ impl Tree {
     pub fn descend_mut(&mut self, masked: &[&str], prefix_depth: usize) -> &mut PrefixNode {
         assert!(
             !masked.is_empty(),
-            "descend_mut precondition: masked must be non-empty (tokenize+mask guarantee N ≥ 1)",
+            "descend_mut precondition: masked must be non-empty",
         );
 
         let length = masked.len();
@@ -178,7 +178,7 @@ impl Tree {
     pub fn descend(&self, masked: &[&str], prefix_depth: usize) -> Option<&PrefixNode> {
         assert!(
             !masked.is_empty(),
-            "descend precondition: masked must be non-empty (tokenize+mask guarantee N ≥ 1)",
+            "descend precondition: masked must be non-empty",
         );
 
         let length = masked.len();

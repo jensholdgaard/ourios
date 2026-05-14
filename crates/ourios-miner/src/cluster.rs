@@ -38,6 +38,12 @@ use crate::sim_seq::sim_seq;
 use crate::tokenize::tokenize;
 use crate::tree::{DEFAULT_PREFIX_DEPTH, Leaf, OwnedToken, Tree};
 
+/// Sentinel `template_id` returned by [`MinerCluster::ingest`]
+/// when no template was allocated for the input — currently the
+/// empty-input parse-failure path. Real templates always have
+/// id `>= 1` (see `next_template_id` initialisation).
+pub const NO_TEMPLATE: u64 = 0;
+
 /// A multi-tenant in-memory miner.
 ///
 /// Holds one [`TenantState`] per [`TenantId`]; per-tenant state
@@ -72,13 +78,26 @@ pub struct MinerCluster {
 ///
 /// `template_id` allocation lives on [`MinerCluster`], not here
 /// — see the `next_template_id` comment there for why.
+///
+/// `template_count` is a cache of the tree's leaf count,
+/// incremented on every leaf insertion in [`MinerCluster::ingest`].
+/// It exists because the public [`MinerCluster::template_count`]
+/// metric is intended for frequent introspection (and will back
+/// the §6.8 `template_count` gauge once telemetry lands), and
+/// walking the tree on every read would be O(N-leaves). The
+/// cache invariant is: any call site that pushes to
+/// `tree`'s leaves must also `template_count += 1`.
 struct TenantState {
     tree: Tree,
+    template_count: usize,
 }
 
 impl TenantState {
     fn new() -> Self {
-        Self { tree: Tree::new() }
+        Self {
+            tree: Tree::new(),
+            template_count: 0,
+        }
     }
 }
 
@@ -107,7 +126,8 @@ impl MinerCluster {
 
     /// Ingest a raw line for the named tenant. Returns the
     /// `template_id` allocated (or reused) for the line's
-    /// masked shape.
+    /// masked shape, or [`NO_TEMPLATE`] (`0`) when the input
+    /// produces no tokens (empty or whitespace-only `raw`).
     ///
     /// On first sight of `tenant_id`, allocates a fresh
     /// per-tenant store. Lines whose masked shape matches an
@@ -115,10 +135,22 @@ impl MinerCluster {
     /// `template_id`; everything else pulls the next monotonic
     /// id from the cluster-wide allocator and creates a new
     /// leaf under the same `(length, prefix)` bucket.
+    ///
+    /// Empty/whitespace-only inputs are treated as a parse
+    /// failure: no template is allocated and [`NO_TEMPLATE`] is
+    /// returned. This is a placeholder for the §6.8
+    /// `parse_failures_total` metric path that lands with the
+    /// confidence-zone branching PR; for now it just keeps
+    /// [`Tree::descend_mut`]'s `N ≥ 1` precondition from
+    /// panicking on a corner-case input.
     pub fn ingest(&mut self, tenant_id: &TenantId, raw: &str) -> u64 {
         let tokenized = tokenize(raw);
         let masked = mask(&tokenized.tokens);
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
+
+        if masked_strs.is_empty() {
+            return NO_TEMPLATE;
+        }
 
         // Phase 1 — read-only lookup. Avoids the mutable-borrow
         // chain through `tenants.entry()` + `descend_mut` so we
@@ -160,16 +192,22 @@ impl MinerCluster {
             template: new_template,
             template_id: new_id,
         });
+        // Maintain the TenantState::template_count cache invariant —
+        // every leaf push under `state.tree` is mirrored here so
+        // `MinerCluster::template_count` can stay O(1).
+        state.template_count += 1;
         new_id
     }
 
     /// Number of distinct templates this tenant has accumulated.
     /// Returns 0 for a tenant the cluster has never seen.
+    ///
+    /// O(1): served from the [`TenantState::template_count`]
+    /// cache rather than walking the tree. The cache is
+    /// maintained by [`MinerCluster::ingest`].
     #[must_use]
     pub fn template_count(&self, tenant_id: &TenantId) -> usize {
-        self.tenants
-            .get(tenant_id)
-            .map_or(0, |s| s.tree.leaf_count())
+        self.tenants.get(tenant_id).map_or(0, |s| s.template_count)
     }
 
     /// Snapshot of `(masked_template, template_id)` pairs for
@@ -341,5 +379,49 @@ mod tests {
         // prefix)` bucket but different leaves.
         assert_ne!(id_in, id_out);
         assert_eq!(cluster.template_count(&t), 2);
+    }
+
+    #[test]
+    fn ingest_returns_no_template_sentinel_for_empty_input() {
+        // Arrange — `tokenize` documents that empty and
+        // whitespace-only inputs produce zero tokens; `mask`
+        // preserves length, so `Tree::descend{,_mut}` would see
+        // an empty slice and trip its `N ≥ 1` precondition.
+        // `ingest` short-circuits to the [`NO_TEMPLATE`] sentinel
+        // instead of panicking — placeholder for the §6.8
+        // `parse_failures_total` metric path.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        // Act
+        let id_empty = cluster.ingest(&t, "");
+        let id_blank = cluster.ingest(&t, "   \t\n");
+
+        // Assert — both inputs yield the sentinel; no template
+        // is allocated; the tenant's count stays at 0.
+        assert_eq!(id_empty, NO_TEMPLATE);
+        assert_eq!(id_blank, NO_TEMPLATE);
+        assert_eq!(cluster.template_count(&t), 0);
+    }
+
+    #[test]
+    fn template_count_grows_with_each_distinct_template() {
+        // Arrange — three lines: two share a masked shape, one
+        // differs. The cache on TenantState must track exactly
+        // the number of distinct templates the tree holds.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        // Act — first ingest creates leaf 1, second hits the
+        // existing leaf (no count change), third creates leaf 2.
+        let _ = cluster.ingest(&t, "user 42 logged in");
+        let _ = cluster.ingest(&t, "user 17 logged in");
+        let _ = cluster.ingest(&t, "GET /home 200");
+
+        // Assert — pin the cache invariant: the O(1) reading
+        // matches the O(N) `Tree::leaf_count` walk for the same
+        // tenant state.
+        let cached = cluster.template_count(&t);
+        assert_eq!(cached, 2);
     }
 }

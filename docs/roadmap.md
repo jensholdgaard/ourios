@@ -2,9 +2,10 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-05-13** (after the prefix-tree skeleton and
-> the `MinerCluster` ⇆ `Tree` integration landed; widening still
-> deferred).
+> Last updated: **2026-05-13** — after the OTLP-alignment work
+> landed (PR #20 finding doc + PR #21 RFC 0001 §6.1 amendment).
+> §4 + §5 now split "OTLP record consumption" (in MVP) from
+> "OTLP wire endpoints" (post-MVP); see §5's footnote-row.
 
 This document answers two questions in one place: *what does
 "MVP" mean for Ourios*, and *how far are we from it*. The
@@ -88,10 +89,10 @@ What's specifically missing for the thesis gates:
 | Gate | Blocker(s) |
 |---|---|
 | **A1** | Records-to-Parquet writer, mined records flowing through a real pipeline (corpus → Parquet) |
-| **B1** | DataFusion frontend, Parquet reader, predicate pushdown wiring |
+| **B1** | DataFusion frontend, Parquet reader, predicate pushdown wiring; `time_unix_nano` carried end-to-end (now in the amended §6.1 schema, not yet in the writer) |
 | **B2** | Same as B1 plus `template_id` as a queryable column |
 | **C1** | Separators preservation through ingest, `reconstruct()`, `lossy_flag` semantics, body retention |
-| **C2** | `widen` + best-candidate selection (the tree + descend are in place; the attach decision is exact-match only until widening lands) |
+| **C2** | `widen` + best-candidate selection (the tree + descend are in place; the attach decision is exact-match only until widening lands) **AND** the miner consumes structured `OtlpLogRecord` (not raw `&str`) so the corpus exercises the OTLP shape the thesis is being measured against |
 
 For `cargo test --all-features`'s outer-loop view: 48 passed /
 23 ignored. The 23 ignored stubs map to RFC 0001 §5 scenarios
@@ -127,6 +128,13 @@ scenarios are green.
   `reconstruct()` + `lossy_flag` semantics per §6.6.
 - Per-parameter byte-limit check + `OVERFLOW` marker + forced
   body retention.
+- **`MinerCluster::ingest` consumes a structured `OtlpLogRecord`**
+  (per RFC 0001 §6.1 as amended), not a raw `&str`. The
+  `body_kind = String` / `body_kind = Structured` fork lands
+  with the §6.2 algorithm rewrite (a follow-on PR to the §6.1
+  amendment). Severity, scope, and the OTLP-canonical JSON
+  encoding for structured bodies all flow through the miner from
+  this phase forward.
 
 **Unblocks:** thesis gates **C1** (reconstruction) and **C2**
 (template-count convergence). RFC 0001 §5 scenarios H1.\*,
@@ -142,9 +150,14 @@ DataFusion-aware reader can open.
 **Capabilities to land:**
 
 - New crate `ourios-parquet`.
-- Record schema matching RFC 0001 §6.1 (`tenant_id`,
-  `template_id`, `template_version`, `params`, `separators`,
-  `body?`, `confidence`, `lossy_flag`).
+- Record schema matching the amended RFC 0001 §6.1: identity +
+  partitioning columns, the OTLP-derived columns (`time_unix_nano`,
+  `severity_number` + `severity_text`, `scope_name` +
+  `scope_version`, `attributes`, `resource_attributes`,
+  `trace_id` + `span_id` + `flags`, `event_name`,
+  `dropped_attributes_count`), and the body / miner-derived
+  columns (`body_kind`, `body?`, `params`, `separators`,
+  `confidence`, `lossy_flag`).
 - Writer: record batch → Parquet file (with row-group sizing
   from `hazards.md` H4 — target 128 MB–1 GB row groups).
 - Reader: Parquet file → record batch (for verification + the
@@ -171,11 +184,18 @@ compaction is a post-MVP PR.
   files with DataFusion and accept raw SQL. **No DSL** — RFC
   0002's surface is a post-MVP concern; the bench can use SQL
   directly.
-- New crate `ourios-bench` — corpus runner that ingests the
-  corpus, writes Parquet, runs the A1/B1/B2/C1/C2 measurements,
-  and reports numbers that go into `benchmarks.md` §9 (Status).
+- New crate `ourios-bench` — corpus runner that reads
+  pre-recorded OTLP `LogsData` test data into a stream of
+  `OtlpLogRecord`s, hands them to the miner, writes Parquet,
+  runs the A1/B1/B2/C1/C2 measurements, and reports numbers
+  that go into `benchmarks.md` §9 (Status). **No network
+  receiver** in MVP — the bench reads OTLP from disk, not from
+  a gRPC/HTTP listener (those stay post-MVP per §5).
 - `testdata/corpus/` — anonymised real-log corpus committed to
-  the repo (or a download script if size demands).
+  the repo (or a download script if size demands), serialised
+  as OTLP `LogsData` (canonical JSON or protobuf) so the bench
+  exercises the same record shape an OTel deployment would
+  produce.
 
 **Unblocks:** thesis gates **B1** (predicate-pushdown latency)
 and **B2** (template-exact latency). At the end of this phase,
@@ -194,12 +214,25 @@ is *"answering 'does the thesis hold?' doesn't require it,"* not
 | Capability | Why deferred for MVP | When it lands |
 |---|---|---|
 | **Write-ahead log** (`ourios-wal`) | Corpus replay is bounded and reproducible; durability is irrelevant for thesis-proving | First post-MVP shipping PR series — required before any non-corpus traffic |
-| **OTLP receiver** (gRPC + HTTP) | Bench input is the corpus, not gRPC | Same — paired with WAL since both gate ingest |
+| **OTLP wire endpoints** (gRPC + HTTP listeners) | Bench reads OTLP from disk, not the network — see Phase 3. The wire-decode layer (`tonic`, `axum`, `opentelemetry-proto`) is independent of the record shape and adds no signal to thesis gates | First post-MVP shipping PR series — paired with WAL since both gate non-corpus ingest. RFC 0003 (forthcoming) specifies the wire-decode design |
 | **Snapshot mechanism** (RFC 0001 §6.9) | Corpus runs from cold start; replay budget moot | After WAL — snapshots are an optimisation on top of WAL replay |
 | **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | After Phase 1 finishes — the metrics depend on the miner's hot path being final |
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | Post-MVP — RFC 0002 already drafted but not specified |
 | **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | Post-MVP, tied to operator-console RFC (see RFC 0001 §9 *"Multi-tenancy and operational lifecycle"*) |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | Post-MVP, sequencing TBD |
+
+**Note on OTLP scope.** The pre-amendment roadmap listed
+"OTLP receiver (gRPC + HTTP)" as a single post-MVP item.
+PR #20 + #21 split that scope: the **OTLP record shape**
+(`OtlpLogRecord` consumption, the canonical JSON encoding,
+the OTLP-aligned Parquet schema) is in MVP — it's a
+prerequisite for thesis-gate **C2**'s validity, because the
+template-count convergence the corpus measures has to be over
+records that look like real OTel traffic, not over
+flat-text caricatures of it. Only the **wire endpoints** —
+the actual gRPC/HTTP listeners that decode OTLP off the
+network — remain post-MVP, and that's the row in the table
+above.
 
 ---
 

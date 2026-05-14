@@ -20,6 +20,7 @@
 - [Process](./rfcs/README.md)
 - [RFC 0001 — Template miner](./rfcs/0001-template-miner.md)
 - [RFC 0002 — Query DSL](./rfcs/0002-query-dsl.md)
+- [RFC 0003 — OTLP receiver](./rfcs/0003-otlp-receiver.md)
 
 # Talks
 

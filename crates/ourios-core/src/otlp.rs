@@ -19,9 +19,11 @@
 //! `otel.*` namespace is also reserved. Synthesising a
 //! `tenant_id` attribute into `resource_attributes` would violate
 //! both contracts. The receiver derives `tenant_id` from `Resource`
-//! attributes (or auth context) per RFC 0003 §6.3 and attaches it
-//! here as a separate field — leaving `resource_attributes`
-//! faithful to what the wire delivered.
+//! attributes per RFC 0003 §6.3 and attaches it here as a separate
+//! field — leaving `resource_attributes` faithful to what the wire
+//! delivered. (Auth-context-driven tenant binding is currently a
+//! RFC 0003 §9 open question; if it lands, it joins the same
+//! derivation rule rather than displacing it.)
 
 use crate::tenant::TenantId;
 // Re-export the proto types this module exposes on its public

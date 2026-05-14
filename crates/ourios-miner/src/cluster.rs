@@ -164,11 +164,15 @@ impl MinerCluster {
     ///   tree is **not** walked; the template id is keyed on
     ///   `(severity_number, scope_name, BodyKind::Structured)`
     ///   per §6.1, and the same tuple reuses the same id on
-    ///   subsequent records. `confidence = 1.0`,
-    ///   `lossy_flag = false` (RFC0001.9) — those columns aren't
-    ///   on the cluster's API yet but the contract is preserved
-    ///   here so the Parquet writer crate can read them off the
-    ///   record verbatim.
+    ///   subsequent records. RFC 0001 §6.1 also pins
+    ///   `confidence = 1.0` and `lossy_flag = false` for this
+    ///   branch (RFC0001.9) — those values are *derived by the
+    ///   miner* (sentinel-constants for the structured branch),
+    ///   not stored on `OtlpLogRecord`. They aren't on the
+    ///   cluster's return surface yet because the Parquet writer
+    ///   crate that consumes them doesn't exist; when it lands the
+    ///   miner will emit them alongside the `template_id`. No
+    ///   fields on `OtlpLogRecord` carry these values today.
     /// - `None` — the wire delivered no body. Returns
     ///   [`NO_TEMPLATE`]; no allocation. Whether absent body
     ///   should get its own sentinel template id is currently
@@ -649,6 +653,37 @@ mod tests {
         // Assert
         assert_ne!(id_none, id_some);
         assert_eq!(cluster.template_count(&t), 2);
+    }
+
+    #[test]
+    fn structured_body_isolates_template_ids_across_tenants() {
+        // Arrange — two tenants emit identical structured records
+        // (same severity, same scope). The §3.7 invariant
+        // ("template trees never cross-pollinate") applies to the
+        // structured store too, even though §3.7.2's exemplar
+        // scenario in RFC 0001 §5 uses a String body. This test
+        // is the structured-branch regression for that invariant:
+        // the per-tenant `structured_templates` maps must be
+        // independent, AND the cluster-wide id allocator must
+        // hand the second tenant a distinct id rather than
+        // reusing the first tenant's.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let a = TenantId::new("tenant-a");
+        let b = TenantId::new("tenant-b");
+
+        // Act — same (severity, scope) tuple, different tenants.
+        let id_a = cluster.ingest(&structured_record(&a, 9, Some("lib.auth")));
+        let id_b = cluster.ingest(&structured_record(&b, 9, Some("lib.auth")));
+
+        // Assert — distinct ids (no cross-tenant id reuse), and
+        // both tenants count exactly one template (no
+        // cross-pollination of the structured store).
+        assert_ne!(
+            id_a, id_b,
+            "structured records with identical key tuple must get distinct template_ids across tenants",
+        );
+        assert_eq!(cluster.template_count(&a), 1);
+        assert_eq!(cluster.template_count(&b), 1);
     }
 
     #[test]

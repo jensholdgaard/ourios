@@ -159,3 +159,27 @@ fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
 fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
     todo!("RFC 0001 §6.8");
 }
+
+/// Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id.
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+#[ignore = "RFC 0001 Red gate — implementation pending"]
+fn rfc0001_9_structured_body_short_circuits_to_structured_template_id() {
+    todo!("RFC 0001 §6.1 (Body representation), §6.2 (step 0)");
+}
+
+/// Scenario RFC0001.10 — `time_unix_nano` is preserved verbatim from the wire.
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+#[ignore = "RFC 0001 Red gate — implementation pending"]
+fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
+    todo!("RFC 0001 §6.1 (record schema)");
+}
+
+/// Scenario RFC0001.11 — `severity_number = 0` and `scope_name = None` are distinct key buckets.
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+#[ignore = "RFC 0001 Red gate — implementation pending"]
+fn rfc0001_11_severity_zero_and_scope_none_are_distinct_key_buckets() {
+    todo!("RFC 0001 §6.1 (Template-key composition)");
+}

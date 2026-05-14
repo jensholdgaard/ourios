@@ -11,9 +11,31 @@
 //! home on the OTLP wire — see RFC 0003 §6.3) and to flatten the
 //! `ResourceLogs → ScopeLogs → LogRecord` nesting into the shape
 //! the miner consumes.
+//!
+//! `tenant_id` is deliberately a sibling field, **not** folded into
+//! `resource_attributes`. Per the `OTel` `Resource` spec, resource
+//! attributes describe the *observed entity* (`service.name`,
+//! `host.*`, `k8s.*`, …), not ingest-routing decisions; the
+//! `otel.*` namespace is also reserved. Synthesising a
+//! `tenant_id` attribute into `resource_attributes` would violate
+//! both contracts. The receiver derives `tenant_id` from `Resource`
+//! attributes per RFC 0003 §6.3 and attaches it here as a separate
+//! field — leaving `resource_attributes` faithful to what the wire
+//! delivered. (Auth-context-driven tenant binding is currently a
+//! RFC 0003 §9 open question; if it lands, it joins the same
+//! derivation rule rather than displacing it.)
 
 use crate::tenant::TenantId;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+// Re-export the proto types this module exposes on its public
+// surface so downstream crates (the miner, the future receiver,
+// the future Parquet writer) can use them without taking a
+// direct `opentelemetry-proto` dependency. The proto types are
+// still the canonical definitions — this is just a single import
+// path through `ourios_core::otlp::*` so the dep graph stays one
+// crate deep. `any_value` is also re-exported because callers
+// constructing a non-string `AnyValue` need its `Value` enum to
+// fill the `value: Option<any_value::Value>` field.
+pub use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 
 /// One OTLP `LogRecord` after wire decode and tenant derivation.
 ///

@@ -519,6 +519,20 @@ question is the prior decision; the rest are downstream.*
       layer question that does not change the A/B predicate-branch
       decision, but should be answered before §9 user research
       because the answer changes who counts as a "user".
+- [ ] **First-class query dimensions for OTel-canonical fields.**
+      RFC 0001 §6.1 stores `service.name` (via
+      `resource_attributes`), `trace_id` / `span_id`, `scope_name`,
+      and `attributes` as faithful columns — but the storage spec
+      stays silent on how the DSL surfaces them. Community
+      feedback (OpenTelemetry maintainer guidance, May 2026) is
+      that these are the primary correlation/query dimensions a
+      log backend is judged on: `service.name` for cross-service
+      navigation, `trace_id`/`span_id` for log↔trace correlation,
+      typed `attributes` access without string-flattening. The
+      DSL should give them ergonomic, *named* surface (e.g.
+      `service ==`, `trace_id ==`, `attr["k"] ==`) rather than
+      requiring users to hand-write attribute-map lookups. Decide
+      the surface here so RFC 0001 doesn't have to retrofit it.
 
 The DSL is the most user-facing surface in the project. More open
 questions here is healthier than fewer.

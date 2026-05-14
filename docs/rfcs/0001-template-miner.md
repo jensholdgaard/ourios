@@ -565,15 +565,18 @@ direction and the primary obligation lives in those other RFCs.
 >   ticker per §6.8)
 
 > **Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id**
-> - **Given** an `OtlpLogRecord` whose `body` is `AnyValue::Kvlist`
->   (or any non-`String` `AnyValue` variant)
+> - **Given** an `OtlpLogRecord` whose `body` is
+>   `Body::Structured(AnyValue)` (any non-`String` `AnyValue`
+>   variant carried verbatim per RFC 0003 §6.4)
 > - **When** the record is ingested
 > - **Then** the §6.2 algorithm skips tokenize/mask/descend per
 >   step 0 and allocates or reuses the structured-template id
 >   for `(severity_number, scope_name, BodyKind::Structured)`
 > - **And** the emitted record has `body_kind = Structured`
 > - **And** the `body` column carries the OTLP-canonical JSON
->   encoding produced upstream per RFC 0003 §6.4
+>   encoding of that `AnyValue`, produced at Parquet-write time
+>   (the in-memory record carries the decoded `AnyValue` itself
+>   per the §6.4 amendment)
 > - **And** `params` and `separators` are empty
 > - **And** `confidence == 1.0` (the §6.1 sentinel)
 > - **And** `lossy_flag == false`

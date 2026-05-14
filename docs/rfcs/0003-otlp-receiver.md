@@ -334,28 +334,48 @@ batch** with a transport-level error naming the failing
 Resource and the missing attribute. Per-Resource partial
 acceptance is reserved for a future RFC (see §9).
 
-### 6.4 AnyValue canonicalisation boundary
+### 6.4 AnyValue canonicalisation is deferred to the storage layer
 
-The receiver — not the miner — performs the AnyValue → OTLP-
-canonical JSON conversion for `body.kind != AnyValue::String`
-records. Rationale:
+> **Amendment (PR introducing `ourios-core::otlp::OtlpLogRecord`).**
+> This subsection originally pinned the receiver as the place
+> that canonicalises structured `AnyValue` bodies into
+> OTLP-canonical JSON, with the in-memory record carrying
+> pre-cached `Bytes`. The amended position carries the
+> `AnyValue` *itself* on the in-memory record and defers
+> canonicalisation to the storage layer (Parquet writer,
+> when it lands). Rationale below.
 
-- The miner's signature
-  (`MinerCluster::ingest(record: &OtlpLogRecord)`) takes a
-  ready-to-template record. Pushing the canonicalisation
-  upstream keeps the miner's hot path off any
-  serialisation/canonicalisation work.
-- The two transports (gRPC + protobuf vs HTTP + JSON) need
-  different canonicalisation strategies (re-serialise from
-  decoded `AnyValue` vs normalise existing JSON). The receiver
-  knows which transport delivered the record; the miner
-  shouldn't.
-- Storing canonicalised JSON in the in-memory `OtlpLogRecord`
-  makes the structured-Body short-circuit in RFC 0001 §6.2
-  step 0 a constant-time write.
+The receiver hands the miner an `OtlpLogRecord` whose body, when
+present and structured, carries the decoded `AnyValue` verbatim
+(`Body::Structured(AnyValue)`). The miner runs the §6.2 step-0
+short-circuit on the discriminator alone; it does not walk the
+`AnyValue` tree. Canonicalisation to OTLP-canonical JSON
+(per RFC 0001 §6.1 *Body representation*) happens once, at
+Parquet-write time.
 
-For `body.kind = AnyValue::String`, no canonicalisation is
-needed; the unwrapped string is passed through as `L_raw`.
+Rationale:
+
+- **Optionality.** RFC 0001 §6.1 reserves a future "mine inner
+  field" mode (e.g. mine `body.kvlist["msg"]` as the line if
+  present) gated on corpus evidence. That mode needs the
+  structured tree, not pre-cached bytes. Carrying `AnyValue`
+  preserves the option without committing to the design.
+- **Single canonicalisation pass.** Whether the body arrived
+  as gRPC-protobuf or HTTP-JSON, the storage layer performs
+  exactly one canonicalisation step at write time. The
+  receiver no longer has to know two canonicalisation
+  strategies (re-serialise vs normalise); the storage layer
+  owns the one canonical mapping per RFC 0001 §6.1.
+- **Miner hot path is unchanged.** The §6.2 step-0
+  short-circuit only inspects the discriminator
+  (`Body::Structured(_)` vs `Body::String(_)`); no
+  `AnyValue` walking, no allocation in the structured branch.
+  The hot-path argument that originally favoured pre-caching
+  was speculative — until corpus benchmarks say otherwise,
+  carrying the tree costs nothing the miner cares about.
+
+For `Body::String(s)`, no canonicalisation is ever needed; the
+unwrapped string is passed through as `L_raw`.
 
 ### 6.5 WAL-before-ack sequencing
 
@@ -365,7 +385,8 @@ after every record is durably written. Concrete contract:
 1. Receiver accepts the request and decodes to
    `ExportLogsServiceRequest`.
 2. Receiver fans out to per-tenant `OtlpLogRecord` streams
-   (§6.3) and canonicalises bodies as needed (§6.4).
+   (§6.3); body canonicalisation does not happen here, per the
+   amended §6.4.
 3. Receiver appends every record to the WAL.
 4. Receiver fsyncs the WAL segment(s) touched.
 5. Receiver hands records to the miner for templating.
@@ -394,9 +415,18 @@ violate `[§3.4]`.
 
 ### 6.6 The `OtlpLogRecord` in-memory shape
 
+> **Amendment (PR introducing `ourios-core::otlp::OtlpLogRecord`).**
+> Body now carries the decoded `AnyValue` rather than its
+> OTLP-canonical JSON encoding (see amended §6.4).
+> `body_kind` is derived from `body` rather than stored on
+> the record, since the §6.2 step-0 fork only needs to read
+> the discriminator.
+
 The receiver materialises each wire-level `LogRecord` (plus its
 inherited `Resource` and `InstrumentationScope` context) into a
-single owned struct:
+single owned struct. The authoritative definition lives in the
+`ourios-core::otlp` module; the sketch below mirrors that
+module:
 
 ```text
 struct OtlpLogRecord {
@@ -410,24 +440,36 @@ struct OtlpLogRecord {
     severity_text: Option<String>,
     scope_name: Option<String>,
     scope_version: Option<String>,
-    attributes: Vec<KeyValue>,
+    attributes: Vec<KeyValue>,            // opentelemetry-proto KeyValue
     dropped_attributes_count: u32,
-    resource_attributes: Vec<KeyValue>,
+    resource_attributes: Vec<KeyValue>,   // opentelemetry-proto KeyValue
     trace_id: Option<[u8; 16]>,
     span_id: Option<[u8; 8]>,
     flags: u32,
     event_name: Option<String>,
 
-    // Body (already canonicalised per §6.4)
-    body_kind: BodyKind,         // String | Structured
-    body: BodyPayload,           // String(String) | Structured(Bytes)
+    // Body — None when the wire delivered no body
+    body: Option<Body>,
 }
+
+enum Body {
+    String(String),
+    Structured(AnyValue),                 // opentelemetry-proto AnyValue
+}
+
+// `body_kind()` is a method on OtlpLogRecord that returns
+// `Option<BodyKind>` derived from `body`; the discriminator
+// is never stored.
+enum BodyKind { String, Structured }
 ```
 
 The Rust types are informal here; the precise definition lives
-in the `ourios-ingester` crate. The shape mirrors RFC 0001
-§6.1 column-for-column so the Parquet writer can serialise a
-slice of these directly without a translation layer.
+in the `ourios-core::otlp` module — owning the type in
+`ourios-core` (rather than `ourios-ingester`) lets the miner
+take it without depending on the receiver crate, since the
+receiver doesn't yet exist. The shape mirrors RFC 0001 §6.1
+column-for-column so the Parquet writer can serialise a slice
+of these directly without a translation layer.
 
 ### 6.7 Backpressure (deferred)
 

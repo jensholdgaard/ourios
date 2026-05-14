@@ -1666,6 +1666,27 @@ resolves bidirectionally between RFC and tests.
   and vice versa. Implements `docs/benchmarks.md` E2.
   *Covers:* §3.7.1, §3.7.2.
 
+- **Per-`ResourceLogs` tenant derivation** (miner-side stub): assert
+  that when records carrying distinct derived `tenant_id`s arrive
+  in the same ingest sequence, each lands in its derived tenant's
+  tree. The receiver-side test — that the wire-decode layer
+  actually derives `tenant_id` per `ResourceLogs.resource` rather
+  than per `ExportLogsServiceRequest` — is owned by RFC 0003 (see
+  RFC 0003 §6.3); RFC 0001 owns only the miner-side contract.
+  *Covers:* §3.7.3.
+
+- **OTLP-aligned template-key tests**: hand-curated `OtlpLogRecord`
+  fixtures exercising the §6.1 *Template-key composition* tuple.
+  Assert that varying only `severity_number` produces distinct
+  `template_id`s, varying only `scope_name` produces distinct
+  `template_id`s, the `severity_number = 0` (`UNSPECIFIED`) and
+  `scope_name = None` edge buckets are each their own key value,
+  and `body.kind != AnyValue::String` short-circuits per §6.2
+  step 0 with the §6.1 sentinel `confidence = 1.0`,
+  `lossy_flag = false`. The `time_unix_nano` round-trip is a
+  small unit test against the §6.1 record schema.
+  *Covers:* H1.4, H1.5, RFC0001.9, RFC0001.10, RFC0001.11.
+
 - **Drift detection test**: ingest a corpus where a template
   deliberately drifts mid-stream; assert that the drift query in
   §6.7 returns the drifted template within the expected window.

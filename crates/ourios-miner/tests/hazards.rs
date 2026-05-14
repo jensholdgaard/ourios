@@ -33,6 +33,22 @@ fn h1_3_every_widening_emits_an_audit_event() {
     todo!("RFC 0001 §6.4");
 }
 
+/// Scenario H1.4 — `severity_number` is part of the template key (no INFO/ERROR silent merge).
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+#[ignore = "RFC 0001 Red gate — implementation pending"]
+fn h1_4_severity_number_is_part_of_template_key() {
+    todo!("RFC 0001 §6.1 (Template-key composition), §6.2");
+}
+
+/// Scenario H1.5 — `scope_name` is part of the template key (no cross-scope silent merge).
+/// See `docs/rfcs/0001-template-miner.md` §5.
+#[test]
+#[ignore = "RFC 0001 Red gate — implementation pending"]
+fn h1_5_scope_name_is_part_of_template_key() {
+    todo!("RFC 0001 §6.1 (Template-key composition), §6.2");
+}
+
 /// Scenario H2.1 — Oversized parameter triggers OVERFLOW marker and forced body retention.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]

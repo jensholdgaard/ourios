@@ -80,15 +80,14 @@ already structured out, not embedded in a free-text string.
 ## 2. What Ourios consumes today
 
 `MinerCluster::ingest(tenant_id: &TenantId, raw: &str) -> u64`
-([`crates/ourios-miner/src/cluster.rs`](../../crates/ourios-miner/src/cluster.rs)).
-The pipeline:
+(in `crates/ourios-miner/src/cluster.rs`). The pipeline:
 
 1. `tokenize(raw)` splits on Unicode whitespace
-   ([`tokenize.rs`](../../crates/ourios-miner/src/tokenize.rs)).
+   (`crates/ourios-miner/src/tokenize.rs`).
 2. `mask(tokens)` runs UUID / IPv4 / NUM rules over the resulting
-   `&str` slice ([`mask.rs`](../../crates/ourios-miner/src/mask.rs)).
+   `&str` slice (`crates/ourios-miner/src/mask.rs`).
 3. `descend` + leaf lookup attaches to or creates a template
-   ([`tree.rs`](../../crates/ourios-miner/src/tree.rs)).
+   (`crates/ourios-miner/src/tree.rs`).
 
 The Parquet record promised by RFC 0001 §6.1 carries:
 

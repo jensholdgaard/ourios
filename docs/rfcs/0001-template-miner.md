@@ -554,11 +554,13 @@ this section closes:
 > [`docs/architecture/otlp-log-format.md`](../architecture/otlp-log-format.md).
 > The pre-amendment schema treated logs as raw text strings; the
 > amended schema treats every log as a structured OTLP record from
-> the moment it enters the system. The §6.2 algorithm text below
-> is **not** rewritten in this amendment — its
-> `tokenize(L_raw)` framing now applies only to the
-> `body.kind = String` branch; the structured-Body fork and the
-> updated ingest signature land in a follow-up amendment to §6.2.
+> the moment it enters the system. §6.2's algorithm and its ingest
+> signature were aligned to this amendment in a companion edit
+> the same day (see §6.2's amendment note below): the `body.kind`
+> fork is at the top of the algorithm, the descent step
+> incorporates the §6.1 template-key tuple, and the
+> `MinerCluster::ingest` signature now takes a structured
+> `OtlpLogRecord` rather than a raw `&str`.
 
 The miner emits one record per ingested OTLP `LogRecord`. The
 record shape mirrors the wire shape of OTLP logs (the

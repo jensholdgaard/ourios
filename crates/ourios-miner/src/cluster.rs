@@ -124,14 +124,20 @@ impl MinerCluster {
         // chain through `tenants.entry()` + `descend_mut` so we
         // can early-return without committing a `template_id`
         // allocation. RFC §6.2 step 4: candidate selection.
-        if let Some(state) = self.tenants.get(tenant_id) {
-            if let Some(parent) = state.tree.descend(&masked_strs, DEFAULT_PREFIX_DEPTH) {
-                for leaf in &parent.leaves {
-                    if matches_exactly(&masked_strs, &leaf.template) {
-                        return leaf.template_id;
-                    }
-                }
-            }
+        let exact_match_id = self
+            .tenants
+            .get(tenant_id)
+            .and_then(|state| state.tree.descend(&masked_strs, DEFAULT_PREFIX_DEPTH))
+            .and_then(|parent| {
+                parent
+                    .leaves
+                    .iter()
+                    .find(|leaf| matches_exactly(&masked_strs, &leaf.template))
+            })
+            .map(|leaf| leaf.template_id);
+
+        if let Some(id) = exact_match_id {
+            return id;
         }
 
         // Phase 2 — no exact match; allocate id, materialise the

@@ -588,7 +588,7 @@ reconstruction group exists only when the body was mineable
 |---|---|---|---|
 | `time_unix_nano` | `u64` | `LogRecord.time_unix_nano` | Event time at source; `0` = unknown. Required for thesis-gate B1 (time-range queries) |
 | `observed_time_unix_nano` | `Option<u64>` | `LogRecord.observed_time_unix_nano` | Collector observation time |
-| `severity_number` | `u8` | `LogRecord.severity_number` | Normalised severity (1–24, TRACE..FATAL); part of the template key (see below) |
+| `severity_number` | `u8` | `LogRecord.severity_number` | OTLP `SeverityNumber`: `0` = `UNSPECIFIED` (a valid OTLP value for records that omit severity), `1..=24` = TRACE..FATAL with sub-levels. Part of the template key (see below); `0` is a distinct key value — UNSPECIFIED records cluster together, never with TRACE/INFO/etc. |
 | `severity_text` | `Option<String>` | `LogRecord.severity_text` | Source's original severity string |
 | `scope_name` | `Option<String>` | `InstrumentationScope.name` | Library/module emitter; part of the template key (see below) |
 | `scope_version` | `Option<String>` | `InstrumentationScope.version` | Drift / debugging |
@@ -605,7 +605,7 @@ reconstruction group exists only when the body was mineable
 | Field | Rust type (informal) | Source | Purpose |
 |---|---|---|---|
 | `body_kind` | `BodyKind` | derived from `LogRecord.body` | Discriminator: `String` \| `Structured` (see "Body representation") |
-| `body` | `Option<Bytes>` | `LogRecord.body` (encoded) | Verbatim body bytes when `Structured`, when lossy, or when overflow |
+| `body` | `Option<Bytes>` | `LogRecord.body` | When `body_kind = Structured`: the OTLP-canonical JSON encoding of the `AnyValue` (see "Body representation" for the canonical-encoding rule). When `body_kind = String` lossy: the original line bytes. When overflow: per §6.5. |
 | `params` | `Vec<Param>` | from masking | One entry per `<*>` slot. Always empty when `body_kind = Structured` |
 | `separators` | `Vec<Separator>` | from tokenize | `tokens.len() + 1` entries. Always empty when `body_kind = Structured` |
 | `confidence` | `f32` | miner-derived | `simSeq / threshold` at attach time. `1.0` (sentinel) when `body_kind = Structured` |
@@ -654,46 +654,85 @@ Ourios distinguishes two body shapes at ingest:
   per the existing semantics.
 - **`body_kind = Structured`** — `LogRecord.body` is any other
   `AnyValue` variant (kvlist, array, int, double, bool, bytes).
-  The miner does **not** run the §6.2 algorithm. The encoded body
-  is stored verbatim in the `body` column, no template is mined,
-  no `params`/`separators` are emitted. `template_id` is allocated
-  per the *Template identity* rule below — even structured-Body
-  records get a `template_id` so that queries grouping by
-  `template_id` see them as a coherent class — but the leaf the id
-  points at carries an empty `body_template` and the `Structured`
-  marker. `confidence = 1.0` (sentinel), `lossy_flag = false`
-  (the verbatim body is authoritative; nothing is reconstructed).
+  The miner does **not** run the §6.2 algorithm. The body is
+  encoded canonically (see *Canonical encoding* below) and
+  stored in the `body` column; no template is mined, no
+  `params`/`separators` are emitted. `template_id` is allocated
+  per the *Template-key composition* rule below — for this branch
+  the key is `(severity_number, scope_name,
+  BodyKind::Structured)`, so all structured-Body records sharing
+  a `(severity, scope)` share one `template_id`. The leaf the id
+  points at carries the `Structured` marker and an empty
+  `body_template`. `confidence = 1.0` (sentinel),
+  `lossy_flag = false` (the canonically-encoded body is
+  authoritative; nothing is reconstructed from a template).
 
-This is the **conservative default**. It preserves bytes
-(`[§3.3]` reconstruction holds trivially for the structured branch
-because the source bytes are stored verbatim), it avoids
-canonicalising arbitrary `AnyValue` trees (which would be
-non-trivial and could break reconstruction), and it sidesteps the
-spec ambiguity of "what is *the* template for `{"msg": "x",
-"user_id": 42}`." A future opt-in **mine-inner-field** mode (e.g.,
-mine `body.kvlist["msg"]` as the line if present) is a
-configurable knob, not the default; that decision lives with the
-maturity-stage move from `red` → `green` once corpus evidence
-informs which inner-field conventions are worth specifying.
+This is the **conservative default**. It preserves the structural
+content of the body (the canonical-encoding rule below makes
+`[§3.3]` reconstruction well-defined for the structured branch:
+`stored_bytes ↔ AnyValue` is bidirectional and deterministic),
+it avoids inventing template structure for arbitrary `AnyValue`
+trees, and it sidesteps the spec ambiguity of "what is *the*
+template for `{"msg": "x", "user_id": 42}`." A future opt-in
+**mine-inner-field** mode (e.g., mine `body.kvlist["msg"]` as
+the line if present) is a configurable knob, not the default;
+that decision lives with the maturity-stage move from `red` →
+`green` once corpus evidence informs which inner-field
+conventions are worth specifying.
 
-A third path — **render-to-string** (canonicalise structured Body
-to JSON-ish text and mine that) — was rejected because the
-canonical form is not specified in OTLP, two emitters of the same
-structured record could produce different canonical strings, and
-`[§3.3]`'s "render-from-template equals original line byte for
-byte" promise becomes either unmeetable or requires bundling the
-canonicalisation algorithm into the contract.
+A third path — **render-to-string + mine** (canonicalise
+structured Body to JSON-ish text and run it through the §6.2
+mining algorithm) — was rejected because mining over the JSON
+serialisation produces token templates that depend on the
+serialiser's whitespace and field-ordering choices, which is
+both fragile (changing serialisers shifts every template) and
+defeats the §3.3 reconstruction guarantee for any record where
+the original wire form was protobuf rather than JSON. Storing
+the canonical encoding (without mining over it) is different
+from this rejected path: storage is faithful, it just doesn't
+get a template extracted.
+
+**Canonical encoding for `body_kind = Structured`.** The `body`
+column carries the **OTLP-canonical JSON encoding** of the
+`AnyValue` per the OTLP specification's HTTP/JSON binding (the
+proto3 JSON mapping with OTLP-specific overrides — e.g.,
+`trace_id`/`span_id` as hex strings, `bytes` as base64).
+Receivers that take input via OTLP/gRPC (protobuf wire format)
+decode the `AnyValue` and re-serialise to canonical JSON before
+storing; receivers that take input via OTLP/HTTP+JSON canonicalise
+the incoming bytes (proto3 JSON allows a small amount of
+latitude — field ordering, whitespace, `int64` as string vs
+number — which canonicalisation removes). Without a canonical
+rule, the `lossy_flag = false` promise for the structured branch
+is unmeetable: two receivers handling the same logical
+`AnyValue` could produce different stored bytes, and queries
+that join records by body content would silently miss matches.
+The OTLP-canonical JSON form makes the round-trip
+`stored_bytes ↔ AnyValue` well-defined and provider-neutral.
 
 #### Template-key composition
 
 A template's identity (the discriminator the Drain tree uses to
-decide *"is this the same template?"*) is the tuple
+decide *"is this the same template?"*) depends on the body shape:
 
-```
-(severity_number, scope_name, masked_body_tokens)
-```
+- **`body_kind = String`** — key tuple is
+  `(severity_number, scope_name, masked_body_tokens)`.
+- **`body_kind = Structured`** — key tuple is
+  `(severity_number, scope_name, BodyKind::Structured)`. All
+  structured-Body records sharing a `(severity_number, scope_name)`
+  share one `template_id`. This intentionally forfeits
+  structured-body shape clustering — the rationale is that the
+  structured-Body branch's value comes from the faithful
+  preservation of `attributes` and the canonically-encoded
+  `body`, not from grouping similar `AnyValue` shapes.
+  Operators who need shape-level clustering can opt into a
+  future `body_shape_fingerprint` column (a stable hash over
+  the `AnyValue`'s structural skeleton — kvlist key-set, nested
+  shape, leaf-type sequence; values ignored) as a reserved
+  extension; the gate for adding it is "we have a concrete
+  consumer," not "it might be useful."
 
-Not just `masked_body_tokens` alone.
+The bullet rationale below applies to both branches:
 
 - **`severity_number` is part of the key** because `INFO` and
   `ERROR` versions of the same body text are semantically distinct
@@ -701,13 +740,17 @@ Not just `masked_body_tokens` alone.
   logged in"* at ERROR is an alarm (or an emitter bug) — collapsing
   them to one `template_id` would surface either as the other on
   query, which is a `[§3.1]` "no silent merges" violation in
-  disguise.
+  disguise. The OTLP-spec-valid `severity_number = 0`
+  (`UNSPECIFIED`) is a distinct key value, not coalesced with
+  any specified severity.
 - **`scope_name` is part of the key** because the same body text
   emitted from two different instrumentation scopes
   (`myapp.login` vs `myapp.checkout`) describes two different
   events. The scope is the OTel-canonical "which code path
   emitted this," directly analogous to the package/logger name in
-  traditional logging frameworks.
+  traditional logging frameworks. Records with no scope
+  (`scope_name = None`) cluster as their own `(severity, None)`
+  bucket.
 - **`resource_attributes` are NOT part of the key.** They identify
   *who* sent the record (service, host, k8s pod), not *what*
   event was emitted. The `tenant_id` derivation (below) already
@@ -729,8 +772,17 @@ corpus benchmark. The RFC pins only the semantic key.
 
 #### Tenant derivation
 
-`tenant_id` is derived from the OTLP `Resource.attributes` of the
-batch by an operator-configured rule. The default rule:
+`tenant_id` is derived **per `ResourceLogs` group**, not per OTLP
+export batch. Each `ResourceLogs` carries its own
+`Resource.attributes`, and a single OTLP export can contain
+multiple `ResourceLogs` groups from different sources — so one
+export can route records to multiple tenants. The derivation
+runs once per inherited Resource; the resulting `tenant_id`
+applies to every `LogRecord` under that `ResourceLogs` group
+(across all its `ScopeLogs`), and the receiver fans the records
+out into per-tenant streams.
+
+The default per-Resource rule:
 
 ```
 tenant_id := resource.attributes["service.name"]   if present
@@ -745,12 +797,18 @@ composite of multiple attributes) configure an alternative rule;
 the receiver does not invent a tenant identity that the operator
 hasn't declared.
 
-If neither the default rule nor the operator's fallback resolves
-to a tenant, the receiver rejects the batch with a controlled
-error (no panic, no silent assignment to a "default" tenant; the
-sender sees the failure and either fixes its emitter or its
-deployment). The receiver-side specification of this rejection
-path lives in RFC 0003 — OTLP receiver (forthcoming).
+If a `ResourceLogs` group's Resource resolves to no tenant under
+either the default rule or the operator's fallback, the receiver
+rejects the **entire export batch** with a controlled error (no
+panic, no silent assignment to a "default" tenant; the sender
+sees the failure and either fixes its emitter or its deployment).
+Per-Resource rejection within an otherwise-valid batch is **not**
+supported in this RFC — the all-or-nothing failure mode is
+simpler to reason about for the sender, and OTLP's batch-level
+acknowledgement model fits all-or-nothing more naturally than
+partial-success. The receiver-side specification of this
+rejection path (and any future opt-in for partial acceptance)
+lives in RFC 0003 — OTLP receiver (forthcoming).
 
 #### Template identity
 

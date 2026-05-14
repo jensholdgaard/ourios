@@ -27,19 +27,22 @@ superseded-by: —
 ## 1. Summary
 
 Ourios implements a Drain-derived online template miner (`ourios-miner`)
-that converts each ingested log line into a structured record
-`(tenant_id, template_id, template_version, params, separators, body?,
-confidence, lossy_flag)`. The miner is per-tenant by construction
-`[§3.7]`, uses a three-zone confidence model that retains the original
-line in the lossy zone `[§3.1]`, audits every template widening
-`[§3.1]`, captures inter-token separators in a parallel array so that
-bit-identical reconstruction is the default rather than a property-test
-exception `[§3.3]`, bounds parameter values at 256 B with overflow to a
-side `body` column `[§3.2]`, and tracks template structural changes via
-a monotonic `template_version` so that schema drift across deploys is a
-first-class query rather than a silent count drop `[§3.5]`. The
-compression target is 50–200× over raw bytes before any byte-level
-codec runs.
+that converts each ingested OTLP `LogRecord` into a structured Parquet
+record. The record shape is the OTLP `LogRecord` (with its inherited
+Resource and InstrumentationScope context) plus the miner-derived
+columns `(template_id, template_version, params, separators, body_kind,
+body?, confidence, lossy_flag)`; see §6.1 for the full schema and the
+2026-05-13 amendment that aligned it to OTLP. The miner is per-tenant
+by construction `[§3.7]`, uses a three-zone confidence model that
+retains the original line in the lossy zone `[§3.1]`, audits every
+template widening `[§3.1]`, captures inter-token separators in a
+parallel array so that bit-identical reconstruction is the default
+rather than a property-test exception `[§3.3]`, bounds parameter
+values at 256 B with overflow to a side `body` column `[§3.2]`, and
+tracks template structural changes via a monotonic `template_version`
+so that schema drift across deploys is a first-class query rather than
+a silent count drop `[§3.5]`. The compression target is 50–200× over
+raw bytes before any byte-level codec runs.
 
 ## 2. Motivation
 
@@ -543,55 +546,294 @@ this section closes:
 
 ### 6.1 Data model
 
-The miner emits one record per ingested line. The record shape is:
+> **Amendment 2026-05-13.** Section rewritten to align the record
+> schema with the OTLP `LogRecord` shape — the project's stated
+> ingest contract per `docs/glossary.md` (entry **OTLP**: *"we do
+> not invent our own format"*). The investigation that surfaced
+> the gap is
+> [`docs/architecture/otlp-log-format.md`](../architecture/otlp-log-format.md).
+> The pre-amendment schema treated logs as raw text strings; the
+> amended schema treats every log as a structured OTLP record from
+> the moment it enters the system. The §6.2 algorithm text below
+> is **not** rewritten in this amendment — its
+> `tokenize(L_raw)` framing now applies only to the
+> `body.kind = String` branch; the structured-Body fork and the
+> updated ingest signature land in a follow-up amendment to §6.2.
 
-| Field | Rust type (informal) | Purpose |
-|---|---|---|
-| `tenant_id` | `TenantId` | Multi-tenant scoping `[§3.7]` |
-| `template_id` | `u64` | Per-tenant monotonic; identifies the template |
-| `template_version` | `u32` | Per-template monotonic; increments on widening |
-| `params` | `Vec<Param>` | One entry per `<*>` slot, in order |
-| `separators` | `Vec<Separator>` | `tokens.len() + 1` entries; reconstruction support |
-| `body` | `Option<Bytes>` | Original line bytes; populated on lossy or overflow |
-| `confidence` | `f32` | `simSeq / threshold` at attach time |
-| `lossy_flag` | `bool` | True iff `reconstruct(record) ≠ ingested_bytes` is possible |
+The miner emits one record per ingested OTLP `LogRecord`. The
+record shape mirrors the wire shape of OTLP logs (the
+`opentelemetry-proto` `LogRecord` plus its inherited Resource and
+InstrumentationScope context) plus the miner-derived columns that
+template mining produces.
+
+#### Record columns
+
+The record carries three groups of columns. The OTLP-derived
+group preserves the structured shape the wire promised; the
+miner-derived group is what this RFC introduces; the
+reconstruction group exists only when the body was mineable
+(`body.kind = String`).
+
+**Identity and partitioning:**
+
+| Field | Rust type (informal) | Source | Purpose |
+|---|---|---|---|
+| `tenant_id` | `TenantId` | derived from `Resource.attributes` | Multi-tenant scoping `[§3.7]`; default rule below |
+| `template_id` | `u64` | miner-allocated | Cluster-wide unique; see "Template identity" |
+| `template_version` | `u32` | miner-allocated | Increments on widening; see "Template version" |
+
+**OTLP-derived columns** (faithful to `opentelemetry-proto`):
+
+| Field | Rust type (informal) | OTLP source | Purpose |
+|---|---|---|---|
+| `time_unix_nano` | `u64` | `LogRecord.time_unix_nano` | Event time at source; `0` = unknown. Required for thesis-gate B1 (time-range queries) |
+| `observed_time_unix_nano` | `Option<u64>` | `LogRecord.observed_time_unix_nano` | Collector observation time |
+| `severity_number` | `u8` | `LogRecord.severity_number` | OTLP `SeverityNumber`: `0` = `UNSPECIFIED` (a valid OTLP value for records that omit severity), `1..=24` = TRACE..FATAL with sub-levels. Part of the template key (see below); `0` is a distinct key value — UNSPECIFIED records cluster together, never with TRACE/INFO/etc. |
+| `severity_text` | `Option<String>` | `LogRecord.severity_text` | Source's original severity string |
+| `scope_name` | `Option<String>` | `InstrumentationScope.name` | Library/module emitter; part of the template key (see below) |
+| `scope_version` | `Option<String>` | `InstrumentationScope.version` | Drift / debugging |
+| `attributes` | `Vec<KeyValue>` | `LogRecord.attributes` | Per-occurrence structured context |
+| `dropped_attributes_count` | `u32` | `LogRecord.dropped_attributes_count` | Truncation indicator |
+| `resource_attributes` | `Vec<KeyValue>` | `Resource.attributes` | Source identity (`service.name`, `host.*`, etc.) |
+| `trace_id` | `Option<[u8; 16]>` | `LogRecord.trace_id` | Trace correlation |
+| `span_id` | `Option<[u8; 8]>` | `LogRecord.span_id` | Trace correlation |
+| `flags` | `u32` | `LogRecord.flags` | Lower 8 bits = W3C trace flags |
+| `event_name` | `Option<String>` | `LogRecord.event_name` | Identifier for structured-event records |
+
+**Body and miner-derived reconstruction:**
+
+| Field | Rust type (informal) | Source | Purpose |
+|---|---|---|---|
+| `body_kind` | `BodyKind` | derived from `LogRecord.body` | Discriminator: `String` \| `Structured` (see "Body representation") |
+| `body` | `Option<Bytes>` | `LogRecord.body` | When `body_kind = Structured`: the OTLP-canonical JSON encoding of the `AnyValue` (see "Body representation" for the canonical-encoding rule). When `body_kind = String` lossy: the original line bytes. When overflow: per §6.5. |
+| `params` | `Vec<Param>` | from masking | One entry per `<*>` slot. Always empty when `body_kind = Structured` |
+| `separators` | `Vec<Separator>` | from tokenize | `tokens.len() + 1` entries. Always empty when `body_kind = Structured` |
+| `confidence` | `f32` | miner-derived | `simSeq / threshold` at attach time. `1.0` (sentinel) when `body_kind = Structured` |
+| `lossy_flag` | `bool` | miner-derived | True iff `reconstruct(record) ≠ ingested_body_bytes` is possible. Always `false` when `body_kind = Structured` (the verbatim `body` column is the source of truth) |
 
 Where:
 
-- `Param` = `{ type_tag: ParamType, value: Bytes }`. `ParamType` is
-  one of `IP, UUID, NUM, HEX, TS, PATH, STR, OVERFLOW`. `STR` is
-  the unmasked-wildcard fallback — used when a slot was created by
-  template widening of a previously-fixed literal token (the literal
-  itself becomes the param value); `OVERFLOW` carries `(length:
-  u32, sha256_prefix: [u8; 8])` instead of the original value
-  (§6.5). `params.len() == count(<*> in template)`, always; §6.2
-  enforces this when a widening introduces new wildcard slots.
+- `Param` = `{ type_tag: ParamType, value: Bytes }`. `ParamType`
+  is one of `IP, UUID, NUM, HEX, TS, PATH, STR, OVERFLOW`. `STR`
+  is the unmasked-wildcard fallback — used when a slot was
+  created by template widening of a previously-fixed literal
+  token (the literal itself becomes the param value); `OVERFLOW`
+  carries `(length: u32, sha256_prefix: [u8; 8])` instead of the
+  original value (§6.5). `params.len() == count(<*> in template)`,
+  always (in the `body_kind = String` branch); §6.2 enforces
+  this when a widening introduces new wildcard slots.
 - `Separator` is a small inline byte string (typically 1–3 bytes
   in practice). Encoding in Parquet is an implementation detail
   that does not affect this RFC.
+- `KeyValue` mirrors the OTLP `KeyValue` message: a `key:
+  String` and a `value: AnyValue`. `AnyValue` is a discriminated
+  union over `string | bool | int | double | bytes | array | kvlist`.
+  Storing `AnyValue` faithfully in Parquet (rather than flattening
+  to a string) is what keeps query expressions like
+  `attributes["client.address"] = "10.0.0.1"` typed.
+- `BodyKind` is a two-variant enum (`String`, `Structured`) — not
+  the full `AnyValue` discriminator. The body column carries the
+  encoded `AnyValue` payload; `body_kind` is the cheap routing
+  flag the query planner uses to decide whether reconstruction is
+  defined for this row.
 
-**Template identity.** `template_id` is a cluster-wide unique
-monotonic `u64` (with each tenant seeing a monotonic
-subsequence), allocated when a new leaf is created and never
-reused or reassigned. The id space is shared across tenants so
-that the same `u64` value never refers to two different leaves;
-the per-tenant subsequence guarantee preserves `[§3.7]` by
-making each tenant's allocation order observable in isolation.
-Cross-tenant *content* identity is intentionally not guaranteed
-— two tenants emitting the structurally identical template will
-have different `template_id`s, so a `template_id` alone never
-links structurally-equivalent templates across tenants. (The
-`u64` value itself is cluster-wide unique, per the previous
-paragraph; what is not guaranteed is that *the same template*
-across two tenants resolves to the same id.) This preserves
-`[§3.7]` (per-tenant template trees) by construction;
+#### Body representation (`AnyValue` handling)
+
+OTLP's `LogRecord.body` is `AnyValue` — string, bool, int, double,
+bytes, array, or kvlist. The spec is explicit (Logs Data Model
+§Body): *"Body MUST support AnyValue to preserve the semantics of
+structured logs emitted by the applications."* Real OTel emitters
+send structured Body routinely, not just text.
+
+Ourios distinguishes two body shapes at ingest:
+
+- **`body_kind = String`** — `LogRecord.body` is `AnyValue::String`.
+  The miner runs the §6.2 algorithm over the unwrapped string:
+  tokenize, mask, descend the tree, attach to or create a leaf.
+  `params`, `separators`, `confidence`, `lossy_flag` are populated
+  per the existing semantics.
+- **`body_kind = Structured`** — `LogRecord.body` is any other
+  `AnyValue` variant (kvlist, array, int, double, bool, bytes).
+  The miner does **not** run the §6.2 algorithm. The body is
+  encoded canonically (see *Canonical encoding* below) and
+  stored in the `body` column; no template is mined, no
+  `params`/`separators` are emitted. `template_id` is allocated
+  per the *Template-key composition* rule below — for this branch
+  the key is `(severity_number, scope_name,
+  BodyKind::Structured)`, so all structured-Body records sharing
+  a `(severity, scope)` share one `template_id`. The leaf the id
+  points at carries the `Structured` marker and an empty
+  `body_template`. `confidence = 1.0` (sentinel),
+  `lossy_flag = false` (the canonically-encoded body is
+  authoritative; nothing is reconstructed from a template).
+
+This is the **conservative default**. It preserves the structural
+content of the body (the canonical-encoding rule below makes
+`[§3.3]` reconstruction well-defined for the structured branch:
+`stored_bytes ↔ AnyValue` is bidirectional and deterministic),
+it avoids inventing template structure for arbitrary `AnyValue`
+trees, and it sidesteps the spec ambiguity of "what is *the*
+template for `{"msg": "x", "user_id": 42}`." A future opt-in
+**mine-inner-field** mode (e.g., mine `body.kvlist["msg"]` as
+the line if present) is a configurable knob, not the default;
+that decision lives with the maturity-stage move from `red` →
+`green` once corpus evidence informs which inner-field
+conventions are worth specifying.
+
+A third path — **render-to-string + mine** (canonicalise
+structured Body to JSON-ish text and run it through the §6.2
+mining algorithm) — was rejected because mining over the JSON
+serialisation produces token templates that depend on the
+serialiser's whitespace and field-ordering choices, which is
+both fragile (changing serialisers shifts every template) and
+defeats the §3.3 reconstruction guarantee for any record where
+the original wire form was protobuf rather than JSON. Storing
+the canonical encoding (without mining over it) is different
+from this rejected path: storage is faithful, it just doesn't
+get a template extracted.
+
+**Canonical encoding for `body_kind = Structured`.** The `body`
+column carries the **OTLP-canonical JSON encoding** of the
+`AnyValue` per the OTLP specification's HTTP/JSON binding (the
+proto3 JSON mapping with OTLP-specific overrides — e.g.,
+`trace_id`/`span_id` as hex strings, `bytes` as base64).
+Receivers that take input via OTLP/gRPC (protobuf wire format)
+decode the `AnyValue` and re-serialise to canonical JSON before
+storing; receivers that take input via OTLP/HTTP+JSON canonicalise
+the incoming bytes (proto3 JSON allows a small amount of
+latitude — field ordering, whitespace, `int64` as string vs
+number — which canonicalisation removes). Without a canonical
+rule, the `lossy_flag = false` promise for the structured branch
+is unmeetable: two receivers handling the same logical
+`AnyValue` could produce different stored bytes, and queries
+that join records by body content would silently miss matches.
+The OTLP-canonical JSON form makes the round-trip
+`stored_bytes ↔ AnyValue` well-defined and provider-neutral.
+
+#### Template-key composition
+
+A template's identity (the discriminator the Drain tree uses to
+decide *"is this the same template?"*) depends on the body shape:
+
+- **`body_kind = String`** — key tuple is
+  `(severity_number, scope_name, masked_body_tokens)`.
+- **`body_kind = Structured`** — key tuple is
+  `(severity_number, scope_name, BodyKind::Structured)`. All
+  structured-Body records sharing a `(severity_number, scope_name)`
+  share one `template_id`. This intentionally forfeits
+  structured-body shape clustering — the rationale is that the
+  structured-Body branch's value comes from the faithful
+  preservation of `attributes` and the canonically-encoded
+  `body`, not from grouping similar `AnyValue` shapes.
+  Operators who need shape-level clustering can opt into a
+  future `body_shape_fingerprint` column (a stable hash over
+  the `AnyValue`'s structural skeleton — kvlist key-set, nested
+  shape, leaf-type sequence; values ignored) as a reserved
+  extension; the gate for adding it is "we have a concrete
+  consumer," not "it might be useful."
+
+The bullet rationale below applies to both branches:
+
+- **`severity_number` is part of the key** because `INFO` and
+  `ERROR` versions of the same body text are semantically distinct
+  events. *"user logged in"* at INFO is a routine signal; *"user
+  logged in"* at ERROR is an alarm (or an emitter bug) — collapsing
+  them to one `template_id` would surface either as the other on
+  query, which is a `[§3.1]` "no silent merges" violation in
+  disguise. The OTLP-spec-valid `severity_number = 0`
+  (`UNSPECIFIED`) is a distinct key value, not coalesced with
+  any specified severity.
+- **`scope_name` is part of the key** because the same body text
+  emitted from two different instrumentation scopes
+  (`myapp.login` vs `myapp.checkout`) describes two different
+  events. The scope is the OTel-canonical "which code path
+  emitted this," directly analogous to the package/logger name in
+  traditional logging frameworks. Records with no scope
+  (`scope_name = None`) cluster as their own `(severity, None)`
+  bucket.
+- **`resource_attributes` are NOT part of the key.** They identify
+  *who* sent the record (service, host, k8s pod), not *what*
+  event was emitted. The `tenant_id` derivation (below) already
+  encodes the partition decision over Resource. Folding Resource
+  into the template key would explode template cardinality
+  proportionally to the deployment fleet size without adding
+  semantic discrimination — the same `myapp.login` template from
+  two replicas of `service.name = api` is the same template.
+- **`event_name` is not in the key today** but is reserved as a
+  candidate addition. RFC 0001 stays at the OTLP-canonical
+  severity+scope key; promoting `event_name` into the key is a
+  follow-up RFC patch once corpus evidence justifies it.
+
+The Drain tree's implementation of this tuple (extra prefix
+levels above length-N, tuple-keyed leaf lists, separate trees per
+`(severity, scope)`, etc.) is §6.2 implementation territory and
+may be revisited based on cardinality observations from the
+corpus benchmark. The RFC pins only the semantic key.
+
+#### Tenant derivation
+
+`tenant_id` is derived **per `ResourceLogs` group**, not per OTLP
+export batch. Each `ResourceLogs` carries its own
+`Resource.attributes`, and a single OTLP export can contain
+multiple `ResourceLogs` groups from different sources — so one
+export can route records to multiple tenants. The derivation
+runs once per inherited Resource; the resulting `tenant_id`
+applies to every `LogRecord` under that `ResourceLogs` group
+(across all its `ScopeLogs`), and the receiver fans the records
+out into per-tenant streams.
+
+The default per-Resource rule:
+
+```
+tenant_id := resource.attributes["service.name"]   if present
+          ?: <operator-required fallback rule>
+```
+
+`service.name` is the conventional OTel unit of "what application
+emitted this," and it maps directly onto Ourios's per-tenant
+template-tree partitioning (`[§3.7]`). Operators with a different
+multi-tenant model (per-namespace, per-customer-id-attribute,
+composite of multiple attributes) configure an alternative rule;
+the receiver does not invent a tenant identity that the operator
+hasn't declared.
+
+If a `ResourceLogs` group's Resource resolves to no tenant under
+either the default rule or the operator's fallback, the receiver
+rejects the **entire export batch** with a controlled error (no
+panic, no silent assignment to a "default" tenant; the sender
+sees the failure and either fixes its emitter or its deployment).
+Per-Resource rejection within an otherwise-valid batch is **not**
+supported in this RFC — the all-or-nothing failure mode is
+simpler to reason about for the sender, and OTLP's batch-level
+acknowledgement model fits all-or-nothing more naturally than
+partial-success. The receiver-side specification of this
+rejection path (and any future opt-in for partial acceptance)
+lives in RFC 0003 — OTLP receiver (forthcoming).
+
+#### Template identity
+
+`template_id` is a cluster-wide unique monotonic `u64` (with each
+tenant seeing a monotonic subsequence), allocated when a new leaf
+is created and never reused or reassigned. The id space is shared
+across tenants so that the same `u64` value never refers to two
+different leaves; the per-tenant subsequence guarantee preserves
+`[§3.7]` by making each tenant's allocation order observable in
+isolation. Cross-tenant *content* identity is intentionally not
+guaranteed — two tenants emitting the structurally identical
+template (same `(severity_number, scope_name, masked_body_tokens)`
+tuple) will have different `template_id`s, so a `template_id`
+alone never links structurally-equivalent templates across
+tenants. (The `u64` value itself is cluster-wide unique, per the
+previous paragraph; what is not guaranteed is that *the same
+template* across two tenants resolves to the same id.) This
+preserves `[§3.7]` (per-tenant template trees) by construction;
 cross-tenant analytics that need content identity (deduplication
-across tenants for storage savings, shared
-template dashboards) are an opt-in concern and are not provided by
-the miner. A future `template_fingerprint` side column may carry a
-canonical content hash for opt-in cross-tenant use; the gate for
-adding it is "we have a concrete consumer," not "it might be
-useful."
+across tenants for storage savings, shared template dashboards)
+are an opt-in concern and are not provided by the miner. A future
+`template_fingerprint` side column may carry a canonical content
+hash over `(severity_number, scope_name, masked_body_tokens)` for
+opt-in cross-tenant use; the gate for adding it is "we have a
+concrete consumer," not "it might be useful."
 
 **Template version.** `template_version` starts at 1 when the
 template is created and increments by 1 on every widening event:
@@ -620,6 +862,22 @@ reason about under `[§3.7]`, and keep `(template_id,
 template_version)` as a meaningful compound key.
 
 ### 6.2 Algorithm
+
+> **Amendment 2026-05-13.** The pseudocode below describes the
+> mining algorithm for the `body_kind = String` branch only —
+> i.e. when `LogRecord.body` is `AnyValue::String` and the
+> miner treats the unwrapped string as `L_raw`. The
+> `body_kind = Structured` branch (kvlist, array, int, double,
+> bool, bytes) bypasses this algorithm entirely per §6.1's
+> *Body representation* subsection; the structured body is
+> stored verbatim in the record's `body` column with no
+> template/params/separators emitted. The full §6.2 rewrite —
+> including the new ingest signature
+> (`ingest(record: &OtlpLogRecord)` rather than
+> `ingest(_, raw: &str)`) and the explicit fork on
+> `body.kind` — is a follow-up amendment scheduled alongside
+> RFC 0003 (OTLP receiver). This stub keeps the existing
+> algorithm text valid under its now-narrower precondition.
 
 For each ingested line `L_raw`:
 

@@ -1,20 +1,20 @@
 //! Drain prefix tree (RFC 0001 §6.2 step 3).
 //!
-//! Lays out the parent path that `MinerCluster::ingest` walks
-//! before per-leaf `simSeq` selection. The shape is the
-//! Drain-paper canonical one: root → length-N node → prefix-token
-//! nodes → leaf list.
+//! Lays out the parent path that
+//! [`crate::cluster::MinerCluster::ingest`] walks before per-leaf
+//! candidate selection. The shape is the Drain-paper canonical
+//! one: root → length-N node → prefix-token nodes → leaf list.
 //!
 //! # Scope of this module
 //!
-//! This is the **skeleton** PR. It ships the data structures and
-//! [`Tree::descend_mut`] only. The integration that consumes the
-//! parent (best-candidate selection via [`crate::sim_seq::sim_seq`],
-//! the §6.2 step-5 widening branch, audit emission) is a future
-//! PR; until then the tree exists but no caller walks it. Same
-//! pattern as the [`crate::sim_seq`] roll-out — primitive lands
-//! first in isolation, integration follows once the primitive is
-//! settled.
+//! Today the tree backs [`crate::cluster::MinerCluster`]'s
+//! per-tenant template store and supports the exact-match attach
+//! path (`sim_seq == 1.0` → reuse leaf; otherwise → new leaf in
+//! the same `(length, prefix)` bucket). The §6.2 step-5 widening
+//! branch and its §3.1 audit-event invariant are not yet in
+//! place — they land in a follow-up PR that turns the exact-match
+//! check into a `sim_seq >= threshold` decision and introduces
+//! [`OwnedToken::Wildcard`] positions into stored templates.
 //!
 //! # Depth convention
 //!
@@ -147,7 +147,7 @@ impl Tree {
     pub fn descend_mut(&mut self, masked: &[&str], prefix_depth: usize) -> &mut PrefixNode {
         assert!(
             !masked.is_empty(),
-            "descend_mut precondition: masked must be non-empty (tokenize+mask guarantee N ≥ 1)",
+            "descend_mut precondition: masked must be non-empty",
         );
 
         let length = masked.len();
@@ -159,6 +159,78 @@ impl Tree {
         let path = &masked[..walk_depth];
 
         descend_recursively(&mut length_node.root, path)
+    }
+
+    /// Read-only counterpart to [`Tree::descend_mut`]. Returns the
+    /// [`PrefixNode`] that *would* own the leaf list for `masked` if
+    /// every node along the path already exists, or [`None`] if any
+    /// node in the path is missing.
+    ///
+    /// Used by [`crate::cluster::MinerCluster::ingest`] for the
+    /// existence-check phase — looking up an exact match before
+    /// committing the `template_id` allocation that
+    /// [`Tree::descend_mut`] would entail.
+    ///
+    /// # Panics
+    ///
+    /// If `masked` is empty (same precondition as [`Tree::descend_mut`]).
+    #[must_use]
+    pub fn descend(&self, masked: &[&str], prefix_depth: usize) -> Option<&PrefixNode> {
+        assert!(
+            !masked.is_empty(),
+            "descend precondition: masked must be non-empty",
+        );
+
+        let length = masked.len();
+        let length_node = self.by_length.get(&length)?;
+
+        let walk_depth = prefix_depth.min(length);
+        let path = &masked[..walk_depth];
+
+        descend_immutable(&length_node.root, path)
+    }
+
+    /// Total leaf count across the tree. Suitable for the
+    /// `template_count` metric (every leaf corresponds to exactly
+    /// one template). Not on the ingest hot path — full traversal.
+    #[must_use]
+    pub fn leaf_count(&self) -> usize {
+        self.by_length
+            .values()
+            .map(|ln| count_leaves(&ln.root))
+            .sum()
+    }
+
+    /// Collect references to every [`Leaf`] in the tree. Order is
+    /// not guaranteed (`HashMap` iteration). For introspection
+    /// (`templates_for`); not for the ingest hot path.
+    #[must_use]
+    pub fn collect_leaves(&self) -> Vec<&Leaf> {
+        let mut out = Vec::new();
+        for length_node in self.by_length.values() {
+            collect_leaves_recursive(&length_node.root, &mut out);
+        }
+        out
+    }
+}
+
+fn descend_immutable<'t>(node: &'t PrefixNode, path: &[&str]) -> Option<&'t PrefixNode> {
+    if path.is_empty() {
+        return Some(node);
+    }
+    let (head, tail) = path.split_first().expect("non-empty by guard above");
+    let child = node.children.get(*head)?;
+    descend_immutable(child, tail)
+}
+
+fn count_leaves(node: &PrefixNode) -> usize {
+    node.leaves.len() + node.children.values().map(count_leaves).sum::<usize>()
+}
+
+fn collect_leaves_recursive<'t>(node: &'t PrefixNode, out: &mut Vec<&'t Leaf>) {
+    out.extend(node.leaves.iter());
+    for child in node.children.values() {
+        collect_leaves_recursive(child, out);
     }
 }
 
@@ -382,5 +454,168 @@ mod tests {
             (r - 1.0).abs() < f32::EPSILON,
             "borrowed view of stored template must yield 1.0, got {r}",
         );
+    }
+
+    // Tree::descend (immutable)
+
+    #[test]
+    fn descend_returns_none_when_length_bucket_missing() {
+        // Arrange — empty tree, descend asks for a length never seen.
+        let tree = Tree::new();
+
+        // Act
+        let r = tree.descend(&["a", "b"], DEFAULT_PREFIX_DEPTH);
+
+        // Assert
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn descend_returns_none_when_prefix_path_missing() {
+        // Arrange — same length as a known path but a different
+        // first-prefix token. The length bucket exists; the
+        // prefix child does not.
+        let mut tree = Tree::new();
+        let _ = tree.descend_mut(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH);
+
+        // Act — same length 3, different first-prefix token.
+        let r = tree.descend(&["GET", "/home", "200"], DEFAULT_PREFIX_DEPTH);
+
+        // Assert
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn descend_returns_some_at_exact_path_descend_mut_built() {
+        // Arrange — materialise a path, then look it up.
+        let mut tree = Tree::new();
+        {
+            let parent = tree.descend_mut(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH);
+            parent.leaves.push(Leaf {
+                template: [
+                    OwnedToken::Fixed("user".to_string()),
+                    OwnedToken::Fixed("42".to_string()),
+                    OwnedToken::Fixed("logged".to_string()),
+                ]
+                .into(),
+                template_id: 7,
+            });
+        }
+
+        // Act
+        let parent = tree
+            .descend(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH)
+            .expect("path was built");
+
+        // Assert — same leaf observable via immutable descend.
+        assert_eq!(parent.leaves.len(), 1);
+        assert_eq!(parent.leaves[0].template_id, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be non-empty")]
+    fn descend_panics_on_empty_input() {
+        // Arrange
+        let tree = Tree::new();
+        let masked: [&str; 0] = [];
+
+        // Act + Assert
+        let _ = tree.descend(&masked, DEFAULT_PREFIX_DEPTH);
+    }
+
+    // leaf_count + collect_leaves
+
+    #[test]
+    fn leaf_count_is_zero_for_empty_tree() {
+        // Arrange
+        let tree = Tree::new();
+
+        // Act
+        let n = tree.leaf_count();
+
+        // Assert
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn leaf_count_sums_across_length_buckets_and_prefix_paths() {
+        // Arrange — three leaves across two length buckets:
+        //   - length 2, prefix "GET" — 1 leaf
+        //   - length 3, prefix "user 42" — 2 leaves (same parent)
+        let mut tree = Tree::new();
+        {
+            let p = tree.descend_mut(&["GET", "/home"], DEFAULT_PREFIX_DEPTH);
+            p.leaves.push(Leaf {
+                template: [
+                    OwnedToken::Fixed("GET".to_string()),
+                    OwnedToken::Fixed("/home".to_string()),
+                ]
+                .into(),
+                template_id: 1,
+            });
+        }
+        {
+            let p = tree.descend_mut(&["user", "42", "in"], DEFAULT_PREFIX_DEPTH);
+            p.leaves.push(Leaf {
+                template: [
+                    OwnedToken::Fixed("user".to_string()),
+                    OwnedToken::Fixed("42".to_string()),
+                    OwnedToken::Fixed("in".to_string()),
+                ]
+                .into(),
+                template_id: 2,
+            });
+            p.leaves.push(Leaf {
+                template: [
+                    OwnedToken::Fixed("user".to_string()),
+                    OwnedToken::Fixed("42".to_string()),
+                    OwnedToken::Fixed("out".to_string()),
+                ]
+                .into(),
+                template_id: 3,
+            });
+        }
+
+        // Act
+        let n = tree.leaf_count();
+
+        // Assert
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn collect_leaves_returns_every_leaf_ignoring_order() {
+        // Arrange — two leaves in different length buckets.
+        let mut tree = Tree::new();
+        {
+            let p = tree.descend_mut(&["a", "b"], DEFAULT_PREFIX_DEPTH);
+            p.leaves.push(Leaf {
+                template: [
+                    OwnedToken::Fixed("a".to_string()),
+                    OwnedToken::Fixed("b".to_string()),
+                ]
+                .into(),
+                template_id: 10,
+            });
+        }
+        {
+            let p = tree.descend_mut(&["x", "y", "z"], DEFAULT_PREFIX_DEPTH);
+            p.leaves.push(Leaf {
+                template: [
+                    OwnedToken::Fixed("x".to_string()),
+                    OwnedToken::Fixed("y".to_string()),
+                    OwnedToken::Fixed("z".to_string()),
+                ]
+                .into(),
+                template_id: 20,
+            });
+        }
+
+        // Act
+        let leaves = tree.collect_leaves();
+
+        // Assert — set semantics (HashMap iteration unordered).
+        let ids: std::collections::HashSet<u64> = leaves.iter().map(|l| l.template_id).collect();
+        assert_eq!(ids, std::collections::HashSet::from([10, 20]));
     }
 }

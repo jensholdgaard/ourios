@@ -2,8 +2,9 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-05-11** (after PR #15: `sim_seq` +
-> `confidence_ratio` landed).
+> Last updated: **2026-05-13** (after the prefix-tree skeleton and
+> the `MinerCluster` ⇆ `Tree` integration landed; widening still
+> deferred).
 
 This document answers two questions in one place: *what does
 "MVP" mean for Ourios*, and *how far are we from it*. The
@@ -57,7 +58,7 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-05-11)
+## 3. Current state (as of 2026-05-13)
 
 **§5 scenarios green: 6 / 29.** RFC 0001 status: `red`.
 
@@ -68,10 +69,15 @@ What the code does today:
   - `tokenize` (Unicode-whitespace splitting, separators array
     captured but not yet flowing through the pipeline).
   - `mask` with `MaskTag` (UUID/IPv4/NUM rules; HEX/TS/PATH/STR/OVERFLOW are reserved enum variants, no emitter yet).
-  - `sim_seq` + `confidence_ratio` + `Token` enum (RFC §3.2 / §6.3 math primitives, no caller yet).
+  - `sim_seq` + `confidence_ratio` + `Token` enum (RFC §3.2 / §6.3 math primitives — `sim_seq` now drives the cluster's exact-match attach check).
+  - `tree` — Drain prefix tree (`Tree`, `LengthNode`,
+    `PrefixNode`, `Leaf`, `OwnedToken`) with both `descend_mut`
+    and the read-only `descend`, plus leaf-iteration helpers
+    (`leaf_count`, `collect_leaves`). RFC §6.2 step 3.
   - `MinerCluster` with `TenantState` (cluster-wide
-    `template_id` allocator, exact-match `HashMap` per-tenant
-    template store — placeholder for the real Drain tree).
+    `template_id` allocator, per-tenant `Tree` with
+    `sim_seq`-checked **exact-match attach**; widening and the
+    §3.1 audit-event invariant are deferred to the next PR).
 - **No other crates yet.** `ourios-wal`, `ourios-parquet`,
   `ourios-ingester`, `ourios-querier`, `ourios-server`,
   `ourios-bench` are listed in the workspace `Cargo.toml` as
@@ -85,9 +91,9 @@ What's specifically missing for the thesis gates:
 | **B1** | DataFusion frontend, Parquet reader, predicate pushdown wiring |
 | **B2** | Same as B1 plus `template_id` as a queryable column |
 | **C1** | Separators preservation through ingest, `reconstruct()`, `lossy_flag` semantics, body retention |
-| **C2** | Drain tree + `descend` + `widen` + best-candidate selection (replacing the exact-match `HashMap` placeholder) |
+| **C2** | `widen` + best-candidate selection (the tree + descend are in place; the attach decision is exact-match only until widening lands) |
 
-For `cargo test --all-features`'s outer-loop view: 30 passed /
+For `cargo test --all-features`'s outer-loop view: 48 passed /
 23 ignored. The 23 ignored stubs map to RFC 0001 §5 scenarios
 that the missing pieces above would unblock.
 

@@ -8,22 +8,25 @@
 //! different leaves (RFC 0001 §6.1, §5 §3.7.2); each tenant
 //! sees a monotonic *subsequence* of the shared id space.
 //!
-//! What this module is NOT (yet):
+//! What this module is and is not (yet):
 //!
-//! - It is **not** Drain. The per-tenant store is a
-//!   [`HashMap`] keyed on the masked-token sequence: lines that
-//!   produce structurally identical masked sequences share a
-//!   `template_id`, lines that differ in any position get
-//!   distinct ids. This is exact-match templating; future PRs
-//!   replace the `HashMap` with `simSeq` + the depth-bounded
-//!   tree + widening (RFC 0001 §6.2 steps 3–5). The §3.7
-//!   isolation invariant is testable at this layer because
-//!   isolation is about *who owns which store*, not about how
-//!   the store clusters.
+//! - The per-tenant store is now the Drain prefix [`Tree`]
+//!   (root → length-N node → prefix-token nodes → leaf list),
+//!   the data structure introduced in RFC 0001 §6.2 step 3.
+//!   The attach decision is **exact-match only**: a candidate
+//!   line attaches to a leaf when `sim_seq(line, leaf.template)
+//!   == 1.0`; anything else creates a new leaf in the same
+//!   `(length, prefix)` bucket. RFC §6.2 step 5b widening (and
+//!   the §3.1 invariant requiring an audit event for every
+//!   merge) is the focus of the **next** PR — and because no
+//!   widening happens here, no merge happens, and §3.1 is
+//!   preserved vacuously.
 //! - It does not emit audit events, telemetry, body retention,
-//!   or `lossy_flag` — all those follow once the tree exists.
+//!   or `lossy_flag` — all those follow once widening lands.
 //! - It does not write Parquet records — the on-disk shape is
 //!   `ourios-parquet`'s problem.
+//!
+//! [`Tree`]: crate::tree::Tree
 
 use std::collections::HashMap;
 
@@ -31,7 +34,15 @@ use ourios_core::config::MinerConfig;
 use ourios_core::tenant::TenantId;
 
 use crate::mask::mask;
+use crate::sim_seq::sim_seq;
 use crate::tokenize::tokenize;
+use crate::tree::{DEFAULT_PREFIX_DEPTH, Leaf, OwnedToken, Tree};
+
+/// Sentinel `template_id` returned by [`MinerCluster::ingest`]
+/// when no template was allocated for the input — currently the
+/// empty-input parse-failure path. Real templates always have
+/// id `>= 1` (see `next_template_id` initialisation).
+pub const NO_TEMPLATE: u64 = 0;
 
 /// A multi-tenant in-memory miner.
 ///
@@ -60,21 +71,32 @@ pub struct MinerCluster {
 ///
 /// Private: the cross-tenant API surface lives on
 /// [`MinerCluster`]; per-tenant access goes through the cluster
-/// helpers below. Future PRs will give this struct real Drain
-/// machinery; the current `HashMap<Vec<String>, u64>` is the
-/// simplest representation that satisfies §3.7's isolation
-/// contract.
+/// helpers below. `tree` is the Drain prefix tree; under the
+/// current exact-match-only attach policy every stored template
+/// is a `Vec<OwnedToken::Fixed(_)>` (no [`OwnedToken::Wildcard`]
+/// positions until widening lands).
 ///
 /// `template_id` allocation lives on [`MinerCluster`], not here
 /// — see the `next_template_id` comment there for why.
+///
+/// `template_count` is a cache of the tree's leaf count,
+/// incremented on every leaf insertion in [`MinerCluster::ingest`].
+/// It exists because the public [`MinerCluster::template_count`]
+/// metric is intended for frequent introspection (and will back
+/// the §6.8 `template_count` gauge once telemetry lands), and
+/// walking the tree on every read would be O(N-leaves). The
+/// cache invariant is: any call site that pushes to
+/// `tree`'s leaves must also `template_count += 1`.
 struct TenantState {
-    templates: HashMap<Vec<String>, u64>,
+    tree: Tree,
+    template_count: usize,
 }
 
 impl TenantState {
     fn new() -> Self {
         Self {
-            templates: HashMap::new(),
+            tree: Tree::new(),
+            template_count: 0,
         }
     }
 }
@@ -104,43 +126,88 @@ impl MinerCluster {
 
     /// Ingest a raw line for the named tenant. Returns the
     /// `template_id` allocated (or reused) for the line's
-    /// masked shape.
+    /// masked shape, or [`NO_TEMPLATE`] (`0`) when the input
+    /// produces no tokens (empty or whitespace-only `raw`).
     ///
     /// On first sight of `tenant_id`, allocates a fresh
-    /// per-tenant store. Lines whose masked-token sequence has
-    /// been seen before reuse the existing `template_id`; new
-    /// shapes pull the next monotonic id from the cluster-wide
-    /// allocator.
+    /// per-tenant store. Lines whose masked shape matches an
+    /// existing leaf at `sim_seq == 1.0` reuse that leaf's
+    /// `template_id`; everything else pulls the next monotonic
+    /// id from the cluster-wide allocator and creates a new
+    /// leaf under the same `(length, prefix)` bucket.
+    ///
+    /// Empty/whitespace-only inputs are treated as a parse
+    /// failure: no template is allocated and [`NO_TEMPLATE`] is
+    /// returned. This is a placeholder for the §6.8
+    /// `parse_failures_total` metric path that lands with the
+    /// confidence-zone branching PR; for now it just keeps
+    /// [`Tree::descend_mut`]'s `N ≥ 1` precondition from
+    /// panicking on a corner-case input.
     pub fn ingest(&mut self, tenant_id: &TenantId, raw: &str) -> u64 {
         let tokenized = tokenize(raw);
         let masked = mask(&tokenized.tokens);
-        let masked_owned: Vec<String> = masked.tokens.into_iter().map(String::from).collect();
+        let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
 
-        // Two-phase to keep the borrow checker happy: lookup
-        // borrows self.tenants immutably for the early-return,
-        // then the allocate-and-insert path borrows self twice
-        // (next_template_id mutably, tenants mutably).
-        if let Some(state) = self.tenants.get(tenant_id) {
-            if let Some(&id) = state.templates.get(&masked_owned) {
-                return id;
-            }
+        if masked_strs.is_empty() {
+            return NO_TEMPLATE;
         }
 
+        // Phase 1 — read-only lookup. Avoids the mutable-borrow
+        // chain through `tenants.entry()` + `descend_mut` so we
+        // can early-return without committing a `template_id`
+        // allocation. RFC §6.2 step 4: candidate selection.
+        let exact_match_id = self
+            .tenants
+            .get(tenant_id)
+            .and_then(|state| state.tree.descend(&masked_strs, DEFAULT_PREFIX_DEPTH))
+            .and_then(|parent| {
+                parent
+                    .leaves
+                    .iter()
+                    .find(|leaf| matches_exactly(&masked_strs, &leaf.template))
+            })
+            .map(|leaf| leaf.template_id);
+
+        if let Some(id) = exact_match_id {
+            return id;
+        }
+
+        // Phase 2 — no exact match; allocate id, materialise the
+        // path (creating any missing nodes), push the new leaf.
+        // RFC §6.2 step 4: fresh-leaf creation when no candidate
+        // matches.
         let new_id = self.next_template_id;
         self.next_template_id += 1;
+
         let state = self
             .tenants
             .entry(tenant_id.clone())
             .or_insert_with(TenantState::new);
-        state.templates.insert(masked_owned, new_id);
+        let parent = state.tree.descend_mut(&masked_strs, DEFAULT_PREFIX_DEPTH);
+        let new_template: Vec<OwnedToken> = masked_strs
+            .iter()
+            .map(|s| OwnedToken::Fixed((*s).to_string()))
+            .collect();
+        parent.leaves.push(Leaf {
+            template: new_template,
+            template_id: new_id,
+        });
+        // Maintain the TenantState::template_count cache invariant —
+        // every leaf push under `state.tree` is mirrored here so
+        // `MinerCluster::template_count` can stay O(1).
+        state.template_count += 1;
         new_id
     }
 
     /// Number of distinct templates this tenant has accumulated.
     /// Returns 0 for a tenant the cluster has never seen.
+    ///
+    /// O(1): served from the [`TenantState::template_count`]
+    /// cache rather than walking the tree. The cache is
+    /// maintained by [`MinerCluster::ingest`].
     #[must_use]
     pub fn template_count(&self, tenant_id: &TenantId) -> usize {
-        self.tenants.get(tenant_id).map_or(0, |s| s.templates.len())
+        self.tenants.get(tenant_id).map_or(0, |s| s.template_count)
     }
 
     /// Snapshot of `(masked_template, template_id)` pairs for
@@ -148,12 +215,74 @@ impl MinerCluster {
     ///
     /// Order is not guaranteed (`HashMap` iteration). Callers
     /// that need a stable order should sort.
+    ///
+    /// Under the current exact-match-only attach policy every
+    /// stored template is fixed-token-only, so each template is
+    /// returned as its `Vec<String>` shape. When widening lands
+    /// and templates start containing wildcards, this signature
+    /// will need to widen to `Vec<(Vec<OwnedToken>, u64)>` (a
+    /// contract change worth surfacing in that PR — `<*>` as a
+    /// `String` sentinel is the failure mode the
+    /// [`crate::tree::OwnedToken`] type exists to prevent).
     #[must_use]
     pub fn templates_for(&self, tenant_id: &TenantId) -> Vec<(Vec<String>, u64)> {
         self.tenants.get(tenant_id).map_or_else(Vec::new, |s| {
-            s.templates.iter().map(|(t, id)| (t.clone(), *id)).collect()
+            s.tree
+                .collect_leaves()
+                .into_iter()
+                .map(|leaf| (owned_template_as_strings(&leaf.template), leaf.template_id))
+                .collect()
         })
     }
+}
+
+/// Exact-match check between a freshly-masked line and a stored
+/// template. Equivalent to `sim_seq(...) == 1.0` for fixed-only
+/// templates, but materialises no intermediate `Vec<Token<'_>>`
+/// — the hot-path cost of the [`OwnedToken::as_borrowed`] +
+/// `collect()` route would be paid on *every* leaf in the
+/// candidate set on every line. The next PR will switch this
+/// helper to a `sim_seq`-via-iterator path once widening makes
+/// the wildcard branch necessary.
+fn matches_exactly(line: &[&str], template: &[OwnedToken]) -> bool {
+    if line.len() != template.len() {
+        return false;
+    }
+    // Sanity: this helper's correctness is the same as
+    // sim_seq(line, template) == 1.0 (where wildcards count
+    // as matches). Assert in debug to catch divergence early.
+    debug_assert_eq!(
+        line.iter().zip(template.iter()).all(|(s, t)| match t {
+            OwnedToken::Fixed(stored) => *s == stored.as_str(),
+            OwnedToken::Wildcard => true,
+        }),
+        {
+            let view: Vec<crate::sim_seq::Token<'_>> =
+                template.iter().map(OwnedToken::as_borrowed).collect();
+            (sim_seq(line, &view) - 1.0).abs() < f32::EPSILON
+        },
+        "matches_exactly diverged from sim_seq == 1.0",
+    );
+    line.iter().zip(template.iter()).all(|(s, t)| match t {
+        OwnedToken::Fixed(stored) => *s == stored.as_str(),
+        OwnedToken::Wildcard => true,
+    })
+}
+
+fn owned_template_as_strings(template: &[OwnedToken]) -> Vec<String> {
+    template
+        .iter()
+        .map(|t| match t {
+            OwnedToken::Fixed(s) => s.clone(),
+            // Under the current attach policy this branch is
+            // unreachable (no widening => no wildcards), but the
+            // function stays total. The "<*>" sentinel is acceptable
+            // here only because the return type is a snapshot for
+            // operator introspection, never fed back into the
+            // tokenize→mask→ingest pipeline.
+            OwnedToken::Wildcard => "<*>".to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -170,9 +299,9 @@ mod tests {
         let id1 = cluster.ingest(&t, "user 42 logged in");
         let id2 = cluster.ingest(&t, "user 17 logged in");
 
-        // Assert — exact-match templating: <NUM> abstracts the
-        // user id, so both lines mask to the same shape and
-        // share a template_id.
+        // Assert — <NUM> abstracts the user id, so both lines mask
+        // to the same shape and `sim_seq == 1.0` on the existing
+        // leaf, reusing its template_id.
         assert_eq!(id1, id2);
         assert_eq!(cluster.template_count(&t), 1);
     }
@@ -218,5 +347,81 @@ mod tests {
 
         // Assert
         assert_eq!(cluster.template_count(&t), 1);
+    }
+
+    #[test]
+    fn ingest_creates_separate_leaves_for_near_match_under_same_parent() {
+        // Arrange — two lines sharing length and prefix but
+        // differing at a later position. Under the
+        // exact-match-only attach policy (RFC §6.2 step 5 widening
+        // not yet implemented), `sim_seq` between them is `5/6 ≈
+        // 0.833` and falls below `1.0`, so they must produce
+        // distinct template_ids.
+        //
+        // **Locking-test note:** this test pins the *no-widening*
+        // contract. When widening lands in the next PR these two
+        // lines will widen into a single template with `<*>` at
+        // position 3, the assertions below will no longer hold,
+        // and per `CLAUDE.md` §6.2 ("Tests are specifications") the
+        // next PR's review must explicitly acknowledge the
+        // contract change before this test is updated — it must
+        // not be silently edited into compliance.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        // Act — both lines mask to "user <NUM> logged in from <IP>"
+        // / "user <NUM> logged out from <IP>" (length 6, same
+        // prefix tokens at positions 0 and 1).
+        let id_in = cluster.ingest(&t, "user 42 logged in from 10.0.0.1");
+        let id_out = cluster.ingest(&t, "user 42 logged out from 10.0.0.1");
+
+        // Assert — distinct templates today; same `(length,
+        // prefix)` bucket but different leaves.
+        assert_ne!(id_in, id_out);
+        assert_eq!(cluster.template_count(&t), 2);
+    }
+
+    #[test]
+    fn ingest_returns_no_template_sentinel_for_empty_input() {
+        // Arrange — `tokenize` documents that empty and
+        // whitespace-only inputs produce zero tokens; `mask`
+        // preserves length, so `Tree::descend{,_mut}` would see
+        // an empty slice and trip its `N ≥ 1` precondition.
+        // `ingest` short-circuits to the [`NO_TEMPLATE`] sentinel
+        // instead of panicking — placeholder for the §6.8
+        // `parse_failures_total` metric path.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        // Act
+        let id_empty = cluster.ingest(&t, "");
+        let id_blank = cluster.ingest(&t, "   \t\n");
+
+        // Assert — both inputs yield the sentinel; no template
+        // is allocated; the tenant's count stays at 0.
+        assert_eq!(id_empty, NO_TEMPLATE);
+        assert_eq!(id_blank, NO_TEMPLATE);
+        assert_eq!(cluster.template_count(&t), 0);
+    }
+
+    #[test]
+    fn template_count_grows_with_each_distinct_template() {
+        // Arrange — three lines: two share a masked shape, one
+        // differs. The cache on TenantState must track exactly
+        // the number of distinct templates the tree holds.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        // Act — first ingest creates leaf 1, second hits the
+        // existing leaf (no count change), third creates leaf 2.
+        let _ = cluster.ingest(&t, "user 42 logged in");
+        let _ = cluster.ingest(&t, "user 17 logged in");
+        let _ = cluster.ingest(&t, "GET /home 200");
+
+        // Assert — pin the cache invariant: the O(1) reading
+        // matches the O(N) `Tree::leaf_count` walk for the same
+        // tenant state.
+        let cached = cluster.template_count(&t);
+        assert_eq!(cached, 2);
     }
 }

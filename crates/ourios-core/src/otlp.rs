@@ -131,13 +131,17 @@ impl Body {
     /// (proto's `oneof` is unset). The String / Structured fork
     /// is exactly the §6.2 step-0 split: only `string_value`
     /// takes the mining path; everything else takes the
-    /// short-circuit path.
+    /// short-circuit path. The inner `oneof` is *moved* into the
+    /// chosen variant — no deep clone of arrays / kvlists / bytes
+    /// trees, satisfying the amended §6.4 commitment that the
+    /// structured branch does not allocate on the miner-facing
+    /// path.
     #[must_use]
     pub fn from_any_value(value: AnyValue) -> Option<Self> {
-        let inner = value.value.clone()?;
+        let inner = value.value?;
         match inner {
             any_value::Value::StringValue(s) => Some(Self::String(s)),
-            _ => Some(Self::Structured(value)),
+            other => Some(Self::Structured(AnyValue { value: Some(other) })),
         }
     }
 }

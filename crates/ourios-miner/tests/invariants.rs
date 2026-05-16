@@ -131,13 +131,13 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     // shapes so the cross-pollination question is testable. A's
     // lines exercise the "user <NUM> logged in" shape; B's
     // lines exercise the "GET <PATH> <NUM>" shape (the path
-    // differs between B's two lines so each B line is its own
-    // template under exact-match templating, but neither
-    // matches anything in A's set). Both tenants use default
-    // severity (UNSPECIFIED) and scope (None), so the §6.1
-    // template-key tuple's discriminator is constant — what
-    // varies (and what the cross-pollination question pivots on)
-    // is only the masked tokens.
+    // differs between B's two lines so each B line lands in its
+    // own template — sim 2/3 < 0.7 keeps them distinct rather
+    // than widening — but neither matches anything in A's set).
+    // Both tenants use default severity (UNSPECIFIED) and scope
+    // (None), so the §6.1 template-key tuple's discriminator is
+    // constant — what varies (and what the cross-pollination
+    // question pivots on) is only the masked tokens.
     let mut cluster = MinerCluster::new(MinerConfig::default());
     let a = TenantId::new("tenant-a");
     let b = TenantId::new("tenant-b");

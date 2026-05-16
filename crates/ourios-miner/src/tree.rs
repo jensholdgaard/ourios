@@ -7,14 +7,12 @@
 //!
 //! # Scope of this module
 //!
-//! Today the tree backs [`crate::cluster::MinerCluster`]'s
-//! per-tenant template store and supports the exact-match attach
-//! path (`sim_seq == 1.0` → reuse leaf; otherwise → new leaf in
-//! the same `(length, prefix)` bucket). The §6.2 step-5 widening
-//! branch and its §3.1 audit-event invariant are not yet in
-//! place — they land in a follow-up PR that turns the exact-match
-//! check into a `sim_seq >= threshold` decision and introduces
-//! [`OwnedToken::Wildcard`] positions into stored templates.
+//! The tree backs [`crate::cluster::MinerCluster`]'s per-tenant
+//! template store. Leaves carry the §6.1 template-key fields
+//! (template tokens, `template_id`, `template_version`,
+//! `severity_number`, `scope_name`); stored templates may contain
+//! [`OwnedToken::Wildcard`] positions introduced by §6.2 step 5
+//! widening.
 //!
 //! # Depth convention
 //!
@@ -85,9 +83,9 @@ impl OwnedToken {
 /// invariant. The audit event records `(old_version, new_version)`
 /// from the same bump.
 ///
-/// Future PRs will add `slot_types`, retained-body counts, and the
-/// rest of the §6.1 leaf payload; they are deliberately absent
-/// here so the leaf stays reviewable.
+/// `slot_types` and retained-body counts (the rest of the §6.1
+/// leaf payload) will be added when the type-expansion and
+/// body-retention PRs land.
 #[derive(Debug, Clone)]
 pub struct Leaf {
     pub template: Vec<OwnedToken>,
@@ -117,9 +115,9 @@ pub struct Leaf {
 /// holds the candidate set at the deepest prefix level reached
 /// by [`Tree::descend_mut`]. By **convention** intermediate nodes
 /// carry an empty `leaves` — the type does not enforce this; the
-/// field is `pub` so the upcoming integration PR can push into
-/// the node `descend_mut` returns. Pushing into an intermediate
-/// node would be a caller bug.
+/// field is `pub` so [`crate::cluster::MinerCluster::ingest`] can
+/// push into the node `descend_mut` returns. Pushing into an
+/// intermediate node would be a caller bug.
 #[derive(Debug, Default)]
 pub struct PrefixNode {
     pub children: HashMap<String, PrefixNode>,
@@ -135,8 +133,9 @@ pub struct LengthNode {
     pub root: PrefixNode,
 }
 
-/// Root of the Drain prefix tree. One per tenant in the eventual
-/// integration; this module stays tenant-agnostic.
+/// Root of the Drain prefix tree. One per tenant via
+/// [`crate::cluster::MinerCluster`]; this module stays
+/// tenant-agnostic.
 #[derive(Debug, Default)]
 pub struct Tree {
     pub by_length: HashMap<usize, LengthNode>,
@@ -158,11 +157,11 @@ impl Tree {
     /// `masked`, creating any missing nodes along the way.
     ///
     /// Returned node's `leaves` is the candidate set the caller
-    /// will run [`crate::sim_seq::sim_seq`] over (in the
-    /// integration PR). When `masked.len() < prefix_depth` the
-    /// walk stops early — the entire line is consumed as path,
-    /// so short lines bottom out at a **shallower** prefix level
-    /// than long ones. This matches the Drain paper.
+    /// runs [`crate::sim_seq::sim_seq`] over. When
+    /// `masked.len() < prefix_depth` the walk stops early — the
+    /// entire line is consumed as path, so short lines bottom
+    /// out at a **shallower** prefix level than long ones. This
+    /// matches the Drain paper.
     ///
     /// # Panics
     ///
@@ -192,9 +191,9 @@ impl Tree {
     /// node in the path is missing.
     ///
     /// Used by [`crate::cluster::MinerCluster::ingest`] for the
-    /// existence-check phase — looking up an exact match before
-    /// committing the `template_id` allocation that
-    /// [`Tree::descend_mut`] would entail.
+    /// candidate-selection phase — finding the best leaf to attach
+    /// to (or widen) before committing the `template_id` allocation
+    /// that [`Tree::descend_mut`] would entail.
     ///
     /// # Panics
     ///

@@ -28,9 +28,8 @@
 //!   `merges_total`, return the leaf's `template_id`.
 //! - **Best candidate has `sim_seq < threshold`** → fresh leaf in
 //!   the same bucket. The three-zone confidence model (lossy-zone
-//!   body retention + parse-failure floor per RFC §6.3) is the
-//!   next PR; today this branch behaves exactly as the pre-widen
-//!   one did.
+//!   body retention + parse-failure floor per RFC §6.3) lands in
+//!   a follow-up PR; today this branch simply creates a new leaf.
 //!
 //! Audit events flow to the [`AuditSink`] the cluster was
 //! constructed with — [`MinerCluster::new`] defaults to an
@@ -326,8 +325,8 @@ impl MinerCluster {
             None => self.create_new_leaf(record, &masked_strs),
             // Best candidate is below threshold → fresh leaf in
             // the same bucket. The three-zone lossy-floor logic
-            // (RFC §6.3) is the next PR; for now this branch
-            // behaves exactly as the pre-widen one did.
+            // (RFC §6.3) lands in a follow-up PR; for now this
+            // branch is a plain new-leaf creation.
             Some(c) if c.similarity < threshold => self.create_new_leaf(record, &masked_strs),
             // Above threshold → attach (maybe widen).
             Some(c) => self.attach_and_maybe_widen(record, raw, &masked_strs, c),
@@ -550,15 +549,14 @@ impl MinerCluster {
     /// tenant's `Body::String` templates. Returns an empty vec
     /// for unseen tenants.
     ///
-    /// Order is not guaranteed (`HashMap` iteration). Templates
-    /// now contain [`OwnedToken::Wildcard`] positions post-widen
-    /// — the return type is `Vec<(Vec<OwnedToken>, u64)>` (was
-    /// `Vec<(Vec<String>, u64)>` pre-widen) so the wildcard
-    /// vs. literal distinction stays typed; a `"<*>"` string
-    /// sentinel would lose the round-trip guarantee.
-    /// Structured-body templates (§6.2 step-0 short-circuit) are
-    /// not returned by this helper — they have no token shape to
-    /// surface.
+    /// Order is not guaranteed (`HashMap` iteration). Stored
+    /// templates may contain [`OwnedToken::Wildcard`] positions
+    /// from §6.2 step 5 widening, so the return type carries
+    /// [`OwnedToken`] (not `String`) — a `"<*>"` string sentinel
+    /// would lose the wildcard-vs-literal distinction the type
+    /// exists to preserve. Structured-body templates (§6.2 step-0
+    /// short-circuit) are not returned by this helper — they have
+    /// no token shape to surface.
     #[must_use]
     pub fn templates_for(&self, tenant_id: &TenantId) -> Vec<(Vec<OwnedToken>, u64)> {
         self.tenants.get(tenant_id).map_or_else(Vec::new, |s| {
@@ -658,10 +656,8 @@ mod tests {
 
     /// Test helper — a `Body::String` record for `tenant` carrying
     /// `text` and default severity (UNSPECIFIED) / scope (None).
-    /// Mirrors the pre-amendment `cluster.ingest(&tenant, "text")`
-    /// ergonomics so existing tests' assertions stay focused on
-    /// what they're testing rather than on record-construction
-    /// boilerplate.
+    /// Keeps tests focused on their assertions rather than on
+    /// record-construction boilerplate.
     fn string_record(tenant: &TenantId, text: &str) -> OtlpLogRecord {
         OtlpLogRecord {
             tenant_id: tenant.clone(),

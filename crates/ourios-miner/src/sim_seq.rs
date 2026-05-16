@@ -22,8 +22,8 @@
 //! and obscures the type-level distinction between
 //! masking-time tags (`<UUID>`, `<NUM>`, ...) and
 //! widening-time wildcards. The `Token::Wildcard` variant is
-//! the unambiguous representation; future widening code will
-//! produce `Vec<Token<'a>>` directly.
+//! the unambiguous representation. [`crate::tree::OwnedToken`]
+//! is the owned counterpart for stored templates.
 
 /// One position in a Drain template: either a fixed string
 /// (matched literally against the candidate line) or a wildcard

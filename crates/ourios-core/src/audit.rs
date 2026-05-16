@@ -25,18 +25,45 @@ use std::time::SystemTime;
 
 use crate::tenant::TenantId;
 
-/// Distinct kinds of audit-worthy state changes per RFC 0001 §6.4.
+/// Variant-specific payload for an [`AuditEvent`].
 ///
-/// The miner emits one of these per leaf state change; data records
-/// that *cause* the change are durability-ordered after the events
-/// justifying their `template_version` stamp (a barrier this enum
-/// names but does not itself enforce — see the module-level note).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AuditEventType {
+/// Each variant carries only the fields that are meaningful for
+/// that kind of state change. The pre-refactor flat shape
+/// (`AuditEventType` enum + always-present `positions_widened`
+/// and `slots_expanded` vectors on `AuditEvent`) made invalid
+/// combinations representable — e.g. a `TemplateWidened` event
+/// with a non-empty `slots_expanded`, or a rejection event with
+/// `old_version != new_version`. Hoisting the kind-specific
+/// fields into variant payloads pins each contract at the type
+/// level.
+///
+/// The miner emits one of these per leaf state change; data
+/// records that *cause* the change are durability-ordered after
+/// the events justifying their `template_version` stamp (a barrier
+/// this enum names but does not itself enforce — see the
+/// module-level note).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditEventKind {
     /// An existing template gained one or more wildcard slots
     /// because a clean attach would otherwise mismatch positions
     /// (RFC §6.2 step 5).
-    TemplateWidened,
+    TemplateWidened {
+        /// The leaf's `template_version` before this attach.
+        old_version: u32,
+        /// `old_version + 1`. Pinned by construction: a widening
+        /// always bumps the version by exactly one.
+        new_version: u32,
+        /// Canonical-form template before the widening
+        /// (literals + `<*>` for already-wildcard positions).
+        old_template: String,
+        /// Canonical-form template after the widening.
+        new_template: String,
+        /// Token positions (zero-indexed) that became `<*>` in
+        /// this attach. Always non-empty for this variant — a
+        /// would-be widening with zero new wildcards is a clean
+        /// attach, which emits no audit event.
+        positions_widened: Vec<u16>,
+    },
     /// An existing template's wildcard slot type-set widened to
     /// include a new [`ParamType`] (RFC §6.2 step 5 type
     /// expansion).
@@ -44,11 +71,50 @@ pub enum AuditEventType {
     /// **Reserved variant.** Emission lands in the follow-up
     /// type-expansion PR; the variant ships here so the schema is
     /// wire-stable across that change.
-    TemplateTypeExpanded,
+    TemplateTypeExpanded {
+        old_version: u32,
+        new_version: u32,
+        old_template: String,
+        new_template: String,
+        /// Wildcard-slot indices and the [`ParamType`]s newly
+        /// observed there.
+        slots_expanded: Vec<SlotExpansion>,
+    },
     /// A would-be widening was rejected because it would have
     /// left the template with zero non-wildcard tokens (RFC §6.4
     /// degenerate-template guard).
-    TemplateWideningRejectedDegenerate,
+    ///
+    /// Rejection does not bump `template_version` and does not
+    /// mutate the leaf, so there is no `old_version` / `new_version`
+    /// pair to carry — just the single `version` that was current
+    /// when the rejection happened.
+    TemplateWideningRejectedDegenerate {
+        /// The leaf's `template_version` at the time of rejection.
+        version: u32,
+        /// The leaf's canonical-form template — unchanged by the
+        /// rejection.
+        current_template: String,
+        /// The canonical-form template the widening *would* have
+        /// produced. Surfaced so an operator inspecting the audit
+        /// stream can see the degenerate shape that was avoided.
+        would_be_template: String,
+        /// Positions the rejected widening would have replaced
+        /// with `<*>`.
+        would_be_positions: Vec<u16>,
+    },
+}
+
+impl AuditEventKind {
+    /// `true` for events that count toward `merges_total` per
+    /// RFC §6.4 — the two structural widenings. Rejection events
+    /// are recorded but do not increment the counter.
+    #[must_use]
+    pub fn counts_as_merge(&self) -> bool {
+        matches!(
+            self,
+            Self::TemplateWidened { .. } | Self::TemplateTypeExpanded { .. }
+        )
+    }
 }
 
 /// Type tag for a masked parameter slot.
@@ -101,12 +167,14 @@ pub struct SlotExpansion {
     pub added_types: Vec<ParamType>,
 }
 
-/// RFC 0001 §6.4 audit-event schema, structured form.
+/// RFC 0001 §6.4 audit-event schema.
 ///
-/// Field semantics mirror the RFC text exactly:
+/// Splits the schema into shared envelope fields (this struct) and
+/// kind-specific payload ([`AuditEventKind`]). Field semantics:
 ///
-/// - `old_template` / `new_template` — canonical form with `<*>` for
-///   wildcards (literal tokens for fixed positions, space-joined).
+/// - `kind` — see [`AuditEventKind`]. Per-variant payload includes
+///   the version pair (or single version, on rejection), the
+///   canonical-form templates, and the positions / slots affected.
 /// - `triggering_line_hash` — truncated blake3 of `L_raw`, used by
 ///   the §6.7 drift query to join an event to the data record(s)
 ///   that triggered it.
@@ -114,26 +182,13 @@ pub struct SlotExpansion {
 ///   truncated at a UTF-8 char boundary so the string is always
 ///   valid. `None` is reserved for cases where retention is opted
 ///   out at config time; the miner always sets this today.
-/// - `positions_widened` — token positions (zero-indexed) that
-///   became `<*>`. Empty on `TemplateTypeExpanded` and on
-///   `TemplateWideningRejectedDegenerate`.
-/// - `slots_expanded` — wildcard-slot indices and the
-///   [`ParamType`]s newly observed there. Empty on
-///   `TemplateWidened` and on
-///   `TemplateWideningRejectedDegenerate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
-    pub event_type: AuditEventType,
+    pub kind: AuditEventKind,
     pub tenant_id: TenantId,
     pub template_id: u64,
-    pub old_version: u32,
-    pub new_version: u32,
-    pub old_template: String,
-    pub new_template: String,
     pub triggering_line_hash: [u8; 16],
     pub triggering_line_sample: Option<String>,
-    pub positions_widened: Vec<u16>,
-    pub slots_expanded: Vec<SlotExpansion>,
     pub timestamp: SystemTime,
 }
 
@@ -293,19 +348,35 @@ impl AuditSink for SharedAuditSink {
 mod tests {
     use super::*;
 
-    fn sample_event(tenant: &TenantId, kind: AuditEventType) -> AuditEvent {
+    fn widened_event(tenant: &TenantId) -> AuditEvent {
         AuditEvent {
-            event_type: kind,
+            kind: AuditEventKind::TemplateWidened {
+                old_version: 1,
+                new_version: 2,
+                old_template: "user 42 logged in".to_string(),
+                new_template: "user 42 logged <*>".to_string(),
+                positions_widened: vec![3],
+            },
             tenant_id: tenant.clone(),
             template_id: 1,
-            old_version: 1,
-            new_version: 2,
-            old_template: "user 42 logged in".to_string(),
-            new_template: "user 42 logged <*>".to_string(),
             triggering_line_hash: hash_triggering_line(b"user 42 logged out"),
             triggering_line_sample: Some("user 42 logged out".to_string()),
-            positions_widened: vec![3],
-            slots_expanded: vec![],
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    fn rejection_event(tenant: &TenantId) -> AuditEvent {
+        AuditEvent {
+            kind: AuditEventKind::TemplateWideningRejectedDegenerate {
+                version: 2,
+                current_template: "alpha <*> <*>".to_string(),
+                would_be_template: "<*> <*> <*>".to_string(),
+                would_be_positions: vec![0],
+            },
+            tenant_id: tenant.clone(),
+            template_id: 1,
+            triggering_line_hash: hash_triggering_line(b"zzz qqq rrr"),
+            triggering_line_sample: Some("zzz qqq rrr".to_string()),
             timestamp: SystemTime::now(),
         }
     }
@@ -315,20 +386,20 @@ mod tests {
         let mut sink = InMemoryAuditSink::new();
         let t = TenantId::new("tenant-x");
 
-        sink.emit(sample_event(&t, AuditEventType::TemplateWidened));
-        sink.emit(sample_event(
-            &t,
-            AuditEventType::TemplateWideningRejectedDegenerate,
-        ));
+        sink.emit(widened_event(&t));
+        sink.emit(rejection_event(&t));
 
         assert_eq!(sink.len(), 2);
         let drained = sink.drain();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].event_type, AuditEventType::TemplateWidened);
-        assert_eq!(
-            drained[1].event_type,
-            AuditEventType::TemplateWideningRejectedDegenerate,
-        );
+        assert!(matches!(
+            drained[0].kind,
+            AuditEventKind::TemplateWidened { .. },
+        ));
+        assert!(matches!(
+            drained[1].kind,
+            AuditEventKind::TemplateWideningRejectedDegenerate { .. },
+        ));
         assert!(sink.is_empty(), "drain leaves the sink empty");
     }
 
@@ -340,15 +411,25 @@ mod tests {
 
         // Produce via one handle.
         let mut producer = producer_handle;
-        producer.emit(sample_event(&t, AuditEventType::TemplateWidened));
+        producer.emit(widened_event(&t));
 
         // Observe via the other.
         assert_eq!(observer_handle.len(), 1);
         let drained = observer_handle.drain();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].event_type, AuditEventType::TemplateWidened);
+        assert!(matches!(
+            drained[0].kind,
+            AuditEventKind::TemplateWidened { .. },
+        ));
         // The producer's view is also drained — same buffer.
         assert!(observer_handle.is_empty());
+    }
+
+    #[test]
+    fn counts_as_merge_distinguishes_widenings_from_rejections() {
+        let t = TenantId::new("tenant-x");
+        assert!(widened_event(&t).kind.counts_as_merge());
+        assert!(!rejection_event(&t).kind.counts_as_merge());
     }
 
     #[test]

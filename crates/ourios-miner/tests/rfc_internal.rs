@@ -51,7 +51,7 @@ fn rfc0001_1_fresh_leaf_creation_does_not_emit_audit_event() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
-    use ourios_core::audit::{AuditEventType, SharedAuditSink};
+    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -119,15 +119,24 @@ fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
 
     let events = sink.drain();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, AuditEventType::TemplateWidened);
-    assert_eq!(
-        events[1].event_type,
-        AuditEventType::TemplateWideningRejectedDegenerate,
+    assert!(
+        matches!(events[0].kind, AuditEventKind::TemplateWidened { .. }),
+        "event 0: expected TemplateWidened, got {:?}",
+        events[0].kind,
     );
-    // Rejection audit's `new_template` records what the widening
-    // *would* have produced, so an operator inspecting the
-    // event sees the degenerate shape.
-    assert_eq!(events[1].new_template, "<*> <*> <*>");
+    // Rejection audit's `would_be_template` records what the
+    // widening *would* have produced, so an operator inspecting
+    // the event sees the degenerate shape that was avoided.
+    let AuditEventKind::TemplateWideningRejectedDegenerate {
+        would_be_template, ..
+    } = &events[1].kind
+    else {
+        panic!(
+            "event 1: expected TemplateWideningRejectedDegenerate, got {:?}",
+            events[1].kind,
+        );
+    };
+    assert_eq!(would_be_template, "<*> <*> <*>");
 }
 
 /// Scenario RFC0001.3 — Tokenizer is Unicode whitespace only; punctuation stays in tokens.

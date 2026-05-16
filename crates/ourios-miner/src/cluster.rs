@@ -46,7 +46,7 @@
 //! - Three-zone confidence + lossy-zone body retention (RFC §6.3,
 //!   `H1.2`).
 //! - Type-expansion (`TemplateTypeExpanded`); the variant exists
-//!   on [`AuditEventType`] but no widening path emits it yet
+//!   on [`AuditEventKind`] but no widening path emits it yet
 //!   (`H5.2`).
 //! - `reconstruct()` / `lossy_flag` semantics (RFC §6.6).
 //! - Per-parameter 256 B overflow + `OVERFLOW` marker (RFC §6.5).
@@ -57,14 +57,14 @@
 //!
 //! [`Tree`]: crate::tree::Tree
 //! [`AuditSink`]: ourios_core::audit::AuditSink
-//! [`AuditEventType`]: ourios_core::audit::AuditEventType
+//! [`AuditEventKind`]: ourios_core::audit::AuditEventKind
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use ourios_core::audit::{
-    AuditEvent, AuditEventType, AuditSink, InMemoryAuditSink, hash_triggering_line,
+    AuditEvent, AuditEventKind, AuditSink, InMemoryAuditSink, hash_triggering_line,
     sample_first_256_bytes,
 };
 use ourios_core::config::MinerConfig;
@@ -453,31 +453,27 @@ impl MinerCluster {
         // proposed widening would leave zero Fixed tokens, reject.
         if would_be_degenerate(&leaf.template, &positions_widened) {
             let template_id = leaf.template_id;
-            let template_version = leaf.template_version;
-            let old_template = format_template(&leaf.template);
+            let version = leaf.template_version;
+            let current_template = format_template(&leaf.template);
             // The would-be new template, computed without
             // mutating the leaf — needed for the audit payload so
             // an operator inspecting the rejection sees what was
             // proposed.
             let mut new_template_tokens = leaf.template.clone();
             apply_widening(&mut new_template_tokens, &positions_widened);
-            let new_template = format_template(&new_template_tokens);
+            let would_be_template = format_template(&new_template_tokens);
 
             self.audit_sink.emit(AuditEvent {
-                event_type: AuditEventType::TemplateWideningRejectedDegenerate,
+                kind: AuditEventKind::TemplateWideningRejectedDegenerate {
+                    version,
+                    current_template,
+                    would_be_template,
+                    would_be_positions: positions_widened,
+                },
                 tenant_id: record.tenant_id.clone(),
                 template_id,
-                // Version is unchanged on rejection; the audit
-                // event records the *would-be* widening, so both
-                // versions point at the same number.
-                old_version: template_version,
-                new_version: template_version,
-                old_template,
-                new_template,
                 triggering_line_hash: hash_triggering_line(raw.as_bytes()),
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                positions_widened: positions_widened.clone(),
-                slots_expanded: Vec::new(),
                 timestamp: SystemTime::now(),
             });
             self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -498,17 +494,17 @@ impl MinerCluster {
         let new_template = format_template(&leaf.template);
 
         self.audit_sink.emit(AuditEvent {
-            event_type: AuditEventType::TemplateWidened,
+            kind: AuditEventKind::TemplateWidened {
+                old_version,
+                new_version,
+                old_template,
+                new_template,
+                positions_widened,
+            },
             tenant_id: record.tenant_id.clone(),
             template_id,
-            old_version,
-            new_version,
-            old_template,
-            new_template,
             triggering_line_hash: hash_triggering_line(raw.as_bytes()),
             triggering_line_sample: Some(sample_first_256_bytes(raw)),
-            positions_widened,
-            slots_expanded: Vec::new(),
             timestamp: SystemTime::now(),
         });
         self.merges_total.fetch_add(1, Ordering::Relaxed);
@@ -782,13 +778,22 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, AuditEventType::TemplateWidened);
         assert_eq!(events[0].template_id, id_in);
-        assert_eq!(events[0].old_version, 1);
-        assert_eq!(events[0].new_version, 2);
-        assert_eq!(events[0].positions_widened, vec![3]);
-        assert_eq!(events[0].old_template, "user <NUM> logged in from <IP>");
-        assert_eq!(events[0].new_template, "user <NUM> logged <*> from <IP>");
+        let AuditEventKind::TemplateWidened {
+            old_version,
+            new_version,
+            positions_widened,
+            old_template,
+            new_template,
+        } = &events[0].kind
+        else {
+            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        };
+        assert_eq!(*old_version, 1);
+        assert_eq!(*new_version, 2);
+        assert_eq!(*positions_widened, vec![3]);
+        assert_eq!(old_template, "user <NUM> logged in from <IP>");
+        assert_eq!(new_template, "user <NUM> logged <*> from <IP>");
     }
 
     #[test]
@@ -850,9 +855,16 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, AuditEventType::TemplateWidened);
-        assert_eq!(events[0].old_version, 1);
-        assert_eq!(events[0].new_version, 2);
+        let AuditEventKind::TemplateWidened {
+            old_version,
+            new_version,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        };
+        assert_eq!(*old_version, 1);
+        assert_eq!(*new_version, 2);
     }
 
     #[test]
@@ -878,12 +890,32 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].old_version, 1);
-        assert_eq!(events[0].new_version, 2);
-        assert_eq!(events[0].positions_widened, vec![4]);
-        assert_eq!(events[1].old_version, 2);
-        assert_eq!(events[1].new_version, 3);
-        assert_eq!(events[1].positions_widened, vec![5]);
+        let AuditEventKind::TemplateWidened {
+            old_version: ov0,
+            new_version: nv0,
+            positions_widened: p0,
+            ..
+        } = &events[0].kind
+        else {
+            panic!(
+                "event 0: expected TemplateWidened, got {:?}",
+                events[0].kind
+            );
+        };
+        assert_eq!((*ov0, *nv0, p0.clone()), (1, 2, vec![4]));
+        let AuditEventKind::TemplateWidened {
+            old_version: ov1,
+            new_version: nv1,
+            positions_widened: p1,
+            ..
+        } = &events[1].kind
+        else {
+            panic!(
+                "event 1: expected TemplateWidened, got {:?}",
+                events[1].kind
+            );
+        };
+        assert_eq!((*ov1, *nv1, p1.clone()), (2, 3, vec![5]));
     }
 
     #[test]
@@ -977,16 +1009,23 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, AuditEventType::TemplateWidened);
-        assert_eq!(
-            events[1].event_type,
-            AuditEventType::TemplateWideningRejectedDegenerate,
+        assert!(
+            matches!(events[0].kind, AuditEventKind::TemplateWidened { .. }),
+            "event 0: expected TemplateWidened, got {:?}",
+            events[0].kind,
         );
-        // Rejection event: versions point at the same number
-        // (no version bump on rejection).
-        assert_eq!(events[1].old_version, events[1].new_version);
-        // The audit payload records the would-be new template.
-        assert_eq!(events[1].new_template, "<*> <*> <*>");
+        // Rejection variant carries no version bump and surfaces
+        // the would-be template the operator was protected from.
+        let AuditEventKind::TemplateWideningRejectedDegenerate {
+            would_be_template, ..
+        } = &events[1].kind
+        else {
+            panic!(
+                "event 1: expected TemplateWideningRejectedDegenerate, got {:?}",
+                events[1].kind,
+            );
+        };
+        assert_eq!(would_be_template, "<*> <*> <*>");
 
         // Leaf state was not mutated by the rejection — still has
         // its post-widening template (1 Fixed at position 0).
@@ -1100,7 +1139,13 @@ mod tests {
         let events = sink.drain();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].template_id, id_a);
-        assert_eq!(events[0].positions_widened, vec![4]);
+        let AuditEventKind::TemplateWidened {
+            positions_widened, ..
+        } = &events[0].kind
+        else {
+            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        };
+        assert_eq!(*positions_widened, vec![4]);
     }
 
     // ---------- new behaviour from PR #28: body fork + structured short-circuit ----------

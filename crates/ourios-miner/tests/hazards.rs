@@ -60,7 +60,7 @@ fn h1_2_lossy_zone_match_retains_body() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h1_3_every_widening_emits_an_audit_event() {
-    use ourios_core::audit::{AuditEventType, SharedAuditSink};
+    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -71,7 +71,7 @@ fn h1_3_every_widening_emits_an_audit_event() {
     // <IP>` shape; sim_seq = 5/6 ≈ 0.833 ≥ 0.7 → widens
     // position 3. The §3.1 invariant requires this widening to
     // emit an audit event naming the old + new templates, the
-    // tenant, the event_type, and a timestamp.
+    // tenant, the kind, and a timestamp.
     let sink = SharedAuditSink::new();
     let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
     let t = TenantId::new("tenant-x");
@@ -89,16 +89,23 @@ fn h1_3_every_widening_emits_an_audit_event() {
     let events = sink.drain();
     assert_eq!(events.len(), 1, "exactly one widening occurred");
     let e = &events[0];
-    assert_eq!(e.event_type, AuditEventType::TemplateWidened);
     assert_eq!(e.tenant_id, t);
-    assert!(!e.old_template.is_empty(), "old_template must be recorded");
-    assert!(!e.new_template.is_empty(), "new_template must be recorded");
+    let AuditEventKind::TemplateWidened {
+        old_template,
+        new_template,
+        ..
+    } = &e.kind
+    else {
+        panic!("expected TemplateWidened, got {:?}", e.kind);
+    };
+    assert!(!old_template.is_empty(), "old_template must be recorded");
+    assert!(!new_template.is_empty(), "new_template must be recorded");
     assert_ne!(
-        e.old_template, e.new_template,
+        old_template, new_template,
         "old and new templates must differ — the event records the change",
     );
     // Timestamp must round-trip as a real wall-clock value; the
-    // event_type field above covers `event_type` per the scenario.
+    // variant tag above covers `event_type` per the scenario.
     assert!(
         e.timestamp <= std::time::SystemTime::now(),
         "timestamp must not be in the future",
@@ -141,7 +148,7 @@ fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
-    use ourios_core::audit::{AuditEventType, SharedAuditSink};
+    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -149,9 +156,9 @@ fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
 
     // Arrange — set up a single leaf at template_version = 1,
     // then trigger one widening. Per RFC §6.4 the audit event
-    // must carry `event_type = template_widened`, the new
-    // wildcard position(s), and the version bump
-    // (old_version = 1, new_version = 2).
+    // must be a `TemplateWidened` carrying the new wildcard
+    // position(s) and the version bump (old_version = 1,
+    // new_version = 2).
     let sink = SharedAuditSink::new();
     let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
     let t = TenantId::new("tenant-x");
@@ -168,15 +175,22 @@ fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
     // Assert
     let events = sink.drain();
     assert_eq!(events.len(), 1);
-    let e = &events[0];
-    assert_eq!(e.event_type, AuditEventType::TemplateWidened);
-    assert_eq!(e.old_version, 1, "leaf was at version 1 before this attach");
+    let AuditEventKind::TemplateWidened {
+        old_version,
+        new_version,
+        positions_widened,
+        ..
+    } = &events[0].kind
+    else {
+        panic!("expected TemplateWidened, got {:?}", events[0].kind);
+    };
+    assert_eq!(*old_version, 1, "leaf was at version 1 before this attach");
     assert_eq!(
-        e.new_version, 2,
+        *new_version, 2,
         "wildcard widening bumps template_version by one",
     );
     assert_eq!(
-        e.positions_widened,
+        *positions_widened,
         vec![3],
         "position 3 (`in` → `<*>`) is the only mismatched fixed position",
     );

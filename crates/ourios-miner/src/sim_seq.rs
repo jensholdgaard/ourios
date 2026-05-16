@@ -22,8 +22,8 @@
 //! and obscures the type-level distinction between
 //! masking-time tags (`<UUID>`, `<NUM>`, ...) and
 //! widening-time wildcards. The `Token::Wildcard` variant is
-//! the unambiguous representation; future widening code will
-//! produce `Vec<Token<'a>>` directly.
+//! the unambiguous representation. [`crate::tree::OwnedToken`]
+//! is the owned counterpart for stored templates.
 
 /// One position in a Drain template: either a fixed string
 /// (matched literally against the candidate line) or a wildcard
@@ -80,6 +80,68 @@ pub fn sim_seq(line: &[&str], template: &[Token<'_>]) -> f32 {
     // (typically a small log-line token count, never close to
     // 2^24); f32 represents every integer in [0, 2^24] exactly,
     // so no precision loss in the division.
+    #[allow(clippy::cast_precision_loss)]
+    let result = (matches as f32) / (n as f32);
+    result
+}
+
+/// Allocation-free [`sim_seq`] variant for templates stored as
+/// [`crate::tree::OwnedToken`].
+///
+/// The Drain candidate-selection step iterates every leaf in a
+/// `(severity, scope, length, prefix)` bucket and computes
+/// `sim_seq(masked_line, leaf.template)` for each. Going through
+/// the [`Token`] view would force a `Vec<Token<'_>>` allocation
+/// per leaf:
+///
+/// ```ignore
+/// let view: Vec<Token<'_>> = leaf.template.iter().map(OwnedToken::as_borrowed).collect();
+/// let s = sim_seq(line, &view);
+/// ```
+///
+/// On the ingest hot path that's per-leaf heap churn that scales
+/// with bucket size. This variant takes `&[OwnedToken]` directly
+/// and walks both sequences in lockstep — same arithmetic, zero
+/// allocation.
+///
+/// The two functions intentionally share assertion shape so the
+/// substitution is mechanical and the equality
+/// `sim_seq_owned(line, template) == sim_seq(line, &borrowed(template))`
+/// holds exactly (a property test in this module pins it).
+///
+/// # Panics
+///
+/// - If `line.len() != template.len()`. Same precondition as
+///   [`sim_seq`].
+/// - If `line.is_empty()`. Same precondition as [`sim_seq`].
+#[must_use]
+pub fn sim_seq_owned(line: &[&str], template: &[crate::tree::OwnedToken]) -> f32 {
+    assert_eq!(
+        line.len(),
+        template.len(),
+        "sim_seq_owned precondition: line and template must be equal length \
+         (got {} vs {})",
+        line.len(),
+        template.len(),
+    );
+    assert!(
+        !line.is_empty(),
+        "sim_seq_owned precondition: empty inputs have no defined similarity (N ≥ 1 per RFC §3.2)",
+    );
+
+    let n = line.len();
+    let mut matches = 0_usize;
+    for i in 0..n {
+        let position_matches = match &template[i] {
+            crate::tree::OwnedToken::Wildcard => true,
+            crate::tree::OwnedToken::Fixed(s) => line[i] == s.as_str(),
+        };
+        if position_matches {
+            matches += 1;
+        }
+    }
+
+    // See [`sim_seq`] for the cast-precision-loss reasoning.
     #[allow(clippy::cast_precision_loss)]
     let result = (matches as f32) / (n as f32);
     result
@@ -281,5 +343,81 @@ mod tests {
 
         // Act + Assert
         let _ = confidence_ratio(sim, threshold);
+    }
+
+    // sim_seq_owned — equivalence with sim_seq via OwnedToken view
+
+    #[test]
+    fn sim_seq_owned_equals_sim_seq_via_borrowed_view() {
+        use crate::tree::OwnedToken;
+
+        // Every variant of (line position vs template position):
+        //   - literal match
+        //   - literal mismatch
+        //   - wildcard (always matches)
+        let line = ["user", "42", "logged", "in", "from"];
+        let owned = [
+            OwnedToken::Fixed("user".to_string()),
+            OwnedToken::Wildcard,
+            OwnedToken::Fixed("logged".to_string()),
+            OwnedToken::Fixed("OUT".to_string()), // mismatch
+            OwnedToken::Wildcard,
+        ];
+        let borrowed: Vec<Token<'_>> = owned.iter().map(OwnedToken::as_borrowed).collect();
+
+        let owned_score = sim_seq_owned(&line, &owned);
+        let borrowed_score = sim_seq(&line, &borrowed);
+
+        assert!(
+            (owned_score - borrowed_score).abs() < f32::EPSILON,
+            "sim_seq_owned must agree with sim_seq via OwnedToken::as_borrowed; \
+             got owned={owned_score} borrowed={borrowed_score}",
+        );
+        // Sanity: 4 matches out of 5 → 0.8.
+        assert!((owned_score - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sim_seq_owned_identical_returns_one() {
+        use crate::tree::OwnedToken;
+        let line = ["user", "42", "logged"];
+        let template = [
+            OwnedToken::Fixed("user".to_string()),
+            OwnedToken::Fixed("42".to_string()),
+            OwnedToken::Fixed("logged".to_string()),
+        ];
+        let r = sim_seq_owned(&line, &template);
+        assert!((r - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sim_seq_owned_all_wildcards_returns_one() {
+        use crate::tree::OwnedToken;
+        let line = ["whatever", "you", "want"];
+        let template = [
+            OwnedToken::Wildcard,
+            OwnedToken::Wildcard,
+            OwnedToken::Wildcard,
+        ];
+        let r = sim_seq_owned(&line, &template);
+        assert!((r - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be equal length")]
+    fn sim_seq_owned_panics_on_length_mismatch() {
+        use crate::tree::OwnedToken;
+        let line = ["a", "b"];
+        let template = [OwnedToken::Fixed("a".to_string())];
+        let _ = sim_seq_owned(&line, &template);
+    }
+
+    #[test]
+    #[should_panic(expected = "N ≥ 1")]
+    fn sim_seq_owned_panics_on_empty_input() {
+        use crate::tree::OwnedToken;
+        let line: [&str; 0] = [];
+        let template: [OwnedToken; 0] = [];
+        let _ = sim_seq_owned(&line, &template);
     }
 }

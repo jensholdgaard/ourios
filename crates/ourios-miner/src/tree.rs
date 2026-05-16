@@ -7,14 +7,12 @@
 //!
 //! # Scope of this module
 //!
-//! Today the tree backs [`crate::cluster::MinerCluster`]'s
-//! per-tenant template store and supports the exact-match attach
-//! path (`sim_seq == 1.0` → reuse leaf; otherwise → new leaf in
-//! the same `(length, prefix)` bucket). The §6.2 step-5 widening
-//! branch and its §3.1 audit-event invariant are not yet in
-//! place — they land in a follow-up PR that turns the exact-match
-//! check into a `sim_seq >= threshold` decision and introduces
-//! [`OwnedToken::Wildcard`] positions into stored templates.
+//! The tree backs [`crate::cluster::MinerCluster`]'s per-tenant
+//! template store. Leaves carry the §6.1 template-key fields
+//! (template tokens, `template_id`, `template_version`,
+//! `severity_number`, `scope_name`); stored templates may contain
+//! [`OwnedToken::Wildcard`] positions introduced by §6.2 step 5
+//! widening.
 //!
 //! # Depth convention
 //!
@@ -70,25 +68,37 @@ impl OwnedToken {
 
 /// One entry in a [`PrefixNode`]'s leaf list.
 ///
-/// Carries the [`OwnedToken`] template, its `template_id`, and the
-/// `(severity_number, scope_name)` half of the §6.1 *Template-key
-/// composition* tuple — without those two fields, two records that
-/// share masked tokens but differ in severity or scope would
-/// silently coalesce, violating H1.4 / H1.5.
+/// Carries the [`OwnedToken`] template, its `template_id`, its
+/// `template_version`, and the `(severity_number, scope_name)`
+/// half of the §6.1 *Template-key composition* tuple — without
+/// those two fields, two records that share masked tokens but
+/// differ in severity or scope would silently coalesce, violating
+/// H1.4 / H1.5.
 ///
-/// The follow-up integration PR will add `version`, `slot_types`,
-/// retained-body counts, and the rest of the §6.1 leaf payload;
-/// they are deliberately absent here so the skeleton stays
-/// reviewable.
+/// `template_version` starts at `1` on fresh-leaf creation and
+/// increments on every widening per RFC 0001 §6.4 (type-expansion
+/// also bumps it once that PR lands). Versioning lives on the leaf
+/// rather than as a sibling map because every widening is decided
+/// in the same scope that mutates the leaf's template — the
+/// version stamp is part of the same invariant. The audit event
+/// records `(old_version, new_version)` from the same bump.
+///
+/// `slot_types` and retained-body counts (the rest of the §6.1
+/// leaf payload) will be added when the type-expansion and
+/// body-retention PRs land.
 #[derive(Debug, Clone)]
 pub struct Leaf {
     pub template: Vec<OwnedToken>,
     /// Cluster-wide unique identifier per RFC 0001 §6.1 — the
     /// `template_id` allocated by [`crate::cluster::MinerCluster`]
-    /// when the leaf was first created. Field name matches RFC
-    /// language so future `template_version`, slot-id, and
-    /// alias-id additions stay disambiguated.
+    /// when the leaf was first created.
     pub template_id: u64,
+    /// Monotonic version stamp per RFC 0001 §6.4. Starts at `1`
+    /// on fresh-leaf creation; the cluster bumps it by one on each
+    /// widening (and on each type-expansion once that variant has
+    /// an emitter) and records the bump in an audit event. Clean
+    /// attaches (no widening) do not bump it.
+    pub template_version: u32,
     /// `LogRecord.severity_number` half of the template key per
     /// RFC 0001 §6.1 *Template-key composition*. `0` =
     /// `UNSPECIFIED` is its own bucket (RFC0001.11), distinct from
@@ -106,9 +116,9 @@ pub struct Leaf {
 /// holds the candidate set at the deepest prefix level reached
 /// by [`Tree::descend_mut`]. By **convention** intermediate nodes
 /// carry an empty `leaves` — the type does not enforce this; the
-/// field is `pub` so the upcoming integration PR can push into
-/// the node `descend_mut` returns. Pushing into an intermediate
-/// node would be a caller bug.
+/// field is `pub` so [`crate::cluster::MinerCluster::ingest`] can
+/// push into the node `descend_mut` returns. Pushing into an
+/// intermediate node would be a caller bug.
 #[derive(Debug, Default)]
 pub struct PrefixNode {
     pub children: HashMap<String, PrefixNode>,
@@ -124,8 +134,9 @@ pub struct LengthNode {
     pub root: PrefixNode,
 }
 
-/// Root of the Drain prefix tree. One per tenant in the eventual
-/// integration; this module stays tenant-agnostic.
+/// Root of the Drain prefix tree. One per tenant via
+/// [`crate::cluster::MinerCluster`]; this module stays
+/// tenant-agnostic.
 #[derive(Debug, Default)]
 pub struct Tree {
     pub by_length: HashMap<usize, LengthNode>,
@@ -147,11 +158,11 @@ impl Tree {
     /// `masked`, creating any missing nodes along the way.
     ///
     /// Returned node's `leaves` is the candidate set the caller
-    /// will run [`crate::sim_seq::sim_seq`] over (in the
-    /// integration PR). When `masked.len() < prefix_depth` the
-    /// walk stops early — the entire line is consumed as path,
-    /// so short lines bottom out at a **shallower** prefix level
-    /// than long ones. This matches the Drain paper.
+    /// runs [`crate::sim_seq::sim_seq`] over. When
+    /// `masked.len() < prefix_depth` the walk stops early — the
+    /// entire line is consumed as path, so short lines bottom
+    /// out at a **shallower** prefix level than long ones. This
+    /// matches the Drain paper.
     ///
     /// # Panics
     ///
@@ -181,9 +192,9 @@ impl Tree {
     /// node in the path is missing.
     ///
     /// Used by [`crate::cluster::MinerCluster::ingest`] for the
-    /// existence-check phase — looking up an exact match before
-    /// committing the `template_id` allocation that
-    /// [`Tree::descend_mut`] would entail.
+    /// candidate-selection phase — finding the best leaf to attach
+    /// to (or widen) before committing the `template_id` allocation
+    /// that [`Tree::descend_mut`] would entail.
     ///
     /// # Panics
     ///
@@ -350,6 +361,7 @@ mod tests {
             parent.leaves.push(Leaf {
                 template: [OwnedToken::Fixed("marker".to_string())].into(),
                 template_id: 99,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -515,6 +527,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 7,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -570,6 +583,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 1,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -584,6 +598,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 2,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -595,6 +610,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 3,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -620,6 +636,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 10,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -634,6 +651,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 20,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });

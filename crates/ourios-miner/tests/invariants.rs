@@ -131,13 +131,13 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     // shapes so the cross-pollination question is testable. A's
     // lines exercise the "user <NUM> logged in" shape; B's
     // lines exercise the "GET <PATH> <NUM>" shape (the path
-    // differs between B's two lines so each B line is its own
-    // template under exact-match templating, but neither
-    // matches anything in A's set). Both tenants use default
-    // severity (UNSPECIFIED) and scope (None), so the §6.1
-    // template-key tuple's discriminator is constant — what
-    // varies (and what the cross-pollination question pivots on)
-    // is only the masked tokens.
+    // differs between B's two lines so each B line lands in its
+    // own template — sim 2/3 < 0.7 keeps them distinct rather
+    // than widening — but neither matches anything in A's set).
+    // Both tenants use default severity (UNSPECIFIED) and scope
+    // (None), so the §6.1 template-key tuple's discriminator is
+    // constant — what varies (and what the cross-pollination
+    // question pivots on) is only the masked tokens.
     let mut cluster = MinerCluster::new(MinerConfig::default());
     let a = TenantId::new("tenant-a");
     let b = TenantId::new("tenant-b");
@@ -167,14 +167,24 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     let a_templates = cluster.templates_for(&a);
     let b_templates = cluster.templates_for(&b);
 
-    let a_token_set: std::collections::HashSet<&str> = a_templates
-        .iter()
-        .flat_map(|(t, _)| t.iter().map(String::as_str))
-        .collect();
-    let b_token_set: std::collections::HashSet<&str> = b_templates
-        .iter()
-        .flat_map(|(t, _)| t.iter().map(String::as_str))
-        .collect();
+    // Extract the literal-token side of each template; the
+    // cross-pollination question is about Fixed tokens (Wildcard
+    // positions have no token string to compare). `templates_for`
+    // returns `Vec<(Vec<OwnedToken>, u64)>` post-widening — the
+    // wildcard distinction stays typed end-to-end.
+    let literal_tokens = |templates: &[(Vec<ourios_miner::tree::OwnedToken>, u64)]| {
+        templates
+            .iter()
+            .flat_map(|(t, _)| {
+                t.iter().filter_map(|tok| match tok {
+                    ourios_miner::tree::OwnedToken::Fixed(s) => Some(s.clone()),
+                    ourios_miner::tree::OwnedToken::Wildcard => None,
+                })
+            })
+            .collect::<std::collections::HashSet<String>>()
+    };
+    let a_token_set = literal_tokens(&a_templates);
+    let b_token_set = literal_tokens(&b_templates);
 
     assert!(
         a_token_set.contains("user") && a_token_set.contains("logged"),

@@ -12,9 +12,40 @@
 /// Scenario H1.1 — Semantically distinct templates do not silently merge.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h1_1_login_and_logout_remain_distinct_at_default_threshold() {
-    todo!("RFC 0001 §6.4");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — the canonical `hazards.md` H1 horror: two
+    // length-3 lines differing at one position. After masking
+    // neither token gets a tag (no NUM/UUID/IP match) so the
+    // templates are exactly `["user", "logged", "in"]` vs
+    // `["user", "logged", "out"]`. sim_seq = 2/3 ≈ 0.667,
+    // strictly below the default 0.7 threshold, so the §6.2
+    // step-4 candidate selection falls through to fresh-leaf
+    // creation — no widening, no audit, no silent merge.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let id_in = cluster.ingest(&make("user logged in"));
+    let id_out = cluster.ingest(&make("user logged out"));
+
+    // Assert — distinct ids, two templates, zero widenings.
+    assert_ne!(
+        id_in, id_out,
+        "the two semantically distinct lines must not silently merge \
+         at the default threshold",
+    );
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.merges_total(), 0);
 }
 
 /// Scenario H1.2 — Lossy-zone match retains body.
@@ -28,9 +59,66 @@ fn h1_2_lossy_zone_match_retains_body() {
 /// Scenario H1.3 — Every widening emits an audit event.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h1_3_every_widening_emits_an_audit_event() {
-    todo!("RFC 0001 §6.4");
+    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
+    use ourios_core::clock::TestClock;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use std::time::{Duration, SystemTime};
+
+    // Arrange — two length-6 lines differing at one position.
+    // After masking they share the `user <NUM> logged * from
+    // <IP>` shape; sim_seq = 5/6 ≈ 0.833 ≥ 0.7 → widens
+    // position 3. The §3.1 invariant requires this widening to
+    // emit an audit event naming the old + new templates, the
+    // tenant, the kind, and a timestamp.
+    //
+    // A `TestClock` pins the timestamp deterministically so the
+    // assertion is `==` rather than `<= SystemTime::now()`, which
+    // would flake under NTP step / leap seconds / VM pause.
+    let pinned = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let sink = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()))
+        .with_clock(Box::new(TestClock::new(pinned)));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let _ = cluster.ingest(&make("user 42 logged in from 10.0.0.1"));
+    let _ = cluster.ingest(&make("user 42 logged out from 10.0.0.1"));
+
+    // Assert — exactly one audit event, schema fields populated.
+    let events = sink.drain();
+    assert_eq!(events.len(), 1, "exactly one widening occurred");
+    let e = &events[0];
+    assert_eq!(e.tenant_id, t);
+    let AuditEventKind::TemplateWidened {
+        old_template,
+        new_template,
+        ..
+    } = &e.kind
+    else {
+        panic!("expected TemplateWidened, got {:?}", e.kind);
+    };
+    assert!(!old_template.is_empty(), "old_template must be recorded");
+    assert!(!new_template.is_empty(), "new_template must be recorded");
+    assert_ne!(
+        old_template, new_template,
+        "old and new templates must differ — the event records the change",
+    );
+    // The `event_type` clause from the scenario is satisfied by
+    // the `TemplateWidened` variant match above; the timestamp
+    // clause is satisfied by the `TestClock`-pinned value.
+    assert_eq!(
+        e.timestamp, pinned,
+        "timestamp must be the value the cluster's clock returned at emit time",
+    );
 }
 
 /// Scenario H1.4 — `severity_number` is part of the template key (no INFO/ERROR silent merge).
@@ -68,9 +156,53 @@ fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
 /// Scenario H5.1 — Wildcard widening increments `template_version` and emits `template_widened`.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
-    todo!("RFC 0001 §6.4");
+    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — set up a single leaf at template_version = 1,
+    // then trigger one widening. Per RFC §6.4 the audit event
+    // must be a `TemplateWidened` carrying the new wildcard
+    // position(s) and the version bump (old_version = 1,
+    // new_version = 2).
+    let sink = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let _ = cluster.ingest(&make("user 42 logged in from 10.0.0.1"));
+    let _ = cluster.ingest(&make("user 42 logged out from 10.0.0.1"));
+
+    // Assert
+    let events = sink.drain();
+    assert_eq!(events.len(), 1);
+    let AuditEventKind::TemplateWidened {
+        old_version,
+        new_version,
+        positions_widened,
+        ..
+    } = &events[0].kind
+    else {
+        panic!("expected TemplateWidened, got {:?}", events[0].kind);
+    };
+    assert_eq!(*old_version, 1, "leaf was at version 1 before this attach");
+    assert_eq!(
+        *new_version, 2,
+        "wildcard widening bumps template_version by one",
+    );
+    assert_eq!(
+        *positions_widened,
+        vec![3],
+        "position 3 (`in` → `<*>`) is the only mismatched fixed position",
+    );
 }
 
 /// Scenario H5.2 — Type expansion increments `template_version` and emits `template_type_expanded`.

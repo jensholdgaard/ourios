@@ -540,8 +540,8 @@ impl MinerCluster {
                         raw,
                         &masked_strs,
                         c,
-                        &separators,
-                        &params,
+                        separators,
+                        params,
                     ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
@@ -688,9 +688,17 @@ impl MinerCluster {
         raw: &str,
         masked_strs: &[&str],
         candidate: Candidate,
-        separators: &[String],
-        params: &[Param],
+        separators: Vec<String>,
+        params: Vec<Param>,
     ) -> u64 {
+        // Ownership rationale: each of the three exit paths
+        // (clean reuse, degenerate rejection, widening) emits
+        // **one** record and never reuses `separators` / `params`
+        // after that emit. Taking the vectors by value lets each
+        // branch move them straight into the record without a
+        // `.to_vec()` clone — one alloc per ingest instead of
+        // two on the clean / widen hot paths.
+
         // Phase 2 — re-descend mutably to the chosen leaf.
         let state = self
             .tenants
@@ -709,8 +717,8 @@ impl MinerCluster {
             let mut rec = Self::record_envelope(record, BodyKind::String);
             rec.template_id = template_id;
             rec.template_version = template_version;
-            rec.separators = separators.to_vec();
-            rec.params = params.to_vec();
+            rec.separators = separators;
+            rec.params = params;
             rec.confidence = 1.0;
             self.emit_record(rec);
             return template_id;
@@ -748,8 +756,8 @@ impl MinerCluster {
             // audit event — §6.4 treats degenerate widening as a
             // parse failure that retains body.
             let mut rec = Self::record_envelope(record, BodyKind::String);
-            rec.separators = separators.to_vec();
-            rec.params = params.to_vec();
+            rec.separators = separators;
+            rec.params = params;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
             self.emit_record(rec);
@@ -794,8 +802,8 @@ impl MinerCluster {
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.template_id = template_id;
         rec.template_version = new_version;
-        rec.separators = separators.to_vec();
-        rec.params = params.to_vec();
+        rec.separators = separators;
+        rec.params = params;
         rec.confidence = 1.0;
         self.emit_record(rec);
 

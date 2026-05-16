@@ -1,10 +1,13 @@
 //! Mined-record schema and the sink boundary.
 //!
 //! Every line the miner ingests produces exactly one
-//! [`MinedRecord`] (or none, for the `Body::None` corner). The
-//! record is the §6.1 row that ends up in Parquet — schema-stable,
-//! self-contained, addressable by `(tenant_id, template_id,
-//! template_version)`.
+//! [`MinedRecord`] — including the `Body::None` case, which
+//! emits a `BodyKind::Absent` record carrying the template-id
+//! sentinel and `lossy_flag = true` (no tokenize ran, no
+//! template was allocated, reconstruction is not possible).
+//! The record is the §6.1 row that ends up in Parquet —
+//! schema-stable, self-contained, addressable by
+//! `(tenant_id, template_id, template_version)`.
 //!
 //! Producers (today: `ourios-miner`) hand records to an
 //! [`RecordSink`]. Consumers (eventually: `ourios-parquet` writer,

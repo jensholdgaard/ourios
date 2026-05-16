@@ -126,9 +126,78 @@ fn invariant_3_2_2_param_limit_above_1_kib_rejected_at_startup() {
 /// Scenario §3.3.1 — Separators array captured on every successful tokenization.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_3_1_separators_captured_on_every_tokenization() {
-    todo!("RFC 0001 §6.6");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::{BodyKind, SharedRecordSink};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — a mixed batch covering the §6.6 "capture, always"
+    // contract on every `BodyKind::String` exit:
+    //   L1 = "user 42 logged in"           — clean fresh leaf
+    //   L2 = "user 17 logged in"           — clean reuse (same shape)
+    //   L3 = "user 42 logged out from 10.0.0.1" — new bucket (length 6)
+    //   L4 = "user 42 logged out from 10.0.0.2" — clean reuse
+    //   L5 = ""                            — empty / parse-failure path
+    //   L6 = "  \t  "                      — whitespace-only / parse-failure
+    let sink = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    let lines = [
+        "user 42 logged in",
+        "user 17 logged in",
+        "user 42 logged out from 10.0.0.1",
+        "user 42 logged out from 10.0.0.2",
+        "",
+        "  \t  ",
+    ];
+    let mut expected_token_counts = Vec::new();
+    for line in lines {
+        // ourios_miner::tokenize is the source of truth for how
+        // many tokens a line should yield; we capture the count
+        // here so the assertion below can compare against it
+        // independently of the cluster's own bookkeeping.
+        let r = ourios_miner::tokenize::tokenize(line);
+        expected_token_counts.push(r.tokens.len());
+        cluster.ingest(&make(line));
+    }
+
+    let records = sink.drain();
+    assert_eq!(
+        records.len(),
+        lines.len(),
+        "one record per ingested line on every `BodyKind::String` path",
+    );
+
+    // Act + Assert — for every emitted `BodyKind::String` record,
+    // the §6.6 capture invariant holds: `separators.len()
+    // == tokens.len() + 1`. Empty-input rows still satisfy this
+    // (tokens.len() = 0 → separators.len() = 1).
+    for (idx, (rec, expected_tokens)) in
+        records.iter().zip(expected_token_counts.iter()).enumerate()
+    {
+        assert_eq!(
+            rec.body_kind,
+            BodyKind::String,
+            "record {idx} should carry BodyKind::String",
+        );
+        assert_eq!(
+            rec.separators.len(),
+            expected_tokens + 1,
+            "record {idx}: separators.len() must equal tokens.len() + 1 \
+             (got separators={}, expected tokens+1={})",
+            rec.separators.len(),
+            expected_tokens + 1,
+        );
+    }
 }
 
 /// Scenario §3.5.1 — Snapshot format carries a leading version byte.

@@ -69,6 +69,7 @@ use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::confidence::ConfidenceZone;
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
+use ourios_core::record::{BodyKind, MinedRecord, NoOpRecordSink, Param, RecordSink};
 use ourios_core::tenant::TenantId;
 
 use crate::mask::mask;
@@ -121,6 +122,11 @@ pub struct MinerCluster {
     // the trait is `Send` so the cluster stays moveable across
     // threads.
     audit_sink: Box<dyn AuditSink>,
+    // Mined-record sink per RFC §6.1. Same shape as `audit_sink`;
+    // the Parquet writer (post-`ourios-parquet`) drops in by
+    // swapping the impl. Trait-from-day-one — the second
+    // consumer is a named planned roadmap item.
+    record_sink: Box<dyn RecordSink>,
     // §6.4 counter: structural-widening events increment this;
     // rejection events do not. Today only `TemplateWidened`
     // emits; `TemplateTypeExpanded` will also increment once the
@@ -207,13 +213,14 @@ impl TenantState {
 }
 
 impl MinerCluster {
-    /// Build an empty cluster with a [`NoOpAuditSink`] (events
-    /// are dropped) and a [`SystemClock`] (host wall clock).
-    /// Production default — when [`ourios-wal`] lands the WAL
-    /// sink replaces the no-op via [`Self::with_audit_sink`].
-    /// Tests that need to inspect audit emissions use
-    /// [`Self::with_audit_sink`] with a
-    /// [`ourios_core::audit::SharedAuditSink`].
+    /// Build an empty cluster with no-op sinks for both audit
+    /// events ([`NoOpAuditSink`]) and mined records
+    /// ([`NoOpRecordSink`]) and a [`SystemClock`] (host wall
+    /// clock). Production default — when `ourios-wal` and
+    /// `ourios-parquet` land they replace the no-ops via
+    /// [`Self::with_audit_sink`] / [`Self::with_record_sink`].
+    /// Tests that need to inspect emissions opt in via the
+    /// matching `Shared*Sink` types from `ourios-core`.
     #[must_use]
     pub fn new(config: MinerConfig) -> Self {
         Self::with_audit_sink(config, Box::new(NoOpAuditSink::new()))
@@ -234,12 +241,24 @@ impl MinerCluster {
             // sentinel.
             next_template_id: 1,
             audit_sink: sink,
+            record_sink: Box::new(NoOpRecordSink::new()),
             merges_total: AtomicU64::new(0),
             parse_failures_total: AtomicU64::new(0),
             body_retentions_total: AtomicU64::new(0),
             prefix_depth: DEFAULT_PREFIX_DEPTH,
             clock: Box::new(SystemClock::new()),
         }
+    }
+
+    /// Set the mined-record sink. Mirrors [`Self::with_audit_sink`].
+    /// Production builds replace the default [`NoOpRecordSink`]
+    /// with the WAL/Parquet-backed sink once that crate lands;
+    /// tests use a [`ourios_core::record::SharedRecordSink`] for
+    /// observable emissions.
+    #[must_use]
+    pub fn with_record_sink(mut self, sink: Box<dyn RecordSink>) -> Self {
+        self.record_sink = sink;
+        self
     }
 
     /// Set the Drain prefix-tree depth used by this cluster.
@@ -335,6 +354,64 @@ impl MinerCluster {
         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Build the OTLP-envelope half of a `MinedRecord` from the
+    /// incoming `OtlpLogRecord`. The mining-output fields
+    /// (`template_id`, `template_version`, `params`,
+    /// `separators`, `body`, `confidence`, `lossy_flag`) are left
+    /// at their zero / sentinel defaults; the calling site
+    /// customises before calling [`Self::emit_record`].
+    fn record_envelope(record: &OtlpLogRecord, body_kind: BodyKind) -> MinedRecord {
+        MinedRecord {
+            tenant_id: record.tenant_id.clone(),
+            template_id: NO_TEMPLATE,
+            template_version: 0,
+            severity_number: record.severity_number,
+            scope_name: record.scope_name.clone(),
+            time_unix_nano: record.time_unix_nano,
+            body_kind,
+            params: Vec::new(),
+            separators: Vec::new(),
+            body: None,
+            confidence: 0.0,
+            lossy_flag: false,
+        }
+    }
+
+    /// Hand one [`MinedRecord`] to the record sink. Centralised
+    /// so a future "decorate every record with X" step has one
+    /// site to change.
+    fn emit_record(&mut self, record: MinedRecord) {
+        self.record_sink.emit(record);
+    }
+}
+
+/// Free helper: clone tokenize's borrowed-from-input separators
+/// into the `Vec<String>` shape `MinedRecord::separators`
+/// requires. RFC §6.6 "capture, always": the order and length
+/// invariants (`separators.len() == tokens.len() + 1` on
+/// `BodyKind::String`) are upheld by `tokenize` itself; this
+/// just owns the bytes.
+fn separators_to_owned(separators: &[&str]) -> Vec<String> {
+    separators.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// Free helper: lift `mask`'s typed-params output into the
+/// `Vec<Param>` shape `MinedRecord::params` carries. PR-A
+/// alignment: this is "one entry per masked position, in token
+/// order"; PR-B reconciles with §6.1's "one entry per template
+/// `<*>` slot" once `reconstruct()` lands and the alignment
+/// becomes load-bearing.
+fn params_from_mask(typed_params: &[crate::mask::TypedParam<'_>]) -> Vec<Param> {
+    typed_params
+        .iter()
+        .map(|p| Param {
+            type_tag: p.type_tag,
+            value: p.value.to_string(),
+        })
+        .collect()
+}
+
+impl MinerCluster {
     /// Ingest a structured OTLP log record. Returns the
     /// `template_id` allocated (or reused) for the record's
     /// §6.1 *Template-key composition* tuple, or [`NO_TEMPLATE`]
@@ -363,7 +440,18 @@ impl MinerCluster {
     /// per-tenant store.
     pub fn ingest(&mut self, record: &OtlpLogRecord) -> u64 {
         match &record.body {
-            None => NO_TEMPLATE,
+            None => {
+                // The wire delivered no body. Emit a single
+                // record with `BodyKind::Absent` and the
+                // template-id sentinel; tokenize/mask didn't
+                // run, so there's no separator / param info to
+                // carry. `lossy_flag = true` because there is no
+                // template, so reconstruction is not possible.
+                let mut rec = Self::record_envelope(record, BodyKind::Absent);
+                rec.lossy_flag = true;
+                self.emit_record(rec);
+                NO_TEMPLATE
+            }
             Some(Body::String(raw)) => self.ingest_string(record, raw),
             Some(Body::Structured(_)) => self.ingest_structured(record),
         }
@@ -373,13 +461,22 @@ impl MinerCluster {
     fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
         let tokenized = tokenize(raw);
         let masked = mask(&tokenized.tokens);
+        // Pre-compute the owned forms once. Every emit path
+        // reads these.
+        let separators = separators_to_owned(&tokenized.separators);
+        let params = params_from_mask(&masked.typed_params);
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
 
         if masked_strs.is_empty() {
             // Empty / whitespace-only input is a §6.2 step 1
-            // parse failure (the RFC's "emit a parse-failure
-            // record" path). Both counters bump: body retention
-            // applies even when the body is itself empty.
+            // parse failure. Tokenize still produced one
+            // separator entry covering the entire input
+            // (`tokens.len() + 1 == 1`).
+            let mut rec = Self::record_envelope(record, BodyKind::String);
+            rec.separators = separators;
+            rec.body = Some(raw.to_string());
+            rec.lossy_flag = true;
+            self.emit_record(rec);
             self.record_parse_failure();
             return NO_TEMPLATE;
         }
@@ -394,6 +491,12 @@ impl MinerCluster {
         // max-line-bytes" parse-failure path. Retain body per
         // §6.3.
         if masked_strs.len() > u16::MAX as usize {
+            let mut rec = Self::record_envelope(record, BodyKind::String);
+            rec.separators = separators;
+            rec.params = params;
+            rec.body = Some(raw.to_string());
+            rec.lossy_flag = true;
+            self.emit_record(rec);
             self.record_parse_failure();
             return NO_TEMPLATE;
         }
@@ -414,29 +517,64 @@ impl MinerCluster {
             // by definition: there was no weaker match to drop
             // into the lossy zone against, and no template to
             // declare a parse failure against.
-            None => self.create_new_leaf(record, &masked_strs),
+            None => {
+                let new_id = self.create_new_leaf(record, &masked_strs);
+                let mut rec = Self::record_envelope(record, BodyKind::String);
+                rec.template_id = new_id;
+                rec.template_version = 1;
+                rec.separators = separators;
+                rec.params = params;
+                rec.confidence = 1.0;
+                self.emit_record(rec);
+                new_id
+            }
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
                     // Clean: attach to candidate, optionally
                     // widening. RFC §6.2 step 5. No body
-                    // retention.
-                    ConfidenceZone::Clean => {
-                        self.attach_and_maybe_widen(record, raw, &masked_strs, c)
-                    }
+                    // retention. The helper emits its own
+                    // record (one of: clean-reuse, widening, or
+                    // degenerate-rejection).
+                    ConfidenceZone::Clean => self.attach_and_maybe_widen(
+                        record,
+                        raw,
+                        &masked_strs,
+                        c,
+                        &separators,
+                        &params,
+                    ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
                     // 5b). Body retained; no audit event
-                    // (no widening happened). Body retention
-                    // is counted here because parse-failure
-                    // already covers its own body-retention
-                    // bump via `record_parse_failure`.
+                    // (no widening happened). The retention
+                    // counter bumps here; `record_parse_failure`
+                    // covers the parse-failure-zone path
+                    // separately.
                     ConfidenceZone::Lossy => {
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
-                        self.create_new_leaf(record, &masked_strs)
+                        let new_id = self.create_new_leaf(record, &masked_strs);
+                        let mut rec = Self::record_envelope(record, BodyKind::String);
+                        rec.template_id = new_id;
+                        rec.template_version = 1;
+                        rec.separators = separators;
+                        rec.params = params;
+                        rec.confidence = c.similarity / threshold;
+                        rec.body = Some(raw.to_string());
+                        // `lossy_flag` stays false — §6.6: the
+                        // §6.3 lossy zone is "body retained,
+                        // reconstruction expected to match".
+                        self.emit_record(rec);
+                        new_id
                     }
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
                     ConfidenceZone::ParseFailure => {
+                        let mut rec = Self::record_envelope(record, BodyKind::String);
+                        rec.separators = separators;
+                        rec.params = params;
+                        rec.body = Some(raw.to_string());
+                        rec.lossy_flag = true;
+                        self.emit_record(rec);
                         self.record_parse_failure();
                         NO_TEMPLATE
                     }
@@ -550,6 +688,8 @@ impl MinerCluster {
         raw: &str,
         masked_strs: &[&str],
         candidate: Candidate,
+        separators: &[String],
+        params: &[Param],
     ) -> u64 {
         // Phase 2 — re-descend mutably to the chosen leaf.
         let state = self
@@ -564,7 +704,16 @@ impl MinerCluster {
         if positions_widened.is_empty() {
             // Clean attach — no Fixed position mismatched. Reuse
             // the leaf as-is; no version bump, no audit event.
-            return leaf.template_id;
+            let template_id = leaf.template_id;
+            let template_version = leaf.template_version;
+            let mut rec = Self::record_envelope(record, BodyKind::String);
+            rec.template_id = template_id;
+            rec.template_version = template_version;
+            rec.separators = separators.to_vec();
+            rec.params = params.to_vec();
+            rec.confidence = 1.0;
+            self.emit_record(rec);
+            return template_id;
         }
 
         // Degenerate guard (§6.4). Check *before* mutating: if the
@@ -595,8 +744,15 @@ impl MinerCluster {
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
                 timestamp: self.clock.now(),
             });
-            // §6.4: degenerate widening is treated as a parse
-            // failure that retains body.
+            // Emit a parse-failure data record alongside the
+            // audit event — §6.4 treats degenerate widening as a
+            // parse failure that retains body.
+            let mut rec = Self::record_envelope(record, BodyKind::String);
+            rec.separators = separators.to_vec();
+            rec.params = params.to_vec();
+            rec.body = Some(raw.to_string());
+            rec.lossy_flag = true;
+            self.emit_record(rec);
             self.record_parse_failure();
             return NO_TEMPLATE;
         }
@@ -630,6 +786,19 @@ impl MinerCluster {
             timestamp: self.clock.now(),
         });
         self.merges_total.fetch_add(1, Ordering::Relaxed);
+
+        // Emit the widening data record. PR-A carries the
+        // mask-emit params verbatim; reconciliation with the §6.1
+        // "one entry per template `<*>` slot" alignment lands
+        // with `reconstruct()` in the next PR.
+        let mut rec = Self::record_envelope(record, BodyKind::String);
+        rec.template_id = template_id;
+        rec.template_version = new_version;
+        rec.separators = separators.to_vec();
+        rec.params = params.to_vec();
+        rec.confidence = 1.0;
+        self.emit_record(rec);
+
         template_id
     }
 
@@ -645,16 +814,33 @@ impl MinerCluster {
             .tenants
             .entry(record.tenant_id.clone())
             .or_insert_with(TenantState::new);
-        if let Some(&existing_id) = state.structured_templates.get(&key) {
-            return existing_id;
-        }
-        let new_id = self.next_template_id;
-        self.next_template_id += 1;
-        state.structured_templates.insert(key, new_id);
-        // Same cache invariant as create_new_leaf: one fresh
-        // allocation, one cache increment.
-        state.template_count += 1;
-        new_id
+        let template_id = if let Some(&existing_id) = state.structured_templates.get(&key) {
+            existing_id
+        } else {
+            let new_id = self.next_template_id;
+            self.next_template_id += 1;
+            state.structured_templates.insert(key, new_id);
+            // Same cache invariant as create_new_leaf: one fresh
+            // allocation, one cache increment.
+            state.template_count += 1;
+            new_id
+        };
+
+        // Emit a data record. Structured records carry no
+        // separators or params — reconstruction goes via the
+        // canonicalised-JSON `body` field (per §6.2 step 0); the
+        // canonicalisation itself is deferred to the §6.6
+        // follow-up that adds `reconstruct()`. PR-A emits the
+        // record with `body = None` and a placeholder
+        // `confidence = 1.0` (sentinel — no Drain comparison
+        // happens in the structured branch).
+        let mut rec = Self::record_envelope(record, BodyKind::Structured);
+        rec.template_id = template_id;
+        rec.template_version = 1;
+        rec.confidence = 1.0;
+        self.emit_record(rec);
+
+        template_id
     }
 
     /// Number of distinct templates this tenant has accumulated
@@ -804,6 +990,7 @@ mod tests {
     use super::*;
     use ourios_core::audit::SharedAuditSink;
     use ourios_core::otlp::{AnyValue, any_value::Value as AvValue};
+    use ourios_core::record::SharedRecordSink;
 
     /// Test helper — a `Body::String` record for `tenant` carrying
     /// `text` and default severity (UNSPECIFIED) / scope (None).
@@ -1642,5 +1829,222 @@ mod tests {
         assert_eq!(cluster.template_count(&t), 1);
         assert_eq!(cluster.parse_failures_total(), 1);
         assert_eq!(cluster.body_retentions_total(), 1);
+    }
+
+    // ---------- record emission (RFC §6.1 / §6.6 scaffolding) ----------
+
+    /// Test helper — a cluster whose audit and record sinks are
+    /// both `SharedAuditSink`/`SharedRecordSink` clones so tests
+    /// can inspect what was emitted on both streams.
+    fn cluster_with_observable_sinks() -> (MinerCluster, SharedAuditSink, SharedRecordSink) {
+        let audit = SharedAuditSink::new();
+        let records = SharedRecordSink::new();
+        let cluster =
+            MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+                .with_record_sink(Box::new(records.clone()));
+        (cluster, audit, records)
+    }
+
+    #[test]
+    fn body_none_emits_absent_record_with_no_template() {
+        let records = SharedRecordSink::new();
+        let mut cluster =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let t = TenantId::new("tenant-x");
+
+        let r = OtlpLogRecord {
+            tenant_id: t.clone(),
+            body: None,
+            ..Default::default()
+        };
+        let id = cluster.ingest(&r);
+
+        assert_eq!(id, NO_TEMPLATE);
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 1);
+        let rec = &emitted[0];
+        assert_eq!(rec.tenant_id, t);
+        assert_eq!(rec.template_id, NO_TEMPLATE);
+        assert_eq!(rec.body_kind, BodyKind::Absent);
+        assert!(rec.lossy_flag, "Body::None records are lossy (no template)");
+        assert!(rec.separators.is_empty());
+        assert!(rec.params.is_empty());
+        assert!(rec.body.is_none());
+    }
+
+    #[test]
+    fn clean_fresh_leaf_emits_record_with_separators_and_no_body() {
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 1);
+        let rec = &emitted[0];
+        assert_eq!(rec.body_kind, BodyKind::String);
+        assert_ne!(rec.template_id, NO_TEMPLATE);
+        assert_eq!(rec.template_version, 1);
+        // tokenize("user 42 logged in") yields 4 tokens → 5
+        // separators per the §6.6 capture invariant.
+        assert_eq!(rec.separators.len(), 5);
+        // Clean attaches do not retain body and are not lossy.
+        assert!(rec.body.is_none());
+        assert!(!rec.lossy_flag);
+        // sim_seq against a fresh leaf is 1.0 by definition;
+        // confidence = sim / threshold = 1.0 / 0.7 ≈ 1.428, but
+        // the cluster reports the sentinel 1.0 for clean attaches.
+        assert!((rec.confidence - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn clean_reuse_emits_record_at_same_template_id_and_version() {
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+
+        let id1 = cluster.ingest(&string_record(&t, "user 42 logged in"));
+        let id2 = cluster.ingest(&string_record(&t, "user 17 logged in"));
+
+        assert_eq!(id1, id2, "reuse same template");
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].template_id, id1);
+        assert_eq!(emitted[1].template_id, id1);
+        assert_eq!(emitted[0].template_version, 1);
+        assert_eq!(
+            emitted[1].template_version, 1,
+            "clean reuse must not bump the version",
+        );
+    }
+
+    #[test]
+    fn widening_emits_record_with_bumped_version() {
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged out from 10.0.0.1"));
+
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].template_version, 1, "L1 at fresh-leaf version");
+        assert_eq!(
+            emitted[1].template_version, 2,
+            "L2's widening bumps version on the same template_id",
+        );
+        assert_eq!(
+            emitted[0].template_id, emitted[1].template_id,
+            "widening attaches to the same template_id",
+        );
+    }
+
+    #[test]
+    fn lossy_attach_emits_record_with_retained_body_and_lossy_flag_false() {
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+
+        // L2 = sim 3/5 = 0.6 ∈ [0.4, 0.7) → lossy zone.
+        let _ = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+        let l2_raw = "alpha beta gamma rho sigma";
+        let _ = cluster.ingest(&string_record(&t, l2_raw));
+
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 2);
+        let lossy = &emitted[1];
+        assert_eq!(lossy.body.as_deref(), Some(l2_raw));
+        // §6.6: the lossy zone retains body but `lossy_flag`
+        // stays false — reconstruction is expected to match.
+        assert!(!lossy.lossy_flag);
+        // confidence = sim / threshold = 0.6 / 0.7.
+        let expected_conf = 0.6_f32 / 0.7_f32;
+        assert!(
+            (lossy.confidence - expected_conf).abs() < 1e-4,
+            "expected confidence ≈ {expected_conf}, got {}",
+            lossy.confidence,
+        );
+        // Lossy attach creates a fresh leaf, so version is 1.
+        assert_eq!(lossy.template_version, 1);
+        assert_ne!(lossy.template_id, NO_TEMPLATE);
+    }
+
+    #[test]
+    fn parse_failure_zone_emits_record_with_lossy_flag_and_no_template() {
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+
+        // sim 2/6 ≈ 0.333 < 0.4 floor → parse-failure zone.
+        let _ = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
+        let l2_raw = "alpha beta phi rho sigma omega";
+        let _ = cluster.ingest(&string_record(&t, l2_raw));
+
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 2);
+        let pf = &emitted[1];
+        assert_eq!(pf.template_id, NO_TEMPLATE);
+        assert_eq!(pf.template_version, 0);
+        assert!(pf.lossy_flag, "parse-failure records are lossy");
+        assert_eq!(pf.body.as_deref(), Some(l2_raw));
+        assert!(
+            pf.confidence.abs() < f32::EPSILON,
+            "parse-failure confidence is the 0.0 sentinel",
+        );
+    }
+
+    #[test]
+    fn empty_input_emits_parse_failure_record() {
+        let records = SharedRecordSink::new();
+        let mut cluster =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, ""));
+
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 1);
+        let rec = &emitted[0];
+        assert_eq!(rec.template_id, NO_TEMPLATE);
+        assert!(rec.lossy_flag);
+        assert_eq!(rec.body.as_deref(), Some(""));
+        // §6.6 capture invariant on the degenerate case: empty
+        // input still has separators.len() == tokens.len() + 1.
+        assert_eq!(rec.separators.len(), 1);
+    }
+
+    #[test]
+    fn structured_body_emits_record_with_structured_kind() {
+        let records = SharedRecordSink::new();
+        let mut cluster =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&structured_record(&t, 9, Some("lib.auth")));
+
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 1);
+        let rec = &emitted[0];
+        assert_eq!(rec.body_kind, BodyKind::Structured);
+        assert_ne!(rec.template_id, NO_TEMPLATE);
+        assert_eq!(rec.template_version, 1);
+        // Structured records have no token-shape to carry; PR-A
+        // leaves body=None (canonical-JSON encoding is the §6.6
+        // follow-up's job).
+        assert!(rec.separators.is_empty());
+        assert!(rec.params.is_empty());
+        assert!(rec.body.is_none());
+        assert!(!rec.lossy_flag);
+    }
+
+    #[test]
+    fn default_sink_drops_records_silently() {
+        // `MinerCluster::new` defaults to `NoOpRecordSink`; tests
+        // that don't opt into `with_record_sink` simply see no
+        // records (the cluster doesn't crash, doesn't allocate,
+        // doesn't expose state). Pins the production-safe default.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+        // No assertion beyond "the call succeeded" — the contract
+        // is no public observable side effect.
+        assert_eq!(cluster.template_count(&t), 1);
     }
 }

@@ -236,9 +236,72 @@ fn rfc0001_3_regression_separators_always_borrow_from_input() {
 /// Scenario RFC0001.4 — Confidence ratio = simSeq / threshold; decision boundary at 1.0.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_4_confidence_ratio_decision_boundary_at_one() {
-    todo!("RFC 0001 §6.3");
+    use ourios_core::confidence::ConfidenceZone;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::sim_seq::confidence_ratio;
+
+    // The math: confidence = simSeq / threshold.
+    assert!(
+        (confidence_ratio(0.7, 0.7) - 1.0).abs() < f32::EPSILON,
+        "simSeq == threshold → confidence == 1.0",
+    );
+    assert!(
+        (confidence_ratio(0.7, 0.5) - 1.4).abs() < f32::EPSILON,
+        "same simSeq under a lower threshold reframes confidence \
+         scale-invariantly (sim 0.7 / thresh 0.5 = 1.4)",
+    );
+
+    // The decision boundary at confidence == 1.0 maps to the
+    // Clean zone (inclusive); confidence < 1.0 (i.e.
+    // simSeq < threshold) drops to Lossy or below.
+    assert_eq!(
+        ConfidenceZone::classify(0.7, 0.7, 0.5),
+        ConfidenceZone::Clean,
+        "sim == threshold (confidence == 1.0) is on the clean-attach side",
+    );
+    assert_eq!(
+        ConfidenceZone::classify(0.6999, 0.7, 0.5),
+        ConfidenceZone::Lossy,
+        "sim just below threshold (confidence < 1.0) is lossy",
+    );
+
+    // Behavioural check: a line whose sim_seq against the
+    // candidate is exactly the threshold takes the clean-attach
+    // branch (widening if positions differ; body NOT retained).
+    //
+    // Construction: two 10-token lines sharing the first 7
+    // post-mask tokens. Single-letter tokens dodge every mask
+    // rule, so masked == raw and sim_seq = 7/10 = 0.7 exactly.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+    cluster.ingest(&make("a b c d e f g h i j"));
+    cluster.ingest(&make("a b c d e f g x y z"));
+
+    assert_eq!(
+        cluster.template_count(&t),
+        1,
+        "sim == threshold is clean → reuses the existing leaf",
+    );
+    assert_eq!(
+        cluster.merges_total(),
+        1,
+        "clean attach widens the 3 mismatched positions → one merge event",
+    );
+    assert_eq!(
+        cluster.body_retentions_total(),
+        0,
+        "clean zone does not retain body (ConfidenceZone::Clean.retains_body() == false)",
+    );
+    assert_eq!(cluster.parse_failures_total(), 0);
 }
 
 /// Scenario RFC0001.5 — Bare `template_id = X` spans all versions of leaf X.

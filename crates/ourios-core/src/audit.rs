@@ -232,13 +232,43 @@ pub trait AuditSink: Send {
     fn emit(&mut self, event: AuditEvent);
 }
 
+/// Sink that drops every event it receives.
+///
+/// The production default until `ourios-wal` lands.
+/// [`InMemoryAuditSink`] buffers events in an unbounded `Vec` —
+/// fine for tests but a memory leak for any long-running
+/// production miner since the buffer is not externally drainable
+/// through the trait object. Defaulting to `NoOp` keeps
+/// production safe; tests that need to *observe* events opt in
+/// via [`SharedAuditSink`] through
+/// `MinerCluster::with_audit_sink` in `ourios-miner`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOpAuditSink;
+
+impl NoOpAuditSink {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl AuditSink for NoOpAuditSink {
+    fn emit(&mut self, _event: AuditEvent) {
+        // Drop on the floor. The §6.4 audit contract is upheld
+        // by the cluster's emit-site itself; this sink simply
+        // declines to persist.
+    }
+}
+
 /// `Vec`-backed sink for tests and the pre-WAL bootstrap.
 ///
 /// Holds events in memory in emission order. Tests use
 /// [`Self::drain`] (or, more commonly, the [`SharedAuditSink`]
-/// wrapper) to inspect what was emitted. Production code should
-/// not be using this sink — when `ourios-wal` lands, the WAL sink
-/// replaces it everywhere.
+/// wrapper) to inspect what was emitted. **Not** safe to use as
+/// the production default — the buffer grows without bound and
+/// is not externally drainable through a `Box<dyn AuditSink>`.
+/// Use [`NoOpAuditSink`] for production until the WAL-backed
+/// sink lands.
 #[derive(Debug, Default)]
 pub struct InMemoryAuditSink {
     events: Vec<AuditEvent>,

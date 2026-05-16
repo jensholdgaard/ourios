@@ -60,12 +60,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use ourios_core::audit::{
-    AuditEvent, AuditEventKind, AuditSink, InMemoryAuditSink, hash_triggering_line,
+    AuditEvent, AuditEventKind, AuditSink, NoOpAuditSink, hash_triggering_line,
     sample_first_256_bytes,
 };
+use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
@@ -145,6 +145,13 @@ pub struct MinerCluster {
     // 2-token prefix. Tests that don't want that constraint set
     // depth to 0.
     prefix_depth: usize,
+    // Wall-clock source for audit-event `timestamp` stamping per
+    // RFC §6.4. [`SystemClock`] in production; tests substitute
+    // a [`ourios_core::clock::TestClock`] via
+    // [`Self::with_clock`] for deterministic timestamp
+    // assertions (wall-clock comparisons against `now()` flake
+    // under NTP step / leap seconds / VM pause).
+    clock: Box<dyn Clock>,
 }
 
 /// Per-tenant template store.
@@ -191,15 +198,16 @@ impl TenantState {
 }
 
 impl MinerCluster {
-    /// Build an empty cluster with an unobservable in-memory
-    /// audit sink — events accumulate but cannot be drained from
-    /// outside the cluster. Suitable for production until the WAL
-    /// sink lands; tests that need to inspect audit emissions use
+    /// Build an empty cluster with a [`NoOpAuditSink`] (events
+    /// are dropped) and a [`SystemClock`] (host wall clock).
+    /// Production default — when [`ourios-wal`] lands the WAL
+    /// sink replaces the no-op via [`Self::with_audit_sink`].
+    /// Tests that need to inspect audit emissions use
     /// [`Self::with_audit_sink`] with a
     /// [`ourios_core::audit::SharedAuditSink`].
     #[must_use]
     pub fn new(config: MinerConfig) -> Self {
-        Self::with_audit_sink(config, Box::new(InMemoryAuditSink::new()))
+        Self::with_audit_sink(config, Box::new(NoOpAuditSink::new()))
     }
 
     /// Build an empty cluster whose audit events flow to `sink`.
@@ -220,6 +228,7 @@ impl MinerCluster {
             merges_total: AtomicU64::new(0),
             parse_failures_total: AtomicU64::new(0),
             prefix_depth: DEFAULT_PREFIX_DEPTH,
+            clock: Box::new(SystemClock::new()),
         }
     }
 
@@ -231,6 +240,20 @@ impl MinerCluster {
     #[must_use]
     pub fn with_prefix_depth(mut self, depth: usize) -> Self {
         self.prefix_depth = depth;
+        self
+    }
+
+    /// Set the wall-clock source used for audit-event `timestamp`
+    /// stamping. Production builds use [`SystemClock`] (the
+    /// default); tests substitute a
+    /// [`ourios_core::clock::TestClock`] for deterministic
+    /// timestamps. The clock is consumed by `Box<dyn Clock>` so
+    /// alternate implementations (recorded traces, monotonic
+    /// counters, future skew-detecting wrappers) drop in without
+    /// touching the cluster's API.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -497,7 +520,7 @@ impl MinerCluster {
                 template_id,
                 triggering_line_hash: hash_triggering_line(raw.as_bytes()),
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                timestamp: SystemTime::now(),
+                timestamp: self.clock.now(),
             });
             self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
             return NO_TEMPLATE;
@@ -529,7 +552,7 @@ impl MinerCluster {
             template_id,
             triggering_line_hash: hash_triggering_line(raw.as_bytes()),
             triggering_line_sample: Some(sample_first_256_bytes(raw)),
-            timestamp: SystemTime::now(),
+            timestamp: self.clock.now(),
         });
         self.merges_total.fetch_add(1, Ordering::Relaxed);
         template_id

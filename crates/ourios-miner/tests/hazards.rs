@@ -61,10 +61,12 @@ fn h1_2_lossy_zone_match_retains_body() {
 #[test]
 fn h1_3_every_widening_emits_an_audit_event() {
     use ourios_core::audit::{AuditEventKind, SharedAuditSink};
+    use ourios_core::clock::TestClock;
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
+    use std::time::{Duration, SystemTime};
 
     // Arrange — two length-6 lines differing at one position.
     // After masking they share the `user <NUM> logged * from
@@ -72,8 +74,14 @@ fn h1_3_every_widening_emits_an_audit_event() {
     // position 3. The §3.1 invariant requires this widening to
     // emit an audit event naming the old + new templates, the
     // tenant, the kind, and a timestamp.
+    //
+    // A `TestClock` pins the timestamp deterministically so the
+    // assertion is `==` rather than `<= SystemTime::now()`, which
+    // would flake under NTP step / leap seconds / VM pause.
+    let pinned = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let sink = SharedAuditSink::new();
-    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()))
+        .with_clock(Box::new(TestClock::new(pinned)));
     let t = TenantId::new("tenant-x");
     let make = |text: &str| OtlpLogRecord {
         tenant_id: t.clone(),
@@ -104,12 +112,12 @@ fn h1_3_every_widening_emits_an_audit_event() {
         old_template, new_template,
         "old and new templates must differ — the event records the change",
     );
-    // Timestamp must round-trip as a real wall-clock value.
-    // (The `event_type` clause from the scenario is satisfied by
-    // the `TemplateWidened` variant match above.)
-    assert!(
-        e.timestamp <= std::time::SystemTime::now(),
-        "timestamp must not be in the future",
+    // The `event_type` clause from the scenario is satisfied by
+    // the `TemplateWidened` variant match above; the timestamp
+    // clause is satisfied by the `TestClock`-pinned value.
+    assert_eq!(
+        e.timestamp, pinned,
+        "timestamp must be the value the cluster's clock returned at emit time",
     );
 }
 

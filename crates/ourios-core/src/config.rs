@@ -38,15 +38,19 @@ pub struct MinerConfig {
     ///   template is allocated, the line is dropped to the
     ///   parse-failure path, the body is still retained.
     ///
-    /// The default is `0.5` (halfway to the project default
-    /// threshold of `0.7`). The RFC does not pin a specific
-    /// default; this value gives the lossy zone meaningful width
-    /// without forcing arbitrary parses through.
+    /// The default is `0.4` per RFC §6.3 *Defaults*: the floor
+    /// matches the threshold from the original Drain paper, on
+    /// the reasoning that lines below the paper's own bar are
+    /// likely genuinely different events. The lossy-zone floor
+    /// is a tuning knob between `0` and `similarity_threshold`;
+    /// it is not load-bearing for any §3 invariant.
     ///
     /// Must hold `0 < similarity_floor ≤ similarity_threshold`.
-    /// Setting the floor equal to the threshold makes the lossy
-    /// zone empty and reduces the three-zone model to the
-    /// pre-§6.3 two-zone shape.
+    /// Setting the floor equal to the threshold collapses the
+    /// lossy zone to zero width — every below-threshold line
+    /// routes straight to the parse-failure path. This is
+    /// **stricter** than the pre-§6.3 "create a fresh leaf for
+    /// every below-threshold line" shape, not equivalent to it.
     pub similarity_floor: f32,
 
     /// Per-parameter byte limit (post-masking). Values above
@@ -104,11 +108,13 @@ impl fmt::Display for MinerConfigError {
 impl Error for MinerConfigError {}
 
 impl Default for MinerConfig {
-    /// RFC 0001 §3.1.1, §6.3, and §3.2.1 defaults.
+    /// RFC 0001 §3.1.1 (`threshold = 0.7`), §6.3
+    /// (`floor = 0.4`), and §3.2.1 (`param_byte_limit = 256`)
+    /// defaults.
     fn default() -> Self {
         Self {
             similarity_threshold: 0.7,
-            similarity_floor: 0.5,
+            similarity_floor: 0.4,
             param_byte_limit: 256,
         }
     }
@@ -123,10 +129,17 @@ impl MinerConfig {
     /// error rather than serve the tenant; this function pins the
     /// rejection, the propagation contract lives at the call site.
     ///
-    /// `similarity_floor` defaults to half of `threshold` so the
-    /// two-arg shape stays compatible with pre-§6.3 callers.
-    /// Setting the floor explicitly goes through
+    /// `similarity_floor` defaults to the RFC §6.3 value of
+    /// `0.4` when the supplied threshold permits it
+    /// (`threshold ≥ 0.4`); for sub-`0.4` thresholds the floor
+    /// degrades to the threshold itself (collapsing the lossy
+    /// zone — the smallest valid configuration). Callers that
+    /// need an explicit floor go through
     /// [`MinerConfig::try_new_full`].
+    ///
+    /// At `threshold = 0.7` (project default), `try_new` and
+    /// [`MinerConfig::default`] produce the same triple
+    /// `(0.7, 0.4, byte_limit)`.
     ///
     /// # Errors
     ///
@@ -135,7 +148,7 @@ impl MinerConfig {
     /// - [`MinerConfigError::ParamByteLimitTooLarge`] when
     ///   `byte_limit` exceeds [`PARAM_BYTE_LIMIT_CEILING`].
     pub fn try_new(threshold: f32, byte_limit: u32) -> Result<Self, MinerConfigError> {
-        Self::try_new_full(threshold, threshold * 0.5, byte_limit)
+        Self::try_new_full(threshold, threshold.min(0.4), byte_limit)
     }
 
     /// Validate a candidate configuration with an explicit

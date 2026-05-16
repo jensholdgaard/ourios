@@ -84,9 +84,9 @@ impl ConfidenceZone {
 mod tests {
     use super::*;
 
-    // Threshold 0.7, floor 0.5 — the project defaults.
+    // Threshold 0.7, floor 0.4 — the RFC §6.3 project defaults.
     const T: f32 = 0.7;
-    const F: f32 = 0.5;
+    const F: f32 = 0.4;
 
     #[test]
     fn classify_above_threshold_is_clean() {
@@ -100,15 +100,15 @@ mod tests {
     #[test]
     fn classify_between_floor_and_threshold_is_lossy() {
         assert_eq!(ConfidenceZone::classify(0.69, T, F), ConfidenceZone::Lossy);
-        assert_eq!(ConfidenceZone::classify(0.6, T, F), ConfidenceZone::Lossy);
-        // Boundary: sim == floor is lossy (still ≥ floor).
         assert_eq!(ConfidenceZone::classify(0.5, T, F), ConfidenceZone::Lossy);
+        // Boundary: sim == floor is lossy (still ≥ floor).
+        assert_eq!(ConfidenceZone::classify(0.4, T, F), ConfidenceZone::Lossy);
     }
 
     #[test]
     fn classify_below_floor_is_parse_failure() {
         assert_eq!(
-            ConfidenceZone::classify(0.49, T, F),
+            ConfidenceZone::classify(0.39, T, F),
             ConfidenceZone::ParseFailure,
         );
         assert_eq!(

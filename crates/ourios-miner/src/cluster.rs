@@ -1497,7 +1497,9 @@ mod tests {
         // L1 = "alpha beta gamma delta epsilon"  (length 5,
         //                                         prefix "alpha beta").
         // L2 = "alpha beta gamma rho sigma"      → sim with L1 = 3/5 = 0.6
-        //                                         → lossy zone (0.5 ≤ 0.6 < 0.7).
+        //                                         → lossy zone
+        //                                         (0.4 ≤ 0.6 < 0.7 under
+        //                                         the RFC §6.3 defaults).
         //
         // Lossy attach: new leaf in the same parent (not widening),
         // body_retentions_total bumps by one, no audit event, no
@@ -1518,9 +1520,18 @@ mod tests {
 
     #[test]
     fn parse_failure_zone_returns_no_template_and_bumps_counters() {
-        // L1 = "alpha beta gamma delta epsilon"  (length 5).
-        // L2 = "alpha beta phi rho sigma"        → sim with L1 = 2/5 = 0.4
-        //                                         → parse-failure zone (< 0.5).
+        // L1 = "alpha beta gamma delta epsilon zeta"  (length 6).
+        // L2 = "alpha beta phi rho sigma omega"        → sim with L1 = 2/6
+        //                                              ≈ 0.333 →
+        //                                              parse-failure zone
+        //                                              (< 0.4 RFC §6.3 floor).
+        //
+        // Pre-§6.3 PR draft used length-5 lines with sim 0.4 and
+        // a 0.5 floor — that boundary collapsed once the floor
+        // was corrected to the RFC-pinned 0.4. Lengthening L2 by
+        // one token (sim 2/6 instead of 2/5) lands the line
+        // unambiguously below the floor without re-introducing a
+        // boundary-dependent assertion.
         //
         // Parse failure: no leaf created, NO_TEMPLATE returned,
         // parse_failures_total AND body_retentions_total both
@@ -1528,8 +1539,8 @@ mod tests {
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
-        let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
-        let id2 = cluster.ingest(&string_record(&t, "alpha beta phi rho sigma"));
+        let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
+        let id2 = cluster.ingest(&string_record(&t, "alpha beta phi rho sigma omega"));
 
         assert_ne!(id1, NO_TEMPLATE, "L1 created the only leaf");
         assert_eq!(

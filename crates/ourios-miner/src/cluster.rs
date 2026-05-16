@@ -66,6 +66,7 @@ use ourios_core::audit::{
     sample_first_256_bytes,
 };
 use ourios_core::clock::{Clock, SystemClock};
+use ourios_core::confidence::ConfidenceZone;
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
@@ -127,11 +128,19 @@ pub struct MinerCluster {
     // names that contract). Atomic so the §6.8 Prometheus exposer
     // can read without taking a lock on the cluster.
     merges_total: AtomicU64,
-    // Placeholder for the §6.8 `parse_failures_total` counter.
-    // Currently only the degenerate-rejection branch and the
-    // empty-input branch increment it; the three-zone parse-
-    // failure floor (RFC §6.3) is the next PR.
+    // §6.8 counter: lines that produced no template. Increments
+    // on empty / over-cap input, degenerate-widening rejection,
+    // and the §6.3 parse-failure zone (`simSeq < floor`).
     parse_failures_total: AtomicU64,
+    // §6.8 counter: lines whose body must be retained in the
+    // emitted data record per RFC §6.3. Increments on the
+    // lossy *zone* (`floor ≤ simSeq < threshold`) and on the
+    // parse-failure zone (`simSeq < floor`); does **not**
+    // increment for clean attaches or for the orthogonal
+    // §6.6 `lossy_flag = true` (tokenizer-failure) path —
+    // see `ConfidenceZone::retains_body`. The numerator of the
+    // §3.1 `body_retention_ratio` gauge.
+    body_retentions_total: AtomicU64,
     // Drain prefix-tree depth (RFC §6.2 step 3 / `tree.rs`'s
     // *Depth convention*). The default
     // [`crate::tree::DEFAULT_PREFIX_DEPTH`] (= 2) matches Drain3's
@@ -227,6 +236,7 @@ impl MinerCluster {
             audit_sink: sink,
             merges_total: AtomicU64::new(0),
             parse_failures_total: AtomicU64::new(0),
+            body_retentions_total: AtomicU64::new(0),
             prefix_depth: DEFAULT_PREFIX_DEPTH,
             clock: Box::new(SystemClock::new()),
         }
@@ -277,16 +287,52 @@ impl MinerCluster {
         self.merges_total.load(Ordering::Relaxed)
     }
 
-    /// Cumulative count of lines that produced no template
-    /// because they tripped the degenerate-template guard (RFC
-    /// §6.4) or yielded zero tokens (empty / whitespace-only
-    /// `Body::String`). Read-side placeholder for the §6.8
-    /// Prometheus gauge; the full three-zone parse-failure floor
-    /// (RFC §6.3) lands in a follow-up PR and will route lines
-    /// below the floor through this same counter.
+    /// Cumulative count of lines that produced no template:
+    /// empty / whitespace-only `Body::String`, over-cap lines
+    /// (`> u16::MAX` tokens), the §6.4 degenerate-template
+    /// rejection branch, and the §6.3 parse-failure zone
+    /// (`simSeq < similarity_floor`). Read-side placeholder for
+    /// the §6.8 `parse_failures_total` Prometheus gauge.
     #[must_use]
     pub fn parse_failures_total(&self) -> u64 {
         self.parse_failures_total.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of lines whose body the emitted data
+    /// record will retain per RFC §6.3 / §6.4. Bumps on every
+    /// path the RFC marks "retain body":
+    ///
+    /// - §6.3 lossy zone (`floor ≤ sim < threshold`) — line
+    ///   attaches to a fresh leaf with body retained.
+    /// - §6.3 parse-failure zone (`sim < floor`) — no template,
+    ///   body retained.
+    /// - §6.2 step 1 parse-failure paths: empty / whitespace-only
+    ///   input and over-cap input (line longer than the
+    ///   `u16::MAX`-token bound). Both are emitted as parse-
+    ///   failure records carrying the original bytes.
+    /// - §6.4 degenerate-widening rejection — "treated as a
+    ///   parse failure ... retain body" per the RFC.
+    ///
+    /// Clean attaches don't bump this; nor does the orthogonal
+    /// §6.6 `lossy_flag = true` path (tokenizer failure).
+    /// Numerator of the §3.1 `body_retention_ratio` gauge.
+    #[must_use]
+    pub fn body_retentions_total(&self) -> u64 {
+        self.body_retentions_total.load(Ordering::Relaxed)
+    }
+
+    /// Mark one parse-failure event: increments both
+    /// `parse_failures_total` and `body_retentions_total`. RFC
+    /// §6.3 says every parse-failure path retains body (the
+    /// record is emitted with the original bytes even when no
+    /// template was allocated), so the two counters move
+    /// together at every parse-failure site — empty input,
+    /// over-cap input, the §6.4 degenerate-widening rejection,
+    /// and the §6.3 parse-failure zone. Centralised here so a
+    /// future contract change touches one site, not four.
+    fn record_parse_failure(&self) {
+        self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ingest a structured OTLP log record. Returns the
@@ -330,11 +376,11 @@ impl MinerCluster {
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
 
         if masked_strs.is_empty() {
-            // Empty input is the §6.3 parse-failure floor's
-            // simplest case; counting it here matches the future
-            // §6.3 branch's contract (parse_failures_total
-            // counts every line that produces no template).
-            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            // Empty / whitespace-only input is a §6.2 step 1
+            // parse failure (the RFC's "emit a parse-failure
+            // record" path). Both counters bump: body retention
+            // applies even when the body is itself empty.
+            self.record_parse_failure();
             return NO_TEMPLATE;
         }
 
@@ -344,9 +390,11 @@ impl MinerCluster {
         // safely — emitting an audit with a truncated set would
         // be the silent-merge bug `[CLAUDE.md §3.1]` exists to
         // prevent. ≥65 536 tokens in a single log line is
-        // pathological; treat as a parse failure.
+        // pathological; the §6.2 step 1 "line longer than
+        // max-line-bytes" parse-failure path. Retain body per
+        // §6.3.
         if masked_strs.len() > u16::MAX as usize {
-            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            self.record_parse_failure();
             return NO_TEMPLATE;
         }
 
@@ -359,17 +407,41 @@ impl MinerCluster {
         let best = self.find_best_candidate(record, &masked_strs);
 
         let threshold = self.config.similarity_threshold;
+        let floor = self.config.similarity_floor;
 
         match best {
-            // No candidate at all → fresh leaf.
+            // No candidate at all → fresh leaf. Treated as clean
+            // by definition: there was no weaker match to drop
+            // into the lossy zone against, and no template to
+            // declare a parse failure against.
             None => self.create_new_leaf(record, &masked_strs),
-            // Best candidate is below threshold → fresh leaf in
-            // the same bucket. The three-zone lossy-floor logic
-            // (RFC §6.3) lands in a follow-up PR; for now this
-            // branch is a plain new-leaf creation.
-            Some(c) if c.similarity < threshold => self.create_new_leaf(record, &masked_strs),
-            // Above threshold → attach (maybe widen).
-            Some(c) => self.attach_and_maybe_widen(record, raw, &masked_strs, c),
+            Some(c) => {
+                match ConfidenceZone::classify(c.similarity, threshold, floor) {
+                    // Clean: attach to candidate, optionally
+                    // widening. RFC §6.2 step 5. No body
+                    // retention.
+                    ConfidenceZone::Clean => {
+                        self.attach_and_maybe_widen(record, raw, &masked_strs, c)
+                    }
+                    // Lossy: new leaf rather than force-merge
+                    // into a too-weak candidate (RFC §6.2 step
+                    // 5b). Body retained; no audit event
+                    // (no widening happened). Body retention
+                    // is counted here because parse-failure
+                    // already covers its own body-retention
+                    // bump via `record_parse_failure`.
+                    ConfidenceZone::Lossy => {
+                        self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
+                        self.create_new_leaf(record, &masked_strs)
+                    }
+                    // Parse failure: no template allocated.
+                    // Both counters bump via the shared helper.
+                    ConfidenceZone::ParseFailure => {
+                        self.record_parse_failure();
+                        NO_TEMPLATE
+                    }
+                }
+            }
         }
     }
 
@@ -523,7 +595,9 @@ impl MinerCluster {
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
                 timestamp: self.clock.now(),
             });
-            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            // §6.4: degenerate widening is treated as a parse
+            // failure that retains body.
+            self.record_parse_failure();
             return NO_TEMPLATE;
         }
 
@@ -1039,6 +1113,8 @@ mod tests {
         //  - returns NO_TEMPLATE
         //  - emits TemplateWideningRejectedDegenerate
         //  - increments parse_failures_total (not merges_total)
+        //  - increments body_retentions_total — §6.4 "treated as
+        //    a parse failure ... retain body"
         //  - does NOT bump template_version or modify the leaf
         //
         // Construction notes:
@@ -1079,6 +1155,11 @@ mod tests {
         assert_eq!(l3, NO_TEMPLATE);
         assert_eq!(cluster.merges_total(), 1, "only L2's widening counts");
         assert_eq!(cluster.parse_failures_total(), 1, "L3 was rejected");
+        assert_eq!(
+            cluster.body_retentions_total(),
+            1,
+            "§6.4 says degenerate-rejected lines retain body",
+        );
 
         let events = sink.drain();
         assert_eq!(events.len(), 2);
@@ -1122,6 +1203,12 @@ mod tests {
         assert_eq!(id_empty, NO_TEMPLATE);
         assert_eq!(id_blank, NO_TEMPLATE);
         assert_eq!(cluster.template_count(&t), 0);
+        assert_eq!(
+            cluster.body_retentions_total(),
+            2,
+            "empty input is still a parse failure that retains body \
+             (RFC §6.3: every parse-failure path bumps both counters)",
+        );
         assert_eq!(
             cluster.parse_failures_total(),
             2,
@@ -1170,40 +1257,46 @@ mod tests {
         // anything (no merges happen). That doesn't test the
         // best-candidate logic.
         //
-        // Better: under the default 0.7 threshold, ingest two
-        // lines whose mismatch is at *one* position (sim 4/5 =
-        // 0.8) — those collapse to a single leaf via widening.
-        // To get two leaves under one parent we need at least
-        // one mismatch that falls below 0.7. So:
+        // Under the default 0.7 threshold + 0.5 floor:
         //
-        //   L1 = "alpha beta gamma delta epsilon"  → leaf A
-        //   L2 = "alpha beta phi rho sigma"        → sim 2/5 = 0.4
-        //                                            < 0.7 → leaf B
-        //                                            (same prefix
-        //                                            "alpha beta",
-        //                                            length 5)
-        //   L3 = "alpha beta gamma delta zeta"     → sim with
-        //                                            leaf A = 4/5
-        //                                            = 0.8, sim
-        //                                            with leaf B
-        //                                            = 2/5 = 0.4.
-        //                                            Best is A.
-        //                                            Widens A at
+        //   L1 = "alpha beta gamma delta epsilon"  → leaf A.
+        //   L2 = "alpha beta gamma rho sigma"      → sim with A = 3/5
+        //                                            = 0.6 ∈ [0.5, 0.7)
+        //                                            → lossy zone →
+        //                                            new leaf B (same
+        //                                            `(length, prefix)`
+        //                                            bucket).
+        //   L3 = "alpha beta gamma delta zeta"     → sim with A = 4/5
+        //                                            = 0.8 (clean), sim
+        //                                            with B = 3/5 = 0.6
+        //                                            (lossy). Best
+        //                                            candidate is A;
+        //                                            widens A at
         //                                            position 4.
+        //
+        // (Pre-three-zone this test had L2 at sim 0.4 — that's
+        // now a parse failure rather than a leaf, so L2 was
+        // rewritten to land in the lossy zone where the
+        // best-candidate-selection question still makes sense.)
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
         let id_a = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
-        let id_b = cluster.ingest(&string_record(&t, "alpha beta phi rho sigma"));
+        let id_b = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
         assert_ne!(id_a, id_b, "leaves are distinct after L2");
         assert_eq!(cluster.template_count(&t), 2);
         assert!(
             sink.is_empty(),
-            "L2 fell below threshold → fresh leaf, no widening",
+            "L2 fell into the lossy zone → fresh leaf, no widening",
+        );
+        assert_eq!(
+            cluster.body_retentions_total(),
+            1,
+            "L2's lossy attach is one body retention",
         );
 
         let id_c = cluster.ingest(&string_record(&t, "alpha beta gamma delta zeta"));
-        // Must widen leaf A (sim 0.8), not B (sim 0.4).
+        // Must widen leaf A (sim 0.8, clean), not B (sim 0.6, lossy).
         assert_eq!(
             id_c, id_a,
             "best-candidate selection must pick the higher-similarity leaf",
@@ -1432,6 +1525,122 @@ mod tests {
         assert_eq!(id, NO_TEMPLATE);
         assert_eq!(cluster.template_count(&t), 0);
         assert_eq!(cluster.parse_failures_total(), 1);
+        assert_eq!(
+            cluster.body_retentions_total(),
+            1,
+            "RFC §6.3: over-cap lines retain body alongside the parse-failure count",
+        );
         assert_eq!(cluster.merges_total(), 0);
+    }
+
+    // ---------- three-zone confidence (RFC §6.3) ----------
+
+    #[test]
+    fn lossy_zone_creates_new_leaf_and_bumps_body_retention() {
+        // L1 = "alpha beta gamma delta epsilon"  (length 5,
+        //                                         prefix "alpha beta").
+        // L2 = "alpha beta gamma rho sigma"      → sim with L1 = 3/5 = 0.6
+        //                                         → lossy zone
+        //                                         (0.4 ≤ 0.6 < 0.7 under
+        //                                         the RFC §6.3 defaults).
+        //
+        // Lossy attach: new leaf in the same parent (not widening),
+        // body_retentions_total bumps by one, no audit event, no
+        // merges_total bump.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+        let id2 = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
+
+        assert_ne!(id1, id2, "lossy attach creates a distinct leaf");
+        assert_eq!(cluster.template_count(&t), 2);
+        assert_eq!(cluster.body_retentions_total(), 1);
+        assert_eq!(cluster.merges_total(), 0);
+        assert_eq!(cluster.parse_failures_total(), 0);
+        assert!(sink.is_empty(), "lossy attach emits no audit event");
+    }
+
+    #[test]
+    fn parse_failure_zone_returns_no_template_and_bumps_counters() {
+        // L1 = "alpha beta gamma delta epsilon zeta"  (length 6).
+        // L2 = "alpha beta phi rho sigma omega"        → sim with L1 = 2/6
+        //                                              ≈ 0.333 →
+        //                                              parse-failure zone
+        //                                              (< 0.4 RFC §6.3 floor).
+        //
+        // Pre-§6.3 PR draft used length-5 lines with sim 0.4 and
+        // a 0.5 floor — that boundary collapsed once the floor
+        // was corrected to the RFC-pinned 0.4. Lengthening L2 by
+        // one token (sim 2/6 instead of 2/5) lands the line
+        // unambiguously below the floor without re-introducing a
+        // boundary-dependent assertion.
+        //
+        // Parse failure: no leaf created, NO_TEMPLATE returned,
+        // parse_failures_total AND body_retentions_total both
+        // bump (RFC §6.3 says parse failure also retains body).
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon zeta"));
+        let id2 = cluster.ingest(&string_record(&t, "alpha beta phi rho sigma omega"));
+
+        assert_ne!(id1, NO_TEMPLATE, "L1 created the only leaf");
+        assert_eq!(
+            id2, NO_TEMPLATE,
+            "below-floor similarity → parse failure, not new leaf",
+        );
+        assert_eq!(
+            cluster.template_count(&t),
+            1,
+            "parse failure must not allocate a leaf",
+        );
+        assert_eq!(cluster.parse_failures_total(), 1);
+        assert_eq!(
+            cluster.body_retentions_total(),
+            1,
+            "RFC §6.3: parse failure retains body too",
+        );
+        assert_eq!(cluster.merges_total(), 0);
+        assert!(sink.is_empty(), "parse failure emits no audit event");
+    }
+
+    #[test]
+    fn clean_attach_does_not_bump_body_retentions() {
+        // sim ≥ threshold → ConfidenceZone::Clean →
+        // retains_body() == false → counter unchanged.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        // Two structurally identical (post-mask) lines: sim == 1.0,
+        // clean attach to the existing leaf.
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+        let _ = cluster.ingest(&string_record(&t, "user 17 logged in"));
+
+        assert_eq!(cluster.body_retentions_total(), 0);
+        assert_eq!(cluster.parse_failures_total(), 0);
+        assert_eq!(cluster.template_count(&t), 1);
+    }
+
+    #[test]
+    fn floor_at_threshold_collapses_lossy_zone() {
+        // With floor == threshold, the lossy zone is empty. Every
+        // below-threshold attach goes straight to parse failure.
+        // Pin the corner case so a future config refactor that
+        // accidentally re-introduces the lossy zone is caught.
+        let config = MinerConfig::try_new_full(0.7, 0.7, 256).expect("valid config");
+        let mut cluster = MinerCluster::new(config);
+        let t = TenantId::new("tenant-x");
+
+        // L1 establishes the leaf; L2 has sim 3/5 = 0.6 — under
+        // the collapsed-zone config this is < floor, so parse
+        // failure (not lossy, since lossy zone is empty).
+        let _id1 = cluster.ingest(&string_record(&t, "alpha beta gamma delta epsilon"));
+        let id2 = cluster.ingest(&string_record(&t, "alpha beta gamma rho sigma"));
+
+        assert_eq!(id2, NO_TEMPLATE);
+        assert_eq!(cluster.template_count(&t), 1);
+        assert_eq!(cluster.parse_failures_total(), 1);
+        assert_eq!(cluster.body_retentions_total(), 1);
     }
 }

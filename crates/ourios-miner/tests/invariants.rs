@@ -52,6 +52,35 @@ fn invariant_3_2_1_default_param_byte_limit_is_256() {
     assert_eq!(cfg.param_byte_limit, 256);
 }
 
+/// Default `similarity_floor` is `0.4` per RFC 0001 §6.3
+/// *Defaults*. Sibling of `invariant_3_1_1_default_threshold_is_0_7`
+/// — together they pin the three-zone boundaries production runs
+/// with. The two-arg shorthand `MinerConfig::try_new(0.7, 256)`
+/// produces the same triple as `MinerConfig::default()`, so the
+/// invariant is asserted on both shapes.
+///
+/// (Not a §5 scenario id today — the floor is a tuning knob, not
+/// a §3 invariant — but locked in as a regression pin so a future
+/// config refactor cannot silently slide the boundary.)
+#[test]
+fn invariant_default_similarity_floor_is_0_4() {
+    use ourios_core::config::MinerConfig;
+
+    let from_default = MinerConfig::default();
+    assert!(
+        (from_default.similarity_floor - 0.4_f32).abs() < f32::EPSILON,
+        "Default::default() similarity_floor must be 0.4, got {}",
+        from_default.similarity_floor,
+    );
+
+    let from_try_new = MinerConfig::try_new(0.7, 256).expect("project defaults are valid");
+    assert!(
+        (from_try_new.similarity_floor - 0.4_f32).abs() < f32::EPSILON,
+        "try_new(0.7, 256) must produce the same floor as Default::default(), got {}",
+        from_try_new.similarity_floor,
+    );
+}
+
 /// Scenario §3.2.2 — Configured limit above 1 KiB is rejected at startup.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]

@@ -315,6 +315,18 @@ impl MinerCluster {
             return NO_TEMPLATE;
         }
 
+        // Cap the line's token count at the audit-event's
+        // position width (RFC §6.4 pins `positions_widened:
+        // Vec<u16>`). Lines exceeding this can't be widened
+        // safely — emitting an audit with a truncated set would
+        // be the silent-merge bug `[CLAUDE.md §3.1]` exists to
+        // prevent. ≥65 536 tokens in a single log line is
+        // pathological; treat as a parse failure.
+        if masked_strs.len() > u16::MAX as usize {
+            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            return NO_TEMPLATE;
+        }
+
         // Phase 1 — read-only candidate selection. RFC §6.2 step
         // 4: among leaves in the same `(severity, scope, length,
         // prefix)` bucket, pick `argmax sim_seq`. The walk is
@@ -352,18 +364,24 @@ impl MinerCluster {
 
         let mut best: Option<Candidate> = None;
         for (leaf_idx, leaf) in parent.leaves.iter().enumerate() {
-            // Filter by the non-token half of the template key
-            // (RFC §6.1 *Template-key composition*). Length is a
-            // structural property of the prefix bucket; we still
-            // check it because `descend` walks at most
-            // `self.prefix_depth` levels, so two lines of
-            // different length CAN end up under the same parent
-            // when both are shorter than the prefix depth — in
-            // which case `sim_seq` would panic on mismatched
-            // lengths.
+            // Length is structurally guaranteed by the tree's
+            // length-keyed first level (`Tree::descend` looks up
+            // `by_length[masked_strs.len()]`), so a length
+            // mismatch here would be a tree-invariant bug rather
+            // than a runtime case to handle. Debug-only assert.
+            debug_assert_eq!(
+                leaf.template.len(),
+                masked_strs.len(),
+                "tree partitions by length; every leaf under this parent must match",
+            );
+            // Filter on the non-token half of the §6.1
+            // template-key composition tuple. (Severity and
+            // scope are *not* part of the tree's keying today —
+            // we instead keep one leaf per `(severity, scope)`
+            // pair under each `(length, prefix)` bucket and
+            // filter on the leaf-list side.)
             if leaf.severity_number != record.severity_number
                 || leaf.scope_name.as_deref() != record.scope_name.as_deref()
-                || leaf.template.len() != masked_strs.len()
             {
                 continue;
             }
@@ -466,13 +484,14 @@ impl MinerCluster {
             let mut new_template_tokens = leaf.template.clone();
             apply_widening(&mut new_template_tokens, &positions_widened);
             let would_be_template = format_template(&new_template_tokens);
+            let would_be_positions = positions_to_u16(&positions_widened);
 
             self.audit_sink.emit(AuditEvent {
                 kind: AuditEventKind::TemplateWideningRejectedDegenerate {
                     version,
                     current_template,
                     would_be_template,
-                    would_be_positions: positions_widened,
+                    would_be_positions,
                 },
                 tenant_id: record.tenant_id.clone(),
                 template_id,
@@ -489,6 +508,7 @@ impl MinerCluster {
         let template_id = leaf.template_id;
         let old_version = leaf.template_version;
         let old_template = format_template(&leaf.template);
+        let positions_u16 = positions_to_u16(&positions_widened);
         apply_widening(&mut leaf.template, &positions_widened);
         leaf.template_version = leaf
             .template_version
@@ -503,7 +523,7 @@ impl MinerCluster {
                 new_version,
                 old_template,
                 new_template,
-                positions_widened,
+                positions_widened: positions_u16,
             },
             tenant_id: record.tenant_id.clone(),
             template_id,
@@ -588,25 +608,20 @@ struct Candidate {
 /// the candidate line has a different value. Per RFC §6.2 step
 /// 5, these are exactly the positions that would become `<*>` if
 /// the line attached to the leaf.
-fn find_widening_positions(line: &[&str], template: &[OwnedToken]) -> Vec<u16> {
+///
+/// Returns `usize` positions; `MinerCluster::ingest_string` has
+/// already capped `line.len()` at `u16::MAX`, so a downstream
+/// `u16` conversion at audit-construction time is infallible.
+/// Using `usize` here avoids the silent-drop hazard a `u16` return
+/// type carried (a missed mismatch position would have produced
+/// an empty `positions_widened` → clean attach → silent merge).
+fn find_widening_positions(line: &[&str], template: &[OwnedToken]) -> Vec<usize> {
     debug_assert_eq!(line.len(), template.len());
     line.iter()
         .zip(template.iter())
         .enumerate()
         .filter_map(|(i, (l, t))| match t {
-            OwnedToken::Fixed(s) if s.as_str() != *l => {
-                u16::try_from(i).ok().or_else(|| {
-                    // > u16::MAX tokens in a line is well past
-                    // any realistic mask output. Drop the
-                    // position rather than panic — the widening
-                    // simply won't apply at that index, which
-                    // is safe-but-conservative (we won't merge
-                    // when we maybe could have, and the line
-                    // creates a new leaf instead).
-                    debug_assert!(false, "more than u16::MAX tokens in a line");
-                    None
-                })
-            }
+            OwnedToken::Fixed(s) if s.as_str() != *l => Some(i),
             _ => None,
         })
         .collect()
@@ -615,27 +630,60 @@ fn find_widening_positions(line: &[&str], template: &[OwnedToken]) -> Vec<u16> {
 /// RFC §6.4 degenerate-template guard. Returns `true` iff
 /// applying `positions_widened` to `template` would leave the
 /// template with zero `OwnedToken::Fixed(_)` positions.
-fn would_be_degenerate(template: &[OwnedToken], positions_widened: &[u16]) -> bool {
-    template.iter().enumerate().all(|(i, tok)| match tok {
-        OwnedToken::Wildcard => true,
-        OwnedToken::Fixed(_) => {
-            // Already-Fixed positions count toward degeneracy
-            // only if this widening would replace them.
-            u16::try_from(i).is_ok_and(|i_u16| positions_widened.contains(&i_u16))
+///
+/// `positions_widened` is sorted ascending by construction
+/// ([`find_widening_positions`] walks indices left-to-right), so
+/// we lockstep-walk both sequences in `O(N + M)` with no
+/// allocation. The previous `.contains()`-inside-`.all()` shape
+/// was `O(N · M)`.
+fn would_be_degenerate(template: &[OwnedToken], positions_widened: &[usize]) -> bool {
+    debug_assert!(
+        positions_widened.windows(2).all(|w| w[0] < w[1]),
+        "positions_widened must be sorted ascending (find_widening_positions invariant)",
+    );
+    let mut widen_iter = positions_widened.iter().copied();
+    let mut next_widen = widen_iter.next();
+    for (i, tok) in template.iter().enumerate() {
+        match tok {
+            OwnedToken::Wildcard => {} // already wildcard, doesn't contribute
+            OwnedToken::Fixed(_) => {
+                if next_widen == Some(i) {
+                    // About to become wildcard via this widening.
+                    next_widen = widen_iter.next();
+                } else {
+                    // A Fixed token survives this widening →
+                    // not degenerate.
+                    return false;
+                }
+            }
         }
-    })
+    }
+    true
 }
 
 /// Replace `Fixed` tokens at the given positions with
 /// `Wildcard`, in place. Positions that are already `Wildcard`
 /// are no-ops; positions not in the list are unchanged.
-fn apply_widening(template: &mut [OwnedToken], positions: &[u16]) {
+fn apply_widening(template: &mut [OwnedToken], positions: &[usize]) {
     for &pos in positions {
-        let idx = pos as usize;
-        if idx < template.len() {
-            template[idx] = OwnedToken::Wildcard;
+        if pos < template.len() {
+            template[pos] = OwnedToken::Wildcard;
         }
     }
+}
+
+/// Convert `usize` positions to the `Vec<u16>` shape RFC §6.4
+/// requires for `AuditEvent` payloads. Infallible: callers must
+/// have already enforced the line-length cap so every position
+/// fits.
+fn positions_to_u16(positions: &[usize]) -> Vec<u16> {
+    positions
+        .iter()
+        .map(|&p| {
+            u16::try_from(p)
+                .expect("line length capped at u16::MAX in ingest_string; positions fit")
+        })
+        .collect()
 }
 
 /// Canonical string form of a template: literal tokens for
@@ -1332,5 +1380,34 @@ mod tests {
         assert!(matches!(template[0], OwnedToken::Fixed(ref s) if s == "a"));
         assert!(matches!(template[1], OwnedToken::Wildcard));
         assert!(matches!(template[2], OwnedToken::Fixed(ref s) if s == "c"));
+    }
+
+    #[test]
+    fn ingest_string_routes_lines_above_u16_max_tokens_to_parse_failure() {
+        // The cap defends `positions_widened: Vec<u16>` (RFC §6.4)
+        // from a silent-merge bug: if the helper had to drop
+        // out-of-range positions, an attach with no surviving
+        // mismatches would have looked like a clean match
+        // (no widening, no audit, no `merges_total` bump).
+        // Producing a 65 537-token line here is the smallest input
+        // that exercises the cap.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+
+        let n: usize = (u16::MAX as usize) + 2;
+        let mut text = String::with_capacity(n * 2);
+        for i in 0..n {
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push('x');
+        }
+
+        let id = cluster.ingest(&string_record(&t, &text));
+
+        assert_eq!(id, NO_TEMPLATE);
+        assert_eq!(cluster.template_count(&t), 0);
+        assert_eq!(cluster.parse_failures_total(), 1);
+        assert_eq!(cluster.merges_total(), 0);
     }
 }

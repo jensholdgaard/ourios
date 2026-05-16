@@ -8,31 +8,20 @@
 //!
 //! Default rule set: UUID, IPv4, NUM. The other RFC §6.1
 //! variants (`Hex`, `Ts`, `Path`, `Str`, `Overflow`) are reserved
-//! on `ParamType` because the Parquet record schema (§6.1) is
+//! on [`ParamType`] because the Parquet record schema (§6.1) is
 //! the data contract, but they have no `mask()` emitter — `Str`
 //! is added by the widening PR (§6.2 step 5b), `Overflow` by the
 //! byte-limit PR (§6.5), and `Hex` / `Ts` / `Path` by future
 //! masking-rule PRs. Internally the masking-emit subset is the
-//! private `MaskTag` enum, kept separate from `ParamType` so its
-//! tag-string and `ParamType` mappings are exhaustive total
+//! private `MaskTag` enum, kept separate from [`ParamType`] so its
+//! tag-string and [`ParamType`] mappings are exhaustive total
 //! functions the compiler will hold us to.
+//!
+//! `ParamType` itself lives in `ourios-core::audit` so the audit
+//! event schema and the masker share one type rather than a
+//! near-identical pair.
 
-/// The type assigned to a masked parameter slot.
-///
-/// Matches RFC 0001 §6.1's `ParamType`. Not every variant has a
-/// `mask()` emitter (see module docs); the masking-emit subset
-/// is the private `MaskTag` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ParamType {
-    Ip,
-    Uuid,
-    Num,
-    Hex,
-    Ts,
-    Path,
-    Str,
-    Overflow,
-}
+pub use ourios_core::audit::ParamType;
 
 /// One typed parameter extracted by the masking pass.
 ///

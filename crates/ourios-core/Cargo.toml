@@ -14,6 +14,10 @@ publish = false
 # faithful to the spec — no hand-rolled re-implementation that could
 # drift from the OTel `AnyValue`/`KeyValue` semantics).
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+# Hash function for `AuditEvent::triggering_line_hash` per RFC 0001
+# §6.4. Truncated blake3 (first 16 bytes) joins audit events back to
+# the data record(s) that triggered them in the §6.7 drift query.
+blake3 = { version = "1", default-features = false }
 
 [lints]
 workspace = true

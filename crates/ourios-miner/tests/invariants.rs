@@ -167,14 +167,24 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     let a_templates = cluster.templates_for(&a);
     let b_templates = cluster.templates_for(&b);
 
-    let a_token_set: std::collections::HashSet<&str> = a_templates
-        .iter()
-        .flat_map(|(t, _)| t.iter().map(String::as_str))
-        .collect();
-    let b_token_set: std::collections::HashSet<&str> = b_templates
-        .iter()
-        .flat_map(|(t, _)| t.iter().map(String::as_str))
-        .collect();
+    // Extract the literal-token side of each template; the
+    // cross-pollination question is about Fixed tokens (Wildcard
+    // positions have no token string to compare). `templates_for`
+    // returns `Vec<(Vec<OwnedToken>, u64)>` post-widening — the
+    // wildcard distinction stays typed end-to-end.
+    let literal_tokens = |templates: &[(Vec<ourios_miner::tree::OwnedToken>, u64)]| {
+        templates
+            .iter()
+            .flat_map(|(t, _)| {
+                t.iter().filter_map(|tok| match tok {
+                    ourios_miner::tree::OwnedToken::Fixed(s) => Some(s.clone()),
+                    ourios_miner::tree::OwnedToken::Wildcard => None,
+                })
+            })
+            .collect::<std::collections::HashSet<String>>()
+    };
+    let a_token_set = literal_tokens(&a_templates);
+    let b_token_set = literal_tokens(&b_templates);
 
     assert!(
         a_token_set.contains("user") && a_token_set.contains("logged"),

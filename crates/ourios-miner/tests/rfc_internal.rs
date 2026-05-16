@@ -13,17 +13,121 @@
 /// Scenario RFC0001.1 — Fresh-leaf creation does not emit an audit event.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_1_fresh_leaf_creation_does_not_emit_audit_event() {
-    todo!("RFC 0001 §6.2");
+    use ourios_core::audit::SharedAuditSink;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — ingest two structurally distinct lines, both
+    // creating fresh leaves. Per §6.2 step 4, fresh-leaf
+    // creation does not emit an audit event; the audit stream
+    // is reserved for widening events.
+    let sink = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let _ = cluster.ingest(&make("user 42 logged in"));
+    let _ = cluster.ingest(&make("GET /home 200"));
+
+    // Assert — both lines created fresh leaves; the sink
+    // remains empty.
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(cluster.merges_total(), 0);
+    assert!(
+        sink.is_empty(),
+        "fresh-leaf creation must not emit audit events",
+    );
 }
 
 /// Scenario RFC0001.2 — Degenerate-template guard rejects fully-wildcard widening.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
-    todo!("RFC 0001 §6.4");
+    use ourios_core::audit::{AuditEventType, SharedAuditSink};
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
+
+    // Arrange — force a degenerate-widening attempt.
+    //
+    // The default prefix-tree shape (`prefix_depth = 2`) makes
+    // this scenario structurally unreachable: the first two
+    // tokens of any line are baked into the descend path, so
+    // any leaf reachable as a widening target has those two
+    // positions Fixed by construction. To test the §6.4 guard
+    // we drop `prefix_depth` to 0 (all length-N lines share one
+    // leaf list) so widenings can reach every position. The
+    // tunable is exposed precisely for this kind of guard
+    // exercise.
+    //
+    // Threshold of 0.3 so a 1/3-similar attach triggers widening
+    // rather than fresh-leaf creation.
+    //   L1 = ["alpha", "beta", "gamma"]  — v=1, all-Fixed.
+    //   L2 = ["alpha", "xxx", "yyy"]     — sim 1/3 → widens
+    //                                       positions 1, 2 →
+    //                                       template
+    //                                       ["alpha", <*>, <*>],
+    //                                       v=2. NOT degenerate.
+    //   L3 = ["zzz", "qqq", "rrr"]       — sim 2/3 (two wildcard
+    //                                       matches) → would
+    //                                       widen position 0 →
+    //                                       fully degenerate →
+    //                                       rejected.
+    let config = MinerConfig::try_new(0.3, 256).expect("valid config");
+    let sink = SharedAuditSink::new();
+    let mut cluster =
+        MinerCluster::with_audit_sink(config, Box::new(sink.clone())).with_prefix_depth(0);
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let l1 = cluster.ingest(&make("alpha beta gamma"));
+    let _l2 = cluster.ingest(&make("alpha xxx yyy"));
+    let l3 = cluster.ingest(&make("zzz qqq rrr"));
+
+    // Assert — L3 was rejected (NO_TEMPLATE), the rejection
+    // was audited but did not increment `merges_total`, and
+    // `parse_failures_total` ticked.
+    assert_ne!(l1, NO_TEMPLATE, "L1 created the leaf");
+    assert_eq!(
+        l3, NO_TEMPLATE,
+        "L3's widening would be fully wildcard → rejected"
+    );
+    assert_eq!(
+        cluster.merges_total(),
+        1,
+        "only L2's (non-degenerate) widening counts toward merges_total",
+    );
+    assert_eq!(
+        cluster.parse_failures_total(),
+        1,
+        "L3's rejection is a parse failure",
+    );
+
+    let events = sink.drain();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, AuditEventType::TemplateWidened);
+    assert_eq!(
+        events[1].event_type,
+        AuditEventType::TemplateWideningRejectedDegenerate,
+    );
+    // Rejection audit's `new_template` records what the widening
+    // *would* have produced, so an operator inspecting the
+    // event sees the degenerate shape.
+    assert_eq!(events[1].new_template, "<*> <*> <*>");
 }
 
 /// Scenario RFC0001.3 — Tokenizer is Unicode whitespace only; punctuation stays in tokens.

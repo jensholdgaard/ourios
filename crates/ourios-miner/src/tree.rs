@@ -70,25 +70,36 @@ impl OwnedToken {
 
 /// One entry in a [`PrefixNode`]'s leaf list.
 ///
-/// Carries the [`OwnedToken`] template, its `template_id`, and the
-/// `(severity_number, scope_name)` half of the §6.1 *Template-key
-/// composition* tuple — without those two fields, two records that
-/// share masked tokens but differ in severity or scope would
-/// silently coalesce, violating H1.4 / H1.5.
+/// Carries the [`OwnedToken`] template, its `template_id`, its
+/// `template_version`, and the `(severity_number, scope_name)`
+/// half of the §6.1 *Template-key composition* tuple — without
+/// those two fields, two records that share masked tokens but
+/// differ in severity or scope would silently coalesce, violating
+/// H1.4 / H1.5.
 ///
-/// The follow-up integration PR will add `version`, `slot_types`,
-/// retained-body counts, and the rest of the §6.1 leaf payload;
-/// they are deliberately absent here so the skeleton stays
-/// reviewable.
+/// `template_version` starts at `1` on fresh-leaf creation and
+/// increments on every widening or type-expansion per RFC 0001
+/// §6.4. Versioning lives on the leaf rather than as a sibling map
+/// because every widening is decided in the same scope that mutates
+/// the leaf's template — the version stamp is part of the same
+/// invariant. The audit event records `(old_version, new_version)`
+/// from the same bump.
+///
+/// Future PRs will add `slot_types`, retained-body counts, and the
+/// rest of the §6.1 leaf payload; they are deliberately absent
+/// here so the leaf stays reviewable.
 #[derive(Debug, Clone)]
 pub struct Leaf {
     pub template: Vec<OwnedToken>,
     /// Cluster-wide unique identifier per RFC 0001 §6.1 — the
     /// `template_id` allocated by [`crate::cluster::MinerCluster`]
-    /// when the leaf was first created. Field name matches RFC
-    /// language so future `template_version`, slot-id, and
-    /// alias-id additions stay disambiguated.
+    /// when the leaf was first created.
     pub template_id: u64,
+    /// Monotonic version stamp per RFC 0001 §6.4. Starts at `1`
+    /// on fresh-leaf creation; the cluster bumps it by one on each
+    /// widening or type-expansion and records the bump in an
+    /// audit event. Clean attaches (no widening) do not bump it.
+    pub template_version: u32,
     /// `LogRecord.severity_number` half of the template key per
     /// RFC 0001 §6.1 *Template-key composition*. `0` =
     /// `UNSPECIFIED` is its own bucket (RFC0001.11), distinct from
@@ -350,6 +361,7 @@ mod tests {
             parent.leaves.push(Leaf {
                 template: [OwnedToken::Fixed("marker".to_string())].into(),
                 template_id: 99,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -515,6 +527,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 7,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -570,6 +583,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 1,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -584,6 +598,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 2,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -595,6 +610,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 3,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -620,6 +636,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 10,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });
@@ -634,6 +651,7 @@ mod tests {
                 ]
                 .into(),
                 template_id: 20,
+                template_version: 1,
                 severity_number: 0,
                 scope_name: None,
             });

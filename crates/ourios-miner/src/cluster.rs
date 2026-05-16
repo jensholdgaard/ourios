@@ -120,10 +120,12 @@ pub struct MinerCluster {
     // the trait is `Send` so the cluster stays moveable across
     // threads.
     audit_sink: Box<dyn AuditSink>,
-    // §6.4 counter: every emitted `TemplateWidened` or
-    // `TemplateTypeExpanded` event increments this; rejection
-    // events do not. Atomic so the §6.8 Prometheus exposer (a
-    // future PR) can read without taking a lock on the cluster.
+    // §6.4 counter: structural-widening events increment this;
+    // rejection events do not. Today only `TemplateWidened`
+    // emits; `TemplateTypeExpanded` will also increment once the
+    // type-expansion PR lands ([`AuditEventKind::counts_as_merge`]
+    // names that contract). Atomic so the §6.8 Prometheus exposer
+    // can read without taking a lock on the cluster.
     merges_total: AtomicU64,
     // Placeholder for the §6.8 `parse_failures_total` counter.
     // Currently only the degenerate-rejection branch and the
@@ -241,10 +243,12 @@ impl MinerCluster {
         &self.config
     }
 
-    /// Cumulative count of widening + type-expansion events
-    /// emitted across all tenants. RFC §6.4: rejected-degenerate
-    /// events do not increment this counter. Placeholder for the
-    /// §6.8 Prometheus gauge.
+    /// Cumulative count of structural-widening events across all
+    /// tenants — `TemplateWidened` today, plus
+    /// `TemplateTypeExpanded` once that variant has an emitter
+    /// (see [`AuditEventKind::counts_as_merge`]). Rejection events
+    /// are recorded but do not increment this counter.
+    /// Read-side placeholder for the §6.8 Prometheus gauge.
     #[must_use]
     pub fn merges_total(&self) -> u64 {
         self.merges_total.load(Ordering::Relaxed)
@@ -253,9 +257,10 @@ impl MinerCluster {
     /// Cumulative count of lines that produced no template
     /// because they tripped the degenerate-template guard (RFC
     /// §6.4) or yielded zero tokens (empty / whitespace-only
-    /// `Body::String`). Placeholder for the §6.8 Prometheus
-    /// gauge; the full three-zone parse-failure floor lands in
-    /// the next PR.
+    /// `Body::String`). Read-side placeholder for the §6.8
+    /// Prometheus gauge; the full three-zone parse-failure floor
+    /// (RFC §6.3) lands in a follow-up PR and will route lines
+    /// below the floor through this same counter.
     #[must_use]
     pub fn parse_failures_total(&self) -> u64 {
         self.parse_failures_total.load(Ordering::Relaxed)

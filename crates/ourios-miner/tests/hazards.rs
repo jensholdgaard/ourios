@@ -104,8 +104,9 @@ fn h1_3_every_widening_emits_an_audit_event() {
         old_template, new_template,
         "old and new templates must differ — the event records the change",
     );
-    // Timestamp must round-trip as a real wall-clock value; the
-    // variant tag above covers `event_type` per the scenario.
+    // Timestamp must round-trip as a real wall-clock value.
+    // (The `event_type` clause from the scenario is satisfied by
+    // the `TemplateWidened` variant match above.)
     assert!(
         e.timestamp <= std::time::SystemTime::now(),
         "timestamp must not be in the future",

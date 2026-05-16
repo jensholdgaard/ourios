@@ -28,14 +28,10 @@ use crate::tenant::TenantId;
 /// Variant-specific payload for an [`AuditEvent`].
 ///
 /// Each variant carries only the fields that are meaningful for
-/// that kind of state change. The pre-refactor flat shape
-/// (`AuditEventType` enum + always-present `positions_widened`
-/// and `slots_expanded` vectors on `AuditEvent`) made invalid
-/// combinations representable — e.g. a `TemplateWidened` event
-/// with a non-empty `slots_expanded`, or a rejection event with
-/// `old_version != new_version`. Hoisting the kind-specific
-/// fields into variant payloads pins each contract at the type
-/// level.
+/// that kind of state change — a `TemplateWidened` cannot
+/// represent `slots_expanded`, and a
+/// `TemplateWideningRejectedDegenerate` cannot represent a
+/// version bump. The compiler enforces those per-kind contracts.
 ///
 /// The miner emits one of these per leaf state change; data
 /// records that *cause* the change are durability-ordered after

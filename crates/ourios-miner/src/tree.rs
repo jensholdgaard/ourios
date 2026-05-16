@@ -76,12 +76,12 @@ impl OwnedToken {
 /// H1.4 / H1.5.
 ///
 /// `template_version` starts at `1` on fresh-leaf creation and
-/// increments on every widening or type-expansion per RFC 0001
-/// §6.4. Versioning lives on the leaf rather than as a sibling map
-/// because every widening is decided in the same scope that mutates
-/// the leaf's template — the version stamp is part of the same
-/// invariant. The audit event records `(old_version, new_version)`
-/// from the same bump.
+/// increments on every widening per RFC 0001 §6.4 (type-expansion
+/// also bumps it once that PR lands). Versioning lives on the leaf
+/// rather than as a sibling map because every widening is decided
+/// in the same scope that mutates the leaf's template — the
+/// version stamp is part of the same invariant. The audit event
+/// records `(old_version, new_version)` from the same bump.
 ///
 /// `slot_types` and retained-body counts (the rest of the §6.1
 /// leaf payload) will be added when the type-expansion and
@@ -95,8 +95,9 @@ pub struct Leaf {
     pub template_id: u64,
     /// Monotonic version stamp per RFC 0001 §6.4. Starts at `1`
     /// on fresh-leaf creation; the cluster bumps it by one on each
-    /// widening or type-expansion and records the bump in an
-    /// audit event. Clean attaches (no widening) do not bump it.
+    /// widening (and on each type-expansion once that variant has
+    /// an emitter) and records the bump in an audit event. Clean
+    /// attaches (no widening) do not bump it.
     pub template_version: u32,
     /// `LogRecord.severity_number` half of the template key per
     /// RFC 0001 §6.1 *Template-key composition*. `0` =

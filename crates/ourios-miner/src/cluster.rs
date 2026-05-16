@@ -71,7 +71,7 @@ use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
 
 use crate::mask::mask;
-use crate::sim_seq::sim_seq;
+use crate::sim_seq::sim_seq_owned;
 use crate::tokenize::tokenize;
 use crate::tree::{DEFAULT_PREFIX_DEPTH, Leaf, OwnedToken, Tree};
 // `DEFAULT_PREFIX_DEPTH` is used as the prefix-depth field's
@@ -408,9 +408,10 @@ impl MinerCluster {
             {
                 continue;
             }
-            let view: Vec<crate::sim_seq::Token<'_>> =
-                leaf.template.iter().map(OwnedToken::as_borrowed).collect();
-            let similarity = sim_seq(masked_strs, &view);
+            // Allocation-free over `&[OwnedToken]`. The borrowed
+            // `Token` view + `Vec::collect` form would allocate
+            // per leaf on every ingest call.
+            let similarity = sim_seq_owned(masked_strs, &leaf.template);
             let candidate = Candidate {
                 leaf_idx,
                 similarity,

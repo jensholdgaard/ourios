@@ -299,15 +299,40 @@ impl MinerCluster {
     }
 
     /// Cumulative count of lines whose body the emitted data
-    /// record will retain per RFC §6.3 — every line whose
-    /// confidence zone (`ConfidenceZone::retains_body`) is
-    /// `Lossy` or `ParseFailure`. Clean attaches don't bump
-    /// this; nor does the orthogonal §6.6 `lossy_flag = true`
-    /// path (tokenizer failure). Numerator of the §3.1
-    /// `body_retention_ratio` gauge.
+    /// record will retain per RFC §6.3 / §6.4. Bumps on every
+    /// path the RFC marks "retain body":
+    ///
+    /// - §6.3 lossy zone (`floor ≤ sim < threshold`) — line
+    ///   attaches to a fresh leaf with body retained.
+    /// - §6.3 parse-failure zone (`sim < floor`) — no template,
+    ///   body retained.
+    /// - §6.2 step 1 parse-failure paths: empty / whitespace-only
+    ///   input and over-cap input (line longer than the
+    ///   `u16::MAX`-token bound). Both are emitted as parse-
+    ///   failure records carrying the original bytes.
+    /// - §6.4 degenerate-widening rejection — "treated as a
+    ///   parse failure ... retain body" per the RFC.
+    ///
+    /// Clean attaches don't bump this; nor does the orthogonal
+    /// §6.6 `lossy_flag = true` path (tokenizer failure).
+    /// Numerator of the §3.1 `body_retention_ratio` gauge.
     #[must_use]
     pub fn body_retentions_total(&self) -> u64 {
         self.body_retentions_total.load(Ordering::Relaxed)
+    }
+
+    /// Mark one parse-failure event: increments both
+    /// `parse_failures_total` and `body_retentions_total`. RFC
+    /// §6.3 says every parse-failure path retains body (the
+    /// record is emitted with the original bytes even when no
+    /// template was allocated), so the two counters move
+    /// together at every parse-failure site — empty input,
+    /// over-cap input, the §6.4 degenerate-widening rejection,
+    /// and the §6.3 parse-failure zone. Centralised here so a
+    /// future contract change touches one site, not four.
+    fn record_parse_failure(&self) {
+        self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ingest a structured OTLP log record. Returns the
@@ -351,11 +376,11 @@ impl MinerCluster {
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
 
         if masked_strs.is_empty() {
-            // Empty input is the §6.3 parse-failure floor's
-            // simplest case; counting it here matches the future
-            // §6.3 branch's contract (parse_failures_total
-            // counts every line that produces no template).
-            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            // Empty / whitespace-only input is a §6.2 step 1
+            // parse failure (the RFC's "emit a parse-failure
+            // record" path). Both counters bump: body retention
+            // applies even when the body is itself empty.
+            self.record_parse_failure();
             return NO_TEMPLATE;
         }
 
@@ -365,9 +390,11 @@ impl MinerCluster {
         // safely — emitting an audit with a truncated set would
         // be the silent-merge bug `[CLAUDE.md §3.1]` exists to
         // prevent. ≥65 536 tokens in a single log line is
-        // pathological; treat as a parse failure.
+        // pathological; the §6.2 step 1 "line longer than
+        // max-line-bytes" parse-failure path. Retain body per
+        // §6.3.
         if masked_strs.len() > u16::MAX as usize {
-            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            self.record_parse_failure();
             return NO_TEMPLATE;
         }
 
@@ -389,32 +416,28 @@ impl MinerCluster {
             // declare a parse failure against.
             None => self.create_new_leaf(record, &masked_strs),
             Some(c) => {
-                let zone = ConfidenceZone::classify(c.similarity, threshold, floor);
-                if zone.retains_body() {
-                    // Both lossy and parse-failure retain body.
-                    // The actual `body` column in the emitted
-                    // data record waits for the §6.6 PR; the
-                    // counter is the §3.1 numerator for the
-                    // `body_retention_ratio` gauge today.
-                    self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
-                }
-                match zone {
+                match ConfidenceZone::classify(c.similarity, threshold, floor) {
                     // Clean: attach to candidate, optionally
-                    // widening. RFC §6.2 step 5.
+                    // widening. RFC §6.2 step 5. No body
+                    // retention.
                     ConfidenceZone::Clean => {
                         self.attach_and_maybe_widen(record, raw, &masked_strs, c)
                     }
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
-                    // 5b). Counted as a body retention; no
-                    // audit event (no widening happened).
-                    ConfidenceZone::Lossy => self.create_new_leaf(record, &masked_strs),
+                    // 5b). Body retained; no audit event
+                    // (no widening happened). Body retention
+                    // is counted here because parse-failure
+                    // already covers its own body-retention
+                    // bump via `record_parse_failure`.
+                    ConfidenceZone::Lossy => {
+                        self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
+                        self.create_new_leaf(record, &masked_strs)
+                    }
                     // Parse failure: no template allocated.
-                    // Body retention still applies (counted
-                    // above); the §6.6 PR will surface the
-                    // retained bytes in the data record.
+                    // Both counters bump via the shared helper.
                     ConfidenceZone::ParseFailure => {
-                        self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+                        self.record_parse_failure();
                         NO_TEMPLATE
                     }
                 }
@@ -572,7 +595,9 @@ impl MinerCluster {
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
                 timestamp: self.clock.now(),
             });
-            self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
+            // §6.4: degenerate widening is treated as a parse
+            // failure that retains body.
+            self.record_parse_failure();
             return NO_TEMPLATE;
         }
 
@@ -1088,6 +1113,8 @@ mod tests {
         //  - returns NO_TEMPLATE
         //  - emits TemplateWideningRejectedDegenerate
         //  - increments parse_failures_total (not merges_total)
+        //  - increments body_retentions_total — §6.4 "treated as
+        //    a parse failure ... retain body"
         //  - does NOT bump template_version or modify the leaf
         //
         // Construction notes:
@@ -1128,6 +1155,11 @@ mod tests {
         assert_eq!(l3, NO_TEMPLATE);
         assert_eq!(cluster.merges_total(), 1, "only L2's widening counts");
         assert_eq!(cluster.parse_failures_total(), 1, "L3 was rejected");
+        assert_eq!(
+            cluster.body_retentions_total(),
+            1,
+            "§6.4 says degenerate-rejected lines retain body",
+        );
 
         let events = sink.drain();
         assert_eq!(events.len(), 2);
@@ -1171,6 +1203,12 @@ mod tests {
         assert_eq!(id_empty, NO_TEMPLATE);
         assert_eq!(id_blank, NO_TEMPLATE);
         assert_eq!(cluster.template_count(&t), 0);
+        assert_eq!(
+            cluster.body_retentions_total(),
+            2,
+            "empty input is still a parse failure that retains body \
+             (RFC §6.3: every parse-failure path bumps both counters)",
+        );
         assert_eq!(
             cluster.parse_failures_total(),
             2,
@@ -1487,6 +1525,11 @@ mod tests {
         assert_eq!(id, NO_TEMPLATE);
         assert_eq!(cluster.template_count(&t), 0);
         assert_eq!(cluster.parse_failures_total(), 1);
+        assert_eq!(
+            cluster.body_retentions_total(),
+            1,
+            "RFC §6.3: over-cap lines retain body alongside the parse-failure count",
+        );
         assert_eq!(cluster.merges_total(), 0);
     }
 

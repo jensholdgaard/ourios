@@ -386,7 +386,7 @@ fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
             events[0].kind,
         );
     };
-    assert_eq!((*w_old, *w_new), (2, 3), "widening bumps version 2 → 3",);
+    assert_eq!((*w_old, *w_new), (2, 3), "widening bumps version 2 → 3");
     assert_eq!(*positions_widened, vec![3]);
 
     let AuditEventKind::TemplateTypeExpanded {

@@ -323,9 +323,104 @@ fn rfc0001_6_bare_template_id_does_not_follow_alias_chains() {
 /// Scenario RFC0001.7 — Combined widening + type-expansion increments version twice and emits two events in order.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
-    todo!("RFC 0001 §6.2, §6.4");
+    use ourios_core::audit::{AuditEventKind, ParamType, SharedAuditSink};
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — a leaf with one pre-existing wildcard slot whose
+    // slot_types = {Str} (seeded via a literal widening at
+    // position 4). The third line then triggers a Fixed mismatch
+    // at position 3 (literal "hour" → "minute" → widening) AND
+    // brings a `<NUM>` token at position 4 (the existing
+    // wildcard, whose slot_types[0] = {Str}, doesn't contain
+    // Num → type expansion).
+    //
+    // Per RFC §6.2 the third line's attach must emit
+    // `TemplateWidened` first, then `TemplateTypeExpanded`,
+    // bumping `template_version` twice.
+    let sink = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // L1: fresh 5-token leaf, v=1. Shared prefix ["user","logged"].
+    let _ = cluster.ingest(&make("user logged at hour NOW"));
+    // L2: literal widening at position 4 ("NOW" → "LATER").
+    //     sim_seq = 4/5 ≥ default threshold 0.7. v=2, slot_types
+    //     = [{Str}].
+    let _ = cluster.ingest(&make("user logged at hour LATER"));
+    // Discard the L2 event so we can assert exactly the L3 trail.
+    let _ = sink.drain();
+
+    // Act — L3: Fixed mismatch at position 3 ("hour" → "minute")
+    // AND `<NUM>` (from "13") at position 4's pre-existing
+    // wildcard. sim_seq = 4/5 → Clean. Combined attach.
+    let _ = cluster.ingest(&make("user logged at minute 13"));
+
+    // Assert — exactly two events in widening-then-expansion
+    // order, with the version pair carrying the two-bump trail
+    // (2 → 3 from widening, 3 → 4 from expansion).
+    let events = sink.drain();
+    assert_eq!(
+        events.len(),
+        2,
+        "combined attach must emit exactly two audit events",
+    );
+
+    let AuditEventKind::TemplateWidened {
+        old_version: w_old,
+        new_version: w_new,
+        positions_widened,
+        ..
+    } = &events[0].kind
+    else {
+        panic!(
+            "event 0 must be TemplateWidened (widening fires before expansion), got {:?}",
+            events[0].kind,
+        );
+    };
+    assert_eq!((*w_old, *w_new), (2, 3), "widening bumps version 2 → 3");
+    assert_eq!(*positions_widened, vec![3]);
+
+    let AuditEventKind::TemplateTypeExpanded {
+        old_version: e_old,
+        new_version: e_new,
+        slots_expanded,
+        ..
+    } = &events[1].kind
+    else {
+        panic!(
+            "event 1 must be TemplateTypeExpanded, got {:?}",
+            events[1].kind,
+        );
+    };
+    assert_eq!(
+        (*e_old, *e_new),
+        (3, 4),
+        "expansion bumps version 3 → 4 in the same attach",
+    );
+    // The existing wildcard at template position 4 is ordinal 1
+    // in the post-widen template (the freshly-widened slot at
+    // position 3 takes ordinal 0). Expansion adds Num.
+    assert_eq!(slots_expanded.len(), 1);
+    assert_eq!(slots_expanded[0].slot_index, 1);
+    assert_eq!(slots_expanded[0].added_types, vec![ParamType::Num]);
+
+    // RFC §6.4: both events count toward merges_total via
+    // `AuditEventKind::counts_as_merge`, so the counter
+    // increments by exactly 2 across the combined attach.
+    assert_eq!(
+        cluster.merges_total(),
+        3,
+        "merges_total: 1 (L2 widen) + 1 (L3 widen) + 1 (L3 expand)",
+    );
 }
 
 /// Scenario RFC0001.8 — `confidence_p50` and `confidence_p01` are emitted as gauges.

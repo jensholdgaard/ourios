@@ -268,13 +268,13 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
     // Extract the literal-token side of each template; the
     // cross-pollination question is about Fixed tokens (Wildcard
     // positions have no token string to compare). `templates_for`
-    // returns `Vec<(Vec<OwnedToken>, u64)>` post-widening — the
-    // wildcard distinction stays typed end-to-end.
-    let literal_tokens = |templates: &[(Vec<ourios_miner::tree::OwnedToken>, u64)]| {
+    // returns `Vec<LeafSnapshot>` post-widening — the wildcard
+    // distinction stays typed end-to-end.
+    let literal_tokens = |templates: &[ourios_miner::cluster::LeafSnapshot]| {
         templates
             .iter()
-            .flat_map(|(t, _)| {
-                t.iter().filter_map(|tok| match tok {
+            .flat_map(|snap| {
+                snap.template.iter().filter_map(|tok| match tok {
                     ourios_miner::tree::OwnedToken::Fixed(s) => Some(s.clone()),
                     ourios_miner::tree::OwnedToken::Wildcard => None,
                 })

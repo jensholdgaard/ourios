@@ -163,6 +163,99 @@ pub struct SlotExpansion {
     pub added_types: Vec<ParamType>,
 }
 
+/// Compact bitset over the [`ParamType`] alphabet — one byte per
+/// wildcard slot — recording every `ParamType` observed in that
+/// slot per RFC 0001 §6.1 (`slot_types: Vec<HashSet<ParamType>>`).
+///
+/// The byte layout is private; the public surface is value-based
+/// (`singleton`, `insert`, `contains`, `iter`, `is_empty`, `union`)
+/// so the layout can change without breaking callers. A new
+/// `ParamType` variant forces an update to [`SlotTypes::bit`] —
+/// the compiler enforces totality via the exhaustive match. Eight
+/// variants fit a `u8`; if the alphabet grows past eight, widen the
+/// backing integer here (the same exhaustive match will fail to
+/// compile and force the choice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SlotTypes(u8);
+
+impl SlotTypes {
+    /// Empty type set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Type set containing only `t`.
+    #[must_use]
+    pub const fn singleton(t: ParamType) -> Self {
+        Self(Self::bit(t))
+    }
+
+    /// Returns a copy of `self` with `t` added. Idempotent — adding
+    /// a type already present leaves the set unchanged.
+    #[must_use]
+    pub const fn insert(self, t: ParamType) -> Self {
+        Self(self.0 | Self::bit(t))
+    }
+
+    /// `true` iff `t` is in the set.
+    #[must_use]
+    pub const fn contains(self, t: ParamType) -> bool {
+        (self.0 & Self::bit(t)) != 0
+    }
+
+    /// `true` iff the set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Set-union with `other`.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Iterates the variants in [`ParamType`] declaration order
+    /// (`Ip, Uuid, Num, Hex, Ts, Path, Str, Overflow`). The order
+    /// is stable — `SlotExpansion::added_types` and any other
+    /// audit-event payload built by collecting this iterator
+    /// inherits it, so two ingests that expand a slot with the
+    /// same set of types produce the same wire-form audit.
+    pub fn iter(self) -> impl Iterator<Item = ParamType> {
+        const ALL: [ParamType; 8] = [
+            ParamType::Ip,
+            ParamType::Uuid,
+            ParamType::Num,
+            ParamType::Hex,
+            ParamType::Ts,
+            ParamType::Path,
+            ParamType::Str,
+            ParamType::Overflow,
+        ];
+        ALL.into_iter().filter(move |t| self.contains(*t))
+    }
+
+    const fn bit(t: ParamType) -> u8 {
+        match t {
+            ParamType::Ip => 1 << 0,
+            ParamType::Uuid => 1 << 1,
+            ParamType::Num => 1 << 2,
+            ParamType::Hex => 1 << 3,
+            ParamType::Ts => 1 << 4,
+            ParamType::Path => 1 << 5,
+            ParamType::Str => 1 << 6,
+            ParamType::Overflow => 1 << 7,
+        }
+    }
+}
+
+impl FromIterator<ParamType> for SlotTypes {
+    fn from_iter<I: IntoIterator<Item = ParamType>>(iter: I) -> Self {
+        iter.into_iter().fold(Self::new(), Self::insert)
+    }
+}
+
 /// RFC 0001 §6.4 audit-event schema.
 ///
 /// Splits the schema into shared envelope fields (this struct) and
@@ -505,5 +598,94 @@ mod tests {
         let raw = "x".repeat(300);
         let sample = sample_first_256_bytes(&raw);
         assert_eq!(sample.len(), 256);
+    }
+
+    #[test]
+    fn slot_types_default_and_new_are_empty() {
+        assert!(SlotTypes::new().is_empty());
+        assert!(SlotTypes::default().is_empty());
+    }
+
+    #[test]
+    fn slot_types_singleton_contains_only_that_variant() {
+        let s = SlotTypes::singleton(ParamType::Num);
+        assert!(s.contains(ParamType::Num));
+        assert!(!s.contains(ParamType::Uuid));
+        assert!(!s.contains(ParamType::Str));
+    }
+
+    #[test]
+    fn slot_types_insert_is_idempotent() {
+        // The expansion logic re-inserts on every attach (cheap and
+        // monotonic); idempotence pins the contract that a no-op
+        // attach won't accidentally toggle bits.
+        let s = SlotTypes::singleton(ParamType::Num);
+        assert_eq!(s.insert(ParamType::Num), s);
+    }
+
+    #[test]
+    fn slot_types_iter_yields_declared_order_regardless_of_insertion_order() {
+        // ParamType declaration order: Ip, Uuid, Num, Hex, Ts, Path,
+        // Str, Overflow. Pinned because TemplateTypeExpanded payloads
+        // collect from this iterator — a reorder here would flip
+        // the on-wire `added_types` ordering on the audit event.
+        let s = SlotTypes::new()
+            .insert(ParamType::Str)
+            .insert(ParamType::Num)
+            .insert(ParamType::Ip);
+        let collected: Vec<_> = s.iter().collect();
+        assert_eq!(
+            collected,
+            vec![ParamType::Ip, ParamType::Num, ParamType::Str],
+        );
+    }
+
+    #[test]
+    fn slot_types_from_iter_round_trips_through_iter() {
+        let original: Vec<ParamType> = vec![ParamType::Num, ParamType::Uuid, ParamType::Str];
+        let set: SlotTypes = original.iter().copied().collect();
+        let collected: Vec<_> = set.iter().collect();
+        // Declared order, not insertion order — see the iter test.
+        assert_eq!(
+            collected,
+            vec![ParamType::Uuid, ParamType::Num, ParamType::Str],
+        );
+    }
+
+    #[test]
+    fn slot_types_union_is_set_union() {
+        let a = SlotTypes::singleton(ParamType::Num).insert(ParamType::Uuid);
+        let b = SlotTypes::singleton(ParamType::Ip).insert(ParamType::Num);
+        let u = a.union(b);
+        assert!(u.contains(ParamType::Num));
+        assert!(u.contains(ParamType::Uuid));
+        assert!(u.contains(ParamType::Ip));
+        assert!(!u.contains(ParamType::Str));
+    }
+
+    #[test]
+    fn slot_types_bit_assignments_are_mutually_distinct() {
+        // Each ParamType must map to its own bit; otherwise insert/
+        // contains would alias variants. Reflectively iterate every
+        // variant (declared once in the const ALL inside iter()) by
+        // round-tripping each through singleton + iter.
+        for t in [
+            ParamType::Ip,
+            ParamType::Uuid,
+            ParamType::Num,
+            ParamType::Hex,
+            ParamType::Ts,
+            ParamType::Path,
+            ParamType::Str,
+            ParamType::Overflow,
+        ] {
+            let s = SlotTypes::singleton(t);
+            let observed: Vec<_> = s.iter().collect();
+            assert_eq!(
+                observed,
+                vec![t],
+                "singleton({t:?}) must round-trip to a single-element iter",
+            );
+        }
     }
 }

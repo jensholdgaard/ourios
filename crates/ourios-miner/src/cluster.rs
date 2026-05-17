@@ -72,9 +72,9 @@ use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::record::{BodyKind, MinedRecord, NoOpRecordSink, Param, RecordSink};
 use ourios_core::tenant::TenantId;
 
-use crate::mask::mask;
+use crate::mask::{Masked, mask};
 use crate::sim_seq::sim_seq_owned;
-use crate::tokenize::tokenize;
+use crate::tokenize::{Tokenized, tokenize};
 use crate::tree::{DEFAULT_PREFIX_DEPTH, Leaf, OwnedToken, Tree};
 // `DEFAULT_PREFIX_DEPTH` is used as the prefix-depth field's
 // default — see `MinerCluster::with_audit_sink`.
@@ -426,33 +426,42 @@ fn build_record_params<'a>(
         typed_params.len(),
         "mask emits typed_params parallel to wildcard_positions",
     );
-    let line_mask_set: std::collections::HashSet<usize> =
-        line_wildcard_positions.iter().copied().collect();
-    let wildcard_count = leaf_template
-        .iter()
-        .filter(|t| matches!(t, OwnedToken::Wildcard))
-        .count();
-    let mut out = Vec::with_capacity(wildcard_count);
-    let mut tp_iter = typed_params.iter();
+    // `line_wildcard_positions` is ascending by construction —
+    // mask() populates it in a single forward pass over the
+    // tokenized line. We can therefore advance an index in
+    // lockstep with the template walk instead of materialising
+    // a HashSet for `contains` probes (the hot path runs once
+    // per ingested line).
+    let mut out = Vec::with_capacity(typed_params.len());
+    let mut wp_idx = 0usize;
     for (i, tok) in leaf_template.iter().enumerate() {
         if !matches!(tok, OwnedToken::Wildcard) {
             continue;
         }
-        if line_mask_set.contains(&i) {
-            let tp = tp_iter
-                .next()
-                .expect("typed_params and line_wildcard_positions agree");
+        if wp_idx < line_wildcard_positions.len() && line_wildcard_positions[wp_idx] == i {
+            let tp = &typed_params[wp_idx];
+            wp_idx += 1;
             out.push(Param {
                 type_tag: tp.type_tag,
                 value: tp.value.to_string(),
             });
         } else {
+            // Template-Wildcard at a position the current line
+            // did not mask — i.e. a historical widening of a
+            // position carrying a literal in this line. RFC §6.6
+            // step 5b: capture the literal as Str so
+            // reconstruction can restore it.
             out.push(Param {
                 type_tag: ParamType::Str,
                 value: line_tokens[i].to_string(),
             });
         }
     }
+    debug_assert_eq!(
+        wp_idx,
+        line_wildcard_positions.len(),
+        "every line-mask position must align with a template-Wildcard position",
+    );
     out
 }
 
@@ -460,19 +469,25 @@ fn build_record_params<'a>(
 /// Mask-position tokens become `Wildcard`; other positions stay
 /// `Fixed` with the literal value.
 fn build_leaf_template(masked_tokens: &[&str], wildcard_positions: &[usize]) -> Vec<OwnedToken> {
-    let wildcard_set: std::collections::HashSet<usize> =
-        wildcard_positions.iter().copied().collect();
-    masked_tokens
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            if wildcard_set.contains(&i) {
-                OwnedToken::Wildcard
-            } else {
-                OwnedToken::Fixed((*s).to_string())
-            }
-        })
-        .collect()
+    // `wildcard_positions` is ascending (mask() emits in
+    // single-pass token order); advance an index in lockstep
+    // rather than allocating a HashSet on the hot path.
+    let mut out = Vec::with_capacity(masked_tokens.len());
+    let mut wp_idx = 0usize;
+    for (i, s) in masked_tokens.iter().enumerate() {
+        if wp_idx < wildcard_positions.len() && wildcard_positions[wp_idx] == i {
+            out.push(OwnedToken::Wildcard);
+            wp_idx += 1;
+        } else {
+            out.push(OwnedToken::Fixed((*s).to_string()));
+        }
+    }
+    debug_assert_eq!(
+        wp_idx,
+        wildcard_positions.len(),
+        "all wildcard positions consumed by template walk",
+    );
+    out
 }
 
 impl MinerCluster {
@@ -523,13 +538,22 @@ impl MinerCluster {
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.
     fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
-        let tokenized = tokenize(raw);
-        let masked = mask(&tokenized.tokens);
-        let separators = separators_to_owned(&tokenized.separators);
-        let line_tokens: Vec<&str> = tokenized.tokens.clone();
-        let wildcard_positions = masked.wildcard_positions.clone();
-        let typed_params = masked.typed_params.clone();
-        let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
+        // Destructure rather than clone: `Tokenized.tokens` and
+        // `Masked.{tokens,wildcard_positions,typed_params}` are
+        // all consumed once on the way through this function, so
+        // the previous per-line clones were pure overhead. The
+        // `&line_tokens` borrow in `mask()` ends before we move
+        // out of `Masked`, so the lifetimes still line up.
+        let Tokenized {
+            tokens: line_tokens,
+            separators: raw_separators,
+        } = tokenize(raw);
+        let Masked {
+            tokens: masked_strs,
+            wildcard_positions,
+            typed_params,
+        } = mask(&line_tokens);
+        let separators = separators_to_owned(&raw_separators);
 
         if masked_strs.is_empty() {
             // Empty / whitespace-only input is a §6.2 step 1
@@ -723,10 +747,13 @@ impl MinerCluster {
     }
 
     /// RFC §6.2 step 4 (fresh-leaf branch). Allocates a new
-    /// `template_id`, materialises the prefix path, pushes a
-    /// fixed-only leaf. RFC0001.1: this path **does not** emit an
-    /// audit event — `template_count` already reflects the
-    /// allocation and `merges_total` is reserved for widening.
+    /// `template_id`, materialises the prefix path, and pushes a
+    /// leaf whose template is the caller-supplied `Vec<OwnedToken>`
+    /// — typically built by [`build_leaf_template`] so that masked
+    /// positions enter as `Wildcard` and literal positions stay
+    /// `Fixed`. RFC0001.1: this path **does not** emit an audit
+    /// event — `template_count` already reflects the allocation
+    /// and `merges_total` is reserved for widening.
     fn create_new_leaf_with_template(
         &mut self,
         record: &OtlpLogRecord,

@@ -37,11 +37,25 @@ pub struct TypedParam<'a> {
 ///
 /// `tokens.len()` always equals the input token count
 /// (position-preserving): each entry is either the original token
-/// (unmasked) or the type-tag string (masked). `typed_params`
-/// holds, in match order, one entry per masked position.
+/// (unmasked) or the type-tag string (masked) — the type-tag
+/// form is what the tree walk descends by, so the prefix-tree
+/// partitioning still distinguishes `<NUM>` from `<UUID>` at the
+/// same position.
+///
+/// `wildcard_positions` lists the token indices where mask
+/// substituted a tag; the cluster uses this to build the leaf
+/// template (Wildcards at masked positions per RFC 0001 §6.6) and
+/// to align `MinedRecord::params` with template-Wildcard order at
+/// emit time. The slot index of the k-th masked position is `k`
+/// — the index into [`Self::typed_params`].
+///
+/// `typed_params` holds, in match order, one entry per masked
+/// position; `typed_params[k]` is the original value of the
+/// token at position `wildcard_positions[k]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Masked<'a> {
     pub tokens: Vec<&'a str>,
+    pub wildcard_positions: Vec<usize>,
     pub typed_params: Vec<TypedParam<'a>>,
 }
 
@@ -58,10 +72,12 @@ pub struct Masked<'a> {
 #[must_use]
 pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
     let mut out_tokens = Vec::with_capacity(tokens.len());
+    let mut wildcard_positions = Vec::new();
     let mut typed_params = Vec::new();
-    for &tok in tokens {
+    for (i, &tok) in tokens.iter().enumerate() {
         if let Some(tag) = classify(tok) {
             out_tokens.push(tag.as_str());
+            wildcard_positions.push(i);
             typed_params.push(TypedParam {
                 type_tag: tag.into(),
                 value: tok,
@@ -72,6 +88,7 @@ pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
     }
     Masked {
         tokens: out_tokens,
+        wildcard_positions,
         typed_params,
     }
 }

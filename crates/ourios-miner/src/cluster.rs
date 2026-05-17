@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_core::audit::{
-    AuditEvent, AuditEventKind, AuditSink, NoOpAuditSink, hash_triggering_line,
+    AuditEvent, AuditEventKind, AuditSink, NoOpAuditSink, ParamType, hash_triggering_line,
     sample_first_256_bytes,
 };
 use ourios_core::clock::{Clock, SystemClock};
@@ -395,18 +395,82 @@ fn separators_to_owned(separators: &[&str]) -> Vec<String> {
     separators.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// Free helper: lift `mask`'s typed-params output into the
-/// `Vec<Param>` shape `MinedRecord::params` carries. PR-A
-/// alignment: this is "one entry per masked position, in token
-/// order"; PR-B reconciles with §6.1's "one entry per template
-/// `<*>` slot" once `reconstruct()` lands and the alignment
-/// becomes load-bearing.
-fn params_from_mask(typed_params: &[crate::mask::TypedParam<'_>]) -> Vec<Param> {
-    typed_params
+/// Free helper: build `MinedRecord::params` aligned to the
+/// leaf's template-Wildcard order per RFC §6.1 / §6.6.
+///
+/// Walks `leaf_template` left-to-right. For each `Wildcard`
+/// position the helper picks the value source:
+///
+/// - If position `i` is in this line's `line_wildcard_positions`
+///   (mask matched here), take the next entry from
+///   `typed_params` — the entries are paired with
+///   `line_wildcard_positions` by index, and both lists are in
+///   ascending position order, so an iterator stays aligned as
+///   we walk.
+/// - Otherwise the Wildcard is a *widened* position (either
+///   from a previous attach or from the widening that brought
+///   this attach here). STR fallback per RFC §6.2 step 5b
+///   "Build the params array": the value is the original
+///   `L_tok[i]` with `type_tag = STR`.
+///
+/// `Fixed` positions don't contribute to params — they
+/// reconstruct from the template itself.
+fn build_record_params<'a>(
+    leaf_template: &[OwnedToken],
+    line_tokens: &[&'a str],
+    line_wildcard_positions: &[usize],
+    typed_params: &[crate::mask::TypedParam<'a>],
+) -> Vec<Param> {
+    debug_assert_eq!(
+        line_wildcard_positions.len(),
+        typed_params.len(),
+        "mask emits typed_params parallel to wildcard_positions",
+    );
+    let line_mask_set: std::collections::HashSet<usize> =
+        line_wildcard_positions.iter().copied().collect();
+    let wildcard_count = leaf_template
         .iter()
-        .map(|p| Param {
-            type_tag: p.type_tag,
-            value: p.value.to_string(),
+        .filter(|t| matches!(t, OwnedToken::Wildcard))
+        .count();
+    let mut out = Vec::with_capacity(wildcard_count);
+    let mut tp_iter = typed_params.iter();
+    for (i, tok) in leaf_template.iter().enumerate() {
+        if !matches!(tok, OwnedToken::Wildcard) {
+            continue;
+        }
+        if line_mask_set.contains(&i) {
+            let tp = tp_iter
+                .next()
+                .expect("typed_params and line_wildcard_positions agree");
+            out.push(Param {
+                type_tag: tp.type_tag,
+                value: tp.value.to_string(),
+            });
+        } else {
+            out.push(Param {
+                type_tag: ParamType::Str,
+                value: line_tokens[i].to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Free helper: build a fresh-leaf template from a masked line.
+/// Mask-position tokens become `Wildcard`; other positions stay
+/// `Fixed` with the literal value.
+fn build_leaf_template(masked_tokens: &[&str], wildcard_positions: &[usize]) -> Vec<OwnedToken> {
+    let wildcard_set: std::collections::HashSet<usize> =
+        wildcard_positions.iter().copied().collect();
+    masked_tokens
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if wildcard_set.contains(&i) {
+                OwnedToken::Wildcard
+            } else {
+                OwnedToken::Fixed((*s).to_string())
+            }
         })
         .collect()
 }
@@ -461,17 +525,18 @@ impl MinerCluster {
     fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
         let tokenized = tokenize(raw);
         let masked = mask(&tokenized.tokens);
-        // Pre-compute the owned forms once. Every emit path
-        // reads these.
         let separators = separators_to_owned(&tokenized.separators);
-        let params = params_from_mask(&masked.typed_params);
+        let line_tokens: Vec<&str> = tokenized.tokens.clone();
+        let wildcard_positions = masked.wildcard_positions.clone();
+        let typed_params = masked.typed_params.clone();
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
 
         if masked_strs.is_empty() {
             // Empty / whitespace-only input is a §6.2 step 1
             // parse failure. Tokenize still produced one
             // separator entry covering the entire input
-            // (`tokens.len() + 1 == 1`).
+            // (`tokens.len() + 1 == 1`). No template → empty
+            // params (nothing to align against).
             let mut rec = Self::record_envelope(record, BodyKind::String);
             rec.separators = separators;
             rec.body = Some(raw.to_string());
@@ -489,11 +554,11 @@ impl MinerCluster {
         // prevent. ≥65 536 tokens in a single log line is
         // pathological; the §6.2 step 1 "line longer than
         // max-line-bytes" parse-failure path. Retain body per
-        // §6.3.
+        // §6.3. Params stay empty — there's no template
+        // alignment to populate.
         if masked_strs.len() > u16::MAX as usize {
             let mut rec = Self::record_envelope(record, BodyKind::String);
             rec.separators = separators;
-            rec.params = params;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
             self.emit_record(rec);
@@ -518,7 +583,15 @@ impl MinerCluster {
             // into the lossy zone against, and no template to
             // declare a parse failure against.
             None => {
-                let new_id = self.create_new_leaf(record, &masked_strs);
+                let template = build_leaf_template(&masked_strs, &wildcard_positions);
+                let new_id =
+                    self.create_new_leaf_with_template(record, &masked_strs, template.clone());
+                let params = build_record_params(
+                    &template,
+                    &line_tokens,
+                    &wildcard_positions,
+                    &typed_params,
+                );
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = new_id;
                 rec.template_version = 1;
@@ -531,17 +604,20 @@ impl MinerCluster {
             Some(c) => {
                 match ConfidenceZone::classify(c.similarity, threshold, floor) {
                     // Clean: attach to candidate, optionally
-                    // widening. RFC §6.2 step 5. No body
-                    // retention. The helper emits its own
-                    // record (one of: clean-reuse, widening, or
-                    // degenerate-rejection).
+                    // widening. RFC §6.2 step 5. The helper
+                    // emits its own record (clean-reuse,
+                    // widening, or degenerate-rejection),
+                    // building params against the leaf's
+                    // (possibly post-widening) template.
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
                         record,
                         raw,
                         &masked_strs,
                         c,
                         separators,
-                        params,
+                        &line_tokens,
+                        &wildcard_positions,
+                        &typed_params,
                     ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
@@ -552,7 +628,18 @@ impl MinerCluster {
                     // separately.
                     ConfidenceZone::Lossy => {
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
-                        let new_id = self.create_new_leaf(record, &masked_strs);
+                        let template = build_leaf_template(&masked_strs, &wildcard_positions);
+                        let new_id = self.create_new_leaf_with_template(
+                            record,
+                            &masked_strs,
+                            template.clone(),
+                        );
+                        let params = build_record_params(
+                            &template,
+                            &line_tokens,
+                            &wildcard_positions,
+                            &typed_params,
+                        );
                         let mut rec = Self::record_envelope(record, BodyKind::String);
                         rec.template_id = new_id;
                         rec.template_version = 1;
@@ -568,10 +655,10 @@ impl MinerCluster {
                     }
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
+                    // Params stay empty (no template alignment).
                     ConfidenceZone::ParseFailure => {
                         let mut rec = Self::record_envelope(record, BodyKind::String);
                         rec.separators = separators;
-                        rec.params = params;
                         rec.body = Some(raw.to_string());
                         rec.lossy_flag = true;
                         self.emit_record(rec);
@@ -640,7 +727,17 @@ impl MinerCluster {
     /// fixed-only leaf. RFC0001.1: this path **does not** emit an
     /// audit event — `template_count` already reflects the
     /// allocation and `merges_total` is reserved for widening.
-    fn create_new_leaf(&mut self, record: &OtlpLogRecord, masked_strs: &[&str]) -> u64 {
+    fn create_new_leaf_with_template(
+        &mut self,
+        record: &OtlpLogRecord,
+        masked_strs: &[&str],
+        template: Vec<OwnedToken>,
+    ) -> u64 {
+        debug_assert_eq!(
+            template.len(),
+            masked_strs.len(),
+            "fresh-leaf template must match masked-token length",
+        );
         let new_id = self.next_template_id;
         self.next_template_id += 1;
 
@@ -649,12 +746,8 @@ impl MinerCluster {
             .entry(record.tenant_id.clone())
             .or_insert_with(TenantState::new);
         let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
-        let new_template: Vec<OwnedToken> = masked_strs
-            .iter()
-            .map(|s| OwnedToken::Fixed((*s).to_string()))
-            .collect();
         parent.leaves.push(Leaf {
-            template: new_template,
+            template,
             template_id: new_id,
             template_version: 1,
             severity_number: record.severity_number,
@@ -682,6 +775,7 @@ impl MinerCluster {
     ///     `template_version`, emit `TemplateWidened`, increment
     ///     `merges_total`, return the leaf's existing
     ///     `template_id`.
+    #[allow(clippy::too_many_arguments)]
     fn attach_and_maybe_widen(
         &mut self,
         record: &OtlpLogRecord,
@@ -689,16 +783,10 @@ impl MinerCluster {
         masked_strs: &[&str],
         candidate: Candidate,
         separators: Vec<String>,
-        params: Vec<Param>,
+        line_tokens: &[&str],
+        wildcard_positions: &[usize],
+        typed_params: &[crate::mask::TypedParam<'_>],
     ) -> u64 {
-        // Ownership rationale: each of the three exit paths
-        // (clean reuse, degenerate rejection, widening) emits
-        // **one** record and never reuses `separators` / `params`
-        // after that emit. Taking the vectors by value lets each
-        // branch move them straight into the record without a
-        // `.to_vec()` clone — one alloc per ingest instead of
-        // two on the clean / widen hot paths.
-
         // Phase 2 — re-descend mutably to the chosen leaf.
         let state = self
             .tenants
@@ -714,6 +802,12 @@ impl MinerCluster {
             // the leaf as-is; no version bump, no audit event.
             let template_id = leaf.template_id;
             let template_version = leaf.template_version;
+            let params = build_record_params(
+                &leaf.template,
+                line_tokens,
+                wildcard_positions,
+                typed_params,
+            );
             let mut rec = Self::record_envelope(record, BodyKind::String);
             rec.template_id = template_id;
             rec.template_version = template_version;
@@ -754,10 +848,10 @@ impl MinerCluster {
             });
             // Emit a parse-failure data record alongside the
             // audit event — §6.4 treats degenerate widening as a
-            // parse failure that retains body.
+            // parse failure that retains body. Params stay empty
+            // (no template alignment).
             let mut rec = Self::record_envelope(record, BodyKind::String);
             rec.separators = separators;
-            rec.params = params;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
             self.emit_record(rec);
@@ -778,6 +872,11 @@ impl MinerCluster {
             .expect("template_version overflow: 2^32 widenings on one leaf is implausible");
         let new_version = leaf.template_version;
         let new_template = format_template(&leaf.template);
+        // Snapshot the post-widening template for the params
+        // build below — `leaf` is borrowed mutably so we need an
+        // owned clone before relinquishing the borrow to emit
+        // through `self.audit_sink`.
+        let leaf_template_after = leaf.template.clone();
 
         self.audit_sink.emit(AuditEvent {
             kind: AuditEventKind::TemplateWidened {
@@ -795,10 +894,17 @@ impl MinerCluster {
         });
         self.merges_total.fetch_add(1, Ordering::Relaxed);
 
-        // Emit the widening data record. PR-A carries the
-        // mask-emit params verbatim; reconciliation with the §6.1
-        // "one entry per template `<*>` slot" alignment lands
-        // with `reconstruct()` in the next PR.
+        // Emit the widening data record. Params align with the
+        // post-widening template: each Wildcard in the new
+        // template either matches a mask-position on this line
+        // (typed_params entry) or was a Fixed position widened
+        // by this attach (STR fallback per §6.2 step 5b).
+        let params = build_record_params(
+            &leaf_template_after,
+            line_tokens,
+            wildcard_positions,
+            typed_params,
+        );
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.template_id = template_id;
         rec.template_version = new_version;
@@ -1101,6 +1207,17 @@ mod tests {
     /// contract change is explicit, not silent: the old test
     /// asserted *distinct ids*, the new one asserts *same id +
     /// audit event*. PR review must acknowledge the swap.
+    ///
+    /// PR-B-1 locking-test update: masked positions (`<NUM>`,
+    /// `<IP>`) now enter the leaf template as `Wildcard` rather
+    /// than `Fixed("<NUM>")` / `Fixed("<IP>")`, so the rendered
+    /// `old_template` reads `user <*> logged in from <*>` and the
+    /// widened `new_template` reads `user <*> logged <*> from <*>`.
+    /// The audit event shape is unchanged — only the tag-vs-`<*>`
+    /// surface differs because typed-param data is now attached to
+    /// the parallel params vector rather than encoded in the
+    /// template string. Reconstruction (RFC 0001 §6.6) restores
+    /// the typed values via that params vector.
     #[test]
     fn near_match_under_same_parent_widens_into_single_template() {
         let (mut cluster, sink) = cluster_with_observable_sink();
@@ -1134,8 +1251,8 @@ mod tests {
         assert_eq!(*old_version, 1);
         assert_eq!(*new_version, 2);
         assert_eq!(*positions_widened, vec![3]);
-        assert_eq!(old_template, "user <NUM> logged in from <IP>");
-        assert_eq!(new_template, "user <NUM> logged <*> from <IP>");
+        assert_eq!(old_template, "user <*> logged in from <*>");
+        assert_eq!(new_template, "user <*> logged <*> from <*>");
     }
 
     #[test]
@@ -1161,6 +1278,22 @@ mod tests {
         // A line whose mask matches an existing leaf exactly (no
         // mismatched Fixed positions) reuses the leaf with no
         // widening, no version bump, no audit event.
+        //
+        // PR-B-1 locking-test update: the old assertion required
+        // every leaf token to be `Fixed(_)`, which was correct
+        // when masked tokens entered the template as
+        // `Fixed("<NUM>")`. Under the new model masked positions
+        // are `Wildcard` in the leaf template from creation — the
+        // typed-param data lives in the parallel params vector,
+        // not in the template string. The relevant contract is
+        // therefore "no version bump and no audit event", not
+        // "no wildcards at all": a same-shape ingest must not
+        // widen the leaf, so the template's Wildcard set must
+        // match the line's mask set (Wildcard only at position 1
+        // — the masked `42`/`17`). We assert that exact set
+        // rather than counting wildcards, so a future bug that
+        // accidentally widened the `logged`/`in` positions on a
+        // same-shape ingest would still fail this test.
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
@@ -1171,15 +1304,18 @@ mod tests {
         assert_eq!(cluster.merges_total(), 0);
         assert!(sink.is_empty());
 
-        // Template stays fixed-only (no `<*>` from widening).
         let templates = cluster.templates_for(&t);
         assert_eq!(templates.len(), 1);
-        assert!(
-            templates[0]
-                .0
-                .iter()
-                .all(|t| matches!(t, OwnedToken::Fixed(_))),
-            "no Wildcard tokens should be present without widening: {:?}",
+        let wildcard_positions: Vec<usize> = templates[0]
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| matches!(t, OwnedToken::Wildcard).then_some(i))
+            .collect();
+        assert_eq!(
+            wildcard_positions,
+            vec![1],
+            "exact same-shape ingest must leave the leaf's mask set unchanged: {:?}",
             templates[0].0,
         );
     }

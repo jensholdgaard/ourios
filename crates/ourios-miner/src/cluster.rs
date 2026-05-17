@@ -448,41 +448,18 @@ fn param_type_for_line_position(
     }
 }
 
-/// Heuristic classification of a leaf's pre-widen `Fixed` token.
-/// Used only to seed `slot_types` on widening.
-///
-/// **Known limitation.** On main (this PR's baseline), `mask()`
-/// emits the tag strings `<NUM>` / `<IP>` / `<UUID>` and the
-/// fresh-leaf builder stores them as `Fixed("<NUM>")` etc. The
-/// leaf carries no metadata distinguishing a `Fixed("<NUM>")` that
-/// came from a mask emit (slot type Num) from one that came from a
-/// literal user input token spelled "<NUM>" (slot type Str). This
-/// heuristic classifies any matching tag string as the
-/// corresponding `ParamType`; the mis-classification surface is
-/// bounded to the seed step on widening — a future correct
-/// observation at the slot only causes a missed
-/// `TemplateTypeExpanded` audit, not a silent template merge — and
-/// is eliminated entirely by PR-B-1, which switches masked
-/// positions to `Wildcard` in the leaf template (with `slot_types`
-/// seeded from `typed_params` at fresh-leaf creation, no inference
-/// required).
-fn type_at_leaf_fixed_token(s: &str) -> ParamType {
-    match s {
-        "<NUM>" => ParamType::Num,
-        "<IP>" => ParamType::Ip,
-        "<UUID>" => ParamType::Uuid,
-        _ => ParamType::Str,
-    }
-}
-
 /// On widening, seed [`Leaf::slot_types`] for each newly-introduced
 /// `Wildcard` position. The initial type set captures both
 /// observations the widening witnessed:
 ///
-/// - the pre-widen token (which was a `Fixed`-token mismatch — the
-///   reason widening fired)
+/// - the pre-widen `Fixed` token — under PR-B-1's model this is
+///   always a *literal* token (mask-emitted positions enter the
+///   leaf as `Wildcard` from creation in [`MinerCluster::
+///   create_new_leaf`]), so its `ParamType` is unconditionally
+///   `Str` per RFC §6.2 step 5b.
 /// - the line's token at that position (the value that triggered
-///   the widening)
+///   the widening), classified from mask's output by
+///   [`param_type_for_line_position`].
 ///
 /// Neither observation counts as a `TemplateTypeExpanded` — the
 /// slot didn't exist before this attach, so there's no "expansion"
@@ -499,7 +476,6 @@ fn type_at_leaf_fixed_token(s: &str) -> ParamType {
 /// over the post-widen template is enough.
 fn update_slot_types_on_widening(
     slot_types: &mut Vec<SlotTypes>,
-    pre_widen_template: &[OwnedToken],
     post_widen_template: &[OwnedToken],
     line_wildcard_positions: &[usize],
     line_typed_params: &[crate::mask::TypedParam<'_>],
@@ -509,34 +485,21 @@ fn update_slot_types_on_widening(
         positions_widened.windows(2).all(|w| w[0] < w[1]),
         "positions_widened must be sorted ascending",
     );
-    debug_assert_eq!(
-        pre_widen_template.len(),
-        post_widen_template.len(),
-        "widening is in-place — length is invariant",
-    );
 
     let mut ordinal = 0usize;
     let mut widen_iter = positions_widened.iter().copied().peekable();
     for (p, tok) in post_widen_template.iter().enumerate() {
         if matches!(tok, OwnedToken::Wildcard) {
             if widen_iter.peek().copied() == Some(p) {
-                // The line's type at the triggering position is
-                // authoritative — read it from mask's
-                // classification rather than inferring from the
-                // masked-token string (which collides with literal
-                // "<NUM>"/"<IP>"/"<UUID>" tokens, see
-                // `param_type_for_line_position`).
+                // Line side: authoritative classification from
+                // mask. Leaf side: PR-B-1 invariant — the
+                // pre-widen Fixed at a widened position is always
+                // a literal (mask-emit positions enter as
+                // Wildcard), so the initial slot type is
+                // {Str, line_type}.
                 let line_type =
                     param_type_for_line_position(p, line_wildcard_positions, line_typed_params);
-                let pre_token = match &pre_widen_template[p] {
-                    OwnedToken::Fixed(s) => s.as_str(),
-                    OwnedToken::Wildcard => unreachable!(
-                        "find_widening_positions only flags Fixed mismatches; \
-                         a pre-existing Wildcard cannot appear in positions_widened",
-                    ),
-                };
-                let initial =
-                    SlotTypes::singleton(type_at_leaf_fixed_token(pre_token)).insert(line_type);
+                let initial = SlotTypes::singleton(ParamType::Str).insert(line_type);
                 slot_types.insert(ordinal, initial);
                 widen_iter.next();
             }
@@ -727,10 +690,11 @@ fn plan_attach(
         };
     }
 
-    // Widening path. Snapshot pre-widen template for slot seeding
-    // and the audit payload's `old_template` string.
+    // Widening path. PR-B-1 invariant: every Fixed token in a
+    // leaf is a literal (mask-emit positions enter as Wildcard),
+    // so the pre-widen template doesn't need to be snapshot for
+    // slot seeding — the seed is always `{Str, line_type}`.
     let template_id = leaf.template_id;
-    let pre_widen_template = leaf.template.clone();
     let old_version = leaf.template_version;
     let old_template_str = format_template(&leaf.template);
     let positions_u16 = positions_to_u16(&positions_widened);
@@ -738,7 +702,6 @@ fn plan_attach(
     apply_widening(&mut leaf.template, &positions_widened);
     update_slot_types_on_widening(
         &mut leaf.slot_types,
-        &pre_widen_template,
         &leaf.template,
         line_wildcard_positions,
         line_typed_params,
@@ -901,7 +864,12 @@ impl MinerCluster {
             // into the lossy zone against, and no template to
             // declare a parse failure against.
             None => {
-                let new_id = self.create_new_leaf(record, &masked_strs);
+                let new_id = self.create_new_leaf(
+                    record,
+                    &masked_strs,
+                    &masked.wildcard_positions,
+                    &masked.typed_params,
+                );
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = new_id;
                 rec.template_version = 1;
@@ -937,7 +905,12 @@ impl MinerCluster {
                     // separately.
                     ConfidenceZone::Lossy => {
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
-                        let new_id = self.create_new_leaf(record, &masked_strs);
+                        let new_id = self.create_new_leaf(
+                            record,
+                            &masked_strs,
+                            &masked.wildcard_positions,
+                            &masked.typed_params,
+                        );
                         let mut rec = Self::record_envelope(record, BodyKind::String);
                         rec.template_id = new_id;
                         rec.template_version = 1;
@@ -1021,11 +994,30 @@ impl MinerCluster {
     }
 
     /// RFC §6.2 step 4 (fresh-leaf branch). Allocates a new
-    /// `template_id`, materialises the prefix path, pushes a
-    /// fixed-only leaf. RFC0001.1: this path **does not** emit an
-    /// audit event — `template_count` already reflects the
-    /// allocation and `merges_total` is reserved for widening.
-    fn create_new_leaf(&mut self, record: &OtlpLogRecord, masked_strs: &[&str]) -> u64 {
+    /// `template_id`, materialises the prefix path, pushes a leaf
+    /// whose template carries `OwnedToken::Wildcard` at every
+    /// mask-emitted position and `OwnedToken::Fixed` elsewhere.
+    /// `slot_types` is seeded from `typed_params` in ordinal order
+    /// — `slot_types[k]` is the singleton `{typed_params[k]
+    /// .type_tag}` for the k-th masked position, recording the
+    /// type observed at that slot's first sight.
+    ///
+    /// RFC0001.1: this path **does not** emit an audit event —
+    /// `template_count` already reflects the allocation and
+    /// `merges_total` is reserved for widening / type-expansion
+    /// events on existing leaves.
+    fn create_new_leaf(
+        &mut self,
+        record: &OtlpLogRecord,
+        masked_strs: &[&str],
+        line_wildcard_positions: &[usize],
+        line_typed_params: &[crate::mask::TypedParam<'_>],
+    ) -> u64 {
+        debug_assert_eq!(
+            line_wildcard_positions.len(),
+            line_typed_params.len(),
+            "mask invariant: typed_params parallel to wildcard_positions",
+        );
         let new_id = self.next_template_id;
         self.next_template_id += 1;
 
@@ -1034,9 +1026,28 @@ impl MinerCluster {
             .entry(record.tenant_id.clone())
             .or_insert_with(TenantState::new);
         let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
-        let new_template: Vec<OwnedToken> = masked_strs
+        // Build the leaf template: Wildcard at every mask-emitted
+        // position, Fixed at every other. `wildcard_positions` is
+        // ascending (single forward pass over the tokens) so we
+        // can walk both arrays in lockstep without allocating a
+        // membership set.
+        let mut new_template = Vec::with_capacity(masked_strs.len());
+        let mut wp_iter = line_wildcard_positions.iter().copied().peekable();
+        for (p, s) in masked_strs.iter().enumerate() {
+            if wp_iter.peek().copied() == Some(p) {
+                new_template.push(OwnedToken::Wildcard);
+                wp_iter.next();
+            } else {
+                new_template.push(OwnedToken::Fixed((*s).to_string()));
+            }
+        }
+        debug_assert!(
+            wp_iter.peek().is_none(),
+            "every wildcard_position must land within masked_strs.len()",
+        );
+        let slot_types: Vec<SlotTypes> = line_typed_params
             .iter()
-            .map(|s| OwnedToken::Fixed((*s).to_string()))
+            .map(|tp| SlotTypes::singleton(tp.type_tag))
             .collect();
         parent.leaves.push(Leaf {
             template: new_template,
@@ -1044,11 +1055,7 @@ impl MinerCluster {
             template_version: 1,
             severity_number: record.severity_number,
             scope_name: record.scope_name.clone(),
-            // Fresh leaves have no Wildcards yet (masking emits
-            // `Fixed("<NUM>")` on main; mask→Wildcard arrives in
-            // the PR-B-1 follow-on). The first widening grows
-            // `slot_types` in lockstep with the new Wildcard slots.
-            slot_types: vec![],
+            slot_types,
         });
         // Maintain the TenantState::template_count cache invariant —
         // every fresh allocation under `state` is mirrored here so
@@ -1534,8 +1541,17 @@ mod tests {
         assert_eq!(*old_version, 1);
         assert_eq!(*new_version, 2);
         assert_eq!(*positions_widened, vec![3]);
-        assert_eq!(old_template, "user <NUM> logged in from <IP>");
-        assert_eq!(new_template, "user <NUM> logged <*> from <IP>");
+        // PR-B-1: mask-emit positions (`<NUM>` at index 1, `<IP>`
+        // at index 5) enter the leaf as `Wildcard` from creation,
+        // so the canonical-form template renders them as `<*>`,
+        // not as the tag string. The audit-event shape is
+        // unchanged — only the rendered template strings differ
+        // because the type information now lives in the parallel
+        // `slot_types` vector rather than encoded in the template
+        // (RFC 0001 §6.6 reconstruction substitutes back via
+        // `params`, not the template string).
+        assert_eq!(old_template, "user <*> logged in from <*>");
+        assert_eq!(new_template, "user <*> logged <*> from <*>");
     }
 
     #[test]
@@ -1559,8 +1575,21 @@ mod tests {
     #[test]
     fn exact_sim_seq_match_attaches_without_widening_or_audit() {
         // A line whose mask matches an existing leaf exactly (no
-        // mismatched Fixed positions) reuses the leaf with no
-        // widening, no version bump, no audit event.
+        // mismatched Fixed positions, no new ParamType at any
+        // existing wildcard) reuses the leaf with no version bump
+        // and no audit event.
+        //
+        // PR-B-1 locking-test update: under the new leaf model
+        // mask-emit positions enter the leaf as `Wildcard` from
+        // creation (with `slot_types[0] = {Num}` for the `<NUM>`
+        // at position 1). The relevant contract is therefore
+        // "no version bump, no audit, slot_types unchanged" — not
+        // "no wildcards in the template at all". Both lines mask
+        // to the same shape (`<NUM>` at position 1), and the
+        // second line's `<NUM>` is already in `slot_types[0]`'s
+        // set, so type-expansion doesn't fire either. The leaf's
+        // wildcard set is asserted explicitly so a future bug
+        // that accidentally widened position 2 or 3 still fails.
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
@@ -1571,17 +1600,29 @@ mod tests {
         assert_eq!(cluster.merges_total(), 0);
         assert!(sink.is_empty());
 
-        // Template stays fixed-only (no `<*>` from widening).
         let templates = cluster.templates_for(&t);
         assert_eq!(templates.len(), 1);
-        assert!(
-            templates[0]
-                .template
-                .iter()
-                .all(|t| matches!(t, OwnedToken::Fixed(_))),
-            "no Wildcard tokens should be present without widening: {:?}",
+        assert_eq!(
+            templates[0].template_version, 1,
+            "no version bump on same-shape clean attach",
+        );
+        let wildcard_positions: Vec<usize> = templates[0]
+            .template
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| matches!(t, OwnedToken::Wildcard).then_some(i))
+            .collect();
+        assert_eq!(
+            wildcard_positions,
+            vec![1],
+            "leaf's wildcard set must match the line's mask set: {:?}",
             templates[0].template,
         );
+        // The slot's type set stayed at {Num} — the second `<NUM>`
+        // line is already in the set, so no expansion fired.
+        assert_eq!(templates[0].slot_types.len(), 1);
+        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(types, vec![ParamType::Num]);
     }
 
     #[test]
@@ -1660,16 +1701,77 @@ mod tests {
         assert_eq!((*ov1, *nv1, p1.clone()), (2, 3, vec![5]));
     }
 
+    #[test]
+    fn fresh_leaf_carries_wildcard_at_mask_positions_with_seeded_slot_types() {
+        // PR-B-1 contract: at fresh-leaf creation, `mask()`'s
+        // wildcard_positions feed directly into the leaf's
+        // template (Wildcard at those positions, Fixed elsewhere)
+        // and `slot_types` is seeded from `typed_params` in
+        // ordinal order (one entry per masked position).
+        //
+        // This is the structural prerequisite for §6.6
+        // reconstruction: the template Wildcard slots and the
+        // `params` vector now align position-for-ordinal.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // Mask emits at positions 1 (`<NUM>`) and 5 (`<IP>`).
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
+
+        // Fresh-leaf creation does NOT emit an audit event
+        // (RFC0001.1) — even with non-empty slot_types.
+        assert!(sink.is_empty());
+
+        let templates = cluster.templates_for(&t);
+        assert_eq!(templates.len(), 1);
+        let snap = &templates[0];
+
+        // Template shape: Wildcard at mask positions, Fixed
+        // elsewhere.
+        assert_eq!(snap.template.len(), 6);
+        assert!(matches!(snap.template[0], OwnedToken::Fixed(ref s) if s == "user"));
+        assert!(matches!(snap.template[1], OwnedToken::Wildcard));
+        assert!(matches!(snap.template[2], OwnedToken::Fixed(ref s) if s == "logged"));
+        assert!(matches!(snap.template[3], OwnedToken::Fixed(ref s) if s == "in"));
+        assert!(matches!(snap.template[4], OwnedToken::Fixed(ref s) if s == "from"));
+        assert!(matches!(snap.template[5], OwnedToken::Wildcard));
+
+        // slot_types seeded from typed_params in ordinal order.
+        assert_eq!(snap.slot_types.len(), 2);
+        assert_eq!(
+            snap.slot_types[0].iter().collect::<Vec<_>>(),
+            vec![ParamType::Num],
+        );
+        assert_eq!(
+            snap.slot_types[1].iter().collect::<Vec<_>>(),
+            vec![ParamType::Ip],
+        );
+    }
+
     // ---------- §6.4 type expansion (PR-B-0) ----------
 
     #[test]
-    fn literal_widening_seeds_slot_types_with_str_for_both_observations() {
-        // Pre-widen Fixed token "in" and triggering literal "out"
-        // are both classified as Str by `type_at_position`. The
-        // newly-introduced wildcard's slot_types should be
-        // {Str} (the singleton — Str ∪ Str = Str). No
-        // TemplateTypeExpanded event fires; the existence of the
-        // slot is covered by TemplateWidened alone.
+    fn literal_widening_seeds_slot_types_with_str_for_pre_widen_and_line() {
+        // A literal-vs-literal widening at a position that wasn't
+        // previously a wildcard. Under PR-B-1 the fresh leaf also
+        // carries a Wildcard at position 1 (the `<NUM>` from the
+        // mask emit at creation), so after widening position 3
+        // there are TWO wildcard slots: ordinal 0 = the mask-emit
+        // wildcard (slot_types = {Num}), ordinal 1 = the literal
+        // widening (slot_types = {Str}).
+        //
+        // PR-B-1 locking-test update (was
+        // `literal_widening_seeds_slot_types_with_str_for_both_
+        // observations` under PR-B-0, when fresh leaves had no
+        // wildcards yet). The contract being pinned now is:
+        //   - literal widening produces exactly one
+        //     `TemplateWidened` event (no type expansion at
+        //     position 1 — the existing `<NUM>` slot already
+        //     contains Num, and the second line's `<NUM>` doesn't
+        //     trigger an expansion).
+        //   - The newly-widened slot at ordinal 1 contains {Str}
+        //     (the pre-widen literal "in" and the triggering "out"
+        //     both classify as Str).
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
@@ -1687,35 +1789,42 @@ mod tests {
         assert_eq!(templates.len(), 1);
         assert_eq!(
             templates[0].slot_types.len(),
-            1,
-            "exactly one wildcard slot"
+            2,
+            "two wildcard slots: ordinal 0 from mask emit, ordinal 1 from widening",
         );
-        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
-        assert_eq!(types, vec![ParamType::Str]);
+        let ordinal_0: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(ordinal_0, vec![ParamType::Num]);
+        let ordinal_1: Vec<_> = templates[0].slot_types[1].iter().collect();
+        assert_eq!(ordinal_1, vec![ParamType::Str]);
     }
 
     #[test]
-    fn fixed_mask_tag_widening_captures_both_param_types_in_slot() {
-        // CLAUDE.md §3.1 regression: a leaf with `Fixed("<NUM>")`
-        // widened by a `<UUID>` line on main produces:
-        //   - one TemplateWidened event (position 1)
-        //   - slot_types[0] = {Num, Uuid} (both types observed
-        //     during the widening, captured as the slot's initial
-        //     state — neither counts as an "expansion" because the
-        //     slot didn't exist pre-widen)
-        // PR #32 had this case silently merging without any audit
-        // signal because masked positions entered the leaf as
-        // Wildcard from creation; PR-B-0 keeps mask tags as Fixed
-        // so the Fixed-mismatch widening fires, with the slot type
-        // information accumulated for future expansion checks.
+    fn mask_tag_transition_at_typed_wildcard_emits_type_expanded() {
+        // CLAUDE.md §3.1 regression for mask-tag type transitions
+        // at a wildcard slot.
+        //
+        // Setup: the fresh leaf carries a Wildcard at position 2
+        // (from the `<NUM>` mask emit at creation) with
+        // `slot_types[0] = {Num}`. The second line lands `<UUID>`
+        // at the same position. Under PR-B-1 the leaf position is
+        // already a Wildcard, so `find_widening_positions` returns
+        // empty (no Fixed mismatch); the §3.1 signal moves to the
+        // type-expansion path instead, which fires
+        // `TemplateTypeExpanded` and grows the slot's type set.
+        //
+        // PR-B-1 locking-test update (was
+        // `fixed_mask_tag_widening_captures_both_param_types_in_
+        // slot` under PR-B-0, when fresh leaves stored
+        // `Fixed("<NUM>")` and the same case fired
+        // `TemplateWidened`). The §3.1 invariant — every mask-tag
+        // transition at a tree-routed slot must produce an audit
+        // signal — is preserved end-to-end; only the *event kind*
+        // changes.
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
-        // Prefix ["user", "logged"] shared (positions 0–1 inside
-        // prefix_depth=2). The mask-tag divergence sits at
-        // position 2 so both lines route to the same leaf, where
-        // sim_seq sees Fixed("<NUM>") vs "<UUID>" → Fixed
-        // mismatch → widening at position 2.
+        // Prefix ["user", "logged"] shared; mask-tag divergence
+        // at position 2 (Num vs Uuid).
         let _ = cluster.ingest(&string_record(&t, "user logged 42 in"));
         let _ = cluster.ingest(&string_record(
             &t,
@@ -1723,14 +1832,20 @@ mod tests {
         ));
 
         let events = sink.drain();
-        assert_eq!(events.len(), 1, "single TemplateWidened, no expansion");
-        let AuditEventKind::TemplateWidened {
-            positions_widened, ..
+        assert_eq!(events.len(), 1, "single TemplateTypeExpanded, no widening");
+        let AuditEventKind::TemplateTypeExpanded {
+            old_version,
+            new_version,
+            slots_expanded,
+            ..
         } = &events[0].kind
         else {
-            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+            panic!("expected TemplateTypeExpanded, got {:?}", events[0].kind);
         };
-        assert_eq!(*positions_widened, vec![2]);
+        assert_eq!((*old_version, *new_version), (1, 2));
+        assert_eq!(slots_expanded.len(), 1);
+        assert_eq!(slots_expanded[0].slot_index, 0);
+        assert_eq!(slots_expanded[0].added_types, vec![ParamType::Uuid]);
 
         let templates = cluster.templates_for(&t);
         assert_eq!(templates.len(), 1);
@@ -1739,7 +1854,7 @@ mod tests {
         assert_eq!(
             types,
             vec![ParamType::Uuid, ParamType::Num],
-            "slot must record both the pre-widen Num and the triggering Uuid",
+            "slot must record both Num (from creation) and Uuid (from this attach)",
         );
     }
 
@@ -1965,10 +2080,14 @@ mod tests {
         // - Line A: "GET /home 42 ok" — masks <NUM> at position 2.
         // - Line B: "GET /home <UUID-string> ok" — masks <UUID>.
         //
-        // Pre-PR-B-0: same tree path (length=4, prefix=GET/home);
-        // sim_seq with the leaf's Fixed("<NUM>") at position 2 vs
-        // the line's "<UUID>" → Fixed mismatch → TemplateWidened
-        // fires. slot_types[0] then captures {Num, Uuid}.
+        // Under PR-B-1's leaf model the §3.1 audit signal moves
+        // from `TemplateWidened` to `TemplateTypeExpanded`:
+        // masked positions enter the leaf as `Wildcard` from
+        // creation, so the second line doesn't trigger a Fixed
+        // mismatch; the divergence surfaces as the slot's type
+        // set growing to {Num, Uuid}. The §3.1 contract — every
+        // mask-tag transition at a tree-routed slot audits — is
+        // preserved; the event kind changes.
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
@@ -1983,17 +2102,16 @@ mod tests {
             !events.is_empty(),
             "§3.1: mask-tag type change at a tree-routed wildcard slot must audit",
         );
-        let AuditEventKind::TemplateWidened {
-            positions_widened, ..
-        } = &events[0].kind
-        else {
-            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        let AuditEventKind::TemplateTypeExpanded { slots_expanded, .. } = &events[0].kind else {
+            panic!("expected TemplateTypeExpanded, got {:?}", events[0].kind);
         };
-        assert_eq!(*positions_widened, vec![2]);
+        assert_eq!(slots_expanded.len(), 1);
+        assert_eq!(slots_expanded[0].slot_index, 0);
+        assert_eq!(slots_expanded[0].added_types, vec![ParamType::Uuid]);
 
         // Confirm the slot's type set captures the divergence so a
         // *third* mask-tag type at the same position would emit
-        // TemplateTypeExpanded.
+        // another TemplateTypeExpanded.
         let templates = cluster.templates_for(&t);
         let types: Vec<_> = templates[0].slot_types[0].iter().collect();
         assert_eq!(types, vec![ParamType::Uuid, ParamType::Num]);

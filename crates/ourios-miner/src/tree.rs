@@ -42,6 +42,8 @@
 
 use std::collections::HashMap;
 
+use ourios_core::audit::SlotTypes;
+
 use crate::sim_seq::Token;
 
 /// One position in a stored template — the owned counterpart to
@@ -83,9 +85,15 @@ impl OwnedToken {
 /// version stamp is part of the same invariant. The audit event
 /// records `(old_version, new_version)` from the same bump.
 ///
-/// `slot_types` and retained-body counts (the rest of the §6.1
-/// leaf payload) will be added when the type-expansion and
-/// body-retention PRs land.
+/// `slot_types` records the set of [`ParamType`](ourios_core::audit::ParamType)
+/// values observed in each wildcard slot per RFC 0001 §6.1 — one
+/// `SlotTypes` per `OwnedToken::Wildcard` in `template`, indexed
+/// **by wildcard-slot ordinal** (left-to-right), not by template
+/// position. The cluster uses it to fire `TemplateTypeExpanded`
+/// audit events when a new `ParamType` lands at a known slot.
+///
+/// Retained-body counts (the rest of the §6.1 leaf payload) will be
+/// added when the body-retention PR lands.
 #[derive(Debug, Clone)]
 pub struct Leaf {
     pub template: Vec<OwnedToken>,
@@ -95,9 +103,9 @@ pub struct Leaf {
     pub template_id: u64,
     /// Monotonic version stamp per RFC 0001 §6.4. Starts at `1`
     /// on fresh-leaf creation; the cluster bumps it by one on each
-    /// widening (and on each type-expansion once that variant has
-    /// an emitter) and records the bump in an audit event. Clean
-    /// attaches (no widening) do not bump it.
+    /// widening and by one again on each type-expansion that fires
+    /// in the same attach, recording the bump in an audit event.
+    /// Clean attaches (no widening, no new type) do not bump it.
     pub template_version: u32,
     /// `LogRecord.severity_number` half of the template key per
     /// RFC 0001 §6.1 *Template-key composition*. `0` =
@@ -108,6 +116,14 @@ pub struct Leaf {
     /// is its own bucket (RFC0001.11), distinct from any specified
     /// scope.
     pub scope_name: Option<String>,
+    /// Per-wildcard-slot observed `ParamType` set per RFC 0001 §6.1.
+    /// `slot_types.len()` equals the count of `OwnedToken::Wildcard`
+    /// tokens in `template`; `slot_types[k]` is the set for the
+    /// k-th wildcard from the left. The cluster maintains the
+    /// ordinal alignment when widening inserts new wildcards
+    /// (the new slot's entry is inserted at the corresponding
+    /// ordinal, not appended).
+    pub slot_types: Vec<SlotTypes>,
 }
 
 /// Internal node at a prefix-token level (or the per-length root).
@@ -364,6 +380,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
             std::ptr::from_ref(&parent.leaves)
         };
@@ -530,6 +547,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
         }
 
@@ -586,6 +604,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
         }
         {
@@ -601,6 +620,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
             p.leaves.push(Leaf {
                 template: [
@@ -613,6 +633,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
         }
 
@@ -639,6 +660,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
         }
         {
@@ -654,6 +676,7 @@ mod tests {
                 template_version: 1,
                 severity_number: 0,
                 scope_name: None,
+                slot_types: vec![],
             });
         }
 

@@ -62,8 +62,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_core::audit::{
-    AuditEvent, AuditEventKind, AuditSink, NoOpAuditSink, hash_triggering_line,
-    sample_first_256_bytes,
+    AuditEvent, AuditEventKind, AuditSink, NoOpAuditSink, ParamType, SlotExpansion, SlotTypes,
+    hash_triggering_line, sample_first_256_bytes,
 };
 use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::confidence::ConfidenceZone;
@@ -411,6 +411,309 @@ fn params_from_mask(typed_params: &[crate::mask::TypedParam<'_>]) -> Vec<Param> 
         .collect()
 }
 
+/// Classify a single masked-line token for the §6.4 slot-type
+/// machinery: known mask tags map to their [`ParamType`]; every
+/// other token (literal that didn't match a mask rule) is treated
+/// as `Str` per RFC §6.2 step 5 ("the original literal at that
+/// position … is captured as `{ type_tag: STR, value: L_tok[pos]
+/// }`").
+fn type_at_position(token: &str) -> ParamType {
+    match token {
+        "<NUM>" => ParamType::Num,
+        "<IP>" => ParamType::Ip,
+        "<UUID>" => ParamType::Uuid,
+        _ => ParamType::Str,
+    }
+}
+
+/// On widening, seed [`Leaf::slot_types`] for each newly-introduced
+/// `Wildcard` position. The initial type set captures both
+/// observations the widening witnessed:
+///
+/// - the pre-widen token (which was a `Fixed`-token mismatch — the
+///   reason widening fired)
+/// - the line's token at that position (the value that triggered
+///   the widening)
+///
+/// Neither observation counts as a `TemplateTypeExpanded` — the
+/// slot didn't exist before this attach, so there's no "expansion"
+/// to audit; the `TemplateWidened` event covers the structural
+/// change. Subsequent attaches with a `ParamType` not in this
+/// initial set are what trigger `TemplateTypeExpanded` events
+/// later in the same attach (or in future attaches).
+///
+/// Ordinal alignment: positions are inserted into `slot_types` at
+/// the post-widen wildcard-ordinal of each newly-widened position,
+/// so the post-call invariant `slot_types.len() == count(template
+/// Wildcards)` holds. `positions_widened` is ascending (by the
+/// [`find_widening_positions`] contract), so a single forward walk
+/// over the post-widen template is enough.
+fn update_slot_types_on_widening(
+    slot_types: &mut Vec<SlotTypes>,
+    pre_widen_template: &[OwnedToken],
+    post_widen_template: &[OwnedToken],
+    line_tokens: &[&str],
+    positions_widened: &[usize],
+) {
+    debug_assert!(
+        positions_widened.windows(2).all(|w| w[0] < w[1]),
+        "positions_widened must be sorted ascending",
+    );
+    debug_assert_eq!(
+        pre_widen_template.len(),
+        post_widen_template.len(),
+        "widening is in-place — length is invariant",
+    );
+    debug_assert_eq!(
+        pre_widen_template.len(),
+        line_tokens.len(),
+        "template and line are the same length by sim_seq precondition",
+    );
+
+    let mut ordinal = 0usize;
+    let mut widen_iter = positions_widened.iter().copied().peekable();
+    for (p, tok) in post_widen_template.iter().enumerate() {
+        if matches!(tok, OwnedToken::Wildcard) {
+            if widen_iter.peek().copied() == Some(p) {
+                let pre_token = match &pre_widen_template[p] {
+                    OwnedToken::Fixed(s) => s.as_str(),
+                    OwnedToken::Wildcard => unreachable!(
+                        "find_widening_positions only flags Fixed mismatches; \
+                         a pre-existing Wildcard cannot appear in positions_widened",
+                    ),
+                };
+                let initial = SlotTypes::singleton(type_at_position(pre_token))
+                    .insert(type_at_position(line_tokens[p]));
+                slot_types.insert(ordinal, initial);
+                widen_iter.next();
+            }
+            ordinal += 1;
+        }
+    }
+    debug_assert!(
+        widen_iter.peek().is_none(),
+        "every widened position must have a matching Wildcard in the post-widen template",
+    );
+}
+
+/// Walk the post-widen template's `Wildcard` slots and collect any
+/// `ParamType`s the current line introduces that aren't already in
+/// the slot's `slot_types` entry. Each addition becomes one
+/// [`SlotExpansion`] in the returned vector; an empty result means
+/// the attach is a no-op for the type-expansion path.
+///
+/// `skip_positions` lists positions that were newly created by the
+/// same attach's widening step — their `slot_types` entries were
+/// just initialised in [`update_slot_types_on_widening`], so we do
+/// **not** treat the initial state as an "expansion" (the
+/// `TemplateWidened` event already covers the slot's existence,
+/// and the initial type set is its first state, not an addition).
+fn collect_type_expansions(
+    template: &[OwnedToken],
+    line_tokens: &[&str],
+    slot_types: &[SlotTypes],
+    skip_positions: &[usize],
+) -> Vec<SlotExpansion> {
+    debug_assert!(
+        skip_positions.windows(2).all(|w| w[0] < w[1]),
+        "skip_positions must be sorted ascending",
+    );
+    debug_assert_eq!(template.len(), line_tokens.len());
+
+    let mut out: Vec<SlotExpansion> = Vec::new();
+    let mut ordinal: u16 = 0;
+    let mut skip_iter = skip_positions.iter().copied().peekable();
+    for (p, tok) in template.iter().enumerate() {
+        if matches!(tok, OwnedToken::Wildcard) {
+            let is_freshly_widened = skip_iter.peek().copied() == Some(p);
+            if is_freshly_widened {
+                skip_iter.next();
+            } else {
+                let line_type = type_at_position(line_tokens[p]);
+                let current_set = slot_types[ordinal as usize];
+                if !current_set.contains(line_type) {
+                    out.push(SlotExpansion {
+                        slot_index: ordinal,
+                        added_types: vec![line_type],
+                    });
+                }
+            }
+            ordinal += 1;
+        }
+    }
+    out
+}
+
+/// Apply the expansions returned by [`collect_type_expansions`] to
+/// the leaf's `slot_types`. Idempotent under
+/// [`SlotTypes::insert`] (re-applying the same expansion is a
+/// no-op).
+fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[SlotExpansion]) {
+    for exp in expansions {
+        let s = &mut slot_types[exp.slot_index as usize];
+        for &t in &exp.added_types {
+            *s = s.insert(t);
+        }
+    }
+}
+
+/// Outcome of the leaf-mutating phase of `attach_and_maybe_widen`.
+///
+/// Phase 1 borrows the leaf and produces this enum; phase 2 drops
+/// the leaf borrow and emits audit events / the data record using
+/// the extracted data. The split keeps `&mut self.audit_sink` and
+/// `&mut self.tenants` from clashing on the borrow checker — every
+/// audit emit happens after the leaf borrow ends.
+enum AttachPlan {
+    /// No mutation: similarity 1.0 with no new types at any slot.
+    /// Reuse `(template_id, template_version)` verbatim.
+    CleanReuse {
+        template_id: u64,
+        template_version: u32,
+    },
+    /// Degenerate widening rejected per §6.4. Leaf untouched.
+    Rejected {
+        template_id: u64,
+        version: u32,
+        current_template: String,
+        would_be_template: String,
+        would_be_positions: Vec<u16>,
+    },
+    /// Leaf mutated (widened and/or type-expanded). `events` is the
+    /// audit-event payload in emission order: `TemplateWidened`
+    /// before `TemplateTypeExpanded` per RFC §6.2's combined-attach
+    /// contract.
+    Mutated {
+        template_id: u64,
+        events: Vec<AuditEventKind>,
+        final_version: u32,
+    },
+}
+
+/// RFC §6.2 step 5 — compute the structural mutations and the
+/// resulting audit-event payloads for a candidate-attach decision.
+/// Mutates `leaf.template`, `leaf.template_version`, and
+/// `leaf.slot_types` in place when widening or type-expansion
+/// fires; the caller drops the leaf borrow before draining the
+/// returned `events`.
+fn plan_attach(leaf: &mut Leaf, masked_strs: &[&str]) -> AttachPlan {
+    let positions_widened = find_widening_positions(masked_strs, &leaf.template);
+
+    if positions_widened.is_empty() {
+        // No Fixed mismatch — check for a type-expansion-only
+        // attach (a known wildcard slot seeing a new ParamType).
+        let expansions =
+            collect_type_expansions(&leaf.template, masked_strs, &leaf.slot_types, &[]);
+        if expansions.is_empty() {
+            return AttachPlan::CleanReuse {
+                template_id: leaf.template_id,
+                template_version: leaf.template_version,
+            };
+        }
+        apply_type_expansions(&mut leaf.slot_types, &expansions);
+        let old_version = leaf.template_version;
+        let new_version = leaf
+            .template_version
+            .checked_add(1)
+            .expect("template_version overflow: 2^32 expansions on one leaf is implausible");
+        leaf.template_version = new_version;
+        let template_str = format_template(&leaf.template);
+        return AttachPlan::Mutated {
+            template_id: leaf.template_id,
+            final_version: new_version,
+            events: vec![AuditEventKind::TemplateTypeExpanded {
+                old_version,
+                new_version,
+                // Structure is unchanged by type expansion; both
+                // fields carry the same canonical-form string per
+                // RFC §6.4 (the expansion lives in `slots_expanded`).
+                old_template: template_str.clone(),
+                new_template: template_str,
+                slots_expanded: expansions,
+            }],
+        };
+    }
+
+    if would_be_degenerate(&leaf.template, &positions_widened) {
+        let current_template = format_template(&leaf.template);
+        let mut new_template_tokens = leaf.template.clone();
+        apply_widening(&mut new_template_tokens, &positions_widened);
+        let would_be_template = format_template(&new_template_tokens);
+        let would_be_positions = positions_to_u16(&positions_widened);
+        return AttachPlan::Rejected {
+            template_id: leaf.template_id,
+            version: leaf.template_version,
+            current_template,
+            would_be_template,
+            would_be_positions,
+        };
+    }
+
+    // Widening path. Snapshot pre-widen template for slot seeding
+    // and the audit payload's `old_template` string.
+    let template_id = leaf.template_id;
+    let pre_widen_template = leaf.template.clone();
+    let old_version = leaf.template_version;
+    let old_template_str = format_template(&leaf.template);
+    let positions_u16 = positions_to_u16(&positions_widened);
+
+    apply_widening(&mut leaf.template, &positions_widened);
+    update_slot_types_on_widening(
+        &mut leaf.slot_types,
+        &pre_widen_template,
+        &leaf.template,
+        masked_strs,
+        &positions_widened,
+    );
+    let version_after_widen = old_version
+        .checked_add(1)
+        .expect("template_version overflow: 2^32 widenings on one leaf is implausible");
+    leaf.template_version = version_after_widen;
+    let template_after_widen = format_template(&leaf.template);
+
+    let mut events: Vec<AuditEventKind> = Vec::with_capacity(2);
+    events.push(AuditEventKind::TemplateWidened {
+        old_version,
+        new_version: version_after_widen,
+        old_template: old_template_str,
+        new_template: template_after_widen.clone(),
+        positions_widened: positions_u16,
+    });
+
+    // Pre-existing wildcards may also see a new ParamType from
+    // this same line (RFC §6.2: a single attach can trigger both
+    // widening and type-expansion; events emit in this order).
+    let expansions = collect_type_expansions(
+        &leaf.template,
+        masked_strs,
+        &leaf.slot_types,
+        &positions_widened,
+    );
+    let final_version = if expansions.is_empty() {
+        version_after_widen
+    } else {
+        apply_type_expansions(&mut leaf.slot_types, &expansions);
+        let version_after_expand = version_after_widen
+            .checked_add(1)
+            .expect("template_version overflow: 2^32 expansions on one leaf is implausible");
+        leaf.template_version = version_after_expand;
+        events.push(AuditEventKind::TemplateTypeExpanded {
+            old_version: version_after_widen,
+            new_version: version_after_expand,
+            old_template: template_after_widen.clone(),
+            new_template: template_after_widen,
+            slots_expanded: expansions,
+        });
+        version_after_expand
+    };
+
+    AttachPlan::Mutated {
+        template_id,
+        events,
+        final_version,
+    }
+}
+
 impl MinerCluster {
     /// Ingest a structured OTLP log record. Returns the
     /// `template_id` allocated (or reused) for the record's
@@ -659,6 +962,11 @@ impl MinerCluster {
             template_version: 1,
             severity_number: record.severity_number,
             scope_name: record.scope_name.clone(),
+            // Fresh leaves have no Wildcards yet (masking emits
+            // `Fixed("<NUM>")` on main; mask→Wildcard arrives in
+            // the PR-B-1 follow-on). The first widening grows
+            // `slot_types` in lockstep with the new Wildcard slots.
+            slot_types: vec![],
         });
         // Maintain the TenantState::template_count cache invariant —
         // every fresh allocation under `state` is mirrored here so
@@ -667,21 +975,30 @@ impl MinerCluster {
         new_id
     }
 
-    /// RFC §6.2 step 5 — clean-or-widen attach to an existing
-    /// leaf. The split:
+    /// RFC §6.2 step 5 — clean-or-widen-or-type-expand attach to
+    /// an existing leaf. The exit paths:
     ///
-    /// - No mismatched Fixed positions → clean attach, no
-    ///   widening, no audit. Reuse the leaf's existing
-    ///   `template_id` and `template_version`.
-    /// - One or more mismatched Fixed positions:
-    ///   - Run the §6.4 degenerate guard. If the proposed
-    ///     widening would leave zero Fixed tokens, emit
+    /// - No mismatched `Fixed` positions **and** no new `ParamType`
+    ///   at any existing `Wildcard` slot → truly clean attach;
+    ///   reuse the leaf's `(template_id, template_version)`, no
+    ///   audit event.
+    /// - No mismatched `Fixed` positions **but** at least one
+    ///   wildcard slot sees a `ParamType` not in its observed-type
+    ///   set → emit `TemplateTypeExpanded`, bump version by 1.
+    /// - One or more mismatched `Fixed` positions:
+    ///   - Run the §6.4 degenerate guard. If the proposed widening
+    ///     would leave zero `Fixed` tokens, emit
     ///     `TemplateWideningRejectedDegenerate`, increment
     ///     `parse_failures_total`, return [`NO_TEMPLATE`].
-    ///   - Else apply the widening (in place on the leaf), bump
-    ///     `template_version`, emit `TemplateWidened`, increment
-    ///     `merges_total`, return the leaf's existing
-    ///     `template_id`.
+    ///   - Else apply the widening (in place on the leaf), seed
+    ///     `slot_types` for the new slots from the pre-widen Fixed
+    ///     token + the line's token, bump version, emit
+    ///     `TemplateWidened`. Then run the type-expansion check on
+    ///     the *pre-existing* wildcards; if any slot sees a new
+    ///     `ParamType`, bump version again and emit
+    ///     `TemplateTypeExpanded` per RFC §6.2's combined-attach
+    ///     contract (`template_version` increments twice, two events
+    ///     emitted in widening-then-expansion order).
     fn attach_and_maybe_widen(
         &mut self,
         record: &OtlpLogRecord,
@@ -691,123 +1008,99 @@ impl MinerCluster {
         separators: Vec<String>,
         params: Vec<Param>,
     ) -> u64 {
-        // Ownership rationale: each of the three exit paths
-        // (clean reuse, degenerate rejection, widening) emits
-        // **one** record and never reuses `separators` / `params`
-        // after that emit. Taking the vectors by value lets each
-        // branch move them straight into the record without a
-        // `.to_vec()` clone — one alloc per ingest instead of
-        // two on the clean / widen hot paths.
+        // Ownership rationale: each exit path emits **one** data
+        // record and never reuses `separators` / `params` after
+        // that emit. Taking the vectors by value lets each branch
+        // move them straight into the record without a `.to_vec()`
+        // clone.
 
-        // Phase 2 — re-descend mutably to the chosen leaf.
-        let state = self
-            .tenants
-            .get_mut(&record.tenant_id)
-            .expect("tenant present: find_best_candidate returned Some(...)");
-        let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
-        let leaf = &mut parent.leaves[candidate.leaf_idx];
+        // Phase 1 — mutate the leaf and accumulate the audit-event
+        // payloads. Hold the leaf borrow only over the mutation;
+        // emitting through `self.audit_sink` happens in phase 2.
+        let plan = {
+            let state = self
+                .tenants
+                .get_mut(&record.tenant_id)
+                .expect("tenant present: find_best_candidate returned Some(...)");
+            let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
+            let leaf = &mut parent.leaves[candidate.leaf_idx];
+            plan_attach(leaf, masked_strs)
+        };
 
-        let positions_widened = find_widening_positions(masked_strs, &leaf.template);
-
-        if positions_widened.is_empty() {
-            // Clean attach — no Fixed position mismatched. Reuse
-            // the leaf as-is; no version bump, no audit event.
-            let template_id = leaf.template_id;
-            let template_version = leaf.template_version;
-            let mut rec = Self::record_envelope(record, BodyKind::String);
-            rec.template_id = template_id;
-            rec.template_version = template_version;
-            rec.separators = separators;
-            rec.params = params;
-            rec.confidence = 1.0;
-            self.emit_record(rec);
-            return template_id;
-        }
-
-        // Degenerate guard (§6.4). Check *before* mutating: if the
-        // proposed widening would leave zero Fixed tokens, reject.
-        if would_be_degenerate(&leaf.template, &positions_widened) {
-            let template_id = leaf.template_id;
-            let version = leaf.template_version;
-            let current_template = format_template(&leaf.template);
-            // The would-be new template, computed without
-            // mutating the leaf — needed for the audit payload so
-            // an operator inspecting the rejection sees what was
-            // proposed.
-            let mut new_template_tokens = leaf.template.clone();
-            apply_widening(&mut new_template_tokens, &positions_widened);
-            let would_be_template = format_template(&new_template_tokens);
-            let would_be_positions = positions_to_u16(&positions_widened);
-
-            self.audit_sink.emit(AuditEvent {
-                kind: AuditEventKind::TemplateWideningRejectedDegenerate {
-                    version,
-                    current_template,
-                    would_be_template,
-                    would_be_positions,
-                },
-                tenant_id: record.tenant_id.clone(),
+        match plan {
+            AttachPlan::CleanReuse {
                 template_id,
-                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                timestamp: self.clock.now(),
-            });
-            // Emit a parse-failure data record alongside the
-            // audit event — §6.4 treats degenerate widening as a
-            // parse failure that retains body.
-            let mut rec = Self::record_envelope(record, BodyKind::String);
-            rec.separators = separators;
-            rec.params = params;
-            rec.body = Some(raw.to_string());
-            rec.lossy_flag = true;
-            self.emit_record(rec);
-            self.record_parse_failure();
-            return NO_TEMPLATE;
+                template_version,
+            } => {
+                let mut rec = Self::record_envelope(record, BodyKind::String);
+                rec.template_id = template_id;
+                rec.template_version = template_version;
+                rec.separators = separators;
+                rec.params = params;
+                rec.confidence = 1.0;
+                self.emit_record(rec);
+                template_id
+            }
+            AttachPlan::Rejected {
+                template_id,
+                version,
+                current_template,
+                would_be_template,
+                would_be_positions,
+            } => {
+                self.audit_sink.emit(AuditEvent {
+                    kind: AuditEventKind::TemplateWideningRejectedDegenerate {
+                        version,
+                        current_template,
+                        would_be_template,
+                        would_be_positions,
+                    },
+                    tenant_id: record.tenant_id.clone(),
+                    template_id,
+                    triggering_line_hash: hash_triggering_line(raw.as_bytes()),
+                    triggering_line_sample: Some(sample_first_256_bytes(raw)),
+                    timestamp: self.clock.now(),
+                });
+                // §6.4 treats degenerate widening as a parse
+                // failure that retains body.
+                let mut rec = Self::record_envelope(record, BodyKind::String);
+                rec.separators = separators;
+                rec.params = params;
+                rec.body = Some(raw.to_string());
+                rec.lossy_flag = true;
+                self.emit_record(rec);
+                self.record_parse_failure();
+                NO_TEMPLATE
+            }
+            AttachPlan::Mutated {
+                template_id,
+                events,
+                final_version,
+            } => {
+                for kind in events {
+                    let counts_as_merge = kind.counts_as_merge();
+                    self.audit_sink.emit(AuditEvent {
+                        kind,
+                        tenant_id: record.tenant_id.clone(),
+                        template_id,
+                        triggering_line_hash: hash_triggering_line(raw.as_bytes()),
+                        triggering_line_sample: Some(sample_first_256_bytes(raw)),
+                        timestamp: self.clock.now(),
+                    });
+                    if counts_as_merge {
+                        self.merges_total.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let mut rec = Self::record_envelope(record, BodyKind::String);
+                rec.template_id = template_id;
+                rec.template_version = final_version;
+                rec.separators = separators;
+                rec.params = params;
+                rec.confidence = 1.0;
+                self.emit_record(rec);
+                template_id
+            }
         }
-
-        // Apply the widening. Snapshot the pre-widen state for
-        // the audit payload first, then mutate, then emit.
-        let template_id = leaf.template_id;
-        let old_version = leaf.template_version;
-        let old_template = format_template(&leaf.template);
-        let positions_u16 = positions_to_u16(&positions_widened);
-        apply_widening(&mut leaf.template, &positions_widened);
-        leaf.template_version = leaf
-            .template_version
-            .checked_add(1)
-            .expect("template_version overflow: 2^32 widenings on one leaf is implausible");
-        let new_version = leaf.template_version;
-        let new_template = format_template(&leaf.template);
-
-        self.audit_sink.emit(AuditEvent {
-            kind: AuditEventKind::TemplateWidened {
-                old_version,
-                new_version,
-                old_template,
-                new_template,
-                positions_widened: positions_u16,
-            },
-            tenant_id: record.tenant_id.clone(),
-            template_id,
-            triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-            triggering_line_sample: Some(sample_first_256_bytes(raw)),
-            timestamp: self.clock.now(),
-        });
-        self.merges_total.fetch_add(1, Ordering::Relaxed);
-
-        // Emit the widening data record. PR-A carries the
-        // mask-emit params verbatim; reconciliation with the §6.1
-        // "one entry per template `<*>` slot" alignment lands
-        // with `reconstruct()` in the next PR.
-        let mut rec = Self::record_envelope(record, BodyKind::String);
-        rec.template_id = template_id;
-        rec.template_version = new_version;
-        rec.separators = separators;
-        rec.params = params;
-        rec.confidence = 1.0;
-        self.emit_record(rec);
-
-        template_id
     }
 
     /// `Body::Structured` short-circuit per RFC 0001 §6.2 step 0.
@@ -862,9 +1155,8 @@ impl MinerCluster {
         self.tenants.get(tenant_id).map_or(0, |s| s.template_count)
     }
 
-    /// Snapshot of `(template_tokens, template_id)` pairs for one
-    /// tenant's `Body::String` templates. Returns an empty vec
-    /// for unseen tenants.
+    /// Snapshot of one tenant's `Body::String` leaves. Returns an
+    /// empty vec for unseen tenants.
     ///
     /// Order is not guaranteed (`HashMap` iteration). Stored
     /// templates may contain [`OwnedToken::Wildcard`] positions
@@ -875,15 +1167,33 @@ impl MinerCluster {
     /// short-circuit) are not returned by this helper — they have
     /// no token shape to surface.
     #[must_use]
-    pub fn templates_for(&self, tenant_id: &TenantId) -> Vec<(Vec<OwnedToken>, u64)> {
+    pub fn templates_for(&self, tenant_id: &TenantId) -> Vec<LeafSnapshot> {
         self.tenants.get(tenant_id).map_or_else(Vec::new, |s| {
             s.tree
                 .collect_leaves()
                 .into_iter()
-                .map(|leaf| (leaf.template.clone(), leaf.template_id))
+                .map(|leaf| LeafSnapshot {
+                    template: leaf.template.clone(),
+                    template_id: leaf.template_id,
+                    template_version: leaf.template_version,
+                    slot_types: leaf.slot_types.clone(),
+                })
                 .collect()
         })
     }
+}
+
+/// Read-only view of a single leaf surfaced by
+/// [`MinerCluster::templates_for`]. Carries the four fields a
+/// test or operator typically needs to assert on; deliberately
+/// owns its data so callers can drop the cluster borrow before
+/// inspecting the snapshot.
+#[derive(Debug, Clone)]
+pub struct LeafSnapshot {
+    pub template: Vec<OwnedToken>,
+    pub template_id: u64,
+    pub template_version: u32,
+    pub slot_types: Vec<SlotTypes>,
 }
 
 /// One leaf considered as the best match in RFC §6.2 step 4.
@@ -1176,11 +1486,11 @@ mod tests {
         assert_eq!(templates.len(), 1);
         assert!(
             templates[0]
-                .0
+                .template
                 .iter()
                 .all(|t| matches!(t, OwnedToken::Fixed(_))),
             "no Wildcard tokens should be present without widening: {:?}",
-            templates[0].0,
+            templates[0].template,
         );
     }
 
@@ -1258,6 +1568,345 @@ mod tests {
             );
         };
         assert_eq!((*ov1, *nv1, p1.clone()), (2, 3, vec![5]));
+    }
+
+    // ---------- §6.4 type expansion (PR-B-0) ----------
+
+    #[test]
+    fn literal_widening_seeds_slot_types_with_str_for_both_observations() {
+        // Pre-widen Fixed token "in" and triggering literal "out"
+        // are both classified as Str by `type_at_position`. The
+        // newly-introduced wildcard's slot_types should be
+        // {Str} (the singleton — Str ∪ Str = Str). No
+        // TemplateTypeExpanded event fires; the existence of the
+        // slot is covered by TemplateWidened alone.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
+        let _ = cluster.ingest(&string_record(&t, "user 42 logged out"));
+
+        let events = sink.drain();
+        assert_eq!(events.len(), 1, "literal widening: one event only");
+        assert!(matches!(
+            events[0].kind,
+            AuditEventKind::TemplateWidened { .. }
+        ));
+
+        let templates = cluster.templates_for(&t);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(
+            templates[0].slot_types.len(),
+            1,
+            "exactly one wildcard slot"
+        );
+        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(types, vec![ParamType::Str]);
+    }
+
+    #[test]
+    fn fixed_mask_tag_widening_captures_both_param_types_in_slot() {
+        // CLAUDE.md §3.1 regression: a leaf with `Fixed("<NUM>")`
+        // widened by a `<UUID>` line on main produces:
+        //   - one TemplateWidened event (position 1)
+        //   - slot_types[0] = {Num, Uuid} (both types observed
+        //     during the widening, captured as the slot's initial
+        //     state — neither counts as an "expansion" because the
+        //     slot didn't exist pre-widen)
+        // PR #32 had this case silently merging without any audit
+        // signal because masked positions entered the leaf as
+        // Wildcard from creation; PR-B-0 keeps mask tags as Fixed
+        // so the Fixed-mismatch widening fires, with the slot type
+        // information accumulated for future expansion checks.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // Prefix ["user", "logged"] shared (positions 0–1 inside
+        // prefix_depth=2). The mask-tag divergence sits at
+        // position 2 so both lines route to the same leaf, where
+        // sim_seq sees Fixed("<NUM>") vs "<UUID>" → Fixed
+        // mismatch → widening at position 2.
+        let _ = cluster.ingest(&string_record(&t, "user logged 42 in"));
+        let _ = cluster.ingest(&string_record(
+            &t,
+            "user logged 550e8400-e29b-41d4-a716-446655440000 in",
+        ));
+
+        let events = sink.drain();
+        assert_eq!(events.len(), 1, "single TemplateWidened, no expansion");
+        let AuditEventKind::TemplateWidened {
+            positions_widened, ..
+        } = &events[0].kind
+        else {
+            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        };
+        assert_eq!(*positions_widened, vec![2]);
+
+        let templates = cluster.templates_for(&t);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].slot_types.len(), 1);
+        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(
+            types,
+            vec![ParamType::Uuid, ParamType::Num],
+            "slot must record both the pre-widen Num and the triggering Uuid",
+        );
+    }
+
+    #[test]
+    fn clean_attach_at_typed_wildcard_with_known_type_emits_no_audit() {
+        // After a widening that seeds slot_types[0] = {Num, Uuid}
+        // (one Num line, one Uuid line), a third line with `<NUM>`
+        // at the same position attaches cleanly with no events.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "user logged 42 in"));
+        let _ = cluster.ingest(&string_record(
+            &t,
+            "user logged 550e8400-e29b-41d4-a716-446655440000 in",
+        ));
+        let _ = sink.drain();
+
+        // L3 — Num at position 2 (the wildcard) is already in the
+        // slot's set, so no expansion event fires.
+        let _ = cluster.ingest(&string_record(&t, "user logged 99 in"));
+
+        assert!(
+            sink.is_empty(),
+            "known type at typed wildcard must not emit",
+        );
+        let templates = cluster.templates_for(&t);
+        assert_eq!(
+            templates[0].template_version, 2,
+            "version stays at 2 — no expansion",
+        );
+    }
+
+    #[test]
+    fn clean_attach_at_typed_wildcard_with_new_type_emits_type_expanded() {
+        // Seed slot_types[0] = {Str} via literal widening
+        // ("in"/"out"), then ingest a `<NUM>` at the same position
+        // — Num is not in {Str}, so TemplateTypeExpanded fires.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // 5-token lines so the single-position widening keeps
+        // sim_seq at 4/5 = 0.8 ≥ default threshold 0.7. Shorter
+        // lines drop the similarity below threshold and split
+        // into a fresh leaf via the Lossy zone (RFC §6.2 step 5b).
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour in"));
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour out"));
+        let _ = sink.drain();
+
+        // "13" masks to "<NUM>"; it lands at position 4 where the
+        // leaf has a Wildcard with slot_types[0] = {Str}.
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour 13"));
+
+        let events = sink.drain();
+        assert_eq!(events.len(), 1, "exactly one TemplateTypeExpanded");
+        let AuditEventKind::TemplateTypeExpanded {
+            old_version,
+            new_version,
+            slots_expanded,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("expected TemplateTypeExpanded, got {:?}", events[0].kind);
+        };
+        assert_eq!((*old_version, *new_version), (2, 3));
+        assert_eq!(slots_expanded.len(), 1);
+        assert_eq!(slots_expanded[0].slot_index, 0);
+        assert_eq!(slots_expanded[0].added_types, vec![ParamType::Num]);
+
+        let templates = cluster.templates_for(&t);
+        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(types, vec![ParamType::Num, ParamType::Str]);
+    }
+
+    #[test]
+    fn type_expansion_only_attach_counts_toward_merges_total() {
+        // RFC §6.4 — `merges_total` counts both `TemplateWidened`
+        // and `TemplateTypeExpanded` (see
+        // `AuditEventKind::counts_as_merge`). A pure type-expansion
+        // attach must therefore bump the counter.
+        let (mut cluster, _sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour in"));
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour out"));
+        let merges_after_widen = cluster.merges_total();
+
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour 13"));
+        assert_eq!(
+            cluster.merges_total(),
+            merges_after_widen + 1,
+            "type-expansion-only attach must bump merges_total",
+        );
+    }
+
+    #[test]
+    fn combined_widening_and_type_expansion_emits_two_events_in_order() {
+        // RFC §6.2: a single attach can trigger BOTH structural
+        // widening (Fixed mismatch) AND type expansion (new
+        // ParamType at a pre-existing wildcard). In that case
+        // template_version increments twice and two events emit
+        // in widening-then-expansion order.
+        //
+        // Setup: leaf with one pre-existing Wildcard whose
+        // slot_types = {Str}, plus a Fixed literal at another
+        // position. The triggering line widens the literal
+        // (literal-vs-literal Fixed mismatch) AND brings a `<NUM>`
+        // to the pre-existing wildcard.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // L1: fresh 5-token leaf [Fixed("user"), Fixed("logged"),
+        //     Fixed("at"), Fixed("hour"), Fixed("NOW")], slots=[].
+        //     Prefix ["user", "logged"] is shared.
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour NOW"));
+        // L2: literal "NOW" → "LATER" widens position 4. sim_seq
+        //     = 4/5 = 0.8 ≥ threshold. slot_types = [{Str}], v=2.
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour LATER"));
+        let _ = sink.drain();
+
+        // L3: Fixed mismatch at position 3 ("hour" → "minute")
+        //     AND position 4's pre-existing wildcard sees "<NUM>"
+        //     from "13". sim_seq = 4/5 = 0.8 → Clean. After
+        //     widening pos 3 the slot ordinals are: position 3 →
+        //     ordinal 0 (fresh, slot_types=[{Str}]), position 4
+        //     → ordinal 1 (existing, slot_types was [{Str}]).
+        //     Expansion fires at ordinal 1, adding Num.
+        let _ = cluster.ingest(&string_record(&t, "user logged at minute 13"));
+
+        let events = sink.drain();
+        assert_eq!(events.len(), 2, "combined widening + type expansion");
+        let AuditEventKind::TemplateWidened {
+            old_version: w_old,
+            new_version: w_new,
+            positions_widened,
+            ..
+        } = &events[0].kind
+        else {
+            panic!(
+                "event 0 must be TemplateWidened (widening fires before expansion), got {:?}",
+                events[0].kind,
+            );
+        };
+        assert_eq!((*w_old, *w_new), (2, 3));
+        assert_eq!(*positions_widened, vec![3]);
+
+        let AuditEventKind::TemplateTypeExpanded {
+            old_version: e_old,
+            new_version: e_new,
+            slots_expanded,
+            ..
+        } = &events[1].kind
+        else {
+            panic!(
+                "event 1 must be TemplateTypeExpanded, got {:?}",
+                events[1].kind,
+            );
+        };
+        assert_eq!((*e_old, *e_new), (3, 4));
+        // Post-widen template: [Fixed, Fixed, Fixed, Wildcard,
+        // Wildcard]. The freshly-widened slot at position 3 is
+        // ordinal 0; the pre-existing slot at position 4 is
+        // ordinal 1 — that's the one expanding.
+        assert_eq!(slots_expanded.len(), 1);
+        assert_eq!(slots_expanded[0].slot_index, 1);
+        assert_eq!(slots_expanded[0].added_types, vec![ParamType::Num]);
+
+        let templates = cluster.templates_for(&t);
+        assert_eq!(
+            templates[0].template_version, 4,
+            "version is 4 after both bumps",
+        );
+        assert_eq!(templates[0].slot_types.len(), 2, "two wildcard slots");
+    }
+
+    #[test]
+    fn slot_types_are_aligned_by_wildcard_ordinal_not_template_position() {
+        // The leaf's `slot_types[k]` is the type set for the k-th
+        // Wildcard from the left (ordinal), not for template
+        // position k. Pin the invariant by widening positions
+        // out-of-order across multiple attaches and checking the
+        // resulting alignment.
+        let (mut cluster, _sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // L1: 5-token leaf [Fixed("user"), Fixed("logged"),
+        //     Fixed("in"), Fixed("fast"), Fixed("NOW")], v=1.
+        //     Prefix ["user", "logged"] is shared.
+        let _ = cluster.ingest(&string_record(&t, "user logged in fast NOW"));
+        // L2: widen position 3 ("fast" → "slow"). sim_seq = 4/5
+        //     ≥ threshold. slot_types = [{Str}] (one wildcard at
+        //     ordinal 0).
+        let _ = cluster.ingest(&string_record(&t, "user logged in slow NOW"));
+        // L3: widen position 2 ("in" → "out"). Position 3 is a
+        //     pre-existing Wildcard matching "slow". sim_seq =
+        //     4/5 ≥ threshold. The new wildcard at template
+        //     position 2 is inserted at ordinal 0 (it sits left
+        //     of position 3's existing wildcard, now ordinal 1),
+        //     so slot_types = [{Str (new at pos 2)}, {Str (old
+        //     at pos 3)}].
+        let _ = cluster.ingest(&string_record(&t, "user logged out slow NOW"));
+
+        let templates = cluster.templates_for(&t);
+        assert_eq!(templates[0].slot_types.len(), 2);
+        // Both slots are Str-only (literal widenings).
+        for (i, st) in templates[0].slot_types.iter().enumerate() {
+            let types: Vec<_> = st.iter().collect();
+            assert_eq!(
+                types,
+                vec![ParamType::Str],
+                "slot {i}: literal widening seeds only Str",
+            );
+        }
+    }
+
+    #[test]
+    fn silent_merge_across_mask_tag_types_is_audited_not_silent() {
+        // Regression for the CLAUDE.md §3.1 violation that closed
+        // PR #32. Two lines differing only by mask-tag type at a
+        // position beyond `prefix_depth` (default 2) MUST produce
+        // an audit signal, not a silent merge.
+        //
+        // - Line A: "GET /home 42 ok" — masks <NUM> at position 2.
+        // - Line B: "GET /home <UUID-string> ok" — masks <UUID>.
+        //
+        // Pre-PR-B-0: same tree path (length=4, prefix=GET/home);
+        // sim_seq with the leaf's Fixed("<NUM>") at position 2 vs
+        // the line's "<UUID>" → Fixed mismatch → TemplateWidened
+        // fires. slot_types[0] then captures {Num, Uuid}.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "GET /home 42 ok"));
+        let _ = cluster.ingest(&string_record(
+            &t,
+            "GET /home 550e8400-e29b-41d4-a716-446655440000 ok",
+        ));
+
+        let events = sink.drain();
+        assert!(
+            !events.is_empty(),
+            "§3.1: mask-tag type change at a tree-routed wildcard slot must audit",
+        );
+        let AuditEventKind::TemplateWidened {
+            positions_widened, ..
+        } = &events[0].kind
+        else {
+            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        };
+        assert_eq!(*positions_widened, vec![2]);
+
+        // Confirm the slot's type set captures the divergence so a
+        // *third* mask-tag type at the same position would emit
+        // TemplateTypeExpanded.
+        let templates = cluster.templates_for(&t);
+        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(types, vec![ParamType::Uuid, ParamType::Num]);
     }
 
     #[test]
@@ -1380,7 +2029,7 @@ mod tests {
         // its post-widening template (1 Fixed at position 0).
         let templates = cluster.templates_for(&t);
         assert_eq!(templates.len(), 1);
-        let leaf_template = &templates[0].0;
+        let leaf_template = &templates[0].template;
         assert_eq!(leaf_template.len(), 3);
         assert!(matches!(leaf_template[0], OwnedToken::Fixed(ref s) if s == "alpha"));
         assert!(matches!(leaf_template[1], OwnedToken::Wildcard));

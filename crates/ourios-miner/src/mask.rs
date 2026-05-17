@@ -37,11 +37,26 @@ pub struct TypedParam<'a> {
 ///
 /// `tokens.len()` always equals the input token count
 /// (position-preserving): each entry is either the original token
-/// (unmasked) or the type-tag string (masked). `typed_params`
-/// holds, in match order, one entry per masked position.
+/// (unmasked) or the type-tag string (masked).
+///
+/// `wildcard_positions` lists the line-token indices where mask
+/// substituted a tag, ascending by construction (single forward
+/// pass). It is **parallel** to [`Self::typed_params`]: the
+/// `k`-th masked position is `wildcard_positions[k]`, and that
+/// position's `ParamType` is `typed_params[k].type_tag`. Consumers
+/// that need a per-position classification must use this field
+/// rather than re-matching against the tag-string content of
+/// [`Self::tokens`] — the tag strings collide with literal log
+/// tokens that happen to read `"<NUM>"` / `"<IP>"` / `"<UUID>"`
+/// (mask leaves such literals unchanged), so string-shape
+/// inference mis-classifies them as the corresponding `ParamType`.
+///
+/// `typed_params` holds, in match order, one entry per masked
+/// position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Masked<'a> {
     pub tokens: Vec<&'a str>,
+    pub wildcard_positions: Vec<usize>,
     pub typed_params: Vec<TypedParam<'a>>,
 }
 
@@ -58,10 +73,12 @@ pub struct Masked<'a> {
 #[must_use]
 pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
     let mut out_tokens = Vec::with_capacity(tokens.len());
+    let mut wildcard_positions = Vec::new();
     let mut typed_params = Vec::new();
-    for &tok in tokens {
+    for (i, &tok) in tokens.iter().enumerate() {
         if let Some(tag) = classify(tok) {
             out_tokens.push(tag.as_str());
+            wildcard_positions.push(i);
             typed_params.push(TypedParam {
                 type_tag: tag.into(),
                 value: tok,
@@ -72,6 +89,7 @@ pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
     }
     Masked {
         tokens: out_tokens,
+        wildcard_positions,
         typed_params,
     }
 }
@@ -204,6 +222,55 @@ mod tests {
         assert_eq!(r.typed_params[0].value, "42");
         assert_eq!(r.typed_params[1].type_tag, ParamType::Ip);
         assert_eq!(r.typed_params[1].value, "10.0.0.1");
+        // wildcard_positions records the *input* indices where
+        // mask emitted a tag; parallel to typed_params (§6.2
+        // alignment used by the cluster's type-expansion logic).
+        assert_eq!(r.wildcard_positions, vec![1, 5]);
+    }
+
+    #[test]
+    fn mask_wildcard_positions_are_ascending_and_parallel_to_typed_params() {
+        // Pin the §6.2 alignment contract: `wildcard_positions[k]`
+        // is the input-token index whose original value is
+        // `typed_params[k].value`. Consumers (cluster type-expansion)
+        // rely on this parallel ordering.
+        let tokens = ["alpha", "10.0.0.1", "beta", "42", "gamma", "-7"];
+
+        let r = mask(&tokens);
+
+        assert_eq!(r.wildcard_positions, vec![1, 3, 5]);
+        assert_eq!(r.typed_params.len(), 3);
+        for (k, p) in r.wildcard_positions.iter().copied().enumerate() {
+            assert_eq!(
+                r.typed_params[k].value, tokens[p],
+                "typed_params[{k}].value must equal the input token at wildcard_positions[{k}] = {p}",
+            );
+        }
+    }
+
+    #[test]
+    fn mask_does_not_classify_literal_mask_tag_token() {
+        // §6.2 ambiguity: an input log line containing the literal
+        // string "<NUM>" is **not** classified by the mask rules
+        // (it's not all digits, not a UUID, not an IPv4). The
+        // surface effect is that `wildcard_positions` does not
+        // include that position and `typed_params` carries no
+        // entry for it — consumers that key off `Masked`'s typed
+        // metadata see "no classification here". This is the
+        // contract the cluster's `param_type_for_line_position`
+        // helper relies on to avoid the literal-vs-tag collision
+        // the audit-stream classifier would otherwise produce.
+        let tokens = ["value", "<NUM>", "<IP>", "<UUID>", "ok"];
+
+        let r = mask(&tokens);
+
+        assert_eq!(r.tokens, tokens, "literal tags pass through unchanged");
+        assert!(
+            r.wildcard_positions.is_empty(),
+            "literals matching tag strings must not be classified: {:?}",
+            r.wildcard_positions,
+        );
+        assert!(r.typed_params.is_empty());
     }
 
     #[test]

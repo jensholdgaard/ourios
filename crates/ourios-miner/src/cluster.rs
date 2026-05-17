@@ -411,14 +411,63 @@ fn params_from_mask(typed_params: &[crate::mask::TypedParam<'_>]) -> Vec<Param> 
         .collect()
 }
 
-/// Classify a single masked-line token for the §6.4 slot-type
-/// machinery: known mask tags map to their [`ParamType`]; every
-/// other token (literal that didn't match a mask rule) is treated
-/// as `Str` per RFC §6.2 step 5 ("the original literal at that
-/// position … is captured as `{ type_tag: STR, value: L_tok[pos]
-/// }`").
-fn type_at_position(token: &str) -> ParamType {
-    match token {
+/// Look up the `ParamType` at a line position from `mask()`'s
+/// classification — the authoritative source.
+///
+/// `wildcard_positions` is ascending (single forward pass over the
+/// input tokens), so a binary search is `O(log n)` per call.
+/// Returns `Str` for positions `mask()` did not classify (the
+/// original token wasn't a numeric, UUID, or IPv4 literal); per
+/// RFC §6.2 step 5 the literal value is captured as
+/// `ParamType::Str`.
+///
+/// **Why not match the masked-token string content.** An input log
+/// line that contains the literal token `"<NUM>"` / `"<IP>"` /
+/// `"<UUID>"` passes through `mask()` unchanged because the rules
+/// (digits / IPv4 / UUID) don't fire on it. The masked-token at
+/// that position is therefore the literal string, indistinguishable
+/// by content from a mask-emitted tag. String-shape inference
+/// would mis-classify the literal as the corresponding `ParamType`
+/// and corrupt `slot_types` / suppress `TemplateTypeExpanded`
+/// audits. The `wildcard_positions` array does not include the
+/// position for the literal case, so this lookup gives the right
+/// answer in both.
+fn param_type_for_line_position(
+    p: usize,
+    wildcard_positions: &[usize],
+    typed_params: &[crate::mask::TypedParam<'_>],
+) -> ParamType {
+    debug_assert_eq!(
+        wildcard_positions.len(),
+        typed_params.len(),
+        "mask invariant: typed_params parallel to wildcard_positions",
+    );
+    match wildcard_positions.binary_search(&p) {
+        Ok(k) => typed_params[k].type_tag,
+        Err(_) => ParamType::Str,
+    }
+}
+
+/// Heuristic classification of a leaf's pre-widen `Fixed` token.
+/// Used only to seed `slot_types` on widening.
+///
+/// **Known limitation.** On main (this PR's baseline), `mask()`
+/// emits the tag strings `<NUM>` / `<IP>` / `<UUID>` and the
+/// fresh-leaf builder stores them as `Fixed("<NUM>")` etc. The
+/// leaf carries no metadata distinguishing a `Fixed("<NUM>")` that
+/// came from a mask emit (slot type Num) from one that came from a
+/// literal user input token spelled "<NUM>" (slot type Str). This
+/// heuristic classifies any matching tag string as the
+/// corresponding `ParamType`; the mis-classification surface is
+/// bounded to the seed step on widening — a future correct
+/// observation at the slot only causes a missed
+/// `TemplateTypeExpanded` audit, not a silent template merge — and
+/// is eliminated entirely by PR-B-1, which switches masked
+/// positions to `Wildcard` in the leaf template (with `slot_types`
+/// seeded from `typed_params` at fresh-leaf creation, no inference
+/// required).
+fn type_at_leaf_fixed_token(s: &str) -> ParamType {
+    match s {
         "<NUM>" => ParamType::Num,
         "<IP>" => ParamType::Ip,
         "<UUID>" => ParamType::Uuid,
@@ -452,7 +501,8 @@ fn update_slot_types_on_widening(
     slot_types: &mut Vec<SlotTypes>,
     pre_widen_template: &[OwnedToken],
     post_widen_template: &[OwnedToken],
-    line_tokens: &[&str],
+    line_wildcard_positions: &[usize],
+    line_typed_params: &[crate::mask::TypedParam<'_>],
     positions_widened: &[usize],
 ) {
     debug_assert!(
@@ -464,17 +514,20 @@ fn update_slot_types_on_widening(
         post_widen_template.len(),
         "widening is in-place — length is invariant",
     );
-    debug_assert_eq!(
-        pre_widen_template.len(),
-        line_tokens.len(),
-        "template and line are the same length by sim_seq precondition",
-    );
 
     let mut ordinal = 0usize;
     let mut widen_iter = positions_widened.iter().copied().peekable();
     for (p, tok) in post_widen_template.iter().enumerate() {
         if matches!(tok, OwnedToken::Wildcard) {
             if widen_iter.peek().copied() == Some(p) {
+                // The line's type at the triggering position is
+                // authoritative — read it from mask's
+                // classification rather than inferring from the
+                // masked-token string (which collides with literal
+                // "<NUM>"/"<IP>"/"<UUID>" tokens, see
+                // `param_type_for_line_position`).
+                let line_type =
+                    param_type_for_line_position(p, line_wildcard_positions, line_typed_params);
                 let pre_token = match &pre_widen_template[p] {
                     OwnedToken::Fixed(s) => s.as_str(),
                     OwnedToken::Wildcard => unreachable!(
@@ -482,8 +535,8 @@ fn update_slot_types_on_widening(
                          a pre-existing Wildcard cannot appear in positions_widened",
                     ),
                 };
-                let initial = SlotTypes::singleton(type_at_position(pre_token))
-                    .insert(type_at_position(line_tokens[p]));
+                let initial =
+                    SlotTypes::singleton(type_at_leaf_fixed_token(pre_token)).insert(line_type);
                 slot_types.insert(ordinal, initial);
                 widen_iter.next();
             }
@@ -510,7 +563,8 @@ fn update_slot_types_on_widening(
 /// and the initial type set is its first state, not an addition).
 fn collect_type_expansions(
     template: &[OwnedToken],
-    line_tokens: &[&str],
+    line_wildcard_positions: &[usize],
+    line_typed_params: &[crate::mask::TypedParam<'_>],
     slot_types: &[SlotTypes],
     skip_positions: &[usize],
 ) -> Vec<SlotExpansion> {
@@ -518,7 +572,6 @@ fn collect_type_expansions(
         skip_positions.windows(2).all(|w| w[0] < w[1]),
         "skip_positions must be sorted ascending",
     );
-    debug_assert_eq!(template.len(), line_tokens.len());
 
     let mut out: Vec<SlotExpansion> = Vec::new();
     let mut ordinal: u16 = 0;
@@ -529,7 +582,10 @@ fn collect_type_expansions(
             if is_freshly_widened {
                 skip_iter.next();
             } else {
-                let line_type = type_at_position(line_tokens[p]);
+                // Line side: authoritative classification from
+                // mask, not from the masked-token string.
+                let line_type =
+                    param_type_for_line_position(p, line_wildcard_positions, line_typed_params);
                 let current_set = slot_types[ordinal as usize];
                 if !current_set.contains(line_type) {
                     out.push(SlotExpansion {
@@ -596,14 +652,36 @@ enum AttachPlan {
 /// `leaf.slot_types` in place when widening or type-expansion
 /// fires; the caller drops the leaf borrow before draining the
 /// returned `events`.
-fn plan_attach(leaf: &mut Leaf, masked_strs: &[&str]) -> AttachPlan {
+//
+// This function maps 1:1 onto the RFC §6.2 step 5 algorithm:
+// (clean reuse / type-expansion-only / degenerate rejection /
+// widening + optional expansion). Each branch reads and mutates
+// the same `leaf` state, so factoring branches into helpers would
+// require shuttling the leaf back and forth (or returning partial
+// `AttachPlan`s and re-entering). The current single-function
+// shape keeps the RFC mapping line-for-line and the locking-tests
+// in `cluster::tests` against this function direct; the
+// too_many_lines lint is silenced here rather than fragmenting
+// the algorithm for the lint's sake.
+#[allow(clippy::too_many_lines)]
+fn plan_attach(
+    leaf: &mut Leaf,
+    masked_strs: &[&str],
+    line_wildcard_positions: &[usize],
+    line_typed_params: &[crate::mask::TypedParam<'_>],
+) -> AttachPlan {
     let positions_widened = find_widening_positions(masked_strs, &leaf.template);
 
     if positions_widened.is_empty() {
         // No Fixed mismatch — check for a type-expansion-only
         // attach (a known wildcard slot seeing a new ParamType).
-        let expansions =
-            collect_type_expansions(&leaf.template, masked_strs, &leaf.slot_types, &[]);
+        let expansions = collect_type_expansions(
+            &leaf.template,
+            line_wildcard_positions,
+            line_typed_params,
+            &leaf.slot_types,
+            &[],
+        );
         if expansions.is_empty() {
             return AttachPlan::CleanReuse {
                 template_id: leaf.template_id,
@@ -662,7 +740,8 @@ fn plan_attach(leaf: &mut Leaf, masked_strs: &[&str]) -> AttachPlan {
         &mut leaf.slot_types,
         &pre_widen_template,
         &leaf.template,
-        masked_strs,
+        line_wildcard_positions,
+        line_typed_params,
         &positions_widened,
     );
     let version_after_widen = old_version
@@ -685,7 +764,8 @@ fn plan_attach(leaf: &mut Leaf, masked_strs: &[&str]) -> AttachPlan {
     // widening and type-expansion; events emit in this order).
     let expansions = collect_type_expansions(
         &leaf.template,
-        masked_strs,
+        line_wildcard_positions,
+        line_typed_params,
         &leaf.slot_types,
         &positions_widened,
     );
@@ -842,6 +922,8 @@ impl MinerCluster {
                         record,
                         raw,
                         &masked_strs,
+                        &masked.wildcard_positions,
+                        &masked.typed_params,
                         c,
                         separators,
                         params,
@@ -999,11 +1081,14 @@ impl MinerCluster {
     ///     `TemplateTypeExpanded` per RFC §6.2's combined-attach
     ///     contract (`template_version` increments twice, two events
     ///     emitted in widening-then-expansion order).
+    #[allow(clippy::too_many_arguments)]
     fn attach_and_maybe_widen(
         &mut self,
         record: &OtlpLogRecord,
         raw: &str,
         masked_strs: &[&str],
+        line_wildcard_positions: &[usize],
+        line_typed_params: &[crate::mask::TypedParam<'_>],
         candidate: Candidate,
         separators: Vec<String>,
         params: Vec<Param>,
@@ -1024,7 +1109,12 @@ impl MinerCluster {
                 .expect("tenant present: find_best_candidate returned Some(...)");
             let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
             let leaf = &mut parent.leaves[candidate.leaf_idx];
-            plan_attach(leaf, masked_strs)
+            plan_attach(
+                leaf,
+                masked_strs,
+                line_wildcard_positions,
+                line_typed_params,
+            )
         };
 
         match plan {
@@ -1907,6 +1997,53 @@ mod tests {
         let templates = cluster.templates_for(&t);
         let types: Vec<_> = templates[0].slot_types[0].iter().collect();
         assert_eq!(types, vec![ParamType::Uuid, ParamType::Num]);
+    }
+
+    #[test]
+    fn literal_mask_tag_token_in_line_classifies_as_str_not_num() {
+        // Regression for PR #33's review feedback. If a log line
+        // literally contains the token `"<NUM>"` (e.g., a
+        // placeholder a developer wrote into the message),
+        // `mask()` does NOT classify it (the digit rule doesn't
+        // fire on non-digit strings). The cluster's per-position
+        // type classification therefore reports `Str` for that
+        // position, NOT `Num`.
+        //
+        // Setup at position 3: literal widening seeds
+        // slot_types[0] = {Str}. Then a third line brings the
+        // literal `"<NUM>"` at the same position. The classifier
+        // must read mask's `wildcard_positions` (empty for this
+        // position, since the rule didn't fire) and conclude
+        // `Str`, which is already in the slot's set — no audit
+        // event. The pre-fix code would have inferred `Num` from
+        // the masked-token string content and incorrectly fired
+        // `TemplateTypeExpanded`, corrupting slot_types.
+        let (mut cluster, sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour in"));
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour out"));
+        let _ = sink.drain();
+
+        // The third line's position-4 token is the literal
+        // string "<NUM>". mask() leaves it alone (not all-digits).
+        let _ = cluster.ingest(&string_record(&t, "user logged at hour <NUM>"));
+
+        assert!(
+            sink.is_empty(),
+            "literal `<NUM>` must be Str (already in slot's set), not a spurious Num expansion",
+        );
+        let templates = cluster.templates_for(&t);
+        assert_eq!(
+            templates[0].template_version, 2,
+            "no version bump: the literal `<NUM>` did not introduce a new type",
+        );
+        let types: Vec<_> = templates[0].slot_types[0].iter().collect();
+        assert_eq!(
+            types,
+            vec![ParamType::Str],
+            "slot_types stays at {{Str}} — Num must not leak in from a literal-tag token",
+        );
     }
 
     #[test]

@@ -155,6 +155,14 @@ pub struct MinerCluster {
     // see `ConfidenceZone::retains_body`. The numerator of the
     // §3.1 `body_retention_ratio` gauge.
     body_retentions_total: AtomicU64,
+    // §6.5 / §3.2 counter: per-parameter byte-limit overflow
+    // events. Increments by the count of `Overflow`-tagged
+    // [`Param`] entries on each emitted record. Read-side
+    // placeholder for the §6.8 `params_overflow_total` *counter*
+    // metric — the §3.2 `params_overflow_ratio` *gauge* is the
+    // derived rolling ratio that lands alongside it once total
+    // emitted params is tracked.
+    params_overflow_total: AtomicU64,
     // Wall-clock source for audit-event `timestamp` stamping per
     // RFC §6.4. [`SystemClock`] in production; tests substitute
     // a [`ourios_core::clock::TestClock`] via
@@ -251,6 +259,7 @@ impl MinerCluster {
             merges_total: AtomicU64::new(0),
             parse_failures_total: AtomicU64::new(0),
             body_retentions_total: AtomicU64::new(0),
+            params_overflow_total: AtomicU64::new(0),
             clock: Box::new(SystemClock::new()),
         }
     }
@@ -417,6 +426,47 @@ impl MinerCluster {
         self.body_retentions_total.load(Ordering::Relaxed)
     }
 
+    /// Cumulative count of per-parameter byte-limit overflow
+    /// events per RFC §6.5. Increments by the count of
+    /// `Overflow`-tagged [`Param`]s on each emitted record (so a
+    /// record with two oversized params bumps the counter by 2).
+    /// Read-side placeholder for the §6.8 `params_overflow_total`
+    /// *counter* metric; the §3.2 `params_overflow_ratio` *gauge*
+    /// is the derived rolling ratio with the `> 0.01` per-service
+    /// alert threshold — both ship together once the exporter
+    /// lands and are not this method's responsibility.
+    #[must_use]
+    pub fn params_overflow_total(&self) -> u64 {
+        self.params_overflow_total.load(Ordering::Relaxed)
+    }
+
+    /// Apply RFC §6.5's "overflow forces body retention" rule to
+    /// a record about to be emitted: if any `Param` carries
+    /// `type_tag = Overflow`, set `body = Some(raw)` (overriding
+    /// any previous setting) and bump `params_overflow_total` by
+    /// the overflow count. No-op when the record has no overflow
+    /// params.
+    ///
+    /// The override of `body` is intentional: even on paths that
+    /// already retain body (lossy zone, parse-failure zone), the
+    /// caller's `body` may be `None` or partial; an overflow
+    /// record's body must always carry the original line bytes
+    /// so `reconstruct()`'s `Overflow` branch (RFC §6.6) has
+    /// something to fall back to.
+    fn apply_overflow_retention(&self, rec: &mut MinedRecord, raw: &str) {
+        let overflow_count = rec
+            .params
+            .iter()
+            .filter(|p| p.type_tag == ParamType::Overflow)
+            .count();
+        if overflow_count > 0 {
+            rec.body = Some(raw.to_string());
+            #[allow(clippy::cast_possible_truncation)]
+            self.params_overflow_total
+                .fetch_add(overflow_count as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Mark one parse-failure event: increments both
     /// `parse_failures_total` and `body_retentions_total`. RFC
     /// §6.3 says every parse-failure path retains body (the
@@ -494,18 +544,18 @@ fn separators_to_owned(separators: &[&str]) -> Vec<String> {
 }
 
 /// Free helper: lift `mask`'s typed-params output into the
-/// `Vec<Param>` shape `MinedRecord::params` carries. PR-A
-/// alignment: this is "one entry per masked position, in token
-/// order"; PR-B reconciles with §6.1's "one entry per template
-/// `<*>` slot" once `reconstruct()` lands and the alignment
-/// becomes load-bearing.
-fn params_from_mask(typed_params: &[crate::mask::TypedParam<'_>]) -> Vec<Param> {
+/// `Vec<Param>` shape `MinedRecord::params` carries, applying the
+/// §6.5 per-parameter byte-limit check.
+///
+/// Any value whose UTF-8 byte length exceeds `byte_limit` is
+/// replaced by an `Overflow` marker (RFC §6.5); the caller is
+/// responsible for setting `body = Some(raw)` on the emitted
+/// record when [`crate::overflow::any_overflow`] returns true for
+/// the resulting params vector.
+fn params_from_mask(typed_params: &[crate::mask::TypedParam<'_>], byte_limit: u32) -> Vec<Param> {
     typed_params
         .iter()
-        .map(|p| Param {
-            type_tag: p.type_tag,
-            value: p.value.to_string(),
-        })
+        .map(|p| crate::overflow::cap_param_value(p.type_tag, p.value.to_string(), byte_limit))
         .collect()
 }
 
@@ -716,6 +766,7 @@ fn build_record_params(
     masked_strs: &[&str],
     line_wildcard_positions: &[usize],
     line_typed_params: &[crate::mask::TypedParam<'_>],
+    byte_limit: u32,
 ) -> Vec<Param> {
     debug_assert_eq!(
         line_wildcard_positions.len(),
@@ -738,18 +789,24 @@ fn build_record_params(
         if !matches!(tok, OwnedToken::Wildcard) {
             continue;
         }
-        if k < line_wildcard_positions.len() && line_wildcard_positions[k] == p {
-            out.push(Param {
-                type_tag: line_typed_params[k].type_tag,
-                value: line_typed_params[k].value.to_string(),
-            });
-            k += 1;
-        } else {
-            out.push(Param {
-                type_tag: ParamType::Str,
-                value: masked_strs[p].to_string(),
-            });
-        }
+        let (type_tag, value) =
+            if k < line_wildcard_positions.len() && line_wildcard_positions[k] == p {
+                let entry = (
+                    line_typed_params[k].type_tag,
+                    line_typed_params[k].value.to_string(),
+                );
+                k += 1;
+                entry
+            } else {
+                // STR fallback for an existing-Wildcard / freshly-
+                // widened-literal slot — see helper docstring.
+                (ParamType::Str, masked_strs[p].to_string())
+            };
+        // RFC §6.5 byte-limit check at the param boundary: an
+        // over-cap value becomes an Overflow marker.
+        out.push(crate::overflow::cap_param_value(
+            type_tag, value, byte_limit,
+        ));
     }
     debug_assert_eq!(
         k,
@@ -820,6 +877,7 @@ fn plan_attach(
     masked_strs: &[&str],
     line_wildcard_positions: &[usize],
     line_typed_params: &[crate::mask::TypedParam<'_>],
+    byte_limit: u32,
 ) -> AttachPlan {
     let positions_widened =
         find_widening_positions(masked_strs, &leaf.template, line_wildcard_positions);
@@ -843,6 +901,7 @@ fn plan_attach(
                     masked_strs,
                     line_wildcard_positions,
                     line_typed_params,
+                    byte_limit,
                 ),
             };
         }
@@ -859,6 +918,7 @@ fn plan_attach(
             masked_strs,
             line_wildcard_positions,
             line_typed_params,
+            byte_limit,
         );
         return AttachPlan::Mutated {
             template_id: leaf.template_id,
@@ -954,11 +1014,13 @@ fn plan_attach(
 
     // Build params aligned to the post-widen template's wildcard
     // slots. §6.6 reconstruction reads against this alignment.
+    // §6.5 cap applied per-slot inside `build_record_params`.
     let params = build_record_params(
         &leaf.template,
         masked_strs,
         line_wildcard_positions,
         line_typed_params,
+        byte_limit,
     );
 
     AttachPlan::Mutated {
@@ -1016,6 +1078,17 @@ impl MinerCluster {
     }
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.
+    //
+    // Like `plan_attach`, this function maps 1:1 onto its RFC
+    // section's algorithm steps (tokenize → mask → §6.2 step-1
+    // empty / over-cap guards → §6.2 step 4 candidate selection
+    // → §6.3 three-zone classification → §6.2 step 5 attach).
+    // Each branch sets up its own record envelope, so factoring
+    // out the branches would mostly shuffle local-variable
+    // arguments without simplifying the algorithm; the
+    // too_many_lines lint is silenced here rather than
+    // fragmenting the per-step structure.
+    #[allow(clippy::too_many_lines)]
     fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
         // RFC §6.2 step 1 (H7.2): a tokenizer failure (today:
         // embedded NUL byte) routes the line to the parse-failure
@@ -1038,10 +1111,19 @@ impl MinerCluster {
             }
         };
         let masked = mask(&tokenized.tokens);
+        // Resolve the tenant's effective tunables once for this
+        // ingest (RFC 0004 §3.4): per-tenant override if seeded
+        // before allocation and the tenant is allocated, else the
+        // cluster default.
+        let effective_config = self.effective_config(&record.tenant_id);
         // Pre-compute the owned forms once. Every emit path
-        // reads these.
+        // reads these. The §6.5 byte-limit check is applied here
+        // (one shared `params` vector across the fresh-leaf and
+        // empty/over-cap paths); the attach paths rebuild via
+        // `build_record_params` so they apply the same check on
+        // the aligned per-Wildcard-slot params.
         let separators = separators_to_owned(&tokenized.separators);
-        let params = params_from_mask(&masked.typed_params);
+        let params = params_from_mask(&masked.typed_params, effective_config.param_byte_limit);
         let masked_strs: Vec<&str> = masked.tokens.into_iter().collect();
 
         if masked_strs.is_empty() {
@@ -1073,6 +1155,10 @@ impl MinerCluster {
             rec.params = params;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
+            // §6.5: bump `params_overflow_total` if any param
+            // exceeded the byte limit. Body retention is already
+            // set above for this parse-failure path.
+            self.apply_overflow_retention(&mut rec, raw);
             self.emit_record(rec);
             self.record_parse_failure();
             return NO_TEMPLATE;
@@ -1084,11 +1170,6 @@ impl MinerCluster {
         // immutable so we can early-return (or fall through to
         // fresh-leaf creation) without committing a
         // `template_id` allocation.
-        // Resolve the tenant's effective tunables once for this
-        // ingest (RFC 0004 §3.4): per-tenant override if seeded
-        // before allocation and the tenant is allocated, else the
-        // cluster default.
-        let effective_config = self.effective_config(&record.tenant_id);
         let best = self.find_best_candidate(record, &masked_strs, &masked.wildcard_positions);
 
         let threshold = effective_config.similarity_threshold;
@@ -1112,6 +1193,9 @@ impl MinerCluster {
                 rec.separators = separators;
                 rec.params = params;
                 rec.confidence = 1.0;
+                // §6.5: force body retention on this fresh-leaf
+                // record if any of its params overflowed.
+                self.apply_overflow_retention(&mut rec, raw);
                 self.emit_record(rec);
                 new_id
             }
@@ -1121,7 +1205,10 @@ impl MinerCluster {
                     // widening. RFC §6.2 step 5. No body
                     // retention. The helper emits its own
                     // record (one of: clean-reuse, widening, or
-                    // degenerate-rejection).
+                    // degenerate-rejection); the per-tenant
+                    // byte_limit is threaded through so the
+                    // helper's rebuilt aligned params also get
+                    // §6.5 capping.
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
                         record,
                         raw,
@@ -1131,6 +1218,7 @@ impl MinerCluster {
                         c,
                         separators,
                         params,
+                        effective_config.param_byte_limit,
                     ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
@@ -1157,6 +1245,10 @@ impl MinerCluster {
                         // `lossy_flag` stays false — §6.6: the
                         // §6.3 lossy zone is "body retained,
                         // reconstruction expected to match".
+                        // §6.5: bump `params_overflow_total` for
+                        // any overflow params (body is already
+                        // retained for the §6.3 reason).
+                        self.apply_overflow_retention(&mut rec, raw);
                         self.emit_record(rec);
                         new_id
                     }
@@ -1168,6 +1260,10 @@ impl MinerCluster {
                         rec.params = params;
                         rec.body = Some(raw.to_string());
                         rec.lossy_flag = true;
+                        // §6.5: bump `params_overflow_total` for
+                        // any overflow params (body is already
+                        // retained for the parse-failure reason).
+                        self.apply_overflow_retention(&mut rec, raw);
                         self.emit_record(rec);
                         self.record_parse_failure();
                         NO_TEMPLATE
@@ -1348,6 +1444,7 @@ impl MinerCluster {
         candidate: Candidate,
         separators: Vec<String>,
         params: Vec<Param>,
+        byte_limit: u32,
     ) -> u64 {
         // Ownership rationale: each exit path emits **one** data
         // record and never reuses `separators` / `params` after
@@ -1372,6 +1469,7 @@ impl MinerCluster {
                 masked_strs,
                 line_wildcard_positions,
                 line_typed_params,
+                byte_limit,
             )
         };
 
@@ -1394,6 +1492,9 @@ impl MinerCluster {
                 rec.separators = separators;
                 rec.params = aligned_params;
                 rec.confidence = 1.0;
+                // §6.5: force body retention on this clean-reuse
+                // record if any of its aligned params overflowed.
+                self.apply_overflow_retention(&mut rec, raw);
                 self.emit_record(rec);
                 template_id
             }
@@ -1427,6 +1528,10 @@ impl MinerCluster {
                 rec.params = params;
                 rec.body = Some(raw.to_string());
                 rec.lossy_flag = true;
+                // §6.5: bump `params_overflow_total` if the
+                // line-ordered params contained any oversized
+                // values (body already retained for §6.4).
+                self.apply_overflow_retention(&mut rec, raw);
                 self.emit_record(rec);
                 self.record_parse_failure();
                 NO_TEMPLATE
@@ -1457,6 +1562,10 @@ impl MinerCluster {
                 rec.separators = separators;
                 rec.params = aligned_params;
                 rec.confidence = 1.0;
+                // §6.5: force body retention on this widened /
+                // type-expanded record if any of its aligned
+                // params overflowed.
+                self.apply_overflow_retention(&mut rec, raw);
                 self.emit_record(rec);
                 template_id
             }

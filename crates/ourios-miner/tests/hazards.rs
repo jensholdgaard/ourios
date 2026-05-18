@@ -140,9 +140,252 @@ fn h1_5_scope_name_is_part_of_template_key() {
 /// Scenario H2.1 — Oversized parameter triggers OVERFLOW marker and forced body retention.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h2_1_oversized_parameter_triggers_overflow_marker() {
-    todo!("RFC 0001 §6.5");
+    use ourios_core::audit::ParamType;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::reconstruct::reconstruct;
+
+    // Arrange — default `MinerConfig` (256-byte limit). One
+    // numeric token longer than 256 bytes (300 ASCII digits)
+    // forces the §6.5 overflow path: `mask()` classifies it as
+    // `<NUM>`, `params_from_mask` runs the byte-limit check, and
+    // the resulting `Param` carries `type_tag = Overflow` plus
+    // the `(length, sha256_prefix)` marker. The emitted record's
+    // `body` column is set to the original line per §6.5's
+    // "overflow forces body retention" rule, and
+    // `params_overflow_total` increments by exactly 1.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let big_num = "9".repeat(300);
+    let raw = format!("user {big_num} logged in");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let _ = cluster.ingest(&make(&raw));
+
+    // Assert — exactly one record emitted, with an Overflow
+    // marker at the params slot for the oversized numeric.
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+
+    assert_eq!(rec.params.len(), 1, "one mask-emit slot (the big number)");
+    assert_eq!(
+        rec.params[0].type_tag,
+        ParamType::Overflow,
+        "oversized param must be tagged Overflow per RFC §6.5",
+    );
+    assert!(
+        rec.params[0]
+            .value
+            .starts_with("OVERFLOW(length=300,sha256="),
+        "marker must encode length and sha256 prefix, got: {}",
+        rec.params[0].value,
+    );
+
+    // Body retention — RFC §6.5: "overflow forces body retention,
+    // regardless of lossy_flag." The clean-attach path (this is
+    // a fresh leaf) would normally leave body=None; the §6.5
+    // path overrides.
+    assert_eq!(
+        rec.body.as_deref(),
+        Some(raw.as_str()),
+        "overflow forces body retention so reconstruct can fall back via the body column",
+    );
+
+    // Reconstruct — the Overflow branch in §6.6 returns body
+    // verbatim. End-to-end round-trip.
+    let snapshots = cluster.templates_for(&t);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        reconstruct(rec, &snapshots[0].template),
+        raw.as_bytes().to_vec(),
+        "reconstruct must round-trip the original bytes via the §6.6 Overflow body-fallback path",
+    );
+
+    // §6.8 counter contract: `params_overflow_total` bumped by
+    // exactly the overflow count on this record (one oversized
+    // param ⇒ one increment).
+    assert_eq!(
+        cluster.params_overflow_total(),
+        1,
+        "params_overflow_total must increment per Overflow-tagged param",
+    );
+}
+
+/// Supplemental H2.1 coverage — overflow applied via the
+/// **aligned-params path** (`build_record_params`), not the
+/// fresh-leaf `params_from_mask` path the primary H2.1 test
+/// exercises. A second ingest with `sim_seq` = 1.0 against an
+/// existing wildcard slot routes through clean-reuse + the
+/// per-slot byte-limit check inside `build_record_params`.
+#[test]
+fn h2_1_overflow_via_aligned_params_at_existing_wildcard() {
+    use ourios_core::audit::ParamType;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::reconstruct::reconstruct;
+
+    // Arrange — L1 creates a fresh leaf with `<NUM>` mask emit
+    // at position 1 (Wildcard slot, slot_types[0] = {Num}). L2
+    // brings a *new* numeric value at the same slot — sim_seq
+    // matches the existing Wildcard so the attach is clean and
+    // params are rebuilt through `build_record_params`. The
+    // §6.5 byte-limit check on that helper must catch a
+    // >256-byte value at the slot.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // L1: 4-token line, mask emits `<NUM>` at position 1 (the
+    // `42`). Creates the wildcard slot.
+    let _ = cluster.ingest(&make("user 42 logged in"));
+    let _ = records.drain();
+    assert_eq!(cluster.params_overflow_total(), 0);
+
+    // L2: same shape, but the numeric at position 1 is 300 digits
+    // — exceeds the 256-byte default limit. Routes through the
+    // aligned-params path (clean-reuse, `sim_seq` = 1.0).
+    let big_num = "9".repeat(300);
+    let raw_l2 = format!("user {big_num} logged in");
+    let _ = cluster.ingest(&make(&raw_l2));
+
+    // Assert — emitted record (L2) carries the Overflow marker,
+    // retained body, and the counter bumped.
+    let emitted = records.drain();
+    assert_eq!(
+        emitted.len(),
+        1,
+        "L2 is the only ingest since the last drain"
+    );
+    let rec = &emitted[0];
+
+    assert_eq!(rec.params.len(), 1, "one wildcard slot at position 1");
+    assert_eq!(
+        rec.params[0].type_tag,
+        ParamType::Overflow,
+        "the aligned-params builder must apply the §6.5 cap",
+    );
+    assert!(
+        rec.params[0]
+            .value
+            .starts_with("OVERFLOW(length=300,sha256="),
+        "unexpected marker on the aligned-params path: {}",
+        rec.params[0].value,
+    );
+    assert_eq!(
+        rec.body.as_deref(),
+        Some(raw_l2.as_str()),
+        "overflow on the aligned-params path must also force body retention",
+    );
+
+    // Reconstruct round-trips via the §6.6 Overflow body-fallback.
+    let snapshots = cluster.templates_for(&t);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        reconstruct(rec, &snapshots[0].template),
+        raw_l2.as_bytes().to_vec(),
+        "reconstruct must round-trip the original line via the Overflow body fallback",
+    );
+
+    assert_eq!(
+        cluster.params_overflow_total(),
+        1,
+        "params_overflow_total must increment via the aligned-params path too",
+    );
+}
+
+/// Supplemental H2.1 coverage — the byte-limit decision follows
+/// the **per-tenant `MinerConfig::param_byte_limit`** (RFC 0004
+/// §3.4), not just the cluster default. Two tenants with
+/// different limits ingest the same line; only the
+/// stricter-limit tenant trips the marker.
+#[test]
+fn h2_1_per_tenant_byte_limit_override_honoured() {
+    use ourios_core::audit::ParamType;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — cluster default = 256-byte limit; tenant B
+    // overridden to 64. A 100-byte numeric should pass through
+    // for tenant A (no overflow) and trip the marker for tenant B
+    // (over the 64-byte limit). Both tenants see the same line
+    // shape.
+    let tenant_a = TenantId::new("tenant-a");
+    let tenant_b = TenantId::new("tenant-b");
+    let strict = MinerConfig::try_new_full(0.7, 0.4, 64).expect("64-byte limit is valid");
+    let records = SharedRecordSink::new();
+    let mut cluster = MinerCluster::new(MinerConfig::default())
+        .with_record_sink(Box::new(records.clone()))
+        .with_tenant_config(tenant_b.clone(), strict);
+    let make = |tenant: &TenantId, text: &str| OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // 100-byte numeric value.
+    let medium_num = "9".repeat(100);
+    let raw = format!("user {medium_num} logged in");
+
+    // Act — same line into both tenants.
+    let _ = cluster.ingest(&make(&tenant_a, &raw));
+    let _ = cluster.ingest(&make(&tenant_b, &raw));
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2);
+    let rec_a = &emitted[0];
+    let rec_b = &emitted[1];
+
+    // Tenant A — under the default 256-byte limit, the param
+    // passes through as `Num` with the original value. No
+    // marker, no body retention, counter untouched.
+    assert_eq!(rec_a.params[0].type_tag, ParamType::Num);
+    assert_eq!(rec_a.params[0].value, medium_num);
+    assert!(rec_a.body.is_none(), "tenant A's value is under its limit");
+
+    // Tenant B — over the 64-byte override, so the marker fires
+    // with retained body.
+    assert_eq!(
+        rec_b.params[0].type_tag,
+        ParamType::Overflow,
+        "tenant B's stricter byte_limit must trip the marker for the same value",
+    );
+    assert!(
+        rec_b.params[0]
+            .value
+            .starts_with("OVERFLOW(length=100,sha256="),
+    );
+    assert_eq!(rec_b.body.as_deref(), Some(raw.as_str()));
+
+    // Counter: exactly one overflow event (tenant B only).
+    assert_eq!(
+        cluster.params_overflow_total(),
+        1,
+        "params_overflow_total must follow per-tenant byte_limit",
+    );
 }
 
 /// Scenario H2.2 — Per-service overflow rate above 1% raises an alert.

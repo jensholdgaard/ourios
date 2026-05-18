@@ -10,6 +10,12 @@ publish = false
 
 [dependencies]
 ourios-core = { path = "../ourios-core" }
+# RFC 0001 §6.5: `Param.value` for `ParamType::Overflow` carries a
+# `(length, sha256_prefix: [u8; 8])` marker. The default-features
+# = false build of `sha2` drops the asm backend and keeps the
+# pure-Rust path — sufficient for an 8-byte-prefix hash on a
+# per-param hot path, with no platform-specific build assumptions.
+sha2 = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true

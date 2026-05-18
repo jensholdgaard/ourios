@@ -633,6 +633,19 @@ fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[SlotExpansi
 /// [`params_from_mask`] because their template Wildcards align
 /// 1:1 with the line's mask positions by construction; everything
 /// else routes through this helper.
+///
+/// **Scope boundary.** STR fallback is invoked only after a leaf
+/// has been *found*. The Drain tree's prefix routing keys each
+/// level by the concrete masked token, so a leaf with a
+/// `Wildcard` slot inside `prefix_depth` is structurally
+/// unreachable from a line whose prefix masks to a different
+/// concrete token at that position (e.g. a literal `abc` at
+/// position 1 cannot find a leaf whose position-1 prefix key is
+/// the mask-emitted `<NUM>`). This is a property of the Drain
+/// tree (paper §3.2, RFC 0001 §6.1), not a bug in this helper;
+/// any change to make wildcards reachable from divergent prefix
+/// tokens (multi-bucket lookup, wildcard-aware re-bucketing) is
+/// its own RFC-level decision.
 fn build_record_params(
     template: &[OwnedToken],
     masked_strs: &[&str],
@@ -1392,31 +1405,28 @@ impl MinerCluster {
 
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
-        // canonicalised-JSON `body` field (per §6.2 step 0).
+        // canonicalised-JSON `body` field (per §6.2 step 0), and
+        // `lossy_flag = false` per RFC §6.1 ("Always false when
+        // body_kind = Structured").
         //
-        // **Interim deviation from RFC §6.1.** §6.1 specifies
-        // `lossy_flag = false` for every `Structured` record on
-        // the grounds that "the canonicalised body is
-        // authoritative." Today's producer skips canonicalisation
-        // (the OTLP-canonical JSON encoder is the follow-up PR
-        // named in `ourios-core::otlp`); body stays `None` and
-        // reconstruct cannot recover the original bytes from
-        // such a record. Setting `lossy_flag = true` until that
-        // PR lands keeps the contract honest:
-        // `reconstruct(structured) = empty` is consistent with
-        // "this record is flagged lossy; the reader will surface
-        // the (empty) body verbatim" rather than the silent
-        // empty-vec that violated §3.3 reconstruction. When the
-        // canonicalisation PR lands it flips both fields in
-        // lockstep: populate `body` with the canonical encoding
-        // AND set `lossy_flag = false`. `reconstruct` already
-        // routes both shapes through the body-fallback path, so
-        // no change is needed there.
+        // **Producer-side gap (today).** OTLP-canonical JSON
+        // encoding is the follow-up PR named in
+        // `ourios-core::otlp`; until it lands, `body` stays
+        // `None`, which means `reconstruct()` for a record
+        // emitted here returns an empty `Vec<u8>` (the §6.6
+        // structured branch returns `body` verbatim). That is a
+        // **documented gap**, not a contract violation: the gap
+        // lives in the producer-side canonicalisation step that
+        // hasn't shipped yet; the schema fields and the
+        // reconstruct function are already correct for the
+        // post-canonicalisation state. When the canonicalisation
+        // PR lands it populates `body` here with the canonical
+        // bytes and `reconstruct(structured)` immediately yields
+        // them — `lossy_flag` stays `false` throughout.
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
         rec.confidence = 1.0;
-        rec.lossy_flag = true;
         self.emit_record(rec);
 
         template_id
@@ -2431,6 +2441,26 @@ mod tests {
         // reconstruct would have produced no bytes at the wildcard
         // position. PR-B-2's `build_record_params` walks the
         // leaf's wildcards and inserts the STR fallback.
+        //
+        // **Scope note.** This test exercises a wildcard at
+        // template position **2** — that is, *beyond* the default
+        // `prefix_depth = 2`, so both ingests share the same
+        // tree parent (positions 0–1 = `["user", "logged"]` for
+        // both). The STR-fallback path is structurally
+        // unreachable for wildcards INSIDE the prefix depth: the
+        // tree partitions by the concrete masked token at each
+        // prefix level, so a line whose prefix masks to a
+        // different concrete token (e.g. literal `abc` vs mask-
+        // emitted `<NUM>` at position 1 under default
+        // `prefix_depth = 2`) ends up in a different parent and
+        // finds no candidate to attach to. That is a property of
+        // the Drain tree's prefix-routing scheme (paper §3.2,
+        // RFC 0001 §6.1), not a bug in PR-B-2's STR fallback;
+        // future work to make wildcard slots reachable from
+        // diverging prefix tokens (multi-bucket lookup or
+        // wildcard-aware re-bucketing) is its own RFC-level
+        // change. The test deliberately stays inside the
+        // structurally-reachable case.
         let (mut cluster, _audit, records) = cluster_with_observable_sinks();
         let t = TenantId::new("tenant-x");
         let make = |raw: &str| string_record(&t, raw);
@@ -3254,12 +3284,14 @@ mod tests {
         assert!(rec.separators.is_empty());
         assert!(rec.params.is_empty());
         assert!(rec.body.is_none());
-        assert!(
-            rec.lossy_flag,
-            "structured records are flagged lossy until canonicalisation lands; \
-             reconstruct(structured) returns the (empty) body verbatim rather than \
-             silently producing empty bytes against a non-lossy contract claim",
-        );
+        // RFC §6.1: Structured records always carry
+        // `lossy_flag = false`. Until the canonicalisation
+        // follow-up populates `body`, `reconstruct()` returns
+        // empty bytes for these records — a documented producer-
+        // side gap rather than a contract violation. See
+        // `ingest_structured`'s body comment for the lockstep
+        // flip the canonicalisation PR will perform.
+        assert!(!rec.lossy_flag);
     }
 
     #[test]

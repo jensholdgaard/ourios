@@ -466,10 +466,153 @@ fn h5_3_drift_query_returns_templates_that_gained_a_version() {
 
 /// Scenario H7.1 — Reconstruction property holds across the corpus.
 /// See `docs/rfcs/0001-template-miner.md` §5.
+///
+/// Property: for every record `r` emitted by the miner across
+/// the committed `testdata/corpus/` where `r.lossy_flag = false`,
+/// `reconstruct(r, &template) == r.ingested_bytes` byte-for-byte
+/// (the §3.3 invariant — `CLAUDE.md` §3.3 / RFC 0001 §6.6).
+///
+/// **Corpus design constraint.** The MVP implementation does
+/// **not** snapshot templates per `template_version`, so the
+/// corpus must be authored such that no widening fires during
+/// ingestion. `testdata/corpus/README.md` documents the rule:
+/// mask-emit-driven variation only (`<NUM>` / `<IP>` / `<UUID>`
+/// at the variable position, identical literals elsewhere). A
+/// future PR that adds template-version snapshotting can relax
+/// this and exercise widening in the corpus too.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h7_1_reconstruction_property_holds_across_corpus() {
-    todo!("RFC 0001 §6.6");
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::reconstruct::reconstruct;
+    use ourios_miner::tree::OwnedToken;
+
+    // Arrange — load every `*.txt` file under `testdata/corpus/`.
+    // Paths are resolved relative to the workspace root via
+    // CARGO_MANIFEST_DIR so the test runs identically under
+    // `cargo test` and `cargo test --workspace`.
+    //
+    // `MANIFEST_DIR` points at `crates/ourios-miner/`; the
+    // corpus sits at the repo root.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let corpus_dir = Path::new(manifest_dir)
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root is two levels above CARGO_MANIFEST_DIR")
+        .join("testdata/corpus");
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&corpus_dir)
+        .unwrap_or_else(|e| panic!("read_dir({}): {e}", corpus_dir.display()))
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        })
+        .collect();
+    // Sort by file name so the test is deterministic across
+    // platforms (directory iteration order is filesystem-
+    // dependent).
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read_to_string({}): {e}", path.display()));
+        for line in contents.lines() {
+            let trimmed = line.trim_end_matches(['\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            lines.push(trimmed.to_string());
+        }
+    }
+    assert!(
+        !lines.is_empty(),
+        "corpus is empty — testdata/corpus/*.txt must contribute at least one line",
+    );
+
+    // Ingest every line through a fresh cluster. One ingest →
+    // one emit, in order, so `emitted[i]` corresponds to
+    // `lines[i]`.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("corpus");
+    for line in &lines {
+        cluster.ingest(&OtlpLogRecord {
+            tenant_id: t.clone(),
+            body: Some(Body::String(line.clone())),
+            ..Default::default()
+        });
+    }
+    let emitted = records.drain();
+    assert_eq!(
+        emitted.len(),
+        lines.len(),
+        "one record per ingested line (RFC §6.1 emit contract)",
+    );
+
+    // Snapshot the current templates by id. The corpus is
+    // authored such that no widening fires during this run, so
+    // `template_version` stays at 1 for every leaf and the
+    // current shape equals the shape at every emit. A future
+    // PR that exercises widening in the corpus must snapshot
+    // per (template_id, template_version) — see the
+    // doc comment above.
+    let snapshots = cluster.templates_for(&t);
+    let templates: HashMap<u64, Vec<OwnedToken>> = snapshots
+        .iter()
+        .map(|s| (s.template_id, s.template.clone()))
+        .collect();
+    for snap in &snapshots {
+        assert_eq!(
+            snap.template_version, 1,
+            "corpus design constraint: no widening (leaf template_id {} is at version {})",
+            snap.template_id, snap.template_version,
+        );
+    }
+
+    // Property: every non-lossy record reconstructs byte-for-byte.
+    let mut non_lossy_count = 0usize;
+    for (idx, (line, rec)) in lines.iter().zip(emitted.iter()).enumerate() {
+        if rec.lossy_flag {
+            continue;
+        }
+        non_lossy_count += 1;
+        let template = templates.get(&rec.template_id).unwrap_or_else(|| {
+            panic!(
+                "corpus line {idx} (`{line}`): emitted record's template_id {} \
+                 has no matching leaf snapshot",
+                rec.template_id,
+            )
+        });
+        let recovered = reconstruct(rec, template);
+        assert_eq!(
+            recovered,
+            line.as_bytes(),
+            "H7.1 §3.3: corpus line {idx} (`{line}`) failed bit-identical reconstruction \
+             (template_id {}, template_version {})",
+            rec.template_id,
+            rec.template_version,
+        );
+    }
+
+    // Sanity guard: a future regression that flips every record
+    // to `lossy_flag = true` would skip every assertion above
+    // and pass silently. Require at least one non-lossy record
+    // — the H7.1 property is vacuously true otherwise.
+    assert!(
+        non_lossy_count > 0,
+        "H7.1 must exercise at least one non-lossy record; corpus produced zero",
+    );
 }
 
 /// Scenario H7.2 — Tokenizer failure sets `lossy_flag = true` and retains body.

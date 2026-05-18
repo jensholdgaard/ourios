@@ -140,9 +140,87 @@ fn h1_5_scope_name_is_part_of_template_key() {
 /// Scenario H2.1 — Oversized parameter triggers OVERFLOW marker and forced body retention.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h2_1_oversized_parameter_triggers_overflow_marker() {
-    todo!("RFC 0001 §6.5");
+    use ourios_core::audit::ParamType;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::reconstruct::reconstruct;
+
+    // Arrange — default `MinerConfig` (256-byte limit). One
+    // numeric token longer than 256 bytes (300 ASCII digits)
+    // forces the §6.5 overflow path: `mask()` classifies it as
+    // `<NUM>`, `params_from_mask` runs the byte-limit check, and
+    // the resulting `Param` carries `type_tag = Overflow` plus
+    // the `(length, sha256_prefix)` marker. The emitted record's
+    // `body` column is set to the original line per §6.5's
+    // "overflow forces body retention" rule, and
+    // `params_overflow_total` increments by exactly 1.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let big_num = "9".repeat(300);
+    let raw = format!("user {big_num} logged in");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let _ = cluster.ingest(&make(&raw));
+
+    // Assert — exactly one record emitted, with an Overflow
+    // marker at the params slot for the oversized numeric.
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+
+    assert_eq!(rec.params.len(), 1, "one mask-emit slot (the big number)");
+    assert_eq!(
+        rec.params[0].type_tag,
+        ParamType::Overflow,
+        "oversized param must be tagged Overflow per RFC §6.5",
+    );
+    assert!(
+        rec.params[0]
+            .value
+            .starts_with("OVERFLOW(length=300,sha256="),
+        "marker must encode length and sha256 prefix, got: {}",
+        rec.params[0].value,
+    );
+
+    // Body retention — RFC §6.5: "overflow forces body retention,
+    // regardless of lossy_flag." The clean-attach path (this is
+    // a fresh leaf) would normally leave body=None; the §6.5
+    // path overrides.
+    assert_eq!(
+        rec.body.as_deref(),
+        Some(raw.as_str()),
+        "overflow forces body retention so reconstruct can fall back via the body column",
+    );
+
+    // Reconstruct — the Overflow branch in §6.6 returns body
+    // verbatim. End-to-end round-trip.
+    let snapshots = cluster.templates_for(&t);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        reconstruct(rec, &snapshots[0].template),
+        raw.as_bytes().to_vec(),
+        "reconstruct must round-trip the original bytes via the §6.6 Overflow body-fallback path",
+    );
+
+    // §6.8 counter contract: `params_overflow_total` bumped by
+    // exactly the overflow count on this record (one oversized
+    // param ⇒ one increment).
+    assert_eq!(
+        cluster.params_overflow_total(),
+        1,
+        "params_overflow_total must increment per Overflow-tagged param",
+    );
 }
 
 /// Scenario H2.2 — Per-service overflow rate above 1% raises an alert.

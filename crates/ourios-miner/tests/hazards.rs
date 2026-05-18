@@ -469,17 +469,19 @@ fn h5_3_drift_query_returns_templates_that_gained_a_version() {
 ///
 /// Property: for every record `r` emitted by the miner across
 /// the committed `testdata/corpus/` where `r.lossy_flag = false`,
-/// `reconstruct(r, &template) == r.ingested_bytes` byte-for-byte
-/// (the §3.3 invariant — `CLAUDE.md` §3.3 / RFC 0001 §6.6).
+/// `reconstruct(r, &template_at_emit_time) == r.ingested_bytes`
+/// byte-for-byte (the §3.3 invariant — `CLAUDE.md` §3.3 /
+/// RFC 0001 §6.6).
 ///
-/// **Corpus design constraint.** The MVP implementation does
-/// **not** snapshot templates per `template_version`, so the
-/// corpus must be authored such that no widening fires during
-/// ingestion. `testdata/corpus/README.md` documents the rule:
-/// mask-emit-driven variation only (`<NUM>` / `<IP>` / `<UUID>`
-/// at the variable position, identical literals elsewhere). A
-/// future PR that adds template-version snapshotting can relax
-/// this and exercise widening in the corpus too.
+/// **Template-version snapshotting.** A widening (§6.4) mints a
+/// new `template_version` and the prior version's literal shape
+/// is sealed: once a record is emitted at `(id, v)`, the v's
+/// token sequence never changes. So the test snapshots templates
+/// into a `(template_id, template_version) -> tokens` map after
+/// every ingest, using `or_insert_with` to preserve the
+/// first-seen shape for each version. A record at `(id, v_emit)`
+/// is then reconstructed against the v_emit-era template, even
+/// when a later ingest in the same run pushed the leaf to v+1.
 #[test]
 fn h7_1_reconstruction_property_holds_across_corpus() {
     use std::collections::HashMap;
@@ -541,17 +543,27 @@ fn h7_1_reconstruction_property_holds_across_corpus() {
 
     // Ingest every line through a fresh cluster. One ingest →
     // one emit, in order, so `emitted[i]` corresponds to
-    // `lines[i]`.
+    // `lines[i]`. After each ingest, snapshot the current
+    // template shape for every leaf into a version-keyed map
+    // (`or_insert_with` so the first time a `(id, v)` pair is
+    // observed wins — subsequent widenings produce `(id, v+1)`
+    // entries without clobbering the earlier seal).
     let records = SharedRecordSink::new();
     let mut cluster =
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
     let t = TenantId::new("corpus");
+    let mut version_snapshots: HashMap<(u64, u32), Vec<OwnedToken>> = HashMap::new();
     for line in &lines {
         cluster.ingest(&OtlpLogRecord {
             tenant_id: t.clone(),
             body: Some(Body::String(line.clone())),
             ..Default::default()
         });
+        for snap in cluster.templates_for(&t) {
+            version_snapshots
+                .entry((snap.template_id, snap.template_version))
+                .or_insert_with(|| snap.template.clone());
+        }
     }
     let emitted = records.drain();
     assert_eq!(
@@ -560,40 +572,25 @@ fn h7_1_reconstruction_property_holds_across_corpus() {
         "one record per ingested line (RFC §6.1 emit contract)",
     );
 
-    // Snapshot the current templates by id. The corpus is
-    // authored such that no widening fires during this run, so
-    // `template_version` stays at 1 for every leaf and the
-    // current shape equals the shape at every emit. A future
-    // PR that exercises widening in the corpus must snapshot
-    // per (template_id, template_version) — see the
-    // doc comment above.
-    let snapshots = cluster.templates_for(&t);
-    let templates: HashMap<u64, Vec<OwnedToken>> = snapshots
-        .iter()
-        .map(|s| (s.template_id, s.template.clone()))
-        .collect();
-    for snap in &snapshots {
-        assert_eq!(
-            snap.template_version, 1,
-            "corpus design constraint: no widening (leaf template_id {} is at version {})",
-            snap.template_id, snap.template_version,
-        );
-    }
-
-    // Property: every non-lossy record reconstructs byte-for-byte.
+    // Property: every non-lossy record reconstructs byte-for-byte
+    // against the template that was active at its emit-time
+    // `template_version`.
     let mut non_lossy_count = 0usize;
     for (idx, (line, rec)) in lines.iter().zip(emitted.iter()).enumerate() {
         if rec.lossy_flag {
             continue;
         }
         non_lossy_count += 1;
-        let template = templates.get(&rec.template_id).unwrap_or_else(|| {
-            panic!(
-                "corpus line {idx} (`{line}`): emitted record's template_id {} \
-                 has no matching leaf snapshot",
-                rec.template_id,
-            )
-        });
+        let template = version_snapshots
+            .get(&(rec.template_id, rec.template_version))
+            .unwrap_or_else(|| {
+                panic!(
+                    "corpus line {idx} (`{line}`): emitted record \
+                     (template_id={}, template_version={}) has no \
+                     matching versioned snapshot",
+                    rec.template_id, rec.template_version,
+                )
+            });
         let recovered = reconstruct(rec, template);
         assert_eq!(
             recovered,

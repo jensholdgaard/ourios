@@ -1392,16 +1392,31 @@ impl MinerCluster {
 
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
-        // canonicalised-JSON `body` field (per §6.2 step 0); the
-        // canonicalisation itself is deferred to the §6.6
-        // follow-up that adds `reconstruct()`. PR-A emits the
-        // record with `body = None` and a placeholder
-        // `confidence = 1.0` (sentinel — no Drain comparison
-        // happens in the structured branch).
+        // canonicalised-JSON `body` field (per §6.2 step 0).
+        //
+        // **Interim deviation from RFC §6.1.** §6.1 specifies
+        // `lossy_flag = false` for every `Structured` record on
+        // the grounds that "the canonicalised body is
+        // authoritative." Today's producer skips canonicalisation
+        // (the OTLP-canonical JSON encoder is the follow-up PR
+        // named in `ourios-core::otlp`); body stays `None` and
+        // reconstruct cannot recover the original bytes from
+        // such a record. Setting `lossy_flag = true` until that
+        // PR lands keeps the contract honest:
+        // `reconstruct(structured) = empty` is consistent with
+        // "this record is flagged lossy; the reader will surface
+        // the (empty) body verbatim" rather than the silent
+        // empty-vec that violated §3.3 reconstruction. When the
+        // canonicalisation PR lands it flips both fields in
+        // lockstep: populate `body` with the canonical encoding
+        // AND set `lossy_flag = false`. `reconstruct` already
+        // routes both shapes through the body-fallback path, so
+        // no change is needed there.
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
         rec.confidence = 1.0;
+        rec.lossy_flag = true;
         self.emit_record(rec);
 
         template_id
@@ -3230,13 +3245,21 @@ mod tests {
         assert_eq!(rec.body_kind, BodyKind::Structured);
         assert_ne!(rec.template_id, NO_TEMPLATE);
         assert_eq!(rec.template_version, 1);
-        // Structured records have no token-shape to carry; PR-A
-        // leaves body=None (canonical-JSON encoding is the §6.6
-        // follow-up's job).
+        // Structured records carry no token shape today, and
+        // canonical-JSON encoding is the follow-up PR. Until that
+        // lands `body = None` and `lossy_flag = true` so
+        // reconstruct's contract stays honest (see the rationale
+        // block on `ingest_structured`). The follow-up flips both
+        // in lockstep.
         assert!(rec.separators.is_empty());
         assert!(rec.params.is_empty());
         assert!(rec.body.is_none());
-        assert!(!rec.lossy_flag);
+        assert!(
+            rec.lossy_flag,
+            "structured records are flagged lossy until canonicalisation lands; \
+             reconstruct(structured) returns the (empty) body verbatim rather than \
+             silently producing empty bytes against a non-lossy contract claim",
+        );
     }
 
     #[test]

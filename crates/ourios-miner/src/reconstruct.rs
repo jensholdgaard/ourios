@@ -21,15 +21,20 @@ use crate::tree::OwnedToken;
 /// - [`BodyKind::Structured`]: §6.2 step 0 short-circuits to the
 ///   canonicalised JSON, which the RFC pseudo-code names as the
 ///   source of truth and which this function returns verbatim
-///   from `record.body`. **Producer-side caveat:** today's
-///   `MinerCluster::ingest_structured` ships records with `body =
-///   None` (OTLP-canonical JSON encoding is deferred to the
-///   `Body::Structured` follow-up PR named in `ourios-core::otlp`),
-///   so reconstructing a structured record produced by this
-///   crate currently returns empty. The function's contract is
-///   already correct — once the producer populates the
-///   canonicalised body, structured reconstruction works without
-///   another change here.
+///   from `record.body`.
+///
+///   **Producer state today.** `MinerCluster::ingest_structured`
+///   ships records with `body = None` *and* `lossy_flag = true`
+///   because canonical-JSON encoding is the follow-up PR named in
+///   `ourios-core::otlp`. Until that PR lands, calling
+///   `reconstruct` on a structured record returns empty bytes,
+///   correctly routed through the `lossy_flag = true` body-
+///   fallback path (not through a non-lossy contract claim the
+///   producer can't satisfy). When canonicalisation lands the
+///   producer flips both fields in lockstep — `body =
+///   Some(canonical_json)` and `lossy_flag = false` — and the
+///   structured branch here yields the canonical bytes verbatim.
+///   No change to `reconstruct` is required at that point.
 /// - [`BodyKind::String`] with `lossy_flag = true` or any
 ///   [`ParamType::Overflow`] entry in `params`: reconstruction is
 ///   not guaranteed to equal ingest, so the function returns the
@@ -183,10 +188,32 @@ mod tests {
     #[test]
     fn reconstruct_structured_returns_body_verbatim() {
         // §6.2 step 0: structured records carry the canonicalised
-        // JSON in `body`; reconstruct surfaces it unchanged.
+        // JSON in `body`; reconstruct surfaces it unchanged. This
+        // is the post-canonicalisation behaviour the function is
+        // already contractually prepared for; see the producer-
+        // side `ingest_structured` for the interim state today.
         let mut r = record_envelope(BodyKind::Structured);
         r.body = Some(r#"{"k":"v"}"#.to_string());
         assert_eq!(reconstruct(&r, &[]), br#"{"k":"v"}"#.to_vec());
+    }
+
+    #[test]
+    fn reconstruct_structured_today_is_routed_through_lossy_body_fallback() {
+        // Pins the current contract end-to-end: structured records
+        // emitted by `MinerCluster::ingest_structured` today carry
+        // `body = None`, `lossy_flag = true` (interim — see the
+        // rationale block on that function). `reconstruct` must
+        // return empty bytes via the body-fallback path rather
+        // than silently producing empty bytes against a non-lossy
+        // contract claim. When canonicalisation lands the
+        // producer populates `body` and clears `lossy_flag`; this
+        // test will then expect the canonical bytes (the test
+        // above `reconstruct_structured_returns_body_verbatim`
+        // already pins that endpoint).
+        let mut r = record_envelope(BodyKind::Structured);
+        r.lossy_flag = true;
+        r.body = None;
+        assert_eq!(reconstruct(&r, &[]), Vec::<u8>::new());
     }
 
     #[test]

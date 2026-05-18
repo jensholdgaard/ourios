@@ -5,6 +5,17 @@
 //! `CLAUDE.md` §3.2 ceiling are rejected by [`MinerConfig::try_new`]
 //! per RFC 0001 §3.2.2 — initialisation fails before the miner
 //! ever serves the offending tenant.
+//!
+//! **Tunables vs invariants (RFC 0004).** Every field on
+//! [`MinerConfig`] is a *tunable* — globally settable, overridable
+//! per tenant, validated at construction. The set is closed: each
+//! field below sits *inside* a `CLAUDE.md` §3 invariant rather
+//! than against one. The non-tunable invariants (widening + audit,
+//! `severity_number` in the template key, body retention on the
+//! §6.3 lossy zone, bit-identical reconstruction, per-tenant
+//! mining) live in the algorithm itself and never appear as
+//! fields here. Adding a field that touches those areas requires
+//! a `meta:` RFC against `CLAUDE.md` §3 — see RFC 0004 §3.5.
 
 use std::error::Error;
 use std::fmt;
@@ -16,6 +27,19 @@ use std::fmt;
 /// explicit, validated pair. Field access is intentionally `pub`
 /// — once a `MinerConfig` exists it has been validated, so
 /// downstream code reads it as plain data.
+///
+/// # The tunable surface (RFC 0004 §3.2)
+///
+/// | Field | Default | Validated range | §3 invariant it lives inside |
+/// |---|---|---|---|
+/// | [`similarity_threshold`](Self::similarity_threshold) | `0.7` | `(0, 1]` | §3.1 — strict-by-default |
+/// | [`similarity_floor`](Self::similarity_floor) | `0.4` | `(0, threshold]` | §3.1 — bounds the §6.3 lossy zone; body retention in that zone is invariant |
+/// | [`prefix_depth`](Self::prefix_depth) | `2` | `0..=8` | §3.1 — affects tree quality, not safety |
+/// | [`param_byte_limit`](Self::param_byte_limit) | `256` | `1..=1024` | §3.2 — bounds cardinality; overflow spilling is invariant |
+///
+/// The struct is `Clone + Copy + 'static`, so the cluster can
+/// hold a default and a per-tenant override map without
+/// allocation overhead on the hot path.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MinerConfig {
     /// `simSeq` cutoff `s ∈ (0, 1]` for the clean-attach branch
@@ -57,11 +81,36 @@ pub struct MinerConfig {
     /// `CLAUDE.md` §3.2's 1 KiB ceiling are rejected by
     /// [`MinerConfig::try_new`].
     pub param_byte_limit: u32,
+
+    /// Drain prefix-tree depth (RFC 0001 §6.2 step 3 — the number
+    /// of leading masked tokens the tree partitions by before
+    /// reaching a leaf list). Higher = more precise grouping at
+    /// the cost of slightly more memory per tenant; lower = more
+    /// candidate-scan work but the §6.4 widening / type-expansion
+    /// paths become reachable for more line shapes (RFC0001.2's
+    /// degenerate-template guard test, for instance, runs with
+    /// `prefix_depth = 0`).
+    ///
+    /// The default is `2` per the Drain paper §3.2 (Drain3's
+    /// `depth = 4` total → 2 prefix-token levels). RFC 0001 §6.1
+    /// names `~8` as the realistic ceiling; values above
+    /// [`PREFIX_DEPTH_CEILING`] are rejected by
+    /// [`MinerConfig::with_prefix_depth`].
+    ///
+    /// Stored as [`u8`] because the realistic ceiling is small and
+    /// the cluster up-casts to [`usize`] at the tree-call boundary;
+    /// the type rejects nonsensical "tens of thousands" values at
+    /// the API surface.
+    pub prefix_depth: u8,
 }
 
 /// Per-`CLAUDE.md` §3.2: the project ceiling on configurable
 /// parameter byte limits. Above this requires an RFC.
 pub const PARAM_BYTE_LIMIT_CEILING: u32 = 1024;
+
+/// Per-RFC 0001 §6.1: the realistic ceiling on the Drain prefix
+/// depth. Above this requires an RFC.
+pub const PREFIX_DEPTH_CEILING: u8 = 8;
 
 /// Failure modes for [`MinerConfig::try_new`] /
 /// [`MinerConfig::try_new_full`].
@@ -80,6 +129,9 @@ pub enum MinerConfigError {
     /// The supplied per-parameter byte limit exceeds the
     /// `CLAUDE.md` §3.2 ceiling of [`PARAM_BYTE_LIMIT_CEILING`].
     ParamByteLimitTooLarge(u32),
+    /// The supplied prefix depth exceeds the RFC 0001 §6.1
+    /// ceiling of [`PREFIX_DEPTH_CEILING`].
+    PrefixDepthTooLarge(u8),
 }
 
 impl fmt::Display for MinerConfigError {
@@ -101,6 +153,12 @@ impl fmt::Display for MinerConfigError {
                     "param_byte_limit exceeds the §3.2 ceiling of {PARAM_BYTE_LIMIT_CEILING} bytes (got {v})",
                 )
             }
+            Self::PrefixDepthTooLarge(v) => {
+                write!(
+                    f,
+                    "prefix_depth exceeds the RFC 0001 §6.1 ceiling of {PREFIX_DEPTH_CEILING} (got {v})",
+                )
+            }
         }
     }
 }
@@ -109,13 +167,14 @@ impl Error for MinerConfigError {}
 
 impl Default for MinerConfig {
     /// RFC 0001 §3.1.1 (`threshold = 0.7`), §6.3
-    /// (`floor = 0.4`), and §3.2.1 (`param_byte_limit = 256`)
-    /// defaults.
+    /// (`floor = 0.4`), §3.2.1 (`param_byte_limit = 256`), and
+    /// §6.2 step 3 (`prefix_depth = 2` per the Drain paper §3.2).
     fn default() -> Self {
         Self {
             similarity_threshold: 0.7,
             similarity_floor: 0.4,
             param_byte_limit: 256,
+            prefix_depth: 2,
         }
     }
 }
@@ -182,6 +241,26 @@ impl MinerConfig {
             similarity_threshold: threshold,
             similarity_floor: floor,
             param_byte_limit: byte_limit,
+            // Picks up `MinerConfig::default()`'s prefix_depth (2,
+            // per the Drain paper). Override with
+            // [`Self::with_prefix_depth`].
+            prefix_depth: Self::default().prefix_depth,
         })
+    }
+
+    /// Return a copy of `self` with [`prefix_depth`][Self::prefix_depth]
+    /// replaced. Validates against the RFC 0001 §6.1 ceiling
+    /// [`PREFIX_DEPTH_CEILING`].
+    ///
+    /// # Errors
+    ///
+    /// [`MinerConfigError::PrefixDepthTooLarge`] when `depth >
+    /// PREFIX_DEPTH_CEILING`.
+    pub fn with_prefix_depth(mut self, depth: u8) -> Result<Self, MinerConfigError> {
+        if depth > PREFIX_DEPTH_CEILING {
+            return Err(MinerConfigError::PrefixDepthTooLarge(depth));
+        }
+        self.prefix_depth = depth;
+        Ok(self)
     }
 }

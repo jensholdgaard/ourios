@@ -104,18 +104,55 @@ pub fn sim_seq(line: &[&str], template: &[Token<'_>]) -> f32 {
 /// and walks both sequences in lockstep — same arithmetic, zero
 /// allocation.
 ///
-/// The two functions intentionally share assertion shape so the
-/// substitution is mechanical and the equality
-/// `sim_seq_owned(line, template) == sim_seq(line, &borrowed(template))`
-/// holds exactly (a property test in this module pins it).
+/// The two functions share the same precondition shape, and the
+/// equality
+/// `sim_seq_owned(line, template, &[]) == sim_seq(line, &borrowed(template))`
+/// holds when `line_wildcard_positions` is empty (a property
+/// test in this module pins it). With a non-empty
+/// `line_wildcard_positions` slice the equivalence intentionally
+/// diverges: `sim_seq_owned` then refuses to mark a leaf
+/// `Fixed(s)` as a match when the line at that position is a
+/// mask emit, even if `line[i] == s` by content. See the inline
+/// comment in the `Fixed` arm for the §3.1 / §3.3 motivation
+/// (literal-tag-vs-mask-emit collision).
+///
+/// # Preconditions on `line_wildcard_positions`
+///
+/// Entries are **token indices** into `line` (the same index
+/// `mask()` populates from `tokens.iter().enumerate()`), not
+/// byte offsets.
+///
+/// - Strictly ascending (sorted, no duplicates) — the function
+///   uses [`slice::binary_search`] for the per-position lookup,
+///   which is `O(log n)` and correct only on sorted input.
+///   `mask()`'s output satisfies this by construction (single
+///   forward pass), so the cluster's own call sites are safe;
+///   external callers passing the slice directly must hold the
+///   invariant.
+/// - Every entry must satisfy `< line.len()`.
+///
+/// Both preconditions are enforced with `assert!` (not
+/// `debug_assert!`) because the function sits at the crate's
+/// public surface — an unsorted or out-of-bounds slice would
+/// otherwise let `binary_search` return an unspecified result
+/// and silently produce wrong similarity scores in release. The
+/// check is O(n) over a typically-small mask-position count, so
+/// the runtime cost is negligible next to the ingest path's
+/// per-leaf work.
 ///
 /// # Panics
 ///
 /// - If `line.len() != template.len()`. Same precondition as
 ///   [`sim_seq`].
 /// - If `line.is_empty()`. Same precondition as [`sim_seq`].
+/// - If `line_wildcard_positions` is not strictly ascending.
+/// - If any entry of `line_wildcard_positions` is out of bounds.
 #[must_use]
-pub fn sim_seq_owned(line: &[&str], template: &[crate::tree::OwnedToken]) -> f32 {
+pub fn sim_seq_owned(
+    line: &[&str],
+    template: &[crate::tree::OwnedToken],
+    line_wildcard_positions: &[usize],
+) -> f32 {
     assert_eq!(
         line.len(),
         template.len(),
@@ -128,13 +165,43 @@ pub fn sim_seq_owned(line: &[&str], template: &[crate::tree::OwnedToken]) -> f32
         !line.is_empty(),
         "sim_seq_owned precondition: empty inputs have no defined similarity (N ≥ 1 per RFC §3.2)",
     );
+    debug_assert!(
+        line_wildcard_positions.windows(2).all(|w| w[0] < w[1]),
+        "sim_seq_owned precondition: line_wildcard_positions must be strictly ascending \
+         (required by binary_search; mask() guarantees this for in-crate callers)",
+    );
+    debug_assert!(
+        line_wildcard_positions
+            .last()
+            .is_none_or(|&p| p < line.len()),
+        "sim_seq_owned precondition: every line_wildcard_position must be in bounds (< line.len())",
+    );
 
     let n = line.len();
     let mut matches = 0_usize;
     for i in 0..n {
         let position_matches = match &template[i] {
             crate::tree::OwnedToken::Wildcard => true,
-            crate::tree::OwnedToken::Fixed(s) => line[i] == s.as_str(),
+            crate::tree::OwnedToken::Fixed(s) => {
+                // PR-B-1 invariant: every leaf `Fixed` came from a
+                // literal token (mask-emit positions enter as
+                // `Wildcard`). String-equality with `line[i]` is
+                // therefore a semantic match *unless* the line's
+                // token at position `i` is a mask-emit tag whose
+                // string happens to collide with the leaf's
+                // literal (rare but real — a log line carrying the
+                // literal token `<NUM>`/`<IP>`/`<UUID>` creates a
+                // `Fixed("<NUM>")` leaf and the next line with a
+                // genuine numeric value masks to `"<NUM>"` at the
+                // same position). Treating those as a match would
+                // silently merge two different log shapes and
+                // drop the mask-emit's typed value from `params`
+                // (§3.1 + §3.3 violation). The
+                // `line_wildcard_positions` lookup distinguishes
+                // the two cases.
+                let line_is_mask_emit = line_wildcard_positions.binary_search(&i).is_ok();
+                !line_is_mask_emit && line[i] == s.as_str()
+            }
         };
         if position_matches {
             matches += 1;
@@ -365,7 +432,7 @@ mod tests {
         ];
         let borrowed: Vec<Token<'_>> = owned.iter().map(OwnedToken::as_borrowed).collect();
 
-        let owned_score = sim_seq_owned(&line, &owned);
+        let owned_score = sim_seq_owned(&line, &owned, &[]);
         let borrowed_score = sim_seq(&line, &borrowed);
 
         assert!(
@@ -386,7 +453,7 @@ mod tests {
             OwnedToken::Fixed("42".to_string()),
             OwnedToken::Fixed("logged".to_string()),
         ];
-        let r = sim_seq_owned(&line, &template);
+        let r = sim_seq_owned(&line, &template, &[]);
         assert!((r - 1.0).abs() < f32::EPSILON);
     }
 
@@ -399,7 +466,7 @@ mod tests {
             OwnedToken::Wildcard,
             OwnedToken::Wildcard,
         ];
-        let r = sim_seq_owned(&line, &template);
+        let r = sim_seq_owned(&line, &template, &[]);
         assert!((r - 1.0).abs() < f32::EPSILON);
     }
 
@@ -409,7 +476,7 @@ mod tests {
         use crate::tree::OwnedToken;
         let line = ["a", "b"];
         let template = [OwnedToken::Fixed("a".to_string())];
-        let _ = sim_seq_owned(&line, &template);
+        let _ = sim_seq_owned(&line, &template, &[]);
     }
 
     #[test]
@@ -418,6 +485,6 @@ mod tests {
         use crate::tree::OwnedToken;
         let line: [&str; 0] = [];
         let template: [OwnedToken; 0] = [];
-        let _ = sim_seq_owned(&line, &template);
+        let _ = sim_seq_owned(&line, &template, &[]);
     }
 }

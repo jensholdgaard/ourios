@@ -20,6 +20,43 @@ pub struct Tokenized<'a> {
     pub separators: Vec<&'a str>,
 }
 
+/// Why `tokenize` rejected an input. Per RFC 0001 §6.2 step 1 a
+/// tokenizer failure routes the line to the parse-failure path
+/// with `lossy_flag = true` and the body retained verbatim
+/// (hazard H7.2), so any future failure mode added here must
+/// flow through the same emit path.
+///
+/// Marked `#[non_exhaustive]` because the RFC names other
+/// tokenizer-failure modes (malformed UTF-8, `max_line_bytes`
+/// overflow) that future PRs will add as variants. Callers
+/// exhaustively matching on the current variants would otherwise
+/// break on the next addition; the attribute forces a wildcard
+/// arm and keeps adding a variant non-breaking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TokenizeError {
+    /// The input contained an embedded NUL byte (U+0000). NUL is
+    /// the canonical "this is a binary blob, not text" signal in
+    /// log-shipping pipelines (truncated frames, mis-decoded
+    /// protobuf, certificate noise); admitting it would let the
+    /// miner build templates over non-text payloads. Carries the
+    /// byte offset of the first NUL so a reader inspecting the
+    /// retained body has a pointer to the suspicious region.
+    EmbeddedNul { offset: usize },
+}
+
+impl std::fmt::Display for TokenizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmbeddedNul { offset } => {
+                write!(f, "input contains embedded NUL byte at offset {offset}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TokenizeError {}
+
 /// Split `line` on Unicode whitespace.
 ///
 /// Whitespace is every codepoint matching [`char::is_whitespace`]:
@@ -31,8 +68,33 @@ pub struct Tokenized<'a> {
 /// `[`, `]`, `(`, `)` — stays inside the token; structured
 /// separators are the masking layer's responsibility (RFC 0001
 /// §4.2).
-#[must_use]
-pub fn tokenize(line: &str) -> Tokenized<'_> {
+///
+/// # Errors
+///
+/// Returns [`TokenizeError::EmbeddedNul`] if `line` contains a NUL
+/// byte.
+///
+/// Other tokenizer-failure modes named in RFC 0001 §6.2 step 1:
+///
+/// - **Malformed UTF-8** is structurally impossible at this entry
+///   — the `&str` invariant guarantees valid UTF-8, so this
+///   function never sees it.
+/// - **Line longer than `max_line_bytes`** is **not** caught
+///   here. The miner does not yet expose a `max_line_bytes`
+///   config; `ingest_string` instead enforces an upstream
+///   post-tokenization cap on the *token count* (≤ `u16::MAX`)
+///   to keep widening-position audit payloads in range. A line
+///   of arbitrary byte length is admitted into this function so
+///   long as its UTF-8 is valid and it carries no NUL; a
+///   `max_line_bytes` byte cap will land as a configurable
+///   pre-tokenize guard in a future PR. Until then a single
+///   pathological long line is bounded only by the `u16::MAX`
+///   token-count cap downstream.
+pub fn tokenize(line: &str) -> Result<Tokenized<'_>, TokenizeError> {
+    if let Some(offset) = line.bytes().position(|b| b == 0) {
+        return Err(TokenizeError::EmbeddedNul { offset });
+    }
+
     let mut tokens = Vec::new();
     let mut separators = Vec::new();
 
@@ -62,5 +124,59 @@ pub fn tokenize(line: &str) -> Tokenized<'_> {
         separators.push(&line[sep_start..end]);
     }
 
-    Tokenized { tokens, separators }
+    Ok(Tokenized { tokens, separators })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_rejects_embedded_nul_with_byte_offset() {
+        // RFC §6.2 step 1: embedded NUL is a tokenizer failure.
+        // The returned offset must point at the first NUL so a
+        // reader inspecting the retained `body` can locate the
+        // suspicious region.
+        let line = "user 42\0secret";
+        let err = tokenize(line).unwrap_err();
+        assert_eq!(err, TokenizeError::EmbeddedNul { offset: 7 });
+    }
+
+    #[test]
+    fn tokenize_rejects_leading_nul() {
+        let line = "\0";
+        let err = tokenize(line).unwrap_err();
+        assert_eq!(err, TokenizeError::EmbeddedNul { offset: 0 });
+    }
+
+    #[test]
+    fn tokenize_accepts_nul_free_input() {
+        // Round-trip an ordinary line to confirm the validation
+        // step is a guard, not a behavior change for clean inputs.
+        let r = tokenize("hello world").expect("nul-free");
+        assert_eq!(r.tokens, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn tokenize_error_display_includes_offset() {
+        // Pin the Display message — `?` and standard error
+        // propagation crates surface this string, so a
+        // human-readable, offset-bearing format is the public
+        // contract.
+        let err = TokenizeError::EmbeddedNul { offset: 7 };
+        assert_eq!(
+            err.to_string(),
+            "input contains embedded NUL byte at offset 7",
+        );
+    }
+
+    #[test]
+    fn tokenize_error_implements_std_error_trait() {
+        // Pin the `std::error::Error` impl so callers can return
+        // the error through `Box<dyn Error>` / `?` against
+        // `Result<_, Box<dyn Error>>` without a custom wrapper.
+        fn assert_error<E: std::error::Error>(_: &E) {}
+        let err = TokenizeError::EmbeddedNul { offset: 0 };
+        assert_error(&err);
+    }
 }

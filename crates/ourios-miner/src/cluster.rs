@@ -306,12 +306,24 @@ impl MinerCluster {
         self.merges_total.load(Ordering::Relaxed)
     }
 
-    /// Cumulative count of lines that produced no template:
-    /// empty / whitespace-only `Body::String`, over-cap lines
-    /// (`> u16::MAX` tokens), the §6.4 degenerate-template
-    /// rejection branch, and the §6.3 parse-failure zone
-    /// (`simSeq < similarity_floor`). Read-side placeholder for
-    /// the §6.8 `parse_failures_total` Prometheus gauge.
+    /// Cumulative count of lines that produced no template. Two
+    /// disjoint sources contribute, but the counter is one gauge:
+    ///
+    /// - §6.3 / §6.4 body-retention paths: empty /
+    ///   whitespace-only `Body::String`, over-cap lines
+    ///   (`> u16::MAX` tokens), the §6.4 degenerate-template
+    ///   rejection branch, and the §6.3 parse-failure zone
+    ///   (`simSeq < similarity_floor`). These also bump
+    ///   `body_retentions_total`.
+    /// - §6.6 tokenizer-failure paths (today: embedded NUL byte
+    ///   per H7.2). These set `lossy_flag = true` on the emitted
+    ///   record and do **not** bump `body_retentions_total` (the
+    ///   `body_retention_ratio` gauge surfaces §6.3 zone
+    ///   retention, not the orthogonal §6.6 reconstruction-
+    ///   impossible retention).
+    ///
+    /// Read-side placeholder for the §6.8
+    /// `parse_failures_total` Prometheus gauge.
     #[must_use]
     pub fn parse_failures_total(&self) -> u64 {
         self.parse_failures_total.load(Ordering::Relaxed)
@@ -349,9 +361,30 @@ impl MinerCluster {
     /// over-cap input, the §6.4 degenerate-widening rejection,
     /// and the §6.3 parse-failure zone. Centralised here so a
     /// future contract change touches one site, not four.
+    ///
+    /// The §6.6 `lossy_flag = true` tokenizer-failure path is
+    /// **not** routed through this helper — its body retention is
+    /// the orthogonal "reconstruction impossible" case the
+    /// `body_retentions_total` metric doc explicitly excludes,
+    /// not the §6.3 lossy-zone retention the gauge is meant to
+    /// surface. That path uses [`Self::record_tokenizer_failure`].
     fn record_parse_failure(&self) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark one tokenizer-failure event per RFC §6.6: increments
+    /// `parse_failures_total` only. The orthogonal `lossy_flag =
+    /// true` semantics mean the body IS retained on the emitted
+    /// record (so a reader can surface it verbatim), but this
+    /// retention is *not* the §3.1 `body_retention_ratio`
+    /// numerator — that gauge counts the §6.3 retention paths,
+    /// not the §6.6 reconstruction-impossible paths. Counting
+    /// tokenizer failures here would inflate the ratio with
+    /// events that aren't body-retention events in the
+    /// gauge-contract sense.
+    fn record_tokenizer_failure(&self) {
+        self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Build the OTLP-envelope half of a `MinedRecord` from the
@@ -576,6 +609,91 @@ fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[SlotExpansi
     }
 }
 
+/// RFC §6.6 alignment: build the `params` vector with one entry
+/// per `Wildcard` slot in the leaf template, left-to-right.
+///
+/// For each wildcard at template position `p`:
+///
+/// - If the line had a mask emit at the same position
+///   (`p ∈ line_wildcard_positions`), use that `TypedParam`
+///   verbatim — the original token bytes and its `ParamType`.
+/// - Else (the line had a literal at `p` but the leaf carries a
+///   `Wildcard` there — either from a past widening of a
+///   literal-token mismatch, or because this attach just
+///   freshly-widened a literal at `p`), fall back to
+///   `{ type_tag: Str, value: masked_strs[p] }`. `masked_strs[p]`
+///   for a non-mask position is the original literal token (mask
+///   leaves unclassified tokens unchanged), so the STR fallback
+///   captures the bytes reconstruction will need.
+///
+/// This is the contract [`crate::reconstruct::reconstruct`] reads
+/// against. Producers
+/// for fresh-leaf paths (`None` / `Lossy` zones in
+/// [`MinerCluster::ingest_string`]) build params via the simpler
+/// [`params_from_mask`] because their template Wildcards align
+/// 1:1 with the line's mask positions by construction; everything
+/// else routes through this helper.
+///
+/// **Scope boundary.** STR fallback is invoked only after a leaf
+/// has been *found*. The Drain tree's prefix routing keys each
+/// level by the concrete masked token, so a leaf with a
+/// `Wildcard` slot inside `prefix_depth` is structurally
+/// unreachable from a line whose prefix masks to a different
+/// concrete token at that position (e.g. a literal `abc` at
+/// position 1 cannot find a leaf whose position-1 prefix key is
+/// the mask-emitted `<NUM>`). This is a property of the Drain
+/// tree (paper §3.2, RFC 0001 §6.1), not a bug in this helper;
+/// any change to make wildcards reachable from divergent prefix
+/// tokens (multi-bucket lookup, wildcard-aware re-bucketing) is
+/// its own RFC-level decision.
+fn build_record_params(
+    template: &[OwnedToken],
+    masked_strs: &[&str],
+    line_wildcard_positions: &[usize],
+    line_typed_params: &[crate::mask::TypedParam<'_>],
+) -> Vec<Param> {
+    debug_assert_eq!(
+        line_wildcard_positions.len(),
+        line_typed_params.len(),
+        "mask invariant: typed_params parallel to wildcard_positions",
+    );
+    debug_assert_eq!(
+        template.len(),
+        masked_strs.len(),
+        "sim_seq precondition: template and line are the same length",
+    );
+
+    let wildcard_count = template
+        .iter()
+        .filter(|t| matches!(t, OwnedToken::Wildcard))
+        .count();
+    let mut out = Vec::with_capacity(wildcard_count);
+    let mut k = 0usize;
+    for (p, tok) in template.iter().enumerate() {
+        if !matches!(tok, OwnedToken::Wildcard) {
+            continue;
+        }
+        if k < line_wildcard_positions.len() && line_wildcard_positions[k] == p {
+            out.push(Param {
+                type_tag: line_typed_params[k].type_tag,
+                value: line_typed_params[k].value.to_string(),
+            });
+            k += 1;
+        } else {
+            out.push(Param {
+                type_tag: ParamType::Str,
+                value: masked_strs[p].to_string(),
+            });
+        }
+    }
+    debug_assert_eq!(
+        k,
+        line_wildcard_positions.len(),
+        "every mask emit position must coincide with a template Wildcard",
+    );
+    out
+}
+
 /// Outcome of the leaf-mutating phase of `attach_and_maybe_widen`.
 ///
 /// Phase 1 borrows the leaf and produces this enum; phase 2 drops
@@ -585,10 +703,13 @@ fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[SlotExpansi
 /// audit emit happens after the leaf borrow ends.
 enum AttachPlan {
     /// No mutation: similarity 1.0 with no new types at any slot.
-    /// Reuse `(template_id, template_version)` verbatim.
+    /// Reuse `(template_id, template_version)` verbatim. `params`
+    /// is aligned with the leaf's wildcard slots per RFC §6.6 —
+    /// see [`build_record_params`].
     CleanReuse {
         template_id: u64,
         template_version: u32,
+        params: Vec<Param>,
     },
     /// Degenerate widening rejected per §6.4. Leaf untouched.
     Rejected {
@@ -601,11 +722,13 @@ enum AttachPlan {
     /// Leaf mutated (widened and/or type-expanded). `events` is the
     /// audit-event payload in emission order: `TemplateWidened`
     /// before `TemplateTypeExpanded` per RFC §6.2's combined-attach
-    /// contract.
+    /// contract. `params` is aligned with the post-widen template's
+    /// wildcard slots.
     Mutated {
         template_id: u64,
         events: Vec<AuditEventKind>,
         final_version: u32,
+        params: Vec<Param>,
     },
 }
 
@@ -633,7 +756,8 @@ fn plan_attach(
     line_wildcard_positions: &[usize],
     line_typed_params: &[crate::mask::TypedParam<'_>],
 ) -> AttachPlan {
-    let positions_widened = find_widening_positions(masked_strs, &leaf.template);
+    let positions_widened =
+        find_widening_positions(masked_strs, &leaf.template, line_wildcard_positions);
 
     if positions_widened.is_empty() {
         // No Fixed mismatch — check for a type-expansion-only
@@ -649,6 +773,12 @@ fn plan_attach(
             return AttachPlan::CleanReuse {
                 template_id: leaf.template_id,
                 template_version: leaf.template_version,
+                params: build_record_params(
+                    &leaf.template,
+                    masked_strs,
+                    line_wildcard_positions,
+                    line_typed_params,
+                ),
             };
         }
         apply_type_expansions(&mut leaf.slot_types, &expansions);
@@ -659,9 +789,16 @@ fn plan_attach(
             .expect("template_version overflow: 2^32 expansions on one leaf is implausible");
         leaf.template_version = new_version;
         let template_str = format_template(&leaf.template);
+        let params = build_record_params(
+            &leaf.template,
+            masked_strs,
+            line_wildcard_positions,
+            line_typed_params,
+        );
         return AttachPlan::Mutated {
             template_id: leaf.template_id,
             final_version: new_version,
+            params,
             events: vec![AuditEventKind::TemplateTypeExpanded {
                 old_version,
                 new_version,
@@ -750,10 +887,20 @@ fn plan_attach(
         version_after_expand
     };
 
+    // Build params aligned to the post-widen template's wildcard
+    // slots. §6.6 reconstruction reads against this alignment.
+    let params = build_record_params(
+        &leaf.template,
+        masked_strs,
+        line_wildcard_positions,
+        line_typed_params,
+    );
+
     AttachPlan::Mutated {
         template_id,
         events,
         final_version,
+        params,
     }
 }
 
@@ -799,13 +946,32 @@ impl MinerCluster {
                 NO_TEMPLATE
             }
             Some(Body::String(raw)) => self.ingest_string(record, raw),
-            Some(Body::Structured(_)) => self.ingest_structured(record),
+            Some(Body::Structured(av)) => self.ingest_structured(record, av),
         }
     }
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.
     fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
-        let tokenized = tokenize(raw);
+        // RFC §6.2 step 1 (H7.2): a tokenizer failure (today:
+        // embedded NUL byte) routes the line to the parse-failure
+        // path with `lossy_flag = true` and the original body
+        // retained verbatim. Reconstruction is not possible — the
+        // line bytes are non-text — so the reader will surface the
+        // body column instead. This is orthogonal to the §6.3
+        // body-retention paths: `record_tokenizer_failure` bumps
+        // only `parse_failures_total`, not `body_retentions_total`
+        // (the gauge contract excludes §6.6 retentions).
+        let tokenized = match tokenize(raw) {
+            Ok(t) => t,
+            Err(_err) => {
+                let mut rec = Self::record_envelope(record, BodyKind::String);
+                rec.body = Some(raw.to_string());
+                rec.lossy_flag = true;
+                self.emit_record(rec);
+                self.record_tokenizer_failure();
+                return NO_TEMPLATE;
+            }
+        };
         let masked = mask(&tokenized.tokens);
         // Pre-compute the owned forms once. Every emit path
         // reads these.
@@ -853,7 +1019,7 @@ impl MinerCluster {
         // immutable so we can early-return (or fall through to
         // fresh-leaf creation) without committing a
         // `template_id` allocation.
-        let best = self.find_best_candidate(record, &masked_strs);
+        let best = self.find_best_candidate(record, &masked_strs, &masked.wildcard_positions);
 
         let threshold = self.config.similarity_threshold;
         let floor = self.config.similarity_floor;
@@ -949,6 +1115,7 @@ impl MinerCluster {
         &self,
         record: &OtlpLogRecord,
         masked_strs: &[&str],
+        line_wildcard_positions: &[usize],
     ) -> Option<Candidate> {
         let state = self.tenants.get(&record.tenant_id)?;
         let parent = state.tree.descend(masked_strs, self.prefix_depth)?;
@@ -979,7 +1146,7 @@ impl MinerCluster {
             // Allocation-free over `&[OwnedToken]`. The borrowed
             // `Token` view + `Vec::collect` form would allocate
             // per leaf on every ingest call.
-            let similarity = sim_seq_owned(masked_strs, &leaf.template);
+            let similarity = sim_seq_owned(masked_strs, &leaf.template, line_wildcard_positions);
             let candidate = Candidate {
                 leaf_idx,
                 similarity,
@@ -1128,12 +1295,20 @@ impl MinerCluster {
             AttachPlan::CleanReuse {
                 template_id,
                 template_version,
+                params: aligned_params,
             } => {
+                // §6.6: emit the params vector aligned with the
+                // leaf's wildcard slots, not the line-ordered
+                // `params_from_mask` we built earlier. The leaf
+                // may carry wildcards from past widenings that
+                // the current line has a literal at; those slots
+                // need a Str-fallback entry that the mask emit
+                // doesn't produce.
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = template_id;
                 rec.template_version = template_version;
                 rec.separators = separators;
-                rec.params = params;
+                rec.params = aligned_params;
                 rec.confidence = 1.0;
                 self.emit_record(rec);
                 template_id
@@ -1159,7 +1334,10 @@ impl MinerCluster {
                     timestamp: self.clock.now(),
                 });
                 // §6.4 treats degenerate widening as a parse
-                // failure that retains body.
+                // failure that retains body. `lossy_flag = true`
+                // so reconstruct surfaces the retained body and
+                // ignores `params`; the line-ordered fallback is
+                // fine here.
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.separators = separators;
                 rec.params = params;
@@ -1173,6 +1351,7 @@ impl MinerCluster {
                 template_id,
                 events,
                 final_version,
+                params: aligned_params,
             } => {
                 for kind in events {
                     let counts_as_merge = kind.counts_as_merge();
@@ -1192,7 +1371,7 @@ impl MinerCluster {
                 rec.template_id = template_id;
                 rec.template_version = final_version;
                 rec.separators = separators;
-                rec.params = params;
+                rec.params = aligned_params;
                 rec.confidence = 1.0;
                 self.emit_record(rec);
                 template_id
@@ -1206,7 +1385,11 @@ impl MinerCluster {
     /// entire lookup. First observation of a tuple allocates;
     /// subsequent records with the same tuple reuse. Structured
     /// records never widen and never emit audit events.
-    fn ingest_structured(&mut self, record: &OtlpLogRecord) -> u64 {
+    fn ingest_structured(
+        &mut self,
+        record: &OtlpLogRecord,
+        any_value: &ourios_core::otlp::AnyValue,
+    ) -> u64 {
         let key = (record.severity_number, record.scope_name.clone());
         let state = self
             .tenants
@@ -1226,16 +1409,29 @@ impl MinerCluster {
 
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
-        // canonicalised-JSON `body` field (per §6.2 step 0); the
-        // canonicalisation itself is deferred to the §6.6
-        // follow-up that adds `reconstruct()`. PR-A emits the
-        // record with `body = None` and a placeholder
-        // `confidence = 1.0` (sentinel — no Drain comparison
-        // happens in the structured branch).
+        // `body` field (per §6.2 step 0), and `lossy_flag = false`
+        // per RFC §6.1 ("Always false when body_kind =
+        // Structured").
+        //
+        // **Interim body format.** OTLP-canonical JSON encoding
+        // is the follow-up PR named in `ourios-core::otlp`.
+        // Until it ships, we still populate `body` with a
+        // stored representation of the `AnyValue` — its `Debug`
+        // form — so `reconstruct(structured) == record.body`
+        // holds in the §3.3 sense ("what we stored is what we
+        // return"). The format is **not** OTLP-canonical yet;
+        // the canonicalisation PR replaces this `Debug` rendering
+        // with the canonical JSON encoding without changing the
+        // schema field or `lossy_flag`. The reader-visible effect
+        // of the migration is the bytes in the column changing
+        // shape; the contract that `reconstruct` returns
+        // whatever the producer stored is invariant.
+        let stored_body = format!("{any_value:?}");
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
         rec.confidence = 1.0;
+        rec.body = Some(stored_body);
         self.emit_record(rec);
 
         template_id
@@ -1314,14 +1510,34 @@ struct Candidate {
 /// Using `usize` here avoids the silent-drop hazard a `u16` return
 /// type carried (a missed mismatch position would have produced
 /// an empty `positions_widened` → clean attach → silent merge).
-fn find_widening_positions(line: &[&str], template: &[OwnedToken]) -> Vec<usize> {
+fn find_widening_positions(
+    line: &[&str],
+    template: &[OwnedToken],
+    line_wildcard_positions: &[usize],
+) -> Vec<usize> {
     debug_assert_eq!(line.len(), template.len());
     line.iter()
         .zip(template.iter())
         .enumerate()
         .filter_map(|(i, (l, t))| match t {
-            OwnedToken::Fixed(s) if s.as_str() != *l => Some(i),
-            _ => None,
+            OwnedToken::Fixed(s) => {
+                // Symmetric with `sim_seq_owned`'s Fixed-match
+                // rule: a leaf `Fixed` matches `line[i]` only when
+                // the strings agree AND the line at `i` is *not*
+                // a mask-emit. The literal-tag collision
+                // (`Fixed("<NUM>")` ≡ a literal `<NUM>` user
+                // input, line at `i` is a real numeric → masked
+                // string also `"<NUM>"`) must widen so the line's
+                // typed value lands in `params` rather than being
+                // silently absorbed by string equality.
+                let line_is_mask_emit = line_wildcard_positions.binary_search(&i).is_ok();
+                if !line_is_mask_emit && s.as_str() == *l {
+                    None
+                } else {
+                    Some(i)
+                }
+            }
+            OwnedToken::Wildcard => None,
         })
         .collect()
 }
@@ -2165,6 +2381,133 @@ mod tests {
     }
 
     #[test]
+    fn literal_mask_tag_in_leaf_vs_real_mask_emit_on_line_does_not_silently_merge() {
+        // Symmetric regression for the PR #35 review concern: a
+        // leaf with `Fixed("<NUM>")` (because the *first* line
+        // carried the literal token `<NUM>`) MUST NOT merge with a
+        // later line that puts a real numeric value at the same
+        // position. The masked-line token at that position is also
+        // `"<NUM>"`, so a naive string-equality match in
+        // `sim_seq_owned` / `find_widening_positions` would mark
+        // it as a Fixed match — silently merging the two log
+        // shapes AND dropping the numeric's value from `params`
+        // (§3.1 + §3.3 violation; reconstruct would render
+        // `<NUM>` literally instead of recovering `42`).
+        //
+        // `line_wildcard_positions` plumbed through sim_seq +
+        // find_widening fixes both: the line at position 1 is a
+        // mask emit (in `line_wildcard_positions`), so it does
+        // NOT match the leaf's literal `Fixed("<NUM>")`. sim_seq
+        // returns 2/3 ≈ 0.667 < 0.7 threshold → Lossy zone →
+        // fresh leaf. Two templates result, body retained on the
+        // Lossy line.
+        let (mut cluster, audit_sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // L1: literal `<NUM>` token. mask() doesn't classify it.
+        let raw_l1 = "value <NUM> ok";
+        let id1 = cluster.ingest(&string_record(&t, raw_l1));
+        // L2: real numeric at the same position. mask() emits
+        // `<NUM>` here.
+        let raw_l2 = "value 42 ok";
+        let id2 = cluster.ingest(&string_record(&t, raw_l2));
+
+        // Distinct template ids — no silent merge.
+        assert_ne!(
+            id1, id2,
+            "leaf `Fixed(\"<NUM>\")` (literal) must not absorb a real mask-emit `<NUM>`",
+        );
+        assert_eq!(cluster.template_count(&t), 2);
+        // No widening fired (the Lossy zone created a new leaf
+        // rather than widening). No audit events.
+        assert!(audit_sink.is_empty());
+        // The §6.3 lossy zone bumped body_retentions for L2 (and
+        // retained its body on the emitted record).
+        assert_eq!(cluster.body_retentions_total(), 1);
+    }
+
+    #[test]
+    fn existing_wildcard_receives_literal_emits_str_param_and_reconstructs() {
+        // PR-B-2 STR-fallback regression for the "existing wildcard
+        // receives a literal observation" path (distinct from the
+        // freshly-widened-literal-slot case covered by H7.4).
+        //
+        // Setup: a prior `<NUM>` mask emit creates a Wildcard at
+        // position 2 with `slot_types[0] = {Num}`. A later line at
+        // the same position carries a literal whose mask does not
+        // classify (e.g. "abc-def-1234" — neither digits nor UUID
+        // nor IPv4). sim_seq still matches (Wildcard matches
+        // anything), so the attach is Clean — and `build_record_
+        // params` must emit `{Str, "abc-def-1234"}` for the slot
+        // so reconstruct round-trips the literal verbatim.
+        //
+        // The pre-PR-B-2 code (params_from_mask) would have emitted
+        // params=[] for this attach because mask emitted nothing —
+        // reconstruct would have produced no bytes at the wildcard
+        // position. PR-B-2's `build_record_params` walks the
+        // leaf's wildcards and inserts the STR fallback.
+        //
+        // **Scope note.** This test exercises a wildcard at
+        // template position **2** — that is, *beyond* the default
+        // `prefix_depth = 2`, so both ingests share the same
+        // tree parent (positions 0–1 = `["user", "logged"]` for
+        // both). The STR-fallback path is structurally
+        // unreachable for wildcards INSIDE the prefix depth: the
+        // tree partitions by the concrete masked token at each
+        // prefix level, so a line whose prefix masks to a
+        // different concrete token (e.g. literal `abc` vs mask-
+        // emitted `<NUM>` at position 1 under default
+        // `prefix_depth = 2`) ends up in a different parent and
+        // finds no candidate to attach to. That is a property of
+        // the Drain tree's prefix-routing scheme (paper §3.2,
+        // RFC 0001 §6.1), not a bug in PR-B-2's STR fallback;
+        // future work to make wildcard slots reachable from
+        // diverging prefix tokens (multi-bucket lookup or
+        // wildcard-aware re-bucketing) is its own RFC-level
+        // change. The test deliberately stays inside the
+        // structurally-reachable case.
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+        let make = |raw: &str| string_record(&t, raw);
+
+        // L1: creates the wildcard at position 2 with
+        // slot_types[0] = {Num} (mask emit).
+        let _ = cluster.ingest(&make("user logged 42 in"));
+        let l1_emit = records.drain();
+        assert_eq!(l1_emit.len(), 1);
+
+        // L2: literal at position 2 lands on the existing
+        // wildcard. {Str} expands the slot's type set → emits
+        // TemplateTypeExpanded, but the record's params must
+        // carry the literal so reconstruct works.
+        let raw_l2 = "user logged abc-def-1234 in";
+        let _ = cluster.ingest(&make(raw_l2));
+
+        let l2_emit = records.drain();
+        assert_eq!(l2_emit.len(), 1);
+        let rec = &l2_emit[0];
+
+        // params has exactly one entry for the one wildcard slot,
+        // and it's a STR fallback carrying the literal verbatim.
+        assert_eq!(rec.params.len(), 1, "one wildcard → one param");
+        assert_eq!(
+            rec.params[0].type_tag,
+            ParamType::Str,
+            "literal at an existing wildcard → STR fallback",
+        );
+        assert_eq!(rec.params[0].value, "abc-def-1234");
+
+        // End-to-end: reconstruct round-trips the original bytes.
+        let snapshots = cluster.templates_for(&t);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            crate::reconstruct::reconstruct(rec, &snapshots[0].template),
+            raw_l2.as_bytes().to_vec(),
+            "STR-fallback alignment must let reconstruct recover the literal byte-for-byte",
+        );
+    }
+
+    #[test]
     fn audit_event_carries_triggering_line_hash_and_sample() {
         // RFC §6.4 fields: triggering_line_hash (truncated blake3)
         // and triggering_line_sample (first 256 B at char
@@ -2549,7 +2892,7 @@ mod tests {
             OwnedToken::Fixed("in".to_string()),
         ];
         let line = ["user", "17", "anything", "out"];
-        let positions = find_widening_positions(&line, &template);
+        let positions = find_widening_positions(&line, &template, &[]);
         // Position 0: Fixed "user" == "user" → no widening.
         // Position 1: Fixed "42" != "17" → widen.
         // Position 2: Wildcard → never in the widening set.
@@ -2937,12 +3280,21 @@ mod tests {
         assert_eq!(rec.body_kind, BodyKind::Structured);
         assert_ne!(rec.template_id, NO_TEMPLATE);
         assert_eq!(rec.template_version, 1);
-        // Structured records have no token-shape to carry; PR-A
-        // leaves body=None (canonical-JSON encoding is the §6.6
-        // follow-up's job).
+        // RFC §6.1: Structured records always carry
+        // `lossy_flag = false`. The producer populates `body`
+        // with a stored representation of the structured value
+        // so `reconstruct()` returns what we stored, satisfying
+        // §3.3. Today that representation is the AnyValue's
+        // `Debug` form — an interim placeholder. The follow-up
+        // PR replaces it with OTLP-canonical JSON without
+        // changing the schema field or `lossy_flag`. See
+        // `ingest_structured` for the rationale.
         assert!(rec.separators.is_empty());
         assert!(rec.params.is_empty());
-        assert!(rec.body.is_none());
+        assert!(
+            rec.body.is_some(),
+            "structured records must carry the stored body representation"
+        );
         assert!(!rec.lossy_flag);
     }
 

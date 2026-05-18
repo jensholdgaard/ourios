@@ -145,7 +145,7 @@ fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
 fn rfc0001_3_tokenizer_is_unicode_whitespace_only() {
     use ourios_miner::tokenize::tokenize;
 
-    let r = tokenize("key=value, other=42");
+    let r = tokenize("key=value, other=42").expect("nul-free test input");
     assert_eq!(r.tokens, vec!["key=value,", "other=42"]);
     assert_eq!(
         r.separators.len(),
@@ -158,7 +158,7 @@ fn rfc0001_3_tokenizer_is_unicode_whitespace_only() {
     // tokens.len() == 1 would miss a buggy tokenizer that *drops*
     // the punctuation char (PR #8 review, comment 3178317220).
     for line in ["a=b", "a:b", "a,b", "a;b", "a[b", "a]b", "a(b", "a)b"] {
-        let r = tokenize(line);
+        let r = tokenize(line).expect("nul-free test input");
         assert_eq!(
             r.tokens.len(),
             1,
@@ -170,10 +170,10 @@ fn rfc0001_3_tokenizer_is_unicode_whitespace_only() {
         );
     }
 
-    let r = tokenize("hello world");
+    let r = tokenize("hello world").expect("nul-free test input");
     assert_eq!(r.tokens, vec!["hello", "world"]);
 
-    let r = tokenize("hello\u{00A0}world");
+    let r = tokenize("hello\u{00A0}world").expect("nul-free test input");
     assert_eq!(
         r.tokens,
         vec!["hello", "world"],
@@ -190,14 +190,14 @@ fn rfc0001_3_tokenizer_is_unicode_whitespace_only() {
 fn rfc0001_3_regression_vt_and_ff_split_tokens() {
     use ourios_miner::tokenize::tokenize;
 
-    let r = tokenize("hello\u{000B}world");
+    let r = tokenize("hello\u{000B}world").expect("nul-free test input");
     assert_eq!(
         r.tokens,
         vec!["hello", "world"],
         "U+000B (vertical tab) must split",
     );
 
-    let r = tokenize("hello\u{000C}world");
+    let r = tokenize("hello\u{000C}world").expect("nul-free test input");
     assert_eq!(
         r.tokens,
         vec!["hello", "world"],
@@ -217,7 +217,7 @@ fn rfc0001_3_regression_separators_always_borrow_from_input() {
     use ourios_miner::tokenize::tokenize;
 
     for line in ["", "hello", "  hello  world  ", "hello\nworld\n"] {
-        let r = tokenize(line);
+        let r = tokenize(line).expect("nul-free test input");
         let bounds = line.as_bytes().as_ptr_range();
         for (idx, sep) in r.separators.iter().enumerate() {
             let sep_ptr = sep.as_ptr();

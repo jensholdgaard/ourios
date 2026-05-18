@@ -19,8 +19,17 @@ use crate::tree::OwnedToken;
 ///
 /// - [`BodyKind::Absent`]: no body on the wire; returns empty.
 /// - [`BodyKind::Structured`]: §6.2 step 0 short-circuits to the
-///   canonicalised JSON `body`; this is the source of truth, so
-///   returns `body` verbatim (or empty if missing).
+///   canonicalised JSON, which the RFC pseudo-code names as the
+///   source of truth and which this function returns verbatim
+///   from `record.body`. **Producer-side caveat:** today's
+///   `MinerCluster::ingest_structured` ships records with `body =
+///   None` (OTLP-canonical JSON encoding is deferred to the
+///   `Body::Structured` follow-up PR named in `ourios-core::otlp`),
+///   so reconstructing a structured record produced by this
+///   crate currently returns empty. The function's contract is
+///   already correct — once the producer populates the
+///   canonicalised body, structured reconstruction works without
+///   another change here.
 /// - [`BodyKind::String`] with `lossy_flag = true` or any
 ///   [`ParamType::Overflow`] entry in `params`: reconstruction is
 ///   not guaranteed to equal ingest, so the function returns the

@@ -52,10 +52,24 @@ pub enum TokenizeError {
 /// # Errors
 ///
 /// Returns [`TokenizeError::EmbeddedNul`] if `line` contains a NUL
-/// byte. Other tokenizer-failure modes named in RFC 0001 §6.2
-/// step 1 (malformed UTF-8, line longer than `max_line_bytes`)
-/// are caught before this function — UTF-8 by the `&str`
-/// invariant, line length by `ingest_string`'s explicit cap.
+/// byte.
+///
+/// Other tokenizer-failure modes named in RFC 0001 §6.2 step 1:
+///
+/// - **Malformed UTF-8** is structurally impossible at this entry
+///   — the `&str` invariant guarantees valid UTF-8, so this
+///   function never sees it.
+/// - **Line longer than `max_line_bytes`** is **not** caught
+///   here. The miner does not yet expose a `max_line_bytes`
+///   config; `ingest_string` instead enforces an upstream
+///   post-tokenization cap on the *token count* (≤ `u16::MAX`)
+///   to keep widening-position audit payloads in range. A line
+///   of arbitrary byte length is admitted into this function so
+///   long as its UTF-8 is valid and it carries no NUL; a
+///   `max_line_bytes` byte cap will land as a configurable
+///   pre-tokenize guard in a future PR. Until then a single
+///   pathological long line is bounded only by the `u16::MAX`
+///   token-count cap downstream.
 pub fn tokenize(line: &str) -> Result<Tokenized<'_>, TokenizeError> {
     if let Some(offset) = line.bytes().position(|b| b == 0) {
         return Err(TokenizeError::EmbeddedNul { offset });

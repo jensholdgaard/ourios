@@ -349,9 +349,30 @@ impl MinerCluster {
     /// over-cap input, the §6.4 degenerate-widening rejection,
     /// and the §6.3 parse-failure zone. Centralised here so a
     /// future contract change touches one site, not four.
+    ///
+    /// The §6.6 `lossy_flag = true` tokenizer-failure path is
+    /// **not** routed through this helper — its body retention is
+    /// the orthogonal "reconstruction impossible" case the
+    /// `body_retentions_total` metric doc explicitly excludes,
+    /// not the §6.3 lossy-zone retention the gauge is meant to
+    /// surface. That path uses [`Self::record_tokenizer_failure`].
     fn record_parse_failure(&self) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark one tokenizer-failure event per RFC §6.6: increments
+    /// `parse_failures_total` only. The orthogonal `lossy_flag =
+    /// true` semantics mean the body IS retained on the emitted
+    /// record (so a reader can surface it verbatim), but this
+    /// retention is *not* the §3.1 `body_retention_ratio`
+    /// numerator — that gauge counts the §6.3 retention paths,
+    /// not the §6.6 reconstruction-impossible paths. Counting
+    /// tokenizer failures here would inflate the ratio with
+    /// events that aren't body-retention events in the
+    /// gauge-contract sense.
+    fn record_tokenizer_failure(&self) {
+        self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Build the OTLP-envelope half of a `MinedRecord` from the
@@ -710,7 +731,8 @@ fn plan_attach(
     line_wildcard_positions: &[usize],
     line_typed_params: &[crate::mask::TypedParam<'_>],
 ) -> AttachPlan {
-    let positions_widened = find_widening_positions(masked_strs, &leaf.template);
+    let positions_widened =
+        find_widening_positions(masked_strs, &leaf.template, line_wildcard_positions);
 
     if positions_widened.is_empty() {
         // No Fixed mismatch — check for a type-expansion-only
@@ -910,7 +932,10 @@ impl MinerCluster {
         // path with `lossy_flag = true` and the original body
         // retained verbatim. Reconstruction is not possible — the
         // line bytes are non-text — so the reader will surface the
-        // body column instead.
+        // body column instead. This is orthogonal to the §6.3
+        // body-retention paths: `record_tokenizer_failure` bumps
+        // only `parse_failures_total`, not `body_retentions_total`
+        // (the gauge contract excludes §6.6 retentions).
         let tokenized = match tokenize(raw) {
             Ok(t) => t,
             Err(_err) => {
@@ -918,7 +943,7 @@ impl MinerCluster {
                 rec.body = Some(raw.to_string());
                 rec.lossy_flag = true;
                 self.emit_record(rec);
-                self.record_parse_failure();
+                self.record_tokenizer_failure();
                 return NO_TEMPLATE;
             }
         };
@@ -969,7 +994,7 @@ impl MinerCluster {
         // immutable so we can early-return (or fall through to
         // fresh-leaf creation) without committing a
         // `template_id` allocation.
-        let best = self.find_best_candidate(record, &masked_strs);
+        let best = self.find_best_candidate(record, &masked_strs, &masked.wildcard_positions);
 
         let threshold = self.config.similarity_threshold;
         let floor = self.config.similarity_floor;
@@ -1065,6 +1090,7 @@ impl MinerCluster {
         &self,
         record: &OtlpLogRecord,
         masked_strs: &[&str],
+        line_wildcard_positions: &[usize],
     ) -> Option<Candidate> {
         let state = self.tenants.get(&record.tenant_id)?;
         let parent = state.tree.descend(masked_strs, self.prefix_depth)?;
@@ -1095,7 +1121,7 @@ impl MinerCluster {
             // Allocation-free over `&[OwnedToken]`. The borrowed
             // `Token` view + `Vec::collect` form would allocate
             // per leaf on every ingest call.
-            let similarity = sim_seq_owned(masked_strs, &leaf.template);
+            let similarity = sim_seq_owned(masked_strs, &leaf.template, line_wildcard_positions);
             let candidate = Candidate {
                 leaf_idx,
                 similarity,
@@ -1442,14 +1468,34 @@ struct Candidate {
 /// Using `usize` here avoids the silent-drop hazard a `u16` return
 /// type carried (a missed mismatch position would have produced
 /// an empty `positions_widened` → clean attach → silent merge).
-fn find_widening_positions(line: &[&str], template: &[OwnedToken]) -> Vec<usize> {
+fn find_widening_positions(
+    line: &[&str],
+    template: &[OwnedToken],
+    line_wildcard_positions: &[usize],
+) -> Vec<usize> {
     debug_assert_eq!(line.len(), template.len());
     line.iter()
         .zip(template.iter())
         .enumerate()
         .filter_map(|(i, (l, t))| match t {
-            OwnedToken::Fixed(s) if s.as_str() != *l => Some(i),
-            _ => None,
+            OwnedToken::Fixed(s) => {
+                // Symmetric with `sim_seq_owned`'s Fixed-match
+                // rule: a leaf `Fixed` matches `line[i]` only when
+                // the strings agree AND the line at `i` is *not*
+                // a mask-emit. The literal-tag collision
+                // (`Fixed("<NUM>")` ≡ a literal `<NUM>` user
+                // input, line at `i` is a real numeric → masked
+                // string also `"<NUM>"`) must widen so the line's
+                // typed value lands in `params` rather than being
+                // silently absorbed by string equality.
+                let line_is_mask_emit = line_wildcard_positions.binary_search(&i).is_ok();
+                if !line_is_mask_emit && s.as_str() == *l {
+                    None
+                } else {
+                    Some(i)
+                }
+            }
+            OwnedToken::Wildcard => None,
         })
         .collect()
 }
@@ -2293,6 +2339,52 @@ mod tests {
     }
 
     #[test]
+    fn literal_mask_tag_in_leaf_vs_real_mask_emit_on_line_does_not_silently_merge() {
+        // Symmetric regression for the PR #35 review concern: a
+        // leaf with `Fixed("<NUM>")` (because the *first* line
+        // carried the literal token `<NUM>`) MUST NOT merge with a
+        // later line that puts a real numeric value at the same
+        // position. The masked-line token at that position is also
+        // `"<NUM>"`, so a naive string-equality match in
+        // `sim_seq_owned` / `find_widening_positions` would mark
+        // it as a Fixed match — silently merging the two log
+        // shapes AND dropping the numeric's value from `params`
+        // (§3.1 + §3.3 violation; reconstruct would render
+        // `<NUM>` literally instead of recovering `42`).
+        //
+        // `line_wildcard_positions` plumbed through sim_seq +
+        // find_widening fixes both: the line at position 1 is a
+        // mask emit (in `line_wildcard_positions`), so it does
+        // NOT match the leaf's literal `Fixed("<NUM>")`. sim_seq
+        // returns 2/3 ≈ 0.667 < 0.7 threshold → Lossy zone →
+        // fresh leaf. Two templates result, body retained on the
+        // Lossy line.
+        let (mut cluster, audit_sink) = cluster_with_observable_sink();
+        let t = TenantId::new("tenant-x");
+
+        // L1: literal `<NUM>` token. mask() doesn't classify it.
+        let raw_l1 = "value <NUM> ok";
+        let id1 = cluster.ingest(&string_record(&t, raw_l1));
+        // L2: real numeric at the same position. mask() emits
+        // `<NUM>` here.
+        let raw_l2 = "value 42 ok";
+        let id2 = cluster.ingest(&string_record(&t, raw_l2));
+
+        // Distinct template ids — no silent merge.
+        assert_ne!(
+            id1, id2,
+            "leaf `Fixed(\"<NUM>\")` (literal) must not absorb a real mask-emit `<NUM>`",
+        );
+        assert_eq!(cluster.template_count(&t), 2);
+        // No widening fired (the Lossy zone created a new leaf
+        // rather than widening). No audit events.
+        assert!(audit_sink.is_empty());
+        // The §6.3 lossy zone bumped body_retentions for L2 (and
+        // retained its body on the emitted record).
+        assert_eq!(cluster.body_retentions_total(), 1);
+    }
+
+    #[test]
     fn audit_event_carries_triggering_line_hash_and_sample() {
         // RFC §6.4 fields: triggering_line_hash (truncated blake3)
         // and triggering_line_sample (first 256 B at char
@@ -2677,7 +2769,7 @@ mod tests {
             OwnedToken::Fixed("in".to_string()),
         ];
         let line = ["user", "17", "anything", "out"];
-        let positions = find_widening_positions(&line, &template);
+        let positions = find_widening_positions(&line, &template, &[]);
         // Position 0: Fixed "user" == "user" → no widening.
         // Position 1: Fixed "42" != "17" → widen.
         // Position 2: Wildcard → never in the widening set.

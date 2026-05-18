@@ -115,7 +115,11 @@ pub fn sim_seq(line: &[&str], template: &[Token<'_>]) -> f32 {
 ///   [`sim_seq`].
 /// - If `line.is_empty()`. Same precondition as [`sim_seq`].
 #[must_use]
-pub fn sim_seq_owned(line: &[&str], template: &[crate::tree::OwnedToken]) -> f32 {
+pub fn sim_seq_owned(
+    line: &[&str],
+    template: &[crate::tree::OwnedToken],
+    line_wildcard_positions: &[usize],
+) -> f32 {
     assert_eq!(
         line.len(),
         template.len(),
@@ -134,7 +138,26 @@ pub fn sim_seq_owned(line: &[&str], template: &[crate::tree::OwnedToken]) -> f32
     for i in 0..n {
         let position_matches = match &template[i] {
             crate::tree::OwnedToken::Wildcard => true,
-            crate::tree::OwnedToken::Fixed(s) => line[i] == s.as_str(),
+            crate::tree::OwnedToken::Fixed(s) => {
+                // PR-B-1 invariant: every leaf `Fixed` came from a
+                // literal token (mask-emit positions enter as
+                // `Wildcard`). String-equality with `line[i]` is
+                // therefore a semantic match *unless* the line's
+                // token at position `i` is a mask-emit tag whose
+                // string happens to collide with the leaf's
+                // literal (rare but real — a log line carrying the
+                // literal token `<NUM>`/`<IP>`/`<UUID>` creates a
+                // `Fixed("<NUM>")` leaf and the next line with a
+                // genuine numeric value masks to `"<NUM>"` at the
+                // same position). Treating those as a match would
+                // silently merge two different log shapes and
+                // drop the mask-emit's typed value from `params`
+                // (§3.1 + §3.3 violation). The
+                // `line_wildcard_positions` lookup distinguishes
+                // the two cases.
+                let line_is_mask_emit = line_wildcard_positions.binary_search(&i).is_ok();
+                !line_is_mask_emit && line[i] == s.as_str()
+            }
         };
         if position_matches {
             matches += 1;
@@ -365,7 +388,7 @@ mod tests {
         ];
         let borrowed: Vec<Token<'_>> = owned.iter().map(OwnedToken::as_borrowed).collect();
 
-        let owned_score = sim_seq_owned(&line, &owned);
+        let owned_score = sim_seq_owned(&line, &owned, &[]);
         let borrowed_score = sim_seq(&line, &borrowed);
 
         assert!(
@@ -386,7 +409,7 @@ mod tests {
             OwnedToken::Fixed("42".to_string()),
             OwnedToken::Fixed("logged".to_string()),
         ];
-        let r = sim_seq_owned(&line, &template);
+        let r = sim_seq_owned(&line, &template, &[]);
         assert!((r - 1.0).abs() < f32::EPSILON);
     }
 
@@ -399,7 +422,7 @@ mod tests {
             OwnedToken::Wildcard,
             OwnedToken::Wildcard,
         ];
-        let r = sim_seq_owned(&line, &template);
+        let r = sim_seq_owned(&line, &template, &[]);
         assert!((r - 1.0).abs() < f32::EPSILON);
     }
 
@@ -409,7 +432,7 @@ mod tests {
         use crate::tree::OwnedToken;
         let line = ["a", "b"];
         let template = [OwnedToken::Fixed("a".to_string())];
-        let _ = sim_seq_owned(&line, &template);
+        let _ = sim_seq_owned(&line, &template, &[]);
     }
 
     #[test]
@@ -418,6 +441,6 @@ mod tests {
         use crate::tree::OwnedToken;
         let line: [&str; 0] = [];
         let template: [OwnedToken; 0] = [];
-        let _ = sim_seq_owned(&line, &template);
+        let _ = sim_seq_owned(&line, &template, &[]);
     }
 }

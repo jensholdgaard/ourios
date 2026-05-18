@@ -259,9 +259,18 @@ fn h7_2_tokenizer_failure_sets_lossy_flag_and_retains_body() {
 
     // Assert — NO_TEMPLATE sentinel returned, parse-failures
     // counter ticked, and the emitted record carries body=raw,
-    // lossy_flag=true, no template id.
+    // lossy_flag=true, no template id. `body_retentions_total`
+    // stays at zero: the §6.6 tokenizer-failure path is
+    // orthogonal to the §6.3 body-retention paths the gauge
+    // counts (the body IS retained on the emitted record, but
+    // not as a §3.1 `body_retention_ratio` event).
     assert_eq!(id, NO_TEMPLATE);
     assert_eq!(cluster.parse_failures_total(), 1);
+    assert_eq!(
+        cluster.body_retentions_total(),
+        0,
+        "tokenizer-failure retention is orthogonal to §6.3 retentions and must not inflate the ratio",
+    );
 
     let emitted = records.drain();
     assert_eq!(emitted.len(), 1);

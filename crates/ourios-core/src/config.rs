@@ -126,6 +126,14 @@ pub enum MinerConfigError {
     /// — the RFC §6.3 three-zone model requires
     /// `0 < floor ≤ threshold`.
     FloorOutOfRange { floor: f32, threshold: f32 },
+    /// The supplied per-parameter byte limit is zero — RFC 0001
+    /// §6.5's overflow-marker contract would tag every non-empty
+    /// param as `Overflow` and force body retention on every
+    /// record. Reject at startup so the cluster never enters
+    /// that state (RFC 0001 §3.2.2: configuration rejected
+    /// values must refuse to serve the tenant rather than
+    /// degrade silently).
+    ParamByteLimitZero,
     /// The supplied per-parameter byte limit exceeds the
     /// `CLAUDE.md` §3.2 ceiling of [`PARAM_BYTE_LIMIT_CEILING`].
     ParamByteLimitTooLarge(u32),
@@ -145,6 +153,12 @@ impl fmt::Display for MinerConfigError {
                     f,
                     "similarity_floor must be in (0, similarity_threshold] per RFC §6.3 \
                      (got floor={floor}, threshold={threshold})",
+                )
+            }
+            Self::ParamByteLimitZero => {
+                write!(
+                    f,
+                    "param_byte_limit must be in 1..={PARAM_BYTE_LIMIT_CEILING} bytes per RFC 0001 §6.5 (got 0; every non-empty param would be marked OVERFLOW)",
                 )
             }
             Self::ParamByteLimitTooLarge(v) => {
@@ -204,6 +218,8 @@ impl MinerConfig {
     ///
     /// - [`MinerConfigError::ThresholdOutOfRange`] when
     ///   `threshold` is not in `(0, 1]`.
+    /// - [`MinerConfigError::ParamByteLimitZero`] when
+    ///   `byte_limit` is `0`.
     /// - [`MinerConfigError::ParamByteLimitTooLarge`] when
     ///   `byte_limit` exceeds [`PARAM_BYTE_LIMIT_CEILING`].
     pub fn try_new(threshold: f32, byte_limit: u32) -> Result<Self, MinerConfigError> {
@@ -221,6 +237,9 @@ impl MinerConfig {
     ///   `threshold` is not in `(0, 1]`.
     /// - [`MinerConfigError::FloorOutOfRange`] when `floor` is
     ///   not in `(0, threshold]`.
+    /// - [`MinerConfigError::ParamByteLimitZero`] when
+    ///   `byte_limit` is `0` — the §6.5 overflow contract would
+    ///   tag every non-empty param.
     /// - [`MinerConfigError::ParamByteLimitTooLarge`] when
     ///   `byte_limit` exceeds [`PARAM_BYTE_LIMIT_CEILING`].
     pub fn try_new_full(
@@ -233,6 +252,9 @@ impl MinerConfig {
         }
         if !(floor > 0.0 && floor <= threshold) {
             return Err(MinerConfigError::FloorOutOfRange { floor, threshold });
+        }
+        if byte_limit == 0 {
+            return Err(MinerConfigError::ParamByteLimitZero);
         }
         if byte_limit > PARAM_BYTE_LIMIT_CEILING {
             return Err(MinerConfigError::ParamByteLimitTooLarge(byte_limit));

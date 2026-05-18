@@ -158,10 +158,10 @@ pub struct MinerCluster {
     // §6.5 / §3.2 counter: per-parameter byte-limit overflow
     // events. Increments by the count of `Overflow`-tagged
     // [`Param`] entries on each emitted record. Read-side
-    // placeholder for the §6.8 `params_overflow_total` Prometheus
-    // gauge (and the §3.2 `params_overflow_ratio` derivation
-    // when the ratio's denominator — total emitted params —
-    // lands alongside the gauge).
+    // placeholder for the §6.8 `params_overflow_total` *counter*
+    // metric — the §3.2 `params_overflow_ratio` *gauge* is the
+    // derived rolling ratio that lands alongside it once total
+    // emitted params is tracked.
     params_overflow_total: AtomicU64,
     // Wall-clock source for audit-event `timestamp` stamping per
     // RFC §6.4. [`SystemClock`] in production; tests substitute
@@ -431,9 +431,10 @@ impl MinerCluster {
     /// `Overflow`-tagged [`Param`]s on each emitted record (so a
     /// record with two oversized params bumps the counter by 2).
     /// Read-side placeholder for the §6.8 `params_overflow_total`
-    /// Prometheus gauge; alerting on `params_overflow_ratio >
-    /// 0.01` per service per `CLAUDE.md` §3.2 is the alert
-    /// definition's job, not this counter's.
+    /// *counter* metric; the §3.2 `params_overflow_ratio` *gauge*
+    /// is the derived rolling ratio with the `> 0.01` per-service
+    /// alert threshold — both ship together once the exporter
+    /// lands and are not this method's responsibility.
     #[must_use]
     pub fn params_overflow_total(&self) -> u64 {
         self.params_overflow_total.load(Ordering::Relaxed)

@@ -45,6 +45,40 @@ fn rfc0004_1_prefix_depth_above_ceiling_rejected_at_startup() {
     assert!(r_at_ceiling.is_ok(), "ceiling value must be permitted");
 }
 
+/// Scenario RFC0004.1 (continued) — `param_byte_limit = 0` is
+/// rejected at startup. Without this lower-bound check, every
+/// non-empty `Param.value` would trip the §6.5 overflow marker
+/// and force body retention on every record (a silent
+/// degradation that violates the §3.2.2 "configuration rejected
+/// values must refuse to serve the tenant" contract).
+#[test]
+fn rfc0004_1_param_byte_limit_zero_rejected_at_startup() {
+    use ourios_core::config::{MinerConfig, MinerConfigError, PARAM_BYTE_LIMIT_CEILING};
+
+    // Act
+    let r = MinerConfig::try_new_full(0.7, 0.4, 0);
+
+    // Assert — variant equality pins the failure mode.
+    assert_eq!(r, Err(MinerConfigError::ParamByteLimitZero));
+
+    // The rendered message names RFC 0001 §6.5 (the contract the
+    // bound exists to defend) and the inclusive valid range so an
+    // operator reading the startup error sees both.
+    let rendered = r.unwrap_err().to_string();
+    assert!(
+        rendered.contains("§6.5"),
+        "error must cite RFC 0001 §6.5, got: {rendered}",
+    );
+    assert!(
+        rendered.contains("1..=") && rendered.contains(&PARAM_BYTE_LIMIT_CEILING.to_string()),
+        "error must cite the 1..=ceiling range, got: {rendered}",
+    );
+
+    // Boundary inclusive: 1 is the smallest permitted value.
+    let r_at_one = MinerConfig::try_new_full(0.7, 0.4, 1);
+    assert!(r_at_one.is_ok(), "lower boundary (1) must be permitted");
+}
+
 /// Scenario RFC0004.2 — Per-tenant override is honoured.
 ///
 /// Two tenants, same line shape, different `similarity_threshold`

@@ -1,0 +1,47 @@
+user 42 logged in
+user 17 logged in
+user 99 logged in
+user 1 logged in
+session 550e8400-e29b-41d4-a716-446655440000 opened
+session 6ba7b810-9dad-11d1-80b4-00c04fd430c8 opened
+session 00112233-4455-6677-8899-aabbccddeeff opened
+GET /api/v1/users 200
+GET /api/v1/users 404
+GET /api/v1/users 500
+GET /api/v1/orders 200
+GET /api/v1/orders 503
+POST /api/v1/login 200
+POST /api/v1/login 401
+POST /api/v1/login 429
+Connecting to 10.0.0.1
+Connecting to 192.168.1.1
+Connecting to 172.16.0.42
+Connecting to 8.8.8.8
+healthcheck ok
+healthcheck failed
+worker started
+worker stopped
+config loaded
+config validated
+cache hit
+cache miss
+processed 1234 events in batch
+processed 5678 events in batch
+processed 42 events in batch
+client 10.0.0.5 disconnected after 30 seconds
+client 192.168.1.7 disconnected after 5 seconds
+client 8.8.4.4 disconnected after 120 seconds
+job 550e8400-e29b-41d4-a716-446655440000 completed
+job 6ba7b810-9dad-11d1-80b4-00c04fd430c8 completed
+ERROR something went wrong
+ERROR connection refused
+ERROR timeout exceeded
+shutting down
+startup complete
+heartbeat tick 100
+heartbeat tick 200
+heartbeat tick 300
+key=value, other=42
+key=value, other=99
+event published
+event consumed

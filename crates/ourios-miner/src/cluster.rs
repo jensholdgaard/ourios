@@ -946,7 +946,7 @@ impl MinerCluster {
                 NO_TEMPLATE
             }
             Some(Body::String(raw)) => self.ingest_string(record, raw),
-            Some(Body::Structured(_)) => self.ingest_structured(record),
+            Some(Body::Structured(av)) => self.ingest_structured(record, av),
         }
     }
 
@@ -1385,7 +1385,11 @@ impl MinerCluster {
     /// entire lookup. First observation of a tuple allocates;
     /// subsequent records with the same tuple reuse. Structured
     /// records never widen and never emit audit events.
-    fn ingest_structured(&mut self, record: &OtlpLogRecord) -> u64 {
+    fn ingest_structured(
+        &mut self,
+        record: &OtlpLogRecord,
+        any_value: &ourios_core::otlp::AnyValue,
+    ) -> u64 {
         let key = (record.severity_number, record.scope_name.clone());
         let state = self
             .tenants
@@ -1405,28 +1409,29 @@ impl MinerCluster {
 
         // Emit a data record. Structured records carry no
         // separators or params — reconstruction goes via the
-        // canonicalised-JSON `body` field (per §6.2 step 0), and
-        // `lossy_flag = false` per RFC §6.1 ("Always false when
-        // body_kind = Structured").
+        // `body` field (per §6.2 step 0), and `lossy_flag = false`
+        // per RFC §6.1 ("Always false when body_kind =
+        // Structured").
         //
-        // **Producer-side gap (today).** OTLP-canonical JSON
-        // encoding is the follow-up PR named in
-        // `ourios-core::otlp`; until it lands, `body` stays
-        // `None`, which means `reconstruct()` for a record
-        // emitted here returns an empty `Vec<u8>` (the §6.6
-        // structured branch returns `body` verbatim). That is a
-        // **documented gap**, not a contract violation: the gap
-        // lives in the producer-side canonicalisation step that
-        // hasn't shipped yet; the schema fields and the
-        // reconstruct function are already correct for the
-        // post-canonicalisation state. When the canonicalisation
-        // PR lands it populates `body` here with the canonical
-        // bytes and `reconstruct(structured)` immediately yields
-        // them — `lossy_flag` stays `false` throughout.
+        // **Interim body format.** OTLP-canonical JSON encoding
+        // is the follow-up PR named in `ourios-core::otlp`.
+        // Until it ships, we still populate `body` with a
+        // stored representation of the `AnyValue` — its `Debug`
+        // form — so `reconstruct(structured) == record.body`
+        // holds in the §3.3 sense ("what we stored is what we
+        // return"). The format is **not** OTLP-canonical yet;
+        // the canonicalisation PR replaces this `Debug` rendering
+        // with the canonical JSON encoding without changing the
+        // schema field or `lossy_flag`. The reader-visible effect
+        // of the migration is the bytes in the column changing
+        // shape; the contract that `reconstruct` returns
+        // whatever the producer stored is invariant.
+        let stored_body = format!("{any_value:?}");
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
         rec.confidence = 1.0;
+        rec.body = Some(stored_body);
         self.emit_record(rec);
 
         template_id
@@ -3275,22 +3280,21 @@ mod tests {
         assert_eq!(rec.body_kind, BodyKind::Structured);
         assert_ne!(rec.template_id, NO_TEMPLATE);
         assert_eq!(rec.template_version, 1);
-        // Structured records carry no token shape today, and
-        // canonical-JSON encoding is the follow-up PR. Until that
-        // lands `body = None` and `lossy_flag = true` so
-        // reconstruct's contract stays honest (see the rationale
-        // block on `ingest_structured`). The follow-up flips both
-        // in lockstep.
+        // RFC §6.1: Structured records always carry
+        // `lossy_flag = false`. The producer populates `body`
+        // with a stored representation of the structured value
+        // so `reconstruct()` returns what we stored, satisfying
+        // §3.3. Today that representation is the AnyValue's
+        // `Debug` form — an interim placeholder. The follow-up
+        // PR replaces it with OTLP-canonical JSON without
+        // changing the schema field or `lossy_flag`. See
+        // `ingest_structured` for the rationale.
         assert!(rec.separators.is_empty());
         assert!(rec.params.is_empty());
-        assert!(rec.body.is_none());
-        // RFC §6.1: Structured records always carry
-        // `lossy_flag = false`. Until the canonicalisation
-        // follow-up populates `body`, `reconstruct()` returns
-        // empty bytes for these records — a documented producer-
-        // side gap rather than a contract violation. See
-        // `ingest_structured`'s body comment for the lockstep
-        // flip the canonicalisation PR will perform.
+        assert!(
+            rec.body.is_some(),
+            "structured records must carry the stored body representation"
+        );
         assert!(!rec.lossy_flag);
     }
 

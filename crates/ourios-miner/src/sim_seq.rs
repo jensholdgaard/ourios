@@ -131,16 +131,22 @@ pub fn sim_seq(line: &[&str], template: &[Token<'_>]) -> f32 {
 ///   invariant.
 /// - Every entry must satisfy `< line.len()`.
 ///
-/// A `debug_assert` checks both in dev builds. Release builds
-/// will silently produce wrong similarity scores on a violated
-/// precondition; the cost of a runtime check on every ingest
-/// outweighs the protection for an internal helper.
+/// Both preconditions are enforced with `assert!` (not
+/// `debug_assert!`) because the function sits at the crate's
+/// public surface — an unsorted or out-of-bounds slice would
+/// otherwise let `binary_search` return an unspecified result
+/// and silently produce wrong similarity scores in release. The
+/// check is O(n) over a typically-small mask-position count, so
+/// the runtime cost is negligible next to the ingest path's
+/// per-leaf work.
 ///
 /// # Panics
 ///
 /// - If `line.len() != template.len()`. Same precondition as
 ///   [`sim_seq`].
 /// - If `line.is_empty()`. Same precondition as [`sim_seq`].
+/// - If `line_wildcard_positions` is not strictly ascending.
+/// - If any entry of `line_wildcard_positions` is out of bounds.
 #[must_use]
 pub fn sim_seq_owned(
     line: &[&str],

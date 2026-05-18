@@ -25,7 +25,15 @@ pub struct Tokenized<'a> {
 /// with `lossy_flag = true` and the body retained verbatim
 /// (hazard H7.2), so any future failure mode added here must
 /// flow through the same emit path.
+///
+/// Marked `#[non_exhaustive]` because the RFC names other
+/// tokenizer-failure modes (malformed UTF-8, `max_line_bytes`
+/// overflow) that future PRs will add as variants. Callers
+/// exhaustively matching on the current variants would otherwise
+/// break on the next addition; the attribute forces a wildcard
+/// arm and keeps adding a variant non-breaking.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenizeError {
     /// The input contained an embedded NUL byte (U+0000). NUL is
     /// the canonical "this is a binary blob, not text" signal in
@@ -36,6 +44,18 @@ pub enum TokenizeError {
     /// retained body has a pointer to the suspicious region.
     EmbeddedNul { offset: usize },
 }
+
+impl std::fmt::Display for TokenizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmbeddedNul { offset } => {
+                write!(f, "input contains embedded NUL byte at offset {offset}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TokenizeError {}
 
 /// Split `line` on Unicode whitespace.
 ///
@@ -135,5 +155,28 @@ mod tests {
         // step is a guard, not a behavior change for clean inputs.
         let r = tokenize("hello world").expect("nul-free");
         assert_eq!(r.tokens, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn tokenize_error_display_includes_offset() {
+        // Pin the Display message — `?` and standard error
+        // propagation crates surface this string, so a
+        // human-readable, offset-bearing format is the public
+        // contract.
+        let err = TokenizeError::EmbeddedNul { offset: 7 };
+        assert_eq!(
+            err.to_string(),
+            "input contains embedded NUL byte at offset 7",
+        );
+    }
+
+    #[test]
+    fn tokenize_error_implements_std_error_trait() {
+        // Pin the `std::error::Error` impl so callers can return
+        // the error through `Box<dyn Error>` / `?` against
+        // `Result<_, Box<dyn Error>>` without a custom wrapper.
+        fn assert_error<E: std::error::Error>(_: &E) {}
+        let err = TokenizeError::EmbeddedNul { offset: 0 };
+        assert_error(&err);
     }
 }

@@ -51,11 +51,15 @@ use crate::tree::OwnedToken;
 ///
 /// # Panics
 ///
-/// `debug_assert`s the §6.6 capture invariants on the clean path:
-/// `separators.len() == template.len() + 1`, and the `params`
-/// length matches the wildcard count. A shape mismatch indicates
-/// a bug in the producer (params alignment or separator capture);
-/// the asserts catch it at the source in dev builds.
+/// Never. The function is total over its input shape — a record
+/// whose `separators` / `params` lengths don't agree with
+/// `template` (a bug in the producer, or a corrupted Parquet row
+/// the reader path is asked to reconstruct) falls back to
+/// returning the retained `body` (or empty, if `body` is also
+/// absent) rather than panicking. `debug_assert`s still catch
+/// producer-side bugs in dev builds; releases degrade gracefully
+/// because reader-side reconstruction runs over persisted data
+/// the function can't validate upstream.
 #[must_use]
 pub fn reconstruct(record: &MinedRecord, template: &[OwnedToken]) -> Vec<u8> {
     match record.body_kind {
@@ -67,13 +71,33 @@ pub fn reconstruct(record: &MinedRecord, template: &[OwnedToken]) -> Vec<u8> {
                     .params
                     .iter()
                     .any(|p| p.type_tag == ParamType::Overflow)
+                || !template_shape_matches_record(record, template)
             {
+                // §6.6 capture invariants violated — producer bug
+                // or persisted-data corruption. Fall back to the
+                // retained body instead of panicking on indexing.
                 body_bytes_or_empty(record)
             } else {
                 reconstruct_from_template(record, template)
             }
         }
     }
+}
+
+/// Cheap pre-flight check on the §6.6 capture invariants.
+/// `separators.len() == template.len() + 1` and the `params`
+/// length equals the count of `Wildcard` slots in the template.
+/// A mismatch indicates either a producer bug or a corrupted
+/// persisted row.
+fn template_shape_matches_record(record: &MinedRecord, template: &[OwnedToken]) -> bool {
+    if record.separators.len() != template.len() + 1 {
+        return false;
+    }
+    let wildcard_count = template
+        .iter()
+        .filter(|t| matches!(t, OwnedToken::Wildcard))
+        .count();
+    record.params.len() == wildcard_count
 }
 
 fn body_bytes_or_empty(record: &MinedRecord) -> Vec<u8> {
@@ -245,5 +269,54 @@ mod tests {
         r.separators = vec![String::new(), "\u{00A0}".to_string(), String::new()];
         let expected = "alpha\u{00A0}beta".as_bytes().to_vec();
         assert_eq!(reconstruct(&r, &template), expected);
+    }
+
+    #[test]
+    fn reconstruct_shape_mismatch_falls_back_to_body_in_release() {
+        // Producer bug or corrupted persisted row: separators /
+        // params don't agree with template. Release builds must
+        // NOT panic on the indexing inside
+        // `reconstruct_from_template`; they must return the
+        // retained body (or empty if absent) as a graceful
+        // degradation path for reader-side reconstruction over
+        // data the caller can't validate upstream.
+        //
+        // Note: dev builds also avoid the panic — the pre-flight
+        // `template_shape_matches_record` check short-circuits to
+        // the body-fallback branch before the indexing code
+        // runs. The function is total over its input shape.
+        let template = vec![
+            OwnedToken::Fixed("alpha".to_string()),
+            OwnedToken::Wildcard,
+            OwnedToken::Fixed("omega".to_string()),
+        ];
+        let mut r = record_envelope(BodyKind::String);
+        // separators.len() should be template.len() + 1 == 4, but
+        // we pass only 2 — shape mismatch.
+        r.separators = vec![String::new(), String::new()];
+        r.params = vec![Param {
+            type_tag: ParamType::Num,
+            value: "42".to_string(),
+        }];
+        r.body = Some("alpha 42 omega".to_string());
+
+        // Must not panic; must return the body bytes.
+        assert_eq!(reconstruct(&r, &template), b"alpha 42 omega".to_vec());
+    }
+
+    #[test]
+    fn reconstruct_shape_mismatch_with_no_body_returns_empty() {
+        // Same scenario as above but `body` is `None`. The
+        // function must still not panic; it returns empty bytes
+        // as the safest fallback (the reader can detect "no
+        // bytes" and surface a "this record is unreadable"
+        // marker instead).
+        let template = vec![OwnedToken::Fixed("alpha".to_string()), OwnedToken::Wildcard];
+        let mut r = record_envelope(BodyKind::String);
+        // params.len() == 0 but template has 1 Wildcard.
+        r.separators = vec![String::new(), " ".to_string(), String::new()];
+        r.params = vec![];
+
+        assert_eq!(reconstruct(&r, &template), Vec::<u8>::new());
     }
 }

@@ -104,10 +104,33 @@ pub fn sim_seq(line: &[&str], template: &[Token<'_>]) -> f32 {
 /// and walks both sequences in lockstep — same arithmetic, zero
 /// allocation.
 ///
-/// The two functions intentionally share assertion shape so the
-/// substitution is mechanical and the equality
-/// `sim_seq_owned(line, template) == sim_seq(line, &borrowed(template))`
-/// holds exactly (a property test in this module pins it).
+/// The two functions share the same precondition shape, and the
+/// equality
+/// `sim_seq_owned(line, template, &[]) == sim_seq(line, &borrowed(template))`
+/// holds when `line_wildcard_positions` is empty (a property
+/// test in this module pins it). With a non-empty
+/// `line_wildcard_positions` slice the equivalence intentionally
+/// diverges: `sim_seq_owned` then refuses to mark a leaf
+/// `Fixed(s)` as a match when the line at that position is a
+/// mask emit, even if `line[i] == s` by content. See the inline
+/// comment in the `Fixed` arm for the §3.1 / §3.3 motivation
+/// (literal-tag-vs-mask-emit collision).
+///
+/// # Preconditions on `line_wildcard_positions`
+///
+/// - Strictly ascending byte indices (sorted, no duplicates) —
+///   the function uses [`slice::binary_search`] for the per-
+///   position lookup, which is `O(log n)` and correct only on
+///   sorted input. `mask()`'s output satisfies this by
+///   construction (single forward pass), so the cluster's own
+///   call sites are safe; external callers passing the slice
+///   directly must hold the invariant.
+/// - Every position must be `< line.len()`.
+///
+/// A `debug_assert` checks both in dev builds. Release builds
+/// will silently produce wrong similarity scores on a violated
+/// precondition; the cost of a runtime check on every ingest
+/// outweighs the protection for an internal helper.
 ///
 /// # Panics
 ///
@@ -131,6 +154,17 @@ pub fn sim_seq_owned(
     assert!(
         !line.is_empty(),
         "sim_seq_owned precondition: empty inputs have no defined similarity (N ≥ 1 per RFC §3.2)",
+    );
+    debug_assert!(
+        line_wildcard_positions.windows(2).all(|w| w[0] < w[1]),
+        "sim_seq_owned precondition: line_wildcard_positions must be strictly ascending \
+         (required by binary_search; mask() guarantees this for in-crate callers)",
+    );
+    debug_assert!(
+        line_wildcard_positions
+            .last()
+            .is_none_or(|&p| p < line.len()),
+        "sim_seq_owned precondition: every line_wildcard_position must be in bounds (< line.len())",
     );
 
     let n = line.len();

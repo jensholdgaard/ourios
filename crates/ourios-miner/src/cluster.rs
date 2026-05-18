@@ -75,9 +75,7 @@ use ourios_core::tenant::TenantId;
 use crate::mask::mask;
 use crate::sim_seq::sim_seq_owned;
 use crate::tokenize::tokenize;
-use crate::tree::{DEFAULT_PREFIX_DEPTH, Leaf, OwnedToken, Tree};
-// `DEFAULT_PREFIX_DEPTH` is used as the prefix-depth field's
-// default — see `MinerCluster::with_audit_sink`.
+use crate::tree::{Leaf, OwnedToken, Tree};
 
 /// Sentinel `template_id` returned by [`MinerCluster::ingest`] when
 /// no template was allocated for the input. Three paths reach this
@@ -104,7 +102,17 @@ pub const NO_TEMPLATE: u64 = 0;
 /// `TenantDeleted`) is RFC 0001 §9 territory and not in this
 /// type's API yet.
 pub struct MinerCluster {
+    /// Cluster-default [`MinerConfig`] per RFC 0004 §3.4. Used
+    /// for any tenant without a per-tenant override and as the
+    /// fallback when [`Self::effective_config`] doesn't find a
+    /// match.
     config: MinerConfig,
+    /// Per-tenant overrides seeded via [`Self::with_tenant_config`]
+    /// before first observation. RFC 0004 §3.4: the override is
+    /// captured by [`TenantState`] at lazy allocation; entries
+    /// here cease to be load-bearing once their tenant is seen
+    /// (the cached `state.config` is the read path thereafter).
+    tenant_overrides: HashMap<TenantId, MinerConfig>,
     tenants: HashMap<TenantId, TenantState>,
     // Cluster-wide template_id allocator. RFC 0001 §6.1 calls
     // template_id "per-tenant monotonic" but also requires that
@@ -147,19 +155,6 @@ pub struct MinerCluster {
     // see `ConfidenceZone::retains_body`. The numerator of the
     // §3.1 `body_retention_ratio` gauge.
     body_retentions_total: AtomicU64,
-    // Drain prefix-tree depth (RFC §6.2 step 3 / `tree.rs`'s
-    // *Depth convention*). The default
-    // [`crate::tree::DEFAULT_PREFIX_DEPTH`] (= 2) matches Drain3's
-    // `depth = 4` semantics. Exposed as a builder knob via
-    // [`Self::with_prefix_depth`] because: (a) the value is a
-    // real tuning question once corpus measurements arrive and
-    // (b) some §5 scenarios that the cluster must defend — chief
-    // among them RFC0001.2's degenerate-template guard — are
-    // only reachable when leaves can accumulate under a shared
-    // parent, which on the default tree shape requires sharing a
-    // 2-token prefix. Tests that don't want that constraint set
-    // depth to 0.
-    prefix_depth: usize,
     // Wall-clock source for audit-event `timestamp` stamping per
     // RFC §6.4. [`SystemClock`] in production; tests substitute
     // a [`ourios_core::clock::TestClock`] via
@@ -200,14 +195,24 @@ struct TenantState {
     tree: Tree,
     structured_templates: HashMap<(u8, Option<String>), u64>,
     template_count: usize,
+    /// Effective [`MinerConfig`] for this tenant, captured at
+    /// lazy allocation time. Resolves to the per-tenant override
+    /// (set via [`MinerCluster::with_tenant_config`]) if one
+    /// exists; otherwise the cluster default. RFC 0004 §3.4 pins
+    /// this as the per-tenant tunable surface; further mutation
+    /// after allocation is out of scope (the RFC names dynamic
+    /// reconfiguration as an open question; today's contract is
+    /// startup-only).
+    config: MinerConfig,
 }
 
 impl TenantState {
-    fn new() -> Self {
+    fn new(config: MinerConfig) -> Self {
         Self {
             tree: Tree::new(),
             structured_templates: HashMap::new(),
             template_count: 0,
+            config,
         }
     }
 }
@@ -236,6 +241,7 @@ impl MinerCluster {
     pub fn with_audit_sink(config: MinerConfig, sink: Box<dyn AuditSink>) -> Self {
         Self {
             config,
+            tenant_overrides: HashMap::new(),
             tenants: HashMap::new(),
             // Start at 1 so 0 stays available as the [`NO_TEMPLATE`]
             // sentinel.
@@ -245,7 +251,6 @@ impl MinerCluster {
             merges_total: AtomicU64::new(0),
             parse_failures_total: AtomicU64::new(0),
             body_retentions_total: AtomicU64::new(0),
-            prefix_depth: DEFAULT_PREFIX_DEPTH,
             clock: Box::new(SystemClock::new()),
         }
     }
@@ -261,15 +266,75 @@ impl MinerCluster {
         self
     }
 
-    /// Set the Drain prefix-tree depth used by this cluster.
-    /// Default [`crate::tree::DEFAULT_PREFIX_DEPTH`] (= 2). Tests
-    /// or tuning experiments that want every length-N line in the
-    /// same leaf list pass `0`; production should leave the
-    /// default until corpus measurements justify otherwise.
+    /// Convenience for tests / tuning experiments: pre-bake a
+    /// `MinerConfig` with an overridden `prefix_depth` and rebuild
+    /// the cluster.
+    ///
+    /// Production callers should set `prefix_depth` directly via
+    /// `MinerConfig::default().with_prefix_depth(...)` before
+    /// calling [`Self::new`] / [`Self::with_audit_sink`]; this
+    /// helper exists so the in-crate degenerate-guard test (which
+    /// pins `prefix_depth = 0` to make every length-N line share
+    /// one leaf list) keeps its terse setup.
+    ///
+    /// # Panics
+    ///
+    /// If `depth > PREFIX_DEPTH_CEILING` (the RFC 0001 §6.1
+    /// ceiling). Test-only path; the validated config-builder
+    /// surface ([`MinerConfig::with_prefix_depth`]) returns
+    /// `Result` instead.
     #[must_use]
-    pub fn with_prefix_depth(mut self, depth: usize) -> Self {
-        self.prefix_depth = depth;
+    pub fn with_prefix_depth(mut self, depth: u8) -> Self {
+        self.config = self
+            .config
+            .with_prefix_depth(depth)
+            .expect("test-only setter: depth must be within PREFIX_DEPTH_CEILING");
         self
+    }
+
+    /// Register a per-tenant [`MinerConfig`] override per RFC 0004
+    /// §3.4. The override is captured by [`TenantState`] at lazy
+    /// allocation (i.e. on the first ingest for `tenant_id`); set
+    /// it before the tenant is first observed.
+    ///
+    /// If `tenant_id` was already observed before this call, the
+    /// override has no effect — `TenantState` is allocated once
+    /// and its config is captured at that moment. The
+    /// startup-only contract is RFC 0004 §3.4's open question
+    /// resolved in favour of "captured at allocation"; dynamic
+    /// reconfiguration is a future RFC.
+    ///
+    /// Multiple calls with the same `tenant_id` before allocation
+    /// keep the last-set override (`HashMap::insert` semantics).
+    #[must_use]
+    pub fn with_tenant_config(mut self, tenant_id: TenantId, config: MinerConfig) -> Self {
+        self.tenant_overrides.insert(tenant_id, config);
+        self
+    }
+
+    /// Resolve the effective [`MinerConfig`] for `tenant_id`.
+    /// Order of preference:
+    ///
+    /// 1. If `TenantState` already exists, its captured config
+    ///    (set at lazy allocation, never mutated thereafter).
+    /// 2. Else, the per-tenant override registered via
+    ///    [`Self::with_tenant_config`].
+    /// 3. Else, the cluster-default config.
+    ///
+    /// Returns by value (`MinerConfig` is `Copy`); no borrow.
+    /// Callers that need to keep the tenants map borrowed during
+    /// algorithm work should call this *before* descending into
+    /// the per-tenant store.
+    fn effective_config(&self, tenant_id: &TenantId) -> MinerConfig {
+        self.tenants.get(tenant_id).map_or_else(
+            || {
+                self.tenant_overrides
+                    .get(tenant_id)
+                    .copied()
+                    .unwrap_or(self.config)
+            },
+            |s| s.config,
+        )
     }
 
     /// Set the wall-clock source used for audit-event `timestamp`
@@ -1019,10 +1084,15 @@ impl MinerCluster {
         // immutable so we can early-return (or fall through to
         // fresh-leaf creation) without committing a
         // `template_id` allocation.
+        // Resolve the tenant's effective tunables once for this
+        // ingest (RFC 0004 §3.4): per-tenant override if seeded
+        // before allocation and the tenant is allocated, else the
+        // cluster default.
+        let effective_config = self.effective_config(&record.tenant_id);
         let best = self.find_best_candidate(record, &masked_strs, &masked.wildcard_positions);
 
-        let threshold = self.config.similarity_threshold;
-        let floor = self.config.similarity_floor;
+        let threshold = effective_config.similarity_threshold;
+        let floor = effective_config.similarity_floor;
 
         match best {
             // No candidate at all → fresh leaf. Treated as clean
@@ -1118,7 +1188,12 @@ impl MinerCluster {
         line_wildcard_positions: &[usize],
     ) -> Option<Candidate> {
         let state = self.tenants.get(&record.tenant_id)?;
-        let parent = state.tree.descend(masked_strs, self.prefix_depth)?;
+        // Per-tenant `prefix_depth` (RFC 0004 §3.4) — read from
+        // the captured `state.config` rather than the cluster
+        // default.
+        let parent = state
+            .tree
+            .descend(masked_strs, state.config.prefix_depth as usize)?;
 
         let mut best: Option<Candidate> = None;
         for (leaf_idx, leaf) in parent.leaves.iter().enumerate() {
@@ -1188,11 +1263,18 @@ impl MinerCluster {
         let new_id = self.next_template_id;
         self.next_template_id += 1;
 
+        // Resolve effective config BEFORE the entry/get-or-insert
+        // borrow on `self.tenants` — the `or_insert_with` closure
+        // can't reach back to `self.tenant_overrides` while the
+        // map is borrowed mutably.
+        let effective_config = self.effective_config(&record.tenant_id);
         let state = self
             .tenants
             .entry(record.tenant_id.clone())
-            .or_insert_with(TenantState::new);
-        let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
+            .or_insert_with(|| TenantState::new(effective_config));
+        let parent = state
+            .tree
+            .descend_mut(masked_strs, state.config.prefix_depth as usize);
         // Build the leaf template: Wildcard at every mask-emitted
         // position, Fixed at every other. `wildcard_positions` is
         // ascending (single forward pass over the tokens) so we
@@ -1281,7 +1363,9 @@ impl MinerCluster {
                 .tenants
                 .get_mut(&record.tenant_id)
                 .expect("tenant present: find_best_candidate returned Some(...)");
-            let parent = state.tree.descend_mut(masked_strs, self.prefix_depth);
+            let parent = state
+                .tree
+                .descend_mut(masked_strs, state.config.prefix_depth as usize);
             let leaf = &mut parent.leaves[candidate.leaf_idx];
             plan_attach(
                 leaf,
@@ -1391,10 +1475,14 @@ impl MinerCluster {
         any_value: &ourios_core::otlp::AnyValue,
     ) -> u64 {
         let key = (record.severity_number, record.scope_name.clone());
+        // Same pre-compute pattern as `create_new_leaf`: resolve
+        // effective config before the mutable borrow on
+        // `self.tenants`.
+        let effective_config = self.effective_config(&record.tenant_id);
         let state = self
             .tenants
             .entry(record.tenant_id.clone())
-            .or_insert_with(TenantState::new);
+            .or_insert_with(|| TenantState::new(effective_config));
         let template_id = if let Some(&existing_id) = state.structured_templates.get(&key) {
             existing_id
         } else {

@@ -1,7 +1,7 @@
 ---
 rfc: 0004
 title: Configuration policy — tunables vs invariants
-status: drafted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-18

@@ -576,6 +576,78 @@ fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[SlotExpansi
     }
 }
 
+/// RFC §6.6 alignment: build the `params` vector with one entry
+/// per `Wildcard` slot in the leaf template, left-to-right.
+///
+/// For each wildcard at template position `p`:
+///
+/// - If the line had a mask emit at the same position
+///   (`p ∈ line_wildcard_positions`), use that `TypedParam`
+///   verbatim — the original token bytes and its `ParamType`.
+/// - Else (the line had a literal at `p` but the leaf carries a
+///   `Wildcard` there — either from a past widening of a
+///   literal-token mismatch, or because this attach just
+///   freshly-widened a literal at `p`), fall back to
+///   `{ type_tag: Str, value: masked_strs[p] }`. `masked_strs[p]`
+///   for a non-mask position is the original literal token (mask
+///   leaves unclassified tokens unchanged), so the STR fallback
+///   captures the bytes reconstruction will need.
+///
+/// This is the contract [`crate::reconstruct::reconstruct`] reads
+/// against. Producers
+/// for fresh-leaf paths (`None` / `Lossy` zones in
+/// [`MinerCluster::ingest_string`]) build params via the simpler
+/// [`params_from_mask`] because their template Wildcards align
+/// 1:1 with the line's mask positions by construction; everything
+/// else routes through this helper.
+fn build_record_params(
+    template: &[OwnedToken],
+    masked_strs: &[&str],
+    line_wildcard_positions: &[usize],
+    line_typed_params: &[crate::mask::TypedParam<'_>],
+) -> Vec<Param> {
+    debug_assert_eq!(
+        line_wildcard_positions.len(),
+        line_typed_params.len(),
+        "mask invariant: typed_params parallel to wildcard_positions",
+    );
+    debug_assert_eq!(
+        template.len(),
+        masked_strs.len(),
+        "sim_seq precondition: template and line are the same length",
+    );
+
+    let wildcard_count = template
+        .iter()
+        .filter(|t| matches!(t, OwnedToken::Wildcard))
+        .count();
+    let mut out = Vec::with_capacity(wildcard_count);
+    let mut k = 0usize;
+    for (p, tok) in template.iter().enumerate() {
+        if !matches!(tok, OwnedToken::Wildcard) {
+            continue;
+        }
+        if k < line_wildcard_positions.len() && line_wildcard_positions[k] == p {
+            out.push(Param {
+                type_tag: line_typed_params[k].type_tag,
+                value: line_typed_params[k].value.to_string(),
+            });
+            k += 1;
+        } else {
+            out.push(Param {
+                type_tag: ParamType::Str,
+                value: masked_strs[p].to_string(),
+            });
+        }
+    }
+    debug_assert_eq!(
+        k,
+        line_wildcard_positions.len(),
+        "every mask emit position must coincide with a template Wildcard",
+    );
+    out
+}
+
 /// Outcome of the leaf-mutating phase of `attach_and_maybe_widen`.
 ///
 /// Phase 1 borrows the leaf and produces this enum; phase 2 drops
@@ -585,10 +657,13 @@ fn apply_type_expansions(slot_types: &mut [SlotTypes], expansions: &[SlotExpansi
 /// audit emit happens after the leaf borrow ends.
 enum AttachPlan {
     /// No mutation: similarity 1.0 with no new types at any slot.
-    /// Reuse `(template_id, template_version)` verbatim.
+    /// Reuse `(template_id, template_version)` verbatim. `params`
+    /// is aligned with the leaf's wildcard slots per RFC §6.6 —
+    /// see [`build_record_params`].
     CleanReuse {
         template_id: u64,
         template_version: u32,
+        params: Vec<Param>,
     },
     /// Degenerate widening rejected per §6.4. Leaf untouched.
     Rejected {
@@ -601,11 +676,13 @@ enum AttachPlan {
     /// Leaf mutated (widened and/or type-expanded). `events` is the
     /// audit-event payload in emission order: `TemplateWidened`
     /// before `TemplateTypeExpanded` per RFC §6.2's combined-attach
-    /// contract.
+    /// contract. `params` is aligned with the post-widen template's
+    /// wildcard slots.
     Mutated {
         template_id: u64,
         events: Vec<AuditEventKind>,
         final_version: u32,
+        params: Vec<Param>,
     },
 }
 
@@ -649,6 +726,12 @@ fn plan_attach(
             return AttachPlan::CleanReuse {
                 template_id: leaf.template_id,
                 template_version: leaf.template_version,
+                params: build_record_params(
+                    &leaf.template,
+                    masked_strs,
+                    line_wildcard_positions,
+                    line_typed_params,
+                ),
             };
         }
         apply_type_expansions(&mut leaf.slot_types, &expansions);
@@ -659,9 +742,16 @@ fn plan_attach(
             .expect("template_version overflow: 2^32 expansions on one leaf is implausible");
         leaf.template_version = new_version;
         let template_str = format_template(&leaf.template);
+        let params = build_record_params(
+            &leaf.template,
+            masked_strs,
+            line_wildcard_positions,
+            line_typed_params,
+        );
         return AttachPlan::Mutated {
             template_id: leaf.template_id,
             final_version: new_version,
+            params,
             events: vec![AuditEventKind::TemplateTypeExpanded {
                 old_version,
                 new_version,
@@ -750,10 +840,20 @@ fn plan_attach(
         version_after_expand
     };
 
+    // Build params aligned to the post-widen template's wildcard
+    // slots. §6.6 reconstruction reads against this alignment.
+    let params = build_record_params(
+        &leaf.template,
+        masked_strs,
+        line_wildcard_positions,
+        line_typed_params,
+    );
+
     AttachPlan::Mutated {
         template_id,
         events,
         final_version,
+        params,
     }
 }
 
@@ -805,7 +905,23 @@ impl MinerCluster {
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.
     fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
-        let tokenized = tokenize(raw);
+        // RFC §6.2 step 1 (H7.2): a tokenizer failure (today:
+        // embedded NUL byte) routes the line to the parse-failure
+        // path with `lossy_flag = true` and the original body
+        // retained verbatim. Reconstruction is not possible — the
+        // line bytes are non-text — so the reader will surface the
+        // body column instead.
+        let tokenized = match tokenize(raw) {
+            Ok(t) => t,
+            Err(_err) => {
+                let mut rec = Self::record_envelope(record, BodyKind::String);
+                rec.body = Some(raw.to_string());
+                rec.lossy_flag = true;
+                self.emit_record(rec);
+                self.record_parse_failure();
+                return NO_TEMPLATE;
+            }
+        };
         let masked = mask(&tokenized.tokens);
         // Pre-compute the owned forms once. Every emit path
         // reads these.
@@ -1128,12 +1244,20 @@ impl MinerCluster {
             AttachPlan::CleanReuse {
                 template_id,
                 template_version,
+                params: aligned_params,
             } => {
+                // §6.6: emit the params vector aligned with the
+                // leaf's wildcard slots, not the line-ordered
+                // `params_from_mask` we built earlier. The leaf
+                // may carry wildcards from past widenings that
+                // the current line has a literal at; those slots
+                // need a Str-fallback entry that the mask emit
+                // doesn't produce.
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.template_id = template_id;
                 rec.template_version = template_version;
                 rec.separators = separators;
-                rec.params = params;
+                rec.params = aligned_params;
                 rec.confidence = 1.0;
                 self.emit_record(rec);
                 template_id
@@ -1159,7 +1283,10 @@ impl MinerCluster {
                     timestamp: self.clock.now(),
                 });
                 // §6.4 treats degenerate widening as a parse
-                // failure that retains body.
+                // failure that retains body. `lossy_flag = true`
+                // so reconstruct surfaces the retained body and
+                // ignores `params`; the line-ordered fallback is
+                // fine here.
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.separators = separators;
                 rec.params = params;
@@ -1173,6 +1300,7 @@ impl MinerCluster {
                 template_id,
                 events,
                 final_version,
+                params: aligned_params,
             } => {
                 for kind in events {
                     let counts_as_merge = kind.counts_as_merge();
@@ -1192,7 +1320,7 @@ impl MinerCluster {
                 rec.template_id = template_id;
                 rec.template_version = final_version;
                 rec.separators = separators;
-                rec.params = params;
+                rec.params = aligned_params;
                 rec.confidence = 1.0;
                 self.emit_record(rec);
                 template_id

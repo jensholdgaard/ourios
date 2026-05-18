@@ -20,6 +20,23 @@ pub struct Tokenized<'a> {
     pub separators: Vec<&'a str>,
 }
 
+/// Why `tokenize` rejected an input. Per RFC 0001 §6.2 step 1 a
+/// tokenizer failure routes the line to the parse-failure path
+/// with `lossy_flag = true` and the body retained verbatim
+/// (hazard H7.2), so any future failure mode added here must
+/// flow through the same emit path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenizeError {
+    /// The input contained an embedded NUL byte (U+0000). NUL is
+    /// the canonical "this is a binary blob, not text" signal in
+    /// log-shipping pipelines (truncated frames, mis-decoded
+    /// protobuf, certificate noise); admitting it would let the
+    /// miner build templates over non-text payloads. Carries the
+    /// byte offset of the first NUL so a reader inspecting the
+    /// retained body has a pointer to the suspicious region.
+    EmbeddedNul { offset: usize },
+}
+
 /// Split `line` on Unicode whitespace.
 ///
 /// Whitespace is every codepoint matching [`char::is_whitespace`]:
@@ -31,8 +48,19 @@ pub struct Tokenized<'a> {
 /// `[`, `]`, `(`, `)` — stays inside the token; structured
 /// separators are the masking layer's responsibility (RFC 0001
 /// §4.2).
-#[must_use]
-pub fn tokenize(line: &str) -> Tokenized<'_> {
+///
+/// # Errors
+///
+/// Returns [`TokenizeError::EmbeddedNul`] if `line` contains a NUL
+/// byte. Other tokenizer-failure modes named in RFC 0001 §6.2
+/// step 1 (malformed UTF-8, line longer than `max_line_bytes`)
+/// are caught before this function — UTF-8 by the `&str`
+/// invariant, line length by `ingest_string`'s explicit cap.
+pub fn tokenize(line: &str) -> Result<Tokenized<'_>, TokenizeError> {
+    if let Some(offset) = line.bytes().position(|b| b == 0) {
+        return Err(TokenizeError::EmbeddedNul { offset });
+    }
+
     let mut tokens = Vec::new();
     let mut separators = Vec::new();
 
@@ -62,5 +90,36 @@ pub fn tokenize(line: &str) -> Tokenized<'_> {
         separators.push(&line[sep_start..end]);
     }
 
-    Tokenized { tokens, separators }
+    Ok(Tokenized { tokens, separators })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_rejects_embedded_nul_with_byte_offset() {
+        // RFC §6.2 step 1: embedded NUL is a tokenizer failure.
+        // The returned offset must point at the first NUL so a
+        // reader inspecting the retained `body` can locate the
+        // suspicious region.
+        let line = "user 42\0secret";
+        let err = tokenize(line).unwrap_err();
+        assert_eq!(err, TokenizeError::EmbeddedNul { offset: 7 });
+    }
+
+    #[test]
+    fn tokenize_rejects_leading_nul() {
+        let line = "\0";
+        let err = tokenize(line).unwrap_err();
+        assert_eq!(err, TokenizeError::EmbeddedNul { offset: 0 });
+    }
+
+    #[test]
+    fn tokenize_accepts_nul_free_input() {
+        // Round-trip an ordinary line to confirm the validation
+        // step is a guard, not a behavior change for clean inputs.
+        let r = tokenize("hello world").expect("nul-free");
+        assert_eq!(r.tokens, vec!["hello", "world"]);
+    }
 }

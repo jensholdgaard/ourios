@@ -165,7 +165,7 @@ fn invariant_3_3_1_separators_captured_on_every_tokenization() {
         // many tokens a line should yield; we capture the count
         // here so the assertion below can compare against it
         // independently of the cluster's own bookkeeping.
-        let r = ourios_miner::tokenize::tokenize(line);
+        let r = ourios_miner::tokenize::tokenize(line).expect("nul-free test input");
         expected_token_counts.push(r.tokens.len());
         cluster.ingest(&make(line));
     }

@@ -232,9 +232,49 @@ fn h7_1_reconstruction_property_holds_across_corpus() {
 /// Scenario H7.2 — Tokenizer failure sets `lossy_flag = true` and retains body.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h7_2_tokenizer_failure_sets_lossy_flag_and_retains_body() {
-    todo!("RFC 0001 §6.6");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::{BodyKind, SharedRecordSink};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
+
+    // Arrange — a line carrying an embedded NUL byte (RFC §6.2
+    // step 1's canonical tokenizer-failure mode). The miner must
+    // route the line to the parse-failure path with the original
+    // bytes retained in `body` and `lossy_flag = true`.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let raw = "user 42\u{0000}secret";
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act
+    let id = cluster.ingest(&make(raw));
+
+    // Assert — NO_TEMPLATE sentinel returned, parse-failures
+    // counter ticked, and the emitted record carries body=raw,
+    // lossy_flag=true, no template id.
+    assert_eq!(id, NO_TEMPLATE);
+    assert_eq!(cluster.parse_failures_total(), 1);
+
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+    assert_eq!(rec.body_kind, BodyKind::String);
+    assert_eq!(rec.template_id, NO_TEMPLATE);
+    assert_eq!(rec.template_version, 0);
+    assert!(rec.lossy_flag, "tokenizer failure must set lossy_flag=true");
+    assert_eq!(
+        rec.body.as_deref(),
+        Some(raw),
+        "body must carry the original line bytes verbatim, NUL included",
+    );
 }
 
 /// Scenario H7.3 — Reader emits body verbatim when `lossy_flag` is true.
@@ -248,7 +288,66 @@ fn h7_3_reader_emits_body_verbatim_when_lossy_flag_is_true() {
 /// Scenario H7.4 — Widened literal slot reconstructs via STR fallback.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h7_4_widened_literal_slot_reconstructs_via_str_fallback() {
-    todo!("RFC 0001 §6.2");
+    use ourios_core::audit::ParamType;
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::reconstruct::reconstruct;
+
+    // Arrange — drive a widening of a literal-token position
+    // (RFC §6.2 step 5: a `<*>` slot opens via the widening of an
+    // originally-literal token). The triggering line then has a
+    // literal at that slot; the §6.2 "build params" rule says
+    // that position's params entry must be
+    // `{ type_tag: STR, value: L_tok[pos] }` so reconstruct can
+    // restore the literal.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // L1 creates a fresh leaf with Wildcard at position 1
+    // (`<NUM>`) and Fixed at positions 0, 2, 3, 4.
+    let _ = cluster.ingest(&make("user 42 logged in NOW"));
+    // L2 (the triggering line for the widening test) mismatches
+    // position 4 ("NOW" → "LATER"). sim_seq = 4/5 = 0.8 ≥ 0.7,
+    // so this attaches with a widening at position 4. The new
+    // wildcard at slot ordinal 1 (the literal-widened one) must
+    // carry params[1] = { Str, "LATER" } for reconstruct.
+    let raw_l2 = "user 42 logged in LATER";
+    let _ = cluster.ingest(&make(raw_l2));
+
+    // Look up the leaf's template so we can pass it to
+    // reconstruct.
+    let snapshots = cluster.templates_for(&t);
+    assert_eq!(snapshots.len(), 1, "single leaf after widening");
+    let snap = &snapshots[0];
+
+    // The post-widen leaf template has 2 wildcards: ordinal 0 at
+    // position 1 (`<NUM>` from creation), ordinal 1 at position 4
+    // (the literal-widened slot).
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2, "one record per ingest");
+    let l2_record = &emitted[1];
+
+    // Pin the STR-fallback contract: params[1] = { Str, "LATER" }.
+    assert_eq!(l2_record.params.len(), 2);
+    assert_eq!(l2_record.params[1].type_tag, ParamType::Str);
+    assert_eq!(l2_record.params[1].value, "LATER");
+
+    // And the headline property: reconstruct(L2) == raw_l2 byte
+    // for byte.
+    assert_eq!(
+        reconstruct(l2_record, &snap.template),
+        raw_l2.as_bytes().to_vec(),
+        "reconstruction must round-trip the literal-widened position",
+    );
 }

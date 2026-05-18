@@ -306,12 +306,24 @@ impl MinerCluster {
         self.merges_total.load(Ordering::Relaxed)
     }
 
-    /// Cumulative count of lines that produced no template:
-    /// empty / whitespace-only `Body::String`, over-cap lines
-    /// (`> u16::MAX` tokens), the §6.4 degenerate-template
-    /// rejection branch, and the §6.3 parse-failure zone
-    /// (`simSeq < similarity_floor`). Read-side placeholder for
-    /// the §6.8 `parse_failures_total` Prometheus gauge.
+    /// Cumulative count of lines that produced no template. Two
+    /// disjoint sources contribute, but the counter is one gauge:
+    ///
+    /// - §6.3 / §6.4 body-retention paths: empty /
+    ///   whitespace-only `Body::String`, over-cap lines
+    ///   (`> u16::MAX` tokens), the §6.4 degenerate-template
+    ///   rejection branch, and the §6.3 parse-failure zone
+    ///   (`simSeq < similarity_floor`). These also bump
+    ///   `body_retentions_total`.
+    /// - §6.6 tokenizer-failure paths (today: embedded NUL byte
+    ///   per H7.2). These set `lossy_flag = true` on the emitted
+    ///   record and do **not** bump `body_retentions_total` (the
+    ///   `body_retention_ratio` gauge surfaces §6.3 zone
+    ///   retention, not the orthogonal §6.6 reconstruction-
+    ///   impossible retention).
+    ///
+    /// Read-side placeholder for the §6.8
+    /// `parse_failures_total` Prometheus gauge.
     #[must_use]
     pub fn parse_failures_total(&self) -> u64 {
         self.parse_failures_total.load(Ordering::Relaxed)
@@ -2382,6 +2394,67 @@ mod tests {
         // The §6.3 lossy zone bumped body_retentions for L2 (and
         // retained its body on the emitted record).
         assert_eq!(cluster.body_retentions_total(), 1);
+    }
+
+    #[test]
+    fn existing_wildcard_receives_literal_emits_str_param_and_reconstructs() {
+        // PR-B-2 STR-fallback regression for the "existing wildcard
+        // receives a literal observation" path (distinct from the
+        // freshly-widened-literal-slot case covered by H7.4).
+        //
+        // Setup: a prior `<NUM>` mask emit creates a Wildcard at
+        // position 2 with `slot_types[0] = {Num}`. A later line at
+        // the same position carries a literal whose mask does not
+        // classify (e.g. "abc-def-1234" — neither digits nor UUID
+        // nor IPv4). sim_seq still matches (Wildcard matches
+        // anything), so the attach is Clean — and `build_record_
+        // params` must emit `{Str, "abc-def-1234"}` for the slot
+        // so reconstruct round-trips the literal verbatim.
+        //
+        // The pre-PR-B-2 code (params_from_mask) would have emitted
+        // params=[] for this attach because mask emitted nothing —
+        // reconstruct would have produced no bytes at the wildcard
+        // position. PR-B-2's `build_record_params` walks the
+        // leaf's wildcards and inserts the STR fallback.
+        let (mut cluster, _audit, records) = cluster_with_observable_sinks();
+        let t = TenantId::new("tenant-x");
+        let make = |raw: &str| string_record(&t, raw);
+
+        // L1: creates the wildcard at position 2 with
+        // slot_types[0] = {Num} (mask emit).
+        let _ = cluster.ingest(&make("user logged 42 in"));
+        let l1_emit = records.drain();
+        assert_eq!(l1_emit.len(), 1);
+
+        // L2: literal at position 2 lands on the existing
+        // wildcard. {Str} expands the slot's type set → emits
+        // TemplateTypeExpanded, but the record's params must
+        // carry the literal so reconstruct works.
+        let raw_l2 = "user logged abc-def-1234 in";
+        let _ = cluster.ingest(&make(raw_l2));
+
+        let l2_emit = records.drain();
+        assert_eq!(l2_emit.len(), 1);
+        let rec = &l2_emit[0];
+
+        // params has exactly one entry for the one wildcard slot,
+        // and it's a STR fallback carrying the literal verbatim.
+        assert_eq!(rec.params.len(), 1, "one wildcard → one param");
+        assert_eq!(
+            rec.params[0].type_tag,
+            ParamType::Str,
+            "literal at an existing wildcard → STR fallback",
+        );
+        assert_eq!(rec.params[0].value, "abc-def-1234");
+
+        // End-to-end: reconstruct round-trips the original bytes.
+        let snapshots = cluster.templates_for(&t);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            crate::reconstruct::reconstruct(rec, &snapshots[0].template),
+            raw_l2.as_bytes().to_vec(),
+            "STR-fallback alignment must let reconstruct recover the literal byte-for-byte",
+        );
     }
 
     #[test]

@@ -118,14 +118,18 @@ pub fn sim_seq(line: &[&str], template: &[Token<'_>]) -> f32 {
 ///
 /// # Preconditions on `line_wildcard_positions`
 ///
-/// - Strictly ascending byte indices (sorted, no duplicates) —
-///   the function uses [`slice::binary_search`] for the per-
-///   position lookup, which is `O(log n)` and correct only on
-///   sorted input. `mask()`'s output satisfies this by
-///   construction (single forward pass), so the cluster's own
-///   call sites are safe; external callers passing the slice
-///   directly must hold the invariant.
-/// - Every position must be `< line.len()`.
+/// Entries are **token indices** into `line` (the same index
+/// `mask()` populates from `tokens.iter().enumerate()`), not
+/// byte offsets.
+///
+/// - Strictly ascending (sorted, no duplicates) — the function
+///   uses [`slice::binary_search`] for the per-position lookup,
+///   which is `O(log n)` and correct only on sorted input.
+///   `mask()`'s output satisfies this by construction (single
+///   forward pass), so the cluster's own call sites are safe;
+///   external callers passing the slice directly must hold the
+///   invariant.
+/// - Every entry must satisfy `< line.len()`.
 ///
 /// A `debug_assert` checks both in dev builds. Release builds
 /// will silently produce wrong similarity scores on a violated

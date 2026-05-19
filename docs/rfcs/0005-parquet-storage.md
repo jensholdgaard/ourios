@@ -453,11 +453,31 @@ The row-level audit columns are:
 
 The canonical-JSON encoding of `old_template` / `new_template`
 is `["lit0", "<NUM>", "lit2", ...]` — the same shape the miner's
-in-memory `Vec<OwnedToken>` produces. Encoding decision (§3.6
-applies): dict on every column except `old_template` /
-`new_template` and `triggering_line_hash` (templates are bounded
-but per-tenant repetitive — the bench will tell whether the
-dict pays; hashes are near-random, dict loses).
+in-memory `Vec<OwnedToken>` produces.
+
+**Audit encoding policy** (parallel to §3.6's data-file table;
+the audit stream is low-volume so page indexes and bloom filters
+are unnecessary defaults, but the policy needs to be explicit
+under §3.1's "RFC pins per-column encoding policy" commitment):
+
+| Column | Dictionary | Page index | Bloom filter | Rationale |
+|---|---|---|---|---|
+| `tenant_id` | yes | no | no | Bounded per cluster |
+| `timestamp` | no | yes | no | Delta-encoded inside ZSTD; page index supports time-range pruning on drift queries |
+| `event_kind` | yes | yes | no | Three values today, plus future ordinals |
+| `event_type` | yes | yes | no | Same bounded set as `event_kind`; predicate-pushdown surface for the §6.7 drift query |
+| `template_id` | yes | yes | no | Bounded by tenant template count; bloom filter is unnecessary at audit volume |
+| `old_version`, `new_version` | yes | no | no | Small per template |
+| `old_template`, `new_template` | no | no | no | Per-tenant repetitive but variable-length JSON; defer the dict decision until bench data exists |
+| `positions_widened` (list values) | yes | no | no | Small INT32s |
+| `slots_expanded` (list / struct values) | yes | no | no | Same |
+| `triggering_line_hash` | no | no | no | Near-random 16 bytes, dict loses |
+| `triggering_line_sample` | no | no | no | High-entropy text, dict loses |
+| `reason` | yes | no | no | A small set of guard diagnostic strings in practice |
+
+Compression codec follows §3.5 (`ZSTD-3` across every column).
+Anything not in the table above takes the writer's defaults; the
+table covers every row-level column declared in §3.7.
 
 Audit files are flushed independently of data files: a single
 write to the cluster's audit sink does not force a data flush,

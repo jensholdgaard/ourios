@@ -629,8 +629,25 @@ column the bench won't measure.
 > - **When** the batch is written to a Parquet file by the writer
 >   and read back by the reader via `Reader::open_partition` (the
 >   production query path)
-> - **Then** the recovered `MinedRecord` equals the original in every
->   row-level column, byte for byte
+> - **Then** for every column whose Rust type in `MinedRecord` is
+>   a raw byte container (`trace_id: Option<[u8; 16]>`,
+>   `span_id: Option<[u8; 8]>`, `body: Option<Bytes>`), the
+>   recovered bytes equal the original bytes byte-for-byte
+> - **And** for every typed column (integers, floats, booleans,
+>   timestamps, enum ordinals, plain strings, the `params` and
+>   `separators` lists), the recovered value equals the original
+>   under the column's Rust-level equality — UTF-8 equality for
+>   `String`, numeric equality for integers/floats/timestamps,
+>   element-wise equality for `Vec<T>`
+> - **And** for the canonical-encoded structural columns
+>   (`attributes: Vec<KeyValue>` and `resource_attributes:
+>   Vec<KeyValue>` — encoded as canonical JSON `BYTE_ARRAY` on
+>   disk per §3.3), the recovered `Vec<KeyValue>` equals the
+>   original under structural equality (the canonical encoding
+>   is bidirectional and deterministic per RFC 0001 §6.1, so
+>   structural equality is the testable property at the
+>   `MinedRecord` boundary; byte equality on the encoded bytes
+>   follows as a corollary but is not the primary assertion)
 > - **And** the round-trip equality assertion does **not** include
 >   the pure-partition pseudo-columns (`year`, `month`, `day`,
 >   `hour`); those are covered by RFC0005.5 (partition layout) and

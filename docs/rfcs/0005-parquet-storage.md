@@ -76,9 +76,9 @@ sizing/encoding policy, and the reader's forward-compatibility
 contract are co-designed. Splitting them into three RFCs
 optimises for short documents but loses the cross-cutting
 constraints (e.g. "no dictionary on `body`" is a schema rule
-*and* a writer rule *and* a reader expectation). The §6.8
-telemetry surface and the eventual compaction policy are real
-post-MVP concerns and get their own RFCs.
+*and* a writer rule *and* a reader expectation). The RFC 0001
+§6.8 telemetry surface and the eventual compaction policy are
+real post-MVP concerns and get their own RFCs.
 
 ## 3. Proposed design
 
@@ -152,7 +152,7 @@ not stored row-level and their schema-evolution contract follows
 |---|---|---|---|---|
 | `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Authoritative tenant identifier; also replicated in the partition path (§3.4) for predicate-pushdown convenience. Row value wins on row-vs-path mismatch per §3.9 |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | Monotonic; bloom-filter coverage (§3.6) |
-| `template_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Starts at 1; bumped on §6.4 events |
+| `template_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Starts at 1; bumped on RFC 0001 §6.4 events |
 
 **OTLP-derived columns** (RFC 0001 §6.1 "OTLP-derived columns"):
 
@@ -178,7 +178,7 @@ miner-derived reconstruction"):
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
 | `body_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | `0` = `String`, `1` = `Structured` |
-| `body` | `BYTE_ARRAY` | `BYTE_ARRAY` | OPTIONAL | Original bytes when retained per §6.3/§6.5; canonical-JSON `AnyValue` when `body_kind = Structured`; absent on clean-zone `String` rows |
+| `body` | `BYTE_ARRAY` | `BYTE_ARRAY` | OPTIONAL | Original bytes when retained per RFC 0001 §6.3 (lossy-zone retention) / RFC 0001 §6.5 (overflow forces retention); canonical-JSON `AnyValue` when `body_kind = Structured`; absent on clean-zone `String` rows. Intentionally no `STRING` logical type — the column carries raw bytes (potentially non-UTF-8 log lines or non-JSON binary), not text |
 | `params` | `LIST<STRUCT<type_tag: INT32, value: BYTE_ARRAY>>` | as schema | REQUIRED | Always written (mirrors RFC 0001's `Vec<Param>`); the list is empty (zero elements) when `body_kind = Structured`. `NULL` is not a valid encoding |
 | `separators` | `LIST<BYTE_ARRAY>` | as schema | REQUIRED | Always written (mirrors RFC 0001's `Vec<Separator>`); `tokens.len() + 1` elements when `body_kind = String`, zero elements when `body_kind = Structured`. `NULL` is not a valid encoding |
 | `confidence` | `FLOAT` | `FLOAT` | REQUIRED | `1.0` sentinel when `body_kind = Structured` |
@@ -389,7 +389,7 @@ default does so violates `CLAUDE.md` §3.2 ("Drain assumes
 parameters are short, variable bits. Reality: a `params` slot
 may capture an entire stack trace, request body, or base64
 blob. Unbounded values destroy Parquet's dictionary encoding
-and bloat files."). The §6.5 OVERFLOW marker is the design
+and bloat files."). The RFC 0001 §6.5 OVERFLOW marker is the design
 response in `params`; the `body` column is where retained
 originals land, and those *are* unbounded by construction.
 
@@ -413,7 +413,7 @@ this RFC stores **both** an `event_kind` INT32 ordinal (compact,
 dictionary-encodes to a few bytes) **and** an `event_type` STRING
 column carrying the canonical RFC 0001 §6.4 string. The string
 column is what RFC 0001 §9 names as the predicate-pushdown surface
-for the §6.7 drift query; the ordinal is what the writer and
+for the RFC 0001 §6.7 drift query; the ordinal is what the writer and
 reader use internally. Both columns are REQUIRED and the writer
 must keep them in sync per the mapping table — divergence is an
 implementation bug, not a degree of freedom. The normative
@@ -439,7 +439,7 @@ The row-level audit columns are:
 | `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Same contract as data-file `tenant_id`: row authoritative, replicated in partition path, mismatch → reader error |
 | `timestamp` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | Cluster clock at emit time (matches RFC 0001 §6.4 `timestamp`) |
 | `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | Ordinal per the mapping table above |
-| `event_type` | `STRING` | `BYTE_ARRAY` | REQUIRED | Canonical RFC 0001 §6.4 snake_case string; predicate-pushdown surface for the §6.7 drift query |
+| `event_type` | `STRING` | `BYTE_ARRAY` | REQUIRED | Canonical RFC 0001 §6.4 snake_case string; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | The leaf the event applies to |
 | `old_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Pre-event template version |
 | `new_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Post-event template version (equal to `old_version` for the rejection variant) |
@@ -465,7 +465,7 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 | `tenant_id` | yes | no | no | Bounded per cluster |
 | `timestamp` | no | yes | no | Delta-encoded inside ZSTD; page index supports time-range pruning on drift queries |
 | `event_kind` | yes | yes | no | Three values today, plus future ordinals |
-| `event_type` | yes | yes | no | Same bounded set as `event_kind`; predicate-pushdown surface for the §6.7 drift query |
+| `event_type` | yes | yes | no | Same bounded set as `event_kind`; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
 | `template_id` | yes | yes | no | Bounded by tenant template count; bloom filter is unnecessary at audit volume |
 | `old_version`, `new_version` | yes | no | no | Small per template |
 | `old_template`, `new_template` | no | no | no | Per-tenant repetitive but variable-length JSON; defer the dict decision until bench data exists |
@@ -517,7 +517,7 @@ the **baseline** schema; subsequent changes follow these rules:
    doesn't regress A1/B1/B2.
 
 The PR description that touches the schema must explicitly call
-out which rule above applies, mirroring the §6.7 RFC convention
+out which rule above applies, mirroring the RFC 0001 §6.7 convention
 for invariant-touching PRs.
 
 ### 3.9 Reader contract
@@ -560,9 +560,10 @@ Unknown `ParamType` ordinals (i.e. a value the reader doesn't
 know about) are surfaced as `ParamType::Unknown` — a reserved
 catch-all variant. Queries against records carrying unknown
 variants pass through to the application layer to decide what
-to do (the §6.6 reconstruction path treats unknown variants as
-lossy and falls back to the body column, which is why §6.5's
-overflow-forces-body-retention rule is paired with this).
+to do (the RFC 0001 §6.6 reconstruction path treats unknown
+variants as lossy and falls back to the body column, which is
+why RFC 0001 §6.5's overflow-forces-body-retention rule is
+paired with this).
 
 ### 3.10 Crate shape
 
@@ -739,8 +740,8 @@ column the bench won't measure.
 
 > **Scenario RFC0005.7 — Audit-event stream is a separate file series**
 > - **Given** a corpus run that triggers at least one RFC 0001
->   §6.4 `event_type = template_widened` event (Rust variant
->   `TemplateWidened`)
+>   §6.4 `event_type = template_widened` event (the Rust variant
+>   is `TemplateWidened`)
 > - **When** the cluster's audit sink flushes
 > - **Then** audit events land under `audit/tenant_id=<id>/...`, not
 >   interleaved with the data file series
@@ -752,7 +753,8 @@ column the bench won't measure.
 
 > **Scenario RFC0005.8 — `body` column carries no dictionary encoding**
 > - **Given** a corpus run that retains at least 100 unique high-
->   entropy body strings (e.g. via §6.3 lossy-zone or §6.5 overflow)
+>   entropy body strings (e.g. via RFC 0001 §6.3 lossy-zone or
+>   RFC 0001 §6.5 overflow)
 > - **When** the writer flushes the Parquet file
 > - **Then** the `body` column chunk's `compression` codec is
 >   `ZSTD` (Parquet `CompressionCodec` field)
@@ -770,7 +772,7 @@ column the bench won't measure.
 > - **When** the reader reads it
 > - **Then** the resulting `Param.type_tag` is `ParamType::Unknown`
 > - **And** the record's `reconstruct` call surfaces it as lossy
->   (consistent with §6.6's fallback path)
+>   (consistent with RFC 0001 §6.6's fallback path)
 
 > **Scenario RFC0005.10 — Schema declaration is greppable and immutable**
 > - **Given** the `Schema` singleton defined in `ourios-parquet`
@@ -881,8 +883,9 @@ are normative for the maturity-stage move from `green` to
   manual invocation. Adding a GitHub Actions `schedule:` trigger
   (e.g. nightly at 03:00 UTC) so these run automatically is a
   follow-up workflow PR, not part of this RFC. The RFC notes
-  the gap; the workflow PR will land alongside the §6.5
-  benchmark implementation.
+  the gap; the workflow PR will land alongside the Phase 3
+  `ourios-bench` benchmark implementation (`docs/roadmap.md`
+  §4 Phase 3).
 
 ## 8. References
 

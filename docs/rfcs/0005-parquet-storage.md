@@ -118,12 +118,24 @@ The mapping below is the normative column set. Field order is the
 Parquet schema's declared order; readers MUST address columns by
 name, not by ordinal.
 
-**Identity and partitioning** (RFC 0001 §6.1 "Identity and
-partitioning"):
+**Partition columns.** `tenant_id` and the time-bucket parts
+(`year`, `month`, `day`, `hour`) are **Hive partition columns**,
+*not* row-level columns. Their values live in the partition path
+defined by §3.4 and are synthesised by the reader at read time
+(the standard DataFusion / Arrow `ListingTable` convention).
+They are not part of the row-group column set below and the
+§3.8 schema-evolution rules do not apply to them — the partition
+key contract is pinned in §3.4 separately, and changing it is
+its own §3.5-anchored migration. A reader that opens a file
+outside the partition-aware path (e.g. a raw `Reader::open_file`
+test helper) surfaces records without these partition columns
+populated; that mode is for diagnostics, not production query.
+
+**Identity** (RFC 0001 §6.1 "Identity and partitioning",
+row-level subset):
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
-| `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Hive partition key; not stored inside row groups (the partition path carries the value) |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | Monotonic; bloom-filter coverage (§3.6) |
 | `template_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Starts at 1; bumped on §6.4 events |
 
@@ -152,8 +164,8 @@ miner-derived reconstruction"):
 |---|---|---|---|---|
 | `body_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | `0` = `String`, `1` = `Structured` |
 | `body` | `BYTE_ARRAY` | `BYTE_ARRAY` | OPTIONAL | Original bytes when retained per §6.3/§6.5; canonical-JSON `AnyValue` when `body_kind = Structured`; absent on clean-zone `String` rows |
-| `params` | `LIST<STRUCT<type_tag: INT32, value: BYTE_ARRAY>>` | as schema | OPTIONAL | Always empty (zero-length list) when `body_kind = Structured` |
-| `separators` | `LIST<BYTE_ARRAY>` | as schema | OPTIONAL | `tokens.len() + 1` entries when `body_kind = String`; empty when `Structured` |
+| `params` | `LIST<STRUCT<type_tag: INT32, value: BYTE_ARRAY>>` | as schema | REQUIRED | Always written (mirrors RFC 0001's `Vec<Param>`); the list is empty (zero elements) when `body_kind = Structured`. `NULL` is not a valid encoding |
+| `separators` | `LIST<BYTE_ARRAY>` | as schema | REQUIRED | Always written (mirrors RFC 0001's `Vec<Separator>`); `tokens.len() + 1` elements when `body_kind = String`, zero elements when `body_kind = Structured`. `NULL` is not a valid encoding |
 | `confidence` | `FLOAT` | `FLOAT` | REQUIRED | `1.0` sentinel when `body_kind = Structured` |
 | `lossy_flag` | `BOOLEAN` | `BOOLEAN` | REQUIRED | Always `false` when `body_kind = Structured` |
 
@@ -259,14 +271,15 @@ bytes ingested):
   of this range or below on its own (1024 MB target uncompressed
   → typical 3–8× compression → ~128–340 MB compressed file);
   compaction is deferred.
-- **Compression codec.** **`ZSTD` level 3** for every column
-  except `lossy_flag` (boolean, `RLE` is the natural fit) and
-  the `params` LIST repetition / definition levels (those use
-  Parquet's standard `RLE` regardless of column codec). ZSTD-3
-  is the Apache Arrow / DataFusion default and gives the best
-  ratio-vs-throughput balance Ourios cares about; the
+- **Compression codec.** **`ZSTD` level 3** for every column.
+  ZSTD-3 is the Apache Arrow / DataFusion default and gives the
+  best ratio-vs-throughput balance Ourios cares about; the
   thesis-gate A1 measurements will test whether the choice
-  holds.
+  holds. Compression is orthogonal to per-column *encoding*
+  (dictionary, RLE for booleans, RLE-encoded repetition /
+  definition levels in `LIST` columns — all standard Parquet
+  shapes that apply regardless of the chosen compression
+  codec); §3.6 specifies the encoding policy.
 - **Page size target.** Default 1 MiB pages (Arrow default).
   Bloom filters and page index live on a per-column basis
   (§3.6).
@@ -326,20 +339,24 @@ The audit stream carries the events RFC 0001 §6.4 names —
 timestamp. The contract from RFC 0001 §9 ("Cross-RFC contracts
 pending") is fulfilled by this file series.
 
+As in §3.2, `tenant_id` and the time-bucket parts are
+**partition columns** (Hive path: `audit/tenant=…/year=…/
+month=…/day=…/<flush_uuid>.parquet`), not row-level columns.
+The row-level audit columns are:
+
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
 | `timestamp` | `TIMESTAMP(NANOS, isAdjusted=true)` | `INT64` | REQUIRED | Cluster clock at emit time |
-| `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Hive partition key |
 | `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | `0` = `TemplateWidened`, `1` = `TemplateTypeExpanded`, `2` = `TemplateWideningRejectedDegenerate` |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | The leaf the event applies to |
 | `old_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Pre-event template version |
 | `new_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Post-event template version (equal to `old_version` for the rejection variant) |
-| `old_template` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the pre-event template; `NULL` if not applicable to the variant |
-| `new_template` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the post-event template; `NULL` if not applicable |
-| `positions_widened` | `LIST<INT32>` | as schema | OPTIONAL | For `TemplateWidened`: the positions that gained `<*>`. Empty list for variants that don't widen positions |
-| `type_added` | `INTEGER(8, signed=false)` | `INT32` | OPTIONAL | For `TemplateTypeExpanded`: the `ParamType` ordinal added to a slot |
-| `slot_index` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL | For `TemplateTypeExpanded`: the wildcard-slot ordinal whose type set grew |
-| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | For the rejection variant: the degenerate-template guard's diagnostic string |
+| `old_template` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the pre-event template; `NULL` when the event variant has no pre-image (none of the three variants in this RFC, but reserved for future amendments) |
+| `new_template` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the post-event template; `NULL` for `TemplateWideningRejectedDegenerate` (the widening was rejected, no new template was produced) |
+| `positions_widened` | `LIST<INT32>` | as schema | REQUIRED | Always written; the list is empty (zero elements) for `TemplateTypeExpanded` (no positions involved) and for `TemplateWideningRejectedDegenerate` (the would-be widening was rejected). `NULL` is not a valid encoding. For `TemplateWidened`, the positions that gained `<*>` |
+| `type_added` | `INTEGER(8, signed=false)` | `INT32` | OPTIONAL | `NULL` for variants other than `TemplateTypeExpanded`; the `ParamType` ordinal added to a slot otherwise |
+| `slot_index` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL | `NULL` for variants other than `TemplateTypeExpanded`; the wildcard-slot ordinal whose type set grew otherwise |
+| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate`; the degenerate-template guard's diagnostic string otherwise |
 
 The canonical-JSON encoding of `old_template` / `new_template`
 is `["lit0", "<NUM>", "lit2", ...]` — the same shape the miner's
@@ -508,14 +525,19 @@ column the bench won't measure.
 
 ## 5. Acceptance criteria
 
-> **Scenario RFC0005.1 — Round-trip preserves every §3.2 column**
-> - **Given** a `MinedRecord` populated with every column in §3.2
->   (every OPTIONAL field set to `Some`, every variant of `body_kind`
->   exercised across a batch)
+> **Scenario RFC0005.1 — Round-trip preserves every §3.2 row-level column**
+> - **Given** a `MinedRecord` populated with every row-level column
+>   in §3.2 (every OPTIONAL field set to `Some`, every variant of
+>   `body_kind` exercised across a batch; partition columns from
+>   §3.2's partition-column section are out of scope for this
+>   scenario — they are covered by RFC0005.5)
 > - **When** the batch is written to a Parquet file by the writer
->   and read back by the reader
+>   and read back by the reader (with the partition path known to
+>   the reader so partition columns are synthesised)
 > - **Then** the recovered `MinedRecord` equals the original in every
->   column, byte for byte
+>   row-level column, byte for byte
+> - **And** the synthesised partition columns match the partition
+>   path the writer produced
 
 > **Scenario RFC0005.2 — Missing column tolerance (old-file reader path)**
 > - **Given** a Parquet file produced by a hand-rolled writer that

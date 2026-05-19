@@ -15,14 +15,15 @@ superseded-by: —
 
 Pins the on-disk Parquet contract that the `ourios-parquet` crate
 implements. The contract has four parts: (a) the data-file schema —
-a column-by-column mapping of RFC 0001 §6.1's `MinedRecord` onto
-Parquet types, with `tenant_id` and time as Hive-style partition
-keys; (b) the audit-event file schema — a parallel file series
+a column-by-column mapping of RFC 0001 §6.1's record schema (the
+planned `MinedRecord` Rust type — see §3.0) onto Parquet types,
+with `tenant_id` and time as Hive-style partition keys; (b) the
+audit-event file schema — a parallel file series
 carrying the `TemplateWidened` / `TemplateTypeExpanded` /
 `TemplateWideningRejectedDegenerate` records named in RFC 0001 §6.4;
 (c) the writer's row-group / file sizing, compression codec, and
-encoding policy, all anchored to `docs/hazards.md` H4 and the §3.2
-cardinality invariant; (d) the reader's forward-compatibility
+encoding policy, all anchored to `docs/hazards.md` H4 and the
+`CLAUDE.md` §3.2 cardinality invariant; (d) the reader's forward-compatibility
 contract (unknown columns ignored, missing columns surface as
 documented defaults). Together these are the §3.5 schema baseline:
 every column added after this RFC lands goes through an
@@ -61,7 +62,7 @@ load-bearing for the thesis-gate A1 compression ratio. The
 encoding decisions in this RFC — which columns dictionary-encode,
 which carry bloom filters, which page indexes are enabled, what
 the row-group target is, how `body` is *not* dictionary-encoded
-because the §3.2 cardinality invariant forbids it — are where
+because the `CLAUDE.md` §3.2 cardinality invariant forbids it — are where
 A1's 50–200× promise gets paid. Pinning them in an RFC means
 those decisions are reviewable independently of the writer's
 implementation and stable across PRs that touch the writer for
@@ -157,8 +158,8 @@ not stored row-level and their schema-evolution contract follows
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
-| `time_unix_nano` | `TIMESTAMP(NANOS, isAdjusted=true)` | `INT64` | REQUIRED | `0` = unknown (OTLP convention); time partition key derived from this |
-| `observed_time_unix_nano` | `TIMESTAMP(NANOS, isAdjusted=true)` | `INT64` | OPTIONAL | |
+| `time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | `0` = unknown (OTLP convention); time partition key derived from this |
+| `observed_time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | OPTIONAL | |
 | `severity_number` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | OTLP `SeverityNumber` 0..24; part of template key |
 | `severity_text` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
 | `scope_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | Part of template key |
@@ -166,8 +167,8 @@ not stored row-level and their schema-evolution contract follows
 | `attributes` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | Encoded per §3.3; `NULL` when the OTLP record had no attributes |
 | `dropped_attributes_count` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Mostly zero |
 | `resource_attributes` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | Encoded per §3.3 |
-| `trace_id` | `BYTES` | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL | |
-| `span_id` | `BYTES` | `FIXED_LEN_BYTE_ARRAY(8)` | OPTIONAL | |
+| `trace_id` | `UUID` | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL | Parquet's `UUID` logical type is the 16-byte binding for opaque identifiers; not interpreted as an RFC 4122 UUID |
+| `span_id` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(8)` | OPTIONAL | No matching Parquet logical type for 8-byte opaque ids; physical type alone is the contract |
 | `flags` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Lower 8 bits = W3C trace flags |
 | `event_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
 
@@ -255,16 +256,38 @@ row-level schema declares; the reader's row-vs-path validation
 
 Where:
 
-- `<tenant_id>` is the URL-encoded `TenantId` (Hive partition
-  values are strings; non-ASCII or path-unsafe tenant ids must
-  encode to safe ASCII before being placed in the path).
+- `<tenant_id>` is the **percent-encoded** `TenantId` per
+  RFC 3986 §2.1, with two project-specific overrides:
+  - The input is the `TenantId`'s **UTF-8 byte sequence** (the
+    `TenantId` newtype wraps a Rust `String`, which is already
+    UTF-8). No Unicode normalisation is applied before encoding
+    — the bytes are taken verbatim. This is deterministic and
+    independent of the host's locale.
+  - The **unreserved** set (`A-Za-z0-9`, `-`, `_`, `.`, `~`) is
+    passed through unchanged. Every other byte is percent-encoded
+    (`%XX` with upper-case hex digits). In particular `/` (path
+    separator), `=` (partition key/value delimiter), and `%`
+    (the escape introducer) are always escaped, regardless of
+    whether RFC 3986 would treat them as reserved or unreserved
+    in another context.
+  - Decoding is the inverse; partition values that contain a
+    malformed percent escape (e.g. `%XY` with non-hex digits)
+    are a hard read error.
+  Both writer and reader use this exact algorithm; the
+  RFC0005.5 acceptance criterion's non-ASCII sub-test pins
+  it.
 - `year` / `month` / `day` / `hour` are derived from
   `time_unix_nano` rendered as UTC. Audit-event partitioning
   stops at `day=DD` because audit volume is far lower than data
   volume; an hour-level partition for audit would produce many
   tiny files for no win.
-- `<flush_uuid>` is the writer's flush identifier (UUIDv7 so
-  files sort naturally by creation time within a partition).
+- `<flush_uuid>` is the writer's flush identifier, **pinned to
+  UUIDv7** (RFC 9562). UUIDv7 places a millisecond-precision
+  Unix timestamp in its high bits, so files in a partition sort
+  naturally by creation time when listed lexicographically.
+  This is normative — the writer MUST emit UUIDv7. Operators
+  inspecting a bucket can rely on sort-order = creation-order
+  for tooling like "show me the latest file in this partition."
 
 This is the **production** layout. The MVP corpus runner
 (`ourios-bench` in Phase 3) is allowed to emit all records to a
@@ -320,7 +343,7 @@ state") is the operational check.
 ### 3.6 Encoding policy
 
 Per-column encoding decisions, anchored to query patterns
-(thesis-gate B1/B2) and the §3.2 cardinality invariant:
+(thesis-gate B1/B2) and the `CLAUDE.md` §3.2 cardinality invariant:
 
 | Column | Dictionary | Page index | Bloom filter | Rationale |
 |---|---|---|---|---|
@@ -338,7 +361,7 @@ Per-column encoding decisions, anchored to query patterns
 | `flags` | yes | yes | no | Bounded |
 | `event_name` | yes | yes | no | Bounded |
 | `body_kind` | yes | yes | no | Two values |
-| **`body`** | **no** | no | no | **§3.2 invariant: bodies are unbounded by design. Dictionary encoding would balloon — overflow is the safety valve, dict is the failure mode** |
+| **`body`** | **no** | no | no | **`CLAUDE.md` §3.2 invariant: bodies are unbounded by design. Dictionary encoding would balloon — overflow is the safety valve, dict is the failure mode** |
 | `params` (list values) | no | no | no | Per-row entropy too high |
 | `separators` (list values) | yes | no | no | Almost always a single space — dict crushes it |
 | `confidence` | no | yes | no | Float, narrow range, page-index sufficient |
@@ -369,45 +392,57 @@ audit record (also replicated as the leading Hive partition key,
 partition pseudo-columns derived from `timestamp`. The reader's
 row-vs-path validation (§3.9) applies identically here.
 
-**Event-kind mapping.** RFC 0001 §6.4 refers to these audit
-events by snake_case `event_type` strings; this RFC stores them
-as an `event_kind` INT32 ordinal so dictionary encoding is cheap.
-The normative mapping is:
+**Event-kind mapping and dual-column storage.** RFC 0001 §6.4
+refers to these audit events by snake_case `event_type` strings;
+this RFC stores **both** an `event_kind` INT32 ordinal (compact,
+dictionary-encodes to a few bytes) **and** an `event_type` STRING
+column carrying the canonical RFC 0001 §6.4 string. The string
+column is what RFC 0001 §9 names as the predicate-pushdown surface
+for the §6.7 drift query; the ordinal is what the writer and
+reader use internally. Both columns are REQUIRED and the writer
+must keep them in sync per the mapping table — divergence is an
+implementation bug, not a degree of freedom. The normative
+mapping:
 
-| `event_kind` ordinal | RFC 0001 §6.4 `event_type` string | Rust variant |
+| `event_kind` ordinal | `event_type` string (RFC 0001 §6.4) | Rust variant |
 |---|---|---|
 | `0` | `template_widened` | `TemplateWidened` |
 | `1` | `template_type_expanded` | `TemplateTypeExpanded` |
 | `2` | `template_widening_rejected_degenerate` | `TemplateWideningRejectedDegenerate` |
 
-Adding a new ordinal is a §3.8 additive amendment; renaming or
-renumbering an existing ordinal follows the §3.8 rule for
-changing a column's enum domain (additive only, deprecation via
-new ordinal).
+Adding a new ordinal is a §3.8 additive amendment; the mapping
+table is the source of truth and a new ordinal lands as a new
+row plus a new `event_type` string in the same PR. Renumbering
+an existing ordinal or renaming an `event_type` string is
+forbidden in-place (§3.8 rule 3: column-type changes go through
+add-new-column / migrate / drop).
 
 The row-level audit columns are:
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
 | `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Same contract as data-file `tenant_id`: row authoritative, replicated in partition path, mismatch → reader error |
-| `timestamp` | `TIMESTAMP(NANOS, isAdjusted=true)` | `INT64` | REQUIRED | Cluster clock at emit time |
+| `timestamp` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | Cluster clock at emit time (matches RFC 0001 §6.4 `timestamp`) |
 | `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | Ordinal per the mapping table above |
+| `event_type` | `STRING` | `BYTE_ARRAY` | REQUIRED | Canonical RFC 0001 §6.4 snake_case string; predicate-pushdown surface for the §6.7 drift query |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | The leaf the event applies to |
 | `old_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Pre-event template version |
 | `new_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Post-event template version (equal to `old_version` for the rejection variant) |
-| `old_template` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the pre-event template; `NULL` when the event variant has no pre-image (none of the three variants in this RFC, but reserved for future amendments) |
-| `new_template` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the post-event template; `NULL` for `TemplateWideningRejectedDegenerate` (the widening was rejected, no new template was produced) |
-| `positions_widened` | `LIST<INT32>` | as schema | REQUIRED | Always written; the list is empty (zero elements) for `TemplateTypeExpanded` (no positions involved) and for `TemplateWideningRejectedDegenerate` (the would-be widening was rejected). `NULL` is not a valid encoding. For `TemplateWidened`, the positions that gained `<*>` |
-| `type_added` | `INTEGER(8, signed=false)` | `INT32` | OPTIONAL | `NULL` for variants other than `TemplateTypeExpanded`; the `ParamType` ordinal added to a slot otherwise |
-| `slot_index` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL | `NULL` for variants other than `TemplateTypeExpanded`; the wildcard-slot ordinal whose type set grew otherwise |
+| `old_template` | `STRING` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the pre-event template; `NULL` when the event variant has no pre-image (none of the three variants in this RFC, but reserved for future amendments) |
+| `new_template` | `STRING` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL | The token sequence of the post-event template; `NULL` for `TemplateWideningRejectedDegenerate` (the widening was rejected, no new template was produced) |
+| `positions_widened` | `LIST<INT32>` | as schema | REQUIRED | Always written; the list is empty for `TemplateTypeExpanded` (no positions involved) and `TemplateWideningRejectedDegenerate` (the would-be widening was rejected). For `TemplateWidened`, the positions that gained `<*>`. Mirrors RFC 0001 §6.4 `positions_widened: Vec<u16>` |
+| `slots_expanded` | `LIST<STRUCT<slot_index: INT32, types_added: LIST<INT32>>>` | as schema | REQUIRED | Always written; the list is empty for `TemplateWidened` and `TemplateWideningRejectedDegenerate`. For `TemplateTypeExpanded`, one element per slot whose type set grew, each carrying the wildcard-slot ordinal plus the `ParamType` ordinals added (RFC 0001 §6.4 `slots_expanded: Vec<SlotExpansion>`; `SlotExpansion = { slot_index, types_added }`) |
+| `triggering_line_hash` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(16)` | REQUIRED | Blake3 hash of the raw triggering line `L_raw` (RFC 0001 §6.4 `triggering_line_hash: [u8; 16]`); enables cross-referencing the audit event with the data record that caused it |
+| `triggering_line_sample` | `STRING` | `BYTE_ARRAY` | OPTIONAL | First 256 bytes of `L_raw`, UTF-8 lossy-decoded if necessary (RFC 0001 §6.4 `triggering_line_sample: Option<String>`); `NULL` when the sample was redacted for retention policy |
 | `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate`; the degenerate-template guard's diagnostic string otherwise |
 
 The canonical-JSON encoding of `old_template` / `new_template`
 is `["lit0", "<NUM>", "lit2", ...]` — the same shape the miner's
-in-memory `Vec<OwnedToken>` produces. Encoding decision: dict on
-every column except `old_template` / `new_template` (templates
-are bounded but per-tenant repetitive; the bench will tell
-whether the dict pays).
+in-memory `Vec<OwnedToken>` produces. Encoding decision (§3.6
+applies): dict on every column except `old_template` /
+`new_template` and `triggering_line_hash` (templates are bounded
+but per-tenant repetitive — the bench will tell whether the
+dict pays; hashes are near-random, dict loses).
 
 Audit files are flushed independently of data files: a single
 write to the cluster's audit sink does not force a data flush,
@@ -463,10 +498,10 @@ The reader has three normative requirements:
    produced by an earlier writer that lacks columns the current
    reader expects must read successfully; the missing columns
    default to:
-   - OPTIONAL columns → `None`
-   - REQUIRED columns added in an amendment → the amendment
-     names the default (typically `None` rendered through a
-     wrapping type, or a sentinel like `time_unix_nano = 0`)
+   - OPTIONAL columns → `None`. Per §3.8 rule 1, every
+     amendment-added column is OPTIONAL, so this bullet covers
+     the entire amendment-additive surface — there is no
+     "REQUIRED-added-in-amendment" case to default.
    - The baseline REQUIRED columns from this RFC — the reader
      errors. A file missing baseline columns is corrupted or
      written by an incompatible writer; falling through to a
@@ -651,14 +686,17 @@ column the bench won't measure.
 > - **Except** the final row group of a file, which may be smaller
 
 > **Scenario RFC0005.7 — Audit-event stream is a separate file series**
-> - **Given** a corpus run that triggers at least one §6.4
->   `TemplateWidened` event
+> - **Given** a corpus run that triggers at least one RFC 0001
+>   §6.4 `event_type = template_widened` event (Rust variant
+>   `TemplateWidened`)
 > - **When** the cluster's audit sink flushes
 > - **Then** audit events land under `audit/tenant_id=<id>/...`, not
 >   interleaved with the data file series
-> - **And** the emitted audit record carries the full §3.7 payload
->   (`old_template`, `new_template`, `old_version`, `new_version`,
->   `positions_widened`)
+> - **And** the emitted audit record is populated for every row-
+>   level column declared in §3.7's audit-schema table, with NULL
+>   appearing only on the explicitly-OPTIONAL columns documented
+>   for the variant (e.g. `reason` is NULL for `template_widened`;
+>   `slots_expanded` is an empty list)
 
 > **Scenario RFC0005.8 — `body` column carries no dictionary encoding**
 > - **Given** a corpus run that retains at least 100 unique high-
@@ -669,8 +707,9 @@ column the bench won't measure.
 > - **And** the `body` column chunk's `encodings` list does NOT
 >   include `PLAIN_DICTIONARY` or `RLE_DICTIONARY` (Parquet
 >   `Encoding` enum)
-> - **And** the file size does not balloon proportionally to the
->   number of unique bodies — the §3.2 cardinality invariant holds
+> - **And** the `body` column chunk's `dictionary_page_offset`
+>   is unset (`None`) in the column-chunk metadata — there is
+>   no dictionary page on disk for this column
 
 > **Scenario RFC0005.9 — Unknown `ParamType` ordinal surfaces as `Unknown`**
 > - **Given** a Parquet file with a `params.type_tag` value that the
@@ -763,12 +802,6 @@ are normative for the maturity-stage move from `green` to
   Parquet writer parameter (Arrow default is 1%). Lower FPR
   trades file size for query selectivity. Defer until B2
   numbers exist.
-- [ ] **UUIDv7 vs `<flush_seq>.parquet` for file names.** §3.4
-  proposes UUIDv7 because the bench can be replayed multi-
-  threaded and a sequence number would collide. UUIDv7 is
-  natural-sort by time. If the writer ends up single-threaded
-  per partition in MVP, a sequence may simplify operator tooling
-  ("show me the latest file"). Defer to the writer PR.
 - [ ] **Audit-event retention.** Audit events have a different
   retention policy than log records (audits should outlive the
   data they audit, for forensics). The retention plumbing is

@@ -925,8 +925,15 @@ are normative for the maturity-stage move from `green` to
   opens), §5 (deliberately out of MVP — compaction, the
   post-MVP follow-up RFC named here).
 - Apache Parquet Format specification (file format, page
-  index, bloom filter, LIST encoding) — `parquet.apache.org`.
-- OpenTelemetry Logs Data Model — `AnyValue`, OTLP-canonical
-  JSON encoding.
-- OpenTelemetry Proto3 JSON binding — the normative encoding
-  rule for `body_kind = Structured`.
+  index, bloom filter, `LIST` encoding) — project site
+  <https://parquet.apache.org/>; the normative format spec
+  lives in the repository at
+  <https://github.com/apache/parquet-format>.
+- OpenTelemetry Logs Data Model — `AnyValue`, normative
+  source at
+  <https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/data-model.md>.
+- OpenTelemetry Protocol (OTLP) specification — the JSON
+  binding referenced by the canonical-encoding rule for
+  `body_kind = Structured` lives at
+  <https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/otlp.md>
+  (see the "OTLP/HTTP" section's proto3-JSON mapping).

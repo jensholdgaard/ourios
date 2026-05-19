@@ -81,6 +81,17 @@ post-MVP concerns and get their own RFCs.
 
 ## 3. Proposed design
 
+### 3.0 Terminology note
+
+This RFC uses **`MinedRecord`** as the planned Rust type name for
+the per-row record the miner emits, the same shape RFC 0001 §6.1
+specifies but without yet naming a type. The §6.1 amendment uses
+*"the record"* / *"the miner emits one record"*; this RFC chooses
+`MinedRecord` for the type that backs the writer's input and the
+reader's output, and uses it consistently below. A follow-on PR
+to RFC 0001 may adopt the same name in §6.1; until then, treat
+the two terms as synonyms.
+
 ### 3.1 Scope and what this RFC pins
 
 This RFC pins:
@@ -88,8 +99,8 @@ This RFC pins:
 - The Parquet logical schema (column names, types, repetition,
   nullability) for both the data-file series and the audit-event
   file series.
-- The on-disk partition layout (Hive-style: `tenant=…/year=…/
-  month=…/day=…/hour=…/`).
+- The on-disk partition layout (Hive-style: `tenant_id=…/
+  year=…/month=…/day=…/hour=…/`).
 - The writer's row-group target, file-size target, compression
   codec, and per-column encoding policy (dictionary, page index,
   bloom filter).
@@ -118,24 +129,27 @@ The mapping below is the normative column set. Field order is the
 Parquet schema's declared order; readers MUST address columns by
 name, not by ordinal.
 
-**Partition columns.** `tenant_id` and the time-bucket parts
-(`year`, `month`, `day`, `hour`) are **Hive partition columns**,
-*not* row-level columns. Their values live in the partition path
-defined by §3.4 and are synthesised by the reader at read time
-(the standard DataFusion / Arrow `ListingTable` convention).
-They are not part of the row-group column set below and the
-§3.8 schema-evolution rules do not apply to them — the partition
-key contract is pinned in §3.4 separately, and changing it is
-its own §3.5-anchored migration. A reader that opens a file
-outside the partition-aware path (e.g. a raw `Reader::open_file`
-test helper) surfaces records without these partition columns
-populated; that mode is for diagnostics, not production query.
+**`tenant_id` is row-level, the partition path is an index over
+it.** `tenant_id` is a **REQUIRED row-level column** in every
+data file, listed in the schema table below. It is also replicated
+as the leading Hive partition key (§3.4) so DataFusion / Arrow
+can prune by tenant without opening files. Per
+`docs/talks/0001-template-miner.md` ("`tenant_id` is present on
+every row, not on every file ... we never trust the file to
+tell us the tenant; we trust the row") the row-level value is
+authoritative: the reader resolves `tenant_id` from the row,
+treats the partition path as a partition-pruning index, and
+**errors** on row-vs-path mismatch (§3.9). The time-bucket parts
+(`year`, `month`, `day`, `hour`) are *pure-partition* pseudo-
+columns derived from `time_unix_nano` rendered as UTC; they are
+not stored row-level and their schema-evolution contract follows
+§3.4 (the partition layout), not §3.8 (the row schema).
 
-**Identity** (RFC 0001 §6.1 "Identity and partitioning",
-row-level subset):
+**Identity** (RFC 0001 §6.1 "Identity and partitioning"):
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
+| `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Authoritative tenant identifier; also replicated in the partition path (§3.4) for predicate-pushdown convenience. Row value wins on row-vs-path mismatch per §3.9 |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | Monotonic; bloom-filter coverage (§3.6) |
 | `template_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Starts at 1; bumped on §6.4 events |
 
@@ -224,14 +238,20 @@ consumer," not "it might be useful."
 Data files live at:
 
 ```
-<bucket>/data/tenant=<tenant_id>/year=YYYY/month=MM/day=DD/hour=HH/<flush_uuid>.parquet
+<bucket>/data/tenant_id=<tenant_id>/year=YYYY/month=MM/day=DD/hour=HH/<flush_uuid>.parquet
 ```
 
 Audit-event files live at:
 
 ```
-<bucket>/audit/tenant=<tenant_id>/year=YYYY/month=MM/day=DD/<flush_uuid>.parquet
+<bucket>/audit/tenant_id=<tenant_id>/year=YYYY/month=MM/day=DD/<flush_uuid>.parquet
 ```
+
+The partition path segment is `tenant_id=` (not `tenant=`) so
+the Hive-style partition-discovery convention (column name
+= path segment key) resolves it to the same column name the
+row-level schema declares; the reader's row-vs-path validation
+(§3.9) compares values across the two surfaces unambiguously.
 
 Where:
 
@@ -249,7 +269,7 @@ Where:
 This is the **production** layout. The MVP corpus runner
 (`ourios-bench` in Phase 3) is allowed to emit all records to a
 single file under a degenerate partition path
-(`tenant=corpus/year=2026/month=04/day=02/hour=10/`) because
+(`tenant_id=corpus/year=2026/month=04/day=02/hour=10/`) because
 corpus runs are bounded and producing 24 small files would
 distract from the thesis-gate measurements. The H4 file-sizing
 target (§3.5) is enforced on the production path; the corpus
@@ -261,16 +281,20 @@ Anchored to `docs/hazards.md` H4 and the small-file-problem
 detection threshold (file count must grow sub-linearly with
 bytes ingested):
 
-- **Row-group size target.** 128 MB – 1 GB **uncompressed**
-  bytes per row group (the H4 target). The writer flushes a
-  row group when its in-memory buffer crosses 128 MB; row
-  groups never exceed 1 GB (the next row starts a new row
-  group). Below 128 MB only on the final row group of a file.
-- **File size target.** 256 MB – 2 GB **compressed** bytes
+- **Row-group size target.** 128 MiB – 1 GiB **uncompressed**
+  bytes per row group (binary units; the H4 target is written as
+  "128 MB – 1 GB" but the operational detection threshold is in
+  MiB, and Parquet byte counts in metadata are unprefixed binary
+  bytes — RFC 0005 standardises on MiB/GiB throughout to avoid
+  the ambiguity). The writer flushes a row group when its in-
+  memory buffer crosses 128 MiB; row groups never exceed 1 GiB
+  (the next row starts a new row group). Below 128 MiB only on
+  the final row group of a file.
+- **File size target.** 256 MiB – 2 GiB **compressed** bytes
   post-compaction. The writer's job is to land at the bottom
-  of this range or below on its own (1024 MB target uncompressed
-  → typical 3–8× compression → ~128–340 MB compressed file);
-  compaction is deferred.
+  of this range or below on its own (1024 MiB target
+  uncompressed → typical 3–8× compression → ~128–340 MiB
+  compressed file); compaction is deferred.
 - **Compression codec.** **`ZSTD` level 3** for every column.
   ZSTD-3 is the Apache Arrow / DataFusion default and gives the
   best ratio-vs-throughput balance Ourios cares about; the
@@ -290,7 +314,7 @@ producing the audit-event file at end-of-day) may emit a
 small-row-group file; that's an acknowledged corner case the
 compaction PR will sweep up. Steady-state production traffic
 must produce files inside the §3.5 range; the H4 detection
-metric ("fewer than 5% of files below 128 MiB at steady
+metric ("fewer than 5 % of files below 128 MiB at steady
 state") is the operational check.
 
 ### 3.6 Encoding policy
@@ -339,15 +363,35 @@ The audit stream carries the events RFC 0001 §6.4 names —
 timestamp. The contract from RFC 0001 §9 ("Cross-RFC contracts
 pending") is fulfilled by this file series.
 
-As in §3.2, `tenant_id` and the time-bucket parts are
-**partition columns** (Hive path: `audit/tenant=…/year=…/
-month=…/day=…/<flush_uuid>.parquet`), not row-level columns.
+As in §3.2, `tenant_id` is a row-level REQUIRED column on the
+audit record (also replicated as the leading Hive partition key,
+§3.4); the time-bucket parts (`year`, `month`, `day`) are pure-
+partition pseudo-columns derived from `timestamp`. The reader's
+row-vs-path validation (§3.9) applies identically here.
+
+**Event-kind mapping.** RFC 0001 §6.4 refers to these audit
+events by snake_case `event_type` strings; this RFC stores them
+as an `event_kind` INT32 ordinal so dictionary encoding is cheap.
+The normative mapping is:
+
+| `event_kind` ordinal | RFC 0001 §6.4 `event_type` string | Rust variant |
+|---|---|---|
+| `0` | `template_widened` | `TemplateWidened` |
+| `1` | `template_type_expanded` | `TemplateTypeExpanded` |
+| `2` | `template_widening_rejected_degenerate` | `TemplateWideningRejectedDegenerate` |
+
+Adding a new ordinal is a §3.8 additive amendment; renaming or
+renumbering an existing ordinal follows the §3.8 rule for
+changing a column's enum domain (additive only, deprecation via
+new ordinal).
+
 The row-level audit columns are:
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
+| `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Same contract as data-file `tenant_id`: row authoritative, replicated in partition path, mismatch → reader error |
 | `timestamp` | `TIMESTAMP(NANOS, isAdjusted=true)` | `INT64` | REQUIRED | Cluster clock at emit time |
-| `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | `0` = `TemplateWidened`, `1` = `TemplateTypeExpanded`, `2` = `TemplateWideningRejectedDegenerate` |
+| `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | Ordinal per the mapping table above |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | The leaf the event applies to |
 | `old_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Pre-event template version |
 | `new_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Post-event template version (equal to `old_version` for the rejection variant) |
@@ -408,7 +452,7 @@ for invariant-touching PRs.
 
 ### 3.9 Reader contract
 
-The reader is a single function with two normative requirements:
+The reader has three normative requirements:
 
 1. **Unknown columns are silently ignored.** A file produced by
    a future writer that adds columns the current reader doesn't
@@ -427,6 +471,20 @@ The reader is a single function with two normative requirements:
      errors. A file missing baseline columns is corrupted or
      written by an incompatible writer; falling through to a
      made-up default would corrupt downstream query results.
+3. **Row-vs-path partition validation.** For every row read
+   under a partition-aware path (i.e. via `Reader::open_partition`
+   or the DataFusion `ListingTable` integration that feeds a
+   partition tuple in), the reader compares the row-level
+   `tenant_id` against the partition path's `tenant_id` segment
+   and the row-level `time_unix_nano`'s UTC year / month / day
+   / hour against the path's time-bucket segments. Mismatch is
+   a **hard read error** that names the offending row and the
+   partition path. The row value is authoritative (the talk and
+   RFC 0001 §6.1's row-as-source-of-truth rule); the path is the
+   partition-pruning index. A diagnostic `Reader::open_file`
+   helper that opens a single file without a partition tuple
+   skips this validation and surfaces records as-stored — that
+   mode is not exposed through the production query path.
 
 Unknown `ParamType` ordinals (i.e. a value the reader doesn't
 know about) are surfaced as `ParamType::Unknown` — a reserved
@@ -454,9 +512,12 @@ overflow-forces-body-retention rule is paired with this).
   series.
 
 No trait abstraction over `Writer` or `Reader` until a second
-implementation is named in an RFC (per the memory-captured rule
-"pre-abstract when the second consumer is named, not when it's
-hypothetical"). Phase 3's DataFusion table provider is one
+implementation is named in an RFC. Pre-abstracting when only
+one consumer exists picks an axis for the trait before the
+shape of the second consumer is visible, and an extracted
+trait that turns out to fit only one consumer is harder to
+re-shape than the concrete type would have been. Phase 3's
+DataFusion table provider is one
 consumer of `Reader`; the bench is another; both are concrete,
 neither demands a trait.
 
@@ -528,16 +589,26 @@ column the bench won't measure.
 > **Scenario RFC0005.1 — Round-trip preserves every §3.2 row-level column**
 > - **Given** a `MinedRecord` populated with every row-level column
 >   in §3.2 (every OPTIONAL field set to `Some`, every variant of
->   `body_kind` exercised across a batch; partition columns from
->   §3.2's partition-column section are out of scope for this
->   scenario — they are covered by RFC0005.5)
+>   `body_kind` exercised across a batch — including the row-level
+>   `tenant_id`)
 > - **When** the batch is written to a Parquet file by the writer
->   and read back by the reader (with the partition path known to
->   the reader so partition columns are synthesised)
+>   and read back by the reader via `Reader::open_partition` (the
+>   production query path)
 > - **Then** the recovered `MinedRecord` equals the original in every
 >   row-level column, byte for byte
-> - **And** the synthesised partition columns match the partition
->   path the writer produced
+> - **And** the round-trip equality assertion does **not** include
+>   the pure-partition pseudo-columns (`year`, `month`, `day`,
+>   `hour`); those are covered by RFC0005.5 (partition layout) and
+>   RFC0005.11 (row-vs-path validation)
+
+> **Scenario RFC0005.11 — Row-vs-path validation on partition mismatch**
+> - **Given** a Parquet file whose row-level `tenant_id` (or UTC
+>   year / month / day / hour from `time_unix_nano`) disagrees with
+>   the partition-path segments the file lives under
+> - **When** the reader opens the file via `Reader::open_partition`
+> - **Then** the reader returns a hard error naming the offending
+>   row, the row's value, and the partition path's value
+> - **And** no records are surfaced from the file
 
 > **Scenario RFC0005.2 — Missing column tolerance (old-file reader path)**
 > - **Given** a Parquet file produced by a hand-rolled writer that
@@ -566,7 +637,7 @@ column the bench won't measure.
 >   one of the records carries a tenant id with non-ASCII characters
 > - **When** the writer flushes records to the bucket
 > - **Then** files are placed under
->   `data/tenant=<urlencoded_id>/year=YYYY/month=MM/day=DD/hour=HH/<uuidv7>.parquet`
+>   `data/tenant_id=<urlencoded_id>/year=YYYY/month=MM/day=DD/hour=HH/<uuidv7>.parquet`
 > - **And** every record inside a file shares the partition tuple
 
 > **Scenario RFC0005.6 — Row-group size lands inside H4 target**
@@ -574,15 +645,16 @@ column the bench won't measure.
 >   records under the production writer (not the corpus-mode
 >   single-file path)
 > - **When** the writer flushes Parquet files
-> - **Then** every emitted row group is at least 128 MiB
->   uncompressed and at most 1 GiB uncompressed
+> - **Then** every emitted row group's `total_uncompressed_size`
+>   (Parquet column-chunk metadata, sum across columns) is at
+>   least 128 MiB and at most 1 GiB
 > - **Except** the final row group of a file, which may be smaller
 
 > **Scenario RFC0005.7 — Audit-event stream is a separate file series**
 > - **Given** a corpus run that triggers at least one §6.4
 >   `TemplateWidened` event
 > - **When** the cluster's audit sink flushes
-> - **Then** audit events land under `audit/tenant=<id>/...`, not
+> - **Then** audit events land under `audit/tenant_id=<id>/...`, not
 >   interleaved with the data file series
 > - **And** the emitted audit record carries the full §3.7 payload
 >   (`old_template`, `new_template`, `old_version`, `new_version`,
@@ -592,9 +664,11 @@ column the bench won't measure.
 > - **Given** a corpus run that retains at least 100 unique high-
 >   entropy body strings (e.g. via §6.3 lossy-zone or §6.5 overflow)
 > - **When** the writer flushes the Parquet file
-> - **Then** the `body` column's reported encodings (via Parquet
->   metadata) include `PLAIN` and `ZSTD`, and do NOT include
->   `PLAIN_DICTIONARY` or `RLE_DICTIONARY`
+> - **Then** the `body` column chunk's `compression` codec is
+>   `ZSTD` (Parquet `CompressionCodec` field)
+> - **And** the `body` column chunk's `encodings` list does NOT
+>   include `PLAIN_DICTIONARY` or `RLE_DICTIONARY` (Parquet
+>   `Encoding` enum)
 > - **And** the file size does not balloon proportionally to the
 >   number of unique bodies — the §3.2 cardinality invariant holds
 
@@ -638,8 +712,11 @@ column the bench won't measure.
   `crates/ourios-parquet/tests/sizing.rs`. Generates ≥256 MiB of
   records, flushes through the writer, parses each emitted file's
   Parquet footer, asserts row-group sizes inside the H4 range.
-  Marked `#[ignore]` by default (slow); CI invokes it as a
-  nightly job.
+  Marked `#[ignore]` by default (slow); contributors run it
+  manually via `cargo test --ignored`. Scheduling it on a CI
+  cadence is an open question (§7) — the project's CI workflow
+  has no `schedule` trigger today, so the RFC does not commit to
+  one.
 - **RFC0005.7** — integration test in
   `crates/ourios-parquet/tests/audit.rs` that wires the audit
   sink to the writer's audit path, triggers a widening through
@@ -649,8 +726,9 @@ column the bench won't measure.
   `crates/ourios-parquet/tests/encoding.rs`. Drives 100+ unique
   bodies through the writer, opens the resulting file's footer
   via the `parquet` crate's column-chunk metadata, asserts the
-  `body` column reports `PLAIN`/`ZSTD` and not any of the
-  dictionary variants.
+  `body` column's `compression` is `ZSTD` and its `encodings`
+  list does not include `PLAIN_DICTIONARY` or `RLE_DICTIONARY`
+  (the two distinct Parquet-metadata fields per RFC0005.8).
 - **RFC0005.9** — unit test in `crates/ourios-parquet/src/reader.rs`
   with an in-memory Parquet file built directly from `arrow`
   arrays carrying a forged `99` in the `type_tag` list.
@@ -660,6 +738,13 @@ column the bench won't measure.
   This is the "schema-as-spec" pin: adding a column to `Schema`
   without updating the expected list (and, by implication, this
   RFC) fails the test, mirroring the RFC0004.3 pattern.
+- **RFC0005.11** — integration test in
+  `crates/ourios-parquet/tests/partition_validation.rs` that
+  builds Parquet files at deliberately mismatched partition
+  paths (row says `tenant_id = a`, path segment says
+  `tenant_id=b`) and asserts the reader's hard-error path fires
+  with the documented diagnostic. Sub-tests cover the four
+  time-bucket parts (`year`/`month`/`day`/`hour`).
 
 Criterion benchmarks (in `ourios-bench`, Phase 3 territory) will
 measure A1 (compression ratio) and B1/B2 (predicate-pushdown
@@ -697,7 +782,7 @@ are normative for the maturity-stage move from `green` to
   decision; for the standalone reader tests the bench will use
   whichever is simplest.
 - [ ] **Concurrent writers per partition.** Two writers writing
-  to the same `tenant=…/hour=HH/` simultaneously is fine
+  to the same `tenant_id=…/hour=HH/` simultaneously is fine
   (UUIDv7 prevents filename collision), but readers that
   enumerate partitions during an active write may see partial
   files. The reader contract assumes a file is either complete
@@ -705,6 +790,14 @@ are normative for the maturity-stage move from `green` to
   path, rename on close) is the writer's responsibility; the
   reader does not need to do anything special. Defer the writer
   PR to nail this down.
+- [ ] **Scheduled CI cadence for the slow tests.** RFC0005.6
+  (row-group sizing) and any future criterion benchmarks are
+  marked `#[ignore]` and rely on `cargo test --ignored` /
+  manual invocation. Adding a GitHub Actions `schedule:` trigger
+  (e.g. nightly at 03:00 UTC) so these run automatically is a
+  follow-up workflow PR, not part of this RFC. The RFC notes
+  the gap; the workflow PR will land alongside the §6.5
+  benchmark implementation.
 
 ## 8. References
 

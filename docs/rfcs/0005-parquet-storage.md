@@ -281,6 +281,21 @@ Where:
   stops at `day=DD` because audit volume is far lower than data
   volume; an hour-level partition for audit would produce many
   tiny files for no win.
+- **`time_unix_nano = 0` (OTLP "unknown" sentinel).** The
+  writer derives the partition tuple by first checking
+  `time_unix_nano`; if it is `0`, the writer falls back to
+  `observed_time_unix_nano`. If `observed_time_unix_nano` is
+  also absent or `0`, the record is placed under the epoch
+  partition `year=1970/month=01/day=01/hour=00/` — operators
+  see "unknown-time records cluster under 1970-01-01" as the
+  documented signal, and an emitter-side investigation is the
+  proper response. Rejecting the record was considered and
+  rejected: §3.5 records are end-of-pipeline (the wire-decode
+  receiver already accepted them), and a hard-reject here
+  would silently drop data the WAL already acknowledged.
+  Row-vs-path validation (§3.9) uses the same derivation
+  rule, so a row at `time_unix_nano = 0` placed under the
+  1970 partition validates cleanly.
 - `<flush_uuid>` is the writer's flush identifier, **pinned to
   UUIDv7** (RFC 9562). UUIDv7 places a millisecond-precision
   Unix timestamp in its high bits, so files in a partition sort

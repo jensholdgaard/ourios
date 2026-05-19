@@ -164,9 +164,9 @@ not stored row-level and their schema-evolution contract follows
 | `severity_text` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
 | `scope_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | Part of template key |
 | `scope_version` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
-| `attributes` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | Encoded per §3.3 (mirrors RFC 0001's `Vec<KeyValue>` — always present, possibly empty). For a record with no attributes, the writer emits the canonical empty array `[]` (two bytes, dictionary-encodes to 0 bits at row-group scale). `NULL` is not a valid encoding; the round-trip rule is `Vec::new()` ↔ `[]` |
+| `attributes` | `STRING` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | UTF-8 canonical JSON per §3.3 (mirrors RFC 0001's `Vec<KeyValue>` — always present, possibly empty). For a record with no attributes, the writer emits the canonical empty array `[]` (two bytes — repetitive across no-attribute records so ZSTD compression collapses it). `NULL` is not a valid encoding; the round-trip rule is `Vec::new()` ↔ `[]` |
 | `dropped_attributes_count` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Mostly zero |
-| `resource_attributes` | `BYTE_ARRAY` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | Same contract as `attributes`: REQUIRED, empty `Vec` ↔ `[]`, `NULL` not valid |
+| `resource_attributes` | `STRING` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | Same contract as `attributes`: REQUIRED, UTF-8 canonical JSON, empty `Vec` ↔ `[]`, `NULL` not valid |
 | `trace_id` | `UUID` | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL | Parquet's `UUID` logical type is the 16-byte binding for opaque identifiers; not interpreted as an RFC 4122 UUID |
 | `span_id` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(8)` | OPTIONAL | No matching Parquet logical type for 8-byte opaque ids; physical type alone is the contract |
 | `flags` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Lower 8 bits = W3C trace flags |

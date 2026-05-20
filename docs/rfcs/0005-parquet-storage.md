@@ -158,8 +158,8 @@ not stored row-level and their schema-evolution contract follows
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
-| `time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | `0` = unknown (OTLP convention); time partition key derived from this |
-| `observed_time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | OPTIONAL | |
+| `time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | `0` = unknown (OTLP convention); time partition key derived from this. See "u64 → i64 overflow contract" below |
+| `observed_time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | OPTIONAL | Same overflow contract as `time_unix_nano` |
 | `severity_number` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | OTLP `SeverityNumber` 0..24; part of template key |
 | `severity_text` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
 | `scope_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | Part of template key |
@@ -167,8 +167,8 @@ not stored row-level and their schema-evolution contract follows
 | `attributes` | `STRING` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | UTF-8 canonical JSON per §3.3 (mirrors RFC 0001's `Vec<KeyValue>` — always present, possibly empty). For a record with no attributes, the writer emits the canonical empty array `[]` (two bytes — repetitive across no-attribute records so ZSTD compression collapses it). `NULL` is not a valid encoding; the round-trip rule is `Vec::new()` ↔ `[]` |
 | `dropped_attributes_count` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Mostly zero |
 | `resource_attributes` | `STRING` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | Same contract as `attributes`: REQUIRED, UTF-8 canonical JSON, empty `Vec` ↔ `[]`, `NULL` not valid |
-| `trace_id` | `UUID` | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL | Parquet's `UUID` logical type is the 16-byte binding for opaque identifiers; not interpreted as an RFC 4122 UUID |
-| `span_id` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(8)` | OPTIONAL | No matching Parquet logical type for 8-byte opaque ids; physical type alone is the contract |
+| `trace_id` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL | OTLP / W3C Trace Context `trace_id` is 16 opaque bytes — *not* an RFC 4122 UUID. Parquet's `UUID` logical type is deliberately **not** applied: downstream consumers (Arrow, DataFusion, ParquetTools) treat it as a typed UUID with RFC 4122 validation and formatting, which would misrepresent OTLP's opaque-byte semantics |
+| `span_id` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(8)` | OPTIONAL | Same opaque-byte contract as `trace_id`; no Parquet logical type exists for 8-byte opaque ids |
 | `flags` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Lower 8 bits = W3C trace flags |
 | `event_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
 
@@ -191,6 +191,23 @@ integer enum is `0..=7` matching RFC 0001's `ParamType` ordering:
 `IP, UUID, NUM, HEX, TS, PATH, STR, OVERFLOW`. Adding a new
 variant is a §3.5 schema amendment (additive, but readers MUST
 know how to surface unknown variants — see §3.9).
+
+**`u64` → `i64` overflow contract for nanosecond timestamps.**
+OTLP defines `time_unix_nano` and `observed_time_unix_nano` as
+`uint64` nanoseconds-since-Unix-epoch; Parquet's
+`TIMESTAMP(NANOS)` is backed by `INT64`. The 63-bit physical
+range tops out at `i64::MAX` ≈ 2^63 − 1 ns, which corresponds
+to 2262-04-11T23:47:16.854775807Z UTC. The writer **rejects**
+any record whose `time_unix_nano` or `observed_time_unix_nano`
+exceeds `i64::MAX` with a hard error naming the offending
+record and the offending field; no silent saturation, no wrap-
+around to negative values. The reader, conversely, never
+encounters out-of-range values (the file format itself can't
+hold them), so reads are infallible on this axis. Operators
+running Ourios past year 2262 will need a schema migration
+(per §3.5 / §3.8) to either widen the physical type or
+re-base the epoch; that's a future-RFC concern, not a
+post-MVP gap to plug here.
 
 ### 3.3 `AnyValue` encoding rule
 

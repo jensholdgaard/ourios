@@ -517,8 +517,9 @@ the **baseline** schema; subsequent changes follow these rules:
    doesn't regress A1/B1/B2.
 
 The PR description that touches the schema must explicitly call
-out which rule above applies, mirroring the RFC 0001 §6.7 convention
-for invariant-touching PRs.
+out which rule above applies, mirroring the `CLAUDE.md` §4
+convention for hazard-touching PRs ("the PR description must
+explicitly address how the change preserves the invariant").
 
 ### 3.9 Reader contract
 

@@ -379,9 +379,11 @@ Per-column encoding decisions, anchored to query patterns
 
 | Column | Dictionary | Page index | Bloom filter | Rationale |
 |---|---|---|---|---|
+| `tenant_id` | yes | no | no | Bounded per cluster; one or two distinct values per file because of partition pruning |
 | `template_id` | yes | yes | **yes** | B2 (`where template_id = X`) is bloom-friendly; high cardinality but small relative to row count |
 | `template_version` | yes | yes | no | Always small per template |
 | `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page enables B1 range pruning |
+| `observed_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`; the observation timeline is also broadly monotonic, so delta encoding pays |
 | `severity_number` | yes | yes | no | 0..24 — dict alone is enough |
 | `severity_text` | yes | yes | no | Bounded set in practice |
 | `scope_name` | yes | yes | no | Bounded per deployment |
@@ -564,15 +566,21 @@ The reader has three normative requirements:
    or the DataFusion `ListingTable` integration that feeds a
    partition tuple in), the reader compares the row-level
    `tenant_id` against the partition path's `tenant_id` segment
-   and the row-level `time_unix_nano`'s UTC year / month / day
-   / hour against the path's time-bucket segments. Mismatch is
-   a **hard read error** that names the offending row and the
-   partition path. The row value is authoritative (the talk and
-   RFC 0001 §6.1's row-as-source-of-truth rule); the path is the
-   partition-pruning index. A diagnostic `Reader::open_file`
-   helper that opens a single file without a partition tuple
-   skips this validation and surfaces records as-stored — that
-   mode is not exposed through the production query path.
+   and the row's **derived** UTC year / month / day / hour
+   against the path's time-bucket segments. The derivation
+   algorithm is identical to the writer's in §3.4: prefer
+   `time_unix_nano` if non-zero, else fall back to
+   `observed_time_unix_nano` if present and non-zero, else the
+   1970-01-01T00 epoch. Using the same algorithm on both sides
+   guarantees that a row written under one bucket validates
+   under the same bucket. Mismatch is a **hard read error**
+   that names the offending row and the partition path. The
+   row value is authoritative (the talk and RFC 0001 §6.1's
+   row-as-source-of-truth rule); the path is the partition-
+   pruning index. A diagnostic `Reader::open_file` helper that
+   opens a single file without a partition tuple skips this
+   validation and surfaces records as-stored — that mode is
+   not exposed through the production query path.
 
 Unknown `ParamType` ordinals (i.e. a value the reader doesn't
 know about) are surfaced as `ParamType::Unknown` — a reserved
@@ -734,7 +742,9 @@ column the bench won't measure.
 >   one of the records carries a tenant id with non-ASCII characters
 > - **When** the writer flushes records to the bucket
 > - **Then** files are placed under
->   `data/tenant_id=<urlencoded_id>/year=YYYY/month=MM/day=DD/hour=HH/<uuidv7>.parquet`
+>   `data/tenant_id=<tenant_id>/year=YYYY/month=MM/day=DD/hour=HH/<flush_uuid>.parquet`,
+>   where `<tenant_id>` is the percent-encoded `TenantId` per §3.4
+>   and `<flush_uuid>` is the UUIDv7 flush identifier per §3.4
 > - **And** every record inside a file shares the partition tuple
 
 > **Scenario RFC0005.6 — Row-group size lands inside H4 target**
@@ -791,13 +801,20 @@ column the bench won't measure.
 >   in declared order
 
 > **Scenario RFC0005.11 — Row-vs-path validation on partition mismatch**
-> - **Given** a Parquet file whose row-level `tenant_id` (or UTC
->   year / month / day / hour from `time_unix_nano`) disagrees with
->   the partition-path segments the file lives under
+> - **Given** a Parquet file whose row-level `tenant_id`, or the
+>   row's UTC year / month / day / hour as derived by the §3.4
+>   algorithm (prefer `time_unix_nano` if non-zero, else
+>   `observed_time_unix_nano` if non-zero, else the 1970 epoch),
+>   disagrees with the partition-path segments the file lives
+>   under
 > - **When** the reader opens the file via `Reader::open_partition`
 > - **Then** the reader returns a hard error naming the offending
 >   row, the row's value, and the partition path's value
 > - **And** no records are surfaced from the file
+> - **And** a row with `time_unix_nano = 0` and a non-zero
+>   `observed_time_unix_nano` placed under a partition path
+>   derived from the observed-time fallback validates cleanly
+>   (the same algorithm runs on both sides)
 
 ## 6. Testing strategy
 

@@ -1,0 +1,22 @@
+[package]
+name = "ourios-parquet"
+version = "0.0.0"
+description = "Parquet schema, writer, reader, and audit-event file series for Ourios. RFC 0005 is the on-disk contract."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Arrow's `SchemaRef` is the cross-crate Parquet-Rust interop point
+# (writer / reader / DataFusion `ListingTable` all consume an
+# `arrow::datatypes::Schema`). Declaring the schema in Arrow rather
+# than the lower-level `parquet::schema::types::SchemaDescriptor`
+# means the writer / reader follow-on PRs can hand the same object
+# to `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`
+# without translation.
+arrow = { version = "55", default-features = false }
+
+[lints]
+workspace = true

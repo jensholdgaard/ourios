@@ -364,7 +364,7 @@ Per-column encoding decisions, anchored to query patterns
 |---|---|---|---|---|
 | `template_id` | yes | yes | **yes** | B2 (`where template_id = X`) is bloom-friendly; high cardinality but small relative to row count |
 | `template_version` | yes | yes | no | Always small per template |
-| `time_unix_nano` | no | yes | no | Delta-encoding inside zstd; min/max per page for B1 range pruning |
+| `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page enables B1 range pruning |
 | `severity_number` | yes | yes | no | 0..24 — dict alone is enough |
 | `severity_text` | yes | yes | no | Bounded set in practice |
 | `scope_name` | yes | yes | no | Bounded per deployment |
@@ -463,7 +463,7 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 | Column | Dictionary | Page index | Bloom filter | Rationale |
 |---|---|---|---|---|
 | `tenant_id` | yes | no | no | Bounded per cluster |
-| `timestamp` | no | yes | no | Delta-encoded inside ZSTD; page index supports time-range pruning on drift queries |
+| `timestamp` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding plus ZSTD compression (same shape as data-file `time_unix_nano`); page index supports time-range pruning on drift queries |
 | `event_kind` | yes | yes | no | Three values today, plus future ordinals |
 | `event_type` | yes | yes | no | Same bounded set as `event_kind`; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
 | `template_id` | yes | yes | no | Bounded by tenant template count; bloom filter is unnecessary at audit volume |
@@ -689,15 +689,6 @@ column the bench won't measure.
 >   `hour`); those are covered by RFC0005.5 (partition layout) and
 >   RFC0005.11 (row-vs-path validation)
 
-> **Scenario RFC0005.11 — Row-vs-path validation on partition mismatch**
-> - **Given** a Parquet file whose row-level `tenant_id` (or UTC
->   year / month / day / hour from `time_unix_nano`) disagrees with
->   the partition-path segments the file lives under
-> - **When** the reader opens the file via `Reader::open_partition`
-> - **Then** the reader returns a hard error naming the offending
->   row, the row's value, and the partition path's value
-> - **And** no records are surfaced from the file
-
 > **Scenario RFC0005.2 — Missing column tolerance (old-file reader path)**
 > - **Given** a Parquet file produced by a hand-rolled writer that
 >   omits an OPTIONAL column the current schema declares
@@ -780,6 +771,15 @@ column the bench won't measure.
 >   and compares it against the column list pinned in this RFC
 > - **Then** the two lists are equal in name, type, and repetition,
 >   in declared order
+
+> **Scenario RFC0005.11 — Row-vs-path validation on partition mismatch**
+> - **Given** a Parquet file whose row-level `tenant_id` (or UTC
+>   year / month / day / hour from `time_unix_nano`) disagrees with
+>   the partition-path segments the file lives under
+> - **When** the reader opens the file via `Reader::open_partition`
+> - **Then** the reader returns a hard error naming the offending
+>   row, the row's value, and the partition path's value
+> - **And** no records are surfaced from the file
 
 ## 6. Testing strategy
 

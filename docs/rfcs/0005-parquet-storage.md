@@ -178,7 +178,7 @@ miner-derived reconstruction"):
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
 | `body_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | `0` = `String`, `1` = `Structured` |
-| `body` | `BYTE_ARRAY` | `BYTE_ARRAY` | OPTIONAL | Original bytes when retained per RFC 0001 §6.3 (lossy-zone retention) / RFC 0001 §6.5 (overflow forces retention); canonical-JSON `AnyValue` when `body_kind = Structured`; absent on clean-zone `String` rows. Intentionally no `STRING` logical type — the column carries raw bytes (potentially non-UTF-8 log lines or non-JSON binary), not text |
+| `body` | (no logical type) | `BYTE_ARRAY` | OPTIONAL | Original bytes when retained per RFC 0001 §6.3 (lossy-zone retention) / RFC 0001 §6.5 (overflow forces retention); canonical-JSON `AnyValue` when `body_kind = Structured`; absent on clean-zone `String` rows. Intentionally no `STRING` logical type — the column carries raw bytes (potentially non-UTF-8 log lines or non-JSON binary), not text |
 | `params` | `LIST<STRUCT<type_tag: INT32, value: BYTE_ARRAY>>` | as schema | REQUIRED | Always written (mirrors RFC 0001's `Vec<Param>`); the list is empty (zero elements) when `body_kind = Structured`. `NULL` is not a valid encoding |
 | `separators` | `LIST<BYTE_ARRAY>` | as schema | REQUIRED | Always written (mirrors RFC 0001's `Vec<Separator>`); `tokens.len() + 1` elements when `body_kind = String`, zero elements when `body_kind = Structured`. `NULL` is not a valid encoding |
 | `confidence` | `FLOAT` | `FLOAT` | REQUIRED | `1.0` sentinel when `body_kind = Structured` |
@@ -379,7 +379,7 @@ Per-column encoding decisions, anchored to query patterns
 
 | Column | Dictionary | Page index | Bloom filter | Rationale |
 |---|---|---|---|---|
-| `tenant_id` | yes | no | no | Bounded per cluster; one or two distinct values per file because of partition pruning |
+| `tenant_id` | yes | no | no | Exactly one distinct value per file in valid data (§3.4 places each file under a single `tenant_id=…` partition, §3.9 errors on row-vs-path mismatch); dictionary encoding collapses the column to a one-entry dictionary plus an indexed RLE stream |
 | `template_id` | yes | yes | **yes** | B2 (`where template_id = X`) is bloom-friendly; high cardinality but small relative to row count |
 | `template_version` | yes | yes | no | Always small per template |
 | `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page enables B1 range pruning |
@@ -752,9 +752,11 @@ column the bench won't measure.
 >   records under the production writer (not the corpus-mode
 >   single-file path)
 > - **When** the writer flushes Parquet files
-> - **Then** every emitted row group's `total_uncompressed_size`
->   (Parquet column-chunk metadata, sum across columns) is at
->   least 128 MiB and at most 1 GiB
+> - **Then** every emitted row group's `total_byte_size` (the
+>   uncompressed size field on `RowGroup` in the Parquet
+>   metadata — equal to the sum of its column chunks'
+>   `total_uncompressed_size`) is at least 128 MiB and at most
+>   1 GiB
 > - **Except** the final row group of a file, which may be smaller
 
 > **Scenario RFC0005.7 — Audit-event stream is a separate file series**

@@ -106,11 +106,21 @@ impl Writer {
     ///   or `ArrowWriter` setup fails.
     pub fn open(bucket_root: &Path, partition: PartitionKey) -> Result<Self, WriterError> {
         let dir = partition.data_path(bucket_root);
-        std::fs::create_dir_all(&dir).map_err(WriterError::Io)?;
+        std::fs::create_dir_all(&dir).map_err(|source| WriterError::Io {
+            op: "create_dir_all",
+            path: dir.clone(),
+            source_path: None,
+            source,
+        })?;
         let flush_uuid = Uuid::now_v7();
         let final_path = dir.join(format!("{flush_uuid}.parquet"));
         let temp_path = dir.join(format!("{flush_uuid}.parquet.tmp"));
-        let file = File::create(&temp_path).map_err(WriterError::Io)?;
+        let file = File::create(&temp_path).map_err(|source| WriterError::Io {
+            op: "create",
+            path: temp_path.clone(),
+            source_path: None,
+            source,
+        })?;
 
         let props = writer_properties()?;
         let inner =
@@ -241,7 +251,12 @@ impl Writer {
             .take()
             .expect("temp_path is Some until close consumes it");
         let metadata = inner.close().map_err(WriterError::Parquet)?;
-        std::fs::rename(&temp_path, &self.final_path).map_err(WriterError::Io)?;
+        std::fs::rename(&temp_path, &self.final_path).map_err(|source| WriterError::Io {
+            op: "rename",
+            path: self.final_path.clone(),
+            source_path: Some(temp_path.clone()),
+            source,
+        })?;
         Ok(WrittenFile {
             path: self.final_path.clone(),
             partition: self.partition.clone(),
@@ -306,8 +321,25 @@ pub struct WrittenFile {
 /// Errors produced by [`Writer`].
 #[derive(Debug)]
 pub enum WriterError {
-    /// Filesystem I/O failure (directory create, file open).
-    Io(io::Error),
+    /// Filesystem I/O failure. Carries the operation name and
+    /// the path(s) involved so logs and recovery scripts can
+    /// pinpoint which step failed and which `.parquet.tmp` (if
+    /// any) is left on disk for diagnosis.
+    Io {
+        /// Short operation name (e.g. `"create_dir_all"`,
+        /// `"create"`, `"rename"`).
+        op: &'static str,
+        /// The primary path the operation was acting on. For
+        /// `rename`, this is the *destination*; the source
+        /// path lives in [`Self::source_path`] (when set).
+        path: PathBuf,
+        /// Secondary path for two-path operations (only
+        /// populated for `rename`, where it carries the source
+        /// `.parquet.tmp` path that's left on disk).
+        source_path: Option<PathBuf>,
+        /// Underlying `io::Error`.
+        source: io::Error,
+    },
     /// Parquet writer failure (footer write, codec failure).
     Parquet(ParquetError),
     /// `RecordBatch` construction failed — see [`BatchError`].
@@ -329,7 +361,24 @@ pub enum WriterError {
 impl fmt::Display for WriterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "filesystem I/O: {e}"),
+            Self::Io {
+                op,
+                path,
+                source_path,
+                source,
+            } => match source_path {
+                Some(src) => write!(
+                    f,
+                    "filesystem I/O on `{op}` from {} to {}: {source}",
+                    src.display(),
+                    path.display(),
+                ),
+                None => write!(
+                    f,
+                    "filesystem I/O on `{op}` at {}: {source}",
+                    path.display(),
+                ),
+            },
             Self::Parquet(e) => write!(f, "parquet writer: {e}"),
             Self::Batch(e) => write!(f, "record batch: {e}"),
             Self::PartitionMismatch {
@@ -360,7 +409,7 @@ impl fmt::Display for WriterError {
 impl std::error::Error for WriterError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io { source, .. } => Some(source),
             Self::Parquet(e) => Some(e),
             Self::Batch(e) => Some(e),
             Self::PartitionMismatch { .. } => None,

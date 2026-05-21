@@ -117,6 +117,13 @@ pub enum BatchError {
         /// Actual separator-vec length on the offending record.
         actual: usize,
     },
+    /// A `lossy_flag = true` String record had `body = None`.
+    /// The §6.6 reconstruction path for lossy rows returns the
+    /// retained body verbatim — without a body to fall back
+    /// to, the record is unreconstructable downstream. Reject
+    /// at write time so the file never contains a row that
+    /// would surface this corruption on read.
+    MissingBodyForLossyString,
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -163,6 +170,12 @@ impl fmt::Display for BatchError {
                  String. Parse-failure / tokenizer-failure rows (lossy_flag = true) are \
                  exempt from this check",
             ),
+            Self::MissingBodyForLossyString => write!(
+                f,
+                "lossy_flag = true String record has body = None, but RFC 0001 §6.6's lossy \
+                 reconstruction path returns the retained body verbatim — without one, the \
+                 record is unreconstructable on read",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -175,7 +188,8 @@ impl std::error::Error for BatchError {
             | Self::AttributesNotYetEncoded { .. }
             | Self::UnsupportedAbsentBody
             | Self::StructuredBodyNotYetCanonical
-            | Self::InvalidSeparatorsForString { .. } => None,
+            | Self::InvalidSeparatorsForString { .. }
+            | Self::MissingBodyForLossyString => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -336,22 +350,32 @@ impl Builders {
             None => self.body.append_null(),
         }
 
-        // RFC 0005 §3.2 invariant: `body_kind = String` clean
-        // attaches carry `tokens.len() + 1` separators. The
-        // writer can't reach `tokens.len()` (the template store
-        // is the reader's concern), but `tokens.len() >=
-        // params.len()` always — so `separators.len() <
-        // params.len() + 1` is a definite contract violation.
-        // Parse-failure / tokenizer-failure rows (`lossy_flag =
-        // true`) reconstruct via the retained body and don't
-        // walk `separators`; they're exempt.
-        if r.body_kind == BodyKind::String && !r.lossy_flag {
-            let expected_at_least = r.params.len() + 1;
-            if r.separators.len() < expected_at_least {
-                return Err(BatchError::InvalidSeparatorsForString {
-                    expected_at_least,
-                    actual: r.separators.len(),
-                });
+        // RFC 0005 §3.2 / RFC 0001 §6.6 reconstruction
+        // invariants for `body_kind = String`:
+        // - Clean attach (`lossy_flag = false`): `separators.len()
+        //   >= params.len() + 1`. The writer can't reach
+        //   `tokens.len()` (the template store is the reader's
+        //   concern), but `tokens.len() >= params.len()` always
+        //   — so falling below `params.len() + 1` is a definite
+        //   contract violation.
+        // - Lossy attach (`lossy_flag = true`): reconstruction
+        //   returns the retained `body` verbatim and doesn't
+        //   walk `separators`. The carve-out is real, but
+        //   `body` MUST be present — without it the lossy
+        //   record is unreconstructable on read.
+        if r.body_kind == BodyKind::String {
+            if r.lossy_flag {
+                if r.body.is_none() {
+                    return Err(BatchError::MissingBodyForLossyString);
+                }
+            } else {
+                let expected_at_least = r.params.len() + 1;
+                if r.separators.len() < expected_at_least {
+                    return Err(BatchError::InvalidSeparatorsForString {
+                        expected_at_least,
+                        actual: r.separators.len(),
+                    });
+                }
             }
         }
         append_params(&mut self.params, &r.params);
@@ -637,6 +661,22 @@ mod tests {
             }
             other => panic!("expected InvalidSeparatorsForString, got {other:?}"),
         }
+    }
+
+    /// The lossy carve-out requires the retained `body` to be
+    /// present: without it, RFC 0001 §6.6 reconstruction has
+    /// nothing to fall back to. Reject the missing-body case.
+    #[test]
+    fn lossy_string_without_body_returns_missing_body_error() {
+        let mut rec = empty_record();
+        rec.separators = Vec::new();
+        rec.lossy_flag = true;
+        rec.body = None;
+        let err = mined_records_to_batch(&[rec]).expect_err("lossy + body=None must error");
+        assert!(
+            matches!(err, BatchError::MissingBodyForLossyString),
+            "expected MissingBodyForLossyString, got {err:?}",
+        );
     }
 
     /// The carve-out: `lossy_flag = true` (parse-failure /

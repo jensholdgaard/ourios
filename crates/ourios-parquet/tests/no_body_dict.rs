@@ -192,7 +192,8 @@ fn rfc0005_6_params_value_leaf_has_no_dictionary_encoding() {
     let metadata = reader.metadata();
     assert!(metadata.num_row_groups() >= 1);
 
-    let mut params_leaves_checked = 0;
+    let mut saw_params_value_leaf = false;
+    let mut saw_params_type_tag_leaf = false;
     for rg_idx in 0..metadata.num_row_groups() {
         let rg = metadata.row_group(rg_idx);
         for col_idx in 0..rg.num_columns() {
@@ -200,10 +201,11 @@ fn rfc0005_6_params_value_leaf_has_no_dictionary_encoding() {
             // Both params LIST<STRUCT<...>> leaves get the §3.6
             // "(list values)" Dictionary = no treatment.
             let path = col.column_path().string();
-            if path != "params.list.element.value" && path != "params.list.element.type_tag" {
-                continue;
+            match path.as_str() {
+                "params.list.element.value" => saw_params_value_leaf = true,
+                "params.list.element.type_tag" => saw_params_type_tag_leaf = true,
+                _ => continue,
             }
-            params_leaves_checked += 1;
 
             assert!(
                 matches!(col.compression(), Compression::ZSTD(_)),
@@ -226,13 +228,15 @@ fn rfc0005_6_params_value_leaf_has_no_dictionary_encoding() {
             );
         }
     }
-    // Expect at least one of each leaf — if zero, the dotted
-    // column-path naming convention has changed and the
-    // writer's ColumnPath overrides are silently no-op.
+    // Track each leaf separately — if either is missing, the
+    // dotted column-path naming convention has changed and the
+    // writer's matching ColumnPath override is silently no-op.
     assert!(
-        params_leaves_checked >= 2,
-        "expected both `params.list.element.value` and \
-         `params.list.element.type_tag` column chunks in the file, \
-         found {params_leaves_checked}",
+        saw_params_value_leaf,
+        "expected `params.list.element.value` column chunk in the file",
+    );
+    assert!(
+        saw_params_type_tag_leaf,
+        "expected `params.list.element.type_tag` column chunk in the file",
     );
 }

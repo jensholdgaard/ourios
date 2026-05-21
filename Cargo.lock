@@ -21,6 +21,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "arrow-schema"
+version = "55.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af7686986a3bf2254c9fb130c623cdcb2f8e1f15763e7c71c310f0834da3d292"
+
+[[package]]
 name = "blake3"
 version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -281,6 +287,13 @@ version = "0.0.0"
 dependencies = [
  "ourios-core",
  "sha2",
+]
+
+[[package]]
+name = "ourios-parquet"
+version = "0.0.0"
+dependencies = [
+ "arrow-schema",
 ]
 
 [[package]]

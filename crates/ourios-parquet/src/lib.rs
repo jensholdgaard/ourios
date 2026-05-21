@@ -1,0 +1,202 @@
+//! `ourios-parquet` — Parquet schema, writer, reader, and
+//! audit-event file series for Ourios.
+//!
+//! RFC 0005 is the normative on-disk contract. This crate
+//! implements that contract; the §3.10 "Crate shape" plan splits
+//! the work across follow-on PRs:
+//!
+//! 1. **scaffold** (this PR) — `data_schema()` / `audit_schema()`
+//!    Arrow schemas plus column-name constants for greppability.
+//!    The RFC0005.10 "schema-as-spec" pin test lands alongside.
+//! 2. writer — `Writer` opening a file at a partition path,
+//!    appending rows in the §3.2 column order, rotating row
+//!    groups at the §3.5 threshold.
+//! 3. reader — `Reader` with the §3.9 forward-/backward-compat
+//!    contract (unknown columns ignored, missing OPTIONAL
+//!    columns surface as `None`, row-vs-path validation).
+//! 4. audit stream — `AuditWriter` / `AuditReader` for the §3.7
+//!    parallel file series.
+//!
+//! Arrow's `SchemaRef` is the cross-crate interop point — the
+//! follow-on writer/reader hand the same `SchemaRef` to
+//! `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`
+//! without translating to `parquet::schema::types::SchemaDescriptor`
+//! by hand.
+
+#![deny(unsafe_code)]
+
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
+
+/// Data-file column-name constants (RFC 0005 §3.2). Production
+/// code addressing columns by name MUST use these so renames stay
+/// greppable and the RFC0005.10 schema-pin test catches drift.
+pub mod columns {
+    pub const TENANT_ID: &str = "tenant_id";
+    pub const TEMPLATE_ID: &str = "template_id";
+    pub const TEMPLATE_VERSION: &str = "template_version";
+    pub const TIME_UNIX_NANO: &str = "time_unix_nano";
+    pub const OBSERVED_TIME_UNIX_NANO: &str = "observed_time_unix_nano";
+    pub const SEVERITY_NUMBER: &str = "severity_number";
+    pub const SEVERITY_TEXT: &str = "severity_text";
+    pub const SCOPE_NAME: &str = "scope_name";
+    pub const SCOPE_VERSION: &str = "scope_version";
+    pub const ATTRIBUTES: &str = "attributes";
+    pub const DROPPED_ATTRIBUTES_COUNT: &str = "dropped_attributes_count";
+    pub const RESOURCE_ATTRIBUTES: &str = "resource_attributes";
+    pub const TRACE_ID: &str = "trace_id";
+    pub const SPAN_ID: &str = "span_id";
+    pub const FLAGS: &str = "flags";
+    pub const EVENT_NAME: &str = "event_name";
+    pub const BODY_KIND: &str = "body_kind";
+    pub const BODY: &str = "body";
+    pub const PARAMS: &str = "params";
+    pub const SEPARATORS: &str = "separators";
+    pub const CONFIDENCE: &str = "confidence";
+    pub const LOSSY_FLAG: &str = "lossy_flag";
+}
+
+/// Audit-event file column-name constants (RFC 0005 §3.7).
+pub mod audit_columns {
+    pub const TENANT_ID: &str = "tenant_id";
+    pub const TIMESTAMP: &str = "timestamp";
+    pub const EVENT_KIND: &str = "event_kind";
+    pub const EVENT_TYPE: &str = "event_type";
+    pub const TEMPLATE_ID: &str = "template_id";
+    pub const OLD_VERSION: &str = "old_version";
+    pub const NEW_VERSION: &str = "new_version";
+    pub const OLD_TEMPLATE: &str = "old_template";
+    pub const NEW_TEMPLATE: &str = "new_template";
+    pub const POSITIONS_WIDENED: &str = "positions_widened";
+    pub const SLOTS_EXPANDED: &str = "slots_expanded";
+    pub const TRIGGERING_LINE_HASH: &str = "triggering_line_hash";
+    pub const TRIGGERING_LINE_SAMPLE: &str = "triggering_line_sample";
+    pub const REASON: &str = "reason";
+}
+
+/// Build the data-file Arrow schema per RFC 0005 §3.2.
+///
+/// Column order matches the RFC's §3.2 declaration order; readers
+/// MUST address columns by name (the §3.2 normative rule), but the
+/// declared order is what shows up in `cargo doc` and what the
+/// schema-pin test asserts so writer / reader implementations stay
+/// in lockstep with the RFC.
+#[must_use]
+pub fn data_schema() -> SchemaRef {
+    let utc: Arc<str> = "UTC".into();
+    let params_element = Field::new(
+        "element",
+        DataType::Struct(
+            vec![
+                Field::new("type_tag", DataType::Int32, false),
+                Field::new("value", DataType::Binary, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    let separators_element = Field::new("element", DataType::Binary, false);
+
+    Arc::new(ArrowSchema::new(vec![
+        Field::new(columns::TENANT_ID, DataType::Utf8, false),
+        Field::new(columns::TEMPLATE_ID, DataType::UInt64, false),
+        Field::new(columns::TEMPLATE_VERSION, DataType::UInt32, false),
+        Field::new(
+            columns::TIME_UNIX_NANO,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(utc.clone())),
+            false,
+        ),
+        Field::new(
+            columns::OBSERVED_TIME_UNIX_NANO,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(utc)),
+            true,
+        ),
+        Field::new(columns::SEVERITY_NUMBER, DataType::UInt8, false),
+        Field::new(columns::SEVERITY_TEXT, DataType::Utf8, true),
+        Field::new(columns::SCOPE_NAME, DataType::Utf8, true),
+        Field::new(columns::SCOPE_VERSION, DataType::Utf8, true),
+        Field::new(columns::ATTRIBUTES, DataType::Utf8, false),
+        Field::new(columns::DROPPED_ATTRIBUTES_COUNT, DataType::UInt32, false),
+        Field::new(columns::RESOURCE_ATTRIBUTES, DataType::Utf8, false),
+        Field::new(columns::TRACE_ID, DataType::FixedSizeBinary(16), true),
+        Field::new(columns::SPAN_ID, DataType::FixedSizeBinary(8), true),
+        Field::new(columns::FLAGS, DataType::UInt32, false),
+        Field::new(columns::EVENT_NAME, DataType::Utf8, true),
+        Field::new(columns::BODY_KIND, DataType::UInt8, false),
+        Field::new(columns::BODY, DataType::Binary, true),
+        Field::new(
+            columns::PARAMS,
+            DataType::List(Arc::new(params_element)),
+            false,
+        ),
+        Field::new(
+            columns::SEPARATORS,
+            DataType::List(Arc::new(separators_element)),
+            false,
+        ),
+        Field::new(columns::CONFIDENCE, DataType::Float32, false),
+        Field::new(columns::LOSSY_FLAG, DataType::Boolean, false),
+    ]))
+}
+
+/// Build the audit-event file Arrow schema per RFC 0005 §3.7.
+///
+/// Both `event_kind` (`UInt8` Arrow — Parquet stores it physically
+/// as `INT32` since Parquet has no narrower integer physical type,
+/// with the §3.7 logical type `INTEGER(8, signed=false)`) and
+/// `event_type` (`Utf8` Arrow → `STRING` Parquet) are persisted
+/// per §3.7's dual-column rule. The ordinal is the compact
+/// internal representation; the string is the predicate-pushdown
+/// surface RFC 0001 §9 requires for the §6.7 drift query.
+#[must_use]
+pub fn audit_schema() -> SchemaRef {
+    let utc: Arc<str> = "UTC".into();
+    let positions_element = Field::new("element", DataType::Int32, false);
+    let types_added_element = Field::new("element", DataType::Int32, false);
+    let slot_expansion_struct = DataType::Struct(
+        vec![
+            Field::new("slot_index", DataType::Int32, false),
+            Field::new(
+                "types_added",
+                DataType::List(Arc::new(types_added_element)),
+                false,
+            ),
+        ]
+        .into(),
+    );
+    let slots_expanded_element = Field::new("element", slot_expansion_struct, false);
+
+    Arc::new(ArrowSchema::new(vec![
+        Field::new(audit_columns::TENANT_ID, DataType::Utf8, false),
+        Field::new(
+            audit_columns::TIMESTAMP,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(utc)),
+            false,
+        ),
+        Field::new(audit_columns::EVENT_KIND, DataType::UInt8, false),
+        Field::new(audit_columns::EVENT_TYPE, DataType::Utf8, false),
+        Field::new(audit_columns::TEMPLATE_ID, DataType::UInt64, false),
+        Field::new(audit_columns::OLD_VERSION, DataType::UInt32, false),
+        Field::new(audit_columns::NEW_VERSION, DataType::UInt32, false),
+        Field::new(audit_columns::OLD_TEMPLATE, DataType::Utf8, false),
+        Field::new(audit_columns::NEW_TEMPLATE, DataType::Utf8, false),
+        Field::new(
+            audit_columns::POSITIONS_WIDENED,
+            DataType::List(Arc::new(positions_element)),
+            false,
+        ),
+        Field::new(
+            audit_columns::SLOTS_EXPANDED,
+            DataType::List(Arc::new(slots_expanded_element)),
+            false,
+        ),
+        Field::new(
+            audit_columns::TRIGGERING_LINE_HASH,
+            DataType::FixedSizeBinary(16),
+            false,
+        ),
+        Field::new(audit_columns::TRIGGERING_LINE_SAMPLE, DataType::Utf8, true),
+        Field::new(audit_columns::REASON, DataType::Utf8, true),
+    ]))
+}

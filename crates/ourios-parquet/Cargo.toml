@@ -1,0 +1,31 @@
+[package]
+name = "ourios-parquet"
+version = "0.0.0"
+description = "Parquet schema, writer, reader, and audit-event file series for Ourios. RFC 0005 is the on-disk contract."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# `arrow-schema` is the slim sub-crate of the Arrow workspace
+# carrying just the schema types (`DataType`, `Field`, `Schema`,
+# `SchemaRef`). The scaffold needs only those — the broader
+# `arrow` meta-crate (and `arrow-array` / `arrow-data` etc.) will
+# enter the dep tree alongside the writer / reader follow-on PRs
+# that actually allocate `RecordBatch`es. Keeping the scaffold's
+# dep footprint minimal speeds clean builds and surfaces
+# downstream-version drift sooner.
+#
+# `arrow-schema`'s `Schema` is also the cross-crate Parquet-Rust
+# interop point: `parquet::arrow::ArrowWriter` and
+# `ParquetRecordBatchReader` both consume an
+# `arrow_schema::SchemaRef`, so declaring the schema here means
+# the writer / reader PRs hand the same object across without
+# translating to `parquet::schema::types::SchemaDescriptor` by
+# hand.
+arrow-schema = { version = "55", default-features = false }
+
+[lints]
+workspace = true

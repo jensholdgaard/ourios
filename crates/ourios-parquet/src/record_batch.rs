@@ -9,12 +9,16 @@
 //! **`AnyValue` → canonical JSON.** RFC 0005 §3.3 mandates
 //! OTLP-canonical JSON for the `attributes`, `resource_attributes`,
 //! and (when `body_kind = Structured`) `body` columns. The
-//! current builder writes the `Debug` rendering of the
-//! `Vec<KeyValue>` / `AnyValue` as an interim placeholder per the
-//! PR-E1 breadcrumb on [`ourios_core::otlp::Body::Structured`];
-//! the canonicalisation PR will replace those two call sites
-//! (`encode_attributes` and `encode_structured_body`) without
-//! changing the schema or the writer.
+//! current builder handles **only the empty case** for the
+//! `KeyValue` lists — it emits the literal `"[]"` directly into
+//! the column (the RFC 0005 §3.2 `Vec::new()` ↔ `[]` rule) — and
+//! `unimplemented!()`s on any non-empty input. Corpus / bench
+//! inputs today carry empty attributes; the RFC 0003 receiver is
+//! what populates them, and the canonicalisation PR named in the
+//! PR-E1 breadcrumb on [`ourios_core::otlp::Body::Structured`]
+//! is the one that fills in the proto3-JSON-with-OTLP-overrides
+//! encoder. Fail-loud rather than emit non-JSON `Debug` bytes
+//! masquerading as JSON.
 
 use std::fmt;
 use std::sync::Arc;
@@ -206,12 +210,10 @@ impl Builders {
         append_option_str(&mut self.scope_name, r.scope_name.as_deref());
         append_option_str(&mut self.scope_version, r.scope_version.as_deref());
 
-        self.attributes
-            .append_value(encode_attributes(&r.attributes));
+        append_attributes(&mut self.attributes, &r.attributes);
         self.dropped_attributes_count
             .append_value(r.dropped_attributes_count);
-        self.resource_attributes
-            .append_value(encode_attributes(&r.resource_attributes));
+        append_attributes(&mut self.resource_attributes, &r.resource_attributes);
 
         match r.trace_id {
             Some(b) => self.trace_id.append_value(b).map_err(BatchError::Arrow)?,
@@ -320,14 +322,14 @@ fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separ
     builder.append(true);
 }
 
-/// Interim canonical-JSON encoder per the PR-E1 breadcrumb on
+/// Interim canonical-JSON appender per the PR-E1 breadcrumb on
 /// [`ourios_core::otlp::Body::Structured`].
 ///
-/// - Empty input → `"[]"` (RFC 0005 §3.2's `Vec::new()` ↔ `[]`
-///   round-trip rule). This is the *only* code path corpus /
-///   bench inputs exercise today, since the OTLP receiver
-///   (RFC 0003, post-MVP) is what would populate non-empty
-///   `Vec<KeyValue>`.
+/// - Empty input → appends the literal `"[]"` directly into the
+///   builder (RFC 0005 §3.2's `Vec::new()` ↔ `[]` round-trip
+///   rule). The `&'static str` argument means no per-row `String`
+///   allocation — important on the hot path where corpus / bench
+///   inputs today carry empty attributes for every record.
 /// - Non-empty input → **panic with a clear deferral message**.
 ///   The original cut of this function emitted `format!(
 ///   "{attrs:?}")` (Rust `Debug` rendering) which is *not* valid
@@ -337,9 +339,10 @@ fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separ
 ///   canonicalisation PR lands. RFC 0005 §3.3 names the
 ///   normative encoding (proto3 JSON with OTLP overrides);
 ///   implementing it is that PR's job.
-fn encode_attributes(attrs: &[KeyValue]) -> String {
+fn append_attributes(b: &mut StringBuilder, attrs: &[KeyValue]) {
     if attrs.is_empty() {
-        return "[]".to_string();
+        b.append_value("[]");
+        return;
     }
     unimplemented!(
         "ourios-parquet: canonical JSON encoding of non-empty KeyValue lists is deferred to \

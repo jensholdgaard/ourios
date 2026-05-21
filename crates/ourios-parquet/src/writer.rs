@@ -242,9 +242,16 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
         // per §3.6); we opt out per-column below for the high-
         // entropy ones.
         .set_dictionary_enabled(true)
-        // Page-index ON by default — §3.6's "page index" column
-        // is `yes` for most columns; cheaper to enable globally
-        // and skip per-column overrides.
+        // Per-page statistics enabled. Distinct from the Parquet
+        // "page index" feature (OffsetIndex / ColumnIndex)
+        // controlled by `set_writer_version` + writer behaviour;
+        // `EnabledStatistics::Page` only controls the granularity
+        // of min/max stats inside each `DataPage` header. The
+        // §3.6 "page index `yes`" column will be addressed
+        // properly in the reader PR (PR-F) when the
+        // page-index-read path lands and the writer-side toggle
+        // is locked against a measurable read benefit; pinning a
+        // shape here without that feedback loop is premature.
         .set_statistics_enabled(EnabledStatistics::Page);
 
     // §3.6: NO dictionary on `body`. CLAUDE.md §3.2's cardinality

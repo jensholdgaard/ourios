@@ -9,23 +9,34 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# `arrow-schema` is the slim sub-crate of the Arrow workspace
-# carrying just the schema types (`DataType`, `Field`, `Schema`,
-# `SchemaRef`). The scaffold needs only those — the broader
-# `arrow` meta-crate (and `arrow-array` / `arrow-data` etc.) will
-# enter the dep tree alongside the writer / reader follow-on PRs
-# that actually allocate `RecordBatch`es. Keeping the scaffold's
-# dep footprint minimal speeds clean builds and surfaces
-# downstream-version drift sooner.
-#
-# `arrow-schema`'s `Schema` is also the cross-crate Parquet-Rust
-# interop point: `parquet::arrow::ArrowWriter` and
-# `ParquetRecordBatchReader` both consume an
-# `arrow_schema::SchemaRef`, so declaring the schema here means
-# the writer / reader PRs hand the same object across without
-# translating to `parquet::schema::types::SchemaDescriptor` by
-# hand.
+ourios-core = { path = "../ourios-core" }
+# Arrow + Parquet — sized to the writer's needs. `arrow-array`
+# carries the `RecordBatch` / array-builder surface
+# `record_batch::mined_records_to_batch` uses; `arrow-schema`
+# stays for the `Schema` / `Field` / `DataType` declarations
+# (same cross-crate interop point the writer and reader hand to
+# `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`).
+# `parquet` carries the actual writer (`arrow` feature pulls in
+# `arrow::array::RecordBatch` integration).
+arrow-array = { version = "55", default-features = false }
 arrow-schema = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
+# UUIDv7 file naming per RFC 0005 §3.4 — timestamp-in-high-bits
+# means lexicographic sort = creation-order.
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+# Calendar derivation for partition paths (year/month/day/hour
+# in UTC). `chrono` is already in the Arrow dep tree for
+# timestamp conversions; declaring it explicitly avoids
+# relying on a transitive surface. Only the `std` feature is
+# needed — `DateTime::<Utc>::from_timestamp_nanos` + the
+# `Datelike` / `Timelike` traits live there. `clock` (which
+# pulls in `iana-time-zone` and platform timezone lookup) is
+# deliberately off; we never read the wall clock.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Used by tests that build `MinedRecord` fixtures.
+tempfile = "3"
 
 [lints]
 workspace = true

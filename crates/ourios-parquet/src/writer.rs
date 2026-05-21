@@ -213,18 +213,25 @@ impl Writer {
     /// populated by [`Writer::open`] and only consumed here;
     /// `close` takes `self` by value so it can't run twice.
     pub fn close(mut self) -> Result<WrittenFile, WriterError> {
+        // Take both `inner` and `temp_path` BEFORE attempting
+        // any fallible work. If `inner.close()` or
+        // `fs::rename` then errors, `self.temp_path` is already
+        // `None` so the [`Drop`] impl won't delete the
+        // partially-written `.parquet.tmp` file on the way out
+        // — the file stays on disk for diagnosis / recovery,
+        // matching the # Errors clause above. This ordering is
+        // load-bearing: a failed `close` that destroyed its own
+        // artifact would be the worst-case failure mode.
         let inner = self
             .inner
             .take()
             .expect("Writer::close consumes self; inner is Some on entry");
-        let metadata = inner.close().map_err(WriterError::Parquet)?;
         let temp_path = self
             .temp_path
             .take()
             .expect("temp_path is Some until close consumes it");
+        let metadata = inner.close().map_err(WriterError::Parquet)?;
         std::fs::rename(&temp_path, &self.final_path).map_err(WriterError::Io)?;
-        // Replace the now-stale Drop bookkeeping: the temp file
-        // no longer exists, so Drop has nothing to clean up.
         Ok(WrittenFile {
             path: self.final_path.clone(),
             partition: self.partition.clone(),

@@ -46,13 +46,16 @@ use uuid::Uuid;
 
 use crate::audit_record_batch::{AuditBatchError, audit_events_to_batch};
 use crate::partition::PartitionKey;
+use crate::writer::ROW_GROUP_FLUSH_BYTES;
 use crate::{audit_columns, audit_schema};
 
 /// Rows per internal sub-batch passed to `ArrowWriter::write`.
 /// Audit volume is far lower than data volume; a smaller chunk
-/// size keeps per-batch memory bounded without changing the §3.5
-/// row-group sizing story (the audit stream rarely reaches a
-/// single row group).
+/// size keeps per-batch memory bounded for the common case. The
+/// §3.5 row-group sizing invariant is still enforced via the
+/// `in_progress_size()` flush below — defensive against
+/// pathological-volume audit streams that could otherwise grow
+/// a row group past the §3.5 1 GiB ceiling.
 const SUB_BATCH_ROWS: usize = 256;
 
 /// Streaming audit Parquet writer.
@@ -134,6 +137,15 @@ impl AuditWriter {
     /// no hour segment per §3.4), converts the slice to a
     /// `RecordBatch`, and forwards to `ArrowWriter::write`.
     ///
+    /// **Row-group sizing.** Mirrors the data writer's defensive
+    /// flush: a check on `inner.in_progress_size()` before and
+    /// after each sub-batch keeps row groups bounded by
+    /// [`ROW_GROUP_FLUSH_BYTES`] + one sub-batch's worth of bytes,
+    /// well under the §3.5 1 GiB ceiling. Audit volume is far
+    /// lower than data volume in practice (the §3.7 "low-volume
+    /// stream" framing), so the threshold rarely fires — but a
+    /// pathological-volume audit run can't blow past §3.5 either.
+    ///
     /// # Errors
     ///
     /// - [`AuditWriterError::PartitionMismatch`] when an event's
@@ -143,7 +155,8 @@ impl AuditWriter {
     ///   construction fails (timestamp out of range, Arrow
     ///   internal error).
     /// - [`AuditWriterError::Parquet`] when the underlying
-    ///   Parquet writer rejects the batch.
+    ///   Parquet writer rejects the batch or a row-group flush
+    ///   fails.
     ///
     /// # Panics
     ///
@@ -169,8 +182,16 @@ impl AuditWriter {
             .as_mut()
             .expect("inner ArrowWriter is Some until AuditWriter::close is called");
         for chunk in events.chunks(SUB_BATCH_ROWS) {
+            if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+                inner.flush().map_err(AuditWriterError::Parquet)?;
+            }
             let batch = audit_events_to_batch(chunk).map_err(AuditWriterError::Batch)?;
             inner.write(&batch).map_err(AuditWriterError::Parquet)?;
+        }
+        // Post-write check so the next `append_events` call
+        // doesn't inherit an over-threshold buffer.
+        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            inner.flush().map_err(AuditWriterError::Parquet)?;
         }
         Ok(())
     }
@@ -178,12 +199,23 @@ impl AuditWriter {
     /// Close the writer, finalising the Parquet footer on the
     /// temp file and atomically renaming it to the final path.
     ///
+    /// **Both fallible steps preserve the temp file on disk for
+    /// diagnosis.** `inner` and `temp_path` are taken out of
+    /// `self` *before* any fallible work; if either `inner.close()`
+    /// (footer write) or `fs::rename` (atomic publish) then errors,
+    /// `self.temp_path` is already `None` so the [`Drop`] impl
+    /// won't delete the partially-written `.parquet.tmp`. This
+    /// ordering is load-bearing — a failed `close` that destroyed
+    /// its own artifact would be the worst-case failure mode,
+    /// matching the data writer's [`crate::writer::Writer::close`]
+    /// contract.
+    ///
     /// # Errors
     ///
     /// - [`AuditWriterError::Parquet`] when the footer write
-    ///   fails.
+    ///   fails (temp file left on disk).
     /// - [`AuditWriterError::Io`] when the atomic rename fails
-    ///   (the temp file stays on disk for diagnosis).
+    ///   (temp file left on disk).
     ///
     /// # Panics
     ///
@@ -191,6 +223,12 @@ impl AuditWriter {
     /// populated by [`Self::open`] and only consumed here;
     /// `close` takes `self` by value so it can't run twice.
     pub fn close(mut self) -> Result<AuditWrittenFile, AuditWriterError> {
+        // Take both `inner` and `temp_path` BEFORE any fallible
+        // work so that a failed `inner.close()` / `fs::rename`
+        // leaves the `.parquet.tmp` on disk for diagnosis (the
+        // [`Drop`] impl only removes the file when `temp_path`
+        // is still `Some`). Matches the data writer's contract;
+        // see the doc comment above.
         let inner = self
             .inner
             .take()

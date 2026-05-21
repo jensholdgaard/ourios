@@ -246,12 +246,12 @@ impl Builders {
         append_option_str(&mut self.scope_name, r.scope_name.as_deref());
         append_option_str(&mut self.scope_version, r.scope_version.as_deref());
 
-        append_attributes(&mut self.attributes, "attributes", &r.attributes)?;
+        append_attributes(&mut self.attributes, columns::ATTRIBUTES, &r.attributes)?;
         self.dropped_attributes_count
             .append_value(r.dropped_attributes_count);
         append_attributes(
             &mut self.resource_attributes,
-            "resource_attributes",
+            columns::RESOURCE_ATTRIBUTES,
             &r.resource_attributes,
         )?;
 

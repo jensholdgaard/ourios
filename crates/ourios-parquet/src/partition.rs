@@ -173,10 +173,16 @@ pub fn percent_encode_tenant(s: &str) -> String {
 }
 
 const fn hex_nibble(n: u8) -> char {
+    // Callers pass `b >> 4` or `b & 0x0F` from a `u8`, both of
+    // which produce values in `0..=15`. The fallback arm is
+    // structurally unreachable; `unreachable!()` fails loudly if
+    // a future caller breaks that contract rather than emitting
+    // a sentinel that would silently produce malformed
+    // percent-encoding.
     match n {
         0..=9 => (b'0' + n) as char,
         10..=15 => (b'A' + n - 10) as char,
-        _ => '?', // unreachable in practice; nibble is 4 bits
+        _ => unreachable!(),
     }
 }
 

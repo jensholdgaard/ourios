@@ -250,16 +250,15 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
         // per §3.6); we opt out per-column below for the high-
         // entropy ones.
         .set_dictionary_enabled(true)
-        // Per-page statistics enabled. Distinct from the Parquet
-        // "page index" feature (OffsetIndex / ColumnIndex)
-        // controlled by `set_writer_version` + writer behaviour;
-        // `EnabledStatistics::Page` only controls the granularity
-        // of min/max stats inside each `DataPage` header. The
-        // §3.6 "page index `yes`" column will be addressed
-        // properly in the reader PR (PR-F) when the
-        // page-index-read path lands and the writer-side toggle
-        // is locked against a measurable read benefit; pinning a
-        // shape here without that feedback loop is premature.
+        // Per-page statistics enabled. In parquet-rs `≥ 53`,
+        // setting `EnabledStatistics::Page` causes the writer to
+        // emit the Parquet "page index" (`ColumnIndex` +
+        // `OffsetIndex`) alongside the per-page min/max stats in
+        // each `DataPage` header. This satisfies §3.6's "page
+        // index = yes" entries (for `template_id`, `time_unix_nano`,
+        // `severity_*`, `scope_*`, `trace_id`, `span_id`, etc.) —
+        // a writer-side metadata check (`column_index_offset` is
+        // `Some(_)`) pins the contract.
         .set_statistics_enabled(EnabledStatistics::Page);
 
     // §3.6: NO dictionary on `body`. CLAUDE.md §3.2's cardinality
@@ -269,9 +268,10 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
     builder = builder.set_column_dictionary_enabled(body, false);
 
     // §3.6: NO dictionary on the high-entropy attribute / id
-    // columns (`attributes`, `trace_id`, `span_id`, `params`
-    // values). Page index stays on for `trace_id` / `span_id`
-    // per the §3.6 table; on `attributes` it's `no`/`no`/`no`.
+    // columns (`attributes`, `trace_id`, `span_id`). Page index
+    // stays on for `trace_id` / `span_id` via the global
+    // `EnabledStatistics::Page`; on `attributes` it's no-dict
+    // and the page-index toggle is the §3.6 row's no-no-no.
     for high_entropy in [
         crate::columns::ATTRIBUTES,
         crate::columns::TRACE_ID,
@@ -280,6 +280,25 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
         builder = builder
             .set_column_dictionary_enabled(ColumnPath::new(vec![high_entropy.to_string()]), false);
     }
+
+    // §3.6 also marks the `params` list-value leaf as `Dictionary
+    // = no` ("Per-row entropy too high"). Parquet's 3-level LIST
+    // encoding for `LIST<STRUCT<type_tag: INT32, value:
+    // BINARY>>` exposes the value leaf at the dotted path
+    // `params.list.element.value`; this override disables dict
+    // on that exact leaf, leaving the small-cardinality
+    // `params.list.element.type_tag` leaf to inherit the global
+    // dict-on default (the §3.6 entry's "list values"
+    // parenthetical scopes the no-dict rule to the byte payload
+    // only). The integration test `tests/no_body_dict.rs` /
+    // related metadata walks pin both expectations.
+    let params_value_leaf = ColumnPath::new(vec![
+        crate::columns::PARAMS.to_string(),
+        "list".to_string(),
+        "element".to_string(),
+        "value".to_string(),
+    ]);
+    builder = builder.set_column_dictionary_enabled(params_value_leaf, false);
 
     // §3.6: bloom filter on `template_id` (B2 predicate-pushdown).
     let template_id = ColumnPath::new(vec![crate::columns::TEMPLATE_ID.to_string()]);

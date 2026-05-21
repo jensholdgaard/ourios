@@ -17,7 +17,8 @@
 
 use std::fs::File;
 
-use ourios_core::record::{BodyKind, MinedRecord};
+use ourios_core::audit::ParamType;
+use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{PartitionKey, Writer};
 use parquet::basic::{Compression, Encoding};
@@ -133,5 +134,100 @@ fn rfc0005_8_body_column_has_no_dictionary_encoding() {
     assert!(
         body_checked >= 1,
         "expected at least one `body` column chunk in the file",
+    );
+}
+
+/// RFC 0005 §3.6 sub-rule — the `params` list-value leaf
+/// (`params.list.element.value`) also carries `Dictionary: no`
+/// per "Per-row entropy too high". Verify by writing records
+/// with non-empty `params` and asserting the leaf column's
+/// encodings + `dictionary_page_offset` reflect the override.
+#[test]
+fn rfc0005_6_params_value_leaf_has_no_dictionary_encoding() {
+    let bucket = TempDir::new().unwrap();
+
+    // 50 records, each with one param. Per-row entropy is the
+    // whole point — distinct values so dict, if enabled, would
+    // grow the dictionary linearly.
+    let records: Vec<MinedRecord> = (0..50)
+        .map(|i| MinedRecord {
+            tenant_id: TenantId::new("tenant-x"),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 1_775_127_480_000_000_000,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: format!("unique-param-value-{i}-padded-with-noise-{i:08}"),
+            }],
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        })
+        .collect();
+
+    let partition = PartitionKey::derive(&records[0]).expect("derive partition");
+    let mut writer = Writer::open(bucket.path(), partition).expect("open writer");
+    writer.append_records(&records).expect("append");
+    let written = writer.close().expect("close writer");
+    assert_eq!(written.num_rows, 50);
+
+    // Walk the file's column chunks and find the params value
+    // leaf by its dotted column path.
+    let file = File::open(&written.path).expect("open parquet file");
+    let reader = SerializedFileReader::new(file).expect("open parquet reader");
+    let metadata = reader.metadata();
+    assert!(metadata.num_row_groups() >= 1);
+
+    let mut params_value_checked = 0;
+    for rg_idx in 0..metadata.num_row_groups() {
+        let rg = metadata.row_group(rg_idx);
+        for col_idx in 0..rg.num_columns() {
+            let col = rg.column(col_idx);
+            // Parquet 3-level LIST nesting: `params.list.element.value`.
+            if col.column_path().string() != "params.list.element.value" {
+                continue;
+            }
+            params_value_checked += 1;
+
+            assert!(
+                matches!(col.compression(), Compression::ZSTD(_)),
+                "params value leaf compression must be ZSTD, got {:?}",
+                col.compression(),
+            );
+            let encs = col.encodings();
+            assert!(
+                !encs.contains(&Encoding::PLAIN_DICTIONARY),
+                "params value leaf encodings must not include PLAIN_DICTIONARY, got {encs:?}",
+            );
+            assert!(
+                !encs.contains(&Encoding::RLE_DICTIONARY),
+                "params value leaf encodings must not include RLE_DICTIONARY, got {encs:?}",
+            );
+            assert!(
+                col.dictionary_page_offset().is_none(),
+                "params value leaf must have no dictionary_page_offset, got {:?}",
+                col.dictionary_page_offset(),
+            );
+        }
+    }
+    assert!(
+        params_value_checked >= 1,
+        "expected at least one `params.list.element.value` column chunk in the file — \
+         if zero, the dotted column-path naming convention has changed and the \
+         writer's ColumnPath override is silently no-op",
     );
 }

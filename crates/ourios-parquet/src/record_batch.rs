@@ -12,13 +12,15 @@
 //! current builder handles **only the empty case** for the
 //! `KeyValue` lists — it emits the literal `"[]"` directly into
 //! the column (the RFC 0005 §3.2 `Vec::new()` ↔ `[]` rule) — and
-//! `unimplemented!()`s on any non-empty input. Corpus / bench
-//! inputs today carry empty attributes; the RFC 0003 receiver is
-//! what populates them, and the canonicalisation PR named in the
-//! PR-E1 breadcrumb on [`ourios_core::otlp::Body::Structured`]
-//! is the one that fills in the proto3-JSON-with-OTLP-overrides
-//! encoder. Fail-loud rather than emit non-JSON `Debug` bytes
-//! masquerading as JSON.
+//! returns [`BatchError::AttributesNotYetEncoded`] on any
+//! non-empty input. Corpus / bench inputs today carry empty
+//! attributes; the RFC 0003 receiver is what populates them, and
+//! the canonicalisation PR named in the PR-E1 breadcrumb on
+//! [`ourios_core::otlp::Body::Structured`] is the one that fills
+//! in the proto3-JSON-with-OTLP-overrides encoder. Surfacing a
+//! structured error rather than panicking (or emitting non-JSON
+//! `Debug` bytes masquerading as JSON) lets the writer fail a
+//! batch gracefully without crashing the ingest process.
 
 use std::fmt;
 use std::sync::Arc;
@@ -396,4 +398,107 @@ fn append_attributes(
         column,
         count: attrs.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::cast::AsArray;
+    use ourios_core::otlp::{AnyValue, KeyValue, any_value};
+    use ourios_core::record::BodyKind;
+    use ourios_core::tenant::TenantId;
+
+    use super::*;
+
+    fn empty_record() -> MinedRecord {
+        MinedRecord {
+            tenant_id: TenantId::new("t"),
+            template_id: 0,
+            template_version: 0,
+            severity_number: 0,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 1,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: Vec::new(),
+            separators: Vec::new(),
+            body: None,
+            confidence: 0.0,
+            lossy_flag: false,
+        }
+    }
+
+    /// Sanity: the empty-attributes path serialises to literal `[]`
+    /// (the §3.2 `Vec::new()` ↔ `[]` round-trip rule) and does not
+    /// hit the `AttributesNotYetEncoded` branch.
+    #[test]
+    fn empty_attributes_serialise_to_open_bracket_close_bracket() {
+        let batch = mined_records_to_batch(&[empty_record()]).expect("batch builds");
+        let attrs_idx = batch.schema().index_of(crate::columns::ATTRIBUTES).unwrap();
+        let arr = batch.column(attrs_idx).as_string::<i32>();
+        assert_eq!(arr.value(0), "[]");
+        let resource_idx = batch
+            .schema()
+            .index_of(crate::columns::RESOURCE_ATTRIBUTES)
+            .unwrap();
+        let res = batch.column(resource_idx).as_string::<i32>();
+        assert_eq!(res.value(0), "[]");
+    }
+
+    /// Non-empty attributes return `AttributesNotYetEncoded`
+    /// rather than panicking via `unimplemented!()`. Pins the
+    /// graceful-error contract until the RFC 0005 §3.3
+    /// canonicalisation PR replaces this branch with a real
+    /// encoder.
+    #[test]
+    fn non_empty_attributes_returns_not_yet_encoded_error() {
+        let mut rec = empty_record();
+        rec.attributes = vec![KeyValue {
+            key: "client.address".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue("10.0.0.1".to_string())),
+            }),
+            ..KeyValue::default()
+        }];
+        let err = mined_records_to_batch(&[rec]).expect_err("non-empty attrs must error");
+        match err {
+            BatchError::AttributesNotYetEncoded { column, count } => {
+                assert_eq!(column, "attributes");
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
+        }
+    }
+
+    /// Same contract on the `resource_attributes` side: empty in
+    /// the primary `attributes` column, populated in
+    /// `resource_attributes`, still errors with the right column
+    /// name.
+    #[test]
+    fn non_empty_resource_attributes_errors_on_correct_column() {
+        let mut rec = empty_record();
+        rec.resource_attributes = vec![KeyValue {
+            key: "service.name".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue("ourios".to_string())),
+            }),
+            ..KeyValue::default()
+        }];
+        let err = mined_records_to_batch(&[rec]).expect_err("non-empty resource attrs must error");
+        match err {
+            BatchError::AttributesNotYetEncoded { column, count } => {
+                assert_eq!(column, "resource_attributes");
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
+        }
+    }
 }

@@ -482,6 +482,12 @@ const fn param_type_ordinal(t: ParamType) -> i32 {
         ParamType::Path => 5,
         ParamType::Str => 6,
         ParamType::Overflow => 7,
+        // `Unknown(N)` is the reader-side catch-all for ordinals
+        // a future writer added that this enum doesn't yet
+        // recognise (RFC 0005 §3.9). Round-trip the raw ordinal
+        // on read-then-write so the unknown variant doesn't get
+        // lost or remapped.
+        ParamType::Unknown(ord) => ord,
     }
 }
 

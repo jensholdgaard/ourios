@@ -26,10 +26,12 @@
 #![deny(unsafe_code)]
 
 pub mod partition;
+pub mod reader;
 pub mod record_batch;
 pub mod writer;
 
 pub use partition::{PartitionKey, TimestampOverflowError, percent_encode_tenant};
+pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};
 pub use writer::{ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile};
 

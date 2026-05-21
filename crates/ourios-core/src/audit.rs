@@ -148,6 +148,16 @@ pub enum ParamType {
     /// and the slot's payload becomes `{length, sha256_prefix}`.
     /// Reserved here; emitter lands with the overflow PR.
     Overflow,
+    /// Reader-side catch-all per RFC 0005 §3.9: a
+    /// `params.type_tag` ordinal that the current `ParamType`
+    /// enum doesn't recognise (e.g. a value written by a future
+    /// writer that added a new variant). Carries the raw ordinal
+    /// so the writer can round-trip it on read-then-write, and
+    /// so a future Rust upgrade that adds the missing variant
+    /// can migrate `Unknown(N)` rows into the typed variant by
+    /// matching the ordinal. RFC 0005 §6.6's reconstruction path
+    /// treats `Unknown` as lossy (falls back to the body column).
+    Unknown(i32),
 }
 
 /// Slot expansion entry carried on `TemplateTypeExpanded` events
@@ -246,6 +256,15 @@ impl SlotTypes {
             ParamType::Path => 1 << 5,
             ParamType::Str => 1 << 6,
             ParamType::Overflow => 1 << 7,
+            // `Unknown` is a reader-side catch-all for ordinals
+            // a future writer added that the current enum
+            // doesn't recognise; it has no bit position in the
+            // `SlotTypes` bitset (the miner never produces
+            // `Unknown` — it's purely an on-read shape). Map
+            // to 0 so type-tracking is a no-op on the unknown
+            // case; the writer round-trips the ordinal via
+            // `param_type_ordinal` independently.
+            ParamType::Unknown(_) => 0,
         }
     }
 }

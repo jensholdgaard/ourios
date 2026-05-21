@@ -298,22 +298,23 @@ fn batch_to_audit_events(
     let n = batch.num_rows();
     let mut events: Vec<AuditEvent> = Vec::with_capacity(n);
 
-    let tenant_id = required_string(batch, audit_columns::TENANT_ID)?;
-    let timestamp = required_timestamp(batch, audit_columns::TIMESTAMP)?;
-    let event_kind = required_u8(batch, audit_columns::EVENT_KIND)?;
+    let tenant_id = required_string(batch, audit_columns::TENANT_ID, row_offset)?;
+    let timestamp = required_timestamp(batch, audit_columns::TIMESTAMP, row_offset)?;
+    let event_kind = required_u8(batch, audit_columns::EVENT_KIND, row_offset)?;
     // `event_type` is required-and-redundant (kept in sync with
     // `event_kind` by the writer). Surface it for sanity-check
     // diagnostics but use `event_kind` as the source of truth
     // for variant dispatch.
-    let _event_type = required_string(batch, audit_columns::EVENT_TYPE)?;
-    let template_id = required_u64(batch, audit_columns::TEMPLATE_ID)?;
-    let old_version = required_u32(batch, audit_columns::OLD_VERSION)?;
-    let new_version = required_u32(batch, audit_columns::NEW_VERSION)?;
-    let old_template = required_string(batch, audit_columns::OLD_TEMPLATE)?;
-    let new_template = required_string(batch, audit_columns::NEW_TEMPLATE)?;
+    let _event_type = required_string(batch, audit_columns::EVENT_TYPE, row_offset)?;
+    let template_id = required_u64(batch, audit_columns::TEMPLATE_ID, row_offset)?;
+    let old_version = required_u32(batch, audit_columns::OLD_VERSION, row_offset)?;
+    let new_version = required_u32(batch, audit_columns::NEW_VERSION, row_offset)?;
+    let old_template = required_string(batch, audit_columns::OLD_TEMPLATE, row_offset)?;
+    let new_template = required_string(batch, audit_columns::NEW_TEMPLATE, row_offset)?;
     let positions_widened_lists = decode_positions_column(batch, row_offset)?;
     let slots_expanded_lists = decode_slots_column(batch, row_offset)?;
-    let triggering_line_hash = required_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH)?;
+    let triggering_line_hash =
+        required_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH, row_offset)?;
     let triggering_line_sample = optional_string(batch, audit_columns::TRIGGERING_LINE_SAMPLE)?;
     let reason = optional_string(batch, audit_columns::REASON)?;
 
@@ -649,10 +650,19 @@ fn decode_param_type(ord: i32) -> ParamType {
 // enum; sharing the helpers would force a `ReaderError ↔
 // AuditReaderError` conversion that adds friction without
 // removing real duplication.
+//
+// Each helper takes `row_offset: usize` and uses it to compute
+// `file_row = row_offset + i` for per-row `Conversion` error
+// details, so every Conversion error this module produces reports
+// the same file-global row index as the top-level
+// `UnknownEventKind` / `TimestampDecode` / `PartitionMismatch`
+// variants — the §3.9 "internal index convention" CodeRabbit
+// flagged on the first round.
 
 fn required_string(
     batch: &RecordBatch,
     name: &'static str,
+    row_offset: usize,
 ) -> Result<Vec<String>, AuditReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
@@ -666,7 +676,7 @@ fn required_string(
         if arr.is_null(i) {
             return Err(AuditReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
         out.push(arr.value(i).to_string());
@@ -674,7 +684,11 @@ fn required_string(
     Ok(out)
 }
 
-fn required_u64(batch: &RecordBatch, name: &'static str) -> Result<Vec<u64>, AuditReaderError> {
+fn required_u64(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<u64>, AuditReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<UInt64Type>()
@@ -682,10 +696,14 @@ fn required_u64(batch: &RecordBatch, name: &'static str) -> Result<Vec<u64>, Aud
             column: name,
             detail: format!("expected UInt64Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
-fn required_u32(batch: &RecordBatch, name: &'static str) -> Result<Vec<u32>, AuditReaderError> {
+fn required_u32(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<u32>, AuditReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<UInt32Type>()
@@ -693,10 +711,14 @@ fn required_u32(batch: &RecordBatch, name: &'static str) -> Result<Vec<u32>, Aud
             column: name,
             detail: format!("expected UInt32Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
-fn required_u8(batch: &RecordBatch, name: &'static str) -> Result<Vec<u8>, AuditReaderError> {
+fn required_u8(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<u8>, AuditReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<UInt8Type>()
@@ -704,12 +726,13 @@ fn required_u8(batch: &RecordBatch, name: &'static str) -> Result<Vec<u8>, Audit
             column: name,
             detail: format!("expected UInt8Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
 fn required_timestamp(
     batch: &RecordBatch,
     name: &'static str,
+    row_offset: usize,
 ) -> Result<Vec<i64>, AuditReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
@@ -726,7 +749,7 @@ fn required_timestamp(
         if arr.is_null(i) {
             return Err(AuditReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
         out.push(arr.value(i));
@@ -737,6 +760,7 @@ fn required_timestamp(
 fn required_fixed_bytes16(
     batch: &RecordBatch,
     name: &'static str,
+    row_offset: usize,
 ) -> Result<Vec<[u8; 16]>, AuditReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
@@ -759,7 +783,7 @@ fn required_fixed_bytes16(
         if arr.is_null(i) {
             return Err(AuditReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
         let slice = arr.value(i);
@@ -773,6 +797,7 @@ fn required_fixed_bytes16(
 fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
     arr: &arrow_array::PrimitiveArray<T>,
     name: &'static str,
+    row_offset: usize,
 ) -> Result<Vec<T::Native>, AuditReaderError> {
     if arr.null_count() == 0 {
         return Ok(arr.values().to_vec());
@@ -781,7 +806,7 @@ fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
         if arr.is_null(i) {
             return Err(AuditReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
     }
@@ -829,4 +854,111 @@ fn optional_string(
 fn optional_column<'a>(batch: &'a RecordBatch, name: &'static str) -> Option<&'a dyn Array> {
     let idx = batch.schema().index_of(name).ok()?;
     Some(batch.column(idx).as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Colocated unit tests for the audit-reader paths that the
+    //! integration tests (`tests/audit_round_trip.rs` /
+    //! `tests/audit_row_vs_path_validation.rs`) don't exercise
+    //! directly — specifically the file-global row-index
+    //! propagation and the `decode_timestamp` failure paths.
+
+    use super::*;
+    use crate::audit_record_batch::audit_events_to_batch;
+    use arrow_array::{ArrayRef, UInt8Array};
+    use ourios_core::audit::{AuditEvent, AuditEventKind, hash_triggering_line};
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn widened_event(tenant: &str) -> AuditEvent {
+        AuditEvent {
+            kind: AuditEventKind::TemplateWidened {
+                old_version: 1,
+                new_version: 2,
+                old_template: "[\"user\",\"<*>\"]".to_string(),
+                new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
+                positions_widened: vec![1],
+            },
+            tenant_id: ourios_core::tenant::TenantId::new(tenant),
+            template_id: 7,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+        }
+    }
+
+    /// Pins file-global row indexing in `batch_to_audit_events`:
+    /// a forged batch where row 0 carries an unknown `event_kind`
+    /// must report `row_index = row_offset` (not `0`) on the
+    /// returned `UnknownEventKind` error. This is the multi-batch
+    /// invariant — without the
+    /// `row_offset + i` addition, a later-batch error in a real
+    /// file would point at row 0 of every batch instead of the
+    /// running file-level offset.
+    #[test]
+    fn batch_to_audit_events_reports_file_global_row_index_on_unknown_event_kind() {
+        let valid = audit_events_to_batch(&[widened_event("acme")]).expect("batch builds");
+        let event_kind_idx = valid
+            .schema()
+            .index_of(audit_columns::EVENT_KIND)
+            .expect("schema has event_kind");
+
+        // Replace the event_kind column with a single 99 ordinal —
+        // outside the §3.7 mapping table — keeping every other
+        // column intact.
+        let mut columns: Vec<ArrayRef> = valid.columns().to_vec();
+        columns[event_kind_idx] = Arc::new(UInt8Array::from(vec![99u8]));
+        let forged =
+            RecordBatch::try_new(valid.schema(), columns).expect("forged batch type-checks");
+
+        // Pretend this batch is the second batch of a longer file —
+        // the prior batches contributed 50 rows.
+        let err = batch_to_audit_events(&forged, 50).expect_err("unknown event_kind must error");
+        match err {
+            AuditReaderError::UnknownEventKind { row_index, ordinal } => {
+                assert_eq!(
+                    row_index, 50,
+                    "row index must be file-global, not batch-local"
+                );
+                assert_eq!(ordinal, 99);
+            }
+            other => panic!("expected UnknownEventKind, got {other:?}"),
+        }
+    }
+
+    /// `decode_timestamp` rejects negative i64 nanos as
+    /// `TimestampDecode` — covers the `u64::try_from` branch.
+    /// The `checked_add` branch is defensive against narrow-
+    /// `SystemTime` platforms (macOS / Linux both have wide
+    /// enough ranges that `u64::MAX` nanos doesn't overflow);
+    /// we cover the construction-time check explicitly via the
+    /// negative-i64 path which all platforms hit identically.
+    #[test]
+    fn decode_timestamp_rejects_negative_i64() {
+        let err = decode_timestamp(-1, 42).expect_err("negative i64 must error");
+        match err {
+            AuditReaderError::TimestampDecode { row_index, nanos } => {
+                assert_eq!(row_index, 42);
+                assert_eq!(nanos, -1);
+            }
+            other => panic!("expected TimestampDecode, got {other:?}"),
+        }
+    }
+
+    /// `decode_timestamp` round-trips a valid i64 nanos value
+    /// through `checked_add` to a `SystemTime` — sanity check
+    /// that the defensive replacement of `+` with
+    /// `checked_add(...)` didn't break the happy path.
+    #[test]
+    fn decode_timestamp_accepts_post_epoch_nanos() {
+        // 2026-04-02T10:58:00Z = 1_775_127_480 secs.
+        let ns = 1_775_127_480_000_000_000_i64;
+        let t = decode_timestamp(ns, 0).expect("valid nanos must decode");
+        let recovered = t
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_nanos();
+        assert_eq!(recovered, u128::try_from(ns).unwrap());
+    }
 }

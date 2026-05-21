@@ -40,7 +40,7 @@ fn partition_for(event: &AuditEvent) -> PartitionKey {
         .duration_since(UNIX_EPOCH)
         .expect("post-epoch")
         .as_nanos();
-    let ns = u64::try_from(nanos).expect("fits i64");
+    let ns = u64::try_from(nanos).expect("fits u64");
     let proxy = MinedRecord {
         tenant_id: event.tenant_id.clone(),
         template_id: 0,

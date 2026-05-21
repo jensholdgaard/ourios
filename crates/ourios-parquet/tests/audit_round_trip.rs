@@ -104,7 +104,7 @@ fn audit_partition_for(event: &AuditEvent) -> PartitionKey {
         .duration_since(UNIX_EPOCH)
         .expect("test events are post-epoch")
         .as_nanos();
-    let ns = u64::try_from(nanos).expect("test events fit i64");
+    let ns = u64::try_from(nanos).expect("test events fit u64");
     let proxy = MinedRecord {
         tenant_id: event.tenant_id.clone(),
         template_id: 0,

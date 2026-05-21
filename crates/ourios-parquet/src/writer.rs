@@ -8,17 +8,26 @@
 //!
 //! Encoding policy per §3.6:
 //! - ZSTD level 3 compression on every column.
-//! - Dictionary encoding **on** globally, **off** for the
-//!   high-entropy columns the §3.6 table marks `no`: `body`
-//!   (the [`CLAUDE.md`] §3.2 cardinality invariant — bodies are
-//!   unbounded by design; dict on `body` is the failure mode),
-//!   `attributes` (JSON `BYTE_ARRAY`, high entropy), `trace_id`
-//!   and `span_id` (16- and 8-byte near-random opaque ids — dict
-//!   and bloom both lose). The other columns in the §3.6 table
-//!   that the table also says `no` for (`params` list values,
-//!   `confidence`, `time_unix_nano` / `observed_time_unix_nano`,
-//!   `lossy_flag`) get sensible defaults from arrow-rs without
-//!   needing per-column overrides.
+//! - Dictionary encoding **on** globally, **off** explicitly
+//!   per-column for every §3.6 row marked `Dictionary = no`:
+//!   `body` (the [`CLAUDE.md`] §3.2 cardinality invariant —
+//!   bodies are unbounded by design; dict on `body` is the
+//!   failure mode), `attributes` (JSON `BYTE_ARRAY`, high
+//!   entropy), `trace_id` / `span_id` (16- and 8-byte
+//!   near-random opaque ids), `time_unix_nano` /
+//!   `observed_time_unix_nano` (delta-encoded inside ZSTD;
+//!   dict would interfere), `confidence` (float, narrow range),
+//!   and the `params.list.element.value` list-value leaf
+//!   ("Per-row entropy too high"). The §3.6 `lossy_flag` row
+//!   says `Dictionary = n/a` (boolean RLE handles it natively),
+//!   so no override is needed for that one.
+//! - Per-page statistics **on** globally so the Parquet page
+//!   index (`ColumnIndex` + `OffsetIndex`) is emitted for the
+//!   `Page index = yes` columns; downgraded to
+//!   `EnabledStatistics::Chunk` for the `Page index = no`
+//!   columns (`tenant_id`, `attributes`, `resource_attributes`,
+//!   `body`, `params.list.element.value`,
+//!   `separators.list.element`).
 //! - Bloom filter on `template_id` (B2 predicate-pushdown).
 //!
 //! [`CLAUDE.md`]: ../../../../CLAUDE.md

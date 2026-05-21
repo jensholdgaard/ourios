@@ -76,6 +76,16 @@ pub enum BatchError {
     /// writer returns this error rather than crashing the ingest
     /// process. Carries the column name and entry count.
     AttributesNotYetEncoded { column: &'static str, count: usize },
+    /// A record carried [`BodyKind::Absent`] (the in-memory
+    /// "wire delivered no body" variant). RFC 0005 §3.2's
+    /// `body_kind` column pins exactly two ordinals (`0 = String,
+    /// 1 = Structured`); silently mapping `Absent` to one of
+    /// them would misclassify wire-absent rows. Until a future
+    /// RFC 0005 amendment either adds a third ordinal or adds a
+    /// separate `body_present` boolean column, the writer
+    /// rejects these records rather than corrupting the
+    /// `body_kind` semantics.
+    UnsupportedAbsentBody,
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -96,6 +106,13 @@ impl fmt::Display for BatchError {
                  the RFC 0005 §3.3 canonicalisation PR (corpus / bench inputs today carry \
                  empty attributes; the RFC 0003 receiver is what populates them)",
             ),
+            Self::UnsupportedAbsentBody => write!(
+                f,
+                "record carries BodyKind::Absent (wire-absent body), which RFC 0005 §3.2's \
+                 body_kind column does not yet encode (the column pins ordinals 0=String, \
+                 1=Structured); a future RFC 0005 amendment is required to represent this \
+                 in the schema",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -104,7 +121,9 @@ impl fmt::Display for BatchError {
 impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TimestampOverflow { .. } | Self::AttributesNotYetEncoded { .. } => None,
+            Self::TimestampOverflow { .. }
+            | Self::AttributesNotYetEncoded { .. }
+            | Self::UnsupportedAbsentBody => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -247,7 +266,7 @@ impl Builders {
         self.flags.append_value(r.flags);
         append_option_str(&mut self.event_name, r.event_name.as_deref());
 
-        self.body_kind.append_value(body_kind_ordinal(r.body_kind));
+        self.body_kind.append_value(body_kind_ordinal(r.body_kind)?);
         match r.body.as_deref() {
             Some(s) => self.body.append_value(s.as_bytes()),
             None => self.body.append_null(),
@@ -303,17 +322,17 @@ fn append_option_str(b: &mut StringBuilder, v: Option<&str>) {
     }
 }
 
-fn body_kind_ordinal(k: BodyKind) -> u8 {
-    // RFC 0005 §3.2 body_kind column: 0 = String, 1 = Structured.
-    // BodyKind::Absent is an in-memory-only variant for the
-    // wire-absent case; on disk it maps to "no body" via a NULL
-    // body column, but we still need an ordinal. Reuse `0`
-    // (String) for now since `Absent` rows carry no template
-    // and a future RFC 0005 amendment may introduce a third
-    // ordinal — see RFC0005.10 (the schema-pin) for the contract.
+/// Map an in-memory [`BodyKind`] to the §3.2 on-disk `body_kind`
+/// ordinal. The schema pins exactly two ordinals (`0 = String,
+/// 1 = Structured`); `BodyKind::Absent` has no on-disk
+/// representation today and the writer rejects records carrying
+/// it via [`BatchError::UnsupportedAbsentBody`] rather than
+/// silently misclassifying them.
+fn body_kind_ordinal(k: BodyKind) -> Result<u8, BatchError> {
     match k {
-        BodyKind::String | BodyKind::Absent => 0,
-        BodyKind::Structured => 1,
+        BodyKind::String => Ok(0),
+        BodyKind::Structured => Ok(1),
+        BodyKind::Absent => Err(BatchError::UnsupportedAbsentBody),
     }
 }
 
@@ -476,6 +495,21 @@ mod tests {
             }
             other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
         }
+    }
+
+    /// `BodyKind::Absent` is not representable in the §3.2
+    /// `body_kind` column today (the ordinals pin to
+    /// `0 = String, 1 = Structured`). The writer rejects such
+    /// records rather than silently lumping them with String.
+    #[test]
+    fn absent_body_kind_returns_unsupported_error() {
+        let mut rec = empty_record();
+        rec.body_kind = BodyKind::Absent;
+        let err = mined_records_to_batch(&[rec]).expect_err("Absent body must error");
+        assert!(
+            matches!(err, BatchError::UnsupportedAbsentBody),
+            "expected UnsupportedAbsentBody, got {err:?}",
+        );
     }
 
     /// Same contract on the `resource_attributes` side: empty in

@@ -212,7 +212,12 @@ mod tests {
             event_name: None,
             body_kind: BodyKind::String,
             params: Vec::new(),
-            separators: Vec::new(),
+            // Minimum-valid clean-attach String shape:
+            // `separators.len() = params.len() + 1 = 1`. The
+            // partition tests don't exercise the writer, but
+            // keeping fixtures invariant-consistent prevents
+            // accidental reuse breakage if they ever do.
+            separators: vec![String::new()],
             body: None,
             confidence: 0.0,
             lossy_flag: false,

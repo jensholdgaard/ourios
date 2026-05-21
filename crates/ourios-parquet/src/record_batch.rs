@@ -99,15 +99,24 @@ pub enum BatchError {
     /// miner's `format!("{any_value:?}")` call site with a real
     /// proto3-JSON-with-OTLP-overrides encoder.
     StructuredBodyNotYetCanonical,
-    /// A clean-attach `body_kind = String` record had an empty
-    /// `separators` vec, violating the RFC 0005 §3.2 invariant
-    /// ("`tokens.len() + 1` elements when `body_kind = String`")
-    /// for the reconstruction path RFC 0001 §6.6 depends on. The
-    /// check carves out `lossy_flag = true` rows (parse-failure
-    /// / tokenizer-failure paths where reconstruction returns
-    /// the retained body verbatim and doesn't walk
-    /// `separators`).
-    EmptySeparatorsForString,
+    /// A clean-attach `body_kind = String` record had too few
+    /// `separators` entries to satisfy the RFC 0005 §3.2
+    /// invariant ("`tokens.len() + 1` elements when
+    /// `body_kind = String`"). The writer doesn't know
+    /// `tokens.len()` directly (the template store is the
+    /// reader's concern), but `tokens.len() >= params.len()`
+    /// always — so `separators.len() < params.len() + 1` is a
+    /// definite contract violation. Carves out `lossy_flag =
+    /// true` rows (parse-failure / tokenizer-failure paths
+    /// where RFC 0001 §6.6 reconstruction returns the retained
+    /// body verbatim and doesn't walk `separators`).
+    InvalidSeparatorsForString {
+        /// Lower bound on the valid separator count, derived
+        /// as `params.len() + 1`.
+        expected_at_least: usize,
+        /// Actual separator-vec length on the offending record.
+        actual: usize,
+    },
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -143,12 +152,16 @@ impl fmt::Display for BatchError {
                  ourios_core::otlp::Body::Structured) must land before structured rows can \
                  be written",
             ),
-            Self::EmptySeparatorsForString => write!(
+            Self::InvalidSeparatorsForString {
+                expected_at_least,
+                actual,
+            } => write!(
                 f,
-                "clean-attach String record has empty separators (RFC 0005 §3.2 invariant: \
-                 `tokens.len() + 1` separator entries for body_kind = String; required for \
-                 RFC 0001 §6.6 reconstruction). Parse-failure / tokenizer-failure paths \
-                 carry lossy_flag = true and are exempt from this check",
+                "clean-attach String record has separators.len() = {actual} which is below \
+                 the lower bound expected_at_least = {expected_at_least} (params.len() + 1) \
+                 required by RFC 0005 §3.2's `tokens.len() + 1` invariant for body_kind = \
+                 String. Parse-failure / tokenizer-failure rows (lossy_flag = true) are \
+                 exempt from this check",
             ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
@@ -162,7 +175,7 @@ impl std::error::Error for BatchError {
             | Self::AttributesNotYetEncoded { .. }
             | Self::UnsupportedAbsentBody
             | Self::StructuredBodyNotYetCanonical
-            | Self::EmptySeparatorsForString => None,
+            | Self::InvalidSeparatorsForString { .. } => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -324,13 +337,22 @@ impl Builders {
         }
 
         // RFC 0005 §3.2 invariant: `body_kind = String` clean
-        // attaches MUST carry `tokens.len() + 1` separators
-        // (at minimum: non-empty). Parse-failure / tokenizer-
-        // failure rows (`lossy_flag = true`) reconstruct via the
-        // retained body and so legitimately carry empty
-        // separators — they're exempt.
-        if r.body_kind == BodyKind::String && !r.lossy_flag && r.separators.is_empty() {
-            return Err(BatchError::EmptySeparatorsForString);
+        // attaches carry `tokens.len() + 1` separators. The
+        // writer can't reach `tokens.len()` (the template store
+        // is the reader's concern), but `tokens.len() >=
+        // params.len()` always — so `separators.len() <
+        // params.len() + 1` is a definite contract violation.
+        // Parse-failure / tokenizer-failure rows (`lossy_flag =
+        // true`) reconstruct via the retained body and don't
+        // walk `separators`; they're exempt.
+        if r.body_kind == BodyKind::String && !r.lossy_flag {
+            let expected_at_least = r.params.len() + 1;
+            if r.separators.len() < expected_at_least {
+                return Err(BatchError::InvalidSeparatorsForString {
+                    expected_at_least,
+                    actual: r.separators.len(),
+                });
+            }
         }
         append_params(&mut self.params, &r.params);
         append_separators(&mut self.separators, &r.separators);
@@ -563,19 +585,58 @@ mod tests {
     }
 
     /// RFC 0005 §3.2 invariant: clean-attach `body_kind = String`
-    /// rows MUST carry non-empty `separators`. Reject otherwise
-    /// so a downstream §6.6 reconstruction never gets a
-    /// shape-mismatched record.
+    /// rows MUST satisfy `separators.len() >= params.len() + 1`.
+    /// Reject otherwise so a downstream §6.6 reconstruction
+    /// never gets a shape-mismatched record. Tests both the
+    /// "empty separators" case (params=0, separators=0) and the
+    /// "non-empty but too few" case (params=2, separators=1).
     #[test]
-    fn empty_separators_on_clean_string_returns_error() {
+    fn invalid_separators_on_clean_string_returns_error() {
+        // Case 1: empty separators with empty params (lower
+        // bound is 1, actual is 0).
         let mut rec = empty_record();
+        rec.params = Vec::new();
         rec.separators = Vec::new();
         rec.lossy_flag = false;
         let err = mined_records_to_batch(&[rec]).expect_err("empty separators must error");
-        assert!(
-            matches!(err, BatchError::EmptySeparatorsForString),
-            "expected EmptySeparatorsForString, got {err:?}",
-        );
+        match err {
+            BatchError::InvalidSeparatorsForString {
+                expected_at_least,
+                actual,
+            } => {
+                assert_eq!(expected_at_least, 1);
+                assert_eq!(actual, 0);
+            }
+            other => panic!("expected InvalidSeparatorsForString, got {other:?}"),
+        }
+
+        // Case 2: non-empty but below the lower bound
+        // (params.len() = 2 ⇒ separators must be at least 3).
+        let mut rec = empty_record();
+        rec.params = vec![
+            ourios_core::record::Param {
+                type_tag: ParamType::Num,
+                value: "1".to_string(),
+            },
+            ourios_core::record::Param {
+                type_tag: ParamType::Num,
+                value: "2".to_string(),
+            },
+        ];
+        rec.separators = vec![String::new(), String::new()];
+        rec.lossy_flag = false;
+        let err = mined_records_to_batch(&[rec])
+            .expect_err("non-empty but below the lower bound must error");
+        match err {
+            BatchError::InvalidSeparatorsForString {
+                expected_at_least,
+                actual,
+            } => {
+                assert_eq!(expected_at_least, 3);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("expected InvalidSeparatorsForString, got {other:?}"),
+        }
     }
 
     /// The carve-out: `lossy_flag = true` (parse-failure /

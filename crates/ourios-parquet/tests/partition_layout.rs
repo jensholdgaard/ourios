@@ -36,7 +36,10 @@ fn empty_record(tenant: &str, ts_unix_nano: u64) -> MinedRecord {
         event_name: None,
         body_kind: BodyKind::String,
         params: Vec::new(),
-        separators: vec![String::new(), String::new()],
+        // `separators.len() = params.len() + 1 = 1` — the
+        // minimum-valid shape for a clean-attach String row
+        // with no wildcards.
+        separators: vec![String::new()],
         body: None,
         confidence: 1.0,
         lossy_flag: false,

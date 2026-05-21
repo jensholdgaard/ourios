@@ -62,7 +62,11 @@ fn body_record(seed: usize) -> MinedRecord {
         event_name: None,
         body_kind: BodyKind::String,
         params: Vec::new(),
-        separators: vec![String::new(), String::new()],
+        // lossy_flag = true exempts this row from the writer's
+        // `separators.len() >= params.len() + 1` check, but
+        // keep the canonical 1-separator-for-0-tokens shape
+        // anyway for fixture cleanliness.
+        separators: vec![String::new()],
         body: Some(high_entropy_body(seed)),
         confidence: 0.5,
         lossy_flag: true, // body retained per §6.3 lossy-zone

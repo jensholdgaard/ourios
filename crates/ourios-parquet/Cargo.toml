@@ -9,14 +9,23 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# Arrow's `SchemaRef` is the cross-crate Parquet-Rust interop point
-# (writer / reader / DataFusion `ListingTable` all consume an
-# `arrow::datatypes::Schema`). Declaring the schema in Arrow rather
-# than the lower-level `parquet::schema::types::SchemaDescriptor`
-# means the writer / reader follow-on PRs can hand the same object
-# to `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`
-# without translation.
-arrow = { version = "55", default-features = false }
+# `arrow-schema` is the slim sub-crate of the Arrow workspace
+# carrying just the schema types (`DataType`, `Field`, `Schema`,
+# `SchemaRef`). The scaffold needs only those — the broader
+# `arrow` meta-crate (and `arrow-array` / `arrow-data` etc.) will
+# enter the dep tree alongside the writer / reader follow-on PRs
+# that actually allocate `RecordBatch`es. Keeping the scaffold's
+# dep footprint minimal speeds clean builds and surfaces
+# downstream-version drift sooner.
+#
+# `arrow-schema`'s `Schema` is also the cross-crate Parquet-Rust
+# interop point: `parquet::arrow::ArrowWriter` and
+# `ParquetRecordBatchReader` both consume an
+# `arrow_schema::SchemaRef`, so declaring the schema here means
+# the writer / reader PRs hand the same object across without
+# translating to `parquet::schema::types::SchemaDescriptor` by
+# hand.
+arrow-schema = { version = "55", default-features = false }
 
 [lints]
 workspace = true

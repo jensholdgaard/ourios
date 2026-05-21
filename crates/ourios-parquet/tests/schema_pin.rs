@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
 use ourios_parquet::{audit_schema, data_schema};
 
 fn check_schema_against(expected: &[Field], schema: &SchemaRef) {

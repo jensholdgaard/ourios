@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
 
 /// Data-file column-name constants (RFC 0005 §3.2). Production
 /// code addressing columns by name MUST use these so renames stay
@@ -142,11 +142,13 @@ pub fn data_schema() -> SchemaRef {
 
 /// Build the audit-event file Arrow schema per RFC 0005 §3.7.
 ///
-/// Both `event_kind` (INT32 ordinal) and `event_type` (STRING)
-/// are persisted per §3.7's dual-column rule — the ordinal is the
-/// compact internal representation, the string is the
-/// predicate-pushdown surface RFC 0001 §9 requires for the §6.7
-/// drift query.
+/// Both `event_kind` (`UInt8` Arrow — Parquet stores it physically
+/// as `INT32` since Parquet has no narrower integer physical type,
+/// with the §3.7 logical type `INTEGER(8, signed=false)`) and
+/// `event_type` (`Utf8` Arrow → `STRING` Parquet) are persisted
+/// per §3.7's dual-column rule. The ordinal is the compact
+/// internal representation; the string is the predicate-pushdown
+/// surface RFC 0001 §9 requires for the §6.7 drift query.
 #[must_use]
 pub fn audit_schema() -> SchemaRef {
     let utc: Arc<str> = "UTC".into();

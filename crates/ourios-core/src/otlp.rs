@@ -107,6 +107,20 @@ pub enum Body {
     /// the miner allocates or reuses the
     /// `(severity_number, scope_name, BodyKind::Structured)`
     /// sentinel template id per §6.1 *Template-key composition*.
+    ///
+    /// **Wire-export round-trip rule (RFC 0003 implementer note).**
+    /// `MinedRecord.body` for these rows is the OTLP-canonical
+    /// JSON encoding of the original `AnyValue` (RFC 0005 §3.3).
+    /// A future OTLP exporter MUST decode that JSON back into the
+    /// matching `AnyValue` variant (`Kvlist`, `Array`, `IntValue`,
+    /// `DoubleValue`, `BoolValue`, `BytesValue`) — *not* emit it
+    /// as `AnyValue::String` carrying the raw JSON text. The
+    /// latter shortcut is lossy: receivers (e.g. Grafana / Loki)
+    /// render `AnyValue::String` as text rather than walking the
+    /// structured tree, and "Body MUST support `AnyValue` to
+    /// preserve the semantics of structured logs" (OpenTelemetry
+    /// Logs Data Model §Body) is then violated end-to-end.
+    /// RFC 0003 will pin this as part of the exporter contract.
     Structured(AnyValue),
 }
 

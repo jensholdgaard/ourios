@@ -97,8 +97,21 @@ impl Writer {
     /// row-vs-path agreement: a writer scoped to one partition
     /// MUST NOT write rows from another), converts the slice to
     /// a `RecordBatch`, and forwards to `ArrowWriter::write`.
-    /// Flushes a row group when the in-progress buffer crosses
-    /// [`ROW_GROUP_FLUSH_BYTES`].
+    ///
+    /// **Row-group sizing.** Flushes a row group before *and*
+    /// after each write when the in-progress buffer crosses
+    /// [`ROW_GROUP_FLUSH_BYTES`] (128 MiB, RFC 0005 §3.5's lower
+    /// bound). This bounds row-group overshoot to *one batch's
+    /// worth of bytes*. The §3.5 upper bound ("never exceed
+    /// 1 GiB") is enforced by caller discipline: callers handing
+    /// in batches large enough to push a single write past 1 GiB
+    /// of uncompressed Arrow bytes will produce a single
+    /// oversized row group. Production callers should chunk
+    /// `records` into batches well below that ceiling; corpus /
+    /// bench inputs in PR-E2 are several orders of magnitude
+    /// below it. A future PR may add internal chunking based on
+    /// `ArrowWriter`'s row-count target if the caller-discipline
+    /// rule proves fragile.
     ///
     /// # Errors
     ///
@@ -127,8 +140,21 @@ impl Writer {
                 });
             }
         }
+        // Pre-write flush: if the in-progress row group already
+        // crosses the §3.5 lower threshold from the *previous*
+        // append, seal it now so this new batch starts a fresh
+        // row group rather than piling on top. Bounds row-group
+        // overshoot to a single batch's worth of bytes; callers
+        // that hand in batches larger than (1 GiB − 128 MiB) can
+        // still individually exceed the §3.5 upper bound, which
+        // is a caller-side discipline the rustdoc documents.
+        if self.inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            self.inner.flush().map_err(WriterError::Parquet)?;
+        }
         let batch = mined_records_to_batch(records).map_err(WriterError::Batch)?;
         self.inner.write(&batch).map_err(WriterError::Parquet)?;
+        // Post-write flush: if this batch just tipped the buffer
+        // past the threshold, seal it before returning.
         if self.inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
             self.inner.flush().map_err(WriterError::Parquet)?;
         }
@@ -261,24 +287,26 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
         // `Some(_)`) pins the contract.
         .set_statistics_enabled(EnabledStatistics::Page);
 
-    // §3.6: NO dictionary on `body`. CLAUDE.md §3.2's cardinality
-    // invariant — bodies are unbounded by design; dict would
-    // balloon. This is the load-bearing override.
-    let body = ColumnPath::new(vec![crate::columns::BODY.to_string()]);
-    builder = builder.set_column_dictionary_enabled(body, false);
-
-    // §3.6: NO dictionary on the high-entropy attribute / id
-    // columns (`attributes`, `trace_id`, `span_id`). Page index
-    // stays on for `trace_id` / `span_id` via the global
-    // `EnabledStatistics::Page`; on `attributes` it's no-dict
-    // and the page-index toggle is the §3.6 row's no-no-no.
-    for high_entropy in [
+    // §3.6 `Dictionary = no` overrides. The RFC's §3.6 table
+    // names every column that opts out; this loop is the
+    // exhaustive set. `body` carries `CLAUDE.md` §3.2's
+    // cardinality invariant load-bearing rationale (bodies are
+    // unbounded by design); the others are either high-entropy
+    // (`attributes`, `trace_id`, `span_id`) or non-text numeric
+    // columns where dict-encoding adds overhead without payoff
+    // (`time_unix_nano`, `observed_time_unix_nano`,
+    // `confidence`).
+    for no_dict_col in [
+        crate::columns::TIME_UNIX_NANO,
+        crate::columns::OBSERVED_TIME_UNIX_NANO,
         crate::columns::ATTRIBUTES,
         crate::columns::TRACE_ID,
         crate::columns::SPAN_ID,
+        crate::columns::BODY,
+        crate::columns::CONFIDENCE,
     ] {
         builder = builder
-            .set_column_dictionary_enabled(ColumnPath::new(vec![high_entropy.to_string()]), false);
+            .set_column_dictionary_enabled(ColumnPath::new(vec![no_dict_col.to_string()]), false);
     }
 
     // §3.6 also marks the `params` list-value leaf as `Dictionary
@@ -298,7 +326,42 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
         "element".to_string(),
         "value".to_string(),
     ]);
-    builder = builder.set_column_dictionary_enabled(params_value_leaf, false);
+    builder = builder.set_column_dictionary_enabled(params_value_leaf.clone(), false);
+
+    // §3.6 `Page index = no` overrides. The global
+    // `EnabledStatistics::Page` writes per-page stats AND the
+    // Parquet `ColumnIndex` / `OffsetIndex`; downgrading these
+    // columns to `EnabledStatistics::Chunk` keeps the chunk-
+    // level min/max (still useful for row-group pruning) but
+    // suppresses the per-page surface. The columns named here
+    // are the §3.6 table's `Page index = no` rows: `tenant_id`
+    // (one value per file — page index is moot), `attributes` /
+    // `resource_attributes` / `body` (high-entropy JSON / opaque
+    // bytes), and the `params` / `separators` list-value leaves
+    // ("Per-row entropy too high" / "Almost always a single
+    // space").
+    for no_page_idx_col in [
+        crate::columns::TENANT_ID,
+        crate::columns::ATTRIBUTES,
+        crate::columns::RESOURCE_ATTRIBUTES,
+        crate::columns::BODY,
+    ] {
+        builder = builder.set_column_statistics_enabled(
+            ColumnPath::new(vec![no_page_idx_col.to_string()]),
+            EnabledStatistics::Chunk,
+        );
+    }
+    // The `params` and `separators` list-value leaves at the
+    // 3-level LIST encoding path.
+    builder = builder.set_column_statistics_enabled(params_value_leaf, EnabledStatistics::Chunk);
+    builder = builder.set_column_statistics_enabled(
+        ColumnPath::new(vec![
+            crate::columns::SEPARATORS.to_string(),
+            "list".to_string(),
+            "element".to_string(),
+        ]),
+        EnabledStatistics::Chunk,
+    );
 
     // §3.6: bloom filter on `template_id` (B2 predicate-pushdown).
     let template_id = ColumnPath::new(vec![crate::columns::TEMPLATE_ID.to_string()]);

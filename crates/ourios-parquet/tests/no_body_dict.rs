@@ -137,13 +137,15 @@ fn rfc0005_8_body_column_has_no_dictionary_encoding() {
     );
 }
 
-/// RFC 0005 §3.6 sub-rule — the `params` list-value leaf
-/// (`params.list.element.value`) also carries `Dictionary: no`
-/// per "Per-row entropy too high". Verify by writing records
-/// with non-empty `params` and asserting the leaf column's
-/// encodings + `dictionary_page_offset` reflect the override.
+/// RFC 0005 §3.6 sub-rule — the `params` "(list values)" row
+/// carries `Dictionary = no`. The "list values" wording covers
+/// both leaves of the `LIST<STRUCT<type_tag, value>>` element,
+/// so both `params.list.element.type_tag` and
+/// `params.list.element.value` need verification. Same §3.6
+/// no-dict policy as RFC0005.8's body column, applied to a
+/// different column path.
 #[test]
-fn rfc0005_6_params_value_leaf_has_no_dictionary_encoding() {
+fn rfc0005_8_params_list_leaves_have_no_dictionary_encoding() {
     let bucket = TempDir::new().unwrap();
 
     // 50 records, each with one param. Per-row entropy is the

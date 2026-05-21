@@ -99,6 +99,15 @@ pub enum BatchError {
     /// miner's `format!("{any_value:?}")` call site with a real
     /// proto3-JSON-with-OTLP-overrides encoder.
     StructuredBodyNotYetCanonical,
+    /// A clean-attach `body_kind = String` record had an empty
+    /// `separators` vec, violating the RFC 0005 §3.2 invariant
+    /// ("`tokens.len() + 1` elements when `body_kind = String`")
+    /// for the reconstruction path RFC 0001 §6.6 depends on. The
+    /// check carves out `lossy_flag = true` rows (parse-failure
+    /// / tokenizer-failure paths where reconstruction returns
+    /// the retained body verbatim and doesn't walk
+    /// `separators`).
+    EmptySeparatorsForString,
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -134,6 +143,13 @@ impl fmt::Display for BatchError {
                  ourios_core::otlp::Body::Structured) must land before structured rows can \
                  be written",
             ),
+            Self::EmptySeparatorsForString => write!(
+                f,
+                "clean-attach String record has empty separators (RFC 0005 §3.2 invariant: \
+                 `tokens.len() + 1` separator entries for body_kind = String; required for \
+                 RFC 0001 §6.6 reconstruction). Parse-failure / tokenizer-failure paths \
+                 carry lossy_flag = true and are exempt from this check",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -145,7 +161,8 @@ impl std::error::Error for BatchError {
             Self::TimestampOverflow { .. }
             | Self::AttributesNotYetEncoded { .. }
             | Self::UnsupportedAbsentBody
-            | Self::StructuredBodyNotYetCanonical => None,
+            | Self::StructuredBodyNotYetCanonical
+            | Self::EmptySeparatorsForString => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -306,6 +323,15 @@ impl Builders {
             None => self.body.append_null(),
         }
 
+        // RFC 0005 §3.2 invariant: `body_kind = String` clean
+        // attaches MUST carry `tokens.len() + 1` separators
+        // (at minimum: non-empty). Parse-failure / tokenizer-
+        // failure rows (`lossy_flag = true`) reconstruct via the
+        // retained body and so legitimately carry empty
+        // separators — they're exempt.
+        if r.body_kind == BodyKind::String && !r.lossy_flag && r.separators.is_empty() {
+            return Err(BatchError::EmptySeparatorsForString);
+        }
         append_params(&mut self.params, &r.params);
         append_separators(&mut self.separators, &r.separators);
 
@@ -482,7 +508,12 @@ mod tests {
             event_name: None,
             body_kind: BodyKind::String,
             params: Vec::new(),
-            separators: Vec::new(),
+            // RFC 0005 §3.2: `tokens.len() + 1` separators when
+            // body_kind = String. With zero tokens, one
+            // (empty-string) separator span — the minimum that
+            // satisfies the §3.2 invariant for clean-attach
+            // String records.
+            separators: vec![String::new()],
             body: None,
             confidence: 0.0,
             lossy_flag: false,
@@ -529,6 +560,36 @@ mod tests {
             }
             other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
         }
+    }
+
+    /// RFC 0005 §3.2 invariant: clean-attach `body_kind = String`
+    /// rows MUST carry non-empty `separators`. Reject otherwise
+    /// so a downstream §6.6 reconstruction never gets a
+    /// shape-mismatched record.
+    #[test]
+    fn empty_separators_on_clean_string_returns_error() {
+        let mut rec = empty_record();
+        rec.separators = Vec::new();
+        rec.lossy_flag = false;
+        let err = mined_records_to_batch(&[rec]).expect_err("empty separators must error");
+        assert!(
+            matches!(err, BatchError::EmptySeparatorsForString),
+            "expected EmptySeparatorsForString, got {err:?}",
+        );
+    }
+
+    /// The carve-out: `lossy_flag = true` (parse-failure /
+    /// tokenizer-failure rows where reconstruction returns the
+    /// retained body verbatim) is allowed to have empty
+    /// separators — §6.6's reconstruction doesn't walk them on
+    /// the lossy path.
+    #[test]
+    fn empty_separators_on_lossy_string_is_allowed() {
+        let mut rec = empty_record();
+        rec.separators = Vec::new();
+        rec.lossy_flag = true;
+        rec.body = Some("orig line".to_string());
+        mined_records_to_batch(&[rec]).expect("lossy_flag carve-out must not error");
     }
 
     /// `BodyKind::Structured` rows can't yet be written

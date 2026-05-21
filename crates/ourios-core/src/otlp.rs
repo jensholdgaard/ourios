@@ -109,18 +109,26 @@ pub enum Body {
     /// sentinel template id per §6.1 *Template-key composition*.
     ///
     /// **Wire-export round-trip rule (RFC 0003 implementer note).**
-    /// `MinedRecord.body` for these rows is the OTLP-canonical
-    /// JSON encoding of the original `AnyValue` (RFC 0005 §3.3).
-    /// A future OTLP exporter MUST decode that JSON back into the
-    /// matching `AnyValue` variant (`Kvlist`, `Array`, `IntValue`,
-    /// `DoubleValue`, `BoolValue`, `BytesValue`) — *not* emit it
-    /// as `AnyValue::String` carrying the raw JSON text. The
-    /// latter shortcut is lossy: receivers (e.g. Grafana / Loki)
-    /// render `AnyValue::String` as text rather than walking the
-    /// structured tree, and "Body MUST support `AnyValue` to
-    /// preserve the semantics of structured logs" (OpenTelemetry
-    /// Logs Data Model §Body) is then violated end-to-end.
-    /// RFC 0003 will pin this as part of the exporter contract.
+    /// The *target* on-disk encoding for `MinedRecord.body` on
+    /// `Structured` rows is OTLP-canonical JSON per RFC 0005 §3.3.
+    /// The *current* miner implementation (in
+    /// `ourios-miner::cluster::ingest_structured`) writes the
+    /// `Debug` rendering of the decoded `AnyValue` (`format!(
+    /// "{any_value:?}")`) as an interim placeholder — the
+    /// canonicalisation PR replaces it before any wire-export
+    /// path lands. Either way, the future OTLP exporter MUST
+    /// decode the stored bytes back into the matching `AnyValue`
+    /// variant (the `opentelemetry_proto::tonic::common::v1::
+    /// any_value::Value` enum — `KvlistValue`, `ArrayValue`,
+    /// `IntValue`, `DoubleValue`, `BoolValue`, `BytesValue`,
+    /// `StringValue`) — *not* emit the stored bytes as
+    /// `AnyValue::StringValue` carrying the raw text. The latter
+    /// shortcut is lossy: receivers (e.g. Grafana / Loki) render
+    /// `StringValue` as text rather than walking the structured
+    /// tree, and "Body MUST support `AnyValue` to preserve the
+    /// semantics of structured logs" (OpenTelemetry Logs Data
+    /// Model §Body) is then violated end-to-end. RFC 0003 will
+    /// pin this as part of the exporter contract.
     Structured(AnyValue),
 }
 

@@ -508,6 +508,22 @@ impl MinerCluster {
     /// `separators`, `body`, `confidence`, `lossy_flag`) are left
     /// at their zero / sentinel defaults; the calling site
     /// customises before calling [`Self::emit_record`].
+    ///
+    /// **Per-record clone cost (deferred optimisation).** The
+    /// `attributes` and `resource_attributes` vectors are
+    /// `.clone()`-d once per emitted record. For corpus / bench
+    /// inputs today the vectors are empty (`Vec::clone` on an
+    /// empty `Vec` is essentially free), so there's no measured
+    /// cost. Once the RFC 0003 receiver populates them — and
+    /// especially `resource_attributes`, which is typically
+    /// identical across every record in a `ResourceLogs` group —
+    /// the deep clone becomes a hot-path concern worth measuring.
+    /// The shape options at that point (per-record-borrowed,
+    /// `Arc<[KeyValue]>` interning, take-ownership-from-receiver)
+    /// are RFC 0003 / `ourios-ingester` territory; pinning a
+    /// shape here would optimise without data. The
+    /// [`MinedRecord`] field type stays plain `Vec<KeyValue>` for
+    /// now so it mirrors `OtlpLogRecord`'s shape exactly.
     fn record_envelope(record: &OtlpLogRecord, body_kind: BodyKind) -> MinedRecord {
         MinedRecord {
             tenant_id: record.tenant_id.clone(),

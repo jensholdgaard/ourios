@@ -254,9 +254,14 @@ impl Drop for Writer {
         // unreadable Parquet files an enumeration reader would
         // trip over.
         if let Some(temp) = self.temp_path.take() {
-            // `ArrowWriter`'s own `Drop` will run first (field
-            // order in `Self`); whatever bytes it flushed land
-            // in the temp file we're about to remove.
+            // Drop the `ArrowWriter` *before* `remove_file`:
+            // on Windows the underlying `File` holds an
+            // exclusive handle and `remove_file` on the path
+            // would fail while the writer is still alive.
+            // (Custom `Drop::drop` runs first; struct fields
+            // are only dropped after this function returns —
+            // we have to release the file handle explicitly.)
+            drop(self.inner.take());
             // Best-effort: ignore I/O errors here — there's no
             // recovery path from a destructor, and the worst-
             // case outcome is a stray `.parquet.tmp` that

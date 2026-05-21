@@ -71,14 +71,24 @@ const SUB_BATCH_ROWS: usize = 1024;
 /// **atomically**: bytes are written to a `<uuid>.parquet.tmp`
 /// path while the writer is open; [`Writer::close`] renames the
 /// temp file to the final `<uuid>.parquet` only after the footer
-/// is on disk. Readers that enumerate the partition can rely on
-/// "every `*.parquet` file has a valid footer" — they filter the
-/// `.parquet.tmp` suffix out. If the writer is dropped without
-/// [`Writer::close`] (panic, early-return), [`Drop`] removes the
-/// `.parquet.tmp` file so an aborted write doesn't pollute the
-/// partition directory with an unreadable file. This satisfies
-/// RFC 0005 §7's "atomic-publish convention (write to a temp
-/// path, rename on close)" open-question item.
+/// is written and the file is closed. Readers that enumerate the
+/// partition can rely on "every `*.parquet` file has a logically
+/// complete footer" — they filter the `.parquet.tmp` suffix out.
+/// If the writer is dropped without [`Writer::close`] (panic,
+/// early-return), [`Drop`] removes the `.parquet.tmp` file so an
+/// aborted write doesn't pollute the partition directory with an
+/// unreadable file. This satisfies RFC 0005 §7's "atomic-publish
+/// convention (write to a temp path, rename on close)"
+/// open-question item.
+///
+/// **The atomic publish is logical, not crash-durable.** Neither
+/// the data pages nor the rename metadata are
+/// [`File::sync_all`]-ed; a host crash or power loss between the
+/// rename and the OS's next page-cache flush could leave the
+/// renamed file with truncated or zero-padded contents on disk.
+/// Crash-survival durability is the WAL's domain (`CLAUDE.md`
+/// §3.4 "WAL-before-ack"); see [`Writer::close`]'s rustdoc for
+/// the full reasoning.
 pub struct Writer {
     inner: Option<ArrowWriter<File>>,
     partition: PartitionKey,

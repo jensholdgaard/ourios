@@ -107,6 +107,28 @@ pub enum Body {
     /// the miner allocates or reuses the
     /// `(severity_number, scope_name, BodyKind::Structured)`
     /// sentinel template id per §6.1 *Template-key composition*.
+    ///
+    /// **Wire-export round-trip rule (RFC 0003 implementer note).**
+    /// The *target* on-disk encoding for `MinedRecord.body` on
+    /// `Structured` rows is OTLP-canonical JSON per RFC 0005 §3.3.
+    /// The *current* miner implementation (in
+    /// `ourios-miner::cluster::ingest_structured`) writes the
+    /// `Debug` rendering of the decoded `AnyValue` (`format!(
+    /// "{any_value:?}")`) as an interim placeholder — the
+    /// canonicalisation PR replaces it before any wire-export
+    /// path lands. Either way, the future OTLP exporter MUST
+    /// decode the stored bytes back into the matching `AnyValue`
+    /// variant (the `opentelemetry_proto::tonic::common::v1::
+    /// any_value::Value` enum — `KvlistValue`, `ArrayValue`,
+    /// `IntValue`, `DoubleValue`, `BoolValue`, `BytesValue`,
+    /// `StringValue`) — *not* emit the stored bytes as
+    /// `AnyValue::StringValue` carrying the raw text. The latter
+    /// shortcut is lossy: receivers (e.g. Grafana / Loki) render
+    /// `StringValue` as text rather than walking the structured
+    /// tree, and "Body MUST support `AnyValue` to preserve the
+    /// semantics of structured logs" (OpenTelemetry Logs Data
+    /// Model §Body) is then violated end-to-end. RFC 0003 will
+    /// pin this as part of the exporter contract.
     Structured(AnyValue),
 }
 

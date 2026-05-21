@@ -508,14 +508,40 @@ impl MinerCluster {
     /// `separators`, `body`, `confidence`, `lossy_flag`) are left
     /// at their zero / sentinel defaults; the calling site
     /// customises before calling [`Self::emit_record`].
+    ///
+    /// **Per-record clone cost (deferred optimisation).** The
+    /// `attributes` and `resource_attributes` vectors are
+    /// `.clone()`-d once per emitted record. For corpus / bench
+    /// inputs today the vectors are empty (`Vec::clone` on an
+    /// empty `Vec` is essentially free), so there's no measured
+    /// cost. Once the RFC 0003 receiver populates them — and
+    /// especially `resource_attributes`, which is typically
+    /// identical across every record in a `ResourceLogs` group —
+    /// the deep clone becomes a hot-path concern worth measuring.
+    /// The shape options at that point (per-record-borrowed,
+    /// `Arc<[KeyValue]>` interning, take-ownership-from-receiver)
+    /// are RFC 0003 / `ourios-ingester` territory; pinning a
+    /// shape here would optimise without data. The
+    /// [`MinedRecord`] field type stays plain `Vec<KeyValue>` for
+    /// now so it mirrors `OtlpLogRecord`'s shape exactly.
     fn record_envelope(record: &OtlpLogRecord, body_kind: BodyKind) -> MinedRecord {
         MinedRecord {
             tenant_id: record.tenant_id.clone(),
             template_id: NO_TEMPLATE,
             template_version: 0,
             severity_number: record.severity_number,
+            severity_text: record.severity_text.clone(),
             scope_name: record.scope_name.clone(),
+            scope_version: record.scope_version.clone(),
             time_unix_nano: record.time_unix_nano,
+            observed_time_unix_nano: record.observed_time_unix_nano,
+            attributes: record.attributes.clone(),
+            dropped_attributes_count: record.dropped_attributes_count,
+            resource_attributes: record.resource_attributes.clone(),
+            trace_id: record.trace_id,
+            span_id: record.span_id,
+            flags: record.flags,
+            event_name: record.event_name.clone(),
             body_kind,
             params: Vec::new(),
             separators: Vec::new(),

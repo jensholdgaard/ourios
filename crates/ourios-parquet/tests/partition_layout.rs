@@ -8,7 +8,7 @@
 //! The flush identifier is verified to be a `UUIDv7` (per §3.4's
 //! normative "writer MUST emit `UUIDv7`" clause).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ourios_core::record::{BodyKind, MinedRecord};
 use ourios_core::tenant::TenantId;
@@ -73,26 +73,34 @@ fn rfc0005_5_files_land_at_expected_partition_paths() {
         assert!(path.exists(), "writer must produce a real file at {path:?}");
     }
 
-    // Strip the bucket root so the asserted prefix is partition-relative.
-    let rel = |p: &Path| -> String {
-        p.strip_prefix(bucket_path)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
+    // Component-wise prefix comparison stays portable across
+    // path-separator conventions (Unix `/` vs Windows `\`).
+    let rel = |p: &Path| -> PathBuf { p.strip_prefix(bucket_path).unwrap().to_path_buf() };
+    let prefix = |tenant: &str, hour: &str| -> PathBuf {
+        [
+            "data",
+            &format!("tenant_id={tenant}"),
+            "year=2026",
+            "month=04",
+            "day=02",
+            &format!("hour={hour}"),
+        ]
+        .iter()
+        .collect()
     };
     assert!(
-        rel(&p1).starts_with("data/tenant_id=tenant-a/year=2026/month=04/day=02/hour=10/"),
-        "{}",
+        rel(&p1).starts_with(prefix("tenant-a", "10")),
+        "{:?}",
         rel(&p1),
     );
     assert!(
-        rel(&p2).starts_with("data/tenant_id=tenant-a/year=2026/month=04/day=02/hour=11/"),
-        "{}",
+        rel(&p2).starts_with(prefix("tenant-a", "11")),
+        "{:?}",
         rel(&p2),
     );
     assert!(
-        rel(&p3).starts_with("data/tenant_id=tenant-b/year=2026/month=04/day=02/hour=12/"),
-        "{}",
+        rel(&p3).starts_with(prefix("tenant-b", "12")),
+        "{:?}",
         rel(&p3),
     );
 
@@ -178,13 +186,10 @@ fn rfc0005_5_non_ascii_tenant_id_percent_encodes() {
     let rec = empty_record("tenant-å", 1_775_127_480_000_000_000);
     let path = write_one_record(bucket_path, &rec);
 
-    let rel = path
-        .strip_prefix(bucket_path)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let rel = path.strip_prefix(bucket_path).unwrap().to_path_buf();
+    let expected_prefix: PathBuf = ["data", "tenant_id=tenant-%C3%A5"].iter().collect();
     assert!(
-        rel.starts_with("data/tenant_id=tenant-%C3%A5/"),
-        "non-ASCII tenant must percent-encode per §3.4, got: {rel}",
+        rel.starts_with(&expected_prefix),
+        "non-ASCII tenant must percent-encode per §3.4, got: {rel:?}",
     );
 }

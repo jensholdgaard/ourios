@@ -30,6 +30,7 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field};
+use ourios_core::audit::ParamType;
 use ourios_core::otlp::KeyValue;
 use ourios_core::record::{BodyKind, MinedRecord};
 
@@ -65,6 +66,14 @@ pub enum BatchError {
     /// overflowed (`time_unix_nano` or
     /// `observed_time_unix_nano`) and the offending value.
     TimestampOverflow { field: &'static str, value: u64 },
+    /// A record carried a non-empty `attributes` or
+    /// `resource_attributes` `Vec<KeyValue>`. The canonical-JSON
+    /// encoder is deferred to the RFC 0005 §3.3 canonicalisation
+    /// PR (see the PR-E1 breadcrumb on
+    /// [`ourios_core::otlp::Body::Structured`]); until then the
+    /// writer returns this error rather than crashing the ingest
+    /// process. Carries the column name and entry count.
+    AttributesNotYetEncoded { column: &'static str, count: usize },
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -79,6 +88,12 @@ impl fmt::Display for BatchError {
                 f,
                 "{field} = {value} exceeds i64::MAX (RFC 0005 §3.2 u64→i64 overflow contract)",
             ),
+            Self::AttributesNotYetEncoded { column, count } => write!(
+                f,
+                "{column}: canonical-JSON encoding of {count} KeyValue entries is deferred to \
+                 the RFC 0005 §3.3 canonicalisation PR (corpus / bench inputs today carry \
+                 empty attributes; the RFC 0003 receiver is what populates them)",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -87,7 +102,7 @@ impl fmt::Display for BatchError {
 impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TimestampOverflow { .. } => None,
+            Self::TimestampOverflow { .. } | Self::AttributesNotYetEncoded { .. } => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -210,10 +225,14 @@ impl Builders {
         append_option_str(&mut self.scope_name, r.scope_name.as_deref());
         append_option_str(&mut self.scope_version, r.scope_version.as_deref());
 
-        append_attributes(&mut self.attributes, &r.attributes);
+        append_attributes(&mut self.attributes, "attributes", &r.attributes)?;
         self.dropped_attributes_count
             .append_value(r.dropped_attributes_count);
-        append_attributes(&mut self.resource_attributes, &r.resource_attributes);
+        append_attributes(
+            &mut self.resource_attributes,
+            "resource_attributes",
+            &r.resource_attributes,
+        )?;
 
         match r.trace_id {
             Some(b) => self.trace_id.append_value(b).map_err(BatchError::Arrow)?,
@@ -305,7 +324,7 @@ fn append_params(
         values
             .field_builder::<Int32Builder>(0)
             .expect("type_tag field index 0")
-            .append_value(p.type_tag as i32);
+            .append_value(param_type_ordinal(p.type_tag));
         values
             .field_builder::<BinaryBuilder>(1)
             .expect("value field index 1")
@@ -313,6 +332,30 @@ fn append_params(
         values.append(true);
     }
     builder.append(true);
+}
+
+/// Stable on-disk ordinal for [`ParamType`] per RFC 0001 §6.5
+/// and RFC 0005 §3.2 ("The `params.type_tag` integer enum is
+/// `0..=7` matching RFC 0001's `ParamType` ordering: `IP, UUID,
+/// NUM, HEX, TS, PATH, STR, OVERFLOW`").
+///
+/// Using an explicit `match` rather than `enum as i32` makes the
+/// on-disk encoding immune to a future reorder of the
+/// `ParamType` variants in `ourios-core` — a reorder would no
+/// longer silently rewrite the column's semantic content. Adding
+/// a new variant is a §3.8 schema amendment and the match arm is
+/// the compile-time signal that the new ordinal needs picking.
+const fn param_type_ordinal(t: ParamType) -> i32 {
+    match t {
+        ParamType::Ip => 0,
+        ParamType::Uuid => 1,
+        ParamType::Num => 2,
+        ParamType::Hex => 3,
+        ParamType::Ts => 4,
+        ParamType::Path => 5,
+        ParamType::Str => 6,
+        ParamType::Overflow => 7,
+    }
 }
 
 fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separators: &[String]) {
@@ -330,25 +373,27 @@ fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separ
 ///   rule). The `&'static str` argument means no per-row `String`
 ///   allocation — important on the hot path where corpus / bench
 ///   inputs today carry empty attributes for every record.
-/// - Non-empty input → **panic with a clear deferral message**.
-///   The original cut of this function emitted `format!(
-///   "{attrs:?}")` (Rust `Debug` rendering) which is *not* valid
-///   JSON and contradicts §3.3 / the module-level contract;
-///   panicking instead surfaces the gap loudly to any future
-///   caller that ingests non-empty attributes before the
-///   canonicalisation PR lands. RFC 0005 §3.3 names the
-///   normative encoding (proto3 JSON with OTLP overrides);
-///   implementing it is that PR's job.
-fn append_attributes(b: &mut StringBuilder, attrs: &[KeyValue]) {
+/// - Non-empty input → returns
+///   [`BatchError::AttributesNotYetEncoded`] so the writer fails
+///   the batch gracefully rather than crashing the ingest process.
+///   The original cut emitted `format!("{attrs:?}")` (Rust `Debug`
+///   rendering) which is *not* valid JSON; the structured error
+///   surfaces the gap loudly without inviting downstream code to
+///   silently store non-JSON masquerading as JSON. RFC 0005 §3.3
+///   names the normative encoding (proto3 JSON with OTLP
+///   overrides); implementing it is the canonicalisation PR's
+///   job.
+fn append_attributes(
+    b: &mut StringBuilder,
+    column: &'static str,
+    attrs: &[KeyValue],
+) -> Result<(), BatchError> {
     if attrs.is_empty() {
         b.append_value("[]");
-        return;
+        return Ok(());
     }
-    unimplemented!(
-        "ourios-parquet: canonical JSON encoding of non-empty KeyValue lists is deferred to \
-         the RFC 0005 §3.3 canonicalisation PR (see the PR-E1 breadcrumb on \
-         ourios_core::otlp::Body::Structured). Got {} entries — corpus / bench inputs \
-         today carry empty attributes; the RFC 0003 receiver is what populates them.",
-        attrs.len(),
-    );
+    Err(BatchError::AttributesNotYetEncoded {
+        column,
+        count: attrs.len(),
+    })
 }

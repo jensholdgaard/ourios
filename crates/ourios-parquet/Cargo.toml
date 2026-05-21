@@ -27,8 +27,12 @@ uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 # Calendar derivation for partition paths (year/month/day/hour
 # in UTC). `chrono` is already in the Arrow dep tree for
 # timestamp conversions; declaring it explicitly avoids
-# relying on a transitive surface.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# relying on a transitive surface. Only the `std` feature is
+# needed — `DateTime::<Utc>::from_timestamp_nanos` + the
+# `Datelike` / `Timelike` traits live there. `clock` (which
+# pulls in `iana-time-zone` and platform timezone lookup) is
+# deliberately off; we never read the wall clock.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Used by tests that build `MinedRecord` fixtures.

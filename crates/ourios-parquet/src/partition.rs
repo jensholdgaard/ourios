@@ -280,12 +280,22 @@ mod tests {
             day: 2,
             hour: 10,
         };
-        let bucket = Path::new("/tmp/bucket");
-        let path = key.data_path(bucket);
-        assert_eq!(
-            path.to_str().unwrap(),
-            "/tmp/bucket/data/tenant_id=tenant-x/year=2026/month=04/day=02/hour=10"
-        );
+        let bucket = PathBuf::from("bucket");
+        let path = key.data_path(&bucket);
+        // Component-wise comparison so the test stays portable
+        // across OS path separators (Unix `/` vs Windows `\`).
+        let expected: PathBuf = [
+            "bucket",
+            "data",
+            "tenant_id=tenant-x",
+            "year=2026",
+            "month=04",
+            "day=02",
+            "hour=10",
+        ]
+        .iter()
+        .collect();
+        assert_eq!(path, expected);
     }
 
     #[test]
@@ -297,11 +307,18 @@ mod tests {
             day: 2,
             hour: 10,
         };
-        let bucket = Path::new("/tmp/bucket");
-        let path = key.audit_path(bucket);
-        assert_eq!(
-            path.to_str().unwrap(),
-            "/tmp/bucket/audit/tenant_id=tenant-x/year=2026/month=04/day=02"
-        );
+        let bucket = PathBuf::from("bucket");
+        let path = key.audit_path(&bucket);
+        let expected: PathBuf = [
+            "bucket",
+            "audit",
+            "tenant_id=tenant-x",
+            "year=2026",
+            "month=04",
+            "day=02",
+        ]
+        .iter()
+        .collect();
+        assert_eq!(path, expected);
     }
 }

@@ -110,6 +110,64 @@ fn rfc0005_5_files_land_at_expected_partition_paths() {
     }
 }
 
+/// Writer fail-fast: appending a record whose derived partition
+/// disagrees with the writer's open partition errors at write
+/// time (the §3.9 row-vs-path contract enforced from the write
+/// side too, not just the read side).
+#[test]
+fn writer_rejects_records_outside_its_partition() {
+    use ourios_parquet::WriterError;
+
+    let bucket = TempDir::new().unwrap();
+    let bucket_path = bucket.path();
+
+    // Open a writer scoped to tenant-a at hour 10.
+    let opening = empty_record("tenant-a", 1_775_127_480_000_000_000);
+    let partition = PartitionKey::derive(&opening).unwrap();
+    let mut writer = Writer::open(bucket_path, partition.clone()).unwrap();
+
+    // First, an in-partition record — writes cleanly.
+    writer.append_records(&[opening]).unwrap();
+
+    // Now append a record from tenant-b: same hour, different
+    // tenant_id. The writer must reject before touching the
+    // RecordBatch builder.
+    let foreign = empty_record("tenant-b", 1_775_127_480_000_000_000);
+    let err = writer.append_records(&[foreign]).unwrap_err();
+    match err {
+        WriterError::PartitionMismatch {
+            row_index,
+            expected,
+            actual,
+        } => {
+            assert_eq!(row_index, 0);
+            assert_eq!(expected.tenant_id, "tenant-a");
+            assert_eq!(actual.tenant_id, "tenant-b");
+            assert_eq!(expected.hour, actual.hour); // same hour, only tenant differs
+        }
+        other => panic!("expected PartitionMismatch, got {other:?}"),
+    }
+
+    // A record one hour later from the right tenant — same
+    // tenant, derived hour differs.
+    let later = empty_record("tenant-a", 1_775_127_480_000_000_000 + 3600 * 1_000_000_000);
+    let err = writer.append_records(&[later]).unwrap_err();
+    match err {
+        WriterError::PartitionMismatch {
+            row_index,
+            expected,
+            actual,
+        } => {
+            assert_eq!(row_index, 0);
+            assert_eq!(expected.tenant_id, "tenant-a");
+            assert_eq!(actual.tenant_id, "tenant-a");
+            assert_eq!(expected.hour, 10);
+            assert_eq!(actual.hour, 11);
+        }
+        other => panic!("expected PartitionMismatch, got {other:?}"),
+    }
+}
+
 /// RFC0005.5 sub-test — non-ASCII tenant ids percent-encode per §3.4.
 #[test]
 fn rfc0005_5_non_ascii_tenant_id_percent_encodes() {

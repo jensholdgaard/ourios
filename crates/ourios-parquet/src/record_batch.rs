@@ -29,6 +29,7 @@ use arrow_schema::{ArrowError, DataType, Field};
 use ourios_core::otlp::KeyValue;
 use ourios_core::record::{BodyKind, MinedRecord};
 
+use crate::partition::TimestampOverflowError;
 use crate::{columns, data_schema};
 
 /// Build an Arrow `RecordBatch` matching `data_schema()` from a
@@ -84,6 +85,15 @@ impl std::error::Error for BatchError {
         match self {
             Self::TimestampOverflow { .. } => None,
             Self::Arrow(e) => Some(e),
+        }
+    }
+}
+
+impl From<TimestampOverflowError> for BatchError {
+    fn from(e: TimestampOverflowError) -> Self {
+        Self::TimestampOverflow {
+            field: e.field,
+            value: e.value,
         }
     }
 }
@@ -310,15 +320,32 @@ fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separ
     builder.append(true);
 }
 
-/// Interim canonical-JSON placeholder per the PR-E1 breadcrumb.
-/// Returns an empty JSON array `"[]"` for an empty `Vec<KeyValue>`
-/// (RFC 0005 §3.2's `Vec::new()` ↔ `[]` round-trip rule); for
-/// non-empty inputs, returns the `Debug` rendering until the
-/// canonicalisation PR replaces this site.
+/// Interim canonical-JSON encoder per the PR-E1 breadcrumb on
+/// [`ourios_core::otlp::Body::Structured`].
+///
+/// - Empty input → `"[]"` (RFC 0005 §3.2's `Vec::new()` ↔ `[]`
+///   round-trip rule). This is the *only* code path corpus /
+///   bench inputs exercise today, since the OTLP receiver
+///   (RFC 0003, post-MVP) is what would populate non-empty
+///   `Vec<KeyValue>`.
+/// - Non-empty input → **panic with a clear deferral message**.
+///   The original cut of this function emitted `format!(
+///   "{attrs:?}")` (Rust `Debug` rendering) which is *not* valid
+///   JSON and contradicts §3.3 / the module-level contract;
+///   panicking instead surfaces the gap loudly to any future
+///   caller that ingests non-empty attributes before the
+///   canonicalisation PR lands. RFC 0005 §3.3 names the
+///   normative encoding (proto3 JSON with OTLP overrides);
+///   implementing it is that PR's job.
 fn encode_attributes(attrs: &[KeyValue]) -> String {
     if attrs.is_empty() {
-        "[]".to_string()
-    } else {
-        format!("{attrs:?}")
+        return "[]".to_string();
     }
+    unimplemented!(
+        "ourios-parquet: canonical JSON encoding of non-empty KeyValue lists is deferred to \
+         the RFC 0005 §3.3 canonicalisation PR (see the PR-E1 breadcrumb on \
+         ourios_core::otlp::Body::Structured). Got {} entries — corpus / bench inputs \
+         today carry empty attributes; the RFC 0003 receiver is what populates them.",
+        attrs.len(),
+    );
 }

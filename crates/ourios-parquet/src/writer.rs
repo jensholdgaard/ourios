@@ -84,13 +84,22 @@ impl Writer {
         })
     }
 
-    /// Append `records` to the writer. Converts the slice to a
-    /// `RecordBatch` first, then forwards to `ArrowWriter::write`.
+    /// Append `records` to the writer. Validates each record's
+    /// partition matches the writer's open partition (§3.4 / §3.9
+    /// row-vs-path agreement: a writer scoped to one partition
+    /// MUST NOT write rows from another), converts the slice to
+    /// a `RecordBatch`, and forwards to `ArrowWriter::write`.
     /// Flushes a row group when the in-progress buffer crosses
     /// [`ROW_GROUP_FLUSH_BYTES`].
     ///
     /// # Errors
     ///
+    /// - [`WriterError::PartitionMismatch`] when a record's derived
+    ///   partition (per §3.4's time-fallback algorithm) disagrees
+    ///   with the writer's `partition`. Fail-fast at write time
+    ///   keeps the §3.9 reader contract enforceable — a file
+    ///   written here will never produce a row-vs-path mismatch
+    ///   on read.
     /// - [`WriterError::Batch`] when `RecordBatch` construction
     ///   fails (timestamp overflow per RFC 0005 §3.2, or Arrow
     ///   internal error).
@@ -99,6 +108,16 @@ impl Writer {
     pub fn append_records(&mut self, records: &[MinedRecord]) -> Result<(), WriterError> {
         if records.is_empty() {
             return Ok(());
+        }
+        for (idx, r) in records.iter().enumerate() {
+            let derived = PartitionKey::derive(r).map_err(|e| WriterError::Batch(e.into()))?;
+            if derived != self.partition {
+                return Err(WriterError::PartitionMismatch {
+                    row_index: idx,
+                    expected: self.partition.clone(),
+                    actual: derived,
+                });
+            }
         }
         let batch = mined_records_to_batch(records).map_err(WriterError::Batch)?;
         self.inner.write(&batch).map_err(WriterError::Parquet)?;
@@ -156,6 +175,18 @@ pub enum WriterError {
     Parquet(ParquetError),
     /// `RecordBatch` construction failed — see [`BatchError`].
     Batch(BatchError),
+    /// A record in the batch belongs to a different partition than
+    /// the one the writer was opened against. Surfaces the
+    /// row-vs-path contract from RFC 0005 §3.9 at write time
+    /// rather than letting the reader catch the mismatch later.
+    PartitionMismatch {
+        /// Zero-based index into the batch slice.
+        row_index: usize,
+        /// The partition the writer was opened against.
+        expected: PartitionKey,
+        /// The partition derived from the offending record.
+        actual: PartitionKey,
+    },
 }
 
 impl fmt::Display for WriterError {
@@ -164,6 +195,27 @@ impl fmt::Display for WriterError {
             Self::Io(e) => write!(f, "filesystem I/O: {e}"),
             Self::Parquet(e) => write!(f, "parquet writer: {e}"),
             Self::Batch(e) => write!(f, "record batch: {e}"),
+            Self::PartitionMismatch {
+                row_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "record at index {row_index} derives partition (tenant_id={}, \
+                 year={:04}, month={:02}, day={:02}, hour={:02}) which does not match the \
+                 writer's open partition (tenant_id={}, year={:04}, month={:02}, day={:02}, \
+                 hour={:02}) — RFC 0005 §3.9 row-vs-path contract",
+                actual.tenant_id,
+                actual.year,
+                actual.month,
+                actual.day,
+                actual.hour,
+                expected.tenant_id,
+                expected.year,
+                expected.month,
+                expected.day,
+                expected.hour,
+            ),
         }
     }
 }
@@ -174,6 +226,7 @@ impl std::error::Error for WriterError {
             Self::Io(e) => Some(e),
             Self::Parquet(e) => Some(e),
             Self::Batch(e) => Some(e),
+            Self::PartitionMismatch { .. } => None,
         }
     }
 }

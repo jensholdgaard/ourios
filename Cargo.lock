@@ -826,6 +826,7 @@ dependencies = [
  "chrono",
  "ourios-core",
  "parquet",
+ "serde_json",
  "tempfile",
  "uuid",
 ]

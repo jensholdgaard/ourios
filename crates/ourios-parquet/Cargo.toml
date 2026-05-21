@@ -33,6 +33,16 @@ uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 # pulls in `iana-time-zone` and platform timezone lookup) is
 # deliberately off; we never read the wall clock.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Audit-stream rejection variant's `would_be_template` /
+# `would_be_positions` ride in the §3.7 `reason` column as a JSON
+# object (the §3.7 text describes the column as "the degenerate-
+# template guard's diagnostic string"; structuring the diagnostic
+# as JSON preserves the in-memory `AuditEventKind::
+# TemplateWideningRejectedDegenerate` shape across a round trip
+# without amending the schema). serde_json carries the encoder
+# and parser for that single column; the rest of the audit stream
+# is plain Arrow columns.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Used by tests that build `MinedRecord` fixtures.

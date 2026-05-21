@@ -161,7 +161,12 @@ fn build_one_row_against(schema: Arc<ArrowSchema>) -> RecordBatch {
             }
             "lossy_flag" => {
                 let mut b = BooleanBuilder::new();
-                b.append_value(true);
+                // Clean-attach shape: body is None (no
+                // retention needed), so the writer-side
+                // invariant (separators.len() >= params.len() + 1)
+                // is the relevant check. Our params=0 +
+                // separators=[""] satisfies it (1 >= 1).
+                b.append_value(false);
                 Arc::new(b.finish())
             }
             "future_column" => {
@@ -252,6 +257,136 @@ fn rfc0005_4_missing_required_column_returns_hard_error() {
         Err(other) => panic!("expected MissingRequiredColumn, got {other:?}"),
         Ok(_) => panic!("expected MissingRequiredColumn, got Ok"),
     }
+}
+
+/// Reader-side shape-invariant: a foreign-built file with
+/// `lossy_flag = true` and `body = NULL` is corruption. The
+/// reader mirrors the writer's `MissingBodyForLossyString`
+/// rejection — RFC 0001 §6.6 reconstruction has nothing to
+/// fall back to.
+#[test]
+fn reader_rejects_lossy_string_without_body() {
+    let schema = ourios_parquet::data_schema();
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        // Build the row using the helper, then override
+        // `lossy_flag = true` + `body = NULL` after the fact
+        // would be awkward; build inline instead.
+        let arr: ArrayRef = match field.name().as_str() {
+            "lossy_flag" => {
+                let mut b = BooleanBuilder::new();
+                b.append_value(true);
+                Arc::new(b.finish())
+            }
+            "body" => {
+                let mut b = BinaryBuilder::new();
+                b.append_null();
+                Arc::new(b.finish())
+            }
+            other => single_field_array(other),
+        };
+        arrays.push(arr);
+    }
+    let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+    let f = write_batch(schema, &batch);
+
+    match Reader::open_file(f.path()).and_then(Reader::read_all) {
+        Err(ReaderError::Conversion { column, .. }) => assert_eq!(column, "body"),
+        Err(other) => panic!("expected Conversion on body, got {other:?}"),
+        Ok(_) => panic!("expected Conversion error"),
+    }
+}
+
+/// Reader-side shape-invariant: clean-attach String row with
+/// `separators` shorter than `params.len() + 1` is rejected,
+/// mirroring the writer's `InvalidSeparatorsForString`.
+#[test]
+fn reader_rejects_clean_string_with_too_few_separators() {
+    let schema = ourios_parquet::data_schema();
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let arr: ArrayRef = match field.name().as_str() {
+            "lossy_flag" => {
+                let mut b = BooleanBuilder::new();
+                b.append_value(false);
+                Arc::new(b.finish())
+            }
+            "params" => {
+                // Two params on disk; with the empty separators
+                // below, separators.len() = 0 < params.len() + 1 = 3.
+                let element_struct = StructBuilder::new(
+                    vec![
+                        Field::new("type_tag", DataType::Int32, false),
+                        Field::new("value", DataType::Binary, true),
+                    ],
+                    vec![
+                        Box::new(Int32Builder::new()),
+                        Box::new(BinaryBuilder::new()),
+                    ],
+                );
+                let mut b = GenericListBuilder::<i32, StructBuilder>::new(element_struct)
+                    .with_field(Field::new(
+                        "element",
+                        DataType::Struct(
+                            vec![
+                                Field::new("type_tag", DataType::Int32, false),
+                                Field::new("value", DataType::Binary, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    ));
+                for _ in 0..2 {
+                    b.values()
+                        .field_builder::<Int32Builder>(0)
+                        .unwrap()
+                        .append_value(2);
+                    b.values()
+                        .field_builder::<BinaryBuilder>(1)
+                        .unwrap()
+                        .append_value(b"x");
+                    b.values().append(true);
+                }
+                b.append(true);
+                Arc::new(b.finish())
+            }
+            "separators" => {
+                // Empty separators on a clean-attach String row.
+                let mut b = GenericListBuilder::<i32, BinaryBuilder>::new(BinaryBuilder::new())
+                    .with_field(Field::new("element", DataType::Binary, false));
+                b.append(true);
+                Arc::new(b.finish())
+            }
+            other => single_field_array(other),
+        };
+        arrays.push(arr);
+    }
+    let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+    let f = write_batch(schema, &batch);
+
+    match Reader::open_file(f.path()).and_then(Reader::read_all) {
+        Err(ReaderError::Conversion { column, .. }) => assert_eq!(column, "separators"),
+        Err(other) => panic!("expected Conversion on separators, got {other:?}"),
+        Ok(_) => panic!("expected Conversion error"),
+    }
+}
+
+/// Helper used by the two shape-invariant tests above to
+/// populate the "everything else" columns. Defers to
+/// `build_one_row_against` for the columns it overrides.
+fn single_field_array(field_name: &str) -> ArrayRef {
+    // Build a one-row schema containing only the requested
+    // field, run the standard builder over it, return the
+    // resulting array.
+    let schema = ourios_parquet::data_schema();
+    let target = schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == field_name)
+        .unwrap_or_else(|| panic!("field {field_name} not in data_schema"));
+    let single = Arc::new(ArrowSchema::new(vec![(**target).clone()]));
+    let one_row = build_one_row_against(single);
+    one_row.column(0).clone()
 }
 
 /// Scenario RFC0005.9 — Unknown `ParamType` ordinal → reader

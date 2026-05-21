@@ -387,7 +387,7 @@ fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, Reade
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
         };
 
-        records.push(MinedRecord {
+        let record = MinedRecord {
             tenant_id: TenantId::new(tenant_id[i].clone()),
             template_id: template_id[i],
             template_version: template_version[i],
@@ -410,10 +410,58 @@ fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, Reade
             body: body_string,
             confidence: confidence[i],
             lossy_flag: lossy_flag[i],
-        });
+        };
+        // §3.2 reconstruction invariants — the writer rejects
+        // these shapes too (`record_batch::Builders::append`),
+        // so a file containing them indicates either corruption
+        // or a foreign writer that doesn't honour the contract.
+        validate_record_shape(&record, i)?;
+        records.push(record);
     }
 
     Ok(records)
+}
+
+/// Enforce the RFC 0005 §3.2 / RFC 0001 §6.6 shape invariants
+/// the writer guarantees on its inputs. The reader applies the
+/// same checks against file contents so a foreign or corrupt
+/// file can't yield a `MinedRecord` shape that downstream §6.6
+/// reconstruction wouldn't be able to handle.
+fn validate_record_shape(record: &MinedRecord, row_index: usize) -> Result<(), ReaderError> {
+    if record.body_kind != BodyKind::String {
+        return Ok(());
+    }
+    if record.lossy_flag {
+        // Lossy String rows: §6.6 reconstruction returns the
+        // retained body verbatim, so `body` must be present.
+        if record.body.is_none() {
+            return Err(ReaderError::Conversion {
+                column: columns::BODY,
+                detail: format!(
+                    "row {row_index}: lossy_flag = true with body = None — RFC 0001 §6.6 \
+                     reconstruction needs the retained body bytes",
+                ),
+            });
+        }
+    } else {
+        // Clean attach: `separators.len() >= params.len() + 1`.
+        // tokens.len() >= params.len() always, and separators
+        // = tokens.len() + 1, so the lower bound is the
+        // strictly-correct check the writer enforces too.
+        let expected_at_least = record.params.len() + 1;
+        if record.separators.len() < expected_at_least {
+            return Err(ReaderError::Conversion {
+                column: columns::SEPARATORS,
+                detail: format!(
+                    "row {row_index}: clean-attach String record has separators.len() = {} \
+                     below the lower bound expected_at_least = {expected_at_least} \
+                     (params.len() + 1) required by RFC 0005 §3.2",
+                    record.separators.len(),
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn decode_body_kind(ord: u8) -> Result<BodyKind, ReaderError> {
@@ -505,6 +553,23 @@ fn decode_params_column(batch: &RecordBatch) -> Result<Vec<Vec<Param>>, ReaderEr
 
         let mut row_params = Vec::with_capacity(struct_arr.len());
         for i in 0..struct_arr.len() {
+            // The list-element struct itself is declared
+            // non-nullable in `data_schema()` (the LIST's
+            // `element` field carries `nullable: false`).
+            // A NULL struct here is file corruption — surface
+            // it before inspecting the inner type_tag / value
+            // fields, since `is_null` on a NULL struct's
+            // children would also fire and report a less
+            // informative error.
+            if struct_arr.is_null(i) {
+                return Err(ReaderError::Conversion {
+                    column: columns::PARAMS,
+                    detail: format!(
+                        "row {row_idx} param {i}: list-element struct is NULL but the schema \
+                         marks the LIST element non-nullable",
+                    ),
+                });
+            }
             // `type_tag` is declared non-nullable in §3.2.
             // NULL here is file corruption — surface as
             // Conversion rather than silently decoding to

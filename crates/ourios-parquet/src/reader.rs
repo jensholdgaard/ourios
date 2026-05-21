@@ -149,6 +149,11 @@ impl Reader {
         let mut out = Vec::new();
         let partition = self.partition;
         let file_path = self.file_path;
+        // Running file-level row offset so multi-batch files
+        // report stable row indices across batches in
+        // `PartitionMismatch` errors. Per-batch `enumerate()`
+        // would reset to 0 every batch.
+        let mut row_offset: usize = 0;
         for batch in self.inner {
             // `ParquetRecordBatchReader` yields `ArrowError`;
             // `From<ArrowError> for ParquetError` lets us
@@ -156,10 +161,11 @@ impl Reader {
             let batch = batch.map_err(|e| ReaderError::Parquet(e.into()))?;
             let records = batch_to_mined_records(&batch)?;
             if let Some(p) = &partition {
-                for (idx, r) in records.iter().enumerate() {
-                    validate_row_vs_partition(r, p, idx, &file_path)?;
+                for (idx_in_batch, r) in records.iter().enumerate() {
+                    validate_row_vs_partition(r, p, row_offset + idx_in_batch, &file_path)?;
                 }
             }
+            row_offset += records.len();
             out.extend(records);
         }
         Ok(out)
@@ -499,15 +505,39 @@ fn decode_params_column(batch: &RecordBatch) -> Result<Vec<Vec<Param>>, ReaderEr
 
         let mut row_params = Vec::with_capacity(struct_arr.len());
         for i in 0..struct_arr.len() {
+            // `type_tag` is declared non-nullable in §3.2.
+            // NULL here is file corruption — surface as
+            // Conversion rather than silently decoding to
+            // `Ip` (ordinal 0).
+            if type_tag_col.is_null(i) {
+                return Err(ReaderError::Conversion {
+                    column: columns::PARAMS,
+                    detail: format!(
+                        "row {row_idx} param {i}: type_tag is NULL but the schema marks the \
+                         struct field non-nullable",
+                    ),
+                });
+            }
             let type_tag = decode_param_type(type_tag_col.value(i));
-            let value_bytes = if value_bin.is_null(i) {
-                &[][..]
-            } else {
-                value_bin.value(i)
-            };
+            // The schema declares `value` as nullable, but the
+            // writer never emits NULL (it always writes the
+            // param's bytes). A NULL here therefore indicates
+            // file corruption or a foreign writer; surface as
+            // Conversion rather than collapsing NULL into the
+            // empty-string sentinel where downstream consumers
+            // can't tell them apart.
+            if value_bin.is_null(i) {
+                return Err(ReaderError::Conversion {
+                    column: columns::PARAMS,
+                    detail: format!(
+                        "row {row_idx} param {i}: value is NULL — the writer never produces \
+                         NULL value bytes, so this signals file corruption",
+                    ),
+                });
+            }
             row_params.push(Param {
                 type_tag,
-                value: String::from_utf8_lossy(value_bytes).into_owned(),
+                value: String::from_utf8_lossy(value_bin.value(i)).into_owned(),
             });
         }
         out.push(row_params);
@@ -548,12 +578,20 @@ fn decode_separators_column(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Rea
             })?;
         let mut row_seps = Vec::with_capacity(bin.len());
         for i in 0..bin.len() {
-            let bytes = if bin.is_null(i) {
-                &[][..]
-            } else {
-                bin.value(i)
-            };
-            row_seps.push(String::from_utf8_lossy(bytes).into_owned());
+            // The schema declares the inner element non-nullable
+            // (`Field::new("element", Binary, false)`). NULL on
+            // this leaf is file corruption; surface as
+            // Conversion rather than silently mapping to "".
+            if bin.is_null(i) {
+                return Err(ReaderError::Conversion {
+                    column: columns::SEPARATORS,
+                    detail: format!(
+                        "row {row_idx} separator {i}: list element is NULL but the schema \
+                         marks it non-nullable",
+                    ),
+                });
+            }
+            row_seps.push(String::from_utf8_lossy(bin.value(i)).into_owned());
         }
         out.push(row_seps);
     }
@@ -596,7 +634,7 @@ fn required_u64(batch: &RecordBatch, name: &'static str) -> Result<Vec<u64>, Rea
             column: name,
             detail: format!("expected UInt64Array, got {:?}", col.data_type()),
         })?;
-    Ok(arr.values().to_vec())
+    materialize_required_primitive(arr, name)
 }
 
 fn required_u32(batch: &RecordBatch, name: &'static str) -> Result<Vec<u32>, ReaderError> {
@@ -607,7 +645,7 @@ fn required_u32(batch: &RecordBatch, name: &'static str) -> Result<Vec<u32>, Rea
             column: name,
             detail: format!("expected UInt32Array, got {:?}", col.data_type()),
         })?;
-    Ok(arr.values().to_vec())
+    materialize_required_primitive(arr, name)
 }
 
 fn required_u8(batch: &RecordBatch, name: &'static str) -> Result<Vec<u8>, ReaderError> {
@@ -618,7 +656,7 @@ fn required_u8(batch: &RecordBatch, name: &'static str) -> Result<Vec<u8>, Reade
             column: name,
             detail: format!("expected UInt8Array, got {:?}", col.data_type()),
         })?;
-    Ok(arr.values().to_vec())
+    materialize_required_primitive(arr, name)
 }
 
 fn required_f32(batch: &RecordBatch, name: &'static str) -> Result<Vec<f32>, ReaderError> {
@@ -629,6 +667,32 @@ fn required_f32(batch: &RecordBatch, name: &'static str) -> Result<Vec<f32>, Rea
             column: name,
             detail: format!("expected Float32Array, got {:?}", col.data_type()),
         })?;
+    materialize_required_primitive(arr, name)
+}
+
+/// Materialise a primitive Arrow array into `Vec<T::Native>`,
+/// erroring on any NULL slot. Plain `arr.values().to_vec()` would
+/// silently turn NULL slots into zero (the underlying primitive
+/// buffer's default fill), masking file corruption. Fast-paths
+/// the null-free case so the common path is still a single
+/// buffer copy.
+fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
+    arr: &arrow_array::PrimitiveArray<T>,
+    name: &'static str,
+) -> Result<Vec<T::Native>, ReaderError> {
+    if arr.null_count() == 0 {
+        return Ok(arr.values().to_vec());
+    }
+    for i in 0..arr.len() {
+        if arr.is_null(i) {
+            return Err(ReaderError::Conversion {
+                column: name,
+                detail: format!("row {i}: null on a REQUIRED column"),
+            });
+        }
+    }
+    // Validity buffer reported nulls but no row matched —
+    // unreachable in practice.
     Ok(arr.values().to_vec())
 }
 

@@ -27,6 +27,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::audit::ParamType;
+use crate::otlp::KeyValue;
 use crate::tenant::TenantId;
 
 /// RFC 0001 §6.1 *Body representation* discriminator.
@@ -69,14 +70,13 @@ pub struct Param {
 /// One row the miner emits per ingested line — RFC 0001 §6.1
 /// record schema.
 ///
-/// Fields the §6.1 schema names but PR-A defers (everything in
-/// `OtlpLogRecord` outside of the mining-output set —
-/// `attributes`, `resource_attributes`, `trace_id`, `span_id`,
-/// `flags`, `event_name`, etc.) land alongside the Parquet
-/// writer, where they actually become observable. PR-A carries
-/// only what the cluster has to populate today: the identity
-/// triple, the template-key half of `(severity, scope)`, the
-/// time field, and the mining outputs.
+/// Carries the full §6.1 OTLP-derived envelope plus the mining
+/// outputs. The receiver (RFC 0003, post-MVP) populates the
+/// OTLP-derived fields from the wire; the miner copies them
+/// through unchanged. Until the receiver lands, corpus / bench
+/// inputs leave the OTLP envelope at its `OtlpLogRecord::default()`
+/// values (zero / `None` / empty `Vec`), which surface as NULL
+/// or empty in the corresponding RFC 0005 §3.2 Parquet columns.
 ///
 /// Records emitted on the parse-failure paths
 /// (`body::None`-with-record, empty input, over-cap, degenerate
@@ -100,10 +100,48 @@ pub struct MinedRecord {
     /// so a reader can filter without joining back through the
     /// template store.
     pub severity_number: u8,
+    /// `LogRecord.severity_text` — the source's original severity
+    /// string, when set. Outside the §6.1 template key (the
+    /// numeric `severity_number` is canonical) but retained
+    /// per-record for query / display fidelity.
+    pub severity_text: Option<String>,
     pub scope_name: Option<String>,
+    /// `InstrumentationScope.version` — emitter library version,
+    /// retained per-record for drift / debugging. Outside the
+    /// template key.
+    pub scope_version: Option<String>,
     /// Source event time per `OtlpLogRecord.time_unix_nano`. `0`
     /// = unknown.
     pub time_unix_nano: u64,
+    /// `LogRecord.observed_time_unix_nano` — collector observation
+    /// time, when set.
+    pub observed_time_unix_nano: Option<u64>,
+    /// `LogRecord.attributes` — per-occurrence structured context.
+    /// Mirrors RFC 0001 §6.1's `Vec<KeyValue>`; the Parquet writer
+    /// (RFC 0005 §3.3) encodes this as canonical JSON in the
+    /// `attributes` `BYTE_ARRAY` column. Empty vec ↔ `[]` on disk
+    /// per RFC 0005 §3.2.
+    pub attributes: Vec<KeyValue>,
+    /// `LogRecord.dropped_attributes_count` — truncation indicator
+    /// from the receiver.
+    pub dropped_attributes_count: u32,
+    /// `Resource.attributes` — source identity (`service.name`,
+    /// `host.*`, `k8s.*`, ...) copied onto every record under the
+    /// originating `ResourceLogs` group. Same on-disk encoding as
+    /// `attributes`.
+    pub resource_attributes: Vec<KeyValue>,
+    /// `LogRecord.trace_id` — opaque 16 bytes (W3C Trace Context),
+    /// when set. RFC 0005 §3.2 stores this as
+    /// `FIXED_LEN_BYTE_ARRAY(16)` with no logical type — *not*
+    /// an RFC 4122 UUID.
+    pub trace_id: Option<[u8; 16]>,
+    /// `LogRecord.span_id` — opaque 8 bytes, when set.
+    pub span_id: Option<[u8; 8]>,
+    /// `LogRecord.flags` — lower 8 bits are W3C trace flags.
+    pub flags: u32,
+    /// `LogRecord.event_name` — identifier for structured-event
+    /// records.
+    pub event_name: Option<String>,
     /// §6.1 *Body representation* fork.
     pub body_kind: BodyKind,
     /// Masked-parameter slots in template order. Empty for
@@ -285,8 +323,18 @@ mod tests {
             template_id: 7,
             template_version: 1,
             severity_number: 9,
+            severity_text: None,
             scope_name: Some("lib.auth".to_string()),
+            scope_version: None,
             time_unix_nano: 1_700_000_000_000_000_000,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
             body_kind: BodyKind::String,
             params: vec![Param {
                 type_tag: ParamType::Num,
@@ -311,8 +359,18 @@ mod tests {
             template_id: 0,
             template_version: 0,
             severity_number: 0,
+            severity_text: None,
             scope_name: None,
+            scope_version: None,
             time_unix_nano: 0,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
             body_kind: BodyKind::String,
             params: Vec::new(),
             separators: Vec::new(),

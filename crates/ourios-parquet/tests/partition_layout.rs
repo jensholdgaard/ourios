@@ -176,6 +176,59 @@ fn writer_rejects_records_outside_its_partition() {
     }
 }
 
+/// Atomic-publish contract (RFC 0005 §7): a writer dropped
+/// without [`Writer::close`] removes its `.parquet.tmp` so the
+/// partition directory never accrues unreadable / header-only
+/// Parquet files. Successful close renames the temp file to its
+/// final `<uuid>.parquet` name.
+#[test]
+fn writer_atomic_publish_on_close_and_cleanup_on_drop() {
+    let bucket = TempDir::new().unwrap();
+    let bucket_path = bucket.path();
+
+    let opening = empty_record("tenant-a", 1_775_127_480_000_000_000);
+    let partition = PartitionKey::derive(&opening).expect("derive partition");
+
+    // 1. Drop without close → no leftover files in the
+    //    partition directory.
+    {
+        let mut writer = Writer::open(bucket_path, partition.clone()).unwrap();
+        writer
+            .append_records(std::slice::from_ref(&opening))
+            .unwrap();
+        let temp_glimpse = writer.final_path().with_extension("parquet.tmp");
+        assert!(
+            temp_glimpse.exists(),
+            "writer must use a `.parquet.tmp` filename while open",
+        );
+        // Explicit drop without close.
+        drop(writer);
+        assert!(
+            !temp_glimpse.exists(),
+            "Drop must clean up the .parquet.tmp file when close wasn't called",
+        );
+    }
+
+    // 2. Open a fresh writer, write, close. Final file exists
+    //    at the `<uuid>.parquet` name; no `.parquet.tmp` is left
+    //    behind.
+    let mut writer = Writer::open(bucket_path, partition).unwrap();
+    writer.append_records(&[opening]).unwrap();
+    let written = writer.close().expect("close");
+    assert!(written.path.exists(), "final path must exist after close");
+    assert_eq!(
+        written.path.extension().and_then(|s| s.to_str()),
+        Some("parquet"),
+        "published file MUST have the .parquet extension, got {:?}",
+        written.path,
+    );
+    let stray_tmp = written.path.with_extension("parquet.tmp");
+    assert!(
+        !stray_tmp.exists(),
+        "no .parquet.tmp must remain after successful close, found {stray_tmp:?}",
+    );
+}
+
 /// RFC0005.5 sub-test — non-ASCII tenant ids percent-encode per §3.4.
 #[test]
 fn rfc0005_5_non_ascii_tenant_id_percent_encodes() {

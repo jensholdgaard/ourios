@@ -86,6 +86,19 @@ pub enum BatchError {
     /// rejects these records rather than corrupting the
     /// `body_kind` semantics.
     UnsupportedAbsentBody,
+    /// A record carried `body_kind = Structured`. RFC 0005 §3.3
+    /// requires the `body` column for these rows to hold
+    /// OTLP-canonical JSON, but the miner today populates
+    /// `MinedRecord.body` with an interim `Debug` rendering
+    /// (see the PR-E1 breadcrumb on
+    /// [`ourios_core::otlp::Body::Structured`]). Writing the
+    /// interim bytes would silently store non-canonical /
+    /// non-JSON content into a §3.3-governed column. Symmetric
+    /// to [`Self::AttributesNotYetEncoded`]: the writer fails
+    /// the batch until the canonicalisation PR replaces the
+    /// miner's `format!("{any_value:?}")` call site with a real
+    /// proto3-JSON-with-OTLP-overrides encoder.
+    StructuredBodyNotYetCanonical,
     /// Arrow rejected the constructed `RecordBatch` (schema
     /// mismatch, column-length mismatch, etc.). Internal bug if
     /// it ever fires — the array builders are constructed against
@@ -113,6 +126,14 @@ impl fmt::Display for BatchError {
                  1=Structured); a future RFC 0005 amendment is required to represent this \
                  in the schema",
             ),
+            Self::StructuredBodyNotYetCanonical => write!(
+                f,
+                "record carries body_kind = Structured but the body column would receive the \
+                 miner's interim Debug rendering rather than RFC 0005 §3.3's OTLP-canonical \
+                 JSON; the canonicalisation PR (see PR-E1 breadcrumb on \
+                 ourios_core::otlp::Body::Structured) must land before structured rows can \
+                 be written",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -123,7 +144,8 @@ impl std::error::Error for BatchError {
         match self {
             Self::TimestampOverflow { .. }
             | Self::AttributesNotYetEncoded { .. }
-            | Self::UnsupportedAbsentBody => None,
+            | Self::UnsupportedAbsentBody
+            | Self::StructuredBodyNotYetCanonical => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -267,6 +289,18 @@ impl Builders {
         append_option_str(&mut self.event_name, r.event_name.as_deref());
 
         self.body_kind.append_value(body_kind_ordinal(r.body_kind)?);
+        // RFC 0005 §3.3: when `body_kind = Structured`, the body
+        // column carries OTLP-canonical JSON. The miner today
+        // populates `body` with `format!("{any_value:?}")` per
+        // the PR-E1 breadcrumb on `ourios_core::otlp::Body::
+        // Structured` — that's *not* canonical JSON, so writing
+        // it would store non-conforming bytes for a §3.3-
+        // governed column. Reject these records until the
+        // canonicalisation PR lands (symmetric to the
+        // `AttributesNotYetEncoded` deferral above).
+        if r.body_kind == BodyKind::Structured {
+            return Err(BatchError::StructuredBodyNotYetCanonical);
+        }
         match r.body.as_deref() {
             Some(s) => self.body.append_value(s.as_bytes()),
             None => self.body.append_null(),
@@ -495,6 +529,22 @@ mod tests {
             }
             other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
         }
+    }
+
+    /// `BodyKind::Structured` rows can't yet be written
+    /// faithfully — the miner stores an interim Debug
+    /// rendering of the `AnyValue` rather than canonical JSON.
+    /// The writer rejects until the canonicalisation PR lands.
+    #[test]
+    fn structured_body_kind_returns_not_yet_canonical_error() {
+        let mut rec = empty_record();
+        rec.body_kind = BodyKind::Structured;
+        rec.body = Some("{\"placeholder\":true}".to_string());
+        let err = mined_records_to_batch(&[rec]).expect_err("structured body must error");
+        assert!(
+            matches!(err, BatchError::StructuredBodyNotYetCanonical),
+            "expected StructuredBodyNotYetCanonical, got {err:?}",
+        );
     }
 
     /// `BodyKind::Absent` is not representable in the §3.2

@@ -56,18 +56,29 @@ pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
 /// Streaming Parquet writer for one partition's data file.
 ///
-/// One [`Writer`] writes one Parquet file. After [`Writer::close`]
-/// returns, the file is complete on disk and ready for reader
-/// access; before then the file's footer is not yet present and
-/// readers MUST treat it as in-progress (§3.4's atomic-publish
-/// convention — pinned in RFC 0005 §7 as an open question on the
-/// concurrent-writer side, but the writer-side rule is "close
-/// before announcing").
+/// One [`Writer`] writes one Parquet file. The writer publishes
+/// **atomically**: bytes are written to a `<uuid>.parquet.tmp`
+/// path while the writer is open; [`Writer::close`] renames the
+/// temp file to the final `<uuid>.parquet` only after the footer
+/// is on disk. Readers that enumerate the partition can rely on
+/// "every `*.parquet` file has a valid footer" — they filter the
+/// `.parquet.tmp` suffix out. If the writer is dropped without
+/// [`Writer::close`] (panic, early-return), [`Drop`] removes the
+/// `.parquet.tmp` file so an aborted write doesn't pollute the
+/// partition directory with an unreadable file. This satisfies
+/// RFC 0005 §7's "atomic-publish convention (write to a temp
+/// path, rename on close)" open-question item.
 pub struct Writer {
-    inner: ArrowWriter<File>,
+    inner: Option<ArrowWriter<File>>,
     partition: PartitionKey,
     flush_uuid: Uuid,
-    file_path: PathBuf,
+    /// Final `<uuid>.parquet` path the file moves to on close.
+    final_path: PathBuf,
+    /// `<uuid>.parquet.tmp` path the writer actually writes to.
+    /// `None` once [`Self::close`] renames it away; the [`Drop`]
+    /// impl uses `None` as the "already published; nothing to
+    /// clean up" signal.
+    temp_path: Option<PathBuf>,
 }
 
 impl Writer {
@@ -86,18 +97,20 @@ impl Writer {
         let dir = partition.data_path(bucket_root);
         std::fs::create_dir_all(&dir).map_err(WriterError::Io)?;
         let flush_uuid = Uuid::now_v7();
-        let file_path = dir.join(format!("{flush_uuid}.parquet"));
-        let file = File::create(&file_path).map_err(WriterError::Io)?;
+        let final_path = dir.join(format!("{flush_uuid}.parquet"));
+        let temp_path = dir.join(format!("{flush_uuid}.parquet.tmp"));
+        let file = File::create(&temp_path).map_err(WriterError::Io)?;
 
         let props = writer_properties()?;
         let inner =
             ArrowWriter::try_new(file, data_schema(), Some(props)).map_err(WriterError::Parquet)?;
 
         Ok(Self {
-            inner,
+            inner: Some(inner),
             partition,
             flush_uuid,
-            file_path,
+            final_path,
+            temp_path: Some(temp_path),
         })
     }
 
@@ -135,6 +148,13 @@ impl Writer {
     ///   internal error).
     /// - [`WriterError::Parquet`] when the underlying Parquet
     ///   writer rejects the batch (codec or footer error).
+    ///
+    /// # Panics
+    ///
+    /// Structurally impossible. The inner `ArrowWriter` is
+    /// `Some` from [`Writer::open`] until [`Writer::close`]
+    /// takes ownership of `self`; `append_records` borrows
+    /// `&mut self` and therefore cannot run after `close`.
     pub fn append_records(&mut self, records: &[MinedRecord]) -> Result<(), WriterError> {
         if records.is_empty() {
             return Ok(());
@@ -149,6 +169,10 @@ impl Writer {
                 });
             }
         }
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("inner ArrowWriter is Some until Writer::close is called");
         // Pre-write flush: if the in-progress row group already
         // crosses the §3.5 lower threshold from the *previous*
         // append, seal it now so this new batch starts a fresh
@@ -157,42 +181,90 @@ impl Writer {
         // that hand in batches larger than (1 GiB − 128 MiB) can
         // still individually exceed the §3.5 upper bound, which
         // is a caller-side discipline the rustdoc documents.
-        if self.inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-            self.inner.flush().map_err(WriterError::Parquet)?;
+        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            inner.flush().map_err(WriterError::Parquet)?;
         }
         let batch = mined_records_to_batch(records).map_err(WriterError::Batch)?;
-        self.inner.write(&batch).map_err(WriterError::Parquet)?;
+        inner.write(&batch).map_err(WriterError::Parquet)?;
         // Post-write flush: if this batch just tipped the buffer
         // past the threshold, seal it before returning.
-        if self.inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-            self.inner.flush().map_err(WriterError::Parquet)?;
+        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            inner.flush().map_err(WriterError::Parquet)?;
         }
         Ok(())
     }
 
-    /// Close the writer, finalising the Parquet footer on disk.
-    /// Must be called for the file to be readable; dropping
-    /// without `close` leaves the file truncated/header-only.
+    /// Close the writer, finalising the Parquet footer on the
+    /// temp file and atomically renaming it to the final path.
+    /// Must be called for the file to land at its final name;
+    /// dropping without `close` leaves only a `.parquet.tmp`
+    /// that the [`Drop`] impl deletes.
     ///
     /// # Errors
     ///
-    /// [`WriterError::Parquet`] when the footer write fails.
-    pub fn close(self) -> Result<WrittenFile, WriterError> {
-        let metadata = self.inner.close().map_err(WriterError::Parquet)?;
+    /// - [`WriterError::Parquet`] when the footer write fails.
+    /// - [`WriterError::Io`] when the atomic rename from the
+    ///   temp filename to the final path fails (the temp file
+    ///   is left in place for diagnosis in that case).
+    ///
+    /// # Panics
+    ///
+    /// Structurally impossible. `inner` / `temp_path` are
+    /// populated by [`Writer::open`] and only consumed here;
+    /// `close` takes `self` by value so it can't run twice.
+    pub fn close(mut self) -> Result<WrittenFile, WriterError> {
+        let inner = self
+            .inner
+            .take()
+            .expect("Writer::close consumes self; inner is Some on entry");
+        let metadata = inner.close().map_err(WriterError::Parquet)?;
+        let temp_path = self
+            .temp_path
+            .take()
+            .expect("temp_path is Some until close consumes it");
+        std::fs::rename(&temp_path, &self.final_path).map_err(WriterError::Io)?;
+        // Replace the now-stale Drop bookkeeping: the temp file
+        // no longer exists, so Drop has nothing to clean up.
         Ok(WrittenFile {
-            path: self.file_path,
-            partition: self.partition,
+            path: self.final_path.clone(),
+            partition: self.partition.clone(),
             flush_uuid: self.flush_uuid,
             num_rows: metadata.num_rows,
         })
     }
 
-    /// Inspector for the absolute path the writer is writing
-    /// into. Useful for tests; production callers usually take
-    /// [`WrittenFile::path`] from [`Writer::close`]'s return value.
+    /// Inspector for the absolute path the writer will publish
+    /// to after [`Self::close`]. While the writer is open, the
+    /// actual bytes live at `<this path>.tmp`; useful for tests
+    /// that want to assert the final landing site without
+    /// reading the file.
     #[must_use]
-    pub fn file_path(&self) -> &Path {
-        &self.file_path
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // If `close` consumed the writer cleanly, `temp_path`
+        // is `None` and the rename has already happened.
+        // Otherwise the writer was dropped mid-stream (panic,
+        // `?` early-return, etc.); remove the `.parquet.tmp`
+        // file so the partition directory doesn't accrue
+        // unreadable Parquet files an enumeration reader would
+        // trip over.
+        if let Some(temp) = self.temp_path.take() {
+            // `ArrowWriter`'s own `Drop` will run first (field
+            // order in `Self`); whatever bytes it flushed land
+            // in the temp file we're about to remove.
+            // Best-effort: ignore I/O errors here — there's no
+            // recovery path from a destructor, and the worst-
+            // case outcome is a stray `.parquet.tmp` that
+            // operators clean up by hand. We deliberately do
+            // not log; the WAL / ingest layer above is the
+            // place for that.
+            let _ = std::fs::remove_file(&temp);
+        }
     }
 }
 

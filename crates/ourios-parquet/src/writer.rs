@@ -122,9 +122,25 @@ impl Writer {
             source,
         })?;
 
-        let props = writer_properties()?;
-        let inner =
-            ArrowWriter::try_new(file, data_schema(), Some(props)).map_err(WriterError::Parquet)?;
+        // From this point on, the `.parquet.tmp` file exists on
+        // disk. If anything below errors, no `Writer` is
+        // constructed and `Drop` therefore never runs — we'd
+        // leak the temp file unless we clean it up explicitly.
+        let props = match writer_properties() {
+            Ok(p) => p,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(e);
+            }
+        };
+        let inner = match ArrowWriter::try_new(file, data_schema(), Some(props)) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(WriterError::Parquet(e));
+            }
+        };
 
         Ok(Self {
             inner: Some(inner),
@@ -219,6 +235,19 @@ impl Writer {
     /// Must be called for the file to land at its final name;
     /// dropping without `close` leaves only a `.parquet.tmp`
     /// that the [`Drop`] impl deletes.
+    ///
+    /// **Atomic publish is logical, not crash-durable.** Once
+    /// this method returns, the final-path file has a complete
+    /// Parquet footer and any subsequent reader can open it.
+    /// However, neither the data pages nor the rename metadata
+    /// are [`File::sync_all`]-ed before this call returns — a
+    /// host crash or power loss between rename and the OS's
+    /// next page-cache flush could leave the renamed file with
+    /// truncated or zero-padded contents on disk. Crash-survival
+    /// durability is the WAL's domain (`CLAUDE.md` §3.4
+    /// "WAL-before-ack"); the Parquet writer is the storage tier
+    /// and assumes its records are recoverable via WAL replay
+    /// after a crash.
     ///
     /// # Errors
     ///

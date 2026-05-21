@@ -192,42 +192,47 @@ fn rfc0005_6_params_value_leaf_has_no_dictionary_encoding() {
     let metadata = reader.metadata();
     assert!(metadata.num_row_groups() >= 1);
 
-    let mut params_value_checked = 0;
+    let mut params_leaves_checked = 0;
     for rg_idx in 0..metadata.num_row_groups() {
         let rg = metadata.row_group(rg_idx);
         for col_idx in 0..rg.num_columns() {
             let col = rg.column(col_idx);
-            // Parquet 3-level LIST nesting: `params.list.element.value`.
-            if col.column_path().string() != "params.list.element.value" {
+            // Both params LIST<STRUCT<...>> leaves get the §3.6
+            // "(list values)" Dictionary = no treatment.
+            let path = col.column_path().string();
+            if path != "params.list.element.value" && path != "params.list.element.type_tag" {
                 continue;
             }
-            params_value_checked += 1;
+            params_leaves_checked += 1;
 
             assert!(
                 matches!(col.compression(), Compression::ZSTD(_)),
-                "params value leaf compression must be ZSTD, got {:?}",
+                "{path}: compression must be ZSTD, got {:?}",
                 col.compression(),
             );
             let encs = col.encodings();
             assert!(
                 !encs.contains(&Encoding::PLAIN_DICTIONARY),
-                "params value leaf encodings must not include PLAIN_DICTIONARY, got {encs:?}",
+                "{path}: encodings must not include PLAIN_DICTIONARY, got {encs:?}",
             );
             assert!(
                 !encs.contains(&Encoding::RLE_DICTIONARY),
-                "params value leaf encodings must not include RLE_DICTIONARY, got {encs:?}",
+                "{path}: encodings must not include RLE_DICTIONARY, got {encs:?}",
             );
             assert!(
                 col.dictionary_page_offset().is_none(),
-                "params value leaf must have no dictionary_page_offset, got {:?}",
+                "{path}: must have no dictionary_page_offset, got {:?}",
                 col.dictionary_page_offset(),
             );
         }
     }
+    // Expect at least one of each leaf — if zero, the dotted
+    // column-path naming convention has changed and the
+    // writer's ColumnPath overrides are silently no-op.
     assert!(
-        params_value_checked >= 1,
-        "expected at least one `params.list.element.value` column chunk in the file — \
-         if zero, the dotted column-path naming convention has changed and the \
-         writer's ColumnPath override is silently no-op",
+        params_leaves_checked >= 2,
+        "expected both `params.list.element.value` and \
+         `params.list.element.type_tag` column chunks in the file, \
+         found {params_leaves_checked}",
     );
 }

@@ -17,16 +17,18 @@
 //!   near-random opaque ids), `time_unix_nano` /
 //!   `observed_time_unix_nano` (delta-encoded inside ZSTD;
 //!   dict would interfere), `confidence` (float, narrow range),
-//!   and the `params.list.element.value` list-value leaf
-//!   ("Per-row entropy too high"). The §3.6 `lossy_flag` row
-//!   says `Dictionary = n/a` (boolean RLE handles it natively),
-//!   so no override is needed for that one.
+//!   and both leaves of the `params` list element
+//!   (`params.list.element.type_tag` and
+//!   `params.list.element.value` — §3.6 "(list values)" covers
+//!   the entire `LIST<STRUCT<...>>` element). The §3.6
+//!   `lossy_flag` row says `Dictionary = n/a` (boolean RLE
+//!   handles it natively), so no override is needed for that one.
 //! - Per-page statistics **on** globally so the Parquet page
 //!   index (`ColumnIndex` + `OffsetIndex`) is emitted for the
 //!   `Page index = yes` columns; downgraded to
 //!   `EnabledStatistics::Chunk` for the `Page index = no`
 //!   columns (`tenant_id`, `attributes`, `resource_attributes`,
-//!   `body`, `params.list.element.value`,
+//!   `body`, both `params` list-element leaves,
 //!   `separators.list.element`).
 //! - Bloom filter on `template_id` (B2 predicate-pushdown).
 //!
@@ -53,6 +55,15 @@ use crate::record_batch::{BatchError, mined_records_to_batch};
 /// threshold. The writer flushes a row group when
 /// `ArrowWriter::in_progress_size` crosses this.
 pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// Rows per internal sub-batch passed to `ArrowWriter::write`.
+/// Chosen so that even with multi-KiB per-record payloads, a
+/// single sub-batch's contribution after the [`ROW_GROUP_FLUSH_BYTES`]
+/// threshold check stays well under RFC 0005 §3.5's hard 1 GiB
+/// upper bound: 1024 rows × ≤ 768 KiB per record ≈ 768 MiB,
+/// plus a 128 MiB pre-flushed buffer ≈ 896 MiB worst case, with
+/// the 1 GiB ceiling still uncrossed.
+const SUB_BATCH_ROWS: usize = 1024;
 
 /// Streaming Parquet writer for one partition's data file.
 ///
@@ -120,20 +131,15 @@ impl Writer {
     /// MUST NOT write rows from another), converts the slice to
     /// a `RecordBatch`, and forwards to `ArrowWriter::write`.
     ///
-    /// **Row-group sizing.** Flushes a row group before *and*
-    /// after each write when the in-progress buffer crosses
-    /// [`ROW_GROUP_FLUSH_BYTES`] (128 MiB, RFC 0005 §3.5's lower
-    /// bound). This bounds row-group overshoot to *one batch's
-    /// worth of bytes*. The §3.5 upper bound ("never exceed
-    /// 1 GiB") is enforced by caller discipline: callers handing
-    /// in batches large enough to push a single write past 1 GiB
-    /// of uncompressed Arrow bytes will produce a single
-    /// oversized row group. Production callers should chunk
-    /// `records` into batches well below that ceiling; corpus /
-    /// bench inputs in PR-E2 are several orders of magnitude
-    /// below it. A future PR may add internal chunking based on
-    /// `ArrowWriter`'s row-count target if the caller-discipline
-    /// rule proves fragile.
+    /// **Row-group sizing.** Internally chunks `records` into
+    /// sub-batches of [`SUB_BATCH_ROWS`] (1024) rows and runs a
+    /// flush-when-over-threshold check before each sub-batch
+    /// write. RFC 0005 §3.5 pins the row-group target at 128 MiB
+    /// – 1 GiB uncompressed; chunking + per-sub-batch flush
+    /// keeps the maximum row-group size bounded to roughly
+    /// `ROW_GROUP_FLUSH_BYTES + (per-record bytes × SUB_BATCH_ROWS)`,
+    /// which stays comfortably under 1 GiB for the per-record
+    /// sizes log ingest produces in practice.
     ///
     /// # Errors
     ///
@@ -173,21 +179,25 @@ impl Writer {
             .inner
             .as_mut()
             .expect("inner ArrowWriter is Some until Writer::close is called");
-        // Pre-write flush: if the in-progress row group already
-        // crosses the §3.5 lower threshold from the *previous*
-        // append, seal it now so this new batch starts a fresh
-        // row group rather than piling on top. Bounds row-group
-        // overshoot to a single batch's worth of bytes; callers
-        // that hand in batches larger than (1 GiB − 128 MiB) can
-        // still individually exceed the §3.5 upper bound, which
-        // is a caller-side discipline the rustdoc documents.
-        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-            inner.flush().map_err(WriterError::Parquet)?;
+        // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
+        // flush-if-over-threshold check before every sub-batch.
+        // The bound on row-group size is therefore:
+        //   (§3.5 lower threshold) + (one sub-batch's worth) ≈
+        //   well under §3.5's 1 GiB upper bound for any
+        //   reasonable per-record size. The size check happens
+        //   *before* every sub-batch (not after), so a sub-batch
+        //   that pushes the buffer past the threshold seals the
+        //   next time around — bounded overshoot is intentional;
+        //   unbounded overshoot is what the RFC prohibits.
+        for chunk in records.chunks(SUB_BATCH_ROWS) {
+            if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+                inner.flush().map_err(WriterError::Parquet)?;
+            }
+            let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
+            inner.write(&batch).map_err(WriterError::Parquet)?;
         }
-        let batch = mined_records_to_batch(records).map_err(WriterError::Batch)?;
-        inner.write(&batch).map_err(WriterError::Parquet)?;
-        // Post-write flush: if this batch just tipped the buffer
-        // past the threshold, seal it before returning.
+        // Final post-write check so the next `append_records`
+        // call doesn't inherit an over-threshold buffer.
         if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
             inner.flush().map_err(WriterError::Parquet)?;
         }
@@ -402,23 +412,29 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
             .set_column_dictionary_enabled(ColumnPath::new(vec![no_dict_col.to_string()]), false);
     }
 
-    // §3.6 also marks the `params` list-value leaf as `Dictionary
-    // = no` ("Per-row entropy too high"). Parquet's 3-level LIST
-    // encoding for `LIST<STRUCT<type_tag: INT32, value:
-    // BINARY>>` exposes the value leaf at the dotted path
-    // `params.list.element.value`; this override disables dict
-    // on that exact leaf, leaving the small-cardinality
-    // `params.list.element.type_tag` leaf to inherit the global
-    // dict-on default (the §3.6 entry's "list values"
-    // parenthetical scopes the no-dict rule to the byte payload
-    // only). The integration test `tests/no_body_dict.rs` /
-    // related metadata walks pin both expectations.
+    // §3.6 also marks the `params` "(list values)" row as
+    // `Dictionary = no` / `Page index = no`. "List values" here
+    // covers every leaf of the LIST<STRUCT<...>> element — both
+    // the `type_tag` and `value` leaves — per a literal reading
+    // of the RFC table. Parquet's 3-level LIST encoding exposes
+    // the leaves at the dotted paths
+    // `params.list.element.type_tag` (INT32) and
+    // `params.list.element.value` (BINARY). These overrides
+    // disable dict + page index on both leaves; the
+    // `tests/no_body_dict.rs` metadata walks pin both.
+    let params_type_tag_leaf = ColumnPath::new(vec![
+        crate::columns::PARAMS.to_string(),
+        "list".to_string(),
+        "element".to_string(),
+        "type_tag".to_string(),
+    ]);
     let params_value_leaf = ColumnPath::new(vec![
         crate::columns::PARAMS.to_string(),
         "list".to_string(),
         "element".to_string(),
         "value".to_string(),
     ]);
+    builder = builder.set_column_dictionary_enabled(params_type_tag_leaf.clone(), false);
     builder = builder.set_column_dictionary_enabled(params_value_leaf.clone(), false);
 
     // §3.6 `Page index = no` overrides. The global
@@ -445,7 +461,10 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
         );
     }
     // The `params` and `separators` list-value leaves at the
-    // 3-level LIST encoding path.
+    // 3-level LIST encoding path. Both `params.list.element.type_tag`
+    // and `params.list.element.value` are covered per the §3.6
+    // "(list values)" literal reading.
+    builder = builder.set_column_statistics_enabled(params_type_tag_leaf, EnabledStatistics::Chunk);
     builder = builder.set_column_statistics_enabled(params_value_leaf, EnabledStatistics::Chunk);
     builder = builder.set_column_statistics_enabled(
         ColumnPath::new(vec![

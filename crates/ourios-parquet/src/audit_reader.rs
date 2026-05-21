@@ -125,7 +125,7 @@ impl AuditReader {
         let mut row_offset: usize = 0;
         for batch in self.inner {
             let batch = batch.map_err(|e| AuditReaderError::Parquet(e.into()))?;
-            let events = batch_to_audit_events(&batch)?;
+            let events = batch_to_audit_events(&batch, row_offset)?;
             if let Some(p) = &partition {
                 for (idx_in_batch, e) in events.iter().enumerate() {
                     validate_event_vs_partition(e, p, row_offset + idx_in_batch, &file_path)?;
@@ -285,7 +285,16 @@ fn validate_event_vs_partition(
     Ok(())
 }
 
-fn batch_to_audit_events(batch: &RecordBatch) -> Result<Vec<AuditEvent>, AuditReaderError> {
+/// Decode one batch's rows into [`AuditEvent`]s. `row_offset` is
+/// the file-level index of this batch's first row (cumulative
+/// row count across all prior batches in the same file), so every
+/// row-index field on returned errors is file-global —
+/// consistent with [`AuditReaderError::PartitionMismatch`] which
+/// is also computed file-globally in [`AuditReader::read_all`].
+fn batch_to_audit_events(
+    batch: &RecordBatch,
+    row_offset: usize,
+) -> Result<Vec<AuditEvent>, AuditReaderError> {
     let n = batch.num_rows();
     let mut events: Vec<AuditEvent> = Vec::with_capacity(n);
 
@@ -302,14 +311,15 @@ fn batch_to_audit_events(batch: &RecordBatch) -> Result<Vec<AuditEvent>, AuditRe
     let new_version = required_u32(batch, audit_columns::NEW_VERSION)?;
     let old_template = required_string(batch, audit_columns::OLD_TEMPLATE)?;
     let new_template = required_string(batch, audit_columns::NEW_TEMPLATE)?;
-    let positions_widened_lists = decode_positions_column(batch)?;
-    let slots_expanded_lists = decode_slots_column(batch)?;
+    let positions_widened_lists = decode_positions_column(batch, row_offset)?;
+    let slots_expanded_lists = decode_slots_column(batch, row_offset)?;
     let triggering_line_hash = required_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH)?;
     let triggering_line_sample = optional_string(batch, audit_columns::TRIGGERING_LINE_SAMPLE)?;
     let reason = optional_string(batch, audit_columns::REASON)?;
 
     for i in 0..n {
-        let ts = decode_timestamp(timestamp[i], i)?;
+        let file_row = row_offset + i;
+        let ts = decode_timestamp(timestamp[i], file_row)?;
         let kind = match event_kind[i] {
             EVENT_KIND_TEMPLATE_WIDENED => AuditEventKind::TemplateWidened {
                 old_version: old_version[i],
@@ -346,7 +356,7 @@ fn batch_to_audit_events(batch: &RecordBatch) -> Result<Vec<AuditEvent>, AuditRe
             }
             other => {
                 return Err(AuditReaderError::UnknownEventKind {
-                    row_index: i,
+                    row_index: file_row,
                     ordinal: other,
                 });
             }
@@ -366,10 +376,16 @@ fn batch_to_audit_events(batch: &RecordBatch) -> Result<Vec<AuditEvent>, AuditRe
     Ok(events)
 }
 
+/// Convert a non-negative i64 nanos-since-epoch to [`SystemTime`].
+/// Uses [`SystemTime::checked_add`] so an out-of-`Duration`-range
+/// nanos value (corrupt or foreign-writer file) returns a
+/// structured error instead of panicking on the arithmetic.
 fn decode_timestamp(nanos: i64, row_index: usize) -> Result<SystemTime, AuditReaderError> {
     let ns_u64 =
         u64::try_from(nanos).map_err(|_| AuditReaderError::TimestampDecode { row_index, nanos })?;
-    Ok(SystemTime::UNIX_EPOCH + Duration::from_nanos(ns_u64))
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_nanos(ns_u64))
+        .ok_or(AuditReaderError::TimestampDecode { row_index, nanos })
 }
 
 /// Decode the rejection variant's `reason` column payload. The
@@ -390,7 +406,10 @@ fn decode_rejection_reason(s: &str) -> Option<(String, Vec<u16>)> {
     Some((template, positions))
 }
 
-fn decode_positions_column(batch: &RecordBatch) -> Result<Vec<Vec<u16>>, AuditReaderError> {
+fn decode_positions_column(
+    batch: &RecordBatch,
+    row_offset: usize,
+) -> Result<Vec<Vec<u16>>, AuditReaderError> {
     let idx = batch
         .schema()
         .index_of(audit_columns::POSITIONS_WIDENED)
@@ -407,11 +426,12 @@ fn decode_positions_column(batch: &RecordBatch) -> Result<Vec<Vec<u16>>, AuditRe
             })?;
     let mut out = Vec::with_capacity(list.len());
     for row_idx in 0..list.len() {
+        let file_row = row_offset + row_idx;
         if list.is_null(row_idx) {
             return Err(AuditReaderError::Conversion {
                 column: audit_columns::POSITIONS_WIDENED,
                 detail: format!(
-                    "row {row_idx}: positions_widened list is NULL but the schema marks it \
+                    "row {file_row}: positions_widened list is NULL but the schema marks it \
                      REQUIRED",
                 ),
             });
@@ -429,7 +449,7 @@ fn decode_positions_column(batch: &RecordBatch) -> Result<Vec<Vec<u16>>, AuditRe
                 return Err(AuditReaderError::Conversion {
                     column: audit_columns::POSITIONS_WIDENED,
                     detail: format!(
-                        "row {row_idx} position {i}: element is NULL but the schema marks \
+                        "row {file_row} position {i}: element is NULL but the schema marks \
                          it non-nullable",
                     ),
                 });
@@ -438,7 +458,7 @@ fn decode_positions_column(batch: &RecordBatch) -> Result<Vec<Vec<u16>>, AuditRe
             let p = u16::try_from(v).map_err(|_| AuditReaderError::Conversion {
                 column: audit_columns::POSITIONS_WIDENED,
                 detail: format!(
-                    "row {row_idx} position {i}: value {v} doesn't fit in u16 (RFC 0001 \
+                    "row {file_row} position {i}: value {v} doesn't fit in u16 (RFC 0001 \
                      §6.4's `positions_widened: Vec<u16>`)",
                 ),
             })?;
@@ -449,7 +469,10 @@ fn decode_positions_column(batch: &RecordBatch) -> Result<Vec<Vec<u16>>, AuditRe
     Ok(out)
 }
 
-fn decode_slots_column(batch: &RecordBatch) -> Result<Vec<Vec<SlotExpansion>>, AuditReaderError> {
+fn decode_slots_column(
+    batch: &RecordBatch,
+    row_offset: usize,
+) -> Result<Vec<Vec<SlotExpansion>>, AuditReaderError> {
     let idx = batch
         .schema()
         .index_of(audit_columns::SLOTS_EXPANDED)
@@ -467,16 +490,17 @@ fn decode_slots_column(batch: &RecordBatch) -> Result<Vec<Vec<SlotExpansion>>, A
 
     let mut out = Vec::with_capacity(list.len());
     for row_idx in 0..list.len() {
+        let file_row = row_offset + row_idx;
         if list.is_null(row_idx) {
             return Err(AuditReaderError::Conversion {
                 column: audit_columns::SLOTS_EXPANDED,
                 detail: format!(
-                    "row {row_idx}: slots_expanded list is NULL but the schema marks it \
+                    "row {file_row}: slots_expanded list is NULL but the schema marks it \
                      REQUIRED",
                 ),
             });
         }
-        out.push(decode_slot_row(&list.value(row_idx), row_idx)?);
+        out.push(decode_slot_row(&list.value(row_idx), file_row)?);
     }
     Ok(out)
 }

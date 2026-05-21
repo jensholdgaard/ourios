@@ -355,17 +355,31 @@ fn append_slots(builder: &mut GenericListBuilder<i32, StructBuilder>, slots: &[S
 /// `would_be_positions` pair as a JSON object for the `reason`
 /// column. See the module-level note on the §3.7 "diagnostic
 /// string" framing.
+///
+/// # Panics
+///
+/// Structurally impossible. The inner [`ReasonPayload`] is two
+/// owned-or-borrowed scalars; `serde_json::to_string` only fails
+/// when the `Serialize` impl produces an error (e.g. an
+/// invalid-UTF-8 map key) which neither field can ever do.
 #[must_use]
 pub fn encode_rejection_reason(would_be_template: &str, would_be_positions: &[u16]) -> String {
-    let positions: Vec<serde_json::Value> = would_be_positions
-        .iter()
-        .map(|p| serde_json::Value::from(u64::from(*p)))
-        .collect();
-    let obj = serde_json::json!({
-        "would_be_template": would_be_template,
-        "would_be_positions": positions,
-    });
-    obj.to_string()
+    // Serde's derive-based serializer streams field-by-field
+    // straight into the output buffer — no intermediate
+    // `serde_json::Value` tree, no per-element boxing. The
+    // resulting JSON shape (key order, types) matches the
+    // matching `decode_rejection_reason` parser in
+    // `audit_reader.rs`.
+    #[derive(serde::Serialize)]
+    struct ReasonPayload<'a> {
+        would_be_template: &'a str,
+        would_be_positions: &'a [u16],
+    }
+    serde_json::to_string(&ReasonPayload {
+        would_be_template,
+        would_be_positions,
+    })
+    .expect("ReasonPayload is always serialisable")
 }
 
 fn system_time_to_i64_nanos(t: SystemTime) -> Result<i64, AuditBatchError> {

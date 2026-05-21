@@ -75,6 +75,15 @@ pub struct AuditWriter {
     flush_uuid: Uuid,
     final_path: PathBuf,
     temp_path: Option<PathBuf>,
+    /// Set to `true` once any `ArrowWriter::write` /
+    /// `ArrowWriter::flush` call returns `Err`. The underlying
+    /// `ArrowWriter`'s buffer state is undefined after such a
+    /// failure (the row group may be partially written), so
+    /// [`Self::close`] refuses to publish — renaming the temp file
+    /// into place would silently land a potentially-corrupted
+    /// audit file. The temp file is left on disk for diagnosis
+    /// (the [`Drop`] impl skips its usual cleanup when poisoned).
+    poisoned: bool,
 }
 
 impl AuditWriter {
@@ -128,6 +137,7 @@ impl AuditWriter {
             flush_uuid,
             final_path,
             temp_path: Some(temp_path),
+            poisoned: false,
         })
     }
 
@@ -146,17 +156,28 @@ impl AuditWriter {
     /// stream" framing), so the threshold rarely fires — but a
     /// pathological-volume audit run can't blow past §3.5 either.
     ///
+    /// **Poisoning.** A failed `inner.write()` or `inner.flush()`
+    /// leaves the underlying `ArrowWriter`'s buffer in an
+    /// undefined state — the partial row group can't be safely
+    /// recovered. When that happens, the writer marks itself
+    /// poisoned and [`Self::close`] subsequently returns
+    /// [`AuditWriterError::Poisoned`] instead of renaming the
+    /// temp file into place. The `.parquet.tmp` stays on disk
+    /// for diagnosis. Per-event validation errors
+    /// (`PartitionMismatch`, `Batch`) do **not** poison — the
+    /// inner writer hasn't been touched yet.
+    ///
     /// # Errors
     ///
     /// - [`AuditWriterError::PartitionMismatch`] when an event's
     ///   derived audit partition disagrees with the writer's
-    ///   open partition.
+    ///   open partition. **Non-poisoning** (no Parquet writes
+    ///   attempted).
     /// - [`AuditWriterError::Batch`] when `RecordBatch`
-    ///   construction fails (timestamp out of range, Arrow
-    ///   internal error).
+    ///   construction fails. **Non-poisoning**.
     /// - [`AuditWriterError::Parquet`] when the underlying
     ///   Parquet writer rejects the batch or a row-group flush
-    ///   fails.
+    ///   fails. **Poisons the writer**.
     ///
     /// # Panics
     ///
@@ -181,19 +202,18 @@ impl AuditWriter {
             .inner
             .as_mut()
             .expect("inner ArrowWriter is Some until AuditWriter::close is called");
-        for chunk in events.chunks(SUB_BATCH_ROWS) {
-            if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-                inner.flush().map_err(AuditWriterError::Parquet)?;
-            }
-            let batch = audit_events_to_batch(chunk).map_err(AuditWriterError::Batch)?;
-            inner.write(&batch).map_err(AuditWriterError::Parquet)?;
+        // Run the Parquet-touching loop in a helper that takes a
+        // `&mut ArrowWriter<File>` so the outer `self.poisoned =
+        // true` assignment can run after the borrow on `self.inner`
+        // ends. Poison only on Parquet errors — `Batch` errors
+        // come from `audit_events_to_batch` BEFORE any `inner.write`
+        // touches the buffer, so the inner writer is still in a
+        // clean state and a follow-up `append_events` is safe.
+        let result = append_chunks(inner, events);
+        if matches!(result, Err(AuditWriterError::Parquet(_))) {
+            self.poisoned = true;
         }
-        // Post-write check so the next `append_events` call
-        // doesn't inherit an over-threshold buffer.
-        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-            inner.flush().map_err(AuditWriterError::Parquet)?;
-        }
-        Ok(())
+        result
     }
 
     /// Close the writer, finalising the Parquet footer on the
@@ -210,8 +230,18 @@ impl AuditWriter {
     /// matching the data writer's [`crate::writer::Writer::close`]
     /// contract.
     ///
+    /// **Poisoning check.** If a prior `append_events` returned a
+    /// [`AuditWriterError::Parquet`] error, the writer is
+    /// poisoned and this method refuses to publish — returns
+    /// [`AuditWriterError::Poisoned`] without touching `inner` /
+    /// `temp_path`, so the [`Drop`] impl's poisoned branch leaves
+    /// the temp file on disk for diagnosis.
+    ///
     /// # Errors
     ///
+    /// - [`AuditWriterError::Poisoned`] when a prior
+    ///   `append_events` failed with a Parquet error (temp file
+    ///   left on disk).
     /// - [`AuditWriterError::Parquet`] when the footer write
     ///   fails (temp file left on disk).
     /// - [`AuditWriterError::Io`] when the atomic rename fails
@@ -223,6 +253,14 @@ impl AuditWriter {
     /// populated by [`Self::open`] and only consumed here;
     /// `close` takes `self` by value so it can't run twice.
     pub fn close(mut self) -> Result<AuditWrittenFile, AuditWriterError> {
+        if self.poisoned {
+            // Refuse to publish a possibly-partial file. Don't
+            // take `inner` / `temp_path` — `Drop` sees `poisoned
+            // = true` and leaves the .parquet.tmp on disk for
+            // diagnosis. The Parquet handle is released as part
+            // of the destructor cascade.
+            return Err(AuditWriterError::Poisoned);
+        }
         // Take both `inner` and `temp_path` BEFORE any fallible
         // work so that a failed `inner.close()` / `fs::rename`
         // leaves the `.parquet.tmp` on disk for diagnosis (the
@@ -263,6 +301,16 @@ impl AuditWriter {
 
 impl Drop for AuditWriter {
     fn drop(&mut self) {
+        if self.poisoned {
+            // A poisoned writer preserves its `.parquet.tmp` for
+            // diagnosis. Release the file handle (drop inner) but
+            // leave the temp file on disk — `close()` already
+            // returned `Poisoned` without consuming `temp_path`,
+            // so it's still `Some(...)` here. We deliberately do
+            // not `remove_file` it.
+            drop(self.inner.take());
+            return;
+        }
         if let Some(temp) = self.temp_path.take() {
             drop(self.inner.take());
             let _ = std::fs::remove_file(&temp);
@@ -295,6 +343,13 @@ pub enum AuditWriterError {
         expected: PartitionKey,
         actual: PartitionKey,
     },
+    /// A prior [`AuditWriter::append_events`] returned a
+    /// `Parquet` error, leaving the underlying writer's buffer in
+    /// an undefined state. [`AuditWriter::close`] refuses to
+    /// publish to protect against landing a partial / corrupted
+    /// audit file; the `.parquet.tmp` is preserved on disk for
+    /// diagnosis.
+    Poisoned,
 }
 
 impl fmt::Display for AuditWriterError {
@@ -339,6 +394,13 @@ impl fmt::Display for AuditWriterError {
                 expected.month,
                 expected.day,
             ),
+            Self::Poisoned => write!(
+                f,
+                "AuditWriter is poisoned — a prior append_events failed with a Parquet \
+                 error, leaving the buffer in an undefined state; close() refuses to \
+                 publish to avoid landing a partial / corrupted file (the .parquet.tmp is \
+                 preserved on disk for diagnosis)",
+            ),
         }
     }
 }
@@ -349,9 +411,32 @@ impl std::error::Error for AuditWriterError {
             Self::Io { source, .. } => Some(source),
             Self::Parquet(e) => Some(e),
             Self::Batch(e) => Some(e),
-            Self::PartitionMismatch { .. } => None,
+            Self::PartitionMismatch { .. } | Self::Poisoned => None,
         }
     }
+}
+
+/// Inner Parquet-touching loop of [`AuditWriter::append_events`].
+/// Borrows the `ArrowWriter` directly so the caller can set
+/// `self.poisoned = true` after the borrow ends if this returns
+/// an `Err(AuditWriterError::Parquet(_))`. Per the §3.5 row-group
+/// sizing rule, runs a `flush()` when the in-progress buffer
+/// crosses [`ROW_GROUP_FLUSH_BYTES`] (128 MiB).
+fn append_chunks(
+    inner: &mut ArrowWriter<File>,
+    events: &[AuditEvent],
+) -> Result<(), AuditWriterError> {
+    for chunk in events.chunks(SUB_BATCH_ROWS) {
+        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            inner.flush().map_err(AuditWriterError::Parquet)?;
+        }
+        let batch = audit_events_to_batch(chunk).map_err(AuditWriterError::Batch)?;
+        inner.write(&batch).map_err(AuditWriterError::Parquet)?;
+    }
+    if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+        inner.flush().map_err(AuditWriterError::Parquet)?;
+    }
+    Ok(())
 }
 
 /// Derive the [`PartitionKey`] for an audit event. Reuses the

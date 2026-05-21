@@ -101,6 +101,19 @@ pub enum AuditBatchError {
     /// An event's `timestamp` nanos-since-epoch exceed `i64::MAX`.
     /// Carries the offending value for diagnostics.
     TimestampOverflow { nanos: u128 },
+    /// A `TemplateTypeExpanded` (or
+    /// `TemplateWideningRejectedDegenerate`) event was supplied
+    /// with `old_template != new_template`. Per RFC 0005 §3.7,
+    /// `TemplateTypeExpanded` and `TemplateWideningRejectedDegenerate`
+    /// carry the unchanged template (equal to `old_template`); a
+    /// divergent pair would persist a row that violates the §3.7
+    /// invariant, so the writer rejects rather than emit corrupted
+    /// audit data. Reach this and the upstream producer has a bug.
+    TemplateMustNotChange {
+        variant: &'static str,
+        old_template: String,
+        new_template: String,
+    },
     /// Arrow rejected the constructed `RecordBatch` (column-length
     /// mismatch, schema-shape mismatch). Internal bug if it ever
     /// fires — the array builders are constructed against
@@ -122,6 +135,16 @@ impl fmt::Display for AuditBatchError {
                 "audit event timestamp = {nanos} ns exceeds i64::MAX (RFC 0005 §3.7's \
                  INT64-backed timestamp overflow contract)",
             ),
+            Self::TemplateMustNotChange {
+                variant,
+                old_template,
+                new_template,
+            } => write!(
+                f,
+                "audit event {variant} has old_template = {old_template:?} != new_template \
+                 = {new_template:?}, but RFC 0005 §3.7 requires they be equal for this \
+                 variant (template tokens don't change)",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -130,7 +153,9 @@ impl fmt::Display for AuditBatchError {
 impl std::error::Error for AuditBatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::PreEpochTimestamp | Self::TimestampOverflow { .. } => None,
+            Self::PreEpochTimestamp
+            | Self::TimestampOverflow { .. }
+            | Self::TemplateMustNotChange { .. } => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -262,6 +287,22 @@ impl Builders {
                 new_template,
                 slots_expanded,
             } => {
+                // §3.7 invariant: TemplateTypeExpanded carries the
+                // unchanged template, so `old_template ==
+                // new_template`. The in-memory variant has both
+                // fields independently (the miner builds them
+                // separately), so we enforce the invariant at the
+                // serialisation boundary rather than trusting the
+                // producer. Persisting divergent strings would be a
+                // §3.7 contract violation a future reader couldn't
+                // disambiguate.
+                if old_template != new_template {
+                    return Err(AuditBatchError::TemplateMustNotChange {
+                        variant: "TemplateTypeExpanded",
+                        old_template: old_template.clone(),
+                        new_template: new_template.clone(),
+                    });
+                }
                 self.event_kind
                     .append_value(EVENT_KIND_TEMPLATE_TYPE_EXPANDED);
                 self.event_type

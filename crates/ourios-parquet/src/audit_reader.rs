@@ -60,10 +60,12 @@ impl AuditReader {
     ///
     /// # Errors
     ///
-    /// - [`AuditReaderError::Io`] on file-open / Parquet-footer
-    ///   parsing failures.
-    /// - [`AuditReaderError::Parquet`] on Parquet schema / reader
-    ///   construction failures.
+    /// - [`AuditReaderError::Io`] on file-open failures
+    ///   (filesystem-level errors from [`File::open`]).
+    /// - [`AuditReaderError::Parquet`] on Parquet-footer parsing,
+    ///   schema-parse, or reader-construction failures (anything
+    ///   surfaced by `ParquetRecordBatchReaderBuilder::try_new`
+    ///   or `build`).
     /// - [`AuditReaderError::MissingRequiredColumn`] if the
     ///   file's schema lacks one of the §3.7 baseline REQUIRED
     ///   columns.
@@ -329,14 +331,49 @@ fn batch_to_audit_events(
                 new_template: new_template[i].clone(),
                 positions_widened: positions_widened_lists[i].clone(),
             },
-            EVENT_KIND_TEMPLATE_TYPE_EXPANDED => AuditEventKind::TemplateTypeExpanded {
-                old_version: old_version[i],
-                new_version: new_version[i],
-                old_template: old_template[i].clone(),
-                new_template: new_template[i].clone(),
-                slots_expanded: slots_expanded_lists[i].clone(),
-            },
+            EVENT_KIND_TEMPLATE_TYPE_EXPANDED => {
+                // §3.7 invariant: TemplateTypeExpanded carries the
+                // unchanged template (`old_template ==
+                // new_template`). The writer enforces this, but a
+                // corrupt / foreign-writer file could violate it.
+                // Surface as `Conversion` rather than silently
+                // accept a malformed row whose `slots_expanded`
+                // would then be the only "real" payload while the
+                // template columns disagree.
+                if old_template[i] != new_template[i] {
+                    return Err(AuditReaderError::Conversion {
+                        column: audit_columns::NEW_TEMPLATE,
+                        detail: format!(
+                            "row {file_row}: TemplateTypeExpanded has \
+                             old_template != new_template ({:?} != {:?}) — RFC 0005 §3.7 \
+                             requires equality for this variant (template tokens don't change)",
+                            old_template[i], new_template[i],
+                        ),
+                    });
+                }
+                AuditEventKind::TemplateTypeExpanded {
+                    old_version: old_version[i],
+                    new_version: new_version[i],
+                    old_template: old_template[i].clone(),
+                    new_template: new_template[i].clone(),
+                    slots_expanded: slots_expanded_lists[i].clone(),
+                }
+            }
             EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE => {
+                // §3.7 invariant: rejection rows also carry the
+                // unchanged template in both columns. Same
+                // disagreement check as TypeExpanded.
+                if old_template[i] != new_template[i] {
+                    return Err(AuditReaderError::Conversion {
+                        column: audit_columns::NEW_TEMPLATE,
+                        detail: format!(
+                            "row {file_row}: TemplateWideningRejectedDegenerate has \
+                             old_template != new_template ({:?} != {:?}) — RFC 0005 §3.7 \
+                             requires equality for this variant (template tokens don't change)",
+                            old_template[i], new_template[i],
+                        ),
+                    });
+                }
                 // Recover `would_be_template` / `would_be_positions`
                 // from the JSON-encoded `reason` column. The
                 // writer always emits this payload for the

@@ -213,6 +213,9 @@ impl Writer {
     ///
     /// # Errors
     ///
+    /// - [`WriterError::Poisoned`] when a prior `append_records`
+    ///   already returned `Parquet`; fails fast without touching
+    ///   `inner`.
     /// - [`WriterError::PartitionMismatch`] when a record's derived
     ///   partition (per §3.4's time-fallback algorithm) disagrees
     ///   with the writer's `partition`. Pre-checked across the
@@ -224,7 +227,8 @@ impl Writer {
     ///   the atomicity note above.
     /// - [`WriterError::Parquet`] when the underlying Parquet
     ///   writer rejects the batch (codec or footer error).
-    ///   **Poisons the writer**.
+    ///   **Poisons the writer**; subsequent `append_records` /
+    ///   `close` calls return `Poisoned`.
     ///
     /// # Panics
     ///
@@ -233,6 +237,16 @@ impl Writer {
     /// takes ownership of `self`; `append_records` borrows
     /// `&mut self` and therefore cannot run after `close`.
     pub fn append_records(&mut self, records: &[MinedRecord]) -> Result<(), WriterError> {
+        if self.poisoned {
+            // Fail fast — touching `inner` after a prior Parquet
+            // error would call into an `ArrowWriter` whose buffer
+            // state is undefined. `close()` will refuse to publish
+            // either way; surface the same `Poisoned` error here
+            // so callers can stop driving the writer immediately
+            // instead of accumulating further (potentially
+            // doomed) Parquet operations.
+            return Err(WriterError::Poisoned);
+        }
         if records.is_empty() {
             return Ok(());
         }

@@ -181,6 +181,9 @@ impl AuditWriter {
     ///
     /// # Errors
     ///
+    /// - [`AuditWriterError::Poisoned`] when a prior
+    ///   `append_events` already returned `Parquet`; fails fast
+    ///   without touching `inner`.
     /// - [`AuditWriterError::PartitionMismatch`] when an event's
     ///   derived audit partition disagrees with the writer's
     ///   open partition. Pre-checked across the whole slice
@@ -191,7 +194,8 @@ impl AuditWriter {
     ///   — see the atomicity note above.
     /// - [`AuditWriterError::Parquet`] when the underlying
     ///   Parquet writer rejects the batch or a row-group flush
-    ///   fails. **Poisons the writer**.
+    ///   fails. **Poisons the writer**; subsequent
+    ///   `append_events` / `close` calls return `Poisoned`.
     ///
     /// # Panics
     ///
@@ -199,6 +203,16 @@ impl AuditWriter {
     /// `Some` from [`Self::open`] until [`Self::close`] takes
     /// ownership of `self`; `append_events` borrows `&mut self`.
     pub fn append_events(&mut self, events: &[AuditEvent]) -> Result<(), AuditWriterError> {
+        if self.poisoned {
+            // Fail fast — touching `inner` after a prior Parquet
+            // error would call into an `ArrowWriter` whose buffer
+            // state is undefined. `close()` will refuse to publish
+            // either way; surface the same `Poisoned` error here
+            // so callers can stop driving the writer immediately
+            // instead of accumulating further (potentially
+            // doomed) Parquet operations.
+            return Err(AuditWriterError::Poisoned);
+        }
         if events.is_empty() {
             return Ok(());
         }

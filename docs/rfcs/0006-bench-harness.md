@@ -141,7 +141,7 @@ This RFC does **not** pin:
 
 ### 3.2 Crate shape
 
-```
+```text
 crates/ourios-bench/
 ├── Cargo.toml
 └── src/
@@ -218,7 +218,7 @@ section by sub-heading.
 
 Per `docs/benchmarks.md` §2 / A1, the formula is:
 
-```
+```text
 ourios_ratio = bytes(raw_corpus) / bytes(ourios_output)
 zstd_ratio   = bytes(raw_corpus) / bytes(zstd_corpus)
 A1_delta     = ourios_ratio / zstd_ratio
@@ -267,7 +267,7 @@ table summarises by corpus name + hardware kind.
 
 Per `docs/benchmarks.md` §4 / C1, the formula is:
 
-```
+```text
 C1 = count(records WHERE !lossy_flag AND reconstruct == bytes)
    / count(records WHERE !lossy_flag)
 ```
@@ -314,6 +314,21 @@ value by 1 M lines". The formula needs three things pinned:
 **when** to sample, **what** counts as plateau, and **what**
 counts as "steady-state value".
 
+The benchmarks.md C2 phrasing —
+*"template count grows sub-linearly and plateaus within 2× of
+its steady-state value by 1 M lines"* — operationalises to:
+**at the 1 M-line mark, the template count is at least half
+of the count the curve eventually converges to**. Since
+template count is monotonic non-decreasing (the miner does not
+unmerge templates), this is the cleanest formulation; if
+`count(1M) ≥ SS / 2`, the curve cannot have more than doubled
+between 1 M lines and end-of-corpus, i.e. it is within 2× of
+its steady-state value. The phrasing reading where SS is
+defined as `max(samples)` and the comparison is
+`plateau_value ≤ 2 × max` is tautological — `plateau_value ≤
+max` by definition — and was rejected after the first
+copilot review of this RFC.
+
 Pinned definitions:
 
 - **Sample cadence**: every `N` lines, where
@@ -322,31 +337,32 @@ Pinned definitions:
   resolution (~1024 samples) regardless of corpus size; a
   1 M-line corpus samples every 977 lines, a 10 k-line corpus
   samples every 10 lines.
-- **Steady-state value (SS)**: the maximum template count
-  observed across all samples. Defined retroactively at the
-  end of ingest, not online — this avoids the bench having
-  to estimate SS while still ingesting.
-- **Plateau condition**: the last `K = 64` samples are within
-  `± 5%` of `SS`. `K` is corpus-relative-via-cadence — 64
-  samples is 6.25% of the ~1024 total — so the plateau window
-  is a fixed fraction of the corpus, not a fixed line count.
-  The 5% tolerance acknowledges that even a stable corpus
-  emits the occasional new template (a singleton noise line).
-- **Sub-linear check**: not in addition to the plateau check
-  — if the curve plateaus, it is sub-linear by definition.
-  The §4 / C2 phrasing ("grows sub-linearly *and* plateaus") is
-  read as a single condition, satisfied by plateau detection.
-- **Pass condition**: plateau is reached *strictly before*
-  the 1 M-line mark on a corpus of ≥ 1 M lines. Corpora
-  smaller than 1 M lines are recorded as `C2_pass = N/A`
-  (insufficient data); the §9 row notes the corpus size.
+- **Steady-state value (SS)**: the template count at the
+  **last** sample (line index = `total_lines - 1` rounded to
+  the nearest sample). Operationally, "where the curve ended
+  up". Not the running max — see the rationale paragraph above.
+- **Count at 1 M lines**: the template count at the sample
+  whose line index is closest to `1_000_000`. Defined only on
+  corpora of `≥ 1_000_000` lines.
+- **Convergence ratio**: `count_at_1m / SS`. By monotonicity,
+  this lives in `(0.0, 1.0]`.
+- **Pass condition** (gate): `convergence_ratio ≥ 0.5` on a
+  corpus of `≥ 1_000_000` lines. This is the "within 2× of
+  SS by 1 M lines" rule. Corpora smaller than 1 M lines are
+  recorded as `c2.pass = null` (insufficient data); the §9
+  row notes the corpus size and the gate is not asserted.
+- **Plateau-detection diagnostic** (not a gate): the curve
+  is "plateaued" at the sample where the trailing `K = 64`
+  samples all lie within `± 5%` of the SS. The diagnostic is
+  useful for understanding where the curve actually flattens
+  (often well before 1 M lines), but it does not gate the
+  RFC — the gate is the 2× rule above.
 
-Reported as: `template_count_at_plateau`, `plateau_line_index`
-(line at which the plateau condition first held), `max_count`
-(the SS value), `plateau_ratio = template_count_at_plateau /
-SS` (within `[0.95, 1.0]` by definition when plateau is
-detected). Numeric precision is integer counts and three
-decimal places for the ratio.
+Reported as: `template_count_at_1m_lines` (integer; `null` for
+corpora < 1 M lines), `template_count_at_end` (integer;
+this is SS), `convergence_ratio` (three-decimal float; `null`
+for short corpora), `pass` (bool or `null`),
+`corpus_at_least_1m` (bool).
 
 A future RFC may add a `convergence_curve` artefact (the full
 sample series, written next to the results JSON) so the §9
@@ -375,16 +391,21 @@ the explicit `--allow-unknown-hardware` opt-in so a forgotten
 
 Each bench invocation writes one results JSON to:
 
-```
-benchmarks/results/<UTC-RFC3339>-<git-sha7>.json
+```text
+benchmarks/results/<UTC-RFC3339-ms>-<git-sha7>.json
 ```
 
-The path is deterministic given the time and commit; the
-short SHA disambiguates two runs at the same wall-clock
-second. The directory `benchmarks/` is at the repo root; it is
-gitignored except for the `results/` subdirectory's `.gitkeep`
-and the runs the maintainer chooses to commit (the §9 Results
-section then cites those by file path).
+The timestamp is RFC3339 with millisecond precision (e.g.
+`2026-05-22T14:30:00.123Z`) so two runs on the same commit
+within the same wall-clock second produce different filenames.
+Even at millisecond precision two runs *can* theoretically
+collide on a fast machine; the bench detects the conflict at
+write time and retries with the next millisecond's timestamp,
+emitting a warning to stderr. The directory `benchmarks/` is at
+the repo root; it is gitignored except for the `results/`
+subdirectory's `.gitkeep` and the runs the maintainer chooses
+to commit (the §9 Results section then cites those by file
+path).
 
 The JSON shape is pinned by `report::ResultsFile` and looks
 like:
@@ -393,7 +414,7 @@ like:
 {
   "rfc": "RFC 0006",
   "rfc_version": "v1",
-  "timestamp": "2026-05-22T14:30:00Z",
+  "timestamp": "2026-05-22T14:30:00.123Z",
   "git_sha": "abc1234",
   "hardware_kind": "baseline-8vcpu-32gib",
   "corpus": {
@@ -403,9 +424,7 @@ like:
     "raw_bytes": 1234567
   },
   "ourios": {
-    "parquet_dir": "/tmp/ourios-bench-XXXX/data",
     "parquet_bytes": 89012,
-    "audit_dir": "/tmp/ourios-bench-XXXX/audit",
     "audit_bytes": 1024
   },
   "zstd": {
@@ -428,15 +447,23 @@ like:
   },
   "c2": {
     "sample_cadence": 12,
-    "plateau_line_index": 8192,
-    "template_count_at_plateau": 142,
-    "max_count": 145,
-    "plateau_ratio": 0.979,
+    "total_lines": 1234567,
+    "template_count_at_1m_lines": 142,
+    "template_count_at_end": 145,
+    "convergence_ratio": 0.979,
     "pass": true,
-    "corpus_at_least_1m": false
+    "corpus_at_least_1m": true
   }
 }
 ```
+
+The temp-directory paths the bench actually uses (the
+`Writer`'s bucket root) are intentionally **not** in the
+JSON. They're an implementation detail that differs across
+runs and would otherwise break the §5 RFC0006.7 reproducibility
+scenario. The byte counts are what downstream analysis cares
+about; the paths are debug-only and logged to stderr when
+`--keep-parquet` is passed.
 
 `rfc_version` is a literal `"v1"` and tracks RFC 0006
 amendments; bumping it requires an RFC amendment, and downstream
@@ -453,11 +480,27 @@ finds the matching heading, and rewrites it in place.
 
 ### 3.7 Invocation
 
+The CLI has two output-path concepts and they are spelled
+differently to avoid the §3.4.1 "output bucket directory"
+ambiguity:
+
+- **`--results-dir`** is where the JSON results file from
+  §3.6 lands. Default: `benchmarks/results/`.
+- **`--bucket-dir`** is the `bucket_root` passed to the
+  `ourios-parquet` writer — the directory the writer's
+  `data/` and `audit/` partition trees grow under, and
+  whose total byte size is `bytes(ourios_output)` in the
+  §3.4.1 A1 formula. Default: a fresh temp dir under
+  `std::env::temp_dir()` per invocation, cleaned up on exit
+  unless `--keep-parquet` is passed.
+
 CLI (`crates/ourios-bench/src/main.rs`):
 
-```
+```text
 ourios-bench [--corpus <path>]
-             [--output-dir <path>]
+             [--results-dir <path>]
+             [--bucket-dir <path>]
+             [--keep-parquet]
              [--hardware-kind <tag>]
              [--allow-unknown-hardware]
              [--update-benchmarks-md]
@@ -468,11 +511,14 @@ Flags:
 
 - `--corpus <path>` (default `testdata/corpus/`): directory of
   `*.txt` files the bench loads.
-- `--output-dir <path>` (default `benchmarks/results/`):
-  where the JSON file lands. Parquet output goes to a temp
-  dir under `std::env::temp_dir()` and is **not** retained
-  by default; pass `--keep-parquet` to disable cleanup for
-  inspection.
+- `--results-dir <path>` (default `benchmarks/results/`):
+  where the §3.6 JSON file lands.
+- `--bucket-dir <path>` (default: fresh temp dir): the
+  Parquet writer's `bucket_root`. Cleaned up on exit unless
+  `--keep-parquet` is passed.
+- `--keep-parquet` (off by default): suppress the temp-dir
+  cleanup so the Parquet partition tree is inspectable after
+  the bench exits. Path is logged to stderr.
 - `--hardware-kind <tag>` (required unless
   `--allow-unknown-hardware`): the §3.5 annotation.
 - `--update-benchmarks-md` (off by default): append / rewrite
@@ -601,29 +647,42 @@ the harness or the formulas.
 > - **When** the bench runs the C1 measurement
 > - **Then** `non_lossy_reconstruct_ok / non_lossy_total =
 >   1.000000` (six-decimal precision)
+> - **And** the results JSON records `c1.pass = true`
 > - **And** if any non-lossy row has `reconstruct(record) !=
 >   ingested_bytes`, the bench writes the failing row's
 >   `template_id`, `template_version`, expected bytes, and
->   actual reconstruction to stderr and exits with non-zero
-> - **And** the §9 row records `c1.pass = false` so the
->   markdown surface reflects the failure even when the bench
->   was run without `--update-benchmarks-md` (the JSON file
->   still records the failure)
+>   actual reconstruction to stderr and exits with non-zero,
+>   and the results JSON records `c1.pass = false`
+> - **And** the bench writes the results JSON irrespective of
+>   `--update-benchmarks-md` — the JSON file always lands;
+>   only the `docs/benchmarks.md` §9 mutation is gated by the
+>   flag, so a failure run still leaves a machine-readable
+>   record on disk
 
-> **Scenario RFC0006.3 — C2 plateau detection on a stable corpus**
-> - **Given** a synthetic stable corpus of ≥ 1 M lines whose
->   template count is known to plateau in the first few
->   thousand lines (constructed by the bench's integration
->   test; not committed to `testdata/corpus/`)
+> **Scenario RFC0006.3 — C2 gate ("within 2× of SS by 1 M lines") on a stable corpus**
+> - **Given** a synthetic stable corpus of `≥ 1_000_000` lines
+>   whose template alphabet is bounded (constructed by the
+>   bench's integration test; not committed to
+>   `testdata/corpus/`)
 > - **When** the bench runs the C2 measurement
-> - **Then** `plateau_line_index < 1_000_000`
-> - **And** `plateau_ratio ∈ [0.95, 1.0]`
-> - **And** `template_count_at_plateau ≤ 2 × max_count` (the
->   §4 / C2 "within 2× of steady-state" rule)
+> - **Then** `c2.corpus_at_least_1m = true`
+> - **And** `template_count_at_1m_lines` is the integer
+>   sample-count at the sample whose line index is closest to
+>   `1_000_000`
+> - **And** `template_count_at_end` is the integer sample-count
+>   at the final sample (the §3.4.3 SS definition)
+> - **And** `convergence_ratio = template_count_at_1m_lines /
+>   template_count_at_end ≥ 0.5` — the "within 2× of SS"
+>   gate, made non-tautological by defining SS as the
+>   end-of-corpus value rather than the running max
 > - **And** `c2.pass = true`
 > - **And** the convergence curve in the results JSON has
 >   exactly the `sample_cadence`-derived number of samples
 >   (`total_lines / cadence`, rounded)
+> - **And** on a corpus of `< 1_000_000` lines,
+>   `c2.corpus_at_least_1m = false`, `c2.pass = null`, and
+>   `c2.template_count_at_1m_lines = null` — the gate
+>   abstains rather than passing or failing
 
 > **Scenario RFC0006.4 — Result file shape is stable and the §9 update is reversible**
 > - **Given** the bench has run and written its results JSON
@@ -666,15 +725,24 @@ the harness or the formulas.
 >   `(git_sha, hardware_kind)` pair untouched
 
 > **Scenario RFC0006.7 — Bench is reproducible across runs**
-> - **Given** the bench is invoked twice in succession on the
->   same git checkout and the same corpus, with no code or
->   data changes in between
+> - **Given** the bench is invoked twice on the same git
+>   checkout and the same corpus, with no code or data changes
+>   in between
 > - **When** the two runs complete
-> - **Then** `a1.delta`, `c1.rate`, and `c2.plateau_line_index`
->   are bit-identical across the two runs
-> - **And** the only fields that differ between the two
->   results JSON files are `timestamp` and (incidentally)
->   the output file path
+> - **Then** every measurement field of the results JSON is
+>   bit-identical across the two runs — specifically
+>   `corpus.raw_bytes`, `corpus.total_lines`,
+>   `corpus.total_files`, `ourios.parquet_bytes`,
+>   `ourios.audit_bytes`, `zstd.compressed_bytes`, `a1.delta`,
+>   `c1.rate`, `c1.non_lossy_total`,
+>   `c1.non_lossy_reconstruct_ok`, `c2.template_count_at_end`,
+>   and (when the corpus is `≥ 1 M lines`)
+>   `c2.template_count_at_1m_lines` / `c2.convergence_ratio`
+> - **And** the only fields that legitimately differ are
+>   `timestamp` (wall-clock) and the output JSON file's path
+>   (derived from `timestamp`). The temp-dir bucket the writer
+>   used is **not** in the JSON per §3.6, so it cannot
+>   contribute to a spurious diff
 
 ## 6. Testing strategy
 

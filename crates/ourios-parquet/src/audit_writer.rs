@@ -163,18 +163,32 @@ impl AuditWriter {
     /// poisoned and [`Self::close`] subsequently returns
     /// [`AuditWriterError::Poisoned`] instead of renaming the
     /// temp file into place. The `.parquet.tmp` stays on disk
-    /// for diagnosis. Per-event validation errors
-    /// (`PartitionMismatch`, `Batch`) do **not** poison — the
-    /// inner writer hasn't been touched yet.
+    /// for diagnosis. `PartitionMismatch` and `Batch` errors do
+    /// **not** poison: the writer remains usable for a follow-up
+    /// `append_events` call.
+    ///
+    /// `append_events` is **not all-or-nothing** across the
+    /// sub-batches it issues internally. The slice is chunked
+    /// into [`SUB_BATCH_ROWS`]-sized pieces; if chunk *N* writes
+    /// successfully and chunk *N+1*'s `audit_events_to_batch`
+    /// then errors with `Batch`, the events from chunks `0..N`
+    /// have already landed in the in-progress row group. Callers
+    /// that want atomicity must pre-validate inputs (timestamps,
+    /// rejection-variant template equality) before the first
+    /// `append_events` call. `PartitionMismatch`, by contrast,
+    /// *is* pre-checked across the whole slice before any writes
+    /// happen, so it fires before chunk 0.
     ///
     /// # Errors
     ///
     /// - [`AuditWriterError::PartitionMismatch`] when an event's
     ///   derived audit partition disagrees with the writer's
-    ///   open partition. **Non-poisoning** (no Parquet writes
-    ///   attempted).
+    ///   open partition. Pre-checked across the whole slice
+    ///   before any `inner.write`. **Non-poisoning**.
     /// - [`AuditWriterError::Batch`] when `RecordBatch`
-    ///   construction fails. **Non-poisoning**.
+    ///   construction fails. **Non-poisoning**, but earlier
+    ///   chunks in the same call may have written successfully
+    ///   — see the atomicity note above.
     /// - [`AuditWriterError::Parquet`] when the underlying
     ///   Parquet writer rejects the batch or a row-group flush
     ///   fails. **Poisons the writer**.
@@ -206,9 +220,13 @@ impl AuditWriter {
         // `&mut ArrowWriter<File>` so the outer `self.poisoned =
         // true` assignment can run after the borrow on `self.inner`
         // ends. Poison only on Parquet errors — `Batch` errors
-        // come from `audit_events_to_batch` BEFORE any `inner.write`
-        // touches the buffer, so the inner writer is still in a
-        // clean state and a follow-up `append_events` is safe.
+        // come from `audit_events_to_batch`, which runs on a
+        // single chunk and doesn't touch `inner` itself; the
+        // buffer's state at the moment a `Batch` error fires is
+        // whatever earlier chunks left it (clean, or holding
+        // already-written events from this same call). Either
+        // way a follow-up `append_events` is safe — the contract
+        // is "writer remains usable", not "no events persisted".
         let result = append_chunks(inner, events);
         if matches!(result, Err(AuditWriterError::Parquet(_))) {
             self.poisoned = true;

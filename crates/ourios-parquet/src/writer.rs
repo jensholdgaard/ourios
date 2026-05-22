@@ -100,6 +100,16 @@ pub struct Writer {
     /// impl uses `None` as the "already published; nothing to
     /// clean up" signal.
     temp_path: Option<PathBuf>,
+    /// Set to `true` once any `ArrowWriter::write` /
+    /// `ArrowWriter::flush` call returns `Err`. The underlying
+    /// `ArrowWriter`'s buffer state is undefined after such a
+    /// failure (the row group may be partially written), so
+    /// [`Self::close`] refuses to publish — renaming the temp file
+    /// into place would silently land a potentially-corrupted
+    /// data file. The temp file is left on disk for diagnosis
+    /// (the [`Drop`] impl skips its usual cleanup when poisoned).
+    /// Mirrors [`crate::audit_writer::AuditWriter`]'s contract.
+    poisoned: bool,
 }
 
 impl Writer {
@@ -158,6 +168,7 @@ impl Writer {
             flush_uuid,
             final_path,
             temp_path: Some(temp_path),
+            poisoned: false,
         })
     }
 
@@ -177,19 +188,47 @@ impl Writer {
     /// which stays comfortably under 1 GiB for the per-record
     /// sizes log ingest produces in practice.
     ///
+    /// **Poisoning.** A failed `inner.write()` or `inner.flush()`
+    /// leaves the underlying `ArrowWriter`'s buffer in an
+    /// undefined state — the partial row group can't be safely
+    /// recovered. When that happens, the writer marks itself
+    /// poisoned and [`Self::close`] subsequently returns
+    /// [`WriterError::Poisoned`] instead of renaming the temp
+    /// file into place. The `.parquet.tmp` stays on disk for
+    /// diagnosis. `PartitionMismatch` and `Batch` errors do
+    /// **not** poison: the writer remains usable for a follow-up
+    /// `append_records` call.
+    ///
+    /// `append_records` is **not all-or-nothing** across the
+    /// sub-batches it issues internally. The slice is chunked
+    /// into [`SUB_BATCH_ROWS`]-sized pieces; if chunk *N* writes
+    /// successfully and chunk *N+1*'s `mined_records_to_batch`
+    /// then errors with `Batch`, the rows from chunks `0..N` have
+    /// already landed in the in-progress row group. Callers that
+    /// want atomicity must validate inputs (timestamps, body
+    /// shapes, partition match) before the first `append_records`
+    /// call. `PartitionMismatch`, by contrast, *is* pre-checked
+    /// across the whole slice before any writes happen, so it
+    /// fires before chunk 0.
+    ///
     /// # Errors
     ///
+    /// - [`WriterError::Poisoned`] when a prior `append_records`
+    ///   already returned `Parquet`; fails fast without touching
+    ///   `inner`.
     /// - [`WriterError::PartitionMismatch`] when a record's derived
     ///   partition (per §3.4's time-fallback algorithm) disagrees
-    ///   with the writer's `partition`. Fail-fast at write time
-    ///   keeps the §3.9 reader contract enforceable — a file
-    ///   written here will never produce a row-vs-path mismatch
-    ///   on read.
+    ///   with the writer's `partition`. Pre-checked across the
+    ///   whole slice before any `inner.write`. **Non-poisoning**.
     /// - [`WriterError::Batch`] when `RecordBatch` construction
     ///   fails (timestamp overflow per RFC 0005 §3.2, or Arrow
-    ///   internal error).
+    ///   internal error). **Non-poisoning**, but earlier chunks
+    ///   in the same call may have written successfully — see
+    ///   the atomicity note above.
     /// - [`WriterError::Parquet`] when the underlying Parquet
     ///   writer rejects the batch (codec or footer error).
+    ///   **Poisons the writer**; subsequent `append_records` /
+    ///   `close` calls return `Poisoned`.
     ///
     /// # Panics
     ///
@@ -198,6 +237,16 @@ impl Writer {
     /// takes ownership of `self`; `append_records` borrows
     /// `&mut self` and therefore cannot run after `close`.
     pub fn append_records(&mut self, records: &[MinedRecord]) -> Result<(), WriterError> {
+        if self.poisoned {
+            // Fail fast — touching `inner` after a prior Parquet
+            // error would call into an `ArrowWriter` whose buffer
+            // state is undefined. `close()` will refuse to publish
+            // either way; surface the same `Poisoned` error here
+            // so callers can stop driving the writer immediately
+            // instead of accumulating further (potentially
+            // doomed) Parquet operations.
+            return Err(WriterError::Poisoned);
+        }
         if records.is_empty() {
             return Ok(());
         }
@@ -215,29 +264,22 @@ impl Writer {
             .inner
             .as_mut()
             .expect("inner ArrowWriter is Some until Writer::close is called");
-        // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
-        // flush-if-over-threshold check before every sub-batch.
-        // The bound on row-group size is therefore:
-        //   (§3.5 lower threshold) + (one sub-batch's worth) ≈
-        //   well under §3.5's 1 GiB upper bound for any
-        //   reasonable per-record size. The size check happens
-        //   *before* every sub-batch (not after), so a sub-batch
-        //   that pushes the buffer past the threshold seals the
-        //   next time around — bounded overshoot is intentional;
-        //   unbounded overshoot is what the RFC prohibits.
-        for chunk in records.chunks(SUB_BATCH_ROWS) {
-            if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-                inner.flush().map_err(WriterError::Parquet)?;
-            }
-            let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
-            inner.write(&batch).map_err(WriterError::Parquet)?;
+        // Run the Parquet-touching loop in a helper that takes a
+        // `&mut ArrowWriter<File>` so the outer `self.poisoned =
+        // true` assignment can run after the borrow on `self.inner`
+        // ends. Poison only on Parquet errors — `Batch` errors
+        // come from `mined_records_to_batch`, which runs on a
+        // single chunk and doesn't touch `inner` itself; the
+        // buffer's state at the moment a `Batch` error fires is
+        // whatever earlier chunks left it (clean, or holding
+        // already-written rows from this same call). Either way
+        // a follow-up `append_records` is safe — the contract
+        // is "writer remains usable", not "no rows persisted".
+        let result = append_chunks(inner, records);
+        if matches!(result, Err(WriterError::Parquet(_))) {
+            self.poisoned = true;
         }
-        // Final post-write check so the next `append_records`
-        // call doesn't inherit an over-threshold buffer.
-        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
-            inner.flush().map_err(WriterError::Parquet)?;
-        }
-        Ok(())
+        result
     }
 
     /// Close the writer, finalising the Parquet footer on the
@@ -259,8 +301,17 @@ impl Writer {
     /// and assumes its records are recoverable via WAL replay
     /// after a crash.
     ///
+    /// **Poisoning check.** If a prior `append_records` returned
+    /// a [`WriterError::Parquet`] error, the writer is poisoned
+    /// and this method refuses to publish — returns
+    /// [`WriterError::Poisoned`] without touching `inner` /
+    /// `temp_path`, so the [`Drop`] impl's poisoned branch leaves
+    /// the temp file on disk for diagnosis.
+    ///
     /// # Errors
     ///
+    /// - [`WriterError::Poisoned`] when a prior `append_records`
+    ///   failed with a Parquet error (temp file left on disk).
     /// - [`WriterError::Parquet`] when the footer write fails.
     /// - [`WriterError::Io`] when the atomic rename from the
     ///   temp filename to the final path fails (the temp file
@@ -272,6 +323,13 @@ impl Writer {
     /// populated by [`Writer::open`] and only consumed here;
     /// `close` takes `self` by value so it can't run twice.
     pub fn close(mut self) -> Result<WrittenFile, WriterError> {
+        if self.poisoned {
+            // Refuse to publish a possibly-partial file. Don't
+            // take `inner` / `temp_path` — `Drop` sees
+            // `poisoned = true` and leaves the .parquet.tmp on
+            // disk for diagnosis.
+            return Err(WriterError::Poisoned);
+        }
         // Take both `inner` and `temp_path` BEFORE attempting
         // any fallible work. If `inner.close()` or
         // `fs::rename` then errors, `self.temp_path` is already
@@ -317,6 +375,16 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
+        if self.poisoned {
+            // A poisoned writer preserves its `.parquet.tmp` for
+            // diagnosis. Release the file handle (drop inner) but
+            // leave the temp file on disk — `close()` already
+            // returned `Poisoned` without consuming `temp_path`,
+            // so it's still `Some(...)` here. We deliberately do
+            // not `remove_file` it.
+            drop(self.inner.take());
+            return;
+        }
         // If `close` consumed the writer cleanly, `temp_path`
         // is `None` and the rename has already happened.
         // Otherwise the writer was dropped mid-stream (panic,
@@ -395,6 +463,13 @@ pub enum WriterError {
         /// The partition derived from the offending record.
         actual: PartitionKey,
     },
+    /// A prior [`Writer::append_records`] returned a `Parquet`
+    /// error, leaving the underlying writer's buffer in an
+    /// undefined state. [`Writer::close`] refuses to publish to
+    /// protect against landing a partial / corrupted data file;
+    /// the `.parquet.tmp` is preserved on disk for diagnosis.
+    /// Mirrors [`crate::audit_writer::AuditWriterError::Poisoned`].
+    Poisoned,
 }
 
 impl fmt::Display for WriterError {
@@ -441,6 +516,13 @@ impl fmt::Display for WriterError {
                 expected.day,
                 expected.hour,
             ),
+            Self::Poisoned => write!(
+                f,
+                "Writer is poisoned — a prior append_records failed with a Parquet error, \
+                 leaving the buffer in an undefined state; close() refuses to publish to \
+                 avoid landing a partial / corrupted file (the .parquet.tmp is preserved \
+                 on disk for diagnosis)",
+            ),
         }
     }
 }
@@ -451,9 +533,45 @@ impl std::error::Error for WriterError {
             Self::Io { source, .. } => Some(source),
             Self::Parquet(e) => Some(e),
             Self::Batch(e) => Some(e),
-            Self::PartitionMismatch { .. } => None,
+            Self::PartitionMismatch { .. } | Self::Poisoned => None,
         }
     }
+}
+
+/// Inner Parquet-touching loop of [`Writer::append_records`].
+/// Borrows the `ArrowWriter` directly so the caller can set
+/// `self.poisoned = true` after the borrow ends if this returns
+/// an `Err(WriterError::Parquet(_))`. Per the §3.5 row-group
+/// sizing rule, runs a `flush()` when the in-progress buffer
+/// crosses [`ROW_GROUP_FLUSH_BYTES`] (128 MiB). Symmetric helper
+/// to the audit writer's `append_chunks`.
+fn append_chunks(
+    inner: &mut ArrowWriter<File>,
+    records: &[MinedRecord],
+) -> Result<(), WriterError> {
+    // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
+    // flush-if-over-threshold check before every sub-batch.
+    // The bound on row-group size is therefore:
+    //   (§3.5 lower threshold) + (one sub-batch's worth) ≈
+    //   well under §3.5's 1 GiB upper bound for any reasonable
+    //   per-record size. The size check happens *before* every
+    //   sub-batch (not after), so a sub-batch that pushes the
+    //   buffer past the threshold seals the next time around —
+    //   bounded overshoot is intentional; unbounded overshoot
+    //   is what the RFC prohibits.
+    for chunk in records.chunks(SUB_BATCH_ROWS) {
+        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            inner.flush().map_err(WriterError::Parquet)?;
+        }
+        let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
+        inner.write(&batch).map_err(WriterError::Parquet)?;
+    }
+    // Final post-write check so the next `append_records` call
+    // doesn't inherit an over-threshold buffer.
+    if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+        inner.flush().map_err(WriterError::Parquet)?;
+    }
+    Ok(())
 }
 
 /// Build the [`WriterProperties`] that encode RFC 0005 §3.5

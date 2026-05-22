@@ -64,7 +64,7 @@ goals, or post-MVP shipping concerns.
 
 **RFC 0001 §5 scenarios green: 18 / 35.** RFC 0001 status: `red`.
 RFC 0005 §5 scenarios green: **10 / 11** (RFC0005.6 — the
->256 MiB row-group sizing scenario — defers until a corpus run
+≥256 MiB row-group sizing scenario — defers until a corpus run
 exists; see `docs/rfcs/0005-parquet-storage.md` §6). RFC 0005
 status: still `drafted` in frontmatter; a follow-up maintainer
 sign-off bumps it to `green` once RFC0005.6 has a corpus
@@ -87,9 +87,15 @@ What the code does today:
 - **`ourios-miner`** —
   - `tokenize` (Unicode-whitespace splitting, separators
     captured and threaded through `reconstruct()`).
-  - `mask` with `MaskTag` (UUID / IPv4 / NUM emitters; HEX / TS
-    / PATH / STR / OVERFLOW reserved variants — STR / OVERFLOW
-    emitters live; HEX / TS / PATH still reserved).
+  - `mask` — the private `MaskTag` enum carries the
+    mask-emitted subset (`Uuid`, `Ip`, `Num`); `ParamType` in
+    `ourios-core` carries the full RFC 0001 §6.1 alphabet
+    (including the reserved `Hex` / `Ts` / `Path` and the
+    non-mask-emitted `Str` / `Overflow`). `Str` is produced by
+    widening (§6.2 step 5b — slot type expansion); `Overflow`
+    is produced by the per-parameter byte-limit check (§6.5,
+    in `overflow`). `Hex` / `Ts` / `Path` are reserved with no
+    emitter yet.
   - `sim_seq` + `confidence_ratio` + `Token` (RFC §3.2 / §6.3
     primitives, driving best-candidate attach selection).
   - `tree` — Drain prefix tree with descend + descend_mut.

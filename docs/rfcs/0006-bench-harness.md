@@ -167,15 +167,15 @@ harness, call `harness.run()`, hand the result to `report`.
 
 No trait abstraction over `Harness` or `Corpus` until a second
 consumer exists. The crate is internal to the project; SemVer
-applies to it only via the `WrittenFile` shape under
+applies to it only via the `report::ResultsFile` shape under
 `benchmarks/results/<...>.json`.
 
 ### 3.3 Corpus format
 
 For v1, the bench reads plain-text `*.txt` files under
 `testdata/corpus/` per the existing convention in
-`testdata/corpus/README.md` and `crates/ourios-miner/tests/
-hazards.rs`. Each non-empty line becomes one `OtlpLogRecord`
+`testdata/corpus/README.md` and the loader in
+`crates/ourios-miner/tests/hazards.rs`. Each non-empty line becomes one `OtlpLogRecord`
 with `Body::String(line)`, a default tenant (`bench-tenant`),
 severity (`9` / `INFO`), and scope (`None` / `None`); the
 in-memory shape matches what `MinerCluster::ingest` expects
@@ -233,7 +233,9 @@ Pinned definitions:
   for every `*.txt` file in the corpus directory the bench was
   invoked against. UTF-8 encoded; trailing newlines included.
   No transformation: this is the byte count an operator
-  measures with `du -b testdata/corpus/`.
+  measures with `find testdata/corpus/ -name '*.txt' -exec
+  stat --printf='%s\n' {} + | awk '{s+=$1}END{print s}'`
+  (or the platform equivalent).
 - **`bytes(ourios_output)`**: sum of
   `std::fs::metadata(p).len()` for every `*.parquet` file
   under the bench's output bucket directory, **including the
@@ -695,7 +697,7 @@ the harness or the formulas.
 > - **Then** `c2.corpus_at_least_1m = true`
 > - **And** `template_count_at_1m_lines` is the integer
 >   sample-count at the sample whose line index is closest to
->   `1_000_000`
+>   `999_999` (zero-indexed; per §3.4.3)
 > - **And** `template_count_at_end` is the integer sample-count
 >   at the final sample (the §3.4.3 SS definition)
 > - **And** `convergence_ratio = template_count_at_1m_lines /

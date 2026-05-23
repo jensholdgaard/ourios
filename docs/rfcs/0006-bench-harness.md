@@ -173,13 +173,27 @@ applies to it only via the `report::ResultsFile` shape under
 ### 3.3 Corpus format
 
 For v1, the bench reads plain-text `*.txt` files under
-`testdata/corpus/` per the existing convention in
-`testdata/corpus/README.md` and the loader in
-`crates/ourios-miner/tests/hazards.rs`. Each non-empty line becomes one `OtlpLogRecord`
+`testdata/corpus/` per the format convention in
+`testdata/corpus/README.md` (one log line per row, UTF-8, empty
+rows skipped). Each non-empty line becomes one `OtlpLogRecord`
 with `Body::String(line)`, a default tenant (`bench-tenant`),
 severity (`9` / `INFO`), and scope (`None` / `None`); the
 in-memory shape matches what `MinerCluster::ingest` expects
 for `body_kind = String` records.
+
+The bench reuses the same corpus files and one-line-per-record
+shape as the H7.1 loader in
+`crates/ourios-miner/tests/hazards.rs`, but intentionally
+differs on pipeline defaults: H7.1 uses tenant `"corpus"` and
+severity `0` (unspecified), while the bench uses `"bench-tenant"`
+and severity `9` (`INFO`). The divergence is deliberate —
+H7.1 exercises the miner's body-reconstruction invariant where
+tenant/severity are irrelevant, whereas the bench exercises
+the full write path where a realistic severity aids coverage of
+the Parquet writer's field encoding. Both loaders produce
+`Body::String` records from the same `*.txt` files; they are
+not code-shared because their purposes and default-filling
+strategies differ.
 
 Time stamps for the synthesised records are deterministic:
 `time_unix_nano` starts at a fixed RFC 0005-friendly baseline
@@ -432,9 +446,9 @@ like:
   "hardware_kind": "baseline-8vcpu-32gib",
   "corpus": {
     "directory": "testdata/corpus/",
-    "total_lines": 12345,
+    "total_lines": 1234567,
     "total_files": 2,
-    "raw_bytes": 1234567
+    "raw_bytes": 98765432
   },
   "ourios": {
     "data_parquet_bytes": 56789,
@@ -460,14 +474,14 @@ like:
     "pass": true
   },
   "c2": {
-    "sample_cadence": 12,
+    "sample_cadence": 1206,
     "total_lines": 1234567,
     "template_count_at_1m_lines": 142,
     "template_count_at_end": 145,
     "convergence_ratio": 0.979,
     "convergence_curve": [
-      {"lines": 100000, "template_count": 98},
-      {"lines": 200000, "template_count": 121}
+      {"lines": 1206, "template_count": 14},
+      {"lines": 2412, "template_count": 27}
     ],
     "pass": true,
     "corpus_at_least_1m": true

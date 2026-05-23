@@ -364,10 +364,11 @@ this is SS), `convergence_ratio` (three-decimal float; `null`
 for short corpora), `pass` (bool or `null`),
 `corpus_at_least_1m` (bool).
 
-A future RFC may add a `convergence_curve` artefact (the full
-sample series, written next to the results JSON) so the §9
-Results section can include plots. v1 records the curve in the
-results JSON but does not plot.
+v1 records the convergence curve in the results JSON (as
+`c2.convergence_curve`, an array of `{"lines": N,
+"template_count": M}` objects at the sample cadence) but does
+not plot it. A future RFC may add a plot artefact so the §9
+Results section can include visualisations.
 
 ### 3.5 Hardware baseline and annotation
 
@@ -401,11 +402,12 @@ within the same wall-clock second produce different filenames.
 Even at millisecond precision two runs *can* theoretically
 collide on a fast machine; the bench detects the conflict at
 write time and retries with the next millisecond's timestamp,
-emitting a warning to stderr. The directory `benchmarks/` is at
-the repo root; it is gitignored except for the `results/`
-subdirectory's `.gitkeep` and the runs the maintainer chooses
-to commit (the §9 Results section then cites those by file
-path).
+emitting a warning to stderr. The directory `benchmarks/` will be created at the repo root by
+the implementation PR that lands the `ourios-bench` crate. That
+same PR adds a `.gitignore` entry ignoring `benchmarks/results/`
+except for a `.gitkeep` and the specific runs the maintainer
+chooses to commit (the §9 Results section then cites those by
+file path).
 
 The JSON shape is pinned by `report::ResultsFile` and looks
 like:
@@ -451,6 +453,10 @@ like:
     "template_count_at_1m_lines": 142,
     "template_count_at_end": 145,
     "convergence_ratio": 0.979,
+    "convergence_curve": [
+      {"lines": 100000, "template_count": 98},
+      {"lines": 200000, "template_count": 121}
+    ],
     "pass": true,
     "corpus_at_least_1m": true
   }
@@ -467,9 +473,11 @@ about; the paths are debug-only and logged to stderr when
 
 `rfc_version` is a literal `"v1"` and tracks RFC 0006
 amendments; bumping it requires an RFC amendment, and downstream
-analysis tooling refuses unknown versions (matching the
-RFC 0005 §3.9 "unknown column ignored, unknown ordinal
-explicit error" pattern).
+analysis tooling refuses unknown versions with a hard error.
+This is the bench's own forward-compatibility policy — the
+results JSON is a closed schema, unlike RFC 0005 §3.9's Parquet
+reader which ignores unknown columns and surfaces unknown
+ordinals as `ParamType::Unknown`.
 
 A human-readable summary is appended to `docs/benchmarks.md`
 §9 as a sub-heading per run, with the same numbers in a
@@ -626,7 +634,9 @@ the harness or the formulas.
 > **Scenario RFC0006.1 — A1 formula is well-defined on the seed corpus**
 > - **Given** the bench is invoked with `--corpus testdata/
 >   corpus/`, the writer ships with the §3.5 / §3.6 RFC 0005
->   encoding policy, and `zstd -19` is installed on the host
+>   encoding policy, and a ZSTD level-19 reference
+>   implementation is available (shell-out vs `zstd_safe` — §7
+>   open question)
 > - **When** the bench runs the A1 measurement
 > - **Then** `bytes(raw_corpus)` equals
 >   `sum(std::fs::metadata(f).len())` over the `*.txt` files
@@ -767,11 +777,12 @@ Per `CLAUDE.md` §6.2 / `docs/verification.md` §2:
 - **RFC0006.3** — integration test in
   `crates/ourios-bench/tests/c2.rs`. Builds a synthetic
   corpus in memory (no committed `testdata/`) of 1.5 M lines
-  with a known small template alphabet; asserts plateau is
-  detected before 1 M lines and `plateau_ratio` falls in
-  `[0.95, 1.0]`. A second sub-test feeds a non-plateauing
-  corpus (every line introduces a new template structure)
-  and asserts `c2.pass = false`.
+  with a known small template alphabet; asserts
+  `convergence_ratio ≥ 0.5` and the convergence curve has
+  exactly `total_lines / sample_cadence` entries (rounded). A
+  second sub-test feeds a non-plateauing corpus (every line
+  introduces a new template structure) and asserts
+  `c2.pass = false`.
 - **RFC0006.4** — colocated unit test in
   `crates/ourios-bench/src/report.rs`. Serialises a
   hand-built `ResultsFile`, parses the JSON back, asserts
@@ -815,8 +826,9 @@ are a separate measurement category.
       slow-test CI cadence. This RFC inherits the question;
       resolution is the workflow PR that lands the cadence.
 - [ ] **Result-file retention policy.** `benchmarks/
-      results/*.json` is gitignored by default; specific runs
-      are committed when the maintainer cites them in §9.
+      results/*.json` will be gitignored by default (§3.6);
+      specific runs are committed when the maintainer cites
+      them in §9.
       Open: should there be a `benchmarks/results/baseline/`
       sub-directory whose contents are *always* committed, so
       regression detection has a stable reference even when

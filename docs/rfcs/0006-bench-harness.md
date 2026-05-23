@@ -336,13 +336,22 @@ Pinned definitions:
   uses ceiling division so the curve never exceeds 1024
   samples regardless of corpus size; a 1 M-line corpus
   samples every 977 lines, a 10 k-line corpus samples every
-  10 lines.
+  10 lines. **Sampling indices**: the curve records
+  template count after processing line indices
+  `N-1, 2N-1, 3N-1, …` (i.e. after every N-th line,
+  zero-indexed). The final sample is always taken at
+  `total_lines - 1` (the last line), regardless of whether
+  it falls on a cadence boundary. The sample count is
+  therefore `ceil(total_lines / N)` — at most 1024 entries.
 - **Steady-state value (SS)**: the template count at the
-  **last** sample (line index = `total_lines - 1` rounded to
-  the nearest sample). Operationally, "where the curve ended
+  **last** sample (line index = `total_lines - 1`; always
+  included by the final-sample rule above).
+  Operationally, "where the curve ended
   up". Not the running max — see the rationale paragraph above.
 - **Count at 1 M lines**: the template count at the sample
-  whose line index is closest to `1_000_000`. Defined only on
+  whose line index is closest to `999_999` (the millionth
+  line, zero-indexed). When two samples are equidistant, the
+  earlier one wins (floor tie-break). Defined only on
   corpora of `≥ 1_000_000` lines.
 - **Convergence ratio**: `count_at_1m / SS`. By monotonicity,
   this lives in `(0.0, 1.0]`.
@@ -426,8 +435,9 @@ like:
     "raw_bytes": 1234567
   },
   "ourios": {
-    "parquet_bytes": 89012,
-    "audit_bytes": 1024
+    "data_parquet_bytes": 56789,
+    "audit_parquet_bytes": 1024,
+    "total_parquet_bytes": 57813
   },
   "zstd": {
     "level": 19,
@@ -469,7 +479,14 @@ JSON. They're an implementation detail that differs across
 runs and would otherwise break the §5 RFC0006.7 reproducibility
 scenario. The byte counts are what downstream analysis cares
 about; the paths are debug-only and logged to stderr when
-`--keep-parquet` is passed.
+`--keep-parquet` is passed. The field relationship:
+`total_parquet_bytes = data_parquet_bytes + audit_parquet_bytes`,
+and `total_parquet_bytes` is the value §3.4.1 calls
+`bytes(ourios_output)`. `data_parquet_bytes` is the sum of
+`*.parquet` sizes under `data/…`; `audit_parquet_bytes` is the
+sum under `audit/…`. The split is recorded for diagnostic
+transparency (understanding how much of the footprint is audit
+overhead) but the A1 formula operates on the total.
 
 `rfc_version` is a literal `"v1"` and tracks RFC 0006
 amendments; bumping it requires an RFC amendment, and downstream
@@ -742,8 +759,9 @@ the harness or the formulas.
 > - **Then** every measurement field of the results JSON is
 >   bit-identical across the two runs — specifically
 >   `corpus.raw_bytes`, `corpus.total_lines`,
->   `corpus.total_files`, `ourios.parquet_bytes`,
->   `ourios.audit_bytes`, `zstd.compressed_bytes`, `a1.delta`,
+>   `corpus.total_files`, `ourios.data_parquet_bytes`,
+>   `ourios.audit_parquet_bytes`, `ourios.total_parquet_bytes`,
+>   `zstd.compressed_bytes`, `a1.delta`,
 >   `c1.rate`, `c1.non_lossy_total`,
 >   `c1.non_lossy_reconstruct_ok`, `c2.template_count_at_end`,
 >   and (when the corpus is `≥ 1 M lines`)
@@ -763,7 +781,7 @@ Per `CLAUDE.md` §6.2 / `docs/verification.md` §2:
   `ourios_bench::run` against a fixture corpus committed under
   `crates/ourios-bench/tests/fixtures/`, captures the
   resulting JSON, and asserts each formula leg
-  (`raw_bytes` from `fs::metadata`, `parquet_bytes` from
+  (`raw_bytes` from `fs::metadata`, `total_parquet_bytes` from
   inspecting the output bucket, `zstd_bytes` from the
   `zstd_safe` crate or a shell-out — see §7 open question on
   the codec wrapper choice).

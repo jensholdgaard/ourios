@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Bench harness — A1 / C1 / C2 thesis-gate measurement
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-22
@@ -103,7 +103,7 @@ This RFC pins:
   writer).
 - The corpus input format for v1 — plain-text `*.txt` files
   under `testdata/corpus/`, one line per row, UTF-8, matching
-  the existing `crates/ourios-miner/tests/corpus.rs` loader.
+  the existing `crates/ourios-miner/tests/hazards.rs` loader.
   An OTLP-LogsData migration is a future PR; A1 / C1 / C2 are
   meaningful on plain-text input today.
 - The A1 / C1 / C2 measurement formulas — what is divided by
@@ -113,7 +113,7 @@ This RFC pins:
   across hardware classes don't masquerade as code
   regressions.
 - The output format: a per-run JSON results file under
-  `benchmarks/results/<UTC-RFC3339>-<git-sha>.json`, and a
+  `benchmarks/results/<UTC-RFC3339-ms>-<git-sha7>.json`, and a
   human-readable summary appended to `docs/benchmarks.md` §9
   under a date-stamped sub-heading.
 - The invocation surface: `cargo run -p ourios-bench --` or
@@ -148,7 +148,7 @@ crates/ourios-bench/
     ├── main.rs        # CLI entry point, argument parsing
     ├── lib.rs         # public surface for integration tests
     ├── corpus.rs      # *.txt loader (mirrors ourios-miner's
-    │                  # tests/corpus.rs but factored for reuse)
+    │                  # tests/hazards.rs but factored for reuse)
     ├── harness.rs     # ingest loop, per-line measurement
     │                  # callbacks (lines into miner, records
     │                  # into Parquet writer, samples C2)
@@ -175,7 +175,7 @@ applies to it only via the `WrittenFile` shape under
 For v1, the bench reads plain-text `*.txt` files under
 `testdata/corpus/` per the existing convention in
 `testdata/corpus/README.md` and `crates/ourios-miner/tests/
-corpus.rs`. Each non-empty line becomes one `OtlpLogRecord`
+hazards.rs`. Each non-empty line becomes one `OtlpLogRecord`
 with `Body::String(line)`, a default tenant (`bench-tenant`),
 severity (`9` / `INFO`), and scope (`None` / `None`); the
 in-memory shape matches what `MinerCluster::ingest` expects
@@ -285,7 +285,7 @@ Pinned definitions:
 - **`reconstruct(record)`** is the function exposed by
   `ourios_miner::reconstruct::reconstruct` (the same one
   RFC 0001 §6.6 specifies and `crates/ourios-miner/tests/
-  corpus.rs` already exercises at unit scale via H7.1).
+  hazards.rs` already exercises at unit scale via H7.1).
 - **`bytes`** is the original line bytes the loader handed
   `MinerCluster::ingest`, captured by the harness alongside
   each `MinedRecord`. The bench MUST capture the input line
@@ -332,11 +332,11 @@ copilot review of this RFC.
 Pinned definitions:
 
 - **Sample cadence**: every `N` lines, where
-  `N = max(1, lines_in_corpus / 1024)`. The cadence is
-  corpus-relative so the convergence curve has the same
-  resolution (~1024 samples) regardless of corpus size; a
-  1 M-line corpus samples every 977 lines, a 10 k-line corpus
-  samples every 10 lines.
+  `N = max(1, ceil(lines_in_corpus / 1024))`. The cadence
+  uses ceiling division so the curve never exceeds 1024
+  samples regardless of corpus size; a 1 M-line corpus
+  samples every 977 lines, a 10 k-line corpus samples every
+  10 lines.
 - **Steady-state value (SS)**: the template count at the
   **last** sample (line index = `total_lines - 1` rounded to
   the nearest sample). Operationally, "where the curve ended

@@ -102,10 +102,15 @@ This RFC pins:
   of supporting modules (corpus loader, ingest harness, result
   writer).
 - The corpus input format for v1 — plain-text `*.txt` files
-  under `testdata/corpus/`, one line per row, UTF-8, matching
-  the existing `crates/ourios-miner/tests/hazards.rs` loader.
-  An OTLP-LogsData migration is a future PR; A1 / C1 / C2 are
-  meaningful on plain-text input today.
+  under `testdata/corpus/`, one line per row, UTF-8, the same
+  on-disk shape `testdata/corpus/README.md` documents and the
+  existing H7.1 property test in
+  `crates/ourios-miner/tests/hazards.rs` reads. The bench
+  reuses the on-disk *format*, not the test's `OtlpLogRecord`
+  fixture defaults (see §3.3 for the bench-specific
+  tenant / severity / scope envelope). An OTLP-LogsData
+  migration is a future PR; A1 / C1 / C2 are meaningful on
+  plain-text input today.
 - The A1 / C1 / C2 measurement formulas — what is divided by
   what, where the byte counts come from, what equality means.
 - The "hardware baseline annotation" rule: every result line
@@ -117,9 +122,12 @@ This RFC pins:
   human-readable summary appended to `docs/benchmarks.md` §9
   under a date-stamped sub-heading.
 - The invocation surface: `cargo run -p ourios-bench --` or
-  `just bench`, with CLI flags pinning corpus selection,
-  result-file output, and the optional "annotate-only mode"
-  that runs measurements but does not write `benchmarks.md`.
+  `just thesis-bench`, with CLI flags pinning corpus
+  selection, result-file output, and the optional
+  "annotate-only mode" that runs measurements but does not
+  write `benchmarks.md`. The recipe is *not* named
+  `just bench` — that name is already taken by the
+  criterion-micro-benchmark recipe in `justfile`; see §3.7.
 
 This RFC does **not** pin:
 
@@ -298,10 +306,29 @@ failure (non-zero exit code) rather than a degraded gate.
 
 Pinned definitions:
 
-- **`reconstruct(record)`** is the function exposed by
-  `ourios_miner::reconstruct::reconstruct` (the same one
-  RFC 0001 §6.6 specifies and `crates/ourios-miner/tests/
-  hazards.rs` already exercises at unit scale via H7.1).
+- **`reconstruct(record, template)`** is the function exposed
+  by `ourios_miner::reconstruct::reconstruct`, signature
+  `fn reconstruct(record: &MinedRecord, template: &[OwnedToken])
+  -> Vec<u8>` — same function RFC 0001 §6.6 specifies and the
+  H7.1 property test in `crates/ourios-miner/tests/hazards.rs`
+  already exercises at unit scale. The function takes the
+  emitted record **and** the leaf's template token slice at
+  the record's emit-time `(template_id, template_version)`;
+  template snapshots have to be captured separately because a
+  later attach can widen the same leaf and rewrite the live
+  template.
+- **Template-snapshot capture** mirrors the H7.1 pattern:
+  after each `MinerCluster::ingest`, the harness walks
+  `cluster.templates_for(tenant)` and records the current
+  template tokens into a `HashMap<(template_id,
+  template_version), Vec<OwnedToken>>` via `or_insert_with`
+  (so the first observation of a `(id, v)` pair wins and
+  later widenings produce `(id, v+1)` entries without
+  clobbering). At C1 evaluation time, each record's
+  `(template_id, template_version)` looks up its
+  emit-time-active snapshot. A record whose key is not in the
+  map is a contract violation — the harness exits with
+  non-zero before reporting C1.
 - **`bytes`** is the original line bytes the loader handed
   `MinerCluster::ingest`, captured by the harness alongside
   each `MinedRecord`. The bench MUST capture the input line
@@ -309,9 +336,9 @@ Pinned definitions:
   the comparison happens against the exact bytes the miner
   saw.
 - **Equality** is byte-for-byte `==` between
-  `reconstruct(record).as_bytes()` and the captured line
-  bytes. No trailing-newline normalisation, no case folding,
-  no whitespace trimming.
+  `reconstruct(record, template)` (a `Vec<u8>`) and
+  `line.as_bytes()`. No trailing-newline normalisation, no
+  case folding, no whitespace trimming.
 - Reported as a fraction with **six** decimal places
   (`1.000000` / `0.999998`). C1's `100.000%` target makes
   three-decimal precision insufficient — a single failing
@@ -569,11 +596,17 @@ Flags:
   gates to compute. Useful when iterating on a single
   measurement.
 
-Adds a `just bench` recipe wrapping `cargo run -p
-ourios-bench --release --`. The `--release` is normative — A1
-on a debug-mode writer would understate compression because
-debug builds disable some `arrow` / `parquet` optimisations
-the release writer relies on.
+Adds a `just thesis-bench` recipe wrapping `cargo run -p
+ourios-bench --release --`. The recipe is *not* named
+`just bench` — the existing `bench` recipe in `justfile`
+already runs `cargo bench` (criterion micro-benchmarks; the
+suite is empty today, but the recipe is reserved for the
+follow-up that lands `crates/ourios-bench/benches/`).
+`thesis-bench` makes the gate-vs-microbench distinction
+greppable at the recipe level. The `--release` is normative —
+A1 on a debug-mode writer would understate compression
+because debug builds disable some `arrow` / `parquet`
+optimisations the release writer relies on.
 
 CI cadence: not on every PR — too slow for the per-PR loop and
 hardware-dependent in ways that would generate noise. The

@@ -531,6 +531,18 @@ sum under `audit/…`. The split is recorded for diagnostic
 transparency (understanding how much of the footprint is audit
 overhead) but the A1 formula operates on the total.
 
+**Gate sections are nullable.** The `a1`, `c1`, and `c2` keys
+are always present at the top level but their values are
+`null` when the corresponding gate is skipped (via
+`--gates` per §3.7) or abstains (e.g. `c2` on a corpus of
+`< 1 M lines` — see §3.4.3). The example above shows all
+three populated (the "all gates ran, all gates pass" case);
+a `--gates c1` run produces `"a1": null, "c2": null` while
+`"c1": { ... }` carries the populated payload. Downstream
+analysis MUST handle the `null` case (rather than assuming
+the object shape) — the §5 RFC0006.6 scenario asserts the
+behaviour.
+
 `rfc_version` is a literal `"v1"` and tracks RFC 0006
 amendments; bumping it requires an RFC amendment, and downstream
 analysis tooling refuses unknown versions with a hard error.
@@ -743,18 +755,21 @@ the harness or the formulas.
 > - **When** the bench runs the C2 measurement
 > - **Then** `c2.corpus_at_least_1m = true`
 > - **And** `template_count_at_1m_lines` is the integer
->   sample-count at the sample whose line index is closest to
->   `999_999` (zero-indexed; per §3.4.3)
-> - **And** `template_count_at_end` is the integer sample-count
->   at the final sample (the §3.4.3 SS definition)
+>   **template count** at the sample whose line index is
+>   closest to `999_999` (zero-indexed; per §3.4.3)
+> - **And** `template_count_at_end` is the integer
+>   **template count** at the final sample (the §3.4.3 SS
+>   definition)
 > - **And** `convergence_ratio = template_count_at_1m_lines /
 >   template_count_at_end ≥ 0.5` — the "within 2× of SS"
 >   gate, made non-tautological by defining SS as the
 >   end-of-corpus value rather than the running max
 > - **And** `c2.pass = true`
 > - **And** the convergence curve in the results JSON has
->   exactly the `sample_cadence`-derived number of samples
->   (`total_lines / cadence`, rounded)
+>   exactly `ceil(total_lines / sample_cadence)` samples (the
+>   sampling rule pinned in §3.4.3: indices
+>   `N-1, 2N-1, 3N-1, …` plus a guaranteed final sample at
+>   `total_lines - 1`)
 > - **And** on a corpus of `< 1_000_000` lines,
 >   `c2.corpus_at_least_1m = false`, `c2.pass = null`, and
 >   `c2.template_count_at_1m_lines = null` — the gate

@@ -235,16 +235,25 @@ fn walk(
         })?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
-            let raw = line.map_err(|e| BenchError::Corpus {
+            // `lines()` allocates one `String` per line and
+            // strips the trailing `\n` but not `\r`. Pop the
+            // CR(s) a CRLF file leaves in place rather than
+            // `trim_end_matches('\r').to_string()` (which
+            // would allocate a second copy on every line), then
+            // move the `String` straight into `Body::String` —
+            // one allocation per line on the hot loader path.
+            let mut raw = line.map_err(|e| BenchError::Corpus {
                 detail: format!("read line in {}: {e}", path.display()),
             })?;
-            let trimmed = raw.trim_end_matches('\r');
-            if trimmed.is_empty() {
+            while raw.ends_with('\r') {
+                raw.pop();
+            }
+            if raw.is_empty() {
                 continue;
             }
             lines.push(OtlpLogRecord {
                 tenant_id: tenant.clone(),
-                body: Some(Body::String(trimmed.to_string())),
+                body: Some(Body::String(raw)),
                 time_unix_nano: *next_ns,
                 severity_number: BENCH_SEVERITY_NUMBER,
                 severity_text: Some(BENCH_SEVERITY_TEXT.to_string()),
@@ -311,6 +320,40 @@ mod tests {
         assert!(
             matches!(err, BenchError::Corpus { .. }),
             "expected Corpus variant, got {err:?}",
+        );
+    }
+
+    /// CRLF line endings get their trailing `\r` stripped (the
+    /// `while raw.ends_with('\r') { raw.pop() }` path) and
+    /// blank lines — including CR-only lines — are skipped.
+    /// Pins the loader's CR handling, which the
+    /// single-allocation refactor rewrote from
+    /// `trim_end_matches('\r')` to in-place `pop`.
+    #[test]
+    fn strips_crlf_and_skips_blank_lines() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("crlf.txt");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // Two real CRLF lines with a CR-only blank line
+        // between them — only the two real lines survive.
+        // (`lines()` splits on `\n`, so each `\r\n` becomes a
+        // line with a trailing `\r`, and the lone `\r\n`
+        // becomes a `"\r"` that pops to empty.)
+        file.write_all(b"user 42 logged in\r\n\r\nuser 43 logged in\r\n")
+            .expect("write");
+        drop(file);
+
+        let load = load(tmp.path()).expect("crlf corpus loads");
+        assert_eq!(load.lines.len(), 2, "blank + CR-only lines are skipped");
+        assert_eq!(
+            line_bytes(&load.lines[0]),
+            Some("user 42 logged in".as_bytes()),
+            "trailing CR stripped, no leftover \\r",
+        );
+        assert_eq!(
+            line_bytes(&load.lines[1]),
+            Some("user 43 logged in".as_bytes()),
         );
     }
 

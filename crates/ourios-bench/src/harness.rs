@@ -12,9 +12,10 @@
 //!
 //! Mirrors the H7.1 property test pattern in
 //! `crates/ourios-miner/tests/hazards.rs` for the snapshot
-//! capture (per-`(template_id, template_version)` token
-//! tokens via `or_insert`); the streaming surface is the
-//! bench-specific shape.
+//! capture (per-`(template_id, template_version)` template
+//! tokens captured once per unique pair via
+//! `HashMap::entry(...).Vacant.insert`); the streaming
+//! surface is the bench-specific shape.
 //!
 //! Future implementation PRs plug additional gate
 //! accumulators into the same callback signature:

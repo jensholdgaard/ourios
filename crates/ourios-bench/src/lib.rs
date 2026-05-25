@@ -111,7 +111,7 @@ impl GateSet {
 /// # Panics
 ///
 /// Panics on a `usize → u64` conversion failure for
-/// `harness_output.lines.len()`. The bound is documented
+/// `corpus_load.lines.len()`. The bound is documented
 /// inline: `usize ≤ u64` holds on every Rust Tier 1 / 2
 /// target, so this only fires on a hypothetical 128-bit
 /// platform — at which point the panic is exactly the

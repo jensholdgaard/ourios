@@ -2,22 +2,24 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! This file is the **Red-stage scaffold** for the RFC. The
-//! public surface declared here is what the RFC0006.1–7
-//! acceptance-criterion tests will exercise once they land in
-//! a follow-up PR; today every entry point returns
-//! [`BenchError::NotImplemented`] so the crate compiles, the
-//! test stubs link, and the maturity-model gate (`specified`
-//! → `red`: stubs exist and fail) is satisfied without
-//! pre-committing to an implementation shape the tests would
-//! then have to fight.
+//! **Implementation status (PR-I1):** the C1 gate is live —
+//! [`run`] computes C1 end-to-end on the corpus directory
+//! when `config.gates.c1` is set and returns a populated
+//! [`ResultsFile`]. A1 and C2 still return
+//! [`BenchError::NotImplemented`] when selected via
+//! `config.gates`; their `#[ignore]`'d test stubs in
+//! `tests/{a1,c2,reproducibility}.rs` get un-ignored as the
+//! respective implementations land. The CLI parser (RFC 0006
+//! §3.7) and the `docs/benchmarks.md` §9 result-file writer
+//! ([`ResultsFile`] → disk / markdown) also remain
+//! unwritten — `main.rs` is the red-stage scaffold and the
+//! binary path doesn't yet drive [`run`].
 //!
 //! Per RFC 0006 §3.2 the eventual module layout is `corpus`,
 //! `harness`, `a1`, `c1`, `c2`, `report`. Those modules land
-//! incrementally. PR-I1 extracts `corpus`, `harness`, and
-//! `c1` to bring the C1 gate into the green column;
-//! `a1` / `c2` / `report` remain collapsed (and unwritten)
-//! until their respective implementation PRs.
+//! incrementally. PR-I1 extracted `corpus`, `harness`, and
+//! `c1`; `a1` / `c2` / `report` remain collapsed (and
+//! unwritten) until their respective implementation PRs.
 
 #![deny(unsafe_code)]
 

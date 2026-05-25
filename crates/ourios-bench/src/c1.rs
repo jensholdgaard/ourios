@@ -28,9 +28,12 @@ use crate::harness::HarnessOutput;
 
 /// Compute the C1 result for one harness run. Returns the
 /// populated [`C1Result`] regardless of whether the gate
-/// passes; the caller surfaces `c1.pass = false` via the
-/// results JSON, and `main.rs` translates that into a
-/// non-zero process exit per §3.4.2.
+/// passes; `c1.pass = false` lands in the results JSON when
+/// any non-lossy row failed to reconstruct. Translating that
+/// flag into a non-zero process exit is the binary's
+/// responsibility per §3.4.2 — that path lands with the CLI
+/// parser PR; today `main.rs` is the red-stage scaffold and
+/// doesn't yet drive [`crate::run`].
 ///
 /// The two `u64 → f64` casts (for `rate` and
 /// `lossy_flag_ratio`) lose precision above `2^52` ≈ 4.5 × 10¹⁵

@@ -141,7 +141,16 @@ fn walk(
 
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        // Use `fs::metadata` (fallible, symlink-following)
+        // rather than `Path::is_dir` (which returns `false`
+        // on metadata errors and would silently skip
+        // unreadable subdirectories). A permission-denied
+        // subdir now surfaces as `BenchError::Corpus`
+        // instead of disappearing from the corpus count.
+        let meta = fs::metadata(&path).map_err(|e| BenchError::Corpus {
+            detail: format!("metadata({}): {e}", path.display()),
+        })?;
+        if meta.is_dir() {
             walk(&path, total_files, raw_bytes, lines, tenant, next_ns)?;
             continue;
         }
@@ -152,9 +161,6 @@ fn walk(
             continue;
         }
         *total_files += 1;
-        let meta = entry.metadata().map_err(|e| BenchError::Corpus {
-            detail: format!("metadata({}): {e}", path.display()),
-        })?;
         *raw_bytes += meta.len();
         // Stream lines via `BufReader` rather than slurping
         // the whole file with `read_to_string` — RFC 0006

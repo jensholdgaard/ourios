@@ -802,6 +802,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-bench"
+version = "0.0.0"
+dependencies = [
+ "ourios-core",
+ "ourios-miner",
+ "ourios-parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "ourios-core"
 version = "0.0.0"
 dependencies = [

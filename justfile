@@ -43,6 +43,13 @@ book-serve:
 bench:
     cargo bench
 
+# Run the RFC 0006 thesis-gate bench harness (A1 / C1 / C2).
+# Always release mode — RFC 0006 §3.7 pins `--release` as
+# normative because debug-mode codec output understates A1.
+# Implementation is in-flight; see `crates/ourios-bench/`.
+thesis-bench *ARGS:
+    cargo run -p ourios-bench --release -- {{ARGS}}
+
 # Lint commit message (requires `committed`: cargo install committed).
 lint-commits:
     committed --commit-file .git/COMMIT_EDITMSG

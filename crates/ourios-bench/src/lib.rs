@@ -185,7 +185,7 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     let c1_result = c1_acc.map(|acc| acc.finalize());
     let (a1_result, ourios, zstd) = match a1_acc {
         Some(mut acc) => {
-            acc.write_audit(&harness_result.audit_events)?;
+            acc.write_audit(harness_result.audit_events)?;
             let a1 = acc.finalize(raw_bytes, &config.corpus_dir)?;
             let ourios = OuriosStats {
                 data_parquet_bytes: a1.data_parquet_bytes,
@@ -284,7 +284,16 @@ fn ensure_bucket_has_no_parquet(bucket_root: &std::path::Path) -> Result<(), Ben
                     detail: format!("scan bucket entry under {}: {e}", d.display()),
                 })?;
                 let path = entry.path();
-                if path.is_dir() {
+                // `fs::metadata` (fallible) rather than
+                // `Path::is_dir` (false on metadata errors),
+                // so an unreadable entry fails the scan
+                // instead of being silently treated as a
+                // non-directory and skipped — which could miss
+                // nested `*.parquet`.
+                let meta = std::fs::metadata(&path).map_err(|e| BenchError::Pipeline {
+                    detail: format!("scan bucket metadata({}): {e}", path.display()),
+                })?;
+                if meta.is_dir() {
                     stack.push(path);
                 } else if path
                     .extension()

@@ -125,17 +125,16 @@ impl A1Accumulator {
     /// proxy record carrying the event's tenant + timestamp,
     /// the established `ourios-parquet` pattern). Called once
     /// after the harness loop, before [`Self::finalize`].
-    pub(crate) fn write_audit(&mut self, events: &[AuditEvent]) -> Result<(), crate::BenchError> {
+    pub(crate) fn write_audit(&mut self, events: Vec<AuditEvent>) -> Result<(), crate::BenchError> {
         if let Some(e) = self.error.take() {
             return Err(e);
         }
         let mut by_partition: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
         for event in events {
-            let partition = audit_partition(event)?;
-            by_partition
-                .entry(partition)
-                .or_default()
-                .push(event.clone());
+            // Borrow for the partition derive, then move the
+            // event into the per-partition vec — no clone.
+            let partition = audit_partition(&event)?;
+            by_partition.entry(partition).or_default().push(event);
         }
         for (partition, events) in by_partition {
             let mut writer = AuditWriter::open(&self.bucket_root, partition).map_err(|e| {
@@ -221,9 +220,16 @@ fn audit_partition(event: &AuditEvent) -> Result<PartitionKey, crate::BenchError
         time_unix_nano,
         ..proxy_record()
     };
-    PartitionKey::derive(&proxy).map_err(|e| crate::BenchError::Pipeline {
+    let mut key = PartitionKey::derive(&proxy).map_err(|e| crate::BenchError::Pipeline {
         detail: format!("audit partition derive failed: {e}"),
-    })
+    })?;
+    // Audit partitioning is day-granular — `audit_path` drops
+    // the `hour` segment (RFC 0005 §3.4: "audit volume is far
+    // lower"). Normalising `hour` to 0 collapses all same-day
+    // events onto one key so a multi-hour run writes a single
+    // audit file per day instead of one per (day, hour).
+    key.hour = 0;
+    Ok(key)
 }
 
 /// A `MinedRecord` with every field at its zero value, used

@@ -1,10 +1,13 @@
 //! `ourios-bench` binary entry point.
 //!
-//! Thin wrapper that parses CLI arguments into a
-//! [`ourios_bench::BenchConfig`] and calls
-//! [`ourios_bench::run`]. The CLI surface is pinned by
-//! RFC 0006 §3.7; this file is the Red-gate scaffold and the
-//! argument parser is still a stub.
+//! Once implemented, this binary will be a thin wrapper that
+//! parses CLI arguments into a [`ourios_bench::BenchConfig`]
+//! and calls [`ourios_bench::run`]. The CLI surface is pinned
+//! by RFC 0006 §3.7. **Today this file is the Red-gate
+//! scaffold**: `main()` prints a banner to stderr and exits
+//! non-zero without touching the library. Argument parsing
+//! and the call into `run` land in the PR-H2 follow-up
+//! together with the test stubs that exercise them.
 
 use std::process::ExitCode;
 

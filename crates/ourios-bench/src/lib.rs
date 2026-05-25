@@ -90,7 +90,7 @@ impl GateSet {
 /// against this exact error.
 pub fn run(_config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     Err(BenchError::NotImplemented {
-        what: "BenchConfig::run is RFC 0006 Red-gate scaffold — no measurement code yet",
+        what: "ourios_bench::run is RFC 0006 Red-gate scaffold — no measurement code yet",
     })
 }
 
@@ -196,8 +196,14 @@ pub struct ConvergenceSample {
 /// [`Self::NotImplemented`]; the other variants are the wire
 /// shapes the eventual implementation will use, declared now so
 /// downstream test code doesn't have to refactor when they start
-/// firing.
+/// firing. Marked `#[non_exhaustive]` so adding measurement-
+/// surface variants (e.g. a future `Zstd { detail }` once the
+/// §7 ZSTD-integration code lands) isn't a breaking change for
+/// downstream `match` arms — mirrors the
+/// `crates/ourios-miner/src/tokenize.rs::TokenizeError`
+/// precedent.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BenchError {
     /// Red-gate placeholder.
     NotImplemented { what: &'static str },

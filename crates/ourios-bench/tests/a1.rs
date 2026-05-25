@@ -9,16 +9,18 @@
 //! - `bytes(ourios_output)` from the bench's bucket dir
 //!   (`data/...` plus `audit/...`, post-rename `*.parquet`
 //!   files only).
-//! - `bytes(zstd_corpus)` from the `zstd_safe` Rust crate at
-//!   level 19 (per the §7 ZSTD-integration resolution; not a
-//!   shell-out to the system `zstd` binary).
+//! - `bytes(zstd_corpus)` from the `zstd` crate at level 19
+//!   (per the §7 ZSTD-integration resolution; not a shell-out
+//!   to the system `zstd` binary).
 //! - The reported `delta = ourios_ratio / zstd_ratio` rounded
 //!   down to three significant figures.
 //!
-//! Stubs are tagged `#[ignore]` so the default `cargo test`
-//! is unaffected while the RFC is at the `red` maturity stage.
-//! The implementation PR that lands the A1 measurement deletes
-//! the `#[ignore]` attribute alongside its code change.
+//! Un-`#[ignore]`'d in PR-I2 when the A1 measurement landed.
+//! The test independently recomputes each byte count from the
+//! artifacts on disk (corpus `*.txt`, bucket `*.parquet`,
+//! per-file ZSTD-19) and asserts the bench's reported values
+//! match — a buggy `run()` whose internal counters drift from
+//! disk fails here.
 
 use ourios_bench::{BenchConfig, BenchError, GateSet, run};
 use std::path::PathBuf;
@@ -33,7 +35,6 @@ use std::path::PathBuf;
 ///   §3.4.1 pin; the impl stores it as the exact `f64`
 ///   representation of `3.0`, which is bit-exact.
 #[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
 #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
 fn rfc0006_1_a1_formula_well_defined_on_seed_corpus() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
@@ -85,7 +86,7 @@ fn rfc0006_1_a1_formula_well_defined_on_seed_corpus() {
     );
     assert_eq!(
         results_file.zstd.compressed_bytes, actual_zstd_bytes,
-        "zstd.compressed_bytes must match `zstd_safe` level-19 output on the same corpus",
+        "zstd.compressed_bytes must match `zstd` level-19 output on the same corpus",
     );
     assert_eq!(results_file.zstd.level, 19, "§3.4.1 pins ZSTD-19");
 
@@ -179,17 +180,30 @@ fn sum_parquet_bytes(bucket: &std::path::Path) -> u64 {
 }
 
 /// Compute `bytes(zstd_corpus)` independently by encoding each
-/// `*.txt` file with `zstd_safe` at level 19 (per the §7
-/// ZSTD-integration resolution) and summing the resulting
-/// byte counts. The implementation under test should produce
-/// the identical value.
-fn zstd_level_19_bytes(_dir: &std::path::Path) -> u64 {
-    // The fixture helper lands with the A1 implementation PR
-    // — it shares the same `zstd_safe` invocation the impl
-    // uses, so this is mechanical to write once the impl
-    // exists. Stubbed here so the test compiles and shows
-    // the intended dependency.
-    unimplemented!("RFC 0006 Red gate — zstd_safe fixture lands with the A1 implementation PR")
+/// `*.txt` file (recursive) with `zstd` at level 19 and
+/// summing the compressed lengths. Per-file, not concatenated,
+/// per §3.4.1 — the bench under test must produce the
+/// identical value.
+fn zstd_level_19_bytes(dir: &std::path::Path) -> u64 {
+    fn walk(dir: &std::path::Path, total: &mut u64) {
+        for entry in std::fs::read_dir(dir).expect("corpus dir readable") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, total);
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+            {
+                let bytes = std::fs::read(&path).expect("read txt");
+                let compressed = zstd::bulk::compress(&bytes, 19).expect("zstd compress");
+                *total += compressed.len() as u64;
+            }
+        }
+    }
+    let mut total = 0u64;
+    walk(dir, &mut total);
+    total
 }
 
 /// Sanity guard against `BenchError::NotImplemented` slipping
@@ -199,7 +213,6 @@ fn zstd_level_19_bytes(_dir: &std::path::Path) -> u64 {
 /// can't make this guard fail for the wrong reason — once A1
 /// lands, this guard turns green even before C1/C2 do.
 #[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
 fn rfc0006_1_run_no_longer_returns_not_implemented() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");

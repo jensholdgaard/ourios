@@ -22,7 +22,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use ourios_core::record::MinedRecord;
 
 /// Partition key for the on-disk Hive-style layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartitionKey {
     /// Raw (un-encoded) tenant id, as carried on the row.
     pub tenant_id: String,

@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 
+use ourios_core::audit::{AuditEvent, SharedAuditSink};
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
@@ -36,6 +37,16 @@ use ourios_miner::tree::OwnedToken;
 
 use crate::BenchError;
 use crate::corpus::{BENCH_TENANT, CorpusLoad};
+
+/// What [`run`] returns after draining the miner: the
+/// audit-event stream A1 writes into the `audit/...` partition
+/// series for its `bytes(ourios_output)` term. The
+/// per-version template snapshots stay local to [`run`] — they
+/// feed the per-line callback but have no consumer past the
+/// loop, so they aren't surfaced until a gate needs them.
+pub(crate) struct HarnessResult {
+    pub audit_events: Vec<AuditEvent>,
+}
 
 /// Drive the miner over every line in `corpus`, snapshotting
 /// per-`(template_id, template_version)` template tokens
@@ -70,16 +81,18 @@ use crate::corpus::{BENCH_TENANT, CorpusLoad};
 ///   cluster's `templates_for()` doesn't return a leaf for
 ///   (impossible by construction; surfaces a future miner
 ///   bug rather than crashing C1's snapshot lookup).
-pub(crate) fn run<F>(
-    corpus: &CorpusLoad,
-    mut on_record: F,
-) -> Result<HashMap<(u64, u32), Vec<OwnedToken>>, BenchError>
+pub(crate) fn run<F>(corpus: &CorpusLoad, mut on_record: F) -> Result<HarnessResult, BenchError>
 where
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
 {
     let sink = SharedRecordSink::new();
+    let audit_sink = SharedAuditSink::new();
+    // `with_audit_sink` is the constructor that takes the
+    // audit sink; `with_record_sink` is the chainable setter
+    // for the record sink.
     let mut cluster =
-        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
+            .with_record_sink(Box::new(sink.clone()));
     let tenant = TenantId::new(BENCH_TENANT);
     let mut snapshots: HashMap<(u64, u32), Vec<OwnedToken>> = HashMap::new();
 
@@ -117,7 +130,9 @@ where
         on_record(input, &record, template_snapshot);
     }
 
-    Ok(snapshots)
+    Ok(HarnessResult {
+        audit_events: audit_sink.drain(),
+    })
 }
 
 /// Take the single record the miner must emit for one
@@ -238,28 +253,30 @@ mod tests {
         );
     }
 
-    /// Returned snapshot map carries entries keyed by
-    /// `(template_id, template_version)` for every distinct
-    /// non-lossy record the harness saw — the C1 path doesn't
-    /// strictly need this (the streaming callback already had
-    /// the snapshot), but it's a useful diagnostic + lets
-    /// future gates inspect the alphabet without re-running.
+    /// A snapshot is captured at most once per unique
+    /// `(template_id, template_version)` — re-emitting the
+    /// same template (the steady-state common case) reuses the
+    /// stored tokens and the same `&[OwnedToken]` reaches the
+    /// callback. Two structurally-identical lines share one
+    /// template, so both callbacks must see byte-identical
+    /// snapshot slices.
     #[test]
-    fn snapshot_map_covers_every_non_lossy_id_version_observed() {
-        let (_tmp, load) = load_lines(&["user 42 logged in", "user 43 logged in"]);
-        let mut emitted_keys = std::collections::HashSet::new();
-        let snapshots = run(&load, |_input, record, _snap| {
-            if !record.lossy_flag && record.template_id != NO_TEMPLATE {
-                emitted_keys.insert((record.template_id, record.template_version));
-            }
+    fn repeated_template_reuses_one_snapshot() {
+        let (_tmp, load) = load_lines(&["user 42 logged in", "user 99 logged in"]);
+        let mut snapshots_seen: Vec<Option<Vec<OwnedToken>>> = Vec::new();
+        run(&load, |_input, _record, snap| {
+            snapshots_seen.push(snap.map(<[OwnedToken]>::to_vec));
         })
         .expect("harness runs");
-        for key in emitted_keys {
-            assert!(
-                snapshots.contains_key(&key),
-                "snapshot map missing entry for emitted non-lossy key {key:?}",
-            );
-        }
+        assert_eq!(snapshots_seen.len(), 2);
+        assert_eq!(
+            snapshots_seen[0], snapshots_seen[1],
+            "two structurally-identical lines share one template snapshot",
+        );
+        assert!(
+            snapshots_seen[0].as_ref().is_some_and(|s| !s.is_empty()),
+            "non-lossy lines carry a non-empty template snapshot",
+        );
     }
 
     /// `require_single` is the RFC 0001 §6.1 one-record-per-

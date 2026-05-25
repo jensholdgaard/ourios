@@ -26,6 +26,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+mod a1;
 mod c1;
 mod corpus;
 mod harness;
@@ -89,24 +90,30 @@ impl GateSet {
 /// per `config.update_benchmarks_md` are the binary's
 /// responsibility (and not yet implemented).
 ///
-/// **Implemented gates**: C1 (PR-I1). A1 and C2 still return
-/// [`BenchError::NotImplemented`] — picking them via
-/// `config.gates` fails the call. At least one gate must be
-/// enabled; an empty `GateSet` returns [`BenchError::Cli`].
+/// **Implemented gates**: A1 (PR-I2) and C1 (PR-I1), in any
+/// combination. C2 still returns [`BenchError::NotImplemented`]
+/// when selected. At least one gate must be enabled; an empty
+/// `GateSet` returns [`BenchError::Cli`].
+///
+/// Both implemented gates share a single miner pass: the
+/// harness streams each emitted record to whichever
+/// accumulators are active (A1 writes it to its partition's
+/// Parquet file, C1 checks its reconstruction), so requesting
+/// both does not double the ingest cost.
 ///
 /// # Errors
 ///
-/// - [`BenchError::NotImplemented`] when `config.gates.a1` or
-///   `config.gates.c2` is set (their implementations land in
-///   follow-up PRs).
+/// - [`BenchError::NotImplemented`] when `config.gates.c2` is
+///   set (its implementation lands in a follow-up PR).
 /// - [`BenchError::Cli`] when no gates are enabled.
 /// - [`BenchError::Corpus`] when the corpus directory is
 ///   unreadable, missing, or contributes no non-empty lines.
 /// - [`BenchError::Pipeline`] when the miner's emit count
 ///   diverges from the input line count (RFC 0001 §6.1
-///   one-record-per-line violation), or when the host clock
-///   is set before the Unix epoch (so `timestamp_now` can't
-///   produce a §3.6-shaped timestamp).
+///   one-record-per-line violation), when the Parquet writer
+///   fails, or when the host clock is set before the Unix
+///   epoch (so `timestamp_now` can't produce a §3.6-shaped
+///   timestamp).
 ///
 /// # Panics
 ///
@@ -118,30 +125,17 @@ impl GateSet {
 /// "surface a real logic bug" behaviour the §3.6 results
 /// shape needs.
 pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
-    if config.gates.a1 {
-        return Err(BenchError::NotImplemented {
-            what: "A1 measurement (lands with the next bench implementation PR)",
-        });
-    }
     if config.gates.c2 {
         return Err(BenchError::NotImplemented {
             what: "C2 measurement (lands with the next bench implementation PR)",
         });
     }
-    if !config.gates.c1 {
+    if !config.gates.a1 && !config.gates.c1 {
         return Err(BenchError::Cli {
             detail: "no gates enabled; --gates must include at least one of a1, c1, c2".to_string(),
         });
     }
 
-    // C1 path. Doesn't write Parquet (A1 isn't enabled), so
-    // the `ourios.*` byte counts come out zero in this run's
-    // results JSON. That's the §3.6 nullability rule applied
-    // to the *gate* fields (`a1: None`), with the per-section
-    // byte counters left as zero rather than wrapped in
-    // `Option` — the schema pins them as required `u64` so
-    // an A1-skipped run still serialises against the same
-    // shape.
     let corpus_load = corpus::load(&config.corpus_dir)?;
     let directory = corpus_load.directory.clone();
     let total_files = corpus_load.total_files;
@@ -153,11 +147,59 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     // than surfacing it; `expect` names the assumption.
     let total_lines = u64::try_from(corpus_load.lines.len())
         .expect("usize fits in u64 on every supported Rust target");
-    let mut c1_acc = c1::C1Accumulator::new();
-    harness::run(&corpus_load, |input, emitted, snap| {
-        c1_acc.record(input, emitted, snap);
+
+    // Resolve the Parquet output bucket A1 writes into. A
+    // caller-supplied `bucket_dir` is used as-is; otherwise a
+    // scratch dir is created and (unless `--keep-parquet`)
+    // removed when `_bucket_guard` drops at end of scope.
+    // Held even when A1 is disabled so the branch stays simple
+    // — an unused empty temp dir costs one inode.
+    let (bucket_root, _bucket_guard) = resolve_bucket(config)?;
+
+    let mut c1_acc = config.gates.c1.then(c1::C1Accumulator::new);
+    let mut a1_acc = config
+        .gates
+        .a1
+        .then(|| a1::A1Accumulator::new(&bucket_root));
+
+    let harness_result = harness::run(&corpus_load, |input, emitted, snap| {
+        if let Some(acc) = c1_acc.as_mut() {
+            acc.record(input, emitted, snap);
+        }
+        if let Some(acc) = a1_acc.as_mut() {
+            acc.record(emitted);
+        }
     })?;
-    let c1_result = c1_acc.finalize();
+
+    let c1_result = c1_acc.map(|acc| acc.finalize());
+    let (a1_result, ourios, zstd) = match a1_acc {
+        Some(mut acc) => {
+            acc.write_audit(&harness_result.audit_events)?;
+            let a1 = acc.finalize(raw_bytes, &config.corpus_dir)?;
+            let ourios = OuriosStats {
+                data_parquet_bytes: a1.data_parquet_bytes,
+                audit_parquet_bytes: a1.audit_parquet_bytes,
+                total_parquet_bytes: a1.total_parquet_bytes,
+            };
+            let zstd = ZstdStats {
+                level: 19,
+                compressed_bytes: a1.zstd_bytes,
+            };
+            (Some(a1.result), ourios, zstd)
+        }
+        None => (
+            None,
+            OuriosStats {
+                data_parquet_bytes: 0,
+                audit_parquet_bytes: 0,
+                total_parquet_bytes: 0,
+            },
+            ZstdStats {
+                level: 19,
+                compressed_bytes: 0,
+            },
+        ),
+    };
 
     Ok(ResultsFile {
         rfc: "RFC 0006".to_string(),
@@ -174,19 +216,36 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
             total_files,
             raw_bytes,
         },
-        ourios: OuriosStats {
-            data_parquet_bytes: 0,
-            audit_parquet_bytes: 0,
-            total_parquet_bytes: 0,
-        },
-        zstd: ZstdStats {
-            level: 19,
-            compressed_bytes: 0,
-        },
-        a1: None,
-        c1: Some(c1_result),
+        ourios,
+        zstd,
+        a1: a1_result,
+        c1: c1_result,
         c2: None,
     })
+}
+
+/// Resolve the Parquet output bucket. Returns the directory
+/// plus an optional [`tempfile::TempDir`] guard whose `Drop`
+/// removes a scratch bucket at end of `run`. When the caller
+/// passed an explicit `bucket_dir`, the guard is `None` (the
+/// caller owns the directory's lifetime). `--keep-parquet`
+/// persists a scratch dir by leaking the guard via
+/// `TempDir::keep`.
+fn resolve_bucket(
+    config: &BenchConfig,
+) -> Result<(PathBuf, Option<tempfile::TempDir>), BenchError> {
+    if let Some(dir) = &config.bucket_dir {
+        return Ok((dir.clone(), None));
+    }
+    let tmp = tempfile::TempDir::new().map_err(|e| BenchError::Pipeline {
+        detail: format!("create scratch bucket dir: {e}"),
+    })?;
+    if config.keep_parquet {
+        let path = tmp.keep();
+        return Ok((path, None));
+    }
+    let path = tmp.path().to_path_buf();
+    Ok((path, Some(tmp)))
 }
 
 /// Format `SystemTime::now()` as a §3.6 millisecond-precision
@@ -458,44 +517,36 @@ mod tests {
         );
     }
 
-    /// PR-I1 marker — A1 and C2 still return
+    /// PR-I2 marker — C2 still returns
     /// `BenchError::NotImplemented` from `run()`, even though
-    /// C1 now produces a real `ResultsFile`. This test pins
-    /// the partial-implementation gate: a future PR that
-    /// lands A1 (or C2) makes this assertion fail by
-    /// returning `Ok(...)`, which is the maturity-model
-    /// marker that the corresponding gate has graduated. The
+    /// A1 (PR-I2) and C1 (PR-I1) now produce real results.
+    /// This test pins the partial-implementation gate: the PR
+    /// that lands C2 makes this assertion fail by returning
+    /// something other than `NotImplemented`, which is the
+    /// maturity-model marker that C2 has graduated. The C2
     /// implementation PR rewrites this test alongside its
-    /// code change.
+    /// code change. C2 is checked before any corpus work, so
+    /// the bogus `corpus_dir` is never read.
     #[test]
-    fn a1_and_c2_still_return_not_implemented() {
-        for gates in [
-            GateSet {
-                a1: true,
-                c1: false,
-                c2: false,
-            },
-            GateSet {
+    fn c2_still_returns_not_implemented() {
+        let config = BenchConfig {
+            corpus_dir: std::path::PathBuf::from("."),
+            results_dir: std::path::PathBuf::from("."),
+            bucket_dir: None,
+            keep_parquet: false,
+            hardware_kind: None,
+            update_benchmarks_md: false,
+            gates: GateSet {
                 a1: false,
                 c1: false,
                 c2: true,
             },
-        ] {
-            let config = BenchConfig {
-                corpus_dir: std::path::PathBuf::from("."),
-                results_dir: std::path::PathBuf::from("."),
-                bucket_dir: None,
-                keep_parquet: false,
-                hardware_kind: None,
-                update_benchmarks_md: false,
-                gates,
-            };
-            let err = run(&config).expect_err("A1 / C2 not yet implemented");
-            assert!(
-                matches!(err, BenchError::NotImplemented { .. }),
-                "expected NotImplemented, got {err:?}",
-            );
-        }
+        };
+        let err = run(&config).expect_err("C2 not yet implemented");
+        assert!(
+            matches!(err, BenchError::NotImplemented { .. }),
+            "expected NotImplemented, got {err:?}",
+        );
     }
 
     /// `ResultsFile` is the §3.6 contract incarnated; its serde

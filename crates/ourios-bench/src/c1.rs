@@ -80,7 +80,11 @@ pub(crate) fn compute(harness: &HarnessOutput) -> C1Result {
     // passes (no failing rows) so a future H7.1 regression
     // that turns every row lossy would surface via the
     // `lossy_flag_ratio` quality signal, not via C1.
-    let all_total = u64::try_from(harness.records.len()).unwrap_or(u64::MAX);
+    // `usize → u64` is infallible on every Rust Tier 1 / 2
+    // target; `expect` names the assumption rather than
+    // silently capping with `unwrap_or(u64::MAX)`.
+    let all_total = u64::try_from(harness.records.len())
+        .expect("usize fits in u64 on every supported Rust target");
     let rate = if non_lossy_total > 0 {
         (non_lossy_ok as f64) / (non_lossy_total as f64)
     } else {

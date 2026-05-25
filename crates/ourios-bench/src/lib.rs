@@ -103,6 +103,16 @@ impl GateSet {
 /// - [`BenchError::Pipeline`] when the miner's emit count
 ///   diverges from the input line count (RFC 0001 §6.1
 ///   one-record-per-line violation).
+///
+/// # Panics
+///
+/// Panics on a `usize → u64` conversion failure for
+/// `harness_output.lines.len()`. The bound is documented
+/// inline: `usize ≤ u64` holds on every Rust Tier 1 / 2
+/// target, so this only fires on a hypothetical 128-bit
+/// platform — at which point the panic is exactly the
+/// "surface a real logic bug" behaviour the §3.6 results
+/// shape needs.
 pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     if config.gates.a1 {
         return Err(BenchError::NotImplemented {
@@ -133,7 +143,13 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     let total_files = corpus_load.total_files;
     let raw_bytes = corpus_load.raw_bytes;
     let harness_output = harness::run(corpus_load)?;
-    let total_lines = u64::try_from(harness_output.lines.len()).unwrap_or(u64::MAX);
+    // `usize → u64` is infallible on every Rust Tier 1 / 2
+    // target (`usize ≤ u64`). The earlier
+    // `.unwrap_or(u64::MAX)` formulation would silently bury
+    // a real logic bug on a future 128-bit target rather
+    // than surfacing it; `expect` names the assumption.
+    let total_lines = u64::try_from(harness_output.lines.len())
+        .expect("usize fits in u64 on every supported Rust target");
     let c1_result = c1::compute(&harness_output);
 
     Ok(ResultsFile {

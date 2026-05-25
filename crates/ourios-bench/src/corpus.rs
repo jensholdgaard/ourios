@@ -18,7 +18,8 @@
 //! the §3.4.1 definition of `bytes(raw_corpus)` is naturally
 //! recursive.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use ourios_core::otlp::{Body, OtlpLogRecord};
@@ -60,12 +61,15 @@ pub(crate) struct CorpusLine {
 #[derive(Debug)]
 pub(crate) struct CorpusLoad {
     pub lines: Vec<CorpusLine>,
-    /// Number of `*.txt` files contributing lines (after
-    /// recursive walk).
+    /// Number of `*.txt` files found under the corpus
+    /// directory (recursive). Empty files count — the §3.4.1
+    /// A1 formula sums `metadata.len()` over every `*.txt`,
+    /// not just non-empty ones, so the diagnostic surfaces
+    /// the input the formula actually consumed.
     pub total_files: u32,
-    /// Sum of `fs::metadata(*.txt).len()` over every file
-    /// that contributed lines. Matches the §3.4.1
-    /// `bytes(raw_corpus)` formula.
+    /// Sum of `fs::metadata(*.txt).len()` over every `*.txt`
+    /// file found (empty files included). Matches the §3.4.1
+    /// `bytes(raw_corpus)` formula 1:1.
     pub raw_bytes: u64,
     /// User-facing directory path string for the results JSON.
     pub directory: String,
@@ -120,13 +124,19 @@ fn walk(
     // Sort entries by file name so the bench is deterministic
     // across platforms — `read_dir` order is filesystem-
     // dependent. Same pattern as
-    // `crates/ourios-miner/tests/hazards.rs::h7_1`.
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .map_err(|e| BenchError::Corpus {
-            detail: format!("read_dir({}): {e}", dir.display()),
-        })?
-        .filter_map(Result::ok)
-        .collect();
+    // `crates/ourios-miner/tests/hazards.rs::h7_1`. Per-entry
+    // errors are surfaced explicitly (no `filter_map(ok)`) so
+    // an unreadable directory entry undercounts loudly rather
+    // than silently.
+    let read_dir = fs::read_dir(dir).map_err(|e| BenchError::Corpus {
+        detail: format!("read_dir({}): {e}", dir.display()),
+    })?;
+    let mut entries: Vec<fs::DirEntry> =
+        read_dir
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| BenchError::Corpus {
+                detail: format!("read_dir entry under {}: {e}", dir.display()),
+            })?;
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
@@ -146,11 +156,21 @@ fn walk(
             detail: format!("metadata({}): {e}", path.display()),
         })?;
         *raw_bytes += meta.len();
-        let contents = fs::read_to_string(&path).map_err(|e| BenchError::Corpus {
-            detail: format!("read_to_string({}): {e}", path.display()),
+        // Stream lines via `BufReader` rather than slurping
+        // the whole file with `read_to_string` — RFC 0006
+        // sizes corpora at low millions of lines per file,
+        // and a 100 MiB-class single-file corpus would spike
+        // memory unnecessarily if we read the full contents
+        // up front.
+        let file = File::open(&path).map_err(|e| BenchError::Corpus {
+            detail: format!("open({}): {e}", path.display()),
         })?;
-        for line in contents.lines() {
-            let trimmed = line.trim_end_matches('\r');
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let raw = line.map_err(|e| BenchError::Corpus {
+                detail: format!("read line in {}: {e}", path.display()),
+            })?;
+            let trimmed = raw.trim_end_matches('\r');
             if trimmed.is_empty() {
                 continue;
             }

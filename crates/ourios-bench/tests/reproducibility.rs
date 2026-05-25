@@ -101,22 +101,36 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     );
 }
 
-/// Sanity-check that the timestamp looks like an RFC3339
-/// string with millisecond precision per §3.6
-/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`). The bench doesn't depend on
-/// `chrono` for parsing — string-shape validation is enough
-/// here, since the determinism contract is what the
-/// `assert_eq!` above pins.
+/// Validate that the timestamp matches the §3.6 millisecond-
+/// precision RFC3339 form exactly: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+/// Checks every position — the four separator characters at
+/// indices 4 / 7 (`-`), 10 (`T`), 13 / 16 (`:`), 19 (`.`),
+/// and 23 (`Z`), plus the seventeen digit positions
+/// (0–3, 5–6, 8–9, 11–12, 14–15, 17–18, 20–22) are ASCII
+/// digits. Tight enough to reject a string like
+/// `"aaaaaaaaaaTaaaaaaaa.aaaZ"` (which a length + separator-
+/// only check would let through) without taking a `chrono`
+/// dependency for full RFC3339 parsing.
 ///
 /// Validation goes through `as_bytes()` (not `&s[i..j]`) so a
-/// non-ASCII byte in a corrupt timestamp surfaces as the
-/// "shape mismatch" assertion message rather than a
-/// `panicked at 'byte index … is not a char boundary'`
-/// generic panic that hides the intent.
+/// non-ASCII byte surfaces as the "shape mismatch" assertion
+/// message rather than a `panicked at 'byte index … is not a
+/// char boundary'` generic panic.
 fn parse_rfc3339(s: &str) {
     let bytes = s.as_bytes();
+    let shape_ok = bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit());
     assert!(
-        bytes.len() == 24 && bytes[23] == b'Z' && bytes[10] == b'T' && bytes[19] == b'.',
+        shape_ok,
         "RFC 0006 §3.6 pins millisecond-precision RFC3339 (`YYYY-MM-DDTHH:MM:SS.mmmZ`); got {s:?}",
     );
 }

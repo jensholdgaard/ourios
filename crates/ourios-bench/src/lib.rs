@@ -2,24 +2,24 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! **Implementation status (PR-I1):** the C1 gate is live —
-//! [`run`] computes C1 end-to-end on the corpus directory
-//! when `config.gates.c1` is set and returns a populated
-//! [`ResultsFile`]. A1 and C2 still return
+//! **Implementation status (PR-I2):** the A1 (compression) and
+//! C1 (reconstruction) gates are live — [`run`] computes them
+//! end-to-end, in any combination, in a single miner pass, and
+//! returns a populated [`ResultsFile`]. C2 still returns
 //! [`BenchError::NotImplemented`] when selected via
-//! `config.gates`; their `#[ignore]`'d test stubs in
-//! `tests/{a1,c2,reproducibility}.rs` get un-ignored as the
-//! respective implementations land. The CLI parser (RFC 0006
-//! §3.7) and the `docs/benchmarks.md` §9 result-file writer
-//! ([`ResultsFile`] → disk / markdown) also remain
-//! unwritten — `main.rs` is the red-stage scaffold and the
-//! binary path doesn't yet drive [`run`].
+//! `config.gates`; its `#[ignore]`'d test stubs in
+//! `tests/{c2,reproducibility}.rs` get un-ignored when it
+//! lands. The CLI parser (RFC 0006 §3.7) and the
+//! `docs/benchmarks.md` §9 result-file writer ([`ResultsFile`]
+//! → disk / markdown) also remain unwritten — `main.rs` is the
+//! red-stage scaffold and the binary path doesn't yet drive
+//! [`run`].
 //!
 //! Per RFC 0006 §3.2 the eventual module layout is `corpus`,
 //! `harness`, `a1`, `c1`, `c2`, `report`. Those modules land
-//! incrementally. PR-I1 extracted `corpus`, `harness`, and
-//! `c1`; `a1` / `c2` / `report` remain collapsed (and
-//! unwritten) until their respective implementation PRs.
+//! incrementally. PR-I1 extracted `corpus`, `harness`, `c1`;
+//! PR-I2 added `a1`; `c2` / `report` remain unwritten until
+//! their respective implementation PRs.
 
 #![deny(unsafe_code)]
 
@@ -156,6 +156,17 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     // — an unused empty temp dir costs one inode.
     let (bucket_root, _bucket_guard) = resolve_bucket(config)?;
 
+    // A1 measures every `*.parquet` under the bucket; a
+    // caller-supplied dir that already holds Parquet (e.g. a
+    // prior `--keep-parquet` run) would inflate
+    // `bytes(ourios_output)` and skew the ratio. Refuse to
+    // measure into a dirty bucket. A scratch `TempDir` is
+    // always empty, so this only ever fires on a reused
+    // caller dir.
+    if config.gates.a1 {
+        ensure_bucket_has_no_parquet(&bucket_root)?;
+    }
+
     let mut c1_acc = config.gates.c1.then(c1::C1Accumulator::new);
     let mut a1_acc = config
         .gates
@@ -246,6 +257,53 @@ fn resolve_bucket(
     }
     let path = tmp.path().to_path_buf();
     Ok((path, Some(tmp)))
+}
+
+/// Error if the bucket's `data/` or `audit/` subtree already
+/// holds a `*.parquet` file. A1 sums every Parquet file under
+/// the bucket, so pre-existing artifacts (from a prior
+/// `--keep-parquet` run into the same directory) would inflate
+/// `bytes(ourios_output)`. Missing subtrees are fine (nothing
+/// to collide with).
+fn ensure_bucket_has_no_parquet(bucket_root: &std::path::Path) -> Result<(), BenchError> {
+    for sub in ["data", "audit"] {
+        let dir = bucket_root.join(sub);
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            let entries = match std::fs::read_dir(&d) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(BenchError::Pipeline {
+                        detail: format!("scan bucket {}: {e}", d.display()),
+                    });
+                }
+            };
+            for entry in entries {
+                let entry = entry.map_err(|e| BenchError::Pipeline {
+                    detail: format!("scan bucket entry under {}: {e}", d.display()),
+                })?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
+                {
+                    return Err(BenchError::Cli {
+                        detail: format!(
+                            "bucket {} already contains a Parquet file ({}); A1 would \
+                             count it in bytes(ourios_output). Point --bucket-dir at an \
+                             empty directory or omit it to use a fresh scratch dir.",
+                            bucket_root.display(),
+                            path.display(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Format `SystemTime::now()` as a §3.6 millisecond-precision

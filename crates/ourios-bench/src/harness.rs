@@ -3,12 +3,11 @@
 //! Drives a fresh `MinerCluster` over every line in a loaded
 //! corpus and yields one `(input, emitted, template)` triple
 //! per ingested line to a caller-supplied callback. The
-//! callback shape lets each gate (C1 today, A1 / C2 in
-//! follow-ups) compute its result *while* the loop runs,
-//! without the harness buffering every emitted `MinedRecord`
-//! in memory — a `Vec<MinedRecord>` for an RFC-sized 1 M-line
-//! corpus is a real OOM risk given each record's `Vec` /
-//! `String` payload.
+//! callback shape lets each gate compute its result *while*
+//! the loop runs, without the harness buffering every emitted
+//! `MinedRecord` in memory — a `Vec<MinedRecord>` for an
+//! RFC-sized 1 M-line corpus is a real OOM risk given each
+//! record's `Vec` / `String` payload.
 //!
 //! Mirrors the H7.1 property test pattern in
 //! `crates/ourios-miner/tests/hazards.rs` for the snapshot
@@ -17,13 +16,19 @@
 //! `HashMap::entry(...).Vacant.insert`); the streaming
 //! surface is the bench-specific shape.
 //!
-//! Future implementation PRs plug additional gate
-//! accumulators into the same callback signature:
+//! Current consumers (`lib::run` plugs in whichever are
+//! enabled):
 //!
-//! - A1: a writer-accumulator that streams `MinedRecord`s
-//!   into `ourios_parquet::Writer` and sums the bucket bytes.
-//! - C2: a counter-accumulator that samples the template
-//!   count at the §3.4.3 cadence.
+//! - C1 (PR-I1): checks each emitted record's reconstruction
+//!   against the input bytes.
+//! - A1 (PR-I2): streams each `MinedRecord` into its
+//!   partition's `ourios_parquet::Writer` and, after the loop,
+//!   writes the drained audit events (returned in
+//!   [`HarnessResult`]) so it can sum the full bucket bytes.
+//!
+//! C2 (template-count convergence) is the remaining future
+//! consumer — a counter-accumulator that samples the template
+//! count at the §3.4.3 cadence.
 
 use std::collections::HashMap;
 

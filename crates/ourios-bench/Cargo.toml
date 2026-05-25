@@ -36,18 +36,12 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 zstd = "0.13"
 # A1 writes the Parquet output bucket somewhere measurable; when
 # `BenchConfig.bucket_dir` is `None`, `run` creates a scratch dir
-# here and (unless `--keep-parquet`) cleans it up on exit.
+# here and (unless `--keep-parquet`) cleans it up on exit. The
+# integration tests reuse both `tempfile` (scratch corpora /
+# buckets) and `zstd` (the RFC0006.1 test recomputes the
+# reference byte count) — normal dependencies are visible to
+# `tests/`, so no separate `[dev-dependencies]` mirror is needed.
 tempfile = "3"
-
-[dev-dependencies]
-# Integration tests reuse `tempfile` for scratch corpora /
-# buckets; the RFC0006.1 test also recomputes the ZSTD-19
-# reference byte count, so it needs `zstd` on the test side.
-tempfile = "3"
-# The RFC0006.1 integration test independently recomputes the
-# ZSTD-19 reference byte count to check the bench's reported
-# value, so it needs `zstd` on the test side too.
-zstd = "0.13"
 
 [lints]
 workspace = true

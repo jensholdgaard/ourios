@@ -184,6 +184,13 @@ fn sum_parquet_bytes(bucket: &std::path::Path) -> u64 {
 /// summing the compressed lengths. Per-file, not concatenated,
 /// per §3.4.1 — the bench under test must produce the
 /// identical value.
+///
+/// Uses the streaming encoder (`zstd::stream::copy_encode`) to
+/// match the production path exactly: one-shot
+/// `zstd::bulk::compress` can emit a different frame header
+/// (it knows the content size up front, streaming doesn't), so
+/// the byte counts would diverge by a few header bytes if the
+/// two sides used different APIs.
 fn zstd_level_19_bytes(dir: &std::path::Path) -> u64 {
     fn walk(dir: &std::path::Path, total: &mut u64) {
         for entry in std::fs::read_dir(dir).expect("corpus dir readable") {
@@ -195,8 +202,9 @@ fn zstd_level_19_bytes(dir: &std::path::Path) -> u64 {
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
             {
-                let bytes = std::fs::read(&path).expect("read txt");
-                let compressed = zstd::bulk::compress(&bytes, 19).expect("zstd compress");
+                let file = std::fs::File::open(&path).expect("open txt");
+                let mut compressed = Vec::new();
+                zstd::stream::copy_encode(file, &mut compressed, 19).expect("zstd compress");
                 *total += compressed.len() as u64;
             }
         }
@@ -240,4 +248,42 @@ fn rfc0006_1_run_no_longer_returns_not_implemented() {
         }
         Err(other) => panic!("unexpected error from implemented run(): {other}"),
     }
+}
+
+/// A1 refuses to measure into a `--bucket-dir` that already
+/// holds a Parquet file — a prior `--keep-parquet` run's
+/// artifacts would otherwise inflate `bytes(ourios_output)`
+/// and skew the ratio. The guard fires before the miner runs,
+/// so a pre-seeded `data/.../x.parquet` is enough to trip it.
+#[test]
+fn a1_rejects_a_bucket_that_already_holds_parquet() {
+    let bucket = tempfile::TempDir::new().expect("temp dir");
+    let results = tempfile::TempDir::new().expect("temp dir");
+    // Pre-seed a stray Parquet file under the data subtree.
+    let stale = bucket.path().join("data").join("tenant_id=x");
+    std::fs::create_dir_all(&stale).expect("mkdir");
+    std::fs::write(stale.join("stale.parquet"), b"not really parquet").expect("seed");
+
+    let config = BenchConfig {
+        corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("testdata/corpus"),
+        results_dir: results.path().to_path_buf(),
+        bucket_dir: Some(bucket.path().to_path_buf()),
+        keep_parquet: false,
+        hardware_kind: Some("dev-laptop".to_string()),
+        update_benchmarks_md: false,
+        gates: GateSet {
+            a1: true,
+            c1: false,
+            c2: false,
+        },
+    };
+    let err = run(&config).expect_err("dirty bucket must be rejected");
+    assert!(
+        matches!(&err, BenchError::Cli { detail } if detail.contains("already contains a Parquet file")),
+        "expected a Cli error about a non-empty bucket, got {err:?}",
+    );
 }

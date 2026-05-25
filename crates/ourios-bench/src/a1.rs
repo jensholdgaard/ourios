@@ -206,7 +206,16 @@ fn audit_partition(event: &AuditEvent) -> Result<PartitionKey, crate::BenchError
             detail: format!("audit event timestamp before Unix epoch: {e}"),
         })?
         .as_nanos();
-    let time_unix_nano = u64::try_from(nanos).unwrap_or(u64::MAX);
+    // The on-disk `time_unix_nano` is `u64`; an audit event
+    // stamped past ~year 2554 overflows it. Surface that
+    // explicitly rather than silently clamping to `u64::MAX`
+    // (which would land every overflowing event in one bogus
+    // partition).
+    let time_unix_nano = u64::try_from(nanos).map_err(|_| crate::BenchError::Pipeline {
+        detail: format!(
+            "audit event timestamp {nanos} ns exceeds the u64 time_unix_nano representation",
+        ),
+    })?;
     let proxy = MinedRecord {
         tenant_id: event.tenant_id.clone(),
         time_unix_nano,
@@ -250,25 +259,37 @@ fn proxy_record() -> MinedRecord {
 }
 
 /// Sum `*.parquet` file sizes under `dir` (recursive), skipping
-/// pre-rename `*.parquet.tmp` files per RFC 0005 §7. Returns
-/// `Ok(0)` when `dir` doesn't exist (a gate that produced no
-/// output for that subtree — e.g. zero audit events).
+/// pre-rename `*.parquet.tmp` files per RFC 0005 §7. A missing
+/// directory yields `Ok(0)` (a gate that produced no output
+/// for that subtree — e.g. zero audit events); any *other* I/O
+/// error surfaces as [`crate::BenchError::Pipeline`] rather
+/// than silently undercounting. Errors here are categorised
+/// `Pipeline` (reading writer artifacts is part of the
+/// measurement, not JSON/markdown reporting).
 fn sum_parquet_bytes(dir: &Path) -> Result<u64, crate::BenchError> {
-    if !dir.exists() {
-        return Ok(0);
-    }
+    // `fs::read_dir` (below) returns `NotFound` for a missing
+    // directory; we map only that to `Ok(0)` and propagate
+    // every other error (e.g. permission denied), unlike
+    // `Path::exists()` which collapses all I/O errors to
+    // "false" and would undercount.
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let entries = std::fs::read_dir(&d).map_err(|e| crate::BenchError::Report {
-            detail: format!("read_dir({}): {e}", d.display()),
-        })?;
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(crate::BenchError::Pipeline {
+                    detail: format!("read_dir({}): {e}", d.display()),
+                });
+            }
+        };
         for entry in entries {
-            let entry = entry.map_err(|e| crate::BenchError::Report {
+            let entry = entry.map_err(|e| crate::BenchError::Pipeline {
                 detail: format!("read_dir entry under {}: {e}", d.display()),
             })?;
             let path = entry.path();
-            let meta = std::fs::metadata(&path).map_err(|e| crate::BenchError::Report {
+            let meta = std::fs::metadata(&path).map_err(|e| crate::BenchError::Pipeline {
                 detail: format!("metadata({}): {e}", path.display()),
             })?;
             if meta.is_dir() {
@@ -287,9 +308,32 @@ fn sum_parquet_bytes(dir: &Path) -> Result<u64, crate::BenchError> {
     Ok(total)
 }
 
+/// A sink that discards what it's written and only tallies the
+/// byte count — lets the ZSTD encoder stream its output past
+/// us without us holding the compressed buffer.
+struct CountingSink(u64);
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `usize → u64` is lossless on every supported target;
+        // saturating keeps the counter monotone even on the
+        // hypothetical 128-bit one.
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compute `bytes(zstd_corpus)` — run ZSTD-19 over each `*.txt`
 /// file under `dir` individually and sum the compressed
-/// lengths. Per-file (not concatenated) per §3.4.1.
+/// lengths. Per-file (not concatenated) per §3.4.1. The input
+/// is streamed from the file and the compressed output is
+/// streamed into a [`CountingSink`], so neither the raw file
+/// nor its compressed image is held in memory in full —
+/// bounded regardless of corpus file size.
+#[allow(clippy::cast_possible_truncation)]
 fn zstd_level_19_bytes(dir: &Path) -> Result<u64, crate::BenchError> {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -311,15 +355,16 @@ fn zstd_level_19_bytes(dir: &Path) -> Result<u64, crate::BenchError> {
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
             {
-                let bytes = std::fs::read(&path).map_err(|e| crate::BenchError::Corpus {
-                    detail: format!("read({}): {e}", path.display()),
+                let file = std::fs::File::open(&path).map_err(|e| crate::BenchError::Corpus {
+                    detail: format!("open({}): {e}", path.display()),
                 })?;
-                let compressed = zstd::bulk::compress(&bytes, ZSTD_LEVEL).map_err(|e| {
-                    crate::BenchError::Report {
+                let mut sink = CountingSink(0);
+                zstd::stream::copy_encode(file, &mut sink, ZSTD_LEVEL).map_err(|e| {
+                    crate::BenchError::Pipeline {
                         detail: format!("zstd compress({}): {e}", path.display()),
                     }
                 })?;
-                total += compressed.len() as u64;
+                total += sink.0;
             }
         }
     }

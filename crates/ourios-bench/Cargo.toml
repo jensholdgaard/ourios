@@ -1,0 +1,40 @@
+[package]
+name = "ourios-bench"
+version = "0.0.0"
+description = "RFC 0006 thesis-gate bench harness (A1 / C1 / C2). Drives ourios-miner + ourios-parquet against a corpus and computes the writer-side thesis-gate numbers."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "ourios-bench"
+path = "src/main.rs"
+
+[lib]
+name = "ourios_bench"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace crates the harness drives end-to-end. The bench is
+# the only consumer that pulls all three on the same dep line
+# (miner + parquet writer + the core OtlpLogRecord shape they
+# share).
+ourios-core = { path = "../ourios-core" }
+ourios-miner = { path = "../ourios-miner" }
+ourios-parquet = { path = "../ourios-parquet" }
+# Serde + serde_json for the §3.6 ResultsFile JSON contract.
+# `derive` gives the struct→JSON path; `std` covers the rest.
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# `tempfile` is the standard scratch-directory helper the other
+# integration tests in this workspace use (see ourios-parquet's
+# dev-dependencies). The bench's red-gate test stubs will need
+# it once they run real flows.
+tempfile = "3"
+
+[lints]
+workspace = true

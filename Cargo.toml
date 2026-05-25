@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ourios-bench",
     "crates/ourios-core",
     "crates/ourios-miner",
     "crates/ourios-parquet",
@@ -11,7 +12,6 @@ members = [
 #   crates/ourios-ingester
 #   crates/ourios-querier
 #   crates/ourios-server
-#   crates/ourios-bench
 
 [workspace.package]
 edition = "2024"

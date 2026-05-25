@@ -10,13 +10,20 @@
 //! (no `parquet_dir`, no `audit_dir`, no results filename), so
 //! the only legitimate diff in the JSON is the `timestamp`
 //! field. The test normalises that field then compares the
-//! two `ResultsFile`s via the canonical-JSON byte form —
-//! comparing serialised JSON bytes rather than `PartialEq` on
-//! the struct itself rules out the `f64::PartialEq` edge case
-//! where `-0.0 == 0.0` would mask a true bit-level
+//! two `ResultsFile`s via their stable `serde_json` byte form
+//! — comparing serialised JSON bytes rather than `PartialEq`
+//! on the struct itself rules out the `f64::PartialEq` edge
+//! case where `-0.0 == 0.0` would mask a true bit-level
 //! difference. JSON renders `-0.0` and `0.0` distinctly, so
 //! the string compare *is* bit-identical for every float in
 //! the §3.6 schema.
+//!
+//! "Stable" here means `serde_json::to_string` on a struct:
+//! field order is fixed by the struct definition and the
+//! impl is deterministic. This is *not* canonical JSON
+//! (RFC 8785 — sorted keys, normalised numbers) — `ResultsFile`
+//! is a struct, not a map, so the stronger canonical-form
+//! property isn't needed.
 
 use ourios_bench::{BenchConfig, GateSet, run};
 use std::path::PathBuf;
@@ -68,7 +75,7 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     parse_rfc3339(&run_b.timestamp);
 
     // Normalise the one volatile field, then compare the
-    // canonical-JSON serialisations byte-for-byte. Every
+    // stable serde_json serialisations byte-for-byte. Every
     // other field — `rfc`, `rfc_version`, `git_sha`,
     // `hardware_kind`, the corpus counters, ourios bytes,
     // zstd bytes, every gate's payload including
@@ -78,7 +85,7 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     // `assert_eq!` on the struct directly) sidesteps the
     // `f64::PartialEq` edge case where `-0.0 == 0.0` would
     // mask a true bit-level diff — JSON renders the two
-    // distinctly. Comparing the canonical form also catches
+    // distinctly. Comparing the serialised form also catches
     // nondeterminism in any field a future RFC amendment
     // adds to `ResultsFile` without the test needing a
     // follow-up.
@@ -89,8 +96,8 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     let json_b = serde_json::to_string(&run_b).expect("serialise run_b");
     assert_eq!(
         json_a, json_b,
-        "RFC 0006 §3.6 determinism: canonical-JSON form of every non-timestamp field must \
-         be bit-identical",
+        "RFC 0006 §3.6 determinism: stable serde_json form of every non-timestamp field \
+         must be bit-identical",
     );
 }
 
@@ -100,9 +107,16 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
 /// `chrono` for parsing — string-shape validation is enough
 /// here, since the determinism contract is what the
 /// `assert_eq!` above pins.
+///
+/// Validation goes through `as_bytes()` (not `&s[i..j]`) so a
+/// non-ASCII byte in a corrupt timestamp surfaces as the
+/// "shape mismatch" assertion message rather than a
+/// `panicked at 'byte index … is not a char boundary'`
+/// generic panic that hides the intent.
 fn parse_rfc3339(s: &str) {
+    let bytes = s.as_bytes();
     assert!(
-        s.len() == 24 && s.ends_with('Z') && &s[10..11] == "T" && &s[19..20] == ".",
+        bytes.len() == 24 && bytes[23] == b'Z' && bytes[10] == b'T' && bytes[19] == b'.',
         "RFC 0006 §3.6 pins millisecond-precision RFC3339 (`YYYY-MM-DDTHH:MM:SS.mmmZ`); got {s:?}",
     );
 }

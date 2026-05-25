@@ -119,25 +119,38 @@ fn assert_within_1_percent(actual: f64, expected: f64, field: &str) {
     }
     let relative_diff = (actual - expected).abs() / expected.abs();
     assert!(
-        relative_diff < 0.01,
+        relative_diff <= 0.01,
         "{field}: expected {expected}, got {actual} — relative drift {relative_diff:.4} > 1%",
     );
 }
 
-/// Sum `*.txt` file sizes under `dir` via `fs::metadata` — the
-/// independent reference for `bytes(raw_corpus)` per §3.4.1.
+/// Sum `*.txt` file sizes under `dir` via `fs::metadata`,
+/// **recursively** — the independent reference for
+/// `bytes(raw_corpus)` per §3.4.1. The RFC describes the
+/// formula as "sum of `std::fs::metadata(p).len()` for every
+/// `*.txt` file in the corpus directory", which is naturally
+/// recursive (`find … -name '*.txt'`). The committed seed
+/// corpus is flat today but a future nested layout under
+/// `testdata/corpus/<archetype>/...` would silently
+/// undercount if this helper were single-level. Matches the
+/// `sum_parquet_bytes` recursion shape below.
 fn sum_txt_bytes(dir: &std::path::Path) -> u64 {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(dir).expect("corpus dir readable") {
-        let entry = entry.expect("dir entry");
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
-        {
-            total += entry.metadata().expect("metadata").len();
+    fn walk(dir: &std::path::Path, total: &mut u64) {
+        for entry in std::fs::read_dir(dir).expect("corpus dir readable") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, total);
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+            {
+                *total += entry.metadata().expect("metadata").len();
+            }
         }
     }
+    let mut total = 0u64;
+    walk(dir, &mut total);
     total
 }
 

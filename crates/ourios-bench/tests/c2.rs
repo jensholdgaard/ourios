@@ -80,6 +80,14 @@ fn rfc0006_3_c2_gate_passes_on_stable_corpus() {
     assert_eq!(c2.pass, Some(true), "c2.pass = true on stable corpus");
 
     // §3.4.3 sample-count rule: ceil(total_lines / cadence).
+    // Pin cadence > 0 explicitly so a future implementation
+    // bug that produces `sample_cadence = 0` fails with an
+    // actionable message rather than a generic
+    // `div_ceil`-induced divide-by-zero panic.
+    assert!(
+        c2.sample_cadence > 0,
+        "§3.4.3 pins sample_cadence = max(1, ceil(lines / 1024)); got 0",
+    );
     let expected_samples = c2.total_lines.div_ceil(c2.sample_cadence);
     assert_eq!(
         c2.convergence_curve.len() as u64,

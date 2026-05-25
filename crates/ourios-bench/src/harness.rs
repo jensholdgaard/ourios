@@ -85,17 +85,7 @@ where
 
     for input in &corpus.lines {
         cluster.ingest(input);
-        let mut emitted = sink.drain();
-        if emitted.len() != 1 {
-            return Err(BenchError::Pipeline {
-                detail: format!(
-                    "miner emitted {} record(s) for one ingested line — RFC 0001 §6.1 \
-                     pins one-record-per-line",
-                    emitted.len(),
-                ),
-            });
-        }
-        let record = emitted.pop().expect("len == 1 checked above");
+        let record = require_single(sink.drain())?;
 
         // Skip the snapshot capture for lossy / parse-failure
         // records. Lossy rows are excluded from C1's
@@ -107,22 +97,12 @@ where
         if want_snapshot {
             let key = (record.template_id, record.template_version);
             if let std::collections::hash_map::Entry::Vacant(slot) = snapshots.entry(key) {
-                let snap = cluster
-                    .templates_for(&tenant)
-                    .into_iter()
-                    .find(|s| {
-                        s.template_id == record.template_id
-                            && s.template_version == record.template_version
-                    })
-                    .ok_or_else(|| BenchError::Pipeline {
-                        detail: format!(
-                            "miner emitted record at (template_id={}, template_version={}) \
-                             but templates_for() returned no matching leaf — RFC 0001 §6.1 \
-                             contract violation",
-                            record.template_id, record.template_version,
-                        ),
-                    })?;
-                slot.insert(snap.template);
+                let template = snapshot_for(
+                    cluster.templates_for(&tenant),
+                    record.template_id,
+                    record.template_version,
+                )?;
+                slot.insert(template);
             }
         }
 
@@ -138,6 +118,52 @@ where
     }
 
     Ok(snapshots)
+}
+
+/// Take the single record the miner must emit for one
+/// ingested line (RFC 0001 §6.1). Returns
+/// [`BenchError::Pipeline`] for any count other than 1.
+///
+/// Generic over the element type so the count guard is unit-
+/// testable without constructing a full `MinedRecord` (which
+/// has no `Default`); `run` instantiates it at
+/// `T = MinedRecord`.
+fn require_single<T>(mut emitted: Vec<T>) -> Result<T, BenchError> {
+    if emitted.len() != 1 {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "miner emitted {} record(s) for one ingested line — RFC 0001 §6.1 \
+                 pins one-record-per-line",
+                emitted.len(),
+            ),
+        });
+    }
+    Ok(emitted.pop().expect("len == 1 checked above"))
+}
+
+/// Find the template tokens for the emit-time `(template_id,
+/// template_version)` among the leaves the cluster reports.
+/// Returns [`BenchError::Pipeline`] when no leaf matches — by
+/// construction the miner always reports the leaf for a
+/// freshly-emitted non-lossy record, so an absence is an
+/// RFC 0001 §6.1 contract violation worth surfacing rather
+/// than a `panic` deep in C1's snapshot lookup.
+fn snapshot_for(
+    leaves: Vec<ourios_miner::cluster::LeafSnapshot>,
+    template_id: u64,
+    template_version: u32,
+) -> Result<Vec<OwnedToken>, BenchError> {
+    leaves
+        .into_iter()
+        .find(|s| s.template_id == template_id && s.template_version == template_version)
+        .map(|s| s.template)
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: format!(
+                "miner emitted record at (template_id={template_id}, \
+                 template_version={template_version}) but templates_for() returned no \
+                 matching leaf — RFC 0001 §6.1 contract violation",
+            ),
+        })
 }
 
 #[cfg(test)]
@@ -234,5 +260,50 @@ mod tests {
                 "snapshot map missing entry for emitted non-lossy key {key:?}",
             );
         }
+    }
+
+    /// `require_single` is the RFC 0001 §6.1 one-record-per-
+    /// line guard. The real miner always emits exactly one
+    /// record per ingest, so the error branches are
+    /// unreachable through `run`; the guard is generic over
+    /// `T` precisely so the count logic is testable here
+    /// without constructing a `MinedRecord` (which has no
+    /// `Default`).
+    #[test]
+    fn require_single_accepts_exactly_one() {
+        assert_eq!(require_single(vec![42u32]).expect("one element"), 42);
+    }
+
+    #[test]
+    fn require_single_rejects_zero_and_many() {
+        let zero = require_single::<u32>(vec![]).expect_err("empty must error");
+        assert!(
+            matches!(&zero, BenchError::Pipeline { detail } if detail.contains("emitted 0")),
+            "expected Pipeline mentioning a 0 count, got {zero:?}",
+        );
+        let many = require_single(vec![1u32, 2, 3]).expect_err("3 elements must error");
+        assert!(
+            matches!(&many, BenchError::Pipeline { detail } if detail.contains("emitted 3")),
+            "expected Pipeline mentioning a 3 count, got {many:?}",
+        );
+    }
+
+    /// `snapshot_for` is the RFC 0001 §6.1 leaf-lookup guard.
+    /// The success path is exercised end-to-end by every
+    /// `run`-based test above; the error path (no leaf matches
+    /// the emitted `(id, version)`) can't be reached through
+    /// the real miner, so we pin it here with an empty leaf
+    /// list — no `LeafSnapshot` construction required.
+    #[test]
+    fn snapshot_for_errors_when_no_leaf_matches() {
+        let err = snapshot_for(Vec::new(), 7, 3).expect_err("no leaf must error");
+        assert!(
+            matches!(
+                &err,
+                BenchError::Pipeline { detail }
+                    if detail.contains("template_id=7") && detail.contains("template_version=3")
+            ),
+            "expected Pipeline naming the missing (id, version), got {err:?}",
+        );
     }
 }

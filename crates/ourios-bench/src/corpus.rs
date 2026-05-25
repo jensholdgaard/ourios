@@ -309,6 +309,31 @@ mod tests {
         );
     }
 
+    /// `line_bytes` recovers the input bytes from a
+    /// `Body::String` record and returns `None` for any other
+    /// body shape. The bench corpus only ever produces
+    /// `Body::String`, so the `None` arm is defensive — pin
+    /// it so a future loader change that emits a non-string
+    /// body surfaces here rather than silently dropping the
+    /// line from C1's denominator.
+    #[test]
+    fn line_bytes_handles_string_and_non_string_bodies() {
+        let string_record = OtlpLogRecord {
+            body: Some(Body::String("user 42 logged in".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(
+            line_bytes(&string_record),
+            Some("user 42 logged in".as_bytes()),
+        );
+
+        let absent_body = OtlpLogRecord {
+            body: None,
+            ..Default::default()
+        };
+        assert_eq!(line_bytes(&absent_body), None);
+    }
+
     /// A symlinked subdirectory pointing back at an ancestor
     /// must surface as `BenchError::Corpus` (cycle detected)
     /// rather than recursing until the stack overflows.

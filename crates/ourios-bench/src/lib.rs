@@ -104,7 +104,9 @@ impl GateSet {
 ///   unreadable, missing, or contributes no non-empty lines.
 /// - [`BenchError::Pipeline`] when the miner's emit count
 ///   diverges from the input line count (RFC 0001 §6.1
-///   one-record-per-line violation).
+///   one-record-per-line violation), or when the host clock
+///   is set before the Unix epoch (so `timestamp_now` can't
+///   produce a §3.6-shaped timestamp).
 ///
 /// # Panics
 ///
@@ -157,7 +159,7 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     Ok(ResultsFile {
         rfc: "RFC 0006".to_string(),
         rfc_version: "v1".to_string(),
-        timestamp: timestamp_now(),
+        timestamp: timestamp_now()?,
         git_sha: git_sha_short(),
         hardware_kind: config
             .hardware_kind
@@ -189,6 +191,13 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
 /// inline (no `chrono` dep) because the bench only needs
 /// emission, not parsing or arithmetic.
 ///
+/// Returns [`BenchError::Pipeline`] if the host clock is set
+/// before the Unix epoch (`SystemTime::duration_since` would
+/// otherwise propagate `SystemTimeError`). The bench
+/// surfaces clock misconfiguration through the same error
+/// path it uses for other infrastructure failures, rather
+/// than panicking inside a `Result`-returning API.
+///
 /// The casts in this function are bounded by physical time:
 /// `total_seconds` is `u64` but only the low ~31 bits are
 /// used in any realistic invocation (years in `[1970, 9999]`
@@ -201,11 +210,13 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn timestamp_now() -> String {
+fn timestamp_now() -> Result<String, BenchError> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("wall clock before UNIX_EPOCH");
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("host clock is set before the Unix epoch: {e}"),
+        })?;
     let total_seconds = dur.as_secs();
     let millis = dur.subsec_millis();
 
@@ -220,7 +231,9 @@ fn timestamp_now() -> String {
     let second = seconds_of_day % 60;
     let (year, month, day) = civil_from_days(days);
 
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+    ))
 }
 
 /// Days-since-1970-01-01 → (year, month, day) via Howard

@@ -45,6 +45,20 @@ pub(crate) const TIME_INCREMENT_NS: u64 = 1_000_000;
 /// partition; multi-tenant scenarios are a future RFC.
 pub(crate) const BENCH_TENANT: &str = "bench-tenant";
 
+/// Default severity number per §3.3 — `9` (INFO). Severity
+/// participates in the template key per RFC 0001 §6.1, so
+/// keeping every bench record on the same severity means
+/// they all share the same key bucket regardless of body
+/// content. The RFC pins INFO specifically so a future
+/// multi-severity bench corpus has a documented baseline to
+/// diverge from.
+pub(crate) const BENCH_SEVERITY_NUMBER: u8 = 9;
+
+/// Default severity text per §3.3 — `"INFO"` (the canonical
+/// `OTel` name for severity 9). Round-trips through the
+/// writer / reader as the §3.2 `severity_text` column.
+pub(crate) const BENCH_SEVERITY_TEXT: &str = "INFO";
+
 /// One loaded corpus line — the original input bytes (for the
 /// `C1` reconstruction comparison) plus the `OtlpLogRecord`
 /// handed to the miner.
@@ -184,6 +198,8 @@ fn walk(
                 tenant_id: tenant.clone(),
                 body: Some(Body::String(trimmed.to_string())),
                 time_unix_nano: *next_ns,
+                severity_number: BENCH_SEVERITY_NUMBER,
+                severity_text: Some(BENCH_SEVERITY_TEXT.to_string()),
                 ..Default::default()
             };
             lines.push(CorpusLine {
@@ -216,10 +232,20 @@ mod tests {
         assert!(!load.lines.is_empty(), "seed corpus has at least one line");
         assert!(load.raw_bytes > 0, "raw_bytes is the sum of *.txt sizes");
 
-        // First line uses the §3.3 baseline timestamp.
+        // First line uses the §3.3 baseline timestamp + the
+        // pinned severity / scope envelope so the miner sees
+        // every bench record on the same template-key bucket
+        // (RFC 0001 §6.1: severity is part of the key).
         let first = &load.lines[0];
         assert_eq!(first.record.time_unix_nano, TIME_BASELINE_NS);
         assert_eq!(first.record.tenant_id.as_str(), BENCH_TENANT);
+        assert_eq!(first.record.severity_number, BENCH_SEVERITY_NUMBER);
+        assert_eq!(
+            first.record.severity_text.as_deref(),
+            Some(BENCH_SEVERITY_TEXT),
+        );
+        assert_eq!(first.record.scope_name, None);
+        assert_eq!(first.record.scope_version, None);
         assert!(
             matches!(first.record.body, Some(Body::String(_))),
             "every line wraps as Body::String",

@@ -712,9 +712,8 @@ the harness or the formulas.
 > **Scenario RFC0006.1 — A1 formula is well-defined on the seed corpus**
 > - **Given** the bench is invoked with `--corpus testdata/
 >   corpus/`, the writer ships with the §3.5 / §3.6 RFC 0005
->   encoding policy, and a ZSTD level-19 reference
->   implementation is available (shell-out vs `zstd_safe` — §7
->   open question)
+>   encoding policy, and the `zstd_safe` Rust crate is linked
+>   (per the §7 resolution of the ZSTD-integration question)
 > - **When** the bench runs the A1 measurement
 > - **Then** `bytes(raw_corpus)` equals
 >   `sum(std::fs::metadata(f).len())` over the `*.txt` files
@@ -847,8 +846,7 @@ Per `CLAUDE.md` §6.2 / `docs/verification.md` §2:
   resulting JSON, and asserts each formula leg
   (`raw_bytes` from `fs::metadata`, `total_parquet_bytes` from
   inspecting the output bucket, `zstd_bytes` from the
-  `zstd_safe` crate or a shell-out — see §7 open question on
-  the codec wrapper choice).
+  `zstd_safe` crate per the §7 ZSTD-integration resolution).
 - **RFC0006.2** — integration test in
   `crates/ourios-bench/tests/c1.rs`. Drives the bench against
   the seed corpus; asserts `c1.rate == 1.0`. A second
@@ -888,16 +886,27 @@ are a separate measurement category.
 
 ## 7. Open questions
 
-- [ ] **`zstd` integration.** Two options for invoking the
-      reference codec: (a) shell out to the system `zstd`
-      binary, requiring it on PATH for every bench invocation,
-      versus (b) link the `zstd_safe` Rust crate (already in
-      the dep tree via `parquet`'s `zstd` feature). Option (b)
-      is more reproducible (no dependency on the host `zstd`
-      version) but adds a wrapper layer between the formula
-      and the published "ZSTD-19" tag — a slight Drain-paper
-      apples-to-apples concern. Resolution before `green`
-      stage.
+- [x] **`zstd` integration.** **Resolved 2026-05-25: the
+      bench links the `zstd_safe` Rust crate.** Already in the
+      dep tree via `parquet`'s `zstd` feature, so the marginal
+      build cost is zero. The decision turns on cross-platform
+      reproducibility: shell-out requires `zstd` on PATH at
+      runtime (not default on macOS or Windows, version varies
+      across Linux distros), and version drift across hosts
+      would mean the same Ourios commit produces different A1
+      numbers on different machines. With the crate, the
+      compressor version is pinned by `Cargo.lock` and the
+      bundled C library builds on every Tier 1 Rust platform
+      — A1 is reproducible across Linux / macOS / Windows / CI
+      runners without a host-side install step. The
+      Drain-paper apples-to-apples concern is small in
+      practice: `zstd_safe` wraps the same C library at the
+      same compression level, so the resulting bytes are
+      identical to what the CLI binary produces. (RFC0006.1
+      asserts the byte-count formula directly; if a future
+      observer wants to spot-check against a CLI binary, the
+      JSON results file records `zstd.level = 19` so a
+      reproduction pipeline is unambiguous.)
 - [ ] **Convergence curve plotting.** The results JSON
       carries the full sample series. Should the §9
       sub-heading also render a tiny SVG / ASCII plot of the

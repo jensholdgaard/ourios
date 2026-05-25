@@ -45,7 +45,7 @@ use crate::corpus::{BENCH_TENANT, CorpusLoad};
 /// `snapshot` is `None` when the emitted record is lossy
 /// (`record.lossy_flag = true`) or carries the
 /// [`NO_TEMPLATE`] sentinel (`template_id = 0`, the
-/// parse-failure path per RFC 0001 §6.6). Non-lossy records
+/// parse-failure path per RFC 0001 §6.2). Non-lossy records
 /// always receive `Some(template_tokens)`; a missing snapshot
 /// for a real `(id, v)` pair surfaces as
 /// [`BenchError::Pipeline`] (the cluster's `templates_for()`

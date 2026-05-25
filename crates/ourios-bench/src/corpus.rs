@@ -149,21 +149,26 @@ fn walk(
     next_ns: &mut u64,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<(), BenchError> {
-    // Cycle guard. `fs::metadata` follows symlinks, so a
-    // symlinked subdirectory pointing back at an ancestor
-    // would recurse until the stack overflows. Canonicalize
-    // each directory and refuse to descend into one we've
-    // already visited — `HashSet::insert` returns `false`
-    // when the resolved path is a repeat, which is exactly
-    // the loop signal.
+    // Cycle / alias guard. `fs::metadata` follows symlinks,
+    // so a symlinked subdirectory pointing back at an
+    // ancestor would recurse until the stack overflows.
+    // Canonicalize each directory and refuse to descend into
+    // one we've already visited — `HashSet::insert` returns
+    // `false` when the resolved path is a repeat. That covers
+    // both a true symlink loop and a benign alias (two paths
+    // resolving to the same real directory); both are
+    // rejected because re-walking the same directory would
+    // double-count its lines / bytes and skew A1 / C1, not
+    // only because of the unbounded-recursion risk.
     let canonical = fs::canonicalize(dir).map_err(|e| BenchError::Corpus {
         detail: format!("canonicalize({}): {e}", dir.display()),
     })?;
     if !visited.insert(canonical.clone()) {
         return Err(BenchError::Corpus {
             detail: format!(
-                "corpus directory cycle detected: {} resolves to {}, already visited — \
-                 a symlink loop would recurse indefinitely",
+                "corpus directory visited twice: {} resolves to {}, already seen — a symlink \
+                 cycle (which would recurse indefinitely) or an alias (two paths to the same \
+                 directory, which would double-count)",
                 dir.display(),
                 canonical.display(),
             ),

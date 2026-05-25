@@ -2,27 +2,33 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! This file is the **Red-stage scaffold** for the RFC. The
-//! public surface declared here is what the RFC0006.1–7
-//! acceptance-criterion tests will exercise once they land in
-//! a follow-up PR; today every entry point returns
-//! [`BenchError::NotImplemented`] so the crate compiles, the
-//! test stubs link, and the maturity-model gate (`specified`
-//! → `red`: stubs exist and fail) is satisfied without
-//! pre-committing to an implementation shape the tests would
-//! then have to fight.
+//! **Implementation status (PR-I1):** the C1 gate is live —
+//! [`run`] computes C1 end-to-end on the corpus directory
+//! when `config.gates.c1` is set and returns a populated
+//! [`ResultsFile`]. A1 and C2 still return
+//! [`BenchError::NotImplemented`] when selected via
+//! `config.gates`; their `#[ignore]`'d test stubs in
+//! `tests/{a1,c2,reproducibility}.rs` get un-ignored as the
+//! respective implementations land. The CLI parser (RFC 0006
+//! §3.7) and the `docs/benchmarks.md` §9 result-file writer
+//! ([`ResultsFile`] → disk / markdown) also remain
+//! unwritten — `main.rs` is the red-stage scaffold and the
+//! binary path doesn't yet drive [`run`].
 //!
 //! Per RFC 0006 §3.2 the eventual module layout is `corpus`,
 //! `harness`, `a1`, `c1`, `c2`, `report`. Those modules land
-//! incrementally; this scaffold keeps them collapsed into
-//! `lib.rs` so the first scaffold PR stays under CLAUDE.md
-//! §5.2's "≤ 5 files per phase" rule. The first per-module
-//! split is what flips the maturity gate from `red` → `green`.
+//! incrementally. PR-I1 extracted `corpus`, `harness`, and
+//! `c1`; `a1` / `c2` / `report` remain collapsed (and
+//! unwritten) until their respective implementation PRs.
 
 #![deny(unsafe_code)]
 
 use std::fmt;
 use std::path::PathBuf;
+
+mod c1;
+mod corpus;
+mod harness;
 
 /// Configuration for one bench invocation.
 ///
@@ -77,21 +83,211 @@ impl GateSet {
 
 /// Top-level entry point. Loads the corpus, drives the miner
 /// and writer pipeline, computes the §3.4 measurements for
-/// every enabled gate, writes the §3.6 results JSON, and
-/// optionally rewrites the `docs/benchmarks.md` §9 sub-heading
-/// per `config.update_benchmarks_md`.
+/// every enabled gate, and returns the §3.6 results in
+/// memory; writing the JSON file to `config.results_dir` and
+/// optionally rewriting the `docs/benchmarks.md` §9 sub-heading
+/// per `config.update_benchmarks_md` are the binary's
+/// responsibility (and not yet implemented).
+///
+/// **Implemented gates**: C1 (PR-I1). A1 and C2 still return
+/// [`BenchError::NotImplemented`] — picking them via
+/// `config.gates` fails the call. At least one gate must be
+/// enabled; an empty `GateSet` returns [`BenchError::Cli`].
 ///
 /// # Errors
 ///
-/// Returns [`BenchError`] for any failure along the path. The
-/// scaffold stage returns [`BenchError::NotImplemented`] from
-/// every entry point — the Red-gate tests in
-/// `tests/{a1,c1,c2,reproducibility}.rs` are `#[ignore]`'d
-/// against this exact error.
-pub fn run(_config: &BenchConfig) -> Result<ResultsFile, BenchError> {
-    Err(BenchError::NotImplemented {
-        what: "ourios_bench::run has no measurement code yet",
+/// - [`BenchError::NotImplemented`] when `config.gates.a1` or
+///   `config.gates.c2` is set (their implementations land in
+///   follow-up PRs).
+/// - [`BenchError::Cli`] when no gates are enabled.
+/// - [`BenchError::Corpus`] when the corpus directory is
+///   unreadable, missing, or contributes no non-empty lines.
+/// - [`BenchError::Pipeline`] when the miner's emit count
+///   diverges from the input line count (RFC 0001 §6.1
+///   one-record-per-line violation), or when the host clock
+///   is set before the Unix epoch (so `timestamp_now` can't
+///   produce a §3.6-shaped timestamp).
+///
+/// # Panics
+///
+/// Panics on a `usize → u64` conversion failure for
+/// `corpus_load.lines.len()`. The bound is documented
+/// inline: `usize ≤ u64` holds on every Rust Tier 1 / 2
+/// target, so this only fires on a hypothetical 128-bit
+/// platform — at which point the panic is exactly the
+/// "surface a real logic bug" behaviour the §3.6 results
+/// shape needs.
+pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
+    if config.gates.a1 {
+        return Err(BenchError::NotImplemented {
+            what: "A1 measurement (lands with the next bench implementation PR)",
+        });
+    }
+    if config.gates.c2 {
+        return Err(BenchError::NotImplemented {
+            what: "C2 measurement (lands with the next bench implementation PR)",
+        });
+    }
+    if !config.gates.c1 {
+        return Err(BenchError::Cli {
+            detail: "no gates enabled; --gates must include at least one of a1, c1, c2".to_string(),
+        });
+    }
+
+    // C1 path. Doesn't write Parquet (A1 isn't enabled), so
+    // the `ourios.*` byte counts come out zero in this run's
+    // results JSON. That's the §3.6 nullability rule applied
+    // to the *gate* fields (`a1: None`), with the per-section
+    // byte counters left as zero rather than wrapped in
+    // `Option` — the schema pins them as required `u64` so
+    // an A1-skipped run still serialises against the same
+    // shape.
+    let corpus_load = corpus::load(&config.corpus_dir)?;
+    let directory = corpus_load.directory.clone();
+    let total_files = corpus_load.total_files;
+    let raw_bytes = corpus_load.raw_bytes;
+    // `usize → u64` is infallible on every Rust Tier 1 / 2
+    // target (`usize ≤ u64`). The earlier
+    // `.unwrap_or(u64::MAX)` formulation would silently bury
+    // a real logic bug on a future 128-bit target rather
+    // than surfacing it; `expect` names the assumption.
+    let total_lines = u64::try_from(corpus_load.lines.len())
+        .expect("usize fits in u64 on every supported Rust target");
+    let mut c1_acc = c1::C1Accumulator::new();
+    harness::run(&corpus_load, |input, emitted, snap| {
+        c1_acc.record(input, emitted, snap);
+    })?;
+    let c1_result = c1_acc.finalize();
+
+    Ok(ResultsFile {
+        rfc: "RFC 0006".to_string(),
+        rfc_version: "v1".to_string(),
+        timestamp: timestamp_now()?,
+        git_sha: git_sha_short(),
+        hardware_kind: config
+            .hardware_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        corpus: CorpusStats {
+            directory,
+            total_lines,
+            total_files,
+            raw_bytes,
+        },
+        ourios: OuriosStats {
+            data_parquet_bytes: 0,
+            audit_parquet_bytes: 0,
+            total_parquet_bytes: 0,
+        },
+        zstd: ZstdStats {
+            level: 19,
+            compressed_bytes: 0,
+        },
+        a1: None,
+        c1: Some(c1_result),
+        c2: None,
     })
+}
+
+/// Format `SystemTime::now()` as a §3.6 millisecond-precision
+/// RFC3339 string (`YYYY-MM-DDTHH:MM:SS.mmmZ`). Computed
+/// inline (no `chrono` dep) because the bench only needs
+/// emission, not parsing or arithmetic.
+///
+/// Returns [`BenchError::Pipeline`] if the host clock is set
+/// before the Unix epoch (`SystemTime::duration_since` would
+/// otherwise propagate `SystemTimeError`). The bench
+/// surfaces clock misconfiguration through the same error
+/// path it uses for other infrastructure failures, rather
+/// than panicking inside a `Result`-returning API.
+///
+/// The casts in this function are bounded by physical time:
+/// `total_seconds` is `u64` but only the low ~31 bits are
+/// used in any realistic invocation (years in `[1970, 9999]`
+/// fit easily); `seconds_of_day < 86_400` always fits in
+/// `u32`. The `#[allow]`s below name the bounds explicitly
+/// rather than introducing `TryFrom` plumbing for casts that
+/// can't actually fail.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn timestamp_now() -> Result<String, BenchError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("host clock is set before the Unix epoch: {e}"),
+        })?;
+    let total_seconds = dur.as_secs();
+    let millis = dur.subsec_millis();
+
+    // Civil-time conversion (UTC). The algorithm comes from
+    // Howard Hinnant's "date" paper; same shape as
+    // `chrono::DateTime::<Utc>::from_timestamp` but inlined to
+    // skip the dep.
+    let days = (total_seconds / 86_400) as i64;
+    let seconds_of_day = (total_seconds % 86_400) as u32;
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+    ))
+}
+
+/// Days-since-1970-01-01 → (year, month, day) via Howard
+/// Hinnant's algorithm. Returns Gregorian calendar
+/// year / month / day for any signed-64-bit `days`.
+///
+/// The casts are bounded by the algorithm: `doe` is always
+/// in `[0, 146_096]`, `yoe` in `[0, 399]`, `y + era * 400` is
+/// bounded by the input `days` (so a wall-clock-now input
+/// produces a year in `[1970, …]`, which fits comfortably in
+/// `i32`). The `#[allow]`s name the bounds rather than
+/// introducing fallible conversions.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast
+)]
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    // Shift the epoch to 0000-03-01 so February's variable
+    // length lands at the end of the year.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = (y + i64::from(m <= 2)) as i32;
+    (year, m, d)
+}
+
+/// Resolve the short (7-character) git SHA via
+/// `git rev-parse --short=7 HEAD`. Falls back to `"unknown"`
+/// when the bench isn't running from a git checkout (or git
+/// isn't on PATH). The §3.5 hardware-kind annotation has the
+/// same "explicit-unknown rather than silent-default" shape;
+/// this mirrors it for the git SHA.
+fn git_sha_short() -> String {
+    use std::process::Command;
+    Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() == 7)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// §3.6 JSON results file. Field order mirrors the RFC.
@@ -262,28 +458,44 @@ mod tests {
         );
     }
 
-    /// Red-stage scaffold marker: every `run()` call returns
-    /// `BenchError::NotImplemented`. This test exists to flip
-    /// red the moment a future PR removes the placeholder and
-    /// starts returning a `ResultsFile`; the implementation PR
-    /// that lands the harness deletes (or rewrites) this test
-    /// rather than weakening it.
+    /// PR-I1 marker — A1 and C2 still return
+    /// `BenchError::NotImplemented` from `run()`, even though
+    /// C1 now produces a real `ResultsFile`. This test pins
+    /// the partial-implementation gate: a future PR that
+    /// lands A1 (or C2) makes this assertion fail by
+    /// returning `Ok(...)`, which is the maturity-model
+    /// marker that the corresponding gate has graduated. The
+    /// implementation PR rewrites this test alongside its
+    /// code change.
     #[test]
-    fn run_returns_not_implemented_in_red_stage() {
-        let config = BenchConfig {
-            corpus_dir: std::path::PathBuf::from("."),
-            results_dir: std::path::PathBuf::from("."),
-            bucket_dir: None,
-            keep_parquet: false,
-            hardware_kind: None,
-            update_benchmarks_md: false,
-            gates: GateSet::all(),
-        };
-        let err = run(&config).expect_err("red-stage scaffold must return NotImplemented");
-        assert!(
-            matches!(err, BenchError::NotImplemented { .. }),
-            "expected NotImplemented, got {err:?}",
-        );
+    fn a1_and_c2_still_return_not_implemented() {
+        for gates in [
+            GateSet {
+                a1: true,
+                c1: false,
+                c2: false,
+            },
+            GateSet {
+                a1: false,
+                c1: false,
+                c2: true,
+            },
+        ] {
+            let config = BenchConfig {
+                corpus_dir: std::path::PathBuf::from("."),
+                results_dir: std::path::PathBuf::from("."),
+                bucket_dir: None,
+                keep_parquet: false,
+                hardware_kind: None,
+                update_benchmarks_md: false,
+                gates,
+            };
+            let err = run(&config).expect_err("A1 / C2 not yet implemented");
+            assert!(
+                matches!(err, BenchError::NotImplemented { .. }),
+                "expected NotImplemented, got {err:?}",
+            );
+        }
     }
 
     /// `ResultsFile` is the §3.6 contract incarnated; its serde
@@ -329,5 +541,36 @@ mod tests {
         assert!(parsed.a1.is_none(), "skipped-gate nullability holds");
         assert!(parsed.c1.is_none());
         assert!(parsed.c2.is_none());
+    }
+
+    /// `civil_from_days` is the inlined Howard-Hinnant
+    /// algorithm `timestamp_now` uses to format the §3.6
+    /// RFC3339 string. Pin a few well-known anchors so a
+    /// regression in the date conversion surfaces here
+    /// rather than as a §9 result row dated 1970 by accident.
+    #[test]
+    fn civil_from_days_anchors() {
+        // 1970-01-01 — the Unix epoch.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+
+        // 1969-12-31 — one day before the epoch (negative
+        // input branch).
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+
+        // 2026-04-02 — the §3.3 corpus baseline timestamp's
+        // date. Days from 1970-01-01 (= day 0) to
+        // 2026-04-02 = 20_545. Pinning the literal catches
+        // an off-by-one drift in the algorithm.
+        assert_eq!(civil_from_days(20_545), (2026, 4, 2));
+
+        // 2024-02-29 — leap day. Days from 1970-01-01 to
+        // 2024-02-29 = 19_782. Pins the leap-year branch
+        // of the algorithm.
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+
+        // 2000-03-01 — day after the famous 2000 leap day
+        // (divisible by 400). Days from 1970-01-01 to
+        // 2000-03-01 = 11_017. Pins the 400-year cycle.
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
     }
 }

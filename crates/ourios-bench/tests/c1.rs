@@ -11,17 +11,20 @@
 //! - A non-zero exit code and stderr diagnostics when any
 //!   non-lossy row's `reconstruct(record, template)` doesn't
 //!   equal the ingested bytes (covered by the second sub-test,
-//!   which constructs a forged record path).
+//!   which constructs a forged record path — still
+//!   `#[ignore]`'d because the forged-record fixture +
+//!   non-zero-exit plumbing land with the CLI parser PR).
 //!
-//! Stubs are tagged `#[ignore]` so the default `cargo test`
-//! is unaffected while the RFC is at the `red` maturity stage.
+//! The seed-corpus gate test was un-`#[ignore]`'d in PR-I1
+//! when the C1 measurement code landed; the forged-mismatch
+//! sub-test remains `#[ignore]`'d until its dependencies
+//! exist.
 
 use ourios_bench::{BenchConfig, GateSet, run};
 use std::path::PathBuf;
 
 /// Scenario RFC0006.2 — C1 = 100% on the seed corpus.
 #[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
 fn rfc0006_2_c1_is_100_percent_on_seed_corpus() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");
@@ -43,7 +46,7 @@ fn rfc0006_2_c1_is_100_percent_on_seed_corpus() {
         },
     };
 
-    let results_file = run(&config).expect("bench runs once C1 is implemented");
+    let results_file = run(&config).expect("C1 implemented in PR-I1");
     let c1 = results_file.c1.expect("c1 populated when --gates c1");
 
     assert_eq!(

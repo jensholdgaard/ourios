@@ -100,7 +100,7 @@ pub fn run(_config: &BenchConfig) -> Result<ResultsFile, BenchError> {
 /// downstream analysis tooling can parse it without re-reading
 /// the RFC; `rfc_version = "v1"` is the stability tag and
 /// bumping it requires an amendment.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResultsFile {
     /// Always `"RFC 0006"`.
     pub rfc: String,
@@ -126,7 +126,7 @@ pub struct ResultsFile {
 }
 
 /// §3.6 `corpus` block.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CorpusStats {
     pub directory: String,
     pub total_lines: u64,
@@ -136,7 +136,7 @@ pub struct CorpusStats {
 
 /// §3.6 `ourios` block. `total = data + audit`; A1 operates on
 /// the total per §3.4.1.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OuriosStats {
     pub data_parquet_bytes: u64,
     pub audit_parquet_bytes: u64,
@@ -144,14 +144,14 @@ pub struct OuriosStats {
 }
 
 /// §3.6 `zstd` block. `level` is pinned to 19 by §3.4.1.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ZstdStats {
     pub level: u8,
     pub compressed_bytes: u64,
 }
 
 /// §3.6 `a1` block (populated only when A1 ran).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct A1Result {
     pub ourios_ratio: f64,
     pub zstd_ratio: f64,
@@ -161,7 +161,7 @@ pub struct A1Result {
 }
 
 /// §3.6 `c1` block (populated only when C1 ran).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct C1Result {
     pub non_lossy_total: u64,
     pub non_lossy_reconstruct_ok: u64,
@@ -172,7 +172,7 @@ pub struct C1Result {
 
 /// §3.6 `c2` block (populated only when C2 ran). `pass` is
 /// `None` when the corpus is `< 1 M lines` (§3.4.3 abstention).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct C2Result {
     pub sample_cadence: u64,
     pub total_lines: u64,
@@ -184,7 +184,7 @@ pub struct C2Result {
     pub corpus_at_least_1m: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConvergenceSample {
     pub lines: u64,
     pub template_count: u64,

@@ -90,7 +90,7 @@ impl GateSet {
 /// against this exact error.
 pub fn run(_config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     Err(BenchError::NotImplemented {
-        what: "ourios_bench::run is RFC 0006 Red-gate scaffold — no measurement code yet",
+        what: "ourios_bench::run has no measurement code yet",
     })
 }
 
@@ -231,3 +231,103 @@ impl fmt::Display for BenchError {
 }
 
 impl std::error::Error for BenchError {}
+
+#[cfg(test)]
+mod tests {
+    //! Colocated unit tests pinning the contracts that are
+    //! testable today: the `GateSet::all()` API shape, the
+    //! Red-stage `run()` return value, and the §3.6
+    //! `ResultsFile` serde round-trip. The integration tests in
+    //! `tests/{a1,c1,c2,reproducibility}.rs` exercise the
+    //! end-to-end pipeline; these unit tests pin the surface
+    //! contracts independently so a future refactor that
+    //! breaks them surfaces before the (slower) integration
+    //! suite runs.
+    use super::*;
+
+    /// `GateSet::all()` is the default the CLI uses when
+    /// `--gates` is omitted (RFC 0006 §3.7). Pinning the
+    /// constructor against the literal struct catches an
+    /// accidental change (e.g. a `c2: false` default) that
+    /// would silently drop a thesis gate.
+    #[test]
+    fn gate_set_all_enables_a1_c1_and_c2() {
+        assert_eq!(
+            GateSet::all(),
+            GateSet {
+                a1: true,
+                c1: true,
+                c2: true,
+            },
+        );
+    }
+
+    /// Red-stage scaffold marker: every `run()` call returns
+    /// `BenchError::NotImplemented`. This test exists to flip
+    /// red the moment a future PR removes the placeholder and
+    /// starts returning a `ResultsFile`; the implementation PR
+    /// that lands the harness deletes (or rewrites) this test
+    /// rather than weakening it.
+    #[test]
+    fn run_returns_not_implemented_in_red_stage() {
+        let config = BenchConfig {
+            corpus_dir: std::path::PathBuf::from("."),
+            results_dir: std::path::PathBuf::from("."),
+            bucket_dir: None,
+            keep_parquet: false,
+            hardware_kind: None,
+            update_benchmarks_md: false,
+            gates: GateSet::all(),
+        };
+        let err = run(&config).expect_err("red-stage scaffold must return NotImplemented");
+        assert!(
+            matches!(err, BenchError::NotImplemented { .. }),
+            "expected NotImplemented, got {err:?}",
+        );
+    }
+
+    /// `ResultsFile` is the §3.6 contract incarnated; its serde
+    /// shape is what downstream analysis tooling parses. Pin a
+    /// minimal round-trip so a stray field rename or omission
+    /// fails this test before drift reaches a real `.json`
+    /// file on disk. Field values are deliberately sentinel
+    /// (`"sentinel"` / `0` / empty vec) — the shape is the
+    /// contract, not the values.
+    #[test]
+    fn results_file_roundtrips_through_serde_json() {
+        let original = ResultsFile {
+            rfc: "RFC 0006".to_string(),
+            rfc_version: "v1".to_string(),
+            timestamp: "2026-05-25T00:00:00.000Z".to_string(),
+            git_sha: "abc1234".to_string(),
+            hardware_kind: "sentinel".to_string(),
+            corpus: CorpusStats {
+                directory: "sentinel".to_string(),
+                total_lines: 0,
+                total_files: 0,
+                raw_bytes: 0,
+            },
+            ourios: OuriosStats {
+                data_parquet_bytes: 0,
+                audit_parquet_bytes: 0,
+                total_parquet_bytes: 0,
+            },
+            zstd: ZstdStats {
+                level: 19,
+                compressed_bytes: 0,
+            },
+            a1: None,
+            c1: None,
+            c2: None,
+        };
+
+        let json = serde_json::to_string(&original).expect("serialise");
+        let parsed: ResultsFile = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.rfc, original.rfc);
+        assert_eq!(parsed.rfc_version, "v1");
+        assert_eq!(parsed.zstd.level, 19);
+        assert!(parsed.a1.is_none(), "skipped-gate nullability holds");
+        assert!(parsed.c1.is_none());
+        assert!(parsed.c2.is_none());
+    }
+}

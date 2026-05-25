@@ -90,27 +90,38 @@ fn rfc0006_1_a1_formula_well_defined_on_seed_corpus() {
     assert_eq!(results_file.zstd.level, 19, "§3.4.1 pins ZSTD-19");
 
     // Formula assertions. The §3.4.1 rounding rule says the
-    // emitted `delta` is rounded *down* to three significant
-    // figures; the assertions below use a small tolerance
-    // (`0.01`) rather than reimplementing the rounding here
-    // — the precise truncation contract lands as a unit test
-    // in `src/a1.rs::tests` when that module is extracted.
+    // emitted ratios are rounded *down* to three significant
+    // figures; we use a 1% relative tolerance — wide enough
+    // for the 3-sigfig truncation to land inside (3-sigfig
+    // precision is roughly 0.5% in the worst case), tight
+    // enough to catch a formula-leg bug. The precise
+    // truncation contract lands as a unit test in
+    // `src/a1.rs::tests` when that module is extracted.
     let expected_ourios_ratio = actual_raw_bytes as f64 / actual_parquet_total as f64;
     let expected_zstd_ratio = actual_raw_bytes as f64 / actual_zstd_bytes as f64;
     let expected_delta = expected_ourios_ratio / expected_zstd_ratio;
-    assert!(
-        (a1.ourios_ratio - expected_ourios_ratio).abs() < 0.01,
-        "ourios_ratio drift from formula > 1%",
-    );
-    assert!(
-        (a1.zstd_ratio - expected_zstd_ratio).abs() < 0.01,
-        "zstd_ratio drift from formula > 1%",
-    );
-    assert!(
-        (a1.delta - expected_delta).abs() < 0.01,
-        "delta drift from formula > 1%",
-    );
+    assert_within_1_percent(a1.ourios_ratio, expected_ourios_ratio, "ourios_ratio");
+    assert_within_1_percent(a1.zstd_ratio, expected_zstd_ratio, "zstd_ratio");
+    assert_within_1_percent(a1.delta, expected_delta, "delta");
     assert_eq!(a1.target_delta, 3.0, "§3.4.1 pins target ≥ 3×");
+}
+
+/// Relative-tolerance comparison: `actual` must be within
+/// 1% of `expected`. The message names the field and reports
+/// both values so a failure diagnoses cleanly.
+#[allow(clippy::cast_precision_loss, clippy::float_cmp)]
+fn assert_within_1_percent(actual: f64, expected: f64, field: &str) {
+    if expected == 0.0 {
+        // Avoid divide-by-zero on the relative check — for an
+        // expected zero, demand exact match.
+        assert!(actual == 0.0, "{field}: expected 0.0 (exact), got {actual}");
+        return;
+    }
+    let relative_diff = (actual - expected).abs() / expected.abs();
+    assert!(
+        relative_diff < 0.01,
+        "{field}: expected {expected}, got {actual} — relative drift {relative_diff:.4} > 1%",
+    );
 }
 
 /// Sum `*.txt` file sizes under `dir` via `fs::metadata` — the

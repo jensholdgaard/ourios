@@ -6,10 +6,17 @@
 //! every measurement field of the results JSON is bit-identical
 //! across the two runs.
 //!
-//! Per §3.6, temp-directory paths are intentionally NOT in
-//! the JSON, so the only legitimate diffs are `timestamp`
-//! (wall-clock) and the derived output filename. This test
-//! pins that the bench has no other source of nondeterminism.
+//! Per §3.6 the JSON carries no implementation-detail paths
+//! (no `parquet_dir`, no `audit_dir`, no results filename), so
+//! the only legitimate diff in the JSON is the `timestamp`
+//! field. The test normalises that field then compares the
+//! two `ResultsFile`s via the canonical-JSON byte form —
+//! comparing serialised JSON bytes rather than `PartialEq` on
+//! the struct itself rules out the `f64::PartialEq` edge case
+//! where `-0.0 == 0.0` would mask a true bit-level
+//! difference. JSON renders `-0.0` and `0.0` distinctly, so
+//! the string compare *is* bit-identical for every float in
+//! the §3.6 schema.
 
 use ourios_bench::{BenchConfig, GateSet, run};
 use std::path::PathBuf;
@@ -61,22 +68,29 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     parse_rfc3339(&run_b.timestamp);
 
     // Normalise the one volatile field, then compare the
-    // entire `ResultsFile`. Every other field — `rfc`,
-    // `rfc_version`, `git_sha`, `hardware_kind`, the corpus
-    // counters, ourios bytes, zstd bytes, every gate's
-    // payload including `convergence_curve` and the per-gate
-    // `pass` flags — must be bit-identical under the §3.6
-    // determinism contract. Comparing the full struct (rather
-    // than enumerating fields by hand as the earlier draft
-    // did) catches nondeterminism in any field a future RFC
-    // amendment adds to `ResultsFile` without the test
-    // needing a follow-up.
+    // canonical-JSON serialisations byte-for-byte. Every
+    // other field — `rfc`, `rfc_version`, `git_sha`,
+    // `hardware_kind`, the corpus counters, ourios bytes,
+    // zstd bytes, every gate's payload including
+    // `convergence_curve` and the per-gate `pass` flags —
+    // must be bit-identical under the §3.6 determinism
+    // contract. Comparing serialised JSON (rather than
+    // `assert_eq!` on the struct directly) sidesteps the
+    // `f64::PartialEq` edge case where `-0.0 == 0.0` would
+    // mask a true bit-level diff — JSON renders the two
+    // distinctly. Comparing the canonical form also catches
+    // nondeterminism in any field a future RFC amendment
+    // adds to `ResultsFile` without the test needing a
+    // follow-up.
     let pinned_timestamp = "2026-01-01T00:00:00.000Z".to_string();
     run_a.timestamp = pinned_timestamp.clone();
     run_b.timestamp = pinned_timestamp;
+    let json_a = serde_json::to_string(&run_a).expect("serialise run_a");
+    let json_b = serde_json::to_string(&run_b).expect("serialise run_b");
     assert_eq!(
-        run_a, run_b,
-        "RFC 0006 §3.6 determinism: every non-timestamp field must be bit-identical",
+        json_a, json_b,
+        "RFC 0006 §3.6 determinism: canonical-JSON form of every non-timestamp field must \
+         be bit-identical",
     );
 }
 

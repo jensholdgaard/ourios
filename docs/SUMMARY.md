@@ -23,6 +23,7 @@
 - [RFC 0003 — OTLP receiver](./rfcs/0003-otlp-receiver.md)
 - [RFC 0004 — Configuration policy](./rfcs/0004-configuration-policy.md)
 - [RFC 0005 — Parquet storage](./rfcs/0005-parquet-storage.md)
+- [RFC 0006 — Bench harness](./rfcs/0006-bench-harness.md)
 
 # Talks
 

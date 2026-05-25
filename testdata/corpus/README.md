@@ -10,7 +10,7 @@ C2 template-count convergence).
 One log line per file row. UTF-8. No trailing whitespace.
 Empty rows are skipped by the loader.
 
-The loader (`crates/ourios-miner/tests/corpus.rs`) reads every
+The loader (`crates/ourios-miner/tests/hazards.rs`) reads every
 `*.txt` file under this directory and wraps each line in an
 `OtlpLogRecord` with `Body::String(line)` plus a default tenant
 / severity / scope. This is the minimum shape H7.1 needs — the

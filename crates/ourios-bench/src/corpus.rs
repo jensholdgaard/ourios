@@ -18,9 +18,10 @@
 //! the §3.4.1 definition of `bytes(raw_corpus)` is naturally
 //! recursive.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
@@ -97,6 +98,7 @@ pub(crate) fn load(dir: &Path) -> Result<CorpusLoad, BenchError> {
     let mut lines = Vec::new();
     let tenant = TenantId::new(BENCH_TENANT);
     let mut next_ns = TIME_BASELINE_NS;
+    let mut visited = HashSet::new();
 
     walk(
         dir,
@@ -105,6 +107,7 @@ pub(crate) fn load(dir: &Path) -> Result<CorpusLoad, BenchError> {
         &mut lines,
         &tenant,
         &mut next_ns,
+        &mut visited,
     )?;
 
     if lines.is_empty() {
@@ -144,7 +147,29 @@ fn walk(
     lines: &mut Vec<OtlpLogRecord>,
     tenant: &TenantId,
     next_ns: &mut u64,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), BenchError> {
+    // Cycle guard. `fs::metadata` follows symlinks, so a
+    // symlinked subdirectory pointing back at an ancestor
+    // would recurse until the stack overflows. Canonicalize
+    // each directory and refuse to descend into one we've
+    // already visited — `HashSet::insert` returns `false`
+    // when the resolved path is a repeat, which is exactly
+    // the loop signal.
+    let canonical = fs::canonicalize(dir).map_err(|e| BenchError::Corpus {
+        detail: format!("canonicalize({}): {e}", dir.display()),
+    })?;
+    if !visited.insert(canonical.clone()) {
+        return Err(BenchError::Corpus {
+            detail: format!(
+                "corpus directory cycle detected: {} resolves to {}, already visited — \
+                 a symlink loop would recurse indefinitely",
+                dir.display(),
+                canonical.display(),
+            ),
+        });
+    }
+
     // Sort entries by file name so the bench is deterministic
     // across platforms — `read_dir` order is filesystem-
     // dependent. Same pattern as
@@ -175,7 +200,15 @@ fn walk(
             detail: format!("metadata({}): {e}", path.display()),
         })?;
         if meta.is_dir() {
-            walk(&path, total_files, raw_bytes, lines, tenant, next_ns)?;
+            walk(
+                &path,
+                total_files,
+                raw_bytes,
+                lines,
+                tenant,
+                next_ns,
+                visited,
+            )?;
             continue;
         }
         if !path
@@ -273,6 +306,31 @@ mod tests {
         assert!(
             matches!(err, BenchError::Corpus { .. }),
             "expected Corpus variant, got {err:?}",
+        );
+    }
+
+    /// A symlinked subdirectory pointing back at an ancestor
+    /// must surface as `BenchError::Corpus` (cycle detected)
+    /// rather than recursing until the stack overflows.
+    /// Unix-only: portable symlink creation needs
+    /// `std::os::unix`, and Windows symlinks require elevated
+    /// privileges in CI.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycle_errors_rather_than_recursing_forever() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        // A real corpus file so the failure can't be the
+        // "empty corpus" path.
+        std::fs::write(tmp.path().join("seed.txt"), "line one\n").expect("write seed");
+        // sub/loop -> tmp forms the cycle.
+        let subdir = tmp.path().join("sub");
+        std::fs::create_dir(&subdir).expect("mkdir sub");
+        symlink(tmp.path(), subdir.join("loop")).expect("symlink loop");
+        let err = load(tmp.path()).expect_err("symlink cycle must error");
+        assert!(
+            matches!(err, BenchError::Corpus { .. }),
+            "expected Corpus cycle error, got {err:?}",
         );
     }
 }

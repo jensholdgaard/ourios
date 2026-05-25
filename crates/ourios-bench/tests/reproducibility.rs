@@ -43,64 +43,52 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     let (b1, r1, mut c1) = make_config();
     c1.results_dir = r1.path().to_path_buf();
     c1.bucket_dir = Some(b1.path().to_path_buf());
-    let run_a = run(&c1).expect("first run");
+    let mut run_a = run(&c1).expect("first run");
 
     let (b2, r2, mut c2) = make_config();
     c2.results_dir = r2.path().to_path_buf();
     c2.bucket_dir = Some(b2.path().to_path_buf());
-    let run_b = run(&c2).expect("second run");
+    let mut run_b = run(&c2).expect("second run");
 
-    // Corpus-level invariants
-    assert_eq!(run_a.corpus.raw_bytes, run_b.corpus.raw_bytes);
-    assert_eq!(run_a.corpus.total_lines, run_b.corpus.total_lines);
-    assert_eq!(run_a.corpus.total_files, run_b.corpus.total_files);
+    // Both timestamps must be RFC3339-parseable per §3.6 — but
+    // we do *not* assert they differ. Two runs landing in the
+    // same millisecond is rare but possible on a fast machine,
+    // and §3.6's collision-retry rule means the *filenames*
+    // still disambiguate via the retry counter. The
+    // reproducibility contract is "non-timestamp fields are
+    // bit-identical", not "timestamps necessarily disagree".
+    parse_rfc3339(&run_a.timestamp);
+    parse_rfc3339(&run_b.timestamp);
 
-    // Ourios-output byte counts (writer is deterministic given
-    // identical input + identical encoding policy)
+    // Normalise the one volatile field, then compare the
+    // entire `ResultsFile`. Every other field — `rfc`,
+    // `rfc_version`, `git_sha`, `hardware_kind`, the corpus
+    // counters, ourios bytes, zstd bytes, every gate's
+    // payload including `convergence_curve` and the per-gate
+    // `pass` flags — must be bit-identical under the §3.6
+    // determinism contract. Comparing the full struct (rather
+    // than enumerating fields by hand as the earlier draft
+    // did) catches nondeterminism in any field a future RFC
+    // amendment adds to `ResultsFile` without the test
+    // needing a follow-up.
+    let pinned_timestamp = "2026-01-01T00:00:00.000Z".to_string();
+    run_a.timestamp = pinned_timestamp.clone();
+    run_b.timestamp = pinned_timestamp;
     assert_eq!(
-        run_a.ourios.data_parquet_bytes,
-        run_b.ourios.data_parquet_bytes,
+        run_a, run_b,
+        "RFC 0006 §3.6 determinism: every non-timestamp field must be bit-identical",
     );
-    assert_eq!(
-        run_a.ourios.audit_parquet_bytes,
-        run_b.ourios.audit_parquet_bytes,
-    );
-    assert_eq!(
-        run_a.ourios.total_parquet_bytes,
-        run_b.ourios.total_parquet_bytes,
-    );
+}
 
-    // Reference codec byte count (zstd_safe at level 19 is
-    // deterministic per the §7 resolution)
-    assert_eq!(run_a.zstd.compressed_bytes, run_b.zstd.compressed_bytes);
-
-    // Gate measurements
-    let a1_a = run_a.a1.as_ref().expect("a1 populated");
-    let a1_b = run_b.a1.as_ref().expect("a1 populated");
-    assert!((a1_a.delta - a1_b.delta).abs() < f64::EPSILON);
-
-    let c1_a = run_a.c1.as_ref().expect("c1 populated");
-    let c1_b = run_b.c1.as_ref().expect("c1 populated");
-    assert_eq!(c1_a.non_lossy_total, c1_b.non_lossy_total);
-    assert_eq!(c1_a.non_lossy_reconstruct_ok, c1_b.non_lossy_reconstruct_ok,);
-    assert!((c1_a.rate - c1_b.rate).abs() < f64::EPSILON);
-
-    let c2_a = run_a.c2.as_ref().expect("c2 populated");
-    let c2_b = run_b.c2.as_ref().expect("c2 populated");
-    assert_eq!(c2_a.template_count_at_end, c2_b.template_count_at_end);
-    assert_eq!(
-        c2_a.template_count_at_1m_lines,
-        c2_b.template_count_at_1m_lines,
-    );
-
-    // `timestamp` and the output filename derived from it are
-    // the ONLY legitimate diffs — temp-dir paths aren't in
-    // the JSON per §3.6, so they can't contribute. The
-    // bucket-dir paths above are different between the two
-    // runs (different `tempfile::TempDir`s) but don't show up
-    // in `run_a` / `run_b`.
-    assert_ne!(
-        run_a.timestamp, run_b.timestamp,
-        "timestamp is the only legitimate diff and must differ",
+/// Sanity-check that the timestamp looks like an RFC3339
+/// string with millisecond precision per §3.6
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`). The bench doesn't depend on
+/// `chrono` for parsing — string-shape validation is enough
+/// here, since the determinism contract is what the
+/// `assert_eq!` above pins.
+fn parse_rfc3339(s: &str) {
+    assert!(
+        s.len() == 24 && s.ends_with('Z') && &s[10..11] == "T" && &s[19..20] == ".",
+        "RFC 0006 §3.6 pins millisecond-precision RFC3339 (`YYYY-MM-DDTHH:MM:SS.mmmZ`); got {s:?}",
     );
 }

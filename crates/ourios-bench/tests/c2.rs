@@ -3,10 +3,13 @@
 //!
 //! Asserts the §3.4.3 C2 measurement on a synthetic stable
 //! corpus of ≥ 1 M lines whose template alphabet is bounded.
-//! The corpus is constructed in-memory by this test rather
-//! than being committed to `testdata/corpus/` (per the §5
-//! "constructed by the bench's integration test; not committed
-//! to `testdata/corpus/`" pin).
+//! The corpus is generated into a temp directory on disk by
+//! this test rather than being committed to
+//! `testdata/corpus/` (per the §5 "constructed by the bench's
+//! integration test; not committed to `testdata/corpus/`"
+//! pin) — the bench loader reads `*.txt` files from a
+//! directory path, so an on-disk temp dir is the smallest
+//! shape that exercises the production path.
 //!
 //! What's pinned:
 //!

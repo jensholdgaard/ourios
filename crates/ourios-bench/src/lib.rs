@@ -146,15 +146,18 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     let directory = corpus_load.directory.clone();
     let total_files = corpus_load.total_files;
     let raw_bytes = corpus_load.raw_bytes;
-    let harness_output = harness::run(corpus_load)?;
     // `usize → u64` is infallible on every Rust Tier 1 / 2
     // target (`usize ≤ u64`). The earlier
     // `.unwrap_or(u64::MAX)` formulation would silently bury
     // a real logic bug on a future 128-bit target rather
     // than surfacing it; `expect` names the assumption.
-    let total_lines = u64::try_from(harness_output.lines.len())
+    let total_lines = u64::try_from(corpus_load.lines.len())
         .expect("usize fits in u64 on every supported Rust target");
-    let c1_result = c1::compute(&harness_output);
+    let mut c1_acc = c1::C1Accumulator::new();
+    harness::run(&corpus_load, |input, emitted, snap| {
+        c1_acc.record(input, emitted, snap);
+    })?;
+    let c1_result = c1_acc.finalize();
 
     Ok(ResultsFile {
         rfc: "RFC 0006".to_string(),
@@ -538,5 +541,36 @@ mod tests {
         assert!(parsed.a1.is_none(), "skipped-gate nullability holds");
         assert!(parsed.c1.is_none());
         assert!(parsed.c2.is_none());
+    }
+
+    /// `civil_from_days` is the inlined Howard-Hinnant
+    /// algorithm `timestamp_now` uses to format the §3.6
+    /// RFC3339 string. Pin a few well-known anchors so a
+    /// regression in the date conversion surfaces here
+    /// rather than as a §9 result row dated 1970 by accident.
+    #[test]
+    fn civil_from_days_anchors() {
+        // 1970-01-01 — the Unix epoch.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+
+        // 1969-12-31 — one day before the epoch (negative
+        // input branch).
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+
+        // 2026-04-02 — the §3.3 corpus baseline timestamp's
+        // date. Days from 1970-01-01 (= day 0) to
+        // 2026-04-02 = 20_545. Pinning the literal catches
+        // an off-by-one drift in the algorithm.
+        assert_eq!(civil_from_days(20_545), (2026, 4, 2));
+
+        // 2024-02-29 — leap day. Days from 1970-01-01 to
+        // 2024-02-29 = 19_782. Pins the leap-year branch
+        // of the algorithm.
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+
+        // 2000-03-01 — day after the famous 2000 leap day
+        // (divisible by 400). Days from 1970-01-01 to
+        // 2000-03-01 = 11_017. Pins the 400-year cycle.
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
     }
 }

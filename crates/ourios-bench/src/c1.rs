@@ -7,104 +7,136 @@
 //!    / count(records WHERE !lossy_flag)
 //! ```
 //!
-//! Equality is byte-for-byte `Vec<u8> == line.as_bytes()`
-//! after looking up the emit-time `(template_id,
-//! template_version)` snapshot via the harness's
-//! [`crate::harness::HarnessOutput::snapshots`] map. The
+//! Equality is byte-for-byte
+//! `reconstruct(record, template) == line_bytes`, where
+//! `line_bytes` come from the input OTLP record's body. The
 //! target is `1.000000` (six-decimal precision) on every
 //! corpus.
 //!
 //! `lossy_flag = true` rows are excluded from **both**
-//! numerator and denominator — that's the definition of
-//! "non-lossy reconstruction rate". The bench also reports
+//! numerator and denominator — the definition of "non-lossy
+//! reconstruction rate". The bench also reports
 //! `lossy_flag_ratio = count(lossy) / count(all)` as a
-//! quality signal per `docs/benchmarks.md` C1, with the ≤ 5%
-//! / ≤ 20% targets surfaced but **not** gating.
+//! quality signal per `docs/benchmarks.md` C1, with the
+//! ≤ 5% / ≤ 20% targets surfaced but **not** gating.
+//!
+//! The accumulator is **streaming** — fed one record at a
+//! time by the harness loop rather than receiving a buffered
+//! `Vec<MinedRecord>` after the fact. Keeps memory bounded
+//! at `O(snapshots)` on RFC-sized corpora regardless of line
+//! count.
 
+use ourios_core::otlp::OtlpLogRecord;
+use ourios_core::record::MinedRecord;
 use ourios_miner::reconstruct::reconstruct;
+use ourios_miner::tree::OwnedToken;
 
 use crate::C1Result;
-use crate::harness::HarnessOutput;
+use crate::corpus::line_bytes;
 
-/// Compute the C1 result for one harness run. Returns the
-/// populated [`C1Result`] regardless of whether the gate
-/// passes; `c1.pass = false` lands in the results JSON when
-/// any non-lossy row failed to reconstruct. Translating that
-/// flag into a non-zero process exit is the binary's
-/// responsibility per §3.4.2 — that path lands with the CLI
-/// parser PR; today `main.rs` is the red-stage scaffold and
-/// doesn't yet drive [`crate::run`].
+/// Streaming accumulator for the §3.4.2 C1 measurement.
 ///
-/// The two `u64 → f64` casts (for `rate` and
-/// `lossy_flag_ratio`) lose precision above `2^52` ≈ 4.5 × 10¹⁵
-/// records; the bench will never see corpora that large
-/// (RFC0006.3 puts the upper end at low millions), so the
-/// allow is safe.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn compute(harness: &HarnessOutput) -> C1Result {
-    let mut non_lossy_total = 0u64;
-    let mut non_lossy_ok = 0u64;
-    let mut lossy_count = 0u64;
+/// The harness loop calls [`Self::record`] once per ingested
+/// line; [`Self::finalize`] computes the [`C1Result`] from
+/// the accumulated counters at the end.
+#[derive(Debug, Default)]
+pub(crate) struct C1Accumulator {
+    non_lossy_total: u64,
+    non_lossy_reconstruct_ok: u64,
+    lossy_count: u64,
+    all_total: u64,
+}
 
-    for (cline, record) in harness.lines.iter().zip(harness.records.iter()) {
-        if record.lossy_flag {
-            lossy_count += 1;
-            continue;
+impl C1Accumulator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one `(input, emitted, snapshot)` triple per
+    /// the harness callback contract. `snapshot` is the
+    /// emit-time `(template_id, template_version)` template
+    /// tokens; `None` for lossy / `NO_TEMPLATE` records
+    /// (which §3.4.2 excludes from the rate anyway).
+    pub(crate) fn record(
+        &mut self,
+        input: &OtlpLogRecord,
+        emitted: &MinedRecord,
+        snapshot: Option<&[OwnedToken]>,
+    ) {
+        self.all_total = self.all_total.saturating_add(1);
+        if emitted.lossy_flag {
+            self.lossy_count = self.lossy_count.saturating_add(1);
+            return;
         }
-        non_lossy_total += 1;
-        // The H7.1 contract guarantees a snapshot for every
-        // emitted (id, version) pair; an absent snapshot is a
-        // bench bug (the §3.4.2 "key not in map → bench exits
-        // non-zero" rule from the RFC0006.2 docstring). We
-        // panic here because the snapshots map is built
-        // alongside the records in a single harness loop, so
-        // an absence is impossible by construction — the
-        // panic catches future refactors that break that
-        // construction.
-        let template = harness
-            .snapshots
-            .get(&(record.template_id, record.template_version))
-            .unwrap_or_else(|| {
-                panic!(
-                    "RFC 0006 §3.4.2: emitted record (template_id={}, template_version={}) \
-                     has no matching snapshot — harness invariant violated",
-                    record.template_id, record.template_version,
-                )
-            });
-        if reconstruct(record, template) == cline.line.as_bytes() {
-            non_lossy_ok += 1;
+        // Non-lossy. §3.4.2 says we count this record in the
+        // denominator regardless of whether the snapshot
+        // lookup succeeds; an absent snapshot for a non-lossy
+        // record is the harness's "RFC 0001 §6.1 contract
+        // violation" hard error (and the harness has already
+        // returned `BenchError::Pipeline` before we get
+        // here), so in practice we always see `Some(...)`
+        // for non-lossy.
+        self.non_lossy_total = self.non_lossy_total.saturating_add(1);
+        let Some(template) = snapshot else {
+            // Defensive — should be unreachable per the
+            // harness contract.
+            return;
+        };
+        let Some(line) = line_bytes(input) else {
+            // Bench corpus is always `Body::String`; a
+            // non-string body would also be a contract
+            // violation. Skip silently in C1's denominator
+            // would be wrong, so we already counted it
+            // above. Mismatch is reported via `pass = false`
+            // at finalize time.
+            return;
+        };
+        if reconstruct(emitted, template) == line {
+            self.non_lossy_reconstruct_ok = self.non_lossy_reconstruct_ok.saturating_add(1);
         }
     }
 
-    // §3.4.2 fraction. Defined as `1.0` (vacuously perfect)
-    // when there are zero non-lossy rows — surfaces a
-    // single-record all-lossy corpus as "no reconstruction
-    // failures observed" rather than `NaN`. The gate still
-    // passes (no failing rows) so a future H7.1 regression
-    // that turns every row lossy would surface via the
-    // `lossy_flag_ratio` quality signal, not via C1.
-    // `usize → u64` is infallible on every Rust Tier 1 / 2
-    // target; `expect` names the assumption rather than
-    // silently capping with `unwrap_or(u64::MAX)`.
-    let all_total = u64::try_from(harness.records.len())
-        .expect("usize fits in u64 on every supported Rust target");
-    let rate = if non_lossy_total > 0 {
-        (non_lossy_ok as f64) / (non_lossy_total as f64)
-    } else {
-        1.0
-    };
-    let lossy_flag_ratio = if all_total > 0 {
-        (lossy_count as f64) / (all_total as f64)
-    } else {
-        0.0
-    };
-
-    C1Result {
-        non_lossy_total,
-        non_lossy_reconstruct_ok: non_lossy_ok,
-        rate,
-        lossy_flag_ratio,
-        pass: non_lossy_ok == non_lossy_total,
+    /// Compute the §3.4.2 [`C1Result`] from the accumulator.
+    ///
+    /// `c1.pass = false` lands in the results JSON when any
+    /// non-lossy row failed to reconstruct. Translating that
+    /// flag into a non-zero process exit is the binary's
+    /// responsibility per §3.4.2 — that path lands with the
+    /// CLI parser PR; today `main.rs` is the red-stage
+    /// scaffold and doesn't yet drive [`crate::run`].
+    ///
+    /// The two `u64 → f64` casts (for `rate` and
+    /// `lossy_flag_ratio`) lose precision above `2^52` ≈
+    /// 4.5 × 10¹⁵ records; the bench will never see corpora
+    /// that large (RFC 0006 §3.4.3 puts the upper end at low
+    /// millions), so the allow is safe.
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn finalize(&self) -> C1Result {
+        // §3.4.2 fraction. Defined as `1.0` (vacuously
+        // perfect) when there are zero non-lossy rows —
+        // surfaces a single-record all-lossy corpus as "no
+        // reconstruction failures observed" rather than
+        // `NaN`. The gate still passes (no failing rows) so
+        // a future H7.1 regression that turns every row
+        // lossy would surface via the `lossy_flag_ratio`
+        // quality signal, not via C1.
+        let rate = if self.non_lossy_total > 0 {
+            (self.non_lossy_reconstruct_ok as f64) / (self.non_lossy_total as f64)
+        } else {
+            1.0
+        };
+        let lossy_flag_ratio = if self.all_total > 0 {
+            (self.lossy_count as f64) / (self.all_total as f64)
+        } else {
+            0.0
+        };
+        C1Result {
+            non_lossy_total: self.non_lossy_total,
+            non_lossy_reconstruct_ok: self.non_lossy_reconstruct_ok,
+            rate,
+            lossy_flag_ratio,
+            pass: self.non_lossy_reconstruct_ok == self.non_lossy_total,
+        }
     }
 }
 
@@ -123,18 +155,22 @@ mod tests {
             .join("testdata/corpus")
     }
 
-    /// End-to-end: load the seed corpus, run the harness,
-    /// compute C1. Asserts the RFC0006.2 target — every
-    /// non-lossy row reconstructs byte-for-byte. Same
-    /// property the H7.1 unit-scale test pins in
-    /// `crates/ourios-miner/tests/hazards.rs`, only here it
-    /// flows through the bench's own corpus → harness → C1
-    /// pipeline.
+    /// End-to-end: load the seed corpus, run the harness
+    /// against a `C1Accumulator`, finalize. Asserts the
+    /// RFC0006.2 target — every non-lossy row reconstructs
+    /// byte-for-byte. Same property the H7.1 unit-scale test
+    /// pins in `crates/ourios-miner/tests/hazards.rs`, only
+    /// here it flows through the bench's own corpus →
+    /// streaming harness → C1 pipeline.
     #[test]
     fn c1_is_100_percent_on_seed_corpus() {
         let load = corpus::load(&seed_corpus_dir()).expect("seed corpus loads");
-        let harness = harness::run(load).expect("harness runs");
-        let c1 = compute(&harness);
+        let mut acc = C1Accumulator::new();
+        harness::run(&load, |input, emitted, snap| {
+            acc.record(input, emitted, snap);
+        })
+        .expect("harness runs");
+        let c1 = acc.finalize();
         assert_eq!(
             c1.non_lossy_reconstruct_ok, c1.non_lossy_total,
             "RFC 0006 §3.4.2: every non-lossy row must reconstruct byte-for-byte",
@@ -145,5 +181,16 @@ mod tests {
             c1.rate,
         );
         assert!(c1.pass, "c1.pass must be true when rate = 1.000000");
+    }
+
+    /// Empty accumulator (no records observed) finalises as
+    /// the vacuously-perfect `rate = 1.0` / `pass = true` per
+    /// the §3.4.2 carve-out for zero non-lossy rows.
+    #[test]
+    fn empty_accumulator_finalises_vacuously() {
+        let c1 = C1Accumulator::new().finalize();
+        assert_eq!(c1.non_lossy_total, 0);
+        assert!((c1.rate - 1.0).abs() < f64::EPSILON);
+        assert!(c1.pass, "empty corpus is vacuously perfect");
     }
 }

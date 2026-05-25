@@ -59,22 +59,20 @@ pub(crate) const BENCH_SEVERITY_NUMBER: u8 = 9;
 /// writer / reader as the §3.2 `severity_text` column.
 pub(crate) const BENCH_SEVERITY_TEXT: &str = "INFO";
 
-/// One loaded corpus line — the original input bytes (for the
-/// `C1` reconstruction comparison) plus the `OtlpLogRecord`
-/// handed to the miner.
-#[derive(Debug)]
-pub(crate) struct CorpusLine {
-    /// The trimmed `*.txt` line as read from disk.
-    pub line: String,
-    /// The OTLP record fed to `MinerCluster::ingest`.
-    pub record: OtlpLogRecord,
-}
-
-/// Aggregate output of [`load`]: lines + the `corpus` metadata
-/// fields the §3.6 results JSON requires.
+/// Aggregate output of [`load`]: per-line OTLP records plus the
+/// `corpus` metadata fields the §3.6 results JSON requires.
+///
+/// Each [`OtlpLogRecord`] carries the original line bytes
+/// inside `body = Some(Body::String(line))`. The earlier shape
+/// of this struct also stored the line as a separate `String`
+/// field on a `CorpusLine` wrapper, which doubled the
+/// per-line memory footprint on multi-million-line corpora;
+/// the §3.4.2 reconstruction compare and any other consumer
+/// pulls the bytes from the OTLP body via a small helper
+/// like [`line_bytes`].
 #[derive(Debug)]
 pub(crate) struct CorpusLoad {
-    pub lines: Vec<CorpusLine>,
+    pub lines: Vec<OtlpLogRecord>,
     /// Number of `*.txt` files found under the corpus
     /// directory (recursive). Empty files count — the §3.4.1
     /// A1 formula sums `metadata.len()` over every `*.txt`,
@@ -127,11 +125,23 @@ pub(crate) fn load(dir: &Path) -> Result<CorpusLoad, BenchError> {
     })
 }
 
+/// Borrow the original line bytes from an OTLP record's body.
+/// Returns `None` for non-`Body::String` records (e.g. wire-
+/// absent bodies the bench corpus never produces). C1's
+/// reconstruction compare uses this rather than holding a
+/// separate `String` per line.
+pub(crate) fn line_bytes(record: &OtlpLogRecord) -> Option<&[u8]> {
+    match &record.body {
+        Some(Body::String(s)) => Some(s.as_bytes()),
+        _ => None,
+    }
+}
+
 fn walk(
     dir: &Path,
     total_files: &mut u32,
     raw_bytes: &mut u64,
-    lines: &mut Vec<CorpusLine>,
+    lines: &mut Vec<OtlpLogRecord>,
     tenant: &TenantId,
     next_ns: &mut u64,
 ) -> Result<(), BenchError> {
@@ -194,17 +204,13 @@ fn walk(
             if trimmed.is_empty() {
                 continue;
             }
-            let record = OtlpLogRecord {
+            lines.push(OtlpLogRecord {
                 tenant_id: tenant.clone(),
                 body: Some(Body::String(trimmed.to_string())),
                 time_unix_nano: *next_ns,
                 severity_number: BENCH_SEVERITY_NUMBER,
                 severity_text: Some(BENCH_SEVERITY_TEXT.to_string()),
                 ..Default::default()
-            };
-            lines.push(CorpusLine {
-                line: trimmed.to_string(),
-                record,
             });
             *next_ns = next_ns.saturating_add(TIME_INCREMENT_NS);
         }
@@ -237,28 +243,26 @@ mod tests {
         // every bench record on the same template-key bucket
         // (RFC 0001 §6.1: severity is part of the key).
         let first = &load.lines[0];
-        assert_eq!(first.record.time_unix_nano, TIME_BASELINE_NS);
-        assert_eq!(first.record.tenant_id.as_str(), BENCH_TENANT);
-        assert_eq!(first.record.severity_number, BENCH_SEVERITY_NUMBER);
-        assert_eq!(
-            first.record.severity_text.as_deref(),
-            Some(BENCH_SEVERITY_TEXT),
-        );
-        assert_eq!(first.record.scope_name, None);
-        assert_eq!(first.record.scope_version, None);
+        assert_eq!(first.time_unix_nano, TIME_BASELINE_NS);
+        assert_eq!(first.tenant_id.as_str(), BENCH_TENANT);
+        assert_eq!(first.severity_number, BENCH_SEVERITY_NUMBER);
+        assert_eq!(first.severity_text.as_deref(), Some(BENCH_SEVERITY_TEXT));
+        assert_eq!(first.scope_name, None);
+        assert_eq!(first.scope_version, None);
         assert!(
-            matches!(first.record.body, Some(Body::String(_))),
+            matches!(first.body, Some(Body::String(_))),
             "every line wraps as Body::String",
+        );
+        assert!(
+            line_bytes(first).is_some(),
+            "line_bytes() recovers the input bytes from Body::String",
         );
 
         // Subsequent lines advance by exactly TIME_INCREMENT_NS
         // (mod the saturating-add edge case which can't fire on
         // any realistic corpus). Pin on the second line.
         if let Some(second) = load.lines.get(1) {
-            assert_eq!(
-                second.record.time_unix_nano,
-                TIME_BASELINE_NS + TIME_INCREMENT_NS,
-            );
+            assert_eq!(second.time_unix_nano, TIME_BASELINE_NS + TIME_INCREMENT_NS,);
         }
     }
 

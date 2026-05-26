@@ -158,6 +158,16 @@ struct Block {
 /// - the `BENCH-RESULTS` marker pair is mismatched (a `BEGIN`
 ///   without a following `END`, or an orphan `END`).
 pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, BenchError> {
+    // The block header is backtick-delimited
+    // (`#### `sha` on `hw` — updated …`); a backtick or
+    // control char (notably a newline) in a user-influenced
+    // field would corrupt that format and mis-parse on the
+    // next run. Reject them up front. `git_sha` is hex-or-
+    // "unknown" so it can't trip this, but it's cheap to guard
+    // both header-bound fields.
+    ensure_header_safe("hardware_kind", &results.hardware_kind)?;
+    ensure_header_safe("git_sha", &results.git_sha)?;
+
     let mut blocks = parse_region(md)?;
 
     // Merge this run into the block for its (sha, hardware)
@@ -235,6 +245,23 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
 
 fn pass_verdict(pass: bool) -> String {
     if pass { "PASS" } else { "FAIL" }.to_string()
+}
+
+/// Reject a header-bound field that would break the
+/// backtick-delimited `#### …` block header — a backtick (the
+/// field delimiter) or any control character (newline / tab /
+/// etc.). Surfaced as [`BenchError::Report`] rather than
+/// silently writing a region that won't round-trip.
+fn ensure_header_safe(field: &str, value: &str) -> Result<(), BenchError> {
+    if value.contains('`') || value.chars().any(char::is_control) {
+        return Err(BenchError::Report {
+            detail: format!(
+                "{field} {value:?} contains a backtick or control character, which would \
+                 corrupt the §9 results-block header"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Extract the `YYYY-MM-DD` date from an RFC3339 `timestamp`,
@@ -328,10 +355,15 @@ fn parse_header(header: &str) -> Option<(String, String, String)> {
     let _mid = parts.next()?;
     let hw = parts.next()?.to_string();
     let tail = parts.next().unwrap_or("");
-    let date = tail
-        .split_once("updated ")
-        .map_or_else(String::new, |(_, d)| d.trim().to_string());
-    Some((sha, hw, date))
+    // Require the "updated " marker and a non-empty date.
+    // A header missing it is corruption — returning `None`
+    // makes `parse_region` raise `BenchError::Report` rather
+    // than re-rendering an empty "— updated".
+    let date = tail.split_once("updated ").map(|(_, d)| d.trim())?;
+    if date.is_empty() {
+        return None;
+    }
+    Some((sha, hw, date.to_string()))
 }
 
 /// Parse a table data row `| <gate> | <m> | <t> | <v> |` into
@@ -707,6 +739,31 @@ mod tests {
         r.timestamp = "not-a-date".to_string();
         let err = update_status_section(&md_with_status(), &r)
             .expect_err("malformed timestamp must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A block header missing the "updated <date>" suffix is
+    /// corruption (an empty date would otherwise round-trip)
+    /// → `parse_region` raises `Report`.
+    #[test]
+    fn block_header_without_date_errors() {
+        let corrupt = format!(
+            "## 9. Status\n\n{REGION_BEGIN}\n\n#### `deadbee` on `somebox`\n\n{REGION_END}\n"
+        );
+        let err = update_status_section(&corrupt, &sample_results())
+            .expect_err("a dateless block header must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A backtick in `hardware_kind` would break the
+    /// backtick-delimited header → rejected as `Report` before
+    /// any write.
+    #[test]
+    fn backtick_in_hardware_kind_errors() {
+        let mut r = sample_results();
+        r.hardware_kind = "evil`box".to_string();
+        let err = update_status_section(&md_with_status(), &r)
+            .expect_err("backtick in hardware_kind must error");
         assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
     }
 

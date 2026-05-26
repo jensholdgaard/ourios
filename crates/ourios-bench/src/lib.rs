@@ -2,24 +2,20 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! **Implementation status (PR-J1):** the A1 (compression) and
-//! C1 (reconstruction) gates are live — [`run`] computes them
-//! end-to-end, in any combination, in a single miner pass, and
-//! returns a populated [`ResultsFile`]. The CLI (RFC 0006
-//! §3.7) in `main.rs` drives `run` and writes the §3.6 JSON
-//! results file via [`write_results_json`]. C2 still returns
-//! [`BenchError::NotImplemented`] when selected via
-//! `config.gates`; its `#[ignore]`'d test stubs in
-//! `tests/{c2,reproducibility}.rs` get un-ignored when it
-//! lands. The `docs/benchmarks.md` §9 markdown appender (the
-//! `--update-benchmarks-md` path) is the remaining `report`
-//! piece and lands in a follow-up.
+//! **Implementation status (PR-J2):** all three writer-side
+//! gates — A1 (compression), C1 (reconstruction), C2
+//! (template-count convergence) — are live. [`run`] computes
+//! any combination in a single miner pass and returns a
+//! populated [`ResultsFile`]. The CLI (RFC 0006 §3.7) in
+//! `main.rs` drives `run` and writes the §3.6 JSON results
+//! file via [`write_results_json`]. The remaining piece is the
+//! `docs/benchmarks.md` §9 markdown appender (the
+//! `--update-benchmarks-md` path), which lands in a follow-up.
 //!
 //! Per RFC 0006 §3.2 the module layout is `corpus`, `harness`,
 //! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
 //! `harness`, `c1`; PR-I2 added `a1`; PR-J1 added `report`
-//! (JSON half); `c2` remains unwritten until its
-//! implementation PR.
+//! (JSON half) + the CLI; PR-J2 added `c2`.
 
 #![deny(unsafe_code)]
 
@@ -28,6 +24,7 @@ use std::path::PathBuf;
 
 mod a1;
 mod c1;
+mod c2;
 mod corpus;
 mod harness;
 mod report;
@@ -93,21 +90,18 @@ impl GateSet {
 /// per `config.update_benchmarks_md` are the binary's
 /// responsibility (and not yet implemented).
 ///
-/// **Implemented gates**: A1 (PR-I2) and C1 (PR-I1), in any
-/// combination. C2 still returns [`BenchError::NotImplemented`]
-/// when selected. At least one gate must be enabled; an empty
-/// `GateSet` returns [`BenchError::Cli`].
+/// All three gates — A1, C1, C2 — are implemented and run in
+/// any combination. At least one gate must be enabled; an
+/// empty `GateSet` returns [`BenchError::Cli`].
 ///
-/// Both implemented gates share a single miner pass: the
-/// harness streams each emitted record to whichever
-/// accumulators are active (A1 writes it to its partition's
-/// Parquet file, C1 checks its reconstruction), so requesting
-/// both does not double the ingest cost.
+/// The gates share a single miner pass: the harness streams
+/// each emitted record to whichever accumulators are active
+/// (A1 writes it to its partition's Parquet file, C1 checks
+/// its reconstruction, C2 counts distinct templates), so
+/// requesting several does not multiply the ingest cost.
 ///
 /// # Errors
 ///
-/// - [`BenchError::NotImplemented`] when `config.gates.c2` is
-///   set (its implementation lands in a follow-up PR).
 /// - [`BenchError::Cli`] when no gates are enabled.
 /// - [`BenchError::Corpus`] when the corpus directory is
 ///   unreadable, missing, or contributes no non-empty lines.
@@ -128,12 +122,7 @@ impl GateSet {
 /// "surface a real logic bug" behaviour the §3.6 results
 /// shape needs.
 pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
-    if config.gates.c2 {
-        return Err(BenchError::NotImplemented {
-            what: "C2 measurement (lands with the next bench implementation PR)",
-        });
-    }
-    if !config.gates.a1 && !config.gates.c1 {
+    if !config.gates.a1 && !config.gates.c1 && !config.gates.c2 {
         return Err(BenchError::Cli {
             detail: "no gates enabled; --gates must include at least one of a1, c1, c2".to_string(),
         });
@@ -175,10 +164,11 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     };
 
     let mut c1_acc = config.gates.c1.then(c1::C1Accumulator::new);
+    let mut c2_acc = config.gates.c2.then(|| c2::C2Accumulator::new(total_lines));
 
     // Capture the audit stream only when A1 needs it
     // (`SharedAuditSink` is unbounded — buffering it on a
-    // C1-only run would retain the full event stream for
+    // C1/C2-only run would retain the full event stream for
     // nothing).
     let harness_result = harness::run(&corpus_load, config.gates.a1, |input, emitted, snap| {
         if let Some(acc) = c1_acc.as_mut() {
@@ -187,9 +177,15 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
         if let Some(acc) = a1_acc.as_mut() {
             acc.record(emitted);
         }
+        if let Some(acc) = c2_acc.as_mut() {
+            acc.record(emitted);
+        }
     })?;
 
     let c1_result = c1_acc.map(|acc| acc.finalize());
+    // `C2Accumulator::finalize` takes `self` by value, so the
+    // method path is accepted directly (no closure needed).
+    let c2_result = c2_acc.map(c2::C2Accumulator::finalize);
     let (a1_result, ourios, zstd) = match a1_acc {
         Some(mut acc) => {
             acc.write_audit(harness_result.audit_events)?;
@@ -238,7 +234,7 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
         zstd,
         a1: a1_result,
         c1: c1_result,
-        c2: None,
+        c2: c2_result,
     })
 }
 
@@ -539,14 +535,12 @@ pub struct ConvergenceSample {
 
 /// Errors produced by [`run`] and the §3.4 measurement helpers.
 ///
-/// The Red-gate scaffold only ever returns
-/// [`Self::NotImplemented`]; the other variants are the wire
-/// shapes the eventual implementation will use, declared now so
-/// downstream test code doesn't have to refactor when they start
-/// firing. Marked `#[non_exhaustive]` so adding measurement-
-/// surface variants (e.g. a future `Zstd { detail }` once the
-/// §7 ZSTD-integration code lands) isn't a breaking change for
-/// downstream `match` arms — mirrors the
+/// [`Self::NotImplemented`] is no longer returned by any code
+/// path (every gate is implemented as of PR-J2) but is
+/// retained as a reserved variant for future gates / modes.
+/// Marked `#[non_exhaustive]` so adding measurement-surface
+/// variants isn't a breaking change for downstream `match`
+/// arms — mirrors the
 /// `crates/ourios-miner/src/tokenize.rs::TokenizeError`
 /// precedent.
 #[derive(Debug)]
@@ -609,18 +603,15 @@ mod tests {
         );
     }
 
-    /// PR-I2 marker — C2 still returns
-    /// `BenchError::NotImplemented` from `run()`, even though
-    /// A1 (PR-I2) and C1 (PR-I1) now produce real results.
-    /// This test pins the partial-implementation gate: the PR
-    /// that lands C2 makes this assertion fail by returning
-    /// something other than `NotImplemented`, which is the
-    /// maturity-model marker that C2 has graduated. The C2
-    /// implementation PR rewrites this test alongside its
-    /// code change. C2 is checked before any corpus work, so
-    /// the bogus `corpus_dir` is never read.
+    /// An empty `GateSet` (no gate enabled) is a usage error
+    /// — there's nothing to measure. This replaces the old
+    /// `c2_still_returns_not_implemented` marker (C2 graduated
+    /// in PR-J2, so no gate returns `NotImplemented` anymore);
+    /// the gate-selection contract is still worth pinning. The
+    /// guard runs before any corpus work, so the bogus
+    /// `corpus_dir` is never read.
     #[test]
-    fn c2_still_returns_not_implemented() {
+    fn no_gates_enabled_is_a_cli_error() {
         let config = BenchConfig {
             corpus_dir: std::path::PathBuf::from("."),
             results_dir: std::path::PathBuf::from("."),
@@ -631,13 +622,13 @@ mod tests {
             gates: GateSet {
                 a1: false,
                 c1: false,
-                c2: true,
+                c2: false,
             },
         };
-        let err = run(&config).expect_err("C2 not yet implemented");
+        let err = run(&config).expect_err("no gates enabled is an error");
         assert!(
-            matches!(err, BenchError::NotImplemented { .. }),
-            "expected NotImplemented, got {err:?}",
+            matches!(err, BenchError::Cli { .. }),
+            "expected Cli error, got {err:?}",
         );
     }
 

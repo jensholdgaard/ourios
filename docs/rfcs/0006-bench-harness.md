@@ -118,7 +118,8 @@ This RFC pins:
   across hardware classes don't masquerade as code
   regressions.
 - The output format: a per-run JSON results file under
-  `benchmarks/results/<UTC-RFC3339-ms>-<git-sha7>.json`, and a
+  `benchmarks/results/<UTC-RFC3339-ms-colon-free>-<git-sha7>.json`
+  (filename colons replaced by `-`; see §3.6), and a
   human-readable summary appended to `docs/benchmarks.md` §9
   under a date-stamped sub-heading.
 - The invocation surface: `cargo run -p ourios-bench --` or
@@ -445,16 +446,29 @@ the explicit `--allow-unknown-hardware` opt-in so a forgotten
 Each bench invocation writes one results JSON to:
 
 ```text
-benchmarks/results/<UTC-RFC3339-ms>-<git-sha7>.json
+benchmarks/results/<UTC-RFC3339-ms-colon-free>-<git-sha7>[-N].json
 ```
 
-The timestamp is RFC3339 with millisecond precision (e.g.
-`2026-05-22T14:30:00.123Z`) so two runs on the same commit
-within the same wall-clock second produce different filenames.
+The name embeds the run's millisecond-precision RFC3339
+timestamp with the `:` separators replaced by `-` (so
+`2026-05-22T14:30:00.123Z` becomes
+`2026-05-22T14-30-00.123Z`). The colon substitution is
+required: `:` is illegal in filenames on Windows and awkward
+for shell / tooling elsewhere, so the on-disk *name* is
+colon-free even though the `timestamp` **field inside** the
+JSON keeps canonical RFC3339 (colons included). Two runs on
+the same commit in the same wall-clock second still produce
+distinct names via the millisecond component.
+
 Even at millisecond precision two runs *can* theoretically
-collide on a fast machine; the bench detects the conflict at
-write time and retries with the next millisecond's timestamp,
-emitting a warning to stderr. The directory `benchmarks/` will be created at the repo root by
+collide on a fast machine. The writer creates each candidate
+with an atomic `create_new` ("create iff absent") open and,
+on `AlreadyExists`, appends a numeric suffix (`-1`, `-2`, …)
+until it finds a free name — rather than re-deriving the
+timestamp. This closes the check-then-write race against a
+concurrent run and never clobbers an existing file; if the
+suffix budget is exhausted the write fails loudly rather than
+overwriting. The directory `benchmarks/` will be created at the repo root by
 the implementation PR that lands the `ourios-bench` crate. That
 same PR adds a `.gitignore` entry ignoring `benchmarks/results/`
 except for a `.gitkeep` and the specific runs the maintainer

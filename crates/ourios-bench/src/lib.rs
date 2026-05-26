@@ -2,24 +2,24 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! **Implementation status (PR-I2):** the A1 (compression) and
+//! **Implementation status (PR-J1):** the A1 (compression) and
 //! C1 (reconstruction) gates are live — [`run`] computes them
 //! end-to-end, in any combination, in a single miner pass, and
-//! returns a populated [`ResultsFile`]. C2 still returns
+//! returns a populated [`ResultsFile`]. The CLI (RFC 0006
+//! §3.7) in `main.rs` drives `run` and writes the §3.6 JSON
+//! results file via [`write_results_json`]. C2 still returns
 //! [`BenchError::NotImplemented`] when selected via
 //! `config.gates`; its `#[ignore]`'d test stubs in
 //! `tests/{c2,reproducibility}.rs` get un-ignored when it
-//! lands. The CLI parser (RFC 0006 §3.7) and the
-//! `docs/benchmarks.md` §9 result-file writer ([`ResultsFile`]
-//! → disk / markdown) also remain unwritten — `main.rs` is the
-//! red-stage scaffold and the binary path doesn't yet drive
-//! [`run`].
+//! lands. The `docs/benchmarks.md` §9 markdown appender (the
+//! `--update-benchmarks-md` path) is the remaining `report`
+//! piece and lands in a follow-up.
 //!
-//! Per RFC 0006 §3.2 the eventual module layout is `corpus`,
-//! `harness`, `a1`, `c1`, `c2`, `report`. Those modules land
-//! incrementally. PR-I1 extracted `corpus`, `harness`, `c1`;
-//! PR-I2 added `a1`; `c2` / `report` remain unwritten until
-//! their respective implementation PRs.
+//! Per RFC 0006 §3.2 the module layout is `corpus`, `harness`,
+//! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
+//! `harness`, `c1`; PR-I2 added `a1`; PR-J1 added `report`
+//! (JSON half); `c2` remains unwritten until its
+//! implementation PR.
 
 #![deny(unsafe_code)]
 
@@ -30,6 +30,9 @@ mod a1;
 mod c1;
 mod corpus;
 mod harness;
+mod report;
+
+pub use report::write_results_json;
 
 /// Configuration for one bench invocation.
 ///

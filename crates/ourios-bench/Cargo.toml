@@ -24,6 +24,13 @@ path = "src/lib.rs"
 ourios-core = { path = "../ourios-core" }
 ourios-miner = { path = "../ourios-miner" }
 ourios-parquet = { path = "../ourios-parquet" }
+# CLI argument parsing for the §3.7 flag surface. `clap` is the
+# CNCF-Rust-observability standard (Vector, Quickwit,
+# OpenObserve, GreptimeDB all use it) — the Rust analogue to
+# Go's cobra. `derive` keeps the parser declarative; the binary
+# is operator-facing, exactly where clap's `--help` / validation
+# earn their weight. `ourios-server` will reuse it.
+clap = { version = "4", features = ["derive"] }
 # Serde + serde_json for the §3.6 ResultsFile JSON contract.
 # `derive` gives the struct→JSON path; `std` covers the rest.
 serde = { version = "1", default-features = false, features = ["derive", "std"] }

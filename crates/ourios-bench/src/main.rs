@@ -7,10 +7,10 @@
 //! exit code (a C1 reconstruction mismatch is a hard failure
 //! per §3.4.2).
 //!
-//! The `--update-benchmarks-md` §9 markdown appender is not
-//! implemented yet — the flag is accepted (so the surface
-//! matches §3.7) but currently only warns; the JSON results
-//! file is written regardless.
+//! With `--update-benchmarks-md`, it also folds the run's
+//! results into the `docs/benchmarks.md` §9 Results table
+//! (via [`ourios_bench::update_status_section`]); the JSON
+//! results file is written either way.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,8 +60,9 @@ struct Cli {
     /// requiring `--hardware-kind`.
     #[arg(long)]
     allow_unknown_hardware: bool,
-    /// Append / rewrite the `docs/benchmarks.md` §9 sub-heading
-    /// (not implemented yet — see crate docs).
+    /// Fold this run's results into the `docs/benchmarks.md`
+    /// §9 Results table (rewriting the block for this
+    /// git-sha / hardware-kind in place).
     #[arg(long)]
     update_benchmarks_md: bool,
     /// Comma-separated subset of gates to compute. Default: all.

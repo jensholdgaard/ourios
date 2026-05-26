@@ -149,8 +149,14 @@ struct Block {
 ///
 /// # Errors
 ///
-/// [`BenchError::Report`] if `md` is missing the `## 9.`
-/// Status section the region anchors to.
+/// [`BenchError::Report`] when:
+/// - the managed region doesn't exist yet **and** `md` has no
+///   `## 9. Status` heading to anchor a fresh region to (the
+///   anchor is only consulted on this first-insertion path —
+///   once the marker region exists, updates are
+///   region-relative and don't re-check the heading); or
+/// - the `BENCH-RESULTS` marker pair is mismatched (a `BEGIN`
+///   without a following `END`, or an orphan `END`).
 pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, BenchError> {
     let mut blocks = parse_region(md);
 

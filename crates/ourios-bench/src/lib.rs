@@ -2,20 +2,24 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! **Implementation status (PR-J2):** all three writer-side
+//! **Implementation status (PR-J3):** all three writer-side
 //! gates — A1 (compression), C1 (reconstruction), C2
 //! (template-count convergence) — are live. [`run`] computes
 //! any combination in a single miner pass and returns a
 //! populated [`ResultsFile`]. The CLI (RFC 0006 §3.7) in
-//! `main.rs` drives `run` and writes the §3.6 JSON results
-//! file via [`write_results_json`]. The remaining piece is the
-//! `docs/benchmarks.md` §9 markdown appender (the
-//! `--update-benchmarks-md` path), which lands in a follow-up.
+//! `main.rs` drives `run`, writes the §3.6 JSON results file
+//! via [`write_results_json`], and — with
+//! `--update-benchmarks-md` — folds the results into the
+//! `docs/benchmarks.md` §9 table via [`update_status_section`].
+//! The bench's measurement + reporting surface is complete;
+//! the only RFC 0006 work left is the RFC0006.7
+//! reproducibility test (still `#[ignore]`'d).
 //!
 //! Per RFC 0006 §3.2 the module layout is `corpus`, `harness`,
 //! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
 //! `harness`, `c1`; PR-I2 added `a1`; PR-J1 added `report`
-//! (JSON half) + the CLI; PR-J2 added `c2`.
+//! (JSON half) + the CLI; PR-J2 added `c2`; PR-J3 added the
+//! §9 appender.
 
 #![deny(unsafe_code)]
 
@@ -85,10 +89,12 @@ impl GateSet {
 /// Top-level entry point. Loads the corpus, drives the miner
 /// and writer pipeline, computes the §3.4 measurements for
 /// every enabled gate, and returns the §3.6 results in
-/// memory; writing the JSON file to `config.results_dir` and
-/// optionally rewriting the `docs/benchmarks.md` §9 sub-heading
-/// per `config.update_benchmarks_md` are the binary's
-/// responsibility (and not yet implemented).
+/// memory. Persisting them — writing the JSON file to
+/// `config.results_dir` and, when `config.update_benchmarks_md`
+/// is set, folding them into the `docs/benchmarks.md` §9 table
+/// — is the binary's responsibility, via
+/// [`write_results_json`] and [`update_status_section`]
+/// respectively.
 ///
 /// All three gates — A1, C1, C2 — are implemented and run in
 /// any combination. At least one gate must be enabled; an

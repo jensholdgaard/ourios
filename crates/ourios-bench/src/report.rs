@@ -1,12 +1,22 @@
-//! §3.6 results-file writer.
+//! §3.6 results-file writer + §9 `docs/benchmarks.md` appender.
 //!
-//! Serialises a [`ResultsFile`] to a per-run JSON file under
-//! the results directory. The §9 `docs/benchmarks.md`
-//! appender (the `--update-benchmarks-md` path) is a separate
-//! follow-up — this module only owns the machine-readable
-//! JSON artifact, which lands on every run regardless of the
-//! markdown flag.
+//! Two outputs grow out of a bench run:
+//!
+//! - the machine-readable per-run JSON file
+//!   ([`write_results_json`]), written on every run; and
+//! - the human-readable `docs/benchmarks.md` §9 Results
+//!   summary ([`update_status_section`]), written only when
+//!   `--update-benchmarks-md` is passed.
+//!
+//! The §9 appender keeps one block per `(git_sha,
+//! hardware_kind)` pair inside a bench-managed region; re-runs
+//! rewrite the matching block in place (no duplicate rows per
+//! RFC0006.4) and a partial `--gates` run updates only the
+//! gates it measured, leaving the others' prior numbers intact
+//! (RFC0006.6).
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -96,6 +106,259 @@ pub fn write_results_json(
 /// `timestamp` field inside the JSON keeps canonical RFC3339.
 fn file_stem(timestamp: &str, git_sha: &str) -> String {
     format!("{}-{}", timestamp.replace(':', "-"), git_sha)
+}
+
+/// Start of the bench-managed region inside §9. Everything
+/// between this and [`REGION_END`] is regenerated on each
+/// `--update-benchmarks-md` run; prose outside it is never
+/// touched.
+const REGION_BEGIN: &str = "<!-- BENCH-RESULTS:BEGIN (managed by `ourios-bench --update-benchmarks-md`; do not edit by hand) -->";
+const REGION_END: &str = "<!-- BENCH-RESULTS:END -->";
+
+/// One gate's row in a §9 results block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateRow {
+    measurement: String,
+    target: String,
+    verdict: String,
+}
+
+/// The recorded gates for one `(git_sha, hardware_kind)` block.
+/// Each gate is independently `Some`/`None` so a partial
+/// `--gates` run merges without disturbing gates it didn't
+/// measure (RFC0006.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Block {
+    date: String,
+    a1: Option<GateRow>,
+    c1: Option<GateRow>,
+    c2: Option<GateRow>,
+}
+
+/// Update the §9 Results summary in `md` with `results`,
+/// returning the new markdown. Pure (`&str -> String`) so the
+/// merge / rewrite logic is testable without touching the
+/// filesystem; the binary reads `docs/benchmarks.md`, calls
+/// this, and writes it back.
+///
+/// The block for the run's `(git_sha, hardware_kind)` is
+/// created or rewritten in place; only the gates present in
+/// `results` (`a1` / `c1` / `c2` that are `Some`) are
+/// replaced, so a `--gates c1` re-run leaves any previously
+/// recorded A1 / C2 numbers for that pair untouched.
+///
+/// # Errors
+///
+/// [`BenchError::Report`] if `md` is missing the `## 9.`
+/// Status section the region anchors to.
+pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, BenchError> {
+    let mut blocks = parse_region(md);
+
+    // Merge this run into the block for its (sha, hardware)
+    // pair — created if absent, gate-rows replaced only for
+    // the gates that ran.
+    let key = (results.git_sha.clone(), results.hardware_kind.clone());
+    let block = blocks.entry(key).or_default();
+    // `timestamp` is RFC3339 (`YYYY-MM-DDT…`); the date is the
+    // first 10 chars.
+    block.date = results.timestamp.get(..10).unwrap_or("").to_string();
+    if let Some(a1) = &results.a1 {
+        block.a1 = Some(GateRow {
+            measurement: format!(
+                "delta {:.3}× (ourios {:.3}× / zstd-19 {:.3}×)",
+                a1.delta, a1.ourios_ratio, a1.zstd_ratio,
+            ),
+            target: format!("≥ {:.1}×", a1.target_delta),
+            verdict: pass_verdict(a1.pass),
+        });
+    }
+    if let Some(c1) = &results.c1 {
+        block.c1 = Some(GateRow {
+            measurement: format!(
+                "{:.6} ({}/{} non-lossy; lossy {:.4})",
+                c1.rate, c1.non_lossy_reconstruct_ok, c1.non_lossy_total, c1.lossy_flag_ratio,
+            ),
+            target: "100.000%".to_string(),
+            verdict: pass_verdict(c1.pass),
+        });
+    }
+    if let Some(c2) = &results.c2 {
+        let measurement = match c2.convergence_ratio {
+            Some(ratio) => format!(
+                "ratio {ratio:.3} (count@1M {} / SS {})",
+                c2.template_count_at_1m_lines.unwrap_or(0),
+                c2.template_count_at_end,
+            ),
+            None => format!("n/a (SS {}, corpus < 1 M lines)", c2.template_count_at_end),
+        };
+        let verdict = match c2.pass {
+            Some(true) => "PASS".to_string(),
+            Some(false) => "FAIL".to_string(),
+            None => "ABSTAIN".to_string(),
+        };
+        block.c2 = Some(GateRow {
+            measurement,
+            target: "≥ 0.5".to_string(),
+            verdict,
+        });
+    }
+
+    let region = render_region(&blocks);
+    splice_region(md, &region)
+}
+
+fn pass_verdict(pass: bool) -> String {
+    if pass { "PASS" } else { "FAIL" }.to_string()
+}
+
+/// Parse the existing per-`(sha, hw)` blocks out of the
+/// managed region. Returns empty when the region is absent
+/// (first run). Only recognises the shape `render_region`
+/// emits, so it round-trips its own output.
+fn parse_region(md: &str) -> BTreeMap<(String, String), Block> {
+    let mut blocks = BTreeMap::new();
+    let Some(region) = md
+        .split_once(REGION_BEGIN)
+        .and_then(|(_, rest)| rest.split_once(REGION_END))
+        .map(|(inner, _)| inner)
+    else {
+        return blocks;
+    };
+
+    let mut current: Option<((String, String), Block)> = None;
+    for line in region.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix("#### ") {
+            if let Some((key, block)) = current.take() {
+                blocks.insert(key, block);
+            }
+            current = parse_header(header).map(|(sha, hw, date)| {
+                (
+                    (sha, hw),
+                    Block {
+                        date,
+                        ..Block::default()
+                    },
+                )
+            });
+        } else if let Some((_, block)) = current.as_mut() {
+            if let Some((gate, row)) = parse_row(line) {
+                match gate {
+                    "A1" => block.a1 = Some(row),
+                    "C1" => block.c1 = Some(row),
+                    "C2" => block.c2 = Some(row),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some((key, block)) = current.take() {
+        blocks.insert(key, block);
+    }
+    blocks
+}
+
+/// Parse a block header of the form
+/// "BACKTICK sha BACKTICK on BACKTICK hw BACKTICK — updated date"
+/// into `(sha, hw, date)`. The sha and hw are the
+/// backtick-delimited fields; the date is whatever follows
+/// "updated ".
+fn parse_header(header: &str) -> Option<(String, String, String)> {
+    // Fields between backticks: ["", sha, " on ", hw, " — updated <date>"].
+    let mut parts = header.split('`');
+    let _before = parts.next()?;
+    let sha = parts.next()?.to_string();
+    let _mid = parts.next()?;
+    let hw = parts.next()?.to_string();
+    let tail = parts.next().unwrap_or("");
+    let date = tail
+        .split_once("updated ")
+        .map_or_else(String::new, |(_, d)| d.trim().to_string());
+    Some((sha, hw, date))
+}
+
+/// Parse a table data row `| <gate> | <m> | <t> | <v> |` into
+/// `(gate, GateRow)`. Returns `None` for non-data rows (header
+/// / separator / anything not starting a recognised gate).
+fn parse_row(line: &str) -> Option<(&'static str, GateRow)> {
+    if !line.starts_with('|') {
+        return None;
+    }
+    let cols: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+    if cols.len() != 4 {
+        return None;
+    }
+    let gate = match cols[0] {
+        "A1" => "A1",
+        "C1" => "C1",
+        "C2" => "C2",
+        _ => return None,
+    };
+    Some((
+        gate,
+        GateRow {
+            measurement: cols[1].to_string(),
+            target: cols[2].to_string(),
+            verdict: cols[3].to_string(),
+        },
+    ))
+}
+
+/// Render the full managed region (markers included) from the
+/// merged blocks, in deterministic `(sha, hw)` order.
+fn render_region(blocks: &BTreeMap<(String, String), Block>) -> String {
+    let mut out = String::new();
+    out.push_str(REGION_BEGIN);
+    out.push_str("\n\n");
+    for ((sha, hw), block) in blocks {
+        let _ = writeln!(out, "#### `{sha}` on `{hw}` — updated {}", block.date);
+        out.push('\n');
+        out.push_str("| Gate | Measurement | Target | Verdict |\n");
+        out.push_str("| --- | --- | --- | --- |\n");
+        for (name, row) in [("A1", &block.a1), ("C1", &block.c1), ("C2", &block.c2)] {
+            if let Some(row) = row {
+                let _ = writeln!(
+                    out,
+                    "| {name} | {} | {} | {} |",
+                    row.measurement, row.target, row.verdict,
+                );
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str(REGION_END);
+    out
+}
+
+/// Splice the rendered region back into `md`: replace an
+/// existing region between the markers, or append a fresh
+/// `### Results` sub-section at the end of the `## 9.` section
+/// (which is the last section, so end-of-file).
+fn splice_region(md: &str, region: &str) -> Result<String, BenchError> {
+    if let (Some(begin), Some(end_rel)) = (
+        md.find(REGION_BEGIN),
+        md.find(REGION_END).map(|e| e + REGION_END.len()),
+    ) {
+        let mut out = String::with_capacity(md.len());
+        out.push_str(&md[..begin]);
+        out.push_str(region);
+        out.push_str(&md[end_rel..]);
+        return Ok(out);
+    }
+
+    // First run: the region doesn't exist yet. Anchor it to
+    // the §9 Status section.
+    if !md.contains("## 9. Status") {
+        return Err(BenchError::Report {
+            detail: "docs/benchmarks.md has no `## 9. Status` section to anchor the results region"
+                .to_string(),
+        });
+    }
+    let mut out = md.trim_end().to_string();
+    out.push_str("\n\n### Results\n\n");
+    out.push_str(region);
+    out.push('\n');
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -204,5 +467,89 @@ mod tests {
         let second = write_results_json(&r, tmp.path()).expect("second");
         assert_ne!(first, second, "second run gets a distinct path");
         assert!(first.exists() && second.exists(), "both files survive");
+    }
+
+    /// Minimal §9-bearing markdown to feed the appender (the
+    /// `## 9. Status` anchor is all `update_status_section`
+    /// requires).
+    fn md_with_status() -> String {
+        "# Benchmarks\n\n## 9. Status\n\nNo benchmark has been run yet.\n".to_string()
+    }
+
+    /// First `--update-benchmarks-md` run with no prior region
+    /// creates a `### Results` sub-section with one block for
+    /// the run's `(git_sha, hardware_kind)`, and the
+    /// prior prose survives.
+    #[test]
+    fn first_update_creates_results_block() {
+        let md = update_status_section(&md_with_status(), &sample_results()).expect("update");
+        assert!(md.contains("## 9. Status"), "prose section preserved");
+        assert!(md.contains("### Results"));
+        assert!(md.contains("#### `abc1234` on `baseline-8vcpu-32gib`"));
+        assert!(md.contains("| A1 |") && md.contains("| C1 |"));
+        // C2 was None in the sample → no C2 row.
+        assert!(!md.contains("| C2 |"), "absent gate has no row");
+    }
+
+    /// RFC0006.4 — re-running on the same `(git_sha,
+    /// hardware_kind)` rewrites the block in place; no
+    /// duplicate sub-heading.
+    #[test]
+    fn rerun_same_sha_hw_rewrites_in_place() {
+        let once = update_status_section(&md_with_status(), &sample_results()).expect("once");
+        let mut updated = sample_results();
+        // A different measurement on the same (sha, hw).
+        updated.c1.as_mut().unwrap().rate = 0.999_999;
+        updated.c1.as_mut().unwrap().non_lossy_reconstruct_ok = 99;
+        let twice = update_status_section(&once, &updated).expect("twice");
+
+        assert_eq!(
+            twice
+                .matches("#### `abc1234` on `baseline-8vcpu-32gib`")
+                .count(),
+            1,
+            "same (sha, hw) must not duplicate the sub-heading",
+        );
+        assert!(
+            twice.contains("0.999999"),
+            "block reflects the rerun's number"
+        );
+    }
+
+    /// RFC0006.6 — a partial `--gates c1` run updates only the
+    /// C1 row, leaving the A1 number previously recorded for
+    /// the same `(sha, hw)` intact.
+    #[test]
+    fn partial_gate_rerun_preserves_other_gates() {
+        // First a full A1+C1 run.
+        let full = update_status_section(&md_with_status(), &sample_results()).expect("full");
+        let a1_line = full
+            .lines()
+            .find(|l| l.starts_with("| A1 |"))
+            .expect("A1 row present after full run")
+            .to_string();
+
+        // Then a C1-only rerun (A1 / C2 absent from results).
+        let mut c1_only = sample_results();
+        c1_only.a1 = None;
+        c1_only.c2 = None;
+        c1_only.c1.as_mut().unwrap().rate = 0.5;
+        let after = update_status_section(&full, &c1_only).expect("c1-only");
+
+        // A1 row is byte-for-byte preserved; C1 row changed.
+        assert!(
+            after.lines().any(|l| l == a1_line),
+            "the prior A1 row must survive a C1-only rerun untouched",
+        );
+        assert!(after.contains("0.500000"), "C1 row reflects the rerun");
+    }
+
+    /// Missing the `## 9.` anchor is a `Report` error rather
+    /// than silently producing a malformed doc.
+    #[test]
+    fn missing_status_section_errors() {
+        let err = update_status_section("# Benchmarks\n\nno section nine\n", &sample_results())
+            .expect_err("must error without §9");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
     }
 }

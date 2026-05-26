@@ -16,7 +16,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use ourios_bench::{BenchConfig, BenchError, GateSet, run, write_results_json};
+use ourios_bench::{
+    BenchConfig, BenchError, GateSet, run, update_status_section, write_results_json,
+};
+
+/// The §9 Results doc the `--update-benchmarks-md` path
+/// rewrites. Relative to the invocation directory (the
+/// maintainer runs `just thesis-bench` from the repo root).
+const BENCHMARKS_MD_PATH: &str = "docs/benchmarks.md";
 
 /// RFC 0006 §1 hardware baseline tag, surfaced in the
 /// `--allow-unknown-hardware` warning so an operator knows
@@ -144,10 +151,7 @@ fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
     }
     print_summary(&results);
     if update_md {
-        eprintln!(
-            "ourios-bench: warning: --update-benchmarks-md is not implemented yet (the §9 \
-             markdown appender lands in a follow-up PR); JSON results written only.",
-        );
+        update_benchmarks_md(&results)?;
     }
 
     // §3.4.2: a non-lossy reconstruction mismatch is a
@@ -169,6 +173,22 @@ fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Read `docs/benchmarks.md`, fold this run's results into its
+/// §9 Results region, and write it back. Thin file I/O around
+/// the pure [`update_status_section`] transform.
+fn update_benchmarks_md(results: &ourios_bench::ResultsFile) -> Result<(), BenchError> {
+    let path = std::path::Path::new(BENCHMARKS_MD_PATH);
+    let md = std::fs::read_to_string(path).map_err(|e| BenchError::Report {
+        detail: format!("read {}: {e} (run from the repo root?)", path.display()),
+    })?;
+    let updated = update_status_section(&md, results)?;
+    std::fs::write(path, updated).map_err(|e| BenchError::Report {
+        detail: format!("write {}: {e}", path.display()),
+    })?;
+    eprintln!("ourios-bench: updated {} §9 Results", path.display());
+    Ok(())
 }
 
 /// Print a one-line-per-gate human summary to stdout. The

@@ -29,7 +29,7 @@ mod corpus;
 mod harness;
 mod report;
 
-pub use report::write_results_json;
+pub use report::{update_status_section, write_results_json};
 
 /// Configuration for one bench invocation.
 ///

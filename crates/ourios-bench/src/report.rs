@@ -163,11 +163,13 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
     // Merge this run into the block for its (sha, hardware)
     // pair — created if absent, gate-rows replaced only for
     // the gates that ran.
+    // The displayed "updated <date>" is the `YYYY-MM-DD`
+    // prefix of the RFC3339 timestamp; validate it rather than
+    // emitting an empty date from a malformed field.
+    let date = results_date(&results.timestamp)?;
     let key = (results.git_sha.clone(), results.hardware_kind.clone());
     let block = blocks.entry(key).or_default();
-    // `timestamp` is RFC3339 (`YYYY-MM-DDT…`); the date is the
-    // first 10 chars.
-    block.date = results.timestamp.get(..10).unwrap_or("").to_string();
+    block.date = date;
     if let Some(a1) = &results.a1 {
         block.a1 = Some(GateRow {
             measurement: format!(
@@ -233,6 +235,28 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
 
 fn pass_verdict(pass: bool) -> String {
     if pass { "PASS" } else { "FAIL" }.to_string()
+}
+
+/// Extract the `YYYY-MM-DD` date from an RFC3339 `timestamp`,
+/// erroring if it isn't shaped like one. Guards against a
+/// malformed `timestamp` (e.g. from corrupt JSON) silently
+/// rendering an empty "updated " in the §9 header.
+fn results_date(timestamp: &str) -> Result<String, BenchError> {
+    let bytes = timestamp.as_bytes();
+    let shaped = bytes.len() >= 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit());
+    if !shaped {
+        return Err(BenchError::Report {
+            detail: format!(
+                "results timestamp {timestamp:?} is not RFC3339-shaped (need a YYYY-MM-DD prefix)"
+            ),
+        });
+    }
+    Ok(timestamp[..10].to_string())
 }
 
 /// Parse the existing per-`(sha, hw)` blocks out of the
@@ -373,8 +397,17 @@ fn render_region(blocks: &BTreeMap<(String, String), Block>) -> String {
 /// before `BEGIN`) is a [`BenchError::Report`] rather than a
 /// silent second region — a half-present region means the doc
 /// was hand-edited into a corrupt state, which we surface
-/// instead of compounding.
+/// instead of compounding. More than one of either marker is
+/// likewise rejected: updating only the first region would
+/// leave the others stale.
 fn splice_region(md: &str, region: &str) -> Result<String, BenchError> {
+    if md.matches(REGION_BEGIN).count() > 1 || md.matches(REGION_END).count() > 1 {
+        return Err(BenchError::Report {
+            detail: "docs/benchmarks.md has more than one BENCH-RESULTS region — collapse them \
+                     to a single managed region by hand before re-running"
+                .to_string(),
+        });
+    }
     let begin = md.find(REGION_BEGIN);
     // Only accept an END that comes after the BEGIN marker.
     let end = begin.and_then(|b| {
@@ -663,6 +696,30 @@ mod tests {
         });
         let err =
             update_status_section(&md_with_status(), &r).expect_err("inconsistent C2 must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A malformed `timestamp` (not RFC3339-shaped) errors
+    /// rather than rendering an empty "updated " date.
+    #[test]
+    fn malformed_timestamp_errors() {
+        let mut r = sample_results();
+        r.timestamp = "not-a-date".to_string();
+        let err = update_status_section(&md_with_status(), &r)
+            .expect_err("malformed timestamp must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// More than one managed region is corruption — updating
+    /// only the first would leave the others stale, so it's a
+    /// `Report` error.
+    #[test]
+    fn multiple_regions_error() {
+        let doc = format!(
+            "## 9. Status\n\n{REGION_BEGIN}\n\n{REGION_END}\n\nstray\n\n{REGION_BEGIN}\n\n{REGION_END}\n"
+        );
+        let err =
+            update_status_section(&doc, &sample_results()).expect_err("two regions must error");
         assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
     }
 

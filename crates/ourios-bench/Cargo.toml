@@ -28,12 +28,19 @@ ourios-parquet = { path = "../ourios-parquet" }
 # `derive` gives the struct→JSON path; `std` covers the rest.
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-
-[dev-dependencies]
-# `tempfile` is the standard scratch-directory helper the other
-# integration tests in this workspace use (see ourios-parquet's
-# dev-dependencies). The bench's red-gate test stubs will need
-# it once they run real flows.
+# A1's ZSTD-19 reference codec (RFC 0006 §3.4.1 / §7). `zstd` is
+# the ergonomic safe wrapper over `zstd-safe`; both bind the same
+# bundled C library and `parquet`'s `zstd` feature already pulls
+# it into the tree, so the version is pinned by `Cargo.lock` and
+# A1 is reproducible across hosts without a system `zstd` binary.
+zstd = "0.13"
+# A1 writes the Parquet output bucket somewhere measurable; when
+# `BenchConfig.bucket_dir` is `None`, `run` creates a scratch dir
+# here and (unless `--keep-parquet`) cleans it up on exit. The
+# integration tests reuse both `tempfile` (scratch corpora /
+# buckets) and `zstd` (the RFC0006.1 test recomputes the
+# reference byte count) — normal dependencies are visible to
+# `tests/`, so no separate `[dev-dependencies]` mirror is needed.
 tempfile = "3"
 
 [lints]

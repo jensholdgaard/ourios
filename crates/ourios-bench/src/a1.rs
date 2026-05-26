@@ -101,17 +101,24 @@ impl A1Accumulator {
         let partition = PartitionKey::derive(emitted).map_err(|e| crate::BenchError::Pipeline {
             detail: format!("partition derive failed: {e}"),
         })?;
-        let writer = match self.data_writers.entry(partition.clone()) {
-            std::collections::hash_map::Entry::Occupied(w) => w.into_mut(),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let w = Writer::open(&self.bucket_root, partition).map_err(|e| {
-                    crate::BenchError::Pipeline {
-                        detail: format!("parquet writer open: {e}"),
-                    }
-                })?;
-                slot.insert(w)
-            }
-        };
+        // Hot path: the partition writer almost always already
+        // exists (a corpus stays in one hour for ~3.6 M lines
+        // at the §3.3 1 ms/line cadence). `contains_key` +
+        // `get_mut` keep the common case clone-free; the
+        // `PartitionKey` (with its `String`) is only cloned on
+        // the rare first-sight-of-a-partition miss.
+        if !self.data_writers.contains_key(&partition) {
+            let writer = Writer::open(&self.bucket_root, partition.clone()).map_err(|e| {
+                crate::BenchError::Pipeline {
+                    detail: format!("parquet writer open: {e}"),
+                }
+            })?;
+            self.data_writers.insert(partition.clone(), writer);
+        }
+        let writer = self
+            .data_writers
+            .get_mut(&partition)
+            .expect("writer inserted above when absent");
         writer
             .append_records(std::slice::from_ref(emitted))
             .map_err(|e| crate::BenchError::Pipeline {
@@ -444,6 +451,41 @@ mod tests {
     // not a tolerance.
     #![allow(clippy::float_cmp)]
     use super::*;
+
+    /// Day-level audit partitioning: two events on the same
+    /// calendar day but different hours must collapse to one
+    /// `PartitionKey` (the `key.hour = 0` normalization), so a
+    /// multi-hour run writes one audit file per day. Pins the
+    /// audit layout contract.
+    #[test]
+    fn audit_partition_collapses_same_day_hours() {
+        use ourios_core::audit::AuditEventKind;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let make = |offset_secs: u64| AuditEvent {
+            kind: AuditEventKind::TemplateWideningRejectedDegenerate {
+                version: 1,
+                current_template: "alpha <*>".to_string(),
+                would_be_template: "<*> <*>".to_string(),
+                would_be_positions: vec![0],
+            },
+            tenant_id: TenantId::new("bench-tenant"),
+            template_id: 1,
+            triggering_line_hash: [0u8; 16],
+            triggering_line_sample: None,
+            // §3.3 baseline (2026-04-02T10:58:00Z) + offset.
+            timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480 + offset_secs),
+        };
+
+        // Same day, ~2 hours apart (10:58 vs 12:58).
+        let early = audit_partition(&make(0)).expect("partition");
+        let later = audit_partition(&make(2 * 3600)).expect("partition");
+        assert_eq!(
+            early, later,
+            "same-day events must share one audit partition key (hour normalized to 0)",
+        );
+        assert_eq!(early.hour, 0, "audit key hour is normalized to 0");
+    }
 
     /// 3-sigfig floor: `12.49` → `12.4`, `3.456` → `3.45`,
     /// `0.98765` → `0.987`. Always rounds toward zero so a

@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use ourios_core::audit::{AuditEvent, SharedAuditSink};
+use ourios_core::audit::{AuditEvent, NoOpAuditSink, SharedAuditSink};
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
@@ -76,6 +76,14 @@ pub(crate) struct HarnessResult {
 /// snapshot. Version monotonicity (the miner never unmerges)
 /// means a `(id, v)` we've already captured stays valid.
 ///
+/// `capture_audit` controls audit-event collection: A1 needs
+/// the stream (it writes it into the `audit/...` series),
+/// other gates don't. When `false` the cluster gets a
+/// [`NoOpAuditSink`] and [`HarnessResult::audit_events`] is
+/// empty — important because [`SharedAuditSink`] is unbounded,
+/// so buffering it on a C1-only run would retain the whole
+/// event stream for nothing.
+///
 /// # Errors
 ///
 /// - [`BenchError::Pipeline`] when the miner's emit count for
@@ -86,18 +94,27 @@ pub(crate) struct HarnessResult {
 ///   cluster's `templates_for()` doesn't return a leaf for
 ///   (impossible by construction; surfaces a future miner
 ///   bug rather than crashing C1's snapshot lookup).
-pub(crate) fn run<F>(corpus: &CorpusLoad, mut on_record: F) -> Result<HarnessResult, BenchError>
+pub(crate) fn run<F>(
+    corpus: &CorpusLoad,
+    capture_audit: bool,
+    mut on_record: F,
+) -> Result<HarnessResult, BenchError>
 where
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
 {
     let sink = SharedRecordSink::new();
-    let audit_sink = SharedAuditSink::new();
+    let audit_sink = capture_audit.then(SharedAuditSink::new);
     // `with_audit_sink` is the constructor that takes the
     // audit sink; `with_record_sink` is the chainable setter
-    // for the record sink.
-    let mut cluster =
-        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
-            .with_record_sink(Box::new(sink.clone()));
+    // for the record sink. A `NoOpAuditSink` is installed when
+    // the caller isn't capturing, so the miner's emissions are
+    // dropped instead of buffered.
+    let audit_box: Box<dyn ourios_core::audit::AuditSink> = match &audit_sink {
+        Some(s) => Box::new(s.clone()),
+        None => Box::new(NoOpAuditSink::new()),
+    };
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), audit_box)
+        .with_record_sink(Box::new(sink.clone()));
     let tenant = TenantId::new(BENCH_TENANT);
     let mut snapshots: HashMap<(u64, u32), Vec<OwnedToken>> = HashMap::new();
 
@@ -136,7 +153,7 @@ where
     }
 
     Ok(HarnessResult {
-        audit_events: audit_sink.drain(),
+        audit_events: audit_sink.map(|s| s.drain()).unwrap_or_default(),
     })
 }
 
@@ -221,7 +238,7 @@ mod tests {
         let (_tmp, load) = load_lines(&["user 42 logged in", "user 43 logged in"]);
         let line_count = load.lines.len();
         let mut count = 0usize;
-        run(&load, |_input, _record, _snap| count += 1).expect("harness runs");
+        run(&load, false, |_input, _record, _snap| count += 1).expect("harness runs");
         assert_eq!(count, line_count);
     }
 
@@ -242,7 +259,7 @@ mod tests {
         ]);
         let mut non_lossy_seen = 0usize;
         let mut non_lossy_with_snapshot = 0usize;
-        run(&load, |_input, record, snap| {
+        run(&load, false, |_input, record, snap| {
             if !record.lossy_flag && record.template_id != NO_TEMPLATE {
                 non_lossy_seen += 1;
                 if snap.is_some() {
@@ -269,7 +286,7 @@ mod tests {
     fn repeated_template_reuses_one_snapshot() {
         let (_tmp, load) = load_lines(&["user 42 logged in", "user 99 logged in"]);
         let mut snapshots_seen: Vec<Option<Vec<OwnedToken>>> = Vec::new();
-        run(&load, |_input, _record, snap| {
+        run(&load, false, |_input, _record, snap| {
             snapshots_seen.push(snap.map(<[OwnedToken]>::to_vec));
         })
         .expect("harness runs");

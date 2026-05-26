@@ -166,7 +166,7 @@ mod tests {
     fn c1_is_100_percent_on_seed_corpus() {
         let load = corpus::load(&seed_corpus_dir()).expect("seed corpus loads");
         let mut acc = C1Accumulator::new();
-        harness::run(&load, |input, emitted, snap| {
+        harness::run(&load, false, |input, emitted, snap| {
             acc.record(input, emitted, snap);
         })
         .expect("harness runs");

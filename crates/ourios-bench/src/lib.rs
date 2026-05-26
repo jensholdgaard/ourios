@@ -148,32 +148,36 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
     let total_lines = u64::try_from(corpus_load.lines.len())
         .expect("usize fits in u64 on every supported Rust target");
 
-    // Resolve the Parquet output bucket A1 writes into. A
-    // caller-supplied `bucket_dir` is used as-is; otherwise a
-    // scratch dir is created and (unless `--keep-parquet`)
-    // removed when `_bucket_guard` drops at end of scope.
-    // Held even when A1 is disabled so the branch stays simple
-    // — an unused empty temp dir costs one inode.
-    let (bucket_root, _bucket_guard) = resolve_bucket(config)?;
-
-    // A1 measures every `*.parquet` under the bucket; a
-    // caller-supplied dir that already holds Parquet (e.g. a
-    // prior `--keep-parquet` run) would inflate
-    // `bytes(ourios_output)` and skew the ratio. Refuse to
-    // measure into a dirty bucket. A scratch `TempDir` is
-    // always empty, so this only ever fires on a reused
-    // caller dir.
-    if config.gates.a1 {
+    // Resolve the Parquet output bucket — but only for A1.
+    // C1 writes no Parquet, so a C1-only run needs no bucket
+    // and must not be tripped up by bucket concerns (e.g. a
+    // `--keep-parquet` flag, or an unwritable temp dir). The
+    // `_bucket_guard` keeps a scratch `TempDir` alive until
+    // end of scope; it's `None` for a caller-supplied dir or
+    // when A1 is disabled.
+    let _bucket_guard: Option<tempfile::TempDir>;
+    let mut a1_acc = if config.gates.a1 {
+        let (bucket_root, guard) = resolve_bucket(config)?;
+        // A1 measures every `*.parquet` under the bucket; a
+        // caller-supplied dir already holding Parquet (e.g. a
+        // prior `--keep-parquet` run) would inflate
+        // `bytes(ourios_output)`. A scratch `TempDir` is always
+        // empty, so this only ever fires on a reused caller dir.
         ensure_bucket_has_no_parquet(&bucket_root)?;
-    }
+        _bucket_guard = guard;
+        Some(a1::A1Accumulator::new(&bucket_root))
+    } else {
+        _bucket_guard = None;
+        None
+    };
 
     let mut c1_acc = config.gates.c1.then(c1::C1Accumulator::new);
-    let mut a1_acc = config
-        .gates
-        .a1
-        .then(|| a1::A1Accumulator::new(&bucket_root));
 
-    let harness_result = harness::run(&corpus_load, |input, emitted, snap| {
+    // Capture the audit stream only when A1 needs it
+    // (`SharedAuditSink` is unbounded — buffering it on a
+    // C1-only run would retain the full event stream for
+    // nothing).
+    let harness_result = harness::run(&corpus_load, config.gates.a1, |input, emitted, snap| {
         if let Some(acc) = c1_acc.as_mut() {
             acc.record(input, emitted, snap);
         }

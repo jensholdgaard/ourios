@@ -239,22 +239,32 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
 /// plus an optional [`tempfile::TempDir`] guard whose `Drop`
 /// removes a scratch bucket at end of `run`. When the caller
 /// passed an explicit `bucket_dir`, the guard is `None` (the
-/// caller owns the directory's lifetime). `--keep-parquet`
-/// persists a scratch dir by leaking the guard via
-/// `TempDir::keep`.
+/// caller owns the directory's lifetime); the scratch case
+/// returns `Some` so the dir is cleaned up on exit.
+///
+/// `keep_parquet` requires an explicit `bucket_dir`: a scratch
+/// dir the caller can't locate (paths are deliberately kept
+/// out of [`ResultsFile`] per §3.6) would be useless to keep
+/// and would just litter the temp filesystem. Requesting
+/// `keep_parquet` without `bucket_dir` returns
+/// [`BenchError::Cli`].
 fn resolve_bucket(
     config: &BenchConfig,
 ) -> Result<(PathBuf, Option<tempfile::TempDir>), BenchError> {
     if let Some(dir) = &config.bucket_dir {
         return Ok((dir.clone(), None));
     }
+    if config.keep_parquet {
+        return Err(BenchError::Cli {
+            detail: "--keep-parquet requires --bucket-dir: a scratch bucket's path isn't \
+                     reported (paths are kept out of the results JSON), so keeping it would \
+                     leave an unfindable directory behind."
+                .to_string(),
+        });
+    }
     let tmp = tempfile::TempDir::new().map_err(|e| BenchError::Pipeline {
         detail: format!("create scratch bucket dir: {e}"),
     })?;
-    if config.keep_parquet {
-        let path = tmp.keep();
-        return Ok((path, None));
-    }
     let path = tmp.path().to_path_buf();
     Ok((path, Some(tmp)))
 }
@@ -284,15 +294,23 @@ fn ensure_bucket_has_no_parquet(bucket_root: &std::path::Path) -> Result<(), Ben
                     detail: format!("scan bucket entry under {}: {e}", d.display()),
                 })?;
                 let path = entry.path();
-                // `fs::metadata` (fallible) rather than
-                // `Path::is_dir` (false on metadata errors),
-                // so an unreadable entry fails the scan
-                // instead of being silently treated as a
-                // non-directory and skipped — which could miss
-                // nested `*.parquet`.
-                let meta = std::fs::metadata(&path).map_err(|e| BenchError::Pipeline {
+                // `symlink_metadata` (fallible, does NOT
+                // follow symlinks) rather than `Path::is_dir`
+                // (false on metadata errors). A symlinked
+                // entry is skipped, not descended into: the
+                // bench writes real directories, so a symlink
+                // in the output bucket is unexpected, and
+                // following one risks an unbounded scan loop
+                // (a symlinked subdir pointing at an
+                // ancestor). Skipping is safe — there are no
+                // legitimate symlinked Parquet artifacts to
+                // miss.
+                let meta = std::fs::symlink_metadata(&path).map_err(|e| BenchError::Pipeline {
                     detail: format!("scan bucket metadata({}): {e}", path.display()),
                 })?;
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
                 if meta.is_dir() {
                     stack.push(path);
                 } else if path

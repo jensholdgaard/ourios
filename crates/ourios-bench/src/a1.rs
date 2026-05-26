@@ -295,9 +295,19 @@ fn sum_parquet_bytes(dir: &Path) -> Result<u64, crate::BenchError> {
                 detail: format!("read_dir entry under {}: {e}", d.display()),
             })?;
             let path = entry.path();
-            let meta = std::fs::metadata(&path).map_err(|e| crate::BenchError::Pipeline {
-                detail: format!("metadata({}): {e}", path.display()),
-            })?;
+            // `symlink_metadata` (does NOT follow symlinks):
+            // the bench writes real directories, so a symlink
+            // in its own output bucket is unexpected. Skip it
+            // rather than follow it — a symlinked subdir
+            // pointing at an ancestor would otherwise loop the
+            // scan forever and hang A1's finalize.
+            let meta =
+                std::fs::symlink_metadata(&path).map_err(|e| crate::BenchError::Pipeline {
+                    detail: format!("metadata({}): {e}", path.display()),
+                })?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 stack.push(path);
             } else if path

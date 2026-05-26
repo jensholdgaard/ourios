@@ -287,3 +287,34 @@ fn a1_rejects_a_bucket_that_already_holds_parquet() {
         "expected a Cli error about a non-empty bucket, got {err:?}",
     );
 }
+
+/// `--keep-parquet` without `--bucket-dir` is rejected: a
+/// scratch bucket's path isn't reported, so keeping it would
+/// leave an unfindable directory behind. The guard fires in
+/// bucket resolution, before any corpus work.
+#[test]
+fn keep_parquet_without_bucket_dir_is_rejected() {
+    let results = tempfile::TempDir::new().expect("temp dir");
+    let config = BenchConfig {
+        corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("testdata/corpus"),
+        results_dir: results.path().to_path_buf(),
+        bucket_dir: None,
+        keep_parquet: true,
+        hardware_kind: Some("dev-laptop".to_string()),
+        update_benchmarks_md: false,
+        gates: GateSet {
+            a1: true,
+            c1: false,
+            c2: false,
+        },
+    };
+    let err = run(&config).expect_err("keep_parquet without bucket_dir must be rejected");
+    assert!(
+        matches!(&err, BenchError::Cli { detail } if detail.contains("--keep-parquet requires --bucket-dir")),
+        "expected a Cli error about --keep-parquet, got {err:?}",
+    );
+}

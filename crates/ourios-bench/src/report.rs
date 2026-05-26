@@ -37,7 +37,9 @@ const MAX_COLLISION_CANDIDATES: u32 = 10_000;
 ///
 /// [`BenchError::Report`] when the directory can't be created,
 /// the results can't be serialised, the file write fails, or
-/// all [`MAX_COLLISION_CANDIDATES`] name candidates are taken.
+/// all `MAX_COLLISION_CANDIDATES + 1` name candidates are
+/// taken (the unsuffixed `<stem>.json` plus
+/// `<stem>-1 ..= <stem>-MAX`).
 pub fn write_results_json(
     results: &ResultsFile,
     results_dir: &Path,

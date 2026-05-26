@@ -7,21 +7,37 @@
 //! JSON artifact, which lands on every run regardless of the
 //! markdown flag.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::{BenchError, ResultsFile};
 
+/// Upper bound on collision-suffix candidates tried before
+/// giving up. A few thousand results files sharing one
+/// `(timestamp-ms, git_sha)` is already pathological; the cap
+/// stops a wedged filesystem from spinning forever.
+const MAX_COLLISION_CANDIDATES: u32 = 10_000;
+
 /// Write `results` as pretty JSON to `results_dir`, returning
 /// the path written. The file name is
-/// `<timestamp>-<git_sha>.json` per §3.1, with a numeric
+/// `<timestamp>-<git_sha>.json` per §3.6, with a numeric
 /// suffix (`-1`, `-2`, …) appended on collision so two runs
 /// landing in the same millisecond on the same commit don't
-/// clobber each other (the §3.6 collision-retry rule).
+/// clobber each other.
+///
+/// Each candidate is created with `OpenOptions::create_new`
+/// (atomic "create iff absent") and retried on
+/// `AlreadyExists`, so the file is never clobbered — neither
+/// by a TOCTOU race against a concurrent run nor by the
+/// suffix budget running out (that returns an error rather
+/// than overwriting `<stem>-<MAX>.json`).
 ///
 /// # Errors
 ///
 /// [`BenchError::Report`] when the directory can't be created,
-/// the results can't be serialised, or the file write fails.
+/// the results can't be serialised, the file write fails, or
+/// all [`MAX_COLLISION_CANDIDATES`] name candidates are taken.
 pub fn write_results_json(
     results: &ResultsFile,
     results_dir: &Path,
@@ -31,25 +47,44 @@ pub fn write_results_json(
     })?;
 
     let stem = file_stem(&results.timestamp, &results.git_sha);
-    let mut path = results_dir.join(format!("{stem}.json"));
-    // Bounded collision retry. A few thousand same-ms same-sha
-    // runs is already pathological; cap the suffix search so a
-    // filesystem returning a persistent error from `exists`
-    // can't spin forever.
-    for counter in 1..=10_000u32 {
-        if !path.exists() {
-            break;
-        }
-        path = results_dir.join(format!("{stem}-{counter}.json"));
-    }
-
     let json = serde_json::to_string_pretty(results).map_err(|e| BenchError::Report {
         detail: format!("serialise results: {e}"),
     })?;
-    std::fs::write(&path, json).map_err(|e| BenchError::Report {
-        detail: format!("write({}): {e}", path.display()),
-    })?;
-    Ok(path)
+
+    for counter in 0..=MAX_COLLISION_CANDIDATES {
+        let path = if counter == 0 {
+            results_dir.join(format!("{stem}.json"))
+        } else {
+            results_dir.join(format!("{stem}-{counter}.json"))
+        };
+        // `create_new` is atomic: it fails with `AlreadyExists`
+        // rather than truncating an existing file, closing the
+        // check-then-write race.
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(json.as_bytes())
+                    .map_err(|e| BenchError::Report {
+                        detail: format!("write({}): {e}", path.display()),
+                    })?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(BenchError::Report {
+                    detail: format!("create({}): {e}", path.display()),
+                });
+            }
+        }
+    }
+
+    Err(BenchError::Report {
+        detail: format!(
+            "exhausted {} results-file name candidates for stem {stem} under {} — every \
+             <stem>[-N].json is taken",
+            MAX_COLLISION_CANDIDATES + 1,
+            results_dir.display(),
+        ),
+    })
 }
 
 /// File-name stem `<timestamp>-<git_sha>`, with `:` from the
@@ -118,7 +153,12 @@ mod tests {
 
         assert!(path.exists(), "results file written");
         let text = std::fs::read_to_string(&path).expect("read back");
-        // Every §3.6 required key is present on disk.
+        // Every §3.6 required key is present as a top-level
+        // object key (parse to `Value` rather than substring-
+        // matching, which would false-positive if a key name
+        // appeared inside a string value).
+        let value: serde_json::Value = serde_json::from_str(&text).expect("parse to value");
+        let obj = value.as_object().expect("top level is a JSON object");
         for key in [
             "rfc",
             "rfc_version",
@@ -132,7 +172,7 @@ mod tests {
             "c1",
             "c2",
         ] {
-            assert!(text.contains(&format!("\"{key}\"")), "missing key {key}");
+            assert!(obj.contains_key(key), "missing top-level key {key}");
         }
         let parsed: ResultsFile = serde_json::from_str(&text).expect("parse");
         assert_eq!(parsed, original, "round-trip preserves every field");

@@ -203,6 +203,24 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
             if c1.pass { "PASS" } else { "FAIL" },
         );
     }
+    if let Some(c2) = &results.c2 {
+        // `pass = None` is the §3.4.3 abstention (corpus
+        // < 1 M lines) — surface it as ABSTAIN, not a silent
+        // omission. (C2 isn't computed yet; this line is ready
+        // for when it lands.)
+        let verdict = match c2.pass {
+            Some(true) => "PASS",
+            Some(false) => "FAIL",
+            None => "ABSTAIN (corpus < 1 M lines)",
+        };
+        let ratio = c2
+            .convergence_ratio
+            .map_or_else(|| "n/a".to_string(), |r| format!("{r:.3}"));
+        println!(
+            "  C2 convergence: ratio {ratio} (end template count {}, sample cadence {}) — {verdict}",
+            c2.template_count_at_end, c2.sample_cadence,
+        );
+    }
 }
 
 #[cfg(test)]

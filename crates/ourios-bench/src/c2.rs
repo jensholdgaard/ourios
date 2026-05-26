@@ -96,7 +96,12 @@ impl C2Accumulator {
         let on_cadence = self.processed % self.cadence == 0;
         let is_last = self.processed == self.total_lines;
         if (on_cadence || is_last) && self.curve.last().map(|s| s.lines) != Some(self.processed) {
-            let template_count = u64::try_from(self.seen_template_ids.len()).unwrap_or(u64::MAX);
+            // `usize → u64` is infallible on every Rust Tier 1
+            // / 2 target; `expect` names the assumption rather
+            // than saturating to a bogus `u64::MAX` on a
+            // hypothetical 128-bit target.
+            let template_count = u64::try_from(self.seen_template_ids.len())
+                .expect("template count fits in u64 on every supported Rust target");
             self.curve.push(ConvergenceSample {
                 lines: self.processed,
                 template_count,
@@ -219,32 +224,39 @@ mod tests {
         assert_eq!(r.template_count_at_end, 5);
     }
 
-    /// A corpus that keeps minting new templates past 1 M lines
-    /// (no plateau) fails the gate: `count_1m` is well under
-    /// half the end count. Builds the curve by hand to model
-    /// linear template growth, since the miner would need an
-    /// unbounded-alphabet corpus to reproduce it.
+    /// A corpus whose template count is still climbing steeply
+    /// at 1 M lines (no plateau) fails the gate: `count_1m` is
+    /// far under half the end count.
     #[test]
     fn non_converging_curve_fails_the_gate() {
-        // 2 M lines, one new template every 2 lines → ~1 M
-        // templates total; at 1 M lines only ~500 k exist.
-        // ratio ≈ 0.5 boundary — push it under by minting
-        // faster in the back half. Model directly via observe
-        // with a strictly increasing id each line.
+        // Phase 1 (first 1 M lines): a bounded alphabet of 10
+        // templates, so the count at 1 M is ~10. Phase 2
+        // (next 1 M lines): a brand-new template every line, so
+        // the end count is ~1 M. count_1m / SS ≈ 10 / 1_000_010
+        // ≪ 0.5 → the gate fails unambiguously. (Distinct
+        // phase-2 ids start at 2 M so they never collide with
+        // the 1..=10 alphabet.)
         let total = 2_000_000u64;
         let mut acc = C2Accumulator::new(total);
         for i in 0..total {
-            acc.observe(i + 1); // every line a brand-new id
+            let id = if i < 1_000_000 {
+                (i % 10) + 1
+            } else {
+                2_000_000 + i
+            };
+            acc.observe(id);
         }
         let r = acc.finalize();
         assert!(r.corpus_at_least_1m);
-        // count at ~1 M lines ≈ 1 M; end ≈ 2 M → ratio ≈ 0.5.
-        // Linear growth lands right at the boundary, so assert
-        // the ratio is ~0.5 and well below a converged 1.0.
         let ratio = r.convergence_ratio.expect("ratio on ≥1M corpus");
         assert!(
-            (0.45..=0.55).contains(&ratio),
-            "linear (non-converging) growth gives ratio ≈ 0.5, got {ratio}",
+            ratio < 0.5,
+            "templates still climbing at 1 M → ratio {ratio} must be < 0.5",
+        );
+        assert_eq!(
+            r.pass,
+            Some(false),
+            "a non-converged corpus must fail the C2 gate",
         );
     }
 }

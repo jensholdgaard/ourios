@@ -10,13 +10,20 @@
 //! end — i.e. it's within 2× of steady state.
 //!
 //! The template count at any point is the number of distinct
-//! non-[`NO_TEMPLATE`] `template_id`s seen so far: every
-//! template that exists was created by some ingested line and
-//! stamped onto that line's emitted record, and ids are
-//! monotonic, so counting distinct ids in the record stream
-//! reproduces the live template count without reaching into
-//! the cluster. C2 is therefore a pure stream accumulator over
-//! the harness callback, like C1.
+//! non-[`NO_TEMPLATE`] `template_id`s seen so far. The
+//! cluster's id allocator is **monotonic** — it hands out
+//! `1, 2, 3, …` in creation order (RFC 0001 §6.1:
+//! "per-tenant monotonic"; the bench is single-tenant), so a
+//! template's id first appears on the line that created it and
+//! is strictly greater than every id seen before. That lets
+//! C2 count distinct templates in **O(1) memory**: track the
+//! max id seen and bump a counter only when an id exceeds it.
+//! This matters because a *non-converging* corpus — the very
+//! thing C2 is built to flag — can mint millions of templates;
+//! a `HashSet` of ids would balloon (and could OOM) on exactly
+//! those inputs, whereas the max-plus-counter stays flat. C2
+//! is otherwise a pure stream accumulator over the harness
+//! callback, like C1.
 //!
 //! Pinned definitions (§3.4.3):
 //!
@@ -32,8 +39,6 @@
 //! - **Convergence ratio** = `count_1m / SS`, in `(0, 1]`.
 //! - **Pass**: `ratio ≥ 0.5` on a ≥ 1 M-line corpus; corpora
 //!   below 1 M lines abstain (`pass = None`).
-
-use std::collections::HashSet;
 
 use ourios_core::record::MinedRecord;
 use ourios_miner::cluster::NO_TEMPLATE;
@@ -53,7 +58,14 @@ const ONE_MILLION: u64 = 1_000_000;
 pub(crate) struct C2Accumulator {
     total_lines: u64,
     cadence: u64,
-    seen_template_ids: HashSet<u64>,
+    /// Distinct templates seen so far. Bumped whenever an id
+    /// exceeds `max_template_id` (a newly-created template,
+    /// given monotonic allocation).
+    template_count: u64,
+    /// Largest `template_id` observed. A larger id means a
+    /// freshly-created template; `≤` means a reuse already
+    /// counted.
+    max_template_id: u64,
     curve: Vec<ConvergenceSample>,
     processed: u64,
 }
@@ -67,7 +79,8 @@ impl C2Accumulator {
         Self {
             total_lines,
             cadence,
-            seen_template_ids: HashSet::new(),
+            template_count: 0,
+            max_template_id: 0,
             curve: Vec::new(),
             processed: 0,
         }
@@ -84,8 +97,12 @@ impl C2Accumulator {
     /// scale (millions of synthetic ids) without constructing
     /// `MinedRecord`s or running the miner.
     fn observe(&mut self, template_id: u64) {
-        if template_id != NO_TEMPLATE {
-            self.seen_template_ids.insert(template_id);
+        // A non-`NO_TEMPLATE` id larger than any seen before is
+        // a freshly-created template (monotonic allocation);
+        // a smaller-or-equal id is a reuse already counted.
+        if template_id != NO_TEMPLATE && template_id > self.max_template_id {
+            self.max_template_id = template_id;
+            self.template_count += 1;
         }
         self.processed += 1;
 
@@ -96,15 +113,9 @@ impl C2Accumulator {
         let on_cadence = self.processed % self.cadence == 0;
         let is_last = self.processed == self.total_lines;
         if (on_cadence || is_last) && self.curve.last().map(|s| s.lines) != Some(self.processed) {
-            // `usize → u64` is infallible on every Rust Tier 1
-            // / 2 target; `expect` names the assumption rather
-            // than saturating to a bogus `u64::MAX` on a
-            // hypothetical 128-bit target.
-            let template_count = u64::try_from(self.seen_template_ids.len())
-                .expect("template count fits in u64 on every supported Rust target");
             self.curve.push(ConvergenceSample {
                 lines: self.processed,
-                template_count,
+                template_count: self.template_count,
             });
         }
     }
@@ -158,9 +169,8 @@ mod tests {
 
     /// Drive `observe` over `total_lines` lines whose
     /// `template_id`s cycle through `1..=distinct` (a bounded,
-    /// stable alphabet), then finalize. Pure `HashSet` +
-    /// counter work — no miner, no disk — so even a 1 M-line run is
-    /// milliseconds.
+    /// stable alphabet), then finalize. Pure counter work — no
+    /// miner, no disk — so even a 1 M-line run is milliseconds.
     fn run_stable(total_lines: u64, distinct: u64) -> C2Result {
         let mut acc = C2Accumulator::new(total_lines);
         for i in 0..total_lines {

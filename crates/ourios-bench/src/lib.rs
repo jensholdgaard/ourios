@@ -463,8 +463,13 @@ pub struct ResultsFile {
     pub a1: Option<A1Result>,
     /// `null` when C1 was skipped via `--gates`.
     pub c1: Option<C1Result>,
-    /// `null` when C2 was skipped via `--gates`, or when the
-    /// corpus is `< 1 M lines` (§3.4.3 abstention).
+    /// `null` only when C2 was skipped via `--gates`. On a
+    /// `< 1 M-line` corpus C2 still ran and this is
+    /// `Some(C2Result)` with the *gate* abstaining — the
+    /// abstention shows up as `pass` /
+    /// `template_count_at_1m_lines` / `convergence_ratio`
+    /// being `null` inside the block (§3.4.3), not as the
+    /// whole `c2` field being absent.
     pub c2: Option<C2Result>,
 }
 

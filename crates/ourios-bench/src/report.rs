@@ -264,26 +264,31 @@ fn ensure_header_safe(field: &str, value: &str) -> Result<(), BenchError> {
     Ok(())
 }
 
-/// Extract the `YYYY-MM-DD` date from an RFC3339 `timestamp`,
-/// erroring if it isn't shaped like one. Guards against a
-/// malformed `timestamp` (e.g. from corrupt JSON) silently
-/// rendering an empty "updated " in the §9 header.
-fn results_date(timestamp: &str) -> Result<String, BenchError> {
-    let bytes = timestamp.as_bytes();
-    let shaped = bytes.len() >= 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
+/// True when `s` is exactly a `YYYY-MM-DD` date: 10 chars,
+/// dashes at indices 4 and 7, ASCII digits everywhere else.
+fn is_date_shaped(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
         && [0, 1, 2, 3, 5, 6, 8, 9]
             .iter()
-            .all(|&i| bytes[i].is_ascii_digit());
-    if !shaped {
-        return Err(BenchError::Report {
+            .all(|&i| b[i].is_ascii_digit())
+}
+
+/// Extract the `YYYY-MM-DD` date from an RFC3339 `timestamp`,
+/// erroring if its prefix isn't shaped like one. Guards
+/// against a malformed `timestamp` (e.g. from corrupt JSON)
+/// silently rendering an empty "updated " in the §9 header.
+fn results_date(timestamp: &str) -> Result<String, BenchError> {
+    match timestamp.get(..10) {
+        Some(date) if is_date_shaped(date) => Ok(date.to_string()),
+        _ => Err(BenchError::Report {
             detail: format!(
                 "results timestamp {timestamp:?} is not RFC3339-shaped (need a YYYY-MM-DD prefix)"
             ),
-        });
+        }),
     }
-    Ok(timestamp[..10].to_string())
 }
 
 /// Parse the existing per-`(sha, hw)` blocks out of the
@@ -348,22 +353,31 @@ fn parse_region(md: &str) -> Result<BTreeMap<(String, String), Block>, BenchErro
 /// backtick-delimited fields; the date is whatever follows
 /// "updated ".
 fn parse_header(header: &str) -> Option<(String, String, String)> {
-    // Fields between backticks: ["", sha, " on ", hw, " — updated <date>"].
+    // The header `render_region` emits, after the `#### `
+    // prefix, splits on backtick into exactly five segments:
+    //   ["", sha, " on ", hw, " — updated <date>"].
+    // Validate every fixed delimiter and reject any extra
+    // backtick segment, so a hand-edited / corrupt header is
+    // surfaced as corruption by `parse_region` rather than
+    // silently normalised onto an unintended `(sha, hw)` key.
     let mut parts = header.split('`');
-    let _before = parts.next()?;
-    let sha = parts.next()?.to_string();
-    let _mid = parts.next()?;
-    let hw = parts.next()?.to_string();
-    let tail = parts.next().unwrap_or("");
-    // Require the "updated " marker and a non-empty date.
-    // A header missing it is corruption — returning `None`
-    // makes `parse_region` raise `BenchError::Report` rather
-    // than re-rendering an empty "— updated".
-    let date = tail.split_once("updated ").map(|(_, d)| d.trim())?;
-    if date.is_empty() {
+    let before = parts.next()?;
+    let sha = parts.next()?;
+    let mid = parts.next()?;
+    let hw = parts.next()?;
+    let tail = parts.next()?;
+    if parts.next().is_some() {
+        // Extra backtick → not our shape.
         return None;
     }
-    Some((sha, hw, date.to_string()))
+    if !before.is_empty() || mid != " on " {
+        return None;
+    }
+    let date = tail.strip_prefix(" — updated ")?;
+    if !is_date_shaped(date) {
+        return None;
+    }
+    Some((sha.to_string(), hw.to_string(), date.to_string()))
 }
 
 /// Parse a table data row `| <gate> | <m> | <t> | <v> |` into
@@ -752,6 +766,19 @@ mod tests {
         );
         let err = update_status_section(&corrupt, &sample_results())
             .expect_err("a dateless block header must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A block header with the wrong fixed delimiter (here
+    /// `" ON "` instead of `" on "`) is corruption — it must
+    /// not be silently normalised onto a `(sha, hw)` key.
+    #[test]
+    fn block_header_wrong_delimiter_errors() {
+        let corrupt = format!(
+            "## 9. Status\n\n{REGION_BEGIN}\n\n#### `deadbee` ON `somebox` — updated 2026-05-26\n\n{REGION_END}\n"
+        );
+        let err = update_status_section(&corrupt, &sample_results())
+            .expect_err("a wrong-delimiter header must error");
         assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
     }
 

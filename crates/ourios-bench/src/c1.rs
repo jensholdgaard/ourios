@@ -99,11 +99,8 @@ impl C1Accumulator {
     /// Compute the §3.4.2 [`C1Result`] from the accumulator.
     ///
     /// `c1.pass = false` lands in the results JSON when any
-    /// non-lossy row failed to reconstruct. Translating that
-    /// flag into a non-zero process exit is the binary's
-    /// responsibility per §3.4.2 — that path lands with the
-    /// CLI parser PR; today `main.rs` is the red-stage
-    /// scaffold and doesn't yet drive [`crate::run`].
+    /// non-lossy row failed to reconstruct; `main.rs` maps that
+    /// to a non-zero process exit per §3.4.2.
     ///
     /// The two `u64 → f64` casts (for `rate` and
     /// `lossy_flag_ratio`) lose precision above `2^52` ≈
@@ -192,5 +189,82 @@ mod tests {
         assert_eq!(c1.non_lossy_total, 0);
         assert!((c1.rate - 1.0).abs() < f64::EPSILON);
         assert!(c1.pass, "empty corpus is vacuously perfect");
+    }
+
+    /// RFC0006.2 (mismatch sub-criterion) — a non-lossy row
+    /// whose `reconstruct` disagrees with the input bytes is
+    /// counted as a failure (`pass = false`, `rate < 1`). The
+    /// real miner never produces this (it's the H7.1 property),
+    /// so the mismatch path is only reachable via a hand-forged
+    /// fixture: a `[Fixed("alpha")]` template reconstructs to
+    /// "alpha" while the input line is "beta". End-to-end
+    /// forcing through the live pipeline would need a
+    /// fault-injection hook the harness deliberately doesn't
+    /// have, so this unit test is the home of the contract;
+    /// `main.rs` turns `pass = false` into a non-zero exit
+    /// (§3.4.2).
+    #[test]
+    fn reconstruction_mismatch_is_counted_as_failure() {
+        use ourios_core::otlp::{Body, OtlpLogRecord};
+        use ourios_core::record::{BodyKind, MinedRecord};
+        use ourios_core::tenant::TenantId;
+        use ourios_miner::tree::OwnedToken;
+
+        let template = vec![OwnedToken::Fixed("alpha".to_string())];
+        let emitted = MinedRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            template_id: 1,
+            template_version: 0,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 0,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            // 0 params + 2 separators satisfies the §6.6
+            // template-shape invariant for a single Fixed
+            // token, so `reconstruct` uses the template
+            // (yielding "alpha") rather than falling back to
+            // the retained body.
+            params: Vec::new(),
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        };
+        let input = OtlpLogRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            body: Some(Body::String("beta".to_string())),
+            ..Default::default()
+        };
+
+        let mut acc = C1Accumulator::new();
+        acc.record(&input, &emitted, Some(&template));
+        let c1 = acc.finalize();
+
+        assert_eq!(
+            c1.non_lossy_total, 1,
+            "the non-lossy row is in the denominator"
+        );
+        assert_eq!(
+            c1.non_lossy_reconstruct_ok, 0,
+            "the mismatch is not counted as a success",
+        );
+        assert!(
+            (c1.rate - 0.0).abs() < f64::EPSILON,
+            "rate is 0 on a sole mismatch"
+        );
+        assert!(
+            !c1.pass,
+            "RFC 0006 §3.4.2: a reconstruction mismatch must fail the C1 gate",
+        );
     }
 }

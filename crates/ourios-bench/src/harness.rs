@@ -31,8 +31,10 @@
 //! count at the §3.4.3 cadence.
 
 use std::collections::HashMap;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ourios_core::audit::{AuditEvent, NoOpAuditSink, SharedAuditSink};
+use ourios_core::clock::TestClock;
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
@@ -41,7 +43,7 @@ use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
 use ourios_miner::tree::OwnedToken;
 
 use crate::BenchError;
-use crate::corpus::{BENCH_TENANT, CorpusLoad};
+use crate::corpus::{BENCH_TENANT, CorpusLoad, TIME_BASELINE_NS};
 
 /// What [`run`] returns after draining the miner: the
 /// audit-event stream A1 writes into the `audit/...` partition
@@ -113,8 +115,19 @@ where
         Some(s) => Box::new(s.clone()),
         None => Box::new(NoOpAuditSink::new()),
     };
+    // Pin the miner's clock to a fixed instant (the §3.3
+    // corpus baseline) so audit-event timestamps are
+    // deterministic. The default `SystemClock` would stamp
+    // each run's audit events with wall-clock time, making
+    // A1's audit-stream bytes — and therefore the compression
+    // ratio — differ run-to-run; RFC0006.7 requires bit-
+    // identical measurements across reruns. A bench audit
+    // timestamp isn't a meaningful measurement, only its
+    // reproducibility is.
+    let bench_clock = TestClock::new(UNIX_EPOCH + Duration::from_nanos(TIME_BASELINE_NS));
     let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), audit_box)
-        .with_record_sink(Box::new(sink.clone()));
+        .with_record_sink(Box::new(sink.clone()))
+        .with_clock(Box::new(bench_clock));
     let tenant = TenantId::new(BENCH_TENANT);
     let mut snapshots: HashMap<(u64, u32), Vec<OwnedToken>> = HashMap::new();
 

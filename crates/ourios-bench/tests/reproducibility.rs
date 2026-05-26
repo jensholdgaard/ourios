@@ -30,7 +30,6 @@ use std::path::PathBuf;
 
 /// Scenario RFC0006.7 — two consecutive runs produce bit-identical measurements.
 #[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
 fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
     let make_config = || {
         let bucket = tempfile::TempDir::new().expect("temp dir");

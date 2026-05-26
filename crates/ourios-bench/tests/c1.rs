@@ -8,17 +8,16 @@
 //!   §3.4.2; three decimals are insufficient for 100% target).
 //! - The results JSON records `c1.pass = true` when all
 //!   non-lossy rows reconstruct exactly.
-//! - A non-zero exit code and stderr diagnostics when any
-//!   non-lossy row's `reconstruct(record, template)` doesn't
-//!   equal the ingested bytes (covered by the second sub-test,
-//!   which constructs a forged record path — still
-//!   `#[ignore]`'d because the forged-record fixture +
-//!   non-zero-exit plumbing land with the CLI parser PR).
 //!
-//! The seed-corpus gate test was un-`#[ignore]`'d in PR-I1
-//! when the C1 measurement code landed; the forged-mismatch
-//! sub-test remains `#[ignore]`'d until its dependencies
-//! exist.
+//! The mismatch sub-criterion (a non-lossy row whose
+//! `reconstruct` ≠ the ingested bytes must fail the gate) is
+//! covered by the colocated unit test
+//! `c1::tests::reconstruction_mismatch_is_counted_as_failure`
+//! in `src/c1.rs`: the real miner never produces a non-lossy
+//! mismatch (the H7.1 property), so the path is only reachable
+//! via a hand-forged record, which is a unit-level concern.
+//! `main.rs` maps the resulting `pass = false` to a non-zero
+//! process exit (§3.4.2).
 
 use ourios_bench::{BenchConfig, GateSet, run};
 use std::path::PathBuf;
@@ -61,26 +60,11 @@ fn rfc0006_2_c1_is_100_percent_on_seed_corpus() {
     assert!(c1.pass, "c1.pass must be true when rate = 1.000000");
 }
 
-/// Scenario RFC0006.2 — forged reconstruct mismatch is a hard
-/// failure. The bench injects a synthetic record whose
-/// `reconstruct(record, template)` disagrees with the input
-/// (built by hand, not by the miner) and asserts the bench
-/// exits with a non-zero code, emits the failing row's
-/// `(template_id, template_version)` + expected / actual bytes
-/// to stderr, and records `c1.pass = false` in the results JSON.
-///
-/// The implementation that actually constructs the forged
-/// record needs the harness's per-line capture path; this stub
-/// pins the contract until that path exists.
-#[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
-fn rfc0006_2_reconstruct_mismatch_is_a_hard_failure() {
-    // The forged-record fixture and the bench's
-    // non-zero-exit-on-mismatch path land together in the C1
-    // implementation PR. This stub exists so the §5 acceptance
-    // criterion has a test surface to grow into.
-    unimplemented!(
-        "RFC 0006 Red gate — fixture for forged reconstruction \
-         mismatch lands with the C1 implementation PR"
-    )
-}
+// The mismatch sub-criterion is exercised by
+// `c1::tests::reconstruction_mismatch_is_counted_as_failure`
+// (a colocated unit test in `src/c1.rs`), which replaced the
+// `#[ignore]`'d end-to-end stub that lived here: forging a
+// non-lossy mismatch can't be driven through the real miner
+// (the H7.1 property guarantees non-lossy rows reconstruct),
+// so it's a unit-level fixture concern, not an integration
+// test.

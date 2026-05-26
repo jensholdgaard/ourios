@@ -178,7 +178,11 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
                 "{:.6} ({}/{} non-lossy; lossy {:.4})",
                 c1.rate, c1.non_lossy_reconstruct_ok, c1.non_lossy_total, c1.lossy_flag_ratio,
             ),
-            target: "100.000%".to_string(),
+            // Target shown in the same fraction form as the
+            // measurement (`1.000000`), not `100.000%` — the
+            // measurement column is the fraction, so a percent
+            // target would mix units.
+            target: "1.000000".to_string(),
             verdict: pass_verdict(c1.pass),
         });
     }
@@ -334,31 +338,56 @@ fn render_region(blocks: &BTreeMap<(String, String), Block>) -> String {
 /// existing region between the markers, or append a fresh
 /// `### Results` sub-section at the end of the `## 9.` section
 /// (which is the last section, so end-of-file).
+///
+/// The `END` marker is searched for **after** `BEGIN`, and a
+/// mismatched pair (one marker without the other, or `END`
+/// before `BEGIN`) is a [`BenchError::Report`] rather than a
+/// silent second region — a half-present region means the doc
+/// was hand-edited into a corrupt state, which we surface
+/// instead of compounding.
 fn splice_region(md: &str, region: &str) -> Result<String, BenchError> {
-    if let (Some(begin), Some(end_rel)) = (
-        md.find(REGION_BEGIN),
-        md.find(REGION_END).map(|e| e + REGION_END.len()),
-    ) {
-        let mut out = String::with_capacity(md.len());
-        out.push_str(&md[..begin]);
-        out.push_str(region);
-        out.push_str(&md[end_rel..]);
-        return Ok(out);
-    }
+    let begin = md.find(REGION_BEGIN);
+    // Only accept an END that comes after the BEGIN marker.
+    let end = begin.and_then(|b| {
+        let after = b + REGION_BEGIN.len();
+        md[after..].find(REGION_END).map(|rel| after + rel)
+    });
 
-    // First run: the region doesn't exist yet. Anchor it to
-    // the §9 Status section.
-    if !md.contains("## 9. Status") {
-        return Err(BenchError::Report {
-            detail: "docs/benchmarks.md has no `## 9. Status` section to anchor the results region"
+    match (begin, end) {
+        // Well-formed region: replace it (markers included).
+        (Some(b), Some(e)) => {
+            let end_abs = e + REGION_END.len();
+            let mut out = String::with_capacity(md.len());
+            out.push_str(&md[..b]);
+            out.push_str(region);
+            out.push_str(&md[end_abs..]);
+            Ok(out)
+        }
+        // No markers at all: first run — anchor a fresh region
+        // to the §9 Status section.
+        (None, None) if !md.contains(REGION_END) => {
+            if !md.contains("## 9. Status") {
+                return Err(BenchError::Report {
+                    detail: "docs/benchmarks.md has no `## 9. Status` section to anchor the \
+                             results region"
+                        .to_string(),
+                });
+            }
+            let mut out = md.trim_end().to_string();
+            out.push_str("\n\n### Results\n\n");
+            out.push_str(region);
+            out.push('\n');
+            Ok(out)
+        }
+        // Corrupt: BEGIN without a following END, or an END
+        // marker with no (preceding) BEGIN.
+        _ => Err(BenchError::Report {
+            detail: "docs/benchmarks.md has a mismatched BENCH-RESULTS marker pair (a BEGIN \
+                     without a following END, or an orphan END) — fix the managed region by \
+                     hand before re-running --update-benchmarks-md"
                 .to_string(),
-        });
+        }),
     }
-    let mut out = md.trim_end().to_string();
-    out.push_str("\n\n### Results\n\n");
-    out.push_str(region);
-    out.push('\n');
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -550,6 +579,17 @@ mod tests {
     fn missing_status_section_errors() {
         let err = update_status_section("# Benchmarks\n\nno section nine\n", &sample_results())
             .expect_err("must error without §9");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A half-present managed region (a BEGIN marker with no
+    /// following END) is a `Report` error — we don't append a
+    /// second region on top of a corrupt one.
+    #[test]
+    fn mismatched_marker_pair_errors() {
+        let corrupt = format!("## 9. Status\n\n{REGION_BEGIN}\n\n(truncated, no end marker)\n");
+        let err = update_status_section(&corrupt, &sample_results())
+            .expect_err("a BEGIN without END must error");
         assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
     }
 }

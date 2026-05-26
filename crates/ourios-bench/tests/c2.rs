@@ -102,7 +102,10 @@ fn rfc0006_3_c2_gate_passes_on_stable_corpus() {
     let results_file = run(&config).expect("bench runs C2 on the stable corpus");
     let c2 = results_file.c2.expect("c2 populated when --gates c2");
 
-    assert!(c2.corpus_at_least_1m, "synthetic corpus is just over 1 M lines");
+    assert!(
+        c2.corpus_at_least_1m,
+        "synthetic corpus is just over 1 M lines"
+    );
     let count_1m = c2
         .template_count_at_1m_lines
         .expect("template_count_at_1m_lines populated on a ≥ 1 M corpus");

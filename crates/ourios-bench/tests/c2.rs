@@ -30,19 +30,61 @@
 //! `c2.template_count_at_1m_lines = null`.
 
 use ourios_bench::{BenchConfig, GateSet, run};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Scenario RFC0006.3 — C2 gate on a ≥ 1 M-line stable corpus.
+///
+/// `#[ignore]`'d as a **heavy on-demand check**: it generates
+/// and ingests just over a million lines through the real
+/// miner, which is far too slow for the per-PR `cargo test`
+/// loop (and consistent with §3.7's "the bench runs
+/// on-demand / nightly, not per-PR"). Run it with
+/// `cargo test -p ourios-bench -- --ignored`. The C2
+/// convergence math at ≥ 1 M-line scale is covered fast and
+/// by default by the colocated `stable_corpus_passes_the_gate`
+/// unit test in `src/c2.rs`; this test additionally proves the
+/// real miner yields a bounded template alphabet on a stable
+/// corpus so the gate passes end-to-end.
 #[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
+#[ignore = "heavy: ingests >1M lines through the real miner; run with --ignored (see docstring)"]
 fn rfc0006_3_c2_gate_passes_on_stable_corpus() {
+    // >1M lines from a bounded template alphabet: a handful of
+    // message shapes with varying numeric params. The miner
+    // collapses each shape to one template (the numbers mask
+    // to `<*>`), so the template count plateaus within the
+    // first few lines — count_1m == SS → ratio 1.0 → pass.
+    const LINES: u64 = 1_000_001;
+    const SHAPES: [&str; 5] = [
+        "user {} logged in",
+        "request {} took {} ms",
+        "cache miss for key {}",
+        "worker {} processed {} jobs",
+        "connection {} closed",
+    ];
+
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");
     let corpus = tempfile::TempDir::new().expect("temp dir");
-    // The actual corpus generator (write 1.5 M synthetic lines
-    // with a bounded template alphabet to `corpus/*.txt`)
-    // lands with the C2 implementation PR; this stub
-    // documents the shape it produces.
+
+    let path = corpus.path().join("stable.txt");
+    {
+        let file = std::fs::File::create(&path).expect("create corpus file");
+        let mut w = std::io::BufWriter::new(file);
+        // `cycle` over the shapes avoids an index cast.
+        let mut shapes = SHAPES.iter().cycle();
+        for i in 0..LINES {
+            let shape = shapes.next().expect("cycle is infinite");
+            // Fill 1-2 `{}` slots with varying numbers.
+            let line =
+                shape
+                    .replacen("{}", &i.to_string(), 1)
+                    .replacen("{}", &(i % 1000).to_string(), 1);
+            writeln!(w, "{line}").expect("write line");
+        }
+        w.flush().expect("flush corpus");
+    }
+
     let config = BenchConfig {
         corpus_dir: corpus.path().to_path_buf(),
         results_dir: results.path().to_path_buf(),
@@ -57,10 +99,13 @@ fn rfc0006_3_c2_gate_passes_on_stable_corpus() {
         },
     };
 
-    let results_file = run(&config).expect("bench runs once C2 is implemented");
+    let results_file = run(&config).expect("bench runs C2 on the stable corpus");
     let c2 = results_file.c2.expect("c2 populated when --gates c2");
 
-    assert!(c2.corpus_at_least_1m, "synthetic corpus is 1.5 M lines");
+    assert!(
+        c2.corpus_at_least_1m,
+        "synthetic corpus is just over 1 M lines"
+    );
     let count_1m = c2
         .template_count_at_1m_lines
         .expect("template_count_at_1m_lines populated on a ≥ 1 M corpus");
@@ -99,9 +144,10 @@ fn rfc0006_3_c2_gate_passes_on_stable_corpus() {
 /// Scenario RFC0006.3 — C2 abstention on a corpus < 1 M lines.
 /// §3.4.3 carves out the gate when there aren't enough samples
 /// to reach the 1 M-line check; results JSON records
-/// `c2.pass = null` rather than `true` or `false`.
+/// `c2.pass = null` rather than `true` or `false`. Runs on the
+/// seed corpus (77 lines) through the real miner, so it's fast
+/// and exercises the corpus → harness → C2 wiring by default.
 #[test]
-#[ignore = "RFC 0006 Red gate — implementation pending"]
 fn rfc0006_3_c2_abstains_on_short_corpus() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");

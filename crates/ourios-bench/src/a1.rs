@@ -103,27 +103,32 @@ impl A1Accumulator {
         })?;
         // Hot path: the partition writer almost always already
         // exists (a corpus stays in one hour for ~3.6 M lines
-        // at the §3.3 1 ms/line cadence). `contains_key` +
-        // `get_mut` keep the common case clone-free; the
-        // `PartitionKey` (with its `String`) is only cloned on
-        // the rare first-sight-of-a-partition miss.
-        if !self.data_writers.contains_key(&partition) {
-            let writer = Writer::open(&self.bucket_root, partition.clone()).map_err(|e| {
-                crate::BenchError::Pipeline {
-                    detail: format!("parquet writer open: {e}"),
-                }
-            })?;
-            self.data_writers.insert(partition.clone(), writer);
+        // at the §3.3 1 ms/line cadence). A single `get_mut`
+        // serves it — no second lookup, no `PartitionKey`
+        // clone.
+        if let Some(writer) = self.data_writers.get_mut(&partition) {
+            return writer
+                .append_records(std::slice::from_ref(emitted))
+                .map_err(|e| crate::BenchError::Pipeline {
+                    detail: format!("parquet append_records: {e}"),
+                });
         }
-        let writer = self
-            .data_writers
-            .get_mut(&partition)
-            .expect("writer inserted above when absent");
+        // Miss (first record for this partition): open the
+        // writer, append, then store it. `partition` is cloned
+        // once for `Writer::open`; the original moves into the
+        // map as the key.
+        let mut writer = Writer::open(&self.bucket_root, partition.clone()).map_err(|e| {
+            crate::BenchError::Pipeline {
+                detail: format!("parquet writer open: {e}"),
+            }
+        })?;
         writer
             .append_records(std::slice::from_ref(emitted))
             .map_err(|e| crate::BenchError::Pipeline {
                 detail: format!("parquet append_records: {e}"),
-            })
+            })?;
+        self.data_writers.insert(partition, writer);
+        Ok(())
     }
 
     /// Write the miner's audit-event stream into the

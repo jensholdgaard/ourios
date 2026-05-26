@@ -158,7 +158,7 @@ struct Block {
 /// - the `BENCH-RESULTS` marker pair is mismatched (a `BEGIN`
 ///   without a following `END`, or an orphan `END`).
 pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, BenchError> {
-    let mut blocks = parse_region(md);
+    let mut blocks = parse_region(md)?;
 
     // Merge this run into the block for its (sha, hardware)
     // pair — created if absent, gate-rows replaced only for
@@ -193,13 +193,27 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
         });
     }
     if let Some(c2) = &results.c2 {
-        let measurement = match c2.convergence_ratio {
-            Some(ratio) => format!(
-                "ratio {ratio:.3} (count@1M {} / SS {})",
-                c2.template_count_at_1m_lines.unwrap_or(0),
-                c2.template_count_at_end,
-            ),
-            None => format!("n/a (SS {}, corpus < 1 M lines)", c2.template_count_at_end),
+        // §3.4.3 pairs `convergence_ratio` and
+        // `template_count_at_1m_lines`: both `Some` on a ≥ 1 M
+        // corpus, both `None` on abstention. A mixed state is
+        // a corrupt `ResultsFile`, surfaced rather than papered
+        // over with a `0` count.
+        let measurement = match (c2.template_count_at_1m_lines, c2.convergence_ratio) {
+            (Some(count_1m), Some(ratio)) => {
+                format!(
+                    "ratio {ratio:.3} (count@1M {count_1m} / SS {})",
+                    c2.template_count_at_end,
+                )
+            }
+            (None, None) => format!("n/a (SS {}, corpus < 1 M lines)", c2.template_count_at_end),
+            _ => {
+                return Err(BenchError::Report {
+                    detail: "C2 result is inconsistent: convergence_ratio and \
+                             template_count_at_1m_lines must both be set or both absent \
+                             (§3.4.3)"
+                        .to_string(),
+                });
+            }
         };
         let verdict = match c2.pass {
             Some(true) => "PASS".to_string(),
@@ -225,14 +239,14 @@ fn pass_verdict(pass: bool) -> String {
 /// managed region. Returns empty when the region is absent
 /// (first run). Only recognises the shape `render_region`
 /// emits, so it round-trips its own output.
-fn parse_region(md: &str) -> BTreeMap<(String, String), Block> {
+fn parse_region(md: &str) -> Result<BTreeMap<(String, String), Block>, BenchError> {
     let mut blocks = BTreeMap::new();
     let Some(region) = md
         .split_once(REGION_BEGIN)
         .and_then(|(_, rest)| rest.split_once(REGION_END))
         .map(|(inner, _)| inner)
     else {
-        return blocks;
+        return Ok(blocks);
     };
 
     let mut current: Option<((String, String), Block)> = None;
@@ -242,15 +256,24 @@ fn parse_region(md: &str) -> BTreeMap<(String, String), Block> {
             if let Some((key, block)) = current.take() {
                 blocks.insert(key, block);
             }
-            current = parse_header(header).map(|(sha, hw, date)| {
-                (
-                    (sha, hw),
-                    Block {
-                        date,
-                        ..Block::default()
-                    },
-                )
-            });
+            // Every `####` in the managed region is a block
+            // header we wrote. One that won't parse means the
+            // region was hand-edited into a corrupt state;
+            // surface it rather than silently dropping the
+            // block (and its data) on the next rewrite.
+            let (sha, hw, date) = parse_header(header).ok_or_else(|| BenchError::Report {
+                detail: format!(
+                    "unparseable results block header in the managed region: `#### {header}` \
+                     — fix the BENCH-RESULTS region by hand"
+                ),
+            })?;
+            current = Some((
+                (sha, hw),
+                Block {
+                    date,
+                    ..Block::default()
+                },
+            ));
         } else if let Some((_, block)) = current.as_mut() {
             if let Some((gate, row)) = parse_row(line) {
                 match gate {
@@ -265,7 +288,7 @@ fn parse_region(md: &str) -> BTreeMap<(String, String), Block> {
     if let Some((key, block)) = current.take() {
         blocks.insert(key, block);
     }
-    blocks
+    Ok(blocks)
 }
 
 /// Parse a block header of the form
@@ -379,8 +402,18 @@ fn splice_region(md: &str, region: &str) -> Result<String, BenchError> {
                         .to_string(),
                 });
             }
-            let mut out = md.trim_end().to_string();
-            out.push_str("\n\n### Results\n\n");
+            // Preserve `md` byte-for-byte (prose outside the
+            // region is never touched, including its trailing
+            // whitespace); only *add* the newlines needed to
+            // separate the appended section.
+            let mut out = md.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("### Results\n\n");
             out.push_str(region);
             out.push('\n');
             Ok(out)
@@ -597,5 +630,52 @@ mod tests {
         let err = update_status_section(&corrupt, &sample_results())
             .expect_err("a BEGIN without END must error");
         assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// An unparseable `####` header inside the managed region
+    /// is corruption — surfaced as `Report`, not silently
+    /// dropped (which would lose the block on rewrite).
+    #[test]
+    fn corrupt_block_header_errors() {
+        let corrupt = format!(
+            "## 9. Status\n\n{REGION_BEGIN}\n\n#### not a valid block header\n\n{REGION_END}\n"
+        );
+        let err = update_status_section(&corrupt, &sample_results())
+            .expect_err("a malformed block header must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A `Some(ratio)` + `None` count C2 result is an
+    /// impossible §3.4.3 state → `Report`, not a silent
+    /// `count@1M 0`.
+    #[test]
+    fn inconsistent_c2_result_errors() {
+        let mut r = sample_results();
+        r.c2 = Some(crate::C2Result {
+            sample_cadence: 1000,
+            total_lines: 1_000_000,
+            template_count_at_1m_lines: None, // missing…
+            template_count_at_end: 42,
+            convergence_ratio: Some(0.9), // …but ratio present
+            convergence_curve: Vec::new(),
+            pass: Some(true),
+            corpus_at_least_1m: true,
+        });
+        let err =
+            update_status_section(&md_with_status(), &r).expect_err("inconsistent C2 must error");
+        assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// First insertion preserves the prose byte-for-byte (no
+    /// trailing-whitespace trimming outside the markers); the
+    /// original content survives unchanged as a prefix.
+    #[test]
+    fn first_insertion_preserves_prose_verbatim() {
+        let original = "# Benchmarks\n\n## 9. Status\n\nNo run yet.\n";
+        let updated = update_status_section(original, &sample_results()).expect("update");
+        assert!(
+            updated.starts_with(original),
+            "original prose must be preserved verbatim as a prefix:\n{updated}",
+        );
     }
 }

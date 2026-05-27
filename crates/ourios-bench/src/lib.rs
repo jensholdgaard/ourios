@@ -2,18 +2,22 @@
 //! (A1 compression, C1 reconstruction, C2 template-count
 //! convergence).
 //!
-//! **Implementation status (PR-J3):** all three writer-side
-//! gates — A1 (compression), C1 (reconstruction), C2
-//! (template-count convergence) — are live. [`run`] computes
-//! any combination in a single miner pass and returns a
-//! populated [`ResultsFile`]. The CLI (RFC 0006 §3.7) in
-//! `main.rs` drives `run`, writes the §3.6 JSON results file
-//! via [`write_results_json`], and — with
+//! **Implementation status (PR-J4 — RFC 0006 `green`):** all
+//! three writer-side gates — A1 (compression), C1
+//! (reconstruction), C2 (template-count convergence) — are
+//! live. [`run`] computes any combination in a single miner
+//! pass and returns a populated [`ResultsFile`]. The CLI
+//! (RFC 0006 §3.7) in `main.rs` drives `run`, writes the §3.6
+//! JSON results file via [`write_results_json`], and — with
 //! `--update-benchmarks-md` — folds the results into the
 //! `docs/benchmarks.md` §9 table via [`update_status_section`].
-//! The bench's measurement + reporting surface is complete;
-//! the only RFC 0006 work left is the RFC0006.7
-//! reproducibility test (still `#[ignore]`'d).
+//! Every §5 acceptance scenario has a passing test, so RFC 0006
+//! is at maturity `green`. (The one heavy ≥ 1 M-line C2 test
+//! is `#[ignore]`'d for the per-PR loop per §3.7 and runs
+//! on-demand via `cargo test -- --ignored`; its convergence
+//! math is covered by default by the colocated `c2` unit
+//! tests.) `Validated` follows once the gates are measured on
+//! a real corpus + the §1 hardware baseline.
 //!
 //! Per RFC 0006 §3.2 the module layout is `corpus`, `harness`,
 //! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
@@ -522,6 +526,31 @@ pub struct C1Result {
     pub rate: f64,
     pub lossy_flag_ratio: f64,
     pub pass: bool,
+    /// Per-row diagnostics for the first few non-lossy rows
+    /// that failed to reconstruct (RFC0006.2: the bench emits
+    /// each failing row's `template_id` / `template_version` /
+    /// expected / actual to stderr). Bounded — see
+    /// `c1::MISMATCH_SAMPLE_CAP`. **`#[serde(skip)]`**: these
+    /// are stderr-only diagnostics, not part of the §3.6 JSON
+    /// schema, so they never appear in the results file (and
+    /// don't affect the RFC0006.7 reproducibility comparison,
+    /// which is over the JSON form).
+    #[serde(skip)]
+    pub mismatches: Vec<C1Mismatch>,
+}
+
+/// One non-lossy row that failed C1 reconstruction — the
+/// stderr diagnostic payload RFC0006.2 requires. Not
+/// serialised (carried on [`C1Result::mismatches`], which is
+/// `#[serde(skip)]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C1Mismatch {
+    pub template_id: u64,
+    pub template_version: u32,
+    /// The ingested line bytes (UTF-8 lossy for display).
+    pub expected: String,
+    /// What `reconstruct` produced (UTF-8 lossy for display).
+    pub actual: String,
 }
 
 /// §3.6 `c2` block (populated only when C2 ran). `pass` is

@@ -170,6 +170,19 @@ fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
                  byte-for-byte (RFC 0006 §3.4.2 / CLAUDE.md §3.3)",
                 c1.non_lossy_total,
             );
+            // RFC0006.2: emit each failing row's template id /
+            // version + expected vs actual bytes. The sample is
+            // bounded (`c1.mismatches`), so note any overflow.
+            for m in &c1.mismatches {
+                eprintln!(
+                    "  template_id={} template_version={}\n    expected: {:?}\n    actual:   {:?}",
+                    m.template_id, m.template_version, m.expected, m.actual,
+                );
+            }
+            let shown = u64::try_from(c1.mismatches.len()).unwrap_or(u64::MAX);
+            if failed > shown {
+                eprintln!("  … and {} more failing row(s) not shown", failed - shown);
+            }
             return Ok(ExitCode::from(1));
         }
     }

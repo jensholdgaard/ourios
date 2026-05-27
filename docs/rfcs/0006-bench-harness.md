@@ -1,7 +1,7 @@
 ---
 rfc: 0006
 title: Bench harness — A1 / C1 / C2 thesis-gate measurement
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-22

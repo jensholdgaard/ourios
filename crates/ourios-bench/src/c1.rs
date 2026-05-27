@@ -31,8 +31,16 @@ use ourios_core::record::MinedRecord;
 use ourios_miner::reconstruct::reconstruct;
 use ourios_miner::tree::OwnedToken;
 
-use crate::C1Result;
 use crate::corpus::line_bytes;
+use crate::{C1Mismatch, C1Result};
+
+/// Cap on per-row mismatch diagnostics captured (RFC0006.2's
+/// stderr payload). A passing corpus has zero mismatches; a
+/// regression could produce many, so the sample is bounded —
+/// enough rows to diagnose, without buffering an unbounded
+/// failure set. Rows beyond the cap still count toward
+/// `non_lossy_total` / the failure tally.
+pub(crate) const MISMATCH_SAMPLE_CAP: usize = 16;
 
 /// Streaming accumulator for the §3.4.2 C1 measurement.
 ///
@@ -45,6 +53,7 @@ pub(crate) struct C1Accumulator {
     non_lossy_reconstruct_ok: u64,
     lossy_count: u64,
     all_total: u64,
+    mismatches: Vec<C1Mismatch>,
 }
 
 impl C1Accumulator {
@@ -91,19 +100,26 @@ impl C1Accumulator {
             // at finalize time.
             return;
         };
-        if reconstruct(emitted, template) == line {
+        let actual = reconstruct(emitted, template);
+        if actual == line {
             self.non_lossy_reconstruct_ok = self.non_lossy_reconstruct_ok.saturating_add(1);
+        } else if self.mismatches.len() < MISMATCH_SAMPLE_CAP {
+            // Capture the failing row's diagnostics (RFC0006.2)
+            // up to the cap; `main.rs` prints them to stderr.
+            self.mismatches.push(C1Mismatch {
+                template_id: emitted.template_id,
+                template_version: emitted.template_version,
+                expected: String::from_utf8_lossy(line).into_owned(),
+                actual: String::from_utf8_lossy(&actual).into_owned(),
+            });
         }
     }
 
     /// Compute the §3.4.2 [`C1Result`] from the accumulator.
     ///
     /// `c1.pass = false` lands in the results JSON when any
-    /// non-lossy row failed to reconstruct. Translating that
-    /// flag into a non-zero process exit is the binary's
-    /// responsibility per §3.4.2 — that path lands with the
-    /// CLI parser PR; today `main.rs` is the red-stage
-    /// scaffold and doesn't yet drive [`crate::run`].
+    /// non-lossy row failed to reconstruct; `main.rs` maps that
+    /// to a non-zero process exit per §3.4.2.
     ///
     /// The two `u64 → f64` casts (for `rate` and
     /// `lossy_flag_ratio`) lose precision above `2^52` ≈
@@ -136,6 +152,9 @@ impl C1Accumulator {
             rate,
             lossy_flag_ratio,
             pass: self.non_lossy_reconstruct_ok == self.non_lossy_total,
+            // Bounded (≤ `MISMATCH_SAMPLE_CAP`), so the clone is
+            // cheap and keeps `finalize` a `&self` reader.
+            mismatches: self.mismatches.clone(),
         }
     }
 }
@@ -192,5 +211,92 @@ mod tests {
         assert_eq!(c1.non_lossy_total, 0);
         assert!((c1.rate - 1.0).abs() < f64::EPSILON);
         assert!(c1.pass, "empty corpus is vacuously perfect");
+    }
+
+    /// RFC0006.2 (mismatch sub-criterion) — a non-lossy row
+    /// whose `reconstruct` disagrees with the input bytes is
+    /// counted as a failure (`pass = false`, `rate < 1`). The
+    /// real miner never produces this (it's the H7.1 property),
+    /// so the mismatch path is only reachable via a hand-forged
+    /// fixture: a `[Fixed("alpha")]` template reconstructs to
+    /// "alpha" while the input line is "beta". End-to-end
+    /// forcing through the live pipeline would need a
+    /// fault-injection hook the harness deliberately doesn't
+    /// have, so this unit test is the home of the contract;
+    /// `main.rs` turns `pass = false` into a non-zero exit
+    /// (§3.4.2).
+    #[test]
+    fn reconstruction_mismatch_is_counted_as_failure() {
+        use ourios_core::otlp::{Body, OtlpLogRecord};
+        use ourios_core::record::{BodyKind, MinedRecord};
+        use ourios_core::tenant::TenantId;
+        use ourios_miner::tree::OwnedToken;
+
+        let template = vec![OwnedToken::Fixed("alpha".to_string())];
+        let emitted = MinedRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            template_id: 1,
+            template_version: 0,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 0,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            // 0 params + 2 separators satisfies the §6.6
+            // template-shape invariant for a single Fixed
+            // token, so `reconstruct` uses the template
+            // (yielding "alpha") rather than falling back to
+            // the retained body.
+            params: Vec::new(),
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        };
+        let input = OtlpLogRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            body: Some(Body::String("beta".to_string())),
+            ..Default::default()
+        };
+
+        let mut acc = C1Accumulator::new();
+        acc.record(&input, &emitted, Some(&template));
+        let c1 = acc.finalize();
+
+        assert_eq!(
+            c1.non_lossy_total, 1,
+            "the non-lossy row is in the denominator"
+        );
+        assert_eq!(
+            c1.non_lossy_reconstruct_ok, 0,
+            "the mismatch is not counted as a success",
+        );
+        assert!(
+            (c1.rate - 0.0).abs() < f64::EPSILON,
+            "rate is 0 on a sole mismatch"
+        );
+        assert!(
+            !c1.pass,
+            "RFC 0006 §3.4.2: a reconstruction mismatch must fail the C1 gate",
+        );
+
+        // RFC0006.2 diagnostics: the failing row's
+        // template id / version + expected vs actual are
+        // captured for `main.rs` to print to stderr.
+        assert_eq!(c1.mismatches.len(), 1, "the one mismatch is captured");
+        let m = &c1.mismatches[0];
+        assert_eq!(m.template_id, 1);
+        assert_eq!(m.template_version, 0);
+        assert_eq!(m.expected, "beta", "expected = the ingested line");
+        assert_eq!(m.actual, "alpha", "actual = what reconstruct produced");
     }
 }

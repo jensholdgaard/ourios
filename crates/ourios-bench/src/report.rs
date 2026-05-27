@@ -548,6 +548,7 @@ mod tests {
                 rate: 1.0,
                 lossy_flag_ratio: 0.0,
                 pass: true,
+                mismatches: Vec::new(),
             }),
             c2: None,
         }

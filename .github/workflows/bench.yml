@@ -51,13 +51,25 @@ jobs:
         # `pipefail` so a C1 reconstruction failure (the bench's
         # only non-zero exit, §3.4.2) fails the job rather than
         # being swallowed by the `tee` pipe.
+        #
+        # Inputs are passed via `env:`, not interpolated into the
+        # script with `${{ … }}` — that expansion would splice
+        # the (attacker-controllable, for a write-access
+        # dispatcher) input into the shell source verbatim, a
+        # template-injection vector. As `$BENCH_*` they're plain
+        # quoted argv values; clap then validates `--gates`
+        # against its enum and `--hardware-kind` is only ever
+        # stored, never executed.
         shell: bash
+        env:
+          BENCH_GATES: ${{ inputs.gates }}
+          BENCH_HARDWARE: ${{ inputs.hardware_kind }}
         run: |
           set -euo pipefail
           ./target/release/ourios-bench \
             --corpus testdata/corpus \
-            --gates "${{ inputs.gates }}" \
-            --hardware-kind "${{ inputs.hardware_kind }}" \
+            --gates "$BENCH_GATES" \
+            --hardware-kind "$BENCH_HARDWARE" \
             --results-dir bench-results \
             | tee bench-summary.txt
 

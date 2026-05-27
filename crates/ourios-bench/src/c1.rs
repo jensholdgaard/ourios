@@ -31,8 +31,16 @@ use ourios_core::record::MinedRecord;
 use ourios_miner::reconstruct::reconstruct;
 use ourios_miner::tree::OwnedToken;
 
-use crate::C1Result;
 use crate::corpus::line_bytes;
+use crate::{C1Mismatch, C1Result};
+
+/// Cap on per-row mismatch diagnostics captured (RFC0006.2's
+/// stderr payload). A passing corpus has zero mismatches; a
+/// regression could produce many, so the sample is bounded —
+/// enough rows to diagnose, without buffering an unbounded
+/// failure set. Rows beyond the cap still count toward
+/// `non_lossy_total` / the failure tally.
+pub(crate) const MISMATCH_SAMPLE_CAP: usize = 16;
 
 /// Streaming accumulator for the §3.4.2 C1 measurement.
 ///
@@ -45,6 +53,7 @@ pub(crate) struct C1Accumulator {
     non_lossy_reconstruct_ok: u64,
     lossy_count: u64,
     all_total: u64,
+    mismatches: Vec<C1Mismatch>,
 }
 
 impl C1Accumulator {
@@ -91,8 +100,18 @@ impl C1Accumulator {
             // at finalize time.
             return;
         };
-        if reconstruct(emitted, template) == line {
+        let actual = reconstruct(emitted, template);
+        if actual == line {
             self.non_lossy_reconstruct_ok = self.non_lossy_reconstruct_ok.saturating_add(1);
+        } else if self.mismatches.len() < MISMATCH_SAMPLE_CAP {
+            // Capture the failing row's diagnostics (RFC0006.2)
+            // up to the cap; `main.rs` prints them to stderr.
+            self.mismatches.push(C1Mismatch {
+                template_id: emitted.template_id,
+                template_version: emitted.template_version,
+                expected: String::from_utf8_lossy(line).into_owned(),
+                actual: String::from_utf8_lossy(&actual).into_owned(),
+            });
         }
     }
 
@@ -133,6 +152,9 @@ impl C1Accumulator {
             rate,
             lossy_flag_ratio,
             pass: self.non_lossy_reconstruct_ok == self.non_lossy_total,
+            // Bounded (≤ `MISMATCH_SAMPLE_CAP`), so the clone is
+            // cheap and keeps `finalize` a `&self` reader.
+            mismatches: self.mismatches.clone(),
         }
     }
 }
@@ -266,5 +288,15 @@ mod tests {
             !c1.pass,
             "RFC 0006 §3.4.2: a reconstruction mismatch must fail the C1 gate",
         );
+
+        // RFC0006.2 diagnostics: the failing row's
+        // template id / version + expected vs actual are
+        // captured for `main.rs` to print to stderr.
+        assert_eq!(c1.mismatches.len(), 1, "the one mismatch is captured");
+        let m = &c1.mismatches[0];
+        assert_eq!(m.template_id, 1);
+        assert_eq!(m.template_version, 0);
+        assert_eq!(m.expected, "beta", "expected = the ingested line");
+        assert_eq!(m.actual, "alpha", "actual = what reconstruct produced");
     }
 }

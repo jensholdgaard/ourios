@@ -526,6 +526,31 @@ pub struct C1Result {
     pub rate: f64,
     pub lossy_flag_ratio: f64,
     pub pass: bool,
+    /// Per-row diagnostics for the first few non-lossy rows
+    /// that failed to reconstruct (RFC0006.2: the bench emits
+    /// each failing row's `template_id` / `template_version` /
+    /// expected / actual to stderr). Bounded — see
+    /// `c1::MISMATCH_SAMPLE_CAP`. **`#[serde(skip)]`**: these
+    /// are stderr-only diagnostics, not part of the §3.6 JSON
+    /// schema, so they never appear in the results file (and
+    /// don't affect the RFC0006.7 reproducibility comparison,
+    /// which is over the JSON form).
+    #[serde(skip)]
+    pub mismatches: Vec<C1Mismatch>,
+}
+
+/// One non-lossy row that failed C1 reconstruction — the
+/// stderr diagnostic payload RFC0006.2 requires. Not
+/// serialised (carried on [`C1Result::mismatches`], which is
+/// `#[serde(skip)]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C1Mismatch {
+    pub template_id: u64,
+    pub template_version: u32,
+    /// The ingested line bytes (UTF-8 lossy for display).
+    pub expected: String,
+    /// What `reconstruct` produced (UTF-8 lossy for display).
+    pub actual: String,
 }
 
 /// §3.6 `c2` block (populated only when C2 ran). `pass` is

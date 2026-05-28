@@ -1,0 +1,99 @@
+name: Bench
+
+# On-demand thesis-gate bench (RFC 0006 §3.7: "the bench runs on
+# demand … and on the nightly schedule"). `workflow_dispatch`-only
+# for now — the bench is too slow / hardware-dependent for the
+# per-PR loop, so it isn't wired to `push` / `pull_request`.
+#
+# This first version runs against the committed seed corpus
+# (`testdata/corpus/`, ~tens of lines) to establish the
+# build → run → artifact → summary pipeline. The numbers are
+# **indicative only**: a hosted runner is not the `docs/benchmarks.md`
+# §1 hardware baseline, and the seed corpus is far too small to be
+# representative (A1 is *expected* to FAIL on it — Parquet footer /
+# dictionary overhead dwarfs a few KB of data). A follow-up wires in
+# a large, representative corpus. The workflow uploads the results
+# JSON as an artifact and never commits `docs/benchmarks.md` §9 —
+# landing authoritative numbers stays a deliberate act.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gates:
+        description: Comma-separated gates to run (a1,c1,c2)
+        default: a1,c1,c2
+        required: false
+      hardware_kind:
+        description: Hardware tag recorded in the results
+        default: github-ubuntu-4vcpu
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: thesis-gate bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release — §3.7 pins release mode for A1)
+        run: cargo build -p ourios-bench --release
+
+      - name: Run thesis-gate bench
+        # `pipefail` so a C1 reconstruction failure (the bench's
+        # only non-zero exit, §3.4.2) fails the job rather than
+        # being swallowed by the `tee` pipe.
+        #
+        # Inputs are passed via `env:`, not interpolated into the
+        # script with `${{ … }}` — that expansion would splice
+        # the (attacker-controllable, for a write-access
+        # dispatcher) input into the shell source verbatim, a
+        # template-injection vector. As `$BENCH_*` they're plain
+        # quoted argv values; clap then validates `--gates`
+        # against its enum and `--hardware-kind` is only ever
+        # stored, never executed.
+        shell: bash
+        env:
+          BENCH_GATES: ${{ inputs.gates }}
+          BENCH_HARDWARE: ${{ inputs.hardware_kind }}
+        run: |
+          set -euo pipefail
+          ./target/release/ourios-bench \
+            --corpus testdata/corpus \
+            --gates "$BENCH_GATES" \
+            --hardware-kind "$BENCH_HARDWARE" \
+            --results-dir bench-results \
+            | tee bench-summary.txt
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## ourios-bench — thesis-gate results'
+            echo
+            echo '```'
+            cat bench-summary.txt 2>/dev/null || echo '(no summary — the run failed before producing one)'
+            echo '```'
+            echo
+            echo '> **Indicative only.** Seed corpus (`testdata/corpus/`) on a hosted runner —'
+            echo '> not the `docs/benchmarks.md` §1 hardware baseline, and far too small to be'
+            echo '> representative. A1 is expected to FAIL here (Parquet overhead dominates a'
+            echo '> few KB of data). Real numbers need a representative corpus + baseline hardware.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results/*.json
+          if-no-files-found: warn

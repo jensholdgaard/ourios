@@ -1,28 +1,68 @@
 //! Corpus loader for the RFC 0006 bench harness.
 //!
-//! Per RFC 0006 §3.3, the bench reads plain-text `*.txt` files
-//! under a corpus directory, one line per row, UTF-8. Each non-
-//! empty line becomes one `OtlpLogRecord` with
-//! `Body::String(line)`, a default tenant (`bench-tenant`),
-//! severity `9` / `INFO`, and `scope = (None, None)`. Time
-//! stamps advance deterministically — `time_unix_nano` starts
-//! at the §3.3 baseline (`1_775_127_480_000_000_000`, i.e.
-//! 2026-04-02T10:58:00 UTC) and ticks `1_000_000` ns (1 ms) per
-//! line.
+//! Two file formats are consumed:
+//!
+//! - **Plain text** (`*.txt`) — RFC 0006 §3.3 v1 form. One line
+//!   per record, UTF-8. Each non-empty line becomes one
+//!   [`OtlpLogRecord`] with `Body::String(line)`, default tenant
+//!   (`bench-tenant`), severity `9` / `INFO`, and
+//!   `scope = (None, None)`. Timestamps advance
+//!   deterministically — `time_unix_nano` starts at the §3.3
+//!   baseline (`1_775_127_480_000_000_000`, i.e.
+//!   2026-04-02T10:58:00 UTC) and ticks `1_000_000` ns (1 ms)
+//!   per line.
+//!
+//! - **OTLP/JSON Lines** (`*.jsonl`, `*.json`) — RFC 0006 §3.1's
+//!   OTLP-LogsData migration. One OTLP `LogsData` per line
+//!   (the [OTel File Exporter] format the collector emits). Each
+//!   wire `LogRecord`'s envelope is preserved 1:1 onto the
+//!   [`OtlpLogRecord`] per the RFC 0003 §6.6 shape — severity,
+//!   scope, attributes, resource attributes, trace context, body.
+//!   `time_unix_nano` is taken from the wire (file-static =
+//!   run-reproducible). String bodies become `Body::String`;
+//!   any other `AnyValue` becomes `Body::Structured`.
+//!
+//!   This is the path RFC 0003 §6.5 itself names as the MVP bench
+//!   route — "the MVP bench reads OTLP from the on-disk corpus,
+//!   bypassing this component entirely" — pending the
+//!   `ourios-wal` crate (without which a live receiver would
+//!   violate CLAUDE.md §3.4 WAL-before-ack).
+//!
+//! Both formats may coexist in the same directory; the walker
+//! dispatches by extension. `total_files` and `raw_bytes` cover
+//! every consumed file regardless of format — §3.4.1's
+//! `bytes(raw_corpus)` is "the bytes the bench actually read,"
+//! whichever encoding. For OTLP/JSON corpora that includes the
+//! envelope (camelCase keys, base64 bytes), which inflates the
+//! denominator A1 divides into; downstream comparisons across
+//! corpus formats need to account for this.
+//!
+//! Inspiration for the parse strategy
+//! (`serde_json::from_str::<LogsData>` against
+//! [`opentelemetry-proto`] types with the `with-serde` feature)
+//! is [rotel]'s OTLP HTTP receiver — the same pattern it uses on
+//! `ExportLogsServiceRequest`. Keeps the spec mapping
+//! single-sourced in `opentelemetry-proto` rather than a
+//! hand-rolled struct that could drift from the OTLP/JSON spec.
 //!
 //! The walk is **recursive** — same shape as
 //! `tests/a1.rs::sum_txt_bytes` after the second round of
-//! review. The committed seed corpus is flat today but a
-//! future nested `testdata/corpus/<archetype>/...` layout
-//! would silently undercount with a single-level loader, and
-//! the §3.4.1 definition of `bytes(raw_corpus)` is naturally
-//! recursive.
+//! review. The committed seed corpus is flat today but a future
+//! nested `testdata/corpus/<archetype>/...` layout would silently
+//! undercount with a single-level loader, and §3.4.1's
+//! `bytes(raw_corpus)` is naturally recursive.
+//!
+//! [OTel File Exporter]: https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/
+//! [`opentelemetry-proto`]: https://docs.rs/opentelemetry-proto
+//! [rotel]: https://github.com/streamfold/rotel
 
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, LogsData};
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
 
@@ -216,53 +256,209 @@ fn walk(
             )?;
             continue;
         }
-        if !path
+        // Dispatch on extension. `.txt` → plain-text loader
+        // (RFC 0006 §3.3 v1). `.jsonl` / `.json` → OTLP/JSON
+        // Lines loader (the §3.1 OTLP-LogsData path that RFC
+        // 0003 §6.5 itself names as the MVP bench source).
+        // Any other extension is silently skipped — corpora
+        // often sit next to `README.md`, `.gitignore`, sample
+        // configs, etc., and treating those as input would
+        // poison the §3.4.1 byte count.
+        let format = match path
             .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
         {
-            continue;
-        }
+            Some("txt") => CorpusFormat::Txt,
+            Some("jsonl" | "json") => CorpusFormat::OtlpJsonl,
+            _ => continue,
+        };
         *total_files += 1;
         *raw_bytes += meta.len();
-        // Stream lines via `BufReader` rather than slurping
-        // the whole file with `read_to_string` — RFC 0006
-        // sizes corpora at low millions of lines per file,
-        // and a 100 MiB-class single-file corpus would spike
-        // memory unnecessarily if we read the full contents
-        // up front.
-        let file = File::open(&path).map_err(|e| BenchError::Corpus {
-            detail: format!("open({}): {e}", path.display()),
-        })?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            // `lines()` allocates one `String` per line and
-            // strips the trailing `\n` but not `\r`. Pop the
-            // CR(s) a CRLF file leaves in place rather than
-            // `trim_end_matches('\r').to_string()` (which
-            // would allocate a second copy on every line), then
-            // move the `String` straight into `Body::String` —
-            // one allocation per line on the hot loader path.
-            let mut raw = line.map_err(|e| BenchError::Corpus {
-                detail: format!("read line in {}: {e}", path.display()),
-            })?;
-            while raw.ends_with('\r') {
-                raw.pop();
-            }
-            if raw.is_empty() {
-                continue;
-            }
-            lines.push(OtlpLogRecord {
-                tenant_id: tenant.clone(),
-                body: Some(Body::String(raw)),
-                time_unix_nano: *next_ns,
-                severity_number: BENCH_SEVERITY_NUMBER,
-                severity_text: Some(BENCH_SEVERITY_TEXT.to_string()),
-                ..Default::default()
-            });
-            *next_ns = next_ns.saturating_add(TIME_INCREMENT_NS);
+        match format {
+            CorpusFormat::Txt => ingest_txt(&path, lines, tenant, next_ns)?,
+            CorpusFormat::OtlpJsonl => ingest_otlp_jsonl(&path, lines, tenant)?,
         }
     }
     Ok(())
+}
+
+/// Which on-disk encoding a corpus file uses.
+enum CorpusFormat {
+    /// RFC 0006 §3.3 plain text, one line per record.
+    Txt,
+    /// RFC 0006 §3.1 OTLP JSON Lines, one `LogsData` per line
+    /// (the `OTel` File Exporter format).
+    OtlpJsonl,
+}
+
+/// Plain-text ingest (RFC 0006 §3.3). Streams via `BufReader`
+/// rather than `read_to_string` — corpora can reach the 100
+/// MiB class per file, and slurping would spike memory
+/// unnecessarily.
+fn ingest_txt(
+    path: &Path,
+    lines: &mut Vec<OtlpLogRecord>,
+    tenant: &TenantId,
+    next_ns: &mut u64,
+) -> Result<(), BenchError> {
+    let file = File::open(path).map_err(|e| BenchError::Corpus {
+        detail: format!("open({}): {e}", path.display()),
+    })?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        // `lines()` allocates one `String` per line and strips
+        // the trailing `\n` but not `\r`. Pop the CR(s) a
+        // CRLF file leaves in place rather than
+        // `trim_end_matches('\r').to_string()` (which would
+        // allocate a second copy on every line), then move
+        // the `String` straight into `Body::String` — one
+        // allocation per line on the hot loader path.
+        let mut raw = line.map_err(|e| BenchError::Corpus {
+            detail: format!("read line in {}: {e}", path.display()),
+        })?;
+        while raw.ends_with('\r') {
+            raw.pop();
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        lines.push(OtlpLogRecord {
+            tenant_id: tenant.clone(),
+            body: Some(Body::String(raw)),
+            time_unix_nano: *next_ns,
+            severity_number: BENCH_SEVERITY_NUMBER,
+            severity_text: Some(BENCH_SEVERITY_TEXT.to_string()),
+            ..Default::default()
+        });
+        *next_ns = next_ns.saturating_add(TIME_INCREMENT_NS);
+    }
+    Ok(())
+}
+
+/// OTLP JSON Lines ingest (RFC 0006 §3.1, the `OTel` File
+/// Exporter format). Each non-blank line is parsed as one
+/// `LogsData` via `serde_json::from_str` against the
+/// `opentelemetry-proto` types (with the `with-serde`
+/// feature). Walks `resource_logs[].scope_logs[].log_records[]`
+/// and emits one [`OtlpLogRecord`] per wire `LogRecord`, with
+/// the envelope mapped 1:1 per the RFC 0003 §6.6 in-memory
+/// shape. Tenant is the bench default — multi-tenant corpora
+/// are a future RFC.
+fn ingest_otlp_jsonl(
+    path: &Path,
+    lines: &mut Vec<OtlpLogRecord>,
+    tenant: &TenantId,
+) -> Result<(), BenchError> {
+    let file = File::open(path).map_err(|e| BenchError::Corpus {
+        detail: format!("open({}): {e}", path.display()),
+    })?;
+    // 1-based line number for parse-error diagnostics —
+    // matches editor / jq output and what an operator would
+    // type to `sed -n '<n>p'` to inspect the failing line.
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        let raw = line.map_err(|e| BenchError::Corpus {
+            detail: format!("read line in {}: {e}", path.display()),
+        })?;
+        // Skip blank / whitespace-only lines (trailing newline
+        // at EOF, accidental blank separators between
+        // batches). Real `LogsData` JSON always starts with
+        // `{`, so a trimmed-empty check is sufficient and
+        // doesn't require parsing.
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let logs_data: LogsData = serde_json::from_str(&raw).map_err(|e| BenchError::Corpus {
+            detail: format!("parse OTLP/JSON at {}:{}: {e}", path.display(), idx + 1),
+        })?;
+        for rl in logs_data.resource_logs {
+            // Resource attributes are copied onto every
+            // record in the `ResourceLogs` group per the
+            // `OtlpLogRecord` doc-comment ("inherited from
+            // `Resource.attributes` and copied onto every
+            // record under that `ResourceLogs` group"). Hoist
+            // the borrow once so the per-record map doesn't
+            // re-extract.
+            let resource_attrs: Vec<KeyValue> =
+                rl.resource.map(|r| r.attributes).unwrap_or_default();
+            for sl in rl.scope_logs {
+                let scope = sl.scope;
+                for lr in sl.log_records {
+                    lines.push(map_log_record(
+                        tenant.clone(),
+                        &resource_attrs,
+                        scope.as_ref(),
+                        lr,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map one wire `LogRecord` (plus its inherited resource
+/// attributes and `InstrumentationScope`) into the
+/// [`OtlpLogRecord`] shape RFC 0003 §6.6 pins. Severity
+/// clamps wire `i32` into the OTLP-defined `0..=24` band
+/// (`0` = UNSPECIFIED, `1..=24` = TRACE..FATAL with sub-
+/// levels), matching the receiver-boundary narrowing the
+/// `OtlpLogRecord` doc-comment describes ("narrowed from
+/// proto's unbounded `i32` at the receiver boundary"). Empty
+/// strings on optional fields collapse to `None` so
+/// downstream code sees a single absence signal regardless of
+/// whether the wire delivered `""` or omitted the field.
+fn map_log_record(
+    tenant: TenantId,
+    resource_attrs: &[KeyValue],
+    scope: Option<&InstrumentationScope>,
+    lr: LogRecord,
+) -> OtlpLogRecord {
+    OtlpLogRecord {
+        tenant_id: tenant,
+        time_unix_nano: lr.time_unix_nano,
+        observed_time_unix_nano: (lr.observed_time_unix_nano != 0)
+            .then_some(lr.observed_time_unix_nano),
+        severity_number: u8::try_from(lr.severity_number.clamp(0, 24)).unwrap_or(0),
+        severity_text: empty_to_none(lr.severity_text),
+        scope_name: scope.and_then(|s| empty_to_none(s.name.clone())),
+        scope_version: scope.and_then(|s| empty_to_none(s.version.clone())),
+        attributes: lr.attributes,
+        dropped_attributes_count: lr.dropped_attributes_count,
+        resource_attributes: resource_attrs.to_vec(),
+        // Trace / span ids are wire-typed as `Vec<u8>` but
+        // OTLP fixes their length (16 / 8 bytes). Reject any
+        // other length to `None` rather than panicking — a
+        // malformed id is a wire-level concern, not the
+        // bench's. Per RFC 0003 §5 (RFC0003.11), transport
+        // errors are surfaced as `None` here, not panics.
+        trace_id: <[u8; 16]>::try_from(lr.trace_id.as_slice()).ok(),
+        span_id: <[u8; 8]>::try_from(lr.span_id.as_slice()).ok(),
+        flags: lr.flags,
+        event_name: empty_to_none(lr.event_name),
+        body: lr.body.and_then(any_value_to_body),
+    }
+}
+
+/// Body discriminator per RFC 0003 §6.4 (which defers
+/// canonicalisation to the storage layer — the receiver hands
+/// the miner an `AnyValue` verbatim, never a JSON-canonicalised
+/// byte blob). String bodies unwrap into `Body::String`;
+/// every other `AnyValue` variant stays as
+/// `Body::Structured(AnyValue)` carrying the decoded tree.
+/// An `AnyValue { value: None }` is treated as an absent body
+/// per OTLP — `body: None` on the resulting record.
+fn any_value_to_body(av: AnyValue) -> Option<Body> {
+    match av.value {
+        None => None,
+        Some(any_value::Value::StringValue(s)) => Some(Body::String(s)),
+        Some(v) => Some(Body::Structured(AnyValue { value: Some(v) })),
+    }
+}
+
+fn empty_to_none(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]
@@ -405,5 +601,200 @@ mod tests {
             matches!(err, BenchError::Corpus { .. }),
             "expected Corpus cycle error, got {err:?}",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // OTLP/JSON path — RFC 0006 §3.1 (the §6.5 MVP bench source).
+    // ---------------------------------------------------------------
+
+    fn otlp_sample_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/otlp")
+    }
+
+    /// Loads the committed OTLP/JSON sample (3 `LogsData` lines,
+    /// 4 wire `LogRecord`s) and pins every envelope field the
+    /// loader maps onto [`OtlpLogRecord`] per the RFC 0003 §6.6
+    /// in-memory shape. Catches drift in the OTLP/JSON spec
+    /// mapping (camelCase keys, string-encoded `u64`s for
+    /// `timeUnixNano`, base64 bytes), the resource-attribute
+    /// fan-out copy, the scope inheritance, and the empty-
+    /// string → `None` collapse on optional fields.
+    #[test]
+    fn loads_otlp_corpus_envelope_one_to_one() {
+        let load = load(&otlp_sample_dir()).expect("OTLP sample loads");
+        assert_eq!(load.total_files, 1, "the sample dir has one .jsonl file");
+        assert_eq!(
+            load.lines.len(),
+            4,
+            "3 LogsData lines × (1 + 2 + 1) records = 4",
+        );
+        assert!(load.raw_bytes > 0, "raw_bytes counts the .jsonl file size");
+
+        let first = &load.lines[0];
+        assert_eq!(first.tenant_id.as_str(), BENCH_TENANT);
+        assert_eq!(first.time_unix_nano, 1_775_127_480_000_000_000);
+        assert_eq!(
+            first.observed_time_unix_nano,
+            Some(1_775_127_480_000_000_123)
+        );
+        assert_eq!(first.severity_number, 9);
+        assert_eq!(first.severity_text.as_deref(), Some("INFO"));
+        assert_eq!(first.scope_name.as_deref(), Some("bench.scope"));
+        assert_eq!(first.scope_version.as_deref(), Some("1.0.0"));
+        assert_eq!(first.flags, 1);
+        assert_eq!(first.attributes.len(), 1, "one log attribute on record 0");
+        assert_eq!(
+            first.resource_attributes.len(),
+            2,
+            "two resource attributes (service.name + host.name)",
+        );
+        assert_eq!(
+            line_bytes(first),
+            Some("user 42 logged in".as_bytes()),
+            "Body::String unwraps to the wire string",
+        );
+
+        // Second LogsData has 2 records — both should land,
+        // sharing the resource attribute (only service.name on
+        // that line).
+        let second = &load.lines[1];
+        assert_eq!(second.severity_number, 13, "WARN");
+        assert_eq!(line_bytes(second), Some("slow query: 1843ms".as_bytes()));
+        assert_eq!(second.resource_attributes.len(), 1);
+        let third = &load.lines[2];
+        assert_eq!(third.severity_number, 17, "ERROR");
+        assert_eq!(line_bytes(third), Some("connection refused".as_bytes()));
+    }
+
+    /// `body.kvlistValue` (and anything that isn't `stringValue`)
+    /// stays on the record as `Body::Structured(AnyValue)`,
+    /// **not** flattened to text or dropped. Per RFC 0003 §6.4
+    /// the receiver hands the miner the decoded `AnyValue`
+    /// verbatim; canonicalisation is the storage layer's job at
+    /// write time. `line_bytes` returns `None` on these records
+    /// (C1's denominator excludes them).
+    #[test]
+    fn otlp_structured_body_maps_to_body_structured() {
+        let load = load(&otlp_sample_dir()).expect("sample loads");
+        let structured = &load.lines[3];
+        assert!(
+            matches!(structured.body, Some(Body::Structured(_))),
+            "kvlistValue body must round-trip as Body::Structured, got {:?}",
+            structured.body,
+        );
+        assert_eq!(
+            line_bytes(structured),
+            None,
+            "non-string bodies have no `line` representation",
+        );
+    }
+
+    /// Blank lines (and a trailing newline at EOF) are skipped
+    /// without erroring — the `OTel` File Exporter emits one
+    /// `LogsData` per line but operators concatenating multiple
+    /// exporter outputs may end up with extra blanks. The loader
+    /// is permissive about whitespace-only lines and strict
+    /// about everything else.
+    #[test]
+    fn otlp_skips_blank_lines() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("blanks.jsonl");
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(
+            b"\n   \n{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"body\":{\"stringValue\":\"only real line\"}}]}]}]}\n\n",
+        )
+        .expect("write");
+        drop(file);
+
+        let load = load(tmp.path()).expect("blank-only-padding loads");
+        assert_eq!(load.lines.len(), 1);
+        assert_eq!(
+            line_bytes(&load.lines[0]),
+            Some("only real line".as_bytes())
+        );
+    }
+
+    /// A malformed JSON line surfaces as `BenchError::Corpus`
+    /// carrying the 1-based line number — operators routinely
+    /// type that into `sed -n '<n>p'` or open the file at the
+    /// reported position. Silent truncation past the bad line
+    /// would corrupt the corpus count.
+    #[test]
+    fn otlp_malformed_line_errors_with_line_number() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("bad.jsonl");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // Line 1 valid, line 2 malformed.
+        file.write_all(b"{\"resourceLogs\":[]}\nnot json\n")
+            .expect("write");
+        drop(file);
+
+        let err = load(tmp.path()).expect_err("malformed JSON must error");
+        match err {
+            BenchError::Corpus { detail } => {
+                assert!(
+                    detail.contains(":2:"),
+                    "error must name the 1-based line (`:2:`), got {detail:?}",
+                );
+            }
+            other => panic!("expected BenchError::Corpus, got {other:?}"),
+        }
+    }
+
+    /// `severityNumber` is wire-typed `i32`; OTLP defines the
+    /// valid band as `0..=24`. Out-of-band values clamp to
+    /// `24` (FATAL4) — matches the "narrowed from proto's
+    /// unbounded `i32` at the receiver boundary" comment on
+    /// [`OtlpLogRecord::severity_number`]. Pins the clamp so a
+    /// regression doesn't truncate a `99` to `99 as u8 = 99`
+    /// (which is out of the documented enum range).
+    #[test]
+    fn otlp_severity_above_24_clamps_to_24() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("oversev.jsonl");
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"severityNumber\":99,\"body\":{\"stringValue\":\"x\"}}]}]}]}\n",
+        )
+        .expect("write");
+        drop(file);
+
+        let load = load(tmp.path()).expect("loads");
+        assert_eq!(load.lines[0].severity_number, 24, "clamped to FATAL4");
+    }
+
+    /// `.txt` and `.jsonl` may coexist in the same corpus dir
+    /// — the walker dispatches on extension and both contribute
+    /// records. `total_files` and `raw_bytes` count every input
+    /// regardless of format, matching §3.4.1's "the bytes the
+    /// bench actually read."
+    #[test]
+    fn mixed_txt_and_jsonl_both_load() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        // One plain-text line.
+        std::fs::write(tmp.path().join("a.txt"), "txt line one\n").expect("write txt");
+        // One OTLP record.
+        let jsonl_path = tmp.path().join("b.jsonl");
+        let mut f = std::fs::File::create(&jsonl_path).expect("create jsonl");
+        f.write_all(
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"body\":{\"stringValue\":\"otlp line one\"}}]}]}]}\n",
+        )
+        .expect("write jsonl");
+        drop(f);
+
+        let load = load(tmp.path()).expect("mixed corpus loads");
+        assert_eq!(load.total_files, 2, "both files counted");
+        assert_eq!(load.lines.len(), 2, "one record per file");
+        // Sorted order: a.txt before b.jsonl, so the txt line
+        // is first.
+        assert_eq!(line_bytes(&load.lines[0]), Some("txt line one".as_bytes()));
+        assert_eq!(line_bytes(&load.lines[1]), Some("otlp line one".as_bytes()));
     }
 }

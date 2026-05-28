@@ -108,9 +108,12 @@ This RFC pins:
   `crates/ourios-miner/tests/hazards.rs` reads. The bench
   reuses the on-disk *format*, not the test's `OtlpLogRecord`
   fixture defaults (see §3.3 for the bench-specific
-  tenant / severity / scope envelope). An OTLP-LogsData
-  migration is a future PR; A1 / C1 / C2 are meaningful on
-  plain-text input today.
+  tenant / severity / scope envelope). **Amendment (PR-K2,
+  2026-05-28):** the OTLP-LogsData migration has landed — the
+  loader also reads `*.jsonl` / `*.json` files in the OTel
+  File Exporter format (one `LogsData` per line). The
+  measurement formulas are unchanged; the §3.3 plain-text
+  envelope defaults still apply to text input.
 - The A1 / C1 / C2 measurement formulas — what is divided by
   what, where the byte counts come from, what equality means.
 - The "hardware baseline annotation" rule: every result line
@@ -134,10 +137,15 @@ This RFC does **not** pin:
 
 - `B1` / `B2` measurement — both need
   `ourios-querier` (future RFC 0007).
-- The OTLP-LogsData corpus migration (`docs/roadmap.md` §4's
-  "OTLP `LogsData` (canonical JSON or protobuf)" goal). The
-  migration is a follow-up PR; it doesn't change the bench's
-  measurement formulas, only the loader's parse step.
+- ~~The OTLP-LogsData corpus migration (`docs/roadmap.md`
+  §4's "OTLP `LogsData` (canonical JSON or protobuf)"
+  goal).~~ **Landed in PR-K2 (2026-05-28).** The loader now
+  reads `*.jsonl` / `*.json` files in the OTel File Exporter
+  format alongside the plain-text `*.txt` path. As predicted,
+  the measurement formulas were unchanged; only the loader's
+  parse step grew. The follow-up that swaps in the protobuf
+  (`*.binpb`) `LogsData` decode (instead of JSON) remains
+  out of scope for this RFC.
 - `criterion` micro-benchmarks for the miner / writer hot
   paths. `criterion` is the right tool *for* sub-measurements
   (e.g. per-line tokenize cost), but the thesis-gate harness
@@ -223,13 +231,24 @@ PR-E2 / PR-F / PR-G. A1 / C1 / C2 are tenant-distribution
 neutral. Multi-tenant bench scenarios land with future
 multi-tenant integration work.
 
-OTLP-LogsData corpus support is a future PR. The loader
-abstraction in `corpus.rs` exposes
-`load_corpus(path: &Path) -> impl Iterator<Item = OtlpLogRecord>`;
-the v1 implementation routes `*.txt` files through the
-plain-text path. The follow-up that decodes `*.json` /
-`*.binpb` `LogsData` files swaps the implementation behind the
-same interface without touching the harness.
+**Amendment (PR-K2, 2026-05-28):** OTLP-LogsData corpus
+support has landed. The loader dispatches on file extension:
+`*.txt` → the plain-text path above; `*.jsonl` / `*.json` →
+OTLP/JSON Lines (one `LogsData` per line, the OTel File
+Exporter format), parsed via `serde_json::from_str` against
+the `opentelemetry-proto` types (the `with-serde` feature
+gives the OTLP/JSON spec mapping for free). Each wire
+`LogRecord` maps to one `OtlpLogRecord` per the RFC 0003 §6.6
+shape — severity (clamped to OTLP's `0..=24`), scope,
+attributes, resource attributes (copied per record), trace
+context (length-validated `[u8;16]` / `[u8;8]`), body
+(`StringValue` → `Body::String`, anything else →
+`Body::Structured(AnyValue)` per RFC 0003 §6.4). Both formats
+may coexist in the same corpus directory. Wire timestamps are
+honoured for OTLP records (file-static = run-reproducible);
+the §3.3 deterministic baseline still drives the text path.
+The follow-up that decodes the protobuf (`*.binpb`)
+`LogsData` form remains out of scope for this RFC.
 
 ### 3.4 Measurement methodology
 

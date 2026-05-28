@@ -24,6 +24,13 @@ path = "src/lib.rs"
 ourios-core = { path = "../ourios-core" }
 ourios-miner = { path = "../ourios-miner" }
 ourios-parquet = { path = "../ourios-parquet" }
+# OTLP proto types for the §3.1 OTLP/JSON corpus loader (see
+# `src/corpus.rs`). `with-serde` (the OTLP/JSON spec's serde
+# derives) is already enabled on this crate via `ourios-core`'s
+# feature list; declaring the dep here just lets us name the
+# types directly (Rust's resolver requires explicit
+# declaration to import from an otherwise-transitive crate).
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
 # CLI argument parsing for the §3.7 flag surface. `clap` is the
 # CNCF-Rust-observability standard (Vector, Quickwit,
 # OpenObserve, GreptimeDB all use it) — the Rust analogue to

@@ -8,15 +8,20 @@
 //! A1_delta     = ourios_ratio / zstd_ratio
 //! ```
 //!
-//! - `bytes(raw_corpus)` — sum of `*.txt` file sizes (computed
-//!   by [`crate::corpus`] during load, passed in here).
+//! - `bytes(raw_corpus)` — sum of consumed-file sizes
+//!   (`*.txt` + `*.jsonl` + `*.json`, in lockstep with
+//!   [`crate::corpus`]'s extension dispatch; computed during
+//!   load, passed in here).
 //! - `bytes(ourios_output)` — sum of every `*.parquet` file
 //!   under the bench's output bucket, **including the
 //!   `audit/...` series**; the pre-rename `*.parquet.tmp`
 //!   files are skipped (RFC 0005 §7 atomic-publish).
 //! - `bytes(zstd_corpus)` — sum of `zstd -19` output over each
-//!   `*.txt` **individually** (not concatenated — per-file is
-//!   the honest, stricter comparison the Drain paper uses).
+//!   consumed corpus file **individually** (not concatenated —
+//!   per-file is the honest, stricter comparison the Drain
+//!   paper uses). Same extension set as `bytes(raw_corpus)`;
+//!   diverging the two would break the §3.4.1 math invariant
+//!   (both sides must process the same input).
 //! - `A1_delta` — the ratio of ratios, rounded *down* to three
 //!   significant figures so reported numbers err pessimistic.
 //!
@@ -379,10 +384,22 @@ fn zstd_level_19_bytes(dir: &Path) -> Result<u64, crate::BenchError> {
             })?;
             if meta.is_dir() {
                 stack.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
-            {
+                continue;
+            }
+            // Compress every extension the §3.3 / §3.1 corpus
+            // loader actually consumes. If A1 only zstd'd
+            // `*.txt`, an OTLP-only corpus would have
+            // `bytes(raw_corpus) > 0` but `bytes(zstd_corpus)
+            // = 0`, yielding `zstd_ratio = 0` / a meaningless
+            // A1 delta — the math invariant the §3.4.1
+            // formula assumes (both sides processing the same
+            // input) would break. Keep this list in lockstep
+            // with `corpus::walk`'s extension dispatch.
+            if path.extension().is_some_and(|e| {
+                e.eq_ignore_ascii_case("txt")
+                    || e.eq_ignore_ascii_case("jsonl")
+                    || e.eq_ignore_ascii_case("json")
+            }) {
                 let file = std::fs::File::open(&path).map_err(|e| crate::BenchError::Corpus {
                     detail: format!("open({}): {e}", path.display()),
                 })?;
@@ -536,5 +553,57 @@ mod tests {
         assert_eq!(a1.zstd_ratio, 0.0);
         assert_eq!(a1.delta, 0.0);
         assert!(!a1.pass);
+    }
+
+    /// `zstd_level_19_bytes` consumes every extension the
+    /// corpus loader does (`*.txt` + `*.jsonl` + `*.json`),
+    /// not just `*.txt`. Diverging from `corpus::walk` would
+    /// break the §3.4.1 math invariant — an OTLP-only corpus
+    /// would have `bytes(raw_corpus) > 0` while
+    /// `bytes(zstd_corpus) = 0`, yielding `zstd_ratio = 0`
+    /// and a meaningless A1 delta.
+    #[test]
+    fn zstd_consumes_every_corpus_extension() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        std::fs::write(tmp.path().join("a.txt"), b"plain text line\n").expect("txt");
+        std::fs::write(
+            tmp.path().join("b.jsonl"),
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"body\":{\"stringValue\":\"x\"}}]}]}]}\n",
+        )
+        .expect("jsonl");
+        std::fs::write(
+            tmp.path().join("c.json"),
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"body\":{\"stringValue\":\"y\"}}]}]}]}\n",
+        )
+        .expect("json");
+        // An unrelated extension that must NOT be compressed
+        // (would inflate `bytes(zstd_corpus)` past the loader's
+        // honest input).
+        std::fs::write(tmp.path().join("readme.md"), b"# not a corpus file\n").expect("md");
+
+        let bytes = zstd_level_19_bytes(tmp.path()).expect("zstd");
+        assert!(
+            bytes > 0,
+            "zstd compresses something on a mixed-extension corpus",
+        );
+
+        // Sanity check the invariant: same dir without the txt
+        // file (OTLP-only) still produces > 0 bytes — the
+        // failure mode this test guards against is the
+        // pre-fix `txt`-only filter returning 0.
+        let otlp_only = tempfile::TempDir::new().expect("temp dir");
+        std::fs::write(
+            otlp_only.path().join("only.jsonl"),
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"body\":{\"stringValue\":\"hello\"}}]}]}]}\n",
+        )
+        .expect("jsonl");
+        let otlp_bytes = zstd_level_19_bytes(otlp_only.path()).expect("zstd otlp");
+        assert!(
+            otlp_bytes > 0,
+            "OTLP-only corpus must not zero out bytes(zstd_corpus) — A1 math depends on it",
+        );
     }
 }

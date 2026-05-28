@@ -272,12 +272,29 @@ Targets: `A1_delta ≥ 3.0` on every corpus in `benchmarks.md`
 Pinned definitions:
 
 - **`bytes(raw_corpus)`**: sum of `std::fs::metadata(p).len()`
-  for every `*.txt` file in the corpus directory the bench was
-  invoked against. UTF-8 encoded; trailing newlines included.
-  No transformation: this is the byte count an operator
-  measures with `find testdata/corpus/ -name '*.txt' -exec
-  stat --printf='%s\n' {} + | awk '{s+=$1}END{print s}'`
-  (or the platform equivalent).
+  for every corpus file the loader consumed — recursively
+  under the corpus directory. The loader dispatches on
+  extension: `*.txt` (the §3.3 plain-text path), or `*.jsonl`
+  / `*.json` (the §3.1 OTLP/JSON Lines path landed in PR-K2).
+  `*.binpb` protobuf-encoded `LogsData` is reserved for a
+  future follow-up and not counted today. No transformation:
+  this is the byte count an operator measures with `find
+  testdata/corpus/ \( -name '*.txt' -o -name '*.jsonl' -o
+  -name '*.json' \) -exec stat --printf='%s\n' {} + | awk
+  '{s+=$1}END{print s}'` (or the platform equivalent). For
+  OTLP/JSON corpora the byte count includes the envelope
+  (camelCase keys, base64 bytes), so A1 ratios are not
+  directly comparable across formats — a directory holding a
+  mix of `*.txt` and `*.jsonl` produces one aggregate number
+  that conflates both encodings. The §3.6 results JSON's
+  `corpus.directory` field lets consumers locate the corpus
+  and inspect its contents to interpret the result; cleanly
+  comparable runs need a corpus directory of one encoding
+  only. A per-format byte breakdown on the results JSON is a
+  future enhancement (see §9 open questions).
+  `bytes(zstd_corpus)` (below) covers the same extension set
+  so the §3.4.1 math invariant — both sides processing the
+  same input — holds across formats.
 - **`bytes(ourios_output)`**: sum of
   `std::fs::metadata(p).len()` for every `*.parquet` file
   under the bench's output bucket directory, **including the
@@ -290,13 +307,18 @@ Pinned definitions:
   durable artefact).
 - **`bytes(zstd_corpus)`**: sum of `std::fs::metadata(p).len()`
   for every `*.zst` file produced by running
-  `zstd -19 --no-progress` against each input `*.txt`
-  file individually. Level 19 (not 3) matches the Drain
-  paper's published comparison and is the strictest competent
-  byte codec; using ZSTD-3 would make Ourios's A1 trivially
-  pass and is dishonest. The `--no-progress` flag suppresses
-  the progress bar so the bench is deterministic on
-  reinvocation.
+  `zstd -19 --no-progress` against each consumed input file
+  individually — same extension set as `bytes(raw_corpus)`
+  above (`*.txt` + `*.jsonl` + `*.json`). The two byte
+  counts must cover identical input files; broadening one
+  without the other would break the §3.4.1 math invariant
+  (zero `bytes(zstd_corpus)` on an OTLP-only corpus would
+  produce `zstd_ratio = 0` and an undefined A1 delta). Level
+  19 (not 3) matches the Drain paper's published comparison
+  and is the strictest competent byte codec; using ZSTD-3
+  would make Ourios's A1 trivially pass and is dishonest.
+  The `--no-progress` flag suppresses the progress bar so
+  the bench is deterministic on reinvocation.
 - **`A1_delta`** is the ratio of ratios; it has no units.
   Reported to three significant figures (`3.21×`,
   `12.4×`, etc.) and rounded *down* to that precision so
@@ -623,7 +645,12 @@ ourios-bench [--corpus <path>]
 Flags:
 
 - `--corpus <path>` (default `testdata/corpus/`): directory of
-  `*.txt` files the bench loads.
+  corpus files the loader walks recursively. Files are
+  dispatched on extension: `*.txt` (plain-text per §3.3) and
+  `*.jsonl` / `*.json` (OTLP/JSON Lines per §3.1 — one
+  `LogsData` per line, the OTel File Exporter format).
+  Both formats may coexist in the same directory; any other
+  extension is silently skipped.
 - `--results-dir <path>` (default `benchmarks/results/`):
   where the §3.6 JSON file lands.
 - `--bucket-dir <path>` (default: fresh temp dir): the

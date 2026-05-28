@@ -61,7 +61,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
+use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, LogsData};
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
@@ -114,24 +114,28 @@ pub(crate) const BENCH_SEVERITY_TEXT: &str = "INFO";
 #[derive(Debug)]
 pub(crate) struct CorpusLoad {
     pub lines: Vec<OtlpLogRecord>,
-    /// Number of `*.txt` files found under the corpus
-    /// directory (recursive). Empty files count — the §3.4.1
-    /// A1 formula sums `metadata.len()` over every `*.txt`,
-    /// not just non-empty ones, so the diagnostic surfaces
-    /// the input the formula actually consumed.
+    /// Number of corpus files the loader consumed under the
+    /// directory (recursive) — every extension the walker
+    /// dispatches on (`*.txt`, `*.jsonl`, `*.json`). Empty
+    /// files count: the §3.4.1 A1 formula sums
+    /// `metadata.len()` over every consumed file, not just
+    /// non-empty ones, so the diagnostic surfaces the input
+    /// the formula actually consumed.
     pub total_files: u32,
-    /// Sum of `fs::metadata(*.txt).len()` over every `*.txt`
-    /// file found (empty files included). Matches the §3.4.1
-    /// `bytes(raw_corpus)` formula 1:1.
+    /// Sum of `fs::metadata(p).len()` over every consumed
+    /// corpus file (`*.txt` + `*.jsonl` + `*.json`, empty
+    /// files included). Matches the §3.4.1 `bytes(raw_corpus)`
+    /// formula 1:1.
     pub raw_bytes: u64,
     /// User-facing directory path string for the results JSON.
     pub directory: String,
 }
 
-/// Load every `*.txt` file under `dir` (recursive) into a
-/// [`CorpusLoad`]. Errors with [`BenchError::Corpus`] when the
-/// directory is unreadable, contains no `*.txt` files, or
-/// every contributing file is empty.
+/// Walk `dir` recursively and load every recognised corpus
+/// file (`*.txt`, `*.jsonl`, `*.json`) into a [`CorpusLoad`].
+/// Errors with [`BenchError::Corpus`] when the directory is
+/// unreadable, contains no recognised corpus files, or every
+/// contributing file is empty.
 pub(crate) fn load(dir: &Path) -> Result<CorpusLoad, BenchError> {
     let mut total_files = 0u32;
     let mut raw_bytes = 0u64;
@@ -153,7 +157,8 @@ pub(crate) fn load(dir: &Path) -> Result<CorpusLoad, BenchError> {
     if lines.is_empty() {
         return Err(BenchError::Corpus {
             detail: format!(
-                "no non-empty `*.txt` lines under {} (read {} file(s))",
+                "no non-empty corpus lines under {} (read {} file(s); supported extensions: \
+                 `*.txt`, `*.jsonl`, `*.json`)",
                 dir.display(),
                 total_files,
             ),
@@ -264,14 +269,16 @@ fn walk(
         // often sit next to `README.md`, `.gitignore`, sample
         // configs, etc., and treating those as input would
         // poison the §3.4.1 byte count.
-        let format = match path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("txt") => CorpusFormat::Txt,
-            Some("jsonl" | "json") => CorpusFormat::OtlpJsonl,
+        //
+        // `eq_ignore_ascii_case` is allocation-free; a
+        // `to_ascii_lowercase` would allocate a fresh `String`
+        // per directory entry on this hot loader path.
+        let ext = path.extension().and_then(std::ffi::OsStr::to_str);
+        let format = match ext {
+            Some(e) if e.eq_ignore_ascii_case("txt") => CorpusFormat::Txt,
+            Some(e) if e.eq_ignore_ascii_case("jsonl") || e.eq_ignore_ascii_case("json") => {
+                CorpusFormat::OtlpJsonl
+            }
             _ => continue,
         };
         *total_files += 1;
@@ -437,23 +444,13 @@ fn map_log_record(
         span_id: <[u8; 8]>::try_from(lr.span_id.as_slice()).ok(),
         flags: lr.flags,
         event_name: empty_to_none(lr.event_name),
-        body: lr.body.and_then(any_value_to_body),
-    }
-}
-
-/// Body discriminator per RFC 0003 §6.4 (which defers
-/// canonicalisation to the storage layer — the receiver hands
-/// the miner an `AnyValue` verbatim, never a JSON-canonicalised
-/// byte blob). String bodies unwrap into `Body::String`;
-/// every other `AnyValue` variant stays as
-/// `Body::Structured(AnyValue)` carrying the decoded tree.
-/// An `AnyValue { value: None }` is treated as an absent body
-/// per OTLP — `body: None` on the resulting record.
-fn any_value_to_body(av: AnyValue) -> Option<Body> {
-    match av.value {
-        None => None,
-        Some(any_value::Value::StringValue(s)) => Some(Body::String(s)),
-        Some(v) => Some(Body::Structured(AnyValue { value: Some(v) })),
+        // `Body::from_any_value` is the single-sourced
+        // String-vs-Structured fork in `ourios-core`; the
+        // earlier local `any_value_to_body` duplicated its
+        // logic. The deferred-canonicalisation rule (RFC
+        // 0003 §6.4: receiver hands the miner the decoded
+        // `AnyValue` verbatim) lives with the helper.
+        body: lr.body.and_then(Body::from_any_value),
     }
 }
 

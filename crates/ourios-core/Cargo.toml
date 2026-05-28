@@ -16,7 +16,7 @@ publish = false
 # `with-serde` adds the OTLP/JSON spec's Serialize/Deserialize derives
 # (camelCase fields, base64-encoded bytes, …) to the proto types so the
 # bench corpus loader can read OTel File Exporter output (one
-# `LogsData` per JSONL line) via `serde_json::from_slice::<LogsData>()`
+# `LogsData` per JSONL line) via `serde_json::from_str::<LogsData>()`
 # — the same pattern rotel's OTLP HTTP receiver uses on
 # `ExportLogsServiceRequest`. Keeps OTLP-JSON parsing as one feature
 # flag, not a hand-rolled struct that could drift from the spec.

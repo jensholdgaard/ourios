@@ -37,7 +37,12 @@ const BASELINE_HARDWARE_TAG: &str = "baseline-8vcpu-32gib (8 vCPU / 32 GiB / gp3
     about = "RFC 0006 thesis-gate bench harness (A1 compression / C1 reconstruction / C2 convergence)"
 )]
 struct Cli {
-    /// Directory of `*.txt` corpus files to load.
+    /// Directory of corpus files to load (recursive). Walker
+    /// dispatches on extension: `*.txt` (plain-text per RFC
+    /// 0006 §3.3) and `*.jsonl` / `*.json` (OTLP/JSON Lines
+    /// per §3.1 — one `LogsData` per line, the `OTel` File
+    /// Exporter format). Both formats may coexist in the same
+    /// directory; other extensions are silently skipped.
     #[arg(long, default_value = "testdata/corpus")]
     corpus: PathBuf,
     /// Where the §3.6 JSON results file lands.

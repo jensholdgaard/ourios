@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use ourios_core::audit::AuditEvent;
 
+pub(crate) mod frame;
 pub(crate) mod segment;
 
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
@@ -148,13 +149,8 @@ pub struct Wal {
     config: WalConfig,
     /// File handle for the segment currently accepting appends
     /// (per §6.2: append-only, opened by exactly one writer).
-    /// `None` would mean "no current segment open"; in this
-    /// implementation `open` always opens or creates one, so
-    /// the field is always populated post-open. The
-    /// `#[allow(dead_code)]` survives the red-gate slice
-    /// because nothing reads the handle yet — `append` lands
-    /// in the next slice.
-    #[allow(dead_code)]
+    /// Opened with `O_APPEND` so each write atomically lands at
+    /// end-of-file regardless of the user-space cursor.
     current_segment: File,
     /// Path of the file the `current_segment` handle points
     /// at. Kept alongside the handle for diagnostic messages
@@ -164,8 +160,7 @@ pub struct Wal {
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
     /// filename's stem and the segment's in-file header per
-    /// §6.2.1.
-    #[allow(dead_code)]
+    /// §6.2.1. Carried in every `WalOffset` `append` returns.
     current_segment_uuid: uuid::Uuid,
 }
 
@@ -212,13 +207,50 @@ impl Wal {
     /// Append a frame of `kind` carrying `payload` (≤
     /// [`MAX_FRAME_BYTES`]). The frame is **not** durable
     /// yet; the caller batches appends across the §6.3 window
-    /// and calls [`Self::sync`] once per batch.
+    /// and calls [`Self::sync`] once per batch. Returns a
+    /// [`WalOffset`] pointing at the **start** of the new
+    /// frame (the byte the 12 B header begins at), so the
+    /// offset uniquely identifies the appended record even
+    /// after later appends extend the segment.
     ///
     /// # Errors
     ///
     /// See [`AppendError`].
-    pub fn append(&mut self, _kind: FrameKind, _payload: &[u8]) -> Result<WalOffset, AppendError> {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.1 / §6.2.2)");
+    pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(AppendError::TooLarge {
+                len: payload.len(),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        // Record the byte offset where the new frame *starts*
+        // — i.e. the segment's pre-write length. We use
+        // `metadata().len()` rather than `stream_position`:
+        // `O_APPEND` guarantees each write lands at end-of-file
+        // atomically but the user-space cursor isn't
+        // guaranteed synchronised with the kernel's write
+        // offset on every platform (Linux `fcntl(O_APPEND)`
+        // notes), so `stream_position` can be 0 or stale on a
+        // file we haven't seeked into. File metadata length is
+        // truth.
+        let byte = self
+            .current_segment
+            .metadata()
+            .map_err(|source| AppendError::Io {
+                op: "stat(current_segment)",
+                source,
+            })?
+            .len();
+        frame::write_frame(&mut self.current_segment, kind, payload).map_err(|source| {
+            AppendError::Io {
+                op: "write_frame(current_segment)",
+                source,
+            }
+        })?;
+        Ok(WalOffset {
+            segment: self.current_segment_uuid,
+            byte,
+        })
     }
 
     /// Fsync the current segment (and the parent directory if

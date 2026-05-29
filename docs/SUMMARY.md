@@ -24,6 +24,7 @@
 - [RFC 0004 — Configuration policy](./rfcs/0004-configuration-policy.md)
 - [RFC 0005 — Parquet storage](./rfcs/0005-parquet-storage.md)
 - [RFC 0006 — Bench harness](./rfcs/0006-bench-harness.md)
+- [RFC 0007 — Write-ahead log](./rfcs/0007-wal.md)
 
 # Talks
 

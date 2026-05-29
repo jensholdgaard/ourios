@@ -27,7 +27,7 @@
 //! count.
 
 use ourios_core::otlp::OtlpLogRecord;
-use ourios_core::record::MinedRecord;
+use ourios_core::record::{BodyKind, MinedRecord};
 use ourios_miner::reconstruct::reconstruct;
 use ourios_miner::tree::OwnedToken;
 
@@ -77,14 +77,28 @@ impl C1Accumulator {
             self.lossy_count = self.lossy_count.saturating_add(1);
             return;
         }
-        // Non-lossy. §3.4.2 says we count this record in the
-        // denominator regardless of whether the snapshot
-        // lookup succeeds; an absent snapshot for a non-lossy
-        // record is the harness's "RFC 0001 §6.1 contract
-        // violation" hard error (and the harness has already
-        // returned `BenchError::Pipeline` before we get
-        // here), so in practice we always see `Some(...)`
-        // for non-lossy.
+        // Structured-body records are excluded from C1's
+        // denominator. Per RFC 0001 §6.4 / RFC 0003 §6.4,
+        // reconstruction for structured bodies is a
+        // storage-layer round-trip (decode the stored
+        // `AnyValue` bytes) — *not* template + params — so the
+        // template-based reconstruction C1 measures doesn't
+        // apply. Mirrors the lossy-flag exclusion above.
+        // `lossy_count` still tracks low-confidence parses
+        // separately; structured records aren't necessarily
+        // low-confidence, just a different reconstruction
+        // path.
+        if matches!(emitted.body_kind, BodyKind::Structured) {
+            return;
+        }
+        // Non-lossy, string body. §3.4.2 says we count this
+        // record in the denominator regardless of whether the
+        // snapshot lookup succeeds; an absent snapshot for a
+        // non-lossy string record is the harness's "RFC 0001
+        // §6.1 contract violation" hard error (and the harness
+        // has already returned `BenchError::Pipeline` before
+        // we get here), so in practice we always see
+        // `Some(...)` for non-lossy strings.
         self.non_lossy_total = self.non_lossy_total.saturating_add(1);
         let Some(template) = snapshot else {
             // Defensive — should be unreachable per the
@@ -298,5 +312,73 @@ mod tests {
         assert_eq!(m.template_version, 0);
         assert_eq!(m.expected, "beta", "expected = the ingested line");
         assert_eq!(m.actual, "alpha", "actual = what reconstruct produced");
+    }
+
+    /// `BodyKind::Structured` records are excluded from C1's
+    /// denominator. Per RFC 0001 §6.4 / RFC 0003 §6.4,
+    /// reconstruction for structured bodies is a storage-layer
+    /// round-trip (decode the stored `AnyValue` bytes) — *not*
+    /// template + params — so the template-based reconstruction
+    /// C1 measures doesn't apply. Pins the harness/C1
+    /// contract fix that the OTLP fixture's kvlistValue body
+    /// surfaced (the harness's `templates_for()` correctly
+    /// returns no leaf for the sentinel template id RFC 0001
+    /// §6.1 assigns to `(severity, scope, BodyKind::Structured)`,
+    /// so the snapshot lookup is skipped upstream and C1's
+    /// denominator skip is the symmetric guarantee here).
+    #[test]
+    fn structured_body_record_is_excluded_from_denominator() {
+        use ourios_core::otlp::OtlpLogRecord;
+        use ourios_core::record::{BodyKind, MinedRecord};
+        use ourios_core::tenant::TenantId;
+
+        let emitted = MinedRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            // Sentinel template id is not a real Drain leaf;
+            // exact value doesn't matter for this exclusion
+            // test, only `body_kind`.
+            template_id: 42,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 0,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::Structured,
+            params: Vec::new(),
+            separators: vec![String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        };
+        let input = OtlpLogRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            ..Default::default()
+        };
+
+        let mut acc = C1Accumulator::new();
+        // The harness passes `snapshot = None` for structured
+        // records (its own `want_snapshot` excludes them too).
+        acc.record(&input, &emitted, None);
+        let c1 = acc.finalize();
+
+        assert_eq!(
+            c1.non_lossy_total, 0,
+            "structured records are excluded from the denominator",
+        );
+        assert_eq!(c1.non_lossy_reconstruct_ok, 0);
+        // Structured ≠ lossy (separate axes). `all_total`
+        // still counts the record, so the lossy ratio's
+        // denominator stays honest, but the structured record
+        // doesn't appear in `lossy_count`.
+        assert!(c1.lossy_flag_ratio.abs() < f64::EPSILON);
     }
 }

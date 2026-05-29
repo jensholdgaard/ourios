@@ -37,7 +37,7 @@ use ourios_core::audit::{AuditEvent, NoOpAuditSink, SharedAuditSink};
 use ourios_core::clock::TestClock;
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::OtlpLogRecord;
-use ourios_core::record::{MinedRecord, SharedRecordSink};
+use ourios_core::record::{BodyKind, MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
 use ourios_miner::tree::OwnedToken;
@@ -135,13 +135,23 @@ where
         cluster.ingest(input);
         let record = require_single(sink.drain())?;
 
-        // Skip the snapshot capture for lossy / parse-failure
-        // records. Lossy rows are excluded from C1's
-        // numerator and denominator per §3.4.2, and a
-        // `template_id == NO_TEMPLATE` (0) emit has no leaf
-        // by construction — `templates_for()` won't find it,
-        // and we don't need it either.
-        let want_snapshot = !record.lossy_flag && record.template_id != NO_TEMPLATE;
+        // Skip the snapshot capture for lossy / parse-failure /
+        // structured-body records. Lossy rows are excluded from
+        // C1's numerator and denominator per §3.4.2, a
+        // `template_id == NO_TEMPLATE` (0) emit has no leaf by
+        // construction, and structured-body records use the
+        // sentinel template id RFC 0001 §6.1 assigns to
+        // `(severity, scope, BodyKind::Structured)` — that
+        // sentinel is *not* a Drain-tree leaf, so
+        // `templates_for()` correctly returns nothing for it.
+        // Per RFC 0001 §6.4 / RFC 0003 §6.4, reconstruction for
+        // structured bodies is a storage-layer round-trip
+        // (decode the stored `AnyValue` bytes) rather than
+        // template + params, so the bench's C1 (which measures
+        // template-based reconstruction) doesn't apply.
+        let want_snapshot = !record.lossy_flag
+            && record.template_id != NO_TEMPLATE
+            && matches!(record.body_kind, BodyKind::String);
         if want_snapshot {
             let key = (record.template_id, record.template_version);
             if let std::collections::hash_map::Entry::Vacant(slot) = snapshots.entry(key) {

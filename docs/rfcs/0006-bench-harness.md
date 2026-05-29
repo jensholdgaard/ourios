@@ -346,6 +346,18 @@ is a `CLAUDE.md` §3.3 violation and a blocker per §4 /
 benchmarks.md C1; the bench reports such rows as a hard
 failure (non-zero exit code) rather than a degraded gate.
 
+**Amendment (PR-K4, 2026-05-29):** `BodyKind::Structured`
+rows are *also* excluded from the C1 denominator. Per RFC
+0001 §6.4 / RFC 0003 §6.4, reconstruction for structured
+bodies is a storage-layer round-trip (decode the stored
+`AnyValue` bytes) — not a template + params reconstruction —
+so the template-based equality C1 measures doesn't apply to
+them. Structured ≠ lossy (the two are independent axes; a
+structured record can be high-confidence). The harness
+symmetrically skips the `templates_for()` snapshot lookup for
+those records, because RFC 0001 §6.1 assigns them a sentinel
+template id outside the Drain tree (no leaf to find).
+
 Pinned definitions:
 
 - **`reconstruct(record, template)`** is the function exposed

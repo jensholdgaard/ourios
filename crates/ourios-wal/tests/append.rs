@@ -28,9 +28,9 @@ fn open(root: &Path) -> Wal {
 }
 
 /// A single happy-path append writes the §6.2.2 frame bytes
-/// after the §6.2.1 header. The returned [`WalOffset`] points
-/// at the start of the new frame (byte 24, immediately after
-/// the segment header).
+/// after the §6.2.1 header. The returned [`WalOffset`] is the
+/// **post-append** byte position per RFC §6.1: 24 B segment
+/// header + 12 B frame header + payload bytes.
 #[test]
 fn one_append_writes_one_frame_after_the_segment_header() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -40,10 +40,14 @@ fn one_append_writes_one_frame_after_the_segment_header() {
         .append(FrameKind::OtlpBatch, payload)
         .expect("append must succeed");
 
-    // Offset is at byte 24: immediately after the 24 B segment
-    // header, before any frame. The segment UUID matches the
-    // single segment file's name.
-    assert_eq!(offset.byte, 24, "frame starts immediately after the header");
+    // Post-append byte: 24 (segment header) + 12 (frame
+    // header) + 11 (payload) = 47. Matches RFC §6.1's
+    // "returns the post-append offset" — `checkpoint`'s
+    // "skip frames at append-offset ≤ X" composes naturally
+    // on this semantics.
+    let expected_post =
+        24 + frame_header_len() + u64::try_from(payload.len()).expect("len fits u64");
+    assert_eq!(offset.byte, expected_post, "post-append byte position");
     let segment_path = exactly_one_segment_path(tmp.path());
     assert_eq!(
         segment_path
@@ -77,10 +81,11 @@ fn one_append_writes_one_frame_after_the_segment_header() {
     assert_eq!(&bytes[36..], payload, "payload bytes match verbatim");
 }
 
-/// Two appends land back-to-back; the second `WalOffset.byte`
-/// equals exactly the first frame's end (segment header + first
-/// frame's 12 B + first payload). No accidental padding between
-/// frames.
+/// Two appends land back-to-back; offsets are monotonic and
+/// `second.byte == first.byte + 12 + second_payload.len`
+/// (first is the post-append byte for frame 1; the second
+/// frame starts there and runs for `12 + second_payload.len`
+/// more bytes, so its post-append byte is that sum).
 #[test]
 fn consecutive_appends_pack_tight_with_monotonic_offsets() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -96,8 +101,10 @@ fn consecutive_appends_pack_tight_with_monotonic_offsets() {
     assert!(first < second, "offsets are monotonic");
     assert_eq!(
         second.byte,
-        first.byte + 12 + u64::try_from(first_payload.len()).expect("len fits u64"),
-        "second frame starts immediately after the first's header + payload",
+        first.byte
+            + frame_header_len()
+            + u64::try_from(second_payload.len()).expect("len fits u64"),
+        "second post-append byte = first post-append + second frame size",
     );
     assert_eq!(
         second.segment, first.segment,
@@ -138,8 +145,8 @@ fn max_frame_bytes_is_accepted_one_more_is_rejected() {
 
 /// Appends survive close + reopen: an `append` after `Wal::open`
 /// on an existing root extends the same segment (no fresh
-/// segment), and the offset is past the existing frames'
-/// bytes.
+/// segment), and the post-append offset reflects the new
+/// segment length.
 #[test]
 fn append_after_reopen_extends_the_existing_segment() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -151,9 +158,10 @@ fn append_after_reopen_extends_the_existing_segment() {
     let segment_path = exactly_one_segment_path(tmp.path());
     let bytes_after_first = read_all(&segment_path).len();
 
+    let second_payload: &[u8] = b"after-reopen";
     let second_offset = {
         let mut wal = open(tmp.path());
-        wal.append(FrameKind::AuditEvent, b"after-reopen")
+        wal.append(FrameKind::AuditEvent, second_payload)
             .expect("second append after reopen")
     };
 
@@ -167,10 +175,16 @@ fn append_after_reopen_extends_the_existing_segment() {
         first_offset.segment, second_offset.segment,
         "second frame lands in the same segment",
     );
+    // Post-append offset = pre-existing segment length + 12 B
+    // frame header + second payload. Pins that reopen rebuilds
+    // the post-write byte arithmetic from the file's actual
+    // length (not a stale handle cursor).
     assert_eq!(
         second_offset.byte,
-        u64::try_from(bytes_after_first).expect("byte count fits u64"),
-        "second frame starts at the post-first-append byte count",
+        u64::try_from(bytes_after_first).expect("byte count fits u64")
+            + frame_header_len()
+            + u64::try_from(second_payload.len()).expect("len fits u64"),
+        "post-append byte = old segment length + new frame size",
     );
 }
 
@@ -184,6 +198,12 @@ fn exactly_one_segment_path(root: &Path) -> std::path::PathBuf {
     paths.sort();
     assert_eq!(paths.len(), 1, "exactly one segment file");
     paths.into_iter().next().expect("one segment")
+}
+
+/// 12 B frame header size per RFC 0008 §6.2.2, named so tests
+/// don't repeat a magic number.
+fn frame_header_len() -> u64 {
+    12
 }
 
 fn read_all(path: &Path) -> Vec<u8> {

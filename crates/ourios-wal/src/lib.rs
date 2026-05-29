@@ -207,15 +207,36 @@ impl Wal {
     /// Append a frame of `kind` carrying `payload` (≤
     /// [`MAX_FRAME_BYTES`]). The frame is **not** durable
     /// yet; the caller batches appends across the §6.3 window
-    /// and calls [`Self::sync`] once per batch. Returns a
-    /// [`WalOffset`] pointing at the **start** of the new
-    /// frame (the byte the 12 B header begins at), so the
-    /// offset uniquely identifies the appended record even
-    /// after later appends extend the segment.
+    /// and calls [`Self::sync`] once per batch. Returns the
+    /// **post-append** [`WalOffset`] per RFC 0008 §6.1 — the
+    /// byte position immediately past the just-written frame.
+    /// Checkpoint's "skip every frame at append-offset ≤ X"
+    /// (§5 RFC0008.7) and `sync`'s "highest durable offset"
+    /// compose naturally on this semantics: a `WalOffset`
+    /// returned by `append` then `sync` means "everything
+    /// strictly below this byte is on disk".
+    ///
+    /// If `write_frame` fails after partial bytes have hit the
+    /// segment, the file is best-effort truncated back to its
+    /// pre-write length so a subsequent `append` doesn't land
+    /// past a torn tail (which the recovery walk would surface
+    /// as RFC0008.5 corruption, halting replay). The original
+    /// I/O error is surfaced regardless of whether the rollback
+    /// itself succeeds — the caller MUST NOT ack the failed
+    /// batch either way (§3.4).
     ///
     /// # Errors
     ///
     /// See [`AppendError`].
+    ///
+    /// # Panics
+    ///
+    /// Panics in the unreachable case that `payload.len()`
+    /// doesn't fit a `u64`. `MAX_FRAME_BYTES = 16 MiB` is far
+    /// below `u64::MAX` on every platform Rust supports, so
+    /// the conversion only fails if a future change raises
+    /// `MAX_FRAME_BYTES` past `usize::MAX`, which would itself
+    /// require an RFC.
     pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
         if payload.len() > MAX_FRAME_BYTES {
             return Err(AppendError::TooLarge {
@@ -223,17 +244,18 @@ impl Wal {
                 limit: MAX_FRAME_BYTES,
             });
         }
-        // Record the byte offset where the new frame *starts*
-        // — i.e. the segment's pre-write length. We use
+        // Record the segment's pre-write byte length so we can
+        // (a) roll back on a partial write and (b) derive the
+        // post-append offset by adding the known frame size.
         // `metadata().len()` rather than `stream_position`:
-        // `O_APPEND` guarantees each write lands at end-of-file
+        // `O_APPEND` guarantees each write lands at EOF
         // atomically but the user-space cursor isn't
         // guaranteed synchronised with the kernel's write
         // offset on every platform (Linux `fcntl(O_APPEND)`
         // notes), so `stream_position` can be 0 or stale on a
         // file we haven't seeked into. File metadata length is
         // truth.
-        let byte = self
+        let pre_write_byte = self
             .current_segment
             .metadata()
             .map_err(|source| AppendError::Io {
@@ -241,15 +263,32 @@ impl Wal {
                 source,
             })?
             .len();
-        frame::write_frame(&mut self.current_segment, kind, payload).map_err(|source| {
-            AppendError::Io {
+        if let Err(source) = frame::write_frame(&mut self.current_segment, kind, payload) {
+            // Best-effort truncate-back. If the rollback itself
+            // fails the segment is left with a partial frame at
+            // EOF; the recovery walk catches it as RFC0008.5
+            // corruption on the next open and surfaces an
+            // operator-actionable audit event. We report the
+            // primary I/O error rather than the rollback error
+            // because the caller's response is the same either
+            // way (refuse to ack the batch per §3.4) and the
+            // primary error names the actual write that failed.
+            let _ = self.current_segment.set_len(pre_write_byte);
+            return Err(AppendError::Io {
                 op: "write_frame(current_segment)",
                 source,
-            }
-        })?;
+            });
+        }
+        // Post-append byte: pre-write length + 12 B header +
+        // payload. Computed rather than re-stat'd to avoid a
+        // second syscall — the `MAX_FRAME_BYTES` invariant
+        // guarantees this sum fits a u64.
+        let post_write_byte = pre_write_byte
+            + frame::FRAME_HEADER_LEN as u64
+            + u64::try_from(payload.len()).expect("payload.len() fits u64 (≤ MAX_FRAME_BYTES)");
         Ok(WalOffset {
             segment: self.current_segment_uuid,
-            byte,
+            byte: post_write_byte,
         })
     }
 
@@ -797,6 +836,40 @@ mod tests {
         assert_eq!(
             returned_uuid, expected_uuid,
             "in-file UUID must round-trip across open",
+        );
+    }
+
+    /// The append-error rollback uses [`File::set_len`] to
+    /// truncate the segment back to its pre-write length. This
+    /// test pins the primitive: a [`File`] opened with
+    /// `OpenOptions::append(true)` honours [`File::set_len`],
+    /// and a subsequent append-only write lands at the
+    /// truncated EOF (not the previous larger EOF, which would
+    /// leave a hole of zero bytes between the truncated length
+    /// and the new write). Mid-write I/O failures themselves
+    /// are hard to inject without a mock filesystem, but the
+    /// rollback's correctness reduces to "`set_len` followed
+    /// by append writes at the new EOF" — which this test pins
+    /// directly.
+    #[test]
+    fn rollback_set_len_then_append_lands_at_truncated_eof() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let path = tmp.path().join("rollback-test.bin");
+        let mut handle = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create");
+        handle.write_all(b"AAAAAAAAAAAAAAAA").expect("first write"); // 16 B
+        handle.set_len(8).expect("truncate to 8 B");
+        assert_eq!(handle.metadata().expect("stat").len(), 8);
+        handle.write_all(b"BBBB").expect("second write");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"AAAAAAAABBBB",
+            "post-truncate append lands at the truncated EOF, not the old EOF",
         );
     }
 

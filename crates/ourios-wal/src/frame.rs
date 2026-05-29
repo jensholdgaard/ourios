@@ -137,10 +137,15 @@ pub(crate) fn write_frame<W: Write>(
         "write_frame called with oversize payload — caller must check first",
     );
     let kind_byte = kind as u8;
-    // Build the 12 B header in a single stack buffer so the
-    // write is one syscall (`O_APPEND` makes the write +
-    // payload non-contiguous risk irrelevant, but a single
-    // `write_all` is still cheaper than two).
+    // Build the 12 B header in a single stack buffer before
+    // the first `write_all`. The header + payload still take
+    // two `write_all` calls (header then payload) rather than
+    // one vectored write — `Wal::append`'s caller-side
+    // rollback (`set_len(pre_write_byte)`) handles any partial
+    // failure between or within those two calls, so we don't
+    // need the vectored-write atomicity guarantee. Buffering
+    // the header into one slice does mean each individual
+    // `write_all` is one logical chunk.
     let mut header = [0u8; FRAME_HEADER_LEN];
     // `len` is u32_le — payload's length only fits because the
     // caller validated against MAX_FRAME_BYTES < u32::MAX.

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use ourios_core::audit::AuditEvent;
 
+pub(crate) mod frame;
 pub(crate) mod segment;
 
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
@@ -148,13 +149,8 @@ pub struct Wal {
     config: WalConfig,
     /// File handle for the segment currently accepting appends
     /// (per §6.2: append-only, opened by exactly one writer).
-    /// `None` would mean "no current segment open"; in this
-    /// implementation `open` always opens or creates one, so
-    /// the field is always populated post-open. The
-    /// `#[allow(dead_code)]` survives the red-gate slice
-    /// because nothing reads the handle yet — `append` lands
-    /// in the next slice.
-    #[allow(dead_code)]
+    /// Opened with `O_APPEND` so each write atomically lands at
+    /// end-of-file regardless of the user-space cursor.
     current_segment: File,
     /// Path of the file the `current_segment` handle points
     /// at. Kept alongside the handle for diagnostic messages
@@ -164,8 +160,7 @@ pub struct Wal {
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
     /// filename's stem and the segment's in-file header per
-    /// §6.2.1.
-    #[allow(dead_code)]
+    /// §6.2.1. Carried in every `WalOffset` `append` returns.
     current_segment_uuid: uuid::Uuid,
 }
 
@@ -212,13 +207,88 @@ impl Wal {
     /// Append a frame of `kind` carrying `payload` (≤
     /// [`MAX_FRAME_BYTES`]). The frame is **not** durable
     /// yet; the caller batches appends across the §6.3 window
-    /// and calls [`Self::sync`] once per batch.
+    /// and calls [`Self::sync`] once per batch. Returns the
+    /// **post-append** [`WalOffset`] per RFC 0008 §6.1 — the
+    /// byte position immediately past the just-written frame.
+    /// Checkpoint's "skip every frame at append-offset ≤ X"
+    /// (§5 RFC0008.7) and `sync`'s "highest durable offset"
+    /// compose naturally on this semantics: a `WalOffset`
+    /// returned by `append` then `sync` means "everything
+    /// strictly below this byte is on disk".
+    ///
+    /// If `write_frame` fails after partial bytes have hit the
+    /// segment, the file is best-effort truncated back to its
+    /// pre-write length so a subsequent `append` doesn't land
+    /// past a torn tail (which the recovery walk would surface
+    /// as RFC0008.5 corruption, halting replay). The original
+    /// I/O error is surfaced regardless of whether the rollback
+    /// itself succeeds — the caller MUST NOT ack the failed
+    /// batch either way (§3.4).
     ///
     /// # Errors
     ///
     /// See [`AppendError`].
-    pub fn append(&mut self, _kind: FrameKind, _payload: &[u8]) -> Result<WalOffset, AppendError> {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.1 / §6.2.2)");
+    ///
+    /// # Panics
+    ///
+    /// Panics in the unreachable case that `payload.len()`
+    /// doesn't fit a `u64`. Every platform Rust currently
+    /// supports has `usize ≤ u64`, so `u64::try_from(usize)`
+    /// always succeeds; the `expect` documents the invariant
+    /// rather than guarding a real failure mode.
+    pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(AppendError::TooLarge {
+                len: payload.len(),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        // Record the segment's pre-write byte length so we can
+        // (a) roll back on a partial write and (b) derive the
+        // post-append offset by adding the known frame size.
+        // `metadata().len()` rather than `stream_position`:
+        // `O_APPEND` guarantees each write lands at EOF
+        // atomically but the user-space cursor isn't
+        // guaranteed synchronised with the kernel's write
+        // offset on every platform (Linux `fcntl(O_APPEND)`
+        // notes), so `stream_position` can be 0 or stale on a
+        // file we haven't seeked into. File metadata length is
+        // truth.
+        let pre_write_byte = self
+            .current_segment
+            .metadata()
+            .map_err(|source| AppendError::Io {
+                op: "stat(current_segment)",
+                source,
+            })?
+            .len();
+        if let Err(source) = frame::write_frame(&mut self.current_segment, kind, payload) {
+            // Best-effort truncate-back. If the rollback itself
+            // fails the segment is left with a partial frame at
+            // EOF; the recovery walk catches it as RFC0008.5
+            // corruption on the next open and surfaces an
+            // operator-actionable audit event. We report the
+            // primary I/O error rather than the rollback error
+            // because the caller's response is the same either
+            // way (refuse to ack the batch per §3.4) and the
+            // primary error names the actual write that failed.
+            let _ = self.current_segment.set_len(pre_write_byte);
+            return Err(AppendError::Io {
+                op: "write_frame(current_segment)",
+                source,
+            });
+        }
+        // Post-append byte: pre-write length + 12 B header +
+        // payload. Computed rather than re-stat'd to avoid a
+        // second syscall — the `MAX_FRAME_BYTES` invariant
+        // guarantees this sum fits a u64.
+        let post_write_byte = pre_write_byte
+            + frame::FRAME_HEADER_LEN as u64
+            + u64::try_from(payload.len()).expect("payload.len() fits u64 (≤ MAX_FRAME_BYTES)");
+        Ok(WalOffset {
+            segment: self.current_segment_uuid,
+            byte: post_write_byte,
+        })
     }
 
     /// Fsync the current segment (and the parent directory if
@@ -765,6 +835,40 @@ mod tests {
         assert_eq!(
             returned_uuid, expected_uuid,
             "in-file UUID must round-trip across open",
+        );
+    }
+
+    /// The append-error rollback uses [`File::set_len`] to
+    /// truncate the segment back to its pre-write length. This
+    /// test pins the primitive: a [`File`] opened with
+    /// `OpenOptions::append(true)` honours [`File::set_len`],
+    /// and a subsequent append-only write lands at the
+    /// truncated EOF (not the previous larger EOF, which would
+    /// leave a hole of zero bytes between the truncated length
+    /// and the new write). Mid-write I/O failures themselves
+    /// are hard to inject without a mock filesystem, but the
+    /// rollback's correctness reduces to "`set_len` followed
+    /// by append writes at the new EOF" — which this test pins
+    /// directly.
+    #[test]
+    fn rollback_set_len_then_append_lands_at_truncated_eof() {
+        use std::io::Write;
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let path = tmp.path().join("rollback-test.bin");
+        let mut handle = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create");
+        handle.write_all(b"AAAAAAAAAAAAAAAA").expect("first write"); // 16 B
+        handle.set_len(8).expect("truncate to 8 B");
+        assert_eq!(handle.metadata().expect("stat").len(), 8);
+        handle.write_all(b"BBBB").expect("second write");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"AAAAAAAABBBB",
+            "post-truncate append lands at the truncated EOF, not the old EOF",
         );
     }
 

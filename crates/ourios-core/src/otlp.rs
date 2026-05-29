@@ -35,7 +35,9 @@ use crate::tenant::TenantId;
 // crate deep. `any_value` is also re-exported because callers
 // constructing a non-string `AnyValue` need its `Value` enum to
 // fill the `value: Option<any_value::Value>` field.
-pub use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+pub use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, KeyValue, KeyValueList, any_value,
+};
 
 /// One OTLP `LogRecord` after wire decode and tenant derivation.
 ///
@@ -221,11 +223,17 @@ pub mod canonical {
     use super::{AnyValue, KeyValue};
 
     /// Error returned by the canonical encoders / decoders.
-    /// Encoders are infallible in practice on values the
-    /// receiver produces; the `Encode` arm survives for
-    /// pathological inputs (e.g. a `DoubleValue` carrying
-    /// `f64::NAN` — proto allows it, `serde_json` rejects it).
-    /// Decoders fan in malformed-bytes errors from disk.
+    /// Encoders are infallible on every `AnyValue` /
+    /// `Vec<KeyValue>` the type system admits —
+    /// `opentelemetry-proto`'s `with-serde` ships custom
+    /// serializers for the proto3-JSON oddities (`f64::NAN`
+    /// → `"NaN"` string, `i64` → string-encoded JSON number,
+    /// `bytes` → base64) so the recursive primitives never
+    /// panic or return an error. The `Encode` arm exists only
+    /// for `Result`-symmetry with `Decode` and as a defence-
+    /// in-depth surface if a future `opentelemetry-proto`
+    /// release changes that contract. Decoders fan in
+    /// malformed-bytes errors from disk.
     #[derive(Debug)]
     pub enum CanonicalJsonError {
         Encode(serde_json::Error),
@@ -255,9 +263,12 @@ pub mod canonical {
     ///
     /// # Errors
     ///
-    /// [`CanonicalJsonError::Encode`] on pathological inputs the
-    /// receiver should narrow at wire-decode (e.g. a
-    /// `DoubleValue` carrying `f64::NAN`).
+    /// In principle never; see the
+    /// [`CanonicalJsonError`] doc. The `Result` is kept for
+    /// API symmetry with [`decode_any_value`] and as a
+    /// forward-compat surface if a future
+    /// `opentelemetry-proto` release adds a fallible
+    /// serializer.
     pub fn encode_any_value(value: &AnyValue) -> Result<Vec<u8>, CanonicalJsonError> {
         serde_json::to_vec(value).map_err(CanonicalJsonError::Encode)
     }
@@ -281,9 +292,9 @@ pub mod canonical {
     ///
     /// # Errors
     ///
-    /// [`CanonicalJsonError::Encode`] under the same conditions
-    /// as [`encode_any_value`] — a `KeyValue.value`'s underlying
-    /// `AnyValue` rejecting JSON serialisation.
+    /// In principle never; the recursive primitives bottom out
+    /// at infallible serializers (see [`encode_any_value`] /
+    /// the [`CanonicalJsonError`] doc).
     pub fn encode_attributes(attrs: &[KeyValue]) -> Result<Vec<u8>, CanonicalJsonError> {
         serde_json::to_vec(attrs).map_err(CanonicalJsonError::Encode)
     }

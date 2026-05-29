@@ -71,14 +71,18 @@ pub enum BatchError {
     /// A record carried a non-empty `attributes` or
     /// `resource_attributes` `Vec<KeyValue>`. The canonical-JSON
     /// An `attributes` / `resource_attributes` `Vec<KeyValue>`
-    /// failed RFC 0005 §3.3 canonical-JSON encoding. The
-    /// canonical encoder (`ourios_core::otlp::canonical::
-    /// encode_attributes`) is infallible on spec-compliant
-    /// inputs; this variant survives pathological cases the
-    /// receiver should narrow at the wire-decode boundary (e.g.
-    /// a `DoubleValue` carrying `f64::NAN`, which `serde_json`
-    /// rejects). Carries the column name, entry count, and the
-    /// underlying serde error.
+    /// failed RFC 0005 §3.3 canonical-JSON encoding. In
+    /// principle unreachable on every value the type system
+    /// admits — `opentelemetry-proto`'s `with-serde` ships
+    /// proto3-JSON-compliant primitive serializers
+    /// (`f64::NAN` → `"NaN"` string, `i64` → string-encoded
+    /// number, `bytes` → base64) so the recursive variants
+    /// bottom out at infallible primitives. The variant
+    /// survives for `Result`-symmetry with the reader's
+    /// `AttributeDecode` and as a defence-in-depth surface if
+    /// a future `opentelemetry-proto` release breaks that
+    /// contract. Carries the column name, entry count, and
+    /// the underlying serde error.
     AttributeEncode {
         column: &'static str,
         count: usize,
@@ -140,8 +144,9 @@ impl fmt::Display for BatchError {
             } => write!(
                 f,
                 "{column}: RFC 0005 §3.3 canonical-JSON encode of {count} KeyValue entries \
-                 failed: {source} (the encoder is infallible on receiver-narrowed inputs; \
-                 this surfaces a wire-decode bug — e.g. an `f64::NAN` in a `DoubleValue`)",
+                 failed: {source} (in principle unreachable — `opentelemetry-proto`'s \
+                 `with-serde` derives are infallible on every spec-compliant `AnyValue`; \
+                 this means an `opentelemetry-proto` upgrade broke that contract)",
             ),
             Self::UnsupportedAbsentBody => write!(
                 f,

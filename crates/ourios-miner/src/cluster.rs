@@ -1639,43 +1639,38 @@ impl MinerCluster {
         // `body` carries the RFC 0005 §3.3 OTLP-canonical-JSON
         // encoding of the `AnyValue` — the bytes the writer
         // stores in the §3.2 `body` column for structured rows.
-        // Two interlocking invariants prevent a graceful
-        // fallback path here:
+        // Two interlocking invariants prevent any fallback path
+        // that would weaken this:
         //
         // - RFC 0001 §6.1 / body-representation table:
         //   `lossy_flag` is **always `false` when
         //   `body_kind = Structured`** ("the verbatim `body`
-        //   column is the source of truth"). Setting it to
-        //   `true` on the encoder-failure path would mint a
-        //   row shape the RFC says cannot exist.
+        //   column is the source of truth"). Setting it on the
+        //   encoder path would mint a row shape the RFC says
+        //   cannot exist.
         // - RFC 0005 §3.3: the `body` column for structured
         //   rows MUST hold canonical JSON. A
         //   `format!("{any_value:?}")` fallback would silently
         //   write spec-violating bytes into a §3.3-governed
-        //   column — exactly the masquerading-as-JSON failure
-        //   mode the writer's prior
-        //   `StructuredBodyNotYetCanonical` rejection
-        //   prevented.
+        //   column — the masquerading-as-JSON failure mode the
+        //   writer's prior `StructuredBodyNotYetCanonical`
+        //   rejection prevented.
         //
-        // `canonical::encode_any_value` is infallible on
-        // `AnyValue`s the RFC 0003 §6.5 receiver has narrowed
-        // at the wire-decode boundary (`f64::NAN` and friends
-        // are the canonical pathological case). A failure here
-        // is therefore an upstream contract violation — panic
-        // rather than break either invariant. The bench
-        // loader narrows at its own boundary (it constructs
-        // `AnyValue`s only from `serde_json::from_str` over
-        // OTLP-spec JSON, which proto3 JSON already excludes
-        // NaN from), so the panic is unreachable on the
-        // current ingress paths.
-        let bytes = ourios_core::otlp::canonical::encode_any_value(any_value).unwrap_or_else(|e| {
-            panic!(
-                "RFC 0005 §3.3 canonical-JSON encode of structured body failed ({e}); \
-                     the wire-decode boundary (RFC 0003 §6.5 receiver / corpus loader) is \
-                     supposed to narrow inputs serde_json rejects (`f64::NAN`, …) before \
-                     they reach the miner — this indicates an upstream contract violation"
-            );
-        });
+        // `canonical::encode_any_value` is infallible on every
+        // `AnyValue` value the type system admits.
+        // `opentelemetry-proto`'s `with-serde` ships custom
+        // serializers (see `proto.rs::serializer_f64`) that
+        // emit `"NaN"` / `"Infinity"` / `"-Infinity"` strings
+        // per the proto3 JSON spec rather than letting
+        // `serde_json`'s default `f64` path emit `null` — which
+        // also covers the only failure mode review raised on
+        // an earlier revision. The recursive variants
+        // (`ArrayValue`, `KvlistValue`) bottom out in the same
+        // primitive serializers, so encode failure is
+        // unreachable here. `.expect` documents the contract
+        // rather than swallowing a `Result` we never inspect.
+        let bytes = ourios_core::otlp::canonical::encode_any_value(any_value)
+            .expect("RFC 0005 §3.3 encoder is infallible for any spec-compliant AnyValue");
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
@@ -3059,6 +3054,59 @@ mod tests {
 
         assert_ne!(id_a, id_b);
         assert_eq!(cluster.template_count(&t), 2);
+    }
+
+    /// Pin the exact RFC 0005 §3.3 canonical-JSON bytes the
+    /// miner stores in `MinedRecord.body` for a structured
+    /// row. Catches a regression to debug formatting (the
+    /// prior `format!("{any_value:?}")` placeholder), AND
+    /// catches an `opentelemetry-proto` upgrade that breaks
+    /// the OTLP-JSON spec mapping (camelCase, string-encoded
+    /// `i64`, base64 bytes). A non-trivial `AnyValue` exercises
+    /// the recursive `KvlistValue` path through the encoder.
+    #[test]
+    fn structured_body_is_stored_as_otlp_canonical_json() {
+        use ourios_core::otlp::{KeyValue as ProtoKv, KeyValueList};
+        let records = SharedRecordSink::new();
+        let mut cluster =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let av = AnyValue {
+            value: Some(AvValue::KvlistValue(KeyValueList {
+                values: vec![ProtoKv {
+                    key: "user.id".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AvValue::IntValue(42)),
+                    }),
+                    ..Default::default()
+                }],
+            })),
+        };
+        let record = OtlpLogRecord {
+            tenant_id: TenantId::new("tenant-x"),
+            severity_number: 9,
+            scope_name: Some("bench.scope".to_string()),
+            body: Some(Body::Structured(av)),
+            ..Default::default()
+        };
+        cluster.ingest(&record);
+        let emitted = records.drain();
+        assert_eq!(emitted.len(), 1);
+        let body = emitted[0].body.as_deref().expect("structured body is Some");
+        // Pinned canonical form per the proto3 JSON spec
+        // mapping: camelCase keys, `i64` as a quoted string,
+        // recursive `kvlistValue` shape. The opentelemetry-proto
+        // `with-serde` derives emit fields in struct-definition
+        // order, which is what serde_json::to_vec produces
+        // deterministically — RFC0006.7 reproducibility relies
+        // on this same byte stability.
+        assert_eq!(
+            body, r#"{"kvlistValue":{"values":[{"key":"user.id","value":{"intValue":"42"}}]}}"#,
+            "miner must store RFC 0005 §3.3 canonical JSON, not a debug rendering",
+        );
+        assert!(
+            !emitted[0].lossy_flag,
+            "RFC 0001 §6.1: lossy_flag is always false on BodyKind::Structured",
+        );
     }
 
     #[test]

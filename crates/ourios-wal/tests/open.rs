@@ -60,6 +60,11 @@ fn fresh_root_creates_one_segment_with_a_valid_header() {
         .to_string();
     let uuid_from_name = uuid::Uuid::parse_str(&stem).expect("filename is a parseable UUID");
     assert_eq!(uuid_from_name.as_bytes(), &bytes[8..24]);
+    assert_eq!(
+        uuid_from_name.get_version_num(),
+        7,
+        "segment UUID MUST be UUIDv7 — the chronological sort property §6.1 depends on",
+    );
 }
 
 /// Reopening an existing root doesn't add a fresh segment —
@@ -71,16 +76,24 @@ fn fresh_root_creates_one_segment_with_a_valid_header() {
 fn existing_root_reuses_newest_segment() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     drop(Wal::open(default_config(tmp.path())).expect("first open"));
-    let count_after_first = count_segments(tmp.path());
+    let before = segment_paths(tmp.path());
+    assert_eq!(before.len(), 1, "first open created exactly one segment");
+    let original_path = before.into_iter().next().expect("the one segment");
+    let original_bytes = std::fs::read(&original_path).expect("read original");
     drop(Wal::open(default_config(tmp.path())).expect("second open"));
-    let count_after_second = count_segments(tmp.path());
+    let after = segment_paths(tmp.path());
     assert_eq!(
-        count_after_first, 1,
-        "first open created exactly one segment"
+        after,
+        vec![original_path.clone()],
+        "second open MUST reuse the exact same segment file — not delete + recreate, not add a sibling",
     );
+    // Header bytes unchanged: the second open doesn't
+    // rewrite the segment header (no double-write that could
+    // corrupt frames in a future slice).
+    let after_bytes = std::fs::read(&original_path).expect("read after");
     assert_eq!(
-        count_after_first, count_after_second,
-        "second open does not create another segment",
+        original_bytes, after_bytes,
+        "segment contents are unchanged by reopen",
     );
 }
 
@@ -142,10 +155,13 @@ fn every_tunable_out_of_range_value_is_rejected() {
     }
 }
 
-fn count_segments(root: &Path) -> usize {
-    std::fs::read_dir(root)
+fn segment_paths(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<_> = std::fs::read_dir(root)
         .expect("read_dir")
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "wal"))
-        .count()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "wal"))
+        .collect();
+    v.sort();
+    v
 }

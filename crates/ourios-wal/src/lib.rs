@@ -329,14 +329,30 @@ fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
 /// ignored — the segment-header magic check would reject them
 /// later anyway, but filtering by extension avoids the cost.
 fn list_segments(root: &std::path::Path) -> Result<Vec<PathBuf>, OpenError> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(root)
-        .map_err(|source| OpenError::Io {
-            op: "read_dir(wal_root)",
-            source,
-        })?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wal")))
-        .collect();
+    // Per-entry errors surface as `OpenError::Io`. A
+    // `filter_map(|e| e.ok())` would silently drop entries —
+    // a permission-denied stat on the newest segment would
+    // become "no segments exist, mint a fresh one alongside
+    // the unreadable existing one," which violates §6.1's
+    // "open the lexicographically-greatest segment" contract.
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|source| OpenError::Io {
+        op: "read_dir(wal_root)",
+        source,
+    })? {
+        let path = entry
+            .map_err(|source| OpenError::Io {
+                op: "read_dir_entry(wal_root)",
+                source,
+            })?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("wal"))
+        {
+            out.push(path);
+        }
+    }
     out.sort();
     Ok(out)
 }
@@ -549,4 +565,223 @@ pub enum CorruptionReason {
 #[must_use]
 pub fn encode_audit_event(_event: &AuditEvent) -> Vec<u8> {
     unimplemented!("RFC 0008 §9 — AuditEvent serde format lands with the encoder PR");
+}
+
+#[cfg(test)]
+mod tests {
+    //! Colocated unit tests for the `Wal::open` helpers per
+    //! CLAUDE.md §6.2 (unit tests next to the code for
+    //! anything non-trivial). End-to-end coverage of `open`
+    //! lives in `tests/open.rs`; this module pins the smaller
+    //! helper-level contracts so a regression caught at this
+    //! layer surfaces here rather than as a cascading failure
+    //! in the integration suite.
+    use super::*;
+
+    fn default_config(root: &std::path::Path) -> WalConfig {
+        WalConfig {
+            root: root.to_path_buf(),
+            batch_window_ms: 100,
+            segment_size_bytes: 128 * 1024 * 1024,
+            segment_age_secs: 600,
+            housekeeping_secs: 60,
+            macos_full_fsync: false,
+        }
+    }
+
+    /// `validate_config` accepts every default and every
+    /// exact boundary value — both the lower and upper edges
+    /// of each Tunable's §6.9 range. Catches an off-by-one
+    /// that would reject e.g. `segment_size_bytes ==
+    /// MIN_SEGMENT_SIZE_BYTES`.
+    #[test]
+    fn validate_config_accepts_defaults_and_exact_boundaries() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        validate_config(&default_config(tmp.path())).expect("defaults");
+        let boundaries = [
+            WalConfig {
+                batch_window_ms: 0,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                batch_window_ms: MAX_BATCH_WINDOW_MS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_size_bytes: MIN_SEGMENT_SIZE_BYTES,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_size_bytes: MAX_SEGMENT_SIZE_BYTES,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_age_secs: MIN_SEGMENT_AGE_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_age_secs: MAX_SEGMENT_AGE_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                housekeeping_secs: MIN_HOUSEKEEPING_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                housekeeping_secs: MAX_HOUSEKEEPING_SECS,
+                ..default_config(tmp.path())
+            },
+        ];
+        for cfg in boundaries {
+            validate_config(&cfg).expect("boundary value");
+        }
+    }
+
+    /// Every just-outside-bounds value is rejected and the
+    /// error names the violated field. Iterated rather than
+    /// one test per arm — the message format is what the
+    /// operator sees on a real misconfiguration.
+    #[test]
+    fn validate_config_rejects_each_out_of_range_field() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let cases: &[(&str, WalConfig)] = &[
+            (
+                "batch_window_ms",
+                WalConfig {
+                    batch_window_ms: MAX_BATCH_WINDOW_MS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_size_bytes",
+                WalConfig {
+                    segment_size_bytes: MIN_SEGMENT_SIZE_BYTES - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_size_bytes",
+                WalConfig {
+                    segment_size_bytes: MAX_SEGMENT_SIZE_BYTES + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_age_secs",
+                WalConfig {
+                    segment_age_secs: MIN_SEGMENT_AGE_SECS - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_age_secs",
+                WalConfig {
+                    segment_age_secs: MAX_SEGMENT_AGE_SECS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "housekeeping_secs",
+                WalConfig {
+                    housekeeping_secs: MIN_HOUSEKEEPING_SECS - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "housekeeping_secs",
+                WalConfig {
+                    housekeeping_secs: MAX_HOUSEKEEPING_SECS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+        ];
+        for (expected_field, cfg) in cases {
+            match validate_config(cfg).expect_err("out-of-range must reject") {
+                OpenError::InvalidConfig { field, .. } => assert_eq!(
+                    &field, expected_field,
+                    "validation should name the violating field exactly",
+                ),
+                other => panic!("expected InvalidConfig({expected_field}), got {other:?}"),
+            }
+        }
+    }
+
+    /// `list_segments` filters by `.wal` extension and sorts
+    /// the result lex (= chronological per `UUIDv7`). Mixed
+    /// non-segment files are ignored without erroring.
+    #[test]
+    fn list_segments_filters_and_sorts() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let a = tmp.path().join("01890c43-7b3d-7c01-9e00-aaaaaaaaaaaa.wal");
+        let b = tmp.path().join("01890c43-7b3d-7c01-9e00-bbbbbbbbbbbb.wal");
+        let other = tmp.path().join("CHECKPOINT");
+        let readme = tmp.path().join("README.md");
+        for p in [&b, &a, &other, &readme] {
+            std::fs::File::create(p).expect("create");
+        }
+        let listed = list_segments(tmp.path()).expect("list");
+        assert_eq!(listed, vec![a, b], "lex-sorted .wal entries only");
+    }
+
+    /// `create_fresh_segment` lays down a real file on disk
+    /// whose name parses as `UUIDv7` (version 7, not just
+    /// "parseable") and whose body is exactly the 24 B header
+    /// matching `SegmentHeader::new(uuid)`. Pins the §6.1
+    /// "lex-sortable filename = chronological order"
+    /// contract.
+    #[test]
+    fn create_fresh_segment_writes_a_v7_named_header_only_file() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (_handle, path, uuid) = create_fresh_segment(tmp.path()).expect("create");
+        assert!(path.is_file(), "file actually exists");
+        assert_eq!(
+            uuid.get_version_num(),
+            7,
+            "segment UUID MUST be UUIDv7 (chronological sort)",
+        );
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            stem.parse::<uuid::Uuid>().expect("stem parses"),
+            uuid,
+            "filename stem MUST equal the in-memory UUID",
+        );
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(bytes.len(), SEGMENT_HEADER_LEN, "header-only file");
+        assert_eq!(&bytes[0..4], b"OWAL");
+    }
+
+    /// `open_existing_segment` reads a well-formed segment
+    /// without erroring and recovers the header UUID. Built
+    /// on top of `create_fresh_segment` so the input is
+    /// guaranteed to match the §6.2.1 format.
+    #[test]
+    fn open_existing_segment_recovers_header_uuid() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (handle_a, path, expected_uuid) = create_fresh_segment(tmp.path()).expect("create");
+        drop(handle_a); // close before reopening read+append
+        let (_handle_b, returned_path, returned_uuid) =
+            open_existing_segment(&path).expect("reopen");
+        assert_eq!(returned_path, path);
+        assert_eq!(
+            returned_uuid, expected_uuid,
+            "in-file UUID must round-trip across open",
+        );
+    }
+
+    /// A foreign file with `.wal` extension but no `OWAL`
+    /// magic is rejected as `OpenError::Corrupt`, not silently
+    /// reused. Pins the RFC0008.5 "stray-file" rejection.
+    #[test]
+    fn open_existing_segment_rejects_foreign_magic() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let path = tmp.path().join("not-a-segment.wal");
+        std::fs::write(&path, b"NOPEhere--filler-bytes--").expect("write");
+        match open_existing_segment(&path).expect_err("must reject") {
+            OpenError::Corrupt { detail } => assert!(
+                detail.contains("magic mismatch"),
+                "Display message should name the magic mismatch; got {detail:?}",
+            ),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
 }

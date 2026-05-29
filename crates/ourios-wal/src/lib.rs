@@ -232,11 +232,10 @@ impl Wal {
     /// # Panics
     ///
     /// Panics in the unreachable case that `payload.len()`
-    /// doesn't fit a `u64`. `MAX_FRAME_BYTES = 16 MiB` is far
-    /// below `u64::MAX` on every platform Rust supports, so
-    /// the conversion only fails if a future change raises
-    /// `MAX_FRAME_BYTES` past `usize::MAX`, which would itself
-    /// require an RFC.
+    /// doesn't fit a `u64`. Every platform Rust currently
+    /// supports has `usize ≤ u64`, so `u64::try_from(usize)`
+    /// always succeeds; the `expect` documents the invariant
+    /// rather than guarding a real failure mode.
     pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
         if payload.len() > MAX_FRAME_BYTES {
             return Err(AppendError::TooLarge {

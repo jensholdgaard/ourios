@@ -105,20 +105,18 @@ impl std::error::Error for FrameError {
 }
 
 /// CRC32-C input shape per §6.2.2: `kind || _pad || payload`.
-/// Concatenated in a small stack buffer so the CRC runs over a
-/// single contiguous slice (the `crc32c` crate is fastest on
-/// contiguous input).
+/// Computed incrementally — a 4 B stack buffer holds the
+/// `kind || _pad` prefix, then `crc32c_append` folds in the
+/// payload slice without copying. Equivalent to one
+/// `crc32c(kind || _pad || payload)` call without paying the
+/// extra ~16 MiB allocation that concatenating max-sized
+/// payloads would cost.
 fn checksum_input(kind: u8, payload: &[u8]) -> u32 {
-    // Compose `kind || pad || payload` into one logical slice.
-    // For small frames, two `update_le` calls would also work;
-    // a single `crc32c` call keeps the function transparently
-    // equivalent to "CRC of these bytes in this order".
     let mut prefix = [0u8; 4];
     prefix[0] = kind;
     // bytes 1..4 stay zero — that's `_pad`.
-    let mut h = crc32c::crc32c(&prefix);
-    h = crc32c::crc32c_append(h, payload);
-    h
+    let h = crc32c::crc32c(&prefix);
+    crc32c::crc32c_append(h, payload)
 }
 
 /// Serialise a frame to its exact 12 + payload-length on-disk

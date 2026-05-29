@@ -65,7 +65,10 @@ fn one_append_writes_one_frame_after_the_segment_header() {
     // double-write regression where `append` accidentally also
     // re-emits the segment header.
     let bytes = read_all(&segment_path);
-    assert_eq!(bytes.len(), 24 + 12 + payload.len());
+    assert_eq!(
+        bytes.len(),
+        24 + usize::try_from(frame_header_len()).expect("12 fits usize") + payload.len(),
+    );
     // Frame's `len` (LE u32) sits at byte 24.
     assert_eq!(
         &bytes[24..28],
@@ -112,9 +115,10 @@ fn consecutive_appends_pack_tight_with_monotonic_offsets() {
     );
 
     let bytes = read_all(&exactly_one_segment_path(tmp.path()));
+    let header = usize::try_from(frame_header_len()).expect("12 fits usize");
     assert_eq!(
         bytes.len(),
-        24 + (12 + first_payload.len()) + (12 + second_payload.len()),
+        24 + (header + first_payload.len()) + (header + second_payload.len()),
         "no padding between frames",
     );
 }

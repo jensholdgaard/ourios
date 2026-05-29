@@ -1,0 +1,37 @@
+[package]
+name = "ourios-wal"
+version = "0.0.0"
+description = "RFC 0008 write-ahead log — durable append-only buffer between the OTLP receiver and the Parquet writer."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ourios_wal"
+path = "src/lib.rs"
+
+[dependencies]
+# UUIDv7 for segment filenames + checkpoint sidecar payload
+# (RFC 0008 §6.2 / §6.7). UUIDv7's chronological sort gives
+# `WalOffset`'s global monotonicity (§6.1) without a synthetic
+# counter, which is how the checkpoint survives housekeeping
+# deletion of older segments.
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+# CRC32-C (Castagnoli, polynomial `0x1EDC6F41`) per RFC 0008
+# §6.2.2. Same polynomial the Parquet writer already uses on
+# row groups; one implementation, one SIMD-acceleration path
+# on modern x86 / aarch64.
+crc32c = "0.6"
+# `AuditEvent` shape (RFC 0001 §6.4) for `FrameKind::AuditEvent`
+# payloads — the audit-event-through-WAL contract RFC 0005 §3.7
+# defers to this RFC (§6.4 audit-ordering barrier).
+ourios-core = { path = "../ourios-core" }
+
+[dev-dependencies]
+# Scratch directories for the segment-on-disk tests.
+tempfile = "3"
+
+[lints]
+workspace = true

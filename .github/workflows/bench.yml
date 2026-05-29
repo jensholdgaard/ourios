@@ -5,42 +5,66 @@ name: Bench
 # for now — the bench is too slow / hardware-dependent for the
 # per-PR loop, so it isn't wired to `push` / `pull_request`.
 #
-# The `corpus_dir` input selects which directory the loader
-# walks. It defaults to the committed seed (`testdata/corpus/`,
-# ~tens of lines, plain text); operators can point it at the
-# committed OTLP fixture (`crates/ourios-bench/tests/data/otlp`,
-# exercising the PR-K2 loader path) or a future representative
-# corpus. Whichever corpus a run picks, the numbers are
-# **indicative only**: a hosted runner is not the
-# `docs/benchmarks.md` §1 hardware baseline, so results aren't
-# authoritative regardless of corpus size. The default seed is
-# additionally far too small to be representative (A1 is
-# *expected* to FAIL on it — Parquet footer / dictionary overhead
-# dwarfs a few KB of data). The workflow uploads the results
-# JSON as an artifact and never commits `docs/benchmarks.md` §9 —
-# landing authoritative numbers stays a deliberate act.
+# Two phases:
+#
+# 1. **Corpus capture** — driven by the `capture` input. Default
+#    `telemetrygen` boots an OTel collector with a fileexporter
+#    (config: `bench-collector.yaml` next to this file), runs
+#    `telemetrygen logs` against it for `telemetrygen_logs`
+#    records, then snapshots the captured OTLP/JSON file into
+#    `bench-corpus/telemetrygen-synthetic-v1/`. `capture: none`
+#    skips this and uses `corpus_dir` as supplied (lets an
+#    operator pre-stage a corpus the workflow doesn't know how
+#    to fetch).
+#
+# 2. **Bench** — runs `ourios-bench` against whichever corpus
+#    the capture phase produced (or was pre-staged). Numbers
+#    land in `bench-results/*.json` as an artifact.
+#
+# Whichever corpus a run picks, the numbers are **indicative
+# only**: a hosted runner is not the `docs/benchmarks.md` §1
+# hardware baseline (`baseline-8vcpu-32gib`), so results aren't
+# authoritative regardless of corpus. The `telemetrygen` capture
+# is additionally synthetic on content (real OTLP wire envelope,
+# uniform body shape) — `corpus: telemetrygen-synthetic-v1` in
+# the JSON is the warning label. The workflow uploads the
+# results JSON as an artifact and never commits
+# `docs/benchmarks.md` §9 — landing authoritative numbers stays
+# a deliberate human act.
 
 on:
   workflow_dispatch:
     inputs:
+      capture:
+        description: Corpus capture strategy
+        type: choice
+        default: telemetrygen
+        options:
+          - telemetrygen
+          - none
+        required: false
+      telemetrygen_logs:
+        description: Number of synthetic log records to generate (capture=telemetrygen)
+        default: '1000000'
+        required: false
       corpus_dir:
-        # Default matches the historical workflow behaviour
-        # (the committed seed text corpus). The PR-K2 OTLP
-        # loader added `*.jsonl` / `*.json` dispatch in
-        # `corpus::walk`, so an operator can point this at
-        # e.g. `crates/ourios-bench/tests/data/otlp` to
-        # exercise the OTLP path in CI without any external
-        # tooling, or at any future representative corpus.
-        description: Corpus directory (defaults to the committed seed)
-        default: testdata/corpus
+        # When `capture=telemetrygen`, this is **overwritten** by
+        # the captured directory. When `capture=none`, this is
+        # the path the bench reads as-is.
+        description: Corpus directory (used as-is when capture=none)
+        default: bench-corpus/telemetrygen-synthetic-v1
         required: false
       gates:
         description: Comma-separated gates to run (a1,c1,c2)
         default: a1,c1,c2
         required: false
       hardware_kind:
+        # `ci-runner` is the RFC 0006 §3.5 tag for the GH Actions
+        # hosted runner. The §1 baseline `baseline-8vcpu-32gib`
+        # is a different (larger) tag — pass it explicitly when
+        # dispatching against an actual baseline-class VM.
         description: Hardware tag recorded in the results
-        default: github-ubuntu-4vcpu
+        default: ci-runner
         required: false
 
 permissions:
@@ -49,6 +73,13 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Pin the OTel toolchain version across the workflow so the
+# downloaded collector binary and the `go install` of
+# telemetrygen agree. Bump deliberately; reproducibility of
+# captured corpora across re-dispatches depends on this pin.
+env:
+  OTEL_VER: v0.115.0
 
 jobs:
   bench:
@@ -61,6 +92,67 @@ jobs:
 
       - name: Build (release — §3.7 pins release mode for A1)
         run: cargo build -p ourios-bench --release
+
+      - name: Install OTel collector contrib + telemetrygen
+        if: inputs.capture == 'telemetrygen'
+        # fileexporter is contrib-only, so we use the
+        # collector-contrib distribution. telemetrygen lives in
+        # the contrib repo under `cmd/telemetrygen` — `go
+        # install` pins the same version as the collector for
+        # API agreement.
+        run: |
+          set -euxo pipefail
+          curl -fL -o /tmp/otelcol.tar.gz \
+            "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/${OTEL_VER}/otelcol-contrib_${OTEL_VER#v}_linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/otelcol.tar.gz -C /usr/local/bin otelcol-contrib
+          otelcol-contrib --version
+          go install "github.com/open-telemetry/opentelemetry-collector-contrib/cmd/telemetrygen@${OTEL_VER}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Capture corpus (telemetrygen → fileexporter)
+        if: inputs.capture == 'telemetrygen'
+        env:
+          BENCH_LOG_COUNT: ${{ inputs.telemetrygen_logs }}
+        # `BENCH_LOG_COUNT` is the only operator-controllable
+        # input here — passed via `env:` (not `${{ ... }}`
+        # splicing) per the same template-injection-avoidance
+        # rule the bench invocation below documents.
+        run: |
+          set -euxo pipefail
+          mkdir -p bench-corpus/telemetrygen-synthetic-v1
+          mkdir -p /tmp/otel-capture
+          # Start collector in background. The trap on EXIT
+          # makes a flaky telemetrygen failure clean up the
+          # collector instead of leaving an orphaned process
+          # blocking the runner's exit.
+          otelcol-contrib --config .github/workflows/bench-collector.yaml >/tmp/collector.log 2>&1 &
+          COLLECTOR_PID=$!
+          trap 'kill -TERM $COLLECTOR_PID 2>/dev/null || true' EXIT
+          # Wait for OTLP gRPC port. `bash`'s built-in
+          # `/dev/tcp` saves installing `netcat`. 30s is generous
+          # for a cold collector binary on a hosted runner.
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/4317) 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          telemetrygen logs \
+            --otlp-insecure \
+            --otlp-endpoint=127.0.0.1:4317 \
+            --logs "$BENCH_LOG_COUNT"
+          # Let the fileexporter's `flush_interval: 1s` finish
+          # writing the trailing batch before we SIGTERM.
+          sleep 3
+          kill -TERM $COLLECTOR_PID
+          wait $COLLECTOR_PID 2>/dev/null || true
+          trap - EXIT
+          # Move the captured file into the bench corpus dir.
+          # The bench loader dispatches on the `.jsonl`
+          # extension (RFC 0006 §3.1 OTLP/JSON path).
+          mv /tmp/otel-capture/logs.jsonl bench-corpus/telemetrygen-synthetic-v1/logs.jsonl
+          echo "captured $(wc -l < bench-corpus/telemetrygen-synthetic-v1/logs.jsonl) records, \
+                $(stat -c%s bench-corpus/telemetrygen-synthetic-v1/logs.jsonl) bytes"
 
       - name: Run thesis-gate bench
         # `pipefail` so a C1 reconstruction failure (the bench's
@@ -94,10 +186,12 @@ jobs:
         shell: bash
         env:
           BENCH_CORPUS: ${{ inputs.corpus_dir }}
+          BENCH_CAPTURE: ${{ inputs.capture }}
         run: |
           {
             echo '## ourios-bench — thesis-gate results'
             echo
+            echo "Capture: \`${BENCH_CAPTURE}\`"
             echo "Corpus: \`${BENCH_CORPUS}\`"
             echo
             echo '```'
@@ -105,10 +199,12 @@ jobs:
             echo '```'
             echo
             echo '> **Indicative only.** A hosted runner is not the `docs/benchmarks.md` §1'
-            echo '> hardware baseline; results are not authoritative regardless of corpus size.'
-            echo '> The default seed corpus (`testdata/corpus/`) is also far too small to be'
-            echo '> representative — A1 is expected to FAIL there (Parquet overhead dominates a'
-            echo '> few KB of data). Real numbers need a representative corpus + baseline hardware.'
+            echo '> hardware baseline (`baseline-8vcpu-32gib`); results are not authoritative'
+            echo '> regardless of corpus. The `telemetrygen` capture path is additionally'
+            echo '> synthetic on content (real OTLP wire envelope, uniform body shape) — the'
+            echo '> `corpus` field in the results JSON carries `telemetrygen-synthetic-v1` as'
+            echo '> the warning label. A representative-corpus capture (OTel Demo) is a'
+            echo '> follow-up `capture` option.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results JSON

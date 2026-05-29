@@ -1639,23 +1639,48 @@ impl MinerCluster {
         // `body` carries the RFC 0005 §3.3 OTLP-canonical-JSON
         // encoding of the `AnyValue` — the bytes the writer
         // stores in the §3.2 `body` column for structured rows.
-        // `canonical::encode_any_value` is infallible on values
-        // a spec-compliant receiver produces; the fallback path
-        // (debug rendering + `lossy_flag = true` so the reader
-        // returns the body verbatim per RFC 0001 §6.6) survives
-        // pathological inputs like a `DoubleValue` carrying
-        // `f64::NAN` (`serde_json` rejects), which the RFC 0003
-        // §6.5 receiver narrows out at the wire-decode boundary.
+        // Two interlocking invariants prevent a graceful
+        // fallback path here:
+        //
+        // - RFC 0001 §6.1 / body-representation table:
+        //   `lossy_flag` is **always `false` when
+        //   `body_kind = Structured`** ("the verbatim `body`
+        //   column is the source of truth"). Setting it to
+        //   `true` on the encoder-failure path would mint a
+        //   row shape the RFC says cannot exist.
+        // - RFC 0005 §3.3: the `body` column for structured
+        //   rows MUST hold canonical JSON. A
+        //   `format!("{any_value:?}")` fallback would silently
+        //   write spec-violating bytes into a §3.3-governed
+        //   column — exactly the masquerading-as-JSON failure
+        //   mode the writer's prior
+        //   `StructuredBodyNotYetCanonical` rejection
+        //   prevented.
+        //
+        // `canonical::encode_any_value` is infallible on
+        // `AnyValue`s the RFC 0003 §6.5 receiver has narrowed
+        // at the wire-decode boundary (`f64::NAN` and friends
+        // are the canonical pathological case). A failure here
+        // is therefore an upstream contract violation — panic
+        // rather than break either invariant. The bench
+        // loader narrows at its own boundary (it constructs
+        // `AnyValue`s only from `serde_json::from_str` over
+        // OTLP-spec JSON, which proto3 JSON already excludes
+        // NaN from), so the panic is unreachable on the
+        // current ingress paths.
+        let bytes = ourios_core::otlp::canonical::encode_any_value(any_value).unwrap_or_else(|e| {
+            panic!(
+                "RFC 0005 §3.3 canonical-JSON encode of structured body failed ({e}); \
+                     the wire-decode boundary (RFC 0003 §6.5 receiver / corpus loader) is \
+                     supposed to narrow inputs serde_json rejects (`f64::NAN`, …) before \
+                     they reach the miner — this indicates an upstream contract violation"
+            );
+        });
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
         rec.confidence = 1.0;
-        if let Ok(bytes) = ourios_core::otlp::canonical::encode_any_value(any_value) {
-            rec.body = Some(String::from_utf8(bytes).expect("serde_json emits valid UTF-8"));
-        } else {
-            rec.body = Some(format!("{any_value:?}"));
-            rec.lossy_flag = true;
-        }
+        rec.body = Some(String::from_utf8(bytes).expect("serde_json emits valid UTF-8"));
         self.emit_record(rec);
 
         template_id

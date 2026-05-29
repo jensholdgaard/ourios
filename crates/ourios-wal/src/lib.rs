@@ -65,7 +65,10 @@ pub enum FrameKind {
     /// decoded, verbatim.
     OtlpBatch = 0x01,
     /// One serialised [`AuditEvent`]. Encoding choice is
-    /// deferred to PR-M2's implementation per §9.
+    /// deferred to the encoder implementation PR per RFC
+    /// 0008 §9 (this PR is the red-gate scaffold — the
+    /// encoder lands together with the matching `#[ignore]`
+    /// removal in the next PR).
     AuditEvent = 0x02,
 }
 

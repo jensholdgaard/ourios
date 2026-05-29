@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # `WalOffset`'s global monotonicity (§6.1) without a synthetic
 # counter, which is how the checkpoint survives housekeeping
 # deletion of older segments.
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 # CRC32-C (Castagnoli, polynomial `0x1EDC6F41`) per RFC 0008
 # §6.2.2. Same polynomial the Parquet writer already uses on
 # row groups; one implementation, one SIMD-acceleration path

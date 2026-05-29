@@ -133,7 +133,7 @@ the data was accepted; we have lost data we promised to keep.
 faster storage. Ack-without-fsync ever observed in code review → P0
 bug, hotfix path.
 
-**See also.** `CLAUDE.md` §3.4; future RFC 0003 (WAL design);
+**See also.** `CLAUDE.md` §3.4; RFC 0008 (WAL design);
 benchmark D2 (compaction keeps up).
 
 ---

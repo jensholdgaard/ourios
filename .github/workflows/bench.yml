@@ -110,6 +110,7 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Capture corpus (telemetrygen → fileexporter)
+        id: capture
         if: inputs.capture == 'telemetrygen'
         env:
           BENCH_LOG_COUNT: ${{ inputs.telemetrygen_logs }}
@@ -117,9 +118,16 @@ jobs:
         # input here — passed via `env:` (not `${{ ... }}`
         # splicing) per the same template-injection-avoidance
         # rule the bench invocation below documents.
+        #
+        # Emits `corpus_dir` as a step output so the downstream
+        # bench + summary steps consume the *captured* path,
+        # not the (now meaningless when capture=telemetrygen)
+        # `inputs.corpus_dir`. The capture-strategy → corpus-dir
+        # binding lives in one place this way.
         run: |
           set -euxo pipefail
-          mkdir -p bench-corpus/telemetrygen-synthetic-v1
+          CAPTURED_DIR="bench-corpus/telemetrygen-synthetic-v1"
+          mkdir -p "$CAPTURED_DIR"
           mkdir -p /tmp/otel-capture
           # Start collector in background. The trap on EXIT
           # makes a flaky telemetrygen failure clean up the
@@ -131,12 +139,24 @@ jobs:
           # Wait for OTLP gRPC port. `bash`'s built-in
           # `/dev/tcp` saves installing `netcat`. 30s is generous
           # for a cold collector binary on a hosted runner.
+          # Explicit fail-after-timeout — the loop falling
+          # through silently used to make telemetrygen the
+          # error-surface, which logged a connection refusal
+          # with no pointer at the collector itself.
+          READY=false
           for _ in $(seq 1 30); do
             if (echo > /dev/tcp/127.0.0.1/4317) 2>/dev/null; then
+              READY=true
               break
             fi
             sleep 1
           done
+          if [ "$READY" != "true" ]; then
+            echo "::error::collector did not open OTLP gRPC port 4317 within 30s"
+            echo "--- /tmp/collector.log ---"
+            cat /tmp/collector.log || true
+            exit 1
+          fi
           telemetrygen logs \
             --otlp-insecure \
             --otlp-endpoint=127.0.0.1:4317 \
@@ -150,9 +170,10 @@ jobs:
           # Move the captured file into the bench corpus dir.
           # The bench loader dispatches on the `.jsonl`
           # extension (RFC 0006 §3.1 OTLP/JSON path).
-          mv /tmp/otel-capture/logs.jsonl bench-corpus/telemetrygen-synthetic-v1/logs.jsonl
-          echo "captured $(wc -l < bench-corpus/telemetrygen-synthetic-v1/logs.jsonl) records, \
-                $(stat -c%s bench-corpus/telemetrygen-synthetic-v1/logs.jsonl) bytes"
+          mv /tmp/otel-capture/logs.jsonl "$CAPTURED_DIR/logs.jsonl"
+          echo "captured $(wc -l < "$CAPTURED_DIR/logs.jsonl") records, \
+                $(stat -c%s "$CAPTURED_DIR/logs.jsonl") bytes"
+          echo "corpus_dir=$CAPTURED_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Run thesis-gate bench
         # `pipefail` so a C1 reconstruction failure (the bench's
@@ -171,7 +192,10 @@ jobs:
         env:
           BENCH_GATES: ${{ inputs.gates }}
           BENCH_HARDWARE: ${{ inputs.hardware_kind }}
-          BENCH_CORPUS: ${{ inputs.corpus_dir }}
+          # Prefer the captured-path step output (set only when
+          # `capture=telemetrygen` ran). Falls through to the
+          # operator-supplied `corpus_dir` when capture=none.
+          BENCH_CORPUS: ${{ steps.capture.outputs.corpus_dir || inputs.corpus_dir }}
         run: |
           set -euo pipefail
           ./target/release/ourios-bench \
@@ -185,7 +209,10 @@ jobs:
         if: always()
         shell: bash
         env:
-          BENCH_CORPUS: ${{ inputs.corpus_dir }}
+          # Same effective-path rule the bench step uses, so the
+          # summary's `Corpus:` line matches what was actually
+          # measured (not the now-overridden input).
+          BENCH_CORPUS: ${{ steps.capture.outputs.corpus_dir || inputs.corpus_dir }}
           BENCH_CAPTURE: ${{ inputs.capture }}
         run: |
           {

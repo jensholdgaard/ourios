@@ -15,12 +15,17 @@
 //! - **OTLP/JSON Lines** (`*.jsonl`, `*.json`) — RFC 0006 §3.1's
 //!   OTLP-LogsData migration. One OTLP `LogsData` per line
 //!   (the [OTel File Exporter] format the collector emits). Each
-//!   wire `LogRecord`'s envelope is preserved 1:1 onto the
-//!   [`OtlpLogRecord`] per the RFC 0003 §6.6 shape — severity,
-//!   scope, attributes, resource attributes, trace context, body.
-//!   `time_unix_nano` is taken from the wire (file-static =
-//!   run-reproducible). String bodies become `Body::String`;
-//!   any other `AnyValue` becomes `Body::Structured`.
+//!   wire `LogRecord`'s envelope maps onto the [`OtlpLogRecord`]
+//!   per the RFC 0003 §6.6 shape for severity, scope, trace
+//!   context, and body. `attributes` and `resource_attributes`
+//!   are currently stripped (set to empty `Vec`s) pending the
+//!   RFC 0005 §3.3 `KeyValue` canonical-JSON encoder in the
+//!   Parquet writer — see `map_log_record`. `time_unix_nano` is
+//!   taken from the wire (file-static = run-reproducible).
+//!   String bodies become `Body::String`; any other `AnyValue`
+//!   becomes `Body::Structured` (though writing the structured
+//!   variant requires the same canonicalisation PR, so today's
+//!   committed CI fixture stays string-body-only).
 //!
 //!   This is the path RFC 0003 §6.5 itself names as the MVP bench
 //!   route — "the MVP bench reads OTLP from the on-disk corpus,
@@ -399,9 +404,13 @@ fn ingest_otlp_jsonl(
     Ok(())
 }
 
-/// Map one wire `LogRecord` (plus its inherited resource
-/// attributes and `InstrumentationScope`) into the
-/// [`OtlpLogRecord`] shape RFC 0003 §6.6 pins. Severity
+/// Map one wire `LogRecord` (plus its `InstrumentationScope`)
+/// into the [`OtlpLogRecord`] shape RFC 0003 §6.6 pins. The
+/// resource attributes hoisted by the caller would normally
+/// fan out per record (per the §6.6 contract) but are stripped
+/// alongside `log_record.attributes` until the RFC 0005 §3.3
+/// canonicalisation PR lands — see the comment in-body.
+/// Severity
 /// clamps wire `i32` into the OTLP-defined `0..=24` band
 /// (`0` = UNSPECIFIED, `1..=24` = TRACE..FATAL with sub-
 /// levels), matching the receiver-boundary narrowing the

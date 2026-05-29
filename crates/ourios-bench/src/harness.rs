@@ -61,11 +61,16 @@ pub(crate) struct HarnessResult {
 /// ingested line with `(input, emitted, snapshot)`.
 ///
 /// `snapshot` is `None` when the emitted record is lossy
-/// (`record.lossy_flag = true`) or carries the
+/// (`record.lossy_flag = true`), carries the
 /// [`NO_TEMPLATE`] sentinel (`template_id = 0`, the
-/// parse-failure path per RFC 0001 §6.2). Non-lossy records
+/// parse-failure path per RFC 0001 §6.2), or has a non-
+/// `BodyKind::String` body (e.g. `BodyKind::Structured`,
+/// which uses the sentinel template id RFC 0001 §6.1 assigns
+/// to `(severity, scope, BodyKind::Structured)` — that
+/// sentinel isn't a Drain-tree leaf, so `templates_for()`
+/// correctly returns nothing). **Non-lossy string** records
 /// always receive `Some(template_tokens)`; a missing snapshot
-/// for a real `(id, v)` pair surfaces as
+/// for a real `(id, v)` pair on that path surfaces as
 /// [`BenchError::Pipeline`] (the cluster's `templates_for()`
 /// returned a leaf list inconsistent with the just-emitted
 /// record, an RFC 0001 §6.1 contract violation).
@@ -265,13 +270,18 @@ mod tests {
         assert_eq!(count, line_count);
     }
 
-    /// Every non-lossy emitted record's callback gets
-    /// `Some(template)`; lossy / `NO_TEMPLATE` records get
-    /// `None` without failing the harness. Pins the §3.4.2
-    /// lookup contract that c1 relies on: non-lossy needs a
-    /// snapshot, lossy doesn't.
+    /// Every non-lossy, non-`NO_TEMPLATE`, `BodyKind::String`
+    /// callback gets `Some(template)`. Lossy / `NO_TEMPLATE` /
+    /// `BodyKind::Structured` records get `None` without
+    /// failing the harness. Pins the §3.4.2 lookup contract
+    /// that C1 relies on. The plain-text fixture used here has
+    /// only string bodies, so this test focuses on the
+    /// lossy / `NO_TEMPLATE` exclusions; the
+    /// `BodyKind::Structured` exclusion is documented in the
+    /// `run` rustdoc and exercised end-to-end by an OTLP
+    /// fixture run.
     #[test]
-    fn non_lossy_callbacks_carry_a_template_snapshot() {
+    fn non_lossy_string_callbacks_carry_a_template_snapshot() {
         let (_tmp, load) = load_lines(&[
             "user 42 logged in",
             "user 43 logged in",
@@ -283,7 +293,10 @@ mod tests {
         let mut non_lossy_seen = 0usize;
         let mut non_lossy_with_snapshot = 0usize;
         run(&load, false, |_input, record, snap| {
-            if !record.lossy_flag && record.template_id != NO_TEMPLATE {
+            if !record.lossy_flag
+                && record.template_id != NO_TEMPLATE
+                && matches!(record.body_kind, BodyKind::String)
+            {
                 non_lossy_seen += 1;
                 if snap.is_some() {
                     non_lossy_with_snapshot += 1;
@@ -294,7 +307,7 @@ mod tests {
         assert!(non_lossy_seen > 0);
         assert_eq!(
             non_lossy_seen, non_lossy_with_snapshot,
-            "every non-lossy non-NO_TEMPLATE record must receive a snapshot",
+            "every non-lossy non-NO_TEMPLATE string-body record must receive a snapshot",
         );
     }
 

@@ -37,7 +37,7 @@ use ourios_core::audit::{AuditEvent, NoOpAuditSink, SharedAuditSink};
 use ourios_core::clock::TestClock;
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::OtlpLogRecord;
-use ourios_core::record::{MinedRecord, SharedRecordSink};
+use ourios_core::record::{BodyKind, MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
 use ourios_miner::tree::OwnedToken;
@@ -61,11 +61,16 @@ pub(crate) struct HarnessResult {
 /// ingested line with `(input, emitted, snapshot)`.
 ///
 /// `snapshot` is `None` when the emitted record is lossy
-/// (`record.lossy_flag = true`) or carries the
+/// (`record.lossy_flag = true`), carries the
 /// [`NO_TEMPLATE`] sentinel (`template_id = 0`, the
-/// parse-failure path per RFC 0001 §6.2). Non-lossy records
+/// parse-failure path per RFC 0001 §6.2), or has a non-
+/// `BodyKind::String` body (e.g. `BodyKind::Structured`,
+/// which uses the sentinel template id RFC 0001 §6.1 assigns
+/// to `(severity, scope, BodyKind::Structured)` — that
+/// sentinel isn't a Drain-tree leaf, so `templates_for()`
+/// correctly returns nothing). **Non-lossy string** records
 /// always receive `Some(template_tokens)`; a missing snapshot
-/// for a real `(id, v)` pair surfaces as
+/// for a real `(id, v)` pair on that path surfaces as
 /// [`BenchError::Pipeline`] (the cluster's `templates_for()`
 /// returned a leaf list inconsistent with the just-emitted
 /// record, an RFC 0001 §6.1 contract violation).
@@ -135,13 +140,23 @@ where
         cluster.ingest(input);
         let record = require_single(sink.drain())?;
 
-        // Skip the snapshot capture for lossy / parse-failure
-        // records. Lossy rows are excluded from C1's
-        // numerator and denominator per §3.4.2, and a
-        // `template_id == NO_TEMPLATE` (0) emit has no leaf
-        // by construction — `templates_for()` won't find it,
-        // and we don't need it either.
-        let want_snapshot = !record.lossy_flag && record.template_id != NO_TEMPLATE;
+        // Skip the snapshot capture for lossy / parse-failure /
+        // structured-body records. Lossy rows are excluded from
+        // C1's numerator and denominator per §3.4.2, a
+        // `template_id == NO_TEMPLATE` (0) emit has no leaf by
+        // construction, and structured-body records use the
+        // sentinel template id RFC 0001 §6.1 assigns to
+        // `(severity, scope, BodyKind::Structured)` — that
+        // sentinel is *not* a Drain-tree leaf, so
+        // `templates_for()` correctly returns nothing for it.
+        // Per RFC 0001 §6.4 / RFC 0003 §6.4, reconstruction for
+        // structured bodies is a storage-layer round-trip
+        // (decode the stored `AnyValue` bytes) rather than
+        // template + params, so the bench's C1 (which measures
+        // template-based reconstruction) doesn't apply.
+        let want_snapshot = !record.lossy_flag
+            && record.template_id != NO_TEMPLATE
+            && matches!(record.body_kind, BodyKind::String);
         if want_snapshot {
             let key = (record.template_id, record.template_version);
             if let std::collections::hash_map::Entry::Vacant(slot) = snapshots.entry(key) {
@@ -255,13 +270,18 @@ mod tests {
         assert_eq!(count, line_count);
     }
 
-    /// Every non-lossy emitted record's callback gets
-    /// `Some(template)`; lossy / `NO_TEMPLATE` records get
-    /// `None` without failing the harness. Pins the §3.4.2
-    /// lookup contract that c1 relies on: non-lossy needs a
-    /// snapshot, lossy doesn't.
+    /// Every non-lossy, non-`NO_TEMPLATE`, `BodyKind::String`
+    /// callback gets `Some(template)`. Lossy / `NO_TEMPLATE` /
+    /// `BodyKind::Structured` records get `None` without
+    /// failing the harness. Pins the §3.4.2 lookup contract
+    /// that C1 relies on. The plain-text fixture used here has
+    /// only string bodies, so this test focuses on the
+    /// lossy / `NO_TEMPLATE` exclusions; the
+    /// `BodyKind::Structured` exclusion is documented in the
+    /// `run` rustdoc and exercised end-to-end by an OTLP
+    /// fixture run.
     #[test]
-    fn non_lossy_callbacks_carry_a_template_snapshot() {
+    fn non_lossy_string_callbacks_carry_a_template_snapshot() {
         let (_tmp, load) = load_lines(&[
             "user 42 logged in",
             "user 43 logged in",
@@ -273,7 +293,10 @@ mod tests {
         let mut non_lossy_seen = 0usize;
         let mut non_lossy_with_snapshot = 0usize;
         run(&load, false, |_input, record, snap| {
-            if !record.lossy_flag && record.template_id != NO_TEMPLATE {
+            if !record.lossy_flag
+                && record.template_id != NO_TEMPLATE
+                && matches!(record.body_kind, BodyKind::String)
+            {
                 non_lossy_seen += 1;
                 if snap.is_some() {
                     non_lossy_with_snapshot += 1;
@@ -284,7 +307,68 @@ mod tests {
         assert!(non_lossy_seen > 0);
         assert_eq!(
             non_lossy_seen, non_lossy_with_snapshot,
-            "every non-lossy non-NO_TEMPLATE record must receive a snapshot",
+            "every non-lossy non-NO_TEMPLATE string-body record must receive a snapshot",
+        );
+    }
+
+    /// `BodyKind::Structured` records reach the harness without
+    /// triggering the `templates_for()` contract violation that
+    /// the pre-fix path raised, AND the callback receives
+    /// `snapshot = None` for them. End-to-end coverage of the
+    /// production `BodyKind::String` guard the OTLP fixture
+    /// surfaced — uses a synthetic OTLP/JSONL fixture with one
+    /// `stringValue` body and one `kvlistValue` body so the
+    /// harness exercises both the captured-snapshot and the
+    /// skip-snapshot paths in one run.
+    #[test]
+    fn structured_body_record_skips_snapshot_lookup_without_error() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("structured.jsonl");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // Two LogsData lines: a string-body record (normal
+        // template path) and a kvlist-body record (sentinel
+        // template id — the path that pre-fix crashed).
+        file.write_all(
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"timeUnixNano\":\"1775127480000000000\",\
+              \"severityNumber\":9,\
+              \"body\":{\"stringValue\":\"user 1 logged in\"}}]}]}]}\n\
+              {\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"timeUnixNano\":\"1775127481000000000\",\
+              \"severityNumber\":9,\
+              \"body\":{\"kvlistValue\":{\"values\":\
+              [{\"key\":\"event\",\"value\":{\"stringValue\":\"startup\"}}]}}}]}]}]}\n",
+        )
+        .expect("write");
+        drop(file);
+        let load = corpus::load(tmp.path()).expect("OTLP fixture loads");
+
+        let mut snapshots_present = 0usize;
+        let mut snapshots_absent = 0usize;
+        let mut structured_seen = 0usize;
+        run(&load, false, |_input, record, snap| {
+            if matches!(record.body_kind, BodyKind::Structured) {
+                structured_seen += 1;
+                assert!(
+                    snap.is_none(),
+                    "structured records must receive snapshot = None — the harness must skip the sentinel-id `templates_for()` lookup",
+                );
+            }
+            if snap.is_some() {
+                snapshots_present += 1;
+            } else {
+                snapshots_absent += 1;
+            }
+        })
+        .expect("harness must not raise the pre-fix contract violation on structured bodies");
+        assert_eq!(structured_seen, 1, "exactly one structured-body record");
+        assert!(
+            snapshots_present >= 1,
+            "the string-body record gets a snapshot"
+        );
+        assert!(
+            snapshots_absent >= 1,
+            "the structured-body record's `None` is counted"
         );
     }
 

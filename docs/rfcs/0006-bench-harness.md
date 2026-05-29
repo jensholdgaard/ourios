@@ -279,8 +279,8 @@ Pinned definitions:
   `*.binpb` protobuf-encoded `LogsData` is reserved for a
   future follow-up and not counted today. No transformation:
   this is the byte count an operator measures with `find
-  testdata/corpus/ \( -name '*.txt' -o -name '*.jsonl' -o
-  -name '*.json' \) -exec stat --printf='%s\n' {} + | awk
+  testdata/corpus/ \( -iname '*.txt' -o -iname '*.jsonl' -o
+  -iname '*.json' \) -exec stat --printf='%s\n' {} + | awk
   '{s+=$1}END{print s}'` (or the platform equivalent). For
   OTLP/JSON corpora the byte count includes the envelope
   (camelCase keys, base64 bytes), so A1 ratios are not
@@ -776,14 +776,16 @@ the harness or the formulas.
 >   (per the §7 resolution of the ZSTD-integration question)
 > - **When** the bench runs the A1 measurement
 > - **Then** `bytes(raw_corpus)` equals
->   `sum(std::fs::metadata(f).len())` over the `*.txt` files
->   in the corpus directory
+>   `sum(std::fs::metadata(f).len())` over the consumed
+>   corpus files (`*.txt`, `*.jsonl`, `*.json`) in the corpus
+>   directory
 > - **And** `bytes(ourios_output)` equals the sum of all
 >   `*.parquet` (not `*.parquet.tmp`) file sizes under the
 >   bench's output bucket, including the `audit/...` partition
 > - **And** `bytes(zstd_corpus)` equals the sum of
 >   `std::fs::metadata(f).len()` over the `*.zst` files
->   produced by `zstd -19 --no-progress` on each input
+>   produced by `zstd -19 --no-progress` on each consumed
+>   input (same extension set as `bytes(raw_corpus)`)
 > - **And** the reported `delta` equals
 >   `ourios_ratio / zstd_ratio`, rounded down to three
 >   significant figures

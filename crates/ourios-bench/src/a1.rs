@@ -578,15 +578,21 @@ mod tests {
               [{\"body\":{\"stringValue\":\"y\"}}]}]}]}\n",
         )
         .expect("json");
+        let bytes_before_md = zstd_level_19_bytes(tmp.path()).expect("zstd");
+        assert!(
+            bytes_before_md > 0,
+            "zstd compresses something on a mixed-extension corpus",
+        );
         // An unrelated extension that must NOT be compressed
         // (would inflate `bytes(zstd_corpus)` past the loader's
-        // honest input).
+        // honest input). Adding it must leave the byte count
+        // unchanged — the silent assertion the test pre-fixup
+        // was missing.
         std::fs::write(tmp.path().join("readme.md"), b"# not a corpus file\n").expect("md");
-
-        let bytes = zstd_level_19_bytes(tmp.path()).expect("zstd");
-        assert!(
-            bytes > 0,
-            "zstd compresses something on a mixed-extension corpus",
+        let bytes_after_md = zstd_level_19_bytes(tmp.path()).expect("zstd after md");
+        assert_eq!(
+            bytes_before_md, bytes_after_md,
+            "non-corpus extensions (here `.md`) must not be zstd-compressed",
         );
 
         // Sanity check the invariant: same dir without the txt

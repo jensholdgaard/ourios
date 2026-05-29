@@ -16,9 +16,14 @@
 //! follow-up PRs together with the matching ignored-test
 //! flips to `#[test]`.
 
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 use ourios_core::audit::AuditEvent;
+
+pub(crate) mod segment;
+
+use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};
 
 // -----------------------------------------------------------
 // Public types (RFC 0008 §6.1 + §6.2.2)
@@ -108,27 +113,100 @@ pub struct WalConfig {
 /// size and make file-format compatibility per-deployment.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// `wal_segment_size_bytes` validated lower bound per §6.9 —
+/// `MAX_FRAME_BYTES + segment_header + frame_header` rounded
+/// up to a round-numbered 17 MiB so a max-sized frame always
+/// fits inside one segment (otherwise `wal_unflushed_bytes`
+/// could grow past the §6.9 RFC0008.9 bound).
+pub const MIN_SEGMENT_SIZE_BYTES: u64 = 17 * 1024 * 1024;
+
+/// `wal_segment_size_bytes` validated upper bound per §6.9.
+pub const MAX_SEGMENT_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `wal_batch_window_ms` validated upper bound per §6.9; lower
+/// bound is `0` (per-`append` `sync`, allowed but discouraged
+/// per the §6.9 table).
+pub const MAX_BATCH_WINDOW_MS: u64 = 10_000;
+
+/// `wal_segment_age_secs` validated range per §6.9.
+pub const MIN_SEGMENT_AGE_SECS: u64 = 1;
+pub const MAX_SEGMENT_AGE_SECS: u64 = 86_400;
+
+/// `wal_housekeeping_secs` validated range per §6.9.
+pub const MIN_HOUSEKEEPING_SECS: u64 = 1;
+pub const MAX_HOUSEKEEPING_SECS: u64 = 3_600;
+
 /// The append-only write-ahead log itself. One per ingester
-/// process; the §6.1 API is `open → append* → sync* →
-/// checkpoint* + replay` (the last only on startup).
+/// process; the §6.1 API is `open → replay? → append* →
+/// sync* → checkpoint*`.
+#[derive(Debug)]
 pub struct Wal {
-    // Placeholder for the segment-management state per §6.2 +
-    // the in-memory checkpoint high-water-mark per §6.7. The
-    // real fields land with the implementation PRs.
-    _config: WalConfig,
+    /// Held for `append` / `sync` / `checkpoint` to read in
+    /// future slices. `#[allow(dead_code)]` matches the other
+    /// red-gate fields below.
+    #[allow(dead_code)]
+    config: WalConfig,
+    /// File handle for the segment currently accepting appends
+    /// (per §6.2: append-only, opened by exactly one writer).
+    /// `None` would mean "no current segment open"; in this
+    /// implementation `open` always opens or creates one, so
+    /// the field is always populated post-open. The
+    /// `#[allow(dead_code)]` survives the red-gate slice
+    /// because nothing reads the handle yet — `append` lands
+    /// in the next slice.
+    #[allow(dead_code)]
+    current_segment: File,
+    /// Path of the file the `current_segment` handle points
+    /// at. Kept alongside the handle for diagnostic messages
+    /// and the post-rotation parent-dir `fsync` (§6.3) that
+    /// lands with `sync` in the next slice.
+    #[allow(dead_code)]
+    current_segment_path: PathBuf,
+    /// `UUIDv7` of the current segment — same value as the
+    /// filename's stem and the segment's in-file header per
+    /// §6.2.1.
+    #[allow(dead_code)]
+    current_segment_uuid: uuid::Uuid,
 }
 
 impl Wal {
-    /// Open (or create) the WAL rooted at `config.root` and
-    /// validate every §6.9 tunable against its classified
-    /// range. Returns [`OpenError::InvalidConfig`] on the
-    /// first field that falls outside its validated range.
+    /// Open (or create) the WAL rooted at `config.root`.
+    /// Validates every §6.9 tunable against its classified
+    /// range first — out-of-range fields surface as
+    /// [`OpenError::InvalidConfig`] before any filesystem
+    /// state is touched.
+    ///
+    /// On a fresh root (no `*.wal` files present), creates a
+    /// new segment with a `UUIDv7` filename and writes the 24 B
+    /// §6.2.1 header. On an existing root, opens the
+    /// lexicographically-greatest segment (= the newest per
+    /// `UUIDv7`'s chronological sort) for further appends; the
+    /// caller is responsible for calling [`Self::replay`]
+    /// **before** any [`Self::append`] to walk surviving
+    /// frames into the recovery sink.
     ///
     /// # Errors
     ///
     /// See [`OpenError`].
-    pub fn open(_config: WalConfig) -> Result<Self, OpenError> {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.1)");
+    pub fn open(config: WalConfig) -> Result<Self, OpenError> {
+        validate_config(&config)?;
+        std::fs::create_dir_all(&config.root).map_err(|source| OpenError::Io {
+            op: "create_dir_all(wal_root)",
+            source,
+        })?;
+        let existing_segments = list_segments(&config.root)?;
+        let (current_segment, current_segment_path, current_segment_uuid) =
+            if let Some(newest) = existing_segments.into_iter().next_back() {
+                open_existing_segment(&newest)?
+            } else {
+                create_fresh_segment(&config.root)?
+            };
+        Ok(Self {
+            config,
+            current_segment,
+            current_segment_path,
+            current_segment_uuid,
+        })
     }
 
     /// Append a frame of `kind` carrying `payload` (≤
@@ -187,6 +265,157 @@ impl Wal {
     pub fn metrics(&self) -> WalMetrics {
         unimplemented!("RFC 0008 red gate — implementation pending (§6.8)");
     }
+}
+
+/// Per-tunable §6.9 validation. Fails fast on the *first*
+/// out-of-range field — the error names that field so the
+/// operator sees one structured failure rather than a list,
+/// and so a sweep through the config doesn't depend on every
+/// later field's invariants being independently checkable.
+fn validate_config(c: &WalConfig) -> Result<(), OpenError> {
+    let outside = |field, detail: String| OpenError::InvalidConfig { field, detail };
+    if c.batch_window_ms > MAX_BATCH_WINDOW_MS {
+        return Err(outside(
+            "batch_window_ms",
+            format!(
+                "{} exceeds §6.9 upper bound {MAX_BATCH_WINDOW_MS}",
+                c.batch_window_ms
+            ),
+        ));
+    }
+    if c.segment_size_bytes < MIN_SEGMENT_SIZE_BYTES {
+        return Err(outside(
+            "segment_size_bytes",
+            format!(
+                "{} below §6.9 lower bound {MIN_SEGMENT_SIZE_BYTES} (MAX_FRAME_BYTES + headers; a smaller segment couldn't fit a max-sized frame)",
+                c.segment_size_bytes
+            ),
+        ));
+    }
+    if c.segment_size_bytes > MAX_SEGMENT_SIZE_BYTES {
+        return Err(outside(
+            "segment_size_bytes",
+            format!(
+                "{} exceeds §6.9 upper bound {MAX_SEGMENT_SIZE_BYTES}",
+                c.segment_size_bytes
+            ),
+        ));
+    }
+    if !(MIN_SEGMENT_AGE_SECS..=MAX_SEGMENT_AGE_SECS).contains(&c.segment_age_secs) {
+        return Err(outside(
+            "segment_age_secs",
+            format!(
+                "{} outside §6.9 range {MIN_SEGMENT_AGE_SECS}..={MAX_SEGMENT_AGE_SECS}",
+                c.segment_age_secs
+            ),
+        ));
+    }
+    if !(MIN_HOUSEKEEPING_SECS..=MAX_HOUSEKEEPING_SECS).contains(&c.housekeeping_secs) {
+        return Err(outside(
+            "housekeeping_secs",
+            format!(
+                "{} outside §6.9 range {MIN_HOUSEKEEPING_SECS}..={MAX_HOUSEKEEPING_SECS}",
+                c.housekeeping_secs
+            ),
+        ));
+    }
+    // `macos_full_fsync` is a `bool`; nothing to validate.
+    Ok(())
+}
+
+/// Sorted (= chronological per `UUIDv7`) list of `*.wal`
+/// segment paths under `root`. Other files in the directory
+/// (`CHECKPOINT`, `*.lock`, operator-placed) are deliberately
+/// ignored — the segment-header magic check would reject them
+/// later anyway, but filtering by extension avoids the cost.
+fn list_segments(root: &std::path::Path) -> Result<Vec<PathBuf>, OpenError> {
+    // Per-entry errors surface as `OpenError::Io`. A
+    // `filter_map(|e| e.ok())` would silently drop entries —
+    // a permission-denied stat on the newest segment would
+    // become "no segments exist, mint a fresh one alongside
+    // the unreadable existing one," which violates §6.1's
+    // "open the lexicographically-greatest segment" contract.
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|source| OpenError::Io {
+        op: "read_dir(wal_root)",
+        source,
+    })? {
+        let path = entry
+            .map_err(|source| OpenError::Io {
+                op: "read_dir_entry(wal_root)",
+                source,
+            })?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("wal"))
+        {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Open the segment at `path` for further appends. The header
+/// is validated (RFC0008.5: bad magic / unknown version are
+/// hard errors that surface as [`OpenError::Corrupt`]); the
+/// segment's `UUIDv7` comes from the in-file header so a
+/// renamed file still decodes correctly.
+fn open_existing_segment(path: &std::path::Path) -> Result<(File, PathBuf, uuid::Uuid), OpenError> {
+    let mut handle = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| OpenError::Io {
+            op: "open(existing segment)",
+            source,
+        })?;
+    let header = segment::read_header(&mut handle).map_err(|e| OpenError::Corrupt {
+        detail: format!("segment header at {}: {e}", path.display()),
+    })?;
+    Ok((handle, path.to_path_buf(), header.segment_uuid))
+}
+
+/// Create a brand-new segment under `root`: mint a `UUIDv7`,
+/// open `<root>/<uuid>.wal` with `create_new(true)` (the
+/// caller's race-safe primitive), write the 24 B §6.2.1
+/// header, flush — but **do not** fsync. fsync is the §6.3
+/// `sync` call's job; `open` is intentionally cheap so the
+/// receiver can start servicing requests promptly.
+fn create_fresh_segment(root: &std::path::Path) -> Result<(File, PathBuf, uuid::Uuid), OpenError> {
+    let uuid = uuid::Uuid::now_v7();
+    let path = root.join(format!("{uuid}.wal"));
+    let mut handle = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|source| OpenError::Io {
+            op: "create(fresh segment)",
+            source,
+        })?;
+    write_header(&mut handle, &SegmentHeader::new(uuid)).map_err(|source| OpenError::Io {
+        op: "write(segment header)",
+        source,
+    })?;
+    // SEGMENT_HEADER_LEN sanity — if `write_header` ever
+    // diverges from the on-disk format constant, the metadata
+    // size below disagrees with `SEGMENT_HEADER_LEN` and the
+    // assertion fires. We query the file's *metadata*
+    // (post-fsync-irrelevant byte length) rather than the
+    // handle's `stream_position`: on `O_APPEND` handles each
+    // write atomically lands at end-of-file but the
+    // user-space file-position cursor isn't guaranteed
+    // synchronised with the OS-level write offset on every
+    // platform (see Linux `fcntl(O_APPEND)` notes), so
+    // `stream_position` can return 0 or a stale value.
+    debug_assert_eq!(
+        handle.metadata().map(|m| m.len()).unwrap_or_default(),
+        SEGMENT_HEADER_LEN as u64,
+        "segment header write must produce exactly SEGMENT_HEADER_LEN bytes",
+    );
+    Ok((handle, path, uuid))
 }
 
 /// Recovery-time consumer the [`Wal::replay`] scan hands
@@ -336,4 +565,223 @@ pub enum CorruptionReason {
 #[must_use]
 pub fn encode_audit_event(_event: &AuditEvent) -> Vec<u8> {
     unimplemented!("RFC 0008 §9 — AuditEvent serde format lands with the encoder PR");
+}
+
+#[cfg(test)]
+mod tests {
+    //! Colocated unit tests for the `Wal::open` helpers per
+    //! CLAUDE.md §6.2 (unit tests next to the code for
+    //! anything non-trivial). End-to-end coverage of `open`
+    //! lives in `tests/open.rs`; this module pins the smaller
+    //! helper-level contracts so a regression caught at this
+    //! layer surfaces here rather than as a cascading failure
+    //! in the integration suite.
+    use super::*;
+
+    fn default_config(root: &std::path::Path) -> WalConfig {
+        WalConfig {
+            root: root.to_path_buf(),
+            batch_window_ms: 100,
+            segment_size_bytes: 128 * 1024 * 1024,
+            segment_age_secs: 600,
+            housekeeping_secs: 60,
+            macos_full_fsync: false,
+        }
+    }
+
+    /// `validate_config` accepts every default and every
+    /// exact boundary value — both the lower and upper edges
+    /// of each Tunable's §6.9 range. Catches an off-by-one
+    /// that would reject e.g. `segment_size_bytes ==
+    /// MIN_SEGMENT_SIZE_BYTES`.
+    #[test]
+    fn validate_config_accepts_defaults_and_exact_boundaries() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        validate_config(&default_config(tmp.path())).expect("defaults");
+        let boundaries = [
+            WalConfig {
+                batch_window_ms: 0,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                batch_window_ms: MAX_BATCH_WINDOW_MS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_size_bytes: MIN_SEGMENT_SIZE_BYTES,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_size_bytes: MAX_SEGMENT_SIZE_BYTES,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_age_secs: MIN_SEGMENT_AGE_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                segment_age_secs: MAX_SEGMENT_AGE_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                housekeeping_secs: MIN_HOUSEKEEPING_SECS,
+                ..default_config(tmp.path())
+            },
+            WalConfig {
+                housekeeping_secs: MAX_HOUSEKEEPING_SECS,
+                ..default_config(tmp.path())
+            },
+        ];
+        for cfg in boundaries {
+            validate_config(&cfg).expect("boundary value");
+        }
+    }
+
+    /// Every just-outside-bounds value is rejected and the
+    /// error names the violated field. Iterated rather than
+    /// one test per arm — the message format is what the
+    /// operator sees on a real misconfiguration.
+    #[test]
+    fn validate_config_rejects_each_out_of_range_field() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let cases: &[(&str, WalConfig)] = &[
+            (
+                "batch_window_ms",
+                WalConfig {
+                    batch_window_ms: MAX_BATCH_WINDOW_MS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_size_bytes",
+                WalConfig {
+                    segment_size_bytes: MIN_SEGMENT_SIZE_BYTES - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_size_bytes",
+                WalConfig {
+                    segment_size_bytes: MAX_SEGMENT_SIZE_BYTES + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_age_secs",
+                WalConfig {
+                    segment_age_secs: MIN_SEGMENT_AGE_SECS - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "segment_age_secs",
+                WalConfig {
+                    segment_age_secs: MAX_SEGMENT_AGE_SECS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "housekeeping_secs",
+                WalConfig {
+                    housekeeping_secs: MIN_HOUSEKEEPING_SECS - 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+            (
+                "housekeeping_secs",
+                WalConfig {
+                    housekeeping_secs: MAX_HOUSEKEEPING_SECS + 1,
+                    ..default_config(tmp.path())
+                },
+            ),
+        ];
+        for (expected_field, cfg) in cases {
+            match validate_config(cfg).expect_err("out-of-range must reject") {
+                OpenError::InvalidConfig { field, .. } => assert_eq!(
+                    &field, expected_field,
+                    "validation should name the violating field exactly",
+                ),
+                other => panic!("expected InvalidConfig({expected_field}), got {other:?}"),
+            }
+        }
+    }
+
+    /// `list_segments` filters by `.wal` extension and sorts
+    /// the result lex (= chronological per `UUIDv7`). Mixed
+    /// non-segment files are ignored without erroring.
+    #[test]
+    fn list_segments_filters_and_sorts() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let a = tmp.path().join("01890c43-7b3d-7c01-9e00-aaaaaaaaaaaa.wal");
+        let b = tmp.path().join("01890c43-7b3d-7c01-9e00-bbbbbbbbbbbb.wal");
+        let other = tmp.path().join("CHECKPOINT");
+        let readme = tmp.path().join("README.md");
+        for p in [&b, &a, &other, &readme] {
+            std::fs::File::create(p).expect("create");
+        }
+        let listed = list_segments(tmp.path()).expect("list");
+        assert_eq!(listed, vec![a, b], "lex-sorted .wal entries only");
+    }
+
+    /// `create_fresh_segment` lays down a real file on disk
+    /// whose name parses as `UUIDv7` (version 7, not just
+    /// "parseable") and whose body is exactly the 24 B header
+    /// matching `SegmentHeader::new(uuid)`. Pins the §6.1
+    /// "lex-sortable filename = chronological order"
+    /// contract.
+    #[test]
+    fn create_fresh_segment_writes_a_v7_named_header_only_file() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (_handle, path, uuid) = create_fresh_segment(tmp.path()).expect("create");
+        assert!(path.is_file(), "file actually exists");
+        assert_eq!(
+            uuid.get_version_num(),
+            7,
+            "segment UUID MUST be UUIDv7 (chronological sort)",
+        );
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            stem.parse::<uuid::Uuid>().expect("stem parses"),
+            uuid,
+            "filename stem MUST equal the in-memory UUID",
+        );
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(bytes.len(), SEGMENT_HEADER_LEN, "header-only file");
+        assert_eq!(&bytes[0..4], b"OWAL");
+    }
+
+    /// `open_existing_segment` reads a well-formed segment
+    /// without erroring and recovers the header UUID. Built
+    /// on top of `create_fresh_segment` so the input is
+    /// guaranteed to match the §6.2.1 format.
+    #[test]
+    fn open_existing_segment_recovers_header_uuid() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let (handle_a, path, expected_uuid) = create_fresh_segment(tmp.path()).expect("create");
+        drop(handle_a); // close before reopening read+append
+        let (_handle_b, returned_path, returned_uuid) =
+            open_existing_segment(&path).expect("reopen");
+        assert_eq!(returned_path, path);
+        assert_eq!(
+            returned_uuid, expected_uuid,
+            "in-file UUID must round-trip across open",
+        );
+    }
+
+    /// A foreign file with `.wal` extension but no `OWAL`
+    /// magic is rejected as `OpenError::Corrupt`, not silently
+    /// reused. Pins the RFC0008.5 "stray-file" rejection.
+    #[test]
+    fn open_existing_segment_rejects_foreign_magic() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let path = tmp.path().join("not-a-segment.wal");
+        std::fs::write(&path, b"NOPEhere--filler-bytes--").expect("write");
+        match open_existing_segment(&path).expect_err("must reject") {
+            OpenError::Corrupt { detail } => assert!(
+                detail.contains("magic mismatch"),
+                "Display message should name the magic mismatch; got {detail:?}",
+            ),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
 }

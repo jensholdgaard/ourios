@@ -16,5 +16,12 @@
 *.swp
 *~
 
+# Claude Code runtime artefacts (per-session PID / lock files). The
+# `.claude/` tree carries tracked content (`.claude/skills/` slash-
+# command definitions, the personal `settings.local.json`), but the
+# scheduled-task lock file is per-machine ephemera that leaked into
+# PR #62 once and shouldn't again.
+/.claude/scheduled_tasks.lock
+
 # Cargo.lock is NOT ignored — Ourios is a binary (CLAUDE.md §1) and its
 # lockfile is part of the reproducible-build contract.

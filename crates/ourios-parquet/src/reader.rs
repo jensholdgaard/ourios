@@ -38,7 +38,6 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch, StructArray};
 use ourios_core::audit::ParamType;
-use ourios_core::otlp::KeyValue;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
@@ -137,11 +136,10 @@ impl Reader {
     ///   data shape doesn't match what the reader expects
     ///   (logical-type mismatch, unexpected null on a REQUIRED
     ///   column, etc.).
-    /// - [`ReaderError::AttributesNotYetDecoded`] when the
-    ///   file contains a non-empty `attributes` /
-    ///   `resource_attributes` JSON string. The canonical-JSON
-    ///   decoder is symmetric to the writer's encoder — both
-    ///   are deferred to the RFC 0005 §3.3 canonicalisation PR.
+    /// - [`ReaderError::AttributeDecode`] when an
+    ///   `attributes` / `resource_attributes` column's bytes
+    ///   fail the RFC 0005 §3.3 canonical-JSON decode (corrupt
+    ///   file or foreign-producer bytes).
     /// - [`ReaderError::PartitionMismatch`] when a row's
     ///   derived partition disagrees with the writer-side
     ///   partition supplied to [`Self::open_partition`].
@@ -159,7 +157,7 @@ impl Reader {
             // `From<ArrowError> for ParquetError` lets us
             // route everything through the same variant.
             let batch = batch.map_err(|e| ReaderError::Parquet(e.into()))?;
-            let records = batch_to_mined_records(&batch)?;
+            let records = batch_to_mined_records(&batch, row_offset)?;
             if let Some(p) = &partition {
                 for (idx_in_batch, r) in records.iter().enumerate() {
                     validate_row_vs_partition(r, p, row_offset + idx_in_batch, &file_path)?;
@@ -195,13 +193,16 @@ pub enum ReaderError {
         column: &'static str,
         detail: String,
     },
-    /// Non-empty `attributes` or `resource_attributes` column.
-    /// The canonical-JSON decoder is deferred to the RFC 0005
-    /// §3.3 canonicalisation PR (symmetric to the writer's
-    /// `AttributesNotYetEncoded`).
-    AttributesNotYetDecoded {
+    /// An `attributes` / `resource_attributes` column carried
+    /// bytes that the RFC 0005 §3.3 canonical-JSON decoder
+    /// couldn't parse. Treat as file corruption — the writer
+    /// only emits encoder-produced canonical bytes — or as a
+    /// foreign producer that doesn't honour the §3.3 spec.
+    /// Carries the row index for diagnostics.
+    AttributeDecode {
         column: &'static str,
-        encoded: String,
+        row_index: usize,
+        source: ourios_core::otlp::canonical::CanonicalJsonError,
     },
     /// A row's derived partition disagrees with the partition
     /// supplied to [`Reader::open_partition`]. RFC 0005 §3.9
@@ -235,11 +236,15 @@ impl fmt::Display for ReaderError {
             Self::Conversion { column, detail } => {
                 write!(f, "column `{column}` conversion failed: {detail}")
             }
-            Self::AttributesNotYetDecoded { column, encoded } => write!(
+            Self::AttributeDecode {
+                column,
+                row_index,
+                source,
+            } => write!(
                 f,
-                "column `{column}` carries non-empty canonical JSON ({encoded:?}) but the \
-                 RFC 0005 §3.3 decoder is deferred to the canonicalisation PR (symmetric to \
-                 the writer's `AttributesNotYetEncoded`)",
+                "column `{column}` row {row_index}: RFC 0005 §3.3 canonical-JSON decode \
+                 failed: {source} (the writer only emits encoder-produced bytes; either the \
+                 file is corrupt or a foreign producer wrote it)",
             ),
             Self::PartitionMismatch {
                 row_index,
@@ -277,8 +282,8 @@ impl std::error::Error for ReaderError {
             Self::TimestampOverflow(e) => Some(e),
             Self::MissingRequiredColumn { .. }
             | Self::Conversion { .. }
-            | Self::AttributesNotYetDecoded { .. }
             | Self::PartitionMismatch { .. } => None,
+            Self::AttributeDecode { source, .. } => Some(source),
         }
     }
 }
@@ -304,7 +309,15 @@ fn validate_row_vs_partition(
 /// Convert one Arrow `RecordBatch` to a `Vec<MinedRecord>` per
 /// RFC 0005 §3.2. Handles the §3.9 "missing OPTIONAL column →
 /// `None`" rule by checking column presence before unpacking.
-fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, ReaderError> {
+fn batch_to_mined_records(
+    batch: &RecordBatch,
+    // File-global row offset of `batch`'s first row, threaded
+    // from the caller so per-row diagnostics report stable
+    // indices across multi-batch files. Per-batch
+    // `enumerate()` would reset to 0 every batch and produce
+    // ambiguous row numbers in `AttributeDecode` / similar.
+    row_offset: usize,
+) -> Result<Vec<MinedRecord>, ReaderError> {
     let n = batch.num_rows();
     let mut records: Vec<MinedRecord> = Vec::with_capacity(n);
 
@@ -341,20 +354,33 @@ fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, Reade
     let separators_lists = decode_separators_column(batch)?;
 
     for i in 0..n {
+        // Empty-list short-circuit mirrors the writer's
+        // `append_attributes` — avoids the encoder round-trip
+        // on every clean-attach record (the common case).
         let attrs_str = attributes[i].as_str();
-        if attrs_str != "[]" {
-            return Err(ReaderError::AttributesNotYetDecoded {
-                column: columns::ATTRIBUTES,
-                encoded: attrs_str.to_string(),
-            });
-        }
+        let decoded_attrs = if attrs_str == "[]" {
+            Vec::new()
+        } else {
+            ourios_core::otlp::canonical::decode_attributes(attrs_str.as_bytes()).map_err(
+                |source| ReaderError::AttributeDecode {
+                    column: columns::ATTRIBUTES,
+                    row_index: row_offset + i,
+                    source,
+                },
+            )?
+        };
         let res_str = resource_attributes[i].as_str();
-        if res_str != "[]" {
-            return Err(ReaderError::AttributesNotYetDecoded {
-                column: columns::RESOURCE_ATTRIBUTES,
-                encoded: res_str.to_string(),
-            });
-        }
+        let decoded_resource = if res_str == "[]" {
+            Vec::new()
+        } else {
+            ourios_core::otlp::canonical::decode_attributes(res_str.as_bytes()).map_err(
+                |source| ReaderError::AttributeDecode {
+                    column: columns::RESOURCE_ATTRIBUTES,
+                    row_index: row_offset + i,
+                    source,
+                },
+            )?
+        };
 
         let t_ns = u64::try_from(time_unix_nano[i]).map_err(|_| ReaderError::Conversion {
             column: columns::TIME_UNIX_NANO,
@@ -397,9 +423,9 @@ fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, Reade
             scope_version: scope_version.as_ref().and_then(|c| c[i].clone()),
             time_unix_nano: t_ns,
             observed_time_unix_nano: observed_t,
-            attributes: Vec::new(),
+            attributes: decoded_attrs,
             dropped_attributes_count: dropped_attributes_count[i],
-            resource_attributes: Vec::<KeyValue>::new(),
+            resource_attributes: decoded_resource,
             trace_id: trace_id.as_ref().and_then(|c| c[i]),
             span_id: span_id.as_ref().and_then(|c| c[i]),
             flags: flags[i],

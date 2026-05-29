@@ -945,6 +945,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "opentelemetry-proto",
+ "serde_json",
 ]
 
 [[package]]

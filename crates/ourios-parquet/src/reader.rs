@@ -157,7 +157,7 @@ impl Reader {
             // `From<ArrowError> for ParquetError` lets us
             // route everything through the same variant.
             let batch = batch.map_err(|e| ReaderError::Parquet(e.into()))?;
-            let records = batch_to_mined_records(&batch)?;
+            let records = batch_to_mined_records(&batch, row_offset)?;
             if let Some(p) = &partition {
                 for (idx_in_batch, r) in records.iter().enumerate() {
                     validate_row_vs_partition(r, p, row_offset + idx_in_batch, &file_path)?;
@@ -309,7 +309,15 @@ fn validate_row_vs_partition(
 /// Convert one Arrow `RecordBatch` to a `Vec<MinedRecord>` per
 /// RFC 0005 §3.2. Handles the §3.9 "missing OPTIONAL column →
 /// `None`" rule by checking column presence before unpacking.
-fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, ReaderError> {
+fn batch_to_mined_records(
+    batch: &RecordBatch,
+    // File-global row offset of `batch`'s first row, threaded
+    // from the caller so per-row diagnostics report stable
+    // indices across multi-batch files. Per-batch
+    // `enumerate()` would reset to 0 every batch and produce
+    // ambiguous row numbers in `AttributeDecode` / similar.
+    row_offset: usize,
+) -> Result<Vec<MinedRecord>, ReaderError> {
     let n = batch.num_rows();
     let mut records: Vec<MinedRecord> = Vec::with_capacity(n);
 
@@ -356,7 +364,7 @@ fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, Reade
             ourios_core::otlp::canonical::decode_attributes(attrs_str.as_bytes()).map_err(
                 |source| ReaderError::AttributeDecode {
                     column: columns::ATTRIBUTES,
-                    row_index: i,
+                    row_index: row_offset + i,
                     source,
                 },
             )?
@@ -368,7 +376,7 @@ fn batch_to_mined_records(batch: &RecordBatch) -> Result<Vec<MinedRecord>, Reade
             ourios_core::otlp::canonical::decode_attributes(res_str.as_bytes()).map_err(
                 |source| ReaderError::AttributeDecode {
                     column: columns::RESOURCE_ATTRIBUTES,
-                    row_index: i,
+                    row_index: row_offset + i,
                     source,
                 },
             )?

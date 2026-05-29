@@ -15,17 +15,15 @@
 //! - **OTLP/JSON Lines** (`*.jsonl`, `*.json`) — RFC 0006 §3.1's
 //!   OTLP-LogsData migration. One OTLP `LogsData` per line
 //!   (the [OTel File Exporter] format the collector emits). Each
-//!   wire `LogRecord`'s envelope maps onto the [`OtlpLogRecord`]
-//!   per the RFC 0003 §6.6 shape for severity, scope, trace
-//!   context, and body. `attributes` and `resource_attributes`
-//!   are currently stripped (set to empty `Vec`s) pending the
-//!   RFC 0005 §3.3 `KeyValue` canonical-JSON encoder in the
-//!   Parquet writer — see `map_log_record`. `time_unix_nano` is
-//!   taken from the wire (file-static = run-reproducible).
-//!   String bodies become `Body::String`; any other `AnyValue`
-//!   becomes `Body::Structured` (though writing the structured
-//!   variant requires the same canonicalisation PR, so today's
-//!   committed CI fixture stays string-body-only).
+//!   wire `LogRecord`'s envelope maps 1:1 onto the
+//!   [`OtlpLogRecord`] per the RFC 0003 §6.6 shape — severity,
+//!   scope, attributes, resource attributes, trace context, body.
+//!   `time_unix_nano` is taken from the wire (file-static =
+//!   run-reproducible). String bodies become `Body::String`;
+//!   any other `AnyValue` becomes `Body::Structured`. The RFC
+//!   0005 §3.3 canonical-JSON writer (landed in PR #62) lets
+//!   the full envelope survive to disk; PR-K4's earlier strip
+//!   workaround is gone.
 //!
 //!   This is the path RFC 0003 §6.5 itself names as the MVP bench
 //!   route — "the MVP bench reads OTLP from the on-disk corpus,
@@ -66,7 +64,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, LogsData};
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
@@ -354,12 +352,12 @@ fn ingest_txt(
 /// `LogsData` via `serde_json::from_str` against the
 /// `opentelemetry-proto` types (with the `with-serde`
 /// feature). Walks `resource_logs[].scope_logs[].log_records[]`
-/// and emits one [`OtlpLogRecord`] per wire `LogRecord` per
-/// the RFC 0003 §6.6 in-memory shape — with the exception that
-/// `attributes` / `resource_attributes` are currently stripped
-/// (see `map_log_record`'s comment) until the RFC 0005 §3.3
-/// canonicalisation PR lands in the Parquet writer. Tenant is
-/// the bench default — multi-tenant corpora are a future RFC.
+/// and emits one [`OtlpLogRecord`] per wire `LogRecord` —
+/// envelope mapped 1:1 per the RFC 0003 §6.6 in-memory shape;
+/// the RFC 0005 §3.3 canonical-JSON writer landed in PR #62
+/// carries attributes and structured bodies through to disk.
+/// Tenant is the bench default — multi-tenant corpora are a
+/// future RFC.
 fn ingest_otlp_jsonl(
     path: &Path,
     lines: &mut Vec<OtlpLogRecord>,
@@ -387,18 +385,24 @@ fn ingest_otlp_jsonl(
             detail: format!("parse OTLP/JSON at {}:{}: {e}", path.display(), idx + 1),
         })?;
         for rl in logs_data.resource_logs {
-            // `rl.resource.attributes` would normally be copied
-            // onto every record in the group, but the bench
-            // currently strips both `attributes` and
-            // `resource_attributes` per the RFC 0005 §3.3
-            // KeyValue canonicalisation gap (see
-            // `map_log_record`). When that lands the resource
-            // attrs need re-introducing here as a per-group
-            // hoist.
+            // Resource attributes are copied onto every record
+            // in the `ResourceLogs` group per the
+            // `OtlpLogRecord` doc-comment ("inherited from
+            // `Resource.attributes` and copied onto every
+            // record under that `ResourceLogs` group"). Hoist
+            // the borrow once so the per-record map doesn't
+            // re-extract.
+            let resource_attrs: Vec<KeyValue> =
+                rl.resource.map(|r| r.attributes).unwrap_or_default();
             for sl in rl.scope_logs {
                 let scope = sl.scope;
                 for lr in sl.log_records {
-                    lines.push(map_log_record(tenant.clone(), scope.as_ref(), lr));
+                    lines.push(map_log_record(
+                        tenant.clone(),
+                        &resource_attrs,
+                        scope.as_ref(),
+                        lr,
+                    ));
                 }
             }
         }
@@ -406,13 +410,9 @@ fn ingest_otlp_jsonl(
     Ok(())
 }
 
-/// Map one wire `LogRecord` (plus its `InstrumentationScope`)
-/// into the [`OtlpLogRecord`] shape RFC 0003 §6.6 pins. The
-/// resource attributes hoisted by the caller would normally
-/// fan out per record (per the §6.6 contract) but are stripped
-/// alongside `log_record.attributes` until the RFC 0005 §3.3
-/// canonicalisation PR lands — see the comment in-body.
-/// Severity
+/// Map one wire `LogRecord` (plus its inherited resource
+/// attributes and `InstrumentationScope`) into the
+/// [`OtlpLogRecord`] shape RFC 0003 §6.6 pins. Severity
 /// clamps wire `i32` into the OTLP-defined `0..=24` band
 /// (`0` = UNSPECIFIED, `1..=24` = TRACE..FATAL with sub-
 /// levels), matching the receiver-boundary narrowing the
@@ -423,6 +423,7 @@ fn ingest_otlp_jsonl(
 /// whether the wire delivered `""` or omitted the field.
 fn map_log_record(
     tenant: TenantId,
+    resource_attrs: &[KeyValue],
     scope: Option<&InstrumentationScope>,
     lr: LogRecord,
 ) -> OtlpLogRecord {
@@ -435,22 +436,9 @@ fn map_log_record(
         severity_text: empty_to_none(lr.severity_text),
         scope_name: scope.and_then(|s| empty_to_none(s.name.clone())),
         scope_version: scope.and_then(|s| empty_to_none(s.version.clone())),
-        // `attributes` and `resource_attributes` are dropped
-        // until the RFC 0005 §3.3 KeyValue canonical-JSON
-        // encoding lands in the Parquet writer — non-empty
-        // `Vec<KeyValue>` columns are explicitly rejected
-        // today (see `ourios-parquet/src/record_batch.rs`,
-        // "canonical-JSON encoding of {count} KeyValue
-        // entries is deferred…"). Until then a 1:1 OTLP
-        // envelope mapping would crash the bench's writer on
-        // any record with even one attribute. Restore both
-        // assignments to `lr.attributes` /
-        // `resource_attrs.to_vec()` once canonicalisation
-        // lands; the loader test pins the current strip so
-        // that change forces the test to update.
-        attributes: Vec::new(),
+        attributes: lr.attributes,
         dropped_attributes_count: lr.dropped_attributes_count,
-        resource_attributes: Vec::new(),
+        resource_attributes: resource_attrs.to_vec(),
         // Trace / span ids are wire-typed as `Vec<u8>` but
         // OTLP fixes their length (16 / 8 bytes). Reject any
         // other length to `None` rather than panicking — a
@@ -639,11 +627,10 @@ mod tests {
         assert_eq!(load.total_files, 1, "the sample dir has one .jsonl file");
         assert_eq!(
             load.lines.len(),
-            3,
-            "2 LogsData lines × (1 + 2) records = 3 — the kvlistValue\
-             record lives in `structured_body_maps_to_body_structured` \
-             instead so the committed fixture stays Parquet-writable \
-             (RFC 0005 §3.3 canonicalisation pending)",
+            4,
+            "3 LogsData lines × (1 + 2 + 1) records = 4 — the kvlistValue \
+             record is back now that RFC 0005 §3.3 canonicalisation (PR #62) \
+             carries structured bodies through to disk",
         );
         assert!(load.raw_bytes > 0, "raw_bytes counts the .jsonl file size");
 
@@ -659,68 +646,41 @@ mod tests {
         assert_eq!(first.scope_name.as_deref(), Some("bench.scope"));
         assert_eq!(first.scope_version.as_deref(), Some("1.0.0"));
         assert_eq!(first.flags, 1);
-        // `attributes` and `resource_attributes` are pinned
-        // empty — the loader currently strips them per the
-        // RFC 0005 §3.3 KeyValue canonicalisation gap (see
-        // `map_log_record`'s comment). The wire delivers
-        // `user.id=42` on this record + service.name /
-        // host.name on the resource; both round to `[]` until
-        // canonicalisation lands and we revert the strip.
-        // Pinning the strip here means the revert PR has to
-        // update this test, closing the loop.
-        assert!(first.attributes.is_empty());
-        assert!(first.resource_attributes.is_empty());
+        assert_eq!(first.attributes.len(), 1, "one log attribute on record 0");
+        assert_eq!(
+            first.resource_attributes.len(),
+            2,
+            "two resource attributes (service.name + host.name)",
+        );
         assert_eq!(
             line_bytes(first),
             Some("user 42 logged in".as_bytes()),
             "Body::String unwraps to the wire string",
         );
 
-        // Second LogsData has 2 records — both should land
-        // with the same stripped envelope.
+        // Second LogsData has 2 records — both should land,
+        // sharing the resource attribute (only service.name on
+        // that line).
         let second = &load.lines[1];
         assert_eq!(second.severity_number, 13, "WARN");
         assert_eq!(line_bytes(second), Some("slow query: 1843ms".as_bytes()));
-        assert!(second.resource_attributes.is_empty());
+        assert_eq!(second.resource_attributes.len(), 1);
         let third = &load.lines[2];
         assert_eq!(third.severity_number, 17, "ERROR");
         assert_eq!(line_bytes(third), Some("connection refused".as_bytes()));
     }
 
-    /// `body.kvlistValue` (and anything that isn't
-    /// `stringValue`) stays on the record as
-    /// `Body::Structured(AnyValue)`, **not** flattened to text
-    /// or dropped. Per RFC 0003 §6.4 the receiver hands the
-    /// miner the decoded `AnyValue` verbatim; canonicalisation
-    /// is the storage layer's job at write time. `line_bytes`
-    /// returns `None` on these records (C1's denominator
-    /// excludes them — see `c1::record`).
-    ///
-    /// Uses an inline-synthetic fixture rather than the
-    /// committed `sample.jsonl` because the bench's downstream
-    /// Parquet writer can't yet *serialise* `Body::Structured`
-    /// rows (the same RFC 0005 §3.3 canonicalisation gap that
-    /// blocks `attributes`). Keeping the structured-mapping
-    /// coverage inline lets the committed fixture stay
-    /// end-to-end-Parquet-writable for CI workflow runs.
+    /// `body.kvlistValue` (and anything that isn't `stringValue`)
+    /// stays on the record as `Body::Structured(AnyValue)`,
+    /// **not** flattened to text or dropped. Per RFC 0003 §6.4
+    /// the receiver hands the miner the decoded `AnyValue`
+    /// verbatim; the storage layer canonicalises at write
+    /// time. `line_bytes` returns `None` on these records
+    /// (C1's denominator excludes them — see `c1::record`).
     #[test]
     fn otlp_structured_body_maps_to_body_structured() {
-        use std::io::Write;
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let path = tmp.path().join("structured.jsonl");
-        let mut file = std::fs::File::create(&path).expect("create");
-        file.write_all(
-            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
-              [{\"timeUnixNano\":\"1775127483000000000\",\
-              \"severityNumber\":9,\"severityText\":\"INFO\",\
-              \"body\":{\"kvlistValue\":{\"values\":\
-              [{\"key\":\"event\",\"value\":{\"stringValue\":\"startup\"}}]}}}]}]}]}\n",
-        )
-        .expect("write");
-        drop(file);
-
-        let load = load(tmp.path()).expect("sample loads");
-        let structured = &load.lines[0];
+        let load = load(&otlp_sample_dir()).expect("sample loads");
+        let structured = &load.lines[3];
         assert!(
             matches!(structured.body, Some(Body::Structured(_))),
             "kvlistValue body must round-trip as Body::Structured, got {:?}",

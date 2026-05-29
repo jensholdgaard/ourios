@@ -5,14 +5,18 @@ name: Bench
 # for now — the bench is too slow / hardware-dependent for the
 # per-PR loop, so it isn't wired to `push` / `pull_request`.
 #
-# This first version runs against the committed seed corpus
-# (`testdata/corpus/`, ~tens of lines) to establish the
-# build → run → artifact → summary pipeline. The numbers are
-# **indicative only**: a hosted runner is not the `docs/benchmarks.md`
-# §1 hardware baseline, and the seed corpus is far too small to be
-# representative (A1 is *expected* to FAIL on it — Parquet footer /
-# dictionary overhead dwarfs a few KB of data). A follow-up wires in
-# a large, representative corpus. The workflow uploads the results
+# The `corpus_dir` input selects which directory the loader
+# walks. It defaults to the committed seed (`testdata/corpus/`,
+# ~tens of lines, plain text); operators can point it at the
+# committed OTLP fixture (`crates/ourios-bench/tests/data/otlp`,
+# exercising the PR-K2 loader path) or a future representative
+# corpus. Whichever corpus a run picks, the numbers are
+# **indicative only**: a hosted runner is not the
+# `docs/benchmarks.md` §1 hardware baseline, so results aren't
+# authoritative regardless of corpus size. The default seed is
+# additionally far too small to be representative (A1 is
+# *expected* to FAIL on it — Parquet footer / dictionary overhead
+# dwarfs a few KB of data). The workflow uploads the results
 # JSON as an artifact and never commits `docs/benchmarks.md` §9 —
 # landing authoritative numbers stays a deliberate act.
 

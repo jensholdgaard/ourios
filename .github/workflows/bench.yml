@@ -5,20 +5,35 @@ name: Bench
 # for now — the bench is too slow / hardware-dependent for the
 # per-PR loop, so it isn't wired to `push` / `pull_request`.
 #
-# This first version runs against the committed seed corpus
-# (`testdata/corpus/`, ~tens of lines) to establish the
-# build → run → artifact → summary pipeline. The numbers are
-# **indicative only**: a hosted runner is not the `docs/benchmarks.md`
-# §1 hardware baseline, and the seed corpus is far too small to be
-# representative (A1 is *expected* to FAIL on it — Parquet footer /
-# dictionary overhead dwarfs a few KB of data). A follow-up wires in
-# a large, representative corpus. The workflow uploads the results
+# The `corpus_dir` input selects which directory the loader
+# walks. It defaults to the committed seed (`testdata/corpus/`,
+# ~tens of lines, plain text); operators can point it at the
+# committed OTLP fixture (`crates/ourios-bench/tests/data/otlp`,
+# exercising the PR-K2 loader path) or a future representative
+# corpus. Whichever corpus a run picks, the numbers are
+# **indicative only**: a hosted runner is not the
+# `docs/benchmarks.md` §1 hardware baseline, so results aren't
+# authoritative regardless of corpus size. The default seed is
+# additionally far too small to be representative (A1 is
+# *expected* to FAIL on it — Parquet footer / dictionary overhead
+# dwarfs a few KB of data). The workflow uploads the results
 # JSON as an artifact and never commits `docs/benchmarks.md` §9 —
 # landing authoritative numbers stays a deliberate act.
 
 on:
   workflow_dispatch:
     inputs:
+      corpus_dir:
+        # Default matches the historical workflow behaviour
+        # (the committed seed text corpus). The PR-K2 OTLP
+        # loader added `*.jsonl` / `*.json` dispatch in
+        # `corpus::walk`, so an operator can point this at
+        # e.g. `crates/ourios-bench/tests/data/otlp` to
+        # exercise the OTLP path in CI without any external
+        # tooling, or at any future representative corpus.
+        description: Corpus directory (defaults to the committed seed)
+        default: testdata/corpus
+        required: false
       gates:
         description: Comma-separated gates to run (a1,c1,c2)
         default: a1,c1,c2
@@ -64,10 +79,11 @@ jobs:
         env:
           BENCH_GATES: ${{ inputs.gates }}
           BENCH_HARDWARE: ${{ inputs.hardware_kind }}
+          BENCH_CORPUS: ${{ inputs.corpus_dir }}
         run: |
           set -euo pipefail
           ./target/release/ourios-bench \
-            --corpus testdata/corpus \
+            --corpus "$BENCH_CORPUS" \
             --gates "$BENCH_GATES" \
             --hardware-kind "$BENCH_HARDWARE" \
             --results-dir bench-results \
@@ -76,17 +92,22 @@ jobs:
       - name: Write job summary
         if: always()
         shell: bash
+        env:
+          BENCH_CORPUS: ${{ inputs.corpus_dir }}
         run: |
           {
             echo '## ourios-bench — thesis-gate results'
+            echo
+            echo "Corpus: \`${BENCH_CORPUS}\`"
             echo
             echo '```'
             cat bench-summary.txt 2>/dev/null || echo '(no summary — the run failed before producing one)'
             echo '```'
             echo
-            echo '> **Indicative only.** Seed corpus (`testdata/corpus/`) on a hosted runner —'
-            echo '> not the `docs/benchmarks.md` §1 hardware baseline, and far too small to be'
-            echo '> representative. A1 is expected to FAIL here (Parquet overhead dominates a'
+            echo '> **Indicative only.** A hosted runner is not the `docs/benchmarks.md` §1'
+            echo '> hardware baseline; results are not authoritative regardless of corpus size.'
+            echo '> The default seed corpus (`testdata/corpus/`) is also far too small to be'
+            echo '> representative — A1 is expected to FAIL there (Parquet overhead dominates a'
             echo '> few KB of data). Real numbers need a representative corpus + baseline hardware.'
           } >> "$GITHUB_STEP_SUMMARY"
 

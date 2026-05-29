@@ -353,8 +353,13 @@ mod tests {
             flags: 0,
             event_name: None,
             body_kind: BodyKind::Structured,
+            // Per `MinedRecord::separators` doc (and
+            // `params`): both Vecs are empty for non-`String`
+            // body kinds. Preserve that invariant on this
+            // hand-built fixture so the test doesn't assert
+            // against an impossible-to-emit record.
             params: Vec::new(),
-            separators: vec![String::new()],
+            separators: Vec::new(),
             body: None,
             confidence: 1.0,
             lossy_flag: false,

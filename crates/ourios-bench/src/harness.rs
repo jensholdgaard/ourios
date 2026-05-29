@@ -311,6 +311,67 @@ mod tests {
         );
     }
 
+    /// `BodyKind::Structured` records reach the harness without
+    /// triggering the `templates_for()` contract violation that
+    /// the pre-fix path raised, AND the callback receives
+    /// `snapshot = None` for them. End-to-end coverage of the
+    /// production `BodyKind::String` guard the OTLP fixture
+    /// surfaced — uses a synthetic OTLP/JSONL fixture with one
+    /// `stringValue` body and one `kvlistValue` body so the
+    /// harness exercises both the captured-snapshot and the
+    /// skip-snapshot paths in one run.
+    #[test]
+    fn structured_body_record_skips_snapshot_lookup_without_error() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("structured.jsonl");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // Two LogsData lines: a string-body record (normal
+        // template path) and a kvlist-body record (sentinel
+        // template id — the path that pre-fix crashed).
+        file.write_all(
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"timeUnixNano\":\"1775127480000000000\",\
+              \"severityNumber\":9,\
+              \"body\":{\"stringValue\":\"user 1 logged in\"}}]}]}]}\n\
+              {\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"timeUnixNano\":\"1775127481000000000\",\
+              \"severityNumber\":9,\
+              \"body\":{\"kvlistValue\":{\"values\":\
+              [{\"key\":\"event\",\"value\":{\"stringValue\":\"startup\"}}]}}}]}]}]}\n",
+        )
+        .expect("write");
+        drop(file);
+        let load = corpus::load(tmp.path()).expect("OTLP fixture loads");
+
+        let mut snapshots_present = 0usize;
+        let mut snapshots_absent = 0usize;
+        let mut structured_seen = 0usize;
+        run(&load, false, |_input, record, snap| {
+            if matches!(record.body_kind, BodyKind::Structured) {
+                structured_seen += 1;
+                assert!(
+                    snap.is_none(),
+                    "structured records must receive snapshot = None — the harness must skip the sentinel-id `templates_for()` lookup",
+                );
+            }
+            if snap.is_some() {
+                snapshots_present += 1;
+            } else {
+                snapshots_absent += 1;
+            }
+        })
+        .expect("harness must not raise the pre-fix contract violation on structured bodies");
+        assert_eq!(structured_seen, 1, "exactly one structured-body record");
+        assert!(
+            snapshots_present >= 1,
+            "the string-body record gets a snapshot"
+        );
+        assert!(
+            snapshots_absent >= 1,
+            "the structured-body record's `None` is counted"
+        );
+    }
+
     /// A snapshot is captured at most once per unique
     /// `(template_id, template_version)` — re-emitting the
     /// same template (the steady-state common case) reuses the

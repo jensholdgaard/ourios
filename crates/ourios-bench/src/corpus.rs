@@ -354,10 +354,12 @@ fn ingest_txt(
 /// `LogsData` via `serde_json::from_str` against the
 /// `opentelemetry-proto` types (with the `with-serde`
 /// feature). Walks `resource_logs[].scope_logs[].log_records[]`
-/// and emits one [`OtlpLogRecord`] per wire `LogRecord`, with
-/// the envelope mapped 1:1 per the RFC 0003 §6.6 in-memory
-/// shape. Tenant is the bench default — multi-tenant corpora
-/// are a future RFC.
+/// and emits one [`OtlpLogRecord`] per wire `LogRecord` per
+/// the RFC 0003 §6.6 in-memory shape — with the exception that
+/// `attributes` / `resource_attributes` are currently stripped
+/// (see `map_log_record`'s comment) until the RFC 0005 §3.3
+/// canonicalisation PR lands in the Parquet writer. Tenant is
+/// the bench default — multi-tenant corpora are a future RFC.
 fn ingest_otlp_jsonl(
     path: &Path,
     lines: &mut Vec<OtlpLogRecord>,

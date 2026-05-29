@@ -190,6 +190,249 @@ impl Body {
     }
 }
 
+/// RFC 0005 §3.3 OTLP-canonical-JSON encoding for the columns
+/// the writer stores as `BYTE_ARRAY`: `attributes`,
+/// `resource_attributes`, and the `body` column for
+/// `body_kind = Structured`.
+///
+/// The "canonical" rule is the proto3 JSON mapping plus OTLP's
+/// specific overrides (camelCase fields, `string`-encoded
+/// `uint64`s, base64 for `bytes`, etc.). The
+/// `opentelemetry-proto` crate's `with-serde` feature already
+/// implements that spec on its proto types — these helpers are
+/// thin wrappers so callers don't reach for `serde_json`
+/// directly and the spec mapping stays single-sourced through
+/// `opentelemetry-proto`. The same pattern rotel's OTLP HTTP
+/// receiver uses on `ExportLogsServiceRequest`.
+///
+/// Encoders are stable per-`AnyValue`-tree: serde derives have
+/// a fixed field order and `serde_json` is deterministic, so
+/// re-encoding the same in-memory tree produces byte-identical
+/// output across runs — required by RFC0006.7 reproducibility.
+///
+/// **Note on "canonical".** RFC 0005 §3.3 uses "canonical" to
+/// mean "the single normative encoding the writer / reader
+/// agree on," **not** the RFC 8785 canonical-JSON form (sorted
+/// keys, normalised numbers). The two are compatible for our
+/// purposes because struct field order is fixed by proto and
+/// the encode → store → decode round-trip is asserted at the
+/// `AnyValue` / `Vec<KeyValue>` level (not on bytes).
+pub mod canonical {
+    use super::{AnyValue, KeyValue};
+
+    /// Error returned by the canonical encoders / decoders.
+    /// Encoders are infallible in practice on values the
+    /// receiver produces; the `Encode` arm survives for
+    /// pathological inputs (e.g. a `DoubleValue` carrying
+    /// `f64::NAN` — proto allows it, `serde_json` rejects it).
+    /// Decoders fan in malformed-bytes errors from disk.
+    #[derive(Debug)]
+    pub enum CanonicalJsonError {
+        Encode(serde_json::Error),
+        Decode(serde_json::Error),
+    }
+
+    impl core::fmt::Display for CanonicalJsonError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Encode(e) => write!(f, "OTLP-canonical JSON encode: {e}"),
+                Self::Decode(e) => write!(f, "OTLP-canonical JSON decode: {e}"),
+            }
+        }
+    }
+
+    impl std::error::Error for CanonicalJsonError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Encode(e) | Self::Decode(e) => Some(e),
+            }
+        }
+    }
+
+    /// Encode one `AnyValue` to its OTLP-canonical JSON bytes.
+    /// Used by the writer / miner for `body_kind = Structured`
+    /// rows (the `body` column stores these bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`CanonicalJsonError::Encode`] on pathological inputs the
+    /// receiver should narrow at wire-decode (e.g. a
+    /// `DoubleValue` carrying `f64::NAN`).
+    pub fn encode_any_value(value: &AnyValue) -> Result<Vec<u8>, CanonicalJsonError> {
+        serde_json::to_vec(value).map_err(CanonicalJsonError::Encode)
+    }
+
+    /// Inverse of [`encode_any_value`]. Used by the reader to
+    /// recover the structured `AnyValue` from its stored bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`CanonicalJsonError::Decode`] on malformed bytes (file
+    /// corruption or a foreign producer that doesn't honour the
+    /// §3.3 spec).
+    pub fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, CanonicalJsonError> {
+        serde_json::from_slice(bytes).map_err(CanonicalJsonError::Decode)
+    }
+
+    /// Encode a `Vec<KeyValue>` (the in-memory shape of
+    /// `attributes` / `resource_attributes`) to its
+    /// OTLP-canonical JSON bytes. Stored verbatim in the
+    /// matching `BYTE_ARRAY` column by the writer.
+    ///
+    /// # Errors
+    ///
+    /// [`CanonicalJsonError::Encode`] under the same conditions
+    /// as [`encode_any_value`] — a `KeyValue.value`'s underlying
+    /// `AnyValue` rejecting JSON serialisation.
+    pub fn encode_attributes(attrs: &[KeyValue]) -> Result<Vec<u8>, CanonicalJsonError> {
+        serde_json::to_vec(attrs).map_err(CanonicalJsonError::Encode)
+    }
+
+    /// Inverse of [`encode_attributes`]. The reader uses this
+    /// to recover the `Vec<KeyValue>` from a non-empty stored
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// [`CanonicalJsonError::Decode`] on malformed bytes.
+    pub fn decode_attributes(bytes: &[u8]) -> Result<Vec<KeyValue>, CanonicalJsonError> {
+        serde_json::from_slice(bytes).map_err(CanonicalJsonError::Decode)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::otlp::any_value;
+
+        fn string_av(s: &str) -> AnyValue {
+            AnyValue {
+                value: Some(any_value::Value::StringValue(s.to_string())),
+            }
+        }
+
+        fn int_av(n: i64) -> AnyValue {
+            AnyValue {
+                value: Some(any_value::Value::IntValue(n)),
+            }
+        }
+
+        /// Encode → decode round-trips an `AnyValue` for every
+        /// `Value` variant the receiver might hand the storage
+        /// layer. The serde derives are spec-compliant; this
+        /// pins the round-trip property the §3.3 reconstruction
+        /// guarantee depends on.
+        #[test]
+        fn any_value_round_trips_across_variants() {
+            for av in [
+                string_av("hello world"),
+                int_av(-42),
+                AnyValue {
+                    value: Some(any_value::Value::DoubleValue(2.71_f64)),
+                },
+                AnyValue {
+                    value: Some(any_value::Value::BoolValue(true)),
+                },
+                AnyValue {
+                    value: Some(any_value::Value::BytesValue(b"raw\x00bytes".to_vec())),
+                },
+                AnyValue {
+                    value: Some(any_value::Value::ArrayValue(
+                        opentelemetry_proto::tonic::common::v1::ArrayValue {
+                            values: vec![string_av("a"), int_av(1)],
+                        },
+                    )),
+                },
+                AnyValue {
+                    value: Some(any_value::Value::KvlistValue(
+                        opentelemetry_proto::tonic::common::v1::KeyValueList {
+                            values: vec![KeyValue {
+                                key: "k".to_string(),
+                                value: Some(string_av("v")),
+                                ..Default::default()
+                            }],
+                        },
+                    )),
+                },
+            ] {
+                let bytes = encode_any_value(&av).expect("encode");
+                let back = decode_any_value(&bytes).expect("decode");
+                assert_eq!(
+                    av,
+                    back,
+                    "round-trip failed for {av:?}; bytes = {}",
+                    String::from_utf8_lossy(&bytes),
+                );
+            }
+        }
+
+        /// `Vec<KeyValue>` round-trips at the
+        /// `attributes` / `resource_attributes` column boundary.
+        #[test]
+        fn attributes_round_trip() {
+            let attrs = vec![
+                KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(string_av("bench-app")),
+                    ..Default::default()
+                },
+                KeyValue {
+                    key: "user.id".to_string(),
+                    value: Some(int_av(42)),
+                    ..Default::default()
+                },
+            ];
+            let bytes = encode_attributes(&attrs).expect("encode");
+            let back = decode_attributes(&bytes).expect("decode");
+            assert_eq!(attrs, back);
+        }
+
+        /// Re-encoding the same in-memory tree must produce
+        /// byte-identical bytes — RFC0006.7's reproducibility
+        /// requirement carries through the canonicalisation
+        /// boundary.
+        #[test]
+        fn encoder_is_deterministic_across_calls() {
+            let av = AnyValue {
+                value: Some(any_value::Value::KvlistValue(
+                    opentelemetry_proto::tonic::common::v1::KeyValueList {
+                        values: vec![
+                            KeyValue {
+                                key: "alpha".to_string(),
+                                value: Some(int_av(1)),
+                                ..Default::default()
+                            },
+                            KeyValue {
+                                key: "beta".to_string(),
+                                value: Some(string_av("two")),
+                                ..Default::default()
+                            },
+                        ],
+                    },
+                )),
+            };
+            let a = encode_any_value(&av).expect("first encode");
+            let b = encode_any_value(&av).expect("second encode");
+            assert_eq!(
+                a, b,
+                "encoder must be byte-deterministic for the same input"
+            );
+        }
+
+        /// Empty attribute lists encode to a sentinel that
+        /// decodes back to an empty `Vec`. The writer special-
+        /// cases the empty case (no row-level allocation), but
+        /// the helper itself round-trips on the trivial input
+        /// for symmetry.
+        #[test]
+        fn empty_attributes_round_trip() {
+            let bytes = encode_attributes(&[]).expect("encode");
+            assert_eq!(bytes, b"[]");
+            let back = decode_attributes(&bytes).expect("decode");
+            assert!(back.is_empty());
+        }
+    }
+}
+
 impl Default for TenantId {
     /// Empty-tenant default exists so `OtlpLogRecord::default()`
     /// works in tests; production receivers always derive a

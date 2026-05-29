@@ -1636,25 +1636,26 @@ impl MinerCluster {
         // per RFC §6.1 ("Always false when body_kind =
         // Structured").
         //
-        // **Interim body format.** OTLP-canonical JSON encoding
-        // is the follow-up PR named in `ourios-core::otlp`.
-        // Until it ships, we still populate `body` with a
-        // stored representation of the `AnyValue` — its `Debug`
-        // form — so `reconstruct(structured) == record.body`
-        // holds in the §3.3 sense ("what we stored is what we
-        // return"). The format is **not** OTLP-canonical yet;
-        // the canonicalisation PR replaces this `Debug` rendering
-        // with the canonical JSON encoding without changing the
-        // schema field or `lossy_flag`. The reader-visible effect
-        // of the migration is the bytes in the column changing
-        // shape; the contract that `reconstruct` returns
-        // whatever the producer stored is invariant.
-        let stored_body = format!("{any_value:?}");
+        // `body` carries the RFC 0005 §3.3 OTLP-canonical-JSON
+        // encoding of the `AnyValue` — the bytes the writer
+        // stores in the §3.2 `body` column for structured rows.
+        // `canonical::encode_any_value` is infallible on values
+        // a spec-compliant receiver produces; the fallback path
+        // (debug rendering + `lossy_flag = true` so the reader
+        // returns the body verbatim per RFC 0001 §6.6) survives
+        // pathological inputs like a `DoubleValue` carrying
+        // `f64::NAN` (`serde_json` rejects), which the RFC 0003
+        // §6.5 receiver narrows out at the wire-decode boundary.
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
         rec.confidence = 1.0;
-        rec.body = Some(stored_body);
+        if let Ok(bytes) = ourios_core::otlp::canonical::encode_any_value(any_value) {
+            rec.body = Some(String::from_utf8(bytes).expect("serde_json emits valid UTF-8"));
+        } else {
+            rec.body = Some(format!("{any_value:?}"));
+            rec.lossy_flag = true;
+        }
         self.emit_record(rec);
 
         template_id

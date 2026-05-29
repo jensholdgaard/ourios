@@ -7,20 +7,20 @@
 //! the declared schema.
 //!
 //! **`AnyValue` → canonical JSON.** RFC 0005 §3.3 mandates
-//! OTLP-canonical JSON for the `attributes`, `resource_attributes`,
-//! and (when `body_kind = Structured`) `body` columns. The
-//! current builder handles **only the empty case** for the
-//! `KeyValue` lists — it emits the literal `"[]"` directly into
-//! the column (the RFC 0005 §3.2 `Vec::new()` ↔ `[]` rule) — and
-//! returns [`BatchError::AttributesNotYetEncoded`] on any
-//! non-empty input. Corpus / bench inputs today carry empty
-//! attributes; the RFC 0003 receiver is what populates them, and
-//! the canonicalisation PR named in the PR-E1 breadcrumb on
-//! [`ourios_core::otlp::Body::Structured`] is the one that fills
-//! in the proto3-JSON-with-OTLP-overrides encoder. Surfacing a
-//! structured error rather than panicking (or emitting non-JSON
-//! `Debug` bytes masquerading as JSON) lets the writer fail a
-//! batch gracefully without crashing the ingest process.
+//! OTLP-canonical JSON for the `attributes`,
+//! `resource_attributes`, and (when `body_kind = Structured`)
+//! `body` columns. Encoding goes through
+//! [`ourios_core::otlp::canonical`], which wraps
+//! `opentelemetry-proto`'s `with-serde` derives — the same spec
+//! mapping rotel's OTLP HTTP receiver uses on
+//! `ExportLogsServiceRequest`. The empty `Vec::new()` case
+//! still short-circuits to the literal `"[]"` (the RFC 0005 §3.2
+//! `Vec::new()` ↔ `[]` rule, no per-row encoder allocation on
+//! the clean-attach hot path); non-empty inputs go through
+//! `canonical::encode_attributes`. For `body_kind = Structured`
+//! rows, the miner's `ingest_structured` has already encoded
+//! the body into the canonical bytes (`MinedRecord.body` carries
+//! the bytes verbatim), so the writer just appends them.
 
 use std::fmt;
 use std::sync::Arc;
@@ -70,12 +70,20 @@ pub enum BatchError {
     TimestampOverflow { field: &'static str, value: u64 },
     /// A record carried a non-empty `attributes` or
     /// `resource_attributes` `Vec<KeyValue>`. The canonical-JSON
-    /// encoder is deferred to the RFC 0005 §3.3 canonicalisation
-    /// PR (see the PR-E1 breadcrumb on
-    /// [`ourios_core::otlp::Body::Structured`]); until then the
-    /// writer returns this error rather than crashing the ingest
-    /// process. Carries the column name and entry count.
-    AttributesNotYetEncoded { column: &'static str, count: usize },
+    /// An `attributes` / `resource_attributes` `Vec<KeyValue>`
+    /// failed RFC 0005 §3.3 canonical-JSON encoding. The
+    /// canonical encoder (`ourios_core::otlp::canonical::
+    /// encode_attributes`) is infallible on spec-compliant
+    /// inputs; this variant survives pathological cases the
+    /// receiver should narrow at the wire-decode boundary (e.g.
+    /// a `DoubleValue` carrying `f64::NAN`, which `serde_json`
+    /// rejects). Carries the column name, entry count, and the
+    /// underlying serde error.
+    AttributeEncode {
+        column: &'static str,
+        count: usize,
+        source: ourios_core::otlp::canonical::CanonicalJsonError,
+    },
     /// A record carried [`BodyKind::Absent`] (the in-memory
     /// "wire delivered no body" variant). RFC 0005 §3.2's
     /// `body_kind` column pins exactly two ordinals (`0 = String,
@@ -86,19 +94,6 @@ pub enum BatchError {
     /// rejects these records rather than corrupting the
     /// `body_kind` semantics.
     UnsupportedAbsentBody,
-    /// A record carried `body_kind = Structured`. RFC 0005 §3.3
-    /// requires the `body` column for these rows to hold
-    /// OTLP-canonical JSON, but the miner today populates
-    /// `MinedRecord.body` with an interim `Debug` rendering
-    /// (see the PR-E1 breadcrumb on
-    /// [`ourios_core::otlp::Body::Structured`]). Writing the
-    /// interim bytes would silently store non-canonical /
-    /// non-JSON content into a §3.3-governed column. Symmetric
-    /// to [`Self::AttributesNotYetEncoded`]: the writer fails
-    /// the batch until the canonicalisation PR replaces the
-    /// miner's `format!("{any_value:?}")` call site with a real
-    /// proto3-JSON-with-OTLP-overrides encoder.
-    StructuredBodyNotYetCanonical,
     /// A clean-attach `body_kind = String` record had too few
     /// `separators` entries to satisfy the RFC 0005 §3.2
     /// invariant ("`tokens.len() + 1` elements when
@@ -138,11 +133,15 @@ impl fmt::Display for BatchError {
                 f,
                 "{field} = {value} exceeds i64::MAX (RFC 0005 §3.2 u64→i64 overflow contract)",
             ),
-            Self::AttributesNotYetEncoded { column, count } => write!(
+            Self::AttributeEncode {
+                column,
+                count,
+                source,
+            } => write!(
                 f,
-                "{column}: canonical-JSON encoding of {count} KeyValue entries is deferred to \
-                 the RFC 0005 §3.3 canonicalisation PR (corpus / bench inputs today carry \
-                 empty attributes; the RFC 0003 receiver is what populates them)",
+                "{column}: RFC 0005 §3.3 canonical-JSON encode of {count} KeyValue entries \
+                 failed: {source} (the encoder is infallible on receiver-narrowed inputs; \
+                 this surfaces a wire-decode bug — e.g. an `f64::NAN` in a `DoubleValue`)",
             ),
             Self::UnsupportedAbsentBody => write!(
                 f,
@@ -150,14 +149,6 @@ impl fmt::Display for BatchError {
                  body_kind column does not yet encode (the column pins ordinals 0=String, \
                  1=Structured); a future RFC 0005 amendment is required to represent this \
                  in the schema",
-            ),
-            Self::StructuredBodyNotYetCanonical => write!(
-                f,
-                "record carries body_kind = Structured but the body column would receive the \
-                 miner's interim Debug rendering rather than RFC 0005 §3.3's OTLP-canonical \
-                 JSON; the canonicalisation PR (see PR-E1 breadcrumb on \
-                 ourios_core::otlp::Body::Structured) must land before structured rows can \
-                 be written",
             ),
             Self::InvalidSeparatorsForString {
                 expected_at_least,
@@ -185,11 +176,10 @@ impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TimestampOverflow { .. }
-            | Self::AttributesNotYetEncoded { .. }
             | Self::UnsupportedAbsentBody
-            | Self::StructuredBodyNotYetCanonical
             | Self::InvalidSeparatorsForString { .. }
             | Self::MissingBodyForLossyString => None,
+            Self::AttributeEncode { source, .. } => Some(source),
             Self::Arrow(e) => Some(e),
         }
     }
@@ -333,18 +323,16 @@ impl Builders {
         append_option_str(&mut self.event_name, r.event_name.as_deref());
 
         self.body_kind.append_value(body_kind_ordinal(r.body_kind)?);
-        // RFC 0005 §3.3: when `body_kind = Structured`, the body
-        // column carries OTLP-canonical JSON. The miner today
-        // populates `body` with `format!("{any_value:?}")` per
-        // the PR-E1 breadcrumb on `ourios_core::otlp::Body::
-        // Structured` — that's *not* canonical JSON, so writing
-        // it would store non-conforming bytes for a §3.3-
-        // governed column. Reject these records until the
-        // canonicalisation PR lands (symmetric to the
-        // `AttributesNotYetEncoded` deferral above).
-        if r.body_kind == BodyKind::Structured {
-            return Err(BatchError::StructuredBodyNotYetCanonical);
-        }
+        // RFC 0005 §3.3: when `body_kind = Structured`, the
+        // body column carries OTLP-canonical JSON — the bytes
+        // the miner has already encoded via
+        // `ourios_core::otlp::canonical::encode_any_value` (the
+        // miner's `ingest_structured` writes them into
+        // `MinedRecord.body` directly, so the writer just
+        // appends them verbatim). For `String` rows, the body
+        // is the retained line bytes on the §6.6 lossy path
+        // (or `None` on the clean-attach path, reconstructed
+        // from `template + params + separators` by the reader).
         match r.body.as_deref() {
             Some(s) => self.body.append_value(s.as_bytes()),
             None => self.body.append_null(),
@@ -504,18 +492,15 @@ fn append_separators(builder: &mut GenericListBuilder<i32, BinaryBuilder>, separ
 /// - Empty input → appends the literal `"[]"` directly into the
 ///   builder (RFC 0005 §3.2's `Vec::new()` ↔ `[]` round-trip
 ///   rule). The `&'static str` argument means no per-row `String`
-///   allocation — important on the hot path where corpus / bench
-///   inputs today carry empty attributes for every record.
-/// - Non-empty input → returns
-///   [`BatchError::AttributesNotYetEncoded`] so the writer fails
-///   the batch gracefully rather than crashing the ingest process.
-///   The original cut emitted `format!("{attrs:?}")` (Rust `Debug`
-///   rendering) which is *not* valid JSON; the structured error
-///   surfaces the gap loudly without inviting downstream code to
-///   silently store non-JSON masquerading as JSON. RFC 0005 §3.3
-///   names the normative encoding (proto3 JSON with OTLP
-///   overrides); implementing it is the canonicalisation PR's
-///   job.
+///   allocation — important on the hot path where the empty
+///   case is the common one for clean-attach text rows.
+/// - Non-empty input → encoded via
+///   [`ourios_core::otlp::canonical::encode_attributes`] (the
+///   RFC 0005 §3.3 spec mapping, single-sourced through
+///   `opentelemetry-proto`'s `with-serde` derives). Encode
+///   failures (pathological inputs like a non-finite double
+///   that the wire-decode receiver doesn't pre-filter) surface
+///   as [`BatchError::AttributeEncode`].
 fn append_attributes(
     b: &mut StringBuilder,
     column: &'static str,
@@ -525,10 +510,20 @@ fn append_attributes(
         b.append_value("[]");
         return Ok(());
     }
-    Err(BatchError::AttributesNotYetEncoded {
-        column,
-        count: attrs.len(),
-    })
+    let bytes = ourios_core::otlp::canonical::encode_attributes(attrs).map_err(|source| {
+        BatchError::AttributeEncode {
+            column,
+            count: attrs.len(),
+            source,
+        }
+    })?;
+    // `serde_json` emits valid UTF-8 by construction (Rust
+    // strings → JSON), so the `from_utf8` is infallible —
+    // `expect` documents the invariant rather than hiding it
+    // behind a `_ = ...` discard.
+    let as_str = std::str::from_utf8(&bytes).expect("serde_json output is valid UTF-8");
+    b.append_value(as_str);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -572,9 +567,10 @@ mod tests {
         }
     }
 
-    /// Sanity: the empty-attributes path serialises to literal `[]`
-    /// (the §3.2 `Vec::new()` ↔ `[]` round-trip rule) and does not
-    /// hit the `AttributesNotYetEncoded` branch.
+    /// Sanity: the empty-attributes path short-circuits to the
+    /// literal `[]` byte sequence (the §3.2 `Vec::new()` ↔ `[]`
+    /// rule) without invoking the encoder — keeps the
+    /// clean-attach hot path allocation-free.
     #[test]
     fn empty_attributes_serialise_to_open_bracket_close_bracket() {
         let batch = mined_records_to_batch(&[empty_record()]).expect("batch builds");
@@ -589,29 +585,33 @@ mod tests {
         assert_eq!(res.value(0), "[]");
     }
 
-    /// Non-empty attributes return `AttributesNotYetEncoded`
-    /// rather than panicking via `unimplemented!()`. Pins the
-    /// graceful-error contract until the RFC 0005 §3.3
-    /// canonicalisation PR replaces this branch with a real
-    /// encoder.
+    /// Non-empty attributes flow through the RFC 0005 §3.3
+    /// canonical-JSON encoder
+    /// (`ourios_core::otlp::canonical::encode_attributes`) and
+    /// land as valid OTLP-JSON bytes in the column —
+    /// `decode_attributes(stored) == attrs` round-trips. Pins
+    /// the encoder integration that replaced the
+    /// `AttributesNotYetEncoded` deferral.
     #[test]
-    fn non_empty_attributes_returns_not_yet_encoded_error() {
-        let mut rec = empty_record();
-        rec.attributes = vec![KeyValue {
+    fn non_empty_attributes_encode_to_canonical_json_round_trip() {
+        let attrs = vec![KeyValue {
             key: "client.address".to_string(),
             value: Some(AnyValue {
                 value: Some(any_value::Value::StringValue("10.0.0.1".to_string())),
             }),
             ..KeyValue::default()
         }];
-        let err = mined_records_to_batch(&[rec]).expect_err("non-empty attrs must error");
-        match err {
-            BatchError::AttributesNotYetEncoded { column, count } => {
-                assert_eq!(column, "attributes");
-                assert_eq!(count, 1);
-            }
-            other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
-        }
+        let mut rec = empty_record();
+        rec.attributes = attrs.clone();
+        let batch = mined_records_to_batch(&[rec]).expect("batch encodes attributes");
+        let attrs_idx = batch.schema().index_of(crate::columns::ATTRIBUTES).unwrap();
+        let stored = batch.column(attrs_idx).as_string::<i32>().value(0);
+        let decoded = ourios_core::otlp::canonical::decode_attributes(stored.as_bytes())
+            .expect("stored bytes are canonical JSON");
+        assert_eq!(
+            decoded, attrs,
+            "encode → decode must round-trip the in-memory KeyValue list",
+        );
     }
 
     /// RFC 0005 §3.2 invariant: clean-attach `body_kind = String`
@@ -699,20 +699,25 @@ mod tests {
         mined_records_to_batch(&[rec]).expect("lossy_flag carve-out must not error");
     }
 
-    /// `BodyKind::Structured` rows can't yet be written
-    /// faithfully — the miner stores an interim Debug
-    /// rendering of the `AnyValue` rather than canonical JSON.
-    /// The writer rejects until the canonicalisation PR lands.
+    /// `BodyKind::Structured` rows now write — the miner's
+    /// `ingest_structured` populates `MinedRecord.body` with
+    /// RFC 0005 §3.3 canonical JSON, and the writer appends
+    /// those bytes verbatim. Pins that the body column for a
+    /// structured row carries exactly the producer's bytes
+    /// (the §3.3 "what we stored is what we return"
+    /// reconstruction guarantee).
     #[test]
-    fn structured_body_kind_returns_not_yet_canonical_error() {
+    fn structured_body_kind_appends_producer_bytes_verbatim() {
         let mut rec = empty_record();
         rec.body_kind = BodyKind::Structured;
-        rec.body = Some("{\"placeholder\":true}".to_string());
-        let err = mined_records_to_batch(&[rec]).expect_err("structured body must error");
-        assert!(
-            matches!(err, BatchError::StructuredBodyNotYetCanonical),
-            "expected StructuredBodyNotYetCanonical, got {err:?}",
-        );
+        // Canonical JSON the miner would produce for an
+        // `AnyValue { value: Some(IntValue(42)) }`.
+        let canonical = "{\"intValue\":\"42\"}";
+        rec.body = Some(canonical.to_string());
+        let batch = mined_records_to_batch(&[rec]).expect("structured body must write");
+        let body_idx = batch.schema().index_of(crate::columns::BODY).unwrap();
+        let stored = batch.column(body_idx).as_binary::<i32>();
+        assert_eq!(stored.value(0), canonical.as_bytes());
     }
 
     /// `BodyKind::Absent` is not representable in the §3.2
@@ -730,27 +735,29 @@ mod tests {
         );
     }
 
-    /// Same contract on the `resource_attributes` side: empty in
-    /// the primary `attributes` column, populated in
-    /// `resource_attributes`, still errors with the right column
-    /// name.
+    /// Same canonical-encode path on the `resource_attributes`
+    /// column: populated input round-trips through
+    /// `encode_attributes` / `decode_attributes` and lands in
+    /// the matching column.
     #[test]
-    fn non_empty_resource_attributes_errors_on_correct_column() {
-        let mut rec = empty_record();
-        rec.resource_attributes = vec![KeyValue {
+    fn non_empty_resource_attributes_round_trip() {
+        let resource_attrs = vec![KeyValue {
             key: "service.name".to_string(),
             value: Some(AnyValue {
                 value: Some(any_value::Value::StringValue("ourios".to_string())),
             }),
             ..KeyValue::default()
         }];
-        let err = mined_records_to_batch(&[rec]).expect_err("non-empty resource attrs must error");
-        match err {
-            BatchError::AttributesNotYetEncoded { column, count } => {
-                assert_eq!(column, "resource_attributes");
-                assert_eq!(count, 1);
-            }
-            other => panic!("expected AttributesNotYetEncoded, got {other:?}"),
-        }
+        let mut rec = empty_record();
+        rec.resource_attributes = resource_attrs.clone();
+        let batch = mined_records_to_batch(&[rec]).expect("resource attrs must encode");
+        let resource_idx = batch
+            .schema()
+            .index_of(crate::columns::RESOURCE_ATTRIBUTES)
+            .unwrap();
+        let stored = batch.column(resource_idx).as_string::<i32>().value(0);
+        let decoded = ourios_core::otlp::canonical::decode_attributes(stored.as_bytes())
+            .expect("stored bytes are canonical JSON");
+        assert_eq!(decoded, resource_attrs);
     }
 }

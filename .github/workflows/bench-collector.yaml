@@ -1,0 +1,44 @@
+# OTel Collector config used by `bench.yml`'s `capture:
+# telemetrygen` path. Minimal pipeline — OTLP-gRPC receiver →
+# fileexporter writing OTLP/JSON Lines, which is the format
+# `ourios-bench`'s `*.jsonl` loader (RFC 0006 §3.1) consumes.
+#
+# Lives next to the workflow that loads it so the `(workflow,
+# collector config)` pair is reviewed as one unit. Not used by
+# any other crate — this is purely the bench's capture path.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+exporters:
+  # `file/corpus` matches the named-exporter convention in the
+  # fileexporter docs. `format: json` emits one OTLP `LogsData`
+  # JSON object per line — the wire shape the `*.jsonl` loader
+  # reads. `flush_interval` keeps the trailing bytes from sitting
+  # in the in-process buffer when the collector is SIGTERM'd at
+  # the end of the capture.
+  file/corpus:
+    path: /tmp/otel-capture/logs.jsonl
+    format: json
+    flush_interval: 1s
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [file/corpus]
+  telemetry:
+    # Silence collector-self telemetry — the bench is measuring
+    # the captured corpus, not the collector. Prevents the
+    # collector's own scrape endpoint from binding (which would
+    # need its own port and complicate the GH Actions runner
+    # surface).
+    metrics:
+      level: none
+    logs:
+      level: warn

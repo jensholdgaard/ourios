@@ -63,12 +63,6 @@ jobs:
       # writes `logs.jsonl` here, so the corpus lands straight on
       # the runner filesystem.
       OURIOS_CAPTURE_DIR: ${{ github.workspace }}/captured
-      # Envoy admin port the demo publishes (demo .env default).
-      # Used for the frontend-proxy /ready readiness probe — the
-      # demo's .env isn't sourced into the workflow shell, so the
-      # value is pinned here (bump alongside demo_ref if it ever
-      # changes upstream).
-      ENVOY_ADMIN_PORT: '10000'
       # `COMPOSE_FILE` (colon-separated on Linux) layers our
       # override onto the demo's base compose for every
       # `docker compose` call without repeating `-f`. The base
@@ -126,47 +120,38 @@ jobs:
         working-directory: demo
         run: |
           set -euxo pipefail
-          # Gate on the services that actually matter, not just the
-          # collector. The first capture (run 26715857483) showed
-          # ~34% of the corpus was the load generator's
-          # ERR_NAME_NOT_RESOLVED against frontend-proxy: the
-          # load-generator only `depends_on` frontend (started, not
-          # healthy) and frontend-proxy has no healthcheck, so its
-          # Playwright browser tasks hammered Envoy before it was
-          # serving and flooded the corpus with one error template.
-          #
-          # Envoy publishes an admin port with a /ready endpoint
-          # that returns 200 "LIVE" once initialization completes —
-          # the real "frontend-proxy is serving" signal.
-          wait_for() {
-            local name="$1" url="$2" tries="$3"
-            for _ in $(seq 1 "$tries"); do
-              if curl -fsS -o /dev/null "$url" 2>/dev/null; then
-                echo "$name ready"
-                return 0
-              fi
+          # We bypass frontend-proxy (Envoy) — its baked image
+          # config crash-loops in CI (see the compose override) —
+          # and drive the `frontend` HTTP API directly. So gate on
+          # otel-collector (the capture sink) and frontend (the
+          # load target) reaching running state. Neither defines a
+          # healthcheck and frontend only publishes an ephemeral
+          # host port, so "running" + the post-restart settle +
+          # the steady-state slice (which discards early ramp
+          # errors) is the readiness story rather than an HTTP
+          # probe.
+          want_running() {
+            local svc="$1"
+            for _ in $(seq 1 60); do
+              docker compose ps --status running --services 2>/dev/null \
+                | grep -qx "$svc" && { echo "$svc running"; return 0; }
               sleep 5
             done
-            echo "::error::$name not ready after $((tries * 5))s ($url)"
+            echo "::error::$svc did not reach running state"
             docker compose ps
-            docker compose logs frontend-proxy | tail -50 || true
+            docker compose logs "$svc" | tail -50 || true
             return 1
           }
-          # otel-collector first (it's the capture sink); then Envoy
-          # readiness on the published admin port.
-          for _ in $(seq 1 60); do
-            docker compose ps --status running --services 2>/dev/null \
-              | grep -qx otel-collector && break
-            sleep 5
-          done
-          docker compose ps --status running --services | grep -qx otel-collector \
-            || { echo "::error::otel-collector not running"; docker compose ps; docker compose logs otel-collector | tail -50; exit 1; }
-          wait_for frontend-proxy "http://localhost:${ENVOY_ADMIN_PORT}/ready" 60
-          # Restart the load generator now that Envoy is serving, so
-          # its browser tasks start fresh against a resolvable,
-          # ready proxy instead of replaying the startup-race
-          # failures. Pre-restart noise is discarded by the
-          # steady-state slice in the capture step.
+          want_running otel-collector
+          want_running frontend
+          # frontend-proxy is bypassed and crash-loops on its bad
+          # baked config; stop it so it stops burning runner CPU
+          # and restart-spamming. Nothing else depends on it (it
+          # fronts the frontend, not the reverse).
+          docker compose stop frontend-proxy 2>/dev/null || true
+          # Restart the load generator once frontend is up so it
+          # ramps cleanly against a live target; any residual early
+          # errors are discarded by the steady-state slice.
           docker compose restart load-generator
           docker compose ps
 

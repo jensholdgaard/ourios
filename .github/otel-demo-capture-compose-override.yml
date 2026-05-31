@@ -17,8 +17,26 @@
 # doesn't depend on Compose's project-directory resolution when
 # the override is supplied from a different directory than the
 # base compose file.
+#
+# The `load-generator` overrides bypass `frontend-proxy` (Envoy):
+# the published frontend-proxy image carries a baked Envoy
+# bootstrap with a 10th cluster whose address env var the demo
+# doesn't set, so Envoy fails proto validation and crash-loops in
+# CI — which is what flooded the first capture with the load
+# generator's `ERR_NAME_NOT_RESOLVED` (intermittent DNS for a
+# flapping container). Driving the `frontend` HTTP API directly
+# (browser traffic off) removes Envoy from the path entirely; the
+# frontend still fans out to cart / checkout / currency /
+# product-catalog / …, so the business-service log diversity we
+# want still flows. `environment` entries merge by key, so these
+# override the base compose's `LOCUST_BROWSER_TRAFFIC_ENABLED=true`
+# and the `.env` `LOCUST_HOST`.
 
 services:
   otel-collector:
     volumes:
       - ${OURIOS_CAPTURE_DIR}:/capture
+  load-generator:
+    environment:
+      - LOCUST_BROWSER_TRAFFIC_ENABLED=false
+      - LOCUST_HOST=http://frontend:${FRONTEND_PORT}

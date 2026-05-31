@@ -32,7 +32,12 @@
 
 exporters:
   file/corpus:
-    path: /capture/logs.jsonl
+    # Raw capture — written from collector start, so it includes
+    # the demo's startup noise (e.g. the load generator's early
+    # errors before frontend-proxy is serving). The workflow
+    # slices the steady-state window out of this into the final
+    # `logs.jsonl` corpus by byte/line offset.
+    path: /capture/logs.raw.jsonl
     format: json
     flush_interval: 1s
 

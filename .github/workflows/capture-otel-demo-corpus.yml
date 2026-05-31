@@ -1,0 +1,174 @@
+name: Capture OTel Demo corpus
+
+# Runs the OpenTelemetry Demo on a hosted runner, captures the
+# logs its services emit into an OTLP/JSON corpus, and uploads
+# that corpus as a workflow artifact.
+#
+# Why: telemetrygen (the `bench.yml` default) emits a single
+# uniform body, so Drain collapses it to one template and A1
+# (compression) can't show the template-mining win — the first
+# real dispatch measured 1 template / A1 delta 0.95×. The demo's
+# ~20 services emit dozens of distinct log statements with varied
+# attributes — real template + envelope diversity, which is what
+# the thesis-gate A1 needs to be a meaningful measurement.
+#
+# This is **CI Docker** (preinstalled on the GitHub-hosted
+# runner), not a local install — the project's "containerd, not
+# Docker, locally" rule is about developer machines. The demo
+# only ships a docker-compose stack, and a hosted runner is the
+# right venue for a one-time corpus mint.
+#
+# **First-cut scope.** This workflow uploads the corpus as a
+# workflow **artifact** + a diversity manifest so we can confirm
+# the demo runs on a runner and inspect what we captured (size,
+# template diversity) before committing to the release-asset +
+# bench-fetch machinery. Promoting the corpus to a versioned
+# release asset and wiring `bench.yml`'s `capture: otel-demo`
+# path to fetch it is the follow-up once this is validated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      demo_ref:
+        description: opentelemetry-demo git tag to capture from
+        default: '2.2.0'
+        required: false
+      duration_seconds:
+        description: Capture window in seconds (after warmup)
+        default: '600'
+        required: false
+      warmup_seconds:
+        description: Seconds to let the demo reach steady state before capturing
+        default: '90'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: capture demo corpus
+    runs-on: ubuntu-latest
+    # Image pulls (~20 services) + warmup + capture window. 45m
+    # is a generous ceiling; a hung step shouldn't burn toward
+    # GitHub's 6h job limit.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ourios (for the collector overlay)
+        uses: actions/checkout@v4
+
+      - name: Clone opentelemetry-demo
+        env:
+          DEMO_REF: ${{ inputs.demo_ref }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$DEMO_REF" \
+            https://github.com/open-telemetry/opentelemetry-demo demo
+
+      - name: Inject the file/corpus collector overlay
+        run: |
+          set -euxo pipefail
+          # The demo mounts ./src/otel-collector/otelcol-config-extras.yml
+          # into the collector and merges it over the base config
+          # (see OTEL_COLLECTOR_CONFIG_EXTRAS in the demo .env).
+          # Overwriting that file is the most robust injection —
+          # no env wrangling, the compose mount path is unchanged.
+          cp .github/otel-demo-capture-extras.yml \
+            demo/src/otel-collector/otelcol-config-extras.yml
+          echo '--- effective extras ---'
+          cat demo/src/otel-collector/otelcol-config-extras.yml
+
+      - name: Bring up the demo
+        working-directory: demo
+        run: |
+          set -euxo pipefail
+          # Released demo versions reference prebuilt ghcr images,
+          # so `up -d` pulls rather than builds.
+          docker compose up -d
+          # Wait for the collector container to be running before
+          # the warmup clock starts. Image pulls dominate here.
+          for _ in $(seq 1 60); do
+            state="$(docker compose ps --status running --services 2>/dev/null || true)"
+            if echo "$state" | grep -qx otel-collector; then
+              echo "otel-collector is running"
+              break
+            fi
+            sleep 5
+          done
+          if ! docker compose ps --status running --services | grep -qx otel-collector; then
+            echo "::error::otel-collector did not reach running state"
+            docker compose ps
+            docker compose logs otel-collector || true
+            exit 1
+          fi
+
+      - name: Warm up + capture window
+        working-directory: demo
+        env:
+          WARMUP: ${{ inputs.warmup_seconds }}
+          DURATION: ${{ inputs.duration_seconds }}
+        run: |
+          set -euxo pipefail
+          # The demo's load generator drives traffic on its own;
+          # the warmup lets services boot and start emitting before
+          # we count the window.
+          echo "warming up for ${WARMUP}s"
+          sleep "$WARMUP"
+          echo "capturing for ${DURATION}s"
+          sleep "$DURATION"
+
+      - name: Extract the captured corpus
+        working-directory: demo
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/captured"
+          # `docker compose cp` pulls the file the fileexporter
+          # wrote inside the collector container out to the runner.
+          docker compose cp \
+            otel-collector:/tmp/otel-corpus.jsonl \
+            "$GITHUB_WORKSPACE/captured/logs.jsonl"
+          # Tear the stack down before we do anything slow with the
+          # artifact, freeing the runner.
+          docker compose down -v || true
+
+      - name: Build diversity manifest
+        env:
+          # Via `env:`, not `${{ … }}` splicing into the script —
+          # a dispatcher-controlled input expanded inline is a
+          # template-injection vector (the same rule the clone +
+          # capture steps already follow).
+          DEMO_REF: ${{ inputs.demo_ref }}
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/captured"
+          lines="$(wc -l < logs.jsonl)"
+          bytes="$(stat -c%s logs.jsonl)"
+          {
+            echo "# OTel Demo corpus capture"
+            echo
+            echo "- demo_ref: ${DEMO_REF}"
+            echo "- records (lines): ${lines}"
+            echo "- bytes: ${bytes}"
+            echo
+            echo "## Distinct service.name values seen"
+            # Sketch of envelope diversity — how many distinct
+            # emitting services landed in the corpus.
+            grep -o '"service.name"[^}]*"stringValue":"[^"]*"' logs.jsonl \
+              | grep -o '"stringValue":"[^"]*"$' | sort | uniq -c | sort -rn | head -40 || true
+          } > manifest.md
+          echo '--- manifest ---'
+          cat manifest.md
+
+      - name: Upload corpus + manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: otel-demo-corpus
+          path: |
+            captured/logs.jsonl
+            captured/manifest.md
+          if-no-files-found: warn

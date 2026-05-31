@@ -41,6 +41,10 @@ on:
         description: Seconds to let the demo reach steady state before capturing
         default: '90'
         required: false
+      locust_users:
+        description: Concurrent load-generator users (HTTP, browser traffic off — drives corpus volume)
+        default: '40'
+        required: false
 
 permissions:
   contents: read
@@ -63,6 +67,15 @@ jobs:
       # writes `logs.jsonl` here, so the corpus lands straight on
       # the runner filesystem.
       OURIOS_CAPTURE_DIR: ${{ github.workspace }}/captured
+      # Concurrent load-generator users. The base compose's
+      # load-generator has a bare `LOCUST_USERS` passthrough, so
+      # setting it here (shell env) overrides the demo .env default
+      # of 5 for every `docker compose` call. With browser traffic
+      # off (compose override) these are cheap HTTP users, so a
+      # higher count scales corpus volume — more records with
+      # varied params per template — without inflating template
+      # count or needing a multi-hour window.
+      LOCUST_USERS: ${{ inputs.locust_users }}
       # `COMPOSE_FILE` (colon-separated on Linux) layers our
       # override onto the demo's base compose for every
       # `docker compose` call without repeating `-f`. The base

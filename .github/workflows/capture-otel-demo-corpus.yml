@@ -286,9 +286,13 @@ jobs:
             "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "$GITHUB_SHA" "$records" "$bytes")"
           # Create the release if it's new, else clobber its
           # assets — re-minting the same tag replaces the corpus
-          # in place rather than erroring.
+          # in place rather than erroring. On re-mint the notes
+          # are refreshed too (`release edit`), so the provenance
+          # always describes the assets currently attached rather
+          # than the original capture's parameters.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" logs.jsonl.gz manifest.md --clobber
+            gh release edit "$RELEASE_TAG" --notes "$notes"
           else
             gh release create "$RELEASE_TAG" logs.jsonl.gz manifest.md \
               --title "$RELEASE_TAG" --notes "$notes"

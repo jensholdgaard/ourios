@@ -100,8 +100,16 @@ jobs:
           set -euxo pipefail
           # The capture dir must exist before `up` so the bind
           # mount points at a real host directory; the collector
-          # (running as root) then creates logs.jsonl inside it.
+          # then creates logs.jsonl inside it.
           mkdir -p "$OURIOS_CAPTURE_DIR"
+          # World-writable so the fileexporter can create the file
+          # regardless of the collector's UID. The demo pins
+          # `user: 0:0` (root) on otel-collector today, but the
+          # otelcol-contrib image's own default is UID 10001 — if
+          # the demo ever drops the override the bind mount would
+          # otherwise fail with EACCES, and a wrong guess here
+          # costs a full ~15-min dispatch to discover.
+          chmod 0777 "$OURIOS_CAPTURE_DIR"
           # Released demo versions reference prebuilt ghcr images,
           # so `up -d` pulls rather than builds. COMPOSE_FILE (job
           # env) layers in our /capture mount override.

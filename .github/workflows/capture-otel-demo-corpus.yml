@@ -45,9 +45,15 @@ on:
         description: Concurrent load-generator users (HTTP, browser traffic off — drives corpus volume)
         default: '40'
         required: false
+      release_tag:
+        description: If set, publish the corpus as assets on a GitHub release at this tag (e.g. corpus/otel-demo-v1)
+        default: ''
+        required: false
 
 permissions:
-  contents: read
+  # `write` so the optional publish step can create/update the
+  # corpus release. The workflow is manual-dispatch only.
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -257,3 +263,37 @@ jobs:
             captured/logs.raw.jsonl
             captured/manifest.md
           if-no-files-found: warn
+
+      - name: Publish corpus release
+        # Only when a tag is given. Freezes the corpus as a
+        # versioned, reproducible artifact `bench.yml` fetches
+        # (so every bench run sees identical bytes — the RFC 0006
+        # §J4 reproducibility discipline). Provenance (demo ref,
+        # load, window, source commit, size) goes in the notes.
+        if: inputs.release_tag != ''
+        working-directory: captured
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          DEMO_REF: ${{ inputs.demo_ref }}
+          DURATION: ${{ inputs.duration_seconds }}
+        run: |
+          set -euxo pipefail
+          gzip -kf logs.jsonl   # logs.jsonl.gz, keep the original
+          records="$(wc -l < logs.jsonl)"
+          bytes="$(stat -c%s logs.jsonl)"
+          notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- source commit: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
+            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "$GITHUB_SHA" "$records" "$bytes")"
+          # Create the release if it's new, else clobber its
+          # assets — re-minting the same tag replaces the corpus
+          # in place rather than erroring. On re-mint the notes
+          # are refreshed too (`release edit`), so the provenance
+          # always describes the assets currently attached rather
+          # than the original capture's parameters.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" logs.jsonl.gz manifest.md --clobber
+            gh release edit "$RELEASE_TAG" --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" logs.jsonl.gz manifest.md \
+              --title "$RELEASE_TAG" --notes "$notes"
+          fi

@@ -7,14 +7,19 @@
 # and the OTel Collector merges the two — map keys deep-merge,
 # sequence values are replaced.
 #
-# We add one exporter (`file/corpus`) and replace the logs
-# pipeline's exporter list to include it alongside the demo's
-# defaults. `receivers` / `processors` for the logs pipeline are
-# untouched (the deep-merge keeps the base values for keys we
-# don't set), so the captured records carry the demo's real
-# `resourcedetection` resource attributes — the envelope
-# diversity that's the whole point of using the demo over
-# telemetrygen.
+# We add a dedicated capture pipeline (`logs/corpus`) rather than
+# appending `file/corpus` to the demo's own `logs` pipeline. It
+# shares the base `otlp` receiver (the collector fans a receiver
+# out to every pipeline that lists it) and runs a `filter`
+# processor that drops the two non-application noise sources that
+# dominated the first healthy capture: `otelcol-contrib` (the
+# collector's own self-telemetry — `"Logs"/"Metrics"/"Traces"`
+# debug lines, ~32%) and `load-generator` (locust's operational
+# logs, ~22%). What's left is the business-service log diversity
+# (cart / checkout / currency / product-catalog / kafka / …) that
+# actually exercises the template miner. The demo's `logs`
+# pipeline is left untouched, so its observability stack still
+# behaves normally and the services emit what they normally would.
 #
 # `format: json` makes the fileexporter emit one OTLP/JSON
 # `LogsData` object per line — the exact `*.jsonl` shape
@@ -30,11 +35,22 @@
 # also lands the corpus straight on the runner filesystem (no
 # `docker cp`).
 
+processors:
+  filter/corpus:
+    # Drop the non-application noise. filterprocessor removes any
+    # log record matching a condition (error_mode: ignore so a
+    # record missing service.name is kept, not errored). Both
+    # noise sources carry their service.name on the resource.
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'resource.attributes["service.name"] == "otelcol-contrib"'
+        - 'resource.attributes["service.name"] == "load-generator"'
+
 exporters:
   file/corpus:
     # Raw capture — written from collector start, so it includes
-    # the demo's startup noise (e.g. the load generator's early
-    # errors before frontend-proxy is serving). The workflow
+    # the demo's startup noise (early ramp errors). The workflow
     # slices the steady-state window out of this into the final
     # `logs.jsonl` corpus by byte/line offset.
     path: /capture/logs.raw.jsonl
@@ -43,10 +59,12 @@ exporters:
 
 service:
   pipelines:
-    logs:
-      # Full replacement of the base list (sequences don't
-      # merge): the demo's defaults (`opensearch`, `debug`) plus
-      # our capture sink. Keeping the demo defaults means the
-      # demo's own observability stack still behaves normally,
-      # so the services emit the logs they normally would.
-      exporters: [opensearch, debug, file/corpus]
+    # Dedicated capture pipeline — shares the base `otlp` receiver,
+    # filters out the infra noise, writes only business-service
+    # logs to the corpus. The demo's own `logs` pipeline is not
+    # referenced here, so it keeps its base receivers/processors/
+    # exporters untouched.
+    logs/corpus:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/corpus]
+      exporters: [file/corpus]

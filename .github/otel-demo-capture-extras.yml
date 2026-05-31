@@ -1,0 +1,40 @@
+# OTel Collector config overlay for the OTel Demo corpus
+# capture (`capture-otel-demo-corpus.yml`). The capture
+# workflow overwrites the demo's
+# `src/otel-collector/otelcol-config-extras.yml` with this file;
+# the demo's collector is launched with
+# `--config=otelcol-config.yml --config=otelcol-config-extras.yml`,
+# and the OTel Collector merges the two — map keys deep-merge,
+# sequence values are replaced.
+#
+# We add one exporter (`file/corpus`) and replace the logs
+# pipeline's exporter list to include it alongside the demo's
+# defaults. `receivers` / `processors` for the logs pipeline are
+# untouched (the deep-merge keeps the base values for keys we
+# don't set), so the captured records carry the demo's real
+# `resourcedetection` resource attributes — the envelope
+# diversity that's the whole point of using the demo over
+# telemetrygen.
+#
+# `format: json` makes the fileexporter emit one OTLP/JSON
+# `LogsData` object per line — the exact `*.jsonl` shape
+# `ourios-bench`'s corpus loader reads (RFC 0006 §3.1). The path
+# is inside the collector container; the workflow `docker cp`s it
+# out after the capture window rather than bind-mounting (dodges
+# any compose volume-merge ambiguity).
+
+exporters:
+  file/corpus:
+    path: /tmp/otel-corpus.jsonl
+    format: json
+    flush_interval: 1s
+
+service:
+  pipelines:
+    logs:
+      # Full replacement of the base list (sequences don't
+      # merge): the demo's defaults (`opensearch`, `debug`) plus
+      # our capture sink. Keeping the demo defaults means the
+      # demo's own observability stack still behaves normally,
+      # so the services emit the logs they normally would.
+      exporters: [opensearch, debug, file/corpus]

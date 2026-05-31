@@ -43,11 +43,16 @@ on:
         default: telemetrygen
         options:
           - telemetrygen
+          - otel-demo
           - none
         required: false
       telemetrygen_logs:
         description: Number of synthetic log records to generate (capture=telemetrygen)
         default: '1000000'
+        required: false
+      corpus_release_tag:
+        description: Release tag to fetch the frozen corpus from (capture=otel-demo)
+        default: corpus/otel-demo-v1
         required: false
       corpus_dir:
         # When `capture=telemetrygen`, this is **overwritten** by
@@ -206,6 +211,30 @@ jobs:
                 $(stat -c%s "$CAPTURED_DIR/logs.jsonl") bytes"
           echo "corpus_dir=$CAPTURED_DIR" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch OTel Demo corpus (frozen release asset)
+        id: fetch
+        if: inputs.capture == 'otel-demo'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # `env:` not `${{ }}` splicing — same template-injection
+          # rule as the bench step below. The tag is a
+          # dispatcher-controllable input.
+          CORPUS_TAG: ${{ inputs.corpus_release_tag }}
+        # Pulls the frozen corpus minted by
+        # capture-otel-demo-corpus.yml. Every run sees identical
+        # bytes (RFC 0006 §J4 reproducibility), unlike a live
+        # capture. Emits `corpus_dir` so the bench step picks it
+        # up the same way the telemetrygen path does.
+        run: |
+          set -euxo pipefail
+          CORPUS_DIR="bench-corpus/otel-demo-v1"
+          mkdir -p "$CORPUS_DIR"
+          gh release download "$CORPUS_TAG" --pattern 'logs.jsonl.gz' --dir "$CORPUS_DIR"
+          gunzip -f "$CORPUS_DIR/logs.jsonl.gz"
+          echo "fetched $(wc -l < "$CORPUS_DIR/logs.jsonl") records, \
+                $(stat -c%s "$CORPUS_DIR/logs.jsonl") bytes from $CORPUS_TAG"
+          echo "corpus_dir=$CORPUS_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Run thesis-gate bench
         # `pipefail` so a C1 reconstruction failure (the bench's
         # only non-zero exit, §3.4.2) fails the job rather than
@@ -223,10 +252,11 @@ jobs:
         env:
           BENCH_GATES: ${{ inputs.gates }}
           BENCH_HARDWARE: ${{ inputs.hardware_kind }}
-          # Prefer the captured-path step output (set only when
-          # `capture=telemetrygen` ran). Falls through to the
+          # Prefer whichever capture step ran (only one does, by
+          # mutually-exclusive `if`): telemetrygen's `capture` or
+          # otel-demo's `fetch`. Falls through to the
           # operator-supplied `corpus_dir` when capture=none.
-          BENCH_CORPUS: ${{ steps.capture.outputs.corpus_dir || inputs.corpus_dir }}
+          BENCH_CORPUS: ${{ steps.capture.outputs.corpus_dir || steps.fetch.outputs.corpus_dir || inputs.corpus_dir }}
         run: |
           set -euo pipefail
           ./target/release/ourios-bench \
@@ -243,7 +273,7 @@ jobs:
           # Same effective-path rule the bench step uses, so the
           # summary's `Corpus:` line matches what was actually
           # measured (not the now-overridden input).
-          BENCH_CORPUS: ${{ steps.capture.outputs.corpus_dir || inputs.corpus_dir }}
+          BENCH_CORPUS: ${{ steps.capture.outputs.corpus_dir || steps.fetch.outputs.corpus_dir || inputs.corpus_dir }}
           BENCH_CAPTURE: ${{ inputs.capture }}
         run: |
           {

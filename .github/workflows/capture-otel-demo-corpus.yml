@@ -136,6 +136,12 @@ jobs:
           docker compose down -v || true
 
       - name: Build diversity manifest
+        env:
+          # Via `env:`, not `${{ … }}` splicing into the script —
+          # a dispatcher-controlled input expanded inline is a
+          # template-injection vector (the same rule the clone +
+          # capture steps already follow).
+          DEMO_REF: ${{ inputs.demo_ref }}
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/captured"
@@ -144,7 +150,7 @@ jobs:
           {
             echo "# OTel Demo corpus capture"
             echo
-            echo "- demo_ref: ${{ inputs.demo_ref }}"
+            echo "- demo_ref: ${DEMO_REF}"
             echo "- records (lines): ${lines}"
             echo "- bytes: ${bytes}"
             echo

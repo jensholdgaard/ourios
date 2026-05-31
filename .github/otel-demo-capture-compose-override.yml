@@ -1,6 +1,8 @@
 # Compose override for the OTel Demo corpus capture
 # (`capture-otel-demo-corpus.yml`). Layered onto the demo's
-# docker-compose.yml via `-f docker-compose.yml -f <this>`.
+# docker-compose.yml via the workflow's `COMPOSE_FILE` job env
+# (`docker-compose.yml:<this>`), so every `docker compose` call
+# picks it up without repeating `-f`.
 #
 # Bind-mounts a runner-side directory into the collector at
 # `/capture`, the path the file/corpus exporter writes to (see

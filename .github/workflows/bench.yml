@@ -78,8 +78,13 @@ concurrency:
 # downloaded collector binary and the `go install` of
 # telemetrygen agree. Bump deliberately; reproducibility of
 # captured corpora across re-dispatches depends on this pin.
+# v0.115.0 (the initial pick in PR-N1) had no `tar.gz` binary
+# assets — release existed but binary distribution had a gap —
+# so the workflow 404'd on first dispatch. v0.153.0 is the
+# latest stable at this pin's bump and ships the standard
+# `otelcol-contrib_<ver>_linux_amd64.tar.gz` asset.
 env:
-  OTEL_VER: v0.115.0
+  OTEL_VER: v0.153.0
 
 jobs:
   bench:

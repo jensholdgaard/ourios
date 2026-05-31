@@ -18,14 +18,21 @@
 #
 # `format: json` makes the fileexporter emit one OTLP/JSON
 # `LogsData` object per line — the exact `*.jsonl` shape
-# `ourios-bench`'s corpus loader reads (RFC 0006 §3.1). The path
-# is inside the collector container; the workflow `docker cp`s it
-# out after the capture window rather than bind-mounting (dodges
-# any compose volume-merge ambiguity).
+# `ourios-bench`'s corpus loader reads (RFC 0006 §3.1).
+#
+# `/capture` is a host directory bind-mounted into the collector
+# by the capture workflow's compose override. It must be a
+# **mounted, pre-existing** directory, not an arbitrary
+# in-container path: the demo's collector is a distroless image
+# with no writable `/tmp`, and the fileexporter does not create a
+# missing parent dir — pointing it at `/tmp/...` fails the
+# pipeline with `open … no such file or directory`. The mount
+# also lands the corpus straight on the runner filesystem (no
+# `docker cp`).
 
 exporters:
   file/corpus:
-    path: /tmp/otel-corpus.jsonl
+    path: /capture/logs.jsonl
     format: json
     flush_interval: 1s
 

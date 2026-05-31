@@ -1,0 +1,24 @@
+# Compose override for the OTel Demo corpus capture
+# (`capture-otel-demo-corpus.yml`). Layered onto the demo's
+# docker-compose.yml via the workflow's `COMPOSE_FILE` job env
+# (`docker-compose.yml:<this>`), so every `docker compose` call
+# picks it up without repeating `-f`.
+#
+# Bind-mounts a runner-side directory into the collector at
+# `/capture`, the path the file/corpus exporter writes to (see
+# otel-demo-capture-extras.yml). The demo's collector is a
+# distroless image with no writable `/tmp`, so the exporter needs
+# a directory that demonstrably exists — a host bind-mount
+# guarantees that and lands the corpus straight on the runner
+# filesystem, no `docker cp`.
+#
+# `${OURIOS_CAPTURE_DIR}` is an absolute host path the workflow
+# exports + `mkdir`s before `up`. Absolute (not relative) so it
+# doesn't depend on Compose's project-directory resolution when
+# the override is supplied from a different directory than the
+# base compose file.
+
+services:
+  otel-collector:
+    volumes:
+      - ${OURIOS_CAPTURE_DIR}:/capture

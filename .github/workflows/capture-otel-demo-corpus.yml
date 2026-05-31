@@ -57,6 +57,18 @@ jobs:
     # is a generous ceiling; a hung step shouldn't burn toward
     # GitHub's 6h job limit.
     timeout-minutes: 45
+    env:
+      # Host directory bind-mounted into the collector at
+      # `/capture` (see the compose override). The fileexporter
+      # writes `logs.jsonl` here, so the corpus lands straight on
+      # the runner filesystem.
+      OURIOS_CAPTURE_DIR: ${{ github.workspace }}/captured
+      # `COMPOSE_FILE` (colon-separated on Linux) layers our
+      # override onto the demo's base compose for every
+      # `docker compose` call without repeating `-f`. The base
+      # path is relative (resolved from the `demo` working-dir);
+      # the override is absolute so it's project-dir-independent.
+      COMPOSE_FILE: docker-compose.yml:${{ github.workspace }}/.github/otel-demo-capture-compose-override.yml
     steps:
       - name: Checkout ourios (for the collector overlay)
         uses: actions/checkout@v4
@@ -86,8 +98,21 @@ jobs:
         working-directory: demo
         run: |
           set -euxo pipefail
+          # The capture dir must exist before `up` so the bind
+          # mount points at a real host directory; the collector
+          # then creates logs.jsonl inside it.
+          mkdir -p "$OURIOS_CAPTURE_DIR"
+          # World-writable so the fileexporter can create the file
+          # regardless of the collector's UID. The demo pins
+          # `user: 0:0` (root) on otel-collector today, but the
+          # otelcol-contrib image's own default is UID 10001 — if
+          # the demo ever drops the override the bind mount would
+          # otherwise fail with EACCES, and a wrong guess here
+          # costs a full ~15-min dispatch to discover.
+          chmod 0777 "$OURIOS_CAPTURE_DIR"
           # Released demo versions reference prebuilt ghcr images,
-          # so `up -d` pulls rather than builds.
+          # so `up -d` pulls rather than builds. COMPOSE_FILE (job
+          # env) layers in our /capture mount override.
           docker compose up -d
           # Wait for the collector container to be running before
           # the warmup clock starts. Image pulls dominate here.
@@ -121,18 +146,21 @@ jobs:
           echo "capturing for ${DURATION}s"
           sleep "$DURATION"
 
-      - name: Extract the captured corpus
+      - name: Verify capture + tear down
         working-directory: demo
         run: |
           set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/captured"
-          # `docker compose cp` pulls the file the fileexporter
-          # wrote inside the collector container out to the runner.
-          docker compose cp \
-            otel-collector:/tmp/otel-corpus.jsonl \
-            "$GITHUB_WORKSPACE/captured/logs.jsonl"
-          # Tear the stack down before we do anything slow with the
-          # artifact, freeing the runner.
+          # The bind mount means the corpus is already on the host
+          # at $OURIOS_CAPTURE_DIR/logs.jsonl — no docker cp.
+          if [ ! -s "$OURIOS_CAPTURE_DIR/logs.jsonl" ]; then
+            echo "::error::no corpus captured at $OURIOS_CAPTURE_DIR/logs.jsonl (file missing or empty)"
+            docker compose ps
+            docker compose logs otel-collector | tail -50 || true
+            docker compose down -v || true
+            exit 1
+          fi
+          # Tear the stack down before the (slower) manifest +
+          # upload steps, freeing the runner.
           docker compose down -v || true
 
       - name: Build diversity manifest

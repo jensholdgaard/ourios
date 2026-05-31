@@ -63,10 +63,12 @@ jobs:
   capture:
     name: capture demo corpus
     runs-on: ubuntu-latest
-    # Image pulls (~20 services) + warmup + capture window. 45m
-    # is a generous ceiling; a hung step shouldn't burn toward
-    # GitHub's 6h job limit.
-    timeout-minutes: 45
+    # Image pulls (~20 services) + warmup + capture window. The
+    # ceiling must clear the longest `duration_seconds` a scale
+    # series uses (plus ~10m bring-up/slice/publish overhead);
+    # 240m leaves room for multi-hour windows while staying well
+    # under GitHub's 6h job limit so a hung step still fails.
+    timeout-minutes: 240
     env:
       # Host directory bind-mounted into the collector at
       # `/capture` (see the compose override). The fileexporter

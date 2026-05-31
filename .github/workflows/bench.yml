@@ -9,7 +9,9 @@ name: Bench
 #
 # 1. **Corpus capture** — driven by the `capture` input. Default
 #    `telemetrygen` boots an OTel collector with a fileexporter
-#    (config: `bench-collector.yaml` next to this file), runs
+#    (config: `.github/bench-collector.yaml` — one level up
+#    from this workflows/ dir so GitHub doesn't try to parse
+#    the collector config as a workflow), runs
 #    `telemetrygen logs` against it for `telemetrygen_logs`
 #    records, then snapshots the captured OTLP/JSON file into
 #    `bench-corpus/telemetrygen-synthetic-v1/`. `capture: none`
@@ -138,7 +140,7 @@ jobs:
           # makes a flaky telemetrygen failure clean up the
           # collector instead of leaving an orphaned process
           # blocking the runner's exit.
-          otelcol-contrib --config .github/workflows/bench-collector.yaml >/tmp/collector.log 2>&1 &
+          otelcol-contrib --config .github/bench-collector.yaml >/tmp/collector.log 2>&1 &
           COLLECTOR_PID=$!
           trap 'kill -TERM $COLLECTOR_PID 2>/dev/null || true' EXIT
           # Wait for OTLP gRPC port. `bash`'s built-in
@@ -162,10 +164,34 @@ jobs:
             cat /tmp/collector.log || true
             exit 1
           fi
-          telemetrygen logs \
+          # `--rate 0` = unbounded. telemetrygen's `logs`
+          # subcommand defaults `Rate = 1` (one log/sec), which
+          # silently turned a 1M-record capture into an ~11.5-day
+          # crawl on the first dispatch (the worker emitted
+          # "exported batched logs count: 100" every 100s). With
+          # `rate.Inf` 1M records is seconds.
+          #
+          # `timeout 600` is a backstop: any future
+          # misconfiguration that re-introduces throttling (or a
+          # genuine collector stall) fails the step in 10 min with
+          # the collector log dumped, rather than burning a runner
+          # until GitHub's 6h job ceiling. SIGTERM (124) on
+          # timeout propagates out under `set -e`.
+          # `|| tg_rc=$?` captures the real exit code without
+          # tripping `set -e` (the `if ! …; then` form would
+          # report `$?` as 0 inside the branch).
+          tg_rc=0
+          timeout 600 telemetrygen logs \
             --otlp-insecure \
             --otlp-endpoint=127.0.0.1:4317 \
-            --logs "$BENCH_LOG_COUNT"
+            --rate 0 \
+            --logs "$BENCH_LOG_COUNT" || tg_rc=$?
+          if [ "$tg_rc" -ne 0 ]; then
+            echo "::error::telemetrygen failed or timed out (exit $tg_rc; 124 = timeout backstop)"
+            echo "--- /tmp/collector.log ---"
+            cat /tmp/collector.log || true
+            exit 1
+          fi
           # Let the fileexporter's `flush_interval: 1s` finish
           # writing the trailing batch before we SIGTERM.
           sleep 3

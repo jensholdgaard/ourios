@@ -63,6 +63,12 @@ jobs:
       # writes `logs.jsonl` here, so the corpus lands straight on
       # the runner filesystem.
       OURIOS_CAPTURE_DIR: ${{ github.workspace }}/captured
+      # Envoy admin port the demo publishes (demo .env default).
+      # Used for the frontend-proxy /ready readiness probe — the
+      # demo's .env isn't sourced into the workflow shell, so the
+      # value is pinned here (bump alongside demo_ref if it ever
+      # changes upstream).
+      ENVOY_ADMIN_PORT: '10000'
       # `COMPOSE_FILE` (colon-separated on Linux) layers our
       # override onto the demo's base compose for every
       # `docker compose` call without repeating `-f`. The base
@@ -100,7 +106,7 @@ jobs:
           set -euxo pipefail
           # The capture dir must exist before `up` so the bind
           # mount points at a real host directory; the collector
-          # then creates logs.jsonl inside it.
+          # then creates logs.raw.jsonl inside it.
           mkdir -p "$OURIOS_CAPTURE_DIR"
           # World-writable so the fileexporter can create the file
           # regardless of the collector's UID. The demo pins
@@ -114,54 +120,106 @@ jobs:
           # so `up -d` pulls rather than builds. COMPOSE_FILE (job
           # env) layers in our /capture mount override.
           docker compose up -d
-          # Wait for the collector container to be running before
-          # the warmup clock starts. Image pulls dominate here.
+          docker compose ps
+
+      - name: Wait for the traffic path to be ready
+        working-directory: demo
+        run: |
+          set -euxo pipefail
+          # Gate on the services that actually matter, not just the
+          # collector. The first capture (run 26715857483) showed
+          # ~34% of the corpus was the load generator's
+          # ERR_NAME_NOT_RESOLVED against frontend-proxy: the
+          # load-generator only `depends_on` frontend (started, not
+          # healthy) and frontend-proxy has no healthcheck, so its
+          # Playwright browser tasks hammered Envoy before it was
+          # serving and flooded the corpus with one error template.
+          #
+          # Envoy publishes an admin port with a /ready endpoint
+          # that returns 200 "LIVE" once initialization completes —
+          # the real "frontend-proxy is serving" signal.
+          wait_for() {
+            local name="$1" url="$2" tries="$3"
+            for _ in $(seq 1 "$tries"); do
+              if curl -fsS -o /dev/null "$url" 2>/dev/null; then
+                echo "$name ready"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::error::$name not ready after $((tries * 5))s ($url)"
+            docker compose ps
+            docker compose logs frontend-proxy | tail -50 || true
+            return 1
+          }
+          # otel-collector first (it's the capture sink); then Envoy
+          # readiness on the published admin port.
           for _ in $(seq 1 60); do
-            state="$(docker compose ps --status running --services 2>/dev/null || true)"
-            if echo "$state" | grep -qx otel-collector; then
-              echo "otel-collector is running"
-              break
-            fi
+            docker compose ps --status running --services 2>/dev/null \
+              | grep -qx otel-collector && break
             sleep 5
           done
-          if ! docker compose ps --status running --services | grep -qx otel-collector; then
-            echo "::error::otel-collector did not reach running state"
-            docker compose ps
-            docker compose logs otel-collector || true
-            exit 1
-          fi
+          docker compose ps --status running --services | grep -qx otel-collector \
+            || { echo "::error::otel-collector not running"; docker compose ps; docker compose logs otel-collector | tail -50; exit 1; }
+          wait_for frontend-proxy "http://localhost:${ENVOY_ADMIN_PORT}/ready" 60
+          # Restart the load generator now that Envoy is serving, so
+          # its browser tasks start fresh against a resolvable,
+          # ready proxy instead of replaying the startup-race
+          # failures. Pre-restart noise is discarded by the
+          # steady-state slice in the capture step.
+          docker compose restart load-generator
+          docker compose ps
 
-      - name: Warm up + capture window
+      - name: Capture steady-state window
         working-directory: demo
         env:
           WARMUP: ${{ inputs.warmup_seconds }}
           DURATION: ${{ inputs.duration_seconds }}
         run: |
           set -euxo pipefail
-          # The demo's load generator drives traffic on its own;
-          # the warmup lets services boot and start emitting before
-          # we count the window.
-          echo "warming up for ${WARMUP}s"
+          raw="$OURIOS_CAPTURE_DIR/logs.raw.jsonl"
+          # Let the restarted load generator ramp + the services
+          # reach steady state before we mark the window start.
+          echo "settling for ${WARMUP}s"
           sleep "$WARMUP"
-          echo "capturing for ${DURATION}s"
+          # Mark the raw-file line offset: everything already
+          # written (startup + pre-restart load-gen errors) is
+          # excluded from the corpus. `|| echo 0` covers the file
+          # not existing yet (no logs flushed — would fail the
+          # verify step downstream).
+          start_line="$(wc -l < "$raw" 2>/dev/null || echo 0)"
+          echo "CAPTURE_START_LINE=${start_line}" >> "$GITHUB_ENV"
+          echo "steady-state window starts at raw line ${start_line}; capturing ${DURATION}s"
           sleep "$DURATION"
 
-      - name: Verify capture + tear down
+      - name: Slice steady-state corpus + verify
         working-directory: demo
         run: |
           set -euxo pipefail
-          # The bind mount means the corpus is already on the host
-          # at $OURIOS_CAPTURE_DIR/logs.jsonl — no docker cp.
-          if [ ! -s "$OURIOS_CAPTURE_DIR/logs.jsonl" ]; then
-            echo "::error::no corpus captured at $OURIOS_CAPTURE_DIR/logs.jsonl (file missing or empty)"
+          raw="$OURIOS_CAPTURE_DIR/logs.raw.jsonl"
+          out="$OURIOS_CAPTURE_DIR/logs.jsonl"
+          # Stop the collector so the raw file stops growing while
+          # we slice (the rest of the stack can keep running until
+          # teardown).
+          docker compose stop otel-collector || true
+          if [ ! -s "$raw" ]; then
+            echo "::error::no raw capture at $raw (collector wrote nothing)"
             docker compose ps
             docker compose logs otel-collector | tail -50 || true
-            docker compose down -v || true
             exit 1
           fi
-          # Tear the stack down before the (slower) manifest +
-          # upload steps, freeing the runner.
-          docker compose down -v || true
+          # Steady-state slice: everything after the marked offset.
+          tail -n +"$((CAPTURE_START_LINE + 1))" "$raw" > "$out"
+          if [ ! -s "$out" ]; then
+            echo "::error::steady-state slice is empty (no logs after line $CAPTURE_START_LINE of $(wc -l < "$raw"))"
+            exit 1
+          fi
+          echo "raw $(wc -l < "$raw") lines → steady-state $(wc -l < "$out") lines"
+
+      - name: Tear down
+        if: always()
+        working-directory: demo
+        run: docker compose down -v || true
 
       - name: Build diversity manifest
         env:
@@ -198,5 +256,6 @@ jobs:
           name: otel-demo-corpus
           path: |
             captured/logs.jsonl
+            captured/logs.raw.jsonl
             captured/manifest.md
           if-no-files-found: warn

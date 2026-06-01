@@ -126,3 +126,44 @@ impl Querier {
         unimplemented!("RFC 0007 red gate — execution pending (§4; blocked on RFC 0002 DSL)");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The operator-facing `QueryError` messages are a contract
+    /// (hazard §4.6: no DataFusion/SQL leakage, so operators rely
+    /// on these); pin them so a refactor can't silently reword.
+    #[test]
+    fn query_error_display_messages_are_stable() {
+        assert_eq!(
+            QueryError::TenantRequired.to_string(),
+            "query has no tenant scope",
+        );
+        assert_eq!(
+            QueryError::InvalidQuery {
+                detail: "bad filter".into(),
+            }
+            .to_string(),
+            "invalid query: bad filter",
+        );
+        assert_eq!(
+            QueryError::Storage {
+                detail: "s3 timeout".into(),
+            }
+            .to_string(),
+            "storage read failed: s3 timeout",
+        );
+    }
+
+    /// An empty result reports zero pruning/IO — the B1 baseline
+    /// the execution slice fills in.
+    #[test]
+    fn default_result_has_zeroed_stats() {
+        let r = QueryResult::default();
+        assert_eq!(r.stats, QueryStats::default());
+        assert_eq!(r.stats.row_groups_scanned, 0);
+        assert_eq!(r.stats.row_groups_pruned, 0);
+        assert_eq!(r.stats.bytes_read, 0);
+    }
+}

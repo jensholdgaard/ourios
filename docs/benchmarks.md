@@ -316,6 +316,19 @@ goal, or (b) explain why the hot-path effect is bounded below
 measurability. "I did not run the benchmarks" is a PR rejection, per
 `CLAUDE.md` §6.6.
 
+<!-- BENCH-RESULTS:BEGIN (managed by `ourios-bench --update-benchmarks-md`; do not edit by hand) -->
+
+_No `ourios-bench --update-benchmarks-md` run has populated this
+region yet. It is the **bench-managed** results area — automated
+runs replace everything between these markers with one table per
+`(git-sha, hardware)`. The hand-written §9.1 below is the
+**curated** diagnostic narrative and lives outside the region so
+automated runs never touch it. (This empty region is pre-placed so
+the first `--update-benchmarks-md` run replaces it in place rather
+than appending a second results section at end-of-file.)_
+
+<!-- BENCH-RESULTS:END -->
+
 ### 9.1 Results — 2026-06-01 (diagnostic, `ci-runner`)
 
 **Corpus.** `corpus/otel-demo-v{1..4}` — OTel Demo 2.2.0 logs

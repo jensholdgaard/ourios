@@ -113,14 +113,27 @@ place DataFusion types appear; they are an implementation detail
 behind `run`.
 
 ### 4.3 Predicate pushdown (the thesis mechanism)
+Pushdown is scoped to exactly the columns RFC 0005 indexes. Its
+§3.4 query-consumer-absence rule fixes the Phase 3 B1/B2 pushdown
+keys as `template_id`, `tenant_id`, and `time_unix_nano`, and
+§3.6 deliberately gives `params` list values **no** page index and
+**no** bloom filter (per-row entropy too high). The querier
+therefore relies on:
+
 - **Partition pruning**: `tenant_id` and time partition keys filter
   whole directories before any file is opened.
 - **Row-group skipping**: min/max statistics on `template_id`,
-  `time_unix_nano`, severity, and indexed params let DataFusion drop
-  row groups whose stats can't satisfy the predicate.
-- **Bloom filters / page indexes** (RFC 0005 writer policy) for
-  high-selectivity equality on `template_id` and param columns.
-- The querier configures the DataFusion session so these are
+  `time_unix_nano`, and severity let DataFusion drop row groups
+  whose stats can't satisfy the predicate.
+- **Bloom filter / page index** on `template_id` (RFC 0005 §3.6
+  writer policy) for high-selectivity template-exact equality (B2).
+- **Param predicates are *not* row-group-prunable** under the
+  current RFC 0005 format — they apply as post-scan DataFusion
+  filters over the rows the above pruning leaves. They benefit
+  from template/time pruning narrowing the scan, but a param value
+  alone skips no row groups; param-level pruning would need a
+  future RFC 0005 §3.6 storage amendment (§7).
+- The querier configures the DataFusion session so the above are
   enabled, and surfaces `row_groups_pruned` / `bytes_read` in
   `QueryResult` stats so B1 can assert pruning actually happened.
 
@@ -195,8 +208,12 @@ Mapped to `CLAUDE.md` §6.2:
 - [ ] `ListingTable` vs a custom `TableProvider` — does partition
       pruning over object storage need the custom provider, or does
       the listing table's pruning suffice?
-- [ ] Which param columns get bloom filters (RFC 0005 writer policy
-      interaction) — selectivity vs file-size cost.
+- [ ] Param-predicate pushdown is **out of scope** under the
+      current format (RFC 0005 §3.6 gives `params` no index/bloom).
+      If param predicates ever need row-group pruning, that's a
+      **future RFC 0005 §3.6 storage-format amendment** (add index/
+      bloom to selected param columns — selectivity vs file-size
+      cost), not a querier-side policy decision.
 - [ ] Streaming vs materialised results in `QueryResult` (large
       result sets); pagination surface.
 - [ ] Object-store caching / footer-cache policy for repeated

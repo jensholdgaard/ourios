@@ -304,8 +304,11 @@ First measurements landed **2026-06-01** (the writer-side gates
 A1 / C1 / C2 — see §9.1). They are **diagnostic, not canonical**:
 they ran on a GitHub-hosted runner (`ci-runner`), not the §1
 hardware baseline (`baseline-8vcpu-32gib`), against an OTel-Demo
-corpus that is representative in shape but modest in size. B1 / B2
-(query-side) remain unmeasured pending the querier (RFC 0007).
+corpus that is **shape-representative** (real multi-service
+template + envelope diversity) but **not size-representative** —
+every corpus is well below §8's ≥ 1 GiB canonical minimum, so
+this run is intentionally diagnostic, not a thesis verdict. B1 /
+B2 (query-side) remain unmeasured pending the querier (RFC 0007).
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant
@@ -316,9 +319,12 @@ measurability. "I did not run the benchmarks" is a PR rejection, per
 ### 9.1 Results — 2026-06-01 (diagnostic, `ci-runner`)
 
 **Corpus.** `corpus/otel-demo-v{1..4}` — OTel Demo 2.2.0 logs
-captured via the collector fileexporter (`capture-otel-demo-corpus.yml`),
-business-service logs only (collector self-telemetry + load-generator
-filtered out), OTLP/JSON. Sizes 30 / 142 / 285 / 573 MB.
+captured via the collector fileexporter (workflow
+`.github/workflows/capture-otel-demo-corpus.yml`), business-service
+logs only (collector self-telemetry + load-generator filtered out),
+OTLP/JSON. Sizes 30 / 136 / 272 / 547 MiB — all below §8's ≥ 1 GiB
+canonical benchmark minimum (this run is deliberately sub-minimum,
+to chart the trend, hence diagnostic).
 **Hardware.** `ci-runner` (hosted, ~4 vCPU) — **not** the §1
 baseline, so deltas are indicative, not authoritative.
 
@@ -328,12 +334,12 @@ baseline, so deltas are indicative, not authoritative.
 
 | corpus | size | ourios | zstd-19 | A1 delta |
 |---|---|---|---|---|
-| v1 | 30 MB | 15.5× | 33.3× | 0.465 |
-| v2 | 142 MB | 21.5× | 32.3× | 0.666 |
-| v3 | 285 MB | 23.4× | 32.3× | 0.725 |
-| v4 | 573 MB | 24.6× | 32.4× | 0.758 |
+| v1 | 30 MiB | 15.5× | 33.3× | 0.465 |
+| v2 | 136 MiB | 21.5× | 32.3× | 0.666 |
+| v3 | 272 MiB | 23.4× | 32.3× | 0.725 |
+| v4 | 547 MiB | 24.6× | 32.4× | 0.758 |
 
-*Codec sweep* (v4 = 573 MB, ourios ZSTD level varied):
+*Codec sweep* (v4 = 547 MiB, ourios ZSTD level varied):
 
 | ourios ZSTD | ourios | A1 delta |
 |---|---|---|
@@ -368,9 +374,9 @@ records grew 38k → 183k → 366k → 735k — sub-linear throughout. The
 formal gate abstains below 1 M lines (§3.4.3), but the curve shape
 is the strongest evidence yet for the template-mining premise.
 
-**Escalation (§7).** One gate (A1) fails, on a *non-representative*
-corpus and *non-baseline* hardware — so this is "corpus-specific,"
-not the two-gate pillar-level pause. C1 + C2 support the thesis.
+**Escalation (§7).** One gate (A1) fails, on a *size-non-representative*
+corpus (all < §8's 1 GiB minimum) and *non-baseline* hardware — so
+this is "corpus-specific," not the two-gate pillar-level pause. C1 + C2 support the thesis.
 The production ZSTD-3 default is retained: the codec gain is small,
 saturates by level 9, and the residual gap is structural, so a
 higher default isn't worth the ingest-CPU.

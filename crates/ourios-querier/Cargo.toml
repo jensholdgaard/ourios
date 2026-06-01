@@ -1,0 +1,26 @@
+[package]
+name = "ourios-querier"
+version = "0.0.0"
+description = "RFC 0007 querier — DataFusion execution frontend that runs the logs DSL against the RFC 0005 Parquet store."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ourios_querier"
+path = "src/lib.rs"
+
+[dependencies]
+# `TenantId` for the per-request tenant scope (CLAUDE.md §3.7).
+ourios-core = { path = "../ourios-core" }
+# NOTE: `ourios-parquet` (the RFC 0005 reader this queries) and
+# `datafusion` (pillar #3 — the execution engine, kept a
+# `pub(crate)` dep so its types never cross the public API per
+# hazard §4.6) land with the execution slice. The red-gate
+# scaffold doesn't reference them, and `datafusion` is heavy, so
+# they're omitted here to keep the gate build minimal.
+
+[lints]
+workspace = true

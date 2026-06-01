@@ -5,12 +5,12 @@ members = [
     "crates/ourios-core",
     "crates/ourios-miner",
     "crates/ourios-parquet",
+    "crates/ourios-querier",
     "crates/ourios-wal",
 ]
 
 # Remaining members per CLAUDE.md §7 layout will be added as crates land:
 #   crates/ourios-ingester
-#   crates/ourios-querier
 #   crates/ourios-server
 
 [workspace.package]

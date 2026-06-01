@@ -981,6 +981,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-querier"
+version = "0.0.0"
+dependencies = [
+ "ourios-core",
+]
+
+[[package]]
 name = "ourios-wal"
 version = "0.0.0"
 dependencies = [

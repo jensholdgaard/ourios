@@ -300,13 +300,77 @@ ourselves without noticing.
 
 ## 9. Status
 
-As of **2026-04-24**, no benchmark has been run. All targets are
-aspirational. This document will gain a *Results* section as
-measurements arrive, organised by goal id (A1, B1, …) with date,
-hardware, corpus, and delta against target.
+First measurements landed **2026-06-01** (the writer-side gates
+A1 / C1 / C2 — see §9.1). They are **diagnostic, not canonical**:
+they ran on a GitHub-hosted runner (`ci-runner`), not the §1
+hardware baseline (`baseline-8vcpu-32gib`), against an OTel-Demo
+corpus that is representative in shape but modest in size. B1 / B2
+(query-side) remain unmeasured pending the querier (RFC 0007).
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant
 goal, or (b) explain why the hot-path effect is bounded below
 measurability. "I did not run the benchmarks" is a PR rejection, per
 `CLAUDE.md` §6.6.
+
+### 9.1 Results — 2026-06-01 (diagnostic, `ci-runner`)
+
+**Corpus.** `corpus/otel-demo-v{1..4}` — OTel Demo 2.2.0 logs
+captured via the collector fileexporter (`capture-otel-demo-corpus.yml`),
+business-service logs only (collector self-telemetry + load-generator
+filtered out), OTLP/JSON. Sizes 30 / 142 / 285 / 573 MB.
+**Hardware.** `ci-runner` (hosted, ~4 vCPU) — **not** the §1
+baseline, so deltas are indicative, not authoritative.
+
+**A1 — compression (target: ourios ≥ 3.0× zstd-19).**
+
+*Scale series* (ourios at the production ZSTD-3 default):
+
+| corpus | size | ourios | zstd-19 | A1 delta |
+|---|---|---|---|---|
+| v1 | 30 MB | 15.5× | 33.3× | 0.465 |
+| v2 | 142 MB | 21.5× | 32.3× | 0.666 |
+| v3 | 285 MB | 23.4× | 32.3× | 0.725 |
+| v4 | 573 MB | 24.6× | 32.4× | 0.758 |
+
+*Codec sweep* (v4 = 573 MB, ourios ZSTD level varied):
+
+| ourios ZSTD | ourios | A1 delta |
+|---|---|---|
+| 3 (prod default) | 24.6× | 0.758 |
+| 9 | 26.2× | 0.808 |
+| 15 | 26.4× | 0.816 |
+| 19 | 26.9× | 0.829 |
+
+**A1 verdict: FAIL** (target 3.0×; best observed 0.829). Both
+levers are bounded. Scale lifts the delta but plateaus ~0.78
+(ourios asymptotes ~25×; zstd-19 is flat ~32× — the logs are
+locally repetitive, so zstd compresses them well at any size, not
+via a whole-corpus window). Raising ourios's codec to ZSTD-19
+adds only ~+0.07 and saturates by level 9. Even at **equal** codec
+strength, ourios stays ~17% larger than monolithic zstd-19: a
+**structural** cost of columnar Parquet (per-column/per-chunk
+framing, page indexes, row-group metadata, bloom filters) versus
+zstd-19 over one concatenated stream. That same chunking is what
+enables row-group skipping — so the ~17% space premium **is the
+price of queryability**, not an optimisation target. On pure
+compression of this corpus, ourios ≈ 0.83× zstd-19; the thesis
+rests on query performance (B1/B2), not on beating a byte codec.
+
+**C1 — reconstruction (target: 100% bit-identical or flagged lossy).
+PASS** at every size: 1.0 reconstruct rate, ~1.1% of records
+flagged lossy (structured/`kvlist` bodies) and retained verbatim
+per `CLAUDE.md` §3.3.
+
+**C2 — template-count convergence (target: sub-linear). PASS
+(supportive).** Templates grew 282 → 429 → 722 → 1322 while
+records grew 38k → 183k → 366k → 735k — sub-linear throughout. The
+formal gate abstains below 1 M lines (§3.4.3), but the curve shape
+is the strongest evidence yet for the template-mining premise.
+
+**Escalation (§7).** One gate (A1) fails, on a *non-representative*
+corpus and *non-baseline* hardware — so this is "corpus-specific,"
+not the two-gate pillar-level pause. C1 + C2 support the thesis.
+The production ZSTD-3 default is retained: the codec gain is small,
+saturates by level 9, and the residual gap is structural, so a
+higher default isn't worth the ingest-CPU.

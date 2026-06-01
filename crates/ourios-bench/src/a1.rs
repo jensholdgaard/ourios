@@ -75,17 +75,20 @@ pub(crate) struct A1Outcome {
 /// writer.
 pub(crate) struct A1Accumulator {
     bucket_root: PathBuf,
+    zstd_level: i32,
     data_writers: HashMap<PartitionKey, Writer>,
     error: Option<crate::BenchError>,
 }
 
 impl A1Accumulator {
-    /// Create an accumulator writing under `bucket_root`. The
-    /// directory is created lazily by the per-partition
-    /// writers on first record.
-    pub(crate) fn new(bucket_root: &Path) -> Self {
+    /// Create an accumulator writing under `bucket_root` at the
+    /// given Parquet ZSTD level (the A1 codec-sweep knob). The
+    /// directory is created lazily by the per-partition writers
+    /// on first record.
+    pub(crate) fn new(bucket_root: &Path, zstd_level: i32) -> Self {
         Self {
             bucket_root: bucket_root.to_path_buf(),
+            zstd_level,
             data_writers: HashMap::new(),
             error: None,
         }
@@ -122,11 +125,11 @@ impl A1Accumulator {
         // writer, append, then store it. `partition` is cloned
         // once for `Writer::open`; the original moves into the
         // map as the key.
-        let mut writer = Writer::open(&self.bucket_root, partition.clone()).map_err(|e| {
-            crate::BenchError::Pipeline {
-                detail: format!("parquet writer open: {e}"),
-            }
-        })?;
+        let mut writer =
+            Writer::open_with_zstd_level(&self.bucket_root, partition.clone(), self.zstd_level)
+                .map_err(|e| crate::BenchError::Pipeline {
+                    detail: format!("parquet writer open: {e}"),
+                })?;
         writer
             .append_records(std::slice::from_ref(emitted))
             .map_err(|e| crate::BenchError::Pipeline {

@@ -28,6 +28,7 @@ fn rfc0006_2_c1_is_100_percent_on_seed_corpus() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)

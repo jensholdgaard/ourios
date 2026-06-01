@@ -56,6 +56,13 @@ use crate::record_batch::{BatchError, mined_records_to_batch};
 /// `ArrowWriter::in_progress_size` crosses this.
 pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
+/// RFC 0005 §3.6 default ZSTD compression level for data files —
+/// chosen for write throughput on the ingest hot path. [`Writer::open`]
+/// uses it; [`Writer::open_with_zstd_level`] lets the bench sweep
+/// other levels to measure the space/CPU tradeoff. Changing this
+/// default is an RFC 0005 §3.6 decision.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 /// Rows per internal sub-batch passed to `ArrowWriter::write`.
 /// Chosen so that even with multi-KiB per-record payloads, a
 /// single sub-batch's contribution after the [`ROW_GROUP_FLUSH_BYTES`]
@@ -113,18 +120,45 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Open a writer for `partition` under `bucket_root`. Creates
-    /// the partition directory and the `UUIDv7`-named Parquet file;
-    /// the file is empty until [`Writer::append_records`] starts
-    /// adding rows.
+    /// Open a writer for `partition` under `bucket_root` using the
+    /// RFC 0005 §3.6 default compression level
+    /// ([`DEFAULT_ZSTD_LEVEL`]). Creates the partition directory
+    /// and the `UUIDv7`-named Parquet file; the file is empty until
+    /// [`Writer::append_records`] starts adding rows.
+    ///
+    /// # Errors
+    ///
+    /// See [`Writer::open_with_zstd_level`].
+    pub fn open(bucket_root: &Path, partition: PartitionKey) -> Result<Self, WriterError> {
+        Self::open_with_zstd_level(bucket_root, partition, DEFAULT_ZSTD_LEVEL)
+    }
+
+    /// Like [`Writer::open`] but with an explicit ZSTD compression
+    /// level. The on-disk format is unaffected by the level
+    /// (Parquet records the codec per column chunk and readers
+    /// decode any level), so this is a physical-encoding knob, not
+    /// an RFC 0005 §3.5 schema change. Used by `ourios-bench` to
+    /// sweep the space/CPU tradeoff; production writes use
+    /// [`Writer::open`]'s default until an RFC 0005 §3.6 amendment
+    /// says otherwise.
     ///
     /// # Errors
     ///
     /// - [`WriterError::Io`] when the partition directory or
     ///   target file cannot be created.
-    /// - [`WriterError::Parquet`] when the ZSTD level is rejected
-    ///   or `ArrowWriter` setup fails.
-    pub fn open(bucket_root: &Path, partition: PartitionKey) -> Result<Self, WriterError> {
+    /// - [`WriterError::Parquet`] when `zstd_level` is outside the
+    ///   valid ZSTD range or `ArrowWriter` setup fails.
+    pub fn open_with_zstd_level(
+        bucket_root: &Path,
+        partition: PartitionKey,
+        zstd_level: i32,
+    ) -> Result<Self, WriterError> {
+        // Validate the codec level *before* touching the
+        // filesystem so invalid input fails fast without creating
+        // the partition directory or a temp file. The validated
+        // level flows into `writer_properties` so it isn't
+        // re-checked.
+        let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
         let dir = partition.data_path(bucket_root);
         std::fs::create_dir_all(&dir).map_err(|source| WriterError::Io {
             op: "create_dir_all",
@@ -146,14 +180,9 @@ impl Writer {
         // disk. If anything below errors, no `Writer` is
         // constructed and `Drop` therefore never runs — we'd
         // leak the temp file unless we clean it up explicitly.
-        let props = match writer_properties() {
-            Ok(p) => p,
-            Err(e) => {
-                drop(file);
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(e);
-            }
-        };
+        // (The codec level was already validated before any
+        // filesystem work, so building props is infallible here.)
+        let props = writer_properties(zstd);
         let inner = match ArrowWriter::try_new(file, data_schema(), Some(props)) {
             Ok(w) => w,
             Err(e) => {
@@ -576,11 +605,13 @@ fn append_chunks(
 
 /// Build the [`WriterProperties`] that encode RFC 0005 §3.5
 /// (compression codec) and §3.6 (per-column encoding policy).
-fn writer_properties() -> Result<WriterProperties, WriterError> {
+/// `zstd` is the already-validated compression level (the caller
+/// validates up front so invalid input fails before any
+/// filesystem work); production uses [`DEFAULT_ZSTD_LEVEL`], the
+/// bench may sweep it.
+fn writer_properties(zstd: ZstdLevel) -> WriterProperties {
     let mut builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(3).map_err(WriterError::Parquet)?,
-        ))
+        .set_compression(Compression::ZSTD(zstd))
         // Dictionary on globally by default (most columns benefit
         // per §3.6); we opt out per-column below for the high-
         // entropy ones.
@@ -685,5 +716,5 @@ fn writer_properties() -> Result<WriterProperties, WriterError> {
     let template_id = ColumnPath::new(vec![crate::columns::TEMPLATE_ID.to_string()]);
     builder = builder.set_column_bloom_filter_enabled(template_id, true);
 
-    Ok(builder.build())
+    builder.build()
 }

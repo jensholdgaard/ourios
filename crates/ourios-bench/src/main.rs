@@ -73,6 +73,14 @@ struct Cli {
     /// Comma-separated subset of gates to compute. Default: all.
     #[arg(long, value_enum, value_delimiter = ',')]
     gates: Vec<Gate>,
+    /// Parquet data-writer ZSTD level for the A1 measurement.
+    /// Defaults to the production codec
+    /// (`ourios_parquet::DEFAULT_ZSTD_LEVEL` = 3); raise it
+    /// (e.g. 9 / 15 / 19) to sweep the A1 space/CPU tradeoff
+    /// against the ZSTD-19 baseline. Does not change the shipped
+    /// writer default.
+    #[arg(long, default_value_t = ourios_parquet::DEFAULT_ZSTD_LEVEL)]
+    parquet_zstd_level: i32,
 }
 
 /// One thesis gate, as named on the `--gates` flag.
@@ -114,6 +122,7 @@ impl Cli {
             hardware_kind: self.hardware_kind,
             update_benchmarks_md: self.update_benchmarks_md,
             gates,
+            parquet_zstd_level: self.parquet_zstd_level,
         }
     }
 }

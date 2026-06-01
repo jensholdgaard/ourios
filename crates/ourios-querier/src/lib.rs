@@ -71,7 +71,13 @@ pub struct QueryResult {
 /// Errors from [`Querier::run`]. Ourios-owned — no
 /// `datafusion::*` / `arrow::*` / SQL types appear here or in
 /// any public signature (hazard §4.6; RFC0007.3).
+///
+/// Marked `#[non_exhaustive]` because the execution slice will
+/// add failure modes (parse/validation/auth) — matching the
+/// `TokenizeError` / `BenchError` convention so downstream
+/// matches don't break when variants land.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum QueryError {
     /// The query referenced no tenant (cross-tenant scans are
     /// not expressible — RFC0007.5).

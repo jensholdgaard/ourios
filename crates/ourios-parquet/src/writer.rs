@@ -153,6 +153,12 @@ impl Writer {
         partition: PartitionKey,
         zstd_level: i32,
     ) -> Result<Self, WriterError> {
+        // Validate the codec level *before* touching the
+        // filesystem so invalid input fails fast without creating
+        // the partition directory or a temp file. The validated
+        // level flows into `writer_properties` so it isn't
+        // re-checked.
+        let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
         let dir = partition.data_path(bucket_root);
         std::fs::create_dir_all(&dir).map_err(|source| WriterError::Io {
             op: "create_dir_all",
@@ -174,14 +180,9 @@ impl Writer {
         // disk. If anything below errors, no `Writer` is
         // constructed and `Drop` therefore never runs — we'd
         // leak the temp file unless we clean it up explicitly.
-        let props = match writer_properties(zstd_level) {
-            Ok(p) => p,
-            Err(e) => {
-                drop(file);
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(e);
-            }
-        };
+        // (The codec level was already validated before any
+        // filesystem work, so building props is infallible here.)
+        let props = writer_properties(zstd);
         let inner = match ArrowWriter::try_new(file, data_schema(), Some(props)) {
             Ok(w) => w,
             Err(e) => {
@@ -604,13 +605,13 @@ fn append_chunks(
 
 /// Build the [`WriterProperties`] that encode RFC 0005 §3.5
 /// (compression codec) and §3.6 (per-column encoding policy).
-/// `zstd_level` selects the ZSTD compression level; production
-/// uses [`DEFAULT_ZSTD_LEVEL`], the bench may sweep it.
-fn writer_properties(zstd_level: i32) -> Result<WriterProperties, WriterError> {
+/// `zstd` is the already-validated compression level (the caller
+/// validates up front so invalid input fails before any
+/// filesystem work); production uses [`DEFAULT_ZSTD_LEVEL`], the
+/// bench may sweep it.
+fn writer_properties(zstd: ZstdLevel) -> WriterProperties {
     let mut builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?,
-        ))
+        .set_compression(Compression::ZSTD(zstd))
         // Dictionary on globally by default (most columns benefit
         // per §3.6); we opt out per-column below for the high-
         // entropy ones.
@@ -715,5 +716,5 @@ fn writer_properties(zstd_level: i32) -> Result<WriterProperties, WriterError> {
     let template_id = ColumnPath::new(vec![crate::columns::TEMPLATE_ID.to_string()]);
     builder = builder.set_column_bloom_filter_enabled(template_id, true);
 
-    Ok(builder.build())
+    builder.build()
 }

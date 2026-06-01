@@ -40,6 +40,7 @@ fn rfc0006_1_a1_formula_well_defined_on_seed_corpus() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -225,6 +226,7 @@ fn rfc0006_1_run_no_longer_returns_not_implemented() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -265,6 +267,7 @@ fn a1_rejects_a_bucket_that_already_holds_parquet() {
     std::fs::write(stale.join("stale.parquet"), b"not really parquet").expect("seed");
 
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -296,6 +299,7 @@ fn a1_rejects_a_bucket_that_already_holds_parquet() {
 fn keep_parquet_without_bucket_dir_is_rejected() {
     let results = tempfile::TempDir::new().expect("temp dir");
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)

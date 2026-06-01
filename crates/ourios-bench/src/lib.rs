@@ -67,6 +67,11 @@ pub struct BenchConfig {
     /// Which gates to compute. Empty set is rejected by CLI
     /// parsing.
     pub gates: GateSet,
+    /// Parquet data-writer ZSTD level for A1. Defaults to
+    /// `ourios_parquet::DEFAULT_ZSTD_LEVEL` (the production
+    /// codec); raised via `--parquet-zstd-level` to sweep the A1
+    /// space/CPU tradeoff against the §3.4.1 ZSTD-19 baseline.
+    pub parquet_zstd_level: i32,
 }
 
 /// Subset of {A1, C1, C2} selected via `--gates`.
@@ -167,7 +172,10 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
         // empty, so this only ever fires on a reused caller dir.
         ensure_bucket_has_no_parquet(&bucket_root)?;
         _bucket_guard = guard;
-        Some(a1::A1Accumulator::new(&bucket_root))
+        Some(a1::A1Accumulator::new(
+            &bucket_root,
+            config.parquet_zstd_level,
+        ))
     } else {
         _bucket_guard = None;
         None
@@ -653,6 +661,7 @@ mod tests {
     #[test]
     fn no_gates_enabled_is_a_cli_error() {
         let config = BenchConfig {
+            parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
             corpus_dir: std::path::PathBuf::from("."),
             results_dir: std::path::PathBuf::from("."),
             bucket_dir: None,

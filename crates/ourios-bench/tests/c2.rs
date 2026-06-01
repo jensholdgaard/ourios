@@ -86,6 +86,7 @@ fn rfc0006_3_c2_gate_passes_on_stable_corpus() {
     }
 
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         corpus_dir: corpus.path().to_path_buf(),
         results_dir: results.path().to_path_buf(),
         bucket_dir: Some(bucket.path().to_path_buf()),
@@ -152,6 +153,7 @@ fn rfc0006_3_c2_abstains_on_short_corpus() {
     let bucket = tempfile::TempDir::new().expect("temp dir");
     let results = tempfile::TempDir::new().expect("temp dir");
     let config = BenchConfig {
+        parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
         // Seed corpus is < 1 M lines, exercising the
         // abstention path.
         corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))

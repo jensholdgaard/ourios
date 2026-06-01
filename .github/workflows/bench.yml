@@ -65,6 +65,10 @@ on:
         description: Comma-separated gates to run (a1,c1,c2)
         default: a1,c1,c2
         required: false
+      parquet_zstd_level:
+        description: ZSTD level for ourios's Parquet data writer (A1 codec sweep; 3 = production default)
+        default: '3'
+        required: false
       hardware_kind:
         # `ci-runner` is the RFC 0006 §3.5 tag for the GH Actions
         # hosted runner. The §1 baseline `baseline-8vcpu-32gib`
@@ -252,6 +256,7 @@ jobs:
         env:
           BENCH_GATES: ${{ inputs.gates }}
           BENCH_HARDWARE: ${{ inputs.hardware_kind }}
+          BENCH_ZSTD_LEVEL: ${{ inputs.parquet_zstd_level }}
           # Prefer whichever capture step ran (only one does, by
           # mutually-exclusive `if`): telemetrygen's `capture` or
           # otel-demo's `fetch`. Falls through to the
@@ -263,6 +268,7 @@ jobs:
             --corpus "$BENCH_CORPUS" \
             --gates "$BENCH_GATES" \
             --hardware-kind "$BENCH_HARDWARE" \
+            --parquet-zstd-level "$BENCH_ZSTD_LEVEL" \
             --results-dir bench-results \
             | tee bench-summary.txt
 

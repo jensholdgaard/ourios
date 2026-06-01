@@ -39,7 +39,7 @@ pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile};
 pub use partition::{PartitionKey, TimestampOverflowError, percent_encode_tenant};
 pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};
-pub use writer::{ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile};
+pub use writer::{DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile};
 
 use std::sync::Arc;
 

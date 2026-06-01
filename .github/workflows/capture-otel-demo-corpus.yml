@@ -65,10 +65,11 @@ jobs:
     runs-on: ubuntu-latest
     # Image pulls (~20 services) + warmup + capture window. The
     # ceiling must clear the longest `duration_seconds` a scale
-    # series uses (plus ~10m bring-up/slice/publish overhead);
-    # 240m leaves room for multi-hour windows while staying well
-    # under GitHub's 6h job limit so a hung step still fails.
-    timeout-minutes: 240
+    # series uses (plus ~15m bring-up/slice/publish overhead);
+    # 330m fits a 4h window with margin while staying below
+    # GitHub's 6h hard kill, so a hung step fails via this guard
+    # (with logs) rather than an opaque platform timeout.
+    timeout-minutes: 330
     env:
       # Host directory bind-mounted into the collector at
       # `/capture` (see the compose override). The fileexporter

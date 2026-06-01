@@ -38,6 +38,7 @@ fn rfc0006_7_two_runs_produce_bit_identical_measurements() {
             bucket,
             results,
             BenchConfig {
+                parquet_zstd_level: ourios_parquet::DEFAULT_ZSTD_LEVEL,
                 corpus_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .parent()
                     .and_then(std::path::Path::parent)

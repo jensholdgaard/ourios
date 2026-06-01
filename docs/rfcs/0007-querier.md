@@ -1,7 +1,7 @@
 ---
 rfc: 0007
 title: Querier — DataFusion execution frontend for the logs DSL
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-01
@@ -11,7 +11,10 @@ superseded-by: —
 
 # RFC 0007 — Querier: DataFusion execution frontend for the logs DSL
 
-> **Status note.** This is a first draft. It pins the *execution*
+> **Status note.** `specified` — §§1–9 are complete (including §5
+> acceptance criteria and §6 testing strategy, the content the
+> `specified` gate introduces per `docs/rfcs/README.md`). It pins
+> the *execution*
 > layer — how a compiled query runs against the RFC 0005 Parquet
 > contract with predicate pushdown, and how the B1/B2 thesis gates
 > are measured — which is independent of RFC 0002's unresolved
@@ -55,7 +58,7 @@ backend" is unproven on its central premise.
 `docs/roadmap.md` Phase 3 names `ourios-querier` alongside
 `ourios-bench` (shipped). RFC 0006 §1 explicitly routes B1/B2 here.
 The dependency it needs — `ourios-parquet`'s reader contract
-(RFC 0005 §3.0/§3.7) — already exists, so the querier can be built
+(RFC 0005 §3.9 reader contract) — already exists, so the querier can be built
 and benchmarked in parallel with the WAL/receiver ingest path. It
 is the highest-information work available: it converts the project's
 biggest open question into a measurement.
@@ -114,7 +117,7 @@ behind `run`.
 
 ### 4.3 Predicate pushdown (the thesis mechanism)
 Pushdown is scoped to exactly the columns RFC 0005 indexes. Its
-§3.4 query-consumer-absence rule fixes the Phase 3 B1/B2 pushdown
+§3.3 query-consumer-absence rule fixes the Phase 3 B1/B2 pushdown
 keys as `template_id`, `tenant_id`, and `time_unix_nano`, and
 §3.6 deliberately gives `params` list values **no** page index and
 **no** bloom filter (per-row entropy too high). The querier
@@ -132,7 +135,7 @@ therefore relies on:
   filters over the rows the above pruning leaves. They benefit
   from template/time pruning narrowing the scan, but a param value
   alone skips no row groups; param-level pruning would need a
-  future RFC 0005 §3.6 storage amendment (§7).
+  future RFC 0005 §3.6 storage amendment (§8).
 - The querier configures the DataFusion session so the above are
   enabled, and surfaces `row_groups_pruned` / `bytes_read` in
   `QueryResult` stats so B1 can assert pruning actually happened.
@@ -151,8 +154,9 @@ error `Display`. DataFusion is a `pub(crate)` dependency.
   - **Given** a corpus partitioned across many row groups where a
     target `template_id` lives in a known minority of them
   - **When** a template-exact query runs
-  - **Then** `QueryResult.row_groups_pruned / total` exceeds a
-    floor (e.g. ≥ 80% on the bench corpus)
+  - **Then** the pruned fraction `row_groups_pruned /
+    (row_groups_scanned + row_groups_pruned)` (both `QueryResult`
+    stats fields) exceeds a floor (e.g. ≥ 80% on the bench corpus)
   - **And** `bytes_read` is sub-linear in corpus size for fixed
     result size.
 
@@ -175,7 +179,7 @@ error `Display`. DataFusion is a `pub(crate)` dependency.
   - **Given** Parquet files with unknown columns (future schema) or
     missing optional columns (old schema)
   - **When** queried
-  - **Then** results honour RFC 0005 §3.7 reader defaults without
+  - **Then** results honour RFC 0005 §3.9 reader-contract defaults without
     error.
 
 - **RFC0007.5 — tenant isolation `[§3.7]`**
@@ -200,7 +204,32 @@ Mapped to `CLAUDE.md` §6.2:
 - **Property (`proptest`)** — lowering total over the RFC 0002 AST
   (no panic; tenant + time bounds always present in the plan).
 
-## 7. Open questions
+## 7. Alternatives considered
+
+- **Expose DataFusion SQL directly (no logs DSL).** Cheapest to
+  build — register the tables, hand users SQL. Rejected: it
+  violates hazard §4.6 (no DataFusion/SQL leakage), couples the
+  user-facing query contract to an implementation dependency, and
+  forfeits the logs-shaped ergonomics RFC 0002 exists to provide.
+- **Write a bespoke vectorised execution engine.** Maximum control
+  over pushdown. Rejected: it contradicts pillar #3 (`CLAUDE.md`
+  §2 — "we do not write a vectorised execution engine") and the
+  "off-the-shelf parts plus thin glue" thesis (§1). DataFusion
+  already does row-group skipping from Parquet stats.
+- **Lucene/Tantivy-style inverted index alongside Parquet.** A
+  second index structure for term lookups. Rejected for v1: the
+  thesis is that template structure + Parquet statistics *collapse*
+  the inverted index into the columnar store (§1) — adding a
+  separate index pre-judges that the collapse fails, which is what
+  B1/B2 are meant to test. Revisit only if B1/B2 fail.
+- **Defer the crate until RFC 0002's DSL branch is decided.**
+  Rejected: the execution layer (lowering target, pushdown,
+  B1/B2 measurement) is branch-independent (RFC 0002 §5.5), and
+  B1/B2 are the project's largest unmeasured risk — building the
+  branch-independent half now buys the thesis signal soonest. The
+  parser integration waits on RFC 0002 (§8).
+
+## 8. Open questions
 
 - [ ] Blocked on RFC 0002 §3 (Branch A vs B) before the parser
       integration is final — but the execution layer here is
@@ -221,7 +250,7 @@ Mapped to `CLAUDE.md` §6.2:
 - [ ] Async runtime + concurrency model for the querier role of the
       server binary (RFC 0003 sibling).
 
-## 8. References
+## 9. References
 
 - `CLAUDE.md` §1 (thesis), §2 pillar #3 (DataFusion), §4.6 (DSL/no
   leakage hazard), §3.5 (schema evolution), §3.7 (multi-tenancy),

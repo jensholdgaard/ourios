@@ -8,12 +8,18 @@
 //! prove B1 (RFC0007.1) and the B2 latency bench come next.
 //!
 //! This crate is the **read path**: it runs the query against the
-//! RFC 0005 store with predicate pushdown (tenant/time partition
-//! pruning + `template_id` / `time_unix_nano` filters, RFC 0005
-//! §3.3/§3.6) and returns results **without** leaking `DataFusion`
-//! or SQL through the public API (hazard `CLAUDE.md` §4.6). It
-//! reads the shipped RFC 0005 store; it needs neither the WAL nor
-//! the receiver.
+//! RFC 0005 store — scoped to the tenant's partition directory,
+//! with `template_id` / `time_unix_nano` column filters (RFC 0005
+//! §3.3/§3.6) — and returns results **without** leaking
+//! `DataFusion` or SQL through the public API (hazard `CLAUDE.md`
+//! §4.6). It reads the shipped RFC 0005 store; it needs neither
+//! the WAL nor the receiver.
+//!
+//! (Partition-level *time* pruning — deriving `year/month/day/hour`
+//! path bounds from the time range so whole directories are
+//! skipped — is a later refinement; today the time bound is a
+//! column predicate, and the row-group skipping it enables is what
+//! slice 2 / B1 measures.)
 //!
 //! **Throwaway query surface.** [`QueryRequest`] is intentionally
 //! minimal — just the predicates B1/B2 need. The real logs DSL

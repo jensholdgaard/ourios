@@ -1,8 +1,9 @@
-//! Execution slice 1 — `Querier::run` against a real RFC 0005
+//! Execution tests — `Querier::run` against a real RFC 0005
 //! Parquet store written by `ourios-parquet`. Covers the minimal
-//! predicate set B1/B2 need (tenant + time range + template-exact)
-//! and RFC0007.5 tenant isolation. Row-group pruning stats
-//! (RFC0007.1) are slice 2.
+//! predicate set (tenant + time range + template-exact), RFC0007.5
+//! tenant isolation, B1 row-group pruning (RFC0007.1) and B2 —
+//! template-exact work tracks result size, not corpus size
+//! (RFC0007.2).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,6 +17,10 @@ use ourios_querier::{Querier, QueryError, QueryRequest};
 /// 2026-04-02T10:58:00 UTC — all test records sit in one hour
 /// (one partition per tenant), matching the round-trip fixtures.
 const TS0: u64 = 1_775_127_480_000_000_000;
+
+/// One hour in nanoseconds — bump a record into the next
+/// `hour=` partition (a distinct file ⇒ a distinct row group).
+const HOUR_NS: u64 = 3_600_000_000_000;
 
 fn rec(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
     MinedRecord {
@@ -61,6 +66,30 @@ fn write_all(bucket: &Path, recs: &[MinedRecord]) {
         let mut w = Writer::open(bucket, part).expect("open writer");
         w.append_records(&rs).expect("append");
         w.close().expect("close");
+    }
+}
+
+/// Lay down a corpus for tenant "a": the **target** template
+/// (`result_rows` rows in hour 10, one file ⇒ one row group) plus
+/// `n_filler` distinct non-target templates, each its own template
+/// in its own hour (so each is a separate file with a `template_id`
+/// min/max that excludes the target). A `template_id = target`
+/// query must therefore read only the target file's row group and
+/// prune every filler row group — regardless of `n_filler`.
+fn corpus_with_filler(bucket: &Path, target: u64, result_rows: u64, n_filler: u64) {
+    let tgt: Vec<MinedRecord> = (0..result_rows)
+        .map(|i| rec("a", target, TS0 + i * 1_000_000))
+        .collect();
+    write_all(bucket, &tgt);
+    for k in 0..n_filler {
+        // Distinct template id (never the target) in a distinct
+        // hour, so each filler is its own file / row group.
+        let template = target + 1 + k;
+        let base = TS0 + (k + 1) * HOUR_NS;
+        let fill: Vec<MinedRecord> = (0..result_rows)
+            .map(|i| rec("a", template, base + i * 1_000_000))
+            .collect();
+        write_all(bucket, &fill);
     }
 }
 
@@ -209,6 +238,66 @@ async fn rfc0007_1_pushdown_prunes_row_groups() {
         r.stats.bytes_read > 0,
         "the scanned row group reads bytes; stats={:?}",
         r.stats,
+    );
+}
+
+/// RFC0007.2 (B2) — the inverted-index-collapse claim, measured
+/// structurally instead of by wall clock: for a fixed-result
+/// template-exact query, the *work the engine does* tracks the
+/// result size, not the corpus size. Two corpora hold the **same**
+/// target file (5 rows of template 1) but differ ~8× in total size
+/// (3 vs 30 filler templates, each its own row group). A
+/// `template_id = 1` query reads the same row group in both —
+/// `row_groups_scanned` and `bytes_read` are flat — while the
+/// extra corpus is absorbed entirely by pruning.
+#[tokio::test]
+async fn rfc0007_2_template_exact_work_scales_with_result_not_corpus() {
+    let small = tempfile::TempDir::new().expect("temp small");
+    let large = tempfile::TempDir::new().expect("temp large");
+    corpus_with_filler(small.path(), 1, 5, 3); //  4 files
+    corpus_with_filler(large.path(), 1, 5, 30); // 31 files (~8× the corpus)
+
+    let s = Querier::new(small.path())
+        .run(req("a", None, Some(1)))
+        .await
+        .expect("small query");
+    let l = Querier::new(large.path())
+        .run(req("a", None, Some(1)))
+        .await
+        .expect("large query");
+
+    // Same fixed result in both corpora.
+    assert_eq!(s.rows, 5);
+    assert_eq!(l.rows, 5, "result size is fixed regardless of corpus");
+
+    // The headline: the work scanned for the fixed result is FLAT
+    // across an ~8× larger corpus — only the target row group is
+    // read in either case.
+    assert_eq!(
+        s.stats.row_groups_scanned, l.stats.row_groups_scanned,
+        "row groups scanned tracks result, not corpus; small={:?} large={:?}",
+        s.stats, l.stats,
+    );
+    assert_eq!(
+        s.stats.bytes_read, l.stats.bytes_read,
+        "bytes read for the fixed result is flat across corpus sizes; small={:?} large={:?}",
+        s.stats, l.stats,
+    );
+
+    // …and the corpus growth is absorbed entirely by pruning: the
+    // larger corpus prunes strictly more row groups, and its total
+    // row-group count is far larger while scanned stays flat.
+    assert!(
+        l.stats.row_groups_pruned > s.stats.row_groups_pruned,
+        "the larger corpus prunes strictly more row groups; small={:?} large={:?}",
+        s.stats,
+        l.stats,
+    );
+    let s_total = s.stats.row_groups_scanned + s.stats.row_groups_pruned;
+    let l_total = l.stats.row_groups_scanned + l.stats.row_groups_pruned;
+    assert!(
+        l_total >= s_total + 20,
+        "the large corpus genuinely has many more row groups; small_total={s_total} large_total={l_total}",
     );
 }
 

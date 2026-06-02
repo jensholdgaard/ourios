@@ -1,13 +1,15 @@
 //! `ourios-querier` — RFC 0007 querier (pillar #3, `DataFusion`).
 //!
-//! **Status: execution slice 2.** [`Querier::run`] executes a
+//! **Status: execution slice 3.** [`Querier::run`] executes a
 //! minimal query — tenant scope + optional time range + optional
 //! template-exact id — against the RFC 0005 Parquet store via
 //! `DataFusion`, returning a matching-row count **and the scan's
 //! row-group pruning stats** ([`QueryStats`]). Tenant isolation
-//! (RFC0007.5) and B1 pruning (RFC0007.1 — a selective query
-//! provably skips row groups via statistics) are live + tested.
-//! The B2 latency-vs-corpus-size bench (RFC0007.2) comes next.
+//! (RFC0007.5), B1 pruning (RFC0007.1 — a selective query provably
+//! skips row groups via statistics) and B2 (RFC0007.2 — the work
+//! the engine does tracks the result size, not the corpus size;
+//! scanned row groups + bytes read stay flat as the corpus grows,
+//! the growth absorbed by pruning) are live + tested.
 //!
 //! This crate is the **read path**: it runs the query against the
 //! RFC 0005 store — scoped to the tenant's partition directory,

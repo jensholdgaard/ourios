@@ -11,18 +11,14 @@
 // RFC0007.1 (B1 pushdown prunes row groups) is now a LIVE test —
 // see `tests/execution.rs::rfc0007_1_pushdown_prunes_row_groups`.
 
-#[ignore = "RFC 0007 red gate — execution pending (RFC0007.2)"]
-#[test]
-fn rfc0007_2_template_exact_latency_scales_with_result_not_corpus() {
-    // B2: same query against corpora of increasing size with the
-    // result-set size held ~constant — median latency bounded by
-    // result size, not corpus size (the inverted-index-collapse
-    // claim). Measured by criterion across corpus/otel-demo-v*.
-    unimplemented!(
-        "RFC0007.2 — assert template-exact latency tracks result \
-         cardinality, not corpus size"
-    );
-}
+// RFC0007.2 (B2 — template-exact work tracks result size, not
+// corpus size) is now a LIVE test — see
+// `tests/execution.rs::rfc0007_2_template_exact_work_scales_with_result_not_corpus`.
+// It asserts the claim structurally (row groups scanned + bytes
+// read are flat across an ~8× larger corpus, the growth absorbed
+// by pruning), which is deterministic where a wall-clock latency
+// bench would be flaky. A criterion latency bench across the
+// otel-demo corpora is supportive evidence, tracked separately.
 
 #[ignore = "RFC 0007 red gate — execution pending (RFC0007.3)"]
 #[test]

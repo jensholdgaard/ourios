@@ -299,6 +299,29 @@ fn resolve_bucket(
 /// `bytes(ourios_output)`. Missing subtrees are fine (nothing
 /// to collide with).
 fn ensure_bucket_has_no_parquet(bucket_root: &std::path::Path) -> Result<(), BenchError> {
+    if let Some(path) = find_published_parquet(bucket_root)? {
+        return Err(BenchError::Cli {
+            detail: format!(
+                "bucket {} already contains a Parquet file ({}); A1 would \
+                 count it in bytes(ourios_output). Point --bucket-dir at an \
+                 empty directory or omit it to use a fresh scratch dir.",
+                bucket_root.display(),
+                path.display(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// First committed `*.parquet` under the bucket's `data/` or
+/// `audit/` subtree, or `None` if the bucket holds no Parquet.
+/// Shared by [`ensure_bucket_has_no_parquet`] (the A1 path) and
+/// [`store::build_query_store`] (the B2 path), which each wrap it
+/// in a context-appropriate error — a reused bucket skews A1's
+/// byte count and mixes corpora into the B2 query alike.
+pub(crate) fn find_published_parquet(
+    bucket_root: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, BenchError> {
     for sub in ["data", "audit"] {
         let dir = bucket_root.join(sub);
         let mut stack = vec![dir];
@@ -340,20 +363,12 @@ fn ensure_bucket_has_no_parquet(bucket_root: &std::path::Path) -> Result<(), Ben
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
                 {
-                    return Err(BenchError::Cli {
-                        detail: format!(
-                            "bucket {} already contains a Parquet file ({}); A1 would \
-                             count it in bytes(ourios_output). Point --bucket-dir at an \
-                             empty directory or omit it to use a fresh scratch dir.",
-                            bucket_root.display(),
-                            path.display(),
-                        ),
-                    });
+                    return Ok(Some(path));
                 }
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Format `SystemTime::now()` as a §3.6 millisecond-precision

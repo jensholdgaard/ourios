@@ -50,6 +50,21 @@ pub struct BuiltStore {
 /// which can't happen on any supported target — same documented
 /// assumption as [`crate::run`].
 pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltStore, BenchError> {
+    // A reused bucket would let the querier enumerate a prior run's
+    // Parquet too, mixing corpora and skewing both the row counts
+    // and the latency measurement. Reject up front (the A1 path
+    // guards the same way via `ensure_bucket_has_no_parquet`).
+    if let Some(existing) = crate::find_published_parquet(bucket_root)? {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "bucket {} already contains a Parquet file ({}); build_query_store \
+                 needs an empty bucket so the querier doesn't mix corpora",
+                bucket_root.display(),
+                existing.display(),
+            ),
+        });
+    }
+
     let load = corpus::load(corpus_dir)?;
 
     let mut writers: HashMap<PartitionKey, Writer> = HashMap::new();
@@ -123,4 +138,28 @@ fn append_record(
         })?;
     writers.insert(partition, writer);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bucket that already holds a published `*.parquet` is
+    /// rejected, so a reused dir can't silently mix corpora into the
+    /// B2 query (regression guard for the second-build case).
+    #[test]
+    fn rejects_a_non_empty_bucket() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(corpus.path().join("c.txt"), b"user 42 logged in\n").expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let first = build_query_store(corpus.path(), bucket.path()).expect("first build");
+        assert!(first.rows >= 1, "the one corpus line is written");
+
+        let second = build_query_store(corpus.path(), bucket.path());
+        assert!(
+            matches!(second, Err(BenchError::Pipeline { .. })),
+            "a reused, non-empty bucket must be rejected, got {second:?}",
+        );
+    }
 }

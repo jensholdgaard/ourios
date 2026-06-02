@@ -342,24 +342,46 @@ impl Querier {
         }
 
         let ctx = SessionContext::new();
+        // Tenant isolation (RFC0007.5 / §3.7) is enforced here, not
+        // just assumed structural: every resolved file must
+        // canonicalize to a path *under* the tenant's canonical
+        // partition root. The manifest's entries are already validated
+        // as partition-local names (`Manifest::validate`), but a
+        // symlinked `*.parquet` could still resolve outside — this
+        // `starts_with` check is the backstop that fails such a path
+        // loudly rather than reading another tenant's data.
+        let tenant_root = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
+            detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+        })?;
         // One table path per *live* data file (RFC 0009 §3.4 — the
         // manifest, not a directory glob, decides the file set, so a
         // query never sees a compaction's superseded inputs). Each is
         // the canonical absolute path: DataFusion 53 treats an
         // absolute filesystem path as local and URI-encodes it
         // internally, so spaces / reserved characters are handled
-        // without a hand-built `file://…` string. Tenant isolation is
-        // structural — every path is under this tenant's
-        // `data/tenant_id=<enc>/` dir, so no other tenant's rows are
-        // reachable (RFC0007.5). `year/month/day/hour` stay path-only
-        // (not file columns) and the query filters only data columns,
-        // so no table partition columns are declared.
+        // without a hand-built `file://…` string. `year/month/day/hour`
+        // stay path-only (not file columns) and the query filters only
+        // data columns, so no table partition columns are declared.
+        let mut seen = std::collections::HashSet::new();
         let mut urls = Vec::with_capacity(live_files.len());
         for file in &live_files {
             let abs = file.canonicalize().map_err(|e| QueryError::Storage {
                 detail: format!("canonicalize {}: {e}", file.display()),
             })?;
-            urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
+            if !abs.starts_with(&tenant_root) {
+                return Err(QueryError::Storage {
+                    detail: format!(
+                        "resolved file {} escapes tenant partition root {}",
+                        abs.display(),
+                        tenant_root.display(),
+                    ),
+                });
+            }
+            // De-duplicate so a manifest naming the same file twice
+            // can't double-count its rows.
+            if seen.insert(abs.clone()) {
+                urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
+            }
         }
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
@@ -561,5 +583,81 @@ mod tests {
         assert_eq!(stats.row_groups_pruned, 3);
         assert_eq!(stats.row_groups_scanned, 2);
         assert_eq!(stats.bytes_read, 4096);
+    }
+
+    // --- resolve_live_files (RFC 0009 §3.4 manifest / glob fallback) ---
+
+    /// Create `<root>/data/tenant_id=a/year=2026/.../hour=10` and
+    /// return `(tenant_dir, partition_dir)`.
+    fn tenant_and_partition(root: &std::path::Path) -> (PathBuf, PathBuf) {
+        let tenant = root.join("data/tenant_id=a");
+        let partition = tenant.join("year=2026/month=04/day=02/hour=10");
+        std::fs::create_dir_all(&partition).expect("mkdir partition");
+        (tenant, partition)
+    }
+
+    #[test]
+    fn resolve_missing_tenant_dir_is_empty() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let ghost = tmp.path().join("data/tenant_id=ghost");
+        assert!(resolve_live_files(&ghost).expect("resolve").is_empty());
+    }
+
+    #[test]
+    fn resolve_tmp_only_partition_is_empty() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("x.parquet.tmp"), b"partial").expect("write tmp");
+        assert!(resolve_live_files(&tenant).expect("resolve").is_empty());
+    }
+
+    #[test]
+    fn resolve_globs_committed_parquet_without_a_manifest() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
+        std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
+        let files = resolve_live_files(&tenant).expect("resolve");
+        assert_eq!(
+            files.len(),
+            2,
+            "both committed files are live without a manifest"
+        );
+    }
+
+    #[test]
+    fn resolve_manifest_is_authoritative() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
+        std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
+        let manifest = ourios_parquet::Manifest {
+            generation: 1,
+            files: vec!["a.parquet".to_string()],
+        };
+        std::fs::write(
+            partition.join(ourios_parquet::MANIFEST_FILENAME),
+            manifest.to_json().unwrap(),
+        )
+        .expect("write manifest");
+        let files = resolve_live_files(&tenant).expect("resolve");
+        assert_eq!(files.len(), 1, "only the manifest's file is live");
+        assert!(files[0].ends_with("a.parquet"));
+    }
+
+    #[test]
+    fn resolve_malformed_manifest_is_a_storage_error() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
+        std::fs::write(
+            partition.join(ourios_parquet::MANIFEST_FILENAME),
+            b"not json",
+        )
+        .expect("write manifest");
+        assert!(matches!(
+            resolve_live_files(&tenant),
+            Err(QueryError::Storage { .. })
+        ));
     }
 }

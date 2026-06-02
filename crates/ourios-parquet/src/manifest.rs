@@ -34,7 +34,7 @@ pub struct Manifest {
     pub files: Vec<String>,
 }
 
-/// Failure reading or parsing a [`Manifest`].
+/// Failure reading, parsing, or validating a [`Manifest`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ManifestError {
@@ -42,6 +42,14 @@ pub enum ManifestError {
     Io(std::io::Error),
     /// The manifest bytes were not valid manifest JSON.
     Parse(serde_json::Error),
+    /// A `files` entry is not a partition-local `*.parquet` file name
+    /// (it is absolute, contains path separators, or escapes the
+    /// partition directory via `..`). A reader joins entries onto the
+    /// partition dir, so accepting such a name would let a manifest
+    /// point a query at files outside the tenant's partition —
+    /// breaking tenant isolation (`CLAUDE.md` §3.7 / RFC0007.5). Bad
+    /// manifests fail loudly rather than silently mis-resolving.
+    InvalidFilename(String),
 }
 
 impl std::fmt::Display for ManifestError {
@@ -49,6 +57,12 @@ impl std::fmt::Display for ManifestError {
         match self {
             Self::Io(e) => write!(f, "read manifest: {e}"),
             Self::Parse(e) => write!(f, "parse manifest: {e}"),
+            Self::InvalidFilename(name) => {
+                write!(
+                    f,
+                    "manifest lists a non-partition-local file name: {name:?}"
+                )
+            }
         }
     }
 }
@@ -58,8 +72,24 @@ impl std::error::Error for ManifestError {
         match self {
             Self::Io(e) => Some(e),
             Self::Parse(e) => Some(e),
+            Self::InvalidFilename(_) => None,
         }
     }
+}
+
+/// Whether `name` is a bare partition-local `*.parquet` file name:
+/// exactly one path component, that component an ordinary name (no
+/// `/`, no `..`, not absolute), with a `.parquet` extension.
+fn is_partition_local_parquet(name: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(name);
+    let mut components = path.components();
+    let single_normal =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    single_normal
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
 }
 
 impl Manifest {
@@ -75,12 +105,30 @@ impl Manifest {
     /// bytes aren't valid manifest JSON.
     pub fn read(partition_dir: &Path) -> Result<Option<Self>, ManifestError> {
         match std::fs::read(partition_dir.join(MANIFEST_FILENAME)) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(ManifestError::Parse),
+            Ok(bytes) => {
+                let manifest: Self =
+                    serde_json::from_slice(&bytes).map_err(ManifestError::Parse)?;
+                manifest.validate()?;
+                Ok(Some(manifest))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(ManifestError::Io(e)),
         }
+    }
+
+    /// Reject any `files` entry that is not a partition-local
+    /// `*.parquet` file name (see [`ManifestError::InvalidFilename`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::InvalidFilename`] for the first offending name.
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        for name in &self.files {
+            if !is_partition_local_parquet(name) {
+                return Err(ManifestError::InvalidFilename(name.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// Serialize to the canonical JSON bytes the compactor writes and
@@ -134,6 +182,51 @@ mod tests {
         assert!(matches!(
             Manifest::read(dir.path()),
             Err(ManifestError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_plain_parquet_names() {
+        for ok in ["a.parquet", "01890000-0000-7000-8000-000000000000.parquet"] {
+            assert!(is_partition_local_parquet(ok), "{ok} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_path_escaping_or_non_parquet_names() {
+        for bad in [
+            "../escape.parquet", // parent escape
+            "/abs/x.parquet",    // absolute
+            "sub/x.parquet",     // nested
+            "x.txt",             // wrong extension
+            "x",                 // no extension
+            "",                  // empty
+            ".",                 // current dir
+        ] {
+            assert!(
+                !is_partition_local_parquet(bad),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn read_rejects_a_path_escaping_entry() {
+        let dir = tempfile::tempdir().expect("temp");
+        let evil = Manifest {
+            generation: 1,
+            files: vec!["../../../etc/secrets.parquet".to_string()],
+        };
+        // Serialize directly (bypassing validate) to simulate a
+        // malformed/hostile manifest on disk.
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec(&evil).unwrap(),
+        )
+        .expect("write");
+        assert!(matches!(
+            Manifest::read(dir.path()),
+            Err(ManifestError::InvalidFilename(_))
         ));
     }
 }

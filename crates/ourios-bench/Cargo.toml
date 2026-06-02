@@ -57,5 +57,20 @@ zstd = "0.13"
 # `tests/`, so no separate `[dev-dependencies]` mirror is needed.
 tempfile = "3"
 
+[dev-dependencies]
+# B2 latency bench (RFC 0007 §6 — supportive, non-gating evidence
+# for the RFC0007.2 thesis gate that ourios-querier proves
+# structurally). criterion gives warmup + a statistical median,
+# which is what B2's "median latency" target wants; ourios-querier
+# is the unit under test (and pulls DataFusion); a current-thread
+# tokio runtime drives its async `Querier::run`.
+criterion = "0.5"
+ourios-querier = { path = "../ourios-querier" }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[[bench]]
+name = "b2"
+harness = false
+
 [lints]
 workspace = true

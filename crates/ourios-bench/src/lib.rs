@@ -36,8 +36,10 @@ mod c2;
 mod corpus;
 mod harness;
 mod report;
+mod store;
 
 pub use report::{update_status_section, write_results_json};
+pub use store::{BuiltStore, build_query_store};
 
 /// Configuration for one bench invocation.
 ///

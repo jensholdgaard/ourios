@@ -173,8 +173,18 @@ impl Querier {
         }
 
         let ctx = SessionContext::new();
-        let url = ListingTableUrl::parse(format!("file://{}/", tenant_dir.display()))
-            .map_err(storage_err)?;
+        // Build the table URL from the canonical absolute path,
+        // scheme-less with a trailing slash. DataFusion 53 treats
+        // an absolute filesystem path as local and URI-encodes it
+        // internally — so spaces / reserved characters in the
+        // bucket path are handled, unlike a hand-built `file://…`
+        // string. `canonicalize` is safe: we just confirmed the
+        // directory exists. The trailing slash marks it a
+        // directory (not a single object).
+        let abs = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
+            detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+        })?;
+        let url = ListingTableUrl::parse(format!("{}/", abs.display())).map_err(storage_err)?;
         // `year/month/day/hour` are path-only Hive partition cols
         // (parsed from the directory names); `tenant_id` is *not*
         // listed — relative to this tenant-scoped root it's a plain
@@ -225,8 +235,12 @@ impl Querier {
                 .map_err(storage_err)?;
         }
 
-        let batches = df.collect().await.map_err(storage_err)?;
-        let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
+        // `count()` aggregates without materialising the matched
+        // rows' columns — so the heavy `attributes` / `params` /
+        // `body` columns are never read for a count, and Parquet
+        // projection pushdown applies. (`collect()` would buffer
+        // every column of every match.)
+        let rows = df.count().await.map_err(storage_err)? as u64;
         // QueryStats (row-group pruning / bytes) is slice 2 — it
         // comes from the ParquetExec metrics, not the row count.
         Ok(QueryResult {

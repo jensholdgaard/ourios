@@ -134,6 +134,30 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
+/// Whether `dir` (a tenant's partition root) holds at least one
+/// published `*.parquet` file anywhere beneath it. Recursive
+/// because the data is nested `year=/month=/day=/hour=/`. Files
+/// the writer hasn't committed (`*.parquet.tmp`) have extension
+/// `tmp`, so they don't count — which is exactly the
+/// poisoned-writer case we want to treat as "empty", not error.
+fn has_published_parquet(dir: &std::path::Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "parquet") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Map a `DataFusion` error to the Ourios-owned [`QueryError`] so
 /// no `datafusion`/`arrow` type crosses the public boundary (§4.6).
 // Takes the error by value so it drops in cleanly as
@@ -181,9 +205,13 @@ impl Querier {
             .bucket_root
             .join("data")
             .join(format!("tenant_id={enc}"));
-        // No directory ⇒ the tenant has written nothing ⇒ empty
-        // result (not an error; a valid query over an empty range).
-        if !tenant_dir.is_dir() {
+        // No published `*.parquet` under the tenant dir ⇒ the
+        // tenant has nothing queryable ⇒ empty result (not an
+        // error). Covers both the missing-dir case and a dir that
+        // holds only `*.parquet.tmp` (a poisoned/crashed writer) or
+        // empty partition dirs — where `infer_schema` would
+        // otherwise error and wrongly fail the query.
+        if !has_published_parquet(&tenant_dir) {
             return Ok(QueryResult::default());
         }
 

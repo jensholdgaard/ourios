@@ -137,3 +137,33 @@ async fn rfc0007_5_tenant_isolation() {
     let none = q.run(req("ghost", None, None)).await.expect("run ghost");
     assert_eq!(none.rows, 0, "unknown tenant yields an empty result");
 }
+
+/// A tenant directory that exists but holds no *committed*
+/// `*.parquet` (only an uncommitted `*.parquet.tmp`, e.g. a
+/// crashed writer) is an empty result, not an error — the query
+/// must not fail when schema inference would find nothing.
+#[tokio::test]
+async fn tenant_dir_without_committed_parquet_is_empty() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    // Mimic a poisoned/crashed writer: the partition dir and a
+    // `.tmp` file exist, but nothing was committed to `.parquet`.
+    let part = bucket
+        .path()
+        .join("data/tenant_id=a/year=2026/month=04/day=02/hour=10");
+    std::fs::create_dir_all(&part).expect("mkdir partition");
+    std::fs::write(
+        part.join("01890000-0000-7000-8000-000000000000.parquet.tmp"),
+        b"partial",
+    )
+    .expect("write tmp");
+
+    let q = Querier::new(bucket.path());
+    let r = q
+        .run(req("a", None, None))
+        .await
+        .expect("run must not error");
+    assert_eq!(
+        r.rows, 0,
+        "uncommitted .tmp-only tenant dir is empty, not an error"
+    );
+}

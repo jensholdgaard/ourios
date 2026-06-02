@@ -197,9 +197,9 @@ fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
         )));
     }
     let batch = &batches[0];
-    if batch.num_rows() != 1 || batch.num_columns() == 0 {
+    if batch.num_rows() != 1 || batch.num_columns() != 1 {
         return Err(bad(format!(
-            "expected 1 row × ≥1 column, got {}×{}",
+            "expected exactly 1 row × 1 column, got {}×{}",
             batch.num_rows(),
             batch.num_columns(),
         )));

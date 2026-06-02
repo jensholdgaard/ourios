@@ -138,24 +138,40 @@ impl std::error::Error for QueryError {}
 /// published `*.parquet` file anywhere beneath it. Recursive
 /// because the data is nested `year=/month=/day=/hour=/`. Files
 /// the writer hasn't committed (`*.parquet.tmp`) have extension
-/// `tmp`, so they don't count — which is exactly the
-/// poisoned-writer case we want to treat as "empty", not error.
-fn has_published_parquet(dir: &std::path::Path) -> bool {
+/// `tmp`, so they don't count — the poisoned-writer case we treat
+/// as "empty", not error.
+///
+/// A missing directory (`NotFound`) is "empty" (`Ok(false)`); any
+/// *other* I/O error (permission denied, transient failure) is
+/// propagated as [`QueryError::Storage`] rather than silently
+/// masked as "no data" — a wrong zero-row answer is worse than a
+/// surfaced error.
+fn has_published_parquet(dir: &std::path::Path) -> Result<bool, QueryError> {
+    let io_err = |op: &str, p: &std::path::Path, e: &std::io::Error| QueryError::Storage {
+        detail: format!("{op} {}: {e}", p.display()),
+    };
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            // The dir (or a subdir, lost to a concurrent
+            // housekeeping unlink) simply isn't there → not data,
+            // not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err("read_dir", &d, &e)),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err("read_dir entry", &d, &e))?;
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|x| x == "parquet") {
-                return true;
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(path),
+                Ok(_) if path.extension().is_some_and(|x| x == "parquet") => return Ok(true),
+                Ok(_) => {}
+                Err(e) => return Err(io_err("file_type", &path, &e)),
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Map a `DataFusion` error to the Ourios-owned [`QueryError`] so
@@ -211,7 +227,7 @@ impl Querier {
         // holds only `*.parquet.tmp` (a poisoned/crashed writer) or
         // empty partition dirs — where `infer_schema` would
         // otherwise error and wrongly fail the query.
-        if !has_published_parquet(&tenant_dir) {
+        if !has_published_parquet(&tenant_dir)? {
             return Ok(QueryResult::default());
         }
 

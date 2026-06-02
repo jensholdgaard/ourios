@@ -407,6 +407,26 @@ impl Querier {
 mod tests {
     use super::*;
 
+    /// Engine/SQL substrings that must never appear in an
+    /// operator-facing `QueryError` message (RFC0007.3 / §4.6).
+    /// Lowercase — callers scan against the lowercased message.
+    /// None of these collide with the generic Storage message
+    /// ("failed to read the log store").
+    const ENGINE_LEAK_TOKENS: &[&str] = &[
+        "datafusion",
+        "arrow",
+        "parquet",
+        "sql",
+        "select",
+        "schema",
+        "logical plan",
+        "logicalplan",
+        "physical",
+        "recordbatch",
+        "listingtable",
+        "during planning",
+    ];
+
     /// The operator-facing `QueryError` messages are a contract
     /// (hazard §4.6: no DataFusion/SQL leakage, so operators rely
     /// on these); pin them so a refactor can't silently reword.
@@ -432,6 +452,34 @@ mod tests {
             }
             .to_string(),
             "failed to read the log store",
+        );
+    }
+
+    /// RFC0007.3 (string-level boundary) — a `Storage` error
+    /// wrapping engine/SQL text scrubs it from the operator-facing
+    /// `Display` while preserving it in `Debug` for logs. A
+    /// denylist scan (not an exact-string match) so a future
+    /// reword can't let a *new* engine token slip through (§4.6).
+    #[test]
+    fn rfc0007_3_storage_display_leaks_no_engine_tokens() {
+        let leaky = "Arrow error: Parquet error: SELECT failed; schema \
+                     mismatch in LogicalPlan (datafusion physical_plan)";
+        let err = QueryError::Storage {
+            detail: leaky.to_string(),
+        };
+
+        let shown = err.to_string().to_ascii_lowercase();
+        for token in ENGINE_LEAK_TOKENS {
+            assert!(
+                !shown.contains(token),
+                "Storage Display leaked engine token {token:?}: {shown:?}",
+            );
+        }
+        // The detail is preserved for logs (Debug) — scrubbing is a
+        // deliberate Display choice, not data loss.
+        assert!(
+            format!("{err:?}").contains("Parquet"),
+            "Debug must preserve the engine detail for logs",
         );
     }
 

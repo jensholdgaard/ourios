@@ -20,15 +20,19 @@
 // bench would be flaky. A criterion latency bench across the
 // otel-demo corpora is supportive evidence, tracked separately.
 
-#[ignore = "RFC 0007 red gate — execution pending (RFC0007.3)"]
-#[test]
-fn rfc0007_3_no_datafusion_or_sql_leakage() {
-    // §4.6: no datafusion / arrow / SQL type appears in any
-    // public signature or error Display. (Will be a
-    // compile-/string-level boundary assertion once the engine
-    // exists; stubbed here as the red-gate placeholder.)
-    unimplemented!("RFC0007.3 — assert the public API leaks no DataFusion/arrow/SQL types");
-}
+// RFC0007.3 (no DataFusion/arrow/SQL leakage — §4.6) is now LIVE:
+//   - string level: `lib.rs` unit test
+//     `rfc0007_3_storage_display_leaks_no_engine_tokens` (a
+//     `Storage` error scrubs synthetic engine/SQL text from
+//     `Display` while `Debug` preserves it);
+//   - real engine error: `tests/boundary.rs::
+//     rfc0007_3_real_engine_error_does_not_leak` (a corrupt
+//     `*.parquet` trips `DataFusion` schema inference; the
+//     surfaced message leaks none of the engine token denylist).
+// The "no engine type in a public *signature*" half is enforced
+// structurally: `QueryRequest`/`QueryResult`/`QueryStats`/
+// `QueryError` are all Ourios-owned (see crate docs / Cargo.toml
+// note), so no `datafusion`/`arrow` type crosses the API.
 
 #[ignore = "RFC 0007 red gate — execution pending (RFC0007.4)"]
 #[test]

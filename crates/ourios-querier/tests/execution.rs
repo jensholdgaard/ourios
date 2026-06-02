@@ -203,6 +203,13 @@ async fn rfc0007_1_pushdown_prunes_row_groups() {
         "at least one row group was also scanned (matched); stats={:?}",
         r.stats,
     );
+    // The `bytes_scanned` extraction must stay wired — a regression
+    // to always-0 would otherwise pass the row-group asserts above.
+    assert!(
+        r.stats.bytes_read > 0,
+        "the scanned row group reads bytes; stats={:?}",
+        r.stats,
+    );
 }
 
 /// A `bucket_root` whose path contains a space still resolves —

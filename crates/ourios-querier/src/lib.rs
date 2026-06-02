@@ -44,7 +44,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate::expr_fn::count;
-use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
@@ -190,9 +190,13 @@ fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
     let bad = |detail: String| QueryError::Storage {
         detail: format!("count aggregate: {detail}"),
     };
-    let batch = batches
-        .first()
-        .ok_or_else(|| bad("no result batch".to_string()))?;
+    if batches.len() != 1 {
+        return Err(bad(format!(
+            "expected exactly 1 result batch, got {}",
+            batches.len(),
+        )));
+    }
+    let batch = &batches[0];
     if batch.num_rows() != 1 || batch.num_columns() == 0 {
         return Err(bad(format!(
             "expected 1 row × ≥1 column, got {}×{}",
@@ -205,6 +209,9 @@ fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| bad("count column is not Int64".to_string()))?;
+    if col.is_null(0) {
+        return Err(bad("count is null".to_string()));
+    }
     u64::try_from(col.value(0)).map_err(|_| bad("negative count".to_string()))
 }
 
@@ -221,28 +228,38 @@ fn accumulate_scan_stats(plan: &dyn ExecutionPlan, stats: &mut QueryStats) {
     if let Some(metrics) = plan.metrics() {
         // `aggregate_by_name` sums each metric across the scan's
         // per-file / per-partition instances.
-        for metric in metrics.aggregate_by_name().iter() {
-            match metric.value() {
-                // `row_groups_pruned_statistics` is a PruningMetrics
-                // carrying both pruned (skipped via min/max stats)
-                // and matched (read) row-group counts — exactly the
-                // B1 numerator + denominator.
-                MetricValue::PruningMetrics {
-                    name,
-                    pruning_metrics,
-                } if name == "row_groups_pruned_statistics" => {
-                    stats.row_groups_pruned += pruning_metrics.pruned() as u64;
-                    stats.row_groups_scanned += pruning_metrics.matched() as u64;
-                }
-                MetricValue::Count { name, count } if name == "bytes_scanned" => {
-                    stats.bytes_read += count.value() as u64;
-                }
-                _ => {}
-            }
-        }
+        fold_metrics(&metrics.aggregate_by_name(), stats);
     }
     for child in plan.children() {
         accumulate_scan_stats(child.as_ref(), stats);
+    }
+}
+
+/// Fold the `DataFusion`-version-sensitive scan metrics — the
+/// `row_groups_pruned_statistics` `PruningMetrics` and the
+/// `bytes_scanned` `Count` — into `stats`. Pulled out of
+/// [`accumulate_scan_stats`] so the metric-name / value-shape
+/// matching is unit-testable without a live plan (the names are an
+/// engine contract that can drift across `DataFusion` releases).
+fn fold_metrics(metrics: &MetricsSet, stats: &mut QueryStats) {
+    for metric in metrics.iter() {
+        match metric.value() {
+            // `row_groups_pruned_statistics` is a PruningMetrics
+            // carrying both pruned (skipped via min/max stats) and
+            // matched (read) row-group counts — exactly the B1
+            // numerator + denominator.
+            MetricValue::PruningMetrics {
+                name,
+                pruning_metrics,
+            } if name == "row_groups_pruned_statistics" => {
+                stats.row_groups_pruned += pruning_metrics.pruned() as u64;
+                stats.row_groups_scanned += pruning_metrics.matched() as u64;
+            }
+            MetricValue::Count { name, count } if name == "bytes_scanned" => {
+                stats.bytes_read += count.value() as u64;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -425,5 +442,57 @@ mod tests {
         assert_eq!(r.stats.row_groups_scanned, 0);
         assert_eq!(r.stats.row_groups_pruned, 0);
         assert_eq!(r.stats.bytes_read, 0);
+    }
+
+    /// Pin the metric-name / value-shape contract `fold_metrics`
+    /// depends on: a `row_groups_pruned_statistics` `PruningMetrics`
+    /// maps to pruned/matched row-group counts, `bytes_scanned`
+    /// `Count` maps to `bytes_read`, and any other metric is ignored.
+    /// If a `DataFusion` bump renames or reshapes these, this fails
+    /// locally rather than letting the live test silently report
+    /// always-zero stats.
+    #[test]
+    fn fold_metrics_extracts_pruning_and_bytes() {
+        use std::borrow::Cow;
+
+        use datafusion::physical_plan::metrics::{Count, Metric, PruningMetrics};
+
+        let pruning = PruningMetrics::new();
+        pruning.add_pruned(3);
+        pruning.add_matched(2);
+        let bytes = Count::new();
+        bytes.add(4096);
+        // A metric we don't track — must be left untouched.
+        let other = Count::new();
+        other.add(99);
+
+        let mut set = MetricsSet::new();
+        set.push(Arc::new(Metric::new(
+            MetricValue::PruningMetrics {
+                name: Cow::Borrowed("row_groups_pruned_statistics"),
+                pruning_metrics: pruning,
+            },
+            None,
+        )));
+        set.push(Arc::new(Metric::new(
+            MetricValue::Count {
+                name: Cow::Borrowed("bytes_scanned"),
+                count: bytes,
+            },
+            None,
+        )));
+        set.push(Arc::new(Metric::new(
+            MetricValue::Count {
+                name: Cow::Borrowed("output_rows"),
+                count: other,
+            },
+            None,
+        )));
+
+        let mut stats = QueryStats::default();
+        fold_metrics(&set, &mut stats);
+        assert_eq!(stats.row_groups_pruned, 3);
+        assert_eq!(stats.row_groups_scanned, 2);
+        assert_eq!(stats.bytes_read, 4096);
     }
 }

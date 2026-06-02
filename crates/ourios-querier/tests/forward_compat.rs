@@ -2,15 +2,24 @@
 //!
 //! The querier reads through `DataFusion`'s `ListingTable`, which
 //! infers one table schema from the *union* of the files it finds.
-//! This test puts three files with **different** schemas in one
-//! tenant directory and asserts a query still succeeds with the
-//! right count:
+//! This test puts three files with **different** schemas — each
+//! under a distinct `template_id` — in one tenant directory and
+//! asserts every one of them stays individually queryable through
+//! the real querier path:
 //!
 //! - a current full-schema file (the `ourios-parquet` writer);
 //! - a **future** file with an extra column the reader doesn't
 //!   know about (RFC 0005 §3.9 rule 1 — unknown columns ignored);
-//! - an **old** file missing an OPTIONAL column (§3.9 rule 2 —
-//!   missing optional columns default to absent/null, no error).
+//! - an **old** file missing an OPTIONAL column (§3.9 rule 2 — the
+//!   read tolerates the absence without error).
+//!
+//! Because each file carries a distinct `template_id`, a
+//! template-exact query that matches the future / old file proves
+//! that file was *read* — schema drift and all — not silently
+//! dropped during schema union. (The querier is count-only, so the
+//! row-level value of a missing optional column — its `None`
+//! default — is the `ourios-parquet` `Reader`'s contract, asserted
+//! there; here we assert the read path tolerates the drift.)
 //!
 //! The heterogeneous files are written via the raw `ArrowWriter`
 //! over a batch built from the public `ourios_parquet::data_schema()`
@@ -68,10 +77,10 @@ fn rec(template_id: u64, ts_ns: u64) -> MinedRecord {
     }
 }
 
-fn req(template_id: Option<u64>) -> QueryRequest {
+fn req(time_range: Option<(u64, u64)>, template_id: Option<u64>) -> QueryRequest {
     QueryRequest {
         tenant: TenantId::new("a"),
-        time_range: None,
+        time_range,
         template_id,
     }
 }
@@ -126,14 +135,15 @@ fn old_schema_batch(record: &MinedRecord) -> RecordBatch {
 
 /// RFC0007.4 — a tenant directory holding three files with three
 /// different schemas (current, future-with-extra-column,
-/// old-missing-optional-column) queries without error and returns
-/// the correct count. This is the §4.6 read path (`DataFusion`
-/// `ListingTable`) honouring RFC 0005 §3.9 rules 1 + 2.
+/// old-missing-optional-column), each under a distinct
+/// `template_id`. Every file stays individually queryable through
+/// the §4.6 read path (`DataFusion` `ListingTable`), honouring
+/// RFC 0005 §3.9 rules 1 + 2.
 #[tokio::test]
-async fn rfc0007_4_heterogeneous_schemas_read_without_error() {
+async fn rfc0007_4_heterogeneous_schemas_stay_queryable() {
     let bucket = tempfile::TempDir::new().expect("temp");
 
-    // hour 10 — current full schema, via the real writer.
+    // hour 10 / template 1 — current full schema, via the real writer.
     let current = rec(1, TS0);
     {
         let mut w = Writer::open(
@@ -146,29 +156,48 @@ async fn rfc0007_4_heterogeneous_schemas_read_without_error() {
         w.close().expect("close");
     }
 
-    // hour 11 — future writer: an extra, unknown column.
-    let future = rec(1, TS0 + HOUR_NS);
+    // hour 11 / template 2 — future writer: an extra, unknown column.
+    let future = rec(2, TS0 + HOUR_NS);
     write_raw_at(bucket.path(), &future, &future_schema_batch(&future));
 
-    // hour 12 — old writer: a missing OPTIONAL column.
-    let old = rec(1, TS0 + 2 * HOUR_NS);
+    // hour 12 / template 3 — old writer: a missing OPTIONAL column.
+    let old = rec(3, TS0 + 2 * HOUR_NS);
     write_raw_at(bucket.path(), &old, &old_schema_batch(&old));
 
     let q = Querier::new(bucket.path());
 
-    // Template-exact across the heterogeneous corpus: all three
-    // rows are template 1 and must be counted, schema drift and all.
-    let r = q
-        .run(req(Some(1)))
+    // Each file is independently addressable by its template_id.
+    // Matching the *future* file's row proves the file was read
+    // despite the unknown extra column (§3.9 rule 1) — not dropped
+    // during schema union.
+    let f = q
+        .run(req(None, Some(2)))
         .await
-        .expect("heterogeneous-schema query must not error");
-    assert_eq!(
-        r.rows, 3,
-        "all three rows count despite the extra/missing columns",
-    );
+        .expect("future-schema file must query without error");
+    assert_eq!(f.rows, 1, "the file with an unknown extra column is read");
 
-    // And an unfiltered scan agrees — the unknown column is ignored,
-    // the missing optional column defaults to absent, no read error.
-    let all = q.run(req(None)).await.expect("unfiltered query");
-    assert_eq!(all.rows, 3);
+    // Matching the *old* file's row proves the read tolerates the
+    // missing OPTIONAL column (§3.9 rule 2).
+    let o = q
+        .run(req(None, Some(3)))
+        .await
+        .expect("old-schema file must query without error");
+    assert_eq!(o.rows, 1, "the file missing an optional column is read");
+
+    // The current file is unaffected.
+    let c = q.run(req(None, Some(1))).await.expect("current file");
+    assert_eq!(c.rows, 1);
+
+    // A time-range predicate also resolves against a drifted file:
+    // the half-open window around hour 11 selects only the future
+    // file, so pushdown and schema drift coexist.
+    let windowed = q
+        .run(req(Some((TS0 + HOUR_NS, TS0 + HOUR_NS + 1)), None))
+        .await
+        .expect("time-filtered query over drifted files");
+    assert_eq!(windowed.rows, 1, "time pushdown works across schema drift");
+
+    // And an unfiltered scan reads all three heterogeneous files.
+    let all = q.run(req(None, None)).await.expect("unfiltered query");
+    assert_eq!(all.rows, 3, "all three heterogeneous files are read");
 }

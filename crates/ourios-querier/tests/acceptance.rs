@@ -36,14 +36,15 @@
 
 // RFC0007.4 (forward-compatible reads — §3.5 / RFC 0005 §3.9) is
 // now a LIVE test — see `tests/forward_compat.rs::
-// rfc0007_4_heterogeneous_schemas_read_without_error`. A tenant
-// directory mixing a current full-schema file, a future file with
-// an extra unknown column (§3.9 rule 1), and an old file missing an
-// OPTIONAL column (§3.9 rule 2) queries without error and returns
-// the correct count — DataFusion's `ListingTable` merges the file
-// schemas, so the read path tolerates additive drift in both
-// directions. (Missing *baseline REQUIRED* columns stay out of
-// scope: §3.9 makes those a hard error by design.)
+// rfc0007_4_heterogeneous_schemas_stay_queryable`. A tenant
+// directory mixes a current full-schema file, a future file with an
+// extra unknown column (§3.9 rule 1), and an old file missing an
+// OPTIONAL column (§3.9 rule 2), each under a distinct template_id;
+// a template-exact query for the future/old file proves it was read
+// (not dropped during schema union), so the read path tolerates
+// additive drift in both directions. (Missing *baseline REQUIRED*
+// columns stay out of scope: §3.9 makes those a hard error by
+// design.)
 
 // RFC0007.5 (tenant isolation) is now a LIVE test — see
 // `tests/execution.rs::rfc0007_5_tenant_isolation`.

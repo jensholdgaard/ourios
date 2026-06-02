@@ -20,7 +20,7 @@ superseded-by: —
 > querier resolves a partition's live files through the manifest
 > (glob-fallback when absent), sequenced reader-first; and (b) the
 > manifest is a new additive, back-compatible RFC 0005 artifact. The
-> open items in §8 are now implementation details (serialization,
+> open items in §7 are now implementation details (serialization,
 > the S3 atomic-swap primitive, the single-writer lease, cadence
 > defaults), not design forks. Cannot flip to `red` until test stubs
 > exist (and the RFC 0007 reader-side manifest support lands first).
@@ -105,7 +105,7 @@ compaction logic itself is a new `compaction` **module in
 `ourios-parquet`** (it is Parquet-file manipulation — read many via
 `Reader`, write one via `Writer`); no new crate. Driving it from a
 dedicated `compactor` role is a deployment-scaling evolution captured
-in §7, not an MVP requirement.
+in §4, not an MVP requirement.
 
 ### 3.3 What is eligible: sealed partitions
 
@@ -142,7 +142,7 @@ read path (RFC 0007) resolves a partition's files through the
 manifest, not a raw glob; absence of a manifest means "glob all
 `*.parquet`" — so pre-compaction partitions and the current querier
 keep working, and the reader gains manifest support *before* any
-compactor writes one (the reader-first sequencing in §8). Compaction:
+compactor writes one (the reader-first sequencing in §7). Compaction:
 
 1. reads the live set, writes the consolidated `*.parquet.tmp`;
 2. `rename`s it to its committed `*.parquet` name (still not
@@ -158,8 +158,8 @@ A query reads a consistent generation: either the pre-compaction set
 or the post-compaction set, never a mix (RFC0009.3). This is the
 Iceberg/Delta "atomic metadata swap" idea reduced to one flat file per
 partition — deliberately *not* a full table format; the generation-
-subdirectory and glob+lease alternatives were weighed and rejected in
-§7.
+subdirectory and glob-the-directory-reader alternatives were weighed
+and rejected in §4.
 
 ```mermaid
 sequenceDiagram
@@ -185,7 +185,7 @@ sequenceDiagram
 This protocol is an interaction with **RFC 0007** (the querier must
 read through the manifest) and a small extension to **RFC 0005** (the
 manifest is a new per-partition artifact — additive, optional,
-back-compatible). Both are noted in §8.
+back-compatible). Both are recorded as resolved decisions in §7.
 
 ### 3.5 Correctness, idempotency, crash safety
 
@@ -341,9 +341,10 @@ Mapped to `CLAUDE.md` §6.2:
 **Resolved at `specified`** (the design forks; recorded here so the
 history is legible):
 
-- [x] **Manifest vs. generation-dir vs. glob+lock.** Decided: a
-  per-partition `manifest.json` with an atomic generation swap (§3.4);
-  generation-dirs and glob+lease are weighed and rejected in §4.
+- [x] **Manifest vs. generation-subdirectories vs. glob-the-directory
+  reader.** Decided: a per-partition `manifest.json` with an atomic
+  generation swap (§3.4); the generation-subdirectory and
+  glob-the-directory-reader alternatives are rejected in §4.
 - [x] **RFC 0007 read-path change.** Decided: the querier resolves a
   partition's files through the manifest, glob-fallback when absent.
   Sequenced **reader-first** — the RFC 0007 amendment + querier PR
@@ -364,8 +365,8 @@ history is legible):
 - [ ] **Single-writer-per-partition.** Lease, or rely on the ingester
   being the sole writer by construction? (Interacts with the eventual
   horizontally-scaled ingester.)
-- [ ] **Late-arriving data into a compacted partition.** Decided
-  direction: a new small file re-flags the partition as a candidate
+- [ ] **Late-arriving data into a compacted partition.** Direction
+  decided: a new small file re-flags the partition as a candidate
   (§3.3), not re-opening the compacted file; confirm the
   `compaction_grace` default.
 - [ ] **Cadence + concurrency defaults** (RFC 0004): scan interval,

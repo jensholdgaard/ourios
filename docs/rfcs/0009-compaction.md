@@ -22,8 +22,9 @@ superseded-by: —
 > manifest is a new additive, back-compatible RFC 0005 artifact. The
 > open items in §7 are now implementation details (serialization,
 > the S3 atomic-swap primitive, the single-writer lease, cadence
-> defaults), not design forks. Cannot flip to `red` until test stubs
-> exist (and the RFC 0007 reader-side manifest support lands first).
+> defaults), not design forks. The RFC cannot flip to `red` until
+> test stubs exist (and the RFC 0007 reader-side manifest support
+> lands first).
 
 ## 1. Summary
 

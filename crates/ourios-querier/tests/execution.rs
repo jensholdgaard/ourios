@@ -11,7 +11,7 @@ use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{PartitionKey, Writer};
-use ourios_querier::{Querier, QueryRequest};
+use ourios_querier::{Querier, QueryError, QueryRequest};
 
 /// 2026-04-02T10:58:00 UTC — all test records sit in one hour
 /// (one partition per tenant), matching the round-trip fixtures.
@@ -165,5 +165,45 @@ async fn tenant_dir_without_committed_parquet_is_empty() {
     assert_eq!(
         r.rows, 0,
         "uncommitted .tmp-only tenant dir is empty, not an error"
+    );
+}
+
+/// A `bucket_root` whose path contains a space still resolves —
+/// the URL is built from the canonical path (`DataFusion`
+/// URI-encodes it), not a raw `file://{display}` string that would
+/// choke on the space.
+#[tokio::test]
+async fn bucket_path_with_spaces_resolves() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let bucket = tmp.path().join("ourios bucket with spaces");
+    std::fs::create_dir_all(&bucket).expect("mkdir spaced bucket");
+    write_all(&bucket, &[rec("a", 1, TS0), rec("a", 1, TS0 + 1_000_000)]);
+
+    let q = Querier::new(&bucket);
+    let r = q
+        .run(req("a", None, None))
+        .await
+        .expect("run over spaced path");
+    assert_eq!(r.rows, 2, "spaced bucket path queries correctly");
+}
+
+/// A real I/O error reading the tenant directory surfaces as
+/// `QueryError::Storage` — it is NOT silently masked as an empty
+/// result (which would be a wrong zero-row answer). Induced
+/// portably: place a regular *file* where the tenant directory is
+/// expected, so `read_dir` fails with `ENOTDIR` (not `NotFound`).
+#[tokio::test]
+async fn read_dir_error_surfaces_as_storage_not_empty() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    // tenant "x" → data/tenant_id=x; make it a file, not a dir.
+    let data = bucket.path().join("data");
+    std::fs::create_dir_all(&data).expect("mkdir data");
+    std::fs::write(data.join("tenant_id=x"), b"not a directory").expect("write file");
+
+    let q = Querier::new(bucket.path());
+    let result = q.run(req("x", None, None)).await;
+    assert!(
+        matches!(result, Err(QueryError::Storage { .. })),
+        "a non-NotFound read_dir error must surface as Storage, got {result:?}",
     );
 }

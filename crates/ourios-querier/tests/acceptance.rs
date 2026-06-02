@@ -34,14 +34,17 @@
 // `QueryError` are all Ourios-owned (see crate docs / Cargo.toml
 // note), so no `datafusion`/`arrow` type crosses the API.
 
-#[ignore = "RFC 0007 red gate — execution pending (RFC0007.4)"]
-#[test]
-fn rfc0007_4_forward_compatible_reads() {
-    // §3.5: Parquet files with unknown columns (future schema)
-    // or missing optional columns (old schema) query without
-    // error, honouring RFC 0005 §3.9 reader-contract defaults.
-    unimplemented!("RFC0007.4 — assert unknown/missing columns honour RFC 0005 §3.9 defaults");
-}
+// RFC0007.4 (forward-compatible reads — §3.5 / RFC 0005 §3.9) is
+// now a LIVE test — see `tests/forward_compat.rs::
+// rfc0007_4_heterogeneous_schemas_stay_queryable`. A tenant
+// directory mixes a current full-schema file, a future file with an
+// extra unknown column (§3.9 rule 1), and an old file missing an
+// OPTIONAL column (§3.9 rule 2), each under a distinct template_id;
+// a template-exact query for the future/old file proves it was read
+// (not dropped during schema union), so the read path tolerates
+// additive drift in both directions. (Missing *baseline REQUIRED*
+// columns stay out of scope: §3.9 makes those a hard error by
+// design.)
 
 // RFC0007.5 (tenant isolation) is now a LIVE test — see
 // `tests/execution.rs::rfc0007_5_tenant_isolation`.

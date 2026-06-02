@@ -32,6 +32,18 @@ datafusion = { version = "53", default-features = false, features = ["parquet"] 
 # tempfile gives each test a scratch bucket.
 tokio = { version = "1", features = ["rt", "macros"] }
 tempfile = "3"
+# RFC0007.4 (forward-compatible reads) needs Parquet files whose
+# schema differs from the current one — an extra column (future
+# writer) or a missing OPTIONAL column (old writer). The
+# ourios-parquet `Writer` only emits the current schema, so the
+# heterogeneous fixtures are written via the raw `ArrowWriter`
+# over a batch built from the public `data_schema()`. Pinned to
+# the same arrow/parquet 55 ourios-parquet writes with; the files
+# are then read by DataFusion's parquet 58 — the same disk-only
+# cross-version handoff the crate already relies on.
+parquet = { version = "55", default-features = false, features = ["arrow"] }
+arrow-array = { version = "55", default-features = false }
+arrow-schema = { version = "55", default-features = false }
 
 [lints]
 workspace = true

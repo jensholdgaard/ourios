@@ -2206,9 +2206,12 @@ dependencies = [
 name = "ourios-querier"
 version = "0.0.0"
 dependencies = [
+ "arrow-array 55.2.0",
+ "arrow-schema 55.2.0",
  "datafusion",
  "ourios-core",
  "ourios-parquet",
+ "parquet 55.2.0",
  "tempfile",
  "tokio",
 ]

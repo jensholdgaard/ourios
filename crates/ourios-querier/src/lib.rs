@@ -1,11 +1,13 @@
 //! `ourios-querier` — RFC 0007 querier (pillar #3, `DataFusion`).
 //!
-//! **Status: execution slice 1.** [`Querier::run`] executes a
+//! **Status: execution slice 2.** [`Querier::run`] executes a
 //! minimal query — tenant scope + optional time range + optional
 //! template-exact id — against the RFC 0005 Parquet store via
-//! `DataFusion`, returning a matching-row count. Tenant isolation
-//! (RFC0007.5) is live + tested; the row-group pruning stats that
-//! prove B1 (RFC0007.1) and the B2 latency bench come next.
+//! `DataFusion`, returning a matching-row count **and the scan's
+//! row-group pruning stats** ([`QueryStats`]). Tenant isolation
+//! (RFC0007.5) and B1 pruning (RFC0007.1 — a selective query
+//! provably skips row groups via statistics) are live + tested.
+//! The B2 latency-vs-corpus-size bench (RFC0007.2) comes next.
 //!
 //! This crate is the **read path**: it runs the query against the
 //! RFC 0005 store — scoped to the tenant's partition directory,
@@ -32,13 +34,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
+use datafusion::functions_aggregate::expr_fn::count;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::columns;
@@ -174,6 +181,88 @@ fn has_published_parquet(dir: &std::path::Path) -> Result<bool, QueryError> {
     Ok(false)
 }
 
+/// Pull the single aggregate count out of the result batches. A
+/// `COUNT(*)` with no grouping always returns exactly one
+/// `Int64` row; anything else means the plan/return-type changed
+/// out from under us, so it's a surfaced error rather than a
+/// silent (and wrong) zero.
+fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
+    let bad = |detail: String| QueryError::Storage {
+        detail: format!("count aggregate: {detail}"),
+    };
+    if batches.len() != 1 {
+        return Err(bad(format!(
+            "expected exactly 1 result batch, got {}",
+            batches.len(),
+        )));
+    }
+    let batch = &batches[0];
+    if batch.num_rows() != 1 || batch.num_columns() != 1 {
+        return Err(bad(format!(
+            "expected exactly 1 row × 1 column, got {}×{}",
+            batch.num_rows(),
+            batch.num_columns(),
+        )));
+    }
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| bad("count column is not Int64".to_string()))?;
+    if col.is_null(0) {
+        return Err(bad("count is null".to_string()));
+    }
+    u64::try_from(col.value(0)).map_err(|_| bad("negative count".to_string()))
+}
+
+/// Walk the executed physical plan and accumulate the scan
+/// pruning / IO metrics into a [`QueryStats`]. Recursive — the
+/// Parquet scan is a leaf under the aggregate.
+fn scan_stats(plan: &dyn ExecutionPlan) -> QueryStats {
+    let mut stats = QueryStats::default();
+    accumulate_scan_stats(plan, &mut stats);
+    stats
+}
+
+fn accumulate_scan_stats(plan: &dyn ExecutionPlan, stats: &mut QueryStats) {
+    if let Some(metrics) = plan.metrics() {
+        // `aggregate_by_name` sums each metric across the scan's
+        // per-file / per-partition instances.
+        fold_metrics(&metrics.aggregate_by_name(), stats);
+    }
+    for child in plan.children() {
+        accumulate_scan_stats(child.as_ref(), stats);
+    }
+}
+
+/// Fold the `DataFusion`-version-sensitive scan metrics — the
+/// `row_groups_pruned_statistics` `PruningMetrics` and the
+/// `bytes_scanned` `Count` — into `stats`. Pulled out of
+/// [`accumulate_scan_stats`] so the metric-name / value-shape
+/// matching is unit-testable without a live plan (the names are an
+/// engine contract that can drift across `DataFusion` releases).
+fn fold_metrics(metrics: &MetricsSet, stats: &mut QueryStats) {
+    for metric in metrics.iter() {
+        match metric.value() {
+            // `row_groups_pruned_statistics` is a PruningMetrics
+            // carrying both pruned (skipped via min/max stats) and
+            // matched (read) row-group counts — exactly the B1
+            // numerator + denominator.
+            MetricValue::PruningMetrics {
+                name,
+                pruning_metrics,
+            } if name == "row_groups_pruned_statistics" => {
+                stats.row_groups_pruned += pruning_metrics.pruned() as u64;
+                stats.row_groups_scanned += pruning_metrics.matched() as u64;
+            }
+            MetricValue::Count { name, count } if name == "bytes_scanned" => {
+                stats.bytes_read += count.value() as u64;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Map a `DataFusion` error to the Ourios-owned [`QueryError`] so
 /// no `datafusion`/`arrow` type crosses the public boundary (§4.6).
 // Takes the error by value so it drops in cleanly as
@@ -294,18 +383,21 @@ impl Querier {
                 .map_err(storage_err)?;
         }
 
-        // `count()` aggregates without materialising the matched
-        // rows' columns — so the heavy `attributes` / `params` /
-        // `body` columns are never read for a count, and Parquet
-        // projection pushdown applies. (`collect()` would buffer
-        // every column of every match.)
-        let rows = df.count().await.map_err(storage_err)? as u64;
-        // QueryStats (row-group pruning / bytes) is slice 2 — it
-        // comes from the ParquetExec metrics, not the row count.
-        Ok(QueryResult {
-            rows,
-            stats: QueryStats::default(),
-        })
+        // Count via an aggregate so the heavy `attributes` /
+        // `params` / `body` columns are never materialised
+        // (projection pushdown). We build + execute the physical
+        // plan ourselves (rather than `df.count()`) so we can read
+        // the scan's pruning metrics off the retained plan.
+        let counted = df
+            .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
+            .map_err(storage_err)?;
+        let plan = counted.create_physical_plan().await.map_err(storage_err)?;
+        let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .map_err(storage_err)?;
+        let rows = count_value(&batches)?;
+        let stats = scan_stats(plan.as_ref());
+        Ok(QueryResult { rows, stats })
     }
 }
 
@@ -350,5 +442,57 @@ mod tests {
         assert_eq!(r.stats.row_groups_scanned, 0);
         assert_eq!(r.stats.row_groups_pruned, 0);
         assert_eq!(r.stats.bytes_read, 0);
+    }
+
+    /// Pin the metric-name / value-shape contract `fold_metrics`
+    /// depends on: a `row_groups_pruned_statistics` `PruningMetrics`
+    /// maps to pruned/matched row-group counts, `bytes_scanned`
+    /// `Count` maps to `bytes_read`, and any other metric is ignored.
+    /// If a `DataFusion` bump renames or reshapes these, this fails
+    /// locally rather than letting the live test silently report
+    /// always-zero stats.
+    #[test]
+    fn fold_metrics_extracts_pruning_and_bytes() {
+        use std::borrow::Cow;
+
+        use datafusion::physical_plan::metrics::{Count, Metric, PruningMetrics};
+
+        let pruning = PruningMetrics::new();
+        pruning.add_pruned(3);
+        pruning.add_matched(2);
+        let bytes = Count::new();
+        bytes.add(4096);
+        // A metric we don't track — must be left untouched.
+        let other = Count::new();
+        other.add(99);
+
+        let mut set = MetricsSet::new();
+        set.push(Arc::new(Metric::new(
+            MetricValue::PruningMetrics {
+                name: Cow::Borrowed("row_groups_pruned_statistics"),
+                pruning_metrics: pruning,
+            },
+            None,
+        )));
+        set.push(Arc::new(Metric::new(
+            MetricValue::Count {
+                name: Cow::Borrowed("bytes_scanned"),
+                count: bytes,
+            },
+            None,
+        )));
+        set.push(Arc::new(Metric::new(
+            MetricValue::Count {
+                name: Cow::Borrowed("output_rows"),
+                count: other,
+            },
+            None,
+        )));
+
+        let mut stats = QueryStats::default();
+        fold_metrics(&set, &mut stats);
+        assert_eq!(stats.row_groups_pruned, 3);
+        assert_eq!(stats.row_groups_scanned, 2);
+        assert_eq!(stats.bytes_read, 4096);
     }
 }

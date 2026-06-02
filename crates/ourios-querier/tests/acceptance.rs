@@ -8,19 +8,8 @@
 //! the test ↔ criterion mapping is greppable (RFC 0007 §5 /
 //! `docs/verification.md` §2).
 
-#[ignore = "RFC 0007 red gate — execution pending (RFC0007.1)"]
-#[test]
-fn rfc0007_1_pushdown_prunes_row_groups() {
-    // B1: a template-exact query over a corpus where the target
-    // template lives in a minority of row groups prunes most of
-    // them — `row_groups_pruned / (row_groups_scanned +
-    // row_groups_pruned)` exceeds the floor, and `bytes_read` is
-    // sub-linear in corpus size for fixed result size.
-    unimplemented!(
-        "RFC0007.1 — assert QueryStats pruned-fraction ≥ floor and \
-         bytes_read sub-linear in corpus size"
-    );
-}
+// RFC0007.1 (B1 pushdown prunes row groups) is now a LIVE test —
+// see `tests/execution.rs::rfc0007_1_pushdown_prunes_row_groups`.
 
 #[ignore = "RFC 0007 red gate — execution pending (RFC0007.2)"]
 #[test]

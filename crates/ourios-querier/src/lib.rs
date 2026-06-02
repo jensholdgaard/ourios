@@ -181,13 +181,31 @@ fn has_published_parquet(dir: &std::path::Path) -> Result<bool, QueryError> {
     Ok(false)
 }
 
-/// Pull the single aggregate count out of the result batches.
-fn count_value(batches: &[RecordBatch]) -> u64 {
-    batches
+/// Pull the single aggregate count out of the result batches. A
+/// `COUNT(*)` with no grouping always returns exactly one
+/// `Int64` row; anything else means the plan/return-type changed
+/// out from under us, so it's a surfaced error rather than a
+/// silent (and wrong) zero.
+fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
+    let bad = |detail: String| QueryError::Storage {
+        detail: format!("count aggregate: {detail}"),
+    };
+    let batch = batches
         .first()
-        .filter(|b| b.num_rows() > 0)
-        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-        .map_or(0, |a| u64::try_from(a.value(0)).unwrap_or(0))
+        .ok_or_else(|| bad("no result batch".to_string()))?;
+    if batch.num_rows() != 1 || batch.num_columns() == 0 {
+        return Err(bad(format!(
+            "expected 1 row × ≥1 column, got {}×{}",
+            batch.num_rows(),
+            batch.num_columns(),
+        )));
+    }
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| bad("count column is not Int64".to_string()))?;
+    u64::try_from(col.value(0)).map_err(|_| bad("negative count".to_string()))
 }
 
 /// Walk the executed physical plan and accumulate the scan
@@ -360,7 +378,7 @@ impl Querier {
         let batches = collect(Arc::clone(&plan), ctx.task_ctx())
             .await
             .map_err(storage_err)?;
-        let rows = count_value(&batches);
+        let rows = count_value(&batches)?;
         let stats = scan_stats(plan.as_ref());
         Ok(QueryResult { rows, stats })
     }

@@ -80,9 +80,9 @@ untouched).
 
 **In scope.** Background consolidation of the published, committed
 `*.parquet` data files of a single sealed partition
-(`data/tenant_id=<enc>/year=/month=/day=/hour=/`) into one or a few
-files meeting RFC 0005 §3.5 size targets, preserving every stored row
-exactly. The same mechanism applies to the audit-event series
+(`data/tenant_id=<enc>/year=YYYY/month=MM/day=DD/hour=HH/`, the
+RFC 0005 §3.4 Hive layout) into one or a few files meeting RFC 0005
+§3.5 size targets, preserving every stored row exactly. The same mechanism applies to the audit-event series
 (`audit/…`, day-granular).
 
 **Out of scope.** WAL→Parquet flush sizing (RFC 0005/0008);
@@ -110,8 +110,12 @@ input set. A data partition (`…/hour=HH/`) is sealed once wall-clock
 time passes the end of its hour plus a `compaction_grace` margin
 (default 15 min, tunable per RFC 0004) that absorbs late-arriving
 records. A sealed partition is a **candidate** when it has more than
-`compaction_min_files` files (default 4) **or** more than 5 % of its
-files below 128 MiB (the H4 steady-state threshold). Late data that
+`compaction_min_files` files (default 4) **or** holds files below
+128 MiB. This is a **partition-local trigger heuristic** — distinct
+from H4's *tenant-level* detection metric (the per-tenant file-size
+histogram / "fewer than 5 % of files below 128 MiB at steady
+state", §3.6), which is the cluster signal compaction's job is to
+keep satisfied. Late data that
 arrives after a partition is compacted lands as a new small file and
 re-flags the partition as a candidate — compaction is idempotent and
 re-runnable (§3.5).
@@ -163,6 +167,13 @@ sequenceDiagram
     C->>FS: GC orphaned {a,b,c} (lazy, post-commit)
 ```
 
+> **Note.** RFC 0009 is the first RFC to use a Mermaid diagram, and
+> the mdBook build does not yet have `mdbook-mermaid` enabled
+> (`docs/rfcs/README.md` Diagrams) — so this block currently renders
+> as a plain code fence. Enabling the preprocessor + its CI support
+> (it touches `book.toml`, vendored JS assets, and both mdbook CI
+> jobs) is a separate infra change, not bundled into this draft.
+
 This protocol is an interaction with **RFC 0007** (the querier must
 read through the manifest) and a small extension to **RFC 0005** (the
 manifest is a new per-partition artifact — additive, optional,
@@ -170,12 +181,16 @@ back-compatible). Both are noted in §8.
 
 ### 3.5 Correctness, idempotency, crash safety
 
-- **Row conservation.** Compaction reads input rows and writes them
-  byte-equivalently (same RFC 0005 schema, same partition ⇒ row-vs-
-  path validation §3.9 still holds; bit-identical body reconstruction
-  §3.3 is preserved because rows are copied, never re-mined). Total
-  row count and per-`template_id` counts are invariant across a
-  compaction (RFC0009.2).
+- **Row conservation.** Compaction preserves every **row value**
+  exactly — including the raw `body` bytes — but does *not* promise
+  byte-identical Parquet files: the physical encoding may differ
+  (row groups re-packed to the §3.5 sizes, compression re-applied,
+  rows possibly reordered within the partition). The logical
+  guarantees hold: same RFC 0005 schema, same partition ⇒ row-vs-
+  path validation §3.9 still holds; bit-identical *body*
+  reconstruction §3.3 is preserved because rows are copied, never
+  re-mined. Total row count and per-`template_id` counts are
+  invariant across a compaction (RFC0009.2).
 - **Idempotency.** Re-running compaction on a partition with a single
   already-large file is a no-op (not a candidate per §3.3).
 - **Crash safety.** The only commit point is the atomic manifest swap
@@ -193,8 +208,9 @@ back-compatible). Both are noted in §8.
 Every compaction emits an **audit event** (RFC 0005 §3.7 audit
 stream) recording the input file set, the output file, and row count
 in/out — the same "nothing happens silently to stored data" stance as
-template merges (`CLAUDE.md` §3.1). Metrics (OTel meters, per the
-telemetry memo): `compactions_total`, `files_compacted_total`,
+template merges (`CLAUDE.md` §3.1). Metrics (OTel meters per
+`CLAUDE.md` §6.3 observability): `compactions_total`,
+`files_compacted_total`,
 `compaction_bytes_in`/`_out`, `compaction_lag_seconds` (sealed-but-
 uncompacted backlog), and the **H4 detection metric** — a per-tenant
 file-size histogram and a file-count-vs-bytes-ingested ratio.

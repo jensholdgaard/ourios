@@ -1,0 +1,380 @@
+---
+rfc: 0009
+title: Background compaction — small-file consolidation
+status: drafted
+author: Jens Holdgaard Pedersen <jens@holdgaard.org>
+drafting-assistance: Claude
+created: 2026-06-02
+supersedes: —
+superseded-by: —
+---
+
+# RFC 0009 — Background compaction: small-file consolidation
+
+> **Status note.** `drafted` — §§1–4 and §§7–8 are filled (the
+> `drafted` gate per `docs/rfcs/README.md`); §5 acceptance criteria
+> and §6 testing strategy are included as a first cut but firm up at
+> `specified`. The load-bearing open question is the **atomic-publish
+> protocol** (§3.4) — how a compaction commits without a query ever
+> double-counting or missing a row — because it ripples into the
+> RFC 0007 querier read path. That is called out in §8 for
+> resolution before `specified`.
+
+## 1. Summary
+
+Ourios's writers land many small Parquet files per tenant per hour
+(one per writer flush / time-rotated partition; `docs/hazards.md`
+H4). This RFC introduces a **background, per-tenant, per-partition
+compaction** pass that consolidates the small `*.parquet` files of a
+*sealed* partition into one (or few) files inside the RFC 0005 §3.5
+size targets, **without changing a single stored row** and **without
+any query ever seeing a row twice or missing one**. Compaction reuses
+the existing `ourios-parquet` `Reader`/`Writer` and the atomic-publish
+convention (write to `*.parquet.tmp`, commit by rename); the live set
+of a partition is named by a small per-partition **manifest** so the
+commit is a single atomic object swap. It is the mitigation for
+hazard H4 and the lever the RFC 0007 §6 / PR #92 B2 bench identified:
+query latency there is dominated by *per-file footer reads*, not data
+scanning, so fewer/larger files is the next query-latency win.
+
+## 2. Motivation
+
+### 2.1 The small-file problem is now measured, not theoretical
+
+`docs/hazards.md` H4 predicted it; the B2 latency bench
+(`crates/ourios-bench/benches/b2.rs`, RFC 0007 §6, landed in PR #92)
+measured it. With result size held constant while the corpus grows
+1×/10×/50×, query latency grew **sub-linearly but not flat** (~0.95 ms
+→ ~1.55 ms → ~4.36 ms). The structural B2 test
+(`rfc0007_2_template_exact_work_scales_with_result_not_corpus`) proves
+the *scanned* row groups and bytes stay flat; the residual wall-clock
+growth is per-file footer/metadata reads, because file count scales
+with corpus. Compaction is the direct lever on that residual: collapse
+N small files' N footer reads into one.
+
+### 2.2 RFC 0005 explicitly deferred it here
+
+RFC 0005 §3.5 says the writer's job is to "land at the bottom of [the
+file-size] range or below on its own … compaction is deferred," and
+§4.5 parks background compaction as "a post-MVP RFC." Two writer
+behaviours guarantee small files even at steady state and so *require*
+a sweeper: (a) **time-rotated partitions** — an hour partition that
+receives a trickle of late or low-volume traffic produces a sub-128
+MiB file; (b) **end-of-day audit files** (RFC 0005 §3.4) are
+inherently small. H4's detection threshold ("fewer than 5 % of files
+below 128 MiB at steady state") cannot be met by writer sizing alone.
+
+### 2.3 Why at this layer
+
+Compaction is a **write-path / storage** concern, not a query-path
+one: the querier (RFC 0007, hazard §4.6) must stay a pure reader, and
+the WAL→Parquet flush sizing (RFC 0005/0008) is a separate mechanism
+(it sizes files *as they are first written*; this RFC re-consolidates
+files *already published*). Doing it as a background pass keeps it off
+the ack-latency hot path (WAL-before-ack, `CLAUDE.md` §3.4 is
+untouched).
+
+## 3. Proposed design
+
+### 3.1 Scope
+
+**In scope.** Background consolidation of the published, committed
+`*.parquet` data files of a single sealed partition
+(`data/tenant_id=<enc>/year=YYYY/month=MM/day=DD/hour=HH/`, the
+RFC 0005 §3.4 Hive layout) into one or a few files meeting RFC 0005
+§3.5 size targets, preserving every stored row exactly. The same mechanism applies to the audit-event series
+(`audit/…`, day-granular).
+
+**Out of scope.** WAL→Parquet flush sizing (RFC 0005/0008);
+retention/expiry/TTL (no compaction-driven deletion of *data* — only
+of inputs it has just rewritten); cross-partition or cross-tenant
+merges; re-mining or re-templating (compaction copies rows, it does
+not touch the miner); query-side caching.
+
+### 3.2 Where it runs
+
+A background task hosted in the **ingester** role (it already owns the
+write path, the bucket credentials, and per-tenant context), with its
+own bounded concurrency knob so it never starves ingest. The
+compaction logic itself is a new `compaction` **module in
+`ourios-parquet`** (it is Parquet-file manipulation — read many via
+`Reader`, write one via `Writer`); no new crate. Driving it from a
+dedicated `compactor` role is a deployment-scaling evolution captured
+in §7, not an MVP requirement.
+
+### 3.3 What is eligible: sealed partitions
+
+Compaction only ever touches a **sealed** partition — one no longer
+receiving writes — so it never races an active writer for the same
+input set. A data partition (`…/hour=HH/`) is sealed once wall-clock
+time passes the end of its hour plus a `compaction_grace` margin
+(default 15 min, tunable per RFC 0004) that absorbs late-arriving
+records. A sealed partition is a **candidate** when it has more than
+`compaction_min_files` files (default 4) **or** holds files below
+128 MiB. This is a **partition-local trigger heuristic** — distinct
+from H4's *tenant-level* detection metric (the per-tenant file-size
+histogram / "fewer than 5 % of files below 128 MiB at steady
+state", §3.6), which is the cluster signal compaction's job is to
+keep satisfied. Late data that
+arrives after a partition is compacted lands as a new small file and
+re-flags the partition as a candidate — compaction is idempotent and
+re-runnable (§3.5).
+
+### 3.4 The atomic-publish protocol (the crux)
+
+A query (RFC 0007) plans over a partition by enumerating its committed
+`*.parquet` files. If compaction publishes the consolidated file
+*before* deleting its inputs, a concurrent query double-counts; if it
+deletes inputs first, a query misses rows. Object storage (the source
+of truth, `CLAUDE.md` §3.6) offers no atomic multi-object operation,
+so a glob-the-directory reader **cannot** be made correct under
+compaction.
+
+**Proposed (recommended) design — a per-partition manifest.** Each
+partition gains a small `manifest.json` naming the **live set** of
+data files (UUIDv7 names) plus a monotonically increasing generation
+number. The read path (RFC 0007) resolves a partition's files through
+the manifest, not a raw glob; absence of a manifest means "glob all
+`*.parquet`" (backward-compatible with pre-compaction partitions).
+Compaction:
+
+1. reads the live set, writes the consolidated `*.parquet.tmp`;
+2. `rename`s it to its committed `*.parquet` name (still not
+   referenced by any manifest, so invisible to queries);
+3. writes `manifest.json.tmp` naming *only* the new file at
+   `generation + 1`, and **atomically swaps** it into place (single-
+   object rename / conditional put) — this is the commit point;
+4. lazily deletes the now-orphaned input files (a crash here leaves
+   harmless orphans that a GC sweep reclaims; correctness already
+   committed at step 3).
+
+A query reads a consistent generation: either the pre-compaction set
+or the post-compaction set, never a mix. This is the Iceberg/Delta
+"atomic metadata swap" idea reduced to one flat file per partition —
+deliberately *not* a full table format (§7).
+
+```mermaid
+sequenceDiagram
+    participant C as Compactor (ingester)
+    participant FS as Object store (partition)
+    participant Q as Querier
+    Note over FS: manifest@gen=N → {a,b,c}.parquet
+    C->>FS: read live set {a,b,c}
+    C->>FS: write compacted.parquet.tmp → rename compacted.parquet
+    Q-->>FS: plan @gen=N (sees {a,b,c}) ✓ no torn read
+    C->>FS: atomic swap manifest@gen=N+1 → {compacted}
+    Q-->>FS: plan @gen=N+1 (sees {compacted}) ✓
+    C->>FS: GC orphaned {a,b,c} (lazy, post-commit)
+```
+
+> **Note.** RFC 0009 is the first RFC to use a Mermaid diagram, and
+> the mdBook build does not yet have `mdbook-mermaid` enabled
+> (`docs/rfcs/README.md` Diagrams) — so this block currently renders
+> as a plain code fence. Enabling the preprocessor + its CI support
+> (it touches `book.toml`, vendored JS assets, and both mdbook CI
+> jobs) is a separate infra change, not bundled into this draft.
+
+This protocol is an interaction with **RFC 0007** (the querier must
+read through the manifest) and a small extension to **RFC 0005** (the
+manifest is a new per-partition artifact — additive, optional,
+back-compatible). Both are noted in §8.
+
+### 3.5 Correctness, idempotency, crash safety
+
+- **Row conservation.** Compaction preserves every **row value**
+  exactly — including the raw `body` bytes — but does *not* promise
+  byte-identical Parquet files: the physical encoding may differ
+  (row groups re-packed to the §3.5 sizes, compression re-applied,
+  rows possibly reordered within the partition). The logical
+  guarantees hold: same RFC 0005 schema, same partition ⇒ row-vs-
+  path validation §3.9 still holds; bit-identical *body*
+  reconstruction §3.3 is preserved because rows are copied, never
+  re-mined. Total row count and per-`template_id` counts are
+  invariant across a compaction (RFC0009.2).
+- **Idempotency.** Re-running compaction on a partition with a single
+  already-large file is a no-op (not a candidate per §3.3).
+- **Crash safety.** The only commit point is the atomic manifest swap
+  (step 3). A crash before it leaves the prior generation
+  authoritative — no acknowledged data lost (mirrors the WAL
+  crash-recovery discipline, `CLAUDE.md` §3.4). Temp files and
+  post-commit orphans are reclaimed by an idempotent GC sweep.
+- **Heterogeneous input schemas.** Inputs spanning a schema amendment
+  (some files with an added OPTIONAL column) merge to the union schema
+  and stay readable per RFC 0005 §3.9 (the same forward-compatible
+  read RFC0007.4 already tests).
+
+### 3.6 Audit + observability
+
+Every compaction emits an **audit event** (RFC 0005 §3.7 audit
+stream) recording the input file set, the output file, and row count
+in/out — the same "nothing happens silently to stored data" stance as
+template merges (`CLAUDE.md` §3.1). Metrics (OTel meters per
+`CLAUDE.md` §6.3 observability): `compactions_total`,
+`files_compacted_total`,
+`compaction_bytes_in`/`_out`, `compaction_lag_seconds` (sealed-but-
+uncompacted backlog), and the **H4 detection metric** — a per-tenant
+file-size histogram and a file-count-vs-bytes-ingested ratio.
+
+## 4. Alternatives considered
+
+- **No compaction (rely on writer flush sizing).** Rejected: §2.2 —
+  time-rotated low-volume partitions and end-of-day audit files are
+  small by construction, so H4's <5 % threshold is unmeetable without
+  a sweeper, and PR #92 measured the latency cost.
+- **Glob-the-directory reader, delete-after-publish (no manifest).**
+  Rejected: object storage has no atomic multi-object op, so there is
+  always a window where a query double-counts (publish-then-delete) or
+  misses rows (delete-then-publish). §3.4.
+- **Full table format (Apache Iceberg / Delta Lake).** Rejected for
+  now: Pillar 1 commits Ourios to plain Parquet end-to-end (RFC 0005
+  §4.6 rejects even a second *file* format); a full manifest-of-
+  manifests, snapshot log, and schema-registry is far more machinery
+  than one flat per-partition manifest needs. The atomic-swap idea is
+  borrowed from them (§3.4); the bookkeeping is not.
+- **Compaction in the querier.** Rejected: the querier is a pure
+  reader (hazard §4.6); a read path that mutates storage breaks that
+  contract and the multi-reader model.
+- **Dedicated `compactor` role/binary.** A viable evolution for
+  isolating compaction CPU/IO from ingest at scale; deferred — the
+  MVP hosts it as a bounded background task in the ingester (§3.2),
+  and the role split is a later, non-breaking change.
+- **Generation subdirectories instead of a manifest** (`…/gen=K/`,
+  querier reads the highest). Rejected as the primary design: it
+  leaks generation into the partition path (a second pruning axis the
+  querier must learn) and complicates partition discovery; the flat
+  manifest keeps the path stable. Retained as a fallback if the
+  manifest read-path change proves too invasive (§8).
+
+## 5. Acceptance criteria
+
+> `Given / When / Then / And`; ids greppable from tests. These
+> realise hazard H4 and the affected invariants.
+
+- **RFC0009.1 — small-file count falls below the H4 threshold `[H4
+  detection]`**
+  - **Given** a sealed partition with many sub-128 MiB files
+  - **When** compaction runs to completion
+  - **Then** the partition holds files inside the RFC 0005 §3.5 size
+    range, and at steady state fewer than 5 % of a tenant's files are
+    below 128 MiB.
+
+- **RFC0009.2 — row conservation `[§3.3 / data integrity]`**
+  - **Given** any set of input files in a partition
+  - **When** they are compacted
+  - **Then** the multiset of stored rows is identical
+    (total row count and per-`template_id` counts unchanged), and each
+    row still reconstructs bit-identically (RFC 0005 §3.3).
+
+- **RFC0009.3 — query atomicity (no double-count, no miss) `[H4 /
+  RFC0007]`**
+  - **Given** a query planned concurrently with a compaction of the
+    same partition
+  - **When** it executes
+  - **Then** it observes exactly one generation's file set — every
+    row exactly once — never a torn mix of pre- and post-compaction
+    files.
+
+- **RFC0009.4 — crash safety `[§3.4 discipline]`**
+  - **Given** a compactor killed at any point
+  - **When** the system recovers
+  - **Then** no acknowledged row is lost: the partition reads as
+    either the pre- or post-compaction generation, and orphaned
+    temp/input files are reclaimable.
+
+- **RFC0009.5 — tenant + partition isolation `[§3.7]`**
+  - **Given** multi-tenant data
+  - **When** compaction runs
+  - **Then** it never merges files across tenants or across partition
+    keys; a compacted file's rows all share the partition's
+    `tenant_id` and time bucket (RFC 0005 §3.9 row-vs-path holds).
+
+- **RFC0009.6 — forward-compatible merge `[§3.5 / RFC0007.4]`**
+  - **Given** inputs spanning a schema amendment (some with an added
+    OPTIONAL column)
+  - **When** compacted
+  - **Then** the output carries the union schema and reads without
+    error per RFC 0005 §3.9.
+
+- **RFC0009.7 — file count sub-linear in bytes `[H4 / benchmarks
+  D3]`**
+  - **Given** sustained ingest with compaction running
+  - **When** bytes ingested grow
+  - **Then** file count grows sub-linearly, and template-exact query
+    latency (RFC 0007 §6 B2 bench) does not grow proportionally to the
+    pre-compaction file count.
+
+## 6. Testing strategy
+
+Mapped to `CLAUDE.md` §6.2:
+
+- **Property (`proptest`)** — RFC0009.2: over arbitrary input file
+  sets (varied templates, row counts, schemas), compaction preserves
+  the row multiset and per-template counts. The reconstruction
+  property test (RFC 0005 §3.3) runs on compacted output too.
+- **Integration** — RFC0009.1/.5/.6: build a multi-file partition via
+  the `ourios-parquet` writer, compact, assert file-size/count and
+  that a `Querier` returns identical results before and after.
+- **Concurrency** — RFC0009.3: interleave a query with a compaction
+  commit (drive the manifest swap mid-plan) and assert the row count
+  is exactly correct for one generation.
+- **Crash recovery** — RFC0009.4: `SIGKILL` the compactor before and
+  after the manifest swap; assert recovery loses no rows and GC
+  reclaims orphans (the WAL crash-recovery test is the template).
+- **Corpus** — RFC0009.1: file-size histogram on the otel-demo
+  corpora before/after compaction.
+- **Bench (`criterion`)** — RFC0009.7 / benchmarks D2 (compaction
+  throughput) + D3 (file count under load); re-run the RFC 0007 §6 B2
+  latency bench post-compaction to show the per-file footer-read
+  residual (§2.1) shrinks.
+
+## 7. Open questions
+
+- [ ] **Manifest vs. generation-dir vs. glob+lock.** §3.4 recommends a
+  per-partition `manifest.json` with an atomic swap. Confirm before
+  `specified` — it is the load-bearing decision and changes the
+  RFC 0007 read path. (Fallback: generation subdirectories, §4.)
+- [ ] **RFC 0007 read-path change.** The querier must resolve a
+  partition's live files through the manifest (falling back to glob
+  when absent). Does this land as an RFC 0007 amendment + a querier PR
+  before any compactor writes manifests? (Sequencing: reader-tolerates-
+  manifest first, then writer-emits-manifest.)
+- [ ] **RFC 0005 artifact addition.** The manifest is a new
+  per-partition object. Additive + optional + back-compatible, but it
+  is an on-disk-format touch (`CLAUDE.md` §3.5) — does it need an
+  RFC 0005 amendment, or is it owned wholly here?
+- [ ] **Manifest serialization + atomic-swap primitive.** Local FS:
+  `rename` is atomic. S3: needs conditional-put / versioned-put or a
+  single-writer lease. Which object-store abstraction (and does
+  `object_store` give us the primitive portably)?
+- [ ] **Single-writer-per-partition.** How is concurrent compaction of
+  the same partition prevented (lease? the ingester being the sole
+  writer by construction)?
+- [ ] **Late-arriving data into a compacted partition.** New small
+  file + re-flag as candidate (§3.3) vs. re-open. Recommended: the
+  former; confirm the grace window default.
+- [ ] **Cadence + concurrency defaults** (RFC 0004): scan interval,
+  `compaction_min_files`, `compaction_grace`, max concurrent
+  partitions.
+- [ ] **Audit partition compaction** (day-granular) — same protocol,
+  or simpler given lower volume?
+- [ ] **Retention/expiry interplay** — explicitly deferred; note the
+  seam so a later TTL RFC composes with the manifest.
+
+## 8. References
+
+- `docs/hazards.md` H4 (small-file problem) — the hazard this
+  mitigates; `CLAUDE.md` §4 hazard 4.
+- RFC 0005 §3.4 (partitioning + atomic publish), §3.5 (size targets),
+  §3.9 (reader contract / forward-compat), §4.5 (compaction deferral),
+  §3.7 (audit stream).
+- RFC 0007 §6 + `crates/ourios-bench/benches/b2.rs` (PR #92) — the B2
+  latency finding that quantifies the small-file cost; RFC 0007 §4.6
+  (querier stays a pure reader); RFC0007.4 (forward-compatible reads).
+- RFC 0008 (WAL) — crash-recovery discipline (`CLAUDE.md` §3.4) the
+  compactor's commit protocol mirrors.
+- RFC 0004 (configuration policy) — where the cadence/grace/concurrency
+  knobs live.
+- `docs/benchmarks.md` D2 (WAL→Parquet compaction keeps up), D3
+  (small-file count under sustained load).
+- Apache Iceberg / Delta Lake atomic metadata-swap commit — design
+  inspiration for §3.4 (the idea, not the machinery).

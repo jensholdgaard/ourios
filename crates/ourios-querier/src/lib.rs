@@ -1,11 +1,13 @@
 //! `ourios-querier` — RFC 0007 querier (pillar #3, `DataFusion`).
 //!
-//! **Status: execution slice 1.** [`Querier::run`] executes a
+//! **Status: execution slice 2.** [`Querier::run`] executes a
 //! minimal query — tenant scope + optional time range + optional
 //! template-exact id — against the RFC 0005 Parquet store via
-//! `DataFusion`, returning a matching-row count. Tenant isolation
-//! (RFC0007.5) is live + tested; the row-group pruning stats that
-//! prove B1 (RFC0007.1) and the B2 latency bench come next.
+//! `DataFusion`, returning a matching-row count **and the scan's
+//! row-group pruning stats** ([`QueryStats`]). Tenant isolation
+//! (RFC0007.5) and B1 pruning (RFC0007.1 — a selective query
+//! provably skips row groups via statistics) are live + tested.
+//! The B2 latency-vs-corpus-size bench (RFC0007.2) comes next.
 //!
 //! This crate is the **read path**: it runs the query against the
 //! RFC 0005 store — scoped to the tenant's partition directory,
@@ -32,13 +34,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
+use datafusion::functions_aggregate::expr_fn::count;
+use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::columns;
@@ -174,6 +181,53 @@ fn has_published_parquet(dir: &std::path::Path) -> Result<bool, QueryError> {
     Ok(false)
 }
 
+/// Pull the single aggregate count out of the result batches.
+fn count_value(batches: &[RecordBatch]) -> u64 {
+    batches
+        .first()
+        .filter(|b| b.num_rows() > 0)
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .map_or(0, |a| u64::try_from(a.value(0)).unwrap_or(0))
+}
+
+/// Walk the executed physical plan and accumulate the scan
+/// pruning / IO metrics into a [`QueryStats`]. Recursive — the
+/// Parquet scan is a leaf under the aggregate.
+fn scan_stats(plan: &dyn ExecutionPlan) -> QueryStats {
+    let mut stats = QueryStats::default();
+    accumulate_scan_stats(plan, &mut stats);
+    stats
+}
+
+fn accumulate_scan_stats(plan: &dyn ExecutionPlan, stats: &mut QueryStats) {
+    if let Some(metrics) = plan.metrics() {
+        // `aggregate_by_name` sums each metric across the scan's
+        // per-file / per-partition instances.
+        for metric in metrics.aggregate_by_name().iter() {
+            match metric.value() {
+                // `row_groups_pruned_statistics` is a PruningMetrics
+                // carrying both pruned (skipped via min/max stats)
+                // and matched (read) row-group counts — exactly the
+                // B1 numerator + denominator.
+                MetricValue::PruningMetrics {
+                    name,
+                    pruning_metrics,
+                } if name == "row_groups_pruned_statistics" => {
+                    stats.row_groups_pruned += pruning_metrics.pruned() as u64;
+                    stats.row_groups_scanned += pruning_metrics.matched() as u64;
+                }
+                MetricValue::Count { name, count } if name == "bytes_scanned" => {
+                    stats.bytes_read += count.value() as u64;
+                }
+                _ => {}
+            }
+        }
+    }
+    for child in plan.children() {
+        accumulate_scan_stats(child.as_ref(), stats);
+    }
+}
+
 /// Map a `DataFusion` error to the Ourios-owned [`QueryError`] so
 /// no `datafusion`/`arrow` type crosses the public boundary (§4.6).
 // Takes the error by value so it drops in cleanly as
@@ -294,18 +348,21 @@ impl Querier {
                 .map_err(storage_err)?;
         }
 
-        // `count()` aggregates without materialising the matched
-        // rows' columns — so the heavy `attributes` / `params` /
-        // `body` columns are never read for a count, and Parquet
-        // projection pushdown applies. (`collect()` would buffer
-        // every column of every match.)
-        let rows = df.count().await.map_err(storage_err)? as u64;
-        // QueryStats (row-group pruning / bytes) is slice 2 — it
-        // comes from the ParquetExec metrics, not the row count.
-        Ok(QueryResult {
-            rows,
-            stats: QueryStats::default(),
-        })
+        // Count via an aggregate so the heavy `attributes` /
+        // `params` / `body` columns are never materialised
+        // (projection pushdown). We build + execute the physical
+        // plan ourselves (rather than `df.count()`) so we can read
+        // the scan's pruning metrics off the retained plan.
+        let counted = df
+            .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
+            .map_err(storage_err)?;
+        let plan = counted.create_physical_plan().await.map_err(storage_err)?;
+        let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .map_err(storage_err)?;
+        let rows = count_value(&batches);
+        let stats = scan_stats(plan.as_ref());
+        Ok(QueryResult { rows, stats })
     }
 }
 

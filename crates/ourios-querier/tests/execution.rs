@@ -168,6 +168,43 @@ async fn tenant_dir_without_committed_parquet_is_empty() {
     );
 }
 
+/// RFC0007.1 (B1) — a selective `template_id` query prunes row
+/// groups via Parquet statistics rather than scanning them.
+/// Tenant "a" gets two files in different hours: one holds only
+/// template 1, the other only template 2. A `template_id = 1`
+/// query must skip the template-2 file's row group (its
+/// `template_id` min/max can't satisfy `= 1`), so
+/// `row_groups_pruned > 0` and the pruned fraction is positive.
+#[tokio::test]
+async fn rfc0007_1_pushdown_prunes_row_groups() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    // Different hours ⇒ different partition files; each file's
+    // single row group carries a distinct template_id min/max.
+    write_all(bucket.path(), &[rec("a", 1, TS0)]); // hour 10 → template 1
+    write_all(bucket.path(), &[rec("a", 2, TS0 + 3_600_000_000_000)]); // hour 11 → template 2
+
+    let q = Querier::new(bucket.path());
+    let r = q
+        .run(req("a", None, Some(1)))
+        .await
+        .expect("template-exact query");
+
+    assert_eq!(r.rows, 1, "only the one template-1 row matches");
+    let total = r.stats.row_groups_scanned + r.stats.row_groups_pruned;
+    // pruned fraction `pruned / total` is positive iff both are
+    // non-zero — assert that integer-wise (no float).
+    assert!(
+        r.stats.row_groups_pruned >= 1,
+        "the template-2 file's row group must be pruned by statistics; stats={:?}",
+        r.stats,
+    );
+    assert!(
+        total > r.stats.row_groups_pruned,
+        "at least one row group was also scanned (matched); stats={:?}",
+        r.stats,
+    );
+}
+
 /// A `bucket_root` whose path contains a space still resolves —
 /// the URL is built from the canonical path (`DataFusion`
 /// URI-encodes it), not a raw `file://{display}` string that would

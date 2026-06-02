@@ -41,6 +41,7 @@ use datafusion::datasource::listing::{
 use datafusion::error::DataFusionError;
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
+use ourios_parquet::columns;
 use ourios_parquet::percent_encode_tenant;
 
 /// A logs query to execute. **Throwaway surface** while the query
@@ -110,6 +111,11 @@ pub enum QueryError {
     /// The query failed to compile from the logs DSL (RFC 0002).
     InvalidQuery { detail: String },
     /// Object-storage / Parquet read failure during execution.
+    /// `detail` carries the underlying engine message for
+    /// `Debug`/logs **only** — it is deliberately *not* rendered
+    /// by `Display`, because `DataFusion`/arrow error text leaks
+    /// implementation specifics the public surface must not expose
+    /// (hazard §4.6 / RFC0007.3).
     Storage { detail: String },
 }
 
@@ -118,7 +124,10 @@ impl std::fmt::Display for QueryError {
         match self {
             Self::TenantRequired => write!(f, "query has no tenant scope"),
             Self::InvalidQuery { detail } => write!(f, "invalid query: {detail}"),
-            Self::Storage { detail } => write!(f, "storage read failed: {detail}"),
+            // No `detail` here on purpose: the underlying engine
+            // message would leak `DataFusion`/SQL specifics (§4.6).
+            // The detail is preserved on the variant for `Debug`.
+            Self::Storage { .. } => write!(f, "failed to read the log store"),
         }
     }
 }
@@ -229,15 +238,15 @@ impl Querier {
             };
             df = df
                 .filter(
-                    col("time_unix_nano")
+                    col(columns::TIME_UNIX_NANO)
                         .gt_eq(lit(to_ts(start)?))
-                        .and(col("time_unix_nano").lt(lit(to_ts(end)?))),
+                        .and(col(columns::TIME_UNIX_NANO).lt(lit(to_ts(end)?))),
                 )
                 .map_err(storage_err)?;
         }
         if let Some(template_id) = request.template_id {
             df = df
-                .filter(col("template_id").eq(lit(template_id)))
+                .filter(col(columns::TEMPLATE_ID).eq(lit(template_id)))
                 .map_err(storage_err)?;
         }
 
@@ -276,12 +285,15 @@ mod tests {
             .to_string(),
             "invalid query: bad filter",
         );
+        // Storage Display is intentionally generic — the engine
+        // `detail` is NOT surfaced (it would leak DataFusion/SQL
+        // specifics, §4.6 / RFC0007.3).
         assert_eq!(
             QueryError::Storage {
-                detail: "s3 timeout".into(),
+                detail: "Error during planning: SQL ...".into(),
             }
             .to_string(),
-            "storage read failed: s3 timeout",
+            "failed to read the log store",
         );
     }
 

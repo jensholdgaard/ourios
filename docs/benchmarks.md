@@ -124,6 +124,17 @@ exploit structure the tree extracted.
   corpus size, template mining is buying compression but not query
   locality — the inverted-index collapse thesis (`CLAUDE.md` §2) is
   wrong in practice. Open an RFC.
+- **Instruments**: B2 is proven *structurally* (deterministically)
+  by `ourios-querier`'s `rfc0007_2_*` test — for a fixed result the
+  scanned row groups + bytes stay flat as the corpus grows. The
+  `criterion` bench `crates/ourios-bench/benches/b2.rs` adds the
+  *wall-clock* view: a `b2/synthetic` group (result held constant,
+  corpus scaled 1×/10×/50×) and a `b2/otel-demo` group over real
+  corpora (set `OURIOS_B2_CORPUS_DIRS` to a comma-separated list of
+  corpus dirs; skipped when unset, since the corpora aren't
+  committed). Run with `cargo bench -p ourios-bench --bench b2`.
+  These laptop/CI latencies are **indicative**, not §1-baseline
+  canonical, so they are not recorded in §9.
 
 ### B3 — Substring queries (the hard case)
 
@@ -307,8 +318,11 @@ hardware baseline (`baseline-8vcpu-32gib`), against an OTel-Demo
 corpus that is **shape-representative** (real multi-service
 template + envelope diversity) but **not size-representative** —
 every corpus is well below §8's ≥ 1 GiB canonical minimum, so
-this run is intentionally diagnostic, not a thesis verdict. B1 /
-B2 (query-side) remain unmeasured pending the querier (RFC 0007).
+this run is intentionally diagnostic, not a thesis verdict. The
+query-side gates now have instruments — B1 and B2 are proven
+structurally in `ourios-querier`, and B2 has a `criterion` latency
+bench (§B2 "Instruments") — but canonical query numbers on the §1
+hardware against a ≥ 1 GiB corpus are still pending.
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant

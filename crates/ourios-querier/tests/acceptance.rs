@@ -54,12 +54,5 @@ fn rfc0007_4_forward_compatible_reads() {
     unimplemented!("RFC0007.4 — assert unknown/missing columns honour RFC 0005 §3.9 defaults");
 }
 
-#[ignore = "RFC 0007 red gate — execution pending (RFC0007.5)"]
-#[test]
-fn rfc0007_5_tenant_isolation() {
-    // CLAUDE.md §3.7: a query for tenant T returns no row from
-    // another tenant, enforced at the partition-prune layer; a
-    // query without a tenant is a usage error (QueryError::
-    // TenantRequired), not a cross-tenant scan.
-    unimplemented!("RFC0007.5 — assert no cross-tenant rows; tenantless query is a usage error");
-}
+// RFC0007.5 (tenant isolation) is now a LIVE test — see
+// `tests/execution.rs::rfc0007_5_tenant_isolation`.

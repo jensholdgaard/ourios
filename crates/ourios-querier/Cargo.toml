@@ -15,12 +15,23 @@ path = "src/lib.rs"
 [dependencies]
 # `TenantId` for the per-request tenant scope (CLAUDE.md §3.7).
 ourios-core = { path = "../ourios-core" }
-# NOTE: `ourios-parquet` (the RFC 0005 reader this queries) and
-# `datafusion` (pillar #3 — the execution engine, kept a
-# `pub(crate)` dep so its types never cross the public API per
-# hazard §4.6) land with the execution slice. The red-gate
-# scaffold doesn't reference them, and `datafusion` is heavy, so
-# they're omitted here to keep the gate build minimal.
+# The RFC 0005 store this queries — used here for the canonical
+# `percent_encode_tenant` so the tenant partition-dir path matches
+# the writer's byte-for-byte (single source of truth, no drift).
+ourios-parquet = { path = "../ourios-parquet" }
+# Pillar #3 — the execution engine. A plain dep, but its types are
+# kept strictly internal: no `datafusion`/`arrow` type appears in
+# any public signature or error (hazard §4.6). Pulls arrow/parquet
+# 58 vs ourios-parquet's 55; harmless because the two never cross
+# in memory (DataFusion reads Parquet files from disk).
+datafusion = { version = "53", default-features = false, features = ["parquet"] }
+
+[dev-dependencies]
+# Async runtime for the execution integration tests; the writer
+# (ourios-parquet, a normal dep) lays down fixture Parquet, and
+# tempfile gives each test a scratch bucket.
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -26,6 +26,7 @@
 - [RFC 0006 — Bench harness](./rfcs/0006-bench-harness.md)
 - [RFC 0007 — Querier](./rfcs/0007-querier.md)
 - [RFC 0008 — Write-ahead log](./rfcs/0008-wal.md)
+- [RFC 0009 — Compaction](./rfcs/0009-compaction.md)
 
 # Talks
 

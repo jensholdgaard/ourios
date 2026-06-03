@@ -125,7 +125,9 @@ impl Default for CompactionMetrics {
 
 #[cfg(test)]
 mod tests {
-    use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
+    };
 
     use super::*;
 
@@ -158,7 +160,8 @@ mod tests {
         guard.force_flush().expect("force_flush succeeds");
 
         // Assert — every recorded instrument is in the exported stream.
-        let names = collected_names(&exporter.get_finished_metrics().expect("metrics exported"));
+        let rms = exporter.get_finished_metrics().expect("metrics exported");
+        let names = collected_names(&rms);
         for expected in [
             semconv::OURIOS_COMPACTION_SWEEPS,
             semconv::OURIOS_COMPACTION_PARTITIONS,
@@ -172,5 +175,33 @@ mod tests {
                 "exported stream missing {expected}, got {names:?}",
             );
         }
+
+        // …and every `sweeps` datapoint carries the *required*
+        // `ourios.compaction.result` attribute (the round-1 seed bug
+        // emitted an attribute-less point), with the committed sweep
+        // classified as such.
+        let sweeps = rms
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .find(|metric| metric.name() == semconv::OURIOS_COMPACTION_SWEEPS)
+            .expect("sweeps metric present");
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = sweeps.data() else {
+            panic!("sweeps should be a u64 sum, got {:?}", sweeps.data());
+        };
+        assert!(sum.data_points().count() > 0, "a sweep was recorded");
+        assert!(
+            sum.data_points().all(|dp| dp
+                .attributes()
+                .any(|kv| kv.key.as_str() == semconv::OURIOS_COMPACTION_RESULT)),
+            "every sweeps datapoint must carry the required result attribute",
+        );
+        assert!(
+            sum.data_points().any(|dp| dp.attributes().any(|kv| {
+                kv.key.as_str() == semconv::OURIOS_COMPACTION_RESULT
+                    && kv.value.as_str() == "committed"
+            })),
+            "the committed sweep is classified result=committed",
+        );
     }
 }

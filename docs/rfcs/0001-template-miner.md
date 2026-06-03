@@ -1516,8 +1516,10 @@ SDK and transport crates do not leak into every library:
   `opentelemetry` **API** crate and resolve instruments through
   `global::meter("ourios.<subsystem>")`. No SDK, no OTLP, no
   transport dependency in a library crate.
-- A new **`ourios-telemetry`** crate owns the heavy deps
-  (`opentelemetry_sdk`, `opentelemetry-otlp`, and the OTLP transport).
+- A new **`ourios-telemetry`** crate owns the heavy deps — the
+  `opentelemetry_sdk` and `opentelemetry-otlp` crates (the upstream
+  package names, underscore and hyphen respectively) plus the OTLP
+  transport.
   It exposes an `init()` that builds the OTLP push `MeterProvider`
   (periodic-reader export, interval configurable), installs it as the
   process-global provider, and returns a guard whose `shutdown()`
@@ -1558,9 +1560,14 @@ the data points produced during a collection cycle, not a registry of
 instruments, and a synchronous instrument that has recorded no
 measurement contributes no data point. To preserve §3.1.2's
 "full mandatory set is exposed" guarantee even at zero traffic, the
-miner **seeds each mandatory instrument with an initial zero-valued
-measurement at init**, so every metric in the table below appears in
-every collection cycle regardless of traffic. Verification is
+miner **emits an initial data point for each mandatory instrument at
+init**, so every metric in the table below appears in the first
+collection cycle regardless of traffic. The per-kind mechanism is an
+implementation detail of the instrumentation slice: a zero `add()`
+seeds additive instruments (counters / up-down-counters) without
+distorting anything, and observable instruments report through their
+callback; histograms are seeded so they surface **without** a
+synthetic `record(0)` polluting their distribution. Verification is
 therefore by *collecting the metric stream* (an SDK in-memory reader
 in tests), not by enumerating registered instruments.
 
@@ -1804,7 +1811,7 @@ resolves bidirectionally between RFC and tests.
   §3.2.1 (default param byte limit = 256),
   §3.2.2 (limit > 1 KiB rejected).
 
-- **Metrics registry test**: collect the miner's meter
+- **Metric collection test**: collect the miner's meter
   (`global::meter("ourios.miner")`) of a freshly-initialised miner via
   an SDK in-memory reader and assert the collected stream contains
   every §6.8 metric name (each present via its init-seeded data

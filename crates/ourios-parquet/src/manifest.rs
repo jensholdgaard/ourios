@@ -50,6 +50,11 @@ pub enum ManifestError {
     /// breaking tenant isolation (`CLAUDE.md` §3.7 / RFC0007.5). Bad
     /// manifests fail loudly rather than silently mis-resolving.
     InvalidFilename(String),
+    /// A file name appears more than once. The compactor joins each
+    /// entry to the partition dir and reads it, so a duplicate would
+    /// read the same file twice and double-count its rows — the live
+    /// set must be unique.
+    DuplicateFilename(String),
 }
 
 impl std::fmt::Display for ManifestError {
@@ -63,6 +68,9 @@ impl std::fmt::Display for ManifestError {
                     "manifest lists a non-partition-local file name: {name:?}"
                 )
             }
+            Self::DuplicateFilename(name) => {
+                write!(f, "manifest lists a duplicate file name: {name:?}")
+            }
         }
     }
 }
@@ -72,7 +80,7 @@ impl std::error::Error for ManifestError {
         match self {
             Self::Io(e) => Some(e),
             Self::Parse(e) => Some(e),
-            Self::InvalidFilename(_) => None,
+            Self::InvalidFilename(_) | Self::DuplicateFilename(_) => None,
         }
     }
 }
@@ -118,16 +126,21 @@ impl Manifest {
         }
     }
 
-    /// Reject any `files` entry that is not a partition-local
-    /// `*.parquet` file name (see [`ManifestError::InvalidFilename`]).
+    /// Validate the live set: every entry is a partition-local
+    /// `*.parquet` name and no name is repeated.
     ///
     /// # Errors
     ///
-    /// [`ManifestError::InvalidFilename`] for the first offending name.
+    /// [`ManifestError::InvalidFilename`] for the first non-local name,
+    /// or [`ManifestError::DuplicateFilename`] for the first repeat.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        let mut seen = std::collections::HashSet::with_capacity(self.files.len());
         for name in &self.files {
             if !is_partition_local_parquet(name) {
                 return Err(ManifestError::InvalidFilename(name.clone()));
+            }
+            if !seen.insert(name.as_str()) {
+                return Err(ManifestError::DuplicateFilename(name.clone()));
             }
         }
         Ok(())
@@ -339,5 +352,20 @@ mod tests {
         // Assert — rejected, and nothing was published.
         assert!(matches!(result, Err(ManifestError::InvalidFilename(_))));
         assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+    }
+
+    #[test]
+    fn validate_rejects_a_duplicate_file_name() {
+        // Arrange — the same file named twice would double-count.
+        let manifest = Manifest {
+            generation: 1,
+            files: vec!["a.parquet".to_string(), "a.parquet".to_string()],
+        };
+
+        // Act
+        let result = manifest.validate();
+
+        // Assert
+        assert!(matches!(result, Err(ManifestError::DuplicateFilename(_))));
     }
 }

@@ -343,36 +343,80 @@ fn is_candidate(partition_dir: &Path, policy: &CompactionPolicy) -> Result<bool,
 }
 
 /// Enumerate `tenant_dir`'s `year=/month=/day=/hour=` leaf partitions
-/// as `(PartitionKey, hour_dir)`. Directory names that don't parse as
-/// the expected `key=value` segments are skipped (not Ourios output).
-/// A missing `tenant_dir` yields an empty list.
+/// as `(PartitionKey, hour_dir)` — the **cartesian product** of the
+/// four Hive levels. Each level is one [`expand_level`] step folded
+/// over the running frontier, so the descent is a single generic
+/// expansion rather than four hand-nested loops. Directory names that
+/// aren't the canonical `key=value` segments drop out (not Ourios
+/// output); a missing `tenant_dir` yields an empty list.
 fn hour_partitions(
     tenant_dir: &Path,
     tenant: &str,
 ) -> Result<Vec<(PartitionKey, PathBuf)>, CompactionError> {
-    let mut out = Vec::new();
-    for (year_dir, year) in numbered_children(tenant_dir, "year", 4)? {
-        let Ok(year) = i32::try_from(year) else {
-            continue;
-        };
-        for (month_dir, month) in numbered_children(&year_dir, "month", 2)? {
-            for (day_dir, day) in numbered_children(&month_dir, "day", 2)? {
-                for (hour_dir, hour) in numbered_children(&day_dir, "hour", 2)? {
-                    out.push((
-                        PartitionKey {
-                            tenant_id: tenant.to_owned(),
-                            year,
-                            month,
-                            day,
-                            hour,
-                        },
-                        hour_dir,
-                    ));
-                }
-            }
-        }
-    }
-    Ok(out)
+    // The Hive levels, outermost first, with the zero-pad width
+    // `PartitionKey::data_path` writes each segment at.
+    const LEVELS: [(&str, usize); 4] = [("year", 4), ("month", 2), ("day", 2), ("hour", 2)];
+
+    // Fold the levels into the product: start at the tenant root with
+    // no numbers, expand by one level each step (short-circuiting on
+    // I/O error), and end with every hour leaf + its [y, m, d, h].
+    let root = vec![(tenant_dir.to_path_buf(), Vec::<u32>::new())];
+    let leaves = LEVELS.iter().try_fold(root, |frontier, &(prefix, width)| {
+        expand_level(frontier, prefix, width)
+    })?;
+
+    Ok(leaves
+        .into_iter()
+        .filter_map(|(hour_dir, nums)| partition_from(tenant, &nums, hour_dir))
+        .collect())
+}
+
+/// Expand every `(dir, nums)` in `frontier` by one Hive level: replace
+/// it with one entry per `<prefix>=<n>` child directory, appending the
+/// parsed `n` to `nums`. Folding this over the levels is the cartesian
+/// product `year × month × day × hour`.
+fn expand_level(
+    frontier: Vec<(PathBuf, Vec<u32>)>,
+    prefix: &str,
+    width: usize,
+) -> Result<Vec<(PathBuf, Vec<u32>)>, CompactionError> {
+    frontier
+        .into_iter()
+        .map(|(dir, nums)| {
+            numbered_children(&dir, prefix, width).map(|children| {
+                children.into_iter().map(move |(child, value)| {
+                    let mut nums = nums.clone();
+                    nums.push(value);
+                    (child, nums)
+                })
+            })
+        })
+        .collect::<Result<Vec<_>, CompactionError>>()
+        .map(|nested| nested.into_iter().flatten().collect())
+}
+
+/// Build a `(PartitionKey, hour_dir)` from the four parsed
+/// `[year, month, day, hour]` numbers, or `None` if there aren't
+/// exactly four or `year` doesn't fit `i32` (not a partition Ourios
+/// writes).
+fn partition_from(
+    tenant: &str,
+    nums: &[u32],
+    hour_dir: PathBuf,
+) -> Option<(PartitionKey, PathBuf)> {
+    let [year, month, day, hour] = *nums else {
+        return None;
+    };
+    Some((
+        PartitionKey {
+            tenant_id: tenant.to_owned(),
+            year: i32::try_from(year).ok()?,
+            month,
+            day,
+            hour,
+        },
+        hour_dir,
+    ))
 }
 
 /// Subdirectories of `dir` named `<prefix>=<n>` in the canonical

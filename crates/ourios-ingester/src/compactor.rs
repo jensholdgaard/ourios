@@ -4,16 +4,19 @@
 //! select its sealed candidate partitions and consolidate them. It is
 //! synchronous (blocking filesystem + Parquet work) and deterministic,
 //! so it's the unit the tests exercise. [`Compactor::run`] is the thin
-//! daemon: it calls `run_sweep` on a fixed cadence via `spawn_blocking`
-//! and hands each result to a caller-supplied observer (metrics/log
-//! wiring is a later slice).
+//! daemon: it calls `run_sweep` on a fixed cadence via `spawn_blocking`,
+//! records the RFC 0009 §3.6 metrics for each sweep
+//! ([`crate::metrics::CompactionMetrics`]), and hands each result to a
+//! caller-supplied observer for logging.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ourios_parquet::{
     CompactionError, CompactionPolicy, compact_partition, percent_decode_tenant, plan_candidates,
 };
+
+use crate::metrics::CompactionMetrics;
 
 /// Failure during a compaction sweep.
 #[derive(Debug)]
@@ -64,6 +67,10 @@ pub struct SweepReport {
     /// Partitions actually consolidated (a candidate that wasn't a
     /// no-op).
     pub partitions_compacted: usize,
+    /// Total input files merged away across those partitions (the
+    /// `files_before` of each consolidated partition) — the H4
+    /// small-file signal (RFC 0009 §3.6 `ourios.compaction.files`).
+    pub files_compacted: u64,
     /// Total rows rewritten across those partitions.
     pub rows_compacted: u64,
     /// Superseded inputs that couldn't be removed post-commit (orphans
@@ -112,6 +119,7 @@ pub fn run_sweep(
                 Ok(outcome) => {
                     if outcome.committed.is_some() {
                         report.partitions_compacted += 1;
+                        report.files_compacted += to_u64(outcome.files_before);
                         report.rows_compacted += outcome.rows;
                     }
                     report.gc_failures += outcome.gc_failures;
@@ -202,10 +210,11 @@ impl Compactor {
     /// Run sweeps forever, one per `interval` tick. Each sweep runs on
     /// the blocking pool (compaction is blocking I/O) as of the current
     /// wall clock; its [`SweepReport`]/[`IngestError`] result is handed
-    /// to `on_sweep` for logging/metrics — so one failing sweep is
-    /// observed, not fatal, and the loop keeps ticking. (Telemetry
-    /// wiring is a later slice; the observer is the seam.) Does not
-    /// return.
+    /// to `on_sweep` for logging — so one failing sweep is observed,
+    /// not fatal, and the loop keeps ticking. RFC 0009 §3.6 metrics are
+    /// recorded for every sweep via the `ourios.compaction` meter
+    /// (instruments built and seeded once here, before the loop). Does
+    /// not return.
     ///
     /// # Panics
     ///
@@ -216,6 +225,9 @@ impl Compactor {
     where
         F: FnMut(Result<SweepReport, IngestError>),
     {
+        // Built (and zero-seeded) once, before the loop, so the metric
+        // set is visible to the exporter even before the first sweep.
+        let metrics = CompactionMetrics::new();
         let mut ticker = tokio::time::interval(self.interval);
         // A maintenance sweep that overruns `interval` must not make
         // the next ticks fire back-to-back (the default `Burst`) —
@@ -226,13 +238,23 @@ impl Compactor {
             ticker.tick().await;
             let bucket = self.bucket_root.clone();
             let policy = self.policy;
-            let result =
-                tokio::task::spawn_blocking(move || run_sweep(&bucket, now_unix_nanos(), &policy))
-                    .await
-                    .expect("compaction sweep task should not panic");
+            let (result, elapsed) = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
+                let result = run_sweep(&bucket, now_unix_nanos(), &policy);
+                (result, start.elapsed())
+            })
+            .await
+            .expect("compaction sweep task should not panic");
+            metrics.record_sweep(&result, elapsed);
             on_sweep(result);
         }
     }
+}
+
+/// Saturating `usize` → `u64` (lossless on 64-bit; saturates rather
+/// than truncating on a theoretically wider target).
+pub(crate) fn to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// `SystemTime::now()` as Unix nanoseconds (`0` if the clock is before
@@ -318,6 +340,10 @@ mod tests {
         assert_eq!(report.tenants_scanned, 1);
         assert_eq!(report.partitions_compacted, 1);
         assert_eq!(report.rows_compacted, 2);
+        assert_eq!(
+            report.files_compacted, 2,
+            "both input files are merged away (the H4 signal)"
+        );
     }
 
     #[test]

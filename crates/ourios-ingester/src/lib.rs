@@ -23,6 +23,8 @@
 #![deny(unsafe_code)]
 
 pub mod compactor;
+pub mod metrics;
 pub mod receiver;
 
 pub use compactor::{Compactor, IngestError, SweepReport, run_sweep};
+pub use metrics::CompactionMetrics;

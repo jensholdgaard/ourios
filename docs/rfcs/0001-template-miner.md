@@ -237,9 +237,9 @@ runtime decision per leaf.
   type-tag mechanism in §4.2 already requires a slot name; using the
   Drain3 hint format keeps configs portable.
 - **Built-in metrics surface.** Drain3 exposes a set of state
-  counters via callback. `replace` — Ourios exposes OTel meters
-  directly per §6.8, with names that match `[§3.1]`'s required set
-  rather than Drain3's internal names.
+  counters via callback. `replace` — Ourios exposes OTel metrics
+  directly per §6.8 (instrumented via the meter API), with names that
+  match `[§3.1]`'s required set rather than Drain3's internal names.
 - **Parameter masking after the fact.** Drain3 has utilities to
   retroactively mask params in already-clustered lines. `reject` —
   Ourios masks once, at ingest, deterministically. Retroactive
@@ -559,7 +559,7 @@ direction and the primary obligation lives in those other RFCs.
 > **Scenario RFC0001.8 — confidence_p50 and confidence_p01 are emitted as gauges**
 > - **Given** a running miner with a non-empty `confidence`
 >   histogram for some `(tenant_id, service)`
-> - **When** the registered instruments are collected
+> - **When** the miner's meter is collected via an SDK in-memory reader
 > - **Then** `confidence_p50` and `confidence_p01` (attributes
 >   `tenant_id`, `service`) are present as gauges
 > - **And** each value matches the corresponding quantile of the
@@ -1527,16 +1527,27 @@ SDK and transport crates do not leak into every library:
   crate extends the `CLAUDE.md` §7 target layout; the new-crate
   commitment is blessed here, in this RFC, per §7's rule.
 
-Dimensions are OTel **attributes**, not Prometheus labels — and they
-are **metric (data-point) attributes**, recorded per measurement, not
-`Resource`-level attributes set once on the provider. A single
-ingester serves many tenants and many originating services, so
-`tenant_id` and `service` are dimensions of the *ingested data* (the
-log's own `service.name`, the same value §6.1's tenant derivation
-reads), not properties of the Ourios process — they cannot live on the
-`Resource`. The provider's `Resource` carries Ourios's *own* identity
-(`service.name = ourios-ingester`, etc.), distinct from the per-log
-`service` dimension.
+Dimensions are OTel **attributes**, not Prometheus labels, and OTel
+splits them in two: **resource attributes** identify the telemetry
+producer and are set once on the `MeterProvider`; **data-point
+attributes** vary per measurement. Ourios's own identity —
+`service.name = ourios-ingester` (with `service.version`, etc.) — is a
+**resource attribute**: per the semantic conventions it MUST be set
+once on the provider's `Resource` (by the `ourios-telemetry` crate)
+and MUST NOT be repeated on individual data points.
+
+The per-measurement dimensions in the table below — `tenant_id` and
+the originating **service** of the ingested logs — are **data-point
+attributes**. A single ingester multiplexes many tenants and many
+source services, and `[§3.1]` / `[§3.2]` require per-`(tenant,
+service)` breakdowns — notably the §6.5 / H2.2 *per-service* overflow
+alert — which a single producer-level resource attribute could not
+provide. This originating-service dimension is the *log's source*
+service (the value §6.1's tenant derivation reads), **distinct from
+Ourios's own `service.name`**; to avoid colliding with that reserved
+resource key it is carried under a namespaced `ourios.*` attribute,
+whose exact key is fixed by the deferred dotted-semconv redesign, not
+here.
 
 OTel's metric model is **collect-on-read**: a reader / exporter sees
 the data points produced during a collection cycle, not a registry of
@@ -1550,8 +1561,8 @@ therefore by *collecting the metric stream* (an SDK in-memory reader
 in tests), not by enumerating registered instruments.
 
 The metrics enumerated in `[§3.1]` are mandatory. Full set (names and
-instrument kinds pending the dotted-semconv redesign noted above;
-"Labels" are exported as attributes):
+instrument kinds pending the dotted-semconv redesign noted above; the
+dimensions shown are exported as **attributes**, not labels):
 
 | Metric | Type | Attributes | Source invariant / hazard |
 |---|---|---|---|

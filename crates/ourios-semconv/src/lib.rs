@@ -2,9 +2,9 @@
 //! constants for Ourios's custom metrics and attributes.
 //!
 //! GENERATED from `semconv/registry/` by `weaver registry generate`.
-//! Do not edit by hand: change the registry, regenerate, and commit
-//! the result. The CI `semconv-codegen` job fails if this file drifts
-//! from the registry.
+//! Do not edit by hand: change the registry or the template at
+//! `templates/registry/rust/`, regenerate, and commit the result. The
+//! CI `semconv` job fails if this file drifts from the registry.
 
 #![deny(unsafe_code)]
 

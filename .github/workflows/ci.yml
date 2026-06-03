@@ -99,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           weaver registry generate rust crates/ourios-semconv/src \
-            -t templates -r semconv/registry
+            -t templates -r semconv/registry --future
           cargo fmt -p ourios-semconv
       - name: Verify generated constants are in sync
         run: git diff --exit-code -- crates/ourios-semconv/src

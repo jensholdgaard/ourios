@@ -53,6 +53,12 @@ jobs:
       - uses: peaceiris/actions-mdbook@v2
         with:
           mdbook-version: '0.5.2'
+      # RFC diagrams are Mermaid (docs/rfcs/README.md). The
+      # preprocessor is declared in book.toml, so the binary must be
+      # on PATH or `mdbook build` fails with "preprocessor not found".
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook-mermaid@0.17.0
       - run: mdbook build
 
   # Informational coverage report — deliberately NOT gating. It is

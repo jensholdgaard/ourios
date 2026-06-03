@@ -1531,10 +1531,11 @@ Dimensions are OTel **attributes**, not Prometheus labels, and OTel
 splits them in two: **resource attributes** identify the telemetry
 producer and are set once on the `MeterProvider`; **data-point
 attributes** vary per measurement. Ourios's own identity —
-`service.name = ourios-ingester` (with `service.version`, etc.) — is a
-**resource attribute**: per the semantic conventions it MUST be set
-once on the provider's `Resource` (by the `ourios-telemetry` crate)
-and MUST NOT be repeated on individual data points.
+`service.name = ourios-<role>` (e.g. `ourios-ingester`, `ourios-querier`,
+matching the role the `ourios-telemetry` crate initialises the provider
+for; with `service.version`, etc.) — is a **resource attribute**: per
+the semantic conventions it MUST be set once on the provider's
+`Resource` and MUST NOT be repeated on individual data points.
 
 The per-measurement dimensions in the table below — `tenant_id` and
 the originating **service** of the ingested logs — are **data-point
@@ -1542,11 +1543,13 @@ attributes**. A single ingester multiplexes many tenants and many
 source services, and `[§3.1]` / `[§3.2]` require per-`(tenant,
 service)` breakdowns — notably the §6.5 / H2.2 *per-service* overflow
 alert — which a single producer-level resource attribute could not
-provide. This originating-service dimension is the *log's source*
-service (the value §6.1's tenant derivation reads), **distinct from
-Ourios's own `service.name`**; to avoid colliding with that reserved
-resource key it is carried under a namespaced `ourios.*` attribute,
-whose exact key is fixed by the deferred dotted-semconv redesign, not
+provide. The `service` dimension here is the *log's source* service
+(the value §6.1's tenant derivation reads), **distinct from Ourios's
+own `service.name`** — it must not reuse that reserved resource key.
+The table below shows the current attribute names (`tenant_id`,
+`service`); like the metric names, they are converted to the
+namespaced `ourios.*` dotted-semconv scheme by the deferred redesign
+(which fixes the exact key for the source-service dimension) — not
 here.
 
 OTel's metric model is **collect-on-read**: a reader / exporter sees

@@ -102,7 +102,18 @@ jobs:
             -t templates -r semconv/registry --future
           cargo fmt -p ourios-semconv
       - name: Verify generated constants are in sync
-        run: git diff --exit-code -- crates/ourios-semconv/src
+        # `git status --porcelain` (not `git diff`) so the guard also
+        # catches *new* untracked files the generator might emit, not
+        # just edits to the tracked module.
+        run: |
+          set -euo pipefail
+          changes="$(git status --porcelain -- crates/ourios-semconv/src)"
+          if [ -n "$changes" ]; then
+            echo "::error::ourios-semconv is out of sync with semconv/registry/. Regenerate (see the crate header) and commit."
+            echo "$changes"
+            git diff -- crates/ourios-semconv/src
+            exit 1
+          fi
 
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes

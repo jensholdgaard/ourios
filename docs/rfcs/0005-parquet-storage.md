@@ -414,11 +414,12 @@ originals land, and those *are* unbounded by construction.
 
 ### 3.7 Audit-event file schema
 
-The audit stream carries the events RFC 0001 §6.4 names —
+The audit stream carries the template events RFC 0001 §6.4 names —
 `TemplateWidened`, `TemplateTypeExpanded`,
-`TemplateWideningRejectedDegenerate` — plus a kind tag and a
-timestamp. The contract from RFC 0001 §9 ("Cross-RFC contracts
-pending") is fulfilled by this file series.
+`TemplateWideningRejectedDegenerate` — plus, per the 2026-06-03
+amendment below, the `Compaction` event of RFC 0009 §3.6, each with
+a kind tag and a timestamp. The contract from RFC 0001 §9 ("Cross-RFC
+contracts pending") is fulfilled by this file series.
 
 As in §3.2, `tenant_id` is a row-level REQUIRED column on the
 audit record (also replicated as the leading Hive partition key,
@@ -438,11 +439,12 @@ must keep them in sync per the mapping table — divergence is an
 implementation bug, not a degree of freedom. The normative
 mapping:
 
-| `event_kind` ordinal | `event_type` string (RFC 0001 §6.4) | Rust variant |
-|---|---|---|
-| `0` | `template_widened` | `TemplateWidened` |
-| `1` | `template_type_expanded` | `TemplateTypeExpanded` |
-| `2` | `template_widening_rejected_degenerate` | `TemplateWideningRejectedDegenerate` |
+| `event_kind` ordinal | `event_type` string | Rust variant | Source |
+|---|---|---|---|
+| `0` | `template_widened` | `TemplateWidened` | RFC 0001 §6.4 |
+| `1` | `template_type_expanded` | `TemplateTypeExpanded` | RFC 0001 §6.4 |
+| `2` | `template_widening_rejected_degenerate` | `TemplateWideningRejectedDegenerate` | RFC 0001 §6.4 |
+| `3` | `compaction` | `Compaction` | RFC 0009 §3.6 (amendment 2026-06-03) |
 
 Adding a new ordinal is a §3.8 additive amendment; the mapping
 table is the source of truth and a new ordinal lands as a new
@@ -450,6 +452,32 @@ row plus a new `event_type` string in the same PR. Renumbering
 an existing ordinal or renaming an `event_type` string is
 forbidden in-place (§3.8 rule 3: column-type changes go through
 add-new-column / migrate / drop).
+
+> **Amendment 2026-06-03 — compaction audit events.** RFC 0009
+> §3.6 routes a **compaction** audit event through this same stream
+> (the "nothing happens silently to stored data" stance applied to
+> file lifecycle, `CLAUDE.md` §3.1). A compaction event shares the
+> common envelope (`tenant_id`, `timestamp`, `event_kind = 3`,
+> `event_type = "compaction"`, `reason`) but has no template
+> identity. Two changes accommodate it, both back-compatible:
+>
+> 1. The template-specific columns (`template_id`, `old_version`,
+>    `new_version`, `old_template`, `new_template`,
+>    `positions_widened`, `slots_expanded`, `triggering_line_hash`)
+>    are **relaxed to OPTIONAL** (§3.8 rule 6). They stay
+>    *required-by-convention for the template event kinds* (0–2) —
+>    the writer MUST populate them there, enforced in code/tests, so
+>    the template-event contract is unchanged — and are `NULL` for
+>    `compaction`. Existing audit files keep their (non-null)
+>    values, so no data migration is needed.
+> 2. New **OPTIONAL** `compaction_*` columns (below) carry the file
+>    set / generation / row count (§3.8 rule 1). They are `NULL` for
+>    the template kinds.
+>
+> The RFC 0009 §7 fork (structured `reason` vs additive columns) is
+> resolved here in favour of explicit columns: they are queryable
+> (predicate-pushdown for "which compactions touched file X /
+> generation N"), where a JSON blob in `reason` would not be.
 
 The row-level audit columns are:
 
@@ -459,16 +487,29 @@ The row-level audit columns are:
 | `timestamp` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | Cluster clock at emit time (matches RFC 0001 §6.4 `timestamp`) |
 | `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | Ordinal per the mapping table above |
 | `event_type` | `STRING` | `BYTE_ARRAY` | REQUIRED | Canonical RFC 0001 §6.4 snake_case string; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
-| `template_id` | `INTEGER(64, signed=false)` | `INT64` | REQUIRED | The leaf the event applies to |
-| `old_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Pre-event template version |
-| `new_version` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Post-event template version (equal to `old_version` for the rejection variant) |
-| `old_template` | `STRING` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | The token sequence of the pre-event template (matches RFC 0001 §6.4's non-optional `old_template: String`). For `TemplateTypeExpanded` and `TemplateWideningRejectedDegenerate` (variants where the template tokens don't change), `old_template == new_template` |
-| `new_template` | `STRING` (canonical JSON) | `BYTE_ARRAY` | REQUIRED | The token sequence of the post-event template (matches RFC 0001 §6.4's non-optional `new_template: String`). Always set: `TemplateWidened` carries the post-widen template; `TemplateTypeExpanded` and `TemplateWideningRejectedDegenerate` carry the unchanged template (equal to `old_template`) |
-| `positions_widened` | `LIST<INT32>` | as schema | REQUIRED | Always written; the list is empty for `TemplateTypeExpanded` (no positions involved) and `TemplateWideningRejectedDegenerate` (the would-be widening was rejected). For `TemplateWidened`, the positions that gained `<*>`. Mirrors RFC 0001 §6.4 `positions_widened: Vec<u16>` |
-| `slots_expanded` | `LIST<STRUCT<slot_index: INT32, types_added: LIST<INT32>>>` | as schema | REQUIRED | Always written; the list is empty for `TemplateWidened` and `TemplateWideningRejectedDegenerate`. For `TemplateTypeExpanded`, one element per slot whose type set grew, each carrying the wildcard-slot ordinal plus the `ParamType` ordinals added (RFC 0001 §6.4 `slots_expanded: Vec<SlotExpansion>`; `SlotExpansion = { slot_index, types_added }`) |
-| `triggering_line_hash` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(16)` | REQUIRED | Blake3 hash of the raw triggering line `L_raw` (RFC 0001 §6.4 `triggering_line_hash: [u8; 16]`); enables cross-referencing the audit event with the data record that caused it |
+| `template_id` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL† | The leaf the event applies to |
+| `old_version` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL† | Pre-event template version |
+| `new_version` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL† | Post-event template version (equal to `old_version` for the rejection variant) |
+| `old_template` | `STRING` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL† | The token sequence of the pre-event template (matches RFC 0001 §6.4's non-optional `old_template: String`). For `TemplateTypeExpanded` and `TemplateWideningRejectedDegenerate` (variants where the template tokens don't change), `old_template == new_template` |
+| `new_template` | `STRING` (canonical JSON) | `BYTE_ARRAY` | OPTIONAL† | The token sequence of the post-event template (matches RFC 0001 §6.4's non-optional `new_template: String`). Always set: `TemplateWidened` carries the post-widen template; `TemplateTypeExpanded` and `TemplateWideningRejectedDegenerate` carry the unchanged template (equal to `old_template`) |
+| `positions_widened` | `LIST<INT32>` | as schema | OPTIONAL† | Written for template kinds; the list is empty for `TemplateTypeExpanded` (no positions involved) and `TemplateWideningRejectedDegenerate` (the would-be widening was rejected). For `TemplateWidened`, the positions that gained `<*>`. Mirrors RFC 0001 §6.4 `positions_widened: Vec<u16>` |
+| `slots_expanded` | `LIST<STRUCT<slot_index: INT32, types_added: LIST<INT32>>>` | as schema | OPTIONAL† | Written for template kinds; the list is empty for `TemplateWidened` and `TemplateWideningRejectedDegenerate`. For `TemplateTypeExpanded`, one element per slot whose type set grew, each carrying the wildcard-slot ordinal plus the `ParamType` ordinals added (RFC 0001 §6.4 `slots_expanded: Vec<SlotExpansion>`; `SlotExpansion = { slot_index, types_added }`) |
+| `triggering_line_hash` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL† | Blake3 hash of the raw triggering line `L_raw` (RFC 0001 §6.4 `triggering_line_hash: [u8; 16]`); enables cross-referencing the audit event with the data record that caused it |
 | `triggering_line_sample` | `STRING` | `BYTE_ARRAY` | OPTIONAL | First 256 bytes of `L_raw`, UTF-8 lossy-decoded if necessary (RFC 0001 §6.4 `triggering_line_sample: Option<String>`); `NULL` when the sample was redacted for retention policy |
-| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate`; the degenerate-template guard's diagnostic string otherwise |
+| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate` (the degenerate-template guard's diagnostic) and `compaction` (a short human summary); set for those |
+| `compaction_partition` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The compacted data partition, as the canonical `year=…/month=…/day=…/hour=…` key under the row's `tenant_id` (RFC 0009 §3.4). `NULL` for template kinds |
+| `compaction_input_files` | `LIST<STRING>` | as schema | OPTIONAL | **Compaction only.** The input file names that were merged away (RFC 0009 §3.6 `ourios.compaction.files`). `NULL` for template kinds |
+| `compaction_output_file` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The consolidated output file name (the sole live file after the commit). `NULL` for template kinds |
+| `compaction_generation` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** The manifest generation the consolidation committed at (RFC 0009 §3.4). `NULL` for template kinds |
+| `compaction_rows` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** Rows in the consolidated file — equal to the total input rows, the conserved count (RFC0009.2). `NULL` for template kinds |
+
+† **OPTIONAL†** marks columns relaxed from REQUIRED by the
+2026-06-03 amendment (§3.8 rule 6). They are
+*required-by-convention for the template event kinds* (`event_kind`
+0–2): the writer MUST populate them there and a test asserts it, so
+the template-event contract is unchanged; they are `NULL` only for
+`compaction` (kind 3). Existing audit files keep their non-null
+values and read back as `Some` — no data migration.
 
 The canonical-JSON encoding of `old_template` / `new_template`
 is `["lit0", "<NUM>", "lit2", ...]` — the same shape the miner's
@@ -483,7 +524,7 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 |---|---|---|---|---|
 | `tenant_id` | yes | no | no | Bounded per cluster |
 | `timestamp` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding plus ZSTD compression (same shape as data-file `time_unix_nano`); page index supports time-range pruning on drift queries |
-| `event_kind` | yes | yes | no | Three values today, plus future ordinals |
+| `event_kind` | yes | yes | no | A small bounded set (four ordinals today), plus future ordinals |
 | `event_type` | yes | yes | no | Same bounded set as `event_kind`; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
 | `template_id` | yes | yes | no | Bounded by tenant template count; bloom filter is unnecessary at audit volume |
 | `old_version`, `new_version` | yes | no | no | Small per template |
@@ -493,6 +534,11 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 | `triggering_line_hash` | no | no | no | Near-random 16 bytes, dict loses |
 | `triggering_line_sample` | no | no | no | High-entropy text, dict loses |
 | `reason` | yes | no | no | A small set of guard diagnostic strings in practice |
+| `compaction_partition` | yes | yes | no | Bounded per tenant; page index supports range pruning on the compacted partition |
+| `compaction_input_files` (list values) | no | no | no | UUID file names, near-random — dict loses |
+| `compaction_output_file` | no | no | no | UUID file name, near-random — dict loses |
+| `compaction_generation` | yes | no | no | Small monotonic integers per partition |
+| `compaction_rows` | no | no | no | High-cardinality counts; neither dict nor index earns its keep |
 
 Compression codec follows §3.5 (`ZSTD-3` across every column).
 Anything not in the table above takes the writer's defaults; the
@@ -534,6 +580,22 @@ the **baseline** schema; subsequent changes follow these rules:
    an RFC patch — encoding is not part of the *logical* schema,
    so readers don't break, but a benchmark must show the change
    doesn't regress A1/B1/B2.
+6. **Relaxing a column `REQUIRED` → `OPTIONAL`.** Permitted via
+   an amendment that names the columns and the writer invariant
+   that keeps them *required-by-convention* for the event/record
+   kinds that always carry them (enforced by a test). No data-
+   migration is required: existing files wrote the column for
+   every row, so it reads back as `Some` everywhere; only *new*
+   rows of a *new* kind may write `NULL`. The forward-compat
+   caveat — a reader predating the amendment reads a relaxed
+   column as `REQUIRED` and would mishandle a `NULL` — is bounded
+   because (a) Ourios versions reader and writer together and
+   (b) the rows that exercise the `NULL` belong to a kind
+   introduced *by the same amendment*, so no previously-deployed
+   reader is expected to read them. The reverse (`OPTIONAL` →
+   `REQUIRED`, a tightening) is forbidden in-place: it is rule 3
+   (a contract change old files can violate). First applied by
+   the 2026-06-03 compaction-audit amendment (§3.7).
 
 The PR description that touches the schema must explicitly call
 out which rule above applies, mirroring the `CLAUDE.md` §4
@@ -553,12 +615,18 @@ The reader has three normative requirements:
    produced by an earlier writer that lacks columns the current
    reader expects must read successfully; the missing columns
    default to:
-   - OPTIONAL columns → `None`. Per §3.8 rule 1, every
-     amendment-added column is OPTIONAL, so this bullet covers
-     the entire amendment-additive surface — there is no
-     "REQUIRED-added-in-amendment" case to default.
-   - The baseline REQUIRED columns from this RFC — the reader
-     errors. A file missing baseline columns is corrupted or
+   - OPTIONAL columns → `None`. Per §3.8 rule 1 every
+     amendment-added column is OPTIONAL, and per §3.8 rule 6 a
+     column relaxed `REQUIRED` → `OPTIONAL` is read the same way —
+     `None` when a row stores `NULL` (e.g. the template-specific
+     columns on a `compaction` row), `Some` for the non-null
+     values older files wrote. Together these cover the entire
+     amendment surface; there is no "REQUIRED-added-in-amendment"
+     case to default.
+   - The baseline REQUIRED columns *still* declared REQUIRED — the
+     reader errors if they are missing. A file missing a baseline
+     REQUIRED column (the common envelope: `tenant_id`,
+     `timestamp`, `event_kind`, `event_type`) is corrupted or
      written by an incompatible writer; falling through to a
      made-up default would corrupt downstream query results.
 3. **Row-vs-path partition validation.** For every row read
@@ -818,6 +886,23 @@ column the bench won't measure.
 >   derived from the observed-time fallback validates cleanly
 >   (the same algorithm runs on both sides)
 
+> **Scenario RFC0005.12 — Compaction audit event round-trips (amendment 2026-06-03)**
+> - **Given** a `compaction` audit event (`event_kind = 3`,
+>   `event_type = "compaction"`) carrying a partition key, an input
+>   file set, an output file, a manifest generation, and a row count
+> - **When** it is written to the audit stream and read back
+> - **Then** the common envelope (`tenant_id`, `timestamp`,
+>   `event_kind`, `event_type`) and the `compaction_*` columns are
+>   populated with those values
+> - **And** every template-specific column (`template_id`,
+>   `old_version`, `new_version`, `old_template`, `new_template`,
+>   `positions_widened`, `slots_expanded`, `triggering_line_hash`)
+>   reads back as `None` / null
+> - **And** a `template_widened` event written to the same stream
+>   still populates all of those template columns and reads back its
+>   `compaction_*` columns as `None` — i.e. the writer keeps each
+>   kind's required-by-convention columns non-null (§3.8 rule 6)
+
 ## 6. Testing strategy
 
 - **RFC0005.1** — property test in
@@ -875,6 +960,13 @@ column the bench won't measure.
   `tenant_id=b`) and asserts the reader's hard-error path fires
   with the documented diagnostic. Sub-tests cover the four
   time-bucket parts (`year`/`month`/`day`/`hour`).
+- **RFC0005.12** — round-trip test in
+  `crates/ourios-parquet/tests/` lands with the audit-schema
+  code change: write a `compaction` audit event and a
+  `template_widened` event through `AuditWriter`, read them back
+  via `AuditReader`, and assert each kind's columns are populated
+  / null per §3.7 (the relaxed template columns non-null only for
+  template kinds; `compaction_*` non-null only for `compaction`).
 
 Criterion benchmarks (in `ourios-bench`, Phase 3 territory) will
 measure A1 (compression ratio) and B1/B2 (predicate-pushdown

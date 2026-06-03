@@ -79,17 +79,19 @@ impl std::error::Error for ManifestError {
 
 /// Whether `name` is a bare partition-local `*.parquet` file name:
 /// exactly one path component, that component an ordinary name (no
-/// `/`, no `..`, not absolute), with a `.parquet` extension.
+/// `/`, no `..`, not absolute), with a lowercase `.parquet` extension.
+/// The extension match is case-*sensitive* on purpose — the writer
+/// only ever emits lowercase `.parquet`, and the glob fallback
+/// (`resolve_live_files`) / `ListingOptions::with_file_extension`
+/// match lowercase too, so a manifest naming `*.PARQUET` would be
+/// "valid" yet inconsistent with the on-disk contract.
 fn is_partition_local_parquet(name: &str) -> bool {
     use std::path::Component;
     let path = Path::new(name);
     let mut components = path.components();
     let single_normal =
         matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
-    single_normal
-        && path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+    single_normal && path.extension().is_some_and(|ext| ext == "parquet")
 }
 
 impl Manifest {
@@ -231,6 +233,7 @@ mod tests {
             "/abs/x.parquet",    // absolute
             "sub/x.parquet",     // nested
             "x.txt",             // wrong extension
+            "x.PARQUET",         // non-canonical (uppercase) extension
             "x",                 // no extension
             "",                  // empty
             ".",                 // current dir

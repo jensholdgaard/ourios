@@ -12,8 +12,8 @@
 //!   the ingest path once the receiver lands; not exercised here.
 //! - **Background compaction** (RFC 0009 §3.2, `specified`) — the only
 //!   subsystem implemented in this scaffold. [`compactor`] sweeps the
-//!   store for sealed, candidate partitions ([`ourios_parquet::
-//!   plan_candidates`]) and consolidates them
+//!   store for sealed, candidate partitions
+//!   ([`ourios_parquet::plan_candidates`]) and consolidates them
 //!   ([`ourios_parquet::compact_partition`]).
 //!
 //! This is the **scaffold**: it establishes the crate as the ingester

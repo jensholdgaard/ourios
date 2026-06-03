@@ -66,6 +66,12 @@ pub struct SweepReport {
     /// Superseded inputs that couldn't be removed post-commit (orphans
     /// a later sweep/GC reclaims; see `CompactionOutcome.gc_failures`).
     pub gc_failures: usize,
+    /// Per-tenant / per-partition failures encountered, formatted for
+    /// logging. A sweep is **resilient**: one bad tenant or partition
+    /// is recorded here and skipped, never aborting the rest (else a
+    /// persistent error would starve every later tenant, since the
+    /// daemon just retries the same sweep next tick).
+    pub errors: Vec<String>,
 }
 
 /// Run one compaction sweep over `bucket_root`, as of wall-clock
@@ -73,10 +79,16 @@ pub struct SweepReport {
 /// partitions ([`plan_candidates`]) and consolidate each
 /// ([`compact_partition`]), accumulating a [`SweepReport`].
 ///
+/// Resilient: a tenant whose planning fails, or a partition whose
+/// consolidation fails, is recorded in [`SweepReport::errors`] and
+/// skipped — the sweep continues with the rest. Only a failure to
+/// scan the store itself (the tenant listing) is fatal.
+///
 /// # Errors
 ///
-/// [`IngestError`] if the store can't be scanned, or a partition's
-/// planning or consolidation fails.
+/// [`IngestError`] only if the store's tenant directory can't be
+/// scanned; per-tenant / per-partition failures are collected into
+/// the returned report, not propagated.
 pub fn run_sweep(
     bucket_root: &Path,
     now_unix_nanos: u64,
@@ -85,13 +97,27 @@ pub fn run_sweep(
     let mut report = SweepReport::default();
     for tenant in tenants(bucket_root)? {
         report.tenants_scanned += 1;
-        for partition in plan_candidates(bucket_root, &tenant, now_unix_nanos, policy)? {
-            let outcome = compact_partition(bucket_root, &partition)?;
-            if outcome.committed.is_some() {
-                report.partitions_compacted += 1;
-                report.rows_compacted += outcome.rows;
+        let candidates = match plan_candidates(bucket_root, &tenant, now_unix_nanos, policy) {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                report.errors.push(format!("plan tenant {tenant:?}: {e}"));
+                continue;
             }
-            report.gc_failures += outcome.gc_failures;
+        };
+        for partition in candidates {
+            match compact_partition(bucket_root, &partition) {
+                Ok(outcome) => {
+                    if outcome.committed.is_some() {
+                        report.partitions_compacted += 1;
+                        report.rows_compacted += outcome.rows;
+                    }
+                    report.gc_failures += outcome.gc_failures;
+                }
+                Err(e) => report.errors.push(format!(
+                    "compact {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
+                    partition.year, partition.month, partition.day, partition.hour,
+                )),
+            }
         }
     }
     Ok(report)
@@ -323,6 +349,36 @@ mod tests {
         // Assert
         assert_eq!(report.tenants_scanned, 2, "both tenants scanned");
         assert_eq!(report.partitions_compacted, 1, "only tenant a's partition");
+    }
+
+    #[test]
+    fn sweep_isolates_a_failing_tenant() {
+        // Arrange — tenant "a" is a healthy sealed candidate; tenant
+        // "b" has a malformed manifest.json, so planning it errors.
+        let bucket = tempfile::tempdir().expect("temp");
+        write_sealed_candidate(bucket.path(), "a");
+        write_file(bucket.path(), "b", 1, TS0);
+        let b_dir = PartitionKey::derive(&rec("b", 1, TS0))
+            .expect("derive")
+            .data_path(bucket.path());
+        std::fs::write(b_dir.join(ourios_parquet::MANIFEST_FILENAME), b"not json")
+            .expect("corrupt b's manifest");
+
+        // Act
+        let report =
+            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+
+        // Assert — b's failure is recorded, but a is still compacted.
+        assert_eq!(report.tenants_scanned, 2);
+        assert_eq!(
+            report.partitions_compacted, 1,
+            "tenant a compacted despite b failing"
+        );
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "tenant b's failure is recorded, not fatal"
+        );
     }
 
     #[test]

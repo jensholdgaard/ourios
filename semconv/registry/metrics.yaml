@@ -8,7 +8,7 @@ groups:
     unit: "{sweep}"
     attributes:
       - ref: ourios.compaction.result
-        requirement_level: recommended
+        requirement_level: required
 
   - id: metric.ourios.compaction.partitions
     type: metric
@@ -54,7 +54,7 @@ groups:
     unit: "s"
     attributes:
       - ref: ourios.compaction.result
-        requirement_level: recommended
+        requirement_level: required
 
   - id: metric.ourios.compaction.orphan.files
     type: metric

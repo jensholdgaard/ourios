@@ -444,9 +444,11 @@ history is legible):
 - [ ] **Retention/expiry interplay** — explicitly deferred; note the
   seam so a later TTL RFC composes with the manifest.
 - [ ] **Audit-event shape (§3.6).** Carry the compaction file set /
-  generation in a structured `reason` payload (no schema change) vs.
-  OPTIONAL audit columns (RFC 0005 §3.8 additive amendment). Leaning
-  structured `reason`.
+  generation in a structured `reason` payload vs. OPTIONAL audit
+  columns (RFC 0005 §3.8 additive amendment). Per §3.6 the template
+  columns are non-nullable and `event_kind` has no compaction member,
+  so the structured-`reason` route is not schema-free either; leaning
+  the **additive OPTIONAL** route.
 - [ ] **Metric semconv validation (§3.6).** Run the §3.6 metric
   names/units/attributes through the OpenTelemetry semantic-conventions
   check (OTel assistant / `weaver` / rego policy packages) and fix any

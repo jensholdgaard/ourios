@@ -224,7 +224,9 @@ conserved, RFC0009.2), and the committed manifest generation.
 > `timestamp`, `event_kind` / `event_type`, `reason`) but (a) needs a
 > new `compaction` member in the `event_kind` mapping and (b) has no
 > applicable value for the non-nullable template columns, nor a place
-> for the file set / generation. Resolve before `red`:
+> for the file set / generation. This is an implementation detail to
+> settle when the compaction audit-emit code lands — not a design
+> blocker, so it does not gate `red` (tracked in §7). The two routes:
 >
 > - **structured `reason`** — carry the file set / generation as a
 >   structured `reason` payload. Avoids new columns, but still needs
@@ -237,7 +239,7 @@ conserved, RFC0009.2), and the committed manifest generation.
 >   columns per RFC 0005 §3.9.
 >
 > The non-nullability tilts this toward the additive route; settle it
-> against RFC 0005 §3.7 before `red` rather than here.
+> against RFC 0005 §3.7 when that code lands, not here.
 
 #### Metrics (OpenTelemetry semantic conventions)
 

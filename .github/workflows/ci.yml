@@ -58,7 +58,7 @@ jobs:
       # on PATH or `mdbook build` fails with "preprocessor not found".
       - uses: taiki-e/install-action@v2
         with:
-          tool: mdbook-mermaid
+          tool: mdbook-mermaid@0.17.0
       - run: mdbook build
 
   # Aggregate result so branch-protection rules need only require

@@ -122,8 +122,8 @@ The mdBook build has the `mdbook-mermaid` preprocessor enabled
 (`mermaid.min.js`, `mermaid-init.js`) so the rendered book is
 self-contained. The CI `book` job and the Pages workflow install the
 `mdbook-mermaid` binary before building. To work on diagrams locally,
-`cargo install mdbook-mermaid` (the preprocessor binary) — the
-vendored runtime is already committed.
+`cargo install mdbook-mermaid --locked` (the preprocessor binary) —
+the vendored runtime is already committed.
 
 ## Relationship to architecture docs
 

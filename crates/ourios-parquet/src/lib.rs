@@ -28,6 +28,7 @@
 pub mod audit_reader;
 pub mod audit_record_batch;
 pub mod audit_writer;
+pub mod manifest;
 pub mod partition;
 pub mod reader;
 pub mod record_batch;
@@ -36,6 +37,7 @@ pub mod writer;
 pub use audit_reader::{AuditReader, AuditReaderError};
 pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile};
+pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError};
 pub use partition::{PartitionKey, TimestampOverflowError, percent_encode_tenant};
 pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};

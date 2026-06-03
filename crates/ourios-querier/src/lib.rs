@@ -37,7 +37,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array};
-use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -50,6 +49,7 @@ use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
+use ourios_parquet::Manifest;
 use ourios_parquet::columns;
 use ourios_parquet::percent_encode_tenant;
 
@@ -143,44 +143,61 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// Whether `dir` (a tenant's partition root) holds at least one
-/// published `*.parquet` file anywhere beneath it. Recursive
-/// because the data is nested `year=/month=/day=/hour=/`. Files
-/// the writer hasn't committed (`*.parquet.tmp`) have extension
-/// `tmp`, so they don't count — the poisoned-writer case we treat
-/// as "empty", not error.
+/// Resolve the live data files a query must read under `dir` (a
+/// tenant's partition root), honouring the RFC 0009 §3.4
+/// per-partition manifest. Recursive because the data is nested
+/// `year=/month=/day=/hour=/`.
 ///
-/// A missing directory (`NotFound`) is "empty" (`Ok(false)`); any
-/// *other* I/O error (permission denied, transient failure) is
-/// propagated as [`QueryError::Storage`] rather than silently
-/// masked as "no data" — a wrong zero-row answer is worse than a
-/// surfaced error.
-fn has_published_parquet(dir: &std::path::Path) -> Result<bool, QueryError> {
+/// For each partition directory: if it holds a `manifest.json`, the
+/// manifest is authoritative and contributes exactly the files it
+/// names (files present on disk but not listed — orphans awaiting GC,
+/// or a writer's uncommitted `*.parquet.tmp` — are ignored). With no
+/// manifest (every partition today, pre-compaction) it falls back to
+/// all committed `*.parquet` in that directory; `*.parquet.tmp` has
+/// extension `tmp`, so the poisoned-writer case contributes nothing.
+///
+/// An empty result means the tenant has nothing queryable. A missing
+/// directory (`NotFound`) is empty; any *other* I/O error (permission
+/// denied, transient failure) is propagated as [`QueryError::Storage`]
+/// rather than silently masked as "no data" — a wrong zero-row answer
+/// is worse than a surfaced error.
+fn resolve_live_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, QueryError> {
     let io_err = |op: &str, p: &std::path::Path, e: &std::io::Error| QueryError::Storage {
         detail: format!("{op} {}: {e}", p.display()),
     };
+    let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let entries = match std::fs::read_dir(&d) {
             Ok(entries) => entries,
-            // The dir (or a subdir, lost to a concurrent
-            // housekeeping unlink) simply isn't there → not data,
-            // not an error.
+            // The dir (or a subdir, lost to a concurrent housekeeping
+            // unlink) simply isn't there → not data, not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(io_err("read_dir", &d, &e)),
         };
+        let mut subdirs = Vec::new();
+        let mut parquets = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| io_err("read_dir entry", &d, &e))?;
             let path = entry.path();
             match entry.file_type() {
-                Ok(ft) if ft.is_dir() => stack.push(path),
-                Ok(_) if path.extension().is_some_and(|x| x == "parquet") => return Ok(true),
+                Ok(ft) if ft.is_dir() => subdirs.push(path),
+                Ok(_) if path.extension().is_some_and(|x| x == "parquet") => parquets.push(path),
                 Ok(_) => {}
                 Err(e) => return Err(io_err("file_type", &path, &e)),
             }
         }
+        match Manifest::read(&d).map_err(|e| QueryError::Storage {
+            detail: format!("manifest in {}: {e}", d.display()),
+        })? {
+            // Manifest is authoritative: only its named files are live.
+            Some(manifest) => files.extend(manifest.files.into_iter().map(|name| d.join(name))),
+            // No manifest → glob fallback for this partition.
+            None => files.append(&mut parquets),
+        }
+        stack.extend(subdirs);
     }
-    Ok(false)
+    Ok(files)
 }
 
 /// Pull the single aggregate count out of the result batches. A
@@ -312,48 +329,70 @@ impl Querier {
             .bucket_root
             .join("data")
             .join(format!("tenant_id={enc}"));
-        // No published `*.parquet` under the tenant dir ⇒ the
-        // tenant has nothing queryable ⇒ empty result (not an
-        // error). Covers both the missing-dir case and a dir that
-        // holds only `*.parquet.tmp` (a poisoned/crashed writer) or
-        // empty partition dirs — where `infer_schema` would
-        // otherwise error and wrongly fail the query.
-        if !has_published_parquet(&tenant_dir)? {
+        // Resolve the live file set under the tenant dir, honouring
+        // the RFC 0009 §3.4 manifest (glob-fallback when absent). An
+        // empty set ⇒ the tenant has nothing queryable ⇒ empty result
+        // (not an error). Covers the missing-dir case and a partition
+        // holding only `*.parquet.tmp` (a poisoned/crashed writer) —
+        // where building a table over zero files would otherwise
+        // error and wrongly fail the query.
+        let live_files = resolve_live_files(&tenant_dir)?;
+        if live_files.is_empty() {
             return Ok(QueryResult::default());
         }
 
         let ctx = SessionContext::new();
-        // Build the table URL from the canonical absolute path,
-        // scheme-less with a trailing slash. DataFusion 53 treats
-        // an absolute filesystem path as local and URI-encodes it
-        // internally — so spaces / reserved characters in the
-        // bucket path are handled, unlike a hand-built `file://…`
-        // string. `canonicalize` is safe: we just confirmed the
-        // directory exists. The trailing slash marks it a
-        // directory (not a single object).
-        let abs = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
+        // Tenant isolation (RFC0007.5 / §3.7) is enforced here, not
+        // just assumed structural: every resolved file must
+        // canonicalize to a path *under* the tenant's canonical
+        // partition root. The manifest's entries are already validated
+        // as partition-local names (`Manifest::validate`), but a
+        // symlinked `*.parquet` could still resolve outside — this
+        // `starts_with` check is the backstop that fails such a path
+        // loudly rather than reading another tenant's data.
+        let tenant_root = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
             detail: format!("canonicalize {}: {e}", tenant_dir.display()),
         })?;
-        let url = ListingTableUrl::parse(format!("{}/", abs.display())).map_err(storage_err)?;
-        // `year/month/day/hour` are path-only Hive partition cols
-        // (parsed from the directory names); `tenant_id` is *not*
-        // listed — relative to this tenant-scoped root it's a plain
-        // file column, and the rooting is what enforces isolation.
-        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            .with_file_extension(".parquet")
-            .with_table_partition_cols(vec![
-                ("year".to_string(), DataType::Utf8),
-                ("month".to_string(), DataType::Utf8),
-                ("day".to_string(), DataType::Utf8),
-                ("hour".to_string(), DataType::Utf8),
-            ]);
-        let schema = options
-            .infer_schema(&ctx.state(), &url)
+        // One table path per *live* data file (RFC 0009 §3.4 — the
+        // manifest, not a directory glob, decides the file set, so a
+        // query never sees a compaction's superseded inputs). Each is
+        // the canonical absolute path: DataFusion 53 treats an
+        // absolute filesystem path as local and URI-encodes it
+        // internally, so spaces / reserved characters are handled
+        // without a hand-built `file://…` string. `year/month/day/hour`
+        // stay path-only (not file columns) and the query filters only
+        // data columns, so no table partition columns are declared.
+        let mut seen = std::collections::HashSet::new();
+        let mut urls = Vec::with_capacity(live_files.len());
+        for file in &live_files {
+            let abs = file.canonicalize().map_err(|e| QueryError::Storage {
+                detail: format!("canonicalize {}: {e}", file.display()),
+            })?;
+            if !abs.starts_with(&tenant_root) {
+                return Err(QueryError::Storage {
+                    detail: format!(
+                        "resolved file {} escapes tenant partition root {}",
+                        abs.display(),
+                        tenant_root.display(),
+                    ),
+                });
+            }
+            // De-duplicate so a manifest naming the same file twice
+            // can't double-count its rows.
+            if seen.insert(abs.clone()) {
+                urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
+            }
+        }
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        // `infer_schema` over the multi-path set merges the files'
+        // schemas, so additive schema drift across files reads as the
+        // union (RFC0007.4 / RFC 0005 §3.9).
+        let config = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(options)
+            .infer_schema(&ctx.state())
             .await
             .map_err(storage_err)?;
-        let config = ListingTableConfig::new(url)
-            .with_listing_options(options)
-            .with_schema(schema);
         let table = ListingTable::try_new(config).map_err(storage_err)?;
         ctx.register_table("logs", Arc::new(table))
             .map_err(storage_err)?;
@@ -544,5 +583,106 @@ mod tests {
         assert_eq!(stats.row_groups_pruned, 3);
         assert_eq!(stats.row_groups_scanned, 2);
         assert_eq!(stats.bytes_read, 4096);
+    }
+
+    // --- resolve_live_files (RFC 0009 §3.4 manifest / glob fallback) ---
+
+    /// Create `<root>/data/tenant_id=a/year=2026/.../hour=10` and
+    /// return `(tenant_dir, partition_dir)`.
+    fn tenant_and_partition(root: &std::path::Path) -> (PathBuf, PathBuf) {
+        let tenant = root.join("data/tenant_id=a");
+        let partition = tenant.join("year=2026/month=04/day=02/hour=10");
+        std::fs::create_dir_all(&partition).expect("mkdir partition");
+        (tenant, partition)
+    }
+
+    #[test]
+    fn resolve_missing_tenant_dir_is_empty() {
+        // Arrange — a tenant directory that was never written.
+        let tmp = tempfile::tempdir().expect("temp");
+        let ghost = tmp.path().join("data/tenant_id=ghost");
+
+        // Act
+        let files = resolve_live_files(&ghost).expect("resolve");
+
+        // Assert
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn resolve_tmp_only_partition_is_empty() {
+        // Arrange — a partition holding only an uncommitted `.tmp`.
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("x.parquet.tmp"), b"partial").expect("write tmp");
+
+        // Act
+        let files = resolve_live_files(&tenant).expect("resolve");
+
+        // Assert
+        assert!(files.is_empty(), "uncommitted .tmp files are not live");
+    }
+
+    #[test]
+    fn resolve_globs_committed_parquet_without_a_manifest() {
+        // Arrange — two committed files, no manifest.
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
+        std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
+
+        // Act
+        let files = resolve_live_files(&tenant).expect("resolve");
+
+        // Assert
+        assert_eq!(
+            files.len(),
+            2,
+            "both committed files are live without a manifest"
+        );
+    }
+
+    #[test]
+    fn resolve_manifest_is_authoritative() {
+        // Arrange — two files on disk, a manifest naming only one.
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
+        std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
+        let manifest = ourios_parquet::Manifest {
+            generation: 1,
+            files: vec!["a.parquet".to_string()],
+        };
+        std::fs::write(
+            partition.join(ourios_parquet::MANIFEST_FILENAME),
+            manifest.to_json().unwrap(),
+        )
+        .expect("write manifest");
+
+        // Act
+        let files = resolve_live_files(&tenant).expect("resolve");
+
+        // Assert
+        assert_eq!(files.len(), 1, "only the manifest's file is live");
+        assert!(files[0].ends_with("a.parquet"));
+    }
+
+    #[test]
+    fn resolve_malformed_manifest_is_a_storage_error() {
+        // Arrange — a manifest that isn't valid JSON.
+        let tmp = tempfile::tempdir().expect("temp");
+        let (tenant, partition) = tenant_and_partition(tmp.path());
+        std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
+        std::fs::write(
+            partition.join(ourios_parquet::MANIFEST_FILENAME),
+            b"not json",
+        )
+        .expect("write manifest");
+
+        // Act
+        let result = resolve_live_files(&tenant);
+
+        // Assert
+        assert!(matches!(result, Err(QueryError::Storage { .. })));
     }
 }

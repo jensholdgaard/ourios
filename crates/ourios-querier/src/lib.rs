@@ -598,26 +598,43 @@ mod tests {
 
     #[test]
     fn resolve_missing_tenant_dir_is_empty() {
+        // Arrange — a tenant directory that was never written.
         let tmp = tempfile::tempdir().expect("temp");
         let ghost = tmp.path().join("data/tenant_id=ghost");
-        assert!(resolve_live_files(&ghost).expect("resolve").is_empty());
+
+        // Act
+        let files = resolve_live_files(&ghost).expect("resolve");
+
+        // Assert
+        assert!(files.is_empty());
     }
 
     #[test]
     fn resolve_tmp_only_partition_is_empty() {
+        // Arrange — a partition holding only an uncommitted `.tmp`.
         let tmp = tempfile::tempdir().expect("temp");
         let (tenant, partition) = tenant_and_partition(tmp.path());
         std::fs::write(partition.join("x.parquet.tmp"), b"partial").expect("write tmp");
-        assert!(resolve_live_files(&tenant).expect("resolve").is_empty());
+
+        // Act
+        let files = resolve_live_files(&tenant).expect("resolve");
+
+        // Assert
+        assert!(files.is_empty(), "uncommitted .tmp files are not live");
     }
 
     #[test]
     fn resolve_globs_committed_parquet_without_a_manifest() {
+        // Arrange — two committed files, no manifest.
         let tmp = tempfile::tempdir().expect("temp");
         let (tenant, partition) = tenant_and_partition(tmp.path());
         std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
         std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
+
+        // Act
         let files = resolve_live_files(&tenant).expect("resolve");
+
+        // Assert
         assert_eq!(
             files.len(),
             2,
@@ -627,6 +644,7 @@ mod tests {
 
     #[test]
     fn resolve_manifest_is_authoritative() {
+        // Arrange — two files on disk, a manifest naming only one.
         let tmp = tempfile::tempdir().expect("temp");
         let (tenant, partition) = tenant_and_partition(tmp.path());
         std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
@@ -640,13 +658,18 @@ mod tests {
             manifest.to_json().unwrap(),
         )
         .expect("write manifest");
+
+        // Act
         let files = resolve_live_files(&tenant).expect("resolve");
+
+        // Assert
         assert_eq!(files.len(), 1, "only the manifest's file is live");
         assert!(files[0].ends_with("a.parquet"));
     }
 
     #[test]
     fn resolve_malformed_manifest_is_a_storage_error() {
+        // Arrange — a manifest that isn't valid JSON.
         let tmp = tempfile::tempdir().expect("temp");
         let (tenant, partition) = tenant_and_partition(tmp.path());
         std::fs::write(partition.join("a.parquet"), b"a").expect("write a");
@@ -655,9 +678,11 @@ mod tests {
             b"not json",
         )
         .expect("write manifest");
-        assert!(matches!(
-            resolve_live_files(&tenant),
-            Err(QueryError::Storage { .. })
-        ));
+
+        // Act
+        let result = resolve_live_files(&tenant);
+
+        // Assert
+        assert!(matches!(result, Err(QueryError::Storage { .. })));
     }
 }

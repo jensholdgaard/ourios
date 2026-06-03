@@ -149,52 +149,84 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let m = Manifest {
+        // Arrange
+        let manifest = Manifest {
             generation: 7,
             files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
         };
-        let bytes = m.to_json().expect("serialize");
-        let back: Manifest = serde_json::from_slice(&bytes).expect("parse");
-        assert_eq!(m, back);
+
+        // Act
+        let restored: Manifest =
+            serde_json::from_slice(&manifest.to_json().expect("serialize")).expect("parse");
+
+        // Assert
+        assert_eq!(restored, manifest);
     }
 
     #[test]
     fn absent_manifest_is_none() {
+        // Arrange
         let dir = tempfile::tempdir().expect("temp");
-        assert_eq!(Manifest::read(dir.path()).expect("read"), None);
+
+        // Act
+        let read = Manifest::read(dir.path());
+
+        // Assert
+        assert_eq!(read.expect("read"), None);
     }
 
     #[test]
     fn reads_a_written_manifest() {
+        // Arrange
         let dir = tempfile::tempdir().expect("temp");
-        let m = Manifest {
+        let manifest = Manifest {
             generation: 3,
             files: vec!["compacted.parquet".to_string()],
         };
-        std::fs::write(dir.path().join(MANIFEST_FILENAME), m.to_json().unwrap()).expect("write");
-        assert_eq!(Manifest::read(dir.path()).expect("read"), Some(m));
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            manifest.to_json().unwrap(),
+        )
+        .expect("write");
+
+        // Act
+        let read = Manifest::read(dir.path());
+
+        // Assert
+        assert_eq!(read.expect("read"), Some(manifest));
     }
 
     #[test]
     fn malformed_manifest_is_a_parse_error() {
+        // Arrange
         let dir = tempfile::tempdir().expect("temp");
         std::fs::write(dir.path().join(MANIFEST_FILENAME), b"not json").expect("write");
-        assert!(matches!(
-            Manifest::read(dir.path()),
-            Err(ManifestError::Parse(_))
-        ));
+
+        // Act
+        let read = Manifest::read(dir.path());
+
+        // Assert
+        assert!(matches!(read, Err(ManifestError::Parse(_))));
     }
 
     #[test]
     fn accepts_plain_parquet_names() {
-        for ok in ["a.parquet", "01890000-0000-7000-8000-000000000000.parquet"] {
-            assert!(is_partition_local_parquet(ok), "{ok} should be accepted");
+        // Arrange — bare partition-local names a compactor would emit.
+        let names = ["a.parquet", "01890000-0000-7000-8000-000000000000.parquet"];
+
+        // Act & Assert (table-driven over the pure predicate)
+        for name in names {
+            assert!(
+                is_partition_local_parquet(name),
+                "{name} should be accepted"
+            );
         }
     }
 
     #[test]
     fn rejects_path_escaping_or_non_parquet_names() {
-        for bad in [
+        // Arrange — names that escape the partition or aren't parquet.
+        let names = [
             "../escape.parquet", // parent escape
             "/abs/x.parquet",    // absolute
             "sub/x.parquet",     // nested
@@ -202,31 +234,36 @@ mod tests {
             "x",                 // no extension
             "",                  // empty
             ".",                 // current dir
-        ] {
+        ];
+
+        // Act & Assert (table-driven over the pure predicate)
+        for name in names {
             assert!(
-                !is_partition_local_parquet(bad),
-                "{bad:?} should be rejected"
+                !is_partition_local_parquet(name),
+                "{name:?} should be rejected"
             );
         }
     }
 
     #[test]
     fn read_rejects_a_path_escaping_entry() {
+        // Arrange — a hostile manifest on disk (serialized directly,
+        // bypassing `validate`) whose entry escapes the partition.
         let dir = tempfile::tempdir().expect("temp");
         let evil = Manifest {
             generation: 1,
             files: vec!["../../../etc/secrets.parquet".to_string()],
         };
-        // Serialize directly (bypassing validate) to simulate a
-        // malformed/hostile manifest on disk.
         std::fs::write(
             dir.path().join(MANIFEST_FILENAME),
             serde_json::to_vec(&evil).unwrap(),
         )
         .expect("write");
-        assert!(matches!(
-            Manifest::read(dir.path()),
-            Err(ManifestError::InvalidFilename(_))
-        ));
+
+        // Act
+        let read = Manifest::read(dir.path());
+
+        // Assert
+        assert!(matches!(read, Err(ManifestError::InvalidFilename(_))));
     }
 }

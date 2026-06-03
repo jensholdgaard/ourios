@@ -1,0 +1,38 @@
+[package]
+name = "ourios-telemetry"
+version = "0.0.0"
+description = "Ourios telemetry bootstrap — OpenTelemetry SDK MeterProvider + OTLP push metric exporter (RFC 0001 §6.8)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ourios_telemetry"
+path = "src/lib.rs"
+
+[dependencies]
+# The OTel metrics API. Library crates depend only on this (via
+# `global::meter`); this crate is the one place the heavy SDK +
+# exporter live (RFC 0001 §6.8 "Export architecture").
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# The SDK: MeterProvider + periodic reader. `rt-tokio` drives the
+# periodic export on the tokio runtime the server already runs.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "rt-tokio"] }
+# The OTLP push exporter over gRPC (tonic). This is the export path
+# pinned by the §6.8 amendment — push over OTLP, not a scrape endpoint.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic"] }
+
+[features]
+# Exposes `init_in_memory` so other crates' tests (e.g. the miner's
+# §8 metric-collection test) can collect the exported metric stream
+# through an in-memory reader instead of standing up an OTLP endpoint.
+testing = ["opentelemetry_sdk/testing"]
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

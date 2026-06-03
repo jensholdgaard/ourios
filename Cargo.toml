@@ -7,6 +7,7 @@ members = [
     "crates/ourios-miner",
     "crates/ourios-parquet",
     "crates/ourios-querier",
+    "crates/ourios-telemetry",
     "crates/ourios-wal",
 ]
 

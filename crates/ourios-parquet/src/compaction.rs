@@ -259,10 +259,11 @@ pub fn compact_partition(
 /// Select the `tenant`'s sealed partitions that are worth compacting
 /// (RFC 0009 §3.3), as of wall-clock `now_unix_nanos`. The result is
 /// the work list a background compactor feeds to [`compact_partition`];
-/// this function makes only the *decision* (no I/O beyond directory
-/// scans + file metadata), so it is pure and testable. The driving
-/// loop (timer + bounded concurrency) belongs in the ingester role,
-/// which doesn't exist yet.
+/// this function makes only the *decision* — read-only I/O (directory
+/// scans, file metadata, and each candidate partition's
+/// `manifest.json`), no mutation — so it is deterministic and
+/// testable. The driving loop (timer + bounded concurrency) belongs in
+/// the ingester role, which doesn't exist yet.
 ///
 /// A partition is selected when it is **sealed** — its hour ended at
 /// least `policy.grace_nanos` ago, so no writer is still appending —

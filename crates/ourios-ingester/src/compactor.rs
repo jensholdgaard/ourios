@@ -340,6 +340,10 @@ mod tests {
         assert_eq!(report.tenants_scanned, 1);
         assert_eq!(report.partitions_compacted, 1);
         assert_eq!(report.rows_compacted, 2);
+        assert_eq!(
+            report.files_compacted, 2,
+            "both input files are merged away (the H4 signal)"
+        );
     }
 
     #[test]

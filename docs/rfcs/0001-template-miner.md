@@ -406,7 +406,8 @@ direction and the primary obligation lives in those other RFCs.
 
 > **Scenario §3.1.2 — Mandatory metric set is exposed**
 > - **Given** a running miner
-> - **When** the instruments registered on the meter are enumerated
+> - **When** the instruments registered on the miner's meter
+>   (`global::meter("ourios.miner")`) are enumerated
 > - **Then** they contain every metric named in §6.8's table
 >   (`template_count`, `merges_total`, `confidence`,
 >   `confidence_p50`, `confidence_p01`, `body_retention_ratio`,
@@ -1525,9 +1526,16 @@ SDK and transport crates do not leak into every library:
   crate extends the `CLAUDE.md` §7 target layout; the new-crate
   commitment is blessed here, in this RFC, per §7's rule.
 
-Dimensions are OTel **attributes**, not Prometheus labels. The
-`service` dimension is the standard `service.name` resource attribute,
-set once on the provider, not a per-instrument attribute.
+Dimensions are OTel **attributes**, not Prometheus labels — and they
+are **metric (data-point) attributes**, recorded per measurement, not
+`Resource`-level attributes set once on the provider. A single
+ingester serves many tenants and many originating services, so
+`tenant_id` and `service` are dimensions of the *ingested data* (the
+log's own `service.name`, the same value §6.1's tenant derivation
+reads), not properties of the Ourios process — they cannot live on the
+`Resource`. The provider's `Resource` carries Ourios's *own* identity
+(`service.name = ourios-ingester`, etc.), distinct from the per-log
+`service` dimension.
 
 The metrics enumerated in `[§3.1]` are mandatory. Full set (names and
 instrument kinds pending the dotted-semconv redesign noted above;
@@ -1769,8 +1777,9 @@ resolves bidirectionally between RFC and tests.
   §3.2.2 (limit > 1 KiB rejected).
 
 - **Metrics registry test**: enumerate the instruments registered
-  on the meter of a freshly-initialised miner (via an SDK in-memory
-  reader); assert the names, instrument kinds, and attributes in
+  on the miner's meter (`global::meter("ourios.miner")`) of a
+  freshly-initialised miner (via an SDK in-memory reader); assert the
+  names, instrument kinds, and attributes in
   §6.8's table are all present, and that the
   `confidence_p50` / `confidence_p01` gauges track the
   same-attributed `confidence` histogram quantiles.

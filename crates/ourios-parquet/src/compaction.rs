@@ -767,6 +767,32 @@ mod tests {
     }
 
     #[test]
+    fn plan_selects_a_sealed_many_file_partition_via_count() {
+        // Arrange — five files (> default min_files of 4), sealed, with
+        // the size arm disabled (1-byte threshold) so *only* the count
+        // arm can select.
+        let bucket = tempfile::tempdir().expect("temp");
+        for i in 0..5 {
+            write_file(bucket.path(), &[rec(1, TS0 + i * 1_000)]);
+        }
+        let policy = CompactionPolicy {
+            min_files: 4,
+            small_file_bytes: 1,
+            grace_nanos: CompactionPolicy::default().grace_nanos,
+        };
+
+        // Act
+        let selected = plan_candidates(bucket.path(), "a", NOW_SEALED, &policy).expect("plan");
+
+        // Assert
+        assert_eq!(
+            selected,
+            vec![partition()],
+            "the count arm selects a partition with more than min_files"
+        );
+    }
+
+    #[test]
     fn plan_skips_when_files_are_large_and_few() {
         // Arrange — two files, sealed, but a policy where neither the
         // count (2 ≤ min_files) nor the size (1-byte threshold) arm

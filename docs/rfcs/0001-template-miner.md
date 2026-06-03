@@ -406,9 +406,10 @@ direction and the primary obligation lives in those other RFCs.
 
 > **Scenario §3.1.2 — Mandatory metric set is exposed**
 > - **Given** a running miner
-> - **When** the instruments registered on the miner's meter
->   (`global::meter("ourios.miner")`) are enumerated
-> - **Then** they contain every metric named in §6.8's table
+> - **When** the miner's meter (`global::meter("ourios.miner")`) is
+>   collected via an SDK in-memory reader, at zero traffic
+> - **Then** the collected metric stream contains every metric named
+>   in §6.8's table (each present via its init-seeded data point)
 >   (`template_count`, `merges_total`, `confidence`,
 >   `confidence_p50`, `confidence_p01`, `body_retention_ratio`,
 >   `parse_failures_total`, `params_overflow_total`,
@@ -1537,6 +1538,17 @@ reads), not properties of the Ourios process — they cannot live on the
 (`service.name = ourios-ingester`, etc.), distinct from the per-log
 `service` dimension.
 
+OTel's metric model is **collect-on-read**: a reader / exporter sees
+the data points produced during a collection cycle, not a registry of
+instruments, and a synchronous instrument that has recorded no
+measurement contributes no data point. To preserve §3.1.2's
+"full mandatory set is exposed" guarantee even at zero traffic, the
+miner **seeds each mandatory instrument with an initial zero-valued
+measurement at init**, so every metric in the table below appears in
+every collection cycle regardless of traffic. Verification is
+therefore by *collecting the metric stream* (an SDK in-memory reader
+in tests), not by enumerating registered instruments.
+
 The metrics enumerated in `[§3.1]` are mandatory. Full set (names and
 instrument kinds pending the dotted-semconv redesign noted above;
 "Labels" are exported as attributes):
@@ -1597,10 +1609,11 @@ exactly as in live ingest, but updates to the §6.8 metrics are
 suppressed (counters do not increment, histograms do not observe,
 gauges retain their previous value or, if the miner has never
 served live traffic, their zero / empty initialisation value). The
-instruments themselves remain registered on the meter and visible to
-the exporter — §3.1.2's invariant that the full §6.8 set is exposed
-holds across replay; only the *update* path is gated, not the
-*registration* path. A single `wal_replay_progress` gauge
+instruments' init-seeded data points keep the full §6.8 set visible to
+the exporter during replay — suppressing the *update* path leaves each
+metric at its seeded / last value, so §3.1.2's "full set exposed"
+invariant holds across replay without recording replay-window
+measurements. A single `wal_replay_progress` gauge
 (attribute `tenant_id`, value: fraction of the tenant's replay
 window completed in `[0.0, 1.0]`) is exposed during replay so
 operators can see the cold-start curve and confirm replay finished.
@@ -1776,12 +1789,12 @@ resolves bidirectionally between RFC and tests.
   §3.2.1 (default param byte limit = 256),
   §3.2.2 (limit > 1 KiB rejected).
 
-- **Metrics registry test**: enumerate the instruments registered
-  on the miner's meter (`global::meter("ourios.miner")`) of a
-  freshly-initialised miner (via an SDK in-memory reader); assert the
-  names, instrument kinds, and attributes in
-  §6.8's table are all present, and that the
-  `confidence_p50` / `confidence_p01` gauges track the
+- **Metrics registry test**: collect the miner's meter
+  (`global::meter("ourios.miner")`) of a freshly-initialised miner via
+  an SDK in-memory reader and assert the collected stream contains
+  every §6.8 metric name (each present via its init-seeded data
+  point), with the instrument kinds and attributes in §6.8's table,
+  and that the `confidence_p50` / `confidence_p01` gauges track the
   same-attributed `confidence` histogram quantiles.
   *Covers:* §3.1.2, RFC0001.8.
 

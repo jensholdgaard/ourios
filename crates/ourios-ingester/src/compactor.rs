@@ -32,7 +32,10 @@ pub enum IngestError {
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compaction(e) => write!(f, "compaction: {e}"),
+            // `CompactionError`'s Display already starts with
+            // "compaction …", so no prefix here (avoids "compaction:
+            // compaction read: …").
+            Self::Compaction(e) => write!(f, "{e}"),
             Self::Io { op, path, source } => write!(f, "{op} {}: {source}", path.display()),
         }
     }

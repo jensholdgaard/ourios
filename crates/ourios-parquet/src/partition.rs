@@ -205,7 +205,14 @@ pub fn percent_decode_tenant(s: &str) -> Option<String> {
         if b == b'%' {
             let hi = hex_value(*bytes.get(i + 1)?)?;
             let lo = hex_value(*bytes.get(i + 2)?)?;
-            out.push((hi << 4) | lo);
+            let decoded = (hi << 4) | lo;
+            // The encoder only ever escapes bytes *outside* the
+            // unreserved set; an escape of an unreserved byte (`%41`)
+            // is non-canonical, so reject it to stay an exact inverse.
+            if is_unreserved(decoded) {
+                return None;
+            }
+            out.push(decoded);
             i += 3;
         } else if is_unreserved(b) {
             out.push(b);
@@ -227,11 +234,12 @@ const fn is_unreserved(b: u8) -> bool {
     )
 }
 
-/// Parse one ASCII hex digit (either case) to its `0..=15` value.
+/// Parse one **upper-case** ASCII hex digit to its `0..=15` value.
+/// Lower-case is rejected: `percent_encode_tenant` emits upper-case
+/// hex only, so `%2f` is not a canonical encoding of `/`.
 const fn hex_value(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
@@ -333,6 +341,20 @@ mod tests {
                 percent_decode_tenant(bad),
                 None,
                 "{bad:?} should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_non_canonical_escapes() {
+        // Arrange / Act / Assert — escapes the encoder would never emit:
+        // lower-case hex (`%2f`, encoder uses `%2F`) and escapes of an
+        // unreserved byte (`%41` = 'A', which encode leaves literal).
+        for bad in ["%2f", "%c3%a5", "%41", "%7E"] {
+            assert_eq!(
+                percent_decode_tenant(bad),
+                None,
+                "{bad:?} is non-canonical, should not decode"
             );
         }
     }

@@ -73,7 +73,7 @@ groups:
     unit: "{partition}"
     attributes:
       - ref: ourios.tenant
-        requirement_level: recommended
+        requirement_level: required
 
   - id: metric.ourios.storage.parquet.file.size
     type: metric
@@ -84,4 +84,4 @@ groups:
     unit: "By"
     attributes:
       - ref: ourios.tenant
-        requirement_level: recommended
+        requirement_level: required

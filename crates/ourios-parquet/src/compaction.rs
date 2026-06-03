@@ -351,13 +351,13 @@ fn hour_partitions(
     tenant: &str,
 ) -> Result<Vec<(PartitionKey, PathBuf)>, CompactionError> {
     let mut out = Vec::new();
-    for (year_dir, year) in numbered_children(tenant_dir, "year")? {
+    for (year_dir, year) in numbered_children(tenant_dir, "year", 4)? {
         let Ok(year) = i32::try_from(year) else {
             continue;
         };
-        for (month_dir, month) in numbered_children(&year_dir, "month")? {
-            for (day_dir, day) in numbered_children(&month_dir, "day")? {
-                for (hour_dir, hour) in numbered_children(&day_dir, "hour")? {
+        for (month_dir, month) in numbered_children(&year_dir, "month", 2)? {
+            for (day_dir, day) in numbered_children(&month_dir, "day", 2)? {
+                for (hour_dir, hour) in numbered_children(&day_dir, "hour", 2)? {
                     out.push((
                         PartitionKey {
                             tenant_id: tenant.to_owned(),
@@ -375,10 +375,19 @@ fn hour_partitions(
     Ok(out)
 }
 
-/// Subdirectories of `dir` named `<prefix>=<n>` (e.g. `month=04`),
-/// returned as `(path, n)`. Non-matching entries and non-directories
-/// are skipped; a missing `dir` yields an empty list.
-fn numbered_children(dir: &Path, prefix: &str) -> Result<Vec<(PathBuf, u32)>, CompactionError> {
+/// Subdirectories of `dir` named `<prefix>=<n>` in the canonical
+/// zero-padded form `PartitionKey::data_path` writes (`width` digits,
+/// e.g. `month=04`), returned as `(path, n)`. A non-canonical name
+/// (`month=4`, `month=004`) is skipped: it would parse to a value
+/// whose `data_path` form (`month=04`) names a *different* directory,
+/// so the resulting `PartitionKey` wouldn't round-trip to the scanned
+/// dir (RFC 0005 §3.4). Non-matching entries and non-directories are
+/// skipped; a missing `dir` yields an empty list.
+fn numbered_children(
+    dir: &Path,
+    prefix: &str,
+    width: usize,
+) -> Result<Vec<(PathBuf, u32)>, CompactionError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -413,7 +422,12 @@ fn numbered_children(dir: &Path, prefix: &str) -> Result<Vec<(PathBuf, u32)>, Co
             .file_name()
             .to_str()
             .and_then(|name| name.strip_prefix(prefix)?.strip_prefix('='))
-            .and_then(|digits| digits.parse::<u32>().ok())
+            .and_then(|digits| {
+                let value: u32 = digits.parse().ok()?;
+                // Accept only the exact zero-padded form `data_path`
+                // emits, so the PartitionKey round-trips to this dir.
+                (digits == format!("{value:0width$}")).then_some(value)
+            })
         {
             out.push((path, value));
         }
@@ -697,6 +711,29 @@ mod tests {
 
         // Assert
         assert!(selected.is_empty(), "few large files are not a candidate");
+    }
+
+    #[test]
+    fn plan_skips_non_canonical_partition_dir_names() {
+        // Arrange — a sealed partition whose `month` segment isn't
+        // zero-padded (`month=4`, not `month=04`). A PartitionKey from
+        // it would render `month=04` via data_path and miss this dir,
+        // so it must not be selected.
+        let bucket = tempfile::tempdir().expect("temp");
+        let bad = bucket
+            .path()
+            .join("data/tenant_id=a/year=2026/month=4/day=02/hour=10");
+        std::fs::create_dir_all(&bad).expect("mkdir");
+        std::fs::write(bad.join("a.parquet"), b"x").expect("a");
+        std::fs::write(bad.join("b.parquet"), b"y").expect("b");
+
+        // Act
+        let selected =
+            plan_candidates(bucket.path(), "a", NOW_SEALED, &CompactionPolicy::default())
+                .expect("plan");
+
+        // Assert
+        assert!(selected.is_empty(), "non-canonical dir names are skipped");
     }
 
     #[test]

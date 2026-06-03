@@ -459,7 +459,7 @@ add-new-column / migrate / drop).
 > file lifecycle, `CLAUDE.md` §3.1). A compaction event shares the
 > common envelope (`tenant_id`, `timestamp`, `event_kind = 3`,
 > `event_type = "compaction"`, `reason`) but has no template
-> identity. Two changes accommodate it, both back-compatible:
+> identity. Two changes accommodate it, both backward-compatible:
 >
 > 1. The template-specific columns (`template_id`, `old_version`,
 >    `new_version`, `old_template`, `new_template`,
@@ -503,7 +503,7 @@ The row-level audit columns are:
 | `compaction_generation` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** The manifest generation the consolidation committed at (RFC 0009 §3.4). `NULL` for template kinds |
 | `compaction_rows` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** Rows in the consolidated file — equal to the total input rows, the conserved count (RFC0009.2). `NULL` for template kinds |
 
-† **OPTIONAL†** marks columns relaxed from REQUIRED by the
+**OPTIONAL†** marks columns relaxed from REQUIRED by the
 2026-06-03 amendment (§3.8 rule 6). They are
 *required-by-convention for the template event kinds* (`event_kind`
 0–2): the writer MUST populate them there and a test asserts it, so

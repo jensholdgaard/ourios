@@ -62,7 +62,7 @@ jobs:
   # intentionally not a threshold — per CLAUDE.md §6.2 tests are
   # specifications, not a number to game (a `--fail-under` gate would
   # pressure toward shallow tests). `cargo test` (above) remains the
-  # real gate. The lcov + HTML report upload as a build artifact.
+  # real gate. The lcov + HTML report are uploaded as a build artifact.
   coverage:
     name: coverage (informational)
     runs-on: ubuntu-latest

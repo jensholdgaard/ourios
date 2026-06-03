@@ -143,6 +143,28 @@ impl Manifest {
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }
+
+    /// Atomically (re)write the partition's manifest: serialize to a
+    /// sibling `manifest.json.tmp`, then `rename` it over
+    /// `manifest.json`. The rename is the **commit point** (RFC 0009
+    /// §3.4) — a reader observes either the old manifest or the new
+    /// one, never a partial write. The manifest is validated before
+    /// any bytes hit disk, so an invalid set is never published.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::InvalidFilename`] if any entry isn't a
+    /// partition-local `*.parquet` name; [`ManifestError::Io`] on a
+    /// write or rename failure.
+    pub fn write_atomic(&self, partition_dir: &Path) -> Result<(), ManifestError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(ManifestError::Parse)?;
+        let tmp = partition_dir.join(format!("{MANIFEST_FILENAME}.tmp"));
+        let final_path = partition_dir.join(MANIFEST_FILENAME);
+        std::fs::write(&tmp, &bytes).map_err(ManifestError::Io)?;
+        std::fs::rename(&tmp, &final_path).map_err(ManifestError::Io)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +290,44 @@ mod tests {
 
         // Assert
         assert!(matches!(read, Err(ManifestError::InvalidFilename(_))));
+    }
+
+    #[test]
+    fn write_atomic_round_trips_and_overwrites() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp");
+        let first = Manifest {
+            generation: 1,
+            files: vec!["a.parquet".to_string()],
+        };
+        let second = Manifest {
+            generation: 2,
+            files: vec!["compacted.parquet".to_string()],
+        };
+        first.write_atomic(dir.path()).expect("write first");
+
+        // Act — the second write swaps the manifest in place.
+        second.write_atomic(dir.path()).expect("write second");
+
+        // Assert — the latest generation wins, no `.tmp` left behind.
+        assert_eq!(Manifest::read(dir.path()).expect("read"), Some(second));
+        assert!(!dir.path().join(format!("{MANIFEST_FILENAME}.tmp")).exists());
+    }
+
+    #[test]
+    fn write_atomic_rejects_an_invalid_entry_before_writing() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp");
+        let bad = Manifest {
+            generation: 1,
+            files: vec!["../escape.parquet".to_string()],
+        };
+
+        // Act
+        let result = bad.write_atomic(dir.path());
+
+        // Assert — rejected, and nothing was published.
+        assert!(matches!(result, Err(ManifestError::InvalidFilename(_))));
+        assert!(!dir.path().join(MANIFEST_FILENAME).exists());
     }
 }

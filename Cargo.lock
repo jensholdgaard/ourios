@@ -2309,6 +2309,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-ingester"
+version = "0.0.0"
+dependencies = [
+ "ourios-core",
+ "ourios-parquet",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ourios-miner"
 version = "0.0.0"
 dependencies = [

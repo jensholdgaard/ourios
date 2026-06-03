@@ -186,6 +186,43 @@ const fn hex_nibble(n: u8) -> char {
     }
 }
 
+/// Inverse of [`percent_encode_tenant`]: decode a percent-encoded
+/// tenant path segment back to the raw tenant id. Used to recover the
+/// tenant from a `tenant_id=<enc>` directory name when sweeping the
+/// store (e.g. background compaction).
+///
+/// Returns `None` on a malformed escape (`%` not followed by two hex
+/// digits) or if the decoded bytes aren't valid UTF-8 — i.e. a
+/// directory Ourios's writer didn't produce.
+#[must_use]
+pub fn percent_decode_tenant(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex_value(*bytes.get(i + 1)?)?;
+            let lo = hex_value(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Parse one ASCII hex digit (either case) to its `0..=15` value.
+const fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +280,33 @@ mod tests {
         // UTF-8 = 0xC3 0xA5. Verifies "input is the UTF-8 byte
         // sequence" (§3.4) — no Unicode normalisation, just bytes.
         assert_eq!(percent_encode_tenant("å"), "%C3%A5");
+    }
+
+    #[test]
+    fn percent_decode_round_trips_encode() {
+        // Arrange — tenants spanning unreserved, delimiters, and UTF-8.
+        for tenant in ["tenant-id_42.~", "a/b", "k=v", "100%", "å", " tenant "] {
+            // Act
+            let decoded = percent_decode_tenant(&percent_encode_tenant(tenant));
+            // Assert
+            assert_eq!(
+                decoded.as_deref(),
+                Some(tenant),
+                "round-trip for {tenant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_malformed_escapes() {
+        // Arrange / Act / Assert — truncated or non-hex escapes are None.
+        for bad in ["%", "%2", "%2G", "%GG", "a%"] {
+            assert_eq!(
+                percent_decode_tenant(bad),
+                None,
+                "{bad:?} should not decode"
+            );
+        }
     }
 
     #[test]

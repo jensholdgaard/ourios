@@ -63,6 +63,8 @@ impl TelemetryConfig {
 pub enum TelemetryError {
     /// The OTLP exporter could not be built (bad endpoint, TLS, …).
     Exporter(opentelemetry_otlp::ExporterBuildError),
+    /// `MeterProvider::force_flush` failed to export pending metrics.
+    Flush(opentelemetry_sdk::error::OTelSdkError),
     /// `MeterProvider::shutdown` failed to flush on teardown.
     Shutdown(opentelemetry_sdk::error::OTelSdkError),
 }
@@ -71,6 +73,7 @@ impl std::fmt::Display for TelemetryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exporter(e) => write!(f, "building the OTLP metric exporter failed: {e}"),
+            Self::Flush(e) => write!(f, "flushing the meter provider failed: {e}"),
             Self::Shutdown(e) => write!(f, "shutting down the meter provider failed: {e}"),
         }
     }
@@ -80,7 +83,7 @@ impl std::error::Error for TelemetryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Exporter(e) => Some(e),
-            Self::Shutdown(e) => Some(e),
+            Self::Flush(e) | Self::Shutdown(e) => Some(e),
         }
     }
 }
@@ -108,6 +111,18 @@ impl TelemetryGuard {
     /// to flush or shut down.
     pub fn shutdown(&self) -> Result<(), TelemetryError> {
         self.provider.shutdown().map_err(TelemetryError::Shutdown)
+    }
+
+    /// Export pending metrics now, without tearing the pipeline down —
+    /// the periodic reader otherwise exports on its own interval. Tests
+    /// call this before collecting from an in-memory exporter (see
+    /// [`init_in_memory`]).
+    ///
+    /// # Errors
+    /// Returns [`TelemetryError::Flush`] if the meter provider fails to
+    /// export.
+    pub fn force_flush(&self) -> Result<(), TelemetryError> {
+        self.provider.force_flush().map_err(TelemetryError::Flush)
     }
 }
 
@@ -166,10 +181,11 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
 /// whose periodic reader exports into the returned
 /// [`InMemoryMetricExporter`](opentelemetry_sdk::metrics::InMemoryMetricExporter),
 /// installed as the global provider so `global::meter(...)` resolves
-/// against it. Record through the global meter, call
-/// `MeterProvider::force_flush`, then read `get_finished_metrics()` to
-/// assert what was produced — no OTLP endpoint required. Runs inside a
-/// tokio runtime (the periodic reader's export path).
+/// against it. Record through the global meter, call the returned
+/// guard's [`force_flush`](TelemetryGuard::force_flush), then read the
+/// exporter's `get_finished_metrics()` to assert what was produced —
+/// no OTLP endpoint required. Runs inside a tokio runtime (the periodic
+/// reader's export path).
 ///
 /// This installs the **process-global** provider, so tests that call
 /// it share global state: run them serially (or one per test binary),
@@ -205,9 +221,10 @@ mod tests {
     use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
 
     // Build a provider over an in-memory exporter (no global state, no
-    // OTLP endpoint) so the test can assert the exported metric stream.
+    // OTLP endpoint), wrap it in a guard, and assert that the guard's
+    // `force_flush` exports the recorded instrument.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn records_a_counter_through_the_provider() {
+    async fn guard_force_flush_exports_recorded_metrics() {
         // Arrange.
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
@@ -216,10 +233,11 @@ mod tests {
             .build();
         let meter = provider.meter("ourios.compaction");
         let counter = meter.u64_counter("ourios.compaction.sweeps").build();
+        let guard = TelemetryGuard { provider };
 
         // Act.
         counter.add(1, &[]);
-        provider.force_flush().expect("force_flush succeeds");
+        guard.force_flush().expect("force_flush succeeds");
 
         // Assert.
         let resource_metrics = exporter.get_finished_metrics().expect("metrics exported");

@@ -147,9 +147,19 @@ impl Manifest {
     /// Atomically (re)write the partition's manifest: serialize to a
     /// sibling `manifest.json.tmp`, then `rename` it over
     /// `manifest.json`. The rename is the **commit point** (RFC 0009
-    /// §3.4) — a reader observes either the old manifest or the new
-    /// one, never a partial write. The manifest is validated before
-    /// any bytes hit disk, so an invalid set is never published.
+    /// §3.4) — a *concurrent reader* observes either the old manifest
+    /// or the new one, never a partial write. The manifest is
+    /// validated before any bytes hit disk, so an invalid set is never
+    /// published.
+    ///
+    /// This is atomic, **not** crash-durable: without an `fsync` of the
+    /// file and its directory, a host crash mid-write can still leave a
+    /// truncated or missing `manifest.json` (the same caveat as the
+    /// `Writer`). That is safe by construction — a reader with no
+    /// manifest falls back to the `*.parquet` glob, and a compaction
+    /// that crashed before this commit left its inputs intact — so the
+    /// worst case is reverting to the prior generation, never data
+    /// loss. Durable fsync is a later refinement.
     ///
     /// # Errors
     ///

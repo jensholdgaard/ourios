@@ -29,6 +29,12 @@ pub struct CompactionOutcome {
     /// The commit, or `None` when compaction was a no-op (fewer than
     /// two live files — nothing to consolidate).
     pub committed: Option<Committed>,
+    /// Superseded input files that could not be removed after the
+    /// commit. These are non-live (the committed manifest excludes
+    /// them) — harmless orphans a later GC sweep reclaims — so they
+    /// are *counted*, not fatal: a post-commit cleanup failure must
+    /// not report a successful compaction as failed.
+    pub gc_failures: usize,
 }
 
 /// The committed result of a compaction.
@@ -51,7 +57,12 @@ pub enum CompactionError {
     Write(WriterError),
     /// Reading or committing the manifest failed.
     Manifest(ManifestError),
-    /// A filesystem operation (directory scan, orphan removal) failed.
+    /// A live data file has a non-UTF-8 name, so it can't be recorded
+    /// in the UTF-8 JSON manifest. Reachable only via the glob
+    /// fallback (a foreign file dropped into a partition); the writer
+    /// only ever emits UUID names.
+    NonUtf8FileName(PathBuf),
+    /// A filesystem operation (directory scan) failed.
     Io {
         op: &'static str,
         path: PathBuf,
@@ -65,6 +76,13 @@ impl std::fmt::Display for CompactionError {
             Self::Read(e) => write!(f, "compaction read: {e}"),
             Self::Write(e) => write!(f, "compaction write: {e}"),
             Self::Manifest(e) => write!(f, "compaction manifest: {e}"),
+            Self::NonUtf8FileName(path) => {
+                write!(
+                    f,
+                    "compaction: non-UTF-8 data file name: {}",
+                    path.display()
+                )
+            }
             Self::Io { op, path, source } => {
                 write!(f, "compaction {op} {}: {source}", path.display())
             }
@@ -78,6 +96,7 @@ impl std::error::Error for CompactionError {
             Self::Read(e) => Some(e),
             Self::Write(e) => Some(e),
             Self::Manifest(e) => Some(e),
+            Self::NonUtf8FileName(_) => None,
             Self::Io { source, .. } => Some(source),
         }
     }
@@ -101,9 +120,11 @@ impl std::error::Error for CompactionError {
 ///
 /// # Panics
 ///
-/// Panics if a partition file name is not valid UTF-8, or if the
-/// partition's row count exceeds `u64` — neither is reachable on a
-/// supported target (file names are UUIDs; `usize <= u64`).
+/// Panics if the consolidated file's UUID name is not valid UTF-8, or
+/// if a single input file's row count exceeds `u64` — neither is
+/// reachable (the name is a UUID we just wrote; `usize <= u64`). A
+/// *foreign* non-UTF-8 file name surfaces as
+/// [`CompactionError::NonUtf8FileName`], not a panic.
 pub fn compact_partition(
     bucket_root: &Path,
     partition: &PartitionKey,
@@ -115,6 +136,7 @@ pub fn compact_partition(
             files_before: inputs.len(),
             rows: 0,
             committed: None,
+            gc_failures: 0,
         });
     }
 
@@ -133,7 +155,7 @@ pub fn compact_partition(
     } else {
         let bootstrap = Manifest {
             generation: 1,
-            files: file_names(&inputs),
+            files: file_names(&inputs)?,
         };
         bootstrap
             .write_atomic(&partition_dir)
@@ -141,25 +163,25 @@ pub fn compact_partition(
         1
     };
 
-    // Read every input row. `open_partition` validates each row's
-    // tenant + time bucket against this partition (RFC 0005 §3.9 /
-    // RFC0009.5), so a mis-partitioned input aborts the compaction
-    // instead of being silently merged.
-    let mut rows = Vec::new();
+    // Stream the inputs into the consolidated file one at a time, so
+    // peak memory is bounded by a single input file's rows rather than
+    // the whole partition (which can be large). `open_partition`
+    // validates each row's tenant + time bucket against this partition
+    // (RFC 0005 §3.9 / RFC0009.5), so a mis-partitioned input aborts
+    // the compaction instead of being silently merged. Row groups
+    // rotate at the RFC 0005 §3.5 threshold within the single output.
+    let mut writer =
+        Writer::open(bucket_root, partition.clone()).map_err(CompactionError::Write)?;
+    let mut row_count: u64 = 0;
     for file in &inputs {
         let reader =
             Reader::open_partition(file, partition.clone()).map_err(CompactionError::Read)?;
-        rows.extend(reader.read_all().map_err(CompactionError::Read)?);
+        let records = reader.read_all().map_err(CompactionError::Read)?;
+        row_count += u64::try_from(records.len()).expect("file row count fits in u64");
+        writer
+            .append_records(&records)
+            .map_err(CompactionError::Write)?;
     }
-    let row_count = u64::try_from(rows.len()).expect("row count fits in u64");
-
-    // Write the consolidated file (row groups rotate at the RFC 0005
-    // §3.5 threshold within this single file).
-    let mut writer =
-        Writer::open(bucket_root, partition.clone()).map_err(CompactionError::Write)?;
-    writer
-        .append_records(&rows)
-        .map_err(CompactionError::Write)?;
     let written = writer.close().map_err(CompactionError::Write)?;
     let consolidated = written
         .path
@@ -177,20 +199,17 @@ pub fn compact_partition(
     .write_atomic(&partition_dir)
     .map_err(CompactionError::Manifest)?;
 
-    // GC the now-superseded inputs. Post-commit: a crash here leaves
-    // orphaned files the manifest already excludes — harmless, and a
-    // later sweep reclaims them.
+    // GC the now-superseded inputs. The commit already succeeded, so a
+    // delete failure only leaves a non-live orphan (the manifest
+    // excludes it) for a later sweep — it must NOT turn a committed
+    // compaction into a reported failure. Count such failures so the
+    // caller can surface them, and continue.
+    let mut gc_failures = 0;
     for file in &inputs {
         match std::fs::remove_file(file) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(CompactionError::Io {
-                    op: "remove superseded input",
-                    path: file.clone(),
-                    source,
-                });
-            }
+            Err(_) => gc_failures += 1,
         }
     }
 
@@ -201,6 +220,7 @@ pub fn compact_partition(
             file: consolidated,
             generation,
         }),
+        gc_failures,
     })
 }
 
@@ -250,15 +270,18 @@ fn live_files(partition_dir: &Path) -> Result<Vec<PathBuf>, CompactionError> {
     Ok(files)
 }
 
-/// Bare file names of `paths` (for a manifest's `files` list).
-fn file_names(paths: &[PathBuf]) -> Vec<String> {
+/// Bare file names of `paths` (for a manifest's `files` list). A
+/// non-UTF-8 name can't be written to the JSON manifest, so it is a
+/// [`CompactionError::NonUtf8FileName`] rather than a panic — the
+/// glob fallback may pick up a foreign file.
+fn file_names(paths: &[PathBuf]) -> Result<Vec<String>, CompactionError> {
     paths
         .iter()
         .map(|p| {
             p.file_name()
                 .and_then(|s| s.to_str())
-                .expect("partition file name is valid UTF-8")
-                .to_string()
+                .map(String::from)
+                .ok_or_else(|| CompactionError::NonUtf8FileName(p.clone()))
         })
         .collect()
 }
@@ -339,6 +362,7 @@ mod tests {
         // names it, inputs GC'd, rows preserved.
         assert_eq!(outcome.files_before, 2);
         assert_eq!(outcome.rows, 5);
+        assert_eq!(outcome.gc_failures, 0, "both inputs removed");
         let committed = outcome.committed.expect("committed");
         let live = live_files(&dir).expect("live");
         assert_eq!(live.len(), 1, "one file remains live");
@@ -373,7 +397,7 @@ mod tests {
         write_file(bucket.path(), &[rec(1, TS0)]);
         write_file(bucket.path(), &[rec(2, TS0 + 1_000_000)]);
         let dir = partition().data_path(bucket.path());
-        let names = file_names(&live_files(&dir).expect("live"));
+        let names = file_names(&live_files(&dir).expect("live")).expect("names");
         Manifest {
             generation: 5,
             files: names,

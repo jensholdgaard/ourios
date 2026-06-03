@@ -237,9 +237,9 @@ runtime decision per leaf.
   type-tag mechanism in §4.2 already requires a slot name; using the
   Drain3 hint format keeps configs portable.
 - **Built-in metrics surface.** Drain3 exposes a set of state
-  counters via callback. `replace` — Ourios exposes Prometheus
-  metrics directly per §6.8, with names that match `[§3.1]`'s
-  required set rather than Drain3's internal names.
+  counters via callback. `replace` — Ourios exposes OTel metrics
+  directly per §6.8 (instrumented via the meter API), with names that
+  match `[§3.1]`'s required set rather than Drain3's internal names.
 - **Parameter masking after the fact.** Drain3 has utilities to
   retroactively mask params in already-clustered lines. `reject` —
   Ourios masks once, at ingest, deterministically. Retroactive
@@ -406,14 +406,16 @@ direction and the primary obligation lives in those other RFCs.
 
 > **Scenario §3.1.2 — Mandatory metric set is exposed**
 > - **Given** a running miner
-> - **When** the Prometheus registry is enumerated
-> - **Then** it contains every metric named in §6.8's table
+> - **When** the miner's meter (`global::meter("ourios.miner")`) is
+>   collected via an SDK in-memory reader, at zero traffic
+> - **Then** the collected metric stream contains every metric named
+>   in §6.8's table (each present via its init-seeded data point)
 >   (`template_count`, `merges_total`, `confidence`,
 >   `confidence_p50`, `confidence_p01`, `body_retention_ratio`,
 >   `parse_failures_total`, `params_overflow_total`,
 >   `params_overflow_ratio`, `template_version_changes_total`,
->   `miner_latency_seconds`) with the types and labels listed
->   there
+>   `miner_latency_seconds`) with the instrument kinds and
+>   attributes listed there
 
 > **Scenario §3.2.1 — Default per-parameter byte limit is 256**
 > - **Given** a tenant configuration with no per-parameter byte
@@ -557,12 +559,19 @@ direction and the primary obligation lives in those other RFCs.
 > **Scenario RFC0001.8 — confidence_p50 and confidence_p01 are emitted as gauges**
 > - **Given** a running miner with a non-empty `confidence`
 >   histogram for some `(tenant_id, service)`
-> - **When** the Prometheus registry is scraped
-> - **Then** `confidence_p50{tenant_id, service}` and
->   `confidence_p01{tenant_id, service}` are present as gauges
+> - **When** the miner's meter is collected via an SDK in-memory reader
+> - **Then** `confidence_p50` and `confidence_p01` (attributes
+>   `tenant_id`, `service`) are present as gauges
 > - **And** each value matches the corresponding quantile of the
->   same-labelled histogram (computed in-process on a short
+>   same-attributed histogram (computed in-process on a short
 >   ticker per §6.8)
+>
+> *(Pending the §6.8 dotted-semconv redesign: this scenario may be
+> superseded if `confidence_p50` / `confidence_p01` become
+> backend-derived quantiles over the exported histogram rather than
+> in-process gauges. The change is a contract change to the §3.1.2
+> mandatory set and is made under that redesign's own review, not
+> the 2026-06-03 architecture amendment.)*
 
 > **Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id**
 > - **Given** an `OtlpLogRecord` whose `body` is
@@ -1323,9 +1332,9 @@ any param has `type_tag == OVERFLOW`.
 
 **Telemetry.** Two metrics for `[§3.2]` and hazard H2:
 
-- `params_overflow_total` (counter, labelled `tenant_id`,
+- `params_overflow_total` (counter, attributes `tenant_id`,
   `service`): increments per overflow.
-- `params_overflow_ratio` (gauge, labelled `tenant_id`,
+- `params_overflow_ratio` (gauge, attributes `tenant_id`,
   `service`): rolling overflow rate. Alert at `> 0.01` per service
   per `[§3.2]`.
 
@@ -1472,9 +1481,101 @@ exactly the H5 detection signal.
 
 ### 6.8 Telemetry `[§3.1]`, §6.3
 
-The metrics enumerated in `[§3.1]` are mandatory. Full set:
+> **Amendment 2026-06-03.** Telemetry export is realigned from a
+> Prometheus client/scrape model to the **OpenTelemetry SDK** (the
+> maintainer direction recorded against RFC 0009 §3.6 and the roadmap
+> §5 note). This amendment fixes the *export architecture* and the
+> Prometheus-era terminology (registry → meter provider, scrape →
+> OTLP push, labels → attributes) throughout §§6.8–6.9 and the §5
+> scenarios. It deliberately does **not** rename the metrics: the
+> identifiers in the table below stay as-is, pending a dedicated
+> dotted-semconv redesign that converts them to the
+> `ourios.miner.*` scheme, adds them to the `semconv/registry/`
+> weaver registry alongside the compaction set (RFC 0009 §3.6), and
+> resolves the instrument-type and quantile questions that are
+> genuine contract changes to the §3.1.2 mandatory set — including
+> whether `confidence_p50` / `confidence_p01` remain in-process
+> gauges (RFC0001.8) or become collector-/backend-derived quantiles
+> over the exported histogram, the OTLP-native idiom. That redesign
+> moves the mandatory-set contract under its own review rather than
+> riding this architecture change.
 
-| Metric | Type | Labels | Source invariant / hazard |
+#### Export architecture (OTel SDK + OTLP)
+
+Metrics are instrumented through the OpenTelemetry **meter API** and
+exported via the OTel SDK's **OTLP metric exporter** (push, over OTLP
+to a collector / endpoint). There is no `prometheus` client crate and
+no `/metrics` scrape endpoint; any Prometheus compatibility is a
+downstream collector concern, not Ourios's.
+
+The dependency split follows the standard OTel layering so the heavy
+SDK and transport crates do not leak into every library:
+
+- **Instrumented crates** (`ourios-miner`, `ourios-parquet`,
+  `ourios-ingester`, `ourios-querier`) depend only on the lightweight
+  `opentelemetry` **API** crate and resolve instruments through
+  `global::meter("ourios.<subsystem>")`. No SDK, no OTLP, no
+  transport dependency in a library crate.
+- A new **`ourios-telemetry`** crate owns the heavy deps — the
+  `opentelemetry_sdk` and `opentelemetry-otlp` crates (the upstream
+  package names, underscore and hyphen respectively) plus the OTLP
+  transport.
+  It exposes an `init()` that builds the OTLP push `MeterProvider`
+  (periodic-reader export, interval configurable), installs it as the
+  process-global provider, and returns a guard whose `shutdown()`
+  flushes pending metrics on exit. The binary (`ourios-server`) calls
+  `init()` once at start-up; benches and integration tests call the
+  same entry point or substitute an in-memory reader. Adding this
+  crate extends the `CLAUDE.md` §7 target layout; the new-crate
+  commitment is blessed here, in this RFC, per §7's rule.
+
+Dimensions are OTel **attributes**, not Prometheus labels, and OTel
+splits them in two: **resource attributes** identify the telemetry
+producer and are set once on the `MeterProvider`; **data-point
+attributes** vary per measurement. Ourios's own identity —
+`service.name = ourios-<role>` (e.g. `ourios-ingester`, `ourios-querier`,
+matching the role the `ourios-telemetry` crate initialises the provider
+for; with `service.version`, etc.) — is a **resource attribute**: per
+the semantic conventions it MUST be set once on the provider's
+`Resource` and MUST NOT be repeated on individual data points.
+
+The per-measurement dimensions in the table below — among them
+`tenant_id`, the originating **service** of the ingested logs, and
+per-metric dimensions like `event_type` — are **data-point
+attributes**. A single ingester multiplexes many tenants and many
+source services, and `[§3.1]` / `[§3.2]` require per-`(tenant,
+service)` breakdowns — notably the §6.5 / H2.2 *per-service* overflow
+alert — which a single producer-level resource attribute could not
+provide. The `service` dimension here is the *log's source* service
+(the value §6.1's tenant derivation reads), **distinct from Ourios's
+own `service.name`** — it must not reuse that reserved resource key.
+The table below shows the current attribute names (`tenant_id`,
+`service`); like the metric names, they are converted to the
+namespaced `ourios.*` dotted-semconv scheme by the deferred redesign
+(which fixes the exact key for the source-service dimension) — not
+here.
+
+OTel's metric model is **collect-on-read**: a reader / exporter sees
+the data points produced during a collection cycle, not a registry of
+instruments, and a synchronous instrument that has recorded no
+measurement contributes no data point. To preserve §3.1.2's
+"full mandatory set is exposed" guarantee even at zero traffic, the
+miner **emits an initial data point for each mandatory instrument at
+init**, so every metric in the table below appears in the first
+collection cycle regardless of traffic. The per-kind mechanism is an
+implementation detail of the instrumentation slice: a zero `add()`
+seeds additive instruments (counters / up-down-counters) without
+distorting anything, and observable instruments report through their
+callback; histograms are seeded so they surface **without** a
+synthetic `record(0)` polluting their distribution. Verification is
+therefore by *collecting the metric stream* (an SDK in-memory reader
+in tests), not by enumerating registered instruments.
+
+The metrics enumerated in `[§3.1]` are mandatory. Full set (names and
+instrument kinds pending the dotted-semconv redesign noted above; the
+dimensions shown are exported as **attributes**, not labels):
+
+| Metric | Instrument kind | Attributes | Source invariant / hazard |
 |---|---|---|---|
 | `template_count` | gauge | `tenant_id` | `[§3.1]` |
 | `merges_total` | counter | `tenant_id`, `event_type` | `[§3.1]`, H1 |
@@ -1494,7 +1595,7 @@ named views derived from it in-process. The miner recomputes them
 on a short ticker (default 10 s, configurable; the cost is one
 quantile evaluation over the histogram per tenant per service per
 tick — negligible relative to the hot path) and caches the value
-between ticks so a Prometheus scrape never blocks on
+between ticks so a metric export cycle never blocks on
 recomputation. The gauges exist so alerting rules and runbooks can
 name them directly per `[§3.1]` rather than spelling out a
 `histogram_quantile(...)` expression at every reference.
@@ -1530,11 +1631,12 @@ exactly as in live ingest, but updates to the §6.8 metrics are
 suppressed (counters do not increment, histograms do not observe,
 gauges retain their previous value or, if the miner has never
 served live traffic, their zero / empty initialisation value). The
-metrics themselves remain registered and visible to scrapes —
-§3.1.2's invariant that the registry exposes the full §6.8 set
-holds across replay; only the *update* path is gated, not the
-*registration* path. A single `wal_replay_progress` gauge
-(labelled `tenant_id`, value: fraction of the tenant's replay
+instruments' init-seeded data points keep the full §6.8 set visible to
+the exporter during replay — suppressing the *update* path leaves each
+metric at its seeded / last value, so §3.1.2's "full set exposed"
+invariant holds across replay without recording replay-window
+measurements. A single `wal_replay_progress` gauge
+(attribute `tenant_id`, value: fraction of the tenant's replay
 window completed in `[0.0, 1.0]`) is exposed during replay so
 operators can see the cold-start curve and confirm replay finished.
 This metric is replay-only and is not part of the §3.1 mandatory
@@ -1709,11 +1811,13 @@ resolves bidirectionally between RFC and tests.
   §3.2.1 (default param byte limit = 256),
   §3.2.2 (limit > 1 KiB rejected).
 
-- **Metrics registry test**: enumerate the Prometheus registry on
-  a freshly-initialised miner; assert the names, types, and labels
-  in §6.8's table are all present, and that the
-  `confidence_p50` / `confidence_p01` gauges track the
-  same-labelled `confidence` histogram quantiles.
+- **Metric collection test**: collect the miner's meter
+  (`global::meter("ourios.miner")`) of a freshly-initialised miner via
+  an SDK in-memory reader and assert the collected stream contains
+  every §6.8 metric name (each present via its init-seeded data
+  point), with the instrument kinds and attributes in §6.8's table,
+  and that the `confidence_p50` / `confidence_p01` gauges track the
+  same-attributed `confidence` histogram quantiles.
   *Covers:* §3.1.2, RFC0001.8.
 
 - **Data-model contract tests**: small unit tests against the

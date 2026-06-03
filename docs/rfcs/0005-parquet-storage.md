@@ -626,7 +626,7 @@ The reader has three normative requirements:
    produced by an earlier writer that lacks columns the current
    reader expects must read successfully; the missing columns
    default to:
-   - OPTIONAL columns → `None`. Per §3.8 rule 1 every
+   - OPTIONAL columns → `None`. Per §3.8 rule 1, every
      amendment-added column is OPTIONAL, and per §3.8 rule 6 a
      column relaxed `REQUIRED` → `OPTIONAL` is read the same way —
      `None` when a row stores `NULL` (e.g. the template-specific

@@ -1537,8 +1537,9 @@ for; with `service.version`, etc.) — is a **resource attribute**: per
 the semantic conventions it MUST be set once on the provider's
 `Resource` and MUST NOT be repeated on individual data points.
 
-The per-measurement dimensions in the table below — `tenant_id` and
-the originating **service** of the ingested logs — are **data-point
+The per-measurement dimensions in the table below — among them
+`tenant_id`, the originating **service** of the ingested logs, and
+per-metric dimensions like `event_type` — are **data-point
 attributes**. A single ingester multiplexes many tenants and many
 source services, and `[§3.1]` / `[§3.2]` require per-`(tenant,
 service)` breakdowns — notably the §6.5 / H2.2 *per-service* overflow
@@ -1567,7 +1568,7 @@ The metrics enumerated in `[§3.1]` are mandatory. Full set (names and
 instrument kinds pending the dotted-semconv redesign noted above; the
 dimensions shown are exported as **attributes**, not labels):
 
-| Metric | Type | Attributes | Source invariant / hazard |
+| Metric | Instrument kind | Attributes | Source invariant / hazard |
 |---|---|---|---|
 | `template_count` | gauge | `tenant_id` | `[§3.1]` |
 | `merges_total` | counter | `tenant_id`, `event_type` | `[§3.1]`, H1 |

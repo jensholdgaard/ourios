@@ -458,8 +458,9 @@ add-new-column / migrate / drop).
 > (the "nothing happens silently to stored data" stance applied to
 > file lifecycle, `CLAUDE.md` §3.1). A compaction event shares the
 > common envelope (`tenant_id`, `timestamp`, `event_kind = 3`,
-> `event_type = "compaction"`, `reason`) but has no template
-> identity. Two changes accommodate it, both backward-compatible:
+> `event_type = "compaction"`) but has no template identity (and
+> leaves `reason` `NULL` — the facts live in the `compaction_*`
+> columns). Two changes accommodate it, both backward-compatible:
 >
 > 1. The template-specific columns (`template_id`, `old_version`,
 >    `new_version`, `old_template`, `new_template`,
@@ -496,7 +497,7 @@ The row-level audit columns are:
 | `slots_expanded` | `LIST<STRUCT<slot_index: INT32, types_added: LIST<INT32>>>` | as schema | OPTIONAL† | Written for template kinds; the list is empty for `TemplateWidened` and `TemplateWideningRejectedDegenerate`. For `TemplateTypeExpanded`, one element per slot whose type set grew, each carrying the wildcard-slot ordinal plus the `ParamType` ordinals added (RFC 0001 §6.4 `slots_expanded: Vec<SlotExpansion>`; `SlotExpansion = { slot_index, types_added }`) |
 | `triggering_line_hash` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL† | Blake3 hash of the raw triggering line `L_raw` (RFC 0001 §6.4 `triggering_line_hash: [u8; 16]`); enables cross-referencing the audit event with the data record that caused it |
 | `triggering_line_sample` | `STRING` | `BYTE_ARRAY` | OPTIONAL | First 256 bytes of `L_raw`, UTF-8 lossy-decoded if necessary (RFC 0001 §6.4 `triggering_line_sample: Option<String>`); `NULL` when the sample was redacted for retention policy |
-| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate` (the degenerate-template guard's diagnostic) and `compaction` (a short human summary); set for those |
+| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate`; the degenerate-template guard's diagnostic string otherwise. `NULL` for `compaction` — the `compaction_*` columns carry the facts |
 | `compaction_partition` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The compacted data partition, as the canonical `year=…/month=…/day=…/hour=…` key under the row's `tenant_id` (RFC 0009 §3.4). `NULL` for template kinds |
 | `compaction_input_files` | `LIST<STRING>` | as schema | OPTIONAL | **Compaction only.** The input file names that were merged away (RFC 0009 §3.6 `ourios.compaction.files`). `NULL` for template kinds |
 | `compaction_output_file` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The consolidated output file name (the sole live file after the commit). `NULL` for template kinds |

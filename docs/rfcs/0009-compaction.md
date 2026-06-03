@@ -217,13 +217,27 @@ file set, the consolidated output file, the row count (which must be
 conserved, RFC0009.2), and the committed manifest generation.
 
 > **Open question (§7):** the existing audit schema (RFC 0005 §3.7) is
-> shaped for *template* events (`old_template`, `positions_widened`,
-> …). A compaction event reuses the envelope (`tenant_id`, `timestamp`,
-> `event_type = "compaction"`, `reason`) but needs a place for the
-> file set / generation. Resolve before `red`: either carry them as a
-> structured `reason` payload (no schema change) or add OPTIONAL audit
-> columns (an RFC 0005 §3.8 additive amendment). Leaning structured-
-> `reason` to avoid a schema change.
+> shaped for *template* events — `event_kind` is a bounded ordinal
+> mapping with no compaction member, and the template-specific columns
+> (`old_template`, `positions_widened`, …) are **non-nullable**. A
+> compaction event can reuse the common envelope (`tenant_id`,
+> `timestamp`, `event_kind` / `event_type`, `reason`) but (a) needs a
+> new `compaction` member in the `event_kind` mapping and (b) has no
+> applicable value for the non-nullable template columns, nor a place
+> for the file set / generation. Resolve before `red`:
+>
+> - **structured `reason`** — carry the file set / generation as a
+>   structured `reason` payload. Avoids new columns, but still needs
+>   the `event_kind` member *and* forces placeholder values into the
+>   non-nullable template columns (or making them nullable, which is
+>   itself a schema change), so "no schema change" is not quite free.
+> - **additive OPTIONAL columns** — add OPTIONAL compaction columns
+>   and relax the template columns to OPTIONAL (an RFC 0005 §3.8
+>   additive, back-compatible amendment); old readers ignore unknown
+>   columns per RFC 0005 §3.9.
+>
+> The non-nullability tilts this toward the additive route; settle it
+> against RFC 0005 §3.7 before `red` rather than here.
 
 #### Metrics (OpenTelemetry semantic conventions)
 
@@ -232,10 +246,12 @@ SDK's OTLP metric exporter** (push over OTLP to a collector /
 endpoint) — the OTel SDK pipeline end-to-end. No `prometheus` client
 crate and no Prometheus scrape endpoint (maintainer direction,
 2026-06-03, superseding the earlier `opentelemetry-prometheus`
-exporter note in roadmap §4; any Prometheus compatibility is a
+exporter note in roadmap §5; any Prometheus compatibility is a
 downstream collector concern, not Ourios's). The names below follow
 the OTel metric-naming guidelines — dotted/namespaced, no
-`_total`/unit suffixes, UCUM units, dimensions as attributes — and are
+`_total`/unit suffixes, UCUM units (including UCUM curly-brace
+**annotations** such as `{sweep}` / `{file}` for dimensionless counts,
+which annotate the unit `1`), dimensions as attributes — and are
 exported **verbatim** over OTLP (no exporter-side name mangling).
 
 | Metric | Instrument | Unit | Attributes | Source |
@@ -272,7 +288,7 @@ bytes, not a base metric.
 > — so the names/units/attributes stay spec-adherent and can't drift.
 > Compaction is the first place these conventions are pinned; RFC 0001
 > §6.8's Prometheus-style names get the same OTel-source treatment in
-> its own amendment (roadmap §4).
+> its own amendment (roadmap §5).
 
 ## 4. Alternatives considered
 

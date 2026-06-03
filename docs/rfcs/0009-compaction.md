@@ -176,13 +176,6 @@ sequenceDiagram
     C->>FS: GC orphaned {a,b,c} (lazy, post-commit)
 ```
 
-> **Note.** RFC 0009 is the first RFC to use a Mermaid diagram, and
-> the mdBook build does not yet have `mdbook-mermaid` enabled
-> (`docs/rfcs/README.md` Diagrams) — so this block currently renders
-> as a plain code fence. Enabling the preprocessor + its CI support
-> (it touches `book.toml`, vendored JS assets, and both mdbook CI
-> jobs) is a separate infra change, not bundled into this draft.
-
 This protocol is an interaction with **RFC 0007** (the querier must
 read through the manifest) and a small extension to **RFC 0005** (the
 manifest is a new per-partition artifact — additive, optional,

@@ -117,10 +117,13 @@ aesthetic that Mermaid does not provide; RFCs benefit from the
 diff-ability that Excalidraw does not provide. Do not mix the two
 conventions.
 
-The mdBook build does not yet have the `mdbook-mermaid` preprocessor
-enabled — it will be added the first time an RFC actually needs a
-diagram, at which point local builds and the CI workflow both gain
-the preprocessor in the same change.
+The mdBook build has the `mdbook-mermaid` preprocessor enabled
+(`book.toml`), with the Mermaid runtime vendored at the repo root
+(`mermaid.min.js`, `mermaid-init.js`) so the rendered book is
+self-contained. The CI `book` job and the Pages workflow install the
+`mdbook-mermaid` binary before building. To work on diagrams locally,
+`cargo install mdbook-mermaid` (the preprocessor binary) — the
+vendored runtime is already committed.
 
 ## Relationship to architecture docs
 

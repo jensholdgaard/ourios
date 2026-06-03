@@ -264,11 +264,12 @@ pub fn compact_partition(
 /// loop (timer + bounded concurrency) belongs in the ingester role,
 /// which doesn't exist yet.
 ///
-/// A partition is selected when it is **sealed** — its hour ended more
-/// than `policy.grace_nanos` ago, so no writer is still appending — and
-/// a **candidate**: it has at least two live files (fewer can't be
+/// A partition is selected when it is **sealed** — its hour ended at
+/// least `policy.grace_nanos` ago, so no writer is still appending —
+/// and a **candidate**: it has at least two live files (fewer can't be
 /// consolidated) and either more than `policy.min_files` of them or one
-/// below `policy.small_file_bytes`.
+/// below `policy.small_file_bytes`. The list is ordered chronologically
+/// (oldest partition first), deterministic across runs.
 ///
 /// # Errors
 ///
@@ -293,8 +294,9 @@ pub fn plan_candidates(
     Ok(selected)
 }
 
-/// Whether the partition's hour ended more than `grace_nanos` before
-/// `now`. A partition whose `(year, month, day, hour)` is not a real
+/// Whether the partition's hour ended at least `grace_nanos` before
+/// `now` (the comparison is inclusive: sealed at exactly
+/// `hour_end + grace`). A partition whose `(year, month, day, hour)` is not a real
 /// UTC instant (a corrupt directory name) is treated as not sealed.
 fn is_sealed(partition: &PartitionKey, now_unix_nanos: u64, policy: &CompactionPolicy) -> bool {
     let Some(hour_start) = NaiveDate::from_ymd_opt(partition.year, partition.month, partition.day)
@@ -476,6 +478,10 @@ fn numbered_children(
             out.push((path, value));
         }
     }
+    // `read_dir` order is unspecified; sort by value so the descent —
+    // and thus `plan_candidates`' work list — is deterministic
+    // (ascending = chronological: oldest sealed partitions first).
+    out.sort_by_key(|(_, value)| *value);
     Ok(out)
 }
 
@@ -716,6 +722,30 @@ mod tests {
             vec![partition()],
             "the sealed small-file partition is selected"
         );
+    }
+
+    #[test]
+    fn plan_returns_partitions_in_chronological_order() {
+        // Arrange — two sealed small-file partitions, hour 10 and 11.
+        let bucket = tempfile::tempdir().expect("temp");
+        for ts in [TS0, TS0 + HOUR_NANOS] {
+            for template_id in [1_u64, 2] {
+                let record = rec(template_id, ts);
+                let mut w = Writer::open(bucket.path(), PartitionKey::derive(&record).unwrap())
+                    .expect("open");
+                w.append_records(&[record]).expect("append");
+                w.close().expect("close");
+            }
+        }
+        let now = TS0 + 3 * HOUR_NANOS; // past hour 11's end + grace
+
+        // Act
+        let selected =
+            plan_candidates(bucket.path(), "a", now, &CompactionPolicy::default()).expect("plan");
+
+        // Assert — both selected, oldest first, regardless of read_dir order.
+        let hours: Vec<u32> = selected.iter().map(|p| p.hour).collect();
+        assert_eq!(hours, vec![10, 11], "deterministic, chronological");
     }
 
     #[test]

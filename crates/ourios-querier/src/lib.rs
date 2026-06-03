@@ -188,7 +188,7 @@ fn resolve_live_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, QueryError>
             }
         }
         match Manifest::read(&d).map_err(|e| QueryError::Storage {
-            detail: e.to_string(),
+            detail: format!("manifest in {}: {e}", d.display()),
         })? {
             // Manifest is authoritative: only its named files are live.
             Some(manifest) => files.extend(manifest.files.into_iter().map(|name| d.join(name))),

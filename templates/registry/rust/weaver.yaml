@@ -1,0 +1,8 @@
+# Weaver-forge config for the `ourios-semconv` Rust constants crate.
+# `weaver registry generate rust <out> -t templates -r semconv/registry --future`
+# renders the single template below over the whole resolved registry
+# (`--future` matches the `weaver registry check --future` validation).
+templates:
+  - pattern: lib.rs.j2
+    filter: .
+    application_mode: single

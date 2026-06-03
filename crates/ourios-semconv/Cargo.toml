@@ -1,0 +1,20 @@
+[package]
+name = "ourios-semconv"
+version = "0.0.0"
+description = "Generated OpenTelemetry semantic-convention name constants for Ourios (weaver-generated from semconv/registry/)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ourios_semconv"
+path = "src/lib.rs"
+
+# Intentionally dependency-free: a leaf crate of `const &str` names that
+# every instrumented crate (and ourios-core) can depend on without
+# pulling anything. Mirrors upstream `opentelemetry-semantic-conventions`.
+
+[lints]
+workspace = true

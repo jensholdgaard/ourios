@@ -2508,6 +2508,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-semconv"
+version = "0.0.0"
+
+[[package]]
 name = "ourios-telemetry"
 version = "0.0.0"
 dependencies = [

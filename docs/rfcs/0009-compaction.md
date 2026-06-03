@@ -291,6 +291,26 @@ bytes, not a base metric.
 > Compaction is the first place these conventions are pinned; RFC 0001
 > §6.8's Prometheus-style names get the same OTel-source treatment in
 > its own amendment (roadmap §5).
+>
+> **Code generation.** Instrumentation does not hand-type these names:
+> `weaver registry generate` renders the registry into a dependency-
+> free leaf crate **`ourios-semconv`** (`const &str` per metric /
+> attribute, mirroring upstream `opentelemetry-semantic-conventions`),
+> which every instrumented crate depends on. The generator template
+> lives at `templates/registry/rust/`; regenerate with the same command
+> CI runs (`--future` matches `weaver registry check --future`):
+>
+> ```sh
+> weaver registry generate rust crates/ourios-semconv/src \
+>     -t templates -r semconv/registry --future
+> cargo fmt -p ourios-semconv
+> ```
+>
+> The same `semconv` CI job regenerates and fails on any diff (it also
+> catches new untracked files), so the constants cannot drift from the
+> registry. This new leaf crate extends the `CLAUDE.md` §7 layout; the
+> commitment is blessed here, the same way `ourios-telemetry` was
+> blessed in RFC 0001 §6.8.
 
 ## 4. Alternatives considered
 

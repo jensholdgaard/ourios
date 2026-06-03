@@ -43,7 +43,9 @@ pub use compaction::{
     plan_candidates,
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError};
-pub use partition::{PartitionKey, TimestampOverflowError, percent_encode_tenant};
+pub use partition::{
+    PartitionKey, TimestampOverflowError, percent_decode_tenant, percent_encode_tenant,
+};
 pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};
 pub use writer::{DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile};

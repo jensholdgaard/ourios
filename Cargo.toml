@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ourios-bench",
     "crates/ourios-core",
+    "crates/ourios-ingester",
     "crates/ourios-miner",
     "crates/ourios-parquet",
     "crates/ourios-querier",
@@ -10,7 +11,6 @@ members = [
 ]
 
 # Remaining members per CLAUDE.md §7 layout will be added as crates land:
-#   crates/ourios-ingester
 #   crates/ourios-server
 
 [workspace.package]

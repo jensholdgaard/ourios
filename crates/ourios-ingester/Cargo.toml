@@ -1,0 +1,31 @@
+[package]
+name = "ourios-ingester"
+version = "0.0.0"
+description = "Ourios ingester role — OTLP receiver (RFC 0003), WAL-before-ack (RFC 0008), and the background compaction runner (RFC 0009)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ourios_ingester"
+path = "src/lib.rs"
+
+[dependencies]
+# Shared types (TenantId, config) for the ingest path.
+ourios-core = { path = "../ourios-core" }
+# The compaction runner drives ourios-parquet's planner + compactor
+# (RFC 0009 §3.2: compaction is hosted in the ingester role) and uses
+# its tenant-dir percent codec to enumerate the store.
+ourios-parquet = { path = "../ourios-parquet" }
+# Async runtime for the background compaction loop: `time` for the
+# interval timer, `rt` for `spawn_blocking` (compaction is blocking
+# filesystem/Parquet work), `macros` for `#[tokio::main]`/tests.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -158,10 +158,7 @@ fn choose_partition_timestamp(record: &MinedRecord) -> Result<i64, TimestampOver
 pub fn percent_encode_tenant(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
-        if matches!(
-            b,
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
-        ) {
+        if is_unreserved(b) {
             out.push(b as char);
         } else {
             out.push('%');
@@ -183,6 +180,68 @@ const fn hex_nibble(n: u8) -> char {
         0..=9 => (b'0' + n) as char,
         10..=15 => (b'A' + n - 10) as char,
         _ => unreachable!(),
+    }
+}
+
+/// Inverse of [`percent_encode_tenant`]: decode a percent-encoded
+/// tenant path segment back to the raw tenant id. Used to recover the
+/// tenant from a `tenant_id=<enc>` directory name when sweeping the
+/// store (e.g. background compaction).
+///
+/// Returns `None` for any input [`percent_encode_tenant`] would not
+/// have produced: a malformed escape (`%` not followed by two hex
+/// digits), a literal byte outside the unreserved set (one the encoder
+/// would have escaped, e.g. a space or a raw UTF-8 byte), or decoded
+/// bytes that aren't valid UTF-8. This keeps decode the exact inverse
+/// of encode, so a store sweep skips non-Ourios directory names rather
+/// than treating them as tenants.
+#[must_use]
+pub fn percent_decode_tenant(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            let hi = hex_value(*bytes.get(i + 1)?)?;
+            let lo = hex_value(*bytes.get(i + 2)?)?;
+            let decoded = (hi << 4) | lo;
+            // The encoder only ever escapes bytes *outside* the
+            // unreserved set; an escape of an unreserved byte (`%41`)
+            // is non-canonical, so reject it to stay an exact inverse.
+            if is_unreserved(decoded) {
+                return None;
+            }
+            out.push(decoded);
+            i += 3;
+        } else if is_unreserved(b) {
+            out.push(b);
+            i += 1;
+        } else {
+            // A literal byte the encoder would have escaped ⇒ not a
+            // canonical encoding ⇒ not an Ourios directory name.
+            return None;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The RFC 3986 unreserved set `percent_encode_tenant` passes through.
+const fn is_unreserved(b: u8) -> bool {
+    matches!(
+        b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+    )
+}
+
+/// Parse one **upper-case** ASCII hex digit to its `0..=15` value.
+/// Lower-case is rejected: `percent_encode_tenant` emits upper-case
+/// hex only, so `%2f` is not a canonical encoding of `/`.
+const fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -243,6 +302,61 @@ mod tests {
         // UTF-8 = 0xC3 0xA5. Verifies "input is the UTF-8 byte
         // sequence" (§3.4) — no Unicode normalisation, just bytes.
         assert_eq!(percent_encode_tenant("å"), "%C3%A5");
+    }
+
+    #[test]
+    fn percent_decode_round_trips_encode() {
+        // Arrange — tenants spanning unreserved, delimiters, and UTF-8.
+        for tenant in ["tenant-id_42.~", "a/b", "k=v", "100%", "å", " tenant "] {
+            // Act
+            let decoded = percent_decode_tenant(&percent_encode_tenant(tenant));
+            // Assert
+            assert_eq!(
+                decoded.as_deref(),
+                Some(tenant),
+                "round-trip for {tenant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_malformed_escapes() {
+        // Arrange / Act / Assert — truncated or non-hex escapes are None.
+        for bad in ["%", "%2", "%2G", "%GG", "a%"] {
+            assert_eq!(
+                percent_decode_tenant(bad),
+                None,
+                "{bad:?} should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_non_canonical_unescaped_bytes() {
+        // Arrange / Act / Assert — literal bytes the encoder would have
+        // escaped (space, `/`, `=`, raw UTF-8) are not a canonical
+        // encoding, so they don't decode (not an Ourios directory name).
+        for bad in [" tenant ", "a/b", "k=v", "å", "100%off"] {
+            assert_eq!(
+                percent_decode_tenant(bad),
+                None,
+                "{bad:?} should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_non_canonical_escapes() {
+        // Arrange / Act / Assert — escapes the encoder would never emit:
+        // lower-case hex (`%2f`, encoder uses `%2F`) and escapes of an
+        // unreserved byte (`%41` = 'A', which encode leaves literal).
+        for bad in ["%2f", "%c3%a5", "%41", "%7E"] {
+            assert_eq!(
+                percent_decode_tenant(bad),
+                None,
+                "{bad:?} is non-canonical, should not decode"
+            );
+        }
     }
 
     #[test]

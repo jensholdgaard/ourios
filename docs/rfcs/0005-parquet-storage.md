@@ -431,7 +431,9 @@ row-vs-path validation (§3.9) applies identically here.
 refers to these audit events by snake_case `event_type` strings;
 this RFC stores **both** an `event_kind` INT32 ordinal (compact,
 dictionary-encodes to a few bytes) **and** an `event_type` STRING
-column carrying the canonical RFC 0001 §6.4 string. The string
+column carrying the canonical string from the mapping table below
+(RFC 0001 §6.4 for the template kinds, RFC 0009 §3.6 for
+`compaction`). The string
 column is what RFC 0001 §9 names as the predicate-pushdown surface
 for the RFC 0001 §6.7 drift query; the ordinal is what the writer and
 reader use internally. Both columns are REQUIRED and the writer
@@ -487,7 +489,7 @@ The row-level audit columns are:
 | `tenant_id` | `STRING` | `BYTE_ARRAY` | REQUIRED | Same contract as data-file `tenant_id`: row authoritative, replicated in partition path, mismatch → reader error |
 | `timestamp` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | Cluster clock at emit time (matches RFC 0001 §6.4 `timestamp`) |
 | `event_kind` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | Ordinal per the mapping table above |
-| `event_type` | `STRING` | `BYTE_ARRAY` | REQUIRED | Canonical RFC 0001 §6.4 snake_case string; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
+| `event_type` | `STRING` | `BYTE_ARRAY` | REQUIRED | Canonical snake_case string per the mapping table above (RFC 0001 §6.4 for template kinds; RFC 0009 §3.6 for `compaction`); predicate-pushdown surface for the RFC 0001 §6.7 drift query |
 | `template_id` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL† | The leaf the event applies to |
 | `old_version` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL† | Pre-event template version |
 | `new_version` | `INTEGER(32, signed=false)` | `INT32` | OPTIONAL† | Post-event template version (equal to `old_version` for the rejection variant) |

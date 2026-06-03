@@ -50,6 +50,11 @@ pub enum ManifestError {
     /// breaking tenant isolation (`CLAUDE.md` §3.7 / RFC0007.5). Bad
     /// manifests fail loudly rather than silently mis-resolving.
     InvalidFilename(String),
+    /// A file name appears more than once. The compactor joins each
+    /// entry to the partition dir and reads it, so a duplicate would
+    /// read the same file twice and double-count its rows — the live
+    /// set must be unique.
+    DuplicateFilename(String),
 }
 
 impl std::fmt::Display for ManifestError {
@@ -63,6 +68,9 @@ impl std::fmt::Display for ManifestError {
                     "manifest lists a non-partition-local file name: {name:?}"
                 )
             }
+            Self::DuplicateFilename(name) => {
+                write!(f, "manifest lists a duplicate file name: {name:?}")
+            }
         }
     }
 }
@@ -72,7 +80,7 @@ impl std::error::Error for ManifestError {
         match self {
             Self::Io(e) => Some(e),
             Self::Parse(e) => Some(e),
-            Self::InvalidFilename(_) => None,
+            Self::InvalidFilename(_) | Self::DuplicateFilename(_) => None,
         }
     }
 }
@@ -118,16 +126,21 @@ impl Manifest {
         }
     }
 
-    /// Reject any `files` entry that is not a partition-local
-    /// `*.parquet` file name (see [`ManifestError::InvalidFilename`]).
+    /// Validate the live set: every entry is a partition-local
+    /// `*.parquet` name and no name is repeated.
     ///
     /// # Errors
     ///
-    /// [`ManifestError::InvalidFilename`] for the first offending name.
+    /// [`ManifestError::InvalidFilename`] for the first non-local name,
+    /// or [`ManifestError::DuplicateFilename`] for the first repeat.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        let mut seen = std::collections::HashSet::with_capacity(self.files.len());
         for name in &self.files {
             if !is_partition_local_parquet(name) {
                 return Err(ManifestError::InvalidFilename(name.clone()));
+            }
+            if !seen.insert(name.as_str()) {
+                return Err(ManifestError::DuplicateFilename(name.clone()));
             }
         }
         Ok(())
@@ -142,6 +155,38 @@ impl Manifest {
     /// this plain struct).
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
+    }
+
+    /// Atomically (re)write the partition's manifest: serialize to a
+    /// sibling `manifest.json.tmp`, then `rename` it over
+    /// `manifest.json`. The rename is the **commit point** (RFC 0009
+    /// §3.4) — a *concurrent reader* observes either the old manifest
+    /// or the new one, never a partial write. The manifest is
+    /// validated before any bytes hit disk, so an invalid set is never
+    /// published.
+    ///
+    /// This is atomic, **not** crash-durable: without an `fsync` of the
+    /// file and its directory, a host crash mid-write can still leave a
+    /// truncated or missing `manifest.json` (the same caveat as the
+    /// `Writer`). That is safe by construction — a reader with no
+    /// manifest falls back to the `*.parquet` glob, and a compaction
+    /// that crashed before this commit left its inputs intact — so the
+    /// worst case is reverting to the prior generation, never data
+    /// loss. Durable fsync is a later refinement.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::InvalidFilename`] if any entry isn't a
+    /// partition-local `*.parquet` name; [`ManifestError::Io`] on a
+    /// write or rename failure.
+    pub fn write_atomic(&self, partition_dir: &Path) -> Result<(), ManifestError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(ManifestError::Parse)?;
+        let tmp = partition_dir.join(format!("{MANIFEST_FILENAME}.tmp"));
+        let final_path = partition_dir.join(MANIFEST_FILENAME);
+        std::fs::write(&tmp, &bytes).map_err(ManifestError::Io)?;
+        std::fs::rename(&tmp, &final_path).map_err(ManifestError::Io)?;
+        Ok(())
     }
 }
 
@@ -268,5 +313,59 @@ mod tests {
 
         // Assert
         assert!(matches!(read, Err(ManifestError::InvalidFilename(_))));
+    }
+
+    #[test]
+    fn write_atomic_round_trips_and_overwrites() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp");
+        let first = Manifest {
+            generation: 1,
+            files: vec!["a.parquet".to_string()],
+        };
+        let second = Manifest {
+            generation: 2,
+            files: vec!["compacted.parquet".to_string()],
+        };
+        first.write_atomic(dir.path()).expect("write first");
+
+        // Act — the second write swaps the manifest in place.
+        second.write_atomic(dir.path()).expect("write second");
+
+        // Assert — the latest generation wins, no `.tmp` left behind.
+        assert_eq!(Manifest::read(dir.path()).expect("read"), Some(second));
+        assert!(!dir.path().join(format!("{MANIFEST_FILENAME}.tmp")).exists());
+    }
+
+    #[test]
+    fn write_atomic_rejects_an_invalid_entry_before_writing() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("temp");
+        let bad = Manifest {
+            generation: 1,
+            files: vec!["../escape.parquet".to_string()],
+        };
+
+        // Act
+        let result = bad.write_atomic(dir.path());
+
+        // Assert — rejected, and nothing was published.
+        assert!(matches!(result, Err(ManifestError::InvalidFilename(_))));
+        assert!(!dir.path().join(MANIFEST_FILENAME).exists());
+    }
+
+    #[test]
+    fn validate_rejects_a_duplicate_file_name() {
+        // Arrange — the same file named twice would double-count.
+        let manifest = Manifest {
+            generation: 1,
+            files: vec!["a.parquet".to_string(), "a.parquet".to_string()],
+        };
+
+        // Act
+        let result = manifest.validate();
+
+        // Assert
+        assert!(matches!(result, Err(ManifestError::DuplicateFilename(_))));
     }
 }

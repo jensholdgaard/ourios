@@ -1,0 +1,3 @@
+name: ourios
+description: Ourios custom OpenTelemetry semantic conventions.
+schema_url: https://ourios.dev/schemas/ourios-0.1.0.yaml

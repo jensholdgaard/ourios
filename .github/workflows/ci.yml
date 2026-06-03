@@ -61,6 +61,22 @@ jobs:
           tool: mdbook-mermaid@0.17.0
       - run: mdbook build
 
+  # Validate the OTel semantic-conventions registry (metric/attribute
+  # names, units, instruments) with `weaver registry check` — the
+  # gate that keeps Ourios's telemetry names spec-adherent (RFC 0009
+  # §3.6). A required check (in `ci-success`'s `needs`).
+  semconv:
+    name: semconv (weaver)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install weaver
+        run: |
+          curl -sSL https://github.com/open-telemetry/weaver/releases/download/v0.23.0/weaver-x86_64-unknown-linux-gnu.tar.xz \
+            | tar xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/weaver-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
+      - run: weaver registry check -r semconv/registry --future
+
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes
   # a coverage hiccup neutral, so it never blocks a merge. Coverage
@@ -101,7 +117,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, book]
+    needs: [fmt, clippy, test, book, semconv]
     if: always()
     steps:
       - name: Verify required checks

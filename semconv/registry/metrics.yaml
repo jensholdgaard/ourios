@@ -1,0 +1,87 @@
+groups:
+  - id: metric.ourios.compaction.sweeps
+    type: metric
+    metric_name: ourios.compaction.sweeps
+    stability: development
+    brief: Number of compaction sweeps executed, by outcome.
+    instrument: counter
+    unit: "{sweep}"
+    attributes:
+      - ref: ourios.compaction.result
+        requirement_level: recommended
+
+  - id: metric.ourios.compaction.partitions
+    type: metric
+    metric_name: ourios.compaction.partitions
+    stability: development
+    brief: Number of partitions consolidated.
+    instrument: counter
+    unit: "{partition}"
+
+  - id: metric.ourios.compaction.files
+    type: metric
+    metric_name: ourios.compaction.files
+    stability: development
+    brief: Number of input files merged away by compaction.
+    instrument: counter
+    unit: "{file}"
+
+  - id: metric.ourios.compaction.rows
+    type: metric
+    metric_name: ourios.compaction.rows
+    stability: development
+    brief: Number of rows rewritten during consolidation.
+    instrument: counter
+    unit: "{row}"
+
+  - id: metric.ourios.compaction.io
+    type: metric
+    metric_name: ourios.compaction.io
+    stability: development
+    brief: Bytes read from inputs and written to the consolidated file.
+    instrument: counter
+    unit: "By"
+    attributes:
+      - ref: ourios.io.direction
+        requirement_level: required
+
+  - id: metric.ourios.compaction.duration
+    type: metric
+    metric_name: ourios.compaction.duration
+    stability: development
+    brief: Wall-clock duration of a compaction sweep.
+    instrument: histogram
+    unit: "s"
+    attributes:
+      - ref: ourios.compaction.result
+        requirement_level: recommended
+
+  - id: metric.ourios.compaction.orphan.files
+    type: metric
+    metric_name: ourios.compaction.orphan.files
+    stability: development
+    brief: Superseded input files that could not be removed after commit.
+    instrument: counter
+    unit: "{file}"
+
+  - id: metric.ourios.compaction.backlog
+    type: metric
+    metric_name: ourios.compaction.backlog
+    stability: development
+    brief: Sealed partitions awaiting compaction.
+    instrument: updowncounter
+    unit: "{partition}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: recommended
+
+  - id: metric.ourios.storage.parquet.file.size
+    type: metric
+    metric_name: ourios.storage.parquet.file.size
+    stability: development
+    brief: Sizes of published Parquet data files (hazard H4 detector).
+    instrument: histogram
+    unit: "By"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: recommended

@@ -246,7 +246,7 @@ exported **verbatim** over OTLP (no exporter-side name mangling).
 | `ourios.compaction.rows` | Counter | `{row}` | — | rows rewritten (RFC0009.2) |
 | `ourios.compaction.io` | Counter | `By` | `ourios.io.direction` | bytes read / written |
 | `ourios.compaction.duration` | Histogram | `s` | `ourios.compaction.result` | sweep wall-clock |
-| `ourios.compaction.orphans` | Counter | `{file}` | — | inputs left un-GC'd (`gc_failures`) |
+| `ourios.compaction.orphan.files` | Counter | `{file}` | — | inputs left un-GC'd (`gc_failures`) |
 | `ourios.compaction.backlog` | UpDownCounter | `{partition}` | `ourios.tenant` | sealed-but-uncompacted (lag) |
 | `ourios.storage.parquet.file.size` | Histogram | `By` | `ourios.tenant` | **H4 detector** — alert when > 5 % of files < 128 MiB |
 
@@ -266,13 +266,13 @@ The H4 "file-count grows sub-linearly with bytes" signal is a derived
 alert over `ourios.storage.parquet.file.size` (count) and ingested
 bytes, not a base metric.
 
-> **Validation gate.** These names/units/attributes must pass an
-> OpenTelemetry semantic-conventions check (the OTel semconv assistant,
-> or `weaver`/the rego policy packages) **before** instrumentation
-> lands — sequenced per the project's semconv-test plan. Compaction is
-> also the first place these conventions are pinned; RFC 0001 §6.8's
-> Prometheus-style names get the same OTel-source treatment in its own
-> amendment (roadmap §4).
+> **Validation gate.** This set is the OpenTelemetry semantic-
+> conventions **registry** at `semconv/registry/`, validated by
+> `weaver registry check` in CI (the `semconv` job, a required check)
+> — so the names/units/attributes stay spec-adherent and can't drift.
+> Compaction is the first place these conventions are pinned; RFC 0001
+> §6.8's Prometheus-style names get the same OTel-source treatment in
+> its own amendment (roadmap §4).
 
 ## 4. Alternatives considered
 

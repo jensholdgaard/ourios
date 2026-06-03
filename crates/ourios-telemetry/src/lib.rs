@@ -129,6 +129,13 @@ fn resource(service_name: &str) -> Resource {
 /// Build the OTLP push `MeterProvider`, install it as the process-
 /// global provider, and return the [`TelemetryGuard`] that owns it.
 ///
+/// Call this **once**, at process start-up: it is the bootstrap entry
+/// point, not a reconfiguration API. OpenTelemetry's `set_meter_provider` is
+/// last-wins, so a second call replaces the global provider and leaks
+/// the prior pipeline's periodic-reader thread. `ourios-server` owns
+/// the single call; tests use [`init_in_memory`] or build a provider
+/// directly.
+///
 /// Must run inside a tokio runtime: the gRPC (tonic) OTLP exporter and
 /// the periodic reader export on it.
 ///
@@ -163,6 +170,15 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
 /// `MeterProvider::force_flush`, then read `get_finished_metrics()` to
 /// assert what was produced — no OTLP endpoint required. Runs inside a
 /// tokio runtime (the periodic reader's export path).
+///
+/// This installs the **process-global** provider, so tests that call
+/// it share global state: run them serially (or one per test binary),
+/// not concurrently with other telemetry tests. OpenTelemetry exposes no
+/// primitive to restore a previously-installed global provider, so the
+/// returned guard's `Drop` shuts the pipeline down but cannot reinstate
+/// an earlier global. For a fully isolated test, skip the global and
+/// build a provider directly, reading through `provider.meter(...)`
+/// (as this crate's own unit test does).
 ///
 /// Returns the guard plus the exporter to collect from.
 #[cfg(feature = "testing")]

@@ -1,0 +1,41 @@
+groups:
+  - id: registry.ourios
+    type: attribute_group
+    display_name: Ourios attributes
+    brief: Attributes shared across Ourios telemetry.
+    attributes:
+      - id: ourios.tenant
+        type: string
+        stability: development
+        brief: The tenant the telemetry pertains to.
+        examples: ["acme", "t-0042"]
+      - id: ourios.io.direction
+        type:
+          members:
+            - id: read
+              value: "read"
+              stability: development
+              brief: Bytes read from input files.
+            - id: write
+              value: "write"
+              stability: development
+              brief: Bytes written to the consolidated file.
+        stability: development
+        brief: The I/O direction (mirrors `disk.io.direction`).
+      - id: ourios.compaction.result
+        type:
+          members:
+            - id: committed
+              value: "committed"
+              stability: development
+              brief: A consolidation was committed.
+            - id: noop
+              value: "noop"
+              stability: development
+              brief: A candidate that consolidated nothing.
+            - id: error
+              value: "error"
+              stability: development
+              brief: A partition skipped due to an error (resilient sweep).
+        stability: development
+        brief: The outcome of a compaction sweep or partition.

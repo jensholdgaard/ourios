@@ -207,15 +207,90 @@ back-compatible). Both are recorded as resolved decisions in §7.
 
 ### 3.6 Audit + observability
 
-Every compaction emits an **audit event** (RFC 0005 §3.7 audit
-stream) recording the input file set, the output file, and row count
-in/out — the same "nothing happens silently to stored data" stance as
-template merges (`CLAUDE.md` §3.1). Metrics (OTel meters per
-`CLAUDE.md` §6.3 observability): `compactions_total`,
-`files_compacted_total`,
-`compaction_bytes_in`/`_out`, `compaction_lag_seconds` (sealed-but-
-uncompacted backlog), and the **H4 detection metric** — a per-tenant
-file-size histogram and a file-count-vs-bytes-ingested ratio.
+#### Audit event
+
+Every committed compaction emits an **audit event** to the RFC 0005
+§3.7 audit stream — the "nothing happens silently to stored data"
+stance applied to file lifecycle (`CLAUDE.md` §3.1), the same way a
+template merge is audited. The event records the partition, the input
+file set, the consolidated output file, the row count (which must be
+conserved, RFC0009.2), and the committed manifest generation.
+
+> **Open question (§7):** the existing audit schema (RFC 0005 §3.7) is
+> shaped for *template* events — `event_kind` is a bounded ordinal
+> mapping with no compaction member, and the template-specific columns
+> (`old_template`, `positions_widened`, …) are **non-nullable**. A
+> compaction event can reuse the common envelope (`tenant_id`,
+> `timestamp`, `event_kind` / `event_type`, `reason`) but (a) needs a
+> new `compaction` member in the `event_kind` mapping and (b) has no
+> applicable value for the non-nullable template columns, nor a place
+> for the file set / generation. This is an implementation detail to
+> settle when the compaction audit-emit code lands — not a design
+> blocker, so it does not gate `red` (tracked in §7). The two routes:
+>
+> - **structured `reason`** — carry the file set / generation as a
+>   structured `reason` payload. Avoids new columns, but still needs
+>   the `event_kind` member *and* forces placeholder values into the
+>   non-nullable template columns (or making them nullable, which is
+>   itself a schema change), so "no schema change" is not quite free.
+> - **additive OPTIONAL columns** — add OPTIONAL compaction columns
+>   and relax the template columns to OPTIONAL (an RFC 0005 §3.8
+>   additive, back-compatible amendment); old readers ignore unknown
+>   columns per RFC 0005 §3.9.
+>
+> The non-nullability tilts this toward the additive route; settle it
+> against RFC 0005 §3.7 when that code lands, not here.
+
+#### Metrics (OpenTelemetry semantic conventions)
+
+Instrumented as **OpenTelemetry meters** and exported via the **OTel
+SDK's OTLP metric exporter** (push over OTLP to a collector /
+endpoint) — the OTel SDK pipeline end-to-end. No `prometheus` client
+crate and no Prometheus scrape endpoint (maintainer direction,
+2026-06-03, superseding the earlier `opentelemetry-prometheus`
+exporter note in roadmap §5; any Prometheus compatibility is a
+downstream collector concern, not Ourios's). The names below follow
+the OTel metric-naming guidelines — dotted/namespaced, no
+`_total`/unit suffixes, UCUM units (including UCUM curly-brace
+**annotations** such as `{sweep}` / `{file}` for dimensionless counts,
+which annotate the unit `1`), dimensions as attributes — and are
+exported **verbatim** over OTLP (no exporter-side name mangling).
+
+| Metric | Instrument | Unit | Attributes | Source |
+|---|---|---|---|---|
+| `ourios.compaction.sweeps` | Counter | `{sweep}` | `ourios.compaction.result` | RFC 0009 §3.2 |
+| `ourios.compaction.partitions` | Counter | `{partition}` | — | partitions consolidated |
+| `ourios.compaction.files` | Counter | `{file}` | — | input files merged away (H4) |
+| `ourios.compaction.rows` | Counter | `{row}` | — | rows rewritten (RFC0009.2) |
+| `ourios.compaction.io` | Counter | `By` | `ourios.io.direction` | bytes read / written |
+| `ourios.compaction.duration` | Histogram | `s` | `ourios.compaction.result` | sweep wall-clock |
+| `ourios.compaction.orphan.files` | Counter | `{file}` | — | inputs left un-GC'd (`gc_failures`) |
+| `ourios.compaction.backlog` | UpDownCounter | `{partition}` | `ourios.tenant` | sealed-but-uncompacted (lag) |
+| `ourios.storage.parquet.file.size` | Histogram | `By` | `ourios.tenant` | **H4 detector** — alert when > 5 % of files < 128 MiB |
+
+Attributes (namespaced per the conventions):
+
+- `ourios.tenant` (string) — tenant id. Cardinality is bounded by the
+  tenant count; on the per-file-size histogram it is the dimension H4
+  detection needs ("*per-tenant* file-size histogram").
+- `ourios.io.direction` (string, `read` | `write`) — mirrors
+  `disk.io.direction`; one `io` counter with a direction attribute
+  rather than two `_in`/`_out` metrics.
+- `ourios.compaction.result` (string, `committed` | `noop` | `error`)
+  — sweep / partition outcome (`noop` = candidate that consolidated
+  nothing; `error` = a partition skipped per the resilient sweep).
+
+The H4 "file-count grows sub-linearly with bytes" signal is a derived
+alert over `ourios.storage.parquet.file.size` (count) and ingested
+bytes, not a base metric.
+
+> **Validation gate.** This set is the OpenTelemetry semantic-
+> conventions **registry** at `semconv/registry/`, validated by
+> `weaver registry check` in CI (the `semconv` job, a required check)
+> — so the names/units/attributes stay spec-adherent and can't drift.
+> Compaction is the first place these conventions are pinned; RFC 0001
+> §6.8's Prometheus-style names get the same OTel-source treatment in
+> its own amendment (roadmap §5).
 
 ## 4. Alternatives considered
 
@@ -370,6 +445,16 @@ history is legible):
   or simpler given lower volume?
 - [ ] **Retention/expiry interplay** — explicitly deferred; note the
   seam so a later TTL RFC composes with the manifest.
+- [ ] **Audit-event shape (§3.6).** Carry the compaction file set /
+  generation in a structured `reason` payload vs. OPTIONAL audit
+  columns (RFC 0005 §3.8 additive amendment). Per §3.6 the template
+  columns are non-nullable and `event_kind` has no compaction member,
+  so the structured-`reason` route is not schema-free either; leaning
+  the **additive OPTIONAL** route.
+- [ ] **Metric semconv validation (§3.6).** Run the §3.6 metric
+  names/units/attributes through the OpenTelemetry semantic-conventions
+  check (OTel assistant / `weaver` / rego policy packages) and fix any
+  divergence before instrumentation lands.
 
 ## 8. References
 

@@ -4,9 +4,10 @@
 //! select its sealed candidate partitions and consolidate them. It is
 //! synchronous (blocking filesystem + Parquet work) and deterministic,
 //! so it's the unit the tests exercise. [`Compactor::run`] is the thin
-//! daemon: it calls `run_sweep` on a fixed cadence via `spawn_blocking`
-//! and hands each result to a caller-supplied observer (metrics/log
-//! wiring is a later slice).
+//! daemon: it calls `run_sweep` on a fixed cadence via `spawn_blocking`,
+//! records the RFC 0009 §3.6 metrics for each sweep
+//! ([`crate::metrics::CompactionMetrics`]), and hands each result to a
+//! caller-supplied observer for logging.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};

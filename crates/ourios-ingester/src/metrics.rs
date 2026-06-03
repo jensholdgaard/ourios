@@ -35,30 +35,48 @@ pub struct CompactionMetrics {
 }
 
 impl CompactionMetrics {
-    /// Build the instruments on the `ourios.compaction` meter, seeding
-    /// each counter with a zero measurement so the full set is visible
-    /// to the exporter before the first sweep records anything (RFC 0001
-    /// §6.8 collect-on-read). The histogram is intentionally **not**
-    /// seeded: a synthetic `record(0)` would distort its distribution;
-    /// it surfaces on the first real sweep.
+    /// Build the instruments on the `ourios.compaction` meter, with the
+    /// UCUM units the registry (`semconv/registry/metrics.yaml`)
+    /// declares for each.
+    ///
+    /// The attribute-free counters are seeded with a zero measurement so
+    /// they are visible to the exporter before the first sweep records
+    /// anything (RFC 0001 §6.8 collect-on-read). `sweeps` and `duration`
+    /// are **not** seeded: their `ourios.compaction.result` attribute is
+    /// *required* (a `add(0, &[])` would emit a point missing it), and a
+    /// histogram `record(0)` would distort the distribution — both
+    /// surface on the first sweep with a real `result`.
     #[must_use]
     pub fn new() -> Self {
         let meter = global::meter("ourios.compaction");
-        let sweeps = meter.u64_counter(semconv::OURIOS_COMPACTION_SWEEPS).build();
+        let sweeps = meter
+            .u64_counter(semconv::OURIOS_COMPACTION_SWEEPS)
+            .with_unit("{sweep}")
+            .build();
         let partitions = meter
             .u64_counter(semconv::OURIOS_COMPACTION_PARTITIONS)
+            .with_unit("{partition}")
             .build();
-        let files = meter.u64_counter(semconv::OURIOS_COMPACTION_FILES).build();
-        let rows = meter.u64_counter(semconv::OURIOS_COMPACTION_ROWS).build();
+        let files = meter
+            .u64_counter(semconv::OURIOS_COMPACTION_FILES)
+            .with_unit("{file}")
+            .build();
+        let rows = meter
+            .u64_counter(semconv::OURIOS_COMPACTION_ROWS)
+            .with_unit("{row}")
+            .build();
         let orphan_files = meter
             .u64_counter(semconv::OURIOS_COMPACTION_ORPHAN_FILES)
+            .with_unit("{file}")
             .build();
         let duration = meter
             .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
             .with_unit("s")
             .build();
 
-        for counter in [&sweeps, &partitions, &files, &rows, &orphan_files] {
+        // Only the attribute-free counters; `sweeps` carries a required
+        // `result` attribute, so it is not zero-seeded here.
+        for counter in [&partitions, &files, &rows, &orphan_files] {
             counter.add(0, &[]);
         }
 

@@ -596,9 +596,11 @@ the **baseline** schema; subsequent changes follow these rules:
    (b) the rows that exercise the `NULL` belong to a kind
    introduced *by the same amendment*, so no previously-deployed
    reader is expected to read them. The reverse (`OPTIONAL` →
-   `REQUIRED`, a tightening) is forbidden in-place: it is rule 3
-   (a contract change old files can violate). First applied by
-   the 2026-06-03 compaction-audit amendment (§3.7).
+   `REQUIRED`, a tightening) is forbidden in-place — older files
+   may already store `NULL`, which a `REQUIRED` column cannot
+   represent — and, like rules 2 and 3, takes the add-new-column /
+   migrate / drop path. First applied by the 2026-06-03
+   compaction-audit amendment (§3.7).
 
 The PR description that touches the schema must explicitly call
 out which rule above applies, mirroring the `CLAUDE.md` §4

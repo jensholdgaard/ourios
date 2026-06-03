@@ -188,6 +188,11 @@ impl Compactor {
         F: FnMut(Result<SweepReport, IngestError>),
     {
         let mut ticker = tokio::time::interval(self.interval);
+        // A maintenance sweep that overruns `interval` must not make
+        // the next ticks fire back-to-back (the default `Burst`) —
+        // that would pile sustained compaction load after any slow
+        // pass. `Delay` keeps a full `interval` gap between sweeps.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let bucket = self.bucket_root.clone();
@@ -335,10 +340,14 @@ mod tests {
 
     #[test]
     fn run_executes_sweeps_until_cancelled() {
-        // Arrange — a sealed candidate (wall-clock `now` is well past
-        // 2026-04-02, so it's sealed under real time too).
+        // Arrange — a sealed candidate placed ~3h before the real wall
+        // clock (floored to the hour so both files share a partition),
+        // so it is sealed under `now_unix_nanos()` regardless of the
+        // date the suite runs.
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
+        let hour_start = (now_unix_nanos().saturating_sub(3 * HOUR) / HOUR) * HOUR;
+        write_file(bucket.path(), "a", 1, hour_start + 1_000_000);
+        write_file(bucket.path(), "a", 2, hour_start + 2_000_000);
         let compactor = Compactor::new(
             bucket.path(),
             CompactionPolicy::default(),

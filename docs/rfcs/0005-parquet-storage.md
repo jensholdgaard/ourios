@@ -414,7 +414,7 @@ originals land, and those *are* unbounded by construction.
 
 ### 3.7 Audit-event file schema
 
-The audit stream carries the template events RFC 0001 §6.4 names —
+The audit stream carries the template events that RFC 0001 §6.4 names —
 `TemplateWidened`, `TemplateTypeExpanded`,
 `TemplateWideningRejectedDegenerate` — plus, per the 2026-06-03
 amendment below, the `Compaction` event of RFC 0009 §3.6, each with

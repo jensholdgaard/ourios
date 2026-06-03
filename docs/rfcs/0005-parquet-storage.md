@@ -478,9 +478,15 @@ add-new-column / migrate / drop).
 >    the template kinds.
 >
 > The RFC 0009 §7 fork (structured `reason` vs additive columns) is
-> resolved here in favour of explicit columns: they are queryable
-> (predicate-pushdown for "which compactions touched file X /
-> generation N"), where a JSON blob in `reason` would not be.
+> resolved here in favour of explicit columns: they are first-class
+> queryable columns where a JSON blob in `reason` would be opaque to
+> the query engine. The scalar ones (`compaction_partition`,
+> `compaction_output_file`, `compaction_generation`) support
+> predicate-pushdown (row-group skipping via min/max, e.g. "which
+> compaction committed generation N"); `compaction_input_files` is a
+> queryable `LIST` (row-level array-containment filters), not
+> stats-pushdown-indexed but still first-class — versus unparseable
+> inside a `reason` blob.
 
 The row-level audit columns are:
 

@@ -27,6 +27,7 @@
 
 pub mod audit_reader;
 pub mod audit_record_batch;
+pub mod audit_sink;
 pub mod audit_writer;
 pub mod compaction;
 pub mod manifest;
@@ -37,6 +38,7 @@ pub mod writer;
 
 pub use audit_reader::{AuditReader, AuditReaderError};
 pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
+pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile};
 pub use compaction::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, compact_partition,

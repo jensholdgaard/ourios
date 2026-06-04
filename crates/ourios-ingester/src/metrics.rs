@@ -153,6 +153,7 @@ mod tests {
             rows_compacted: 100,
             gc_failures: 1,
             errors: Vec::new(),
+            compaction_events: Vec::new(),
         };
 
         // Act

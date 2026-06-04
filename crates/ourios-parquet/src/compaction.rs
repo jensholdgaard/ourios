@@ -49,6 +49,9 @@ pub struct Committed {
     pub file: String,
     /// Manifest generation the consolidation was committed at.
     pub generation: u64,
+    /// Names of the input files merged away (the pre-compaction live
+    /// set). Surfaced for the RFC 0009 §3.6 compaction audit event.
+    pub input_files: Vec<String>,
 }
 
 /// Policy controlling which sealed partitions [`plan_candidates`]
@@ -224,6 +227,13 @@ pub fn compact_partition(
 
     // Commit: swap the manifest to name only the consolidated file.
     generation += 1;
+    // The input file names (the merged-away set) for the §3.6 audit
+    // event — captured before the GC loop removes the files (names are
+    // stable regardless). Sorted so the audit event is deterministic
+    // regardless of the `live_files` read-dir order (the consolidation
+    // itself reads `inputs` in their original order).
+    let mut input_files = file_names(&inputs)?;
+    input_files.sort();
     Manifest {
         generation,
         files: vec![consolidated.clone()],
@@ -251,6 +261,7 @@ pub fn compact_partition(
         committed: Some(Committed {
             file: consolidated,
             generation,
+            input_files,
         }),
         gc_failures,
     })

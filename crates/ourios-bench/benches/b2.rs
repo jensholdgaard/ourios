@@ -105,6 +105,7 @@ fn template_exact(template_id: u64) -> QueryRequest {
         tenant: TenantId::new("a"),
         time_range: None,
         template_id: Some(template_id),
+        severity_text: None,
     }
 }
 

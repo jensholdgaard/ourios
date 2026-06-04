@@ -98,6 +98,29 @@ fn req(tenant: &str, time_range: Option<(u64, u64)>, template_id: Option<u64>) -
         tenant: TenantId::new(tenant),
         time_range,
         template_id,
+        severity_text: None,
+    }
+}
+
+/// A record with an explicit severity (for the B1 `level='ERROR'`
+/// query shape) — `severity_text` and the canonical OTLP
+/// `severity_number` are set coherently, so a fixture keyed off
+/// either column agrees — otherwise identical to [`rec`].
+fn rec_sev(tenant: &str, template_id: u64, ts_ns: u64, severity: &str) -> MinedRecord {
+    // OTLP severity-number ranges (lower bound of each band).
+    let severity_number: u8 = match severity {
+        "TRACE" => 1,
+        "DEBUG" => 5,
+        "INFO" => 9,
+        "WARN" => 13,
+        "ERROR" => 17,
+        "FATAL" => 21,
+        _ => 0, // UNSPECIFIED
+    };
+    MinedRecord {
+        severity_text: Some(severity.to_string()),
+        severity_number,
+        ..rec(tenant, template_id, ts_ns)
     }
 }
 
@@ -237,6 +260,47 @@ async fn rfc0007_1_pushdown_prunes_row_groups() {
     assert!(
         r.stats.bytes_read > 0,
         "the scanned row group reads bytes; stats={:?}",
+        r.stats,
+    );
+}
+
+/// RFC0007.1 (B1) — the `level='ERROR'` query shape. A
+/// `severity_text = 'ERROR'` filter both counts correctly and
+/// prunes via Parquet statistics: an INFO-only file in another hour
+/// has a `severity_text` min/max that can't satisfy `= 'ERROR'`, so
+/// its row group is skipped. This is the structured predicate that
+/// the B1 reference (`zstdcat | grep ERROR`) does by scanning.
+#[tokio::test]
+async fn rfc0007_1_severity_filter_counts_and_prunes() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    // hour 10: two ERROR rows + one INFO row (mixed file).
+    write_all(
+        bucket.path(),
+        &[
+            rec_sev("a", 1, TS0, "ERROR"),
+            rec_sev("a", 1, TS0 + 1_000_000, "ERROR"),
+            rec_sev("a", 1, TS0 + 2_000_000, "INFO"),
+        ],
+    );
+    // hour 11: an INFO-only file ⇒ its row group's severity_text
+    // min/max is INFO..INFO, which `= 'ERROR'` can prune.
+    write_all(bucket.path(), &[rec_sev("a", 1, TS0 + HOUR_NS, "INFO")]);
+
+    let q = Querier::new(bucket.path());
+    let r = q
+        .run(QueryRequest {
+            tenant: TenantId::new("a"),
+            time_range: None,
+            template_id: None,
+            severity_text: Some("ERROR".to_string()),
+        })
+        .await
+        .expect("severity query");
+
+    assert_eq!(r.rows, 2, "only the two ERROR rows match");
+    assert!(
+        r.stats.row_groups_pruned >= 1,
+        "the INFO-only file's row group is pruned by severity_text stats; stats={:?}",
         r.stats,
     );
 }

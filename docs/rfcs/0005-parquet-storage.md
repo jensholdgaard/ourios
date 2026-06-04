@@ -480,13 +480,15 @@ add-new-column / migrate / drop).
 > The RFC 0009 §7 fork (structured `reason` vs additive columns) is
 > resolved here in favour of explicit columns: they are first-class
 > queryable columns where a JSON blob in `reason` would be opaque to
-> the query engine. The scalar ones (`compaction_partition`,
-> `compaction_output_file`, `compaction_generation`) support
-> predicate-pushdown (row-group skipping via min/max, e.g. "which
-> compaction committed generation N"); `compaction_input_files` is a
-> queryable `LIST` (row-level array-containment filters), not
-> stats-pushdown-indexed but still first-class — versus unparseable
-> inside a `reason` blob.
+> the query engine. The low-cardinality scalars
+> (`compaction_partition`, `compaction_generation`) support
+> predicate-pushdown — row-group skipping via min/max, e.g. "which
+> compaction committed generation N". `compaction_output_file` and
+> the `compaction_input_files` `LIST` are high-entropy UUID names:
+> queryable first-class (equality / array-containment filters) but
+> *not* stats-pushdown-indexed, consistent with their
+> no-dictionary / no-index encoding policy below — still far better
+> than being unparseable inside a `reason` blob.
 
 The row-level audit columns are:
 

@@ -8,12 +8,10 @@ members = [
     "crates/ourios-parquet",
     "crates/ourios-querier",
     "crates/ourios-semconv",
+    "crates/ourios-server",
     "crates/ourios-telemetry",
     "crates/ourios-wal",
 ]
-
-# Remaining members per CLAUDE.md §7 layout will be added as crates land:
-#   crates/ourios-server
 
 [workspace.package]
 edition = "2024"

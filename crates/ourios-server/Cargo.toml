@@ -1,0 +1,28 @@
+[package]
+name = "ourios-server"
+version = "0.0.0"
+description = "Ourios server binary (CLAUDE.md §1, §7). Currently runs the background compaction role (RFC 0009 §3.2) with OTLP metrics + durable audit."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "ourios-server"
+path = "src/main.rs"
+
+[dependencies]
+# The background compaction daemon (RFC 0009 §3.2).
+ourios-ingester = { path = "../ourios-ingester" }
+# Durable compaction-audit sink (RFC 0005 §3.7) + the compaction policy.
+ourios-parquet = { path = "../ourios-parquet" }
+# OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8).
+ourios-telemetry = { path = "../ourios-telemetry" }
+# Async runtime: `rt-multi-thread` for the compactor's `spawn_blocking`
+# sweeps, `signal` for SIGINT graceful shutdown, `macros` for
+# `#[tokio::main]`.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }
+
+[lints]
+workspace = true

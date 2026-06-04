@@ -12,8 +12,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
+use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    CompactionError, CompactionPolicy, compact_partition, percent_decode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionPolicy, PartitionKey, compact_partition,
+    percent_decode_tenant, plan_candidates,
 };
 
 use crate::metrics::CompactionMetrics;
@@ -82,6 +85,10 @@ pub struct SweepReport {
     /// persistent error would starve every later tenant, since the
     /// daemon just retries the same sweep next tick).
     pub errors: Vec<String>,
+    /// One [`AuditPayload::Compaction`] audit event per committed
+    /// compaction (RFC 0009 §3.6 / RFC 0005 §3.7). Built here;
+    /// [`Compactor::run`] emits them through its [`AuditSink`].
+    pub compaction_events: Vec<AuditEvent>,
 }
 
 /// Run one compaction sweep over `bucket_root`, as of wall-clock
@@ -117,10 +124,17 @@ pub fn run_sweep(
         for partition in candidates {
             match compact_partition(bucket_root, &partition) {
                 Ok(outcome) => {
-                    if outcome.committed.is_some() {
+                    if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
                         report.files_compacted += to_u64(outcome.files_before);
                         report.rows_compacted += outcome.rows;
+                        report.compaction_events.push(compaction_audit_event(
+                            &tenant,
+                            now_unix_nanos,
+                            &partition,
+                            committed,
+                            outcome.rows,
+                        ));
                     }
                     report.gc_failures += outcome.gc_failures;
                 }
@@ -185,16 +199,32 @@ fn tenants(bucket_root: &Path) -> Result<Vec<String>, IngestError> {
 /// Background compaction daemon (RFC 0009 §3.2): sweeps the store on a
 /// fixed cadence. Hosted in the ingester role so it never lands on the
 /// ack-latency hot path.
-#[derive(Debug, Clone)]
 pub struct Compactor {
     bucket_root: PathBuf,
     policy: CompactionPolicy,
     interval: Duration,
+    /// Where committed-compaction audit events go (RFC 0009 §3.6).
+    /// Defaults to [`NoOpAuditSink`]; set via [`Self::with_audit_sink`]
+    /// (the WAL-backed sink replaces it once `ourios-wal` lands).
+    audit_sink: Box<dyn AuditSink>,
+}
+
+impl std::fmt::Debug for Compactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `AuditSink` is not `Debug`; name it without its contents.
+        f.debug_struct("Compactor")
+            .field("bucket_root", &self.bucket_root)
+            .field("policy", &self.policy)
+            .field("interval", &self.interval)
+            .field("audit_sink", &"Box<dyn AuditSink>")
+            .finish()
+    }
 }
 
 impl Compactor {
     /// A compactor sweeping `bucket_root` every `interval` under
-    /// `policy`.
+    /// `policy`, dropping audit events ([`NoOpAuditSink`]) until a sink
+    /// is set via [`Self::with_audit_sink`].
     pub fn new(
         bucket_root: impl Into<PathBuf>,
         policy: CompactionPolicy,
@@ -204,7 +234,15 @@ impl Compactor {
             bucket_root: bucket_root.into(),
             policy,
             interval,
+            audit_sink: Box::new(NoOpAuditSink::new()),
         }
+    }
+
+    /// Route committed-compaction audit events to `sink`.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Box<dyn AuditSink>) -> Self {
+        self.audit_sink = sink;
+        self
     }
 
     /// Run sweeps forever, one per `interval` tick. Each sweep runs on
@@ -221,7 +259,7 @@ impl Compactor {
     /// Panics only if a sweep task itself panics — `run_sweep` returns
     /// errors rather than panicking, so this signals a bug, surfaced
     /// loudly rather than silently stalling the daemon.
-    pub async fn run<F>(self, mut on_sweep: F)
+    pub async fn run<F>(mut self, mut on_sweep: F)
     where
         F: FnMut(Result<SweepReport, IngestError>),
     {
@@ -246,6 +284,13 @@ impl Compactor {
             .await
             .expect("compaction sweep task should not panic");
             metrics.record_sweep(&result, elapsed);
+            // Emit the committed-compaction audit events on this (the
+            // async) task — the sink stays off the blocking pool.
+            if let Ok(report) = &result {
+                for event in &report.compaction_events {
+                    self.audit_sink.emit(event.clone());
+                }
+            }
             on_sweep(result);
         }
     }
@@ -255,6 +300,33 @@ impl Compactor {
 /// than truncating on a theoretically wider target).
 pub(crate) fn to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Build the RFC 0009 §3.6 audit event for a committed compaction
+/// (RFC 0005 §3.7 `AuditPayload::Compaction`). The event timestamp is
+/// the sweep's wall clock; the partition is the canonical
+/// `year=…/month=…/day=…/hour=…` key (RFC 0005 §3.4).
+fn compaction_audit_event(
+    tenant: &str,
+    now_unix_nanos: u64,
+    partition: &PartitionKey,
+    committed: &Committed,
+    rows: u64,
+) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: SystemTime::UNIX_EPOCH + Duration::from_nanos(now_unix_nanos),
+        payload: AuditPayload::Compaction {
+            partition: format!(
+                "year={:04}/month={:02}/day={:02}/hour={:02}",
+                partition.year, partition.month, partition.day, partition.hour,
+            ),
+            input_files: committed.input_files.clone(),
+            output_file: committed.file.clone(),
+            generation: committed.generation,
+            rows,
+        },
+    }
 }
 
 /// `SystemTime::now()` as Unix nanoseconds (`0` if the clock is before
@@ -344,6 +416,42 @@ mod tests {
             report.files_compacted, 2,
             "both input files are merged away (the H4 signal)"
         );
+    }
+
+    #[test]
+    fn sweep_emits_a_compaction_audit_event() {
+        // Arrange
+        let bucket = tempfile::tempdir().expect("temp");
+        write_sealed_candidate(bucket.path(), "a");
+
+        // Act
+        let report =
+            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+
+        // Assert — one RFC 0009 §3.6 compaction audit event, carrying
+        // the partition / input set / output / generation / rows.
+        assert_eq!(report.compaction_events.len(), 1);
+        let event = &report.compaction_events[0];
+        assert_eq!(event.tenant_id, TenantId::new("a"));
+        let AuditPayload::Compaction {
+            partition,
+            input_files,
+            output_file,
+            generation,
+            rows,
+        } = &event.payload
+        else {
+            panic!("expected Compaction payload, got {:?}", event.payload);
+        };
+        // TS0 = 2026-04-02T10:58:00Z → hour 10.
+        assert_eq!(partition, "year=2026/month=04/day=02/hour=10");
+        assert_eq!(input_files.len(), 2, "two inputs merged away");
+        assert!(
+            output_file.ends_with(".parquet") && !input_files.contains(output_file),
+            "output is the new consolidated file, distinct from the inputs",
+        );
+        assert_eq!(*generation, 2, "bootstrap gen 1, commit gen 2");
+        assert_eq!(*rows, 2);
     }
 
     #[test]

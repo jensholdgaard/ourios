@@ -229,8 +229,11 @@ pub fn compact_partition(
     generation += 1;
     // The input file names (the merged-away set) for the §3.6 audit
     // event — captured before the GC loop removes the files (names are
-    // stable regardless).
-    let input_files = file_names(&inputs)?;
+    // stable regardless). Sorted so the audit event is deterministic
+    // regardless of the `live_files` read-dir order (the consolidation
+    // itself reads `inputs` in their original order).
+    let mut input_files = file_names(&inputs)?;
+    input_files.sort();
     Manifest {
         generation,
         files: vec![consolidated.clone()],

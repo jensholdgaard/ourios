@@ -315,7 +315,12 @@ fn compaction_audit_event(
 ) -> AuditEvent {
     AuditEvent {
         tenant_id: TenantId::new(tenant),
-        timestamp: SystemTime::UNIX_EPOCH + Duration::from_nanos(now_unix_nanos),
+        // `checked_add` so a saturated `now_unix_nanos` (year ~2554,
+        // unreachable in practice — see `now_unix_nanos`) can't panic;
+        // falls back to the epoch rather than aborting a sweep.
+        timestamp: SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_nanos(now_unix_nanos))
+            .unwrap_or(SystemTime::UNIX_EPOCH),
         payload: AuditPayload::Compaction {
             partition: format!(
                 "year={:04}/month={:02}/day={:02}/hour={:02}",

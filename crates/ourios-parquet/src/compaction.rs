@@ -40,6 +40,15 @@ pub struct CompactionOutcome {
     /// are *counted*, not fatal: a post-commit cleanup failure must
     /// not report a successful compaction as failed.
     pub gc_failures: usize,
+    /// Total bytes of the live input files read (`0` on a no-op) — the
+    /// read volume for `ourios.compaction.io` (RFC 0009 §3.6).
+    pub bytes_read: u64,
+    /// Size in bytes of the consolidated output file (`0` on a no-op) —
+    /// the write volume for `ourios.compaction.io` and the sample for
+    /// the `ourios.storage.parquet.file.size` H4 detector (RFC 0009
+    /// §3.6). Best-effort: a `stat` failure on a file we just wrote or
+    /// read records `0` rather than failing a committed compaction.
+    pub bytes_written: u64,
 }
 
 /// The committed result of a compaction.
@@ -172,6 +181,8 @@ pub fn compact_partition(
             rows: 0,
             committed: None,
             gc_failures: 0,
+            bytes_read: 0,
+            bytes_written: 0,
         });
     }
 
@@ -208,7 +219,9 @@ pub fn compact_partition(
     let mut writer =
         Writer::open(bucket_root, partition.clone()).map_err(CompactionError::Write)?;
     let mut row_count: u64 = 0;
+    let mut bytes_read: u64 = 0;
     for file in &inputs {
+        bytes_read = bytes_read.saturating_add(file_len(file));
         let reader =
             Reader::open_partition(file, partition.clone()).map_err(CompactionError::Read)?;
         let records = reader.read_all().map_err(CompactionError::Read)?;
@@ -218,6 +231,7 @@ pub fn compact_partition(
             .map_err(CompactionError::Write)?;
     }
     let written = writer.close().map_err(CompactionError::Write)?;
+    let bytes_written = file_len(&written.path);
     let consolidated = written
         .path
         .file_name()
@@ -264,7 +278,17 @@ pub fn compact_partition(
             input_files,
         }),
         gc_failures,
+        bytes_read,
+        bytes_written,
     })
+}
+
+/// On-disk size of `path` in bytes, best-effort: a `stat` failure
+/// yields `0`. Used only for `ourios.compaction.io` /
+/// `ourios.storage.parquet.file.size` volume — a metric inaccuracy on
+/// a file we just wrote or read must never fail a committed compaction.
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 /// Select the `tenant`'s sealed partitions that are worth compacting
@@ -645,6 +669,46 @@ mod tests {
             .read_all()
             .expect("read");
         assert_eq!(rows.len(), 5, "every row preserved");
+    }
+
+    #[test]
+    fn reports_byte_volumes_for_io_and_file_size_metrics() {
+        // Arrange — two committed files in one partition.
+        let bucket = tempfile::tempdir().expect("temp");
+        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
+        let dir = partition().data_path(bucket.path());
+
+        // Act
+        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+
+        // Assert — read volume covers both inputs, write volume is the
+        // (sole, live) consolidated file's actual on-disk size.
+        let committed = outcome.committed.expect("committed");
+        let live = live_files(&dir).expect("live");
+        assert_eq!(live.len(), 1, "one consolidated file remains live");
+        let on_disk = std::fs::metadata(&live[0]).expect("stat").len();
+        assert!(outcome.bytes_read > 0, "read volume is recorded");
+        assert_eq!(
+            outcome.bytes_written, on_disk,
+            "write volume is the consolidated file's byte size"
+        );
+        assert!(live[0].ends_with(&committed.file));
+    }
+
+    #[test]
+    fn no_op_reports_zero_byte_volumes() {
+        // Arrange — one file: a no-op, nothing read or written.
+        let bucket = tempfile::tempdir().expect("temp");
+        write_file(bucket.path(), &[rec(1, TS0)]);
+
+        // Act
+        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+
+        // Assert
+        assert!(outcome.committed.is_none());
+        assert_eq!(outcome.bytes_read, 0);
+        assert_eq!(outcome.bytes_written, 0);
     }
 
     #[test]

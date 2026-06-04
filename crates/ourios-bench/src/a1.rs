@@ -484,22 +484,24 @@ mod tests {
     /// audit layout contract.
     #[test]
     fn audit_partition_collapses_same_day_hours() {
-        use ourios_core::audit::AuditEventKind;
+        use ourios_core::audit::{AuditPayload, TemplateChange};
         use std::time::{Duration, UNIX_EPOCH};
 
         let make = |offset_secs: u64| AuditEvent {
-            kind: AuditEventKind::TemplateWideningRejectedDegenerate {
-                version: 1,
-                current_template: "alpha <*>".to_string(),
-                would_be_template: "<*> <*>".to_string(),
-                would_be_positions: vec![0],
-            },
             tenant_id: TenantId::new("bench-tenant"),
-            template_id: 1,
-            triggering_line_hash: [0u8; 16],
-            triggering_line_sample: None,
             // §3.3 baseline (2026-04-02T10:58:00Z) + offset.
             timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480 + offset_secs),
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: [0u8; 16],
+                triggering_line_sample: None,
+                change: TemplateChange::RejectedDegenerate {
+                    version: 1,
+                    current_template: "alpha <*>".to_string(),
+                    would_be_template: "<*> <*>".to_string(),
+                    would_be_positions: vec![0],
+                },
+            },
         };
 
         // Same day, ~2 hours apart (10:58 vs 12:58).

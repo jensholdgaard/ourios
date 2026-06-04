@@ -51,7 +51,7 @@ fn rfc0001_1_fresh_leaf_creation_does_not_emit_audit_event() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
-    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
+    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -120,20 +120,29 @@ fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
     let events = sink.drain();
     assert_eq!(events.len(), 2);
     assert!(
-        matches!(events[0].kind, AuditEventKind::TemplateWidened { .. }),
-        "event 0: expected TemplateWidened, got {:?}",
-        events[0].kind,
+        matches!(
+            events[0].payload,
+            AuditPayload::Template {
+                change: TemplateChange::Widened { .. },
+                ..
+            }
+        ),
+        "event 0: expected Template/Widened, got {:?}",
+        events[0].payload,
     );
     // Rejection audit's `would_be_template` records what the
     // widening *would* have produced, so an operator inspecting
     // the event sees the degenerate shape that was avoided.
-    let AuditEventKind::TemplateWideningRejectedDegenerate {
-        would_be_template, ..
-    } = &events[1].kind
+    let AuditPayload::Template {
+        change: TemplateChange::RejectedDegenerate {
+            would_be_template, ..
+        },
+        ..
+    } = &events[1].payload
     else {
         panic!(
-            "event 1: expected TemplateWideningRejectedDegenerate, got {:?}",
-            events[1].kind,
+            "event 1: expected Template/RejectedDegenerate, got {:?}",
+            events[1].payload,
         );
     };
     assert_eq!(would_be_template, "<*> <*> <*>");
@@ -324,7 +333,7 @@ fn rfc0001_6_bare_template_id_does_not_follow_alias_chains() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
-    use ourios_core::audit::{AuditEventKind, ParamType, SharedAuditSink};
+    use ourios_core::audit::{AuditPayload, ParamType, SharedAuditSink, TemplateChange};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -374,31 +383,39 @@ fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
         "combined attach must emit exactly two audit events",
     );
 
-    let AuditEventKind::TemplateWidened {
-        old_version: w_old,
-        new_version: w_new,
-        positions_widened,
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_version: w_old,
+                new_version: w_new,
+                positions_widened,
+                ..
+            },
         ..
-    } = &events[0].kind
+    } = &events[0].payload
     else {
         panic!(
-            "event 0 must be TemplateWidened (widening fires before expansion), got {:?}",
-            events[0].kind,
+            "event 0 must be Template/Widened (widening fires before expansion), got {:?}",
+            events[0].payload,
         );
     };
     assert_eq!((*w_old, *w_new), (2, 3), "widening bumps version 2 → 3");
     assert_eq!(*positions_widened, vec![3]);
 
-    let AuditEventKind::TemplateTypeExpanded {
-        old_version: e_old,
-        new_version: e_new,
-        slots_expanded,
+    let AuditPayload::Template {
+        change:
+            TemplateChange::TypeExpanded {
+                old_version: e_old,
+                new_version: e_new,
+                slots_expanded,
+                ..
+            },
         ..
-    } = &events[1].kind
+    } = &events[1].payload
     else {
         panic!(
-            "event 1 must be TemplateTypeExpanded, got {:?}",
-            events[1].kind,
+            "event 1 must be Template/TypeExpanded, got {:?}",
+            events[1].payload,
         );
     };
     assert_eq!(
@@ -414,7 +431,7 @@ fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
     assert_eq!(slots_expanded[0].added_types, vec![ParamType::Num]);
 
     // RFC §6.4: both events count toward merges_total via
-    // `AuditEventKind::counts_as_merge`, so the counter
+    // `TemplateChange::counts_as_merge`, so the counter
     // increments by exactly 2 across the combined attach.
     assert_eq!(
         cluster.merges_total(),

@@ -17,7 +17,7 @@
 //! | `TemplateWideningRejectedDegenerate` | `2` | `[]` | `[]` | both = `current_template` | JSON of `would_be_*` |
 //!
 //! **Rejection-variant `reason` payload.** The in-memory
-//! [`AuditEventKind::TemplateWideningRejectedDegenerate`] carries
+//! [`TemplateChange::RejectedDegenerate`] carries
 //! `would_be_template: String` and `would_be_positions: Vec<u16>`,
 //! but the §3.7 column table has no dedicated columns for them.
 //! Per §3.7, the `reason` column is "the degenerate-template
@@ -47,24 +47,20 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field};
-use ourios_core::audit::{AuditEvent, AuditEventKind, ParamType, SlotExpansion};
+use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
 
 use crate::audit_schema;
 
-/// Stable on-disk ordinals for [`AuditEventKind`] per RFC 0005
-/// §3.7's normative mapping table.
-pub const EVENT_KIND_TEMPLATE_WIDENED: u8 = 0;
-pub const EVENT_KIND_TEMPLATE_TYPE_EXPANDED: u8 = 1;
-pub const EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE: u8 = 2;
-
-/// Canonical `event_type` strings per RFC 0005 §3.7's normative
-/// mapping table. Both columns are persisted (the ordinal is the
-/// compact internal handle, the string is the predicate-pushdown
-/// surface RFC 0001 §9 names).
-pub const EVENT_TYPE_TEMPLATE_WIDENED: &str = "template_widened";
-pub const EVENT_TYPE_TEMPLATE_TYPE_EXPANDED: &str = "template_type_expanded";
-pub const EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE: &str =
-    "template_widening_rejected_degenerate";
+/// Stable on-disk `event_kind` ordinals and `event_type` strings
+/// (RFC 0005 §3.7 dual-column mapping). Canonically defined in
+/// `ourios-core`; re-exported here so the reader's ordinal match and
+/// existing call sites resolve them at their established path.
+pub use ourios_core::audit::{
+    EVENT_KIND_COMPACTION, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_COMPACTION,
+    EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
+    EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+};
 
 /// Build an Arrow `RecordBatch` matching [`audit_schema`] from a
 /// slice of [`AuditEvent`]s.
@@ -199,6 +195,11 @@ struct Builders {
     triggering_line_hash: FixedSizeBinaryBuilder,
     triggering_line_sample: StringBuilder,
     reason: StringBuilder,
+    compaction_partition: StringBuilder,
+    compaction_input_files: GenericListBuilder<i32, StringBuilder>,
+    compaction_output_file: StringBuilder,
+    compaction_generation: UInt64Builder,
+    compaction_rows: UInt64Builder,
 }
 
 impl Builders {
@@ -246,6 +247,12 @@ impl Builders {
             triggering_line_hash: FixedSizeBinaryBuilder::with_capacity(cap, 16),
             triggering_line_sample: StringBuilder::with_capacity(cap, 0),
             reason: StringBuilder::with_capacity(cap, 0),
+            compaction_partition: StringBuilder::with_capacity(cap, 0),
+            compaction_input_files: GenericListBuilder::new(StringBuilder::new())
+                .with_field(Field::new("element", DataType::Utf8, false)),
+            compaction_output_file: StringBuilder::with_capacity(cap, 0),
+            compaction_generation: UInt64Builder::with_capacity(cap),
+            compaction_rows: UInt64Builder::with_capacity(cap),
         }
     }
 
@@ -253,25 +260,65 @@ impl Builders {
         self.tenant_id.append_value(e.tenant_id.as_str());
         self.timestamp
             .append_value(system_time_to_i64_nanos(e.timestamp)?);
-        self.template_id.append_value(e.template_id);
-        self.triggering_line_hash
-            .append_value(e.triggering_line_hash)
-            .map_err(AuditBatchError::Arrow)?;
-        match e.triggering_line_sample.as_deref() {
-            Some(s) => self.triggering_line_sample.append_value(s),
-            None => self.triggering_line_sample.append_null(),
+        // event_kind / event_type are derived from the payload
+        // (RFC 0005 §3.7 dual-column storage), never stored.
+        self.event_kind.append_value(e.payload.event_kind());
+        self.event_type.append_value(e.payload.event_type());
+
+        match &e.payload {
+            AuditPayload::Template {
+                template_id,
+                triggering_line_hash,
+                triggering_line_sample,
+                change,
+            } => {
+                // Template events leave the compaction columns NULL
+                // (§3.7 amendment 2026-06-03).
+                self.append_compaction_nulls();
+                self.template_id.append_value(*template_id);
+                self.triggering_line_hash
+                    .append_value(triggering_line_hash)
+                    .map_err(AuditBatchError::Arrow)?;
+                match triggering_line_sample.as_deref() {
+                    Some(s) => self.triggering_line_sample.append_value(s),
+                    None => self.triggering_line_sample.append_null(),
+                }
+                self.append_template_change(change)?;
+            }
+            AuditPayload::Compaction {
+                partition,
+                input_files,
+                output_file,
+                generation,
+                rows,
+            } => {
+                // Compaction events leave every template-specific
+                // column NULL (§3.7 relaxed them to OPTIONAL).
+                self.append_template_nulls();
+                self.compaction_partition.append_value(partition);
+                append_string_list(&mut self.compaction_input_files, input_files);
+                self.compaction_output_file.append_value(output_file);
+                self.compaction_generation.append_value(*generation);
+                self.compaction_rows.append_value(*rows);
+            }
         }
 
-        match &e.kind {
-            AuditEventKind::TemplateWidened {
+        Ok(())
+    }
+
+    /// Append the template-change-specific columns for a
+    /// [`AuditPayload::Template`] event. `template_id` / hash /
+    /// sample are appended by the caller; this fills the version,
+    /// template, positions/slots, and reason columns.
+    fn append_template_change(&mut self, change: &TemplateChange) -> Result<(), AuditBatchError> {
+        match change {
+            TemplateChange::Widened {
                 old_version,
                 new_version,
                 old_template,
                 new_template,
                 positions_widened,
             } => {
-                self.event_kind.append_value(EVENT_KIND_TEMPLATE_WIDENED);
-                self.event_type.append_value(EVENT_TYPE_TEMPLATE_WIDENED);
                 self.old_version.append_value(*old_version);
                 self.new_version.append_value(*new_version);
                 self.old_template.append_value(old_template);
@@ -280,33 +327,25 @@ impl Builders {
                 append_slots(&mut self.slots_expanded, &[]);
                 self.reason.append_null();
             }
-            AuditEventKind::TemplateTypeExpanded {
+            TemplateChange::TypeExpanded {
                 old_version,
                 new_version,
                 old_template,
                 new_template,
                 slots_expanded,
             } => {
-                // §3.7 invariant: TemplateTypeExpanded carries the
-                // unchanged template, so `old_template ==
-                // new_template`. The in-memory variant has both
-                // fields independently (the miner builds them
-                // separately), so we enforce the invariant at the
-                // serialisation boundary rather than trusting the
-                // producer. Persisting divergent strings would be a
-                // §3.7 contract violation a future reader couldn't
-                // disambiguate.
+                // §3.7 invariant: TypeExpanded carries the unchanged
+                // template, so `old_template == new_template`. The
+                // in-memory variant has both fields independently, so
+                // we enforce the invariant at the serialisation
+                // boundary rather than trusting the producer.
                 if old_template != new_template {
                     return Err(AuditBatchError::TemplateMustNotChange {
-                        variant: "TemplateTypeExpanded",
+                        variant: "TypeExpanded",
                         old_template: old_template.clone(),
                         new_template: new_template.clone(),
                     });
                 }
-                self.event_kind
-                    .append_value(EVENT_KIND_TEMPLATE_TYPE_EXPANDED);
-                self.event_type
-                    .append_value(EVENT_TYPE_TEMPLATE_TYPE_EXPANDED);
                 self.old_version.append_value(*old_version);
                 self.new_version.append_value(*new_version);
                 self.old_template.append_value(old_template);
@@ -315,21 +354,15 @@ impl Builders {
                 append_slots(&mut self.slots_expanded, slots_expanded);
                 self.reason.append_null();
             }
-            AuditEventKind::TemplateWideningRejectedDegenerate {
+            TemplateChange::RejectedDegenerate {
                 version,
                 current_template,
                 would_be_template,
                 would_be_positions,
             } => {
-                self.event_kind
-                    .append_value(EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE);
-                self.event_type
-                    .append_value(EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE);
-                // §3.7 column commentary: rejection rows carry the
-                // unchanged template in both old / new (templates
-                // don't change when the widening is rejected); the
-                // version pair collapses to the single `version`
-                // the in-memory variant carries.
+                // Rejection rows carry the unchanged template in both
+                // old / new; the version pair collapses to the single
+                // `version` the in-memory variant carries.
                 self.old_version.append_value(*version);
                 self.new_version.append_value(*version);
                 self.old_template.append_value(current_template);
@@ -342,8 +375,30 @@ impl Builders {
                 ));
             }
         }
-
         Ok(())
+    }
+
+    /// NULL every template-specific column — for a `compaction` row.
+    fn append_template_nulls(&mut self) {
+        self.template_id.append_null();
+        self.old_version.append_null();
+        self.new_version.append_null();
+        self.old_template.append_null();
+        self.new_template.append_null();
+        self.positions_widened.append_null();
+        self.slots_expanded.append_null();
+        self.triggering_line_hash.append_null();
+        self.triggering_line_sample.append_null();
+        self.reason.append_null();
+    }
+
+    /// NULL every compaction-specific column — for a template row.
+    fn append_compaction_nulls(&mut self) {
+        self.compaction_partition.append_null();
+        self.compaction_input_files.append_null();
+        self.compaction_output_file.append_null();
+        self.compaction_generation.append_null();
+        self.compaction_rows.append_null();
     }
 
     fn finish(mut self) -> Vec<ArrayRef> {
@@ -362,8 +417,22 @@ impl Builders {
             Arc::new(self.triggering_line_hash.finish()),
             Arc::new(self.triggering_line_sample.finish()),
             Arc::new(self.reason.finish()),
+            Arc::new(self.compaction_partition.finish()),
+            Arc::new(self.compaction_input_files.finish()),
+            Arc::new(self.compaction_output_file.finish()),
+            Arc::new(self.compaction_generation.finish()),
+            Arc::new(self.compaction_rows.finish()),
         ]
     }
+}
+
+/// Append `values` as one non-null `LIST<STRING>` entry (used for
+/// `compaction_input_files`).
+fn append_string_list(builder: &mut GenericListBuilder<i32, StringBuilder>, values: &[String]) {
+    for v in values {
+        builder.values().append_value(v);
+    }
+    builder.append(true);
 }
 
 fn append_positions(builder: &mut GenericListBuilder<i32, Int32Builder>, positions: &[u16]) {
@@ -434,7 +503,7 @@ fn system_time_to_i64_nanos(t: SystemTime) -> Result<i64, AuditBatchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ourios_core::audit::{AuditEventKind, hash_triggering_line};
+    use ourios_core::audit::{AuditPayload, TemplateChange, hash_triggering_line};
     use ourios_core::tenant::TenantId;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -442,26 +511,42 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(offset_secs)
     }
 
-    fn widened_event() -> AuditEvent {
+    fn template_event(
+        template_id: u64,
+        sample: Option<&str>,
+        change: TemplateChange,
+    ) -> AuditEvent {
         AuditEvent {
-            kind: AuditEventKind::TemplateWidened {
+            tenant_id: TenantId::new("acme"),
+            timestamp: ts(1_775_127_480),
+            payload: AuditPayload::Template {
+                template_id,
+                triggering_line_hash: hash_triggering_line(b"trigger"),
+                triggering_line_sample: sample.map(str::to_string),
+                change,
+            },
+        }
+    }
+
+    fn widened_event() -> AuditEvent {
+        template_event(
+            7,
+            Some("user 42 in"),
+            TemplateChange::Widened {
                 old_version: 1,
                 new_version: 2,
                 old_template: "[\"user\",\"<*>\",\"in\"]".to_string(),
                 new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
                 positions_widened: vec![2],
             },
-            tenant_id: TenantId::new("acme"),
-            template_id: 7,
-            triggering_line_hash: hash_triggering_line(b"trigger"),
-            triggering_line_sample: Some("user 42 in".to_string()),
-            timestamp: ts(1_775_127_480),
-        }
+        )
     }
 
     fn type_expanded_event() -> AuditEvent {
-        AuditEvent {
-            kind: AuditEventKind::TemplateTypeExpanded {
+        template_event(
+            7,
+            None,
+            TemplateChange::TypeExpanded {
                 old_version: 2,
                 new_version: 3,
                 old_template: "[\"user\",\"<*>\"]".to_string(),
@@ -471,47 +556,62 @@ mod tests {
                     added_types: vec![ParamType::Num, ParamType::Ip],
                 }],
             },
-            tenant_id: TenantId::new("acme"),
-            template_id: 7,
-            triggering_line_hash: hash_triggering_line(b"trigger-2"),
-            triggering_line_sample: None,
-            timestamp: ts(1_775_127_490),
-        }
+        )
     }
 
     fn rejection_event() -> AuditEvent {
-        AuditEvent {
-            kind: AuditEventKind::TemplateWideningRejectedDegenerate {
+        template_event(
+            9,
+            Some("zzz qqq"),
+            TemplateChange::RejectedDegenerate {
                 version: 5,
                 current_template: "[\"lit\",\"<*>\"]".to_string(),
                 would_be_template: "[\"<*>\",\"<*>\"]".to_string(),
                 would_be_positions: vec![0, 1],
             },
+        )
+    }
+
+    /// A compaction audit event (RFC 0009 §3.6).
+    fn compaction_event() -> AuditEvent {
+        AuditEvent {
             tenant_id: TenantId::new("acme"),
-            template_id: 9,
-            triggering_line_hash: hash_triggering_line(b"degenerate"),
-            triggering_line_sample: Some("zzz qqq".to_string()),
-            timestamp: ts(1_775_127_500),
+            timestamp: ts(1_775_127_600),
+            payload: AuditPayload::Compaction {
+                partition: "year=2026/month=04/day=02/hour=10".to_string(),
+                input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+                output_file: "c.parquet".to_string(),
+                generation: 7,
+                rows: 100,
+            },
         }
     }
 
     #[test]
     fn builds_batch_for_one_of_each_variant() {
-        let batch =
-            audit_events_to_batch(&[widened_event(), type_expanded_event(), rejection_event()])
-                .expect("batch builds");
-        assert_eq!(batch.num_rows(), 3);
+        let batch = audit_events_to_batch(&[
+            widened_event(),
+            type_expanded_event(),
+            rejection_event(),
+            compaction_event(),
+        ])
+        .expect("batch builds");
+        assert_eq!(batch.num_rows(), 4);
         assert_eq!(batch.schema(), audit_schema());
     }
 
     #[test]
     fn rejection_reason_is_json_with_would_be_fields() {
         let r = rejection_event();
-        let AuditEventKind::TemplateWideningRejectedDegenerate {
-            would_be_template,
-            would_be_positions,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::RejectedDegenerate {
+                    would_be_template,
+                    would_be_positions,
+                    ..
+                },
             ..
-        } = &r.kind
+        } = &r.payload
         else {
             unreachable!();
         };

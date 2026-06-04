@@ -98,6 +98,13 @@ pub mod audit_columns {
     pub const TRIGGERING_LINE_HASH: &str = "triggering_line_hash";
     pub const TRIGGERING_LINE_SAMPLE: &str = "triggering_line_sample";
     pub const REASON: &str = "reason";
+    // Compaction-event columns (RFC 0005 §3.7 amendment 2026-06-03 /
+    // RFC 0009 §3.6); NULL for the template event kinds.
+    pub const COMPACTION_PARTITION: &str = "compaction_partition";
+    pub const COMPACTION_INPUT_FILES: &str = "compaction_input_files";
+    pub const COMPACTION_OUTPUT_FILE: &str = "compaction_output_file";
+    pub const COMPACTION_GENERATION: &str = "compaction_generation";
+    pub const COMPACTION_ROWS: &str = "compaction_rows";
 }
 
 /// Build the data-file Arrow schema per RFC 0005 §3.2.
@@ -201,27 +208,41 @@ pub fn audit_schema() -> SchemaRef {
         ),
         Field::new(audit_columns::EVENT_KIND, DataType::UInt8, false),
         Field::new(audit_columns::EVENT_TYPE, DataType::Utf8, false),
-        Field::new(audit_columns::TEMPLATE_ID, DataType::UInt64, false),
-        Field::new(audit_columns::OLD_VERSION, DataType::UInt32, false),
-        Field::new(audit_columns::NEW_VERSION, DataType::UInt32, false),
-        Field::new(audit_columns::OLD_TEMPLATE, DataType::Utf8, false),
-        Field::new(audit_columns::NEW_TEMPLATE, DataType::Utf8, false),
+        // Template-specific columns: OPTIONAL per the §3.7 amendment
+        // (2026-06-03) — required-by-convention for the template event
+        // kinds (0–2), NULL for `compaction` (kind 3).
+        Field::new(audit_columns::TEMPLATE_ID, DataType::UInt64, true),
+        Field::new(audit_columns::OLD_VERSION, DataType::UInt32, true),
+        Field::new(audit_columns::NEW_VERSION, DataType::UInt32, true),
+        Field::new(audit_columns::OLD_TEMPLATE, DataType::Utf8, true),
+        Field::new(audit_columns::NEW_TEMPLATE, DataType::Utf8, true),
         Field::new(
             audit_columns::POSITIONS_WIDENED,
             DataType::List(Arc::new(positions_element)),
-            false,
+            true,
         ),
         Field::new(
             audit_columns::SLOTS_EXPANDED,
             DataType::List(Arc::new(slots_expanded_element)),
-            false,
+            true,
         ),
         Field::new(
             audit_columns::TRIGGERING_LINE_HASH,
             DataType::FixedSizeBinary(16),
-            false,
+            true,
         ),
         Field::new(audit_columns::TRIGGERING_LINE_SAMPLE, DataType::Utf8, true),
         Field::new(audit_columns::REASON, DataType::Utf8, true),
+        // Compaction-event columns (RFC 0009 §3.6): OPTIONAL, NULL for
+        // the template event kinds.
+        Field::new(audit_columns::COMPACTION_PARTITION, DataType::Utf8, true),
+        Field::new(
+            audit_columns::COMPACTION_INPUT_FILES,
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, false))),
+            true,
+        ),
+        Field::new(audit_columns::COMPACTION_OUTPUT_FILE, DataType::Utf8, true),
+        Field::new(audit_columns::COMPACTION_GENERATION, DataType::UInt64, true),
+        Field::new(audit_columns::COMPACTION_ROWS, DataType::UInt64, true),
     ]))
 }

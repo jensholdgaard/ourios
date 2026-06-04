@@ -75,11 +75,8 @@ fn separators_field() -> Field {
 
 fn positions_widened_field() -> Field {
     let element = Field::new("element", DataType::Int32, false);
-    Field::new(
-        "positions_widened",
-        DataType::List(Arc::new(element)),
-        false,
-    )
+    // OPTIONAL since the §3.7 amendment (NULL on compaction rows).
+    Field::new("positions_widened", DataType::List(Arc::new(element)), true)
 }
 
 fn slots_expanded_field() -> Field {
@@ -96,7 +93,8 @@ fn slots_expanded_field() -> Field {
         .into(),
     );
     let element = Field::new("element", slot_expansion, false);
-    Field::new("slots_expanded", DataType::List(Arc::new(element)), false)
+    // OPTIONAL since the §3.7 amendment (NULL on compaction rows).
+    Field::new("slots_expanded", DataType::List(Arc::new(element)), true)
 }
 
 /// Scenario RFC0005.10 — data-file schema half.
@@ -149,16 +147,29 @@ fn rfc0005_10_audit_schema_matches_pinned_field_list() {
         ),
         Field::new("event_kind", DataType::UInt8, false),
         Field::new("event_type", DataType::Utf8, false),
-        Field::new("template_id", DataType::UInt64, false),
-        Field::new("old_version", DataType::UInt32, false),
-        Field::new("new_version", DataType::UInt32, false),
-        Field::new("old_template", DataType::Utf8, false),
-        Field::new("new_template", DataType::Utf8, false),
+        // Template columns: OPTIONAL since the §3.7 amendment
+        // (required-by-convention for template kinds; NULL for
+        // compaction).
+        Field::new("template_id", DataType::UInt64, true),
+        Field::new("old_version", DataType::UInt32, true),
+        Field::new("new_version", DataType::UInt32, true),
+        Field::new("old_template", DataType::Utf8, true),
+        Field::new("new_template", DataType::Utf8, true),
         positions_widened_field(),
         slots_expanded_field(),
-        Field::new("triggering_line_hash", DataType::FixedSizeBinary(16), false),
+        Field::new("triggering_line_hash", DataType::FixedSizeBinary(16), true),
         Field::new("triggering_line_sample", DataType::Utf8, true),
         Field::new("reason", DataType::Utf8, true),
+        // Compaction columns (RFC 0009 §3.6): OPTIONAL.
+        Field::new("compaction_partition", DataType::Utf8, true),
+        Field::new(
+            "compaction_input_files",
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, false))),
+            true,
+        ),
+        Field::new("compaction_output_file", DataType::Utf8, true),
+        Field::new("compaction_generation", DataType::UInt64, true),
+        Field::new("compaction_rows", DataType::UInt64, true),
     ];
     check_schema_against(&expected, &audit_schema());
 }

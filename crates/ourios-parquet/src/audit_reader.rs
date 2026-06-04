@@ -18,7 +18,7 @@
 //!
 //! **Unknown `event_kind` ordinals** are currently surfaced as a
 //! [`AuditReaderError::UnknownEventKind`] hard error. The audit
-//! event enum [`AuditEventKind`] has no catch-all variant; a
+//! event enum [`AuditPayload`] has no catch-all variant; a
 //! future RFC 0005 §3.8 amendment that adds a new ordinal will
 //! either extend the enum (and this match) or introduce an
 //! `Unknown(u8)` variant analogous to [`ParamType::Unknown`]. The
@@ -35,14 +35,14 @@ use std::time::{Duration, SystemTime};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, RecordBatch, StructArray};
-use ourios_core::audit::{AuditEvent, AuditEventKind, ParamType, SlotExpansion};
+use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
 use ourios_core::tenant::TenantId;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::errors::ParquetError;
 
 use crate::audit_columns;
 use crate::audit_record_batch::{
-    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_COMPACTION, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
@@ -161,7 +161,7 @@ pub enum AuditReaderError {
     },
     /// `event_kind` ordinal isn't one of the §3.7 mapping
     /// table's values. Until a future amendment adds an
-    /// `AuditEventKind::Unknown` variant, unknown ordinals are
+    /// `AuditPayload::Unknown` variant, unknown ordinals are
     /// a hard error.
     UnknownEventKind {
         row_index: usize,
@@ -204,7 +204,7 @@ impl fmt::Display for AuditReaderError {
                 f,
                 "row {row_index}: unknown event_kind ordinal {ordinal} — the §3.7 mapping \
                  table pins 0 / 1 / 2; reading an unknown ordinal needs an \
-                 AuditEventKind::Unknown variant which is deferred until a real new variant \
+                 AuditPayload::Unknown variant which is deferred until a real new variant \
                  lands via a §3.8 amendment",
             ),
             Self::TimestampDecode { row_index, nanos } => write!(
@@ -308,90 +308,92 @@ fn batch_to_audit_events(
     // diagnostics but use `event_kind` as the source of truth
     // for variant dispatch.
     let _event_type = required_string(batch, audit_columns::EVENT_TYPE, row_offset)?;
-    let template_id = required_u64(batch, audit_columns::TEMPLATE_ID, row_offset)?;
-    let old_version = required_u32(batch, audit_columns::OLD_VERSION, row_offset)?;
-    let new_version = required_u32(batch, audit_columns::NEW_VERSION, row_offset)?;
-    let old_template = required_string(batch, audit_columns::OLD_TEMPLATE, row_offset)?;
-    let new_template = required_string(batch, audit_columns::NEW_TEMPLATE, row_offset)?;
+    // Template-group columns — OPTIONAL since the §3.7 amendment
+    // (NULL on `compaction` rows). Required-by-convention for the
+    // template kinds; [`require_at`] errors if a template row finds
+    // one NULL.
+    let template_id = optional_u64(batch, audit_columns::TEMPLATE_ID)?;
+    let old_version = optional_u32(batch, audit_columns::OLD_VERSION)?;
+    let new_version = optional_u32(batch, audit_columns::NEW_VERSION)?;
+    let old_template = optional_string(batch, audit_columns::OLD_TEMPLATE)?.unwrap_or_default();
+    let new_template = optional_string(batch, audit_columns::NEW_TEMPLATE)?.unwrap_or_default();
     let positions_widened_lists = decode_positions_column(batch, row_offset)?;
     let slots_expanded_lists = decode_slots_column(batch, row_offset)?;
-    let triggering_line_hash =
-        required_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH, row_offset)?;
-    let triggering_line_sample = optional_string(batch, audit_columns::TRIGGERING_LINE_SAMPLE)?;
-    let reason = optional_string(batch, audit_columns::REASON)?;
+    let triggering_line_hash = optional_fixed_bytes16(batch, audit_columns::TRIGGERING_LINE_HASH)?;
+    let triggering_line_sample =
+        optional_string(batch, audit_columns::TRIGGERING_LINE_SAMPLE)?.unwrap_or_default();
+    let reason = optional_string(batch, audit_columns::REASON)?.unwrap_or_default();
+    // Compaction-group columns (RFC 0009 §3.6).
+    let compaction_partition =
+        optional_string(batch, audit_columns::COMPACTION_PARTITION)?.unwrap_or_default();
+    let compaction_input_files =
+        optional_string_list(batch, audit_columns::COMPACTION_INPUT_FILES)?;
+    let compaction_output_file =
+        optional_string(batch, audit_columns::COMPACTION_OUTPUT_FILE)?.unwrap_or_default();
+    let compaction_generation = optional_u64(batch, audit_columns::COMPACTION_GENERATION)?;
+    let compaction_rows = optional_u64(batch, audit_columns::COMPACTION_ROWS)?;
 
     for i in 0..n {
         let file_row = row_offset + i;
         let ts = decode_timestamp(timestamp[i], file_row)?;
-        let kind = match event_kind[i] {
-            EVENT_KIND_TEMPLATE_WIDENED => AuditEventKind::TemplateWidened {
-                old_version: old_version[i],
-                new_version: new_version[i],
-                old_template: old_template[i].clone(),
-                new_template: new_template[i].clone(),
-                positions_widened: positions_widened_lists[i].clone(),
+        let payload = match event_kind[i] {
+            EVENT_KIND_TEMPLATE_WIDENED
+            | EVENT_KIND_TEMPLATE_TYPE_EXPANDED
+            | EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE => {
+                let cols = TemplateColumns {
+                    event_kind: event_kind[i],
+                    old_version: &old_version,
+                    new_version: &new_version,
+                    old_template: &old_template,
+                    new_template: &new_template,
+                    positions_widened: &positions_widened_lists,
+                    slots_expanded: &slots_expanded_lists,
+                    reason: &reason,
+                };
+                AuditPayload::Template {
+                    template_id: require_at(&template_id, i, audit_columns::TEMPLATE_ID, file_row)?,
+                    triggering_line_hash: require_at(
+                        &triggering_line_hash,
+                        i,
+                        audit_columns::TRIGGERING_LINE_HASH,
+                        file_row,
+                    )?,
+                    triggering_line_sample: triggering_line_sample.get(i).and_then(Clone::clone),
+                    change: decode_template_change(&cols, i, file_row)?,
+                }
+            }
+            EVENT_KIND_COMPACTION => AuditPayload::Compaction {
+                partition: require_at(
+                    &compaction_partition,
+                    i,
+                    audit_columns::COMPACTION_PARTITION,
+                    file_row,
+                )?,
+                input_files: require_at(
+                    &compaction_input_files,
+                    i,
+                    audit_columns::COMPACTION_INPUT_FILES,
+                    file_row,
+                )?,
+                output_file: require_at(
+                    &compaction_output_file,
+                    i,
+                    audit_columns::COMPACTION_OUTPUT_FILE,
+                    file_row,
+                )?,
+                generation: require_at(
+                    &compaction_generation,
+                    i,
+                    audit_columns::COMPACTION_GENERATION,
+                    file_row,
+                )?,
+                rows: require_at(
+                    &compaction_rows,
+                    i,
+                    audit_columns::COMPACTION_ROWS,
+                    file_row,
+                )?,
             },
-            EVENT_KIND_TEMPLATE_TYPE_EXPANDED => {
-                // §3.7 invariant: TemplateTypeExpanded carries the
-                // unchanged template (`old_template ==
-                // new_template`). The writer enforces this, but a
-                // corrupt / foreign-writer file could violate it.
-                // Surface as `Conversion` rather than silently
-                // accept a malformed row whose `slots_expanded`
-                // would then be the only "real" payload while the
-                // template columns disagree.
-                if old_template[i] != new_template[i] {
-                    return Err(AuditReaderError::Conversion {
-                        column: audit_columns::NEW_TEMPLATE,
-                        detail: format!(
-                            "row {file_row}: TemplateTypeExpanded has \
-                             old_template != new_template ({:?} != {:?}) — RFC 0005 §3.7 \
-                             requires equality for this variant (template tokens don't change)",
-                            old_template[i], new_template[i],
-                        ),
-                    });
-                }
-                AuditEventKind::TemplateTypeExpanded {
-                    old_version: old_version[i],
-                    new_version: new_version[i],
-                    old_template: old_template[i].clone(),
-                    new_template: new_template[i].clone(),
-                    slots_expanded: slots_expanded_lists[i].clone(),
-                }
-            }
-            EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE => {
-                // §3.7 invariant: rejection rows also carry the
-                // unchanged template in both columns. Same
-                // disagreement check as TypeExpanded.
-                if old_template[i] != new_template[i] {
-                    return Err(AuditReaderError::Conversion {
-                        column: audit_columns::NEW_TEMPLATE,
-                        detail: format!(
-                            "row {file_row}: TemplateWideningRejectedDegenerate has \
-                             old_template != new_template ({:?} != {:?}) — RFC 0005 §3.7 \
-                             requires equality for this variant (template tokens don't change)",
-                            old_template[i], new_template[i],
-                        ),
-                    });
-                }
-                // Recover `would_be_template` / `would_be_positions`
-                // from the JSON-encoded `reason` column. The
-                // writer always emits this payload for the
-                // rejection variant; a foreign writer that put a
-                // free-form string in `reason` falls back to the
-                // empty values rather than erroring (per the
-                // module-level note in `audit_record_batch.rs`).
-                let reason_str = reason.as_ref().and_then(|c| c[i].as_deref());
-                let (would_be_template, would_be_positions) = reason_str
-                    .and_then(decode_rejection_reason)
-                    .unwrap_or_default();
-                AuditEventKind::TemplateWideningRejectedDegenerate {
-                    version: old_version[i],
-                    current_template: old_template[i].clone(),
-                    would_be_template,
-                    would_be_positions,
-                }
-            }
             other => {
                 return Err(AuditReaderError::UnknownEventKind {
                     row_index: file_row,
@@ -400,18 +402,128 @@ fn batch_to_audit_events(
             }
         };
 
-        let event = AuditEvent {
-            kind,
+        events.push(AuditEvent {
             tenant_id: TenantId::new(tenant_id[i].clone()),
-            template_id: template_id[i],
-            triggering_line_hash: triggering_line_hash[i],
-            triggering_line_sample: triggering_line_sample.as_ref().and_then(|c| c[i].clone()),
             timestamp: ts,
-        };
-        events.push(event);
+            payload,
+        });
     }
 
     Ok(events)
+}
+
+/// Borrowed per-column slices the template-change decoder reads.
+struct TemplateColumns<'a> {
+    event_kind: u8,
+    old_version: &'a [Option<u32>],
+    new_version: &'a [Option<u32>],
+    old_template: &'a [Option<String>],
+    new_template: &'a [Option<String>],
+    positions_widened: &'a [Vec<u16>],
+    slots_expanded: &'a [Vec<SlotExpansion>],
+    reason: &'a [Option<String>],
+}
+
+/// Value at `col[i]`, or a `Conversion` error if it is absent / NULL —
+/// the writer-invariant violation a corrupt or foreign-writer file
+/// would produce (a template row missing a template column, or a
+/// compaction row missing a compaction column).
+fn require_at<T: Clone>(
+    col: &[Option<T>],
+    i: usize,
+    column: &'static str,
+    file_row: usize,
+) -> Result<T, AuditReaderError> {
+    col.get(i)
+        .and_then(Clone::clone)
+        .ok_or_else(|| AuditReaderError::Conversion {
+            column,
+            detail: format!(
+                "row {file_row}: NULL on a column required for this event_kind \
+                 (writer-invariant violation)",
+            ),
+        })
+}
+
+/// Rebuild the [`TemplateChange`] for row `i` from the template-group
+/// columns, enforcing the §3.7 `old_template == new_template`
+/// invariant for the non-widening kinds.
+fn decode_template_change(
+    cols: &TemplateColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<TemplateChange, AuditReaderError> {
+    let old_version = require_at(cols.old_version, i, audit_columns::OLD_VERSION, file_row)?;
+    let old_template = require_at(cols.old_template, i, audit_columns::OLD_TEMPLATE, file_row)?;
+
+    match cols.event_kind {
+        EVENT_KIND_TEMPLATE_WIDENED => Ok(TemplateChange::Widened {
+            old_version,
+            new_version: require_at(cols.new_version, i, audit_columns::NEW_VERSION, file_row)?,
+            old_template,
+            new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
+            positions_widened: cols.positions_widened[i].clone(),
+        }),
+        EVENT_KIND_TEMPLATE_TYPE_EXPANDED => {
+            let new_template =
+                require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?;
+            require_template_unchanged("TypeExpanded", &old_template, &new_template, file_row)?;
+            Ok(TemplateChange::TypeExpanded {
+                old_version,
+                new_version: require_at(cols.new_version, i, audit_columns::NEW_VERSION, file_row)?,
+                old_template,
+                new_template,
+                slots_expanded: cols.slots_expanded[i].clone(),
+            })
+        }
+        // RejectedDegenerate (the match is only entered for the three
+        // template ordinals).
+        _ => {
+            let new_template =
+                require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?;
+            require_template_unchanged(
+                "RejectedDegenerate",
+                &old_template,
+                &new_template,
+                file_row,
+            )?;
+            // Recover would_be_* from the JSON-encoded `reason`; a
+            // foreign writer that put a free-form string there falls
+            // back to empty rather than erroring.
+            let (would_be_template, would_be_positions) = cols
+                .reason
+                .get(i)
+                .and_then(|r| r.as_deref())
+                .and_then(decode_rejection_reason)
+                .unwrap_or_default();
+            Ok(TemplateChange::RejectedDegenerate {
+                version: old_version,
+                current_template: old_template,
+                would_be_template,
+                would_be_positions,
+            })
+        }
+    }
+}
+
+/// The §3.7 invariant that the non-widening template kinds carry the
+/// unchanged template in both `old_template` and `new_template`.
+fn require_template_unchanged(
+    variant: &str,
+    old_template: &str,
+    new_template: &str,
+    file_row: usize,
+) -> Result<(), AuditReaderError> {
+    if old_template != new_template {
+        return Err(AuditReaderError::Conversion {
+            column: audit_columns::NEW_TEMPLATE,
+            detail: format!(
+                "row {file_row}: {variant} has old_template != new_template ({old_template:?} \
+                 != {new_template:?}) — RFC 0005 §3.7 requires equality for this variant",
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Convert a non-negative i64 nanos-since-epoch to [`SystemTime`].
@@ -465,14 +577,12 @@ fn decode_positions_column(
     let mut out = Vec::with_capacity(list.len());
     for row_idx in 0..list.len() {
         let file_row = row_offset + row_idx;
+        // OPTIONAL since the §3.7 amendment: a `compaction` row has a
+        // NULL list here. Surface it as empty; the per-row dispatch
+        // only reads this for the template kinds.
         if list.is_null(row_idx) {
-            return Err(AuditReaderError::Conversion {
-                column: audit_columns::POSITIONS_WIDENED,
-                detail: format!(
-                    "row {file_row}: positions_widened list is NULL but the schema marks it \
-                     REQUIRED",
-                ),
-            });
+            out.push(Vec::new());
+            continue;
         }
         let elements = list.value(row_idx);
         let i32_arr = elements.as_primitive_opt::<Int32Type>().ok_or_else(|| {
@@ -529,14 +639,11 @@ fn decode_slots_column(
     let mut out = Vec::with_capacity(list.len());
     for row_idx in 0..list.len() {
         let file_row = row_offset + row_idx;
+        // OPTIONAL since the §3.7 amendment: NULL on a `compaction`
+        // row. Empty here; only the template kinds read it.
         if list.is_null(row_idx) {
-            return Err(AuditReaderError::Conversion {
-                column: audit_columns::SLOTS_EXPANDED,
-                detail: format!(
-                    "row {file_row}: slots_expanded list is NULL but the schema marks it \
-                     REQUIRED",
-                ),
-            });
+            out.push(Vec::new());
+            continue;
         }
         out.push(decode_slot_row(&list.value(row_idx), file_row)?);
     }
@@ -721,36 +828,6 @@ fn required_string(
     Ok(out)
 }
 
-fn required_u64(
-    batch: &RecordBatch,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<u64>, AuditReaderError> {
-    let col = required_column(batch, name)?;
-    let arr = col
-        .as_primitive_opt::<UInt64Type>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected UInt64Array, got {:?}", col.data_type()),
-        })?;
-    materialize_required_primitive(arr, name, row_offset)
-}
-
-fn required_u32(
-    batch: &RecordBatch,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<u32>, AuditReaderError> {
-    let col = required_column(batch, name)?;
-    let arr = col
-        .as_primitive_opt::<UInt32Type>()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected UInt32Array, got {:?}", col.data_type()),
-        })?;
-    materialize_required_primitive(arr, name, row_offset)
-}
-
 fn required_u8(
     batch: &RecordBatch,
     name: &'static str,
@@ -790,43 +867,6 @@ fn required_timestamp(
             });
         }
         out.push(arr.value(i));
-    }
-    Ok(out)
-}
-
-fn required_fixed_bytes16(
-    batch: &RecordBatch,
-    name: &'static str,
-    row_offset: usize,
-) -> Result<Vec<[u8; 16]>, AuditReaderError> {
-    let col = required_column(batch, name)?;
-    let arr = col
-        .as_fixed_size_binary_opt()
-        .ok_or_else(|| AuditReaderError::Conversion {
-            column: name,
-            detail: format!("expected FixedSizeBinaryArray, got {:?}", col.data_type()),
-        })?;
-    if usize::try_from(arr.value_length()).ok() != Some(16) {
-        return Err(AuditReaderError::Conversion {
-            column: name,
-            detail: format!(
-                "expected FixedSizeBinary(16), got FixedSizeBinary({})",
-                arr.value_length(),
-            ),
-        });
-    }
-    let mut out = Vec::with_capacity(arr.len());
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            return Err(AuditReaderError::Conversion {
-                column: name,
-                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
-            });
-        }
-        let slice = arr.value(i);
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(slice);
-        out.push(buf);
     }
     Ok(out)
 }
@@ -893,6 +933,120 @@ fn optional_column<'a>(batch: &'a RecordBatch, name: &'static str) -> Option<&'a
     Some(batch.column(idx).as_ref())
 }
 
+/// Per-row `Option<u64>` for a nullable `UInt64` column (the §3.7
+/// `template_id` / `compaction_generation` / `compaction_rows`
+/// columns).
+fn optional_u64(
+    batch: &RecordBatch,
+    name: &'static str,
+) -> Result<Vec<Option<u64>>, AuditReaderError> {
+    let Some(col) = optional_column(batch, name) else {
+        return Ok(Vec::new());
+    };
+    let arr = col
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| AuditReaderError::Conversion {
+            column: name,
+            detail: format!("expected UInt64Array, got {:?}", col.data_type()),
+        })?;
+    Ok((0..arr.len())
+        .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+        .collect())
+}
+
+/// Per-row `Option<u32>` for a nullable `UInt32` column.
+fn optional_u32(
+    batch: &RecordBatch,
+    name: &'static str,
+) -> Result<Vec<Option<u32>>, AuditReaderError> {
+    let Some(col) = optional_column(batch, name) else {
+        return Ok(Vec::new());
+    };
+    let arr = col
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| AuditReaderError::Conversion {
+            column: name,
+            detail: format!("expected UInt32Array, got {:?}", col.data_type()),
+        })?;
+    Ok((0..arr.len())
+        .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+        .collect())
+}
+
+/// Per-row `Option<[u8; 16]>` for the nullable `triggering_line_hash`
+/// `FixedSizeBinary(16)` column.
+fn optional_fixed_bytes16(
+    batch: &RecordBatch,
+    name: &'static str,
+) -> Result<Vec<Option<[u8; 16]>>, AuditReaderError> {
+    let Some(col) = optional_column(batch, name) else {
+        return Ok(Vec::new());
+    };
+    let arr = col
+        .as_fixed_size_binary_opt()
+        .ok_or_else(|| AuditReaderError::Conversion {
+            column: name,
+            detail: format!("expected FixedSizeBinaryArray, got {:?}", col.data_type()),
+        })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for i in 0..arr.len() {
+        if arr.is_null(i) {
+            out.push(None);
+        } else {
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(arr.value(i));
+            out.push(Some(buf));
+        }
+    }
+    Ok(out)
+}
+
+/// Per-row `Option<Vec<String>>` for the nullable
+/// `compaction_input_files` `LIST<STRING>` column. The element field
+/// is non-nullable, so a NULL element is a corrupt row.
+fn optional_string_list(
+    batch: &RecordBatch,
+    name: &'static str,
+) -> Result<Vec<Option<Vec<String>>>, AuditReaderError> {
+    let Some(col) = optional_column(batch, name) else {
+        return Ok(Vec::new());
+    };
+    let list = col
+        .as_list_opt::<i32>()
+        .ok_or_else(|| AuditReaderError::Conversion {
+            column: name,
+            detail: "column is not a LIST<STRING> as declared".to_string(),
+        })?;
+    let mut out = Vec::with_capacity(list.len());
+    for row_idx in 0..list.len() {
+        if list.is_null(row_idx) {
+            out.push(None);
+            continue;
+        }
+        let elements = list.value(row_idx);
+        let strs = elements
+            .as_string_opt::<i32>()
+            .ok_or_else(|| AuditReaderError::Conversion {
+                column: name,
+                detail: "list element is not Utf8".to_string(),
+            })?;
+        let mut row = Vec::with_capacity(strs.len());
+        for i in 0..strs.len() {
+            if strs.is_null(i) {
+                return Err(AuditReaderError::Conversion {
+                    column: name,
+                    detail: format!(
+                        "row {row_idx} element {i}: NULL but the element field is non-nullable",
+                    ),
+                });
+            }
+            row.push(strs.value(i).to_string());
+        }
+        out.push(Some(row));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     //! Colocated unit tests for the audit-reader paths that the
@@ -904,24 +1058,26 @@ mod tests {
     use super::*;
     use crate::audit_record_batch::audit_events_to_batch;
     use arrow_array::{ArrayRef, UInt8Array};
-    use ourios_core::audit::{AuditEvent, AuditEventKind, hash_triggering_line};
+    use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange, hash_triggering_line};
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn widened_event(tenant: &str) -> AuditEvent {
         AuditEvent {
-            kind: AuditEventKind::TemplateWidened {
-                old_version: 1,
-                new_version: 2,
-                old_template: "[\"user\",\"<*>\"]".to_string(),
-                new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
-                positions_widened: vec![1],
-            },
             tenant_id: ourios_core::tenant::TenantId::new(tenant),
-            template_id: 7,
-            triggering_line_hash: hash_triggering_line(b"line"),
-            triggering_line_sample: None,
             timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: AuditPayload::Template {
+                template_id: 7,
+                triggering_line_hash: hash_triggering_line(b"line"),
+                triggering_line_sample: None,
+                change: TemplateChange::Widened {
+                    old_version: 1,
+                    new_version: 2,
+                    old_template: "[\"user\",\"<*>\"]".to_string(),
+                    new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
+                    positions_widened: vec![1],
+                },
+            },
         }
     }
 

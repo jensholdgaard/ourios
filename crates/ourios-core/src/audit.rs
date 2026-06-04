@@ -25,25 +25,19 @@ use std::time::SystemTime;
 
 use crate::tenant::TenantId;
 
-/// Variant-specific payload for an [`AuditEvent`].
+/// The specific state-change of a template-mining
+/// [`AuditPayload::Template`] event (RFC 0001 §6.4).
 ///
-/// Each variant carries only the fields that are meaningful for
-/// that kind of state change — a `TemplateWidened` cannot
-/// represent `slots_expanded`, and a
-/// `TemplateWideningRejectedDegenerate` cannot represent a
-/// version bump. The compiler enforces those per-kind contracts.
-///
-/// The miner emits one of these per leaf state change; data
-/// records that *cause* the change are durability-ordered after
-/// the events justifying their `template_version` stamp (a barrier
-/// this enum names but does not itself enforce — see the
-/// module-level note).
+/// Each variant carries only the fields meaningful for that change
+/// — `Widened` cannot represent `slots_expanded`, and
+/// `RejectedDegenerate` cannot represent a version bump. The
+/// compiler enforces those per-variant contracts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuditEventKind {
+pub enum TemplateChange {
     /// An existing template gained one or more wildcard slots
     /// because a clean attach would otherwise mismatch positions
     /// (RFC §6.2 step 5).
-    TemplateWidened {
+    Widened {
         /// The leaf's `template_version` before this attach.
         old_version: u32,
         /// `old_version + 1`. Pinned by construction: a widening
@@ -67,7 +61,7 @@ pub enum AuditEventKind {
     /// **Reserved variant.** Emission lands in the follow-up
     /// type-expansion PR; the variant ships here so the schema is
     /// wire-stable across that change.
-    TemplateTypeExpanded {
+    TypeExpanded {
         old_version: u32,
         new_version: u32,
         old_template: String,
@@ -84,7 +78,7 @@ pub enum AuditEventKind {
     /// mutate the leaf, so there is no `old_version` / `new_version`
     /// pair to carry — just the single `version` that was current
     /// when the rejection happened.
-    TemplateWideningRejectedDegenerate {
+    RejectedDegenerate {
         /// The leaf's `template_version` at the time of rejection.
         version: u32,
         /// The leaf's canonical-form template — unchanged by the
@@ -100,16 +94,133 @@ pub enum AuditEventKind {
     },
 }
 
-impl AuditEventKind {
+/// Variant-specific payload for an [`AuditEvent`].
+///
+/// The top-level axis is *what kind of thing happened*: a
+/// template-mining decision about a leaf, or a compaction of a
+/// sealed partition (RFC 0009 §3.6). Each carries only the fields
+/// that apply to it — a [`AuditPayload::Compaction`] event has no
+/// `template_id` by construction, so the invalid combination is
+/// unrepresentable. New event kinds (retention, schema evolution,
+/// …) join as sibling variants without disturbing the others.
+///
+/// The miner emits one of these per leaf state change; data records
+/// that *cause* a change are durability-ordered after the events
+/// justifying their `template_version` stamp (a barrier this enum
+/// names but does not itself enforce — see the module-level note).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditPayload {
+    /// A template-mining decision about a specific leaf
+    /// (RFC 0001 §6.4).
+    Template {
+        /// The leaf the event applies to.
+        template_id: u64,
+        /// Truncated blake3 of `L_raw`, used by the §6.7 drift
+        /// query to join an event to the data record(s) that
+        /// triggered it.
+        triggering_line_hash: [u8; 16],
+        /// First 256 *bytes* of `L_raw`, truncated at a UTF-8 char
+        /// boundary. `None` when retention is opted out at config
+        /// time; the miner always sets it today.
+        triggering_line_sample: Option<String>,
+        /// Which template state-change this is.
+        change: TemplateChange,
+    },
+    /// A compaction consolidated a sealed partition's files
+    /// (RFC 0009 §3.6). Carries no template identity.
+    Compaction {
+        /// The compacted data partition, as the canonical
+        /// `year=…/month=…/day=…/hour=…` key under the event's
+        /// `tenant_id` (RFC 0005 §3.4).
+        partition: String,
+        /// Input file names that were merged away.
+        input_files: Vec<String>,
+        /// The consolidated output file (the sole live file after
+        /// the commit).
+        output_file: String,
+        /// Manifest generation the consolidation committed at
+        /// (RFC 0009 §3.4).
+        generation: u64,
+        /// Rows in the consolidated file — equal to the total input
+        /// rows, the conserved count (RFC0009.2).
+        rows: u64,
+    },
+}
+
+/// Stable on-disk `event_kind` ordinals (RFC 0005 §3.7 mapping).
+/// This is the canonical source; the Parquet writer/reader import
+/// these rather than redefining them.
+pub const EVENT_KIND_TEMPLATE_WIDENED: u8 = 0;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`].
+pub const EVENT_KIND_TEMPLATE_TYPE_EXPANDED: u8 = 1;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`].
+pub const EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE: u8 = 2;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`].
+pub const EVENT_KIND_COMPACTION: u8 = 3;
+
+/// Canonical `event_type` strings paired with the ordinals above
+/// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
+pub const EVENT_TYPE_TEMPLATE_WIDENED: &str = "template_widened";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`].
+pub const EVENT_TYPE_TEMPLATE_TYPE_EXPANDED: &str = "template_type_expanded";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`].
+pub const EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE: &str =
+    "template_widening_rejected_degenerate";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`].
+pub const EVENT_TYPE_COMPACTION: &str = "compaction";
+
+impl AuditPayload {
+    /// The stable `event_kind` ordinal for this payload (RFC 0005
+    /// §3.7 dual-column storage) — derived from the type, never
+    /// stored.
+    #[must_use]
+    pub fn event_kind(&self) -> u8 {
+        match self {
+            Self::Template { change, .. } => match change {
+                TemplateChange::Widened { .. } => EVENT_KIND_TEMPLATE_WIDENED,
+                TemplateChange::TypeExpanded { .. } => EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
+                TemplateChange::RejectedDegenerate { .. } => {
+                    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE
+                }
+            },
+            Self::Compaction { .. } => EVENT_KIND_COMPACTION,
+        }
+    }
+
+    /// The canonical `event_type` string paired with
+    /// [`Self::event_kind`].
+    #[must_use]
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::Template { change, .. } => match change {
+                TemplateChange::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
+                TemplateChange::TypeExpanded { .. } => EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
+                TemplateChange::RejectedDegenerate { .. } => {
+                    EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE
+                }
+            },
+            Self::Compaction { .. } => EVENT_TYPE_COMPACTION,
+        }
+    }
+
     /// `true` for events that count toward `merges_total` per
-    /// RFC §6.4 — the two structural widenings. Rejection events
-    /// are recorded but do not increment the counter.
+    /// RFC §6.4 — the two structural template widenings. Rejections
+    /// and compactions are recorded but do not increment the counter.
     #[must_use]
     pub fn counts_as_merge(&self) -> bool {
-        matches!(
-            self,
-            Self::TemplateWidened { .. } | Self::TemplateTypeExpanded { .. }
-        )
+        match self {
+            Self::Template { change, .. } => change.counts_as_merge(),
+            Self::Compaction { .. } => false,
+        }
+    }
+}
+
+impl TemplateChange {
+    /// `true` for the two structural widenings (RFC §6.4
+    /// `merges_total`); rejections do not count.
+    #[must_use]
+    pub fn counts_as_merge(&self) -> bool {
+        matches!(self, Self::Widened { .. } | Self::TypeExpanded { .. })
     }
 }
 
@@ -275,29 +386,19 @@ impl FromIterator<ParamType> for SlotTypes {
     }
 }
 
-/// RFC 0001 §6.4 audit-event schema.
+/// RFC 0001 §6.4 / RFC 0009 §3.6 audit-event schema.
 ///
-/// Splits the schema into shared envelope fields (this struct) and
-/// kind-specific payload ([`AuditEventKind`]). Field semantics:
-///
-/// - `kind` — see [`AuditEventKind`]. Per-variant payload includes
-///   the version pair (or single version, on rejection), the
-///   canonical-form templates, and the positions / slots affected.
-/// - `triggering_line_hash` — truncated blake3 of `L_raw`, used by
-///   the §6.7 drift query to join an event to the data record(s)
-///   that triggered it.
-/// - `triggering_line_sample` — first 256 *bytes* of `L_raw`,
-///   truncated at a UTF-8 char boundary so the string is always
-///   valid. `None` is reserved for cases where retention is opted
-///   out at config time; the miner always sets this today.
+/// Splits into the shared envelope (`tenant_id`, `timestamp`) and a
+/// kind-specific [`payload`](AuditPayload). The payload owns every
+/// field that is not common to all events — so a compaction event
+/// carries no `template_id` by construction. `event_kind` /
+/// `event_type` (RFC 0005 §3.7) are derived from the payload
+/// ([`AuditPayload::event_kind`]), never stored on the struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
-    pub kind: AuditEventKind,
     pub tenant_id: TenantId,
-    pub template_id: u64,
-    pub triggering_line_hash: [u8; 16],
-    pub triggering_line_sample: Option<String>,
     pub timestamp: SystemTime,
+    pub payload: AuditPayload,
 }
 
 /// Truncated blake3 of `bytes` for [`AuditEvent::triggering_line_hash`].
@@ -488,34 +589,53 @@ mod tests {
 
     fn widened_event(tenant: &TenantId) -> AuditEvent {
         AuditEvent {
-            kind: AuditEventKind::TemplateWidened {
-                old_version: 1,
-                new_version: 2,
-                old_template: "user 42 logged in".to_string(),
-                new_template: "user 42 logged <*>".to_string(),
-                positions_widened: vec![3],
-            },
             tenant_id: tenant.clone(),
-            template_id: 1,
-            triggering_line_hash: hash_triggering_line(b"user 42 logged out"),
-            triggering_line_sample: Some("user 42 logged out".to_string()),
             timestamp: SystemTime::now(),
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: hash_triggering_line(b"user 42 logged out"),
+                triggering_line_sample: Some("user 42 logged out".to_string()),
+                change: TemplateChange::Widened {
+                    old_version: 1,
+                    new_version: 2,
+                    old_template: "user 42 logged in".to_string(),
+                    new_template: "user 42 logged <*>".to_string(),
+                    positions_widened: vec![3],
+                },
+            },
         }
     }
 
     fn rejection_event(tenant: &TenantId) -> AuditEvent {
         AuditEvent {
-            kind: AuditEventKind::TemplateWideningRejectedDegenerate {
-                version: 2,
-                current_template: "alpha <*> <*>".to_string(),
-                would_be_template: "<*> <*> <*>".to_string(),
-                would_be_positions: vec![0],
-            },
             tenant_id: tenant.clone(),
-            template_id: 1,
-            triggering_line_hash: hash_triggering_line(b"zzz qqq rrr"),
-            triggering_line_sample: Some("zzz qqq rrr".to_string()),
             timestamp: SystemTime::now(),
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: hash_triggering_line(b"zzz qqq rrr"),
+                triggering_line_sample: Some("zzz qqq rrr".to_string()),
+                change: TemplateChange::RejectedDegenerate {
+                    version: 2,
+                    current_template: "alpha <*> <*>".to_string(),
+                    would_be_template: "<*> <*> <*>".to_string(),
+                    would_be_positions: vec![0],
+                },
+            },
+        }
+    }
+
+    /// A compaction audit event for the new RFC 0009 §3.6 payload.
+    fn compaction_event(tenant: &TenantId) -> AuditEvent {
+        AuditEvent {
+            tenant_id: tenant.clone(),
+            timestamp: SystemTime::now(),
+            payload: AuditPayload::Compaction {
+                partition: "year=2026/month=04/day=02/hour=10".to_string(),
+                input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+                output_file: "c.parquet".to_string(),
+                generation: 7,
+                rows: 100,
+            },
         }
     }
 
@@ -531,12 +651,18 @@ mod tests {
         let drained = sink.drain();
         assert_eq!(drained.len(), 2);
         assert!(matches!(
-            drained[0].kind,
-            AuditEventKind::TemplateWidened { .. },
+            drained[0].payload,
+            AuditPayload::Template {
+                change: TemplateChange::Widened { .. },
+                ..
+            },
         ));
         assert!(matches!(
-            drained[1].kind,
-            AuditEventKind::TemplateWideningRejectedDegenerate { .. },
+            drained[1].payload,
+            AuditPayload::Template {
+                change: TemplateChange::RejectedDegenerate { .. },
+                ..
+            },
         ));
         assert!(sink.is_empty(), "drain leaves the sink empty");
     }
@@ -556,8 +682,11 @@ mod tests {
         let drained = observer_handle.drain();
         assert_eq!(drained.len(), 1);
         assert!(matches!(
-            drained[0].kind,
-            AuditEventKind::TemplateWidened { .. },
+            drained[0].payload,
+            AuditPayload::Template {
+                change: TemplateChange::Widened { .. },
+                ..
+            },
         ));
         // The producer's view is also drained — same buffer.
         assert!(observer_handle.is_empty());
@@ -566,8 +695,34 @@ mod tests {
     #[test]
     fn counts_as_merge_distinguishes_widenings_from_rejections() {
         let t = TenantId::new("tenant-x");
-        assert!(widened_event(&t).kind.counts_as_merge());
-        assert!(!rejection_event(&t).kind.counts_as_merge());
+        assert!(widened_event(&t).payload.counts_as_merge());
+        assert!(!rejection_event(&t).payload.counts_as_merge());
+        assert!(
+            !compaction_event(&t).payload.counts_as_merge(),
+            "a compaction is not a merge"
+        );
+    }
+
+    #[test]
+    fn event_kind_and_type_map_per_rfc_0005_3_7() {
+        // Arrange / Act / Assert — the derived dual-column mapping.
+        let t = TenantId::new("tenant-x");
+        assert_eq!(
+            widened_event(&t).payload.event_kind(),
+            EVENT_KIND_TEMPLATE_WIDENED
+        );
+        assert_eq!(
+            widened_event(&t).payload.event_type(),
+            EVENT_TYPE_TEMPLATE_WIDENED
+        );
+        assert_eq!(
+            compaction_event(&t).payload.event_kind(),
+            EVENT_KIND_COMPACTION
+        );
+        assert_eq!(
+            compaction_event(&t).payload.event_type(),
+            EVENT_TYPE_COMPACTION
+        );
     }
 
     #[test]

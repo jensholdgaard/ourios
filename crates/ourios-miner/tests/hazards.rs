@@ -60,7 +60,7 @@ fn h1_2_lossy_zone_match_retains_body() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h1_3_every_widening_emits_an_audit_event() {
-    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
+    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
     use ourios_core::clock::TestClock;
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
@@ -98,13 +98,17 @@ fn h1_3_every_widening_emits_an_audit_event() {
     assert_eq!(events.len(), 1, "exactly one widening occurred");
     let e = &events[0];
     assert_eq!(e.tenant_id, t);
-    let AuditEventKind::TemplateWidened {
-        old_template,
-        new_template,
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_template,
+                new_template,
+                ..
+            },
         ..
-    } = &e.kind
+    } = &e.payload
     else {
-        panic!("expected TemplateWidened, got {:?}", e.kind);
+        panic!("expected Template/Widened, got {:?}", e.payload);
     };
     assert!(!old_template.is_empty(), "old_template must be recorded");
     assert!(!new_template.is_empty(), "new_template must be recorded");
@@ -400,7 +404,7 @@ fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
-    use ourios_core::audit::{AuditEventKind, SharedAuditSink};
+    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
@@ -427,14 +431,18 @@ fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
     // Assert
     let events = sink.drain();
     assert_eq!(events.len(), 1);
-    let AuditEventKind::TemplateWidened {
-        old_version,
-        new_version,
-        positions_widened,
+    let AuditPayload::Template {
+        change:
+            TemplateChange::Widened {
+                old_version,
+                new_version,
+                positions_widened,
+                ..
+            },
         ..
-    } = &events[0].kind
+    } = &events[0].payload
     else {
-        panic!("expected TemplateWidened, got {:?}", events[0].kind);
+        panic!("expected Template/Widened, got {:?}", events[0].payload);
     };
     assert_eq!(*old_version, 1, "leaf was at version 1 before this attach");
     assert_eq!(

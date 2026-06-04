@@ -11,25 +11,27 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use ourios_core::audit::{AuditEvent, AuditEventKind, hash_triggering_line};
+use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange, hash_triggering_line};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditReader, AuditReaderError, AuditWriter, PartitionKey};
 use tempfile::TempDir;
 
 fn widening_event(tenant: &str, ts_secs: u64) -> AuditEvent {
     AuditEvent {
-        kind: AuditEventKind::TemplateWidened {
-            old_version: 1,
-            new_version: 2,
-            old_template: "[\"user\",\"<*>\"]".to_string(),
-            new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
-            positions_widened: vec![1],
-        },
         tenant_id: TenantId::new(tenant),
-        template_id: 7,
-        triggering_line_hash: hash_triggering_line(b"line"),
-        triggering_line_sample: None,
         timestamp: UNIX_EPOCH + Duration::from_secs(ts_secs),
+        payload: AuditPayload::Template {
+            template_id: 7,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Widened {
+                old_version: 1,
+                new_version: 2,
+                old_template: "[\"user\",\"<*>\"]".to_string(),
+                new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
+                positions_widened: vec![1],
+            },
+        },
     }
 }
 

@@ -44,8 +44,8 @@
 //!
 //! - Three-zone confidence + lossy-zone body retention (RFC §6.3,
 //!   `H1.2`).
-//! - Type-expansion (`TemplateTypeExpanded`); the variant exists
-//!   on [`AuditEventKind`] but no widening path emits it yet
+//! - Type-expansion (`TemplateChange::TypeExpanded`); the variant
+//!   exists on [`TemplateChange`] but no widening path emits it yet
 //!   (`H5.2`).
 //! - `reconstruct()` / `lossy_flag` semantics (RFC §6.6).
 //! - Per-parameter 256 B overflow + `OVERFLOW` marker (RFC §6.5).
@@ -56,14 +56,14 @@
 //!
 //! [`Tree`]: crate::tree::Tree
 //! [`AuditSink`]: ourios_core::audit::AuditSink
-//! [`AuditEventKind`]: ourios_core::audit::AuditEventKind
+//! [`TemplateChange`]: ourios_core::audit::TemplateChange
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_core::audit::{
-    AuditEvent, AuditEventKind, AuditSink, NoOpAuditSink, ParamType, SlotExpansion, SlotTypes,
-    hash_triggering_line, sample_first_256_bytes,
+    AuditEvent, AuditPayload, AuditSink, NoOpAuditSink, ParamType, SlotExpansion, SlotTypes,
+    TemplateChange, hash_triggering_line, sample_first_256_bytes,
 };
 use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::confidence::ConfidenceZone;
@@ -138,7 +138,7 @@ pub struct MinerCluster {
     // §6.4 counter: structural-widening events increment this;
     // rejection events do not. Today only `TemplateWidened`
     // emits; `TemplateTypeExpanded` will also increment once the
-    // type-expansion PR lands ([`AuditEventKind::counts_as_merge`]
+    // type-expansion PR lands ([`TemplateChange::counts_as_merge`]
     // names that contract). Atomic so the §6.8 Prometheus exposer
     // can read without taking a lock on the cluster.
     merges_total: AtomicU64,
@@ -372,7 +372,7 @@ impl MinerCluster {
     /// Cumulative count of structural-widening events across all
     /// tenants — `TemplateWidened` today, plus
     /// `TemplateTypeExpanded` once that variant has an emitter
-    /// (see [`AuditEventKind::counts_as_merge`]). Rejection events
+    /// (see [`TemplateChange::counts_as_merge`]). Rejection events
     /// are recorded but do not increment this counter.
     /// Read-side placeholder for the §6.8 Prometheus gauge.
     #[must_use]
@@ -868,13 +868,13 @@ enum AttachPlan {
         would_be_positions: Vec<u16>,
     },
     /// Leaf mutated (widened and/or type-expanded). `events` is the
-    /// audit-event payload in emission order: `TemplateWidened`
-    /// before `TemplateTypeExpanded` per RFC §6.2's combined-attach
-    /// contract. `params` is aligned with the post-widen template's
-    /// wildcard slots.
+    /// template-change payload in emission order: `Widened` before
+    /// `TypeExpanded` per RFC §6.2's combined-attach contract.
+    /// `params` is aligned with the post-widen template's wildcard
+    /// slots.
     Mutated {
         template_id: u64,
-        events: Vec<AuditEventKind>,
+        events: Vec<TemplateChange>,
         final_version: u32,
         params: Vec<Param>,
     },
@@ -950,7 +950,7 @@ fn plan_attach(
             template_id: leaf.template_id,
             final_version: new_version,
             params,
-            events: vec![AuditEventKind::TemplateTypeExpanded {
+            events: vec![TemplateChange::TypeExpanded {
                 old_version,
                 new_version,
                 // Structure is unchanged by type expansion; both
@@ -1001,8 +1001,8 @@ fn plan_attach(
     leaf.template_version = version_after_widen;
     let template_after_widen = format_template(&leaf.template);
 
-    let mut events: Vec<AuditEventKind> = Vec::with_capacity(2);
-    events.push(AuditEventKind::TemplateWidened {
+    let mut events: Vec<TemplateChange> = Vec::with_capacity(2);
+    events.push(TemplateChange::Widened {
         old_version,
         new_version: version_after_widen,
         old_template: old_template_str,
@@ -1028,7 +1028,7 @@ fn plan_attach(
             .checked_add(1)
             .expect("template_version overflow: 2^32 expansions on one leaf is implausible");
         leaf.template_version = version_after_expand;
-        events.push(AuditEventKind::TemplateTypeExpanded {
+        events.push(TemplateChange::TypeExpanded {
             old_version: version_after_widen,
             new_version: version_after_expand,
             old_template: template_after_widen.clone(),
@@ -1532,17 +1532,19 @@ impl MinerCluster {
                 would_be_positions,
             } => {
                 self.audit_sink.emit(AuditEvent {
-                    kind: AuditEventKind::TemplateWideningRejectedDegenerate {
-                        version,
-                        current_template,
-                        would_be_template,
-                        would_be_positions,
-                    },
                     tenant_id: record.tenant_id.clone(),
-                    template_id,
-                    triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                    triggering_line_sample: Some(sample_first_256_bytes(raw)),
                     timestamp: self.clock.now(),
+                    payload: AuditPayload::Template {
+                        template_id,
+                        triggering_line_hash: hash_triggering_line(raw.as_bytes()),
+                        triggering_line_sample: Some(sample_first_256_bytes(raw)),
+                        change: TemplateChange::RejectedDegenerate {
+                            version,
+                            current_template,
+                            would_be_template,
+                            would_be_positions,
+                        },
+                    },
                 });
                 // §6.4 treats degenerate widening as a parse
                 // failure that retains body. `lossy_flag = true`
@@ -1568,15 +1570,17 @@ impl MinerCluster {
                 final_version,
                 params: aligned_params,
             } => {
-                for kind in events {
-                    let counts_as_merge = kind.counts_as_merge();
+                for change in events {
+                    let counts_as_merge = change.counts_as_merge();
                     self.audit_sink.emit(AuditEvent {
-                        kind,
                         tenant_id: record.tenant_id.clone(),
-                        template_id,
-                        triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                        triggering_line_sample: Some(sample_first_256_bytes(raw)),
                         timestamp: self.clock.now(),
+                        payload: AuditPayload::Template {
+                            template_id,
+                            triggering_line_hash: hash_triggering_line(raw.as_bytes()),
+                            triggering_line_sample: Some(sample_first_256_bytes(raw)),
+                            change,
+                        },
                     });
                     if counts_as_merge {
                         self.merges_total.fetch_add(1, Ordering::Relaxed);
@@ -1987,17 +1991,22 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].template_id, id_in);
-        let AuditEventKind::TemplateWidened {
-            old_version,
-            new_version,
-            positions_widened,
-            old_template,
-            new_template,
-        } = &events[0].kind
+        let AuditPayload::Template {
+            template_id,
+            change:
+                TemplateChange::Widened {
+                    old_version,
+                    new_version,
+                    positions_widened,
+                    old_template,
+                    new_template,
+                },
+            ..
+        } = &events[0].payload
         else {
-            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+            panic!("expected Template/Widened, got {:?}", events[0].payload);
         };
+        assert_eq!(*template_id, id_in);
         assert_eq!(*old_version, 1);
         assert_eq!(*new_version, 2);
         assert_eq!(*positions_widened, vec![3]);
@@ -2098,13 +2107,17 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1);
-        let AuditEventKind::TemplateWidened {
-            old_version,
-            new_version,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::Widened {
+                    old_version,
+                    new_version,
+                    ..
+                },
             ..
-        } = &events[0].kind
+        } = &events[0].payload
         else {
-            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+            panic!("expected Template/Widened, got {:?}", events[0].payload);
         };
         assert_eq!(*old_version, 1);
         assert_eq!(*new_version, 2);
@@ -2133,29 +2146,37 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 2);
-        let AuditEventKind::TemplateWidened {
-            old_version: ov0,
-            new_version: nv0,
-            positions_widened: p0,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::Widened {
+                    old_version: ov0,
+                    new_version: nv0,
+                    positions_widened: p0,
+                    ..
+                },
             ..
-        } = &events[0].kind
+        } = &events[0].payload
         else {
             panic!(
-                "event 0: expected TemplateWidened, got {:?}",
-                events[0].kind
+                "event 0: expected Template/Widened, got {:?}",
+                events[0].payload
             );
         };
         assert_eq!((*ov0, *nv0, p0.clone()), (1, 2, vec![4]));
-        let AuditEventKind::TemplateWidened {
-            old_version: ov1,
-            new_version: nv1,
-            positions_widened: p1,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::Widened {
+                    old_version: ov1,
+                    new_version: nv1,
+                    positions_widened: p1,
+                    ..
+                },
             ..
-        } = &events[1].kind
+        } = &events[1].payload
         else {
             panic!(
-                "event 1: expected TemplateWidened, got {:?}",
-                events[1].kind
+                "event 1: expected Template/Widened, got {:?}",
+                events[1].payload
             );
         };
         assert_eq!((*ov1, *nv1, p1.clone()), (2, 3, vec![5]));
@@ -2241,8 +2262,11 @@ mod tests {
         let events = sink.drain();
         assert_eq!(events.len(), 1, "literal widening: one event only");
         assert!(matches!(
-            events[0].kind,
-            AuditEventKind::TemplateWidened { .. }
+            events[0].payload,
+            AuditPayload::Template {
+                change: TemplateChange::Widened { .. },
+                ..
+            }
         ));
 
         let templates = cluster.templates_for(&t);
@@ -2293,14 +2317,21 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1, "single TemplateTypeExpanded, no widening");
-        let AuditEventKind::TemplateTypeExpanded {
-            old_version,
-            new_version,
-            slots_expanded,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::TypeExpanded {
+                    old_version,
+                    new_version,
+                    slots_expanded,
+                    ..
+                },
             ..
-        } = &events[0].kind
+        } = &events[0].payload
         else {
-            panic!("expected TemplateTypeExpanded, got {:?}", events[0].kind);
+            panic!(
+                "expected Template/TypeExpanded, got {:?}",
+                events[0].payload
+            );
         };
         assert_eq!((*old_version, *new_version), (1, 2));
         assert_eq!(slots_expanded.len(), 1);
@@ -2370,14 +2401,21 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1, "exactly one TemplateTypeExpanded");
-        let AuditEventKind::TemplateTypeExpanded {
-            old_version,
-            new_version,
-            slots_expanded,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::TypeExpanded {
+                    old_version,
+                    new_version,
+                    slots_expanded,
+                    ..
+                },
             ..
-        } = &events[0].kind
+        } = &events[0].payload
         else {
-            panic!("expected TemplateTypeExpanded, got {:?}", events[0].kind);
+            panic!(
+                "expected Template/TypeExpanded, got {:?}",
+                events[0].payload
+            );
         };
         assert_eq!((*old_version, *new_version), (2, 3));
         assert_eq!(slots_expanded.len(), 1);
@@ -2393,7 +2431,7 @@ mod tests {
     fn type_expansion_only_attach_counts_toward_merges_total() {
         // RFC §6.4 — `merges_total` counts both `TemplateWidened`
         // and `TemplateTypeExpanded` (see
-        // `AuditEventKind::counts_as_merge`). A pure type-expansion
+        // `TemplateChange::counts_as_merge`). A pure type-expansion
         // attach must therefore bump the counter.
         let (mut cluster, _sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
@@ -2446,31 +2484,39 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 2, "combined widening + type expansion");
-        let AuditEventKind::TemplateWidened {
-            old_version: w_old,
-            new_version: w_new,
-            positions_widened,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::Widened {
+                    old_version: w_old,
+                    new_version: w_new,
+                    positions_widened,
+                    ..
+                },
             ..
-        } = &events[0].kind
+        } = &events[0].payload
         else {
             panic!(
-                "event 0 must be TemplateWidened (widening fires before expansion), got {:?}",
-                events[0].kind,
+                "event 0 must be Template/Widened (widening fires before expansion), got {:?}",
+                events[0].payload,
             );
         };
         assert_eq!((*w_old, *w_new), (2, 3));
         assert_eq!(*positions_widened, vec![3]);
 
-        let AuditEventKind::TemplateTypeExpanded {
-            old_version: e_old,
-            new_version: e_new,
-            slots_expanded,
+        let AuditPayload::Template {
+            change:
+                TemplateChange::TypeExpanded {
+                    old_version: e_old,
+                    new_version: e_new,
+                    slots_expanded,
+                    ..
+                },
             ..
-        } = &events[1].kind
+        } = &events[1].payload
         else {
             panic!(
-                "event 1 must be TemplateTypeExpanded, got {:?}",
-                events[1].kind,
+                "event 1 must be Template/TypeExpanded, got {:?}",
+                events[1].payload,
             );
         };
         assert_eq!((*e_old, *e_new), (3, 4));
@@ -2562,8 +2608,15 @@ mod tests {
             !events.is_empty(),
             "§3.1: mask-tag type change at a tree-routed wildcard slot must audit",
         );
-        let AuditEventKind::TemplateTypeExpanded { slots_expanded, .. } = &events[0].kind else {
-            panic!("expected TemplateTypeExpanded, got {:?}", events[0].kind);
+        let AuditPayload::Template {
+            change: TemplateChange::TypeExpanded { slots_expanded, .. },
+            ..
+        } = &events[0].payload
+        else {
+            panic!(
+                "expected Template/TypeExpanded, got {:?}",
+                events[0].payload
+            );
         };
         assert_eq!(slots_expanded.len(), 1);
         assert_eq!(slots_expanded[0].slot_index, 0);
@@ -2766,11 +2819,16 @@ mod tests {
 
         let events = sink.drain();
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].triggering_line_hash,
-            hash_triggering_line(l2.as_bytes()),
-        );
-        assert_eq!(events[0].triggering_line_sample.as_deref(), Some(l2));
+        let AuditPayload::Template {
+            triggering_line_hash,
+            triggering_line_sample,
+            ..
+        } = &events[0].payload
+        else {
+            panic!("expected Template, got {:?}", events[0].payload);
+        };
+        assert_eq!(*triggering_line_hash, hash_triggering_line(l2.as_bytes()));
+        assert_eq!(triggering_line_sample.as_deref(), Some(l2));
     }
 
     #[test]
@@ -2850,19 +2908,29 @@ mod tests {
         let events = sink.drain();
         assert_eq!(events.len(), 2);
         assert!(
-            matches!(events[0].kind, AuditEventKind::TemplateWidened { .. }),
-            "event 0: expected TemplateWidened, got {:?}",
-            events[0].kind,
+            matches!(
+                events[0].payload,
+                AuditPayload::Template {
+                    change: TemplateChange::Widened { .. },
+                    ..
+                }
+            ),
+            "event 0: expected Template/Widened, got {:?}",
+            events[0].payload,
         );
         // Rejection variant carries no version bump and surfaces
         // the would-be template the operator was protected from.
-        let AuditEventKind::TemplateWideningRejectedDegenerate {
-            would_be_template, ..
-        } = &events[1].kind
+        let AuditPayload::Template {
+            change:
+                TemplateChange::RejectedDegenerate {
+                    would_be_template, ..
+                },
+            ..
+        } = &events[1].payload
         else {
             panic!(
-                "event 1: expected TemplateWideningRejectedDegenerate, got {:?}",
-                events[1].kind,
+                "event 1: expected Template/RejectedDegenerate, got {:?}",
+                events[1].payload,
             );
         };
         assert_eq!(would_be_template, "<*> <*> <*>");
@@ -2990,13 +3058,17 @@ mod tests {
         assert_eq!(cluster.merges_total(), 1);
         let events = sink.drain();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].template_id, id_a);
-        let AuditEventKind::TemplateWidened {
-            positions_widened, ..
-        } = &events[0].kind
+        let AuditPayload::Template {
+            template_id,
+            change: TemplateChange::Widened {
+                positions_widened, ..
+            },
+            ..
+        } = &events[0].payload
         else {
-            panic!("expected TemplateWidened, got {:?}", events[0].kind);
+            panic!("expected Template/Widened, got {:?}", events[0].payload);
         };
+        assert_eq!(*template_id, id_a);
         assert_eq!(*positions_widened, vec![4]);
     }
 

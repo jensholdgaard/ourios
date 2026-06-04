@@ -2,7 +2,7 @@
 //! and round-trips every §3.7 row-level column.
 //! See `docs/rfcs/0005-parquet-storage.md` §5.
 //!
-//! Writes one [`AuditEvent`] of each [`AuditEventKind`] variant
+//! Writes one [`AuditEvent`] of each [`AuditPayload`] variant
 //! through [`AuditWriter`], reads them back through
 //! [`AuditReader::open_partition`], and asserts full struct
 //! equality.
@@ -21,7 +21,7 @@ use std::path::Component;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_core::audit::{
-    AuditEvent, AuditEventKind, ParamType, SlotExpansion, hash_triggering_line,
+    AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange, hash_triggering_line,
 };
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditReader, AuditWriter, PartitionKey};
@@ -31,29 +31,51 @@ fn ts(offset_secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(offset_secs)
 }
 
-/// Three events, one of each variant, all in the same audit
+fn template_event(
+    tenant: &str,
+    template_id: u64,
+    sample: Option<&str>,
+    offset: u64,
+    change: TemplateChange,
+) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(offset),
+        payload: AuditPayload::Template {
+            template_id,
+            triggering_line_hash: hash_triggering_line(b"trigger"),
+            triggering_line_sample: sample.map(str::to_string),
+            change,
+        },
+    }
+}
+
+/// Three events, one of each template variant, all in the same audit
 /// partition (same tenant, same day). The widening + type-expand
 /// share a `template_id`; the rejection lands on a different one.
 fn three_variants(tenant: &str) -> Vec<AuditEvent> {
     vec![
-        AuditEvent {
-            kind: AuditEventKind::TemplateWidened {
+        // 2026-04-02T10:58:00Z baseline (same day as the round-trip
+        // test data fixtures).
+        template_event(
+            tenant,
+            7,
+            Some("user 42 in"),
+            1_775_127_480,
+            TemplateChange::Widened {
                 old_version: 1,
                 new_version: 2,
                 old_template: "[\"user\",\"<*>\",\"in\"]".to_string(),
                 new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
                 positions_widened: vec![2],
             },
-            tenant_id: TenantId::new(tenant),
-            template_id: 7,
-            triggering_line_hash: hash_triggering_line(b"user 42 in"),
-            triggering_line_sample: Some("user 42 in".to_string()),
-            // 2026-04-02T10:58:00Z baseline (same day as the
-            // round-trip test data fixtures).
-            timestamp: ts(1_775_127_480),
-        },
-        AuditEvent {
-            kind: AuditEventKind::TemplateTypeExpanded {
+        ),
+        template_event(
+            tenant,
+            7,
+            None,
+            1_775_127_490,
+            TemplateChange::TypeExpanded {
                 old_version: 2,
                 new_version: 3,
                 old_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
@@ -69,26 +91,35 @@ fn three_variants(tenant: &str) -> Vec<AuditEvent> {
                     },
                 ],
             },
-            tenant_id: TenantId::new(tenant),
-            template_id: 7,
-            triggering_line_hash: hash_triggering_line(b"user 10.0.0.1 done"),
-            triggering_line_sample: None,
-            timestamp: ts(1_775_127_490),
-        },
-        AuditEvent {
-            kind: AuditEventKind::TemplateWideningRejectedDegenerate {
+        ),
+        template_event(
+            tenant,
+            9,
+            Some("zzz qqq"),
+            1_775_127_500,
+            TemplateChange::RejectedDegenerate {
                 version: 5,
                 current_template: "[\"only-literal\",\"<*>\"]".to_string(),
                 would_be_template: "[\"<*>\",\"<*>\"]".to_string(),
                 would_be_positions: vec![0],
             },
-            tenant_id: TenantId::new(tenant),
-            template_id: 9,
-            triggering_line_hash: hash_triggering_line(b"zzz qqq"),
-            triggering_line_sample: Some("zzz qqq".to_string()),
-            timestamp: ts(1_775_127_500),
-        },
+        ),
     ]
+}
+
+/// A compaction audit event in the same partition (RFC 0009 §3.6).
+fn compaction_event(tenant: &str) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(1_775_127_510),
+        payload: AuditPayload::Compaction {
+            partition: "year=2026/month=04/day=02/hour=10".to_string(),
+            input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            output_file: "c.parquet".to_string(),
+            generation: 7,
+            rows: 100,
+        },
+    }
 }
 
 fn audit_partition_for(event: &AuditEvent) -> PartitionKey {
@@ -219,18 +250,25 @@ fn rfc0005_7_rejection_variant_round_trips_via_reason_column() {
         .iter()
         .find(|e| {
             matches!(
-                e.kind,
-                AuditEventKind::TemplateWideningRejectedDegenerate { .. }
+                &e.payload,
+                AuditPayload::Template {
+                    change: TemplateChange::RejectedDegenerate { .. },
+                    ..
+                }
             )
         })
         .expect("rejection event round-tripped");
 
-    let AuditEventKind::TemplateWideningRejectedDegenerate {
-        version,
-        current_template,
-        would_be_template,
-        would_be_positions,
-    } = &rt_rejection.kind
+    let AuditPayload::Template {
+        change:
+            TemplateChange::RejectedDegenerate {
+                version,
+                current_template,
+                would_be_template,
+                would_be_positions,
+            },
+        ..
+    } = &rt_rejection.payload
     else {
         unreachable!()
     };
@@ -239,4 +277,39 @@ fn rfc0005_7_rejection_variant_round_trips_via_reason_column() {
     assert_eq!(current_template, "[\"only-literal\",\"<*>\"]");
     assert_eq!(would_be_template, "[\"<*>\",\"<*>\"]");
     assert_eq!(would_be_positions, &vec![0]);
+}
+
+/// RFC0005.12 — a `compaction` audit event round-trips with its
+/// `compaction_*` columns populated and the template columns NULL,
+/// and a template event in the same file keeps the inverse (the
+/// §3.8-rule-6 required-by-convention contract).
+#[test]
+fn rfc0005_12_compaction_audit_event_round_trips() {
+    // Arrange — one template event + one compaction event, same
+    // partition.
+    let bucket = TempDir::new().unwrap();
+    let template = three_variants("acme").remove(0);
+    let compaction = compaction_event("acme");
+    let events = vec![template.clone(), compaction.clone()];
+    let partition = audit_partition_for(&events[0]);
+    let mut writer = AuditWriter::open(bucket.path(), partition.clone()).expect("open");
+    writer.append_events(&events).expect("append");
+    let written = writer.close().expect("close");
+
+    // Act
+    let reader = AuditReader::open_partition(&written.path, partition).expect("open_partition");
+    let round_tripped = reader.read_all().expect("read_all");
+
+    // Assert — both events survive, byte-for-byte (the compaction
+    // payload's columns and the template payload's columns are
+    // mutually exclusive and both reconstruct).
+    assert_eq!(round_tripped.len(), 2);
+    assert!(
+        round_tripped.contains(&compaction),
+        "compaction event round-trips with compaction_* columns and NULL template columns",
+    );
+    assert!(
+        round_tripped.contains(&template),
+        "the template event in the same file is unaffected",
+    );
 }

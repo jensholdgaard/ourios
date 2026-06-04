@@ -2,9 +2,10 @@
 //!
 //! **Status: execution slice 3.** [`Querier::run`] executes a
 //! minimal query — tenant scope + optional time range + optional
-//! template-exact id — against the RFC 0005 Parquet store via
-//! `DataFusion`, returning a matching-row count **and the scan's
-//! row-group pruning stats** ([`QueryStats`]). Tenant isolation
+//! template-exact id + optional `severity_text` (the B1 `level='ERROR'`
+//! filter) — against the RFC 0005 Parquet store via `DataFusion`,
+//! returning a matching-row count **and the scan's row-group pruning
+//! stats** ([`QueryStats`]). Tenant isolation
 //! (RFC0007.5), B1 pruning (RFC0007.1 — a selective query provably
 //! skips row groups via statistics) and B2 (RFC0007.2 — the work
 //! the engine does tracks the result size, not the corpus size;
@@ -57,9 +58,10 @@ use ourios_parquet::percent_encode_tenant;
 /// thesis (B1/B2) is unproven — per the maintainer decision, DSL
 /// contracts (RFC 0002) are deferred until B1/B2 say the querier
 /// is worth a stable language. So this carries only the minimal
-/// predicates B1/B2 need: tenant scope, optional time bounds, and
-/// optional template-exact id — exactly the RFC 0005 §3.3
-/// pushdown keys.
+/// predicates B1/B2 need: tenant scope, optional time bounds,
+/// optional template-exact id, and an optional `severity_text`
+/// equality (the B1 `level='ERROR'` filter) — exactly the RFC 0005
+/// §3.3 pushdown keys.
 #[derive(Debug, Clone)]
 pub struct QueryRequest {
     /// Tenant whose data the query is scoped to. Enforced
@@ -70,6 +72,11 @@ pub struct QueryRequest {
     pub time_range: Option<(u64, u64)>,
     /// Optional template-exact filter (B2 — `template_id` equality).
     pub template_id: Option<u64>,
+    /// Optional `severity_text` equality filter — the B1 `level='ERROR'`
+    /// query shape (RFC 0005 §3.2 `severity_text` column). The
+    /// structured counterpart to the B1 reference's `grep ERROR`: rows
+    /// whose severity is null or anything else don't match.
+    pub severity_text: Option<String>,
 }
 
 /// Pruning / IO accounting for one query, surfaced so B1
@@ -421,6 +428,28 @@ impl Querier {
         if let Some(template_id) = request.template_id {
             df = df
                 .filter(col(columns::TEMPLATE_ID).eq(lit(template_id)))
+                .map_err(storage_err)?;
+        }
+        if let Some(severity_text) = &request.severity_text {
+            // `severity_text` is OPTIONAL (RFC 0005 §3.2). If a tenant's
+            // entire file set predates the column, the inferred union
+            // schema omits it — and filtering an unknown column would
+            // fail planning (surfacing as a generic Storage error). An
+            // absent OPTIONAL column reads as all-NULL (RFC 0005 §3.9 /
+            // RFC0007.4), so `severity_text = X` matches nothing: return
+            // an empty result rather than erroring. (Per-file drift,
+            // where *some* file has the column, is handled by DataFusion's
+            // schema union — see tests/forward_compat.rs.)
+            let has_severity = df
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name() == columns::SEVERITY_TEXT);
+            if !has_severity {
+                return Ok(QueryResult::default());
+            }
+            df = df
+                .filter(col(columns::SEVERITY_TEXT).eq(lit(severity_text.as_str())))
                 .map_err(storage_err)?;
         }
 

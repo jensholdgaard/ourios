@@ -82,6 +82,7 @@ fn req(time_range: Option<(u64, u64)>, template_id: Option<u64>) -> QueryRequest
         tenant: TenantId::new("a"),
         time_range,
         template_id,
+        severity_text: None,
     }
 }
 
@@ -200,4 +201,34 @@ async fn rfc0007_4_heterogeneous_schemas_stay_queryable() {
     // And an unfiltered scan reads all three heterogeneous files.
     let all = q.run(req(None, None)).await.expect("unfiltered query");
     assert_eq!(all.rows, 3, "all three heterogeneous files are read");
+}
+
+/// RFC0007.4 / §3.9 rule 2 — a B1 `severity_text='ERROR'` query against
+/// a tenant whose *entire* file set predates the OPTIONAL `severity_text`
+/// column. The inferred union schema omits the column, so a naive filter
+/// would fail planning; instead the absent OPTIONAL column reads as
+/// all-NULL and the equality matches nothing — an empty result, not a
+/// `QueryError`.
+#[tokio::test]
+async fn rfc0007_4_severity_filter_on_column_absent_everywhere_is_empty() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    // The only file omits severity_text (an old writer's output).
+    let old = rec(1, TS0);
+    write_raw_at(bucket.path(), &old, &old_schema_batch(&old));
+
+    let q = Querier::new(bucket.path());
+    let r = q
+        .run(QueryRequest {
+            tenant: TenantId::new("a"),
+            time_range: None,
+            template_id: None,
+            severity_text: Some("ERROR".to_string()),
+        })
+        .await
+        .expect("severity filter on an absent column must not error");
+
+    assert_eq!(
+        r.rows, 0,
+        "an absent OPTIONAL severity_text matches nothing (all-NULL)",
+    );
 }

@@ -54,6 +54,7 @@ fn req(template_id: Option<u64>) -> QueryRequest {
         tenant: TenantId::new("a"),
         time_range: None,
         template_id,
+        severity_text: None,
     }
 }
 

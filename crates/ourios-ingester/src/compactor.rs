@@ -89,6 +89,26 @@ pub struct SweepReport {
     /// compaction (RFC 0009 §3.6 / RFC 0005 §3.7). Built here;
     /// [`Compactor::run`] emits them through its [`AuditSink`].
     pub compaction_events: Vec<AuditEvent>,
+    /// Total input bytes read across the compacted partitions — the
+    /// read volume for `ourios.compaction.io` (RFC 0009 §3.6).
+    pub bytes_read: u64,
+    /// One entry per committed compaction: the consolidated output
+    /// file's size, tagged with its tenant. These are the per-tenant
+    /// `ourios.storage.parquet.file.size` H4 histogram samples; their
+    /// sum is the write volume for `ourios.compaction.io` (RFC 0009
+    /// §3.6).
+    pub compacted_files: Vec<CompactedFile>,
+}
+
+/// A consolidated output file's size tagged with its tenant — one
+/// `ourios.storage.parquet.file.size` sample (RFC 0009 §3.6 H4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactedFile {
+    /// Tenant whose partition was compacted (the `ourios.tenant`
+    /// histogram dimension).
+    pub tenant: String,
+    /// On-disk size of the consolidated file, in bytes.
+    pub bytes: u64,
 }
 
 /// Run one compaction sweep over `bucket_root`, as of wall-clock
@@ -128,6 +148,11 @@ pub fn run_sweep(
                         report.partitions_compacted += 1;
                         report.files_compacted += to_u64(outcome.files_before);
                         report.rows_compacted += outcome.rows;
+                        report.bytes_read = report.bytes_read.saturating_add(outcome.bytes_read);
+                        report.compacted_files.push(CompactedFile {
+                            tenant: tenant.clone(),
+                            bytes: outcome.bytes_written,
+                        });
                         report.compaction_events.push(compaction_audit_event(
                             &tenant,
                             now_unix_nanos,

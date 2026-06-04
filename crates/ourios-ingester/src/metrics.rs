@@ -7,12 +7,17 @@
 //! is installed the global meter is a no-op, so constructing and
 //! recording is always safe.
 //!
-//! This slice records the metric set that the existing
-//! [`CompactionOutcome`](ourios_parquet::CompactionOutcome) already
-//! exposes — sweeps, partitions, files, rows, orphan files, and sweep
-//! duration. `ourios.compaction.io` (needs per-compaction byte counts),
-//! `ourios.compaction.backlog`, and `ourios.storage.parquet.file.size`
-//! are deferred to a follow-up that plumbs the additional data.
+//! Records the per-sweep counters and histograms of RFC 0009 §3.6:
+//! sweeps, partitions, files, rows, orphan files, sweep duration,
+//! `ourios.compaction.io` (bytes read / written), and the
+//! `ourios.storage.parquet.file.size` H4 detector (a per-tenant
+//! distribution of consolidated output sizes — the signal behind the
+//! "alert when > 5 % of files < 128 MiB" rule). All byte volumes come
+//! from [`CompactionOutcome`](ourios_parquet::CompactionOutcome) via
+//! the [`SweepReport`]. `ourios.compaction.backlog` (an
+//! `UpDownCounter` tracking sealed-but-uncompacted lag — a cross-sweep
+//! gauge, not a per-compaction quantity) is the one §3.6 metric still
+//! deferred.
 
 use std::time::Duration;
 
@@ -32,6 +37,8 @@ pub struct CompactionMetrics {
     rows: Counter<u64>,
     orphan_files: Counter<u64>,
     duration: Histogram<f64>,
+    io: Counter<u64>,
+    file_size: Histogram<u64>,
 }
 
 impl CompactionMetrics {
@@ -73,9 +80,20 @@ impl CompactionMetrics {
             .f64_histogram(semconv::OURIOS_COMPACTION_DURATION)
             .with_unit("s")
             .build();
+        let io = meter
+            .u64_counter(semconv::OURIOS_COMPACTION_IO)
+            .with_unit("By")
+            .build();
+        let file_size = meter
+            .u64_histogram(semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE)
+            .with_unit("By")
+            .build();
 
-        // Only the attribute-free counters; `sweeps` carries a required
-        // `result` attribute, so it is not zero-seeded here.
+        // Only the attribute-free counters; `sweeps` and `io` carry
+        // required attributes (`result` / `io.direction`) and `duration`
+        // / `file_size` are histograms, so none are zero-seeded here —
+        // they surface on the first sweep (`io` always, with a 0-byte
+        // read/write point; the histograms only on real samples).
         for counter in [&partitions, &files, &rows, &orphan_files] {
             counter.add(0, &[]);
         }
@@ -87,6 +105,8 @@ impl CompactionMetrics {
             rows,
             orphan_files,
             duration,
+            io,
+            file_size,
         }
     }
 
@@ -113,6 +133,35 @@ impl CompactionMetrics {
             self.files.add(report.files_compacted, &[]);
             self.rows.add(report.rows_compacted, &[]);
             self.orphan_files.add(to_u64(report.gc_failures), &[]);
+
+            // Bytes moved this sweep, split by direction; the write
+            // volume is the sum of the consolidated output sizes
+            // (saturating, matching `run_sweep`'s read accumulation).
+            let bytes_written = report
+                .compacted_files
+                .iter()
+                .fold(0_u64, |acc, f| acc.saturating_add(f.bytes));
+            self.io.add(
+                report.bytes_read,
+                &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "read")],
+            );
+            self.io.add(
+                bytes_written,
+                &[KeyValue::new(semconv::OURIOS_IO_DIRECTION, "write")],
+            );
+
+            // The H4 detector: one per-tenant sample per consolidated
+            // file, so the "> 5 % of files < 128 MiB" rule is a derived
+            // alert over this distribution (RFC 0009 §3.6). A `0` size is
+            // a best-effort `stat` failure (`file_len`), not a real
+            // file — skip it so the small-file distribution isn't skewed
+            // by a bogus zero-byte sample.
+            for file in report.compacted_files.iter().filter(|f| f.bytes > 0) {
+                self.file_size.record(
+                    file.bytes,
+                    &[KeyValue::new(semconv::OURIOS_TENANT, file.tenant.clone())],
+                );
+            }
         }
     }
 }
@@ -125,11 +174,14 @@ impl Default for CompactionMetrics {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use opentelemetry_sdk::metrics::data::{
         AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
     };
 
     use super::*;
+    use crate::compactor::CompactedFile;
 
     // Collected metric names across the in-memory export.
     fn collected_names(rms: &[ResourceMetrics]) -> Vec<String> {
@@ -140,55 +192,24 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn record_sweep_exports_the_compaction_metric_set() {
-        // Arrange — an in-memory provider, then the instruments (built
-        // after, so they resolve against it).
-        let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
-        let metrics = CompactionMetrics::new();
-        let report = SweepReport {
-            tenants_scanned: 2,
-            partitions_compacted: 3,
-            files_compacted: 7,
-            rows_compacted: 100,
-            gc_failures: 1,
-            errors: Vec::new(),
-            compaction_events: Vec::new(),
-        };
-
-        // Act
-        metrics.record_sweep(&Ok(report), Duration::from_millis(50));
-        guard.force_flush().expect("force_flush succeeds");
-
-        // Assert — every recorded instrument is in the exported stream.
-        let rms = exporter.get_finished_metrics().expect("metrics exported");
-        let names = collected_names(&rms);
-        for expected in [
-            semconv::OURIOS_COMPACTION_SWEEPS,
-            semconv::OURIOS_COMPACTION_PARTITIONS,
-            semconv::OURIOS_COMPACTION_FILES,
-            semconv::OURIOS_COMPACTION_ROWS,
-            semconv::OURIOS_COMPACTION_ORPHAN_FILES,
-            semconv::OURIOS_COMPACTION_DURATION,
-        ] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "exported stream missing {expected}, got {names:?}",
-            );
-        }
-
-        // …and every `sweeps` datapoint carries the *required*
-        // `ourios.compaction.result` attribute (the round-1 seed bug
-        // emitted an attribute-less point), with the committed sweep
-        // classified as such.
-        let sweeps = rms
-            .iter()
+    // The exported metric `name`'s aggregated data.
+    fn metric_data<'a>(rms: &'a [ResourceMetrics], name: &str) -> &'a AggregatedMetrics {
+        rms.iter()
             .flat_map(ResourceMetrics::scope_metrics)
             .flat_map(ScopeMetrics::metrics)
-            .find(|metric| metric.name() == semconv::OURIOS_COMPACTION_SWEEPS)
-            .expect("sweeps metric present");
-        let AggregatedMetrics::U64(MetricData::Sum(sum)) = sweeps.data() else {
-            panic!("sweeps should be a u64 sum, got {:?}", sweeps.data());
+            .find(|m| m.name() == name)
+            .unwrap_or_else(|| panic!("metric {name} missing from the exported stream"))
+            .data()
+    }
+
+    // Every `sweeps` point carries the *required* `result` attribute (the
+    // round-1 seed bug emitted an attribute-less point), and the committed
+    // sweep is classified as such.
+    fn assert_sweeps_classified(rms: &[ResourceMetrics]) {
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) =
+            metric_data(rms, semconv::OURIOS_COMPACTION_SWEEPS)
+        else {
+            panic!("sweeps should be a u64 sum");
         };
         assert!(sum.data_points().count() > 0, "a sweep was recorded");
         assert!(
@@ -204,5 +225,140 @@ mod tests {
             })),
             "the committed sweep is classified result=committed",
         );
+    }
+
+    // `io` carries one read point and one write point, each tagged with
+    // its direction; returns the (read, write) byte volumes.
+    fn io_volumes(rms: &[ResourceMetrics]) -> (u64, u64) {
+        let AggregatedMetrics::U64(MetricData::Sum(io)) =
+            metric_data(rms, semconv::OURIOS_COMPACTION_IO)
+        else {
+            panic!("io should be a u64 sum");
+        };
+        let direction = |dir: &str| -> u64 {
+            io.data_points()
+                .find(|dp| {
+                    dp.attributes().any(|kv| {
+                        kv.key.as_str() == semconv::OURIOS_IO_DIRECTION && kv.value.as_str() == dir
+                    })
+                })
+                .unwrap_or_else(|| panic!("io is missing the {dir} direction"))
+                .value()
+        };
+        (direction("read"), direction("write"))
+    }
+
+    // The H4 detector. `expected` is the list of recorded `(tenant, bytes)`
+    // samples; OTel aggregates by attribute set, so several files for one
+    // tenant collapse into a single datapoint with `count` = file count and
+    // `sum` = Σ bytes. Asserts exactly that per-tenant aggregate, and that
+    // no extra tenants appear (so 0-byte / skipped samples stay absent).
+    fn assert_file_size_histogram(rms: &[ResourceMetrics], expected: &[(&str, u64)]) {
+        let AggregatedMetrics::U64(MetricData::Histogram(hist)) =
+            metric_data(rms, semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE)
+        else {
+            panic!("file.size should be a u64 histogram");
+        };
+        // Fold the expected samples into per-tenant (count, sum) aggregates.
+        let mut per_tenant: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+        for &(tenant, bytes) in expected {
+            let entry = per_tenant.entry(tenant).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(bytes);
+        }
+        assert_eq!(
+            hist.data_points().count(),
+            per_tenant.len(),
+            "one datapoint per tenant, no extras",
+        );
+        for (tenant, (count, sum)) in per_tenant {
+            let dp = hist
+                .data_points()
+                .find(|dp| {
+                    dp.attributes().any(|kv| {
+                        kv.key.as_str() == semconv::OURIOS_TENANT && kv.value.as_str() == tenant
+                    })
+                })
+                .unwrap_or_else(|| panic!("file.size is missing tenant {tenant}"));
+            assert_eq!(dp.count(), count, "{tenant}: file count");
+            assert_eq!(dp.sum(), sum, "{tenant}: Σ byte sizes");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn record_sweep_exports_the_compaction_metric_set() {
+        // Arrange — an in-memory provider, then the instruments (built
+        // after, so they resolve against it).
+        let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+        let metrics = CompactionMetrics::new();
+        let report = SweepReport {
+            tenants_scanned: 2,
+            partitions_compacted: 2,
+            files_compacted: 7,
+            rows_compacted: 100,
+            gc_failures: 1,
+            errors: Vec::new(),
+            compaction_events: Vec::new(),
+            bytes_read: 4096,
+            // acme: two consolidated files (OTel merges them into one
+            // per-tenant datapoint); beta: one; ghost: a 0-byte sample
+            // standing in for a best-effort `stat` failure (must be
+            // dropped from the H4 histogram).
+            compacted_files: vec![
+                CompactedFile {
+                    tenant: "acme".to_string(),
+                    bytes: 1024,
+                },
+                CompactedFile {
+                    tenant: "beta".to_string(),
+                    bytes: 2048,
+                },
+                CompactedFile {
+                    tenant: "acme".to_string(),
+                    bytes: 512,
+                },
+                CompactedFile {
+                    tenant: "ghost".to_string(),
+                    bytes: 0,
+                },
+            ],
+        };
+
+        // Act
+        metrics.record_sweep(&Ok(report), Duration::from_millis(50));
+        guard.force_flush().expect("force_flush succeeds");
+
+        // Assert — every recorded instrument is in the exported stream.
+        // (All assertions share this test's single in-memory provider:
+        // `init_in_memory` installs the *global* meter, so two such tests
+        // in one binary would race — one test, one provider.)
+        let rms = exporter.get_finished_metrics().expect("metrics exported");
+        let names = collected_names(&rms);
+        for expected in [
+            semconv::OURIOS_COMPACTION_SWEEPS,
+            semconv::OURIOS_COMPACTION_PARTITIONS,
+            semconv::OURIOS_COMPACTION_FILES,
+            semconv::OURIOS_COMPACTION_ROWS,
+            semconv::OURIOS_COMPACTION_ORPHAN_FILES,
+            semconv::OURIOS_COMPACTION_DURATION,
+            semconv::OURIOS_COMPACTION_IO,
+            semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "exported stream missing {expected}, got {names:?}",
+            );
+        }
+
+        assert_sweeps_classified(&rms);
+
+        // `io` splits the sweep's bytes by direction; the write volume is
+        // the sum of every consolidated output (1024 + 2048 + 512 + 0).
+        assert_eq!(io_volumes(&rms), (4096, 3584), "io read / write volumes");
+
+        // The H4 detector aggregates per tenant: acme's two files merge
+        // into one datapoint (count 2, Σ 1536), beta has one, and the
+        // 0-byte ghost sample is dropped (no `ghost` datapoint).
+        assert_file_size_histogram(&rms, &[("acme", 1024), ("acme", 512), ("beta", 2048)]);
     }
 }

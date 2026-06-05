@@ -637,6 +637,111 @@ mod tests {
         w.close().expect("close");
     }
 
+    /// Hour-10 start (2026-04-02T10:00:00Z): a record at `+off` for any
+    /// `off` in `[0, HOUR_NANOS)` lands in the same partition as
+    /// [`partition`].
+    const HOUR10_START: u64 = 1_775_124_000_000_000_000;
+
+    /// A record varying only the fields the row-conservation property
+    /// exercises (template, in-hour timestamp, severity, one param's
+    /// value); everything else is held to the clean-round-trip shape so
+    /// equality reflects compaction, not codec edge cases.
+    fn prop_rec(
+        template_id: u64,
+        ts_ns: u64,
+        severity_number: u8,
+        param_value: &str,
+    ) -> MinedRecord {
+        MinedRecord {
+            template_id,
+            time_unix_nano: ts_ns,
+            observed_time_unix_nano: Some(ts_ns + 1_000),
+            severity_number,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: param_value.to_string(),
+            }],
+            ..rec(template_id, ts_ns)
+        }
+    }
+
+    /// Total order over the fields `prop_rec` varies — borrows the param
+    /// value (a free fn so the borrow's lifetime ties to the record, which
+    /// a closure can't express here).
+    fn row_key(r: &MinedRecord) -> (u64, u64, u8, &str) {
+        (
+            r.template_id,
+            r.time_unix_nano,
+            r.severity_number,
+            r.params[0].value.as_str(),
+        )
+    }
+
+    proptest::proptest! {
+        // Each case builds + compacts + re-reads a multi-file store, so
+        // cap the case count to keep the suite fast while still covering
+        // a broad spread of splits/contents.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// RFC0009.2 — compaction preserves **every stored row**. For any
+        /// split of records across ≥2 files in one partition, the
+        /// consolidated file holds exactly the same multiset of rows
+        /// (count + content), reordering aside.
+        #[test]
+        fn compaction_conserves_every_row(
+            files in proptest::collection::vec(
+                proptest::collection::vec(
+                    (
+                        proptest::prelude::any::<u64>(),
+                        0u64..HOUR_NANOS,
+                        proptest::prelude::any::<u8>(),
+                        // Numeric, to match the `ParamType::Num` tag
+                        // `prop_rec` sets (a clean-round-trip fixture).
+                        "[0-9]{1,12}",
+                    ),
+                    // 1..=15 records, 2..=5 files — 5 files also exceeds
+                    // the default `min_files` (4), exercising the count arm.
+                    1..=15usize,
+                ),
+                2..=5usize,
+            )
+        ) {
+            let bucket = tempfile::tempdir().expect("temp");
+            let part = partition();
+            let mut expected: Vec<MinedRecord> = Vec::new();
+            for file in &files {
+                let recs: Vec<MinedRecord> = file
+                    .iter()
+                    .map(|(tid, off, sev, val)| prop_rec(*tid, HOUR10_START + off, *sev, val))
+                    .collect();
+                expected.extend(recs.iter().cloned());
+                let mut w = Writer::open(bucket.path(), part.clone()).expect("open writer");
+                w.append_records(&recs).expect("append");
+                w.close().expect("close");
+            }
+
+            let outcome = compact_partition(bucket.path(), &part).expect("compact");
+            proptest::prop_assert!(outcome.committed.is_some(), "≥2 files ⇒ a commit");
+            proptest::prop_assert_eq!(outcome.rows, expected.len() as u64, "row count conserved");
+
+            let dir = part.data_path(bucket.path());
+            let live = live_files(&dir).expect("live");
+            proptest::prop_assert_eq!(live.len(), 1, "one consolidated file");
+            let mut got = Reader::open_partition(&live[0], part.clone())
+                .expect("open")
+                .read_all()
+                .expect("read");
+
+            // Multiset equality: only `(template, ts, severity, param)`
+            // vary, so that tuple is a total key over distinguishable
+            // rows; sorting both by it lets the element-wise `==` (full
+            // record) confirm content is preserved, not just the count.
+            got.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+            expected.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+            proptest::prop_assert_eq!(got, expected, "every row preserved (value-equal)");
+        }
+    }
+
     #[test]
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).

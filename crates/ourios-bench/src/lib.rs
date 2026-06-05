@@ -35,9 +35,11 @@ mod c1;
 mod c2;
 mod corpus;
 mod harness;
+mod reference;
 mod report;
 mod store;
 
+pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
 pub use store::{BuiltStore, build_query_store};
 

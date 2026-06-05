@@ -69,6 +69,10 @@ ourios-querier = { path = "../ourios-querier" }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [[bench]]
+name = "b1"
+harness = false
+
+[[bench]]
 name = "b2"
 harness = false
 

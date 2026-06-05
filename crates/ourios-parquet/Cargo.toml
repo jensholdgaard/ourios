@@ -48,6 +48,9 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 [dev-dependencies]
 # Used by tests that build `MinedRecord` fixtures.
 tempfile = "3"
+# Property tests for the compaction row-conservation invariant
+# (RFC0009.2 / CLAUDE.md §6.2 — invariants get a property test).
+proptest = "1"
 
 [lints]
 workspace = true

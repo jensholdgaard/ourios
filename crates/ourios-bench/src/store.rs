@@ -35,6 +35,12 @@ pub struct BuiltStore {
     /// How many rows that busiest template has (the result size a
     /// `template_id = busiest_template_id` query returns).
     pub busiest_template_rows: u64,
+    /// Smallest non-zero `time_unix_nano` written (`0` if none) — the
+    /// start of the corpus's time span, for picking a B2 query window.
+    pub min_time_unix_nano: u64,
+    /// Largest `time_unix_nano` written (`0` if none) — the end of the
+    /// corpus's time span.
+    pub max_time_unix_nano: u64,
 }
 
 /// Load the corpus at `corpus_dir`, mine it, and write the emitted
@@ -74,6 +80,12 @@ pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltS
     let mut writers: HashMap<PartitionKey, Writer> = HashMap::new();
     let mut counts: HashMap<u64, u64> = HashMap::new();
     let mut rows: u64 = 0;
+    // Track the corpus's `time_unix_nano` span so the B2 bench can pick
+    // a real time window for the partition-pruning measurement. Only
+    // non-zero timestamps count (a `0` falls back to observed/epoch for
+    // partitioning — not a meaningful window bound).
+    let mut min_ts = u64::MAX;
+    let mut max_ts = 0u64;
     // The harness callback returns `()`, so a write error is stashed
     // (first wins) and surfaced after the run — the same pattern
     // `a1::A1Accumulator` uses.
@@ -87,6 +99,10 @@ pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltS
             Ok(()) => {
                 rows += 1;
                 *counts.entry(emitted.template_id).or_insert(0) += 1;
+                if emitted.time_unix_nano != 0 {
+                    min_ts = min_ts.min(emitted.time_unix_nano);
+                    max_ts = max_ts.max(emitted.time_unix_nano);
+                }
             }
             Err(e) => first_err = Some(e),
         }
@@ -105,6 +121,12 @@ pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltS
 
     let (busiest_template_id, busiest_template_rows) =
         counts.into_iter().max_by_key(|&(_, n)| n).unwrap_or((0, 0));
+    // No non-zero timestamp seen ⇒ no meaningful span (report 0, 0).
+    let (min_time_unix_nano, max_time_unix_nano) = if min_ts == u64::MAX {
+        (0, 0)
+    } else {
+        (min_ts, max_ts)
+    };
 
     Ok(BuiltStore {
         tenant: crate::corpus::BENCH_TENANT,
@@ -112,6 +134,8 @@ pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltS
         files,
         busiest_template_id,
         busiest_template_rows,
+        min_time_unix_nano,
+        max_time_unix_nano,
     })
 }
 
@@ -166,5 +190,52 @@ mod tests {
             matches!(second, Err(BenchError::Pipeline { .. })),
             "a reused, non-empty bucket must be rejected, got {second:?}",
         );
+    }
+
+    /// The timestamp span the B2 windowed arm keys off: the text loader
+    /// assigns `TIME_BASELINE_NS + i * TIME_INCREMENT_NS` per line, so a
+    /// 3-line corpus spans `[baseline, baseline + 2·increment]`.
+    #[test]
+    fn tracks_the_timestamp_span() {
+        use crate::corpus::{TIME_BASELINE_NS, TIME_INCREMENT_NS};
+
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("c.txt"),
+            b"login user 1\nlogout user 2\nerror code 3\n",
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_query_store(corpus.path(), bucket.path()).expect("build");
+
+        assert_eq!(built.rows, 3, "one record per line");
+        assert_eq!(built.min_time_unix_nano, TIME_BASELINE_NS, "span start");
+        assert_eq!(
+            built.max_time_unix_nano,
+            TIME_BASELINE_NS + 2 * TIME_INCREMENT_NS,
+            "span end (3rd line)",
+        );
+    }
+
+    /// When no record carries a non-zero `time_unix_nano` (an OTLP/JSON
+    /// corpus with the field absent), the span is reported as `(0, 0)` —
+    /// so the windowed B2 arm skips rather than picking a bogus window.
+    #[test]
+    fn reports_zero_span_when_all_timestamps_are_zero() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("c.jsonl"),
+            b"{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":\
+              [{\"body\":{\"stringValue\":\"no timestamp here\"}}]}]}]}\n",
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_query_store(corpus.path(), bucket.path()).expect("build");
+
+        assert_eq!(built.rows, 1, "the one record is written");
+        assert_eq!(built.min_time_unix_nano, 0, "no non-zero timestamp → 0");
+        assert_eq!(built.max_time_unix_nano, 0, "no non-zero timestamp → 0");
     }
 }

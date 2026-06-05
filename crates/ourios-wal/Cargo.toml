@@ -12,6 +12,20 @@ publish = false
 name = "ourios_wal"
 path = "src/lib.rs"
 
+# Crash-recovery test fixture spawned (and SIGKILL'd) by
+# tests/rfc0008_2_crash_recovery.rs. Not a product binary — the
+# crate is `#![deny(unsafe_code)]`, so a real `fork()` harness is
+# out, and a child process driven by `Child::kill()` is the
+# no-`unsafe` way to exercise a true process death. Kept under
+# tests/ to mark it a fixture; `publish = false` keeps it out of
+# any release.
+[[bin]]
+name = "wal_crash_fixture"
+path = "tests/fixtures/wal_crash_fixture.rs"
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 # UUIDv7 for segment filenames + checkpoint sidecar payload
 # (RFC 0008 §6.2 / §6.7). UUIDv7's chronological sort gives

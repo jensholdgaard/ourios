@@ -668,7 +668,12 @@ fn replay_segment<S: FrameSink>(
         Err(other) => {
             return Err(RecoveryError::Io {
                 op: "validate_header(segment for replay)",
-                source: std::io::Error::new(ErrorKind::InvalidData, other.to_string()),
+                // Pass the typed `HeaderError` straight through as
+                // the `io::Error` source so the structured variant
+                // (bad magic vs unknown version, with its bytes)
+                // survives in the error chain rather than being
+                // flattened to a string.
+                source: std::io::Error::new(ErrorKind::InvalidData, other),
             });
         }
     };

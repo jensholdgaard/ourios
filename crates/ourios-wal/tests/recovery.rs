@@ -48,8 +48,10 @@ impl FrameSink for CollectingSink {
 fn the_one_segment(root: &Path) -> PathBuf {
     let mut paths: Vec<_> = std::fs::read_dir(root)
         .expect("read_dir")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
+        // Surface a per-entry error rather than swallowing it: a
+        // permission / transient-IO failure should fail loudly,
+        // not masquerade as "the wrong number of segments".
+        .map(|e| e.expect("read_dir entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "wal"))
         .collect();
     paths.sort();

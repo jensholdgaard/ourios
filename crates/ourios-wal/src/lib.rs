@@ -107,6 +107,16 @@ pub struct WalConfig {
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
     /// §6.3 / §9. Ignored on other platforms.
+    ///
+    /// **Not yet honoured.** [`Wal::sync`] currently always
+    /// uses `fdatasync` (`File::sync_data`) regardless of this
+    /// flag; the `F_FULLFSYNC` path is deferred to a follow-up.
+    /// The raw `fcntl(F_FULLFSYNC)` needs `unsafe`, which this
+    /// crate's root `#![deny(unsafe_code)]` (CLAUDE.md §6.1)
+    /// forbids without an RFC, so wiring it means either a
+    /// safe-wrapper dependency or an unsafe waiver — a
+    /// maintainer decision tracked separately. Setting it
+    /// `true` today is accepted but has no effect.
     pub macos_full_fsync: bool,
 }
 
@@ -327,6 +337,11 @@ impl Wal {
     /// the full `File::sync_all` — `fdatasync` is undefined on
     /// directories under POSIX.
     ///
+    /// [`WalConfig::macos_full_fsync`] is **not yet consulted**:
+    /// this always uses `fdatasync`, never `fcntl(F_FULLFSYNC)`.
+    /// See that field's doc for why the stronger-durability path
+    /// is deferred.
+    ///
     /// # Errors
     ///
     /// See [`SyncError`].
@@ -387,7 +402,7 @@ impl Wal {
     /// naming makes that chronological, so the last entry is the
     /// segment that was open for appends at crash time (the
     /// **newest**) and every earlier one is closed. For each
-    /// frame the decoder ([`frame::read_frame`]) validates CRC,
+    /// frame the decoder (`frame::read_frame`) validates CRC,
     /// `kind`, `_pad`, and `len`; a corrupt frame on **any**
     /// segment halts the whole walk ([`RecoveryError::Corrupt`])
     /// because the high-water-mark logic needs a contiguous log.

@@ -1,9 +1,10 @@
 //! `ourios-wal` — RFC 0008 write-ahead log.
 //!
-//! **Status: red gate (PR-M2).** The public API surface is in
-//! place but every method returns `unimplemented!()`. The
-//! `#[ignore]`'d integration tests under
-//! `crates/ourios-wal/tests/` enumerate the RFC 0008 §5
+//! **Status: red gate (closing).** `open`, `append`, `sync`,
+//! and `replay` are implemented; `checkpoint` and `metrics`
+//! still return `unimplemented!()` pending their slices
+//! (RFC0008.7 / §6.8). The `#[ignore]`'d integration tests
+//! under `crates/ourios-wal/tests/` enumerate the RFC 0008 §5
 //! acceptance criteria (RFC0008.1 through .9) that the
 //! implementation work has to satisfy before the RFC moves
 //! `red → green`. See RFC 0008 for the design contract.
@@ -12,11 +13,12 @@
 //! same `(WalOffset, FrameKind, FrameSink, Wal)` surface the
 //! RFC pins. Implementation details (segment file layout,
 //! frame format, fsync policy, recovery walk, checkpoint
-//! sidecar) are spelled out in §§6.2–6.7 and land in
-//! follow-up PRs together with the matching ignored-test
-//! flips to `#[test]`.
+//! sidecar) are spelled out in §§6.2–6.7; the durability
+//! (`sync`, §6.3) and crash-recovery (`replay`, §6.6) halves
+//! land here, with the remaining slices in follow-up PRs.
 
 use std::fs::{File, OpenOptions};
+use std::io::{BufReader, ErrorKind};
 use std::path::PathBuf;
 
 use ourios_core::audit::AuditEvent;
@@ -142,10 +144,9 @@ pub const MAX_HOUSEKEEPING_SECS: u64 = 3_600;
 /// sync* → checkpoint*`.
 #[derive(Debug)]
 pub struct Wal {
-    /// Held for `append` / `sync` / `checkpoint` to read in
-    /// future slices. `#[allow(dead_code)]` matches the other
-    /// red-gate fields below.
-    #[allow(dead_code)]
+    /// Read by `sync` / `replay` (the §6.3 parent-directory
+    /// `fsync` and the §6.6 segment walk both need
+    /// `config.root`).
     config: WalConfig,
     /// File handle for the segment currently accepting appends
     /// (per §6.2: append-only, opened by exactly one writer).
@@ -162,6 +163,14 @@ pub struct Wal {
     /// filename's stem and the segment's in-file header per
     /// §6.2.1. Carried in every `WalOffset` `append` returns.
     current_segment_uuid: uuid::Uuid,
+    /// Whether the parent directory still needs an `fsync` to
+    /// make the current segment's directory entry durable
+    /// (§6.3). `open` sets it when it minted a *fresh* segment
+    /// — `create_new`'s directory entry isn't durable until
+    /// the directory itself is fsync'd — and the first `sync`
+    /// clears it. The `open_existing` path leaves it `false`:
+    /// a prior process already made that entry durable.
+    dir_fsync_pending: bool,
 }
 
 impl Wal {
@@ -190,17 +199,20 @@ impl Wal {
             source,
         })?;
         let existing_segments = list_segments(&config.root)?;
-        let (current_segment, current_segment_path, current_segment_uuid) =
+        let (current_segment, current_segment_path, current_segment_uuid, dir_fsync_pending) =
             if let Some(newest) = existing_segments.into_iter().next_back() {
-                open_existing_segment(&newest)?
+                let (file, path, uuid) = open_existing_segment(&newest)?;
+                (file, path, uuid, false)
             } else {
-                create_fresh_segment(&config.root)?
+                let (file, path, uuid) = create_fresh_segment(&config.root)?;
+                (file, path, uuid, true)
             };
         Ok(Self {
             config,
             current_segment,
             current_segment_path,
             current_segment_uuid,
+            dir_fsync_pending,
         })
     }
 
@@ -291,16 +303,52 @@ impl Wal {
         })
     }
 
-    /// Fsync the current segment (and the parent directory if
-    /// a rotation just happened, per §6.3). Returns the
-    /// highest offset that is now durable — the receiver
-    /// gates its acks on this returning `Ok(_)`.
+    /// Fsync the current segment (and the parent directory the
+    /// first time, when `open` minted a fresh segment whose
+    /// directory entry isn't yet durable — same obligation a
+    /// rotation will carry, per §6.3). Returns the highest
+    /// offset that is now durable — the receiver gates its
+    /// acks on this returning `Ok(_)`.
+    ///
+    /// Uses `fdatasync` (`File::sync_data`) on the segment per
+    /// §6.3: the payload + size are what must survive, not the
+    /// inode's every metadata field. The directory `fsync` is
+    /// the full `File::sync_all` — `fdatasync` is undefined on
+    /// directories under POSIX.
     ///
     /// # Errors
     ///
     /// See [`SyncError`].
     pub fn sync(&mut self) -> Result<WalOffset, SyncError> {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.1 / §6.3)");
+        self.current_segment
+            .sync_data()
+            .map_err(|source| SyncError::Io {
+                op: "fdatasync(current_segment)",
+                source,
+            })?;
+        if self.dir_fsync_pending {
+            sync_parent_dir(&self.config.root).map_err(|source| SyncError::Io {
+                op: "fsync(wal_root)",
+                source,
+            })?;
+            self.dir_fsync_pending = false;
+        }
+        // Everything written so far is now durable; the highest
+        // durable byte is the segment's current length. Re-stat
+        // rather than thread a counter so a crash between the
+        // fsync and this read still reports truth.
+        let byte = self
+            .current_segment
+            .metadata()
+            .map_err(|source| SyncError::Io {
+                op: "stat(current_segment)",
+                source,
+            })?
+            .len();
+        Ok(WalOffset {
+            segment: self.current_segment_uuid,
+            byte,
+        })
     }
 
     /// Record that records ≤ `durable_to` are on object
@@ -319,15 +367,83 @@ impl Wal {
     }
 
     /// Walk every surviving segment in chronological order,
-    /// handing each well-formed frame above the checkpoint
-    /// (per §6.6 step 1) to `sink`. Used by the ingester at
-    /// startup before opening network listeners.
+    /// handing each well-formed frame to `sink` (§6.6). Used by
+    /// the ingester at startup before opening network
+    /// listeners; `&mut self` because step 4 *heals* the newest
+    /// segment in place (see below).
+    ///
+    /// Segments are listed and sorted lexicographically; `UUIDv7`
+    /// naming makes that chronological, so the last entry is the
+    /// segment that was open for appends at crash time (the
+    /// **newest**) and every earlier one is closed. For each
+    /// frame the decoder ([`frame::read_frame`]) validates CRC,
+    /// `kind`, `_pad`, and `len`; a corrupt frame on **any**
+    /// segment halts the whole walk ([`RecoveryError::Corrupt`])
+    /// because the high-water-mark logic needs a contiguous log.
+    /// A torn (partial) *tail* frame is the one exception: on the
+    /// newest segment it is RFC0008.4 clean truncation, so the
+    /// scan stops cleanly and the segment is healed —
+    /// `ftruncate` to the last valid boundary, `fdatasync`, and
+    /// `fsync` the parent dir — so the next `append` resumes on a
+    /// frame boundary. On any *closed* segment a torn tail is
+    /// instead RFC0008.5 corruption (its rotation fsync should
+    /// have completed), so it halts the walk.
+    ///
+    /// Checkpoint-skip (§6.6 step 1 — skipping frames at or below
+    /// the `CHECKPOINT` offset) lands with the checkpoint sidecar
+    /// (RFC0008.7); until then no sidecar exists, so `cp` is
+    /// `None` and every surviving frame is delivered.
     ///
     /// # Errors
     ///
     /// See [`RecoveryError`].
-    pub fn replay<S: FrameSink>(&self, _sink: &mut S) -> Result<(), RecoveryError> {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.1 / §6.6)");
+    pub fn replay<S: FrameSink>(&mut self, sink: &mut S) -> Result<(), RecoveryError> {
+        let segments = list_segments(&self.config.root).map_err(|e| match e {
+            OpenError::Io { op, source } => RecoveryError::Io { op, source },
+            // `list_segments` only ever surfaces `Io` (it does no
+            // config validation or header reads); the other arms
+            // are structurally unreachable.
+            OpenError::InvalidConfig { .. } | OpenError::Corrupt { .. } => {
+                unreachable!("list_segments only surfaces OpenError::Io")
+            }
+        })?;
+        let newest_idx = segments.len().checked_sub(1);
+        for (idx, path) in segments.iter().enumerate() {
+            let is_newest = Some(idx) == newest_idx;
+            match replay_segment(path, is_newest, sink)? {
+                SegmentScan::CleanTail => {}
+                SegmentScan::TornTail { valid_to } => self.heal_newest_segment(valid_to)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// RFC0008.4 / §6.6 step 4: truncate a torn tail off the
+    /// newest segment so the next `append` starts on the last
+    /// valid frame boundary, then make the truncation durable.
+    /// The newest segment is the one `open` is holding as
+    /// `current_segment`, so the truncation targets that handle
+    /// directly — its `O_APPEND` writes re-evaluate end-of-file
+    /// per write, so subsequent appends land at `valid_to`.
+    fn heal_newest_segment(&mut self, valid_to: u64) -> Result<(), RecoveryError> {
+        self.current_segment
+            .set_len(valid_to)
+            .map_err(|source| RecoveryError::Io {
+                op: "ftruncate(heal newest segment)",
+                source,
+            })?;
+        self.current_segment
+            .sync_data()
+            .map_err(|source| RecoveryError::Io {
+                op: "fdatasync(heal newest segment)",
+                source,
+            })?;
+        sync_parent_dir(&self.config.root).map_err(|source| RecoveryError::Io {
+            op: "fsync(wal_root after heal)",
+            source,
+        })?;
+        self.dir_fsync_pending = false;
+        Ok(())
     }
 
     /// Snapshot of the OTel-meter metrics per §6.8.
@@ -486,6 +602,140 @@ fn create_fresh_segment(root: &std::path::Path) -> Result<(File, PathBuf, uuid::
         "segment header write must produce exactly SEGMENT_HEADER_LEN bytes",
     );
     Ok((handle, path, uuid))
+}
+
+/// How one segment's frame scan terminated (the §6.6 step-3
+/// per-segment outcome the [`Wal::replay`] driver acts on).
+enum SegmentScan {
+    /// Frames ended on a clean frame boundary (the scan reached
+    /// end-of-file exactly between frames). No healing needed.
+    CleanTail,
+    /// The newest segment stopped on a torn (partial) tail frame
+    /// at byte `valid_to` — RFC0008.4. The caller truncates the
+    /// segment to `valid_to`. Only ever returned for the newest
+    /// segment; a torn tail on a closed segment is corruption.
+    TornTail { valid_to: u64 },
+}
+
+/// Scan one segment's frames left-to-right (§6.6 step 3),
+/// delivering each well-formed frame to `sink`. `is_newest`
+/// selects the torn-tail fork: a short read on the newest
+/// segment is clean truncation ([`SegmentScan::TornTail`]); on
+/// any closed segment it is [`CorruptionReason::TornOnClosedSegment`].
+/// A complete-but-invalid frame (CRC, `kind`, `_pad`, `len`)
+/// is corruption on every segment.
+fn replay_segment<S: FrameSink>(
+    path: &std::path::Path,
+    is_newest: bool,
+    sink: &mut S,
+) -> Result<SegmentScan, RecoveryError> {
+    let file = File::open(path).map_err(|source| RecoveryError::Io {
+        op: "open(segment for replay)",
+        source,
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| RecoveryError::Io {
+            op: "stat(segment for replay)",
+            source,
+        })?
+        .len();
+    let mut reader = BufReader::new(file);
+    let segment_uuid = match segment::read_header(&mut reader) {
+        Ok(header) => header.segment_uuid,
+        Err(segment::HeaderError::Io(source)) => {
+            return Err(RecoveryError::Io {
+                op: "read_header(segment for replay)",
+                source,
+            });
+        }
+        // Bad magic / unknown version on a `*.wal` file is
+        // corruption. Full per-reason classification (a dedicated
+        // `CorruptionReason`) is RFC0008.5's remit; here it
+        // surfaces as an unreadable segment so recovery halts
+        // rather than silently skipping the file's data.
+        Err(other) => {
+            return Err(RecoveryError::Io {
+                op: "validate_header(segment for replay)",
+                source: std::io::Error::new(ErrorKind::InvalidData, other.to_string()),
+            });
+        }
+    };
+    let mut pos = SEGMENT_HEADER_LEN as u64;
+    loop {
+        if pos >= file_len {
+            // Reached end-of-file aligned on a frame boundary —
+            // the legitimate clean end of a segment.
+            return Ok(SegmentScan::CleanTail);
+        }
+        let frame_start = pos;
+        match frame::read_frame(&mut reader) {
+            Ok((kind, payload)) => {
+                sink.consume(kind, &payload)?;
+                pos += frame::FRAME_HEADER_LEN as u64
+                    + u64::try_from(payload.len())
+                        .expect("payload.len() fits u64 (read_frame capped it at MAX_FRAME_BYTES)");
+            }
+            // Short read with bytes still remaining (`pos <
+            // file_len`, guaranteed by the guard above) = a torn
+            // tail frame.
+            Err(frame::FrameError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {
+                if is_newest {
+                    return Ok(SegmentScan::TornTail {
+                        valid_to: frame_start,
+                    });
+                }
+                return Err(RecoveryError::Corrupt {
+                    segment: segment_uuid,
+                    byte: frame_start,
+                    reason: CorruptionReason::TornOnClosedSegment,
+                });
+            }
+            Err(frame::FrameError::Io(source)) => {
+                return Err(RecoveryError::Io {
+                    op: "read_frame(segment for replay)",
+                    source,
+                });
+            }
+            Err(frame::FrameError::CrcMismatch { .. }) => {
+                return Err(RecoveryError::Corrupt {
+                    segment: segment_uuid,
+                    byte: frame_start,
+                    reason: CorruptionReason::CrcMismatch,
+                });
+            }
+            Err(frame::FrameError::UnknownKind { .. }) => {
+                return Err(RecoveryError::Corrupt {
+                    segment: segment_uuid,
+                    byte: frame_start,
+                    reason: CorruptionReason::UnknownKind,
+                });
+            }
+            Err(frame::FrameError::NonZeroPad { .. }) => {
+                return Err(RecoveryError::Corrupt {
+                    segment: segment_uuid,
+                    byte: frame_start,
+                    reason: CorruptionReason::NonZeroPad,
+                });
+            }
+            Err(frame::FrameError::OversizeLen { .. }) => {
+                return Err(RecoveryError::Corrupt {
+                    segment: segment_uuid,
+                    byte: frame_start,
+                    reason: CorruptionReason::OversizeLen,
+                });
+            }
+        }
+    }
+}
+
+/// `fsync` the WAL root directory so a freshly-created or
+/// freshly-truncated segment's directory entry is durable
+/// (§6.3 / §6.6 step 4). Opens the directory read-only and
+/// calls the full `fsync` (`File::sync_all`) — `fdatasync` is
+/// undefined on directories under POSIX.
+fn sync_parent_dir(root: &std::path::Path) -> std::io::Result<()> {
+    File::open(root)?.sync_all()
 }
 
 /// Recovery-time consumer the [`Wal::replay`] scan hands

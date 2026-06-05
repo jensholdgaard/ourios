@@ -365,6 +365,84 @@ async fn rfc0007_2_template_exact_work_scales_with_result_not_corpus() {
     );
 }
 
+/// Lay down a target file in hour 10 (3 rows of template 1) plus one
+/// filler file in each of the next `filler_hours` hours (distinct
+/// templates, distinct partitions).
+fn corpus_over_hours(bucket: &Path, filler_hours: u64) {
+    write_all(
+        bucket,
+        &[
+            rec("a", 1, TS0),
+            rec("a", 1, TS0 + 1_000_000),
+            rec("a", 1, TS0 + 2_000_000),
+        ],
+    );
+    for k in 1..=filler_hours {
+        write_all(bucket, &[rec("a", 100 + k, TS0 + k * HOUR_NS)]);
+    }
+}
+
+/// RFC0007.2 (B2) — partition-level **time** pruning. A time-windowed
+/// query skips whole `hour=` partitions outside the window *before*
+/// `DataFusion` opens their footers, so the work tracks the window, not
+/// the corpus's time span. Two corpora share the same in-window hour-10
+/// data but differ 10× in time span (2 vs 20 filler hours). A query
+/// windowed to hour 10 returns the same 3 rows and — crucially — hands
+/// `DataFusion` the *same* (tiny) set of row groups in both, because the
+/// out-of-window partitions are pruned at the directory level. This is
+/// the piece the `otel-demo` run showed is missing for real logs, where
+/// a template recurs across every partition.
+#[tokio::test]
+async fn rfc0007_2_time_window_prunes_whole_partitions() {
+    let small = tempfile::TempDir::new().expect("temp small");
+    let large = tempfile::TempDir::new().expect("temp large");
+    corpus_over_hours(small.path(), 2); //  3 partitions
+    corpus_over_hours(large.path(), 20); // 21 partitions (10× the time span)
+
+    // A ~1s window inside hour 10 — covers only the target partition.
+    let window = Some((TS0, TS0 + 1_000_000_000));
+    let s = Querier::new(small.path())
+        .run(req("a", window, None))
+        .await
+        .expect("small query");
+    let l = Querier::new(large.path())
+        .run(req("a", window, None))
+        .await
+        .expect("large query");
+
+    // Same in-window result regardless of how many out-of-window hours exist.
+    assert_eq!(s.rows, 3);
+    assert_eq!(
+        l.rows, 3,
+        "the window result is fixed across corpus time span"
+    );
+
+    // The work handed to DataFusion is FLAT across a 10× larger time
+    // span — only hour 10's partition reaches the engine in both.
+    assert_eq!(
+        s.stats.row_groups_scanned, l.stats.row_groups_scanned,
+        "scanned row groups track the window, not the corpus; small={:?} large={:?}",
+        s.stats, l.stats,
+    );
+    assert_eq!(
+        s.stats.bytes_read, l.stats.bytes_read,
+        "bytes read track the window, not the corpus; small={:?} large={:?}",
+        s.stats, l.stats,
+    );
+
+    // Directory-level pruning means the out-of-window partitions never
+    // reach DataFusion at all: the total row groups it sees (scanned +
+    // statistics-pruned) stays tiny even at 20 filler hours — it does
+    // NOT grow with the corpus (which it would if every partition's
+    // footer were opened and pruned by the column predicate instead).
+    let l_total = l.stats.row_groups_scanned + l.stats.row_groups_pruned;
+    assert!(
+        l_total <= 2,
+        "out-of-window partitions are pruned before DataFusion; it saw {l_total} row groups (stats={:?})",
+        l.stats,
+    );
+}
+
 /// A `bucket_root` whose path contains a space still resolves —
 /// the URL is built from the canonical path (`DataFusion`
 /// URI-encodes it), not a raw `file://{display}` string that would

@@ -14,18 +14,28 @@
 //! distribution of consolidated output sizes — the signal behind the
 //! "alert when > 5 % of files < 128 MiB" rule). All byte volumes come
 //! from [`CompactionOutcome`](ourios_parquet::CompactionOutcome) via
-//! the [`SweepReport`]. `ourios.compaction.backlog` (an
-//! `UpDownCounter` tracking sealed-but-uncompacted lag — a cross-sweep
-//! gauge, not a per-compaction quantity) is the one §3.6 metric still
-//! deferred.
+//! the [`SweepReport`]. `ourios.compaction.backlog` — the
+//! sealed-but-uncompacted lag — is an **observable** (async)
+//! `UpDownCounter`: its callback reports each tenant's *absolute*
+//! current backlog at collect time (OpenTelemetry additive-non-monotonic
+//! guidance), which `record_sweep` keeps current from the per-tenant
+//! candidate/compacted breakdown. This completes the §3.6 metric set.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::metrics::{Counter, Histogram, ObservableUpDownCounter};
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
 use crate::compactor::{IngestError, SweepReport, to_u64};
+
+/// Per-tenant current backlog (sealed-but-uncompacted partition count)
+/// shared between [`CompactionMetrics::record_sweep`], which writes the
+/// absolute value after each sweep, and the `ourios.compaction.backlog`
+/// observable callback, which reads it at collection time.
+type BacklogState = Arc<Mutex<HashMap<String, i64>>>;
 
 /// The compaction metric instruments (RFC 0009 §3.6). Build one per
 /// process and call [`CompactionMetrics::record_sweep`] once per sweep.
@@ -39,6 +49,14 @@ pub struct CompactionMetrics {
     duration: Histogram<f64>,
     io: Counter<u64>,
     file_size: Histogram<u64>,
+    /// Current per-tenant backlog `record_sweep` keeps up to date; the
+    /// observable counter's callback reads it.
+    backlog_state: BacklogState,
+    /// Held to keep the observable callback registered with the meter
+    /// for this instrument's lifetime (the value is never read directly
+    /// — the SDK invokes its callback on collect).
+    #[expect(dead_code, reason = "retains the observable-callback registration")]
+    backlog: ObservableUpDownCounter<i64>,
 }
 
 impl CompactionMetrics {
@@ -89,6 +107,33 @@ impl CompactionMetrics {
             .with_unit("By")
             .build();
 
+        // `backlog` is an **observable** (async) UpDownCounter: its
+        // callback reports the *absolute* current per-tenant backlog at
+        // collect time (OTel additive-non-monotonic guidance). Reporting
+        // an absolute value — not a per-sweep delta — is what keeps it
+        // from drifting when a candidate errors one sweep and clears the
+        // next. `record_sweep` keeps `backlog_state` current; the
+        // callback only reads it.
+        let backlog_state: BacklogState = Arc::new(Mutex::new(HashMap::new()));
+        let callback_state = Arc::clone(&backlog_state);
+        let backlog = meter
+            .i64_observable_up_down_counter(semconv::OURIOS_COMPACTION_BACKLOG)
+            .with_unit("{partition}")
+            .with_callback(move |observer| {
+                // Recover a poisoned lock rather than panic — a metrics
+                // collection callback must never bring the process down.
+                let backlog = callback_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (tenant, count) in &*backlog {
+                    observer.observe(
+                        *count,
+                        &[KeyValue::new(semconv::OURIOS_TENANT, tenant.clone())],
+                    );
+                }
+            })
+            .build();
+
         // Only the attribute-free counters; `sweeps` and `io` carry
         // required attributes (`result` / `io.direction`) and `duration`
         // / `file_size` are histograms, so none are zero-seeded here —
@@ -107,6 +152,8 @@ impl CompactionMetrics {
             duration,
             io,
             file_size,
+            backlog_state,
+            backlog,
         }
     }
 
@@ -127,6 +174,11 @@ impl CompactionMetrics {
         self.sweeps.add(1, &attrs);
         self.duration.record(elapsed.as_secs_f64(), &attrs);
 
+        // A fatal sweep error (couldn't even scan the store) yields no
+        // per-tenant data, so the backlog map is deliberately left as-is:
+        // the last-known lag is more honest than clearing to nothing (the
+        // partitions didn't compact, so the backlog hasn't shrunk), and
+        // the failure itself surfaces via `sweeps{result="error"}`.
         if let Ok(report) = result {
             self.partitions
                 .add(to_u64(report.partitions_compacted), &[]);
@@ -162,6 +214,28 @@ impl CompactionMetrics {
                     &[KeyValue::new(semconv::OURIOS_TENANT, file.tenant.clone())],
                 );
             }
+
+            // Rebuild each tenant's *absolute* backlog (candidates the
+            // sweep found minus those it compacted) for the observable
+            // counter's callback. Absolute (not a delta), so a tenant
+            // that clears its lag reports 0 next sweep rather than the
+            // value drifting up over time. A full `clear()` first means a
+            // tenant that no longer appears (data removed, or planning
+            // errored this sweep) stops being reported rather than
+            // emitting a stale value forever; `run_sweep` scans every
+            // tenant each pass, so the surviving set is current.
+            let mut backlog = self
+                .backlog_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            backlog.clear();
+            for t in &report.per_tenant {
+                // candidates_found ≥ partitions_compacted (you can't
+                // compact more than you found), so the lag is non-negative.
+                let lag = i64::try_from(t.candidates_found.saturating_sub(t.partitions_compacted))
+                    .unwrap_or(i64::MAX);
+                backlog.insert(t.tenant.clone(), lag);
+            }
         }
     }
 }
@@ -181,7 +255,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::compactor::CompactedFile;
+    use crate::compactor::{CompactedFile, TenantSweep};
 
     // Collected metric names across the in-memory export.
     fn collected_names(rms: &[ResourceMetrics]) -> Vec<String> {
@@ -285,6 +359,32 @@ mod tests {
         }
     }
 
+    // The backlog observable UpDownCounter aggregates as an i64 Sum; each
+    // tenant's datapoint reports its absolute current lag.
+    fn assert_backlog(rms: &[ResourceMetrics], expected: &[(&str, i64)]) {
+        let AggregatedMetrics::I64(MetricData::Sum(sum)) =
+            metric_data(rms, semconv::OURIOS_COMPACTION_BACKLOG)
+        else {
+            panic!("backlog should be an i64 sum (observable UpDownCounter)");
+        };
+        assert_eq!(
+            sum.data_points().count(),
+            expected.len(),
+            "one backlog datapoint per expected tenant, no extras",
+        );
+        for &(tenant, lag) in expected {
+            let dp = sum
+                .data_points()
+                .find(|dp| {
+                    dp.attributes().any(|kv| {
+                        kv.key.as_str() == semconv::OURIOS_TENANT && kv.value.as_str() == tenant
+                    })
+                })
+                .unwrap_or_else(|| panic!("backlog is missing tenant {tenant}"));
+            assert_eq!(dp.value(), lag, "{tenant}: absolute backlog");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn record_sweep_exports_the_compaction_metric_set() {
         // Arrange — an in-memory provider, then the instruments (built
@@ -322,6 +422,20 @@ mod tests {
                     bytes: 0,
                 },
             ],
+            // acme found 3 candidates but compacted 1 → backlog 2 (lag);
+            // beta compacted all 2 → backlog 0 (cleared).
+            per_tenant: vec![
+                TenantSweep {
+                    tenant: "acme".to_string(),
+                    candidates_found: 3,
+                    partitions_compacted: 1,
+                },
+                TenantSweep {
+                    tenant: "beta".to_string(),
+                    candidates_found: 2,
+                    partitions_compacted: 2,
+                },
+            ],
         };
 
         // Act
@@ -343,6 +457,7 @@ mod tests {
             semconv::OURIOS_COMPACTION_DURATION,
             semconv::OURIOS_COMPACTION_IO,
             semconv::OURIOS_STORAGE_PARQUET_FILE_SIZE,
+            semconv::OURIOS_COMPACTION_BACKLOG,
         ] {
             assert!(
                 names.iter().any(|name| name == expected),
@@ -360,5 +475,9 @@ mod tests {
         // into one datapoint (count 2, Σ 1536), beta has one, and the
         // 0-byte ghost sample is dropped (no `ghost` datapoint).
         assert_file_size_histogram(&rms, &[("acme", 1024), ("acme", 512), ("beta", 2048)]);
+
+        // The backlog reports each tenant's absolute lag: acme found 3
+        // candidates but compacted 1 → 2; beta compacted both → 0.
+        assert_backlog(&rms, &[("acme", 2), ("beta", 0)]);
     }
 }

@@ -37,11 +37,6 @@ const FRAME_PAD_ZEROS: [u8; 3] = [0, 0, 0];
 /// RFC0008.5 sub-case so the recovery driver's audit-event
 /// emission, and the integration tests, can match on the
 /// specific reason rather than string-search a message.
-///
-/// `#[allow(dead_code)]` covers the read side until
-/// `Wal::replay` lands in the next slice — the colocated
-/// corruption tests pin every variant today.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum FrameError {
     /// The 4-byte CRC field didn't match the recomputed
@@ -163,11 +158,6 @@ pub(crate) fn write_frame<W: Write>(
 /// arms on failure. Each error variant maps to one §6.2.2
 /// sub-case — recovery uses the variant to populate the
 /// matching `CorruptionReason` for the audit event.
-///
-/// `#[allow(dead_code)]` matches [`FrameError`] — read side
-/// is exercised only by the colocated corruption tests until
-/// `Wal::replay` lands.
-#[allow(dead_code)]
 pub(crate) fn read_frame<R: Read>(r: &mut R) -> Result<(FrameKind, Vec<u8>), FrameError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     r.read_exact(&mut header).map_err(FrameError::Io)?;

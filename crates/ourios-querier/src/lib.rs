@@ -20,11 +20,13 @@
 //! §4.6). It reads the shipped RFC 0005 store; it needs neither
 //! the WAL nor the receiver.
 //!
-//! (Partition-level *time* pruning — deriving `year/month/day/hour`
-//! path bounds from the time range so whole directories are
-//! skipped — is a later refinement; today the time bound is a
-//! column predicate, and the row-group skipping it enables is what
-//! slice 2 / B1 measures.)
+//! Partition-level *time* pruning is live: a query with a time range
+//! skips whole `year/month/day/hour` partitions whose span can't
+//! overlap the window (`hour_partition_in_window`) before `DataFusion`
+//! opens any footer, so scanned row groups stay flat as the corpus's
+//! time span grows. It layers on the `time_unix_nano` column predicate
+//! (still the row-level correctness authority); the pruning is
+//! conservative and never drops an in-window partition.
 //!
 //! **Throwaway query surface.** [`QueryRequest`] is intentionally
 //! minimal — just the predicates B1/B2 need. The real logs DSL
@@ -52,6 +54,7 @@ use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::Manifest;
 use ourios_parquet::columns;
+use ourios_parquet::hour_partition_in_window;
 use ourios_parquet::percent_encode_tenant;
 
 /// A logs query to execute. **Throwaway surface** while the query
@@ -168,7 +171,10 @@ impl std::error::Error for QueryError {}
 /// denied, transient failure) is propagated as [`QueryError::Storage`]
 /// rather than silently masked as "no data" — a wrong zero-row answer
 /// is worse than a surfaced error.
-fn resolve_live_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, QueryError> {
+fn resolve_live_files(
+    dir: &std::path::Path,
+    window: Option<(u64, u64)>,
+) -> Result<Vec<PathBuf>, QueryError> {
     let io_err = |op: &str, p: &std::path::Path, e: &std::io::Error| QueryError::Storage {
         detail: format!("{op} {}: {e}", p.display()),
     };
@@ -194,13 +200,25 @@ fn resolve_live_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, QueryError>
                 Err(e) => return Err(io_err("file_type", &path, &e)),
             }
         }
-        match Manifest::read(&d).map_err(|e| QueryError::Storage {
-            detail: format!("manifest in {}: {e}", d.display()),
-        })? {
-            // Manifest is authoritative: only its named files are live.
-            Some(manifest) => files.extend(manifest.files.into_iter().map(|name| d.join(name))),
-            // No manifest → glob fallback for this partition.
-            None => files.append(&mut parquets),
+        // Partition-level time pruning (RFC 0007): when the query has a
+        // time range, skip a leaf partition whose `hour=HH` span can't
+        // overlap it — so DataFusion never opens those footers. This is
+        // a pure optimisation layered on the row-level time column
+        // predicate (which stays the correctness authority);
+        // `hour_partition_in_window` is conservative, never pruning a
+        // path it can't prove out of range, so no in-window data is lost.
+        let keep = window.is_none_or(|(start, end)| hour_partition_in_window(&d, start, end));
+        if keep {
+            match Manifest::read(&d).map_err(|e| QueryError::Storage {
+                detail: format!("manifest in {}: {e}", d.display()),
+            })? {
+                // Manifest is authoritative: only its named files are live.
+                Some(manifest) => {
+                    files.extend(manifest.files.into_iter().map(|name| d.join(name)));
+                }
+                // No manifest → glob fallback for this partition.
+                None => files.append(&mut parquets),
+            }
         }
         stack.extend(subdirs);
     }
@@ -343,7 +361,7 @@ impl Querier {
         // holding only `*.parquet.tmp` (a poisoned/crashed writer) —
         // where building a table over zero files would otherwise
         // error and wrongly fail the query.
-        let live_files = resolve_live_files(&tenant_dir)?;
+        let live_files = resolve_live_files(&tenant_dir, request.time_range)?;
         if live_files.is_empty() {
             return Ok(QueryResult::default());
         }
@@ -632,7 +650,7 @@ mod tests {
         let ghost = tmp.path().join("data/tenant_id=ghost");
 
         // Act
-        let files = resolve_live_files(&ghost).expect("resolve");
+        let files = resolve_live_files(&ghost, None).expect("resolve");
 
         // Assert
         assert!(files.is_empty());
@@ -646,7 +664,7 @@ mod tests {
         std::fs::write(partition.join("x.parquet.tmp"), b"partial").expect("write tmp");
 
         // Act
-        let files = resolve_live_files(&tenant).expect("resolve");
+        let files = resolve_live_files(&tenant, None).expect("resolve");
 
         // Assert
         assert!(files.is_empty(), "uncommitted .tmp files are not live");
@@ -661,7 +679,7 @@ mod tests {
         std::fs::write(partition.join("b.parquet"), b"b").expect("write b");
 
         // Act
-        let files = resolve_live_files(&tenant).expect("resolve");
+        let files = resolve_live_files(&tenant, None).expect("resolve");
 
         // Assert
         assert_eq!(
@@ -689,7 +707,7 @@ mod tests {
         .expect("write manifest");
 
         // Act
-        let files = resolve_live_files(&tenant).expect("resolve");
+        let files = resolve_live_files(&tenant, None).expect("resolve");
 
         // Assert
         assert_eq!(files.len(), 1, "only the manifest's file is live");
@@ -709,7 +727,7 @@ mod tests {
         .expect("write manifest");
 
         // Act
-        let result = resolve_live_files(&tenant);
+        let result = resolve_live_files(&tenant, None);
 
         // Assert
         assert!(matches!(result, Err(QueryError::Storage { .. })));

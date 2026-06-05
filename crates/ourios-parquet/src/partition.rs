@@ -18,8 +18,11 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use ourios_core::record::MinedRecord;
+
+/// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
+const HOUR_NANOS: u64 = 3_600_000_000_000;
 
 /// Partition key for the on-disk Hive-style layout.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -124,6 +127,59 @@ impl PartitionKey {
         p.push(format!("day={:02}", self.day));
         p
     }
+}
+
+/// Whether the hour partition at `partition_dir` *could* hold a row in
+/// the half-open window `[start_ns, end_ns)` — i.e. its
+/// `[hour_start, hour_start + 1h)` UTC span overlaps the window.
+///
+/// `partition_dir` is a `…/year=YYYY/month=MM/day=DD/hour=HH` leaf. This
+/// is a **conservative** pruning predicate for the querier: it returns
+/// `true` (do *not* prune — read the partition) whenever the trailing
+/// Hive segments don't parse or the hour isn't a real UTC instant, so a
+/// query can never drop in-window data on an unrecognised layout. The
+/// row-level time filter stays the caller's column predicate; this only
+/// lets it skip footers that are *certain* to fall outside the window
+/// (RFC 0007's deferred partition-level time pruning).
+#[must_use]
+pub fn hour_partition_in_window(partition_dir: &Path, start_ns: u64, end_ns: u64) -> bool {
+    let Some((year, month, day, hour)) = parse_hour_partition(partition_dir) else {
+        return true;
+    };
+    let Some((lo, hi)) = hour_span_ns(year, month, day, hour) else {
+        return true;
+    };
+    // Half-open overlap: [lo, hi) ∩ [start, end) ≠ ∅.
+    lo < end_ns && start_ns < hi
+}
+
+/// Parse the `(year, month, day, hour)` from the trailing four Hive
+/// segments of a partition directory path. `None` if the deepest four
+/// components aren't `hour=`, `day=`, `month=`, `year=` with parseable
+/// numbers (e.g. a non-leaf dir or a foreign path).
+fn parse_hour_partition(dir: &Path) -> Option<(i32, u32, u32, u32)> {
+    let mut segments = dir.components().rev().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    let hour = segments.next()?.strip_prefix("hour=")?.parse().ok()?;
+    let day = segments.next()?.strip_prefix("day=")?.parse().ok()?;
+    let month = segments.next()?.strip_prefix("month=")?.parse().ok()?;
+    let year = segments.next()?.strip_prefix("year=")?.parse().ok()?;
+    Some((year, month, day, hour))
+}
+
+/// The `[start, end)` UTC-nanosecond span of the hour partition
+/// `(year, month, day, hour)`. `None` if it isn't a real UTC instant or
+/// predates the 1970 epoch (no `u64`-nanos row can land there), so the
+/// caller treats it as non-prunable.
+fn hour_span_ns(year: i32, month: u32, day: u32, hour: u32) -> Option<(u64, u64)> {
+    let start = NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(hour, 0, 0)?
+        .and_utc()
+        .timestamp_nanos_opt()?;
+    let lo = u64::try_from(start).ok()?;
+    Some((lo, lo.saturating_add(HOUR_NANOS)))
 }
 
 /// Choose the nanosecond timestamp for partition derivation per
@@ -421,6 +477,77 @@ mod tests {
         .iter()
         .collect();
         assert_eq!(path, expected);
+    }
+
+    /// `hour=10` on 2026-04-02 covers [10:00, 11:00) UTC.
+    const HOUR10_START: u64 = 1_775_124_000_000_000_000; // 2026-04-02T10:00:00Z
+
+    fn hour10_dir() -> PathBuf {
+        [
+            "bucket",
+            "data",
+            "tenant_id=t",
+            "year=2026",
+            "month=04",
+            "day=02",
+            "hour=10",
+        ]
+        .iter()
+        .collect()
+    }
+
+    #[test]
+    fn hour_partition_in_window_overlap_cases() {
+        let dir = hour10_dir();
+        // A window fully inside the hour overlaps.
+        assert!(hour_partition_in_window(
+            &dir,
+            HOUR10_START + 60_000_000_000,
+            HOUR10_START + 120_000_000_000,
+        ));
+        // A window touching the hour's start (half-open, inclusive lo).
+        assert!(hour_partition_in_window(
+            &dir,
+            HOUR10_START,
+            HOUR10_START + 1
+        ));
+        // A window entirely before the hour does not overlap → prune.
+        assert!(!hour_partition_in_window(
+            &dir,
+            HOUR10_START - 120_000_000_000,
+            HOUR10_START - 60_000_000_000,
+        ));
+        // A window starting exactly at the hour's end is excluded
+        // (half-open upper bound) → prune.
+        assert!(!hour_partition_in_window(
+            &dir,
+            HOUR10_START + HOUR_NANOS,
+            HOUR10_START + HOUR_NANOS + 1,
+        ));
+    }
+
+    #[test]
+    fn hour_partition_in_window_is_conservative_on_unparseable_paths() {
+        // A non-leaf / foreign path can't be proven out of range, so it
+        // is never pruned (returns true) — pruning must not drop data.
+        let day_dir: PathBuf = [
+            "bucket",
+            "data",
+            "tenant_id=t",
+            "year=2026",
+            "month=04",
+            "day=02",
+        ]
+        .iter()
+        .collect();
+        assert!(hour_partition_in_window(&day_dir, 0, 1));
+        let foreign: PathBuf = ["some", "other", "dir"].iter().collect();
+        assert!(hour_partition_in_window(&foreign, 0, 1));
+        // A non-canonical hour value (not a real instant) → not pruned.
+        let bad_hour: PathBuf = ["year=2026", "month=04", "day=02", "hour=99"]
+            .iter()
+            .collect();
+        assert!(hour_partition_in_window(&bad_hour, 0, 1));
     }
 
     #[test]

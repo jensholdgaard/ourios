@@ -100,9 +100,9 @@ fn build_synthetic(bucket: &Path, filler_rows: u64) {
     }
 }
 
-fn template_exact(template_id: u64) -> QueryRequest {
+fn template_exact(tenant: &str, template_id: u64) -> QueryRequest {
     QueryRequest {
-        tenant: TenantId::new("a"),
+        tenant: TenantId::new(tenant),
         time_range: None,
         template_id: Some(template_id),
         severity_text: None,
@@ -126,7 +126,7 @@ fn synthetic(c: &mut Criterion) {
         // Sanity: the result is the fixed TARGET_ROWS regardless of
         // corpus — otherwise the latency comparison is meaningless.
         let probe = rt
-            .block_on(querier.run(template_exact(1)))
+            .block_on(querier.run(template_exact("a", 1)))
             .expect("probe query");
         assert_eq!(
             probe.rows, TARGET_ROWS,
@@ -135,7 +135,9 @@ fn synthetic(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(total), &total, |b, _| {
             b.iter(|| {
-                let r = rt.block_on(querier.run(template_exact(1))).expect("query");
+                let r = rt
+                    .block_on(querier.run(template_exact("a", 1)))
+                    .expect("query");
                 black_box(r.rows);
             });
         });
@@ -183,9 +185,30 @@ fn otel_demo(c: &mut Criterion) {
             continue;
         }
         let querier = Querier::new(bucket.path());
+        // Query the corpus's own tenant (the loader is single-tenant);
+        // querying any other tenant would hit the empty-result early
+        // return and time nothing (RFC0007.5 isolation). Probe first so
+        // a result/tenant mismatch fails loudly instead of silently
+        // benchmarking a 0-row query.
+        let query = template_exact(built.tenant, built.busiest_template_id);
+        let probe = rt
+            .block_on(querier.run(query.clone()))
+            .expect("probe query");
+        assert_eq!(
+            probe.rows, built.busiest_template_rows,
+            "the busiest-template query must return its rows (tenant/template wired correctly)",
+        );
         eprintln!(
-            "b2/otel-demo: {dir} — {} rows, {} files; querying template {} ({} rows)",
-            built.rows, built.files, built.busiest_template_id, built.busiest_template_rows,
+            "b2/otel-demo: {dir} — {} rows, {} files; tenant {:?}; querying template {} \
+             → {} rows; scanned {}/{} row groups, {} B",
+            built.rows,
+            built.files,
+            built.tenant,
+            built.busiest_template_id,
+            probe.rows,
+            probe.stats.row_groups_scanned,
+            probe.stats.row_groups_scanned + probe.stats.row_groups_pruned,
+            probe.stats.bytes_read,
         );
 
         let id = path
@@ -195,9 +218,7 @@ fn otel_demo(c: &mut Criterion) {
             .to_string();
         group.bench_function(BenchmarkId::new("corpus", id), |b| {
             b.iter(|| {
-                let r = rt
-                    .block_on(querier.run(template_exact(built.busiest_template_id)))
-                    .expect("query");
+                let r = rt.block_on(querier.run(query.clone())).expect("query");
                 black_box(r.rows);
             });
         });

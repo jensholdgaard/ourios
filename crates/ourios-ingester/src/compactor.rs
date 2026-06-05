@@ -98,6 +98,27 @@ pub struct SweepReport {
     /// sum is the write volume for `ourios.compaction.io` (RFC 0009
     /// §3.6).
     pub compacted_files: Vec<CompactedFile>,
+    /// One entry per *successfully-planned* tenant: how many candidates
+    /// the sweep found vs. how many it actually compacted. The residual
+    /// (`candidates_found − partitions_compacted`) is that tenant's
+    /// current sealed-but-uncompacted backlog — the absolute value the
+    /// `ourios.compaction.backlog` observable reports (RFC 0009 §3.6).
+    /// Tenants whose planning *errored* are omitted (their candidate
+    /// count is unknown; they're recorded in [`Self::errors`]).
+    pub per_tenant: Vec<TenantSweep>,
+}
+
+/// Per-tenant candidate vs. compacted counts for one sweep — the basis
+/// for the `ourios.compaction.backlog` observable `UpDownCounter`
+/// (RFC 0009 §3.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantSweep {
+    /// Tenant the counts are for.
+    pub tenant: String,
+    /// Sealed candidate partitions [`plan_candidates`] selected.
+    pub candidates_found: usize,
+    /// How many of those actually consolidated (committed) this sweep.
+    pub partitions_compacted: usize,
 }
 
 /// A consolidated output file's size tagged with its tenant — one
@@ -141,11 +162,14 @@ pub fn run_sweep(
                 continue;
             }
         };
+        let candidates_found = candidates.len();
+        let mut compacted_here = 0usize;
         for partition in candidates {
             match compact_partition(bucket_root, &partition) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
+                        compacted_here += 1;
                         report.files_compacted += to_u64(outcome.files_before);
                         report.rows_compacted += outcome.rows;
                         report.bytes_read = report.bytes_read.saturating_add(outcome.bytes_read);
@@ -169,6 +193,11 @@ pub fn run_sweep(
                 )),
             }
         }
+        report.per_tenant.push(TenantSweep {
+            tenant,
+            candidates_found,
+            partitions_compacted: compacted_here,
+        });
     }
     Ok(report)
 }
@@ -446,6 +475,33 @@ mod tests {
             report.files_compacted, 2,
             "both input files are merged away (the H4 signal)"
         );
+    }
+
+    #[test]
+    fn sweep_reports_per_tenant_backlog_breakdown() {
+        // Arrange — tenant "a" is a sealed candidate (compacts); tenant
+        // "b" has a single file (not a candidate → 0 found, 0 compacted).
+        let bucket = tempfile::tempdir().expect("temp");
+        write_sealed_candidate(bucket.path(), "a");
+        write_file(bucket.path(), "b", 1, TS0);
+
+        // Act
+        let report =
+            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+
+        // Assert — both tenants get a per-tenant entry; the residual
+        // (candidates_found − partitions_compacted) is each one's backlog.
+        let by_tenant: std::collections::HashMap<&str, &TenantSweep> = report
+            .per_tenant
+            .iter()
+            .map(|t| (t.tenant.as_str(), t))
+            .collect();
+        let a = by_tenant.get("a").expect("tenant a present");
+        assert_eq!(a.candidates_found, 1, "a's sealed partition is a candidate");
+        assert_eq!(a.partitions_compacted, 1, "and it compacts → backlog 0");
+        let b = by_tenant.get("b").expect("tenant b present");
+        assert_eq!(b.candidates_found, 0, "b's single file is not a candidate");
+        assert_eq!(b.partitions_compacted, 0, "→ backlog 0");
     }
 
     #[test]

@@ -742,6 +742,94 @@ mod tests {
         }
     }
 
+    /// Resolve [`partition`]'s live files under `bucket` the way a reader
+    /// does (manifest-authoritative, glob fallback) and read every row.
+    /// Both the directory and the row-vs-path validation derive from the
+    /// same [`partition`], so they can't disagree.
+    fn read_partition_rows(bucket: &Path) -> Vec<MinedRecord> {
+        let part = partition();
+        let mut rows = Vec::new();
+        for f in live_files(&part.data_path(bucket)).expect("live") {
+            rows.extend(
+                Reader::open_partition(&f, part.clone())
+                    .expect("open")
+                    .read_all()
+                    .expect("read"),
+            );
+        }
+        rows.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+        rows
+    }
+
+    /// RFC0009.3 — atomic publish / no torn read. A compaction first
+    /// bootstraps a manifest naming the *inputs*, then writes the
+    /// consolidated file, then atomically swaps the manifest to name only
+    /// that file. This models the two states a crash could freeze and
+    /// asserts a reader is never torn: pre-commit it sees exactly the
+    /// inputs (the on-disk consolidated file is invisible — no double
+    /// count), post-commit exactly the consolidated rows (no loss).
+    #[test]
+    fn atomic_publish_is_never_torn_across_the_swap() {
+        // Arrange — two committed input files (3 rows) in one partition.
+        let bucket = tempfile::tempdir().expect("temp");
+        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
+        let dir = partition().data_path(bucket.path());
+        let inputs = live_files(&dir).expect("inputs");
+        let input_names = file_names(&inputs).expect("names");
+        let originals = read_partition_rows(bucket.path());
+        assert_eq!(originals.len(), 3, "three input rows");
+
+        // Mid-compaction, in compact_partition's order: bootstrap the
+        // manifest naming the inputs *first* (so the reader is
+        // manifest-authoritative before any new file appears)...
+        Manifest {
+            generation: 1,
+            files: input_names,
+        }
+        .write_atomic(&dir)
+        .expect("bootstrap manifest");
+        // ...then write the consolidated file. It now exists on disk but
+        // the manifest still names only the inputs.
+        let mut w = Writer::open(bucket.path(), partition()).expect("writer");
+        w.append_records(&originals).expect("append");
+        let consolidated = w.close().expect("close");
+        let consolidated_name = consolidated
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 name")
+            .to_string();
+
+        // All three files are physically present...
+        let on_disk = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            // Surface (not drop) an entry error so a miscount can't pass.
+            .map(|e| e.expect("read_dir entry"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+            .count();
+        assert_eq!(on_disk, 3, "inputs + consolidated all on disk pre-commit");
+        // ...but the manifest hides the consolidated file: a reader sees
+        // exactly the 3 input rows, never 6 (no torn read / double count).
+        let pre = read_partition_rows(bucket.path());
+        assert_eq!(pre, originals, "pre-commit reader sees only the inputs");
+
+        // Commit: atomic swap to name only the consolidated file.
+        Manifest {
+            generation: 2,
+            files: vec![consolidated_name],
+        }
+        .write_atomic(&dir)
+        .expect("commit manifest");
+
+        // Post-commit: exactly the consolidated rows — no loss, no dup.
+        let post = read_partition_rows(bucket.path());
+        assert_eq!(
+            post, originals,
+            "post-commit reader sees the consolidated rows"
+        );
+    }
+
     #[test]
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).

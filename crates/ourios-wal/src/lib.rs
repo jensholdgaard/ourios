@@ -165,11 +165,19 @@ pub struct Wal {
     current_segment_uuid: uuid::Uuid,
     /// Whether the parent directory still needs an `fsync` to
     /// make the current segment's directory entry durable
-    /// (§6.3). `open` sets it when it minted a *fresh* segment
-    /// — `create_new`'s directory entry isn't durable until
-    /// the directory itself is fsync'd — and the first `sync`
-    /// clears it. The `open_existing` path leaves it `false`:
-    /// a prior process already made that entry durable.
+    /// (§6.3). `open` always sets it `true` and the first
+    /// `sync` of the process clears it — the directory fsync
+    /// runs once per open regardless of whether `open` minted a
+    /// *fresh* segment or reattached to an *existing* one. The
+    /// existing-segment case can't be assumed durable: a prior
+    /// process may have created the segment and crashed before
+    /// its own first `sync`, so its directory entry could still
+    /// be page-cache-only. Acking a frame appended into such a
+    /// segment after only an `fdatasync` (which persists the
+    /// file's data + size but not its directory link) would
+    /// risk losing that acked frame to an orphaned inode on
+    /// power loss — a §3.4 violation. One extra fsync per
+    /// process start is the cheap, conservative guard.
     dir_fsync_pending: bool,
 }
 
@@ -199,20 +207,22 @@ impl Wal {
             source,
         })?;
         let existing_segments = list_segments(&config.root)?;
-        let (current_segment, current_segment_path, current_segment_uuid, dir_fsync_pending) =
+        let (current_segment, current_segment_path, current_segment_uuid) =
             if let Some(newest) = existing_segments.into_iter().next_back() {
-                let (file, path, uuid) = open_existing_segment(&newest)?;
-                (file, path, uuid, false)
+                open_existing_segment(&newest)?
             } else {
-                let (file, path, uuid) = create_fresh_segment(&config.root)?;
-                (file, path, uuid, true)
+                create_fresh_segment(&config.root)?
             };
         Ok(Self {
             config,
             current_segment,
             current_segment_path,
             current_segment_uuid,
-            dir_fsync_pending,
+            // Always pending: the first `sync` fsyncs the parent
+            // directory regardless of fresh-vs-existing open, so
+            // an acked frame's segment is guaranteed a durable
+            // directory entry (see the field doc — §3.4).
+            dir_fsync_pending: true,
         })
     }
 
@@ -303,12 +313,13 @@ impl Wal {
         })
     }
 
-    /// Fsync the current segment (and the parent directory the
-    /// first time, when `open` minted a fresh segment whose
-    /// directory entry isn't yet durable — same obligation a
-    /// rotation will carry, per §6.3). Returns the highest
-    /// offset that is now durable — the receiver gates its
-    /// acks on this returning `Ok(_)`.
+    /// Fsync the current segment (and, on the first `sync`
+    /// after any `open`, the parent directory — so the segment
+    /// holding the just-acked frames is guaranteed a durable
+    /// directory entry, the same obligation a rotation will
+    /// carry, per §6.3). Returns the highest offset that is now
+    /// durable — the receiver gates its acks on this returning
+    /// `Ok(_)`.
     ///
     /// Uses `fdatasync` (`File::sync_data`) on the segment per
     /// §6.3: the payload + size are what must survive, not the

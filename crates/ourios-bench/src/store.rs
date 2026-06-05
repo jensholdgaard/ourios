@@ -21,6 +21,10 @@ use crate::{BenchError, corpus, harness};
 /// a populated query and report the result-vs-corpus relationship.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltStore {
+    /// Tenant every record was written under (the corpus loader is
+    /// single-tenant — [`crate::corpus`]'s `BENCH_TENANT`). A query must
+    /// use this tenant or it scans nothing (RFC0007.5 isolation).
+    pub tenant: &'static str,
     /// Total rows written across all partitions.
     pub rows: u64,
     /// Number of partition files written (one per `*.parquet`).
@@ -103,6 +107,7 @@ pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltS
         counts.into_iter().max_by_key(|&(_, n)| n).unwrap_or((0, 0));
 
     Ok(BuiltStore {
+        tenant: crate::corpus::BENCH_TENANT,
         rows,
         files,
         busiest_template_id,

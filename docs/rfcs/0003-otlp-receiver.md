@@ -227,7 +227,7 @@ discusses this as a deployment option, not a code dependency.
 
 Each scenario carries an id of the form `RFC0003.<m>` that the
 test code references verbatim so the spec↔test mapping is
-greppable (per `docs/rfcs/README.md` §Required-sections and
+greppable (per `docs/rfcs/README.md` *Required sections* and
 `docs/verification.md` §2). Scenarios `.1`–`.11` cover the
 invariants and hazards the §6 design touches; `.12`–`.15` pin
 behaviour the OTLP spec mandates and that the §9 enrichments
@@ -259,7 +259,11 @@ concurrency).
 >   client that retries on transport timeout per the OTLP
 >   spec retry semantics, and a `SIGKILL` injected after
 >   `Wal::sync` returns `Ok(_)` but before the success
->   response reaches the wire (the §6.5 step 5/6 gap)
+>   response reaches the wire — i.e. anywhere in the §6.5
+>   window between step 4 (fsync return) and step 6 (ack);
+>   both the step-4/5 and step-5/6 gaps reduce to the same
+>   duplicate-on-retry contract since the records are
+>   already durable
 > - **When** the receiver process restarts, `Wal::replay`
 >   runs, and the client retries the timed-out export
 > - **Then** the post-restart WAL contains every record the
@@ -301,8 +305,9 @@ concurrency).
 >   the failing `ResourceLogs` index and the missing
 >   attribute key
 > - **And** no record from the batch is appended to the WAL
->   (`wal_syncs_total` does not advance; `wal_unflushed_bytes`
->   returns to its pre-batch value)
+>   (asserted by reopening the WAL post-test and observing
+>   that frame count and segment offsets are unchanged from
+>   the pre-batch snapshot)
 > - **And** no record from the batch reaches
 >   `MinerCluster::ingest` — per-Resource partial acceptance
 >   is reserved per §6.3
@@ -423,8 +428,10 @@ concurrency).
 >   `partial_success` unset (per the OTLP spec's
 >   *otlpgrpc-response* and *otlphttp-response* sections:
 >   "servers SHOULD treat empty as success")
-> - **And** `Wal::sync` is not called, `wal_syncs_total` does
->   not advance, and no record reaches `MinerCluster::ingest`
+> - **And** the receiver does not invoke `Wal::sync`, no
+>   frame is appended (asserted via a test wrapper around the
+>   `Wal` handle that counts `append` and `sync` calls), and
+>   no record reaches `MinerCluster::ingest`
 
 > **Scenario RFC0003.13 — Compression: identity and gzip MUST be supported**
 > - **Given** an HTTP request whose body is the byte-equal
@@ -609,11 +616,11 @@ state is reconstructed); a crash between (3) and (4) loses
 those records but the client retries (no ack was sent); a
 crash between (5) and (6) is the "the server did the work and
 the client never heard about it" case, where client retries
-produce duplicates. The dedup mechanism for that retry path is
-not yet specified — neither `docs/hazards.md` H3 (WAL durability
-vs. latency) nor H8 (replication-induced dedup, currently
-forward-looking) covers the single-replica retry case directly.
-§9 carries this as an open question.
+produce duplicates. This RFC implements no de-duplication:
+duplicates on retry are the explicit at-least-once contract
+per RFC0003.2 and §9 #1 (resolved by reference to the OTLP
+spec's *duplicate-data* section). Any future content-hash or
+request-id dedup is purely additive on top of this baseline.
 
 The receiver itself is post-MVP per `roadmap.md` §5 — the MVP
 bench reads OTLP from the on-disk corpus, bypassing this

@@ -111,8 +111,8 @@ pub struct WalConfig {
     /// **Not yet honoured.** [`Wal::sync`] currently always
     /// uses `fdatasync` (`File::sync_data`) regardless of this
     /// flag; the `F_FULLFSYNC` path is deferred to a follow-up.
-    /// The raw `fcntl(F_FULLFSYNC)` needs `unsafe`, which this
-    /// crate's root `#![deny(unsafe_code)]` (CLAUDE.md §6.1)
+    /// The raw `fcntl(F_FULLFSYNC)` needs `unsafe`, which the
+    /// workspace's `unsafe_code = "deny"` lint (CLAUDE.md §6.1)
     /// forbids without an RFC, so wiring it means either a
     /// safe-wrapper dependency or an unsafe waiver — a
     /// maintainer decision tracked separately. Setting it

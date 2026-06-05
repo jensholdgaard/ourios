@@ -16,6 +16,14 @@ use std::path::{Path, PathBuf};
 
 use ourios_wal::{CorruptionReason, FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
 
+/// On-disk layout sizes (RFC 0008 §6.2.1 / §6.2.2), mirrored
+/// here because the crate-internal constants are `pub(crate)`
+/// and not visible to this integration test. A frame's payload
+/// begins `SEGMENT_HEADER_LEN + FRAME_HEADER_LEN` bytes into the
+/// first segment.
+const SEGMENT_HEADER_LEN: usize = 24;
+const FRAME_HEADER_LEN: usize = 12;
+
 fn default_config(root: &Path) -> WalConfig {
     WalConfig {
         root: root.to_path_buf(),
@@ -220,9 +228,10 @@ fn crc_corruption_halts_replay_without_feeding_the_sink() {
     };
     let seg = the_one_segment(tmp.path());
     let mut bytes = std::fs::read(&seg).expect("read seg");
-    // Payload starts at byte 36: 24 B segment header + 12 B frame
-    // header (len/kind/_pad/crc). Flip its first byte.
-    bytes[36] ^= 0xFF;
+    // Flip the first payload byte (past the segment + frame
+    // headers) so the stored CRC no longer matches.
+    let payload_start = SEGMENT_HEADER_LEN + FRAME_HEADER_LEN;
+    bytes[payload_start] ^= 0xFF;
     std::fs::write(&seg, &bytes).expect("write corrupted seg");
 
     // Act
@@ -241,7 +250,10 @@ fn crc_corruption_halts_replay_without_feeding_the_sink() {
                 CorruptionReason::CrcMismatch,
                 "reason is CRC mismatch"
             );
-            assert_eq!(byte, 24, "frame starts right after the 24 B segment header");
+            assert_eq!(
+                byte, SEGMENT_HEADER_LEN as u64,
+                "frame starts right after the segment header",
+            );
             assert_eq!(segment, segment_uuid, "Corrupt names the offending segment");
         }
         other => panic!("expected RecoveryError::Corrupt, got {other:?}"),

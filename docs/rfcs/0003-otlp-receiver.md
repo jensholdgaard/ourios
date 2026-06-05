@@ -249,10 +249,12 @@ concurrency).
 > - **And** the pre-sync points (`decode`, `tenant_derive`,
 >   `body_materialise`, `append`) all observe the flag as
 >   `false`
-> - **And** the WAL contains every record from the batch,
->   ordered as appended, before the ack fires — verified by
->   replaying a fresh `Wal::open` after the response and
->   counting frames
+> - **And** the WAL contains a single `FrameKind::OtlpBatch`
+>   frame (per RFC 0008 §4) whose payload bytes equal the
+>   encoded `ExportLogsServiceRequest`, before the ack fires
+>   — verified by replaying a fresh `Wal::open` after the
+>   response and asserting one new frame whose payload
+>   round-trips via `prost` to the input request
 
 > **Scenario RFC0003.2 — Crash-before-ack: at-least-once with retry tolerance `[§3.4]`**
 > - **Given** a receiver wired to a real `Wal`, an OTLP
@@ -266,15 +268,18 @@ concurrency).
 >   already durable
 > - **When** the receiver process restarts, `Wal::replay`
 >   runs, and the client retries the timed-out export
-> - **Then** the post-restart WAL contains every record the
->   killed process had fsync'd before the kill (the
+> - **Then** the post-restart WAL contains the `OtlpBatch`
+>   frame the killed process had fsync'd before the kill —
+>   its payload still decodes byte-for-byte to the killed
+>   process's input `ExportLogsServiceRequest` (the
 >   RFC0008.2 guarantee this RFC consumes)
 > - **And** the client's retry is accepted and produces a
->   *second* copy of the same records in the WAL — this
->   duplication is the **at-least-once** contract per the
->   OTLP spec's *duplicate-data* section ("duplicate data is
->   a deliberate tradeoff for telemetry data"); the receiver
->   implements no de-duplication in this RFC
+>   *second* `OtlpBatch` frame whose payload bytes equal the
+>   first — this duplication is the **at-least-once**
+>   contract per the OTLP spec's *duplicate-data* section
+>   ("duplicate data is a deliberate tradeoff for telemetry
+>   data"); the receiver implements no de-duplication in
+>   this RFC
 > - **And** no special "retry" marker is appended; the receiver
 >   has no dedup key (§9 reserves any future dedup mechanism
 >   for a follow-up RFC) and cannot distinguish a retry from
@@ -403,7 +408,7 @@ concurrency).
 >   - a malformed protobuf payload (random bytes that fail
 >     `prost::Message::decode`),
 >   - an over-size request body exceeding the receiver's
->     configured `max_request_bytes`,
+>     configured request-size limit,
 >   - an HTTP request with an unrecognised `Content-Type`,
 >   - an HTTP `POST` to a path other than the configured
 >     `/v1/logs` (covered jointly with RFC0003.14),
@@ -473,9 +478,11 @@ concurrency).
 >   batch's `Wal::sync` returns `Ok(_)` — the §3.4
 >   `AtomicBool` of RFC0003.1 is per in-flight call, not
 >   process-global, and a per-call probe records the order
-> - **And** the WAL contains every record from every call
->   (no record is lost to concurrency, asserted by replay
->   and frame-count)
+> - **And** the WAL contains exactly one `OtlpBatch` frame
+>   per concurrent call (no call's batch is lost to
+>   concurrency, asserted by replay producing N frames whose
+>   payloads round-trip to the N input
+>   `ExportLogsServiceRequest`s)
 > - **And** the test does *not* assert any cross-call
 >   ordering — concurrent batches may interleave in the WAL
 >   as the tokio runtime chooses, which is consistent with
@@ -511,9 +518,9 @@ decoded `ExportLogsServiceRequest` and:
 4. Hands each per-tenant stream to `ourios-miner` (one
    `MinerCluster` per process; the cluster routes internally
    per `tenant_id`).
-5. After every record in the batch has been accepted by the
-   miner AND written to the WAL with fsync, returns a
-   transport-level success.
+5. After the batch has been written to the WAL as a single
+   `OtlpBatch` frame with fsync AND every record accepted by
+   the miner, returns a transport-level success.
 
 ### 6.2 Wire stack defaults
 
@@ -598,14 +605,18 @@ unwrapped string is passed through as `L_raw`.
 ### 6.5 WAL-before-ack sequencing
 
 `[§3.4]` requires the receiver to acknowledge a batch only
-after every record is durably written. Concrete contract:
+after the batch's `OtlpBatch` frame is durably written.
+Concrete contract:
 
 1. Receiver accepts the request and decodes to
    `ExportLogsServiceRequest`.
 2. Receiver fans out to per-tenant `OtlpLogRecord` streams
    (§6.3); body canonicalisation does not happen here, per the
    amended §6.4.
-3. Receiver appends every record to the WAL.
+3. Receiver appends the encoded request as a single
+   `FrameKind::OtlpBatch` frame (verbatim
+   `ExportLogsServiceRequest` protobuf bytes, per RFC 0008
+   §4) to the WAL.
 4. Receiver fsyncs the WAL segment(s) touched.
 5. Receiver hands records to the miner for templating.
 6. Receiver returns transport-level success.
@@ -846,7 +857,8 @@ the spec↔test mapping is greppable.
   binary wired to a real `Wal`, the parent SIGKILLs between
   `Wal::sync` return and ack-emit, the parent restarts the
   child and re-issues the export, and the assertion is that
-  the post-restart WAL contains the records *twice* — the
+  the post-restart WAL contains the same `OtlpBatch` payload
+  bytes *twice* (two frames, one per export attempt) — the
   at-least-once contract per the OTLP spec's *duplicate-data*
   section. The test explicitly does *not* assert dedup;
   RFC0003.2's contract is "no loss + safe retry," not

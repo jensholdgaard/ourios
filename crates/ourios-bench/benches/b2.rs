@@ -216,14 +216,99 @@ fn otel_demo(c: &mut Criterion) {
             .and_then(|s| s.to_str())
             .unwrap_or(dir)
             .to_string();
-        group.bench_function(BenchmarkId::new("corpus", id), |b| {
+        group.bench_function(BenchmarkId::new("corpus", &id), |b| {
             b.iter(|| {
                 let r = rt.block_on(querier.run(query.clone())).expect("query");
                 black_box(r.rows);
             });
         });
+
+        // Partition-pruning measurement (RFC 0007): a query bounded to
+        // the corpus's first hour reaches DataFusion with only that
+        // hour's partition(s) — the rest pruned at the directory level.
+        // The unwindowed probe above touched every partition, so its
+        // row-group total is the no-window baseline to prune against.
+        let baseline_row_groups = probe.stats.row_groups_scanned + probe.stats.row_groups_pruned;
+        if let Some(windowed) = first_hour_window(&rt, &querier, &built, dir, baseline_row_groups) {
+            group.bench_function(BenchmarkId::new("corpus-window-1h", &id), |b| {
+                b.iter(|| {
+                    let r = rt
+                        .block_on(querier.run(windowed.clone()))
+                        .expect("windowed query");
+                    black_box(r.rows);
+                });
+            });
+        }
     }
     group.finish();
+}
+
+/// Probe the **same busiest-template query** as the unwindowed arm but
+/// bounded to the corpus's first hour, assert it prunes partitions
+/// before `DataFusion`, log the pruning, and return the query to bench.
+/// Adding only the time bound (template held fixed) isolates the
+/// directory-level time-pruning effect: the unwindowed template query
+/// scans every partition (a template recurs across all hours on real
+/// logs), so the drop in scanned row groups is purely the window.
+/// `None` (skip) when the corpus is single-partition or has no timestamp
+/// span — nothing to prune. `baseline_row_groups` is the row-group total
+/// the unwindowed query touched — the no-window denominator the windowed
+/// query must come in strictly under (row-groups vs row-groups, not vs
+/// the partition-file count, which can differ when a file holds several
+/// row groups).
+fn first_hour_window(
+    rt: &tokio::runtime::Runtime,
+    querier: &Querier,
+    built: &ourios_bench::BuiltStore,
+    dir: &str,
+    baseline_row_groups: u64,
+) -> Option<QueryRequest> {
+    if built.min_time_unix_nano == 0 || built.files < 2 {
+        eprintln!(
+            "b2/otel-demo: {dir} — single-partition or no timestamp span; skipping windowed arm"
+        );
+        return None;
+    }
+    let hour_start = built.min_time_unix_nano - (built.min_time_unix_nano % HOUR_NS);
+    // Clamp the window end into the querier's i64-nanosecond range, so a
+    // corpus near the year-2262 boundary can't push the bound past
+    // i64::MAX (which the querier rejects as InvalidQuery, panicking the
+    // probe below). Unreachable for real 2026-era corpora; cheap insurance.
+    let hour_end = hour_start.saturating_add(HOUR_NS).min(i64::MAX as u64);
+    // Same query as the unwindowed arm (busiest template) plus the 1h
+    // bound, so only the window varies and the scanned-row-group drop is
+    // purely the directory-level time pruning.
+    let windowed = QueryRequest {
+        tenant: TenantId::new(built.tenant),
+        time_range: Some((hour_start, hour_end)),
+        template_id: Some(built.busiest_template_id),
+        severity_text: None,
+    };
+    let probe = rt
+        .block_on(querier.run(windowed.clone()))
+        .expect("windowed probe");
+    let seen = probe.stats.row_groups_scanned + probe.stats.row_groups_pruned;
+    assert!(
+        seen < baseline_row_groups,
+        "the 1h window must leave DataFusion fewer row groups than the {baseline_row_groups} \
+         it saw unwindowed (saw {seen}); stats={:?}",
+        probe.stats,
+    );
+    eprintln!(
+        "b2/otel-demo: {dir} — windowed 1h [{}, {}) → {} rows; DataFusion saw {} row groups \
+         (scanned {}, {} B) vs {} unwindowed → {} row groups pruned by the time window \
+         (across {} partitions)",
+        hour_start,
+        hour_end,
+        probe.rows,
+        seen,
+        probe.stats.row_groups_scanned,
+        probe.stats.bytes_read,
+        baseline_row_groups,
+        baseline_row_groups - seen,
+        built.files,
+    );
+    Some(windowed)
 }
 
 criterion_group!(benches, synthetic, otel_demo);

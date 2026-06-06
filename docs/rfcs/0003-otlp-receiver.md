@@ -252,7 +252,7 @@ concurrency).
 >   `body_materialise`, `append`) all observe the flag as
 >   `false`
 > - **And** the WAL contains a single `FrameKind::OtlpBatch`
->   frame (per RFC 0008 §4) whose payload bytes equal the
+>   frame (per RFC 0008 §3.2 + §6.2.3) whose payload bytes equal the
 >   encoded `ExportLogsServiceRequest`, before the ack fires
 >   — verified by replaying a fresh `Wal::open` after the
 >   response and asserting one new frame whose payload
@@ -631,7 +631,7 @@ the non-empty case:
 3. Receiver appends the encoded request as a single
    `FrameKind::OtlpBatch` frame (verbatim
    `ExportLogsServiceRequest` protobuf bytes, per RFC 0008
-   §4) to the WAL.
+   §3.2 + §6.2.3) to the WAL.
 4. Receiver fsyncs the WAL segment(s) touched.
 5. Receiver hands records to the miner for templating.
 6. Receiver returns transport-level success.

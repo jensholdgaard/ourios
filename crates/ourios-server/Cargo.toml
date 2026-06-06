@@ -13,16 +13,40 @@ name = "ourios-server"
 path = "src/main.rs"
 
 [dependencies]
-# The background compaction daemon (RFC 0009 §3.2).
+# The background compaction daemon (RFC 0009 §3.2) + the OTLP receiver
+# building blocks (RFC 0003 §6.2): the ingest pipeline, the axum HTTP
+# router, and the tonic `LogsService` impl the receiver role serves.
 ourios-ingester = { path = "../ourios-ingester" }
 # Durable compaction-audit sink (RFC 0005 §3.7) + the compaction policy.
 ourios-parquet = { path = "../ourios-parquet" }
 # OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8).
 ourios-telemetry = { path = "../ourios-telemetry" }
+# The receiver role's durable WAL + miner + miner config (one pipeline
+# over a single `Wal`, RFC 0003 §6.5 / RFC 0008 §3.1).
+ourios-wal = { path = "../ourios-wal" }
+ourios-miner = { path = "../ourios-miner" }
+ourios-core = { path = "../ourios-core" }
+# `LogsServiceServer` to host the receiver's `LogsService` impl over gRPC.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs"] }
+# gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16).
+tonic = { version = "0.14", default-features = false, features = ["transport", "router"] }
+# HTTP transport (serve) for the OTLP/HTTP listener (RFC0003.16); reuses
+# the receiver crate's `router`.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 # Async runtime: `rt-multi-thread` for the compactor's `spawn_blocking`
-# sweeps, `signal` for SIGINT graceful shutdown, `macros` for
-# `#[tokio::main]`.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal"] }
+# sweeps + the receiver listeners, `signal` for SIGINT/SIGTERM graceful
+# shutdown, `net`/`sync` for the listeners + shutdown fan-out, `macros`
+# for `#[tokio::main]`.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
+
+[dev-dependencies]
+# RFC0003.16 served-binary integration test: temp dirs, a real tonic
+# gRPC client (`channel`) + a hand-rolled HTTP/1.1 POST (tokio io/time),
+# prost to encode the request, the WAL to replay + assert durability.
+tempfile = "3"
+prost = { version = "0.14", default-features = false, features = ["std"] }
+tonic = { version = "0.14", default-features = false, features = ["channel"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "time", "process"] }
 
 [lints]
 workspace = true

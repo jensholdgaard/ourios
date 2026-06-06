@@ -155,3 +155,26 @@ async fn oversize_body_is_413() {
         "an oversize request appends no OtlpBatch frame",
     );
 }
+
+#[tokio::test]
+async fn non_post_to_logs_path_is_405() {
+    // A wrong *method* on the logs path is 405 (axum's MethodRouter
+    // default) — ecosystem-consistent with the Collector, vs the 404 a
+    // wrong *path* gets. Confirmed against the OTLP review.
+    let (pipeline, captured) = capturing_pipeline();
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/logs")
+        .body(axum::body::Body::empty())
+        .expect("build GET request");
+    let (status, _) = send(router(pipeline, &HttpConfig::default()), request).await;
+    assert_eq!(
+        status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "a non-POST to /v1/logs is 405, not 404",
+    );
+    assert!(
+        captured.lock().expect("captured").is_empty(),
+        "a rejected-method request appends no OtlpBatch frame",
+    );
+}

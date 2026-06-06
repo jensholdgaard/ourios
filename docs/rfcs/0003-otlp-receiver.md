@@ -321,11 +321,12 @@ concurrency).
 >   (gRPC `INVALID_ARGUMENT` / HTTP 400) whose payload names
 >   the failing `ResourceLogs` index and the missing
 >   attribute key
-> - **And** no record from the batch is appended to the WAL
->   (asserted by shutting down the receiver — dropping its
->   single `Wal` handle per `crates/ourios-wal/src/lib.rs`
->   §6.2 — and then opening a *second* `Wal` and observing
->   via `Wal::replay` that frame count and segment offsets
+> - **And** no `OtlpBatch` frame from the batch is appended
+>   to the WAL (asserted by shutting down the receiver —
+>   dropping its single `Wal` handle per
+>   `crates/ourios-wal/src/lib.rs` §6.2 — and then opening
+>   a *second* `Wal` and observing via `Wal::replay` that
+>   frame count and segment offsets
 >   are unchanged from the pre-batch snapshot)
 > - **And** no record from the batch reaches
 >   `MinerCluster::ingest` — per-Resource partial acceptance
@@ -447,7 +448,9 @@ concurrency).
 > - **And** no part of the receiver panics or restarts; the
 >   process remains alive (each arm of the test asserts this
 >   after the request)
-> - **And** no partial record is appended to the WAL
+> - **And** no `OtlpBatch` frame is appended to the WAL
+>   (the rejected batch never reaches §6.5 step 3, so the
+>   persistence unit — the per-export frame — never lands)
 
 > **Scenario RFC0003.12 — Empty `ExportLogsServiceRequest` returns success without WAL write**
 > - **Given** an `ExportLogsServiceRequest` that carries
@@ -940,7 +943,8 @@ greppable.
   (malformed protobuf, oversize, unrecognised `Content-Type`,
   wrong path, mid-decode cancellation) and the empty-request
   success arm. Each assertion pins the response status code,
-  that no record reaches the WAL or miner, and that the
+  that no `OtlpBatch` frame is appended to the WAL and no
+  record reaches the miner, and that the
   receiver process is still alive afterwards.
 - **Compression and path** (RFC0003.13, RFC0003.14): the gzip
   arm of RFC0003.13 uses `flate2` to construct the

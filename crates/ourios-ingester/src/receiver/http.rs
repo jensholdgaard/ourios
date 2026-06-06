@@ -3,7 +3,7 @@
 //! An `axum` `POST` handler at a configurable path (default `/v1/logs`)
 //! that decodes the body per `Content-Type` (`application/x-protobuf` or
 //! `application/json`) and `Content-Encoding` (`identity` or `gzip`),
-//! hands the decoded `ExportLogsServiceRequest` to the [`IngestPipeline`]
+//! hands the decoded `ExportLogsServiceRequest` to the `IngestPipeline`
 //! (WAL-before-ack), and returns an `ExportLogsServiceResponse`.
 //!
 //! Transport errors are controlled (RFC0003.11): unsupported media type

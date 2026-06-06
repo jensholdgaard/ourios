@@ -1,7 +1,7 @@
 //! OTLP/gRPC listener (RFC 0003 §6.2).
 //!
 //! Implements `opentelemetry-proto`'s `LogsService` over the shared
-//! [`IngestPipeline`]: `export` hands the (already tonic-decoded)
+//! `IngestPipeline`: `export` hands the (already tonic-decoded)
 //! `ExportLogsServiceRequest` to the WAL-before-ack pipeline and maps the
 //! result to a tonic `Status`:
 //! - tenant-resolution failure → `INVALID_ARGUMENT` (naming the failing
@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status};
 
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 
-/// The gRPC `LogsService` over a shared [`IngestPipeline`].
+/// The gRPC `LogsService` over a shared `IngestPipeline`.
 pub struct LogsReceiver {
     pipeline: SharedPipeline,
 }

@@ -7,10 +7,9 @@
 //!
 //! Landed so far:
 //! - [`decode`] — the §6.2 wire-decode layer (protobuf + OTLP/JSON),
-//!   turning a request payload into an `ExportLogsServiceRequest`. No
-//!   live `tonic`/`axum` listener yet: the transports hand their decoded
-//!   payload to this same layer, so decode is specified and tested
-//!   before the framing is wired.
+//!   turning a request payload into an `ExportLogsServiceRequest`. The
+//!   [`http`] and [`grpc`] transports hand their decoded payload to this
+//!   shared layer.
 //! - [`materialize`] — the §6.1 step 2–3 mapping from a decoded
 //!   `LogRecord` to the flat `OtlpLogRecord` the miner consumes (body
 //!   fork + empty-sentinel narrowing).

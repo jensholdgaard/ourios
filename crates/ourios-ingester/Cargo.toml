@@ -41,10 +41,9 @@ ourios-semconv = { path = "../ourios-semconv" }
 # decodes the gRPC / HTTP `application/x-protobuf` payload into the
 # `ExportLogsServiceRequest` these generated types define. `with-serde`
 # carries the OTLP/JSON mapping the `application/json` path uses
-# (RFC0003.6, lands next). Live gRPC/HTTP listeners (`tonic`/`axum`) are
-# a later transport slice — this slice is the pure decode layer.
-# `gen-tonic` (not just `-messages`) for the `logs_service_server`
-# `LogsService` trait the gRPC listener implements (RFC0003.11/.15).
+# (RFC0003.6). `gen-tonic` (not just `-messages`) supplies the
+# `logs_service_server::LogsService` trait the gRPC listener implements
+# (RFC0003.11/.15).
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "with-serde"] }
 # `prost::Message::{decode, encode_to_vec}` for the protobuf payload.
 # `std` is explicit (not relied on via workspace feature unification):

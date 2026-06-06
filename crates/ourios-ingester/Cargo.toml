@@ -12,6 +12,17 @@ publish = false
 name = "ourios_ingester"
 path = "src/lib.rs"
 
+# Crash-recovery test fixture spawned (and SIGKILL'd) by
+# tests/rfc0003_2_crash_before_ack.rs — mirrors ourios-wal's
+# wal_crash_fixture (PR #126). Not a product binary; a real process kill
+# is the only faithful exercise of the crash-before-ack path.
+[[bin]]
+name = "receiver_crash_fixture"
+path = "tests/fixtures/receiver_crash_fixture.rs"
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 # Shared types (TenantId, config) for the ingest path.
 ourios-core = { path = "../ourios-core" }

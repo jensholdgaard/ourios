@@ -4,18 +4,15 @@
 //! durably (WAL-before-ack), lands Parquet in object storage, and runs
 //! background maintenance. It spans three RFCs at different maturities:
 //!
-//! - **OTLP receiver** (RFC 0003, `red`, greening) — the gRPC/HTTP
-//!   ingest front door + mining pipeline. The §5 acceptance criteria
-//!   (RFC0003.1–.15) are enumerated as `tests/rfc0003_*`; the green
-//!   slices flip them one §8 group at a time. Landed: [`receiver::decode`]
-//!   (§6.2 wire decode — protobuf + OTLP/JSON, RFC0003.5/.6),
-//!   [`receiver::materialize`] (§6.1 `LogRecord` → `OtlpLogRecord`,
-//!   RFC0003.7–.10), [`receiver::tenant`] (per-`ResourceLogs` tenant
-//!   derivation + fan-out, RFC0003.3/.4), [`receiver::pipeline`]
-//!   (§6.5 WAL-before-ack ingest path, RFC0003.1/.12), and
-//!   [`receiver::http`] (the OTLP/HTTP listener, RFC0003.11-HTTP/.13/.14),
-//!   and [`receiver::grpc`] (the OTLP/gRPC `LogsService`,
-//!   RFC0003.11-gRPC/.15). Only crash-before-ack (RFC0003.2) remains.
+//! - **OTLP receiver** (RFC 0003) — the gRPC/HTTP ingest front door +
+//!   mining pipeline. **All §5 acceptance criteria (RFC0003.1–.15) are
+//!   live** across [`receiver::decode`] (§6.2 wire decode — protobuf +
+//!   OTLP/JSON), [`receiver::materialize`] (§6.1 `LogRecord` →
+//!   `OtlpLogRecord`), [`receiver::tenant`] (per-`ResourceLogs` tenant
+//!   derivation + fan-out), [`receiver::pipeline`] (§6.5 WAL-before-ack),
+//!   [`receiver::http`] (OTLP/HTTP listener), and [`receiver::grpc`]
+//!   (OTLP/gRPC `LogsService`). Not yet wired: a served-socket binary
+//!   (§9 process-model — the listeners are exercised in-process).
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path by [`receiver::pipeline`]: every non-empty batch is

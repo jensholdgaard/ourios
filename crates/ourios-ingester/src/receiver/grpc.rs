@@ -62,8 +62,9 @@ impl LogsService for LogsReceiver {
             // A WAL append/sync failure — server-side; the batch was not
             // acked (§3.4). Surface the (Display-able) detail.
             Ok(Err(e)) => Err(Status::internal(e.to_string())),
-            // The blocking ingest task panicked or was cancelled.
-            Err(_) => Err(Status::internal("ingest task failed")),
+            // The blocking ingest task panicked or was cancelled;
+            // `JoinError`'s Display is short and safe to surface.
+            Err(join) => Err(Status::internal(format!("ingest task failed: {join}"))),
         }
     }
 }

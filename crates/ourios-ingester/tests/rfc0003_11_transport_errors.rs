@@ -70,10 +70,14 @@ async fn rfc0003_11_grpc_tenant_failure_is_invalid_argument() {
     // Assert: a controlled INVALID_ARGUMENT naming the attribute — not a
     // panic — and nothing appended.
     assert_eq!(status.code(), Code::InvalidArgument);
+    let message = status.message();
     assert!(
-        status.message().contains("service.name"),
-        "the Status names the missing attribute, got {:?}",
-        status.message(),
+        message.contains("service.name"),
+        "the Status names the missing attribute, got {message:?}",
+    );
+    assert!(
+        message.contains("ResourceLogs[0]"),
+        "the Status names the failing ResourceLogs index (RFC0003.4/.11), got {message:?}",
     );
     assert!(
         captured.lock().expect("captured").is_empty(),

@@ -668,10 +668,18 @@ the non-empty case:
 2. Receiver fans out to per-tenant `OtlpLogRecord` streams
    (§6.3); body canonicalisation does not happen here, per the
    amended §6.4.
-3. Receiver appends the encoded request as a single
-   `FrameKind::OtlpBatch` frame (verbatim
-   `ExportLogsServiceRequest` protobuf bytes, per RFC 0008
-   §3.2 + §6.2.3) to the WAL.
+3. Receiver appends the request as a single
+   `FrameKind::OtlpBatch` frame (per RFC 0008 §3.2 + §6.2.3)
+   whose payload is a protobuf-encoded
+   `ExportLogsServiceRequest` decodable via `prost` —
+   semantically equivalent to the input, but byte-equal to
+   the wire payload is *not* required (per RFC0003.1 + .2
+   the contract is "you can recover the input message," not
+   "you get the bytes back"). For the gRPC and
+   HTTP/protobuf paths the receiver MAY store the wire bytes
+   verbatim; for the HTTP/JSON path no incoming protobuf
+   bytes exist and the receiver MUST encode the decoded
+   message.
 4. Receiver fsyncs the WAL segment(s) touched.
 5. Receiver hands records to the miner for templating.
 6. Receiver returns transport-level success.

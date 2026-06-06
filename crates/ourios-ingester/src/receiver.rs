@@ -6,11 +6,11 @@
 //! as the `tests/rfc0003_*` acceptance tests go green.
 //!
 //! Landed so far:
-//! - [`decode`] — the §6.2 wire-decode layer (protobuf today; OTLP/JSON
-//!   next), turning a request payload into an
-//!   `ExportLogsServiceRequest`. No live `tonic`/`axum` listener yet:
-//!   the transports hand their decoded payload to this same layer, so
-//!   decode is specified and tested before the framing is wired.
+//! - [`decode`] — the §6.2 wire-decode layer (protobuf + OTLP/JSON),
+//!   turning a request payload into an `ExportLogsServiceRequest`. No
+//!   live `tonic`/`axum` listener yet: the transports hand their decoded
+//!   payload to this same layer, so decode is specified and tested
+//!   before the framing is wired.
 
 pub mod decode;
 

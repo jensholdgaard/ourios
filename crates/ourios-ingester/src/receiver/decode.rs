@@ -16,9 +16,8 @@ use prost::Message;
 /// error RFC0003.11 requires (gRPC `INVALID_ARGUMENT` / HTTP 400) —
 /// never a panic.
 ///
-/// `#[non_exhaustive]`: the OTLP/JSON path (RFC0003.6) adds a `Json`
-/// variant in the next slice, so downstream `match`es must keep a
-/// wildcard arm.
+/// `#[non_exhaustive]`: future transports/encodings may add variants,
+/// so downstream `match`es must keep a wildcard arm.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeError {

@@ -8,9 +8,10 @@
 //!   ingest front door + mining pipeline. The §5 acceptance criteria
 //!   (RFC0003.1–.15) are enumerated as `tests/rfc0003_*`; the green
 //!   slices flip them one §8 group at a time. Landed: [`receiver::decode`]
-//!   (§6.2 wire decode — protobuf + OTLP/JSON, RFC0003.5/.6) and
+//!   (§6.2 wire decode — protobuf + OTLP/JSON, RFC0003.5/.6),
 //!   [`receiver::materialize`] (§6.1 `LogRecord` → `OtlpLogRecord`,
-//!   RFC0003.7–.10). Tenant fan-out, the live transports, and the
+//!   RFC0003.7–.10), and [`receiver::tenant`] (per-`ResourceLogs` tenant
+//!   derivation + fan-out, RFC0003.3/.4). The live transports and the
 //!   WAL-before-ack path follow.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into

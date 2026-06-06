@@ -14,7 +14,7 @@
 //! so the fan-out slice supplies it.
 
 use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValue};
-use opentelemetry_proto::tonic::logs::v1::LogRecord;
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs};
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
 
@@ -63,6 +63,37 @@ pub fn materialize_record(
         // when the wire delivered no body.
         body: record.body.and_then(Body::from_any_value),
     }
+}
+
+/// Materialise every `LogRecord` under one `ResourceLogs` group into
+/// `OtlpLogRecord`s under `tenant_id`, in `(ScopeLogs, LogRecord)` order.
+///
+/// The group's `Resource` attributes are inherited by every record, and
+/// each `ScopeLogs` contributes its own `InstrumentationScope`
+/// name/version. Tenant derivation (RFC0003.3, per `ResourceLogs`) is the
+/// caller's job — this takes the already-resolved `tenant_id`.
+#[must_use]
+pub fn materialize_resource_logs(
+    resource_logs: ResourceLogs,
+    tenant_id: &TenantId,
+) -> Vec<OtlpLogRecord> {
+    let resource_attributes = resource_logs
+        .resource
+        .map(|resource| resource.attributes)
+        .unwrap_or_default();
+    let mut records = Vec::new();
+    for scope_logs in resource_logs.scope_logs {
+        let scope = scope_logs.scope;
+        for record in scope_logs.log_records {
+            records.push(materialize_record(
+                record,
+                &resource_attributes,
+                scope.as_ref(),
+                tenant_id.clone(),
+            ));
+        }
+    }
+    records
 }
 
 /// Narrow proto's `i32` `severity_number` to the schema's `u8`. Valid

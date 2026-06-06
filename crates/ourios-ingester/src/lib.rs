@@ -11,9 +11,10 @@
 //!   (§6.2 wire decode — protobuf + OTLP/JSON, RFC0003.5/.6),
 //!   [`receiver::materialize`] (§6.1 `LogRecord` → `OtlpLogRecord`,
 //!   RFC0003.7–.10), [`receiver::tenant`] (per-`ResourceLogs` tenant
-//!   derivation + fan-out, RFC0003.3/.4), and [`receiver::pipeline`]
-//!   (§6.5 WAL-before-ack ingest path, RFC0003.1/.12). The live
-//!   gRPC/HTTP transports wrap the pipeline next.
+//!   derivation + fan-out, RFC0003.3/.4), [`receiver::pipeline`]
+//!   (§6.5 WAL-before-ack ingest path, RFC0003.1/.12), and
+//!   [`receiver::http`] (the OTLP/HTTP listener, RFC0003.11-HTTP/.13/.14).
+//!   The gRPC listener follows.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path by [`receiver::pipeline`]: every non-empty batch is

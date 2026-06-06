@@ -24,7 +24,10 @@ use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
 /// ordering can be exercised with a spy that records the `append`/`sync`
 /// calls (RFC0003.1/.12 per §8). The only production implementation is
 /// [`Wal`].
-pub trait Journal {
+///
+/// `Send` so the pipeline can live behind a shared `Arc<Mutex<_>>` as
+/// state in the async HTTP/gRPC listeners.
+pub trait Journal: Send {
     /// Append one `OtlpBatch` frame carrying `payload` (not yet durable).
     ///
     /// # Errors

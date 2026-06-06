@@ -48,8 +48,8 @@ pub fn materialize_record(
         // documented `0..=24` `u8` range — see `severity_to_u8`.
         severity_number: severity_to_u8(record.severity_number),
         severity_text: nonempty(record.severity_text),
-        scope_name: scope.and_then(|s| nonempty(s.name.clone())),
-        scope_version: scope.and_then(|s| nonempty(s.version.clone())),
+        scope_name: scope.and_then(|s| (!s.name.is_empty()).then(|| s.name.clone())),
+        scope_version: scope.and_then(|s| (!s.version.is_empty()).then(|| s.version.clone())),
         attributes: record.attributes,
         // Reflected verbatim from the wire, never recomputed (RFC0003.10).
         dropped_attributes_count: record.dropped_attributes_count,
@@ -75,8 +75,8 @@ fn severity_to_u8(n: i32) -> u8 {
     u8::try_from(n).ok().filter(|v| *v <= 24).unwrap_or(0)
 }
 
-/// Proto scalar `0` → `None`, else `Some` — the §6.9-style narrowing of
-/// a "0 = unset" wire sentinel.
+/// Proto scalar `0` → `None`, else `Some` — the RFC0003.9 narrowing of a
+/// "0 = unset" wire sentinel.
 fn nonzero(v: u64) -> Option<u64> {
     (v != 0).then_some(v)
 }

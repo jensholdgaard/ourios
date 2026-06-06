@@ -1,11 +1,17 @@
-//! OTLP receiver — **placeholder** (RFC 0003, `specified` → `red`).
+//! OTLP receiver (RFC 0003, `red`).
 //!
 //! The ingest front door (OTLP logs over gRPC/HTTP), the Drain-derived
 //! mining pipeline, and the WAL-before-ack durability path
-//! (`CLAUDE.md` §3.4, RFC 0008) live here. The RFC is now `specified`,
-//! and its §5 acceptance criteria (RFC0003.1–.15) are enumerated as
-//! `#[ignore]`'d tests under `crates/ourios-ingester/tests/rfc0003_*` —
-//! the `red` gate. This module stays deliberately empty until the green
-//! slices land the ingest pipeline (wire decode → tenant fan-out →
-//! WAL-before-ack → miner), rather than a half-built path ahead of
-//! review.
+//! (`CLAUDE.md` §3.4, RFC 0008) live here, grown one §8 group at a time
+//! as the `tests/rfc0003_*` acceptance tests go green.
+//!
+//! Landed so far:
+//! - [`decode`] — the §6.2 wire-decode layer (protobuf today; OTLP/JSON
+//!   next), turning a request payload into an
+//!   `ExportLogsServiceRequest`. No live `tonic`/`axum` listener yet:
+//!   the transports hand their decoded payload to this same layer, so
+//!   decode is specified and tested before the framing is wired.
+
+pub mod decode;
+
+pub use decode::{DecodeError, decode_protobuf};

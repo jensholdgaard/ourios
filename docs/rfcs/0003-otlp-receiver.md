@@ -562,14 +562,19 @@ concurrency).
 >   and HTTP `POST /v1/logs` (`application/x-protobuf`) — and
 >   the server is then signalled to shut down
 > - **Then** each client receives transport-level success
->   (gRPC `OK` / HTTP 200) only after its batch is durable, and
->   the batch's `OtlpBatch` frame is recoverable via a
->   subsequent `Wal::replay` — the §6.5 WAL-before-ack contract
->   holds **end-to-end over a real socket**, not just in-process
+>   (gRPC `OK` / HTTP 200) only after its batch is durable — the
+>   §6.5 WAL-before-ack contract holds **end-to-end over a real
+>   socket**, not just in-process
 > - **And** the shutdown signal stops the listeners and exits
->   the process cleanly — without dropping the single `Wal`
->   handle mid-fsync or losing a batch that was already acked
->   (no in-flight, already-fsync'd batch is lost on the way out)
+>   the process cleanly, releasing the single `Wal` handle —
+>   without dropping it mid-fsync or losing a batch that was
+>   already acked (no in-flight, already-fsync'd batch is lost
+>   on the way out)
+> - **And** *after* that clean exit frees the single-writer
+>   handle (RFC 0008 §3.1), opening the WAL and running
+>   `Wal::replay` recovers each batch's `OtlpBatch` frame — the
+>   durability check necessarily follows shutdown, since the WAL
+>   cannot be reopened while the server holds it
 
 ## 6. Proposed design
 
@@ -1028,11 +1033,14 @@ greppable.
   `ourios-server` receiver role bound on ephemeral ports
   (`:0`), exports a non-empty batch over each transport with a
   *real* client — a `tonic` gRPC client and an HTTP client
-  (`reqwest`/`hyper`) — asserts transport success, then opens
-  the WAL and `replay`s to confirm each batch's `OtlpBatch`
-  frame is durable (WAL-before-ack over a real socket). A
-  second arm signals shutdown and asserts the server task joins
-  cleanly without losing an already-acked batch. Unlike
+  (`reqwest`/`hyper`) — and asserts transport success for each.
+  It then signals shutdown and waits for the server task to
+  join cleanly, which releases the single `Wal` handle (RFC
+  0008 §3.1's single-writer rule — the WAL cannot be reopened
+  while the server holds it). *Only after that join* does the
+  test open the WAL and `Wal::replay` it, confirming each
+  batch's `OtlpBatch` frame is durable — WAL-before-ack over a
+  real socket, with no acked batch lost on the way out. Unlike
   RFC0003.1–.15 (in-process: direct handler call / `oneshot`),
   this is the only scenario that crosses a real socket.
 

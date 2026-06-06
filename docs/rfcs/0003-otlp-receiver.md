@@ -356,9 +356,10 @@ concurrency).
 >   equivalence is the Parquet writer's contract per §6.4)
 > - **And** the JSON decoder accepts whitespace and field-
 >   ordering variation (insignificant per proto3-JSON)
-> - **And** the JSON decoder ignores unknown top-level fields
->   in the request body per the OTLP spec's "receivers MUST
->   ignore unknown fields" rule (forward-compatibility)
+> - **And** the JSON decoder ignores unknown fields anywhere
+>   in the request body (top-level, nested, repeated) per the
+>   OTLP spec's "receivers MUST ignore unknown fields" rule
+>   (forward-compatibility)
 
 > **Scenario RFC0003.7 — `Body::Structured` carries the decoded `AnyValue` verbatim**
 > - **Given** a `LogRecord` whose `body` is an `AnyValue` of
@@ -394,11 +395,19 @@ concurrency).
 > - **Given** a `LogRecord` with `severity_number = 0`
 >   (`UNSPECIFIED`), no `scope_name` on its enclosing
 >   `InstrumentationScope`, and `observed_time_unix_nano = 0`
+>   (proto3's scalar default for an unset field — OTLP's
+>   *log-record* section spells this out as "the value of 0
+>   indicates unknown")
 > - **When** the receiver materialises the record
 > - **Then** the derived `OtlpLogRecord` carries
->   `severity_number = 0`, `scope_name = None`, and
->   `observed_time_unix_nano = None` (per RFC 0001 §6.1's
->   optionality)
+>   `severity_number = 0` (kept as `0` because
+>   `UNSPECIFIED` is an explicit OTLP value per
+>   RFC 0001 §6.1, not absence), `scope_name = None`, and
+>   `observed_time_unix_nano = None` — the receiver applies
+>   the wire-`0` → `None` rule for `observed_time_unix_nano`
+>   specifically (the `Option<u64>` typing in RFC 0001 §6.1
+>   exists *for* this conversion; this scenario is the
+>   contract that owns the rule)
 > - **And** the record is accepted by `MinerCluster::ingest`
 >   without rejection, coalescing, substitution, or any
 >   downcast to a "default" value

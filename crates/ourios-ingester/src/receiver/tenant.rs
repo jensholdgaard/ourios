@@ -75,6 +75,7 @@ impl TenantRule {
             })
             .ok_or_else(|| TenantResolutionError {
                 attribute: self.attribute_key.clone(),
+                resource_index: None,
             })
     }
 }
@@ -87,11 +88,17 @@ impl Default for TenantRule {
 
 /// A `ResourceLogs` group's `Resource` did not resolve to a tenant under
 /// the configured rule. Per RFC 0003 §6.3 the **whole** export is
-/// rejected; the error names the attribute the rule required so the
-/// sender can fix its emitter or deployment.
+/// rejected; the error names the failing `ResourceLogs` index and the
+/// attribute the rule required (RFC0003.4) so the sender can fix the
+/// offending emitter or deployment.
+///
+/// `resource_index` is `None` for a bare [`TenantRule::derive`] (which
+/// sees one Resource with no batch context) and `Some(i)` once
+/// [`fan_out`] attaches the group's position in the export.
 #[derive(Debug)]
 pub struct TenantResolutionError {
     attribute: String,
+    resource_index: Option<usize>,
 }
 
 impl TenantResolutionError {
@@ -100,15 +107,36 @@ impl TenantResolutionError {
     pub fn attribute(&self) -> &str {
         &self.attribute
     }
+
+    /// The position of the failing `ResourceLogs` group in the export,
+    /// once known (`fan_out` attaches it; a bare `derive` leaves `None`).
+    #[must_use]
+    pub fn resource_index(&self) -> Option<usize> {
+        self.resource_index
+    }
+
+    /// Attach the failing group's index (called by [`fan_out`]).
+    #[must_use]
+    fn at_resource(mut self, index: usize) -> Self {
+        self.resource_index = Some(index);
+        self
+    }
 }
 
 impl std::fmt::Display for TenantResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "tenant resolution failed: Resource is missing the `{}` attribute (or it is not a non-empty string)",
-            self.attribute
-        )
+        match self.resource_index {
+            Some(index) => write!(
+                f,
+                "tenant resolution failed: ResourceLogs[{index}] is missing the `{}` attribute (or it is not a non-empty string)",
+                self.attribute
+            ),
+            None => write!(
+                f,
+                "tenant resolution failed: Resource is missing the `{}` attribute (or it is not a non-empty string)",
+                self.attribute
+            ),
+        }
     }
 }
 
@@ -131,16 +159,19 @@ pub fn fan_out(
     rule: &TenantRule,
 ) -> Result<Vec<OtlpLogRecord>, TenantResolutionError> {
     let mut records = Vec::new();
-    for resource_logs in request.resource_logs {
+    for (index, resource_logs) in request.resource_logs.into_iter().enumerate() {
         // Scope the borrow of `resource_logs` so it can be moved into
-        // `materialize_resource_logs` afterwards.
+        // `materialize_resource_logs` afterwards. On failure, attach the
+        // group's index so the error names the failing Resource
+        // (RFC0003.4).
         let tenant_id = {
             let resource_attributes = resource_logs
                 .resource
                 .as_ref()
                 .map(|resource| resource.attributes.as_slice())
                 .unwrap_or_default();
-            rule.derive(resource_attributes)?
+            rule.derive(resource_attributes)
+                .map_err(|error| error.at_resource(index))?
         };
         records.extend(materialize_resource_logs(resource_logs, &tenant_id));
     }
@@ -178,8 +209,10 @@ mod tests {
         let attrs = [string_attr("host.name", "node-1")];
         // Act
         let err = TenantRule::service_name().derive(&attrs).unwrap_err();
-        // Assert
+        // Assert: names the attribute; index is unknown at the
+        // single-Resource `derive` level (fan_out attaches it).
         assert_eq!(err.attribute(), "service.name");
+        assert_eq!(err.resource_index(), None);
     }
 
     #[test]

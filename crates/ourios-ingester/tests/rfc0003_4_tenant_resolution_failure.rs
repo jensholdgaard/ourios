@@ -53,14 +53,21 @@ fn rfc0003_4_unresolved_resource_rejects_entire_batch() {
     // Act
     let result = fan_out(request, &TenantRule::service_name());
 
-    // Assert: the whole batch is rejected and the error names the
-    // missing attribute; no records are returned.
+    // Assert: the whole batch is rejected, and the error names both the
+    // failing ResourceLogs index (1) and the missing attribute (RFC0003.4).
     match result {
-        Err(error) => assert_eq!(
-            error.attribute(),
-            "service.name",
-            "the error names the attribute the rule required",
-        ),
+        Err(error) => {
+            assert_eq!(
+                error.attribute(),
+                "service.name",
+                "the error names the attribute the rule required",
+            );
+            assert_eq!(
+                error.resource_index(),
+                Some(1),
+                "the error names the failing ResourceLogs index",
+            );
+        }
         Ok(records) => panic!(
             "expected the whole batch to be rejected, got {} accepted records",
             records.len()

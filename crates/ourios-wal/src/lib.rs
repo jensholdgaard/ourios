@@ -853,6 +853,45 @@ pub enum SyncError {
     },
 }
 
+impl std::fmt::Display for AppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { len, limit } => {
+                write!(f, "frame payload {len} B exceeds the {limit} B limit")
+            }
+            Self::Io { op, source } => write!(f, "WAL append failed at {op}: {source}"),
+            Self::QuiescedAfterRotationFsyncFailure => {
+                write!(f, "WAL is quiesced after a rotation fsync failure (§6.5)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::TooLarge { .. } | Self::QuiescedAfterRotationFsyncFailure => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { op, source } => write!(f, "WAL sync failed at {op}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+        }
+    }
+}
+
 /// Errors from [`Wal::checkpoint`].
 #[derive(Debug)]
 pub enum CheckpointError {

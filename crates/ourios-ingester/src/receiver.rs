@@ -7,10 +7,9 @@
 //!
 //! Landed so far:
 //! - [`decode`] — the §6.2 wire-decode layer (protobuf + OTLP/JSON),
-//!   turning a request payload into an `ExportLogsServiceRequest`. No
-//!   live `tonic`/`axum` listener yet: the transports hand their decoded
-//!   payload to this same layer, so decode is specified and tested
-//!   before the framing is wired.
+//!   turning a request payload into an `ExportLogsServiceRequest`. The
+//!   [`http`] and [`grpc`] transports hand their decoded payload to this
+//!   shared layer.
 //! - [`materialize`] — the §6.1 step 2–3 mapping from a decoded
 //!   `LogRecord` to the flat `OtlpLogRecord` the miner consumes (body
 //!   fork + empty-sentinel narrowing).
@@ -23,9 +22,13 @@
 //! - [`http`] — the OTLP/HTTP listener ([`http::router`]) wrapping the
 //!   pipeline: `Content-Type`/`Content-Encoding` dispatch, controlled
 //!   transport errors, configurable path (RFC0003.11 HTTP arms / .13 /
-//!   .14). The gRPC listener (`tonic`) follows.
+//!   .14).
+//! - [`grpc`] — the OTLP/gRPC `LogsService` ([`grpc::LogsReceiver`])
+//!   wrapping the same pipeline: controlled `Status` mapping + concurrent
+//!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
 pub mod decode;
+pub mod grpc;
 pub mod http;
 pub mod materialize;
 pub mod pipeline;
@@ -33,5 +36,5 @@ pub mod tenant;
 
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
-pub use pipeline::{IngestPipeline, Journal, ReceiveError};
+pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use tenant::{TenantResolutionError, TenantRule, fan_out};

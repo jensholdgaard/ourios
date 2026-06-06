@@ -3,7 +3,7 @@
 //! An `axum` `POST` handler at a configurable path (default `/v1/logs`)
 //! that decodes the body per `Content-Type` (`application/x-protobuf` or
 //! `application/json`) and `Content-Encoding` (`identity` or `gzip`),
-//! hands the decoded `ExportLogsServiceRequest` to the [`IngestPipeline`]
+//! hands the decoded `ExportLogsServiceRequest` to the `IngestPipeline`
 //! (WAL-before-ack), and returns an `ExportLogsServiceResponse`.
 //!
 //! Transport errors are controlled (RFC0003.11): unsupported media type
@@ -13,8 +13,6 @@
 //! The pipeline is shared behind a `Mutex` — the WAL is a single writer
 //! (RFC 0008 §3.1), so concurrent requests serialize on it. The lock is
 //! never held across an `.await`, so a plain `std::sync::Mutex` suffices.
-
-use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -26,11 +24,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
 use prost::Message;
 
 use crate::receiver::decode::{decode_json, decode_protobuf};
-use crate::receiver::pipeline::{IngestPipeline, ReceiveError};
-
-/// The ingest pipeline shared across requests. The single-writer WAL
-/// forces serialization; concurrent requests queue on the mutex.
-pub type SharedPipeline = Arc<Mutex<IngestPipeline>>;
+use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 
 /// OTLP/HTTP listener configuration.
 #[derive(Debug, Clone)]

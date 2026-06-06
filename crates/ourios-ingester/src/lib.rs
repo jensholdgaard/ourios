@@ -13,8 +13,9 @@
 //!   RFC0003.7–.10), [`receiver::tenant`] (per-`ResourceLogs` tenant
 //!   derivation + fan-out, RFC0003.3/.4), [`receiver::pipeline`]
 //!   (§6.5 WAL-before-ack ingest path, RFC0003.1/.12), and
-//!   [`receiver::http`] (the OTLP/HTTP listener, RFC0003.11-HTTP/.13/.14).
-//!   The gRPC listener follows.
+//!   [`receiver::http`] (the OTLP/HTTP listener, RFC0003.11-HTTP/.13/.14),
+//!   and [`receiver::grpc`] (the OTLP/gRPC `LogsService`,
+//!   RFC0003.11-gRPC/.15). Only crash-before-ack (RFC0003.2) remains.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path by [`receiver::pipeline`]: every non-empty batch is

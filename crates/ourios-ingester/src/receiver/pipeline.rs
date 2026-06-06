@@ -11,12 +11,20 @@
 //! The live gRPC/HTTP transports wrap this layer; they hand it a decoded
 //! request and map its `Result` to the transport-level response.
 
+use std::sync::{Arc, Mutex};
+
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, Wal};
 use prost::Message;
 
 use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
+
+/// The ingest pipeline shared across a listener's requests. The
+/// single-writer WAL forces serialization; concurrent requests queue on
+/// the mutex (the lock never spans an `.await`, so `std::sync::Mutex`
+/// suffices). Used by both the HTTP and gRPC transports.
+pub type SharedPipeline = Arc<Mutex<IngestPipeline>>;
 
 /// The durability sink the pipeline appends to and fsyncs through.
 ///

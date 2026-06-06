@@ -13,11 +13,15 @@
 //!   before the framing is wired.
 //! - [`materialize`] — the §6.1 step 2–3 mapping from a decoded
 //!   `LogRecord` to the flat `OtlpLogRecord` the miner consumes (body
-//!   fork + empty-sentinel narrowing). Tenant derivation + fan-out
-//!   (RFC0003.3) layer on top of it next.
+//!   fork + empty-sentinel narrowing).
+//! - [`tenant`] — per-`ResourceLogs` tenant derivation + the
+//!   [`tenant::fan_out`] that tags each record with its `tenant_id`
+//!   (RFC0003.3/.4). The live transports + WAL-before-ack path follow.
 
 pub mod decode;
 pub mod materialize;
+pub mod tenant;
 
 pub use decode::{DecodeError, decode_json, decode_protobuf};
-pub use materialize::materialize_record;
+pub use materialize::{materialize_record, materialize_resource_logs};
+pub use tenant::{TenantResolutionError, TenantRule, fan_out};

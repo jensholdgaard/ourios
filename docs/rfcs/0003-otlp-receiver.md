@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: OTLP receiver — gRPC and HTTP wire endpoints for OpenTelemetry log ingest
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-13

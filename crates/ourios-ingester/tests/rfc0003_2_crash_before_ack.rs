@@ -13,38 +13,22 @@
 //! never saw the ack will retry, producing a duplicate, which the OTLP
 //! spec's *duplicate-data* section accepts as the right tradeoff.
 
-use std::io::{BufRead, BufReader};
+mod ingest_support;
+
 use std::process::{Command, Stdio};
 
+use ingest_support::replay_frames;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use ourios_ingester::receiver::decode_protobuf;
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
-
-fn wal_config(root: &std::path::Path) -> WalConfig {
-    WalConfig {
-        root: root.to_path_buf(),
-        batch_window_ms: 100,
-        segment_size_bytes: 128 * 1024 * 1024,
-        segment_age_secs: 600,
-        housekeeping_secs: 60,
-        macos_full_fsync: false,
-    }
-}
-
-#[derive(Default)]
-struct CollectingSink(Vec<(FrameKind, Vec<u8>)>);
-impl FrameSink for CollectingSink {
-    fn consume(&mut self, kind: FrameKind, payload: &[u8]) -> Result<(), RecoveryError> {
-        self.0.push((kind, payload.to_vec()));
-        Ok(())
-    }
-}
+use ourios_wal::FrameKind;
+use std::io::{BufRead, BufReader};
 
 /// Scenario RFC0003.2 — Crash-before-ack: at-least-once with retry tolerance.
 /// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[test]
 fn rfc0003_2_fsynced_batch_survives_a_crash_before_ack() {
-    // Arrange: a real WAL root the fixture and this test both open.
+    // Arrange: a real WAL root the fixture and this test both open (via
+    // the shared `ingest_support` helper, so the config can't drift).
     let tmp = tempfile::TempDir::new().expect("temp");
 
     // Act: spawn the fixture, wait until it has ingested + fsync'd
@@ -69,18 +53,14 @@ fn rfc0003_2_fsynced_batch_survives_a_crash_before_ack() {
 
     // Assert: the fsync'd OtlpBatch frame survived the crash and recovers
     // the input batch's record.
-    let mut sink = CollectingSink::default();
-    Wal::open(wal_config(tmp.path()))
-        .expect("reopen WAL after crash")
-        .replay(&mut sink)
-        .expect("replay after crash");
+    let frames = replay_frames(tmp.path());
     assert_eq!(
-        sink.0.len(),
+        frames.len(),
         1,
         "exactly one fsync'd OtlpBatch frame survives"
     );
-    assert_eq!(sink.0[0].0, FrameKind::OtlpBatch);
-    let recovered = decode_protobuf(&sink.0[0].1).expect("frame payload decodes");
+    assert_eq!(frames[0].0, FrameKind::OtlpBatch);
+    let recovered = decode_protobuf(&frames[0].1).expect("frame payload decodes");
     let body = recovered.resource_logs[0].scope_logs[0].log_records[0]
         .body
         .as_ref()

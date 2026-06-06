@@ -555,8 +555,8 @@ concurrency).
 > - **Given** `ourios-server` started with the receiver role
 >   enabled (config-toggled per the §9 resolution), the gRPC
 >   listener bound on its configured port (default 4317) and
->   the HTTP listener on its (default 4318), both sharing one
->   `IngestPipeline` over a single `Wal`
+>   the HTTP listener bound on its configured port (default
+>   4318), both sharing one `IngestPipeline` over a single `Wal`
 > - **When** a real OTLP client exports a non-empty batch
 >   (resolvable tenant) over each bound socket — gRPC `Export`
 >   and HTTP `POST /v1/logs` (`application/x-protobuf`) — and
@@ -570,9 +570,8 @@ concurrency).
 >   socket**, not just in-process
 > - **And** the shutdown signal stops the listeners and exits
 >   the process cleanly, releasing the single `Wal` handle —
->   without dropping it mid-fsync or losing a batch that was
->   already acked (no in-flight, already-fsync'd batch is lost
->   on the way out)
+>   without dropping it mid-fsync, and no already-acked batch is
+>   lost on the way out
 > - **And** *after* that clean exit frees the single-writer
 >   handle (RFC 0008 §3.1), opening the WAL and running
 >   `Wal::replay` recovers each batch's `OtlpBatch` frame — the

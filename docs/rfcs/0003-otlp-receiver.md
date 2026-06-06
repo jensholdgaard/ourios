@@ -243,7 +243,7 @@ concurrency).
 > - **When** the receiver runs its accept path
 > - **Then** the transport-level success response (gRPC `OK` /
 >   HTTP 2xx) is emitted only after the `Wal::sync` call
->   covering the batch's frames returns `Ok(_)` — measured by
+>   covering the batch's frame returns `Ok(_)` — measured by
 >   an `AtomicBool` set **after** `sync` returns `Ok(_)`
 >   (mirroring RFC0008.1; the probe inside `sync` would
 >   already be true mid-call). The response-writer asserts
@@ -384,8 +384,11 @@ concurrency).
 >   `Some(Body::String(s))` where `s` is the original UTF-8
 >   string (no wrapping, no quoting, no escaping)
 > - **And** the value handed to `MinerCluster::ingest`
->   matches `s` exactly when read back via the miner's
->   RFC 0001 §6.2 step-0 short-circuit path
+>   equals `s` byte-for-byte (asserted by an instrumented
+>   `MinerCluster` stub that records each `ingest` call's
+>   body argument — the receiver's contract here is the
+>   pass-through, not anything about how the miner indexes
+>   or short-circuits on it)
 
 > **Scenario RFC0003.9 — Edge OTLP fields pass through unchanged**
 > - **Given** a `LogRecord` with `severity_number = 0`
@@ -568,8 +571,9 @@ per `ResourceLogs` group, not per export batch. The receiver:
 If any `ResourceLogs.resource` fails to resolve to a tenant
 under the configured rule, the receiver rejects the **entire
 batch** with a transport-level error naming the failing
-Resource and the missing attribute. Per-Resource partial
-acceptance is reserved for a future RFC (see §9).
+`ResourceLogs` index (the offset in the export's
+`resource_logs[]`) and the missing attribute key. Per-Resource
+partial acceptance is reserved for a future RFC (see §9).
 
 ### 6.4 AnyValue canonicalisation is deferred to the storage layer
 

@@ -436,8 +436,12 @@ concurrency).
 > - **And** no partial record is appended to the WAL
 
 > **Scenario RFC0003.12 — Empty `ExportLogsServiceRequest` returns success without WAL write**
-> - **Given** an `ExportLogsServiceRequest` with
->   `resource_logs` empty
+> - **Given** an `ExportLogsServiceRequest` that carries
+>   **zero `LogRecord`s** — covered shapes are (i)
+>   `resource_logs` empty, (ii) `resource_logs[i].scope_logs`
+>   empty for every `i`, (iii) every
+>   `resource_logs[i].scope_logs[j].log_records` empty. All
+>   three shapes are tested
 > - **When** the receiver processes the request via either
 >   transport
 > - **Then** the receiver emits a transport-level success

@@ -1,5 +1,4 @@
 //! RFC0003.1 — WAL-before-ack `[§3.4]`.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): this acceptance test enumerates
 //! the §5 contract and is `#[ignore]`'d until the OTLP receiver
@@ -7,6 +6,7 @@
 //! `unimplemented!()` body together.
 
 /// Scenario RFC0003.1 — WAL-before-ack.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.1)"]
 #[test]
 fn rfc0003_1_no_ack_before_every_record_is_durable() {

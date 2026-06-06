@@ -1,10 +1,10 @@
 //! RFC0003.8 — `Body::String` reaches the miner as the unwrapped `L_raw`.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): `#[ignore]`'d until the receiver
 //! lands.
 
 /// Scenario RFC0003.8 — `Body::String` reaches the miner as the unwrapped `L_raw`.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.8)"]
 #[test]
 fn rfc0003_8_string_body_reaches_miner_unwrapped() {

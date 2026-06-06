@@ -1,10 +1,10 @@
 //! RFC0003.9 — Edge OTLP fields pass through unchanged.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): `#[ignore]`'d until the receiver
 //! lands.
 
 /// Scenario RFC0003.9 — Edge OTLP fields pass through unchanged.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.9)"]
 #[test]
 fn rfc0003_9_edge_otlp_fields_are_not_coalesced() {

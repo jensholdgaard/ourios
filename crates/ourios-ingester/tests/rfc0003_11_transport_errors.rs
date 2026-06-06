@@ -1,10 +1,10 @@
 //! RFC0003.11 — Transport-level errors are controlled, not panics.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): `#[ignore]`'d until the receiver
 //! lands.
 
 /// Scenario RFC0003.11 — Transport-level errors are controlled, not panics.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.11)"]
 #[test]
 fn rfc0003_11_transport_errors_are_controlled() {

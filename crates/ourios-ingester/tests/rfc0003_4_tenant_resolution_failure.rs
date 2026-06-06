@@ -1,10 +1,10 @@
 //! RFC0003.4 — Tenant resolution failure rejects the entire batch `[§3.7]`.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): `#[ignore]`'d until the receiver
 //! lands.
 
 /// Scenario RFC0003.4 — Tenant resolution failure rejects the entire batch.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.4)"]
 #[test]
 fn rfc0003_4_unresolvable_tenant_rejects_whole_batch() {

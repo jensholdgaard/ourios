@@ -1,10 +1,10 @@
 //! RFC0003.13 — Compression over HTTP: identity and gzip MUST be supported.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): `#[ignore]`'d until the receiver
 //! lands.
 
 /// Scenario RFC0003.13 — Compression over HTTP: identity and gzip MUST be supported.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.13)"]
 #[test]
 fn rfc0003_13_identity_and_gzip_decode_equally_unsupported_is_415() {

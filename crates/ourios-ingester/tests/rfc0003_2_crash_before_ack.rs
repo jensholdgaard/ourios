@@ -1,11 +1,11 @@
 //! RFC0003.2 — Crash-before-ack: at-least-once with retry tolerance `[§3.4]`.
-//! See `docs/rfcs/0003-otlp-receiver.md` §5.
 //!
 //! Red gate (`specified → red`): `#[ignore]`'d until the receiver
 //! lands. Per §8 this uses a child-process harness mirroring
 //! `wal_crash_fixture` (PR #126).
 
 /// Scenario RFC0003.2 — Crash-before-ack: at-least-once with retry tolerance.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[ignore = "RFC 0003 red gate — implementation pending (RFC0003.2)"]
 #[test]
 fn rfc0003_2_crash_before_ack_is_at_least_once_not_lossy() {

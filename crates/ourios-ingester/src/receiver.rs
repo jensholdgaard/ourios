@@ -19,10 +19,14 @@
 //!   (RFC0003.3/.4).
 //! - [`pipeline`] — the §6.5 WAL-before-ack ingest path
 //!   ([`pipeline::IngestPipeline`]): fan out → append one `OtlpBatch`
-//!   frame → fsync → miner → ack (RFC0003.1/.12). The live gRPC/HTTP
-//!   transports wrap this layer next.
+//!   frame → fsync → miner → ack (RFC0003.1/.12).
+//! - [`http`] — the OTLP/HTTP listener ([`http::router`]) wrapping the
+//!   pipeline: `Content-Type`/`Content-Encoding` dispatch, controlled
+//!   transport errors, configurable path (RFC0003.11 HTTP arms / .13 /
+//!   .14). The gRPC listener (`tonic`) follows.
 
 pub mod decode;
+pub mod http;
 pub mod materialize;
 pub mod pipeline;
 pub mod tenant;

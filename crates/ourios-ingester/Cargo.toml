@@ -53,9 +53,20 @@ prost = { version = "0.14", default-features = false, features = ["std"] }
 # `Deserialize` impls — the `application/json` transport body is an
 # `ExportLogsServiceRequest` in the proto3-JSON mapping.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# HTTP transport (RFC 0003 §6.2): the OTLP/HTTP `/v1/logs` listener.
+# `tokio` + `http1` so the router can be served; the handler + extractors
+# (`State`, `Bytes`, `HeaderMap`) are core. On hyper 1.x, already in the
+# tree.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+# gzip decode for OTLP/HTTP `Content-Encoding: gzip` (an OTLP MUST,
+# RFC0003.13). Pure-Rust backend — no zlib C dependency (CLAUDE.md).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Drive the axum `Router` in-process (`ServiceExt::oneshot`) for the
+# HTTP-transport acceptance tests — no real socket.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # Proptest strategy over the OTLP proto value space for the
 # wire-decode equivalence scenarios (RFC0003.5/.6 per §8).
 proptest = "1"

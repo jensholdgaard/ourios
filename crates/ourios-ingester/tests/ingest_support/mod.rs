@@ -148,3 +148,86 @@ pub fn resource_logs_without_scopes(service: &str) -> ResourceLogs {
 pub fn request(resource_logs: Vec<ResourceLogs>) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest { resource_logs }
 }
+
+// ----- HTTP-listener test support (RFC0003.11/.13/.14) -----
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use ourios_ingester::receiver::http::SharedPipeline;
+use tower::ServiceExt;
+
+/// The `OtlpBatch` payloads a [`capturing_pipeline`] appended, in order.
+pub type Captured = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// A `Journal` that records appended payloads (and fsyncs nothing), so a
+/// test can recover what the pipeline ingested without a real WAL.
+struct CapturingJournal {
+    captured: Captured,
+}
+
+impl Journal for CapturingJournal {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+        self.captured
+            .lock()
+            .expect("captured")
+            .push(payload.to_vec());
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), ReceiveError> {
+        Ok(())
+    }
+}
+
+/// A shared pipeline whose `Journal` captures appended payloads, plus the
+/// capture handle.
+pub fn capturing_pipeline() -> (SharedPipeline, Captured) {
+    let captured = Captured::default();
+    let miner = MinerCluster::new(MinerConfig::default());
+    let pipeline = IngestPipeline::new(
+        Box::new(CapturingJournal {
+            captured: captured.clone(),
+        }),
+        miner,
+        TenantRule::service_name(),
+    );
+    (Arc::new(Mutex::new(pipeline)), captured)
+}
+
+/// Build a `POST` request with optional `Content-Type`/`Content-Encoding`.
+pub fn post_request(
+    path: &str,
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+    body: Vec<u8>,
+) -> Request<Body> {
+    let mut builder = Request::builder().method("POST").uri(path);
+    if let Some(value) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, value);
+    }
+    if let Some(value) = content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, value);
+    }
+    builder.body(Body::from(body)).expect("build request")
+}
+
+/// Drive `router` with `request` in-process (no socket) and return the
+/// response status + body bytes.
+pub async fn send(router: Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let response = router.oneshot(request).await.expect("oneshot");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response body")
+        .to_vec();
+    (status, bytes)
+}
+
+/// gzip-compress `bytes` (for the `Content-Encoding: gzip` arm).
+pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}

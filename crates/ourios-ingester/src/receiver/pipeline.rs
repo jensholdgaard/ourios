@@ -5,7 +5,7 @@
 //! fanned out per tenant, the whole export is appended as one
 //! `FrameKind::OtlpBatch` frame and **fsync'd before any ack**
 //! (`CLAUDE.md` §3.4 / RFC0003.1), and only then are the records handed
-//! to the miner (RFC0003.5 step ordering). An empty batch takes the
+//! to the miner (§6.5 step ordering). An empty batch takes the
 //! fast path: success with no WAL write (RFC0003.12).
 //!
 //! The live gRPC/HTTP transports wrap this layer; they hand it a decoded
@@ -116,7 +116,9 @@ impl From<TenantResolutionError> for ReceiveError {
 impl std::fmt::Display for ReceiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TenantResolution(e) => write!(f, "tenant resolution failed: {e}"),
+            // `TenantResolutionError`'s own Display already leads with
+            // "tenant resolution failed: …"; delegate, don't re-prefix.
+            Self::TenantResolution(e) => write!(f, "{e}"),
             Self::WalAppend(e) => write!(f, "WAL append failed: {e:?}"),
             Self::WalSync(e) => write!(f, "WAL sync failed: {e:?}"),
         }

@@ -27,8 +27,9 @@ use std::io::{BufRead, BufReader};
 /// See `docs/rfcs/0003-otlp-receiver.md` §5.
 #[test]
 fn rfc0003_2_fsynced_batch_survives_a_crash_before_ack() {
-    // Arrange: a real WAL root the fixture and this test both open (via
-    // the shared `ingest_support` helper, so the config can't drift).
+    // Arrange: a real WAL root. This test reads it back through the
+    // shared `ingest_support` helper; the fixture (a separate bin) opens
+    // the same root with a matching `WalConfig` literal.
     let tmp = tempfile::TempDir::new().expect("temp");
 
     // Act: spawn the fixture, wait until it has ingested + fsync'd
@@ -46,7 +47,8 @@ fn rfc0003_2_fsynced_batch_survives_a_crash_before_ack() {
     assert_eq!(
         line.trim(),
         "READY",
-        "fixture signalled READY (got {line:?}) — it died before fsync",
+        "fixture must signal READY (got {line:?}) — a different first line \
+         means it failed before reaching the post-fsync READY print",
     );
     child.kill().expect("SIGKILL fixture");
     child.wait().expect("reap fixture");

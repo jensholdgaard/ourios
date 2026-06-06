@@ -16,7 +16,8 @@
 //!   gRPC/HTTP transports wrap the pipeline next.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
-//!   the ingest path once the receiver lands; not exercised here.
+//!   the ingest path by [`receiver::pipeline`]: every non-empty batch is
+//!   appended + fsync'd before its ack (RFC0003.1).
 //! - **Background compaction** (RFC 0009 §3.2, `specified`) — the only
 //!   subsystem implemented in this scaffold. [`compactor`] sweeps the
 //!   store for sealed, candidate partitions

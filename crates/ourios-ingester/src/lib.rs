@@ -7,9 +7,11 @@
 //! - **OTLP receiver** (RFC 0003, `red`, greening) — the gRPC/HTTP
 //!   ingest front door + mining pipeline. The §5 acceptance criteria
 //!   (RFC0003.1–.15) are enumerated as `tests/rfc0003_*`; the green
-//!   slices flip them one §8 group at a time. [`receiver::decode`] is
-//!   the first to land — the §6.2 wire-decode layer (RFC0003.5) — with
-//!   tenant fan-out, transports, and the WAL-before-ack path to follow.
+//!   slices flip them one §8 group at a time. Landed: [`receiver::decode`]
+//!   (§6.2 wire decode — protobuf + OTLP/JSON, RFC0003.5/.6) and
+//!   [`receiver::materialize`] (§6.1 `LogRecord` → `OtlpLogRecord`,
+//!   RFC0003.7–.10). Tenant fan-out, the live transports, and the
+//!   WAL-before-ack path follow.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path once the receiver lands; not exercised here.

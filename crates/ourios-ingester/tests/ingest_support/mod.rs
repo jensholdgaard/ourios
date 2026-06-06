@@ -154,7 +154,7 @@ pub fn request(resource_logs: Vec<ResourceLogs>) -> ExportLogsServiceRequest {
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use ourios_ingester::receiver::http::SharedPipeline;
+use ourios_ingester::receiver::SharedPipeline;
 use tower::ServiceExt;
 
 /// The `OtlpBatch` payloads a [`capturing_pipeline`] appended, in order.

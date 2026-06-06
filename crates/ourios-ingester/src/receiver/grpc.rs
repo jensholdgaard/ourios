@@ -19,8 +19,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::receiver::http::SharedPipeline;
-use crate::receiver::pipeline::ReceiveError;
+use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 
 /// The gRPC `LogsService` over a shared [`IngestPipeline`].
 pub struct LogsReceiver {
@@ -60,9 +59,11 @@ impl LogsService for LogsReceiver {
             Ok(Err(ReceiveError::TenantResolution(e))) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            // A WAL failure (or a panic in the blocking task) is
-            // server-side; the batch was not acked (§3.4).
-            Ok(Err(_)) | Err(_) => Err(Status::internal("ingest failed")),
+            // A WAL append/sync failure — server-side; the batch was not
+            // acked (§3.4). Surface the (Display-able) detail.
+            Ok(Err(e)) => Err(Status::internal(e.to_string())),
+            // The blocking ingest task panicked or was cancelled.
+            Err(_) => Err(Status::internal("ingest task failed")),
         }
     }
 }

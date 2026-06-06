@@ -37,5 +37,5 @@ pub mod tenant;
 
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
-pub use pipeline::{IngestPipeline, Journal, ReceiveError};
+pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use tenant::{TenantResolutionError, TenantRule, fan_out};

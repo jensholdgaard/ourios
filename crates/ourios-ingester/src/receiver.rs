@@ -14,4 +14,4 @@
 
 pub mod decode;
 
-pub use decode::{DecodeError, decode_protobuf};
+pub use decode::{DecodeError, decode_json, decode_protobuf};

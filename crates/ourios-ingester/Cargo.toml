@@ -43,6 +43,10 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 # `DecodeError::source` returns `prost::DecodeError` as `&dyn
 # std::error::Error`, which only impls `Error` under prost's `std`.
 prost = { version = "0.14", default-features = false, features = ["std"] }
+# OTLP/JSON decode (RFC0003.6) via the proto types' `with-serde`
+# `Deserialize` impls — the `application/json` transport body is an
+# `ExportLogsServiceRequest` in the proto3-JSON mapping.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

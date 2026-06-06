@@ -24,12 +24,16 @@ use prost::Message;
 pub enum DecodeError {
     /// Protobuf bytes failed `prost` decode — a malformed wire payload.
     Protobuf(prost::DecodeError),
+    /// OTLP/JSON bytes failed `serde_json` decode — malformed JSON, or
+    /// JSON that doesn't match the proto3-JSON mapping.
+    Json(serde_json::Error),
 }
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protobuf(e) => write!(f, "OTLP protobuf decode failed: {e}"),
+            Self::Json(e) => write!(f, "OTLP/JSON decode failed: {e}"),
         }
     }
 }
@@ -38,6 +42,7 @@ impl std::error::Error for DecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Protobuf(e) => Some(e),
+            Self::Json(e) => Some(e),
         }
     }
 }
@@ -54,4 +59,20 @@ impl std::error::Error for DecodeError {
 /// `ExportLogsServiceRequest` protobuf message.
 pub fn decode_protobuf(bytes: &[u8]) -> Result<ExportLogsServiceRequest, DecodeError> {
     ExportLogsServiceRequest::decode(bytes).map_err(DecodeError::Protobuf)
+}
+
+/// Decode an OTLP/JSON `ExportLogsServiceRequest` — the HTTP
+/// `application/json` transport body, in the proto3-JSON mapping
+/// (RFC0003.6). Unknown fields are ignored per the OTLP/JSON spec
+/// (serde's default), and the proto3-JSON deviations — hex
+/// `traceId`/`spanId`, integer enums, decimal-string 64-bit ints
+/// accepted as number or string, base64 bytes, lowerCamelCase keys —
+/// are handled by the proto types' `with-serde` deserialiser.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Json`] if `bytes` is not well-formed OTLP/JSON
+/// for an `ExportLogsServiceRequest`.
+pub fn decode_json(bytes: &[u8]) -> Result<ExportLogsServiceRequest, DecodeError> {
+    serde_json::from_slice(bytes).map_err(DecodeError::Json)
 }

@@ -1095,12 +1095,17 @@ scenarios — `#[ignore]`'d stubs first, implementations second).
   daemon) — **not** a separate sidecar. Default ports 4317
   (gRPC) / 4318 (HTTP) per §6.1; the end-to-end served contract
   (bind + client round-trip + graceful shutdown) is RFC0003.16.
-- [ ] **Partial-success response semantics.** Is the all-or-
-  nothing batch contract (§6.3) sufficient long-term, or do we
-  need to expose `partial_success.rejected_log_records` for
-  per-tenant-rejection scenarios (e.g., one failing tenant in
-  a multi-tenant batch)? Reserved here; deferred to a future
-  RFC if a concrete operator need surfaces.
+- [x] ~~**Partial-success response semantics.**~~ *Resolved
+  (OTLP review):* the all-or-nothing batch contract (§6.3 /
+  RFC0003.4) is spec-compliant. OTLP mandates only `400 Bad
+  Request` + no client retry for permanently-bad/undecodable
+  input (OTLP/HTTP *Bad Data*) and does **not** require
+  accepting a valid subset; `partial_success.rejected_log_records`
+  is *supported but optional*. We keep whole-batch rejection and
+  defer `partial_success` to a future RFC if a concrete operator
+  need surfaces (e.g. one failing tenant in a large multi-tenant
+  batch). On full success `partial_success` stays unset — the
+  normal OK path.
 - [ ] **Authentication and tenant binding.** If the receiver
   authenticates the client (mTLS, token), does the
   authenticated identity feed into the `tenant_id` derivation

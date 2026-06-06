@@ -154,6 +154,25 @@ fn build_config(
     })
 }
 
+/// Resolve when the process receives `SIGTERM` (what k8s / `nerdctl stop`
+/// send). Non-Unix targets have no `SIGTERM`, so this never resolves and
+/// SIGINT (`ctrl_c`) stays the shutdown path; a SIGTERM-handler install
+/// failure is logged and likewise leaves SIGINT in charge.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            sigterm.recv().await;
+        }
+        Err(e) => {
+            eprintln!("install SIGTERM handler: {e}");
+            std::future::pending::<()>().await;
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = config_from_env()?;
@@ -193,9 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM).
     // `compactor.run` never returns on its own, so the select resolves on
-    // a signal (or a signal-setup failure).
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| format!("install SIGTERM handler: {e}"))?;
+    // a signal (or a SIGINT-setup failure).
     let shutdown = tokio::select! {
         () = compactor.run(|result| match result {
             Ok(report) => {
@@ -206,7 +223,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Err(e) => eprintln!("compaction sweep failed: {e}"),
         }) => Ok(()),
         signal = tokio::signal::ctrl_c() => signal,
-        _ = sigterm.recv() => Ok(()),
+        () = terminate_signal() => Ok(()),
     };
 
     // Drain the receiver listeners gracefully (releasing the single `Wal`)
@@ -285,6 +302,77 @@ mod tests {
         assert!(
             build_config(Some(PathBuf::from("/store")), Some("soon")).is_err(),
             "non-numeric interval is rejected",
+        );
+    }
+
+    #[test]
+    fn build_receiver_config_disabled_unless_explicitly_enabled() {
+        // Arrange / Act / Assert — unset or a falsey value disables the role.
+        for raw in [None, Some("0"), Some("false"), Some("nope")] {
+            assert_eq!(
+                build_receiver_config(raw, None, None, Some(PathBuf::from("/wal"))).expect("ok"),
+                None,
+                "receiver disabled for enabled_raw = {raw:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_receiver_config_enabled_defaults_the_addresses() {
+        // Arrange / Act
+        let params = build_receiver_config(Some("1"), None, None, Some(PathBuf::from("/wal")))
+            .expect("ok")
+            .expect("enabled");
+
+        // Assert
+        assert_eq!(params.grpc_addr, DEFAULT_GRPC_ADDR.parse().unwrap());
+        assert_eq!(params.http_addr, DEFAULT_HTTP_ADDR.parse().unwrap());
+        assert_eq!(params.wal_root, PathBuf::from("/wal"));
+    }
+
+    #[test]
+    fn build_receiver_config_parses_custom_addresses() {
+        // Arrange / Act
+        let params = build_receiver_config(
+            Some("yes"),
+            Some("127.0.0.1:1"),
+            Some("127.0.0.1:2"),
+            Some(PathBuf::from("/wal")),
+        )
+        .expect("ok")
+        .expect("enabled");
+
+        // Assert
+        assert_eq!(params.grpc_addr, "127.0.0.1:1".parse().unwrap());
+        assert_eq!(params.http_addr, "127.0.0.1:2".parse().unwrap());
+    }
+
+    #[test]
+    fn build_receiver_config_requires_a_wal_root_when_enabled() {
+        // Arrange / Act / Assert — the WAL root is mandatory (and must be
+        // non-empty) once the receiver role is on.
+        assert!(
+            build_receiver_config(Some("1"), None, None, None).is_err(),
+            "a missing WAL root is rejected",
+        );
+        assert!(
+            build_receiver_config(Some("1"), None, None, Some(PathBuf::from(""))).is_err(),
+            "an empty WAL root is rejected",
+        );
+    }
+
+    #[test]
+    fn build_receiver_config_rejects_a_malformed_address() {
+        // Arrange / Act / Assert
+        assert!(
+            build_receiver_config(
+                Some("1"),
+                Some("not-an-addr"),
+                None,
+                Some(PathBuf::from("/wal"))
+            )
+            .is_err(),
+            "a malformed bind address is rejected",
         );
     }
 }

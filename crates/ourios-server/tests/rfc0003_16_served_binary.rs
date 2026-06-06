@@ -9,6 +9,10 @@
 //! single-writer `Wal` — does it replay the WAL to assert both batches
 //! are durable (WAL-before-ack end-to-end), with no acked batch lost. No
 //! dedup is asserted (at-least-once).
+//!
+//! Unix-only: it drives graceful shutdown with `kill -TERM`, and the
+//! server's SIGTERM handling is itself Unix-only.
+#![cfg(unix)]
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -180,11 +184,16 @@ async fn rfc0003_16_served_binary_binds_round_trips_and_shuts_down() {
     // SIGTERM the server (what k8s / `nerdctl stop` send) and assert a
     // clean exit — graceful shutdown, no panic.
     let pid = child.id().expect("server pid");
-    std::process::Command::new("kill")
+    let kill_status = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
         .status()
-        .expect("send SIGTERM");
+        .await
+        .expect("run kill -TERM");
+    assert!(
+        kill_status.success(),
+        "kill -TERM succeeded, got {kill_status:?}"
+    );
     let status = timeout(Duration::from_secs(15), child.wait())
         .await
         .expect("server exits before timeout")

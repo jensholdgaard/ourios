@@ -560,7 +560,10 @@ concurrency).
 > - **When** a real OTLP client exports a non-empty batch
 >   (resolvable tenant) over each bound socket — gRPC `Export`
 >   and HTTP `POST /v1/logs` (`application/x-protobuf`) — and
->   the server is then signalled to shut down
+>   **receives each transport response**, and *only then* is the
+>   server signalled to shut down (this scenario pins the
+>   steady-state export→ack→shutdown path; in-flight-during-
+>   shutdown behaviour is out of scope here)
 > - **Then** each client receives transport-level success
 >   (gRPC `OK` / HTTP 200) only after its batch is durable — the
 >   §6.5 WAL-before-ack contract holds **end-to-end over a real

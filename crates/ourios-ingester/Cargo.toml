@@ -15,6 +15,12 @@ path = "src/lib.rs"
 [dependencies]
 # Shared types (TenantId, config) for the ingest path.
 ourios-core = { path = "../ourios-core" }
+# The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /
+# CLAUDE.md §3.4): append the OtlpBatch frame + fsync before acking.
+ourios-wal = { path = "../ourios-wal" }
+# The Drain-derived template miner the pipeline hands per-tenant records
+# to after they are durable (RFC 0003 §6.5 step 5).
+ourios-miner = { path = "../ourios-miner" }
 # The compaction runner drives ourios-parquet's planner + compactor
 # (RFC 0009 §3.2: compaction is hosted in the ingester role) and uses
 # its tenant-dir percent codec to enumerate the store.

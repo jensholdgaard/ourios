@@ -10,9 +10,10 @@
 //!   slices flip them one §8 group at a time. Landed: [`receiver::decode`]
 //!   (§6.2 wire decode — protobuf + OTLP/JSON, RFC0003.5/.6),
 //!   [`receiver::materialize`] (§6.1 `LogRecord` → `OtlpLogRecord`,
-//!   RFC0003.7–.10), and [`receiver::tenant`] (per-`ResourceLogs` tenant
-//!   derivation + fan-out, RFC0003.3/.4). The live transports and the
-//!   WAL-before-ack path follow.
+//!   RFC0003.7–.10), [`receiver::tenant`] (per-`ResourceLogs` tenant
+//!   derivation + fan-out, RFC0003.3/.4), and [`receiver::pipeline`]
+//!   (§6.5 WAL-before-ack ingest path, RFC0003.1/.12). The live
+//!   gRPC/HTTP transports wrap the pipeline next.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path once the receiver lands; not exercised here.

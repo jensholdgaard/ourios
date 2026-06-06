@@ -16,12 +16,18 @@
 //!   fork + empty-sentinel narrowing).
 //! - [`tenant`] — per-`ResourceLogs` tenant derivation + the
 //!   [`tenant::fan_out`] that tags each record with its `tenant_id`
-//!   (RFC0003.3/.4). The live transports + WAL-before-ack path follow.
+//!   (RFC0003.3/.4).
+//! - [`pipeline`] — the §6.5 WAL-before-ack ingest path
+//!   ([`pipeline::IngestPipeline`]): fan out → append one `OtlpBatch`
+//!   frame → fsync → miner → ack (RFC0003.1/.12). The live gRPC/HTTP
+//!   transports wrap this layer next.
 
 pub mod decode;
 pub mod materialize;
+pub mod pipeline;
 pub mod tenant;
 
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
+pub use pipeline::{IngestPipeline, ReceiveError};
 pub use tenant::{TenantResolutionError, TenantRule, fan_out};

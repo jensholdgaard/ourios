@@ -43,7 +43,9 @@ ourios-semconv = { path = "../ourios-semconv" }
 # carries the OTLP/JSON mapping the `application/json` path uses
 # (RFC0003.6, lands next). Live gRPC/HTTP listeners (`tonic`/`axum`) are
 # a later transport slice — this slice is the pure decode layer.
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
+# `gen-tonic` (not just `-messages`) for the `logs_service_server`
+# `LogsService` trait the gRPC listener implements (RFC0003.11/.15).
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "with-serde"] }
 # `prost::Message::{decode, encode_to_vec}` for the protobuf payload.
 # `std` is explicit (not relied on via workspace feature unification):
 # `DecodeError::source` returns `prost::DecodeError` as `&dyn
@@ -61,6 +63,11 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # gzip decode for OTLP/HTTP `Content-Encoding: gzip` (an OTLP MUST,
 # RFC0003.13). Pure-Rust backend — no zlib C dependency (CLAUDE.md).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# gRPC transport (RFC 0003 §6.2): the `LogsService` server. `codegen` for
+# the generated `#[async_trait]` + `Request`/`Response`/`Status`; no
+# socket transport is stood up in this slice (the service is exercised
+# in-process).
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -180,6 +180,12 @@ impl Journal for CapturingJournal {
     }
 }
 
+/// A shared pipeline over a *real* `Wal` at `root` (for concurrency +
+/// durability assertions; drop all clones before `replay_frames`).
+pub fn shared_wal_pipeline(root: &Path) -> SharedPipeline {
+    Arc::new(Mutex::new(open_pipeline(root)))
+}
+
 /// A shared pipeline whose `Journal` captures appended payloads, plus the
 /// capture handle.
 pub fn capturing_pipeline() -> (SharedPipeline, Captured) {

@@ -23,9 +23,13 @@
 //! - [`http`] — the OTLP/HTTP listener ([`http::router`]) wrapping the
 //!   pipeline: `Content-Type`/`Content-Encoding` dispatch, controlled
 //!   transport errors, configurable path (RFC0003.11 HTTP arms / .13 /
-//!   .14). The gRPC listener (`tonic`) follows.
+//!   .14).
+//! - [`grpc`] — the OTLP/gRPC `LogsService` ([`grpc::LogsReceiver`])
+//!   wrapping the same pipeline: controlled `Status` mapping + concurrent
+//!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
 pub mod decode;
+pub mod grpc;
 pub mod http;
 pub mod materialize;
 pub mod pipeline;

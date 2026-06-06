@@ -7,9 +7,7 @@
 
 mod ingest_support;
 
-use ingest_support::{
-    open_pipeline, replay_frames, request, resource_logs, resource_logs_without_scopes,
-};
+use ingest_support::{CallLog, request, resource_logs, resource_logs_without_scopes, spy_pipeline};
 use ourios_core::tenant::TenantId;
 
 /// Scenario RFC0003.12 — Empty `ExportLogsServiceRequest` returns success without WAL write.
@@ -26,26 +24,27 @@ fn rfc0003_12_empty_request_succeeds_without_persisting() {
     ];
 
     for export in empty_shapes {
-        // Arrange
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let mut pipeline = open_pipeline(tmp.path());
+        // Arrange: a spy Journal so we can assert the WAL is touched not
+        // at all (no append *and* no sync — stronger than "no frame").
+        let log: CallLog = CallLog::default();
+        let mut pipeline = spy_pipeline(log.clone());
 
         // Act
         let ingested = pipeline
             .ingest(export)
             .expect("an empty request is accepted");
 
-        // Assert: success with zero records, miner untouched, no frame.
+        // Assert: success with zero records, the WAL untouched, and the
+        // miner untouched.
         assert_eq!(ingested, 0, "no records ingested");
+        assert!(
+            log.lock().expect("call log").is_empty(),
+            "an empty request neither appends nor syncs the WAL",
+        );
         assert_eq!(
             pipeline.miner().template_count(&TenantId::new("svc")),
             0,
             "no record reached the miner",
-        );
-        drop(pipeline);
-        assert!(
-            replay_frames(tmp.path()).is_empty(),
-            "no OtlpBatch frame was appended for an empty request",
         );
     }
 }

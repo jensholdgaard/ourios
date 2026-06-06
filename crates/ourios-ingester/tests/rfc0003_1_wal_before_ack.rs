@@ -7,7 +7,9 @@
 
 mod ingest_support;
 
-use ingest_support::{open_pipeline, replay_frames, request, resource_logs};
+use ingest_support::{
+    CallLog, JournalCall, open_pipeline, replay_frames, request, resource_logs, spy_pipeline,
+};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use ourios_core::tenant::TenantId;
 use ourios_ingester::receiver::decode_protobuf;
@@ -51,5 +53,27 @@ fn rfc0003_1_no_ack_until_the_batch_is_durable() {
     assert!(
         matches!(body, Some(Value::StringValue(s)) if s == "user 1 logged in"),
         "the durable frame recovers the record's body verbatim, got {body:?}",
+    );
+}
+
+/// Scenario RFC0003.1 — the ack is gated on the WAL fsync.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
+#[test]
+fn rfc0003_1_ack_is_gated_on_the_wal_fsync() {
+    // Arrange: a spy Journal records the order of WAL calls.
+    let log: CallLog = CallLog::default();
+    let mut pipeline = spy_pipeline(log.clone());
+    let export = request(vec![resource_logs("checkout", &["user 1 logged in"])]);
+
+    // Act
+    pipeline.ingest(export).expect("the batch is acked");
+
+    // Assert: before returning Ok, the pipeline appended the frame and
+    // then fsync'd it — the ack is gated on `sync`, not merely on the
+    // append being visible. (A removed fsync step would drop `Sync`.)
+    assert_eq!(
+        *log.lock().expect("call log"),
+        vec![JournalCall::Append, JournalCall::Sync],
+        "ingest appended then fsync'd, in that order, before acking",
     );
 }

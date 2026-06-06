@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -15,7 +16,7 @@ use ourios_core::config::MinerConfig;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
 
-use ourios_ingester::receiver::{IngestPipeline, TenantRule};
+use ourios_ingester::receiver::{IngestPipeline, Journal, ReceiveError, TenantRule};
 
 pub fn wal_config(root: &Path) -> WalConfig {
     WalConfig {
@@ -33,7 +34,48 @@ pub fn wal_config(root: &Path) -> WalConfig {
 pub fn open_pipeline(root: &Path) -> IngestPipeline {
     let wal = Wal::open(wal_config(root)).expect("open WAL");
     let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(wal, miner, TenantRule::service_name())
+    IngestPipeline::new(Box::new(wal), miner, TenantRule::service_name())
+}
+
+/// One observed `Journal` call, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalCall {
+    Append,
+    Sync,
+}
+
+/// Shared, ordered log of a spy `Journal`'s calls.
+pub type CallLog = Arc<Mutex<Vec<JournalCall>>>;
+
+/// A `Journal` that records each `append_batch`/`sync` call into a shared
+/// log (and persists nothing), so a test can assert the WAL-before-ack
+/// call sequence (RFC0003.1) and that empty batches touch the WAL not at
+/// all (RFC0003.12).
+struct SpyJournal {
+    log: CallLog,
+}
+
+impl Journal for SpyJournal {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+        self.log.lock().expect("call log").push(JournalCall::Append);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), ReceiveError> {
+        self.log.lock().expect("call log").push(JournalCall::Sync);
+        Ok(())
+    }
+}
+
+/// A pipeline whose `Journal` is a spy recording its calls into `log`
+/// (default miner + `service.name` rule).
+pub fn spy_pipeline(log: CallLog) -> IngestPipeline {
+    let miner = MinerCluster::new(MinerConfig::default());
+    IngestPipeline::new(
+        Box::new(SpyJournal { log }),
+        miner,
+        TenantRule::service_name(),
+    )
 }
 
 /// Reopen the WAL at `root` and return its recovered frames. (Call after

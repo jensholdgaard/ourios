@@ -18,24 +18,62 @@ use prost::Message;
 
 use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
 
-/// The ingester's WAL-before-ack ingest path. Owns the single-writer
-/// `Wal`, the per-process `MinerCluster`, and the tenant-derivation
-/// `TenantRule`.
+/// The durability sink the pipeline appends to and fsyncs through.
+///
+/// Abstracted (rather than a concrete `Wal`) so the WAL-before-ack
+/// ordering can be exercised with a spy that records the `append`/`sync`
+/// calls (RFC0003.1/.12 per §8). The only production implementation is
+/// [`Wal`].
+pub trait Journal {
+    /// Append one `OtlpBatch` frame carrying `payload` (not yet durable).
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::WalAppend`] on a persistence failure.
+    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError>;
+
+    /// Fsync — appended frames are durable when this returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::WalSync`] on an fsync failure.
+    fn sync(&mut self) -> Result<(), ReceiveError>;
+}
+
+impl Journal for Wal {
+    fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError> {
+        Wal::append(self, FrameKind::OtlpBatch, payload)
+            .map(|_| ())
+            .map_err(ReceiveError::WalAppend)
+    }
+
+    fn sync(&mut self) -> Result<(), ReceiveError> {
+        Wal::sync(self).map(|_| ()).map_err(ReceiveError::WalSync)
+    }
+}
+
+/// The ingester's WAL-before-ack ingest path. Owns the durability
+/// [`Journal`], the per-process `MinerCluster`, and the
+/// tenant-derivation `TenantRule`.
 ///
 /// No `Debug`: `MinerCluster` holds the per-tenant Drain trees and does
 /// not implement it.
 pub struct IngestPipeline {
-    wal: Wal,
+    journal: Box<dyn Journal>,
     miner: MinerCluster,
     rule: TenantRule,
 }
 
 impl IngestPipeline {
-    /// Build a pipeline over an opened `Wal`, a `MinerCluster`, and a
-    /// tenant-derivation rule.
+    /// Build a pipeline over a durability [`Journal`] (production: a
+    /// `Box<Wal>`), a `MinerCluster`, and a tenant-derivation rule.
     #[must_use]
-    pub fn new(wal: Wal, miner: MinerCluster, rule: TenantRule) -> Self {
-        Self { wal, miner, rule }
+    pub fn new(journal: Box<dyn Journal>, miner: MinerCluster, rule: TenantRule) -> Self {
+        Self {
+            journal,
+            miner,
+            rule,
+        }
     }
 
     /// Ingest one decoded export per the §6.5 sequence: fan out, append
@@ -71,10 +109,8 @@ impl IngestPipeline {
 
         // Step 3: append the export as one OtlpBatch frame. Step 4: fsync
         // — the batch is durable before the ack below.
-        self.wal
-            .append(FrameKind::OtlpBatch, &payload)
-            .map_err(ReceiveError::WalAppend)?;
-        self.wal.sync().map_err(ReceiveError::WalSync)?;
+        self.journal.append_batch(&payload)?;
+        self.journal.sync()?;
 
         // Step 5: hand records to the miner (only after durability, so a
         // crash between fsync and here replays from the WAL).
@@ -119,8 +155,8 @@ impl std::fmt::Display for ReceiveError {
             // `TenantResolutionError`'s own Display already leads with
             // "tenant resolution failed: …"; delegate, don't re-prefix.
             Self::TenantResolution(e) => write!(f, "{e}"),
-            Self::WalAppend(e) => write!(f, "WAL append failed: {e:?}"),
-            Self::WalSync(e) => write!(f, "WAL sync failed: {e:?}"),
+            Self::WalAppend(e) => write!(f, "{e}"),
+            Self::WalSync(e) => write!(f, "{e}"),
         }
     }
 }
@@ -129,11 +165,8 @@ impl std::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TenantResolution(e) => Some(e),
-            // `ourios_wal::{AppendError, SyncError}` don't implement
-            // `std::error::Error` (RFC 0008 hand-rolled enums), so they
-            // can't be returned as a `source`; their detail is in the
-            // `Display` above.
-            Self::WalAppend(_) | Self::WalSync(_) => None,
+            Self::WalAppend(e) => Some(e),
+            Self::WalSync(e) => Some(e),
         }
     }
 }

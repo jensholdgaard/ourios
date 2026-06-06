@@ -30,9 +30,25 @@ opentelemetry = { version = "0.32", default-features = false, features = ["metri
 # Generated metric/attribute name constants (RFC 0009 §3.6); a leaf,
 # zero-dep crate.
 ourios-semconv = { path = "../ourios-semconv" }
+# OTLP wire decode (RFC 0003 §6.2). Same crate + version + features the
+# rest of the workspace pins (ourios-core, ourios-bench): the receiver
+# decodes the gRPC / HTTP `application/x-protobuf` payload into the
+# `ExportLogsServiceRequest` these generated types define. `with-serde`
+# carries the OTLP/JSON mapping the `application/json` path uses
+# (RFC0003.6, lands next). Live gRPC/HTTP listeners (`tonic`/`axum`) are
+# a later transport slice — this slice is the pure decode layer.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
+# `prost::Message::{decode, encode_to_vec}` for the protobuf payload.
+# `std` is explicit (not relied on via workspace feature unification):
+# `DecodeError::source` returns `prost::DecodeError` as `&dyn
+# std::error::Error`, which only impls `Error` under prost's `std`.
+prost = { version = "0.14", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Proptest strategy over the OTLP proto value space for the
+# wire-decode equivalence scenarios (RFC0003.5/.6 per §8).
+proptest = "1"
 # Stand up an in-memory MeterProvider to assert the compaction metric
 # stream; `testing` exposes `init_in_memory`.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }

@@ -252,14 +252,17 @@ concurrency).
 >   `body_materialise`, `append`) all observe the flag as
 >   `false`
 > - **And** the WAL contains a single `FrameKind::OtlpBatch`
->   frame (per RFC 0008 §3.2 + §6.2.3) whose payload bytes equal the
->   encoded `ExportLogsServiceRequest`, before the ack fires
->   — verified by shutting down the receiver (which drops its
->   `Wal` handle, per the single-writer contract of
->   `crates/ourios-wal/src/lib.rs` §6.2) and then opening a
->   *second* `Wal` to replay via `Wal::replay`, asserting one
->   new frame whose payload round-trips via `prost` to the
->   input request
+>   frame (per RFC 0008 §3.2 + §6.2.3) whose payload decodes
+>   (via `prost`) to the input `ExportLogsServiceRequest`,
+>   before the ack fires — verified by shutting down the
+>   receiver (which drops its `Wal` handle, per the
+>   single-writer contract of `crates/ourios-wal/src/lib.rs`
+>   §6.2) and then opening a *second* `Wal` to replay via
+>   `Wal::replay`, asserting one new frame whose payload
+>   round-trips via `prost` to the input request (byte
+>   equality of the payload to any specific encoding is not
+>   required — protobuf has multiple wire encodings that
+>   decode to the same message; see RFC0003.2)
 > - **And** the §6.5 step-5 miner-acceptance precondition for
 >   ack also holds: every record in the batch has been
 >   handed to `MinerCluster::ingest` and accepted before the
@@ -282,9 +285,11 @@ concurrency).
 >   runs, and the client retries the timed-out export
 > - **Then** the post-restart WAL contains the `OtlpBatch`
 >   frame the killed process had fsync'd before the kill —
->   its payload still decodes byte-for-byte to the killed
->   process's input `ExportLogsServiceRequest` (the
->   RFC0008.2 guarantee this RFC consumes)
+>   its payload decodes (via `prost`) to an
+>   `ExportLogsServiceRequest` semantically equivalent to the
+>   killed process's input (the RFC0008.2 guarantee this RFC
+>   consumes; byte equality of the wire payload is not
+>   required, see the second `And` below for why)
 > - **And** the client's retry is accepted and produces a
 >   *second* `OtlpBatch` frame whose payload decodes to an
 >   `ExportLogsServiceRequest` semantically equivalent to the

@@ -286,12 +286,16 @@ concurrency).
 >   process's input `ExportLogsServiceRequest` (the
 >   RFC0008.2 guarantee this RFC consumes)
 > - **And** the client's retry is accepted and produces a
->   *second* `OtlpBatch` frame whose payload bytes equal the
->   first — this duplication is the **at-least-once**
->   contract per the OTLP spec's *duplicate-data* section
->   ("duplicate data is a deliberate tradeoff for telemetry
->   data"); the receiver implements no de-duplication in
->   this RFC
+>   *second* `OtlpBatch` frame whose payload decodes to an
+>   `ExportLogsServiceRequest` semantically equivalent to the
+>   first (same `resource_logs` after `prost` decode — the
+>   wire bytes need not match, since the client may re-encode
+>   on retry: JSON field-ordering / whitespace, switched
+>   compression, etc.). This duplication is the
+>   **at-least-once** contract per the OTLP spec's
+>   *duplicate-data* section ("duplicate data is a deliberate
+>   tradeoff for telemetry data"); the receiver implements no
+>   de-duplication in this RFC
 > - **And** no special "retry" marker is appended; the receiver
 >   has no dedup key (§9 reserves any future dedup mechanism
 >   for a follow-up RFC) and cannot distinguish a retry from
@@ -471,7 +475,7 @@ concurrency).
 >   `Wal` handle that counts `append` and `sync` calls), and
 >   no record reaches `MinerCluster::ingest`
 
-> **Scenario RFC0003.13 — Compression: identity and gzip MUST be supported**
+> **Scenario RFC0003.13 — Compression over HTTP: identity and gzip MUST be supported**
 > - **Given** an HTTP request whose body is the byte-equal
 >   `ExportLogsServiceRequest` payload of RFC0003.5,
 >   transported with `Content-Encoding: identity` (or absent)
@@ -902,12 +906,15 @@ greppable.
   binary wired to a real `Wal`, the parent SIGKILLs between
   `Wal::sync` return and ack-emit, the parent restarts the
   child and re-issues the export, and the assertion is that
-  the post-restart WAL contains the same `OtlpBatch` payload
-  bytes *twice* (two frames, one per export attempt) — the
-  at-least-once contract per the OTLP spec's *duplicate-data*
-  section. The test explicitly does *not* assert dedup;
-  RFC0003.2's contract is "no loss + safe retry," not
-  exactly-once.
+  the post-restart WAL contains *two* `OtlpBatch` frames
+  whose payloads each decode (via `prost`) to an
+  `ExportLogsServiceRequest` semantically equivalent to the
+  input (byte-equality is not required — see RFC0003.2 — but
+  the second frame must round-trip to the same logical
+  request) — the at-least-once contract per the OTLP spec's
+  *duplicate-data* section. The test explicitly does *not*
+  assert dedup; RFC0003.2's contract is "no loss + safe
+  retry," not exactly-once.
 - **Tenant fan-out** (RFC0003.3, RFC0003.4): unit tests with a
   hand-curated two-Resource batch and an instrumented
   `MinerCluster` stub that records every accepted

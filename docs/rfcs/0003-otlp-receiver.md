@@ -253,16 +253,19 @@ concurrency).
 >   `false`
 > - **And** the WAL contains a single `FrameKind::OtlpBatch`
 >   frame (per RFC 0008 §3.2 + §6.2.3) whose payload decodes
->   (via `prost`) to the input `ExportLogsServiceRequest`,
->   before the ack fires — verified by shutting down the
->   receiver (which drops its `Wal` handle, per the
->   single-writer contract of `crates/ourios-wal/src/lib.rs`
->   §6.2) and then opening a *second* `Wal` to replay via
->   `Wal::replay`, asserting one new frame whose payload
->   round-trips via `prost` to the input request (byte
->   equality of the payload to any specific encoding is not
->   required — protobuf has multiple wire encodings that
->   decode to the same message; see RFC0003.2)
+>   (via `prost`) to the input `ExportLogsServiceRequest` —
+>   verified post-response by shutting down the receiver
+>   (which drops its `Wal` handle, per the single-writer
+>   contract of `crates/ourios-wal/src/lib.rs` §6.2) and then
+>   opening a *second* `Wal` to replay via `Wal::replay`,
+>   asserting one new frame whose payload round-trips via
+>   `prost` to the input request. This `And` is a
+>   content/existence check; the *before-the-ack* ordering is
+>   established by the `AtomicBool` probe in the preceding
+>   `Then` + `And` clauses, not by the replay (byte equality
+>   of the payload to any specific encoding is not required —
+>   protobuf has multiple wire encodings that decode to the
+>   same message; see RFC0003.2)
 > - **And** the §6.5 step-5 miner-acceptance precondition for
 >   ack also holds: every record in the batch has been
 >   handed to `MinerCluster::ingest` and accepted before the

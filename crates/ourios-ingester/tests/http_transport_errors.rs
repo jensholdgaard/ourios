@@ -10,8 +10,10 @@
 mod ingest_support;
 
 use axum::http::StatusCode;
-use ingest_support::{capturing_pipeline, post_request, send};
+use ingest_support::{capturing_pipeline, gzip, post_request, send};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_ingester::receiver::http::{HttpConfig, router};
+use prost::Message;
 
 const PROTOBUF: &str = "application/x-protobuf";
 
@@ -81,6 +83,58 @@ async fn wrong_path_is_404() {
         StatusCode::NOT_FOUND,
     )
     .await;
+}
+
+#[tokio::test]
+async fn gzip_decompression_bomb_is_413() {
+    // Compresses small (under the body limit) but inflates well past it —
+    // DefaultBodyLimit bounds only the compressed bytes, so the
+    // decompressed cap must reject this.
+    let config = HttpConfig {
+        max_body_bytes: 4096,
+        ..HttpConfig::default()
+    };
+    let bomb = gzip(&vec![0u8; 1_000_000]);
+    assert!(
+        bomb.len() < config.max_body_bytes,
+        "the compressed bomb is under the body limit"
+    );
+    let (pipeline, captured) = capturing_pipeline();
+    let (status, _) = send(
+        router(pipeline, &config),
+        post_request("/v1/logs", Some(PROTOBUF), Some("gzip"), bomb),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a gzip body inflating past the cap → 413",
+    );
+    assert!(captured.lock().expect("captured").is_empty());
+}
+
+#[tokio::test]
+async fn content_type_and_encoding_are_case_insensitive() {
+    // Uppercased media type + encoding token must still be accepted (HTTP
+    // media types / Content-Encoding tokens are case-insensitive). An
+    // empty request takes the fast path to 200.
+    let payload = ExportLogsServiceRequest::default().encode_to_vec();
+    let (pipeline, _) = capturing_pipeline();
+    let (status, _) = send(
+        router(pipeline, &HttpConfig::default()),
+        post_request(
+            "/v1/logs",
+            Some("Application/X-Protobuf"),
+            Some("GZIP"),
+            gzip(&payload),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "uppercased Content-Type and Content-Encoding are accepted",
+    );
 }
 
 #[tokio::test]

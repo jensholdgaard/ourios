@@ -52,12 +52,25 @@ impl Default for HttpConfig {
     }
 }
 
+/// Handler state: the shared pipeline plus the decompressed-size cap
+/// (`DefaultBodyLimit` only bounds the *compressed* body, so gzip is
+/// bounded separately to defuse a decompression bomb).
+#[derive(Clone)]
+struct AppState {
+    pipeline: SharedPipeline,
+    max_decompressed_bytes: usize,
+}
+
 /// Build the OTLP/HTTP router over `pipeline`.
 pub fn router(pipeline: SharedPipeline, config: &HttpConfig) -> Router {
+    let state = AppState {
+        pipeline,
+        max_decompressed_bytes: config.max_body_bytes,
+    };
     Router::new()
         .route(&config.path, post(handle_logs))
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
-        .with_state(pipeline)
+        .with_state(state)
 }
 
 /// The OTLP wire format selected by `Content-Type`.
@@ -73,21 +86,20 @@ enum Encoding {
     Gzip,
 }
 
-async fn handle_logs(
-    State(pipeline): State<SharedPipeline>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(format) = content_type(&headers) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     };
     let raw = match content_encoding(&headers) {
         Some(Encoding::Identity) => body.to_vec(),
-        Some(Encoding::Gzip) => match gunzip(&body) {
+        Some(Encoding::Gzip) => match gunzip(&body, state.max_decompressed_bytes) {
             Ok(bytes) => bytes,
-            // A corrupt gzip stream is a malformed request, not an
-            // unsupported one.
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            // Corrupt gzip is a malformed request (400); a body that
+            // decompresses past the limit is too large (413) — a
+            // decompression bomb, since DefaultBodyLimit only bounds the
+            // compressed bytes.
+            Err(GunzipError::Corrupt) => return StatusCode::BAD_REQUEST.into_response(),
+            Err(GunzipError::TooLarge) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         },
         None => return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(),
     };
@@ -99,22 +111,27 @@ async fn handle_logs(
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // WAL-before-ack ingest. The lock spans only this synchronous call.
-    // Recover the guard even if a prior holder panicked: a poisoned lock
-    // must not turn into a panic here (the handler promises not to), so
-    // take the inner guard regardless and let this request proceed.
-    let outcome = pipeline
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .ingest(request);
+    // WAL-before-ack ingest. `ingest` does blocking I/O (WAL append +
+    // fsync), so run it on a blocking thread rather than stalling the
+    // async runtime. The lock spans only the synchronous call, and a
+    // poisoned lock is recovered (the handler promises not to panic).
+    let pipeline = state.pipeline;
+    let outcome = tokio::task::spawn_blocking(move || {
+        pipeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ingest(request)
+    })
+    .await;
 
     match outcome {
-        Ok(_) => success_response(format),
+        Ok(Ok(_)) => success_response(format),
         // A Resource that doesn't resolve to a tenant is a client error
         // (the whole batch is rejected, RFC0003.4).
-        Err(ReceiveError::TenantResolution(_)) => StatusCode::BAD_REQUEST.into_response(),
-        // A WAL failure is server-side; the batch was not acked (§3.4).
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(ReceiveError::TenantResolution(_))) => StatusCode::BAD_REQUEST.into_response(),
+        // A WAL failure (or a panic in the blocking task) is server-side;
+        // the batch was not acked (§3.4).
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -122,8 +139,14 @@ async fn handle_logs(
 /// parameters. `None` = missing or unsupported (→ 415).
 fn content_type(headers: &HeaderMap) -> Option<WireFormat> {
     let value = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
-    let media_type = value.split(';').next().unwrap_or_default().trim();
-    match media_type {
+    // Media types are case-insensitive; ignore any `; charset=…` params.
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
         "application/x-protobuf" => Some(WireFormat::Protobuf),
         "application/json" => Some(WireFormat::Json),
         _ => None,
@@ -136,7 +159,8 @@ fn content_type(headers: &HeaderMap) -> Option<WireFormat> {
 fn content_encoding(headers: &HeaderMap) -> Option<Encoding> {
     match headers.get(header::CONTENT_ENCODING) {
         None => Some(Encoding::Identity),
-        Some(value) => match value.to_str().ok()?.trim() {
+        // Content-Encoding tokens are case-insensitive.
+        Some(value) => match value.to_str().ok()?.trim().to_ascii_lowercase().as_str() {
             "" | "identity" => Some(Encoding::Identity),
             "gzip" => Some(Encoding::Gzip),
             _ => None,
@@ -144,11 +168,30 @@ fn content_encoding(headers: &HeaderMap) -> Option<Encoding> {
     }
 }
 
-fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+/// Why a gzip body was rejected.
+enum GunzipError {
+    /// Not a valid gzip stream.
+    Corrupt,
+    /// The decompressed size exceeded `max` — a decompression bomb.
+    TooLarge,
+}
+
+/// Decompress a gzip body, refusing to inflate past `max` bytes
+/// (`DefaultBodyLimit` bounds only the compressed body, so an attacker
+/// could otherwise expand a tiny upload into an unbounded allocation).
+fn gunzip(bytes: &[u8], max: usize) -> Result<Vec<u8>, GunzipError> {
     use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(bytes);
+    // Read one byte past the cap so we can distinguish "exactly max" from
+    // "over the cap".
+    let cap = max.saturating_add(1) as u64;
+    let mut decoder = flate2::read::GzDecoder::new(bytes).take(cap);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|_| GunzipError::Corrupt)?;
+    if out.len() > max {
+        return Err(GunzipError::TooLarge);
+    }
     Ok(out)
 }
 

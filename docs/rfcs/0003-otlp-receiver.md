@@ -935,11 +935,12 @@ greppable.
   proptest generator can't reliably exercise spec-mandated
   forward-compatibility behaviour.
 - **Body fork** (RFC0003.7, RFC0003.8): table-driven tests
-  over all seven `AnyValue` variants assert
+  over all seven `AnyValue` variants, each asserting that
   `Body::from_any_value` routes `string_value` to
   `Body::String(s)` (unwrapped) and every other variant to
-  `Body::Structured(av)` with `av` structurally equal to the
-  input and the inner `oneof` moved, not cloned.
+  `Body::Structured(av)`, where `av` is structurally equal
+  to the input `AnyValue` and the inner `oneof` is moved,
+  not cloned.
 - **Edge OTLP cases** (RFC0003.9, RFC0003.10): hand-curated
   `LogRecord`s exercising `severity_number = 0`,
   `scope_name = None`, `observed_time_unix_nano = 0`, and
@@ -973,8 +974,9 @@ greppable.
 
 `docs/verification.md` §3's two-loop Red gate applies: the §5
 scenarios become `#[ignore]`d test stubs at `red` stage, then
-get implementations as the receiver crate is built (mirroring
-the PR-M2 pattern that landed RFC0008 §5).
+get implementations as the receiver crate is built (the same
+two-loop pattern RFC 0008 §5 used to drive its red-gate
+scenarios — `#[ignore]`'d stubs first, implementations second).
 
 ## 9. Open questions
 

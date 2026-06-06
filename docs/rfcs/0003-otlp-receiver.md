@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: OTLP receiver — gRPC and HTTP wire endpoints for OpenTelemetry log ingest
-status: green
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-13
@@ -543,6 +543,34 @@ concurrency).
 >   the OTLP spec's recommendation to support concurrent
 >   unary `Export` calls for throughput
 
+> **Amendment (served-binary slice, post-`green`).** Scenarios
+> RFC0003.1–.15 are implemented and were `green` (exercised
+> in-process: `axum`/`tonic` handlers via direct call /
+> `oneshot`, the pipeline + WAL directly). This amendment adds
+> RFC0003.16 — the end-to-end *served-binary* contract, which
+> the §9 *Receiver process model* resolution settles — and
+> re-enters the ladder at `specified` until RFC0003.16 lands.
+
+> **Scenario RFC0003.16 — Served binary: both transports bind, a client export round-trips, graceful shutdown `[§3.4]`**
+> - **Given** `ourios-server` started with the receiver role
+>   enabled (config-toggled per the §9 resolution), the gRPC
+>   listener bound on its configured port (default 4317) and
+>   the HTTP listener on its (default 4318), both sharing one
+>   `IngestPipeline` over a single `Wal`
+> - **When** a real OTLP client exports a non-empty batch
+>   (resolvable tenant) over each bound socket — gRPC `Export`
+>   and HTTP `POST /v1/logs` (`application/x-protobuf`) — and
+>   the server is then signalled to shut down
+> - **Then** each client receives transport-level success
+>   (gRPC `OK` / HTTP 200) only after its batch is durable, and
+>   the batch's `OtlpBatch` frame is recoverable via a
+>   subsequent `Wal::replay` — the §6.5 WAL-before-ack contract
+>   holds **end-to-end over a real socket**, not just in-process
+> - **And** the shutdown signal stops the listeners and exits
+>   the process cleanly — without dropping the single `Wal`
+>   handle mid-fsync or losing a batch that was already acked
+>   (no in-flight, already-fsync'd batch is lost on the way out)
+
 ## 6. Proposed design
 
 ### 6.1 Overall shape
@@ -593,8 +621,13 @@ decoded `ExportLogsServiceRequest` and:
     transport-agnostic at the `AnyValue` level.
 - Both listeners spawn off the same tokio runtime, share a
   single instance of the business-logic layer, and bind on
-  operator-configured ports (defaults TBD, likely 4317 for
-  gRPC and 4318 for HTTP per the OTel convention).
+  operator-configured ports (defaults **4317** for gRPC and
+  **4318** for HTTP, per the OTel convention; configurable).
+  The receiver is a **role of the `ourios-server` binary**,
+  enabled by config and sharing that binary's tokio runtime
+  alongside the other roles (e.g. the compaction daemon) — the
+  §9 *Receiver process model* resolution. The served-binary
+  contract is RFC0003.16.
 
 ### 6.3 Tenant fan-out
 
@@ -991,6 +1024,18 @@ greppable.
   per batch). RFC0003.15 throughput at N = 8 concurrent
   callers. Regressions block merges per `CLAUDE.md` §6.2.
 
+- **Served binary** (RFC0003.16): an integration test boots the
+  `ourios-server` receiver role bound on ephemeral ports
+  (`:0`), exports a non-empty batch over each transport with a
+  *real* client — a `tonic` gRPC client and an HTTP client
+  (`reqwest`/`hyper`) — asserts transport success, then opens
+  the WAL and `replay`s to confirm each batch's `OtlpBatch`
+  frame is durable (WAL-before-ack over a real socket). A
+  second arm signals shutdown and asserts the server task joins
+  cleanly without losing an already-acked batch. Unlike
+  RFC0003.1–.15 (in-process: direct handler call / `oneshot`),
+  this is the only scenario that crosses a real socket.
+
 `docs/verification.md` §3's two-loop Red gate applies: the §5
 scenarios become `#[ignore]`d test stubs at `red` stage, then
 get implementations as the receiver crate is built (the same
@@ -1035,12 +1080,13 @@ scenarios — `#[ignore]`'d stubs first, implementations second).
   0001 §3.2)? Current design says preserve; a future receiver-
   side truncation step would need to either recompute or
   use a separate column.
-- [ ] **Receiver process model.** Is the receiver a separate
-  binary (sidecar shape) or a role of `ourios-server` like
-  `ingester`/`querier` (per `CLAUDE.md` §1)? Current
-  assumption: a role of the existing `ourios-server` binary,
-  toggled by config. Open until the deployment story is
-  considered in detail.
+- [x] ~~**Receiver process model.**~~ *Resolved (served-binary
+  amendment):* the receiver is a **role of the `ourios-server`
+  binary**, enabled by config and sharing that binary's tokio
+  runtime alongside the other roles (e.g. the compaction
+  daemon) — **not** a separate sidecar. Default ports 4317
+  (gRPC) / 4318 (HTTP) per §6.1; the end-to-end served contract
+  (bind + client round-trip + graceful shutdown) is RFC0003.16.
 - [ ] **Partial-success response semantics.** Is the all-or-
   nothing batch contract (§6.3) sufficient long-term, or do we
   need to expose `partial_success.rejected_log_records` for

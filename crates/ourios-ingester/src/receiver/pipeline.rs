@@ -25,8 +25,8 @@ use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
 /// calls (RFC0003.1/.12 per §8). The only production implementation is
 /// [`Wal`].
 ///
-/// `Send` so the pipeline can live behind an `Arc<tokio::Mutex<_>>` as
-/// shared state in the async HTTP/gRPC listeners.
+/// `Send` so the pipeline can live behind a shared `Arc<Mutex<_>>` as
+/// state in the async HTTP/gRPC listeners.
 pub trait Journal: Send {
     /// Append one `OtlpBatch` frame carrying `payload` (not yet durable).
     ///

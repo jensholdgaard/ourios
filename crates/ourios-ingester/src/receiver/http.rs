@@ -100,9 +100,12 @@ async fn handle_logs(
     };
 
     // WAL-before-ack ingest. The lock spans only this synchronous call.
+    // Recover the guard even if a prior holder panicked: a poisoned lock
+    // must not turn into a panic here (the handler promises not to), so
+    // take the inner guard regardless and let this request proceed.
     let outcome = pipeline
         .lock()
-        .expect("ingest pipeline lock not poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .ingest(request);
 
     match outcome {
@@ -160,11 +163,17 @@ fn success_response(format: WireFormat) -> Response {
             response.encode_to_vec(),
         )
             .into_response(),
-        WireFormat::Json => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::to_vec(&response).unwrap_or_default(),
-        )
-            .into_response(),
+        WireFormat::Json => match serde_json::to_vec(&response) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            // Encoding the (trivial) success response shouldn't fail; if
+            // it ever did, a 500 is honest — never a 200 with an empty
+            // body.
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
     }
 }

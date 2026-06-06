@@ -1,7 +1,7 @@
 ---
 rfc: 0003
 title: OTLP receiver — gRPC and HTTP wire endpoints for OpenTelemetry log ingest
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-13
@@ -13,13 +13,12 @@ superseded-by: —
 
 > **How to read this document.** Sections §§1–4 are the design
 > contract — the *what* and the *why*. §5 lists the normative
-> `Given / When / Then` scenarios — the contract — but is a stub
-> at this `drafted` stage and will be filled to move the RFC to
-> `specified`. §6 is the precise specification the receiver
-> crate is implemented against. §7 records the alternatives we
-> evaluated and rejected. §8 maps each §5 scenario (when filled)
-> to the technique that tests it. §9 lists open questions; §10
-> the references.
+> `Given / When / Then` scenarios — the contract the receiver
+> crate is implemented against and tested for. §6 is the precise
+> specification the receiver crate is implemented against. §7
+> records the alternatives we evaluated and rejected. §8 maps
+> each §5 scenario to the technique that tests it. §9 lists
+> open questions; §10 the references.
 >
 > Cross-references to `CLAUDE.md` sections are in square
 > brackets, e.g. `[§3.4]`, and name the invariant the section
@@ -226,57 +225,323 @@ discusses this as a deployment option, not a code dependency.
 
 ## 5. Acceptance criteria
 
-> **Stub.** This RFC is at status `drafted`. §5 acceptance
-> criteria are filled to move to `specified`. The list below
-> sketches the scenarios that will be specified — actual
-> Given/When/Then text is deliberately deferred until the
-> §6 design is reviewed and stable.
+Each scenario carries an id of the form `RFC0003.<m>` that is
+referenced verbatim from each test's leading doc comment (e.g.
+`/// Scenario RFC0003.1 — WAL-before-ack.`) so the spec↔test
+mapping is greppable (per `docs/rfcs/README.md` *Required
+sections* and `docs/verification.md` §2.3 — function names are
+not part of the contract, the doc-comment line is). Scenarios `.1`–`.11` cover the
+invariants and hazards the §6 design touches; `.12`–`.15` pin
+behaviour the OTLP spec mandates and that the §9 enrichments
+surfaced (empty request, compression, default path,
+concurrency).
 
-Sketched scenario set (one per invariant or hazard the receiver
-touches):
+> **Scenario RFC0003.1 — WAL-before-ack `[§3.4]`**
+> - **Given** a `Receiver` wired to a real `Wal` (opened with
+>   defaults) and a single OTLP `ExportLogsServiceRequest`
+>   carrying ≥ 1 `LogRecord`
+> - **When** the receiver runs its accept path
+> - **Then** the transport-level success response (gRPC `OK` /
+>   HTTP 2xx) is emitted only after the `Wal::sync` call
+>   covering the batch's frame returns `Ok(_)` — measured by
+>   an `AtomicBool` set **after** `sync` returns `Ok(_)`
+>   (mirroring RFC0008.1; the probe inside `sync` would
+>   already be true mid-call). The response-writer asserts
+>   the flag is `true` before sending
+> - **And** the pre-sync points (`decode`, `tenant_derive`,
+>   `body_materialise`, `append`) all observe the flag as
+>   `false`
+> - **And** the WAL contains a single `FrameKind::OtlpBatch`
+>   frame (per RFC 0008 §3.2 + §6.2.3) whose payload decodes
+>   (via `prost`) to the input `ExportLogsServiceRequest` —
+>   verified post-response by shutting down the receiver
+>   (which drops its `Wal` handle, per RFC 0008 §3.1's
+>   single-writer architecture — enforced by
+>   `crates/ourios-wal/src/lib.rs:162`) and then
+>   opening a *second* `Wal` to replay via `Wal::replay`,
+>   asserting one new frame whose payload round-trips via
+>   `prost` to the input request. This `And` is a
+>   content/existence check; the *before-the-ack* ordering is
+>   established by the `AtomicBool` probe in the preceding
+>   `Then` + `And` clauses, not by the replay (byte equality
+>   of the payload to any specific encoding is not required —
+>   protobuf has multiple wire encodings that decode to the
+>   same message; see RFC0003.2)
+> - **And** the §6.5 step-5 miner-acceptance precondition for
+>   ack also holds: every record in the batch has been
+>   handed to `MinerCluster::ingest` and accepted before the
+>   ack fires (an instrumented `MinerCluster` stub records
+>   each `ingest` call; the response-writer asserts the
+>   per-batch accepted-count equals the batch's record-count
+>   before sending)
 
-- **RFC0003.1** — WAL-before-ack `[§3.4]`: a request must not
-  receive a 2xx (or gRPC OK) response until every record in the
-  batch is durably written to the WAL.
-- **RFC0003.2** — Crash-before-ack `[§3.4]`: receiver killed
-  between WAL write and response; on restart the records are
-  present, the client retries, and de-duplication does not
-  produce two copies.
-- **RFC0003.3** — Tenant fan-out `[§3.7]`: a single export
-  containing two `ResourceLogs` from different sources produces
-  two distinct per-tenant streams; no record from Resource A
-  appears in tenant B's stream.
-- **RFC0003.4** — Tenant resolution failure `[§3.7]`: an export
-  whose Resource attributes do not resolve to a configured
-  tenant rule is rejected with an error that names the missing
-  attribute; no records are accepted.
-- **RFC0003.5** — gRPC and HTTP/protobuf transports produce the
-  identical in-memory `ExportLogsServiceRequest` for a
-  byte-equal payload.
-- **RFC0003.6** — HTTP/JSON ↔ gRPC/protobuf decode equivalence:
-  a valid OTLP/JSON request with whitespace and field-ordering
-  variation produces the same in-memory `AnyValue` tree (per
-  proto3-JSON decoding) that the same logical record produces
-  over gRPC + protobuf. Body bytes are not yet canonicalised at
-  this layer (canonicalisation is owned by the storage layer
-  per §6.4); equivalence is asserted at the `AnyValue` level.
-- **RFC0003.7** — `body.kind = Structured` records reach the
-  miner as `Body::Structured(AnyValue)` carrying the decoded
-  `AnyValue` verbatim, regardless of the request transport
-  (per the §6.4 amendment; RFC 0001 §6.1 *Body representation*
-  governs how the storage layer later canonicalises the
-  `AnyValue` to JSON bytes at write time).
-- **RFC0003.8** — `body.kind = String` records reach the miner
-  with the unwrapped string as `L_raw` (RFC 0001 §6.2 step 0).
-- **RFC0003.9** — `severity_number = 0` (UNSPECIFIED) and
-  `scope_name = None` records pass through to the miner without
-  rejection or coalescing (RFC 0001 §6.1).
-- **RFC0003.10** — `dropped_attributes_count` from the wire is
-  preserved verbatim on the record (the receiver does not add
-  or recompute).
-- **RFC0003.11** — Transport errors (malformed protobuf,
-  oversize request, invalid `Content-Type`) produce a
-  controlled transport-level error response, not a panic.
+> **Scenario RFC0003.2 — Crash-before-ack: at-least-once with retry tolerance `[§3.4]`**
+> - **Given** a receiver wired to a real `Wal`, an OTLP
+>   client that retries on transport timeout per the OTLP
+>   spec retry semantics, and a `SIGKILL` injected after
+>   `Wal::sync` returns `Ok(_)` but before the success
+>   response reaches the wire — i.e. anywhere in the §6.5
+>   window between step 4 (fsync return) and step 6 (ack);
+>   both the step-4/5 and step-5/6 gaps reduce to the same
+>   duplicate-on-retry contract since the records are
+>   already durable
+> - **When** the receiver process restarts, `Wal::replay`
+>   runs, and the client retries the timed-out export
+> - **Then** the post-restart WAL contains the `OtlpBatch`
+>   frame the killed process had fsync'd before the kill —
+>   its payload decodes (via `prost`) to an
+>   `ExportLogsServiceRequest` semantically equivalent to the
+>   killed process's input (the RFC0008.2 guarantee this RFC
+>   consumes; byte equality of the wire payload is not
+>   required, see the second `And` below for why)
+> - **And** the client's retry is accepted and produces a
+>   *second* `OtlpBatch` frame whose payload decodes to an
+>   `ExportLogsServiceRequest` semantically equivalent to the
+>   first (same `resource_logs` after `prost` decode — the
+>   wire bytes need not match, since the client may re-encode
+>   on retry: JSON field-ordering / whitespace, switched
+>   compression, etc.). This duplication is the
+>   **at-least-once** contract per the OTLP spec's
+>   *duplicate-data* section ("duplicate data is a deliberate
+>   tradeoff for telemetry data"); the receiver implements no
+>   de-duplication in this RFC
+> - **And** no special "retry" marker is appended; the receiver
+>   has no dedup key (§9 reserves any future dedup mechanism
+>   for a follow-up RFC) and cannot distinguish a retry from
+>   an independent batch carrying the same records
+
+> **Scenario RFC0003.3 — Tenant fan-out `[§3.7]`**
+> - **Given** an OTLP batch containing exactly two
+>   `ResourceLogs` groups R_A (`service.name = "svc-a"`) and
+>   R_B (`service.name = "svc-b"`), and an operator-configured
+>   tenant-derivation rule keyed on `service.name`
+> - **When** the receiver processes the batch
+> - **Then** the `(tenant_id, OtlpLogRecord)` pairs accepted
+>   by an instrumented `MinerCluster` stub for `tenant_id_a`
+>   are exactly those derived from R_A and contain no record
+>   derived from R_B
+> - **And** the symmetric assertion holds for `tenant_id_b`
+> - **And** each emitted `OtlpLogRecord`'s `resource_attributes`
+>   reflects the originating Resource verbatim — the receiver
+>   does not mix Resource attribute sets across the fan-out
+
+> **Scenario RFC0003.4 — Tenant resolution failure rejects the entire batch `[§3.7]`**
+> - **Given** an OTLP batch where at least one
+>   `ResourceLogs.resource` lacks the attribute named by the
+>   operator's tenant-derivation rule
+> - **When** the receiver processes the batch
+> - **Then** the receiver emits a transport-level error
+>   (gRPC `INVALID_ARGUMENT` / HTTP 400) whose payload names
+>   the failing `ResourceLogs` index and the missing
+>   attribute key
+> - **And** no `OtlpBatch` frame from the batch is appended
+>   to the WAL (asserted by shutting down the receiver —
+>   dropping its single `Wal` handle per RFC 0008 §3.1's
+>   single-writer architecture (enforced by
+>   `crates/ourios-wal/src/lib.rs:162`) — and then opening
+>   a *second* `Wal` and observing via `Wal::replay` that
+>   frame count and segment offsets
+>   are unchanged from the pre-batch snapshot)
+> - **And** no record from the batch reaches
+>   `MinerCluster::ingest` — per-Resource partial acceptance
+>   is reserved per §6.3
+
+> **Scenario RFC0003.5 — gRPC ≡ HTTP/protobuf decode equivalence**
+> - **Given** a byte-equal `ExportLogsServiceRequest`
+>   protobuf payload
+> - **When** the payload is decoded via the `tonic` gRPC
+>   handler and via the `axum` HTTP handler with
+>   `Content-Type: application/x-protobuf` independently
+> - **Then** the two resulting in-memory
+>   `ExportLogsServiceRequest` values are structurally equal
+>   (`PartialEq`), and every derived `OtlpLogRecord` from
+>   each path is field-for-field equal — including `body`,
+>   `attributes`, `resource_attributes`, `trace_id`,
+>   `span_id`, and `dropped_attributes_count`
+
+> **Scenario RFC0003.6 — HTTP/JSON ↔ gRPC/protobuf equivalence with OTLP-JSON encoding rules**
+> - **Given** an `ExportLogsServiceRequest` carrying
+>   non-trivial `trace_id` and `span_id` bytes, a record with
+>   a `bytes`-typed `AnyValue` attribute, and at least one
+>   record whose `severity_number` exercises a non-default
+>   enum value
+> - **When** the payload is serialised as gRPC + protobuf and
+>   as HTTP + `application/json` per the OTLP-JSON mapping
+>   (hex-encoded `traceId` / `spanId`, base64-encoded
+>   `bytes`, integer-encoded enums, lowerCamelCase field
+>   names) and each is independently decoded by the receiver
+> - **Then** the two derived `OtlpLogRecord` sequences are
+>   equal at the `AnyValue` tree level — no byte-level
+>   canonicalisation is asserted at this layer (canonical-JSON
+>   equivalence is the Parquet writer's contract per §6.4)
+> - **And** the JSON decoder accepts whitespace and field-
+>   ordering variation (insignificant per proto3-JSON)
+> - **And** the JSON decoder ignores unknown fields anywhere
+>   in the request body (top-level, nested, repeated) per the
+>   OTLP spec's "receivers MUST ignore unknown fields" rule
+>   (forward-compatibility)
+
+> **Scenario RFC0003.7 — `Body::Structured` carries the decoded `AnyValue` verbatim**
+> - **Given** a `LogRecord` whose `body` is an `AnyValue` of
+>   a non-`string_value` variant (`kvlist_value`,
+>   `array_value`, `int_value`, `double_value`, `bool_value`,
+>   or `bytes_value`)
+> - **When** the receiver materialises the record via
+>   `ourios_core::otlp::Body::from_any_value` from either
+>   transport
+> - **Then** the resulting `OtlpLogRecord.body` is
+>   `Some(Body::Structured(av))` where `av` is structurally
+>   equal to the wire's `AnyValue` (no canonicalisation, no
+>   reshape, no dropped fields)
+> - **And** the same equality holds across the three
+>   transports, since RFC0003.5 and RFC0003.6 make the
+>   per-transport decodes equivalent at the `AnyValue` level
+
+> **Scenario RFC0003.8 — `Body::String` reaches the miner as the unwrapped `L_raw`**
+> - **Given** a `LogRecord` whose `body` is
+>   `AnyValue { value: Some(string_value(s)) }`
+> - **When** the receiver materialises the record
+> - **Then** the resulting `OtlpLogRecord.body` is
+>   `Some(Body::String(s))` where `s` is the original UTF-8
+>   string (no wrapping, no quoting, no escaping)
+> - **And** the value handed to `MinerCluster::ingest`
+>   equals `s` byte-for-byte (asserted by an instrumented
+>   `MinerCluster` stub that records each `ingest` call's
+>   body argument — the receiver's contract here is the
+>   pass-through, not anything about how the miner indexes
+>   or short-circuits on it)
+
+> **Scenario RFC0003.9 — Edge OTLP fields pass through unchanged**
+> - **Given** a `LogRecord` with `severity_number = 0`
+>   (`UNSPECIFIED`), no `scope_name` on its enclosing
+>   `InstrumentationScope`, and `observed_time_unix_nano = 0`
+>   (proto3's scalar default for an unset field — OTLP's
+>   *log-record* section spells this out as "the value of 0
+>   indicates unknown")
+> - **When** the receiver materialises the record
+> - **Then** the derived `OtlpLogRecord` carries
+>   `severity_number = 0` (kept as `0` because
+>   `UNSPECIFIED` is an explicit OTLP value per
+>   RFC 0001 §6.1, not absence), `scope_name = None`, and
+>   `observed_time_unix_nano = None` — the receiver applies
+>   the wire-`0` → `None` rule for `observed_time_unix_nano`
+>   specifically (the `Option<u64>` typing in RFC 0001 §6.1
+>   exists *for* this conversion; this scenario is the
+>   contract that owns the rule)
+> - **And** the record is accepted by `MinerCluster::ingest`
+>   without rejection, coalescing, substitution, or any
+>   downcast to a "default" value
+
+> **Scenario RFC0003.10 — `dropped_attributes_count` preserved verbatim**
+> - **Given** a `LogRecord` whose `dropped_attributes_count`
+>   is `42` on the wire
+> - **When** the receiver materialises the record
+> - **Then** the resulting `OtlpLogRecord.dropped_attributes_count`
+>   is exactly `42`
+> - **And** the receiver does not recompute the field — it
+>   reflects the *wire-level* claim only, even if a future
+>   receiver-side per-attribute truncation step would have
+>   dropped further attributes (a hypothetical such step is
+>   tracked as a §9 open question)
+
+> **Scenario RFC0003.11 — Transport-level errors are controlled, not panics**
+> - **Given** any of:
+>   - a malformed protobuf payload (random bytes that fail
+>     `prost::Message::decode`),
+>   - an over-size request body exceeding the receiver's
+>     configured request-size limit,
+>   - an HTTP request with an unrecognised `Content-Type`,
+>   - an HTTP `POST` to a path other than the configured
+>     `/v1/logs` (covered jointly with RFC0003.14),
+>   - or a gRPC client cancellation mid-decode
+> - **When** the receiver handles the request
+> - **Then** the receiver emits a controlled transport-level
+>   error — gRPC `INVALID_ARGUMENT` / `RESOURCE_EXHAUSTED` /
+>   `CANCELLED` as appropriate, or HTTP 400 / 413 / 415 / 404
+>   as appropriate
+> - **And** no part of the receiver panics or restarts; the
+>   process remains alive (each arm of the test asserts this
+>   after the request)
+> - **And** no `OtlpBatch` frame is appended to the WAL
+>   (the rejected batch never reaches §6.5 step 3, so the
+>   persistence unit — the per-export frame — never lands)
+
+> **Scenario RFC0003.12 — Empty `ExportLogsServiceRequest` returns success without WAL write**
+> - **Given** an `ExportLogsServiceRequest` that carries
+>   **zero `LogRecord`s** — covered shapes are (i)
+>   `resource_logs` empty, (ii) `resource_logs[i].scope_logs`
+>   empty for every `i`, (iii) every
+>   `resource_logs[i].scope_logs[j].log_records` empty. All
+>   three shapes are tested
+> - **When** the receiver processes the request via either
+>   transport
+> - **Then** the receiver emits a transport-level success
+>   response carrying an `ExportLogsServiceResponse` with
+>   `partial_success` unset (per the OTLP spec's
+>   *otlpgrpc-response* and *otlphttp-response* sections:
+>   "servers SHOULD treat empty as success")
+> - **And** the receiver does not invoke `Wal::sync`, no
+>   frame is appended (asserted via a test wrapper around the
+>   `Wal` handle that counts `append` and `sync` calls), and
+>   no record reaches `MinerCluster::ingest`
+
+> **Scenario RFC0003.13 — Compression over HTTP: identity and gzip MUST be supported**
+> - **Given** an HTTP request whose body is the byte-equal
+>   `ExportLogsServiceRequest` payload of RFC0003.5,
+>   transported with `Content-Encoding: identity` (or absent)
+>   and with `Content-Encoding: gzip` independently
+> - **When** the receiver processes each request
+> - **Then** the two derived `OtlpLogRecord` sequences are
+>   equal — the OTLP spec mandates both encodings, and the
+>   receiver's decode produces semantically identical results
+> - **And** a request with an unsupported `Content-Encoding`
+>   (e.g. `zstd`, `br`) is rejected with HTTP 415 and a
+>   controlled error message; `zstd` support is deferred per
+>   §9
+
+> **Scenario RFC0003.14 — Default `/v1/logs` path with configurable override**
+> - **Given** the HTTP listener bound with the default path
+>   configuration
+> - **When** a `POST` arrives at `/v1/logs`
+> - **Then** the receiver handles it via the OTLP/HTTP code
+>   path defined in §6.2
+> - **And** a `POST` to any other path returns HTTP 404 (the
+>   "wrong path" arm of RFC0003.11)
+> - **And** when the operator configures an override path
+>   (e.g. `/otlp/v1/logs`), it replaces `/v1/logs` as the
+>   accepted path without changing any other receiver
+>   behaviour (the configurability matches the Collector's
+>   OTLP-receiver `path` knob, so deployments that need a
+>   non-standard prefix don't have to front Ourios with a
+>   reverse proxy)
+
+> **Scenario RFC0003.15 — Concurrent `Export` calls each obey WAL-before-ack independently `[§3.4]`**
+> - **Given** N ≥ 2 concurrent gRPC `Export` unary calls
+>   submitted to the receiver from independent client
+>   connections
+> - **When** each call's batch independently traverses the
+>   §6.5 sequence
+> - **Then** each call's ack is emitted only after its own
+>   batch's `Wal::sync` returns `Ok(_)` *and* its own batch's
+>   records have all been accepted by `MinerCluster::ingest`
+>   — the §3.4 `AtomicBool` of RFC0003.1 is per in-flight
+>   call, not process-global; a per-call probe records both
+>   the sync-completion and miner-acceptance ordering before
+>   the response-writer sends
+> - **And** the WAL contains exactly one `OtlpBatch` frame
+>   per concurrent call (no call's batch is lost to
+>   concurrency, asserted by shutting down the receiver —
+>   dropping its single `Wal` handle per RFC 0008 §3.1's
+>   single-writer architecture (enforced by
+>   `crates/ourios-wal/src/lib.rs:162`) — and then opening
+>   a *second* `Wal` whose `Wal::replay` yields N frames
+>   whose payloads round-trip to the N input
+>   `ExportLogsServiceRequest`s)
+> - **And** the test does *not* assert any cross-call
+>   ordering — concurrent batches may interleave in the WAL
+>   as the tokio runtime chooses, which is consistent with
+>   the OTLP spec's recommendation to support concurrent
+>   unary `Export` calls for throughput
 
 ## 6. Proposed design
 
@@ -307,9 +572,9 @@ decoded `ExportLogsServiceRequest` and:
 4. Hands each per-tenant stream to `ourios-miner` (one
    `MinerCluster` per process; the cluster routes internally
    per `tenant_id`).
-5. After every record in the batch has been accepted by the
-   miner AND written to the WAL with fsync, returns a
-   transport-level success.
+5. After the batch has been written to the WAL as a single
+   `OtlpBatch` frame with fsync AND every record accepted by
+   the miner, returns a transport-level success.
 
 ### 6.2 Wire stack defaults
 
@@ -345,8 +610,9 @@ per `ResourceLogs` group, not per export batch. The receiver:
 If any `ResourceLogs.resource` fails to resolve to a tenant
 under the configured rule, the receiver rejects the **entire
 batch** with a transport-level error naming the failing
-Resource and the missing attribute. Per-Resource partial
-acceptance is reserved for a future RFC (see §9).
+`ResourceLogs` index (the offset in the export's
+`resource_logs[]`) and the missing attribute key. Per-Resource
+partial acceptance is reserved for a future RFC (see §9).
 
 ### 6.4 AnyValue canonicalisation is deferred to the storage layer
 
@@ -393,15 +659,30 @@ unwrapped string is passed through as `L_raw`.
 
 ### 6.5 WAL-before-ack sequencing
 
-`[§3.4]` requires the receiver to acknowledge a batch only
-after every record is durably written. Concrete contract:
+`[§3.4]` requires the receiver to acknowledge a non-empty
+batch only after the batch's `OtlpBatch` frame is durably
+written. (The empty-batch fast path of RFC0003.12 is the
+explicit exception: no WAL write occurs, and success is
+returned without an `OtlpBatch` frame.) Concrete contract for
+the non-empty case:
 
 1. Receiver accepts the request and decodes to
    `ExportLogsServiceRequest`.
 2. Receiver fans out to per-tenant `OtlpLogRecord` streams
    (§6.3); body canonicalisation does not happen here, per the
    amended §6.4.
-3. Receiver appends every record to the WAL.
+3. Receiver appends the request as a single
+   `FrameKind::OtlpBatch` frame (per RFC 0008 §3.2 + §6.2.3)
+   whose payload is a protobuf-encoded
+   `ExportLogsServiceRequest` decodable via `prost` —
+   semantically equivalent to the input, but byte-equal to
+   the wire payload is *not* required (per RFC0003.1 + .2
+   the contract is "you can recover the input message," not
+   "you get the bytes back"). For the gRPC and
+   HTTP/protobuf paths the receiver MAY store the wire bytes
+   verbatim; for the HTTP/JSON path no incoming protobuf
+   bytes exist and the receiver MUST encode the decoded
+   message.
 4. Receiver fsyncs the WAL segment(s) touched.
 5. Receiver hands records to the miner for templating.
 6. Receiver returns transport-level success.
@@ -412,11 +693,11 @@ state is reconstructed); a crash between (3) and (4) loses
 those records but the client retries (no ack was sent); a
 crash between (5) and (6) is the "the server did the work and
 the client never heard about it" case, where client retries
-produce duplicates. The dedup mechanism for that retry path is
-not yet specified — neither `docs/hazards.md` H3 (WAL durability
-vs. latency) nor H8 (replication-induced dedup, currently
-forward-looking) covers the single-replica retry case directly.
-§9 carries this as an open question.
+produce duplicates. This RFC implements no de-duplication:
+duplicates on retry are the explicit at-least-once contract
+per RFC0003.2 and §9 #1 (resolved by reference to the OTLP
+spec's *duplicate-data* section). Any future content-hash or
+request-id dedup is purely additive on top of this baseline.
 
 The receiver itself is post-MVP per `roadmap.md` §5 — the MVP
 bench reads OTLP from the on-disk corpus, bypassing this
@@ -625,66 +906,113 @@ its original grounds.
 
 ## 8. Testing strategy
 
-Mapped to the §5 scenarios (sketched at this draft stage; this
-mapping is filled when the §5 scenarios are specified):
+Mapped to the §5 scenarios. Each technique below names the
+scenario ids it covers; each test's leading doc comment
+references the same id verbatim
+(`/// Scenario RFC0003.1 — WAL-before-ack.` etc., per
+`docs/verification.md` §2.3) so the spec↔test mapping is
+greppable.
 
-- **WAL-before-ack** (RFC0003.1, RFC0003.2): an integration
-  test running the receiver against a mock WAL that explicitly
-  records the order of (append, fsync, ack) events.
-  Crash-recovery test SIGKILLs the receiver between fsync and
-  ack, restarts, replays.
-- **Tenant fan-out** (RFC0003.3, RFC0003.4): hand-curated
-  multi-Resource batches, assert that the per-tenant streams
-  handed to the miner contain only the records from each
-  Resource. Property test on the tenant-derivation rule (any
-  rule that returns `Some` for both Resources never produces
-  cross-contamination).
+- **WAL-before-ack and concurrency** (RFC0003.1, RFC0003.15):
+  integration tests against a real `Wal` (defaults), with an
+  `AtomicBool` ordering probe mirroring RFC0008.1 — set after
+  `Wal::sync` returns, asserted `true` by the response-writer
+  and `false` by every pre-sync stage. RFC0003.15 spawns N ≥ 2
+  concurrent `Export` calls and uses a *per-call* probe so the
+  invariant is checked independently per in-flight call.
+- **Crash-before-ack** (RFC0003.2): a child-process harness
+  mirroring `wal_crash_fixture` (PR #126) runs a receiver
+  binary wired to a real `Wal`, the parent SIGKILLs between
+  `Wal::sync` return and ack-emit, the parent restarts the
+  child and re-issues the export, and the assertion is that
+  the post-restart WAL contains *two* `OtlpBatch` frames
+  whose payloads each decode (via `prost`) to an
+  `ExportLogsServiceRequest` semantically equivalent to the
+  input (byte-equality is not required — see RFC0003.2 — but
+  the second frame must round-trip to the same logical
+  request) — the at-least-once contract per the OTLP spec's
+  *duplicate-data* section. The test explicitly does *not*
+  assert dedup; RFC0003.2's contract is "no loss + safe
+  retry," not exactly-once.
+- **Tenant fan-out** (RFC0003.3, RFC0003.4): unit tests with a
+  hand-curated two-Resource batch and an instrumented
+  `MinerCluster` stub that records every accepted
+  `(tenant_id, OtlpLogRecord)` pair. A `proptest` strategy
+  over tenant-derivation rules asserts the
+  cross-contamination-free invariant for any rule that returns
+  `Some` for both Resources. RFC0003.4 uses a hand-curated
+  batch where one Resource lacks the rule's attribute key.
 - **Wire-decode equivalence** (RFC0003.5, RFC0003.6): a
-  property test asserting that a batch of
-  `ExportLogsServiceRequest` payloads, serialised to gRPC +
-  protobuf, HTTP + protobuf, and HTTP + JSON, round-trips
-  through each transport and produces equal in-memory
-  `AnyValue` trees for the same logical records.
-  Byte-level canonical-JSON equivalence is asserted in the
-  Parquet writer's tests, not here, per the §6.4 amendment.
+  `proptest` strategy generates `ExportLogsServiceRequest`
+  payloads across the proto's value space; each is serialised
+  to gRPC + protobuf, HTTP + protobuf, and HTTP + JSON,
+  decoded by the receiver, and the three resulting
+  `OtlpLogRecord` sequences are asserted equal at the
+  `AnyValue` level. The RFC0003.6 OTLP-JSON encoding-rule
+  clauses (hex IDs, base64 bytes, integer enums, ignore
+  unknown fields) use hand-curated payloads, since the
+  proptest generator can't reliably exercise spec-mandated
+  forward-compatibility behaviour.
 - **Body fork** (RFC0003.7, RFC0003.8): table-driven tests
-  over the seven `AnyValue` variants, each asserting that
+  over all seven `AnyValue` variants, each asserting that
   `Body::from_any_value` routes `string_value` to
-  `Body::String` and every other variant to
-  `Body::Structured(AnyValue)` with the inner `oneof` moved,
-  not cloned. String-Body test asserts the unwrapped string is
-  what reaches the miner.
+  `Body::String(s)` (unwrapped) and every other variant to
+  `Body::Structured(av)`, where `av` is structurally equal
+  to the input `AnyValue` and the inner `oneof` is moved,
+  not cloned.
 - **Edge OTLP cases** (RFC0003.9, RFC0003.10): hand-curated
-  records with `severity_number = 0`, `scope_name = None`,
-  non-zero `dropped_attributes_count`. Assert pass-through
-  semantics.
-- **Transport-level errors** (RFC0003.11): malformed protobuf,
-  oversize request, wrong `Content-Type`, etc. Assert
-  controlled error responses with no panic.
-- **Conformance** (additive): fuzz the receiver with valid
-  OTLP batches generated by `proptest` strategies derived
-  from the proto definitions.
-- **Benchmarks** (`criterion`, in `ourios-bench`):
-  end-to-end latency from request arrival to mining-attached,
-  for both transports, at typical batch sizes (1, 100, 1000,
-  10000 records per batch). Throughput sustained at the WAL
-  fsync rate.
+  `LogRecord`s exercising `severity_number = 0`,
+  `scope_name = None`, `observed_time_unix_nano = 0`, and
+  non-zero `dropped_attributes_count`. Assertions pin the
+  pass-through semantics on the derived `OtlpLogRecord`.
+- **Transport-level errors + empty request** (RFC0003.11,
+  RFC0003.12): table-driven tests over each error arm
+  (malformed protobuf, oversize, unrecognised `Content-Type`,
+  wrong path, mid-decode cancellation) and the empty-request
+  success arm. Each assertion pins the response status code,
+  that no `OtlpBatch` frame is appended to the WAL and no
+  record reaches the miner, and that the
+  receiver process is still alive afterwards.
+- **Compression and path** (RFC0003.13, RFC0003.14): the gzip
+  arm of RFC0003.13 uses `flate2` to construct the
+  `Content-Encoding: gzip` body; the unsupported-encoding arm
+  asserts HTTP 415. RFC0003.14's path arm covers the default
+  `/v1/logs`, a wrong-path 404, and an operator-configured
+  override path producing equivalent behaviour.
+- **Conformance fuzzing** (additive, not bound to a single
+  scenario): `proptest` strategies derived from the proto
+  definitions feed random valid batches through the receiver;
+  the only assertion is "no panic; response is either success
+  or a controlled transport-level error" — a backstop against
+  decode paths the hand-curated cases miss.
+- **Benchmarks** (`criterion`, in `ourios-bench`): end-to-end
+  latency from request arrival to ack-fires, for both
+  transports, at batch sizes (1, 100, 1 000, 10 000 records
+  per batch). RFC0003.15 throughput at N = 8 concurrent
+  callers. Regressions block merges per `CLAUDE.md` §6.2.
 
 `docs/verification.md` §3's two-loop Red gate applies: the §5
 scenarios become `#[ignore]`d test stubs at `red` stage, then
-get implementations as the receiver crate is built.
+get implementations as the receiver crate is built (the same
+two-loop pattern RFC 0008 §5 used to drive its red-gate
+scenarios — `#[ignore]`'d stubs first, implementations second).
 
 ## 9. Open questions
 
-- [ ] **Retry-induced duplicate suppression.** A crash between
-  miner-attach (step 5) and ack (step 6) in §6.5 produces
-  duplicates on client retry. The dedup mechanism (e.g., a
-  content-hash idempotency key carried alongside each WAL
-  record, or a request-id header from the OTel SDK) is not
-  yet specified — the existing hazards (`docs/hazards.md` H3,
-  H8) do not cover the single-replica retry case. Settled
-  either in the `ourios-wal` RFC or in a follow-up to this
-  one.
+- [x] ~~**Retry-induced duplicate suppression.**~~
+  *Resolved by §5 / RFC0003.2:* a crash between miner-attach
+  (step 5) and ack (step 6) in §6.5 produces duplicates on
+  client retry, and that is the contract. The OTLP spec's
+  *duplicate-data* section ("the client may re-send … which
+  may result in duplicate data on the server side. This is a
+  deliberate choice and is considered to be the right
+  tradeoff for telemetry data") explicitly accepts
+  at-least-once with duplicates; the Collector's WAL
+  guidance carries the same caveat. The receiver implements
+  no de-duplication in this RFC. If a future RFC introduces
+  a dedup mechanism (content-hash idempotency key, OTel SDK
+  request-id header), it is purely additive — the
+  at-least-once baseline is the floor, not a stop-gap.
 - [ ] **`ResourceLogs.schema_url` / `ScopeLogs.schema_url`
   preservation.** §6.8 records that schema URLs are currently
   dropped because no consumer references them and RFC 0001
@@ -734,11 +1062,14 @@ get implementations as the receiver crate is built.
   the transport level, or pass through and let the miner emit
   a parse-failure record? Current design: pass through,
   per-record granularity is the miner's concern.
-- [ ] **Compression (gzip / zstd over HTTP).** OTLP/HTTP
-  permits content-encoded request bodies. Is MVP-scope
-  receiver expected to support either? Current assumption:
-  identity-only at first; gzip at the framework layer if
-  `axum`/`hyper` provides it for free; zstd deferred.
+- [x] ~~**Compression (gzip / zstd over HTTP).**~~
+  *Resolved by §5 / RFC0003.13:* the OTLP spec mandates that
+  servers support `identity` and `gzip`; both are required
+  acceptance criteria. `zstd` and `br` are out of scope for
+  this RFC — a request carrying an unsupported encoding is
+  rejected with HTTP 415. A future RFC may add `zstd` if
+  operator demand surfaces; until then the 415 response is
+  the contract.
 - [ ] **Receiver-side OTel telemetry (eating our own dog
   food).** The receiver should itself emit metrics about
   request rates, decode failures, fan-out latency. Specified

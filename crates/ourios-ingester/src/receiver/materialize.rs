@@ -44,9 +44,9 @@ pub fn materialize_record(
         // (RFC0003.9; the `Option<u64>` typing exists for this).
         observed_time_unix_nano: nonzero(record.observed_time_unix_nano),
         // `UNSPECIFIED` (`0`) is an explicit OTLP value, kept as `0`
-        // (RFC0003.9). Proto's `i32` is narrowed to the schema's `u8`;
-        // an out-of-range/invalid value narrows to `0`/UNSPECIFIED.
-        severity_number: u8::try_from(record.severity_number).unwrap_or(0),
+        // (RFC0003.9); proto's `i32` is narrowed to the schema's
+        // documented `0..=24` `u8` range — see `severity_to_u8`.
+        severity_number: severity_to_u8(record.severity_number),
         severity_text: nonempty(record.severity_text),
         scope_name: scope.and_then(|s| nonempty(s.name.clone())),
         scope_version: scope.and_then(|s| nonempty(s.version.clone())),
@@ -63,6 +63,16 @@ pub fn materialize_record(
         // when the wire delivered no body.
         body: record.body.and_then(Body::from_any_value),
     }
+}
+
+/// Narrow proto's `i32` `severity_number` to the schema's `u8`. Valid
+/// OTLP severity is `0..=24` (`0` = UNSPECIFIED); any value outside that
+/// range — invalid-but-`u8`-representable (`25..=255`), negative, or
+/// `> 255` — maps to `0`/UNSPECIFIED, so the `OtlpLogRecord` contract the
+/// miner's template key and the Parquet schema rely on holds at this
+/// boundary.
+fn severity_to_u8(n: i32) -> u8 {
+    u8::try_from(n).ok().filter(|v| *v <= 24).unwrap_or(0)
 }
 
 /// Proto scalar `0` → `None`, else `Some` — the §6.9-style narrowing of

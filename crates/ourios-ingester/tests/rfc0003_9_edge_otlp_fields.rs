@@ -72,3 +72,23 @@ fn rfc0003_9_edge_fields_pass_through_without_coalescing() {
         "inherited resource attributes pass through verbatim",
     );
 }
+
+/// Scenario RFC0003.9 — out-of-range `severity_number` narrows to UNSPECIFIED.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5.
+#[test]
+fn rfc0003_9_out_of_range_severity_narrows_to_unspecified() {
+    // Valid OTLP severity is 0..=24; values outside that range (incl.
+    // u8-representable 25..=255, negative, and > 255) normalise to
+    // 0/UNSPECIFIED so the OtlpLogRecord 0..=24 contract holds.
+    for (wire, expected) in [(0i32, 0u8), (24, 24), (25, 0), (1000, 0), (-5, 0)] {
+        let record = LogRecord {
+            severity_number: wire,
+            ..Default::default()
+        };
+        let materialized = materialize_record(record, &[], None, TenantId::new("tenant-a"));
+        assert_eq!(
+            materialized.severity_number, expected,
+            "severity_number {wire} narrows to {expected}",
+        );
+    }
+}

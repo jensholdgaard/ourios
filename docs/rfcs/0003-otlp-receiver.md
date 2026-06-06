@@ -255,8 +255,9 @@ concurrency).
 >   frame (per RFC 0008 §3.2 + §6.2.3) whose payload decodes
 >   (via `prost`) to the input `ExportLogsServiceRequest` —
 >   verified post-response by shutting down the receiver
->   (which drops its `Wal` handle, per the single-writer
->   contract of `crates/ourios-wal/src/lib.rs` §6.2) and then
+>   (which drops its `Wal` handle, per RFC 0008 §3.1's
+>   single-writer architecture — enforced by
+>   `crates/ourios-wal/src/lib.rs:162`) and then
 >   opening a *second* `Wal` to replay via `Wal::replay`,
 >   asserting one new frame whose payload round-trips via
 >   `prost` to the input request. This `And` is a
@@ -335,8 +336,9 @@ concurrency).
 >   attribute key
 > - **And** no `OtlpBatch` frame from the batch is appended
 >   to the WAL (asserted by shutting down the receiver —
->   dropping its single `Wal` handle per
->   `crates/ourios-wal/src/lib.rs` §6.2 — and then opening
+>   dropping its single `Wal` handle per RFC 0008 §3.1's
+>   single-writer architecture (enforced by
+>   `crates/ourios-wal/src/lib.rs:162`) — and then opening
 >   a *second* `Wal` and observing via `Wal::replay` that
 >   frame count and segment offsets
 >   are unchanged from the pre-batch snapshot)
@@ -529,8 +531,9 @@ concurrency).
 > - **And** the WAL contains exactly one `OtlpBatch` frame
 >   per concurrent call (no call's batch is lost to
 >   concurrency, asserted by shutting down the receiver —
->   dropping its single `Wal` handle per
->   `crates/ourios-wal/src/lib.rs` §6.2 — and then opening
+>   dropping its single `Wal` handle per RFC 0008 §3.1's
+>   single-writer architecture (enforced by
+>   `crates/ourios-wal/src/lib.rs:162`) — and then opening
 >   a *second* `Wal` whose `Wal::replay` yields N frames
 >   whose payloads round-trip to the N input
 >   `ExportLogsServiceRequest`s)

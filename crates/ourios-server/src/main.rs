@@ -241,8 +241,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("telemetry shutdown error: {e}");
     }
 
-    // A signal-handler setup failure is fatal: cancelling the compactor and
-    // exiting 0 would leave the server silently doing no work.
+    // A SIGINT (`ctrl_c`) handler setup failure is fatal: cancelling the
+    // compactor and exiting 0 would leave the server silently doing no
+    // work. (A SIGTERM-handler failure is non-fatal — see
+    // `terminate_signal` — leaving SIGINT in charge.)
     shutdown?;
     Ok(())
 }

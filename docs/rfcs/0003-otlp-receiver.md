@@ -225,10 +225,12 @@ discusses this as a deployment option, not a code dependency.
 
 ## 5. Acceptance criteria
 
-Each scenario carries an id of the form `RFC0003.<m>` that the
-test code references verbatim so the spec↔test mapping is
-greppable (per `docs/rfcs/README.md` *Required sections* and
-`docs/verification.md` §2). Scenarios `.1`–`.11` cover the
+Each scenario carries an id of the form `RFC0003.<m>` that is
+referenced verbatim from each test's leading doc comment (e.g.
+`/// Scenario RFC0003.1 — WAL-before-ack.`) so the spec↔test
+mapping is greppable (per `docs/rfcs/README.md` *Required
+sections* and `docs/verification.md` §2.3 — function names are
+not part of the contract, the doc-comment line is). Scenarios `.1`–`.11` cover the
 invariants and hazards the §6 design touches; `.12`–`.15` pin
 behaviour the OTLP spec mandates and that the §9 enrichments
 surfaced (empty request, compression, default path,
@@ -255,6 +257,13 @@ concurrency).
 >   — verified by replaying a fresh `Wal::open` after the
 >   response and asserting one new frame whose payload
 >   round-trips via `prost` to the input request
+> - **And** the §6.5 step-5 miner-acceptance precondition for
+>   ack also holds: every record in the batch has been
+>   handed to `MinerCluster::ingest` and accepted before the
+>   ack fires (an instrumented `MinerCluster` stub records
+>   each `ingest` call; the response-writer asserts the
+>   per-batch accepted-count equals the batch's record-count
+>   before sending)
 
 > **Scenario RFC0003.2 — Crash-before-ack: at-least-once with retry tolerance `[§3.4]`**
 > - **Given** a receiver wired to a real `Wal`, an OTLP
@@ -475,9 +484,12 @@ concurrency).
 > - **When** each call's batch independently traverses the
 >   §6.5 sequence
 > - **Then** each call's ack is emitted only after its own
->   batch's `Wal::sync` returns `Ok(_)` — the §3.4
->   `AtomicBool` of RFC0003.1 is per in-flight call, not
->   process-global, and a per-call probe records the order
+>   batch's `Wal::sync` returns `Ok(_)` *and* its own batch's
+>   records have all been accepted by `MinerCluster::ingest`
+>   — the §3.4 `AtomicBool` of RFC0003.1 is per in-flight
+>   call, not process-global; a per-call probe records both
+>   the sync-completion and miner-acceptance ordering before
+>   the response-writer sends
 > - **And** the WAL contains exactly one `OtlpBatch` frame
 >   per concurrent call (no call's batch is lost to
 >   concurrency, asserted by replay producing N frames whose
@@ -604,9 +616,12 @@ unwrapped string is passed through as `L_raw`.
 
 ### 6.5 WAL-before-ack sequencing
 
-`[§3.4]` requires the receiver to acknowledge a batch only
-after the batch's `OtlpBatch` frame is durably written.
-Concrete contract:
+`[§3.4]` requires the receiver to acknowledge a non-empty
+batch only after the batch's `OtlpBatch` frame is durably
+written. (The empty-batch fast path of RFC0003.12 is the
+explicit exception: no WAL write occurs, and success is
+returned without an `OtlpBatch` frame.) Concrete contract for
+the non-empty case:
 
 1. Receiver accepts the request and decodes to
    `ExportLogsServiceRequest`.
@@ -841,9 +856,11 @@ its original grounds.
 ## 8. Testing strategy
 
 Mapped to the §5 scenarios. Each technique below names the
-scenario ids it covers; the test code references the same ids
-verbatim (`#[test] fn rfc0003_1_wal_before_ack()` etc.) so
-the spec↔test mapping is greppable.
+scenario ids it covers; each test's leading doc comment
+references the same id verbatim
+(`/// Scenario RFC0003.1 — WAL-before-ack.` etc., per
+`docs/verification.md` §2.3) so the spec↔test mapping is
+greppable.
 
 - **WAL-before-ack and concurrency** (RFC0003.1, RFC0003.15):
   integration tests against a real `Wal` (defaults), with an

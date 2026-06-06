@@ -137,6 +137,9 @@ async fn rfc0003_16_served_binary_binds_round_trips_and_shuts_down() {
         .env("OURIOS_RECEIVER_HTTP_ADDR", "127.0.0.1:0")
         .env("OURIOS_WAL_ROOT", &wal_root)
         .stdout(Stdio::piped())
+        // Reap the server if the test returns early (timeout / panic) so a
+        // failing run can't leak the process.
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn ourios-server");
 

@@ -1034,7 +1034,8 @@ greppable.
 
 - **Served binary** (RFC0003.16): an integration test boots the
   `ourios-server` receiver role bound on ephemeral ports
-  (`:0`), exports a non-empty batch over each transport with a
+  (`127.0.0.1:0`, reading back each OS-assigned port), exports a
+  non-empty batch over each transport with a
   *real* client — a `tonic` gRPC client and an HTTP client
   (`reqwest`/`hyper`) — and asserts transport success for each.
   It then signals shutdown and waits for the server task to

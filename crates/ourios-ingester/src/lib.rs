@@ -4,9 +4,11 @@
 //! durably (WAL-before-ack), lands Parquet in object storage, and runs
 //! background maintenance. It spans three RFCs at different maturities:
 //!
-//! - **OTLP receiver** (RFC 0003, `drafted`) — the gRPC/HTTP ingest
-//!   front door + mining pipeline. [`receiver`] is a placeholder until
-//!   RFC 0003 reaches `red`; no ingest is implemented here yet.
+//! - **OTLP receiver** (RFC 0003, `specified` → `red`) — the gRPC/HTTP
+//!   ingest front door + mining pipeline. The §5 acceptance criteria
+//!   (RFC0003.1–.15) are now enumerated as `#[ignore]`'d tests under
+//!   `tests/rfc0003_*`; [`receiver`] stays a placeholder until the
+//!   green slices land the ingest pipeline + WAL-before-ack path.
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path once the receiver lands; not exercised here.

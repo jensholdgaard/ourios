@@ -254,9 +254,12 @@ concurrency).
 > - **And** the WAL contains a single `FrameKind::OtlpBatch`
 >   frame (per RFC 0008 §3.2 + §6.2.3) whose payload bytes equal the
 >   encoded `ExportLogsServiceRequest`, before the ack fires
->   — verified by replaying a fresh `Wal::open` after the
->   response and asserting one new frame whose payload
->   round-trips via `prost` to the input request
+>   — verified by shutting down the receiver (which drops its
+>   `Wal` handle, per the single-writer contract of
+>   `crates/ourios-wal/src/lib.rs` §6.2) and then opening a
+>   *second* `Wal` to replay via `Wal::replay`, asserting one
+>   new frame whose payload round-trips via `prost` to the
+>   input request
 > - **And** the §6.5 step-5 miner-acceptance precondition for
 >   ack also holds: every record in the batch has been
 >   handed to `MinerCluster::ingest` and accepted before the
@@ -319,9 +322,11 @@ concurrency).
 >   the failing `ResourceLogs` index and the missing
 >   attribute key
 > - **And** no record from the batch is appended to the WAL
->   (asserted by reopening the WAL post-test and observing
->   that frame count and segment offsets are unchanged from
->   the pre-batch snapshot)
+>   (asserted by shutting down the receiver — dropping its
+>   single `Wal` handle per `crates/ourios-wal/src/lib.rs`
+>   §6.2 — and then opening a *second* `Wal` and observing
+>   via `Wal::replay` that frame count and segment offsets
+>   are unchanged from the pre-batch snapshot)
 > - **And** no record from the batch reaches
 >   `MinerCluster::ingest` — per-Resource partial acceptance
 >   is reserved per §6.3
@@ -508,8 +513,11 @@ concurrency).
 >   the response-writer sends
 > - **And** the WAL contains exactly one `OtlpBatch` frame
 >   per concurrent call (no call's batch is lost to
->   concurrency, asserted by replay producing N frames whose
->   payloads round-trip to the N input
+>   concurrency, asserted by shutting down the receiver —
+>   dropping its single `Wal` handle per
+>   `crates/ourios-wal/src/lib.rs` §6.2 — and then opening
+>   a *second* `Wal` whose `Wal::replay` yields N frames
+>   whose payloads round-trip to the N input
 >   `ExportLogsServiceRequest`s)
 > - **And** the test does *not* assert any cross-call
 >   ordering — concurrent batches may interleave in the WAL

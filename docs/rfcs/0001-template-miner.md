@@ -1530,7 +1530,12 @@ mechanism.
 `template_id`s **within one tenant** `[§3.7]`, identified by a
 **representative** (canonical) `template_id` — by convention the
 numerically smallest member, so the representative is deterministic
-and does not depend on assertion order. Membership is **cross-leaf
+and does not depend on assertion order. This selection rule is an
+**implementation detail, not a contract**: it may evolve (for
+example, letting an operator designate a preferred representative)
+without changing alias-set semantics, because `resolves_to` expands
+by *membership* regardless of which member is the representative
+(RFC0001.13). Membership is **cross-leaf
 only**: it groups `template_id`s the miner allocated as separate
 leaves. It never crosses the cross-version axis — every version of a
 single leaf already shares one `template_id` (§6.1, "Template

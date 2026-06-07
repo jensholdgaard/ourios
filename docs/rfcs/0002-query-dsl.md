@@ -18,8 +18,9 @@ superseded-by: —
 > MCP agents). This RFC is now `specified` — §6 gives the design, §7 the
 > grammar, §5 the testable acceptance criteria. It advances to `red` →
 > `green` as the parser/compiler lands (the RFC 0007 execution layer it
-> targets is already implemented and tested — RFC 0007 §5), and to
-> `accepted` after the §9 validation.
+> targets is already implemented and tested — RFC 0007 §5); then, per the
+> `docs/rfcs/README.md` ladder, `validated` and finally `accepted` (a
+> maintainer flip) follow the §9 validation.
 > Hazard 6 (`CLAUDE.md` §4 — no DataFusion/SQL leakage) constrains the
 > whole design.
 
@@ -532,6 +533,7 @@ integer      = digit , { digit } ;
    number = integer | float ;  float = integer , "." , digit , { digit } ;
    boolean = "true" | "false" ;
    duration = integer , ( "s"|"m"|"h"|"d"|"w" ) ;  timestamp = RFC 3339 ;
+   digit = "0".."9" ;  letter = "a".."z" | "A".."Z" ;
    hex = digit | "a".."f" | "A".."F"
    — strings are double-quoted with backslash escapes; YAML embedding
    (RFC0002.10) wraps the whole query in a single-quoted YAML scalar so
@@ -571,7 +573,8 @@ two-loop: `#[ignore]`'d stubs first, implementations second).
 - [x] ~~**OTel ecosystem alignment**~~ *Resolved:* OpenTelemetry defines
       the logs data model + API/SDK but **no standard query/read
       language**, and **OTTL is a Collector *transformation* language, not
-      a querying surface** (OTTL README and the OTel logs spec, §11). There
+      a querying surface** (see the OTTL README and the OTel logs spec
+      linked in §11 References). There
       is no canonical OTel read syntax, and no Perses-specific query
       convention, to align to. Bespoke query syntax over the OTel data
       model is the norm (LogQL, PromQL, CloudWatch Insights), so Branch B

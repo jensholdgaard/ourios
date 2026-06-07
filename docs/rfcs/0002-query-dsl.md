@@ -18,7 +18,8 @@ superseded-by: —
 > MCP agents). This RFC is now `specified` — §6 gives the design, §7 the
 > grammar, §5 the testable acceptance criteria. It advances to `red` →
 > `green` as the parser/compiler lands (the RFC 0007 execution layer it
-> targets is already green), and to `accepted` after the §9 validation.
+> targets is already implemented and tested — RFC 0007 §5), and to
+> `accepted` after the §9 validation.
 > Hazard 6 (`CLAUDE.md` §4.6 — no DataFusion/SQL leakage) constrains the
 > whole design.
 
@@ -42,8 +43,10 @@ users (hazard `CLAUDE.md` §4.6). This RFC specifies it:
   `LogicalPlan`. Agents emit JSON, not syntax.
 
 The design rests on `ourios-querier` (RFC 0007), whose execution layer
-(predicate pushdown, tenant isolation, `QueryStats`) is already `green`;
-this RFC adds the *user-facing language* in front of it.
+(predicate pushdown, tenant isolation, `QueryStats`) is already
+implemented and tested (RFC 0007 §5 criteria all live; the RFC itself
+stays `specified` pending this DSL); this RFC adds the *user-facing
+language* in front of it.
 
 ## 2. Motivation
 
@@ -184,8 +187,8 @@ surface? Perses+OTel query conventions?) are folded into §9.
 
 > `Given/When/Then`, ids greppable from tests (`RFC0002.<n>`, referenced
 > verbatim in each test's leading doc comment). These specify the
-> parser + compiler that front-ends the (already-green) RFC 0007 execution
-> layer.
+> parser + compiler that front-ends the (already-implemented, RFC 0007 §5)
+> execution layer.
 
 - **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4.6]`**
   - **Given** a Branch-B predicate (e.g. `template_id == X and severity >= error`)

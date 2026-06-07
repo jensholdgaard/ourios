@@ -288,8 +288,9 @@ A predicate is a boolean expression over **paths**, **operators**, and
 **Paths.**
 
 - **Top-level fields** are bare identifiers mapping to the OTel log
-  data-model fields: `body` (Body — a free-form string *or* structured
-  map/array), `severity` (SeverityNumber), `ts` (Timestamp), `observed_ts`
+  data-model fields: `body` (Body — an OTel `AnyValue`: string, bool, int,
+  double, bytes, array, or kvlist/map), `severity` (SeverityNumber), `ts`
+  (Timestamp), `observed_ts`
   (ObservedTimestamp), `trace_id` (TraceId), `span_id` (SpanId), `scope`
   (InstrumentationScope name), `flags` (TraceFlags). (Backend treatment of
   structured `body` vs `attr.*` is not uniform across the ecosystem; the
@@ -409,11 +410,16 @@ flowchart LR
   line (the `|` newlines above are cosmetic) — the §4 P7 YAML constraint.
 
 - **Structured surface** is the machine contract (MCP tool schema +
-  programmatic clients): a JSON predicate tree (`{field, op, value}` with
-  `and`/`or`/`not` nodes) plus structured stages. It is the formalised,
-  extended successor to the existing `ourios_querier::QueryRequest` (the
-  RFC 0007 structured API) and is the stable surface agents target — no
-  grammar generation required.
+  programmatic clients): a JSON predicate tree — leaf **comparison nodes**
+  `{ "field": …, "op": …, "value": … }` and **boolean nodes**
+  `{ "and" | "or" | "not": [ … ] }` — plus an ordered **`stages`** array
+  mirroring the pipe stages (`range`/`count`/`sort`/`limit`/`project`).
+  Its **JSON Schema is published and versioned with the parser** (snapshot-
+  tested like the §7 grammar; RFC0002.11), and it compiles to the same IR
+  as the string surface (RFC0002.2). It is the formalised, extended
+  successor to the existing `ourios_querier::QueryRequest` (the RFC 0007
+  structured API) and is the stable surface agents target — no grammar
+  generation required.
 
 Both parse/validate to the **same query IR** and compile identically
 (RFC0002.2). The tenant is **not** expressed in either surface — it is
@@ -489,9 +495,15 @@ severity_name = "trace" | "debug" | "info" | "warn" | "error" | "fatal" ;  (* ca
 time         = "now" | ( [ "-" ] , duration ) | timestamp ;   (* e.g. now , -1h *)
 integer      = digit , { digit } ;
 (* lexical: ident = letter , { letter | digit | "_" } ;
-   string = '"' , { char } , '"' ;  number = integer | float ;
-   boolean = "true" | "false" ;  duration = integer , ( "s"|"m"|"h"|"d"|"w" ) ;
-   timestamp = RFC 3339 *)
+   string = '"' , { char | escape } , '"' ;
+   char   = any Unicode scalar except '"' or '\' ;
+   escape = '\' , ( '"' | '\' | "n" | "t" | "r" | ( "u" , 4 * hex ) ) ;
+   number = integer | float ;  boolean = "true" | "false" ;
+   duration = integer , ( "s"|"m"|"h"|"d"|"w" ) ;  timestamp = RFC 3339 ;
+   hex = digit | "a".."f" | "A".."F"
+   — strings are double-quoted with backslash escapes; YAML embedding
+   (RFC0002.10) wraps the whole query in a single-quoted YAML scalar so
+   these double quotes need no YAML-level escaping *)
 ```
 
 ## 8. Testing strategy
@@ -524,17 +536,18 @@ two-loop: `#[ignore]`'d stubs first, implementations second).
       pass on 10–20 sample queries with non-author reviewers, and a
       migration sketch from LogQL/Insights into β. (Replaces the prior
       §9 user-research gate; not required for `specified`.)
-- [x] ~~**OTel ecosystem alignment**~~ *Resolved (maintainer's
-      OpenTelemetry AI, 2026-06-07):* OTel defines the logs data model +
-      API/SDK but **no standard query/read language**; **OTTL is a
-      Collector *transformation* language, not a querying surface**; the
-      sources show no canonical OTel read syntax and no Perses-specific
-      query convention. Bespoke query syntax over the OTel data model is
-      the norm — there is **nothing to align to beyond the field
-      semantics**, which §6.1/§6.2 honour (`ts`/`observed_ts`/`trace_id`/
-      `span_id`/`flags`/`body`/`scope`/`severity` map to the canonical
-      data-model fields, and `severity` ordering is on `SeverityNumber`).
-      Confirms Branch B carries no ecosystem-divergence cost.
+- [x] ~~**OTel ecosystem alignment**~~ *Resolved:* OpenTelemetry defines
+      the logs data model + API/SDK but **no standard query/read
+      language**, and **OTTL is a Collector *transformation* language, not
+      a querying surface** (OTTL README and the OTel logs spec, §11). There
+      is no canonical OTel read syntax, and no Perses-specific query
+      convention, to align to. Bespoke query syntax over the OTel data
+      model is the norm (LogQL, PromQL, CloudWatch Insights), so Branch B
+      carries no ecosystem-divergence cost — the alignment that matters is
+      at the **field semantics**, which §6.1/§6.2 honour
+      (`ts`/`observed_ts`/`trace_id`/`span_id`/`flags`/`body`/`scope`/
+      `severity` → canonical data-model fields; `severity` ordering on
+      `SeverityNumber`).
 - [ ] `--sql` advanced-mode escape hatch — gated + sandboxed, or never?
       (Currently: never; reconsider under a separate RFC.)
 - [ ] Custom user functions — out for v1 (sandboxing is its own project).

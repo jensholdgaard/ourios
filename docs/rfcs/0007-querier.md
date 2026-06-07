@@ -229,13 +229,13 @@ Mapped to `CLAUDE.md` §6.2:
   B1/B2 measurement) is branch-independent (RFC 0002 §5.5), and
   B1/B2 are the project's largest unmeasured risk — building the
   branch-independent half now buys the thesis signal soonest. The
-  parser integration waits on RFC 0002 (§8).
+  parser integration landed once RFC 0002 §3 resolved (Branch B); see §8.
 
 ## 8. Open questions
 
-- [ ] Blocked on RFC 0002 §3 (Branch A vs B) before the parser
-      integration is final — but the execution layer here is
-      branch-independent.
+- [x] RFC 0002 §3 resolved (Branch B, #143) and the parser integration
+      landed (#145–#154; RFC 0002 is `green`). The execution layer here was
+      branch-independent throughout, as planned.
 - [ ] `ListingTable` vs a custom `TableProvider` — does partition
       pruning over object storage need the custom provider, or does
       the listing table's pruning suffice?

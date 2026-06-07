@@ -18,7 +18,8 @@ superseded-by: —
 > MCP agents). This RFC is now **`green`** — all 11 §5 acceptance
 > criteria (RFC0002.1–.11) have passing tests
 > (`crates/ourios-querier/tests/rfc0002_dsl.rs`), landed across PRs
-> #144–#154: the Branch-B parser + structured surface → one IR, the
+> #143 (this spec) and #144–#154 (the red gate + implementation): the
+> Branch-B parser + structured surface → one IR, the
 > IR→DataFusion compile, YAML-embeddability + the structured JSON Schema,
 > and `resolves_to` alias-set expansion via the RFC 0001 §6.7 operator
 > alias map. §6 gives the design, §7 the grammar, §5 the criteria. Per the

@@ -194,9 +194,10 @@ surface? Perses+OTel query conventions?) are folded into §9.
     over RFC 0007 §4.3's pushdown keys (notably `template_id` and
     `time_unix_nano`) prune row groups; for the subset the current
     `ourios_querier` structured request can express (template + time) the
-    DSL result is identical to it. Severity is compiled per RFC 0007 §4.3
-    (the `severity_number` mapping of §6.2/RFC0002.5, not necessarily the
-    `severity_text` equality the current request supports), and predicates
+    DSL result is identical to it. Severity compiles via the §6.2/RFC0002.5
+    `severity_number` mapping (the column is RFC 0005's `severity_number`),
+    not the `severity_text` equality the current request supports, and
+    predicates
     over non-indexed fields (`service`, `attr.*`) compile to a correct
     `Filter` with no row-group-pruning claim (indexed `service.name`
     pushdown would be a future RFC 0005 §3.6 amendment).
@@ -314,9 +315,12 @@ terse aliases `&&`, `||`, `!`; grouping with `()`.
 booleans (`true`/`false`), `null`, duration literals (`30s`, `1h`, `1d`,
 `1w`), and RFC 3339 timestamps.
 
-**Functions** (read-only, bespoke names tuned for queries):
-`matches(path, regex)`, `contains(path, s)`, `starts_with(path, s)`,
-`ends_with(path, s)`, `len(path)`.
+**Functions** (read-only, bespoke names tuned for queries) — boolean
+predicate terms: `matches(path, regex)`, `contains(path, s)`,
+`starts_with(path, s)`, `ends_with(path, s)`. (Scalar-returning functions
+such as `len(path)` are **deferred**: the grammar admits a call only as a
+boolean term, so a numeric `len(...) > n` would need a scalar-comparison
+form — added under a future minor version when a need surfaces.)
 
 **Worked predicate.**
 
@@ -391,18 +395,19 @@ flowchart LR
   ```
 
   Stages: `range(from, to)` (relative durations or RFC 3339; defaults per
-  §4.5), `count [by <fields>]` and other aggregations (`sum`, `min`,
+  §4 P5), `count [by <fields>]` and other aggregations (`sum`, `min`,
   `max`, `avg` over a path), `sort <field-or-aggregate> [asc|desc]`
   (the §7 `sort_key` — a field or an aggregate output like `count`),
   `limit <n>`,
   `project <fields>` / `render`. The whole query is expressible on one
-  line (the `|` newlines above are cosmetic) — the §4.7 YAML constraint.
+  line (the `|` newlines above are cosmetic) — the §4 P7 YAML constraint.
 
 - **Structured surface** is the machine contract (MCP tool schema +
   programmatic clients): a JSON predicate tree (`{field, op, value}` with
-  `and`/`or`/`not` nodes) plus structured stages. It is the formalised
-  successor to the throwaway `ourios_querier::QueryRequest` and is the
-  stable surface agents target — no grammar generation required.
+  `and`/`or`/`not` nodes) plus structured stages. It is the formalised,
+  extended successor to the existing `ourios_querier::QueryRequest` (the
+  RFC 0007 structured API) and is the stable surface agents target — no
+  grammar generation required.
 
 Both parse/validate to the **same query IR** and compile identically
 (RFC0002.2). The tenant is **not** expressed in either surface — it is

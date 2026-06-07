@@ -325,10 +325,13 @@ booleans (`true`/`false`), `null`, duration literals (`30s`, `1h`, `1d`,
 
 **Functions** (read-only, bespoke names tuned for queries) — boolean
 predicate terms: `matches(path, regex)`, `contains(path, s)`,
-`starts_with(path, s)`, `ends_with(path, s)`. (Scalar-returning functions
-such as `len(path)` are **deferred**: the grammar admits a call only as a
-boolean term, so a numeric `len(...) > n` would need a scalar-comparison
-form — added under a future minor version when a need surfaces.)
+`starts_with(path, s)`, `ends_with(path, s)`. They require a **string
+operand**: applying one to a non-string path (`severity`, a numeric/bool
+attribute, `lossy`, `ts`) is a compile-time type error (RFC0002.8), not a
+silent coercion. (Scalar-returning functions such as `len(path)` are
+**deferred**: the grammar admits a call only as a boolean term, so a
+numeric `len(...) > n` would need a scalar-comparison form — added under a
+future minor version when a need surfaces.)
 
 **Worked predicate.**
 
@@ -422,7 +425,7 @@ flowchart LR
   a **comparison node** `{ "field": …, "op": …, "value": … }`, a **call
   node** `{ "call": "<fn>", "args": [ … ] }` whose `args` follow the §7
   typed signatures — `matches`/`contains`/`starts_with`/`ends_with` take
-  `[ <path-string>, <string> ]`, `resolves_to` takes `[ <number> ]`), or a
+  `[ <path-string>, <string> ]`, `resolves_to` takes `[ <number> ]`, or a
   **boolean node**
   (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
   array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a

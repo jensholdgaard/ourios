@@ -2604,6 +2604,7 @@ version = "0.0.0"
 dependencies = [
  "arrow-array 55.2.0",
  "arrow-schema 55.2.0",
+ "chrono",
  "datafusion",
  "ourios-core",
  "ourios-parquet",

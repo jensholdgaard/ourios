@@ -14,8 +14,9 @@ superseded-by: —
 > **Status note.** **`green`** — the §5 acceptance criteria
 > RFC0007.1–.5 all have live passing tests
 > (`crates/ourios-querier/tests/{execution,boundary,forward_compat}.rs`
-> and the `lib.rs` no-leakage unit test; `tests/acceptance.rs` is now a
-> pointer to them). It pins the *execution* layer — how a compiled query
+> and the `crates/ourios-querier/src/lib.rs` no-leakage unit test;
+> `crates/ourios-querier/tests/acceptance.rs` is now a pointer to them).
+> It pins the *execution* layer — how a compiled query
 > runs against the RFC 0005 Parquet contract with predicate pushdown, and
 > how the B1/B2 thesis gates are measured. The status was held at
 > `specified` by the prove-thesis gate (it deliberately did not re-decide

@@ -412,7 +412,8 @@ flowchart LR
 - **Structured surface** is the machine contract (MCP tool schema +
   programmatic clients): a JSON predicate tree — leaf **comparison nodes**
   `{ "field": …, "op": …, "value": … }` and **boolean nodes**
-  `{ "and" | "or" | "not": [ … ] }` — plus an ordered **`stages`** array
+  (`{ "and": [ … ] }` / `{ "or": [ … ] }` with a child array; `{ "not":
+  <node> }` **unary**, per §7) — plus an ordered **`stages`** array
   mirroring the pipe stages (`range`/`count`/`sort`/`limit`/`project`).
   Its **JSON Schema is published and versioned with the parser** (snapshot-
   tested like the §7 grammar; RFC0002.11), and it compiles to the same IR
@@ -423,7 +424,8 @@ flowchart LR
 
 Both parse/validate to the **same query IR** and compile identically
 (RFC0002.2). The tenant is **not** expressed in either surface — it is
-supplied by the executing context (RFC 0007 §3.7 / RFC0007.5); a query
+supplied by the executing context (`CLAUDE.md` §3.7 multi-tenancy;
+enforced per RFC0007.5); a query
 without a tenant is an API usage error, not a cross-tenant scan.
 
 ### 6.5 Compilation target
@@ -498,7 +500,8 @@ integer      = digit , { digit } ;
    string = '"' , { char | escape } , '"' ;
    char   = any Unicode scalar except '"' or '\' ;
    escape = '\' , ( '"' | '\' | "n" | "t" | "r" | ( "u" , 4 * hex ) ) ;
-   number = integer | float ;  boolean = "true" | "false" ;
+   number = integer | float ;  float = integer , "." , digit , { digit } ;
+   boolean = "true" | "false" ;
    duration = integer , ( "s"|"m"|"h"|"d"|"w" ) ;  timestamp = RFC 3339 ;
    hex = digit | "a".."f" | "A".."F"
    — strings are double-quoted with backslash escapes; YAML embedding

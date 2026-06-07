@@ -191,7 +191,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > execution layer.
 
 - **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4.6]`**
-  - **Given** a Branch-B predicate (e.g. `template_id == X and severity >= error`)
+  - **Given** a Branch-B predicate (e.g. `template_id == 42 and severity >= error`)
   - **When** it is parsed and compiled
   - **Then** it yields the query IR and a DataFusion `Filter`. Predicates
     over RFC 0007 §4.3's pushdown keys prune the scan per that section's
@@ -258,7 +258,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
     message.
 
 - **RFC0002.9 — Template primitives compile `[§6.3]`**
-  - **Given** `template_id == X`, `resolves_to(X)`, `lossy == true`,
+  - **Given** `template_id == 42`, `resolves_to(42)`, `lossy == true`,
     `confidence < 0.7`
   - **When** compiled
   - **Then** each compiles to the documented plan (`resolves_to` expands
@@ -362,8 +362,8 @@ First-class vocabulary — **Ourios-specific** extensions (RFC 0001
 §6.3/§6.7), **not** OpenTelemetry log-data-model fields; they live in the
 Ourios schema + query layer alongside the OTel-canonical fields of §6.2:
 
-- `template_id == X` — exact template; resolves to the `template_id` column.
-- `resolves_to(X)` — `X` plus its drift aliases (the RFC 0001 §6.7 drift
+- `template_id == 42` — exact template; resolves to the `template_id` column.
+- `resolves_to(42)` — `X` plus its drift aliases (the RFC 0001 §6.7 drift
   question); compiles to alias-set membership over `template_id`.
 - `confidence` — miner confidence (e.g. `< 0.7`); the `confidence` column.
 - `lossy` — the lossy-reconstruction flag; resolves to the RFC 0001 /
@@ -441,7 +441,7 @@ Every construct compiles to a DataFusion `LogicalPlan`:
 | `limit` | `Limit` |
 | `project` | `Projection` |
 | `render` | custom projection honouring the three-zone reconstruction model |
-| `resolves_to(X)` | custom node expanding to alias-set membership |
+| `resolves_to(42)` | custom node expanding to alias-set membership |
 
 All but `render` and `resolves_to` are DataFusion's built-in algebra;
 those two are the only Ourios extensions, both surface-independent.

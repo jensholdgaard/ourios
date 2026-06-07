@@ -194,10 +194,12 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Given** a Branch-B predicate (e.g. `template_id == X and severity >= error`)
   - **When** it is parsed and compiled
   - **Then** it yields the query IR and a DataFusion `Filter`. Predicates
-    over RFC 0007 §4.3's pushdown keys (notably `template_id` and
-    `time_unix_nano`) prune row groups; for the subset the current
-    `ourios_querier` structured request can express (template + time) the
-    DSL result is identical to it. Severity compiles via the §6.2/RFC0002.5
+    over RFC 0007 §4.3's pushdown keys prune the scan per that section's
+    split — `template_id` skips row groups (B1), `time_unix_nano` prunes
+    partitions and row groups, `tenant_id` prunes partition directories
+    (not row groups); for the subset the current `ourios_querier`
+    structured request can express (template + time) the DSL result is
+    identical to it. Severity compiles via the §6.2/RFC0002.5
     `severity_number` mapping (the column is RFC 0005's `severity_number`),
     not the `severity_text` equality the current request supports, and
     predicates
@@ -398,11 +400,12 @@ flowchart LR
   ```
 
   Stages: `range(from, to)` (relative durations or RFC 3339; defaults per
-  §4 P5), `count [by <fields>]` and other aggregations (`sum`, `min`,
+  §4 P5), `count [by <field, …>]` (comma-separated, per the §7
+  `field_list`) and other aggregations (`sum`, `min`,
   `max`, `avg` over a path), `sort <field-or-aggregate> [asc|desc]`
   (the §7 `sort_key` — a field or an aggregate output like `count`),
   `limit <n>`,
-  `project <fields>` / `render`. The whole query is expressible on one
+  `project <field, …>` / `render`. The whole query is expressible on one
   line (the `|` newlines above are cosmetic) — the §4 P7 YAML constraint.
 
 - **Structured surface** is the machine contract (MCP tool schema +

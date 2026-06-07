@@ -67,8 +67,9 @@ fn h1_2_lossy_zone_match_retains_body() {
     // second line must NOT force-merge into the first candidate:
     // it gets a fresh leaf, retains its body, and carries
     // `confidence = sim/threshold < 1.0` with `lossy_flag = false`
-    // (the flag is reserved for §6.6 tokenizer failure, not a
-    // low-confidence parse). This is the §3.1 "no silent merge"
+    // (`lossy_flag` marks non-reconstructable records — tokenizer or
+    // parse failure — whereas a lossy-zone match is fully
+    // reconstructable). This is the §3.1 "no silent merge"
     // boundary expressed as a positive: a sub-threshold match is
     // recorded losslessly, never coalesced.
     let records = SharedRecordSink::new();
@@ -134,7 +135,7 @@ fn h1_2_lossy_zone_match_retains_body() {
     );
     assert!(
         !lossy_rec.lossy_flag,
-        "lossy_flag is reserved for §6.6 tokenizer failure, not a low-confidence parse",
+        "lossy_flag marks non-reconstructable records (tokenizer/parse failure), not a reconstructable lossy-zone match",
     );
 
     // Confidence reflects the sub-threshold match: sim/threshold =

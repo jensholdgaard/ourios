@@ -212,10 +212,10 @@ impl AliasMap {
     /// provider is installed, so constructing and recording is always
     /// safe).
     ///
-    /// The two counters are seeded with a zero `add` so they surface in
-    /// the first collection cycle even at zero traffic (§6.8
-    /// collect-on-read). The seed carries no `tenant_id` attribute — a
-    /// per-tenant point appears on the first real assertion / retraction.
+    /// `alias_assertions_total` / `alias_retractions_total` carry a
+    /// `tenant_id` attribute, so a per-tenant point appears on the first
+    /// real assertion / retraction (§6.8 collect-on-read) — they are not
+    /// zero-seeded, which would emit a spurious attribute-less series.
     #[must_use]
     pub fn new() -> Self {
         let meter = global::meter("ourios.miner");

@@ -64,16 +64,16 @@ fn rfc0001_12_alias_assertion_is_durably_recorded_and_in_the_map() {
     assert_eq!(events[0].tenant_id, t);
     let AuditPayload::AliasAsserted {
         representative_id,
-        ref member_ids,
+        member_ids,
         ..
-    } = events[0].payload
+    } = &events[0].payload
     else {
         panic!(
             "expected an AliasAsserted payload, got {:?}",
             events[0].payload
         );
     };
-    assert_eq!(representative_id, a);
+    assert_eq!(*representative_id, a);
     assert_eq!(member_ids, &vec![b]);
 
     assert_eq!(map.resolves(&t, a), set([a, b]));
@@ -154,16 +154,16 @@ fn rfc0001_15_retraction_removes_a_member_and_rederives_canonical() {
     assert_eq!(events.len(), 1, "the retraction is itself audited");
     let AuditPayload::AliasRetracted {
         representative_id,
-        ref member_ids,
+        member_ids,
         ..
-    } = events[0].payload
+    } = &events[0].payload
     else {
         panic!(
             "expected an AliasRetracted payload, got {:?}",
             events[0].payload
         );
     };
-    assert_eq!(representative_id, a);
+    assert_eq!(*representative_id, a);
     assert!(member_ids.is_empty());
 
     assert_eq!(map.resolves(&t, a), set([a]));

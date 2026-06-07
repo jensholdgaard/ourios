@@ -405,7 +405,8 @@ flowchart LR
     | limit 10
   ```
 
-  Stages: `range(from, to)` (relative durations or RFC 3339; defaults per
+  Stages: `range(from, to)` (each bound a relative duration, the `now`
+  keyword, or an RFC 3339 timestamp — the §7 `time` form; defaults per
   §4 P5), `count [by <field, …>]` (comma-separated, per the §7
   `field_list`) and other aggregations (`sum`, `min`,
   `max`, `avg` over a path), `sort <field-or-aggregate> [asc|desc]`
@@ -417,15 +418,19 @@ flowchart LR
 - **Structured surface** is the machine contract (MCP tool schema +
   programmatic clients): a top-level object
   `{ "predicate": <node>, "stages": [ <stage>, … ] }` (`stages` optional,
-  default `[]`). Atoms encode §7 directly: a **`field`** is a string equal
-  to a §7 `path` (`"service"`, `"attr.http.status_code"`); an **`op`** is a
-  §7 `cmp_op` string (`"=="`, `">="`, `"=~"`, …); a **`value`** is a JSON
+  default `[]`). A **`field`** is **structured** (no DSL path syntax for
+  agents to build or escape): a bare top-level name string (`"service"`,
+  `"severity"`, `"body"`, `"trace_id"`, …) or an attribute object
+  `{ "resource": "<key>" }` / `{ "attr": "<key>" }` (`<key>` the raw OTel
+  attribute key, e.g. `"k8s.pod.name"`). An **`op`** is a §7 `cmp_op`
+  string (`"=="`, `">="`, `"=~"`, …); a **`value`** is a JSON
   primitive (string / number / bool / null), with durations and timestamps
   carried as their §7 lexical strings (`"1h"`, RFC 3339). A **`<node>`** is
   a **comparison node** `{ "field": …, "op": …, "value": … }`, a **call
   node** `{ "call": "<fn>", "args": [ … ] }` whose `args` follow the §7
   typed signatures — `matches`/`contains`/`starts_with`/`ends_with` take
-  `[ <path-string>, <string> ]`, `resolves_to` takes `[ <number> ]`, or a
+  `[ <field>, <string> ]` (`<field>` as above), `resolves_to` takes
+  `[ <number> ]`, or a
   **boolean node**
   (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
   array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a

@@ -227,9 +227,6 @@ impl AliasMap {
             .u64_counter(METRIC_ALIAS_RETRACTIONS_TOTAL)
             .with_unit("{retraction}")
             .build();
-        assertions_total.add(0, &[]);
-        retractions_total.add(0, &[]);
-
         Self {
             classes: HashMap::new(),
             assertions_total,
@@ -361,10 +358,10 @@ impl AliasMap {
     /// (RFC 0001 §6.7); it re-derives whenever membership changes.
     #[must_use]
     pub fn canonical(&self, tenant: &TenantId, id: u64) -> u64 {
-        self.resolves(tenant, id)
-            .iter()
-            .next()
-            .copied()
+        self.classes
+            .get(tenant)
+            .and_then(|classes| classes.iter().find(|c| c.contains(&id)))
+            .and_then(|c| c.first().copied())
             .unwrap_or(id)
     }
 

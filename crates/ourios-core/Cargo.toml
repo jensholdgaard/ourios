@@ -30,6 +30,21 @@ blake3 = { version = "1", default-features = false }
 # derives so the spec mapping stays single-sourced through the proto
 # crate.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# The OTel metrics **API** only (RFC 0001 §6.8 "Export architecture":
+# library crates depend on the lightweight API and resolve instruments
+# through `global::meter`; the heavy SDK + OTLP exporter live in
+# `ourios-telemetry`). Drives the alias map's
+# `alias_assertions_total` / `alias_retractions_total` counters
+# (§6.8 telemetry table).
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+
+[dev-dependencies]
+# `init_in_memory` collects the alias counters' exported metric stream
+# through an in-memory reader (no OTLP endpoint) in the §6.8 telemetry
+# unit test — same pattern as the compaction-metrics test.
+ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
 [lints]
 workspace = true

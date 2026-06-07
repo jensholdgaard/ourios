@@ -110,6 +110,17 @@ pub enum AuditBatchError {
         old_template: String,
         new_template: String,
     },
+    /// An `alias_asserted` / `alias_retracted` event (RFC 0001 §6.7)
+    /// was handed to the audit-Parquet writer, whose §3.7 schema has
+    /// no columns to represent the alias payload (`representative_id`,
+    /// `member_ids`, `actor`, `reason`). Adding those columns is the
+    /// RFC 0005 storage split (sibling to issue #147), deliberately
+    /// out of scope for the alias write-path slice — so the writer
+    /// rejects rather than inventing columns or dropping the event
+    /// silently. Carries the offending `event_type` for diagnostics.
+    /// Alias events are durable via the alias event log; their
+    /// audit-Parquet materialization waits for that split.
+    AliasEventNotYetPersistable { event_type: &'static str },
     /// Arrow rejected the constructed `RecordBatch` (column-length
     /// mismatch, schema-shape mismatch). Internal bug if it ever
     /// fires — the array builders are constructed against
@@ -141,6 +152,13 @@ impl fmt::Display for AuditBatchError {
                  = {new_template:?}, but RFC 0005 §3.7 requires they be equal for this \
                  variant (template tokens don't change)",
             ),
+            Self::AliasEventNotYetPersistable { event_type } => write!(
+                f,
+                "audit event {event_type} (RFC 0001 §6.7 alias write path) is not yet \
+                 representable in the audit-Parquet schema; the alias columns are the RFC \
+                 0005 storage split (issue #147 sibling). Alias events are durable via the \
+                 alias event log, not this writer.",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -151,7 +169,8 @@ impl std::error::Error for AuditBatchError {
         match self {
             Self::PreEpochTimestamp
             | Self::TimestampOverflow { .. }
-            | Self::TemplateMustNotChange { .. } => None,
+            | Self::TemplateMustNotChange { .. }
+            | Self::AliasEventNotYetPersistable { .. } => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -284,6 +303,16 @@ impl Builders {
                     None => self.triggering_line_sample.append_null(),
                 }
                 self.append_template_change(change)?;
+            }
+            AuditPayload::AliasAsserted { .. } | AuditPayload::AliasRetracted { .. } => {
+                // RFC 0001 §6.7 alias events have no audit-Parquet
+                // columns yet — that schema extension is the RFC 0005
+                // split (#147 sibling). Reject rather than persist a
+                // lossy row; alias events are durable via the alias
+                // event log meanwhile.
+                return Err(AuditBatchError::AliasEventNotYetPersistable {
+                    event_type: e.payload.event_type(),
+                });
             }
             AuditPayload::Compaction {
                 partition,
@@ -633,5 +662,31 @@ mod tests {
         let err = audit_events_to_batch(std::slice::from_ref(&e))
             .expect_err("pre-epoch timestamp must error");
         assert!(matches!(err, AuditBatchError::PreEpochTimestamp));
+    }
+
+    #[test]
+    fn alias_events_are_rejected_pending_the_rfc_0005_split() {
+        // RFC 0001 §6.7 alias events have no audit-Parquet columns yet
+        // (the RFC 0005 storage split). The writer must reject them
+        // rather than persist a lossy row or panic; they stay durable
+        // via the alias event log meanwhile.
+        let asserted = AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: ts(1_775_127_600),
+            payload: AuditPayload::AliasAsserted {
+                representative_id: 1,
+                member_ids: vec![2],
+                actor: ourios_core::alias::ActorId::new("op").expect("non-empty actor"),
+                reason: String::new(),
+            },
+        };
+        let err = audit_events_to_batch(std::slice::from_ref(&asserted))
+            .expect_err("alias events are not yet persistable");
+        assert!(matches!(
+            err,
+            AuditBatchError::AliasEventNotYetPersistable {
+                event_type: "alias_asserted"
+            }
+        ));
     }
 }

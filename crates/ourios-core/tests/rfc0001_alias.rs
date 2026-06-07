@@ -63,7 +63,7 @@ fn rfc0001_14_alias_sets_are_per_tenant_isolated() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[ignore = "RFC 0001 alias write path pending (RFC0001.15)"]
 #[test]
-fn rfc0001_15_retraction_removes_a_member_and_redrives_canonical() {
+fn rfc0001_15_retraction_removes_a_member_and_rederives_canonical() {
     unimplemented!(
         "RFC0001.15 — retracting member A (the canonical / smallest) from class {{A, B}} \
          under tenant T emits a durable `alias_retracted` audit event (same \

@@ -467,7 +467,50 @@ fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
 /// Scenario RFC0001.11 — `severity_number = 0` and `scope_name = None` are distinct key buckets.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_11_severity_zero_and_scope_none_are_distinct_key_buckets() {
-    todo!("RFC 0001 §6.1 (Template-key composition)");
+    use std::collections::HashSet;
+
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — four records with identical body text, varying only
+    // across the full `(severity_number, scope_name)` cross-product
+    // of the two edge-case key positions the RFC locks: severity `0`
+    // (`UNSPECIFIED`, a valid OTLP value) and scope `None` (absent).
+    // Per RFC §6.1, `0` is its own severity bucket and `None` is its
+    // own scope bucket — never coalesced with a specified severity
+    // or named scope. The four `(severity, scope)` combinations must
+    // therefore yield four distinct `template_id`s.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let make = |severity: u8, scope: Option<&str>| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String("user logged in".to_string())),
+        severity_number: severity,
+        scope_name: scope.map(str::to_string),
+        ..Default::default()
+    };
+
+    // Act — (0, None), (0, Some), (9, None), (9, Some).
+    let id_0_none = cluster.ingest(&make(0, None));
+    let id_0_some = cluster.ingest(&make(0, Some("lib.x")));
+    let id_9_none = cluster.ingest(&make(9, None));
+    let id_9_some = cluster.ingest(&make(9, Some("lib.x")));
+
+    // Assert — four distinct ids (one per key bucket), four
+    // templates, no widening coalescing any pair of buckets.
+    let ids = HashSet::from([id_0_none, id_0_some, id_9_none, id_9_some]);
+    assert_eq!(
+        ids.len(),
+        4,
+        "each (severity, scope) bucket — including (0, None) — must get its own template_id; got {ids:?}",
+    );
+    assert_eq!(cluster.template_count(&t), 4);
+    assert_eq!(
+        cluster.merges_total(),
+        0,
+        "the UNSPECIFIED-severity / None-scope buckets must never coalesce with specified ones",
+    );
 }

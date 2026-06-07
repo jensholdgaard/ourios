@@ -128,17 +128,101 @@ fn h1_3_every_widening_emits_an_audit_event() {
 /// Scenario H1.4 — `severity_number` is part of the template key (no INFO/ERROR silent merge).
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h1_4_severity_number_is_part_of_template_key() {
-    todo!("RFC 0001 §6.1 (Template-key composition), §6.2");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — two records whose body text and scope are byte-for-
+    // byte identical, differing only in `severity_number`: `9`
+    // (INFO) vs `17` (ERROR). Per RFC §6.1 *Template-key
+    // composition*, `severity_number` is part of the key, so the
+    // two must never share a `template_id` — an INFO line surfacing
+    // under an ERROR query (or vice versa) is the §3.1 / §4-hazard-1
+    // silent-merge bug in disguise. The body text masks to no tag,
+    // so a key that ignored severity would collapse them
+    // (sim_seq = 1.0).
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let make = |severity: u8| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String("user logged in".to_string())),
+        severity_number: severity,
+        scope_name: Some("lib.auth".to_string()),
+        ..Default::default()
+    };
+
+    // Act
+    let id_info = cluster.ingest(&make(9));
+    let id_error = cluster.ingest(&make(17));
+
+    // Assert — distinct ids, two templates, and no widening or
+    // merge ever coalesced the two severity buckets.
+    assert_ne!(
+        id_info, id_error,
+        "identical body+scope at different severities must not share a template_id",
+    );
+    assert_eq!(cluster.template_count(&t), 2);
+    assert_eq!(
+        cluster.merges_total(),
+        0,
+        "no widening may coalesce the INFO and ERROR severity buckets",
+    );
 }
 
 /// Scenario H1.5 — `scope_name` is part of the template key (no cross-scope silent merge).
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h1_5_scope_name_is_part_of_template_key() {
-    todo!("RFC 0001 §6.1 (Template-key composition), §6.2");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — three records with identical body text and severity,
+    // varying only in `scope_name`: `Some("lib.auth")`,
+    // `Some("lib.payments")`, and `None`. Per RFC §6.1
+    // *Template-key composition*, `scope_name` is part of the key
+    // and `None` is its own bucket — so all three must land on
+    // distinct `template_id`s. Collapsing two scopes onto one
+    // template surfaces a `lib.payments` event under a `lib.auth`
+    // query, the §3.1 / §4-hazard-1 silent merge.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("tenant-x");
+    let make = |scope: Option<&str>| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String("user logged in".to_string())),
+        severity_number: 9,
+        scope_name: scope.map(str::to_string),
+        ..Default::default()
+    };
+
+    // Act
+    let id_auth = cluster.ingest(&make(Some("lib.auth")));
+    let id_pay = cluster.ingest(&make(Some("lib.payments")));
+    let id_none = cluster.ingest(&make(None));
+
+    // Assert — all three distinct (incl. the `None` bucket), three
+    // templates, no widening.
+    assert_ne!(
+        id_auth, id_pay,
+        "identical body+severity across two named scopes must not share a template_id",
+    );
+    assert_ne!(
+        id_auth, id_none,
+        "a named scope must not share a template_id with the `None` scope bucket",
+    );
+    assert_ne!(
+        id_pay, id_none,
+        "a named scope must not share a template_id with the `None` scope bucket",
+    );
+    assert_eq!(cluster.template_count(&t), 3);
+    assert_eq!(
+        cluster.merges_total(),
+        0,
+        "no widening may coalesce two scopes onto one template",
+    );
 }
 
 /// Scenario H2.1 — Oversized parameter triggers OVERFLOW marker and forced body retention.

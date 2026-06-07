@@ -2608,6 +2608,9 @@ dependencies = [
  "ourios-core",
  "ourios-parquet",
  "parquet 55.2.0",
+ "proptest",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

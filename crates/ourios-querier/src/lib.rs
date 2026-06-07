@@ -36,6 +36,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod dsl;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

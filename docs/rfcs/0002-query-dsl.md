@@ -189,11 +189,14 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Given** a Branch-B predicate (e.g. `template_id == X and severity >= error`)
   - **When** it is parsed and compiled
   - **Then** it yields the query IR and a DataFusion `Filter`. Predicates
-    over the RFC 0005 §3.6 indexed columns (`template_id`,
-    `time_unix_nano`, `severity_text`) push down and prune row groups
-    identically to the equivalent `ourios_querier` structured request;
-    predicates over non-indexed fields (`service`, `attr.*`) compile to a
-    correct `Filter` with no row-group-pruning claim (adding `service.name`
+    over RFC 0007 §4.3's pushdown keys (notably `template_id` and
+    `time_unix_nano`) prune row groups; for the subset the current
+    `ourios_querier` structured request can express (template + time) the
+    DSL result is identical to it. Severity is compiled per RFC 0007 §4.3
+    (the `severity_number` mapping of §6.2/RFC0002.5, not necessarily the
+    `severity_text` equality the current request supports), and predicates
+    over non-indexed fields (`service`, `attr.*`) compile to a correct
+    `Filter` with no row-group-pruning claim (indexed `service.name`
     pushdown would be a future RFC 0005 §3.6 amendment).
 
 - **RFC0002.2 — String DSL and structured surface compile to the same plan `[§6.4]`**
@@ -319,6 +322,8 @@ prior draft:
 | `trace_id`, `span_id` | the dedicated columns (log↔trace correlation) |
 | `scope` | `scope_name` |
 | `severity` | `severity_number` (via the §6.1 mapping) |
+| `ts` | `time_unix_nano` (the event timestamp; what `range(...)` filters) |
+| `observed_ts` | `observed_time_unix_nano` |
 
 ### 6.3 Template + correctness primitives
 

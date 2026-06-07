@@ -185,14 +185,16 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > parser + compiler that front-ends the (already-green) RFC 0007 execution
 > layer.
 
-- **RFC0002.1 — A Branch-B predicate parses and compiles to a pushdown filter `[§4.6]`**
-  - **Given** a Branch-B predicate (e.g. `service == "api" and severity >= error`)
+- **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[§4.6]`**
+  - **Given** a Branch-B predicate (e.g. `template_id == X and severity >= error`)
   - **When** it is parsed and compiled
-  - **Then** it yields the query IR and a DataFusion `Filter` whose
-    column predicates match those the RFC 0007 execution layer already
-    pushes down (`template_id`, `time_unix_nano`, `severity_text`,
-    `service.name`), and the result is identical to issuing the equivalent
-    `ourios_querier` structured request.
+  - **Then** it yields the query IR and a DataFusion `Filter`. Predicates
+    over the RFC 0005 §3.6 indexed columns (`template_id`,
+    `time_unix_nano`, `severity_text`) push down and prune row groups
+    identically to the equivalent `ourios_querier` structured request;
+    predicates over non-indexed fields (`service`, `attr.*`) compile to a
+    correct `Filter` with no row-group-pruning claim (adding `service.name`
+    pushdown would be a future RFC 0005 §3.6 amendment).
 
 - **RFC0002.2 — String DSL and structured surface compile to the same plan `[§6.4]`**
   - **Given** a query expressed both as a β string and as the structured
@@ -300,7 +302,7 @@ booleans (`true`/`false`), `null`, duration literals (`30s`, `1h`, `1d`,
 
 **Worked predicate.**
 
-```
+```text
 service == "api" and severity >= error and attr.http.status_code == 500
 ```
 
@@ -345,7 +347,7 @@ flowchart LR
 - **String DSL (surface β)** is the human surface (esp. Perses YAML). A
   query is a predicate optionally followed by `|`-separated stages:
 
-  ```
+  ```text
   service == "api" and severity >= error
     | range(-1h, now)
     | count by template_id
@@ -410,7 +412,7 @@ predicate    = or_expr ;
 or_expr      = and_expr , { ("or" | "||") , and_expr } ;
 and_expr     = unary , { ("and" | "&&") , unary } ;
 unary        = [ "not" | "!" ] , ( comparison | call | "(" , predicate , ")" ) ;
-comparison   = path , cmp_op , literal ;
+comparison   = path , cmp_op , value ;
 cmp_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
 call         = ident , "(" , [ arg , { "," , arg } ] , ")" ;
 arg          = path | literal ;
@@ -423,14 +425,22 @@ dotted_key   = ident , { "." , ident } ;
 stage        = "range" , "(" , time , "," , time , ")"
              | "count" , [ "by" , field_list ]
              | agg_fn , "(" , path , ")" , [ "by" , field_list ]
-             | "sort" , field , [ "asc" | "desc" ]
+             | "sort" , sort_key , [ "asc" | "desc" ]
              | "limit" , integer
              | "project" , field_list
              | "render" ;
 agg_fn       = "sum" | "min" | "max" | "avg" ;
+field_list   = field , { "," , field } ;
+sort_key     = field | ident ;          (* ident = an aggregate output, e.g. count *)
+value        = literal | severity_name ;
 literal      = string | number | boolean | "null" | duration | timestamp ;
-(* lexical: ident, string (dq), number, duration (e.g. 1h/30s/1d/1w),
-   timestamp (RFC 3339), boolean, severity names error|warn|info|… *)
+severity_name = "trace" | "debug" | "info" | "warn" | "error" | "fatal" ;  (* case-insensitive *)
+time         = "now" | [ "-" ] , duration | timestamp ;   (* e.g. now , -1h *)
+integer      = digit , { digit } ;
+(* lexical: ident = letter , { letter | digit | "_" } ;
+   string = '"' , { char } , '"' ;  number = integer | float ;
+   boolean = "true" | "false" ;  duration = integer , ( "s"|"m"|"h"|"d"|"w" ) ;
+   timestamp = RFC 3339 *)
 ```
 
 ## 8. Testing strategy
@@ -516,5 +526,4 @@ Alternatives that would replace the whole design, not just one branch.
 - RFC 0001 §6.1/§6.3/§6.7 (the columns + template/drift primitives);
   RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4.6
   (no-leakage hazard), §3.7 (multi-tenancy).
-```
 

@@ -1227,7 +1227,12 @@ fn rfc0002_11_structured_surface_schema_validation() {
         serde_json::from_str(served).expect("the published schema is valid JSON");
     let validator = Validator::new(&schema_doc).expect("the published schema compiles");
 
-    // Well-formed — must PASS the schema and then parse to an IR (RFC0002.2).
+    assert_well_formed_requests_pass(&validator);
+    assert_malformed_requests_rejected(&validator);
+}
+
+/// Well-formed requests must PASS the schema and then parse to an IR (RFC0002.2).
+fn assert_well_formed_requests_pass(validator: &jsonschema::Validator) {
     let valid: &[&str] = &[
         r#"{"predicate":{"const":true}}"#,
         r#"{"predicate":{"field":"service","op":"==","value":"api"}}"#,
@@ -1236,6 +1241,7 @@ fn rfc0002_11_structured_surface_schema_validation() {
         r#"{"predicate":{"field":{"resource":"k8s.pod.name"},"op":"!=","value":"web-0"}}"#,
         r#"{"predicate":{"call":"contains","args":["body","timeout"]}}"#,
         r#"{"predicate":{"call":"resolves_to","args":[7]}}"#,
+        r#"{"predicate":{"field":"severity","op":">=","value":9}}"#,
         r#"{"predicate":{"and":[{"const":true},{"not":{"field":"lossy","op":"==","value":true}}]}}"#,
         r#"{"predicate":{"const":true},"stages":[
             {"range":{"from":"-1h","to":"now"}},
@@ -1246,6 +1252,7 @@ fn rfc0002_11_structured_surface_schema_validation() {
             {"limit":10},
             {"render":{}}
         ]}"#,
+        r#"{"predicate":{"const":true},"stages":[{"render":null}]}"#,
     ];
     for req in valid {
         let instance: serde_json::Value =
@@ -1261,9 +1268,11 @@ fn rfc0002_11_structured_surface_schema_validation() {
         ourios_querier::dsl::parse_structured(req)
             .unwrap_or_else(|e| panic!("schema-valid request must parse: {req}: {e}"));
     }
+}
 
-    // Malformed — each must be REJECTED by the schema *before* the planner.
-    // (with: the construct each case exercises.)
+/// Malformed requests must each be REJECTED by the schema *before* the planner.
+/// The second tuple element names the construct each case exercises.
+fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
     let invalid: &[(&str, &str)] = &[
         (r#"{"stages":[]}"#, "missing predicate"),
         (
@@ -1310,6 +1319,34 @@ fn rfc0002_11_structured_surface_schema_validation() {
         (
             r#"{"predicate":{"const":true},"stages":[{"frobnicate":1}]}"#,
             "unknown stage kind",
+        ),
+        (
+            r#"{"predicate":{"field":"severity","op":"=~","value":"error"}}"#,
+            "regex operator on severity",
+        ),
+        (
+            r#"{"predicate":{"field":"severity","op":"==","value":1.5}}"#,
+            "non-integer severity value",
+        ),
+        (
+            r#"{"predicate":{"call":"resolves_to","args":[7,8]}}"#,
+            "wrong-arity resolves_to",
+        ),
+        (
+            r#"{"predicate":{"call":"resolves_to","args":[-1]}}"#,
+            "negative resolves_to template id",
+        ),
+        (
+            r#"{"predicate":{"call":"contains","args":["body",1]}}"#,
+            "non-string second arg to contains",
+        ),
+        (
+            r#"{"predicate":{"call":"contains","args":[1,"x"]}}"#,
+            "non-field first arg to contains",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"sort":{"key":"attr.http.status_code"}}]}"#,
+            "non-identifier sort key",
         ),
     ];
     for (req, what) in invalid {

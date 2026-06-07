@@ -1,7 +1,7 @@
 ---
 rfc: 0007
 title: Querier — DataFusion execution frontend for the logs DSL
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-01
@@ -11,18 +11,20 @@ superseded-by: —
 
 # RFC 0007 — Querier: DataFusion execution frontend for the logs DSL
 
-> **Status note.** `specified` — §§1–9 are complete (including §5
-> acceptance criteria and §6 testing strategy, the content the
-> `specified` gate introduces per `docs/rfcs/README.md`). It pins
-> the *execution*
-> layer — how a compiled query runs against the RFC 0005 Parquet
-> contract with predicate pushdown, and how the B1/B2 thesis gates
-> are measured — which is independent of RFC 0002's unresolved
-> Branch A/B *syntax* decision (both branches compile to the same
-> DataFusion `LogicalPlan` target, RFC 0002 §5.5). It deliberately
-> does **not** re-decide the DSL surface. Cannot flip past
-> `specified` until RFC 0002 §3 lands and the §5 acceptance
-> scenarios below have executable tests.
+> **Status note.** **`green`** — the §5 acceptance criteria
+> RFC0007.1–.5 all have live passing tests
+> (`crates/ourios-querier/tests/{execution,boundary,forward_compat}.rs`
+> and the `crates/ourios-querier/src/lib.rs` no-leakage unit test;
+> `crates/ourios-querier/tests/acceptance.rs` is now a pointer to them).
+> It pins the *execution* layer — how a compiled query
+> runs against the RFC 0005 Parquet contract with predicate pushdown, and
+> how the B1/B2 thesis gates are measured. The status was held at
+> `specified` by the prove-thesis gate (it deliberately did not re-decide
+> the DSL surface); that gate is now cleared — RFC 0002 §3 landed
+> (Branch B, #143) and the DSL is fully `green` (#154) — so this RFC
+> advances to `green`. `validated` (the B1/B2 thesis-gate measurement,
+> `docs/benchmarks.md`) and `accepted` follow per the
+> `docs/rfcs/README.md` ladder.
 
 ## 1. Summary
 
@@ -227,13 +229,13 @@ Mapped to `CLAUDE.md` §6.2:
   B1/B2 measurement) is branch-independent (RFC 0002 §5.5), and
   B1/B2 are the project's largest unmeasured risk — building the
   branch-independent half now buys the thesis signal soonest. The
-  parser integration waits on RFC 0002 (§8).
+  parser integration landed once RFC 0002 §3 resolved (Branch B); see §8.
 
 ## 8. Open questions
 
-- [ ] Blocked on RFC 0002 §3 (Branch A vs B) before the parser
-      integration is final — but the execution layer here is
-      branch-independent.
+- [x] RFC 0002 §3 resolved (Branch B, #143) and the parser integration
+      landed (#145–#154; RFC 0002 is `green`). The execution layer here was
+      branch-independent throughout, as planned.
 - [ ] `ListingTable` vs a custom `TableProvider` — does partition
       pruning over object storage need the custom provider, or does
       the listing table's pruning suffice?

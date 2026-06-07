@@ -171,6 +171,38 @@ pub enum SeverityName {
     Fatal,
 }
 
+impl SeverityName {
+    /// The floor of the matching `OTel` `SeverityNumber` range (RFC 0002
+    /// §6.1): `trace`→1, `debug`→5, `info`→9, `warn`→13, `error`→17,
+    /// `fatal`→21. A bare-name severity comparison compiles to the same
+    /// `severity_number` predicate as the numeric form using this floor,
+    /// so `severity >= error` is identical to `severity >= 17`. The `OTel`
+    /// spec standardises the *ranges* and mandates comparing on
+    /// `SeverityNumber`; this name→number choice is Ourios's, aligned with
+    /// those ranges.
+    #[must_use]
+    pub fn floor(self) -> i64 {
+        match self {
+            Self::Trace => 1,
+            Self::Debug => 5,
+            Self::Info => 9,
+            Self::Warn => 13,
+            Self::Error => 17,
+            Self::Fatal => 21,
+        }
+    }
+
+    /// The ceiling of the matching `OTel` `SeverityNumber` band (RFC 0002
+    /// §6.1): each name spans four numbers, so `ceil` is `floor + 3`
+    /// (`error` → 17..=20, `fatal` → 21..=24). Equality / inequality against
+    /// a bare name tests membership in this `floor..=ceil` band; ordering
+    /// comparisons use [`SeverityName::floor`] alone.
+    #[must_use]
+    pub fn ceil(self) -> i64 {
+        self.floor() + 3
+    }
+}
+
 /// A boolean-returning function call (§7 `call`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {

@@ -24,12 +24,26 @@ ourios-parquet = { path = "../ourios-parquet" }
 # any public signature or error (hazard §4.6). Pulls arrow/parquet
 # 58 vs ourios-parquet's 55; harmless because the two never cross
 # in memory (DataFusion reads Parquet files from disk).
-datafusion = { version = "53", default-features = false, features = ["parquet"] }
+# `string_expressions` / `regex_expressions` register the scalar
+# functions the DSL compiler emits for the string calls (`contains` /
+# `starts_with` / `ends_with`) and the `=~` / `!~` regex operators
+# (RFC 0002 §6.1); with default features off they would not be in the
+# session registry and planning those predicates would fail.
+datafusion = { version = "53", default-features = false, features = [
+    "parquet",
+    "string_expressions",
+    "regex_expressions",
+] }
 # RFC 0002 structured (JSON) query surface (§6.4) — deserialised into the
 # shared DSL IR. serde derive for the surface types, serde_json for the
 # parse. No DataFusion/arrow/SQL type crosses this surface (hazard §4.6).
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# RFC 0002 §6.5 — the compiler resolves `range(...)` RFC 3339 timestamp
+# bounds to `time_unix_nano`. `chrono` is already in the Arrow/DataFusion
+# dep tree (and ourios-parquet uses it for the same nanosecond timeline),
+# so this adds no new transitive cost.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # RFC0002.7 — the parse/serialise round-trip is a property test over

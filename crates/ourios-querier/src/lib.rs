@@ -37,6 +37,7 @@
 
 #![deny(unsafe_code)]
 
+mod compile;
 pub mod dsl;
 
 use std::path::PathBuf;
@@ -321,6 +322,62 @@ fn storage_err(e: DataFusionError) -> QueryError {
     }
 }
 
+/// A `time_unix_nano` literal: the RFC 0005 column is
+/// `Timestamp(Nanosecond, "UTC")`, so the literal type must match exactly
+/// or `DataFusion` rejects the comparison. Shared by the `QueryRequest`
+/// path and the DSL compiler.
+fn time_bound_scalar(v: u64) -> Result<ScalarValue, QueryError> {
+    let ns = i64::try_from(v).map_err(|_| QueryError::InvalidQuery {
+        detail: format!("time bound {v} exceeds i64 nanoseconds"),
+    })?;
+    Ok(ScalarValue::TimestampNanosecond(
+        Some(ns),
+        Some("UTC".into()),
+    ))
+}
+
+/// True iff `column` is present in `df`'s (post-union) schema. An OPTIONAL
+/// RFC 0005 column absent from every file in the set is omitted from the
+/// inferred union schema; filtering on it would fail planning, so callers
+/// short-circuit to an empty result instead (RFC 0005 §3.9 / RFC0007.4).
+fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
+    df.schema().fields().iter().any(|f| f.name() == column)
+}
+
+/// Apply the [`QueryRequest`] predicate set as `DataFusion` filters. Returns
+/// `Ok(None)` when a `severity_text` filter targets an absent OPTIONAL column
+/// (provably empty — short-circuit).
+fn apply_request_filters(
+    mut df: datafusion::dataframe::DataFrame,
+    request: &QueryRequest,
+) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError> {
+    if let Some((start, end)) = request.time_range {
+        df = df
+            .filter(
+                col(columns::TIME_UNIX_NANO)
+                    .gt_eq(lit(time_bound_scalar(start)?))
+                    .and(col(columns::TIME_UNIX_NANO).lt(lit(time_bound_scalar(end)?))),
+            )
+            .map_err(storage_err)?;
+    }
+    if let Some(template_id) = request.template_id {
+        df = df
+            .filter(col(columns::TEMPLATE_ID).eq(lit(template_id)))
+            .map_err(storage_err)?;
+    }
+    if let Some(severity_text) = &request.severity_text {
+        // An absent OPTIONAL `severity_text` reads as all-NULL, so
+        // `= X` matches nothing: empty result, not a planning error.
+        if !has_column(&df, columns::SEVERITY_TEXT) {
+            return Ok(None);
+        }
+        df = df
+            .filter(col(columns::SEVERITY_TEXT).eq(lit(severity_text.as_str())))
+            .map_err(storage_err)?;
+    }
+    Ok(Some(df))
+}
+
 /// The query engine. One per querier process; reads the RFC 0005
 /// Parquet store rooted at `bucket_root` (the writer's
 /// `<bucket_root>/data/...` layout).
@@ -352,7 +409,66 @@ impl Querier {
     ///
     /// See [`QueryError`].
     pub async fn run(&self, request: QueryRequest) -> Result<QueryResult, QueryError> {
-        let enc = percent_encode_tenant(request.tenant.as_str());
+        let tenant = request.tenant.clone();
+        let window = request.time_range;
+        self.execute(&tenant, window, |df| apply_request_filters(df, &request))
+            .await
+    }
+
+    /// Compile a parsed DSL [`Query`](dsl::Query) IR (RFC 0002) to the
+    /// `DataFusion` execution layer and run it against the tenant's RFC 0005
+    /// store, returning the matching row count + pruning stats — without
+    /// leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 / RFC0002.3).
+    ///
+    /// `now_unix_nano` is the wall-clock reference the relative `range(...)`
+    /// bounds (`-1h`, `now`) and the default window resolve against; the
+    /// caller supplies it so compilation is deterministic and testable.
+    /// `default_window_nanos` is the tenant's default look-back: a query with
+    /// no `range(...)` stage compiles with the time filter
+    /// `[now - default_window_nanos, now]` (RFC 0002 §4 P5 — **never** an
+    /// unbounded scan).
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::InvalidQuery`] if a literal can't be resolved (a malformed
+    /// duration/timestamp the parser admitted lexically); otherwise see
+    /// [`QueryError`].
+    pub async fn run_query(
+        &self,
+        query: &dsl::Query,
+        tenant: &TenantId,
+        now_unix_nano: u64,
+        default_window_nanos: u64,
+    ) -> Result<QueryResult, QueryError> {
+        let plan = compile::compile(query, now_unix_nano, default_window_nanos)?;
+        self.execute(tenant, Some(plan.window), move |df| {
+            compile::apply(df, plan)
+        })
+        .await
+    }
+
+    /// Shared scan path for both [`run`](Self::run) and
+    /// [`run_query`](Self::run_query): resolve the tenant's live file set
+    /// (honouring partition-level time pruning + the RFC 0009 §3.4 manifest),
+    /// build the listing table with tenant isolation enforced, apply the
+    /// caller's filter, and count via an aggregate so the heavy columns are
+    /// never materialised. `partition_window` drives the directory-level time
+    /// pruning only; row-level correctness stays with the filter.
+    async fn execute<F>(
+        &self,
+        tenant: &TenantId,
+        partition_window: Option<(u64, u64)>,
+        build_filter: F,
+    ) -> Result<QueryResult, QueryError>
+    where
+        // `Ok(None)` ⇒ the filter is provably empty (an absent OPTIONAL
+        // column, RFC 0005 §3.9), so the query short-circuits to an empty
+        // result rather than planning a scan that matches nothing.
+        F: FnOnce(
+            datafusion::dataframe::DataFrame,
+        ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError>,
+    {
+        let enc = percent_encode_tenant(tenant.as_str());
         let tenant_dir = self
             .bucket_root
             .join("data")
@@ -364,7 +480,7 @@ impl Querier {
         // holding only `*.parquet.tmp` (a poisoned/crashed writer) —
         // where building a table over zero files would otherwise
         // error and wrongly fail the query.
-        let live_files = resolve_live_files(&tenant_dir, request.time_range)?;
+        let live_files = resolve_live_files(&tenant_dir, partition_window)?;
         if live_files.is_empty() {
             return Ok(QueryResult::default());
         }
@@ -425,54 +541,11 @@ impl Querier {
         ctx.register_table("logs", Arc::new(table))
             .map_err(storage_err)?;
 
-        let mut df = ctx.table("logs").await.map_err(storage_err)?;
-        if let Some((start, end)) = request.time_range {
-            // `time_unix_nano` is Timestamp(Nanosecond, "UTC")
-            // (RFC 0005 schema); match the literal type exactly.
-            let to_ts = |v: u64| -> Result<ScalarValue, QueryError> {
-                let ns = i64::try_from(v).map_err(|_| QueryError::InvalidQuery {
-                    detail: format!("time bound {v} exceeds i64 nanoseconds"),
-                })?;
-                Ok(ScalarValue::TimestampNanosecond(
-                    Some(ns),
-                    Some("UTC".into()),
-                ))
-            };
-            df = df
-                .filter(
-                    col(columns::TIME_UNIX_NANO)
-                        .gt_eq(lit(to_ts(start)?))
-                        .and(col(columns::TIME_UNIX_NANO).lt(lit(to_ts(end)?))),
-                )
-                .map_err(storage_err)?;
-        }
-        if let Some(template_id) = request.template_id {
-            df = df
-                .filter(col(columns::TEMPLATE_ID).eq(lit(template_id)))
-                .map_err(storage_err)?;
-        }
-        if let Some(severity_text) = &request.severity_text {
-            // `severity_text` is OPTIONAL (RFC 0005 §3.2). If a tenant's
-            // entire file set predates the column, the inferred union
-            // schema omits it — and filtering an unknown column would
-            // fail planning (surfacing as a generic Storage error). An
-            // absent OPTIONAL column reads as all-NULL (RFC 0005 §3.9 /
-            // RFC0007.4), so `severity_text = X` matches nothing: return
-            // an empty result rather than erroring. (Per-file drift,
-            // where *some* file has the column, is handled by DataFusion's
-            // schema union — see tests/forward_compat.rs.)
-            let has_severity = df
-                .schema()
-                .fields()
-                .iter()
-                .any(|f| f.name() == columns::SEVERITY_TEXT);
-            if !has_severity {
-                return Ok(QueryResult::default());
-            }
-            df = df
-                .filter(col(columns::SEVERITY_TEXT).eq(lit(severity_text.as_str())))
-                .map_err(storage_err)?;
-        }
+        let base = ctx.table("logs").await.map_err(storage_err)?;
+        // A provably-empty filter (absent OPTIONAL column) ⇒ no scan.
+        let Some(df) = build_filter(base)? else {
+            return Ok(QueryResult::default());
+        };
 
         // Count via an aggregate so the heavy `attributes` /
         // `params` / `body` columns are never materialised

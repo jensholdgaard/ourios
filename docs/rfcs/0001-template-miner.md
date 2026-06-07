@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Template miner (Drain-derived online log parsing)
-status: red
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -620,6 +620,67 @@ direction and the primary obligation lives in those other RFCs.
 > - (Locks the §6.1 explicit edge-case rules: `0 = UNSPECIFIED`
 >   is a valid OTLP severity that gets its own bucket, and
 >   absent scope is its own bucket.)
+
+> **Scenario RFC0001.12 — Alias assertion is durably recorded and appears in the per-tenant map**
+> - **Given** tenant `T` with two distinct leaves `A` and `B`
+>   (`A < B`) and no existing alias set
+> - **When** an operator asserts `B` is an alias of `A`
+> - **Then** an `alias_asserted` audit event is durably recorded on
+>   the §6.4 stream under the §3.4 WAL-before-ack barrier before the
+>   assertion is acknowledged, naming `tenant_id = T`, the anchor
+>   `representative_id = A`, `member_ids = [B]`, the `actor`, and the
+>   `timestamp` — so the asserted set is `{A} ∪ {B} = {A, B}`
+> - **And** after the per-tenant projection rebuilds, tenant `T`'s
+>   alias map contains an equivalence class with members `{A, B}`
+>   whose derived canonical representative is `A` (the smallest
+>   member)
+
+> **Scenario RFC0001.13 — `resolves_to(rep)` returns all members and excludes non-members**
+> - **Given** tenant `T` whose alias map records the set
+>   `{A, B}` (per RFC0001.12) and an unrelated leaf `C` in no set
+> - **When** the querier compiles `template_id.resolves_to(A)` for
+>   tenant `T`
+> - **Then** the predicate expands to `template_id IN {A, B}`
+> - **And** `resolves_to(B)` expands to the same `{A, B}` (expansion
+>   is by the set, not the direction of assertion)
+> - **And** `resolves_to(C)` expands to exactly `{C}`
+
+> **Scenario RFC0001.14 — Cross-tenant isolation: an alias in tenant A never affects tenant B `[§3.7]`**
+> - **Given** tenant `T1` whose alias map records `{A, B}` and
+>   tenant `T2` that has the same `template_id`s `A` and `B` but no
+>   alias assertion
+> - **When** the querier compiles `template_id.resolves_to(A)` once
+>   for `T1` and once for `T2`
+> - **Then** for `T1` it expands to `{A, B}`
+> - **And** for `T2` it expands to exactly `{A}`
+> - (Locks §3.7: alias sets are per-tenant; an assertion in one
+>   tenant is invisible to every other.)
+
+> **Scenario RFC0001.15 — Retraction removes any member, including the canonical, and is itself audited**
+> - **Given** tenant `T` whose alias map records the equivalence
+>   class `{A, B}` (`A < B`, so `A` is the derived canonical)
+> - **When** an operator retracts member `A` — the canonical /
+>   smallest member — from the class
+> - **Then** an `alias_retracted` audit event is durably recorded
+>   (same WAL-before-ack barrier and field shape as RFC0001.12)
+>   whose asserted set names `A` (here as `representative_id`, the
+>   operator's anchor) plus an empty `member_ids`, and the `actor`
+> - **And** after the projection rebuilds, `A` is removed from the
+>   class, leaving `{B}` — a single member, which is no longer an
+>   alias set, so `resolves_to(A)` expands to exactly `{A}` and
+>   `resolves_to(B)` expands to exactly `{B}`
+> - (Locks the representative-independent retraction rule: retracting
+>   any member is well-defined even when it is the canonical/smallest;
+>   the canonical is re-derived as `min` of the remainder, and a class
+>   that drops to one member ceases to be an alias set.)
+
+> **Scenario RFC0001.16 — A non-aliased id resolves to itself**
+> - **Given** tenant `T` with leaf `Z` and no alias assertion
+>   naming `Z`
+> - **When** the querier compiles `template_id.resolves_to(Z)`
+> - **Then** the predicate expands to exactly `{Z}` — identical to
+>   the base-member behaviour and to bare `template_id = Z`
+>   (RFC0001.6)
 
 ## 6. Proposed design
 
@@ -1449,14 +1510,210 @@ from cross-version: widening is intra-leaf and increments
 aliasing is inter-leaf and groups `template_id`s the miner allocated
 separately (different `template_id`s, the operator asserts they
 mean the same thing). `template_widened` events therefore do **not**
-populate the alias index — they live on the cross-version axis. The
-alias index has no creation event in this RFC: the candidate
-writers (operator-driven, automatic-inference, deferred entirely)
-and the shape of the write API they would expose are open
-questions in §9. Until those questions resolve, RFC 0002's
-`template_id.resolves_to(X)` operates against an alias index
-whose contents are produced out of band; this RFC does not
-specify how.
+populate the alias index — they live on the cross-version axis.
+
+**Alias write path: operator-driven and audited `[§3.1]`.** The
+alias index is **operator-driven**, never silently inferred. An
+alias assertion — "leaf B is the same template as leaf A" — is an
+explicit operator action recorded as an audited, durable event,
+exactly as §3.1 requires of any merge ("every merge emits an audit
+event; explicit"). Automatic inference is the precise failure mode
+§3.1 forbids: an auto-aliased cross-semantic merge is a silent
+merge by another name. The amendment below replaces the previous
+"no creation event / produced out of band" deferral with the
+mechanism.
+
+> **Amendment (alias write path, 2026-06-07).** Resolves the §9
+> open question "Alias index creation mechanism." The alias index
+> is produced by **operator-driven, audited, reversible** assertions
+> on the §6.4 audit stream; automatic inference is deferred to a
+> possible future *propose → operator-confirm* layer (proposals
+> never enter the active index unconfirmed). Adds the
+> `alias_asserted` / `alias_retracted` audit events, the per-tenant
+> alias-map projection the querier reads, and §5 scenarios
+> RFC0001.12–RFC0001.16. The RFC re-enters the ladder at
+> `specified` until those scenarios land (precedent: the RFC 0003
+> served-binary amendment).
+
+*The alias model.* An **alias set** is an equivalence class of
+`template_id`s **within one tenant** `[§3.7]`. Membership — *which*
+`template_id`s are in the class — is the only thing that carries
+contract weight: `resolves_to` expands by membership and nothing
+else (RFC0001.13). The class also has a **canonical representative**,
+defined as the **numerically smallest member** of the materialized
+set. The canonical representative is a **derived display/identity
+convenience, not what defines membership**: it gives the set a stable
+name and is deterministic regardless of assertion order, but it
+plays no part in deciding who belongs to the class. This derivation
+rule is an **evolvable implementation detail, not a contract** — it
+may change (for example, letting an operator designate a preferred
+representative) without changing alias-set semantics, precisely
+because `resolves_to` expands by membership regardless of which
+member is canonical. (This is distinct from the event-level
+`representative_id` below, which is merely the operator's anchor id
+for an assertion and need not equal the derived canonical.)
+Membership is **cross-leaf only**: it groups `template_id`s the miner
+allocated as separate leaves. It never crosses the cross-version
+axis — every version of a single leaf already shares one
+`template_id` (§6.1, "Template identity"), so `template_version` is
+not an alias concern and the alias index holds no `template_version`
+field. The two axes stay disjoint: widenings move a leaf along
+`template_version`; aliasing groups distinct `template_id`s.
+
+*The assertion event.* Aliasing is expressed by two new
+`AuditEventType` variants on the §6.4 audit stream, carrying an
+alias-specific payload:
+
+```text
+{
+  event_type: AuditEventType,  # alias_asserted | alias_retracted
+  tenant_id: TenantId,
+  representative_id: u64,       # operator's anchor id for this
+                               # assertion — names one member of the
+                               # asserted set; carries no contract
+                               # weight beyond that and need not equal
+                               # the set's derived canonical (smallest)
+  member_ids: Vec<u64>,        # the other ids grouped by / removed
+                               # from the set in this assertion
+  actor: ActorId,              # operator / API principal that
+                               # issued the assertion — aliasing is
+                               # never anonymous (§3.1 "explicit")
+  reason: Option<String>,      # operator-supplied justification
+                               # (e.g. "deploy 2026-06 re-split the
+                               # login template"), <= 256 B
+  timestamp: SystemTime,
+}
+```
+
+The **asserted set** of an event is the full union
+`{representative_id} ∪ member_ids` — `representative_id` is one named
+member of that set, never excluded from it. An `alias_asserted` event
+groups its entire asserted set into one equivalence class; an
+`alias_retracted` event removes every id in its asserted set from
+their class. Membership is therefore defined purely by the union of
+ids in the event, independent of which id the operator chose as the
+anchor.
+
+These events flow through the **same audit stream** as
+`template_widened` (§6.4) and inherit its durability contract:
+they are written to the WAL and become durable under the
+§3.4 **WAL-before-ack** barrier before the assertion is
+acknowledged to the operator. An assertion that has not hit the WAL
+is not acknowledged — there are no in-memory-only aliases. Unlike
+widenings, alias events are **not** emitted on the ingest hot path;
+they originate from an explicit operator/control-plane call, so they
+do not gate `attach` latency. They do **not** increment
+`merges_total` (that counter is reserved for the two structural
+widenings, §6.4); alias activity is counted separately as the
+`alias_assertions_total` / `alias_retractions_total` counters
+enumerated in §6.8's telemetry table (mandatory, `tenant_id`
+attribute), keeping operator-driven aliasing first-class telemetry
+per `[§3.1]` / §6.3 alongside `merges_total`.
+
+*Materialization and storage.* The durable alias **event log** (the
+`alias_asserted` / `alias_retracted` stream above) is the source of
+truth; the queryable **per-tenant alias map** is a **projection**
+built by folding that log per tenant. Each `alias_asserted` unions
+its full asserted set (`{representative_id} ∪ member_ids`) into one
+equivalence class, merging any pre-existing classes that share a
+member so that overlapping assertions converge on a single class
+regardless of arrival order; each `alias_retracted` removes its
+asserted set's ids from their class. The canonical representative of
+each materialized class is then **derived** as `min(members)` — so it
+re-derives automatically when membership changes and never depends on
+which id any event named as its anchor. A class that drops to a
+single member is no longer an alias set (that lone id resolves only
+to itself, RFC0001.16). The folded result is persisted as a **per-tenant
+artifact** (one map per tenant, not per partition) that the querier
+reads at compile time. Three venues were considered:
+
+- **Per-tenant projection from the audit/alias event log (chosen).**
+  Aliases are a tenant-scoped projection rebuilt from the durable
+  event log and persisted as a small per-tenant alias-map artifact
+  under the tenant root. This reuses the §6.4 audit infrastructure
+  end-to-end (no new write plane), matches the tenant scope of the
+  data (§3.7), and keeps the truth (the event log) append-only and
+  replayable while the map is a cache that can always be rebuilt by
+  re-folding the log.
+- **Tenant-root `aliases.parquet` / JSON written directly (rejected
+  as the *source of truth*).** A directly-mutated file has no audit
+  trail of its own; it would either duplicate the event log or
+  become an unaudited mutation point, violating §3.1's "every merge
+  is audited." It survives only as the *serialization format* of the
+  projection above — a storage-layer detail (RFC 0005), not the
+  model.
+- **Extending the partition `Manifest` (rejected).** The manifest is
+  **partition-scoped** (`Manifest { generation, files }`, one per
+  partition); alias sets are **tenant-global**. Putting a
+  tenant-global structure in a partition-local manifest would
+  fragment one logical map across every partition and force
+  N-partition fan-in on every query. Poor fit.
+
+*Eventual consistency / read staleness.* The querier and the
+ingester/control-plane run in separate processes (§6.6 names the
+same seam for the live template registry). The alias map the querier
+reads is therefore **eventually consistent** with the latest
+assertion: an alias asserted or retracted at `t` becomes visible to
+queries once the projection is rebuilt and republished, not
+instantaneously. This is the same staleness window the §6.6
+querier↔registry seam already accepts. Staleness is **bounded in both
+directions** by the projection refresh / snapshot cadence:
+
+- *A not-yet-visible **assertion*** makes `resolves_to(X)` return a
+  **subset** of the eventual membership — it never returns rows from
+  a set the operator did not yet assert, so it can only temporarily
+  *under*-include.
+- *A not-yet-visible **retraction*** leaves a stale projection
+  still expanding to the old, larger set, so `resolves_to(X)` can
+  temporarily *over*-include a member the operator already removed.
+
+Both are transient and self-correcting on the next projection
+rebuild, and neither cross-contaminates across tenants (§3.7) or
+fabricates a grouping no operator ever asserted — the over-inclusion
+is always a *previously asserted* membership, never a phantom one.
+The bound on the window (snapshot cadence) is a storage/serving-layer
+knob, deferred to the RFC 0005 storage decision (see §9).
+
+*Reader / query contract.* RFC 0002's `template_id.resolves_to(X)`
+(RFC0002.9, §5.4) loads the requesting tenant's alias map at compile
+time and expands `X` to its alias-set membership: `template_id IN
+{X} ∪ members(set containing X)`. With no assertions for the tenant,
+or for an `X` in no set, the membership is exactly `{X}` — identical
+to today's base-member stub and to bare `template_id = X` for that
+id (RFC0001.6 still holds: bare equality never follows alias
+chains). Expansion is by the **set**, not by direction: passing any
+member of a set (representative or not) resolves to the whole set.
+
+*Reversibility.* An operator can **retract** an alias; the
+retraction is itself an `alias_retracted` audit event with the same
+durability and isolation guarantees, and the projection drops the
+retracted membership on its next rebuild. Aliasing and un-aliasing
+are both explicit, both audited, never silent — closing the loop
+with §3.1.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator / control plane
+    participant WAL as WAL (§3.4 barrier)
+    participant Log as Alias event log (§6.4 stream)
+    participant Proj as Per-tenant alias-map projection
+    participant Q as Querier (resolves_to)
+    Op->>WAL: assert alias {rep, members, actor, reason}
+    WAL-->>Op: ack (only after fsync — §3.4)
+    WAL->>Log: append alias_asserted (durable)
+    Log->>Proj: fold per tenant (rebuild + publish)
+    Q->>Proj: load tenant alias map at compile
+    Q->>Q: resolves_to(X) -> template_id IN members(set with X)
+    Note over Op,Proj: retraction is the symmetric alias_retracted event
+```
+
+*Future work — automatic inference.* A later layer may *propose*
+aliases from a post-deploy heuristic (e.g. a burst of
+`template_widened` / fresh-leaf allocations correlated with a deploy
+timestamp). Such proposals are **never** written to the active alias
+index directly; they enter a review queue and become real only via
+the same operator-confirmed `alias_asserted` event specified above.
+This RFC does not specify that layer — see §9.
 
 **Drift detection as a first-class query.** "Templates that gained
 a new version in the window `[t1, t2]`" is a query against the
@@ -1579,6 +1836,8 @@ dimensions shown are exported as **attributes**, not labels):
 |---|---|---|---|
 | `template_count` | gauge | `tenant_id` | `[§3.1]` |
 | `merges_total` | counter | `tenant_id`, `event_type` | `[§3.1]`, H1 |
+| `alias_assertions_total` | counter | `tenant_id` | `[§3.1]`, §6.7, H5 |
+| `alias_retractions_total` | counter | `tenant_id` | `[§3.1]`, §6.7, H5 |
 | `confidence` | histogram | `tenant_id`, `service` | `[§3.1]`, §6.3 |
 | `confidence_p50` | gauge | `tenant_id`, `service` | `[§3.1]` |
 | `confidence_p01` | gauge | `tenant_id`, `service` | `[§3.1]` |
@@ -1826,6 +2085,19 @@ resolves bidirectionally between RFC and tests.
   data-model layer; the DSL surface itself is tested in RFC 0002.
   *Covers:* RFC0001.5, RFC0001.6.
 
+- **Alias write-path tests**: assert that an operator alias
+  assertion emits a durable `alias_asserted` audit event under the
+  §3.4 barrier and that folding the event log produces the expected
+  per-tenant alias map; that `resolves_to` expands by the set
+  (representative or member) and to `{X}` for an un-aliased id; that
+  a retraction emits `alias_retracted` and drops membership on
+  rebuild; and that an alias asserted in one tenant is invisible to
+  another. The `resolves_to` DSL surface itself is exercised in
+  RFC 0002 (RFC0002.9); these tests own the §6.7 write-path and
+  per-tenant-map contract.
+  *Covers:* RFC0001.12, RFC0001.13, RFC0001.14, RFC0001.15,
+  RFC0001.16.
+
 - **Reader behaviour test**: assert the §6.6 reader emits the
   `body` column verbatim (with the warning marker) for
   `lossy_flag = true` rows, and calls `reconstruct()` for the
@@ -1912,13 +2184,25 @@ RFC's status flips to `accepted`.
       back-pressure event in scope; this overlaps with the OTLP
       receiver's responsibility and likely lives in a future
       `ourios-ingester` RFC.
-- [ ] **Alias index creation mechanism (from §6.7).** Three
-      candidates surfaced: operator-driven (manual "these two
-      leaves are the same"), automatic-inference (post-deploy
-      heuristic that proposes aliases from `template_widened`
-      bursts), or deferred entirely. The choice gates RFC 0002's
-      `template_id.resolves_to(X)` semantics; until it resolves,
-      the alias index has no specified write path.
+- [x] **Alias index creation mechanism (from §6.7) — RESOLVED
+      (2026-06-07).** Of the three candidates (operator-driven,
+      automatic-inference, deferred entirely), the maintainer chose
+      **operator-driven + audited**: an alias is an explicit,
+      audited, reversible operator assertion on the §6.4 stream,
+      never silently inferred (§3.1). The write path, the
+      `alias_asserted` / `alias_retracted` events, the per-tenant
+      alias-map projection the querier reads, and the
+      eventual-consistency semantics are specified in §6.7 ("Alias
+      write path"); the acceptance criteria are RFC0001.12–
+      RFC0001.16 in §5.3. RFC 0002's `template_id.resolves_to(X)`
+      now has a defined backing index. **Remaining future work:**
+      automatic inference is deferred to a possible *propose →
+      operator-confirm* layer (proposals never enter the active
+      index unconfirmed); see the §6.7 "Future work" note. The
+      **physical alias-map file/format and snapshot cadence** are a
+      storage decision owned by the RFC 0005 line, not RFC 0001 —
+      RFC 0001 owns the model, the write path, and the criteria
+      (sibling to the issue #147 split).
 
 **Cross-RFC contracts pending.**
 

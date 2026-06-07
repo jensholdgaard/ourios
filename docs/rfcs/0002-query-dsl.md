@@ -1,7 +1,7 @@
 ---
 rfc: 0002
 title: Query DSL — the Ourios logs query language (Branch B, surface β)
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -15,10 +15,13 @@ superseded-by: —
 > sublanguage takes **Branch B** (distance from OTTL), on the
 > **β** (pipe-composable) top-level surface. Decided 2026-06-07 from the
 > audience analysis in §3.6 (primary: Perses dashboard authors; future:
-> MCP agents). This RFC is now `specified` — §6 gives the design, §7 the
-> grammar, §5 the testable acceptance criteria. It advances to `red` →
-> `green` as the parser/compiler lands (the RFC 0007 execution layer it
-> targets is already implemented and tested — RFC 0007 §5); then, per the
+> MCP agents). This RFC is now **`green`** — all 11 §5 acceptance
+> criteria (RFC0002.1–.11) have passing tests
+> (`crates/ourios-querier/tests/rfc0002_dsl.rs`), landed across PRs
+> #144–#154: the Branch-B parser + structured surface → one IR, the
+> IR→DataFusion compile, YAML-embeddability + the structured JSON Schema,
+> and `resolves_to` alias-set expansion via the RFC 0001 §6.7 operator
+> alias map. §6 gives the design, §7 the grammar, §5 the criteria. Per the
 > `docs/rfcs/README.md` ladder, `validated` and finally `accepted` (a
 > maintainer flip) follow the §9 validation.
 > Hazard 6 (`CLAUDE.md` §4 — no DataFusion/SQL leakage) constrains the

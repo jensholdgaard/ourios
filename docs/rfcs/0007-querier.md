@@ -1,7 +1,7 @@
 ---
 rfc: 0007
 title: Querier — DataFusion execution frontend for the logs DSL
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-01
@@ -11,18 +11,19 @@ superseded-by: —
 
 # RFC 0007 — Querier: DataFusion execution frontend for the logs DSL
 
-> **Status note.** `specified` — §§1–9 are complete (including §5
-> acceptance criteria and §6 testing strategy, the content the
-> `specified` gate introduces per `docs/rfcs/README.md`). It pins
-> the *execution*
-> layer — how a compiled query runs against the RFC 0005 Parquet
-> contract with predicate pushdown, and how the B1/B2 thesis gates
-> are measured — which is independent of RFC 0002's unresolved
-> Branch A/B *syntax* decision (both branches compile to the same
-> DataFusion `LogicalPlan` target, RFC 0002 §5.5). It deliberately
-> does **not** re-decide the DSL surface. Cannot flip past
-> `specified` until RFC 0002 §3 lands and the §5 acceptance
-> scenarios below have executable tests.
+> **Status note.** **`green`** — the §5 acceptance criteria
+> RFC0007.1–.5 all have live passing tests
+> (`crates/ourios-querier/tests/{execution,boundary,forward_compat}.rs`
+> and the `lib.rs` no-leakage unit test; `tests/acceptance.rs` is now a
+> pointer to them). It pins the *execution* layer — how a compiled query
+> runs against the RFC 0005 Parquet contract with predicate pushdown, and
+> how the B1/B2 thesis gates are measured. The status was held at
+> `specified` by the prove-thesis gate (it deliberately did not re-decide
+> the DSL surface); that gate is now cleared — RFC 0002 §3 landed
+> (Branch B, #143) and the DSL is fully `green` (#154) — so this RFC
+> advances to `green`. `validated` (the B1/B2 thesis-gate measurement,
+> `docs/benchmarks.md`) and `accepted` follow per the
+> `docs/rfcs/README.md` ladder.
 
 ## 1. Summary
 

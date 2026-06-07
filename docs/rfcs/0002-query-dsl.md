@@ -412,8 +412,10 @@ flowchart LR
 - **Structured surface** is the machine contract (MCP tool schema +
   programmatic clients): a top-level object
   `{ "predicate": <node>, "stages": [ <stage>, … ] }` (`stages` optional,
-  default `[]`). A **`<node>`** is either a leaf **comparison node**
-  `{ "field": …, "op": …, "value": … }` or a **boolean node**
+  default `[]`). A **`<node>`** is a leaf **comparison node**
+  `{ "field": …, "op": …, "value": … }`, a **call node**
+  `{ "call": "<fn>", "args": [ … ] }` (the §6.1 functions + `resolves_to`,
+  matching the §7 `fn_name` set), or a **boolean node**
   (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
   array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a
   tagged object mirroring a pipe stage
@@ -475,7 +477,9 @@ comparison   = severity_cmp | scalar_cmp ;
 severity_cmp = "severity" , cmp_op , ( severity_name | number ) ;
 scalar_cmp   = scalar_path , cmp_op , literal ;
 cmp_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
-call         = ident , "(" , [ arg , { "," , arg } ] , ")" ;
+call         = fn_name , "(" , [ arg , { "," , arg } ] , ")" ;
+fn_name      = "matches" | "contains" | "starts_with" | "ends_with"
+             | "resolves_to" ;
 arg          = path | literal ;
 path         = field | "resource" , key_tail | "attr" , key_tail ;
 scalar_path  = nonsev_field | "resource" , key_tail | "attr" , key_tail ;

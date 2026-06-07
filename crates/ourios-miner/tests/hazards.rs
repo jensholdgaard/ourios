@@ -668,10 +668,121 @@ fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
 
 /// Scenario H5.2 — Type expansion increments `template_version` and emits `template_type_expanded`.
 /// See `docs/rfcs/0001-template-miner.md` §5.
+///
+/// This is the *type-expansion-only* case, distinct from H5.1's
+/// structural widening: no `Fixed` token mismatches, so no
+/// `template_widened` event fires. A pre-existing wildcard slot
+/// whose `slot_types = {Num}` simply observes a `Str` value and
+/// grows to `{Num, Str}`.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h5_2_type_expansion_increments_version_and_emits_template_type_expanded() {
-    todo!("RFC 0001 §6.4");
+    use ourios_core::audit::{AuditPayload, ParamType, SharedAuditSink, SlotTypes, TemplateChange};
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — L1 creates a 4-token leaf at template_version = 1.
+    // The default `prefix_depth` is 2, so positions 0 and 1
+    // (`request`, `id`) key the prefix path; the `<NUM>` mask emit
+    // sits at position 2 (outside the prefix), giving the leaf a
+    // single wildcard slot with `slot_types[0] = {Num}`. Keeping
+    // the numeric slot outside the prefix is what lets L2 — which
+    // carries a *string* at that position — still route to the
+    // same leaf.
+    let sink = SharedAuditSink::new();
+    let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    let _ = cluster.ingest(&make("request id 42 done"));
+    // Discard L1: it created a fresh leaf, which emits no audit
+    // event (RFC0001.1) — but drain anyway so the assert below
+    // sees exactly the L2 trail.
+    let _ = sink.drain();
+
+    let pre = cluster.templates_for(&t);
+    assert_eq!(pre.len(), 1, "L1 created exactly one leaf");
+    assert_eq!(pre[0].template_version, 1, "fresh leaf starts at v1");
+    assert_eq!(
+        pre[0].slot_types,
+        vec![SlotTypes::singleton(ParamType::Num)],
+        "the position-2 wildcard slot starts as {{Num}}",
+    );
+
+    // Act — L2 matches every `Fixed` position (`request`, `id`,
+    // `done`) exactly and carries the literal `abc` at position 2.
+    // sim_seq = 1.0 (the wildcard slot matches by definition), so
+    // there is no widening; the slot merely sees a new `ParamType`
+    // (`Str`), triggering a pure type expansion.
+    let _ = cluster.ingest(&make("request id abc done"));
+
+    // Assert — exactly one audit event, a `TypeExpanded` (no
+    // `Widened`), bumping the version 1 → 2 and naming slot 0 with
+    // the newly-observed `Str`.
+    let events = sink.drain();
+    assert_eq!(
+        events.len(),
+        1,
+        "type-expansion-only attach emits exactly one event (no widening)",
+    );
+    let AuditPayload::Template {
+        change:
+            TemplateChange::TypeExpanded {
+                old_version,
+                new_version,
+                slots_expanded,
+                ..
+            },
+        ..
+    } = &events[0].payload
+    else {
+        panic!(
+            "expected Template/TypeExpanded, got {:?}",
+            events[0].payload,
+        );
+    };
+    assert_eq!(*old_version, 1, "leaf was at version 1 before the attach");
+    assert_eq!(
+        *new_version, 2,
+        "type expansion bumps template_version by one",
+    );
+    assert_eq!(slots_expanded.len(), 1, "exactly one slot expanded");
+    assert_eq!(
+        slots_expanded[0].slot_index, 0,
+        "the position-2 slot is wildcard ordinal 0",
+    );
+    assert_eq!(
+        slots_expanded[0].added_types,
+        vec![ParamType::Str],
+        "the slot gained Str (the literal `abc` classified as Str)",
+    );
+
+    // The leaf's stored type set grew {Num} → {Num, Str}, and the
+    // version reflects the single bump.
+    let post = cluster.templates_for(&t);
+    assert_eq!(
+        post.len(),
+        1,
+        "type expansion reuses the leaf — no new template",
+    );
+    assert_eq!(post[0].template_version, 2);
+    assert_eq!(
+        post[0].slot_types,
+        vec![SlotTypes::singleton(ParamType::Num).insert(ParamType::Str)],
+        "slot_types[0] became {{Num, Str}}",
+    );
+
+    // RFC §6.4: `TemplateTypeExpanded` counts toward merges_total.
+    assert_eq!(
+        cluster.merges_total(),
+        1,
+        "the lone type expansion increments merges_total by one",
+    );
 }
 
 /// Scenario H5.3 — Drift query returns templates that gained a version in window.

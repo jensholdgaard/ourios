@@ -1,7 +1,7 @@
 ---
 rfc: 0002
-title: Query DSL — prior decision (borrow from OTTL or distance?) and candidate designs
-status: drafted
+title: Query DSL — the Ourios logs query language (Branch B, surface β)
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -11,546 +11,628 @@ superseded-by: —
 
 # RFC 0002 — Query DSL
 
-> **Status note.** This RFC presents a decision tree, not a finished
-> answer. The DSL surface depends on user research we have not done
-> yet (§9) and on a prior decision (§3) that has been raised but not
-> resolved. The RFC cannot flip to `accepted` until §3 is decided and
-> §4–§5 are narrowed to a single branch. Hazard 6 (`CLAUDE.md` §4) —
-> no DataFusion leakage — constrains every branch equally.
+> **Status note.** The prior decision (§3) is **resolved**: the predicate
+> sublanguage takes **Branch B** (distance from OTTL), on the
+> **β** (pipe-composable) top-level surface. Decided 2026-06-07 from the
+> audience analysis in §3.6 (primary: Perses dashboard authors; future:
+> MCP agents). This RFC is now `specified` — §6 gives the design, §7 the
+> grammar, §5 the testable acceptance criteria. It advances to `red` →
+> `green` as the parser/compiler lands (the RFC 0007 execution layer it
+> targets is already implemented and tested — RFC 0007 §5); then, per the
+> `docs/rfcs/README.md` ladder, `validated` and finally `accepted` (a
+> maintainer flip) follow the §9 validation.
+> Hazard 6 (`CLAUDE.md` §4 — no DataFusion/SQL leakage) constrains the
+> whole design.
 
 ## 1. Summary
 
-Ourios exposes a logs DSL. The shape of that DSL depends on a prior
-decision, which this RFC deliberately does **not** pre-commit:
+Ourios exposes a logs query DSL that does **not** leak DataFusion/SQL to
+users (`CLAUDE.md` §4 hazard 6). This RFC specifies it:
 
-- **Branch A** — borrow from OTTL for the predicate sublanguage,
-  track a pinned spec version, enumerate divergences.
-- **Branch B** — actively distance from OTTL; use the OTel *data
-  model* (unavoidable — it is the ingest contract) but with an
-  Ourios-native path and predicate syntax designed for query
-  readability rather than Collector transformation.
+- **Predicate sublanguage — Branch B (distance from OTTL).** An
+  Ourios-native, query-ergonomic syntax over the OTel *data model* (the
+  ingest contract): bare top-level fields (`body`, `severity`,
+  `trace_id`), `resource.` / `attr.` prefixes, bare-identifier severity
+  (`severity >= error`), first-class template + OTel-canonical primitives.
+- **Top-level surface — β (pipe-composable).** A predicate followed by
+  pipe stages: `… | range(-1h, now) | count by template_id | sort count
+  desc | limit 10`. Compact, single-line, and embeddable as a YAML scalar
+  in Perses dashboards.
+- **Two front-ends, one core.** The string DSL (for humans, esp. Perses
+  YAML) and a **structured JSON surface** (for MCP agents + programmatic
+  clients) parse to the same query IR and compile to the same DataFusion
+  `LogicalPlan`. Agents emit JSON, not syntax.
 
-Both branches share the same top-level query surface (one of three
-candidates in §5.3), the same template and correctness primitives
-(§5.4), and the same compilation target (§5.5 — DataFusion
-`LogicalPlan`, no SQL leakage). The difference lives in one layer:
-how paths and predicates are written.
-
-Section 3 lays out the cases for each branch. Section 5 sketches
-both designs concretely enough to compare side by side. Section 9
-lists the prior decision as the first open question.
+The design rests on `ourios-querier` (RFC 0007), whose execution layer
+(predicate pushdown, tenant isolation, `QueryStats`) is already
+implemented and tested (RFC 0007 §5 criteria all live; the RFC itself
+stays `specified` pending this DSL); this RFC adds the *user-facing
+language* in front of it.
 
 ## 2. Motivation
 
 ### 2.1 Why a DSL at all?
 
-`CLAUDE.md` §4 hazard 6 commits Ourios to a DSL that does not leak
-DataFusion SQL through to users. The reasons are stability (we want
-to evolve the backend without breaking user queries), safety (full
-SQL exposes a surface area we cannot audit — arbitrary joins across
-tenants, resource-exhausting scans), and *fit* (logs are a narrow
-domain; a narrow DSL is more ergonomic than a general one).
+`CLAUDE.md` §4 hazard 6 commits Ourios to a DSL that does not leak DataFusion SQL.
+The reasons are **stability** (evolve the backend without breaking user
+queries), **safety** (full SQL exposes cross-tenant joins, unbounded
+scans, recursive CTEs we cannot audit), and **fit** (logs are a narrow
+domain; a narrow DSL is more ergonomic than a general one). This is
+branch-agnostic.
 
-This motivation is branch-agnostic. Whether we borrow from OTTL or
-not, we ship a DSL.
+### 2.2 Why the prior decision mattered
 
-### 2.2 Why the prior decision matters
+"OTTL-inspired" was not a free decision. Borrowing OTTL syntax in a query
+context promises OTTL-literate users that their mental model transfers; if
+the syntax looks the same but behaves differently (OTTL mutates; a query
+filters), the surface actively misleads. §3 records how that decision was
+made.
 
-"OTTL-inspired" sounds like a free decision — borrow the ergonomics,
-skip the parts that do not fit. It is not free. Borrowing OTTL
-syntax in a query context makes a promise to OTTL-literate users
-that their mental model will transfer. If the promise is kept, the
-win is real for that user segment. If the promise is broken — if
-OTTL syntax looks the same but behaves differently in a query
-context — the surface actively misleads users who would have been
-better off learning an unfamiliar DSL from scratch. The decision is
-load-bearing enough to deserve its own section.
+## 3. The prior decision (resolved): distance from OTTL
 
-## 3. The prior decision: borrow from OTTL, or distance from it?
+Both positions were defensible; §3.1–3.4 keep the honest case for each for
+the record. §3.5 records the resolution; §3.6 the reasoning.
 
-Both positions are defensible. This section writes both down
-honestly.
+### 3.1 The case for borrowing (Branch A) — not chosen
 
-### 3.1 The case for borrowing (Branch A)
+- **Positive transfer for Collector-literate SREs.** Engineers who write
+  Collector/OTTL pipelines reuse that mental model at zero onboarding.
+- **Reduces bikeshed surface.** A pinned external spec inherits decisions
+  rather than re-litigating them.
+- **Ecosystem alignment.** Diverging on surface syntax in the OTel orbit
+  can read as gratuitous.
+- **OTTL's path grammar is correct about the data model**, which any
+  alternative must address anyway.
 
-- **Positive transfer for the highest-leverage user segment.** SREs
-  and platform engineers who write Collector processor pipelines
-  already think in OTTL paths and predicates. Reusing that mental
-  model in the query context is zero-onboarding for them.
-- **Reduces bikeshed surface.** Adopting a pinned external
-  specification cuts off a whole class of "why did we pick this
-  syntax" debates. Decisions are inherited, not re-litigated.
-- **Ecosystem alignment.** A project in the OTel orbit that
-  gratuitously diverges on surface syntax looks politically odd and
-  costs us contribution mindshare we do not need to spend.
-- **OTTL's path grammar is near-minimal.** The OTel data model is
-  the ingest contract, so we must address it anyway. OTTL's
-  `resource.attributes["service.name"]` form is verbose, but it is
-  *correct* about the data model, and any alternative has to answer
-  the same disambiguation questions.
+### 3.2 The case for distancing (Branch B) — chosen
 
-### 3.2 The case for distancing (Branch B)
+- **The OTTL-literate population is a minority of OTLP users** — most emit
+  logs via an SDK and never touch OTTL.
+- **Collector ergonomics become query verbosity.**
+  `resource.attributes["service.name"] == "api"` is loud in a query.
+- **Shared syntax + different semantics misleads.** Unfamiliar syntax is a
+  safer failure mode than almost-familiar-but-wrong.
+- **No evolving external spec to track** (OTTL has had breaking changes).
+- **Design freedom** for query-context idioms (`severity >= error`,
+  `attr.foo`).
 
-- **The OTTL-literate population is smaller than "OTLP users."**
-  The subset of OTLP users who write Collector configs is a
-  minority. Most developers emit logs via an SDK and never touch
-  OTTL. The familiarity-transfer argument applies to a narrower
-  segment than §3.1 implies.
-- **OTTL's Collector ergonomics become query verbosity.**
-  `resource.attributes["service.name"] == "api"` is readable in a
-  Collector processor config (where record-typing is explicit) and
-  is unnecessarily loud in a query (where the user is asking a
-  question about logs, not configuring a pipeline). Branch B can
-  collapse this to `resource.service.name == "api"` or similar.
-- **Shared syntax plus different semantics actively misleads.** A
-  user who sees OTTL syntax reasonably expects OTTL semantics —
-  batch mutation, pipeline forwarding. Query semantics are
-  different. The safer failure mode is unfamiliar syntax than
-  almost-familiar-but-not-quite syntax.
-- **Maintenance burden of tracking an evolving spec.** OTTL's
-  grammar has had breaking changes in the Collector-contrib
-  repository. Pinning a version helps, but every time we revisit
-  the pin we pay a review cost that we avoid if we never opted into
-  the commitment.
-- **Design freedom for the query context.** A distanced DSL can use
-  bare-identifier severity (`severity >= error`), short prefixes
-  (`attr.foo`), and other idioms that are tuned for typing speed
-  and readability in the query context — which is where the DSL
-  will actually live.
+### 3.3 What is shared regardless of branch
 
-### 3.3 What the branches have in common
+- The OTel **data model** is the schema of log records (the ingest
+  contract, not a design choice): attributes, resources, severity, body,
+  timestamps, trace context.
+- The **template + correctness primitives** (`template_id`, `confidence`,
+  `lossy`; drift-alias membership via `resolves_to`) are first-class
+  (§6.3).
+- The **compilation target** is a DataFusion `LogicalPlan`, no SQL leakage
+  (§6.5).
 
-Whichever branch wins, the following remain unchanged:
-
-- The OTel *data model* is the schema of log records. We address
-  attributes, resources, severity, body, timestamps, trace context.
-  This is the ingest contract, not a design choice.
-- The top-level query surface (projection, aggregation, sort,
-  limit, time ranges) is Ourios-specific and designed against
-  LogQL/Insights idioms. See §5.3.
-- Template primitives (`template_id`, `confidence`, etc.) are
-  first-class in both branches. See §5.4.
-- Compilation target is DataFusion logical plans, with no SQL
-  leakage. See §5.5.
-
-### 3.4 Consequences of each branch
+### 3.4 Consequences
 
 | Dimension | Branch A (borrow) | Branch B (distance) |
 |---|---|---|
 | Onboarding for Collector-literate SREs | Near-zero | Mild (new syntax, familiar semantics) |
-| Onboarding for SDK users | Same in both (OTel data model) | Same |
-| Maintenance cost | Track pinned OTTL version, amend on bumps | Own every syntactic decision |
-| Risk of semantic confusion (same-syntax, different-meaning) | Real | Avoided |
-| Size of the spec we maintain | Smaller (borrow) | Larger (own) |
-| Ecosystem signalling | Aligned with OTel | Independent |
-| Design freedom | Constrained by OTTL | Unconstrained within OTel data model |
+| Onboarding for SDK / dashboard users | Same (OTel data model) | Same |
+| Maintenance cost | Track pinned OTTL, amend on bumps | Own the grammar |
+| Same-syntax/different-meaning confusion | Real | Avoided |
+| Spec size | Smaller | Larger (owned) |
+| Ecosystem signalling | Aligned with OTel | Independent (in the data model: still aligned) |
+| Design freedom | Constrained by OTTL | Free within the OTel data model |
 
-### 3.5 Status: unresolved
+### 3.5 Resolution
 
-This RFC cannot recommend either branch without user research
-(§9) and non-author review. Both branches are sketched in §5 in
-enough detail for side-by-side comparison. Reviewers: pick one, or
-push back on both and propose a third.
+**Branch B (distance from OTTL), surface β (pipe-composable).** Decided
+2026-06-07 by the maintainer, on the audience analysis in §3.6 in lieu of
+the formal user research originally gated here (§9 now scopes that
+research to the `accepted` gate, not `specified`).
+
+### 3.6 Why — the two audiences
+
+The decision turns on two audiences that re-weight §3.1–3.4:
+
+1. **Primary — Perses dashboard authors (declarative YAML/CRDs).** Queries
+   live as **string scalars in versioned YAML**. Brevity and low
+   bracket/quote density win (readable scalars, clean diffs); the audience
+   thinks in *dashboard* query languages (PromQL/LogQL), not OTTL. Branch
+   B's flat syntax + the β pipe surface embed cleanly on one line; Branch A
+   on surface α would be multi-line and bracket-heavy.
+2. **Future — MCP agents.** Borrow-but-diverge (Branch A + the §6
+   divergence list it required) is the **worst case for LLMs**: strong
+   public-OTTL priors pull a model toward real-OTTL constructs we do not
+   support → plausible-but-invalid queries. A small, self-owned grammar
+   (Branch B) has no priors to fight, is cheaper to embed in an MCP tool
+   schema, and is enforceable with grammar-constrained decoding. And —
+   decisively — agents need not generate syntax at all: they target the
+   **structured surface** (§6.4).
+
+The one strong case for Branch A (onboarding + signalling for
+Collector-literate SREs) lands on the audience that is *not* primary here,
+while its costs (semantic-confusion in the overlap zone; an
+externally-driven breaking cadence against long-lived dashboards + cached
+agent schemas) land squarely on these two. Distancing on *surface syntax*
+costs little ecosystem goodwill because we stay faithful to the OTel
+**data model** (§3.3) and because bespoke query syntax is the norm (LogQL,
+PromQL, CloudWatch Insights all diverge from any transformation language).
+
+The full audience analysis is the drafting-assistance recommendation that
+informed this decision; its three OTel-ecosystem questions (is there an
+OTel *query* language to align with? is OTTL the expected *querying*
+surface? Perses+OTel query conventions?) are folded into §9.
 
 ## 4. Design principles
 
-These rails apply to both branches.
+1. **Familiarity beats cleverness.** A first-time reader understands a
+   query within 30 seconds without a reference. No heavy sigils.
+2. **No DataFusion/SQL leakage** (`CLAUDE.md` §4 hazard 6). If explaining a surface
+   form requires naming a DataFusion type, the form is wrong.
+3. **Predicate, then pipeline.** A query is a *predicate* (the `where`)
+   followed by ordered *stages* (range, aggregate, sort, limit, project).
+   Each reads independently.
+4. **Template + OTel-canonical fields are first-class vocabulary**, not
+   pseudo-columns: `template_id`, `confidence`, `lossy` (drift-alias
+   membership via `resolves_to`);
+   `service`, `trace_id`, `span_id`, `scope` (the primary
+   correlation/query dimensions per OTel maintainer guidance, §6.2).
+5. **Every query has a time range** — explicit `range(...)` or a
+   tenant-configurable default window. Never an unbounded scan.
+6. **One core, two surfaces.** The string DSL and the structured surface
+   are equivalent front-ends over one IR (§6.4); neither can express a
+   query the other cannot.
+7. **YAML-embeddable.** A query is expressible as a single-line scalar
+   that survives a YAML round-trip — a first-class constraint for the
+   Perses audience, not an afterthought.
+8. **The grammar is owned and versioned by this RFC** (§7), not "inspired
+   by" anything. Compatibility pledges are written, not implied.
 
-1. **Familiarity beats cleverness.** A user who reads an Ourios
-   query for the first time should understand what it does within
-   30 seconds, without reading a reference. Rules out
-   heavily-sigil'd and overly abstract forms.
-2. **No DataFusion leakage.** Hazard 6. If a surface form forces us
-   to say "it's the DataFusion X" to explain it, the form is wrong.
-3. **Strict separation of predicate from projection from
-   aggregation.** A query has a clear *where*, a clear *return*,
-   and a clear *roll-up*. Users should be able to read these
-   sections independently.
-4. **Template primitives are first-class.** `template_id`,
-   `template_version`, `drift`, `confidence`, `lossy_flag` are
-   vocabulary, not pseudo-columns.
-5. **Every query has a time range, explicitly or by default.** An
-   unbounded query is a footgun. Missing a `range` clause implies a
-   tenant-configurable default window, never an infinite scan.
-6. **Compatibility pledges are written, not implied.** If Branch A
-   wins, "OTTL-compatible predicates" is pinned to a specific spec
-   version with an enumerated divergence list. If Branch B wins, we
-   own our grammar explicitly and version it ourselves. "Inspired
-   by" without a pledge is marketing.
+## 5. Acceptance criteria
 
-## 5. Proposed designs (two branches)
+> `Given/When/Then`, ids greppable from tests: each test carries the
+> `docs/verification.md` §2.2 doc-comment form —
+> `/// Scenario RFC0002.<n> — <title>.` plus
+> `/// See docs/rfcs/0002-query-dsl.md §5.`. These specify the parser +
+> compiler that front-ends the (already-implemented, RFC 0007 §5)
+> execution layer.
 
-### 5.1 Predicate sublanguage — Branch A (borrow from OTTL)
+- **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4 hazard 6]`**
+  - **Given** a Branch-B predicate (e.g. `template_id == 42 and severity >= error`)
+  - **When** it is parsed and compiled
+  - **Then** it yields the query IR and an **internal** DataFusion
+    `Filter` (a private compilation artifact — never surfaced through the
+    public API, RFC0002.3). Predicates
+    over RFC 0007 §4.3's pushdown keys prune the scan per that section's
+    split — `template_id` skips row groups (B1), `time_unix_nano` prunes
+    partitions and row groups, `tenant_id` prunes partition directories
+    (not row groups); for the subset the current `ourios_querier`
+    structured request can express (template + time) the DSL result is
+    identical to it. Severity compiles via the §6.2/RFC0002.5
+    `severity_number` mapping (the column is RFC 0005's `severity_number`),
+    not the `severity_text` equality the current request supports, and
+    predicates
+    over non-indexed fields (`service`, `attr.*`) compile to a correct
+    `Filter` with no row-group-pruning claim (indexed `service.name`
+    pushdown would be a future RFC 0005 §3.6 amendment).
 
-Predicate expressions and path access follow **OTTL specification
-v1.x** (version to be pinned when this RFC freezes) for:
+- **RFC0002.2 — String DSL and structured surface compile to the same plan `[§6.4]`**
+  - **Given** a query expressed both as a β string and as the structured
+    JSON surface
+  - **When** both are compiled
+  - **Then** they produce the *same* query IR (and hence the same
+    `LogicalPlan`) — the one-core/two-surfaces invariant.
 
-- Path syntax into the OTel log record:
-  `resource.attributes["service.name"]`, `attributes["http.method"]`,
-  `body`, `severity_number`, `severity_text`,
-  `instrumentation_scope.name`, `trace_id`, `span_id`, `flags`,
-  `observed_timestamp`, `timestamp`.
-- Boolean operators: `and`, `or`, `not`, grouping with parentheses.
-- Comparison operators: `==`, `!=`, `<`, `<=`, `>`, `>=`, `=~`
-  (regex), `!=~` (regex negation).
-- Literal forms: strings, numbers, booleans, nil, duration literals
-  (`1h`, `30s`), timestamp literals.
-- Function calls: a *documented subset* of OTTL's function library:
-  `IsMatch`, `Contains`, `Len`, `Int`, `Double`, `String`. Mutation
-  functions (`set`, `delete`, etc.) are excluded — predicates do
-  not mutate.
+- **RFC0002.3 — No DataFusion/arrow/SQL leakage `[CLAUDE.md §4 hazard 6]`**
+  - **Given** the public DSL API (parse, compile, error types)
+  - **When** a query parses, compiles, or fails
+  - **Then** no `datafusion`/`arrow`/SQL type or message appears in any
+    public signature or error string (compile- and string-level boundary
+    test, mirroring RFC0007.3).
 
-The RFC freezes the accepted subset at acceptance time. Future OTTL
-spec versions are not automatically adopted; adoption requires an
-amending RFC that enumerates the delta.
+- **RFC0002.4 — A query without an explicit range gets the tenant default window `[§4 P5]`**
+  - **Given** a query with no `range(...)` stage
+  - **When** it is compiled in a tenant context with a default window W
+  - **Then** the plan carries a time-column filter equal to W — never an
+    unbounded scan.
 
-**Worked predicate in Branch A**:
+- **RFC0002.5 — Bare-identifier severity maps to its SeverityNumber `[§6.1]`**
+  - **Given** `severity >= error` (and `warn`, `info`, `debug`, `trace`,
+    `fatal`)
+  - **When** compiled
+  - **Then** each maps, case-insensitively, to the §6.1 `SeverityNumber`
+    for that level (`error` → 17, etc.) and compiles identically to the
+    numeric form (`severity >= 17`). The name→number mapping is the
+    documented §6.1 one (Ourios's, aligned with the OTel ranges) — not an
+    OTel-standardised threshold.
 
+- **RFC0002.6 — First-class OTel-canonical fields resolve correctly `[§6.2]`**
+  - **Given** `service`, `trace_id`, `span_id`, `scope` used as bare
+    fields
+  - **When** compiled
+  - **Then** each resolves to the RFC 0001 §6.1 column / resource-attribute
+    it names (`service` → `resource["service.name"]`), with no
+    string-flattening required of the user.
+
+- **RFC0002.7 — Parse/serialise round-trip is idempotent**
+  - **Given** any well-formed query (property-generated)
+  - **When** parsed → serialised → parsed
+  - **Then** the second parse equals the first (AST idempotence).
+
+- **RFC0002.8 — A malformed query yields a specific, leak-free error**
+  - **Given** a syntactically or semantically invalid query
+  - **When** parsed/compiled
+  - **Then** it returns a specific error citing the offending
+    token/clause and the §7 grammar — never a panic, never a DataFusion
+    message.
+
+- **RFC0002.9 — Template primitives compile `[§6.3]`**
+  - **Given** `template_id == 42`, `resolves_to(42)`, `lossy == true`,
+    `confidence < 0.7`
+  - **When** compiled
+  - **Then** each compiles to the documented plan (`resolves_to` expands
+    to the alias-set membership of RFC 0001 §6.7), without leaking the
+    underlying representation.
+
+- **RFC0002.10 — A query is a YAML-safe single-line scalar `[§4 P7]`**
+  - **Given** the canonical serialisation of any well-formed query
+  - **When** embedded as a YAML scalar and round-tripped through a YAML
+    parser
+  - **Then** the recovered string parses to the same query (the Perses-
+    embedding guarantee).
+
+- **RFC0002.11 — The structured surface validates against its published schema `[§6.4]`**
+  - **Given** the structured (MCP) query surface
+  - **When** a request is validated against the published JSON schema
+  - **Then** well-formed requests pass and compile; malformed ones are
+    rejected by the schema before reaching the planner.
+
+## 6. Design
+
+### 6.1 Predicate sublanguage (Branch B)
+
+A predicate is a boolean expression over **paths**, **operators**, and
+**literals** against the OTel log data model. The bare literal `true` is
+the **match-all** predicate (for queries that filter only by `range`/other
+stages); `false` matches nothing.
+
+**Paths.**
+
+- **Top-level fields** are bare identifiers mapping to the OTel log
+  data-model fields: `body` (Body — an OTel `AnyValue`: string, bool, int,
+  double, bytes, array, or kvlist/map), `severity` (SeverityNumber), `ts`
+  (Timestamp), `observed_ts`
+  (ObservedTimestamp), `trace_id` (TraceId), `span_id` (SpanId), `scope`
+  (InstrumentationScope name), `flags` (TraceFlags). (Backend treatment of
+  structured `body` vs `attr.*` is not uniform across the ecosystem; the
+  DSL keeps the split explicit rather than flattening.)
+- **Resource attributes**: `resource.<key>` where `<key>` is the OTel
+  attribute key taken literally including dots (`resource.service.name` →
+  resource attribute `"service.name"`). Bracketed form `resource["..."]`
+  for any key not expressible as dotted bare identifiers — characters
+  outside the bare-identifier set, a segment starting with a digit, or a
+  reserved-word collision (`resource["k8s.pod.name"]`, `resource["3rd.party"]`).
+- **Log-record attributes**: `attr.<key>` (`attr.http.status_code` →
+  attribute `"http.status_code"`); bracketed `attr["..."]` for the same
+  non-bare-identifier cases.
+- **Severity**: `severity` compares against a **bare severity name**
+  (`severity >= error`), case-insensitive, or a **numeric** form
+  (`severity >= 17`). All severity comparisons — **including ordering**
+  (`<`/`<=`/`>`/`>=`) — are defined on the OTel **`SeverityNumber`**,
+  **never** on the free-form `severity_text` (per the OTel *comparing
+  severity* guidance). Bare names map to the **floor of the matching OTel
+  `SeverityNumber` range**: `trace`→1, `debug`→5, `info`→9, `warn`→13,
+  `error`→17, `fatal`→21. The spec standardises the *ranges* and says to
+  compare on `SeverityNumber`; this name→number mapping is **Ourios's**,
+  aligned with those ranges, not separately mandated by OTel.
+
+**Operators.** Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`, `=~`
+(regex match), `!~` (regex non-match). Boolean: `and`, `or`, `not`, with
+terse aliases `&&`, `||`, `!`; grouping with `()`.
+
+**Literals.** Double-quoted strings (`"api"`), numbers (`500`, `0.7`),
+booleans (`true`/`false`), `null`, duration literals (`30s`, `1h`, `1d`,
+`1w`), and RFC 3339 timestamps.
+
+**Functions** (read-only, bespoke names tuned for queries) — boolean
+predicate terms: `matches(path, regex)`, `contains(path, s)`,
+`starts_with(path, s)`, `ends_with(path, s)`. They require a **string
+operand**: applying one to a non-string path (`severity`, a numeric/bool
+attribute, `lossy`, `ts`) is a compile-time type error (RFC0002.8), not a
+silent coercion. (Scalar-returning functions such as `len(path)` are
+**deferred**: the grammar admits a call only as a boolean term, so a
+numeric `len(...) > n` would need a scalar-comparison form — added under a
+future minor version when a need surfaces.)
+
+**Worked predicate.**
+
+```text
+service == "api" and severity >= error and attr.http.status_code == 500
 ```
-resource.attributes["service.name"] == "api"
-  and severity_number >= 17
-  and attributes["http.status_code"] == 500
-```
 
-**Divergences from OTTL (Branch A only)** — see §6 for the full
-enumerated list.
+### 6.2 First-class OTel-canonical fields
 
-### 5.2 Predicate sublanguage — Branch B (distance from OTTL)
+Per OpenTelemetry maintainer guidance (the primary dimensions a log
+backend is judged on), these get **named, bare** surface rather than
+hand-written attribute lookups, resolving the last open question of the
+prior draft:
 
-An Ourios-native predicate grammar designed for query readability.
-Still addresses the OTel data model — attributes, resources,
-severity, body, timestamps, trace context — but with a syntax chosen
-to minimise noise in the query context.
-
-- **Path syntax** into the OTel log record:
-  - Top-level fields are bare identifiers: `body`, `severity`,
-    `ts`, `trace_id`, `span_id`, `scope`.
-  - Resource attributes are prefixed with `resource.`:
-    `resource.service.name`, bracketed form
-    `resource["service.name"]` when the key contains characters
-    that are not valid bare identifiers.
-  - Log-record attributes are prefixed with `attr.`:
-    `attr.http.status_code`, bracketed form when needed.
-  - `severity` accepts either a bare severity identifier
-    (`severity >= error`, mapped to severity numbers by the OTel
-    severity-text convention) or a numeric form
-    (`severity >= 17`).
-- **Boolean operators**: `and`, `or`, `not`. Aliases `&&`, `||`,
-  `!` accepted for terseness.
-- **Comparison operators**: `==`, `!=`, `<`, `<=`, `>`, `>=`,
-  `=~`, `!=~`. Same as Branch A.
-- **Literal forms**: same as Branch A.
-- **Function calls**: a bespoke, named library designed for query
-  ergonomics. Initial set: `matches(path, regex)`,
-  `contains(path, substring)`, `len(path)`, `starts_with(path, s)`,
-  `ends_with(path, s)`. Named to match Rust-ecosystem naming
-  conventions, not OTTL's.
-
-**Worked predicate in Branch B** (same semantics as §5.1 example):
-
-```
-resource.service.name == "api"
-  and severity >= error
-  and attr.http.status_code == 500
-```
-
-Notice: shorter by roughly a third, identifier-forward where
-possible, no forced bracket-quoting for common attributes.
-
-**Trade-off realised**: Branch B is more readable; Branch A is more
-transferable. The choice is exactly the one in §3.
-
-### 5.3 Top-level query surface — branch-agnostic
-
-Three candidate surfaces. This decision is separate from §3 — any
-of A/B/C can sit on top of either predicate branch.
-
-#### Candidate α — SQL-ish, clause-structured
-
-```
-from logs
-  where <predicate>
-  range ts in [now() - 1h, now()]
-  aggregate count() by template_id
-  sort count desc
-  limit 10
-```
-
-Pros: reads like English; clear separation; verbose in a way that
-is usually a feature. Cons: drifts from LogQL/Insights idioms.
-
-#### Candidate β — pipe-composable, LogQL-ish
-
-```
-{<predicate>}
-  | range(-1h, now)
-  | count by template_id
-  | sort desc
-  | limit 10
-```
-
-Pros: compact, composable, familiar to LogQL users. Cons: sigils
-(`{}`, `|`); deeply nested pipes can become unreadable.
-
-#### Candidate γ — Insights-ish
-
-```
-filter <predicate>
-range 1h
-stats count() by template_id
-sort count desc
-limit 10
-```
-
-Pros: familiar to CloudWatch users; minimal sigil density;
-verb-per-line. Cons: forces linebreaks in simple queries; less
-composable than β.
-
-*Reviewers: surface choice (α/β/γ) and predicate choice (A/B) are
-independent. Both decisions feed §9.*
-
-### 5.4 Template and correctness primitives — branch-agnostic
-
-Present in both branches. Straw-man forms in Candidate α:
-
-```
-# Find rows where the miner was not fully confident
-where lossy_flag = true
-
-# Find all rows belonging to a template, including drift/aliases
-where template_id.resolves_to(X)
-
-# Find templates that have drifted across versions
-aggregate count() by template_id where template.drift = true
-
-# Reconstruct the original line (honours lossy_flag)
-select render(*) from logs where ...
-```
-
-The `resolves_to` construct answers the drift question in RFC 0001
-§6.7. Equivalent forms exist under β and γ.
-
-### 5.5 Compilation target — branch-agnostic
-
-Every construct compiles to a DataFusion **LogicalPlan**:
-
-| DSL construct        | DataFusion logical node                    |
-|----------------------|--------------------------------------------|
-| `from logs`          | `TableScan` on the tenant's log table      |
-| `where` / filter     | `Filter`                                   |
-| `range`              | `Filter` with a time-column predicate      |
-| projection / `select`| `Projection`                               |
-| `aggregate` / `stats`| `Aggregate`                                |
-| `sort`               | `Sort`                                     |
-| `limit`              | `Limit`                                    |
-| `render(*)`          | Custom `ProjectionExec` that honours the three-zone model |
-| `template_id.resolves_to(X)` | Custom logical node that expands to an `IN` over the alias set |
-
-Most is DataFusion's built-in logical algebra. The two non-trivial
-entries — `render` and `resolves_to` — are the only places Ourios
-extends DataFusion. Both are branch-agnostic.
-
-### 5.6 Stability and versioning — branch-dependent
-
-Branch A: DSL versioning tracks (a) internal changes and (b) OTTL
-compatibility bumps. An OTTL spec bump is always a DSL major
-version.
-
-Branch B: DSL versioning tracks only (a). There is no upstream
-spec to shadow. Consequently Branch B has fewer unsolicited major
-versions but more deliberated ones.
-
-General rules (both branches):
-
-- Additions (new functions, new pseudo-columns) are minor versions.
-- Behavioural changes that could alter a query's result set are
-  major versions, require an RFC amending this one, and ship with
-  a deprecation window.
-
-## 6. Enumerated divergences from OTTL (applies only if Branch A wins)
-
-Known deviations from the pinned OTTL spec under Branch A. The list
-is exhaustive at RFC freeze; any divergence added later requires an
-amending RFC.
-
-| Divergence | Reason |
+| Surface | Resolves to (RFC 0001 §6.1) |
 |---|---|
-| No mutation functions (`set`, `delete`, `keep_keys`, `limit_keys`) | Read-only query context |
-| No `Statement` top-level form | Queries are not OTTL statements |
-| `where` semantics apply to rows, not Collector batches | Different execution model |
-| Ourios-specific paths (`template_id`, `confidence`, etc.) | Not in OTel data model |
-| Duration literals accept Ourios forms (`1d`, `1w`) | Log time windows coarser than Collector processing |
+| `service` | `resource["service.name"]` |
+| `trace_id`, `span_id` | the dedicated columns (log↔trace correlation) |
+| `scope` | `scope_name` |
+| `severity` | `severity_number` (via the §6.1 mapping) |
+| `ts` | `time_unix_nano` (the event timestamp; what `range(...)` filters) |
+| `observed_ts` | `observed_time_unix_nano` |
 
-If Branch B wins, this section is deleted and replaced with a
-"Grammar specification" appendix owned by this RFC.
+`trace_id` / `span_id` literals are **hex strings** (32 and 16 hex digits
+respectively, no separators), **parsed case-insensitively** so uppercase
+OTLP/JSON ids are accepted; the canonical/serialised form is lowercase.
+The compiler hex-decodes them to match the stored byte columns — the
+OTLP/JSON id convention, consistent with RFC0003.6.
 
-## 7. Testing strategy
+### 6.3 Template + correctness primitives
 
-Mapping to `CLAUDE.md` §6.2.
+First-class vocabulary — **Ourios-specific** extensions (RFC 0001
+§6.3/§6.7), **not** OpenTelemetry log-data-model fields; they live in the
+Ourios schema + query layer alongside the OTel-canonical fields of §6.2:
 
-- **Unit tests** for the parser: every documented syntactic form
-  has a positive and negative test.
-- **Property tests**: generate random well-formed queries,
-  round-trip through parser → AST → serialised form → parser,
-  assert idempotence.
-- **Compilation tests**: every DSL construct has a golden-file test
-  of the resulting DataFusion LogicalPlan.
-- **End-to-end query tests**: against the corpora from
-  `docs/benchmarks.md` §1, pin expected query results; any change
-  is a PR-visible diff.
-- **Branch-specific:**
-  - *Branch A only*: OTTL compatibility tests — the pinned OTTL
-    predicate corpus is imported; every supported predicate parses
-    and produces the expected AST; every unsupported predicate
-    fails with a specific error message linking to §6.
-  - *Branch B only*: grammar golden-file tests — every syntactic
-    form is exercised against a committed-to-repo reference
-    grammar snapshot; deviations are visible in PR diffs.
+- `template_id == 42` — exact template; resolves to the `template_id` column.
+- `resolves_to(42)` — `X` plus its drift aliases (the RFC 0001 §6.7 drift
+  question); compiles to alias-set membership over `template_id`.
+- `confidence` — miner confidence (e.g. `< 0.7`); the `confidence` column.
+- `lossy` — the lossy-reconstruction flag; resolves to the RFC 0001 /
+  RFC 0005 **`lossy_flag`** column (`lossy == true`).
+- `render` (pipe stage, §6.5) reconstructs the original line, honouring
+  `lossy`.
 
-## 8. Alternatives considered (to the DSL as a whole)
+The drift *question* is answered by `resolves_to` (alias membership). A
+bare `drift` predicate ("has this template drifted?") is **deferred**:
+per RFC 0001 §6.7 drift is an audit-stream property, not a column in the
+RFC 0005 data files, so it needs an audit-stream query path — a future
+capability, not a row predicate in this grammar.
 
-These are alternatives that would replace *both* §5.1/§5.2, not
-just one branch.
+### 6.4 Two front-ends, one core
 
-### 8.1 Pure SQL (DataFusion dialect)
+```mermaid
+flowchart LR
+  A["string DSL (β)<br/>Perses YAML, humans"] --> P[parser]
+  B["structured surface<br/>JSON, MCP agents + clients"] --> V[schema validate]
+  P --> IR[query IR]
+  V --> IR
+  IR --> C["compiler<br/>(no SQL leakage)"]
+  C --> LP["DataFusion LogicalPlan<br/>(RFC 0007 execution layer)"]
+```
 
-- **Pros**: zero parser implementation; SQL users immediately
-  productive; DataFusion's planner already supports it.
-- **Cons**: violates hazard 6. Exposes SQL features we cannot
-  safely permit (cross-tenant joins, unbounded windows, recursive
-  CTEs) without a sandboxing layer that is its own project. Binds
-  user-facing surface to DataFusion evolution.
-- **Verdict**: rejected as the default. Possible future
-  advanced-mode escape hatch, gated and sandboxed, under a
-  separate RFC.
+- **String DSL (surface β)** is the human surface (esp. Perses YAML). A
+  query is a predicate optionally followed by `|`-separated stages:
 
-### 8.2 LogQL clone
+  ```text
+  service == "api" and severity >= error | range(-1h, now) | count by template_id | sort count desc | limit 10
+  ```
 
-- **Pros**: well-understood logs DSL; Loki migrators
-  immediately productive.
-- **Cons**: LogQL uses label selectors, which are less expressive
-  than the OTel log record. Adopting LogQL means projecting OTel
-  attributes into labels, losing structure and lying about the
-  ingest contract.
-- **Verdict**: rejected as the full DSL. Its top-level query shape
-  survives as Candidate β in §5.3.
+  A predicate-only / "no filter" query uses the match-all atom `true`,
+  e.g. `true | range(-1h, now) | limit 100`.
 
-### 8.3 CloudWatch Logs Insights clone
+  Stages: `range(from, to)` (each bound a relative duration, the `now`
+  keyword, or an RFC 3339 timestamp — the §7 `time` form; defaults per
+  §4 P5), `count [by <field, …>]` (comma-separated, per the §7
+  `field_list`) and other aggregations (`sum`, `min`,
+  `max`, `avg` over a path), `sort <field-or-aggregate> [asc|desc]`
+  (the §7 `sort_key` — a field or an aggregate output like `count`),
+  `limit <n>`,
+  `project <field, …>` / `render`. The whole query is expressible on one
+  line as shown (whitespace around `|` is optional) — the §4 P7 YAML
+  constraint.
 
-- **Pros**: familiar to a large AWS population; clear
-  verb-per-line; explicit aggregation idioms.
-- **Cons**: proprietary syntax, no open spec to pin; attribute
-  model differs from OTel.
-- **Verdict**: rejected as the full DSL. Its readability idioms
-  survive as Candidate γ in §5.3.
+- **Structured surface** is the machine contract (MCP tool schema +
+  programmatic clients): a top-level object
+  `{ "predicate": <node>, "stages": [ <stage>, … ] }` (`stages` optional,
+  default `[]`). A **`field`** is **structured** (no DSL path syntax for
+  agents to build or escape): a bare top-level name string (`"service"`,
+  `"severity"`, `"body"`, `"trace_id"`, …) or an attribute object
+  `{ "resource": "<key>" }` / `{ "attr": "<key>" }` (`<key>` the raw OTel
+  attribute key, e.g. `"k8s.pod.name"`). An **`op`** is a §7 `cmp_op`
+  string (`"=="`, `">="`, `"=~"`, …); a **`value`** is a JSON
+  primitive (string / number / bool / null), with durations and timestamps
+  carried as their §7 lexical strings (`"1h"`, RFC 3339). A **`<node>`** is
+  a **comparison node** `{ "field": …, "op": …, "value": … }`, a **call
+  node** `{ "call": "<fn>", "args": [ … ] }` whose `args` follow the §7
+  typed signatures — `matches`/`contains`/`starts_with`/`ends_with` take
+  `[ <field>, <string> ]` (`<field>` as above), `resolves_to` takes
+  `[ <number> ]`, a **constant node** `{ "const": true | false }` (the §7
+  `bool_lit` match-all / match-none — `{ "const": true }` is the "no
+  filter" predicate), or a **boolean node**
+  (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
+  array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a
+  tagged object covering the full §7 stage set —
+  `range`/`count`/`sum`/`min`/`max`/`avg`/`sort`/`limit`/`project`/`render`.
+  Its **JSON Schema is published and versioned with the parser** (snapshot-
+  tested like the §7 grammar; RFC0002.11), and it compiles to the same IR
+  as the string surface (RFC0002.2). It is the formalised, extended
+  successor to the existing `ourios_querier::QueryRequest` (the RFC 0007
+  structured API) and is the stable surface agents target — no grammar
+  generation required.
 
-### 8.4 Full-custom DSL
+Both parse/validate to the **same query IR** and compile identically
+(RFC0002.2). The tenant is **not** expressed in either surface — it is
+supplied by the executing context (`CLAUDE.md` §3.7 multi-tenancy;
+enforced per RFC0007.5); a query
+without a tenant is an API usage error, not a cross-tenant scan.
 
-- **Pros**: maximum fit; no external compatibility constraints.
-- **Cons**: highest learning cost for every user regardless of
-  background. Violates principle §4.1. "Own every decision" with
-  no upstream pressure.
-- **Verdict**: rejected as a green-field approach. Branch B is
-  *not* full-custom — it borrows the top-level surface from
-  LogQL/Insights and the data model from OTel; only the predicate
-  syntax is Ourios-native. Full-custom would replace the query
-  surface too.
+### 6.5 Compilation target
 
-## 9. Testing the premise (user research)
+Every construct compiles to a DataFusion `LogicalPlan`:
 
-This RFC makes claims about what users will find familiar. Those
-claims are currently unvalidated. Before acceptance, the RFC
-requires at least:
+| DSL construct | DataFusion logical node |
+|---|---|
+| implicit `from logs` | `TableScan` on the tenant's log table |
+| predicate / `range` | `Filter` (range → time-column predicate) |
+| `count` / aggregations | `Aggregate` |
+| `sort` | `Sort` |
+| `limit` | `Limit` |
+| `project` | `Projection` |
+| `render` | custom projection honouring the three-zone reconstruction model |
+| `resolves_to(42)` | custom node expanding to alias-set membership |
 
-- A **user persona document** identifying three-to-five archetypes
-  (e.g. "SRE running a Collector pipeline", "Go developer
-  debugging their service", "analyst exploring historical
-  incidents"), with their expected prior DSL exposure. The
-  Branch A/B decision pivots heavily on the weight of the
-  Collector-operator segment among these.
-- A **readability test** on 10–20 sample queries across:
-  - each surface candidate (α/β/γ),
-  - both predicate branches (A/B),
-  with non-author reviewers scoring them on first-read
-  comprehensibility and semantic-guess accuracy.
-- A **migration feasibility sketch** from LogQL, Insights, and
-  OTTL transformations into each branch × surface combination.
+All but `render` and `resolves_to` are DataFusion's built-in algebra;
+those two are the only Ourios extensions, both surface-independent.
 
-Skipping this step and picking on instinct is the path where we
-build something elegant that nobody wants to use.
+### 6.6 Stability and versioning
 
-## 10. Open questions
+The grammar (§7) is owned and versioned by this RFC. Additions (new
+functions, new first-class fields) are minor versions. Behavioural changes
+that could alter a query's result set are major versions, require an
+amending RFC + a deprecation window, and — because the Perses/MCP
+audiences persist queries (git-versioned dashboards, cached agent schemas)
+— ship with a documented migration. There is no external spec to shadow,
+so major versions are deliberate, not inherited.
 
-*Must be resolved before status flips to `accepted`. The first
-question is the prior decision; the rest are downstream.*
+## 7. Grammar specification (owned by this RFC)
 
-- [ ] **Prior: Branch A (borrow from OTTL) or Branch B (distance
-      from OTTL)?** Decided by §9 user research + explicit
-      reviewer vote.
-- [ ] Which candidate surface (α, β, γ) wins, and under what
-      criteria?
-- [ ] If Branch A: which OTTL spec version is pinned, and how are
-      upstream bumps handled operationally?
-- [ ] If Branch B: does the bare-identifier severity form
-      (`severity >= error`) collide with OTel severity-text
-      casing conventions?
-- [ ] Is there a `--sql` advanced-mode escape hatch, and if so,
-      what are its safety constraints?
-- [ ] How are saved queries and dashboards versioned across DSL
-      major versions?
-- [ ] Does the DSL expose custom user functions? If so, where do
-      they run, and what is the sandboxing story?
-- [ ] How does the DSL address the multi-tenant boundary —
-      implicit in the executing tenant's context, or explicit in
-      the query?
-- [ ] Do we expose `params[N]` positional access, or name
-      parameters via the template schema?
-- [ ] Error messages: how specific can we be about *why* a query
-      was rejected (e.g. linking to §6 divergence table under
-      Branch A, or to the grammar appendix under Branch B)?
-- [ ] Is there a query cost estimator in-path, so users see "this
-      will scan 400 GB" before running?
-- [ ] Is the DSL rendered identically in the CLI and in the UI,
-      or does the UI add affordances the spec does not dictate?
-- [ ] Is the DSL designed to be **agent-friendly** — callable from
-      a CLI with stable, machine-parseable output schemas (JSON,
-      JSONL) suitable for consumption by Claude Code, Cursor,
-      Grafana's GCX, or comparable agentic tools? This is a UX
-      layer question that does not change the A/B predicate-branch
-      decision, but should be answered before §9 user research
-      because the answer changes who counts as a "user".
-- [ ] **First-class query dimensions for OTel-canonical fields.**
-      RFC 0001 §6.1 stores `service.name` (via
-      `resource_attributes`), `trace_id` / `span_id`, `scope_name`,
-      and `attributes` as faithful columns — but the storage spec
-      stays silent on how the DSL surfaces them. Community
-      feedback (OpenTelemetry maintainer guidance, May 2026) is
-      that these are the primary correlation/query dimensions a
-      log backend is judged on: `service.name` for cross-service
-      navigation, `trace_id`/`span_id` for log↔trace correlation,
-      typed `attributes` access without string-flattening. The
-      DSL should give them ergonomic, *named* surface (e.g.
-      `service ==`, `trace_id ==`, `attr["k"] ==`) rather than
-      requiring users to hand-write attribute-map lookups. Decide
-      the surface here so RFC 0001 doesn't have to retrofit it.
+A compact EBNF; the canonical machine-readable grammar lives beside the
+parser and is snapshot-tested (§8). Kept small and regular so it doubles
+as a constrained-decoding grammar for the MCP surface (§3.6).
 
-The DSL is the most user-facing surface in the project. More open
-questions here is healthier than fewer.
+```ebnf
+query        = predicate , { "|" , stage } ;
+predicate    = or_expr ;
+or_expr      = and_expr , { ("or" | "||") , and_expr } ;
+and_expr     = unary , { ("and" | "&&") , unary } ;
+unary        = [ "not" | "!" ] , ( comparison | call | bool_lit | "(" , predicate , ")" ) ;
+bool_lit     = "true" | "false" ;   (* match-all / match-none; a bare `true` = no filter *)
+comparison   = severity_cmp | scalar_cmp ;
+severity_cmp = "severity" , ord_op , ( severity_name | number ) ;
+scalar_cmp   = scalar_path , cmp_op , literal ;
+ord_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" ;   (* no regex — severity is numeric *)
+cmp_op       = ord_op | "=~" | "!~" ;
+call         = str_fn , "(" , path , "," , string , ")"
+             | "resolves_to" , "(" , number , ")" ;
+str_fn       = "matches" | "contains" | "starts_with" | "ends_with" ;
+path         = field | "resource" , key_tail | "attr" , key_tail ;
+scalar_path  = nonsev_field | "resource" , key_tail | "attr" , key_tail ;
+field        = nonsev_field | "severity" ;
+nonsev_field = "body" | "ts" | "observed_ts" | "trace_id" | "span_id"
+             | "scope" | "flags" | "service" | "template_id"
+             | "confidence" | "lossy" ;
+key_tail     = ( "." , dotted_key ) | ( "[" , string , "]" ) ;
+dotted_key   = ident , { "." , ident } ;
+stage        = "range" , "(" , time , "," , time , ")"
+             | "count" , [ "by" , field_list ]
+             | agg_fn , "(" , path , ")" , [ "by" , field_list ]
+             | "sort" , sort_key , [ "asc" | "desc" ]
+             | "limit" , integer
+             | "project" , field_list
+             | "render" ;
+agg_fn       = "sum" | "min" | "max" | "avg" ;
+field_list   = field , { "," , field } ;
+sort_key     = field | ident ;          (* ident = an aggregate output, e.g. count *)
+literal      = string | number | boolean | "null" | duration | timestamp ;
+severity_name = "trace" | "debug" | "info" | "warn" | "error" | "fatal" ;  (* case-insensitive; only as a `severity` RHS *)
+time         = "now" | ( [ "-" ] , duration ) | timestamp ;   (* e.g. now , -1h *)
+integer      = digit , { digit } ;
+(* lexical: ident = letter , { letter | digit | "_" } ;
+   string = '"' , { char | escape } , '"' ;
+   char   = any Unicode scalar except '"' , '\' , or a line terminator
+            (a literal newline must be written as the \n escape — queries
+            are single-line, §4 P7 / RFC0002.10) ;
+   escape = '\' , ( '"' | '\' | "n" | "t" | "r" | ( "u" , 4 * hex ) ) ;
+   number = integer | float ;  float = integer , "." , digit , { digit } ;
+   boolean = "true" | "false" ;
+   duration = integer , ( "s"|"m"|"h"|"d"|"w" ) ;  timestamp = RFC 3339 ;
+   digit = "0".."9" ;  letter = "a".."z" | "A".."Z" ;
+   hex = digit | "a".."f" | "A".."F"
+   — strings are double-quoted with backslash escapes; YAML embedding
+   (RFC0002.10) wraps the whole query in a single-quoted YAML scalar so
+   these double quotes need no YAML-level escaping *)
+```
+
+## 8. Testing strategy
+
+Mapping to `CLAUDE.md` §6.2 and `docs/verification.md` §3 (red→green
+two-loop: `#[ignore]`'d stubs first, implementations second).
+
+- **Unit tests** — every grammar production has a positive and negative
+  parse test.
+- **Property tests** — generate well-formed queries; assert the §5
+  round-trip idempotence (RFC0002.7) and that every generated query is a
+  YAML-safe single-line scalar (RFC0002.10).
+- **Compilation golden tests** — every construct has a golden `LogicalPlan`
+  (debug-rendered) checked in; the no-leakage boundary (RFC0002.3) is a
+  compile + string test.
+- **Equivalence tests** — string vs structured surface compile to the
+  same IR (RFC0002.2); a DSL query and the equivalent `ourios_querier`
+  structured request return identical results + `QueryStats` (RFC0002.1).
+- **Grammar snapshot** — the EBNF / parser grammar is committed and
+  snapshot-tested so changes are PR-visible (Branch B owns its grammar).
+- **End-to-end** — against the `docs/benchmarks.md` §1 corpora, pinned
+  expected results for a query set spanning each construct.
+
+## 9. Open questions
+
+*Narrowed by the §3 resolution. Must be resolved before `accepted`.*
+
+- [ ] **Pre-`accepted` validation.** The §3.6 audience analysis stands in
+      for instinct, not for evidence: before `accepted`, run a readability
+      pass on 10–20 sample queries with non-author reviewers, and a
+      migration sketch from LogQL/Insights into β. (Replaces the prior
+      §9 user-research gate; not required for `specified`.)
+- [x] ~~**OTel ecosystem alignment**~~ *Resolved:* OpenTelemetry defines
+      the logs data model + API/SDK but **no standard query/read
+      language**, and **OTTL is a Collector *transformation* language, not
+      a querying surface** (see the OTTL README and the OTel logs spec
+      linked in §11 References). There
+      is no canonical OTel read syntax, and no Perses-specific query
+      convention, to align to. Bespoke query syntax over the OTel data
+      model is the norm (LogQL, PromQL, CloudWatch Insights), so Branch B
+      carries no ecosystem-divergence cost — the alignment that matters is
+      at the **field semantics**, which §6.1/§6.2 honour
+      (`ts`/`observed_ts`/`trace_id`/`span_id`/`flags`/`body`/`scope`/
+      `severity` → canonical data-model fields; `severity` ordering on
+      `SeverityNumber`).
+- [ ] `--sql` advanced-mode escape hatch — gated + sandboxed, or never?
+      (Currently: never; reconsider under a separate RFC.)
+- [ ] Custom user functions — out for v1 (sandboxing is its own project).
+- [ ] `params[N]` positional access vs named parameters via the template
+      schema.
+- [ ] In-path query cost estimator ("this will scan 400 GB") before run.
+- [ ] Pagination / streaming surface for large result sets (mirrors
+      RFC 0007 §8).
+
+Resolved by this RFC (were open in the draft): branch (B), top-level
+surface (β), severity-text casing (case-insensitive, §6.1), agent-
+friendliness (the structured surface, §6.4), and first-class OTel-
+canonical fields (§6.2).
+
+## 10. Alternatives considered
+
+Alternatives that would replace the whole design, not just one branch.
+
+- **Pure SQL (DataFusion dialect)** — zero parser cost, but violates
+  `CLAUDE.md` §4 hazard 6 (cross-tenant joins, unbounded scans) and binds the user
+  surface to DataFusion. Rejected as default; possible future gated,
+  sandboxed escape hatch under a separate RFC.
+- **LogQL clone** — label selectors are less expressive than the OTel log
+  record; adopting them flattens structure and lies about the ingest
+  contract. Rejected as the full DSL; its top-level shape survives as the
+  chosen β surface.
+- **CloudWatch Insights clone** — proprietary, no open spec; attribute
+  model differs from OTel. Rejected; its verb-per-line readability is the
+  γ alternative we did not pick.
+- **Branch A (borrow OTTL) on any surface** — see §3; not chosen for the
+  Perses/MCP audiences.
 
 ## 11. References
 
-- OpenTelemetry Transformation Language (OTTL) specification:
-  https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/pkg/ottl
-  (pin a commit at RFC freeze under Branch A; reference-only under
-  Branch B).
-- LogQL (Grafana Loki): https://grafana.com/docs/loki/latest/query/
-- CloudWatch Logs Insights:
-  https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html
 - OpenTelemetry log data model:
   https://opentelemetry.io/docs/specs/otel/logs/data-model/
 - OpenTelemetry severity text conventions:
   https://opentelemetry.io/docs/specs/otel/logs/data-model/#field-severitytext
-- Apache DataFusion logical plan docs.
-- `CLAUDE.md` §4 hazard 6; §3.5 and §3.7.
-- RFC 0001 (template miner), specifically §6.1, §6.3, §6.7 for the
-  Ourios-specific pseudo-columns used here.
+- OTTL (reference-only under Branch B):
+  https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/pkg/ottl
+- LogQL: https://grafana.com/docs/loki/latest/query/
+- CloudWatch Logs Insights:
+  https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html
+- Perses (CNCF dashboards-as-code): https://perses.dev/
+- Apache DataFusion logical-plan documentation.
+- RFC 0001 §6.1/§6.3/§6.7 (the columns + template/drift primitives);
+  RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4 hazard 6
+  (no-leakage hazard) and `CLAUDE.md` §3.7 (multi-tenancy).
+

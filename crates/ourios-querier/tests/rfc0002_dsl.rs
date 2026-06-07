@@ -1066,14 +1066,84 @@ fn rfc0002_8_malformed_query_specific_error() {
 
 /// Scenario RFC0002.9 — Template primitives compile.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
-#[ignore = "RFC 0002 red gate — DSL parser/compiler pending (RFC0002.9)"]
-#[test]
-fn rfc0002_9_template_primitives_compile() {
-    unimplemented!(
-        "RFC0002.9 — template_id == 42, resolves_to(42), lossy == true, \
-         confidence < 0.7 each compile to the documented plan \
-         (resolves_to expands to the RFC 0001 §6.7 alias-set membership)."
+///
+/// `template_id == 42`, `resolves_to(42)`, `lossy == true`, and
+/// `confidence < 0.7` each compile to the documented plan and run against a
+/// real RFC 0005 store.
+///
+/// `resolves_to(n)` is *specified* to expand to the RFC 0001 §6.7 cross-alias
+/// set, but no alias index is reachable by the querier yet (RFC 0001 §6.7/§9
+/// leave the alias-index write path unspecified; RFC 0005 has no alias
+/// column), so it honestly compiles to the base member `template_id == n`.
+/// This test pins that current semantics: `resolves_to(42)` returns exactly
+/// the same rows as `template_id == 42` (every version of leaf 42, since
+/// `template_id` is stable across widenings — RFC 0001 §6.1), and crucially
+/// does NOT pull in template 99. When the alias index lands (#148) this test
+/// gets a sibling that asserts the cross-alias widening; the base-member
+/// behaviour asserted here stays correct.
+#[tokio::test]
+async fn rfc0002_9_template_primitives_compile() {
+    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, rec, simple, write_all};
+    use ourios_core::record::MinedRecord;
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::Querier;
+
+    // Arrange — template 42 in two rows, an unrelated template 99 (the
+    // "not an alias" control), one lossy row, and one low-confidence row.
+    let lossy_row = MinedRecord {
+        lossy_flag: true,
+        // A lossy reconstruction MUST retain the original body (invariant §3.3 /
+        // RFC 0005 §3.2), or the writer rejects the row.
+        body: Some("the original line".to_string()),
+        ..rec("a", 7, TS0 + 3_000_000, 9, "api", "lib.cart", None, None)
+    };
+    let low_conf_row = MinedRecord {
+        confidence: 0.5,
+        ..rec("a", 8, TS0 + 4_000_000, 9, "api", "lib.cart", None, None)
+    };
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            simple("a", 42, TS0),
+            simple("a", 42, TS0 + 1_000_000),
+            simple("a", 99, TS0 + 2_000_000),
+            lossy_row,
+            low_conf_row,
+        ],
     );
+    let q = Querier::new(bucket.path());
+    let tenant = TenantId::new("a");
+
+    let run = |text: &'static str| {
+        let q = q.clone();
+        let tenant = tenant.clone();
+        async move {
+            let query = ourios_querier::dsl::parse(text).expect("parse");
+            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+                .await
+                .expect("run_query")
+                .rows
+        }
+    };
+
+    // Act / Assert — exact template id matches its two rows, not template 99.
+    assert_eq!(run("template_id == 42").await, 2, "two template-42 rows");
+    // `resolves_to(42)` compiles to the base member today (#148): same rows as
+    // `template_id == 42`, and it must NOT pull in the unrelated template 99.
+    assert_eq!(
+        run("resolves_to(42)").await,
+        run("template_id == 42").await,
+        "resolves_to(n) is the base member until the alias index lands (#148)",
+    );
+    assert_eq!(
+        run("resolves_to(99)").await,
+        1,
+        "resolves_to(99) matches only its own (single) row — no alias bleed",
+    );
+    // The correctness primitives compile and filter on their columns.
+    assert_eq!(run("lossy == true").await, 1, "one lossy row");
+    assert_eq!(run("confidence < 0.7").await, 1, "one low-confidence row");
 }
 
 /// Scenario RFC0002.10 — A query is a YAML-safe single-line scalar.

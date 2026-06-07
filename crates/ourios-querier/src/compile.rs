@@ -576,9 +576,16 @@ fn compile_call(call: &Call, df: &DataFrame) -> Result<PredExpr, QueryError> {
             string_call(field, df, |lhs| starts_with(lhs, lit(arg.clone())))
         }
         Call::EndsWith { field, arg } => like_call(field, df, &format!("%{}", like_escape(arg))),
-        // RFC0002.9 — true alias-set expansion is SLICE 3; for this slice
-        // `resolves_to(n)` is the exact `template_id == n` (the base member),
-        // which is correct, just not yet widened to drift aliases.
+        // RFC0002.9 / RFC 0002 §6.3 — `resolves_to(n)` is specified as the
+        // *cross-alias* set of template `n` (RFC 0001 §6.7): `n` plus the
+        // leaves a deploy drifted into. We honestly compile it to the base
+        // member `template_id == n` only, because no alias index is reachable
+        // by the querier: RFC 0005 has no alias column, and RFC 0001 §6.7
+        // states the alias index "has no creation event in this RFC" — its
+        // write path is an open question (RFC 0001 §9). `template_id` is stable
+        // across widenings, so this still spans every *version* of leaf `n`
+        // (the cross-version axis); only the cross-alias widening is missing.
+        // Widening to `template_id IN (alias set)` is tracked by #148.
         Call::ResolvesTo(n) => Ok(PredExpr::Filter(col(columns::TEMPLATE_ID).eq(lit(*n)))),
     }
 }

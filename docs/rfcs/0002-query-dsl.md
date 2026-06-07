@@ -266,9 +266,12 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Given** `template_id == 42`, `resolves_to(42)`, `lossy == true`,
     `confidence < 0.7`
   - **When** compiled
-  - **Then** each compiles to the documented plan (`resolves_to` expands
-    to the alias-set membership of RFC 0001 §6.7), without leaking the
-    underlying representation.
+  - **Then** each compiles to the documented plan, without leaking the
+    underlying representation. (`resolves_to` is specified to expand to the
+    alias-set membership of RFC 0001 §6.7; until an alias index is reachable
+    by the querier — RFC 0001 §6.7/§9 leave its write path unspecified — it
+    honestly compiles to the base member `template_id == n` only. Tracked by
+    #148.)
 
 - **RFC0002.10 — A query is a YAML-safe single-line scalar `[§4 P7]`**
   - **Given** the canonical serialisation of any well-formed query
@@ -376,7 +379,13 @@ Ourios schema + query layer alongside the OTel-canonical fields of §6.2:
 
 - `template_id == 42` — exact template; resolves to the `template_id` column.
 - `resolves_to(42)` — `X` plus its drift aliases (the RFC 0001 §6.7 drift
-  question); compiles to alias-set membership over `template_id`.
+  question); specified to compile to alias-set membership over `template_id`.
+  No alias index is reachable by the querier yet — RFC 0001 §6.7 leaves the
+  alias-index write path unspecified (an open question in RFC 0001 §9) and
+  RFC 0005 has no alias column — so today it compiles to the base member
+  `template_id == 42` only (which already spans every *version* of leaf 42,
+  since `template_id` is stable across widenings — RFC 0001 §6.1). Widening
+  to the cross-alias set is tracked by #148.
 - `confidence` — miner confidence (e.g. `< 0.7`); the `confidence` column.
 - `lossy` — the lossy-reconstruction flag; resolves to the RFC 0001 /
   RFC 0005 **`lossy_flag`** column (`lossy == true`).

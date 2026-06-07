@@ -63,11 +63,14 @@ mod wellformed {
     }
 
     /// A raw `OTel` attribute key: either a dotted bare-ident key or an arbitrary
-    /// string (the serialiser picks dotted vs bracketed; both re-parse).
+    /// (bounded) string (the serialiser picks dotted vs bracketed; both
+    /// re-parse). The arbitrary form is length-capped: an unbounded `".*"`
+    /// inflates each leaf's value tree and, multiplied across a recursive
+    /// predicate, overflows the generator's construction stack.
     fn attr_key() -> impl Strategy<Value = String> {
         prop_oneof![
             prop::collection::vec("[a-z][a-z0-9_]{0,5}", 1..=3).prop_map(|segs| segs.join(".")),
-            ".*".prop_map(|s: String| s),
+            ".{0,16}".prop_map(|s: String| s),
         ]
     }
 
@@ -100,10 +103,7 @@ mod wellformed {
 
     /// A string-typed `path` field — the only operands a string function
     /// (`matches`/`contains`/`starts_with`/`ends_with`) accepts (§6.1). Uses
-    /// the dotted-ident key form for `resource`/`attr` (the unbounded `".*"`
-    /// key strategy is reserved for `scalar_field`, where the comparison RHS
-    /// carries the heavy regex generation; doubling it under the recursive
-    /// `call` strategy overflows the generator's construction stack).
+    /// the dotted-ident key form for `resource`/`attr`.
     fn string_field() -> impl Strategy<Value = Field> {
         let dotted_key = prop::collection::vec("[a-z][a-z0-9_]{0,5}", 1..=3)
             .prop_map(|segs: Vec<String>| segs.join("."));
@@ -138,7 +138,7 @@ mod wellformed {
 
     fn value() -> impl Strategy<Value = Value> {
         prop_oneof![
-            ".*".prop_map(Value::Str),
+            ".{0,16}".prop_map(Value::Str),
             (-1_000_000i64..1_000_000).prop_map(Value::Int),
             // Simple decimals only: format!("{f}") must re-lex without an
             // exponent (the lexer reads `digits . digits`).
@@ -168,10 +168,10 @@ mod wellformed {
 
     fn call() -> impl Strategy<Value = Call> {
         prop_oneof![
-            (string_field(), ".*").prop_map(|(field, arg)| Call::Matches { field, arg }),
-            (string_field(), ".*").prop_map(|(field, arg)| Call::Contains { field, arg }),
-            (string_field(), ".*").prop_map(|(field, arg)| Call::StartsWith { field, arg }),
-            (string_field(), ".*").prop_map(|(field, arg)| Call::EndsWith { field, arg }),
+            (string_field(), ".{0,16}").prop_map(|(field, arg)| Call::Matches { field, arg }),
+            (string_field(), ".{0,16}").prop_map(|(field, arg)| Call::Contains { field, arg }),
+            (string_field(), ".{0,16}").prop_map(|(field, arg)| Call::StartsWith { field, arg }),
+            (string_field(), ".{0,16}").prop_map(|(field, arg)| Call::EndsWith { field, arg }),
             any::<u64>().prop_map(Call::ResolvesTo),
         ]
     }
@@ -187,45 +187,37 @@ mod wellformed {
         ]
     }
 
-    /// A `unary` node at the given depth: a term, or `not <expr>`.
-    fn unary(depth: u32) -> BoxedStrategy<Predicate> {
-        if depth == 0 {
-            return term().boxed();
+    /// Canonicalise a freely-generated predicate into the form the parser and
+    /// serialiser both produce: associative `and`/`or` are flattened (no
+    /// same-kind direct nesting) and single-element combinators collapse to
+    /// their child. The round-trip property (RFC0002.7) holds for this
+    /// canonical shape, so the generator emits arbitrary trees and we compare
+    /// against their canonical form.
+    fn canonicalize(p: Predicate) -> Predicate {
+        match p {
+            Predicate::Not(inner) => Predicate::Not(Box::new(canonicalize(*inner))),
+            Predicate::And(terms) => Predicate::and(terms.into_iter().map(canonicalize).collect()),
+            Predicate::Or(terms) => Predicate::or(terms.into_iter().map(canonicalize).collect()),
+            leaf => leaf,
         }
-        prop_oneof![
-            term(),
-            expr(depth - 1).prop_map(|p| Predicate::Not(Box::new(p))),
-        ]
-        .boxed()
     }
 
-    /// A whole predicate at the given depth. The serialiser flattens a
-    /// same-kind nested `and`/`or` and drops redundant parens, so this
-    /// generator never puts an `and` directly inside an `and` (nor `or` in
-    /// `or`): an `and`'s children are unary or `or` nodes, and symmetrically.
-    /// That keeps `parse(serialize(q)) == q` exact (RFC0002.7).
-    fn expr(depth: u32) -> BoxedStrategy<Predicate> {
-        if depth == 0 {
-            return unary(0);
-        }
-        let and_child = prop_oneof![
-            unary(depth - 1),
-            prop::collection::vec(unary(depth - 1), 2..=3).prop_map(Predicate::Or),
-        ];
-        let or_child = prop_oneof![
-            unary(depth - 1),
-            prop::collection::vec(unary(depth - 1), 2..=3).prop_map(Predicate::And),
-        ];
-        prop_oneof![
-            unary(depth),
-            prop::collection::vec(and_child, 2..=3).prop_map(Predicate::And),
-            prop::collection::vec(or_child, 2..=3).prop_map(Predicate::Or),
-        ]
-        .boxed()
-    }
-
+    /// A whole predicate. Built with [`prop_recursive`] so nesting is bounded
+    /// (a small depth / node budget): an unbounded recursive generator builds a
+    /// value tree deep enough to overflow the test thread's stack during
+    /// *generation* on CI's default (~2 MiB) stack. The recursion adds `not`,
+    /// `and`, and `or` over the leaf `term`s; the result is canonicalised so it
+    /// matches the parser/serialiser's flattened, singleton-collapsed shape.
     fn predicate() -> impl Strategy<Value = Predicate> {
-        expr(3)
+        term()
+            .prop_recursive(4, 16, 3, |inner| {
+                prop_oneof![
+                    inner.clone().prop_map(|p| Predicate::Not(Box::new(p))),
+                    prop::collection::vec(inner.clone(), 2..=3).prop_map(Predicate::And),
+                    prop::collection::vec(inner, 2..=3).prop_map(Predicate::Or),
+                ]
+            })
+            .prop_map(canonicalize)
     }
 
     fn time() -> impl Strategy<Value = Time> {
@@ -387,6 +379,18 @@ fn rfc0002_6_first_class_fields_resolve() {
 /// indirectly covers serialise → parse → serialise stability.
 #[test]
 fn rfc0002_7_round_trip_idempotent() {
+    // The bounded generator keeps predicate trees shallow, but run the property
+    // on an explicit large-stack thread anyway so the recursive parse / compare
+    // never rides the harness's default (~2 MiB) test-thread stack.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(round_trip_property)
+        .expect("spawn round-trip worker")
+        .join()
+        .expect("round-trip worker panicked");
+}
+
+fn round_trip_property() {
     use proptest::prelude::*;
 
     let mut runner = proptest::test_runner::TestRunner::default();

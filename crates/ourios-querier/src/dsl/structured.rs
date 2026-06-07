@@ -34,6 +34,7 @@ pub fn parse_structured(json: &str) -> Result<Query, DslError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawQuery {
     predicate: RawNode,
     #[serde(default)]
@@ -62,6 +63,7 @@ enum RawField {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFieldObject {
     #[serde(default)]
     resource: Option<String>,
@@ -108,43 +110,73 @@ fn name_to_field(name: &str) -> Result<Field, DslError> {
 }
 
 /// A predicate node (§6.4 `<node>`). `untagged` so the present keys select the
-/// variant — comparison, call, const, or boolean.
+/// variant — comparison, call, const, or boolean. `serde` forbids
+/// `deny_unknown_fields` on an `untagged` enum (and on its variants), so each
+/// variant carries a dedicated struct that denies unknown keys itself; a node
+/// with a stray extra key matches no variant and is rejected rather than
+/// silently coerced (RFC0002.2 / §6.4 surface contract).
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawNode {
-    Comparison {
-        field: RawField,
-        op: String,
-        value: serde_json::Value,
-    },
-    Call {
-        call: String,
-        args: Vec<serde_json::Value>,
-    },
-    Const {
-        #[serde(rename = "const")]
-        konst: bool,
-    },
-    And {
-        and: Vec<RawNode>,
-    },
-    Or {
-        or: Vec<RawNode>,
-    },
-    Not {
-        not: Box<RawNode>,
-    },
+    Comparison(RawComparison),
+    Call(RawCall),
+    Const(RawConst),
+    And(RawAnd),
+    Or(RawOr),
+    Not(RawNot),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComparison {
+    field: RawField,
+    op: String,
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCall {
+    call: String,
+    args: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConst {
+    #[serde(rename = "const")]
+    konst: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAnd {
+    and: Vec<RawNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOr {
+    or: Vec<RawNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNot {
+    not: Box<RawNode>,
 }
 
 impl RawNode {
     fn into_ir(self) -> Result<Predicate, DslError> {
         match self {
-            Self::Const { konst } => Ok(Predicate::Bool(konst)),
-            Self::And { and } => Ok(Predicate::and(combinator_terms("and", and)?)),
-            Self::Or { or } => Ok(Predicate::or(combinator_terms("or", or)?)),
-            Self::Not { not } => Ok(Predicate::Not(Box::new(not.into_ir()?))),
-            Self::Call { call, args } => Ok(Predicate::Call(call_into_ir(&call, args)?)),
-            Self::Comparison { field, op, value } => comparison_into_ir(field, &op, value),
+            Self::Const(RawConst { konst }) => Ok(Predicate::Bool(konst)),
+            Self::And(RawAnd { and }) => Ok(Predicate::and(combinator_terms("and", and)?)),
+            Self::Or(RawOr { or }) => Ok(Predicate::or(combinator_terms("or", or)?)),
+            Self::Not(RawNot { not }) => Ok(Predicate::Not(Box::new(not.into_ir()?))),
+            Self::Call(RawCall { call, args }) => Ok(Predicate::Call(call_into_ir(&call, args)?)),
+            Self::Comparison(RawComparison { field, op, value }) => {
+                comparison_into_ir(field, &op, value)
+            }
         }
     }
 }
@@ -334,18 +366,21 @@ fn parse_cmp_op(op: &str) -> Result<CmpOp, DslError> {
 struct RawStage(serde_json::Map<String, serde_json::Value>);
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRange {
     from: String,
     to: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCount {
     #[serde(default)]
     by: Vec<RawField>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSort {
     key: String,
     #[serde(default)]
@@ -662,6 +697,47 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        // Arrange / Act — a stray sibling of `predicate`/`stages`.
+        let err = parse_structured(r#"{"predicate":{"const":true},"bogus":1}"#).unwrap_err();
+        // Assert — the malformed input errors instead of being accepted.
+        assert!(err.message().contains("bogus"), "{}", err.message());
+    }
+
+    #[test]
+    fn rejects_unknown_field_object_key() {
+        // Arrange / Act — `{resource|attr}` plus a typo'd extra key.
+        let err = parse_structured(
+            r#"{"predicate":{"field":{"attr":"k","typo":"x"},"op":"==","value":1}}"#,
+        )
+        .unwrap_err();
+        // Assert
+        assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_node_key() {
+        // Arrange / Act — a comparison node with an accidental extra key must
+        // not deserialize as a partial Comparison (untagged variant denial).
+        let err =
+            parse_structured(r#"{"predicate":{"field":"body","op":"==","value":1,"extra":true}}"#)
+                .unwrap_err();
+        // Assert
+        assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_stage_body_key() {
+        // Arrange / Act — a `range` body with an unexpected key.
+        let err = parse_structured(
+            r#"{"predicate":{"const":true},"stages":[{"range":{"from":"-1h","to":"now","step":"5m"}}]}"#,
+        )
+        .unwrap_err();
+        // Assert
+        assert!(err.message().contains("range"), "{}", err.message());
     }
 
     #[test]

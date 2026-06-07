@@ -3,8 +3,12 @@
 //! Two front-ends, one core (RFC 0002 §6.4): the string DSL ([`parse`]) and
 //! the structured JSON surface ([`parse_structured`]) both produce the shared
 //! [`ir::Query`]; [`serialize`] renders it back to a canonical single-line β
-//! string that round-trips (`parse(serialize(q)) == q`, RFC0002.7) and is a
-//! YAML-safe scalar (RFC0002.10).
+//! string. Round-tripping (`parse(serialize(q)) == q`, RFC0002.7) holds for any
+//! `Query` produced by [`parse`] / [`parse_structured`]: those parsers
+//! canonicalise associative `and`/`or` (flatten same-kind nesting, collapse
+//! single-element lists), so a hand-built non-canonical IR may serialise to a
+//! string that re-parses to a *different* (canonical) shape. The serialised
+//! form is a YAML-safe scalar (RFC0002.10).
 //!
 //! No `datafusion`/`arrow`/SQL type or message crosses this surface — the
 //! whole point of the DSL (hazard `CLAUDE.md` §4.6). Errors are the

@@ -193,7 +193,9 @@ surface? Perses+OTel query conventions?) are folded into §9.
 - **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4.6]`**
   - **Given** a Branch-B predicate (e.g. `template_id == 42 and severity >= error`)
   - **When** it is parsed and compiled
-  - **Then** it yields the query IR and a DataFusion `Filter`. Predicates
+  - **Then** it yields the query IR and an **internal** DataFusion
+    `Filter` (a private compilation artifact — never surfaced through the
+    public API, RFC0002.3). Predicates
     over RFC 0007 §4.3's pushdown keys prune the scan per that section's
     split — `template_id` skips row groups (B1), `time_unix_nano` prunes
     partitions and row groups, `tenant_id` prunes partition directories
@@ -418,8 +420,10 @@ flowchart LR
   primitive (string / number / bool / null), with durations and timestamps
   carried as their §7 lexical strings (`"1h"`, RFC 3339). A **`<node>`** is
   a **comparison node** `{ "field": …, "op": …, "value": … }`, a **call
-  node** `{ "call": "<fn>", "args": [ … ] }` (`fn` in the §7 `fn_name` set;
-  each arg a path-string or a value as above), or a **boolean node**
+  node** `{ "call": "<fn>", "args": [ … ] }` whose `args` follow the §7
+  typed signatures — `matches`/`contains`/`starts_with`/`ends_with` take
+  `[ <path-string>, <string> ]`, `resolves_to` takes `[ <number> ]`), or a
+  **boolean node**
   (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
   array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a
   tagged object covering the full §7 stage set —
@@ -481,10 +485,9 @@ comparison   = severity_cmp | scalar_cmp ;
 severity_cmp = "severity" , cmp_op , ( severity_name | number ) ;
 scalar_cmp   = scalar_path , cmp_op , literal ;
 cmp_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
-call         = fn_name , "(" , [ arg , { "," , arg } ] , ")" ;
-fn_name      = "matches" | "contains" | "starts_with" | "ends_with"
-             | "resolves_to" ;
-arg          = path | literal ;
+call         = str_fn , "(" , path , "," , string , ")"
+             | "resolves_to" , "(" , number , ")" ;
+str_fn       = "matches" | "contains" | "starts_with" | "ends_with" ;
 path         = field | "resource" , key_tail | "attr" , key_tail ;
 scalar_path  = nonsev_field | "resource" , key_tail | "attr" , key_tail ;
 field        = nonsev_field | "severity" ;

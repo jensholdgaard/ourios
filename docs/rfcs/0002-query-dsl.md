@@ -434,14 +434,16 @@ and_expr     = unary , { ("and" | "&&") , unary } ;
 unary        = [ "not" | "!" ] , ( comparison | call | "(" , predicate , ")" ) ;
 comparison   = severity_cmp | scalar_cmp ;
 severity_cmp = "severity" , cmp_op , ( severity_name | number ) ;
-scalar_cmp   = path , cmp_op , literal ;
+scalar_cmp   = scalar_path , cmp_op , literal ;
 cmp_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
 call         = ident , "(" , [ arg , { "," , arg } ] , ")" ;
 arg          = path | literal ;
 path         = field | "resource" , key_tail | "attr" , key_tail ;
-field        = "body" | "severity" | "ts" | "observed_ts" | "trace_id"
-             | "span_id" | "scope" | "flags" | "service"
-             | "template_id" | "confidence" | "lossy" ;
+scalar_path  = nonsev_field | "resource" , key_tail | "attr" , key_tail ;
+field        = nonsev_field | "severity" ;
+nonsev_field = "body" | "ts" | "observed_ts" | "trace_id" | "span_id"
+             | "scope" | "flags" | "service" | "template_id"
+             | "confidence" | "lossy" ;
 key_tail     = ( "." , dotted_key ) | ( "[" , string , "]" ) ;
 dotted_key   = ident , { "." , ident } ;
 stage        = "range" , "(" , time , "," , time , ")"
@@ -518,7 +520,7 @@ canonical fields (§6.2).
 Alternatives that would replace the whole design, not just one branch.
 
 - **Pure SQL (DataFusion dialect)** — zero parser cost, but violates
-  hazard §4.6 (cross-tenant joins, unbounded scans) and binds the user
+  hazard `CLAUDE.md` §4.6 (cross-tenant joins, unbounded scans) and binds the user
   surface to DataFusion. Rejected as default; possible future gated,
   sandboxed escape hatch under a separate RFC.
 - **LogQL clone** — label selectors are less expressive than the OTel log
@@ -546,5 +548,5 @@ Alternatives that would replace the whole design, not just one branch.
 - Apache DataFusion logical-plan documentation.
 - RFC 0001 §6.1/§6.3/§6.7 (the columns + template/drift primitives);
   RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4.6
-  (no-leakage hazard), §3.7 (multi-tenancy).
+  (no-leakage hazard) and `CLAUDE.md` §3.7 (multi-tenancy).
 

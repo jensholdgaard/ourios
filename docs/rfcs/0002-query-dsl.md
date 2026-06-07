@@ -221,12 +221,15 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Then** the plan carries a time-column filter equal to W — never an
     unbounded scan.
 
-- **RFC0002.5 — Bare-identifier severity maps by the OTel convention `[§6.1]`**
+- **RFC0002.5 — Bare-identifier severity maps to its SeverityNumber `[§6.1]`**
   - **Given** `severity >= error` (and `warn`, `info`, `debug`, `trace`,
     `fatal`)
   - **When** compiled
-  - **Then** each maps to the correct OTel severity-number range, case-
-    insensitively, identically to the numeric form (`severity >= 17`).
+  - **Then** each maps, case-insensitively, to the §6.1 `SeverityNumber`
+    for that level (`error` → 17, etc.) and compiles identically to the
+    numeric form (`severity >= 17`). The name→number mapping is the
+    documented §6.1 one (Ourios's, aligned with the OTel ranges) — not an
+    OTel-standardised threshold.
 
 - **RFC0002.6 — First-class OTel-canonical fields resolve correctly `[§6.2]`**
   - **Given** `service`, `trace_id`, `span_id`, `scope` used as bare
@@ -278,9 +281,13 @@ A predicate is a boolean expression over **paths**, **operators**, and
 
 **Paths.**
 
-- **Top-level fields** are bare identifiers: `body`, `severity`, `ts`
-  (event timestamp), `observed_ts`, `trace_id`, `span_id`, `scope`
-  (instrumentation-scope name), `flags`.
+- **Top-level fields** are bare identifiers mapping to the OTel log
+  data-model fields: `body` (Body — a free-form string *or* structured
+  map/array), `severity` (SeverityNumber), `ts` (Timestamp), `observed_ts`
+  (ObservedTimestamp), `trace_id` (TraceId), `span_id` (SpanId), `scope`
+  (InstrumentationScope name), `flags` (TraceFlags). (Backend treatment of
+  structured `body` vs `attr.*` is not uniform across the ecosystem; the
+  DSL keeps the split explicit rather than flattening.)
 - **Resource attributes**: `resource.<key>` where `<key>` is the OTel
   attribute key taken literally including dots (`resource.service.name` →
   resource attribute `"service.name"`). Bracketed form
@@ -289,9 +296,15 @@ A predicate is a boolean expression over **paths**, **operators**, and
 - **Log-record attributes**: `attr.<key>` (`attr.http.status_code` →
   attribute `"http.status_code"`); bracketed `attr["k"]` when needed.
 - **Severity**: `severity` compares against a **bare severity name**
-  (`severity >= error`) — mapped to OTel severity numbers by the
-  severity-text convention, case-insensitive — or a **numeric** form
-  (`severity >= 17`).
+  (`severity >= error`), case-insensitive, or a **numeric** form
+  (`severity >= 17`). All severity comparisons — **including ordering**
+  (`<`/`<=`/`>`/`>=`) — are defined on the OTel **`SeverityNumber`**,
+  **never** on the free-form `severity_text` (per the OTel *comparing
+  severity* guidance). Bare names map to the **floor of the matching OTel
+  `SeverityNumber` range**: `trace`→1, `debug`→5, `info`→9, `warn`→13,
+  `error`→17, `fatal`→21. The spec standardises the *ranges* and says to
+  compare on `SeverityNumber`; this name→number mapping is **Ourios's**,
+  aligned with those ranges, not separately mandated by OTel.
 
 **Operators.** Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`, `=~`
 (regex match), `!~` (regex non-match). Boolean: `and`, `or`, `not`, with
@@ -335,7 +348,9 @@ OTLP/JSON id convention, consistent with RFC0003.6.
 
 ### 6.3 Template + correctness primitives
 
-First-class vocabulary (RFC 0001 §6.3/§6.7):
+First-class vocabulary — **Ourios-specific** extensions (RFC 0001
+§6.3/§6.7), **not** OpenTelemetry log-data-model fields; they live in the
+Ourios schema + query layer alongside the OTel-canonical fields of §6.2:
 
 - `template_id == X` — exact template; resolves to the `template_id` column.
 - `resolves_to(X)` — `X` plus its drift aliases (the RFC 0001 §6.7 drift
@@ -498,11 +513,17 @@ two-loop: `#[ignore]`'d stubs first, implementations second).
       pass on 10–20 sample queries with non-author reviewers, and a
       migration sketch from LogQL/Insights into β. (Replaces the prior
       §9 user-research gate; not required for `specified`.)
-- [ ] **OTel ecosystem alignment** (for the maintainer's OpenTelemetry
-      AI): is there an OpenTelemetry *query/read* language (distinct from
-      OTTL) to align with? Is OTTL treated as the expected *querying*
-      surface (making divergence costly) or is bespoke query syntax the
-      norm? Any Perses+OTel query conventions presupposing a syntax?
+- [x] ~~**OTel ecosystem alignment**~~ *Resolved (maintainer's
+      OpenTelemetry AI, 2026-06-07):* OTel defines the logs data model +
+      API/SDK but **no standard query/read language**; **OTTL is a
+      Collector *transformation* language, not a querying surface**; the
+      sources show no canonical OTel read syntax and no Perses-specific
+      query convention. Bespoke query syntax over the OTel data model is
+      the norm — there is **nothing to align to beyond the field
+      semantics**, which §6.1/§6.2 honour (`ts`/`observed_ts`/`trace_id`/
+      `span_id`/`flags`/`body`/`scope`/`severity` map to the canonical
+      data-model fields, and `severity` ordering is on `SeverityNumber`).
+      Confirms Branch B carries no ecosystem-divergence cost.
 - [ ] `--sql` advanced-mode escape hatch — gated + sandboxed, or never?
       (Currently: never; reconsider under a separate RFC.)
 - [ ] Custom user functions — out for v1 (sandboxing is its own project).

@@ -2653,8 +2653,12 @@ name = "ourios-core"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "opentelemetry",
  "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "ourios-telemetry",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

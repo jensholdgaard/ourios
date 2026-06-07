@@ -23,6 +23,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::alias::ActorId;
 use crate::tenant::TenantId;
 
 /// The specific state-change of a template-mining
@@ -126,6 +127,50 @@ pub enum AuditPayload {
         /// Which template state-change this is.
         change: TemplateChange,
     },
+    /// An operator asserted that a set of `template_id`s form one
+    /// alias equivalence class under this event's tenant
+    /// (RFC 0001 §6.7). Cross-leaf only — never a `template_version`
+    /// axis concern, so it carries no `template_version`.
+    ///
+    /// The **asserted set** is the union `{representative_id} ∪
+    /// member_ids`; `representative_id` is the operator's anchor id for
+    /// the assertion (one named member), not the set's *derived*
+    /// canonical (`min(members)`). The projection folds this event by
+    /// unioning the asserted set into one class
+    /// ([`crate::alias::AliasMap`]).
+    AliasAsserted {
+        /// The operator's anchor id — one member of the asserted set;
+        /// carries no contract weight beyond naming the assertion.
+        representative_id: u64,
+        /// The other ids grouped into the set by this assertion.
+        member_ids: Vec<u64>,
+        /// The principal that issued the assertion — aliasing is never
+        /// anonymous (`[§3.1]` "explicit").
+        actor: ActorId,
+        /// Operator-supplied justification, ≤ 256 B
+        /// ([`crate::alias::REASON_BYTE_LIMIT`], mirroring the §6.4
+        /// triggering-line-sample cap). Empty string when none given.
+        reason: String,
+    },
+    /// An operator retracted an id from its alias class
+    /// (RFC 0001 §6.7). Representative-independent: `representative_id`
+    /// names the retracted id (the operator's anchor); `member_ids` is
+    /// the rest of the retracted set (empty for a single-id
+    /// retraction). The projection removes every id in the asserted set
+    /// from its class; a class that drops below two members is no longer
+    /// an alias set.
+    AliasRetracted {
+        /// The operator's anchor id — the (primary) retracted id.
+        representative_id: u64,
+        /// Additional ids retracted in the same action (empty for the
+        /// common single-id retraction).
+        member_ids: Vec<u64>,
+        /// The principal that issued the retraction — un-aliasing is
+        /// explicit and audited too (`[§3.1]`).
+        actor: ActorId,
+        /// Operator-supplied justification, ≤ 256 B. Empty when none.
+        reason: String,
+    },
     /// A compaction consolidated a sealed partition's files
     /// (RFC 0009 §3.6). Carries no template identity.
     Compaction {
@@ -157,6 +202,10 @@ pub const EVENT_KIND_TEMPLATE_TYPE_EXPANDED: u8 = 1;
 pub const EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE: u8 = 2;
 /// See [`EVENT_KIND_TEMPLATE_WIDENED`].
 pub const EVENT_KIND_COMPACTION: u8 = 3;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`]. RFC 0001 §6.7 alias write path.
+pub const EVENT_KIND_ALIAS_ASSERTED: u8 = 4;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`]. RFC 0001 §6.7 alias write path.
+pub const EVENT_KIND_ALIAS_RETRACTED: u8 = 5;
 
 /// Canonical `event_type` strings paired with the ordinals above
 /// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
@@ -168,6 +217,10 @@ pub const EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE: &str =
     "template_widening_rejected_degenerate";
 /// See [`EVENT_TYPE_TEMPLATE_WIDENED`].
 pub const EVENT_TYPE_COMPACTION: &str = "compaction";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0001 §6.7 alias write path.
+pub const EVENT_TYPE_ALIAS_ASSERTED: &str = "alias_asserted";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0001 §6.7 alias write path.
+pub const EVENT_TYPE_ALIAS_RETRACTED: &str = "alias_retracted";
 
 impl AuditPayload {
     /// The stable `event_kind` ordinal for this payload (RFC 0005
@@ -183,6 +236,8 @@ impl AuditPayload {
                     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE
                 }
             },
+            Self::AliasAsserted { .. } => EVENT_KIND_ALIAS_ASSERTED,
+            Self::AliasRetracted { .. } => EVENT_KIND_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_KIND_COMPACTION,
         }
     }
@@ -199,6 +254,8 @@ impl AuditPayload {
                     EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE
                 }
             },
+            Self::AliasAsserted { .. } => EVENT_TYPE_ALIAS_ASSERTED,
+            Self::AliasRetracted { .. } => EVENT_TYPE_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_TYPE_COMPACTION,
         }
     }
@@ -210,7 +267,13 @@ impl AuditPayload {
     pub fn counts_as_merge(&self) -> bool {
         match self {
             Self::Template { change, .. } => change.counts_as_merge(),
-            Self::Compaction { .. } => false,
+            // Alias activity is counted separately via
+            // `alias_assertions_total` / `alias_retractions_total`
+            // (RFC 0001 §6.7); `merges_total` is reserved for the two
+            // structural widenings.
+            Self::AliasAsserted { .. } | Self::AliasRetracted { .. } | Self::Compaction { .. } => {
+                false
+            }
         }
     }
 }

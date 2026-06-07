@@ -1,5 +1,6 @@
 //! Foundational types for Ourios.
 
+pub mod alias;
 pub mod audit;
 pub mod clock;
 pub mod confidence;

@@ -21,7 +21,9 @@ pub use ir::Query;
 pub use parse::parse;
 pub use structured::parse_structured;
 
-pub(crate) use parse::{parse_severity_name_pub, parse_time_pub};
+pub(crate) use parse::{
+    parse_severity_name_pub, parse_time_pub, require_string_operand, validate_sort_key,
+};
 
 /// An error from parsing the logs DSL (either front-end). Hand-rolled (no
 /// `thiserror`, matching the repo's `QueryError`/`TokenizeError` style); the

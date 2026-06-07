@@ -71,7 +71,20 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, DslError> {
     while i < bytes.len() {
         let c = bytes[i];
         match c {
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b' ' | b'\t' => i += 1,
+            // A query is a single-line YAML-safe scalar (§4 P7 / RFC0002.10):
+            // a literal newline or other control char outside a string is not
+            // whitespace, it is a malformed query.
+            b'\n' | b'\r' => {
+                return Err(DslError::new(format!(
+                    "literal newline at byte {i}; a query must be a single line"
+                )));
+            }
+            c if c < 0x20 => {
+                return Err(DslError::new(format!(
+                    "literal control character at byte {i}; a query must be a single line"
+                )));
+            }
             b'|' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
                     out.push(Tok::OrOr);
@@ -242,6 +255,11 @@ fn lex_string(input: &str, start: usize) -> Result<(String, usize), DslError> {
             }
             // A literal newline / control char is not a valid string char:
             // queries are single-line (§4 P7 / RFC0002.10).
+            b'\n' | b'\r' => {
+                return Err(DslError::new(
+                    "literal newline in a string; write it as an escape (\\n)".to_string(),
+                ));
+            }
             c if c < 0x20 => {
                 return Err(DslError::new(
                     "literal control character in string; write it as an escape (e.g. \\n)"
@@ -365,20 +383,39 @@ fn validate_rfc3339(s: &str) -> Result<(), DslError> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
         return Err(err());
     }
-    // Trailing zone / fraction: must end in Z/z or contain a +/- offset.
-    let tail = &s[19..];
-    let ok_tail = tail.eq_ignore_ascii_case("z")
-        || tail.starts_with('+')
-        || (tail.starts_with('-'))
-        || (tail.starts_with('.')
-            && (tail.ends_with('z')
-                || tail.ends_with('Z')
-                || tail.contains('+')
-                || tail.contains('-')));
-    if !ok_tail {
+    // Trailing offset, optionally preceded by a fractional second. The offset
+    // must be a real `Z`/`±hh:mm` — a bare `+` or `+05` is malformed RFC 3339.
+    let mut tail = &s[19..];
+    if let Some(rest) = tail.strip_prefix('.') {
+        let frac_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if frac_len == 0 {
+            return Err(err());
+        }
+        tail = &rest[frac_len..];
+    }
+    if !is_rfc3339_offset(tail) {
         return Err(err());
     }
     Ok(())
+}
+
+/// True for an RFC 3339 zone designator: `Z`/`z`, or a full `±hh:mm` offset
+/// (`hh` ≤ 23, `mm` ≤ 59). Rejects a bare `+`, `+05`, or other partial offset.
+fn is_rfc3339_offset(tail: &str) -> bool {
+    if tail.eq_ignore_ascii_case("z") {
+        return true;
+    }
+    let bytes = tail.as_bytes();
+    if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+        return false;
+    }
+    let digit = |b: u8| b.is_ascii_digit();
+    if !(digit(bytes[1]) && digit(bytes[2]) && digit(bytes[4]) && digit(bytes[5])) {
+        return false;
+    }
+    let hh = u32::from(bytes[1] - b'0') * 10 + u32::from(bytes[2] - b'0');
+    let mm = u32::from(bytes[4] - b'0') * 10 + u32::from(bytes[5] - b'0');
+    hh <= 23 && mm <= 59
 }
 
 fn lex_ident(input: &str, start: usize) -> (String, usize) {
@@ -467,11 +504,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(if terms.len() == 1 {
-            terms.pop().expect("len checked")
-        } else {
-            Predicate::Or(terms)
-        })
+        Ok(Predicate::or(terms))
     }
 
     /// `and_expr = unary , { ("and" | "&&") , unary }`.
@@ -485,11 +518,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(if terms.len() == 1 {
-            terms.pop().expect("len checked")
-        } else {
-            Predicate::And(terms)
-        })
+        Ok(Predicate::and(terms))
     }
 
     /// Consume the next token iff it is the identifier keyword `kw`.
@@ -691,7 +720,11 @@ impl<'a> Parser<'a> {
             return Ok(Call::ResolvesTo(id));
         }
         let field = self.parse_path()?;
-        self.expect(&Tok::Comma, "',' between the path and the string argument")?;
+        require_string_operand(&name, &field)?;
+        self.expect(
+            &Tok::Comma,
+            &format!("',' before {name}(...)'s string argument"),
+        )?;
         let arg = match self.next() {
             Some(Tok::Str(s)) => s.clone(),
             other => {
@@ -701,7 +734,7 @@ impl<'a> Parser<'a> {
                 )));
             }
         };
-        self.expect(&Tok::RParen, "')' to close the function call")?;
+        self.expect(&Tok::RParen, &format!("')' to close {name}(...)"))?;
         Ok(match name.as_str() {
             "matches" => Call::Matches { field, arg },
             "contains" => Call::Contains { field, arg },
@@ -985,6 +1018,58 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Reject a non-string first operand to a string function
+/// (`matches`/`contains`/`starts_with`/`ends_with`) — §6.1 requires a string
+/// operand, so this is a parse-time type error, not a silent coercion. Shared
+/// with the structured surface so both reject the same calls (RFC0002.2).
+pub(crate) fn require_string_operand(name: &str, field: &Field) -> Result<(), DslError> {
+    if field.is_string_operand() {
+        Ok(())
+    } else {
+        Err(DslError::new(format!(
+            "{name}(...) requires a string first operand; {} is not a string field",
+            field_name(field)
+        )))
+    }
+}
+
+/// Validate a §7 `sort_key` — a single bare identifier (a field name or an
+/// aggregate output like `count`). The string surface lexes it as one `ident`
+/// token and the serialiser writes it unquoted, so a structured `sort.key`
+/// must satisfy the same grammar to round-trip (RFC0002.2 / RFC0002.7).
+pub(crate) fn validate_sort_key(key: &str) -> Result<(), DslError> {
+    let mut chars = key.chars();
+    let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic());
+    if head_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(())
+    } else {
+        Err(DslError::new(format!(
+            "sort key {key:?} is not a bare identifier (a field or an aggregate \
+             output like count)"
+        )))
+    }
+}
+
+/// A leak-free name for a [`Field`] in an error message.
+fn field_name(field: &Field) -> String {
+    match field {
+        Field::Body => "body".to_string(),
+        Field::Severity => "severity".to_string(),
+        Field::Ts => "ts".to_string(),
+        Field::ObservedTs => "observed_ts".to_string(),
+        Field::TraceId => "trace_id".to_string(),
+        Field::SpanId => "span_id".to_string(),
+        Field::Scope => "scope".to_string(),
+        Field::Flags => "flags".to_string(),
+        Field::Service => "service".to_string(),
+        Field::TemplateId => "template_id".to_string(),
+        Field::Confidence => "confidence".to_string(),
+        Field::Lossy => "lossy".to_string(),
+        Field::Resource(k) => format!("resource {k:?}"),
+        Field::Attr(k) => format!("attr {k:?}"),
+    }
+}
+
 /// Map a bare non-severity field name to its [`Field`], or `None` if unknown.
 fn bare_field(name: &str) -> Option<Field> {
     Some(match name {
@@ -1243,5 +1328,66 @@ mod tests {
     fn rejects_malformed_duration_and_timestamp() {
         assert!(parse("ts >= -1hour").is_err());
         assert!(parse_time_pub("2026-13-02T03:04:05Z").is_err());
+    }
+
+    #[test]
+    fn flattens_same_kind_groups() {
+        // Arrange / Act — a parenthesised `and` inside an `and` (and likewise
+        // for `or`) must flatten to one associative-normal node so the IR is
+        // canonical and round-trips.
+        let and = parse("body == 1 and (service == \"x\" and template_id == 2)").unwrap();
+        let or = parse("body == 1 or (service == \"x\" or template_id == 2)").unwrap();
+        // Assert — three flat terms, no nested same-kind child.
+        match and.predicate {
+            Predicate::And(terms) => {
+                assert_eq!(terms.len(), 3);
+                assert!(!terms.iter().any(|t| matches!(t, Predicate::And(_))));
+            }
+            other => panic!("expected flat And, got {other:?}"),
+        }
+        match or.predicate {
+            Predicate::Or(terms) => {
+                assert_eq!(terms.len(), 3);
+                assert!(!terms.iter().any(|t| matches!(t, Predicate::Or(_))));
+            }
+            other => panic!("expected flat Or, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_string_operand_in_string_function() {
+        // severity / lossy / ts are not string fields (§6.1).
+        let err = parse("contains(severity, \"x\")").unwrap_err();
+        assert!(err.message().contains("string"), "{}", err.message());
+        assert!(parse("starts_with(lossy, \"x\")").is_err());
+        assert!(parse("matches(ts, \"x\")").is_err());
+        // body / service / attr. are string operands and stay valid.
+        assert!(parse("contains(body, \"x\")").is_ok());
+        assert!(parse("contains(attr.k, \"x\")").is_ok());
+    }
+
+    #[test]
+    fn rejects_literal_newline_outside_a_string() {
+        assert!(parse("body == 1\n| limit 1").is_err());
+        assert!(parse("body\t== 1").is_ok());
+    }
+
+    #[test]
+    fn requires_a_real_rfc3339_offset() {
+        assert!(parse_time_pub("2026-01-02T03:04:05+").is_err());
+        assert!(parse_time_pub("2026-01-02T03:04:05+05").is_err());
+        assert!(parse_time_pub("2026-01-02T03:04:05+05:00").is_ok());
+        assert!(parse_time_pub("2026-01-02T03:04:05.250+05:00").is_ok());
+        assert!(parse_time_pub("2026-01-02T03:04:05Z").is_ok());
+        assert!(parse_time_pub("2026-01-02T03:04:05+25:00").is_err());
+    }
+
+    #[test]
+    fn validate_sort_key_rejects_non_idents() {
+        assert!(validate_sort_key("count").is_ok());
+        assert!(validate_sort_key("template_id").is_ok());
+        assert!(validate_sort_key("attr.http.status_code").is_err());
+        assert!(validate_sort_key("").is_err());
+        assert!(validate_sort_key("3rd").is_err());
     }
 }

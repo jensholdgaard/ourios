@@ -74,11 +74,13 @@ fn write_join(
         if i > 0 {
             out.push_str(sep);
         }
-        // Inside an `and`, a child `or` must be wrapped (lower binding);
-        // inside an `or`, an `and` child needs no parens (higher binding).
+        // Inside an `and`, wrap a child `or` (lower binding). Canonical IR is
+        // flattened, so a same-kind child never appears here; wrap it anyway
+        // so a hand-built non-canonical tree still serialises to a string
+        // that re-parses to the same shape.
         let wrap = match level {
-            BindLevel::And => matches!(term, Predicate::Or(_)),
-            BindLevel::Or => false,
+            BindLevel::And => matches!(term, Predicate::And(_) | Predicate::Or(_)),
+            BindLevel::Or => matches!(term, Predicate::Or(_)),
         };
         write_predicate(out, term, wrap);
     }
@@ -166,15 +168,22 @@ fn write_value(out: &mut String, value: &Value) {
     }
 }
 
-/// Render a float so it re-lexes as a §7 `float` (always has a `.`), and a
-/// negative goes through the `-` `number` literal path.
+/// Render a float so it re-lexes as a §7 `float` (`digits "." digits`): always
+/// a `.`, never exponent notation. Rust's `{}` for `f64` is already fixed-point
+/// (no `e`), but we defend the contract explicitly so a future formatter change
+/// can't silently emit an exponent the lexer would reject. A `-` goes through
+/// the `number` literal path.
 fn write_float(out: &mut String, f: f64) {
     let s = format!("{f}");
-    if s.contains('.') || s.contains('e') || s.contains('E') {
+    debug_assert!(
+        !s.contains(['e', 'E']),
+        "float Display produced an exponent the lexer rejects: {s}"
+    );
+    if s.contains('.') {
         out.push_str(&s);
     } else {
-        // Integer-valued float (e.g. 1.0 → "1"): force a fractional part so
-        // it re-parses as Float, not Int.
+        // Integer-valued float (e.g. 1.0 → "1"): force a fractional part so it
+        // re-parses as Float, not Int.
         let _ = write!(out, "{s}.0");
     }
 }
@@ -388,5 +397,29 @@ mod tests {
         let s = serialize(&q);
         assert!(s.ends_with("1.0"), "{s}");
         assert_eq!(parse(&s).unwrap(), q);
+    }
+
+    #[test]
+    fn floats_serialise_without_an_exponent() {
+        // A small-magnitude float must serialise as fixed-point `digits.digits`
+        // (the lexer rejects an exponent form), and round-trip.
+        use crate::dsl::ir::{CmpOp, Field, OrdOp, Predicate, Query, Value};
+        for f in [0.000_000_001_f64, 0.000_25, 123_456.789] {
+            let q = Query {
+                predicate: Predicate::Comparison {
+                    field: Field::Confidence,
+                    op: CmpOp::Ord(OrdOp::Eq),
+                    value: Value::Float(f),
+                },
+                stages: Vec::new(),
+            };
+            let s = serialize(&q);
+            let lexeme = s.rsplit("== ").next().unwrap();
+            assert!(
+                !lexeme.contains(['e', 'E']),
+                "exponent in float lexeme {lexeme:?}"
+            );
+            assert_eq!(parse(&s).unwrap(), q, "round-trip failed for {s:?}");
+        }
     }
 }

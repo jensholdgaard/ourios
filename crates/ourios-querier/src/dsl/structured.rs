@@ -19,7 +19,7 @@ use super::DslError;
 use super::ir::{
     AggFn, Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
 };
-use super::parse_severity_name_pub;
+use super::{parse_severity_name_pub, require_string_operand, validate_sort_key};
 
 /// Parse a structured (JSON) query into the shared [`Query`] IR.
 ///
@@ -140,8 +140,8 @@ impl RawNode {
     fn into_ir(self) -> Result<Predicate, DslError> {
         match self {
             Self::Const { konst } => Ok(Predicate::Bool(konst)),
-            Self::And { and } => Ok(Predicate::And(into_ir_vec(and)?)),
-            Self::Or { or } => Ok(Predicate::Or(into_ir_vec(or)?)),
+            Self::And { and } => Ok(Predicate::and(combinator_terms("and", and)?)),
+            Self::Or { or } => Ok(Predicate::or(combinator_terms("or", or)?)),
             Self::Not { not } => Ok(Predicate::Not(Box::new(not.into_ir()?))),
             Self::Call { call, args } => Ok(Predicate::Call(call_into_ir(&call, args)?)),
             Self::Comparison { field, op, value } => comparison_into_ir(field, &op, value),
@@ -149,7 +149,16 @@ impl RawNode {
     }
 }
 
-fn into_ir_vec(nodes: Vec<RawNode>) -> Result<Vec<Predicate>, DslError> {
+/// Convert the children of an `and`/`or` combinator, rejecting an empty list
+/// (the §7 grammar has no nullary combinator). Flattening of same-kind nesting
+/// and the single-element collapse happen in [`Predicate::and`]/[`Predicate::or`]
+/// so the structured IR matches the string IR (RFC0002.2).
+fn combinator_terms(kind: &str, nodes: Vec<RawNode>) -> Result<Vec<Predicate>, DslError> {
+    if nodes.is_empty() {
+        return Err(DslError::new(format!(
+            "an \"{kind}\" needs at least one term"
+        )));
+    }
     nodes.into_iter().map(RawNode::into_ir).collect()
 }
 
@@ -181,10 +190,17 @@ fn severity_value(value: &serde_json::Value) -> Result<SeverityValue, DslError> 
                     "{s:?} is not a severity name (trace|debug|info|warn|error|fatal)"
                 ))
             }),
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(SeverityValue::Number)
-            .ok_or_else(|| DslError::new(format!("severity number {n} is not an integer"))),
+        // The string grammar's severity number is an unsigned token (no `-`),
+        // so reject negatives here to keep the two surfaces aligned (RFC0002.2).
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) if i >= 0 => Ok(SeverityValue::Number(i)),
+            Some(_) => Err(DslError::new(format!(
+                "severity number {n} must be non-negative"
+            ))),
+            None => Err(DslError::new(format!(
+                "severity number {n} is not an integer"
+            ))),
+        },
         other => Err(DslError::new(format!(
             "severity must compare against a name or number, found {other}"
         ))),
@@ -201,6 +217,11 @@ fn json_to_value(value: serde_json::Value) -> Result<Value, DslError> {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(Value::Int(i))
+            } else if n.is_u64() || n.is_i64() {
+                // A JSON integer outside i64 range — reject rather than
+                // silently coerce to Float (precision loss; would also diverge
+                // from the string DSL, which errors on out-of-range integers).
+                Err(DslError::new(format!("integer {n} is out of range")))
             } else if let Some(f) = n.as_f64() {
                 Ok(Value::Float(f))
             } else {
@@ -244,6 +265,7 @@ fn call_into_ir(call: &str, mut args: Vec<serde_json::Value>) -> Result<Call, Ds
     let field: RawField = serde_json::from_value(field_json)
         .map_err(|e| DslError::new(format!("{call}: first argument is not a field: {e}")))?;
     let field = field.into_ir()?;
+    require_string_operand(call, &field)?;
     let arg = match arg_str {
         serde_json::Value::String(s) => s,
         other => {
@@ -367,6 +389,15 @@ impl RawStage {
                 Ok(Stage::Range(parse_time(&r.from)?, parse_time(&r.to)?))
             }
             "count" => {
+                // `count` carries its grouping nested (`{"count":{"by":…}}`),
+                // unlike the aggregates' sibling `by`. A top-level sibling `by`
+                // here would be silently dropped, so reject it explicitly.
+                if has_by {
+                    return Err(DslError::new(
+                        "count groups via {\"count\":{\"by\":[…]}}, not a top-level \"by\""
+                            .to_string(),
+                    ));
+                }
                 let c: RawCount = from_stage_body(body, "count")?;
                 Ok(Stage::Count {
                     by: fields_to_ir(c.by)?,
@@ -375,6 +406,7 @@ impl RawStage {
             "sort" => {
                 reject_stray_by("sort")?;
                 let s: RawSort = from_stage_body(body, "sort")?;
+                validate_sort_key(&s.key)?;
                 Ok(Stage::Sort {
                     key: s.key,
                     desc: s.desc,
@@ -563,5 +595,88 @@ mod tests {
     fn rejects_unknown_field_and_malformed_json() {
         assert!(parse_structured(r#"{"predicate":{"field":"nope","op":"==","value":1}}"#).is_err());
         assert!(parse_structured("not json").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_integer_instead_of_float_coercion() {
+        // 18446744073709551615 > i64::MAX must be rejected, not coerced to Float.
+        let err = parse_structured(
+            r#"{"predicate":{"field":"template_id","op":"==","value":18446744073709551615}}"#,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("out of range"), "{}", err.message());
+    }
+
+    #[test]
+    fn rejects_negative_severity_number() {
+        let err = parse_structured(r#"{"predicate":{"field":"severity","op":">=","value":-1}}"#)
+            .unwrap_err();
+        assert!(err.message().contains("non-negative"), "{}", err.message());
+    }
+
+    #[test]
+    fn rejects_non_string_operand_in_call() {
+        assert!(
+            parse_structured(r#"{"predicate":{"call":"contains","args":["severity","x"]}}"#)
+                .is_err()
+        );
+        assert!(
+            parse_structured(r#"{"predicate":{"call":"contains","args":["body","x"]}}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_empty_combinator_and_flattens_same_kind() {
+        // Arrange / Act — empty list rejected; a nested same-kind `and`
+        // flattens to one node (matching the string IR, RFC0002.2).
+        assert!(parse_structured(r#"{"predicate":{"and":[]}}"#).is_err());
+        let q = parse_structured(
+            r#"{"predicate":{"and":[
+                {"field":"body","op":"==","value":1},
+                {"and":[
+                    {"field":"service","op":"==","value":"x"},
+                    {"field":"template_id","op":"==","value":2}
+                ]}
+            ]}}"#,
+        )
+        .unwrap();
+        // Assert
+        match q.predicate {
+            Predicate::And(terms) => assert_eq!(terms.len(), 3),
+            other => panic!("expected flat And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_stray_top_level_by_on_count() {
+        // `count` groups nested; a sibling `by` would be silently dropped.
+        assert!(
+            parse_structured(
+                r#"{"predicate":{"const":true},"stages":[{"count":{},"by":["service"]}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_structured(
+                r#"{"predicate":{"const":true},"stages":[{"count":{"by":["service"]}}]}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validates_sort_key_against_the_grammar() {
+        assert!(
+            parse_structured(r#"{"predicate":{"const":true},"stages":[{"sort":{"key":"count"}}]}"#)
+                .is_ok()
+        );
+        // A dotted attr path is not a §7 sort_key — the string surface could
+        // not re-parse it from the unquoted serialised form.
+        assert!(
+            parse_structured(
+                r#"{"predicate":{"const":true},"stages":[{"sort":{"key":"attr.http.status_code"}}]}"#
+            )
+            .is_err()
+        );
     }
 }

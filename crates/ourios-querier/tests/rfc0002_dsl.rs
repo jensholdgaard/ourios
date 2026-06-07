@@ -14,7 +14,8 @@
 /// its own predicate form); `and`/`or` are never nested in a same-kind parent
 /// (the serialiser flattens those); severity numbers and the int/float/duration
 /// literals stay in a re-lexable range; `field_list`/`by`/`project` use only
-/// bare fields (resource./attr. are not §7 `field`s).
+/// bare fields (resource./attr. are not §7 `field`s); string functions take
+/// only a string-typed operand (§6.1).
 #[cfg(test)]
 mod wellformed {
     use ourios_querier::dsl::ir::{
@@ -97,6 +98,26 @@ mod wellformed {
         prop_oneof![bare_field(), scalar_field()]
     }
 
+    /// A string-typed `path` field — the only operands a string function
+    /// (`matches`/`contains`/`starts_with`/`ends_with`) accepts (§6.1). Uses
+    /// the dotted-ident key form for `resource`/`attr` (the unbounded `".*"`
+    /// key strategy is reserved for `scalar_field`, where the comparison RHS
+    /// carries the heavy regex generation; doubling it under the recursive
+    /// `call` strategy overflows the generator's construction stack).
+    fn string_field() -> impl Strategy<Value = Field> {
+        let dotted_key = prop::collection::vec("[a-z][a-z0-9_]{0,5}", 1..=3)
+            .prop_map(|segs: Vec<String>| segs.join("."));
+        prop_oneof![
+            Just(Field::Body),
+            Just(Field::TraceId),
+            Just(Field::SpanId),
+            Just(Field::Scope),
+            Just(Field::Service),
+            dotted_key.clone().prop_map(Field::Resource),
+            dotted_key.prop_map(Field::Attr),
+        ]
+    }
+
     fn duration_lexeme() -> impl Strategy<Value = String> {
         (
             1u32..=9999,
@@ -147,10 +168,10 @@ mod wellformed {
 
     fn call() -> impl Strategy<Value = Call> {
         prop_oneof![
-            (path_field(), ".*").prop_map(|(field, arg)| Call::Matches { field, arg }),
-            (path_field(), ".*").prop_map(|(field, arg)| Call::Contains { field, arg }),
-            (path_field(), ".*").prop_map(|(field, arg)| Call::StartsWith { field, arg }),
-            (path_field(), ".*").prop_map(|(field, arg)| Call::EndsWith { field, arg }),
+            (string_field(), ".*").prop_map(|(field, arg)| Call::Matches { field, arg }),
+            (string_field(), ".*").prop_map(|(field, arg)| Call::Contains { field, arg }),
+            (string_field(), ".*").prop_map(|(field, arg)| Call::StartsWith { field, arg }),
+            (string_field(), ".*").prop_map(|(field, arg)| Call::EndsWith { field, arg }),
             any::<u64>().prop_map(Call::ResolvesTo),
         ]
     }
@@ -407,40 +428,69 @@ fn rfc0002_8_malformed_query_specific_error() {
         "recordbatch",
     ];
 
-    // Arrange — a table of malformed queries, each with the offending
-    // construct it must be rejected for.
-    let cases: &[(&str, &str)] = &[
-        ("body == ", "missing literal"),
-        ("severity =~ error", "severity with a regex operator"),
-        ("frobnicate == 1", "unknown field"),
-        ("body == \"unterminated", "unterminated string"),
-        ("body == \"line\nbreak\"", "literal newline in a string"),
-        ("contains(body)", "wrong function arity"),
+    // Arrange — a table of malformed queries, each with the offending construct
+    // it must be rejected for and a fragment the error message must name (so a
+    // generic "parse error" can't pass — RFC0002.8 requires the message to cite
+    // the rejected construct).
+    let cases: &[(&str, &str, &str)] = &[
+        ("body == ", "missing literal", "literal"),
+        (
+            "severity =~ error",
+            "severity with a regex operator",
+            "severity",
+        ),
+        ("frobnicate == 1", "unknown field", "frobnicate"),
+        (
+            "body == \"unterminated",
+            "unterminated string",
+            "unterminated",
+        ),
+        (
+            "body == \"line\nbreak\"",
+            "literal newline in a string",
+            "newline",
+        ),
+        ("contains(body)", "wrong function arity", "contains"),
         (
             "contains(body, \"x\", \"y\")",
             "too many function arguments",
+            "contains",
         ),
-        ("template_id == X", "bare identifier as a value"),
-        ("body =! 1", "bad operator token"),
-        ("(body == 1", "unclosed group"),
-        ("body == 1 |", "trailing pipe with no stage"),
-        ("body == 1 | limit -3", "negative limit"),
-        ("severity == louder", "non-severity name on severity"),
+        (
+            "template_id == X",
+            "bare identifier as a value",
+            "identifier",
+        ),
+        ("body =! 1", "bad operator token", "comparison"),
+        ("(body == 1", "unclosed group", "group"),
+        ("body == 1 |", "trailing pipe with no stage", "stage"),
+        ("body == 1 | limit -3", "negative limit", "limit"),
+        (
+            "severity == louder",
+            "non-severity name on severity",
+            "severity",
+        ),
     ];
 
-    for (query, what) in cases {
+    for (query, what, expected_fragment) in cases {
         // Act
         let err = ourios_querier::dsl::parse(query)
             .expect_err(&format!("expected {what} to be rejected: {query:?}"));
 
-        // Assert — a specific, non-empty message …
+        // Assert — a specific, non-empty message that names the offending
+        // construct …
         let msg = err.to_string();
         assert!(
-            !err.message().is_empty(),
-            "error for {what} ({query:?}) must cite the offending construct",
+            !msg.trim().is_empty(),
+            "error for {what} ({query:?}) must be non-empty",
+        );
+        let lower = msg.to_ascii_lowercase();
+        let fragment = expected_fragment.to_ascii_lowercase();
+        assert!(
+            lower.contains(&fragment),
+            "error for {what} ({query:?}) should name {fragment:?}: {msg:?}",
         );
         // … that leaks no engine/SQL token (case-insensitive).
-        let lower = msg.to_ascii_lowercase();
         for token in LEAK_TOKENS {
             assert!(
                 !lower.contains(token),

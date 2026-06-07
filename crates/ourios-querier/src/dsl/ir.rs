@@ -34,6 +34,42 @@ pub enum Predicate {
     Or(Vec<Predicate>),
 }
 
+impl Predicate {
+    /// Build an `and` over `terms`, flattening any nested `and` so the IR is
+    /// associative-normalised (`a and (b and c)` ≡ `a and b and c`). A
+    /// single term collapses to itself. Both front-ends route through this so
+    /// they produce the same canonical IR (RFC0002.2) and the serialised form
+    /// round-trips (RFC0002.7).
+    #[must_use]
+    pub fn and(terms: Vec<Predicate>) -> Predicate {
+        Self::flatten(terms, true)
+    }
+
+    /// Build an `or` over `terms`, flattening any nested `or`. See [`Predicate::and`].
+    #[must_use]
+    pub fn or(terms: Vec<Predicate>) -> Predicate {
+        Self::flatten(terms, false)
+    }
+
+    fn flatten(terms: Vec<Predicate>, is_and: bool) -> Predicate {
+        let mut flat = Vec::with_capacity(terms.len());
+        for term in terms {
+            match term {
+                Predicate::And(inner) if is_and => flat.extend(inner),
+                Predicate::Or(inner) if !is_and => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
+        if flat.len() == 1 {
+            flat.pop().expect("len checked")
+        } else if is_and {
+            Predicate::And(flat)
+        } else {
+            Predicate::Or(flat)
+        }
+    }
+}
+
 /// A path into the `OTel` log data model (§7 `path` / `field`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Field {
@@ -53,6 +89,28 @@ pub enum Field {
     Resource(String),
     /// `attr.<key>` / `attr["<key>"]` — the raw `OTel` attribute key.
     Attr(String),
+}
+
+impl Field {
+    /// Whether a string function (`matches`/`contains`/`starts_with`/
+    /// `ends_with`) may take this field as its first operand. Those functions
+    /// require a string operand (§6.1); applying one to a numeric, boolean, or
+    /// timestamp field is a parse-time type error. `body` is an `OTel`
+    /// `AnyValue` and `resource`/`attr` keys are dynamically typed, so all
+    /// three are treated as string-compatible.
+    #[must_use]
+    pub fn is_string_operand(&self) -> bool {
+        matches!(
+            self,
+            Self::Body
+                | Self::TraceId
+                | Self::SpanId
+                | Self::Scope
+                | Self::Service
+                | Self::Resource(_)
+                | Self::Attr(_)
+        )
+    }
 }
 
 /// Ordering operators valid on any scalar and on severity (§7 `ord_op`).
@@ -170,4 +228,43 @@ pub enum Time {
     Duration { neg: bool, literal: String },
     /// An RFC 3339 timestamp — its lexical form.
     Timestamp(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Field, Predicate};
+
+    fn t(b: bool) -> Predicate {
+        Predicate::Bool(b)
+    }
+
+    #[test]
+    fn and_flattens_nested_same_kind_and_collapses_singletons() {
+        // Arrange / Act — a nested `and` flattens; a single term collapses.
+        let flat = Predicate::and(vec![t(true), Predicate::And(vec![t(false), t(true)])]);
+        let single = Predicate::and(vec![t(true)]);
+        // Assert
+        assert_eq!(flat, Predicate::And(vec![t(true), t(false), t(true)]));
+        assert_eq!(single, t(true));
+    }
+
+    #[test]
+    fn or_does_not_absorb_an_and_child() {
+        // A different-kind child stays nested (only same-kind flattens).
+        let p = Predicate::or(vec![t(true), Predicate::And(vec![t(false), t(true)])]);
+        assert_eq!(
+            p,
+            Predicate::Or(vec![t(true), Predicate::And(vec![t(false), t(true)])])
+        );
+    }
+
+    #[test]
+    fn is_string_operand_classifies_fields() {
+        assert!(Field::Body.is_string_operand());
+        assert!(Field::Service.is_string_operand());
+        assert!(Field::Attr("k".into()).is_string_operand());
+        assert!(!Field::Severity.is_string_operand());
+        assert!(!Field::Lossy.is_string_operand());
+        assert!(!Field::Ts.is_string_operand());
+    }
 }

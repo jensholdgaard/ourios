@@ -1136,7 +1136,9 @@ fn rfc0002_8_malformed_query_specific_error() {
 /// the distinction is the whole point. The expansion is symmetric
 /// (`resolves_to(B)` is the same class) and strictly per-tenant `[§3.7]`:
 /// the alias asserted under `T` does not leak to a tenant `T2` whose map is
-/// empty, so the same `resolves_to(A)` there matches only `A`.
+/// empty, so the same `resolves_to(A)` there matches only `A`. The other
+/// §6.3 template + correctness primitives are covered too: `template_id == n`
+/// (the un-expanded singleton), `lossy == true`, and `confidence < 0.7`.
 #[tokio::test]
 async fn rfc0002_9_resolves_to_expands_via_alias_map() {
     use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
@@ -1162,6 +1164,20 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
             simple("T", C, TS0 + 2 * fixtures::HOUR_NS),
             simple("T2", A, TS0),
             simple("T2", B, TS0 + fixtures::HOUR_NS),
+            // Distinct-id rows under T so the other template primitives have
+            // something to match: one lossy (a lossy String row retains its
+            // body, invariant §3.3) and one low-confidence.
+            ourios_core::record::MinedRecord {
+                template_id: 40,
+                lossy_flag: true,
+                body: Some("raw lossy line".to_string()),
+                ..simple("T", 40, TS0 + 2_000)
+            },
+            ourios_core::record::MinedRecord {
+                template_id: 50,
+                confidence: 0.5,
+                ..simple("T", 50, TS0 + 3_000)
+            },
         ],
     );
     let q = Querier::new(bucket.path());
@@ -1211,6 +1227,19 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
         rows("resolves_to(10)", &t2, &aliases).await,
         1,
         "the T alias must not leak into T2 (same map, per-tenant scope): only A's row matches",
+    );
+
+    // The remaining template + correctness primitives compile and filter —
+    // RFC0002.9 covers template_id / resolves_to / lossy / confidence (§6.3).
+    assert_eq!(
+        rows("lossy == true", &t, &aliases).await,
+        1,
+        "lossy == true matches the one lossy row",
+    );
+    assert_eq!(
+        rows("confidence < 0.7", &t, &aliases).await,
+        1,
+        "confidence < 0.7 matches the one low-confidence row",
     );
 }
 

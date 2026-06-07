@@ -342,10 +342,7 @@ fn field_literal(field: &Field, value: &Value) -> Result<Expr, QueryError> {
             // `confidence` is a Float32 column; a DSL number literal narrows
             // to f32 to match it. The miner emits confidences in [0, 1], so
             // a comparison literal's precision narrowing is intended.
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_precision_loss
-            )]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             Value::Float(f) => Ok(lit(*f as f32)),
             #[allow(clippy::cast_precision_loss)]
             Value::Int(n) => Ok(lit(*n as f32)),

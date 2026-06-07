@@ -325,17 +325,29 @@ prior draft:
 | `ts` | `time_unix_nano` (the event timestamp; what `range(...)` filters) |
 | `observed_ts` | `observed_time_unix_nano` |
 
+`trace_id` / `span_id` literals are **lowercase-hex strings** (32 and 16
+hex digits respectively), accepted case-insensitively with no separators;
+the compiler hex-decodes them to match the stored byte columns — the
+OTLP/JSON id convention, consistent with RFC0003.6.
+
 ### 6.3 Template + correctness primitives
 
 First-class vocabulary (RFC 0001 §6.3/§6.7):
 
-- `template_id == X` — exact template.
+- `template_id == X` — exact template; resolves to the `template_id` column.
 - `resolves_to(X)` — `X` plus its drift aliases (the RFC 0001 §6.7 drift
-  question); compiles to alias-set membership.
-- `confidence` (miner confidence, `< 0.7`), `lossy` (the lossy-
-  reconstruction flag), `drift` (template drifted across versions).
+  question); compiles to alias-set membership over `template_id`.
+- `confidence` — miner confidence (e.g. `< 0.7`); the `confidence` column.
+- `lossy` — the lossy-reconstruction flag; resolves to the RFC 0001 /
+  RFC 0005 **`lossy_flag`** column (`lossy == true`).
 - `render` (pipe stage, §6.5) reconstructs the original line, honouring
   `lossy`.
+
+The drift *question* is answered by `resolves_to` (alias membership). A
+bare `drift` predicate ("has this template drifted?") is **deferred**:
+per RFC 0001 §6.7 drift is an audit-stream property, not a column in the
+RFC 0005 data files, so it needs an audit-stream query path — a future
+capability, not a row predicate in this grammar.
 
 ### 6.4 Two front-ends, one core
 
@@ -424,7 +436,7 @@ arg          = path | literal ;
 path         = field | "resource" , key_tail | "attr" , key_tail ;
 field        = "body" | "severity" | "ts" | "observed_ts" | "trace_id"
              | "span_id" | "scope" | "flags" | "service"
-             | "template_id" | "confidence" | "lossy" | "drift" ;
+             | "template_id" | "confidence" | "lossy" ;
 key_tail     = ( "." , dotted_key ) | ( "[" , string , "]" ) ;
 dotted_key   = ident , { "." , ident } ;
 stage        = "range" , "(" , time , "," , time , ")"

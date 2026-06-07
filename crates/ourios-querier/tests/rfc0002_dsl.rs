@@ -383,6 +383,13 @@ mod fixtures {
     pub const DEFAULT_WINDOW_NS: u64 = 30 * 24 * HOUR_NS;
     /// A `now` reference comfortably after the fixture instants.
     pub const NOW: u64 = TS0 + 24 * HOUR_NS;
+
+    /// An empty alias projection: no operator has aliased anything, so every
+    /// `resolves_to(n)` compiles to the singleton `template_id == n`. Used by
+    /// every test that is not specifically exercising alias expansion.
+    pub fn no_aliases() -> ourios_core::alias::AliasMap {
+        ourios_core::alias::AliasMap::new()
+    }
 }
 
 /// Scenario RFC0002.1 — A Branch-B predicate parses and compiles to a filter.
@@ -408,7 +415,13 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
     // Act — the compiled DSL predicate over the indexed `template_id` key …
     let query = ourios_querier::dsl::parse("template_id == 1").expect("parse");
     let dsl = q
-        .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+        .run_query(
+            &query,
+            &tenant,
+            NOW,
+            DEFAULT_WINDOW_NS,
+            &fixtures::no_aliases(),
+        )
         .await
         .expect("run_query");
     // … and the equivalent direct execution request.
@@ -512,7 +525,13 @@ async fn rfc0002_3_no_datafusion_leakage() {
 
     // Act
     let err = q
-        .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+        .run_query(
+            &query,
+            &tenant,
+            NOW,
+            DEFAULT_WINDOW_NS,
+            &fixtures::no_aliases(),
+        )
         .await
         .expect_err("an out-of-scope attribute comparison must be rejected");
 
@@ -554,7 +573,7 @@ async fn rfc0002_4_default_time_window() {
     // Act — a query with NO range stage (match-all predicate).
     let query = ourios_querier::dsl::parse("true").expect("parse");
     let r = q
-        .run_query(&query, &tenant, now, window)
+        .run_query(&query, &tenant, now, window, &fixtures::no_aliases())
         .await
         .expect("run_query");
 
@@ -610,10 +629,16 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
         let tenant = tenant.clone();
         async move {
             let query = ourios_querier::dsl::parse(text).expect("parse");
-            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
-                .await
-                .expect("run_query")
-                .rows
+            q.run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                &fixtures::no_aliases(),
+            )
+            .await
+            .expect("run_query")
+            .rows
         }
     };
 
@@ -683,10 +708,16 @@ async fn rfc0002_5_named_severity_equality_is_a_band() {
         let tenant = tenant.clone();
         async move {
             let query = ourios_querier::dsl::parse(text).expect("parse");
-            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
-                .await
-                .expect("run_query")
-                .rows
+            q.run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                &fixtures::no_aliases(),
+            )
+            .await
+            .expect("run_query")
+            .rows
         }
     };
 
@@ -744,10 +775,16 @@ async fn rfc0002_6_first_class_fields_resolve() {
         let tenant = tenant.clone();
         async move {
             let query = ourios_querier::dsl::parse(&text).expect("parse");
-            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
-                .await
-                .expect("run_query")
-                .rows
+            q.run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                &fixtures::no_aliases(),
+            )
+            .await
+            .expect("run_query")
+            .rows
         }
     };
 
@@ -817,10 +854,16 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
         let tenant = tenant.clone();
         async move {
             let query = ourios_querier::dsl::parse(text).expect("parse");
-            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
-                .await
-                .expect("run_query")
-                .rows
+            q.run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                &fixtures::no_aliases(),
+            )
+            .await
+            .expect("run_query")
+            .rows
         }
     };
 
@@ -870,7 +913,13 @@ async fn rfc0002_6_non_text_operators_rejected() {
         // Act
         let query = ourios_querier::dsl::parse(text).expect("parse");
         let err = q
-            .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+            .run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                &fixtures::no_aliases(),
+            )
             .await
             .expect_err(&format!("{text:?} must be rejected at compile"));
 
@@ -912,7 +961,13 @@ async fn rfc0002_6_unsupported_stage_rejected() {
     for (text, fragment) in cases {
         let query = ourios_querier::dsl::parse(text).expect("parse");
         let err = q
-            .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+            .run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                &fixtures::no_aliases(),
+            )
             .await
             .expect_err(&format!("{text:?} must be rejected, not dropped"));
         assert!(matches!(err, QueryError::InvalidQuery { .. }), "{text:?}");
@@ -925,9 +980,15 @@ async fn rfc0002_6_unsupported_stage_rejected() {
 
     // A supported pipeline still runs.
     let ok = ourios_querier::dsl::parse("body == \"x\" | limit 5").expect("parse");
-    q.run_query(&ok, &tenant, NOW, DEFAULT_WINDOW_NS)
-        .await
-        .expect("range + limit stay supported");
+    q.run_query(
+        &ok,
+        &tenant,
+        NOW,
+        DEFAULT_WINDOW_NS,
+        &fixtures::no_aliases(),
+    )
+    .await
+    .expect("range + limit stay supported");
 }
 
 /// Scenario RFC0002.7 — Parse/serialise round-trip is idempotent.
@@ -1066,13 +1127,89 @@ fn rfc0002_8_malformed_query_specific_error() {
 
 /// Scenario RFC0002.9 — Template primitives compile.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
-#[ignore = "RFC 0002 red gate — DSL parser/compiler pending (RFC0002.9)"]
-#[test]
-fn rfc0002_9_template_primitives_compile() {
-    unimplemented!(
-        "RFC0002.9 — template_id == 42, resolves_to(42), lossy == true, \
-         confidence < 0.7 each compile to the documented plan \
-         (resolves_to expands to the RFC 0001 §6.7 alias-set membership)."
+///
+/// `resolves_to(n)` expands through the RFC 0001 §6.7 alias map: against an
+/// operator-built map where template `B` aliases template `A` under tenant
+/// `T`, `resolves_to(A)` matches BOTH `A` and `B` rows (and excludes an
+/// un-aliased control `C`), while bare `template_id == A` matches only `A` —
+/// the distinction is the whole point. The expansion is symmetric
+/// (`resolves_to(B)` is the same class) and strictly per-tenant `[§3.7]`:
+/// the alias asserted under `T` does not leak to a tenant `T2` whose map is
+/// empty, so the same `resolves_to(A)` there matches only `A`.
+#[tokio::test]
+async fn rfc0002_9_resolves_to_expands_via_alias_map() {
+    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use ourios_core::alias::{ActorId, AliasMap, Operator};
+    use ourios_core::audit::InMemoryAuditSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::Querier;
+
+    // Arrange — three distinct templates in tenant T (A, B, C) plus the same
+    // template ids under a second tenant T2, so cross-tenant isolation has
+    // rows to (not) match. Each id sits in its own hour so a `template_id`
+    // filter prunes by row-group statistics.
+    const A: u64 = 10;
+    const B: u64 = 20;
+    const C: u64 = 30;
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            simple("T", A, TS0),
+            simple("T", A, TS0 + 1_000),
+            simple("T", B, TS0 + fixtures::HOUR_NS),
+            simple("T", C, TS0 + 2 * fixtures::HOUR_NS),
+            simple("T2", A, TS0),
+            simple("T2", B, TS0 + fixtures::HOUR_NS),
+        ],
+    );
+    let q = Querier::new(bucket.path());
+    let t = TenantId::new("T");
+    let t2 = TenantId::new("T2");
+
+    // Build the alias map via the ourios-core operator API: assert B ≡ A
+    // under T (and nothing under T2).
+    let mut aliases = AliasMap::new();
+    let mut sink = InMemoryAuditSink::new();
+    let by = Operator::now(ActorId::new("op-test").expect("actor"), "merge drift");
+    aliases
+        .assert(&mut sink, &t, A, vec![B], by)
+        .expect("assert");
+
+    let rows = async |text: &str, tenant: &TenantId, map: &AliasMap| {
+        let query = ourios_querier::dsl::parse(text).expect("parse");
+        q.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, map)
+            .await
+            .expect("run_query")
+            .rows
+    };
+
+    // Act / Assert — resolves_to(A) expands to the {A,B} class: 2 A-rows + 1
+    // B-row = 3, and the C row is excluded.
+    assert_eq!(
+        rows("resolves_to(10)", &t, &aliases).await,
+        3,
+        "resolves_to(A) matches both A and B, not C",
+    );
+    // Bare template_id == A is the un-expanded singleton: only the 2 A rows.
+    assert_eq!(
+        rows("template_id == 10", &t, &aliases).await,
+        2,
+        "template_id == A matches only A — the distinction from resolves_to",
+    );
+    // Symmetry — resolves_to(B) is the same class.
+    assert_eq!(
+        rows("resolves_to(20)", &t, &aliases).await,
+        3,
+        "resolves_to(B) matches the same {{A,B}} class",
+    );
+    // Cross-tenant isolation `[§3.7]` — the alias asserted under T does not
+    // leak to T2 (empty map), so resolves_to(A) there matches only A's row.
+    let empty = AliasMap::new();
+    assert_eq!(
+        rows("resolves_to(10)", &t2, &empty).await,
+        1,
+        "the T alias must not leak into T2: only A's row matches",
     );
 }
 

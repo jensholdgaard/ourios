@@ -410,11 +410,14 @@ flowchart LR
   line (the `|` newlines above are cosmetic) — the §4 P7 YAML constraint.
 
 - **Structured surface** is the machine contract (MCP tool schema +
-  programmatic clients): a JSON predicate tree — leaf **comparison nodes**
-  `{ "field": …, "op": …, "value": … }` and **boolean nodes**
-  (`{ "and": [ … ] }` / `{ "or": [ … ] }` with a child array; `{ "not":
-  <node> }` **unary**, per §7) — plus an ordered **`stages`** array
-  mirroring the pipe stages (`range`/`count`/`sort`/`limit`/`project`).
+  programmatic clients): a top-level object
+  `{ "predicate": <node>, "stages": [ <stage>, … ] }` (`stages` optional,
+  default `[]`). A **`<node>`** is either a leaf **comparison node**
+  `{ "field": …, "op": …, "value": … }` or a **boolean node**
+  (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
+  array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a
+  tagged object mirroring a pipe stage
+  (`range`/`count`/`sort`/`limit`/`project`).
   Its **JSON Schema is published and versioned with the parser** (snapshot-
   tested like the §7 grammar; RFC0002.11), and it compiles to the same IR
   as the string surface (RFC0002.2). It is the formalised, extended
@@ -498,7 +501,9 @@ time         = "now" | ( [ "-" ] , duration ) | timestamp ;   (* e.g. now , -1h 
 integer      = digit , { digit } ;
 (* lexical: ident = letter , { letter | digit | "_" } ;
    string = '"' , { char | escape } , '"' ;
-   char   = any Unicode scalar except '"' or '\' ;
+   char   = any Unicode scalar except '"' , '\' , or a line terminator
+            (a literal newline must be written as the \n escape — queries
+            are single-line, §4 P7 / RFC0002.10) ;
    escape = '\' , ( '"' | '\' | "n" | "t" | "r" | ( "u" , 4 * hex ) ) ;
    number = integer | float ;  float = integer , "." , digit , { digit } ;
    boolean = "true" | "false" ;

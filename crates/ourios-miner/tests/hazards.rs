@@ -51,9 +51,134 @@ fn h1_1_login_and_logout_remain_distinct_at_default_threshold() {
 /// Scenario H1.2 — Lossy-zone match retains body.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h1_2_lossy_zone_match_retains_body() {
-    todo!("RFC 0001 §6.6");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
+
+    // Arrange — two length-3 lines sharing the `user logged *`
+    // prefix, differing at the final token. Neither token masks to
+    // a tag (no NUM/UUID/IP match), so the templates are exactly
+    // `["user", "logged", "in"]` and `["user", "logged", "out"]`.
+    // sim_seq = 2/3 ≈ 0.667 lands in the §6.3 lossy zone for the
+    // project defaults (floor 0.4 ≤ 0.667 < threshold 0.7), so the
+    // second line must NOT force-merge into the first candidate:
+    // it gets a fresh leaf, retains its body, and carries
+    // `confidence = sim/threshold < 1.0` with `lossy_flag = false`
+    // (the flag is reserved for §6.6 tokenizer failure, not a
+    // low-confidence parse). This is the §3.1 "no silent merge"
+    // boundary expressed as a positive: a sub-threshold match is
+    // recorded losslessly, never coalesced.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+    let raw_first = "user logged in";
+    let raw_lossy = "user logged out";
+
+    // Act — the first line creates the candidate leaf; the second
+    // scores in the lossy zone against it.
+    let id_first = cluster.ingest(&make(raw_first));
+    let id_lossy = cluster.ingest(&make(raw_lossy));
+
+    // Assert — the lossy-zone line takes a fresh template_id rather
+    // than the candidate's (no silent sub-threshold merge), and the
+    // tenant now holds two templates.
+    assert_ne!(
+        id_first, NO_TEMPLATE,
+        "the candidate line allocated a real template",
+    );
+    assert_ne!(
+        id_lossy, NO_TEMPLATE,
+        "the lossy-zone line allocates its own fresh leaf",
+    );
+    assert_ne!(
+        id_first, id_lossy,
+        "a lossy-zone match must create a fresh leaf, never coalesce into the candidate (§3.1)",
+    );
+    assert_eq!(
+        cluster.template_count(&t),
+        2,
+        "lossy-zone fresh-leaf creation yields a distinct second template",
+    );
+    assert_eq!(
+        cluster.merges_total(),
+        0,
+        "the lossy zone must not widen / merge — that would be a sub-threshold silent merge",
+    );
+
+    // Body retention — the heart of H1.2. The lossy-zone record's
+    // `body` column carries the original line bytes verbatim (§3.3
+    // / §6.3), and `lossy_flag` stays false because the line
+    // tokenized cleanly and reconstruction still succeeds.
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 2, "one record per ingest");
+    let first_rec = &emitted[0];
+    let lossy_rec = &emitted[1];
+
+    assert_eq!(
+        lossy_rec.template_id, id_lossy,
+        "the emitted lossy record carries its fresh template_id",
+    );
+    assert_eq!(
+        lossy_rec.body.as_deref(),
+        Some(raw_lossy),
+        "the lossy zone retains the original line bytes in the body column (§6.3)",
+    );
+    assert!(
+        !lossy_rec.lossy_flag,
+        "lossy_flag is reserved for §6.6 tokenizer failure, not a low-confidence parse",
+    );
+
+    // Confidence reflects the sub-threshold match: sim/threshold =
+    // (2/3)/0.7 ≈ 0.952, strictly below the 1.0 clean-attach
+    // boundary. Compared with a tolerance because the ratio is an
+    // f32 with a repeating-decimal numerator.
+    let expected_confidence = (2.0_f32 / 3.0) / 0.7;
+    assert!(
+        (lossy_rec.confidence - expected_confidence).abs() < 1e-6,
+        "lossy-zone confidence must be sim/threshold, got {}",
+        lossy_rec.confidence,
+    );
+    assert!(
+        lossy_rec.confidence < 1.0,
+        "a lossy-zone confidence is below the clean-attach boundary by construction",
+    );
+
+    // The candidate (first) line is a clean fresh leaf: confidence
+    // 1.0 sentinel, no body retention. Pins that the lossy
+    // semantics are specific to the second line, not a blanket
+    // change to fresh-leaf creation.
+    assert!(
+        (first_rec.confidence - 1.0).abs() < f32::EPSILON,
+        "the candidate fresh leaf carries the clean-attach confidence sentinel",
+    );
+    assert!(
+        first_rec.body.is_none(),
+        "a no-candidate fresh leaf does not retain body — only the lossy zone does",
+    );
+
+    // §3.1 telemetry: exactly one body-retention event (the lossy
+    // line). The candidate fresh leaf and a clean attach do not
+    // count; the §6.6 tokenizer-failure path is excluded by
+    // contract.
+    assert_eq!(
+        cluster.body_retentions_total(),
+        1,
+        "the lossy zone is a §3.1 body_retention_ratio event; the candidate fresh leaf is not",
+    );
+    assert_eq!(
+        cluster.parse_failures_total(),
+        0,
+        "the lossy zone is not a parse failure — a template was allocated",
+    );
 }
 
 /// Scenario H1.3 — Every widening emits an audit event.

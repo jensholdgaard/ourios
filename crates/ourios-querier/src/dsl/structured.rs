@@ -459,6 +459,12 @@ impl RawStage {
             }
             "render" => {
                 reject_stray_by("render")?;
+                // render is argument-less: only an empty body (`{}` or null).
+                if !(body.is_null() || body.as_object().is_some_and(serde_json::Map::is_empty)) {
+                    return Err(DslError::new(format!(
+                        "render takes no arguments; got body `{body}`"
+                    )));
+                }
                 Ok(Stage::Render)
             }
             "sum" | "min" | "max" | "avg" => agg_into_ir(&agg_tag, body, by_value),
@@ -738,6 +744,15 @@ mod tests {
         .unwrap_err();
         // Assert
         assert!(err.message().contains("range"), "{}", err.message());
+    }
+
+    #[test]
+    fn render_rejects_a_non_empty_body() {
+        // Arrange / Act — render is argument-less; a non-empty body is invalid.
+        let err = parse_structured(r#"{"predicate":{"const":true},"stages":[{"render":1}]}"#)
+            .unwrap_err();
+        // Assert
+        assert!(err.message().contains("render"), "{}", err.message());
     }
 
     #[test]

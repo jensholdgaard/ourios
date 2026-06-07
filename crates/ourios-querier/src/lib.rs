@@ -28,11 +28,12 @@
 //! (still the row-level correctness authority); the pruning is
 //! conservative and never drops an in-window partition.
 //!
-//! **Throwaway query surface.** [`QueryRequest`] is intentionally
-//! minimal — just the predicates B1/B2 need. The real logs DSL
-//! (RFC 0002) is deferred until B1/B2 prove the query thesis is
-//! worth a stable language; until then this surface may change
-//! freely (maintainer decision).
+//! **Structured query surface.** [`QueryRequest`] is intentionally
+//! minimal — just the predicates B1/B2 need. The logs DSL (RFC 0002,
+//! now `specified`) lands in [`dsl`]: a Branch-B parser + a structured
+//! surface that both compile to one IR in front of this layer. The DSL
+//! is the stable user-facing contract; `QueryRequest` remains the
+//! internal execution request it targets.
 
 #![deny(unsafe_code)]
 

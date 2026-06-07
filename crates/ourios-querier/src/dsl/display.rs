@@ -2,8 +2,9 @@
 //! `parse(serialize(q)) == q` (RFC0002.7 round-trip) and the result is a
 //! YAML-safe scalar (RFC0002.10). Canonical choices: keyword operators
 //! (`and`/`or`/`not`) over the terse aliases, `==`/`!=`, lowercase severity
-//! names, dotted attribute keys when expressible (else bracketed), and
-//! `\uXXXX`-free escaping limited to the §7 set.
+//! names, dotted attribute keys when expressible (else bracketed), and the
+//! §7 string escapes (`\"` `\\` `\n` `\t` `\r`, and `\uXXXX` for other
+//! control characters).
 
 use std::fmt::Write as _;
 

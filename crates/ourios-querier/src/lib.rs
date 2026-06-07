@@ -428,6 +428,16 @@ impl Querier {
     /// `[now - default_window_nanos, now]` (RFC 0002 §4 P5 — **never** an
     /// unbounded scan).
     ///
+    /// `alias_map` is the in-memory RFC 0001 §6.7 alias projection the caller
+    /// holds for this querier process; `resolves_to(n)` expands through
+    /// [`AliasMap::resolves`](ourios_core::alias::AliasMap::resolves) for
+    /// `tenant`, so a `template_id` an operator aliased matches its whole
+    /// equivalence class. An id in no class resolves to `{id}` — a singleton
+    /// `template_id IN (n)`, behaviorally identical to a bare
+    /// `template_id == n`. The map is a
+    /// projection injected by the caller; this path adds no on-disk loading
+    /// (physical storage is the RFC 0005 split, sibling to #147).
+    ///
     /// # Errors
     ///
     /// [`QueryError::InvalidQuery`] if a literal can't be resolved (a malformed
@@ -439,8 +449,15 @@ impl Querier {
         tenant: &TenantId,
         now_unix_nano: u64,
         default_window_nanos: u64,
+        alias_map: &ourios_core::alias::AliasMap,
     ) -> Result<QueryResult, QueryError> {
-        let plan = compile::compile(query, now_unix_nano, default_window_nanos)?;
+        let plan = compile::compile(
+            query,
+            tenant,
+            now_unix_nano,
+            default_window_nanos,
+            alias_map,
+        )?;
         self.execute(tenant, Some(plan.window), move |df| {
             compile::apply(df, plan)
         })

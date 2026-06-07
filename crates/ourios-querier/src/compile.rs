@@ -43,10 +43,16 @@
 //! whole query — keeps `and`/`or`/`not` semantics correct, and avoids the
 //! planning error that filtering an unknown column would otherwise raise.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
 use datafusion::dataframe::DataFrame;
 use datafusion::functions::expr_fn::{regexp_like, starts_with};
 use datafusion::logical_expr::{Expr, not};
 use datafusion::prelude::{col, lit};
+
+use ourios_core::alias::AliasMap;
+use ourios_core::tenant::TenantId;
 
 use crate::dsl::ir::{
     Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
@@ -58,9 +64,16 @@ use ourios_parquet::columns;
 /// directory-level partition pruning and the row-level time filter) and the
 /// predicate IR, deferred so the `Expr` is built once the union schema is
 /// known (for the absent-column guard). Plus the row `limit`, if any.
+///
+/// `alias_classes` is the eagerly-resolved RFC 0001 §6.7 alias expansion for
+/// every `resolves_to(n)` in the predicate: id → the sorted equivalence class
+/// (`{n}` when `n` is in no class). It is captured here at `compile` time so
+/// `apply`/`compile_predicate` need neither the [`AliasMap`] nor the tenant —
+/// the per-tenant resolution has already happened.
 pub(crate) struct Plan {
     pub(crate) window: (u64, u64),
     predicate: Predicate,
+    alias_classes: BTreeMap<u64, BTreeSet<u64>>,
     limit: Option<usize>,
 }
 
@@ -73,8 +86,10 @@ const NS_PER_SECOND: u64 = 1_000_000_000;
 /// `Expr` building.
 pub(crate) fn compile(
     query: &Query,
+    tenant: &TenantId,
     now_unix_nano: u64,
     default_window_nanos: u64,
+    alias_map: &AliasMap,
 ) -> Result<Plan, QueryError> {
     // This slice executes only the `range` (time window) and `limit` stages.
     // The aggregation / sort / projection / render stages parse into a valid
@@ -107,11 +122,44 @@ pub(crate) fn compile(
         })?),
         None => None,
     };
+    // Eagerly resolve every `resolves_to(n)` against the tenant's alias map
+    // so the deferred predicate compilation in `apply` is tenant-agnostic.
+    let mut alias_classes = BTreeMap::new();
+    collect_alias_classes(&query.predicate, tenant, alias_map, &mut alias_classes);
+
     Ok(Plan {
         window,
         predicate: query.predicate.clone(),
+        alias_classes,
         limit,
     })
+}
+
+/// Walk the predicate IR and, for each `resolves_to(n)`, record the tenant's
+/// alias expansion `n → resolves(tenant, n)` (RFC 0001 §6.7). Per-tenant
+/// resolution `[§3.7]` happens here once; the result rides the [`Plan`].
+fn collect_alias_classes(
+    p: &Predicate,
+    tenant: &TenantId,
+    alias_map: &AliasMap,
+    out: &mut BTreeMap<u64, BTreeSet<u64>>,
+) {
+    match p {
+        Predicate::Call(Call::ResolvesTo(n)) => {
+            out.entry(*n)
+                .or_insert_with(|| alias_map.resolves(tenant, *n));
+        }
+        Predicate::Not(inner) => collect_alias_classes(inner, tenant, alias_map, out),
+        Predicate::And(terms) | Predicate::Or(terms) => {
+            for term in terms {
+                collect_alias_classes(term, tenant, alias_map, out);
+            }
+        }
+        Predicate::Bool(_)
+        | Predicate::Comparison { .. }
+        | Predicate::Severity { .. }
+        | Predicate::Call(_) => {}
+    }
 }
 
 /// Apply a compiled [`Plan`] to the base `DataFrame`: the time-window filter,
@@ -122,6 +170,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
     let Plan {
         window: (start, end),
         predicate,
+        alias_classes,
         limit,
     } = plan;
     let mut df = df
@@ -132,7 +181,7 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         )
         .map_err(crate::storage_err)?;
 
-    match compile_predicate(&predicate, &df)? {
+    match compile_predicate(&predicate, &df, &alias_classes)? {
         // `true` ⇒ match-all ⇒ no predicate filter (window only).
         PredExpr::All => {}
         // `false` ⇒ match-none ⇒ short-circuit to an empty result.
@@ -241,27 +290,36 @@ fn timestamp_nanos(s: &str) -> Result<u64, QueryError> {
     })
 }
 
-fn compile_predicate(p: &Predicate, df: &DataFrame) -> Result<PredExpr, QueryError> {
+fn compile_predicate(
+    p: &Predicate,
+    df: &DataFrame,
+    alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
+) -> Result<PredExpr, QueryError> {
     match p {
         Predicate::Bool(true) => Ok(PredExpr::All),
         Predicate::Bool(false) => Ok(PredExpr::None),
-        Predicate::Not(inner) => match compile_predicate(inner, df)? {
+        Predicate::Not(inner) => match compile_predicate(inner, df, alias_classes)? {
             PredExpr::All => Ok(PredExpr::None),
             PredExpr::None => Ok(PredExpr::All),
             PredExpr::Filter(e) => Ok(PredExpr::Filter(not(e))),
         },
-        Predicate::And(terms) => combine(terms, df, true),
-        Predicate::Or(terms) => combine(terms, df, false),
+        Predicate::And(terms) => combine(terms, df, alias_classes, true),
+        Predicate::Or(terms) => combine(terms, df, alias_classes, false),
         Predicate::Comparison { field, op, value } => compile_comparison(field, *op, value, df),
         Predicate::Severity { op, value } => Ok(compile_severity(*op, value)),
-        Predicate::Call(call) => compile_call(call, df),
+        Predicate::Call(call) => compile_call(call, df, alias_classes),
     }
 }
 
-fn combine(terms: &[Predicate], df: &DataFrame, is_and: bool) -> Result<PredExpr, QueryError> {
+fn combine(
+    terms: &[Predicate],
+    df: &DataFrame,
+    alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
+    is_and: bool,
+) -> Result<PredExpr, QueryError> {
     let mut acc: Option<Expr> = None;
     for term in terms {
-        match (compile_predicate(term, df)?, is_and) {
+        match (compile_predicate(term, df, alias_classes)?, is_and) {
             // `x and true` = x ; `x or false` = x — drop the identity term.
             (PredExpr::All, true) | (PredExpr::None, false) => {}
             // `x and false` = false (whole conjunction is empty).
@@ -566,7 +624,11 @@ fn like_escape(s: &str) -> String {
     out
 }
 
-fn compile_call(call: &Call, df: &DataFrame) -> Result<PredExpr, QueryError> {
+fn compile_call(
+    call: &Call,
+    df: &DataFrame,
+    alias_classes: &BTreeMap<u64, BTreeSet<u64>>,
+) -> Result<PredExpr, QueryError> {
     match call {
         Call::Matches { field, arg } => {
             string_call(field, df, |lhs| regexp_like(lhs, lit(arg.clone()), None))
@@ -576,11 +638,26 @@ fn compile_call(call: &Call, df: &DataFrame) -> Result<PredExpr, QueryError> {
             string_call(field, df, |lhs| starts_with(lhs, lit(arg.clone())))
         }
         Call::EndsWith { field, arg } => like_call(field, df, &format!("%{}", like_escape(arg))),
-        // RFC0002.9 — true alias-set expansion is SLICE 3; for this slice
-        // `resolves_to(n)` is the exact `template_id == n` (the base member),
-        // which is correct, just not yet widened to drift aliases.
-        Call::ResolvesTo(n) => Ok(PredExpr::Filter(col(columns::TEMPLATE_ID).eq(lit(*n)))),
+        // RFC0002.9 — `resolves_to(n)` matches the whole RFC 0001 §6.7 alias
+        // equivalence class of `n` (resolved per-tenant at compile time, see
+        // `collect_alias_classes`). It compiles to `template_id IN (class)`. A
+        // singleton class (no alias on `n`) is `template_id IN (n)`, i.e.
+        // behaviourally identical to a bare `template_id == n`.
+        Call::ResolvesTo(n) => Ok(PredExpr::Filter(resolves_to_expr(*n, alias_classes))),
     }
+}
+
+/// Compile `resolves_to(n)` to a `template_id IN (class)` filter over the
+/// pre-resolved alias class. `alias_classes` carries an entry for every `n` in
+/// the predicate (populated by `collect_alias_classes`); a missing entry
+/// degrades defensively to the singleton `{n}` so it can never compile to an
+/// empty `IN ()` (which would match nothing).
+fn resolves_to_expr(n: u64, alias_classes: &BTreeMap<u64, BTreeSet<u64>>) -> Expr {
+    let list: Vec<Expr> = match alias_classes.get(&n) {
+        Some(class) => class.iter().map(|id| lit(*id)).collect(),
+        None => vec![lit(n)],
+    };
+    col(columns::TEMPLATE_ID).in_list(list, false)
 }
 
 /// A string function over a field's column, guarded for an absent OPTIONAL

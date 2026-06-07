@@ -187,7 +187,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > parser + compiler that front-ends the (already-green) RFC 0007 execution
 > layer.
 
-- **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[§4.6]`**
+- **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4.6]`**
   - **Given** a Branch-B predicate (e.g. `template_id == X and severity >= error`)
   - **When** it is parsed and compiled
   - **Then** it yields the query IR and a DataFusion `Filter`. Predicates
@@ -208,14 +208,14 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Then** they produce the *same* query IR (and hence the same
     `LogicalPlan`) — the one-core/two-surfaces invariant.
 
-- **RFC0002.3 — No DataFusion/arrow/SQL leakage `[§4.6]`**
+- **RFC0002.3 — No DataFusion/arrow/SQL leakage `[CLAUDE.md §4.6]`**
   - **Given** the public DSL API (parse, compile, error types)
   - **When** a query parses, compiles, or fails
   - **Then** no `datafusion`/`arrow`/SQL type or message appears in any
     public signature or error string (compile- and string-level boundary
     test, mirroring RFC0007.3).
 
-- **RFC0002.4 — A query without an explicit range gets the tenant default window `[§4.5]`**
+- **RFC0002.4 — A query without an explicit range gets the tenant default window `[§4 P5]`**
   - **Given** a query with no `range(...)` stage
   - **When** it is compiled in a tenant context with a default window W
   - **Then** the plan carries a time-column filter equal to W — never an
@@ -256,7 +256,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
     to the alias-set membership of RFC 0001 §6.7), without leaking the
     underlying representation.
 
-- **RFC0002.10 — A query is a YAML-safe single-line scalar `[§4.7]`**
+- **RFC0002.10 — A query is a YAML-safe single-line scalar `[§4 P7]`**
   - **Given** the canonical serialisation of any well-formed query
   - **When** embedded as a YAML scalar and round-tripped through a YAML
     parser
@@ -377,7 +377,9 @@ flowchart LR
 
   Stages: `range(from, to)` (relative durations or RFC 3339; defaults per
   §4.5), `count [by <fields>]` and other aggregations (`sum`, `min`,
-  `max`, `avg` over a path), `sort <field> [asc|desc]`, `limit <n>`,
+  `max`, `avg` over a path), `sort <field-or-aggregate> [asc|desc]`
+  (the §7 `sort_key` — a field or an aggregate output like `count`),
+  `limit <n>`,
   `project <fields>` / `render`. The whole query is expressible on one
   line (the `|` newlines above are cosmetic) — the §4.7 YAML constraint.
 
@@ -458,7 +460,7 @@ field_list   = field , { "," , field } ;
 sort_key     = field | ident ;          (* ident = an aggregate output, e.g. count *)
 literal      = string | number | boolean | "null" | duration | timestamp ;
 severity_name = "trace" | "debug" | "info" | "warn" | "error" | "fatal" ;  (* case-insensitive; only as a `severity` RHS *)
-time         = "now" | [ "-" ] , duration | timestamp ;   (* e.g. now , -1h *)
+time         = "now" | ( [ "-" ] , duration ) | timestamp ;   (* e.g. now , -1h *)
 integer      = digit , { digit } ;
 (* lexical: ident = letter , { letter | digit | "_" } ;
    string = '"' , { char } , '"' ;  number = integer | float ;

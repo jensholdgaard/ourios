@@ -412,14 +412,18 @@ flowchart LR
 - **Structured surface** is the machine contract (MCP tool schema +
   programmatic clients): a top-level object
   `{ "predicate": <node>, "stages": [ <stage>, … ] }` (`stages` optional,
-  default `[]`). A **`<node>`** is a leaf **comparison node**
-  `{ "field": …, "op": …, "value": … }`, a **call node**
-  `{ "call": "<fn>", "args": [ … ] }` (the §6.1 functions + `resolves_to`,
-  matching the §7 `fn_name` set), or a **boolean node**
+  default `[]`). Atoms encode §7 directly: a **`field`** is a string equal
+  to a §7 `path` (`"service"`, `"attr.http.status_code"`); an **`op`** is a
+  §7 `cmp_op` string (`"=="`, `">="`, `"=~"`, …); a **`value`** is a JSON
+  primitive (string / number / bool / null), with durations and timestamps
+  carried as their §7 lexical strings (`"1h"`, RFC 3339). A **`<node>`** is
+  a **comparison node** `{ "field": …, "op": …, "value": … }`, a **call
+  node** `{ "call": "<fn>", "args": [ … ] }` (`fn` in the §7 `fn_name` set;
+  each arg a path-string or a value as above), or a **boolean node**
   (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
   array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a
-  tagged object mirroring a pipe stage
-  (`range`/`count`/`sort`/`limit`/`project`).
+  tagged object covering the full §7 stage set —
+  `range`/`count`/`sum`/`min`/`max`/`avg`/`sort`/`limit`/`project`/`render`.
   Its **JSON Schema is published and versioned with the parser** (snapshot-
   tested like the §7 grammar; RFC0002.11), and it compiles to the same IR
   as the string surface (RFC0002.2). It is the formalised, extended

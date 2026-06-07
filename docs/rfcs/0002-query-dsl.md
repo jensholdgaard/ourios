@@ -20,13 +20,13 @@ superseded-by: —
 > `green` as the parser/compiler lands (the RFC 0007 execution layer it
 > targets is already implemented and tested — RFC 0007 §5), and to
 > `accepted` after the §9 validation.
-> Hazard 6 (`CLAUDE.md` §4.6 — no DataFusion/SQL leakage) constrains the
+> Hazard 6 (`CLAUDE.md` §4 — no DataFusion/SQL leakage) constrains the
 > whole design.
 
 ## 1. Summary
 
 Ourios exposes a logs query DSL that does **not** leak DataFusion/SQL to
-users (hazard `CLAUDE.md` §4.6). This RFC specifies it:
+users (`CLAUDE.md` §4 hazard 6). This RFC specifies it:
 
 - **Predicate sublanguage — Branch B (distance from OTTL).** An
   Ourios-native, query-ergonomic syntax over the OTel *data model* (the
@@ -52,7 +52,7 @@ language* in front of it.
 
 ### 2.1 Why a DSL at all?
 
-`CLAUDE.md` §4.6 commits Ourios to a DSL that does not leak DataFusion SQL.
+`CLAUDE.md` §4 hazard 6 commits Ourios to a DSL that does not leak DataFusion SQL.
 The reasons are **stability** (evolve the backend without breaking user
 queries), **safety** (full SQL exposes cross-tenant joins, unbounded
 scans, recursive CTEs we cannot audit), and **fit** (logs are a narrow
@@ -162,7 +162,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
 
 1. **Familiarity beats cleverness.** A first-time reader understands a
    query within 30 seconds without a reference. No heavy sigils.
-2. **No DataFusion/SQL leakage** (hazard `CLAUDE.md` §4.6). If explaining a surface
+2. **No DataFusion/SQL leakage** (`CLAUDE.md` §4 hazard 6). If explaining a surface
    form requires naming a DataFusion type, the form is wrong.
 3. **Predicate, then pipeline.** A query is a *predicate* (the `where`)
    followed by ordered *stages* (range, aggregate, sort, limit, project).
@@ -190,7 +190,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > parser + compiler that front-ends the (already-implemented, RFC 0007 §5)
 > execution layer.
 
-- **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4.6]`**
+- **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4 hazard 6]`**
   - **Given** a Branch-B predicate (e.g. `template_id == 42 and severity >= error`)
   - **When** it is parsed and compiled
   - **Then** it yields the query IR and an **internal** DataFusion
@@ -216,7 +216,7 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Then** they produce the *same* query IR (and hence the same
     `LogicalPlan`) — the one-core/two-surfaces invariant.
 
-- **RFC0002.3 — No DataFusion/arrow/SQL leakage `[CLAUDE.md §4.6]`**
+- **RFC0002.3 — No DataFusion/arrow/SQL leakage `[CLAUDE.md §4 hazard 6]`**
   - **Given** the public DSL API (parse, compile, error types)
   - **When** a query parses, compiles, or fails
   - **Then** no `datafusion`/`arrow`/SQL type or message appears in any
@@ -285,7 +285,9 @@ surface? Perses+OTel query conventions?) are folded into §9.
 ### 6.1 Predicate sublanguage (Branch B)
 
 A predicate is a boolean expression over **paths**, **operators**, and
-**literals** against the OTel log data model.
+**literals** against the OTel log data model. The bare literal `true` is
+the **match-all** predicate (for queries that filter only by `range`/other
+stages); `false` matches nothing.
 
 **Paths.**
 
@@ -398,12 +400,11 @@ flowchart LR
   query is a predicate optionally followed by `|`-separated stages:
 
   ```text
-  service == "api" and severity >= error
-    | range(-1h, now)
-    | count by template_id
-    | sort count desc
-    | limit 10
+  service == "api" and severity >= error | range(-1h, now) | count by template_id | sort count desc | limit 10
   ```
+
+  A predicate-only / "no filter" query uses the match-all atom `true`,
+  e.g. `true | range(-1h, now) | limit 100`.
 
   Stages: `range(from, to)` (each bound a relative duration, the `now`
   keyword, or an RFC 3339 timestamp — the §7 `time` form; defaults per
@@ -413,7 +414,8 @@ flowchart LR
   (the §7 `sort_key` — a field or an aggregate output like `count`),
   `limit <n>`,
   `project <field, …>` / `render`. The whole query is expressible on one
-  line (the `|` newlines above are cosmetic) — the §4 P7 YAML constraint.
+  line as shown (whitespace around `|` is optional) — the §4 P7 YAML
+  constraint.
 
 - **Structured surface** is the machine contract (MCP tool schema +
   programmatic clients): a top-level object
@@ -430,8 +432,9 @@ flowchart LR
   node** `{ "call": "<fn>", "args": [ … ] }` whose `args` follow the §7
   typed signatures — `matches`/`contains`/`starts_with`/`ends_with` take
   `[ <field>, <string> ]` (`<field>` as above), `resolves_to` takes
-  `[ <number> ]`, or a
-  **boolean node**
+  `[ <number> ]`, a **constant node** `{ "const": true | false }` (the §7
+  `bool_lit` match-all / match-none — `{ "const": true }` is the "no
+  filter" predicate), or a **boolean node**
   (`{ "and": [ <node>, … ] }` / `{ "or": [ <node>, … ] }` with a child
   array; `{ "not": <node> }` **unary**, per §7). Each **`<stage>`** is a
   tagged object covering the full §7 stage set —
@@ -488,11 +491,13 @@ query        = predicate , { "|" , stage } ;
 predicate    = or_expr ;
 or_expr      = and_expr , { ("or" | "||") , and_expr } ;
 and_expr     = unary , { ("and" | "&&") , unary } ;
-unary        = [ "not" | "!" ] , ( comparison | call | "(" , predicate , ")" ) ;
+unary        = [ "not" | "!" ] , ( comparison | call | bool_lit | "(" , predicate , ")" ) ;
+bool_lit     = "true" | "false" ;   (* match-all / match-none; a bare `true` = no filter *)
 comparison   = severity_cmp | scalar_cmp ;
-severity_cmp = "severity" , cmp_op , ( severity_name | number ) ;
+severity_cmp = "severity" , ord_op , ( severity_name | number ) ;
 scalar_cmp   = scalar_path , cmp_op , literal ;
-cmp_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
+ord_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" ;   (* no regex — severity is numeric *)
+cmp_op       = ord_op | "=~" | "!~" ;
 call         = str_fn , "(" , path , "," , string , ")"
              | "resolves_to" , "(" , number , ")" ;
 str_fn       = "matches" | "contains" | "starts_with" | "ends_with" ;
@@ -594,7 +599,7 @@ canonical fields (§6.2).
 Alternatives that would replace the whole design, not just one branch.
 
 - **Pure SQL (DataFusion dialect)** — zero parser cost, but violates
-  hazard `CLAUDE.md` §4.6 (cross-tenant joins, unbounded scans) and binds the user
+  `CLAUDE.md` §4 hazard 6 (cross-tenant joins, unbounded scans) and binds the user
   surface to DataFusion. Rejected as default; possible future gated,
   sandboxed escape hatch under a separate RFC.
 - **LogQL clone** — label selectors are less expressive than the OTel log
@@ -621,6 +626,6 @@ Alternatives that would replace the whole design, not just one branch.
 - Perses (CNCF dashboards-as-code): https://perses.dev/
 - Apache DataFusion logical-plan documentation.
 - RFC 0001 §6.1/§6.3/§6.7 (the columns + template/drift primitives);
-  RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4.6
+  RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4 hazard 6
   (no-leakage hazard) and `CLAUDE.md` §3.7 (multi-tenancy).
 

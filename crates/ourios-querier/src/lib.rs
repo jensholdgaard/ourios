@@ -432,8 +432,9 @@ impl Querier {
     /// holds for this querier process; `resolves_to(n)` expands through
     /// [`AliasMap::resolves`](ourios_core::alias::AliasMap::resolves) for
     /// `tenant`, so a `template_id` an operator aliased matches its whole
-    /// equivalence class. An id in no class resolves to `{id}`, leaving the
-    /// compiled plan identical to a bare `template_id == n`. The map is a
+    /// equivalence class. An id in no class resolves to `{id}` — a singleton
+    /// `template_id IN (n)`, behaviorally identical to a bare
+    /// `template_id == n`. The map is a
     /// projection injected by the caller; this path adds no on-disk loading
     /// (physical storage is the RFC 0005 split, sibling to #147).
     ///

@@ -385,8 +385,9 @@ mod fixtures {
     pub const NOW: u64 = TS0 + 24 * HOUR_NS;
 
     /// An empty alias projection: no operator has aliased anything, so every
-    /// `resolves_to(n)` compiles to the singleton `template_id == n`. Used by
-    /// every test that is not specifically exercising alias expansion.
+    /// `resolves_to(n)` compiles to a singleton `template_id IN (n)` list
+    /// (behaviorally a bare `template_id == n`). Used by every test that is
+    /// not specifically exercising alias expansion.
     pub fn no_aliases() -> ourios_core::alias::AliasMap {
         ourios_core::alias::AliasMap::new()
     }
@@ -1203,13 +1204,13 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
         3,
         "resolves_to(B) matches the same {{A,B}} class",
     );
-    // Cross-tenant isolation `[§3.7]` — the alias asserted under T does not
-    // leak to T2 (empty map), so resolves_to(A) there matches only A's row.
-    let empty = AliasMap::new();
+    // Cross-tenant isolation `[§3.7]` — using the SAME populated map, the
+    // alias asserted under T must not affect T2: resolves_to(A) for T2 is
+    // scoped per-tenant and matches only A's row.
     assert_eq!(
-        rows("resolves_to(10)", &t2, &empty).await,
+        rows("resolves_to(10)", &t2, &aliases).await,
         1,
-        "the T alias must not leak into T2: only A's row matches",
+        "the T alias must not leak into T2 (same map, per-tenant scope): only A's row matches",
     );
 }
 

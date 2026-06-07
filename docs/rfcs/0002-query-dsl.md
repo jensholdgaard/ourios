@@ -98,7 +98,8 @@ the record. §3.5 records the resolution; §3.6 the reasoning.
   contract, not a design choice): attributes, resources, severity, body,
   timestamps, trace context.
 - The **template + correctness primitives** (`template_id`, `confidence`,
-  `lossy`, `drift`) are first-class (§6.3).
+  `lossy`; drift-alias membership via `resolves_to`) are first-class
+  (§6.3).
 - The **compilation target** is a DataFusion `LogicalPlan`, no SQL leakage
   (§6.5).
 
@@ -158,13 +159,14 @@ surface? Perses+OTel query conventions?) are folded into §9.
 
 1. **Familiarity beats cleverness.** A first-time reader understands a
    query within 30 seconds without a reference. No heavy sigils.
-2. **No DataFusion/SQL leakage** (hazard §4.6). If explaining a surface
+2. **No DataFusion/SQL leakage** (hazard `CLAUDE.md` §4.6). If explaining a surface
    form requires naming a DataFusion type, the form is wrong.
 3. **Predicate, then pipeline.** A query is a *predicate* (the `where`)
    followed by ordered *stages* (range, aggregate, sort, limit, project).
    Each reads independently.
 4. **Template + OTel-canonical fields are first-class vocabulary**, not
-   pseudo-columns: `template_id`, `confidence`, `lossy`, `drift`;
+   pseudo-columns: `template_id`, `confidence`, `lossy` (drift-alias
+   membership via `resolves_to`);
    `service`, `trace_id`, `span_id`, `scope` (the primary
    correlation/query dimensions per OTel maintainer guidance, §6.2).
 5. **Every query has a time range** — explicit `range(...)` or a
@@ -325,9 +327,10 @@ prior draft:
 | `ts` | `time_unix_nano` (the event timestamp; what `range(...)` filters) |
 | `observed_ts` | `observed_time_unix_nano` |
 
-`trace_id` / `span_id` literals are **lowercase-hex strings** (32 and 16
-hex digits respectively), accepted case-insensitively with no separators;
-the compiler hex-decodes them to match the stored byte columns — the
+`trace_id` / `span_id` literals are **hex strings** (32 and 16 hex digits
+respectively, no separators), **parsed case-insensitively** so uppercase
+OTLP/JSON ids are accepted; the canonical/serialised form is lowercase.
+The compiler hex-decodes them to match the stored byte columns — the
 OTLP/JSON id convention, consistent with RFC0003.6.
 
 ### 6.3 Template + correctness primitives
@@ -429,7 +432,9 @@ predicate    = or_expr ;
 or_expr      = and_expr , { ("or" | "||") , and_expr } ;
 and_expr     = unary , { ("and" | "&&") , unary } ;
 unary        = [ "not" | "!" ] , ( comparison | call | "(" , predicate , ")" ) ;
-comparison   = path , cmp_op , value ;
+comparison   = severity_cmp | scalar_cmp ;
+severity_cmp = "severity" , cmp_op , ( severity_name | number ) ;
+scalar_cmp   = path , cmp_op , literal ;
 cmp_op       = "==" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
 call         = ident , "(" , [ arg , { "," , arg } ] , ")" ;
 arg          = path | literal ;
@@ -449,9 +454,8 @@ stage        = "range" , "(" , time , "," , time , ")"
 agg_fn       = "sum" | "min" | "max" | "avg" ;
 field_list   = field , { "," , field } ;
 sort_key     = field | ident ;          (* ident = an aggregate output, e.g. count *)
-value        = literal | severity_name ;
 literal      = string | number | boolean | "null" | duration | timestamp ;
-severity_name = "trace" | "debug" | "info" | "warn" | "error" | "fatal" ;  (* case-insensitive *)
+severity_name = "trace" | "debug" | "info" | "warn" | "error" | "fatal" ;  (* case-insensitive; only as a `severity` RHS *)
 time         = "now" | [ "-" ] , duration | timestamp ;   (* e.g. now , -1h *)
 integer      = digit , { digit } ;
 (* lexical: ident = letter , { letter | digit | "_" } ;

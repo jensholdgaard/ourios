@@ -1078,24 +1078,283 @@ fn rfc0002_9_template_primitives_compile() {
 
 /// Scenario RFC0002.10 — A query is a YAML-safe single-line scalar.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
-#[ignore = "RFC 0002 red gate — DSL parser/compiler pending (RFC0002.10)"]
+///
+/// The Perses-embedding guarantee (§4 P7): the canonical β serialisation of
+/// any well-formed query is a single-line scalar that, embedded as a YAML
+/// value, survives a YAML round-trip and re-parses to the same query. Two
+/// halves cover it: a hand-written table spanning every surface construct, and
+/// the bounded `wellformed::query` generator (the RFC0002.7 strategy) so the
+/// property holds for arbitrary shapes, not just the table.
 #[test]
 fn rfc0002_10_yaml_safe_single_line() {
-    unimplemented!(
-        "RFC0002.10 — the canonical serialisation of any well-formed query \
-         is a single-line scalar that survives a YAML round-trip and \
-         re-parses to the same query (the Perses-embedding guarantee)."
+    // A diverse table: predicates (bare/first-class/severity/attr/resource,
+    // combinators, negation, calls, escaped + special-char strings, the regex
+    // operators, durations/timestamps in `range`) and the full stage set.
+    let queries: &[&str] = &[
+        "true",
+        "false",
+        "service == \"api\"",
+        "severity >= error",
+        "severity == 17",
+        "severity != warn",
+        "attr.http.status_code == 500",
+        "resource.k8s.pod.name == \"web-0\"",
+        "body =~ \"timeout.*\" and not lossy == true",
+        "template_id == 42 or confidence < 0.7",
+        "contains(body, \"connection refused\")",
+        "starts_with(service, \"api-\") and ends_with(scope, \".cart\")",
+        "matches(body, \"^GET /\") and resolves_to(7)",
+        "body == \"with \\\"quotes\\\" and \\\\backslash and \\t tab\"",
+        "body == \"a: b, c | d # e & f - g\"",
+        "body == \"x\" | range(-1h, now) | count by template_id",
+        "true | range(2026-01-02T03:04:05Z, now) | sum(confidence) by service",
+        "service == \"api\" | sort count desc | limit 10",
+        "true | project body, ts, severity | render",
+        "(severity >= error or template_id == 1) and service == \"api\"",
+        "ts >= 1700000000000 and observed_ts < 1800000000000",
+    ];
+
+    for text in queries {
+        // Arrange — the canonical β form of a well-formed query.
+        let original = ourios_querier::dsl::parse(text)
+            .unwrap_or_else(|e| panic!("table query must parse: {text:?}: {e}"));
+        let beta = ourios_querier::dsl::serialize(&original);
+
+        assert_round_trips_through_yaml(&beta, &original);
+    }
+
+    // The bounded generator (§7-admissible shapes) so the guarantee is not
+    // limited to the hand-written table. Run on a large-stack thread for the
+    // same reason RFC0002.7 does — the recursive parse never rides the
+    // harness's ~2 MiB default test-thread stack.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(yaml_round_trip_property)
+        .expect("spawn YAML round-trip worker")
+        .join()
+        .expect("YAML round-trip worker panicked");
+}
+
+/// Embed `beta` as a YAML scalar (`query: <scalar>`), round-trip through a YAML
+/// parser, extract the scalar, and assert it re-parses to `expected`. Also
+/// asserts the serialised form is genuinely single-line (the P7 constraint —
+/// the value may need YAML quoting, but the query itself is one line).
+fn assert_round_trips_through_yaml(beta: &str, expected: &ourios_querier::dsl::Query) {
+    assert!(
+        !beta.contains('\n'),
+        "canonical serialisation must be single-line: {beta:?}",
     );
+
+    // serde_yaml emits a correctly-quoted scalar for any string, so building
+    // the document via the serializer is itself part of the round-trip.
+    let mut doc = std::collections::BTreeMap::new();
+    doc.insert("query".to_string(), beta.to_string());
+    let yaml = serde_yaml::to_string(&doc).expect("embed query as a YAML scalar");
+
+    let recovered: std::collections::BTreeMap<String, String> =
+        serde_yaml::from_str(&yaml).expect("YAML round-trips");
+    let extracted = recovered.get("query").expect("query scalar survives");
+
+    let reparsed = ourios_querier::dsl::parse(extracted)
+        .unwrap_or_else(|e| panic!("YAML-recovered query failed to re-parse: {e}\n  {extracted}"));
+    assert_eq!(
+        &reparsed, expected,
+        "YAML round-trip changed the query; recovered scalar was: {extracted}",
+    );
+}
+
+fn yaml_round_trip_property() {
+    use proptest::prelude::*;
+
+    let mut runner = proptest::test_runner::TestRunner::default();
+    runner
+        .run(&wellformed::query(), |query| {
+            let beta = ourios_querier::dsl::serialize(&query);
+            prop_assert!(
+                !beta.contains('\n'),
+                "canonical serialisation must be single-line: {}",
+                beta
+            );
+
+            let mut doc = std::collections::BTreeMap::new();
+            doc.insert("query".to_string(), beta.clone());
+            let yaml = serde_yaml::to_string(&doc)
+                .map_err(|e| TestCaseError::fail(format!("YAML embed failed: {e}")))?;
+            let recovered: std::collections::BTreeMap<String, String> = serde_yaml::from_str(&yaml)
+                .map_err(|e| TestCaseError::fail(format!("YAML parse failed: {e}")))?;
+            let extracted = recovered
+                .get("query")
+                .ok_or_else(|| TestCaseError::fail("query scalar missing".to_string()))?;
+            let reparsed = ourios_querier::dsl::parse(extracted).map_err(|e| {
+                TestCaseError::fail(format!(
+                    "recovered query failed to re-parse: {e}\n  {extracted}"
+                ))
+            })?;
+
+            prop_assert_eq!(
+                reparsed,
+                query,
+                "YAML round-trip changed the IR: {}",
+                extracted
+            );
+            Ok(())
+        })
+        .expect("RFC0002.10 YAML round-trip property holds for all generated queries");
 }
 
 /// Scenario RFC0002.11 — The structured surface validates against its published schema.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
-#[ignore = "RFC 0002 red gate — DSL parser/compiler pending (RFC0002.11)"]
+///
+/// Two obligations: the schema is **published + snapshot-tested** (committed
+/// beside the parser and served by `structured_query_schema`, so drift is
+/// PR-visible — §6.6, like the §7 grammar snapshot), and it is the **gate**
+/// (well-formed structured requests pass the JSON Schema *and* parse; malformed
+/// ones are rejected by the schema before reaching the planner).
 #[test]
 fn rfc0002_11_structured_surface_schema_validation() {
-    unimplemented!(
-        "RFC0002.11 — well-formed structured (MCP) requests pass the \
-         published JSON Schema and compile; malformed ones are rejected by \
-         the schema before reaching the planner."
+    use jsonschema::Validator;
+
+    // Snapshot — the served schema is exactly the committed file, and it is a
+    // compilable JSON Schema (not just any JSON). A drift between the file and
+    // the source-of-truth `include_str!` cannot happen silently.
+    let served = ourios_querier::dsl::structured_query_schema();
+    let committed = include_str!("../src/dsl/structured_query.schema.json");
+    assert_eq!(
+        served, committed,
+        "the served schema must equal the committed snapshot (RFC0002.11 / §6.6)",
     );
+    let schema_doc: serde_json::Value =
+        serde_json::from_str(served).expect("the published schema is valid JSON");
+    let validator = Validator::new(&schema_doc).expect("the published schema compiles");
+
+    assert_well_formed_requests_pass(&validator);
+    assert_malformed_requests_rejected(&validator);
+}
+
+/// Well-formed requests must PASS the schema and then parse to an IR (RFC0002.2).
+fn assert_well_formed_requests_pass(validator: &jsonschema::Validator) {
+    let valid: &[&str] = &[
+        r#"{"predicate":{"const":true}}"#,
+        r#"{"predicate":{"field":"service","op":"==","value":"api"}}"#,
+        r#"{"predicate":{"field":"severity","op":">=","value":"error"}}"#,
+        r#"{"predicate":{"field":{"attr":"http.status_code"},"op":"==","value":500}}"#,
+        r#"{"predicate":{"field":{"resource":"k8s.pod.name"},"op":"!=","value":"web-0"}}"#,
+        r#"{"predicate":{"call":"contains","args":["body","timeout"]}}"#,
+        r#"{"predicate":{"call":"resolves_to","args":[7]}}"#,
+        r#"{"predicate":{"field":"severity","op":">=","value":9}}"#,
+        r#"{"predicate":{"and":[{"const":true},{"not":{"field":"lossy","op":"==","value":true}}]}}"#,
+        r#"{"predicate":{"const":true},"stages":[
+            {"range":{"from":"-1h","to":"now"}},
+            {"count":{"by":["template_id","service"]}},
+            {"avg":"confidence","by":["service"]},
+            {"sort":{"key":"count","desc":true}},
+            {"project":["body","ts"]},
+            {"limit":10},
+            {"render":{}}
+        ]}"#,
+        r#"{"predicate":{"const":true},"stages":[{"render":null}]}"#,
+    ];
+    for req in valid {
+        let instance: serde_json::Value =
+            serde_json::from_str(req).expect("a well-formed request is JSON");
+        assert!(
+            validator.is_valid(&instance),
+            "well-formed request must pass the schema: {req}\n  errors: {:?}",
+            validator
+                .iter_errors(&instance)
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>(),
+        );
+        ourios_querier::dsl::parse_structured(req)
+            .unwrap_or_else(|e| panic!("schema-valid request must parse: {req}: {e}"));
+    }
+}
+
+/// Malformed requests must each be REJECTED by the schema *before* the planner.
+/// The second tuple element names the construct each case exercises.
+fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
+    let invalid: &[(&str, &str)] = &[
+        (r#"{"stages":[]}"#, "missing predicate"),
+        (
+            r#"{"predicate":{"const":true},"bogus":1}"#,
+            "unknown top-level key",
+        ),
+        (
+            r#"{"predicate":{"field":"frobnicate","op":"==","value":1}}"#,
+            "unknown field name",
+        ),
+        (
+            r#"{"predicate":{"field":"body","op":"like","value":"x"}}"#,
+            "bad operator",
+        ),
+        (
+            r#"{"predicate":{"field":"body","op":"==","value":[1,2]}}"#,
+            "non-primitive value",
+        ),
+        (
+            r#"{"predicate":{"field":"body","op":"==","value":1,"extra":true}}"#,
+            "extra node key",
+        ),
+        (
+            r#"{"predicate":{"field":{"attr":"k","typo":"x"},"op":"==","value":1}}"#,
+            "extra field-object key",
+        ),
+        (
+            r#"{"predicate":{"field":{"resource":"r","attr":"a"},"op":"==","value":1}}"#,
+            "both resource and attr",
+        ),
+        (r#"{"predicate":{"and":[]}}"#, "empty combinator"),
+        (
+            r#"{"predicate":{"call":"nope","args":["body","x"]}}"#,
+            "unknown function",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"range":{"from":"-1h","to":"now","step":"5m"}}]}"#,
+            "extra stage-body key",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"limit":-3}]}"#,
+            "negative limit",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"frobnicate":1}]}"#,
+            "unknown stage kind",
+        ),
+        (
+            r#"{"predicate":{"field":"severity","op":"=~","value":"error"}}"#,
+            "regex operator on severity",
+        ),
+        (
+            r#"{"predicate":{"field":"severity","op":"==","value":1.5}}"#,
+            "non-integer severity value",
+        ),
+        (
+            r#"{"predicate":{"call":"resolves_to","args":[7,8]}}"#,
+            "wrong-arity resolves_to",
+        ),
+        (
+            r#"{"predicate":{"call":"resolves_to","args":[-1]}}"#,
+            "negative resolves_to template id",
+        ),
+        (
+            r#"{"predicate":{"call":"contains","args":["body",1]}}"#,
+            "non-string second arg to contains",
+        ),
+        (
+            r#"{"predicate":{"call":"contains","args":[1,"x"]}}"#,
+            "non-field first arg to contains",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"sort":{"key":"attr.http.status_code"}}]}"#,
+            "non-identifier sort key",
+        ),
+    ];
+    for (req, what) in invalid {
+        let instance: serde_json::Value =
+            serde_json::from_str(req).expect("malformed-but-still-JSON request");
+        assert!(
+            !validator.is_valid(&instance),
+            "{what}: schema must reject {req} before the planner",
+        );
+    }
 }

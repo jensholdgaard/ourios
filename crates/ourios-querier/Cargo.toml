@@ -66,6 +66,14 @@ tempfile = "3"
 parquet = { version = "55", default-features = false, features = ["arrow"] }
 arrow-array = { version = "55", default-features = false }
 arrow-schema = { version = "55", default-features = false }
+# RFC0002.10 — proves the canonical β serialisation survives a YAML
+# scalar round-trip (the Perses-embedding guarantee). Test-only.
+serde_yaml = { version = "0.9.34", default-features = false }
+# RFC0002.11 — validates the structured surface against its published JSON
+# Schema in the acceptance test. `default-features = false` drops the
+# reqwest/TLS remote-`$ref` resolver: the schema is self-contained
+# (local `$ref`s only), so no network resolver is needed.
+jsonschema = { version = "0.46.5", default-features = false }
 
 [lints]
 workspace = true

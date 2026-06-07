@@ -25,6 +25,16 @@ pub use ir::Query;
 pub use parse::parse;
 pub use structured::parse_structured;
 
+/// The published JSON Schema (draft 2020-12) for the structured query surface
+/// (RFC 0002 §6.4). Versioned alongside the parser and snapshot-tested so any
+/// drift between the surface the parser accepts and its advertised contract is
+/// PR-visible (RFC0002.11 / §6.6). Agents fetch this to constrain or validate
+/// requests before sending them; the planner re-validates on receipt.
+#[must_use]
+pub fn structured_query_schema() -> &'static str {
+    include_str!("structured_query.schema.json")
+}
+
 pub(crate) use parse::{
     parse_severity_name_pub, parse_time_pub, require_string_operand, validate_sort_key,
 };

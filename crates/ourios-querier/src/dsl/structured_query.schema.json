@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ourios.dev/schemas/dsl/structured-query/v1.json",
+  "title": "Ourios structured query surface",
+  "description": "RFC 0002 §6.4 — the machine surface MCP agents and programmatic clients target. Validated before parsing; compiles to the same IR as the string DSL (RFC0002.2). Published and versioned with the parser (RFC0002.11).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["predicate"],
+  "properties": {
+    "predicate": { "$ref": "#/$defs/node" },
+    "stages": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/stage" }
+    }
+  },
+  "$defs": {
+    "field": {
+      "description": "A bare top-level field name or a single-key {resource|attr} object.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "body",
+            "severity",
+            "ts",
+            "observed_ts",
+            "trace_id",
+            "span_id",
+            "scope",
+            "flags",
+            "service",
+            "template_id",
+            "confidence",
+            "lossy"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "resource": { "type": "string" } },
+          "required": ["resource"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "attr": { "type": "string" } },
+          "required": ["attr"]
+        }
+      ]
+    },
+    "cmp_op": {
+      "type": "string",
+      "enum": ["==", "!=", "<", "<=", ">", ">=", "=~", "!~"]
+    },
+    "ord_op": {
+      "description": "The ordering operators — the only ops valid on severity (no regex).",
+      "type": "string",
+      "enum": ["==", "!=", "<", "<=", ">", ">="]
+    },
+    "value": {
+      "description": "A comparison RHS — a JSON primitive (string, number, bool, or null).",
+      "type": ["string", "number", "boolean", "null"]
+    },
+    "node": {
+      "description": "A predicate node: comparison, call, constant, or boolean combinator.",
+      "oneOf": [
+        { "$ref": "#/$defs/comparison_node" },
+        { "$ref": "#/$defs/call_node" },
+        { "$ref": "#/$defs/const_node" },
+        { "$ref": "#/$defs/and_node" },
+        { "$ref": "#/$defs/or_node" },
+        { "$ref": "#/$defs/not_node" }
+      ]
+    },
+    "comparison_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "op", "value"],
+      "properties": {
+        "field": { "$ref": "#/$defs/field" },
+        "op": { "$ref": "#/$defs/cmp_op" },
+        "value": { "$ref": "#/$defs/value" }
+      },
+      "if": {
+        "properties": { "field": { "const": "severity" } },
+        "required": ["field"]
+      },
+      "then": {
+        "properties": {
+          "op": { "$ref": "#/$defs/ord_op" },
+          "value": { "type": ["string", "integer"] }
+        }
+      }
+    },
+    "call_node": {
+      "description": "A typed §7 call. Each function pins its arg arity and types: the string predicates take [<field>, <string>]; resolves_to takes [<non-negative integer>].",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["call", "args"],
+          "properties": {
+            "call": {
+              "type": "string",
+              "enum": ["matches", "contains", "starts_with", "ends_with"]
+            },
+            "args": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [{ "$ref": "#/$defs/field" }, { "type": "string" }]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["call", "args"],
+          "properties": {
+            "call": { "const": "resolves_to" },
+            "args": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "prefixItems": [{ "type": "integer", "minimum": 0 }]
+            }
+          }
+        }
+      ]
+    },
+    "const_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["const"],
+      "properties": { "const": { "type": "boolean" } }
+    },
+    "and_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["and"],
+      "properties": {
+        "and": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/node" }
+        }
+      }
+    },
+    "or_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["or"],
+      "properties": {
+        "or": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/node" }
+        }
+      }
+    },
+    "not_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["not"],
+      "properties": { "not": { "$ref": "#/$defs/node" } }
+    },
+    "stage": {
+      "description": "A pipe stage — a tagged object naming exactly one §7 stage kind (count and the aggregates may carry a sibling `by`).",
+      "oneOf": [
+        { "$ref": "#/$defs/range_stage" },
+        { "$ref": "#/$defs/count_stage" },
+        { "$ref": "#/$defs/agg_stage" },
+        { "$ref": "#/$defs/sort_stage" },
+        { "$ref": "#/$defs/limit_stage" },
+        { "$ref": "#/$defs/project_stage" },
+        { "$ref": "#/$defs/render_stage" }
+      ]
+    },
+    "range_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["range"],
+      "properties": {
+        "range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to"],
+          "properties": {
+            "from": { "type": "string" },
+            "to": { "type": "string" }
+          }
+        }
+      }
+    },
+    "count_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "by": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/field" }
+            }
+          }
+        }
+      }
+    },
+    "agg_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 2,
+      "properties": {
+        "sum": { "$ref": "#/$defs/field" },
+        "min": { "$ref": "#/$defs/field" },
+        "max": { "$ref": "#/$defs/field" },
+        "avg": { "$ref": "#/$defs/field" },
+        "by": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/field" }
+        }
+      },
+      "oneOf": [
+        { "required": ["sum"] },
+        { "required": ["min"] },
+        { "required": ["max"] },
+        { "required": ["avg"] }
+      ]
+    },
+    "sort_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sort"],
+      "properties": {
+        "sort": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key"],
+          "properties": {
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+            },
+            "desc": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "limit_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit"],
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "project_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project"],
+      "properties": {
+        "project": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/field" }
+        }
+      }
+    },
+    "render_stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["render"],
+      "properties": {
+        "render": {
+          "description": "render is argument-less: an empty object or null.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

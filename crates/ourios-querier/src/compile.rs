@@ -76,6 +76,26 @@ pub(crate) fn compile(
     now_unix_nano: u64,
     default_window_nanos: u64,
 ) -> Result<Plan, QueryError> {
+    // This slice executes only the `range` (time window) and `limit` stages.
+    // The aggregation / sort / projection / render stages parse into a valid
+    // IR but are not yet wired to execution; reject them explicitly so a
+    // query asking for one fails fast rather than silently returning a plain
+    // filtered row set (RFC0002 — full pipeline execution is a later slice).
+    for stage in &query.stages {
+        let unsupported = match stage {
+            Stage::Range(..) | Stage::Limit(_) => None,
+            Stage::Count { .. } => Some("count"),
+            Stage::Agg { .. } => Some("aggregation"),
+            Stage::Sort { .. } => Some("sort"),
+            Stage::Project(_) => Some("project"),
+            Stage::Render => Some("render"),
+        };
+        if let Some(name) = unsupported {
+            return Err(QueryError::InvalidQuery {
+                detail: format!("the `{name}` stage is not yet supported by the querier"),
+            });
+        }
+    }
     let window = resolve_window(&query.stages, now_unix_nano, default_window_nanos)?;
     let limit = query.stages.iter().rev().find_map(|s| match s {
         Stage::Limit(n) => Some(*n),
@@ -267,13 +287,24 @@ fn combine(terms: &[Predicate], df: &DataFrame, is_and: bool) -> Result<PredExpr
 }
 
 fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
-    let n = match value {
-        SeverityValue::Name(name) => name.floor(),
-        SeverityValue::Number(n) => *n,
-    };
     // `severity_number` is REQUIRED (always present), so no absent-column
     // guard is needed. Compare as i64; DataFusion coerces against UInt8.
-    PredExpr::Filter(ord_expr(col(columns::SEVERITY_NUMBER), op, lit(n)))
+    let sev = || col(columns::SEVERITY_NUMBER);
+    // A bare name denotes a four-wide OTel band (`error` → 17..=20), so
+    // membership (`==`/`!=`) is a range test, not a single-value compare. A
+    // numeric RHS is exact, and ordering ops use the band floor either way
+    // (RFC0002.5: ordering compares against the floor of the named band).
+    let expr = match (value, op) {
+        (SeverityValue::Name(name), OrdOp::Eq) => sev()
+            .gt_eq(lit(name.floor()))
+            .and(sev().lt_eq(lit(name.ceil()))),
+        (SeverityValue::Name(name), OrdOp::Ne) => {
+            sev().lt(lit(name.floor())).or(sev().gt(lit(name.ceil())))
+        }
+        (SeverityValue::Name(name), _) => ord_expr(sev(), op, lit(name.floor())),
+        (SeverityValue::Number(n), _) => ord_expr(sev(), op, lit(*n)),
+    };
+    PredExpr::Filter(expr)
 }
 
 fn compile_comparison(
@@ -299,16 +330,30 @@ fn column_comparison(
     df: &DataFrame,
 ) -> Result<PredExpr, QueryError> {
     let (column, optional) = column_of(field);
+    // Regex operators are defined only over text columns. A numeric /
+    // boolean / binary / timestamp column has no regex semantics, so reject
+    // it at compile (before the absent-column guard) rather than building a
+    // doomed engine call.
+    if matches!(op, CmpOp::Match | CmpOp::NotMatch) && !is_text_field(field) {
+        return Err(QueryError::InvalidQuery {
+            detail: format!(
+                "the regex operators =~ / !~ are not defined on {}",
+                field_name(field)
+            ),
+        });
+    }
     // Absent OPTIONAL column ⇒ all-NULL ⇒ the leaf matches nothing.
     if optional && !has_column(df, column) {
         return Ok(PredExpr::None);
     }
-    let lhs = col(column);
-    let literal = field_literal(field, value)?;
     let expr = match op {
-        CmpOp::Ord(ord) => ord_expr(lhs, ord, literal),
-        CmpOp::Match => regexp_like(lhs, literal, None),
-        CmpOp::NotMatch => not(regexp_like(lhs, literal, None)),
+        CmpOp::Ord(ord) => ord_expr(col(column), ord, field_literal(field, value)?),
+        CmpOp::Match => regexp_like(col(column), string_literal(field, value)?, None),
+        CmpOp::NotMatch => not(regexp_like(
+            col(column),
+            string_literal(field, value)?,
+            None,
+        )),
     };
     Ok(PredExpr::Filter(expr))
 }
@@ -419,6 +464,18 @@ fn column_of(field: &Field) -> (&'static str, bool) {
     }
 }
 
+/// Whether a field maps to a text-typed column the regex operators
+/// (`=~`/`!~`) and `DataFusion` string functions can apply to. The attribute
+/// fields (`service`/`resource`/`attr`) are JSON-text-backed but are routed
+/// through [`attr_match`] before this is consulted, so the only text columns
+/// reaching the column path are `body` and `scope`.
+fn is_text_field(field: &Field) -> bool {
+    matches!(
+        field,
+        Field::Body | Field::Scope | Field::Service | Field::Resource(_) | Field::Attr(_)
+    )
+}
+
 fn field_name(field: &Field) -> String {
     match field {
         Field::Body => "body".into(),
@@ -481,9 +538,19 @@ fn attr_match(
         detail: format!("attribute key is not encodable: {e}"),
     })?;
     let fragment = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":{needle_value}}}}}");
-    let pattern = format!("%{}%", like_escape(&fragment));
-    let expr = col(column).like(lit(pattern));
-    Ok(PredExpr::Filter(if ord { expr } else { not(expr) }))
+    let value_match = col(column).like(lit(format!("%{}%", like_escape(&fragment))));
+    if ord {
+        // `==` matches when the key is present with this exact string value.
+        return Ok(PredExpr::Filter(value_match));
+    }
+    // `!=` must require the key PRESENT with a *different* value: a row
+    // missing the key does not match. The presence guard matches the key with
+    // any string value, then we exclude the exact value above. Without the
+    // guard, `NOT LIKE` is also true for absent keys, which diverges from the
+    // missing-field "no match" semantics used everywhere else.
+    let key_present = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":");
+    let presence = col(column).like(lit(format!("%{}%", like_escape(&key_present))));
+    Ok(PredExpr::Filter(presence.and(not(value_match))))
 }
 
 /// Escape the `%` / `_` / `\` wildcards in a `LIKE` pattern literal so the
@@ -539,8 +606,17 @@ fn string_call_column(field: &Field) -> Result<&'static str, QueryError> {
     match field {
         Field::Body => Ok(columns::BODY),
         Field::Scope => Ok(columns::SCOPE_NAME),
-        Field::TraceId => Ok(columns::TRACE_ID),
-        Field::SpanId => Ok(columns::SPAN_ID),
+        // `trace_id`/`span_id` are binary id columns. The DSL accepts them as
+        // string operands at parse time (a hex-string equality is meaningful),
+        // but the DataFusion string functions are not defined over binary, so
+        // a string call on one is rejected here until a bytes→hex projection
+        // exists.
+        Field::TraceId | Field::SpanId => Err(QueryError::InvalidQuery {
+            detail: format!(
+                "string functions are not defined on the binary id field {}",
+                field_name(field)
+            ),
+        }),
         // Attribute-backed string fields are JSON-encoded; a string call on
         // them is deferred until attributes are individually columned.
         Field::Service | Field::Resource(_) | Field::Attr(_) => Err(QueryError::InvalidQuery {

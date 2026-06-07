@@ -191,6 +191,16 @@ impl SeverityName {
             Self::Fatal => 21,
         }
     }
+
+    /// The ceiling of the matching `OTel` `SeverityNumber` band (RFC 0002
+    /// §6.1): each name spans four numbers, so `ceil` is `floor + 3`
+    /// (`error` → 17..=20, `fatal` → 21..=24). Equality / inequality against
+    /// a bare name tests membership in this `floor..=ceil` band; ordering
+    /// comparisons use [`SeverityName::floor`] alone.
+    #[must_use]
+    pub fn ceil(self) -> i64 {
+        self.floor() + 3
+    }
 }
 
 /// A boolean-returning function call (§7 `call`).

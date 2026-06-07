@@ -291,7 +291,7 @@ mod fixtures {
     /// One hour in nanoseconds.
     pub const HOUR_NS: u64 = 3_600_000_000_000;
 
-    fn kv(key: &str, value: &str) -> KeyValue {
+    pub fn kv(key: &str, value: &str) -> KeyValue {
         KeyValue {
             key: key.to_string(),
             value: Some(AnyValue {
@@ -347,6 +347,20 @@ mod fixtures {
     /// A minimal record: template 1, INFO, service "api", scope "lib.cart".
     pub fn simple(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
         rec(tenant, template_id, ts_ns, 9, "api", "lib.cart", None, None)
+    }
+
+    /// A record with explicit resource attributes (overriding the default
+    /// single `service.name`), so a test can give one row a key and another
+    /// row none.
+    pub fn rec_with_resource(
+        tenant: &str,
+        ts_ns: u64,
+        resource_attributes: Vec<KeyValue>,
+    ) -> MinedRecord {
+        MinedRecord {
+            resource_attributes,
+            ..rec(tenant, 1, ts_ns, 9, "api", "lib.cart", None, None)
+        }
     }
 
     pub fn write_all(bucket: &Path, recs: &[MinedRecord]) {
@@ -633,6 +647,72 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
     assert_eq!(run("severity == 20").await, 1, "exact numeric severity");
 }
 
+/// Scenario RFC0002.5 (band semantics) — a *named* severity equality denotes
+/// the whole `OTel` four-wide band, not just its floor; ordering still uses the
+/// floor. See `docs/rfcs/0002-query-dsl.md` §5 / §6.1.
+#[tokio::test]
+async fn rfc0002_5_named_severity_equality_is_a_band() {
+    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::Querier;
+
+    // Arrange — rows inside the error band (17..=20) at 17 and 19, one above
+    // the band (21 = fatal), and one below (16 = warn ceiling).
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let sev = |n: u8, i: u64| {
+        rec(
+            "a",
+            1,
+            TS0 + i * 1_000_000,
+            n,
+            "api",
+            "lib.cart",
+            None,
+            None,
+        )
+    };
+    write_all(
+        bucket.path(),
+        &[sev(16, 0), sev(17, 1), sev(19, 2), sev(21, 3)],
+    );
+    let q = Querier::new(bucket.path());
+    let tenant = TenantId::new("a");
+
+    let run = |text: &'static str| {
+        let q = q.clone();
+        let tenant = tenant.clone();
+        async move {
+            let query = ourios_querier::dsl::parse(text).expect("parse");
+            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+                .await
+                .expect("run_query")
+                .rows
+        }
+    };
+
+    // Act / Assert — `== error` matches the 17 and 19 rows (the band), not
+    // just the 17 floor; the 19 row is the regression guard.
+    assert_eq!(
+        run("severity == error").await,
+        2,
+        "== error is the 17..=20 band, so 19 matches",
+    );
+    // `!= error` is everything OUTSIDE the band (16 and 21).
+    assert_eq!(
+        run("severity != error").await,
+        2,
+        "!= error excludes the whole band",
+    );
+    // Ordering still uses the floor (RFC0002.5): `>= error` ≥ 17 ⇒ 17,19,21.
+    assert_eq!(
+        run("severity >= error").await,
+        3,
+        ">= error keeps the floor (17)",
+    );
+    // A numeric equality stays exact — 19 only.
+    assert_eq!(run("severity == 19").await, 1, "numeric == is exact");
+}
+
 /// Scenario RFC0002.6 — First-class OTel-canonical fields resolve correctly.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
@@ -691,12 +771,14 @@ async fn rfc0002_6_first_class_fields_resolve() {
         1,
         "span_id resolves to the byte column",
     );
-    // ts → time_unix_nano: a half-open lower bound excludes row A.
-    let after = TS0 + 500_000;
+    // ts → time_unix_nano: a lower bound *between* row A's `ts` (TS0) and its
+    // `observed_ts` (TS0 + 1_000) — so the count flips (2 → 3) if `ts` is
+    // wrongly resolved to `observed_time_unix_nano`. Excludes row A on `ts`.
+    let after = TS0 + 500;
     assert_eq!(
         run(format!("ts >= {after}")).await,
         2,
-        "ts resolves to time column"
+        "ts resolves to the time column, not observed_time_unix_nano"
     );
     // observed_ts → observed_time_unix_nano (each row's is ts + 1000).
     assert_eq!(
@@ -704,6 +786,148 @@ async fn rfc0002_6_first_class_fields_resolve() {
         2,
         "observed_ts resolves to its column",
     );
+}
+
+/// Scenario RFC0002.6 (attribute `!=` present-key guard) — `attr.k != "v"`
+/// (and `service`/`resource.k`) must require the key PRESENT with a different
+/// value; a row missing the key entirely does not match. See
+/// `docs/rfcs/0002-query-dsl.md` §5 and issue #147 (the JSON-LIKE stopgap).
+#[tokio::test]
+async fn rfc0002_6_attr_not_equal_requires_present_key() {
+    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, kv, rec_with_resource, write_all};
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::Querier;
+
+    // Arrange — three rows on the resource `region` key:
+    //   row A: region = "eu"      row B: region = "us"      row C: no region
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_resource("a", TS0, vec![kv("region", "eu")]),
+            rec_with_resource("a", TS0 + 1_000_000, vec![kv("region", "us")]),
+            rec_with_resource("a", TS0 + 2_000_000, Vec::new()),
+        ],
+    );
+    let q = Querier::new(bucket.path());
+    let tenant = TenantId::new("a");
+
+    let run = |text: &'static str| {
+        let q = q.clone();
+        let tenant = tenant.clone();
+        async move {
+            let query = ourios_querier::dsl::parse(text).expect("parse");
+            q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+                .await
+                .expect("run_query")
+                .rows
+        }
+    };
+
+    // Act / Assert — `!=` matches only the key-present, different-value row
+    // (row B), NOT the missing-key row C.
+    assert_eq!(
+        run("resource.region != \"eu\"").await,
+        1,
+        "!= requires the key present with a different value (missing-key C excluded)",
+    );
+    // Equality stays present+exact (row A only).
+    assert_eq!(
+        run("resource.region == \"eu\"").await,
+        1,
+        "== is present+exact"
+    );
+}
+
+/// Scenario RFC0002.6 (compile-time column-type rejections) — regex on a
+/// non-text column and a string function on a binary id column are rejected
+/// at compile with a specific, leak-free error. See
+/// `docs/rfcs/0002-query-dsl.md` §5 / hazard `CLAUDE.md` §4.6.
+#[tokio::test]
+async fn rfc0002_6_non_text_operators_rejected() {
+    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::{Querier, QueryError};
+
+    const LEAK_TOKENS: &[&str] = &["datafusion", "arrow", "sql", "fixedsizebinary", "binary("];
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(bucket.path(), &[simple("a", 1, TS0)]);
+    let q = Querier::new(bucket.path());
+    let tenant = TenantId::new("a");
+
+    // (query, fragment the message must name)
+    let cases: &[(&str, &str)] = &[
+        ("template_id =~ \"4\"", "template_id"),
+        ("flags =~ \"1\"", "flags"),
+        ("confidence =~ \"0\"", "confidence"),
+        ("lossy =~ \"true\"", "lossy"),
+        ("starts_with(trace_id, \"11\")", "trace_id"),
+        ("contains(span_id, \"22\")", "span_id"),
+    ];
+
+    for (text, fragment) in cases {
+        // Act
+        let query = ourios_querier::dsl::parse(text).expect("parse");
+        let err = q
+            .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+            .await
+            .expect_err(&format!("{text:?} must be rejected at compile"));
+
+        // Assert — Ourios-owned, names the field, leaks no engine type.
+        assert!(matches!(err, QueryError::InvalidQuery { .. }), "{text:?}");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains(fragment),
+            "{text:?} should name {fragment:?}: {msg:?}"
+        );
+        for token in LEAK_TOKENS {
+            assert!(!msg.contains(token), "{text:?} leaked {token:?}: {msg:?}");
+        }
+    }
+}
+
+/// Scenario RFC0002.6 (unsupported stage rejection) — a pipeline stage this
+/// slice does not execute (`count`/aggregation/`sort`/`project`/`render`) is
+/// rejected with a clear error rather than silently dropped.
+#[tokio::test]
+async fn rfc0002_6_unsupported_stage_rejected() {
+    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::{Querier, QueryError};
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(bucket.path(), &[simple("a", 1, TS0)]);
+    let q = Querier::new(bucket.path());
+    let tenant = TenantId::new("a");
+
+    // `range` + `limit` stay supported; the rest must error, not no-op.
+    let cases: &[(&str, &str)] = &[
+        ("body == \"x\" | count", "count"),
+        ("body == \"x\" | sum(confidence)", "aggregation"),
+        ("body == \"x\" | sort ts", "sort"),
+        ("body == \"x\" | project body", "project"),
+        ("body == \"x\" | render", "render"),
+    ];
+    for (text, fragment) in cases {
+        let query = ourios_querier::dsl::parse(text).expect("parse");
+        let err = q
+            .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS)
+            .await
+            .expect_err(&format!("{text:?} must be rejected, not dropped"));
+        assert!(matches!(err, QueryError::InvalidQuery { .. }), "{text:?}");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains(fragment),
+            "{text:?} should name {fragment:?}: {msg:?}"
+        );
+    }
+
+    // A supported pipeline still runs.
+    let ok = ourios_querier::dsl::parse("body == \"x\" | limit 5").expect("parse");
+    q.run_query(&ok, &tenant, NOW, DEFAULT_WINDOW_NS)
+        .await
+        .expect("range + limit stay supported");
 }
 
 /// Scenario RFC0002.7 — Parse/serialise round-trip is idempotent.

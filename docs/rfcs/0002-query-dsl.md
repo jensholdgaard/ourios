@@ -186,9 +186,11 @@ surface? Perses+OTel query conventions?) are folded into §9.
 
 ## 5. Acceptance criteria
 
-> `Given/When/Then`, ids greppable from tests (`RFC0002.<n>`, referenced
-> verbatim in each test's leading doc comment). These specify the
-> parser + compiler that front-ends the (already-implemented, RFC 0007 §5)
+> `Given/When/Then`, ids greppable from tests: each test carries the
+> `docs/verification.md` §2.2 doc-comment form —
+> `/// Scenario RFC0002.<n> — <title>.` plus
+> `/// See docs/rfcs/0002-query-dsl.md §5.`. These specify the parser +
+> compiler that front-ends the (already-implemented, RFC 0007 §5)
 > execution layer.
 
 - **RFC0002.1 — A Branch-B predicate parses and compiles to a filter `[CLAUDE.md §4 hazard 6]`**
@@ -302,11 +304,13 @@ stages); `false` matches nothing.
   DSL keeps the split explicit rather than flattening.)
 - **Resource attributes**: `resource.<key>` where `<key>` is the OTel
   attribute key taken literally including dots (`resource.service.name` →
-  resource attribute `"service.name"`). Bracketed form
-  `resource["k8s.pod.name"]` for keys with characters outside the
-  bare-identifier set.
+  resource attribute `"service.name"`). Bracketed form `resource["..."]`
+  for any key not expressible as dotted bare identifiers — characters
+  outside the bare-identifier set, a segment starting with a digit, or a
+  reserved-word collision (`resource["k8s.pod.name"]`, `resource["3rd.party"]`).
 - **Log-record attributes**: `attr.<key>` (`attr.http.status_code` →
-  attribute `"http.status_code"`); bracketed `attr["k"]` when needed.
+  attribute `"http.status_code"`); bracketed `attr["..."]` for the same
+  non-bare-identifier cases.
 - **Severity**: `severity` compares against a **bare severity name**
   (`severity >= error`), case-insensitive, or a **numeric** form
   (`severity >= 17`). All severity comparisons — **including ordering**

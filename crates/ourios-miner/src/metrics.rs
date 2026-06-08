@@ -108,6 +108,26 @@ fn lock_state(state: &Mutex<MinerMetricsState>) -> std::sync::MutexGuard<'_, Min
     }
 }
 
+/// Increment a per-tenant counter by one, cloning the tenant key only on
+/// its first sight — the hot path (a tenant already in the map) reuses
+/// the borrowed key via `get_mut`.
+fn bump_tenant(map: &mut HashMap<TenantId, u64>, tenant: &TenantId) {
+    if let Some(count) = map.get_mut(tenant) {
+        *count += 1;
+    } else {
+        map.insert(tenant.clone(), 1);
+    }
+}
+
+/// Set a per-tenant value, cloning the tenant key only on first sight.
+fn set_tenant(map: &mut HashMap<TenantId, u64>, tenant: &TenantId, value: u64) {
+    if let Some(slot) = map.get_mut(tenant) {
+        *slot = value;
+    } else {
+        map.insert(tenant.clone(), value);
+    }
+}
+
 /// Borrow the `(tenant, service)` tally for a mutable update,
 /// allocating owned keys only on the first sight of the pair.
 ///
@@ -496,7 +516,7 @@ impl MinerMetrics {
     /// in flight.
     pub(crate) fn record_line_denominator(&self, tenant: &TenantId, service: Option<&str>) {
         let mut st = lock_state(&self.state);
-        *st.body_lines.entry(tenant.clone()).or_insert(0) += 1;
+        bump_tenant(&mut st.body_lines, tenant);
         tally_mut(&mut st.by_service, tenant, service).lines += 1;
     }
 
@@ -549,7 +569,7 @@ impl MinerMetrics {
     /// `ourios.miner.body_retention.utilization` numerator (§6.3 retention paths).
     pub(crate) fn record_body_retention(&self, tenant: &TenantId) {
         let mut st = lock_state(&self.state);
-        *st.body_retentions.entry(tenant.clone()).or_insert(0) += 1;
+        bump_tenant(&mut st.body_retentions, tenant);
     }
 
     /// Record one merge event (§6.8 `ourios.miner.merges`,
@@ -577,7 +597,7 @@ impl MinerMetrics {
     /// `ourios.miner.template.count` observable gauge reads.
     pub(crate) fn set_template_count(&self, tenant: &TenantId, count: u64) {
         let mut st = lock_state(&self.state);
-        st.template_counts.insert(tenant.clone(), count);
+        set_tenant(&mut st.template_counts, tenant, count);
     }
 }
 

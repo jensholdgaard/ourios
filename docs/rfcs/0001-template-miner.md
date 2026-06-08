@@ -1538,12 +1538,11 @@ belt-and-braces, not the primary mechanism.
 
 **Structured bodies are out of scope of this amendment.** A
 `body_kind = Structured` row renders its canonically-encoded `body`
-column, but whether that is `Reconstruction::Faithful` (the canonical
-JSON round-trips the source `AnyValue`) turns on the OTLP-canonical
-JSON encoding decision (RFC0001.9), which is deferred. This amendment
-defines the `Reconstruction` marker for the implemented **`String`**
-path; structured-body rendering and its classification land with
-RFC0001.9.
+column (the §6.1 canonical-encoding rule); how that render is
+classified under the `Reconstruction` signal is out of scope here.
+This amendment defines the marker for the implemented **`String`**
+path; structured-body rendering and its classification are specified
+with the RFC0001.9 structured short-circuit.
 
 **Clean path.** For a faithful row (`lossy_flag = false`, no
 `OVERFLOW` param, template available) the reader invokes

@@ -468,7 +468,7 @@ impl MinerCluster {
     fn apply_overflow_retention(
         &self,
         record: &OtlpLogRecord,
-        service: &str,
+        service: Option<&str>,
         rec: &mut MinedRecord,
         raw: &str,
     ) {
@@ -504,7 +504,7 @@ impl MinerCluster {
     /// `body_retentions_total` metric doc explicitly excludes,
     /// not the §6.3 lossy-zone retention the gauge is meant to
     /// surface. That path uses [`Self::record_tokenizer_failure`].
-    fn record_parse_failure(&self, record: &OtlpLogRecord, service: &str) {
+    fn record_parse_failure(&self, record: &OtlpLogRecord, service: Option<&str>) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
@@ -522,7 +522,7 @@ impl MinerCluster {
     /// tokenizer failures here would inflate the ratio with
     /// events that aren't body-retention events in the
     /// gauge-contract sense.
-    fn record_tokenizer_failure(&self, record: &OtlpLogRecord, service: &str) {
+    fn record_tokenizer_failure(&self, record: &OtlpLogRecord, service: Option<&str>) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .record_parse_failure(&record.tenant_id, service);
@@ -586,7 +586,7 @@ impl MinerCluster {
     /// histogram + p50/p01 reservoir. The ratio-gauge denominators
     /// are bumped earlier, at the top of [`Self::ingest`], so they
     /// lead any numerator for the same line.
-    fn emit_record(&mut self, record: MinedRecord, service: &str) {
+    fn emit_record(&mut self, record: MinedRecord, service: Option<&str>) {
         self.metrics
             .record_line(&record.tenant_id, service, f64::from(record.confidence));
         self.record_sink.emit(record);
@@ -1122,9 +1122,12 @@ impl MinerCluster {
         let started = std::time::Instant::now();
         // Resolve the source service once per ingest. It is
         // constant for the record and feeds every §6.8 per-service
-        // instrument below; the hot-path helpers take it by
-        // reference rather than re-scanning + re-allocating it.
+        // instrument below; the hot-path helpers take the borrowed
+        // `Option<&str>` rather than re-scanning + re-allocating it.
+        // `None` when the source set no `service.name` — `ourios.service`
+        // is then omitted (recommended, not synthesized).
         let service = service_of(&record.resource_attributes);
+        let service = service.as_deref();
         // Bump the per-line denominators before any per-line
         // numerator (overflow / body-retention) for this line. The
         // ratio-gauge callbacks may collect concurrently; denominator
@@ -1132,7 +1135,7 @@ impl MinerCluster {
         // Exactly one record is emitted per ingest, so this matches
         // the `record_line` confidence observation one-to-one.
         self.metrics
-            .record_line_denominator(&record.tenant_id, &service);
+            .record_line_denominator(&record.tenant_id, service);
         let template_id = match &record.body {
             None => {
                 // The wire delivered no body. Emit a single
@@ -1143,18 +1146,18 @@ impl MinerCluster {
                 // template, so reconstruction is not possible.
                 let mut rec = Self::record_envelope(record, BodyKind::Absent);
                 rec.lossy_flag = true;
-                self.emit_record(rec, &service);
+                self.emit_record(rec, service);
                 NO_TEMPLATE
             }
-            Some(Body::String(raw)) => self.ingest_string(record, &service, raw),
-            Some(Body::Structured(av)) => self.ingest_structured(record, &service, av),
+            Some(Body::String(raw)) => self.ingest_string(record, service, raw),
+            Some(Body::Structured(av)) => self.ingest_structured(record, service, av),
         };
         // §6.8 `ourios.miner.duration` histogram (hot-path budget
         // D1) and the `ourios.miner.template.count` observable-gauge
         // mirror. Both read the post-ingest state, so they sit after
         // the body fork.
         self.metrics
-            .record_latency(&record.tenant_id, started.elapsed().as_secs_f64());
+            .record_duration(&record.tenant_id, started.elapsed().as_secs_f64());
         // `usize` ≤ `u64` on every supported target; saturate
         // rather than panic on the impossible overflow.
         let count = u64::try_from(self.template_count(&record.tenant_id)).unwrap_or(u64::MAX);
@@ -1174,7 +1177,7 @@ impl MinerCluster {
     // too_many_lines lint is silenced here rather than
     // fragmenting the per-step structure.
     #[allow(clippy::too_many_lines)]
-    fn ingest_string(&mut self, record: &OtlpLogRecord, service: &str, raw: &str) -> u64 {
+    fn ingest_string(&mut self, record: &OtlpLogRecord, service: Option<&str>, raw: &str) -> u64 {
         // RFC §6.2 step 1 (H7.2): a tokenizer failure (today:
         // embedded NUL byte) routes the line to the parse-failure
         // path with `lossy_flag = true` and the original body
@@ -1524,7 +1527,7 @@ impl MinerCluster {
     fn attach_and_maybe_widen(
         &mut self,
         record: &OtlpLogRecord,
-        service: &str,
+        service: Option<&str>,
         raw: &str,
         masked_strs: &[&str],
         line_wildcard_positions: &[usize],
@@ -1675,7 +1678,7 @@ impl MinerCluster {
     fn ingest_structured(
         &mut self,
         record: &OtlpLogRecord,
-        service: &str,
+        service: Option<&str>,
         any_value: &ourios_core::otlp::AnyValue,
     ) -> u64 {
         let key = (record.severity_number, record.scope_name.clone());

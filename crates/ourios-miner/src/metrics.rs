@@ -52,12 +52,6 @@ use ourios_semconv as semconv;
 /// Meter name per RFC 0001 §6.8 (`global::meter("ourios.miner")`).
 const METER_NAME: &str = "ourios.miner";
 
-/// Sentinel `service` value for records whose `resource_attributes`
-/// carry no `service.name`. Keeps the per-`(tenant, service)`
-/// breakdown total even when the source did not set the key, rather
-/// than silently dropping the line from the denominator.
-const SERVICE_UNKNOWN: &str = "unknown";
-
 /// Resource-attribute key the source service is read from. The
 /// §6.8 `service` attribute is the *log's source* service (distinct
 /// from Ourios's own `service.name` resource attribute), read from
@@ -71,25 +65,27 @@ const RESOURCE_SERVICE_NAME: &str = "service.name";
 const RESERVOIR_CAP: usize = 1024;
 
 /// Read the source `service.name` from a record's
-/// `resource_attributes`, falling back to [`SERVICE_UNKNOWN`] when
-/// absent or non-string. The proto `KeyValue` carries
-/// `value: Option<AnyValue>`; only the `StringValue` variant is a
+/// `resource_attributes`, returning `None` when it is absent, empty,
+/// or non-string. The proto `KeyValue` carries
+/// `value: Option<AnyValue>`; only a non-empty `StringValue` is a
 /// meaningful service identity.
+///
+/// `ourios.service` is `recommended` (not `required`) in the semconv
+/// registry: an absent source `service.name` means the attribute is
+/// **omitted**, not synthesized to a sentinel. Synthesizing a value
+/// would change the attribute's meaning and create a fake series that
+/// could collide with a real service of that name.
 #[must_use]
-pub(crate) fn service_of(resource_attributes: &[OtlpKeyValue]) -> String {
+pub(crate) fn service_of(resource_attributes: &[OtlpKeyValue]) -> Option<String> {
     resource_attributes
         .iter()
         .find(|kv| kv.key == RESOURCE_SERVICE_NAME)
         .and_then(|kv| kv.value.as_ref())
         .and_then(|av| av.value.as_ref())
         .and_then(|v| match v {
-            // An empty `service.name` is treated as missing (not a real
-            // service), so it folds into `SERVICE_UNKNOWN` rather than
-            // creating an empty-string series.
             any_value::Value::StringValue(s) if !s.is_empty() => Some(s.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| SERVICE_UNKNOWN.to_string())
 }
 
 /// Lock the metrics state, recovering the guard if the mutex was poisoned
@@ -99,6 +95,70 @@ fn lock_state(state: &Mutex<MinerMetricsState>) -> std::sync::MutexGuard<'_, Min
     match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Borrow the `(tenant, service)` tally for a mutable update,
+/// allocating owned keys only on the first sight of the pair.
+///
+/// The hot path — a `(tenant, service)` already in flight — clones
+/// nothing: the outer probe is `get_mut(&TenantId)` (no clone) and the
+/// `Some(name)` inner probe is `get_mut(name)` keyed on a borrowed
+/// `&str`. Only the cold first-insert path owns a key (the prior code
+/// cloned the tenant *and* the service on every line). A `None` service
+/// — a line whose source carried no `service.name` — lands in the
+/// dedicated [`ServiceTallies::no_service`] slot, attributed to the
+/// tenant alone (`ourios.service` omitted, see [`service_attrs`]).
+fn tally_mut<'a>(
+    by_service: &'a mut HashMap<TenantId, ServiceTallies>,
+    tenant: &TenantId,
+    service: Option<&str>,
+) -> &'a mut ServiceTally {
+    // `contains_key` releases its borrow before the follow-up `get_mut`
+    // / `entry`, sidestepping the get-then-insert borrow-checker
+    // limitation while still cloning a key only on first insert.
+    if !by_service.contains_key(tenant) {
+        by_service.insert(tenant.clone(), ServiceTallies::default());
+    }
+    let tallies = by_service
+        .get_mut(tenant)
+        .unwrap_or_else(|| unreachable!("inserted above when absent"));
+    match service {
+        None => &mut tallies.no_service,
+        Some(name) if tallies.by_name.contains_key(name) => tallies
+            .by_name
+            .get_mut(name)
+            .unwrap_or_else(|| unreachable!("contains_key was true")),
+        Some(name) => tallies.by_name.entry(name.to_owned()).or_default(),
+    }
+}
+
+/// Per-tenant tallies, split so the common named-service path probes a
+/// borrowed `&str` key and only the service-less lines share a slot.
+#[derive(Default)]
+struct ServiceTallies {
+    /// Tallies for lines carrying a non-empty `service.name`.
+    by_name: HashMap<String, ServiceTally>,
+    /// Tally for lines whose source set no `service.name`. These count
+    /// toward the tenant but emit no `ourios.service` attribute. A
+    /// tenant with only named services leaves this at its zero default;
+    /// the gauge callbacks gate on `lines > 0` so an unused slot emits
+    /// no point.
+    no_service: ServiceTally,
+}
+
+impl ServiceTallies {
+    /// Yield each populated `(service, tally)` for a gauge callback:
+    /// every named service plus the service-less slot, the latter only
+    /// once it has seen a real line (`lines > 0`) so an unused slot
+    /// emits no point.
+    fn iter(&self) -> impl Iterator<Item = (Option<&str>, &ServiceTally)> {
+        let named = self
+            .by_name
+            .iter()
+            .map(|(name, t)| (Some(name.as_str()), t));
+        let unnamed = (self.no_service.lines > 0).then_some((None, &self.no_service));
+        named.chain(unnamed)
     }
 }
 
@@ -120,9 +180,15 @@ struct ServiceTally {
 /// from any thread on collection.
 #[derive(Default)]
 struct MinerMetricsState {
-    /// Per-`(tenant, service)` tallies driving the ratio + quantile
-    /// gauges.
-    by_service: HashMap<(TenantId, String), ServiceTally>,
+    /// Per-tenant, per-optional-service tallies driving the ratio +
+    /// quantile gauges. Nested (not a flat `(TenantId, _)` key) so the
+    /// common hot-path update borrows the tenant for the outer lookup
+    /// (`get_mut(tenant)`) and clones a key only on the first sight of
+    /// a `(tenant, service)` pair. The inner `Option<String>` key is
+    /// `None` for a line whose source carried no `service.name` — the
+    /// line still counts toward the tenant, attributed without a
+    /// service (`ourios.service` omitted, see [`service_attrs`]).
+    by_service: HashMap<TenantId, ServiceTallies>,
     /// Per-tenant template count, mirrored from the cluster so the
     /// `ourios.miner.template.count` observable gauge can report it
     /// without borrowing the cluster.
@@ -331,11 +397,13 @@ impl MinerMetrics {
             .with_unit("1")
             .with_callback(move |obs| {
                 let st = lock_state(&s);
-                for ((tenant, service), tally) in &st.by_service {
-                    obs.observe(
-                        ratio(tally.overflow_lines, tally.lines),
-                        &service_attrs(tenant, service),
-                    );
+                for (tenant, tallies) in &st.by_service {
+                    for (service, tally) in tallies.iter() {
+                        obs.observe(
+                            ratio(tally.overflow_lines, tally.lines),
+                            &service_attrs(tenant, service),
+                        );
+                    }
                 }
             })
             .build();
@@ -369,9 +437,11 @@ impl MinerMetrics {
             .with_unit("1")
             .with_callback(move |obs| {
                 let st = lock_state(&s);
-                for ((tenant, service), tally) in &st.by_service {
-                    if let Some(v) = tally.confidence.quantile(q) {
-                        obs.observe(v, &service_attrs(tenant, service));
+                for (tenant, tallies) in &st.by_service {
+                    for (service, tally) in tallies.iter() {
+                        if let Some(v) = tally.confidence.quantile(q) {
+                            obs.observe(v, &service_attrs(tenant, service));
+                        }
                     }
                 }
             })
@@ -390,32 +460,27 @@ impl MinerMetrics {
     /// incrementing the denominator first guarantees they never
     /// observe `numerator > denominator` (utilization > 1) for a line
     /// in flight.
-    pub(crate) fn record_line_denominator(&self, tenant: &TenantId, service: &str) {
+    pub(crate) fn record_line_denominator(&self, tenant: &TenantId, service: Option<&str>) {
         let mut st = lock_state(&self.state);
         *st.body_lines.entry(tenant.clone()).or_insert(0) += 1;
-        st.by_service
-            .entry((tenant.clone(), service.to_owned()))
-            .or_default()
-            .lines += 1;
+        tally_mut(&mut st.by_service, tenant, service).lines += 1;
     }
 
     /// Observe one ingested line's `confidence` on both the §6.8
     /// histogram and the per-`(tenant, service)` reservoir feeding the
     /// p50/p01 gauges. The line denominator is bumped separately and
     /// earlier by [`Self::record_line_denominator`].
-    pub(crate) fn record_line(&self, tenant: &TenantId, service: &str, confidence: f64) {
+    pub(crate) fn record_line(&self, tenant: &TenantId, service: Option<&str>, confidence: f64) {
         self.confidence
             .record(confidence, &service_attrs(tenant, service));
         let mut st = lock_state(&self.state);
-        st.by_service
-            .entry((tenant.clone(), service.to_owned()))
-            .or_default()
+        tally_mut(&mut st.by_service, tenant, service)
             .confidence
             .observe(confidence);
     }
 
     /// Record the miner's per-line processing duration (§6.8 `ourios.miner.duration`).
-    pub(crate) fn record_latency(&self, tenant: &TenantId, seconds: f64) {
+    pub(crate) fn record_duration(&self, tenant: &TenantId, seconds: f64) {
         self.miner_duration.record(
             seconds,
             &[KeyValue::new(
@@ -430,21 +495,18 @@ impl MinerMetrics {
     /// counter and the per-service overflow-line numerator (the
     /// line is counted once toward the ratio regardless of how many
     /// of its params overflowed).
-    pub(crate) fn record_overflow(&self, tenant: &TenantId, service: &str, count: u64) {
+    pub(crate) fn record_overflow(&self, tenant: &TenantId, service: Option<&str>, count: u64) {
         if count == 0 {
             return;
         }
         self.params_overflow_total
             .add(count, &service_attrs(tenant, service));
         let mut st = lock_state(&self.state);
-        st.by_service
-            .entry((tenant.clone(), service.to_owned()))
-            .or_default()
-            .overflow_lines += 1;
+        tally_mut(&mut st.by_service, tenant, service).overflow_lines += 1;
     }
 
     /// Record one parse-failure line (§6.8 `ourios.miner.parse_failures`).
-    pub(crate) fn record_parse_failure(&self, tenant: &TenantId, service: &str) {
+    pub(crate) fn record_parse_failure(&self, tenant: &TenantId, service: Option<&str>) {
         self.parse_failures_total
             .add(1, &service_attrs(tenant, service));
     }
@@ -485,12 +547,23 @@ impl MinerMetrics {
     }
 }
 
-/// `(ourios.tenant, ourios.service)` data-point attribute pair.
-fn service_attrs(tenant: &TenantId, service: &str) -> [KeyValue; 2] {
-    [
-        KeyValue::new(semconv::OURIOS_TENANT, tenant.as_str().to_owned()),
-        KeyValue::new(semconv::OURIOS_SERVICE, service.to_owned()),
-    ]
+/// Data-point attributes for a `(tenant, service)` measurement.
+///
+/// `ourios.tenant` is `required`, so it is always present.
+/// `ourios.service` is `recommended`: it is emitted only when the
+/// source carried a `service.name` (`Some`). A service-less line
+/// (`None`) is attributed to the tenant alone — the point is **not**
+/// dropped, and no synthetic service value is fabricated.
+fn service_attrs(tenant: &TenantId, service: Option<&str>) -> Vec<KeyValue> {
+    let mut attrs = Vec::with_capacity(1 + usize::from(service.is_some()));
+    attrs.push(KeyValue::new(
+        semconv::OURIOS_TENANT,
+        tenant.as_str().to_owned(),
+    ));
+    if let Some(name) = service {
+        attrs.push(KeyValue::new(semconv::OURIOS_SERVICE, name.to_owned()));
+    }
+    attrs
 }
 
 /// `numerator / denominator`, or `0.0` when the denominator is zero
@@ -550,11 +623,25 @@ mod tests {
             }),
             ..Default::default()
         }];
-        assert_eq!(service_of(&attrs), "checkout");
+        assert_eq!(service_of(&attrs).as_deref(), Some("checkout"));
     }
 
     #[test]
-    fn service_of_absent_is_unknown() {
-        assert_eq!(service_of(&[]), "unknown");
+    fn service_of_absent_is_none() {
+        // `ourios.service` is `recommended`: an absent source
+        // `service.name` is omitted, not synthesized to a sentinel.
+        assert_eq!(service_of(&[]), None);
+    }
+
+    #[test]
+    fn service_of_empty_string_is_none() {
+        let attrs = vec![OtlpKeyValue {
+            key: "service.name".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(String::new())),
+            }),
+            ..Default::default()
+        }];
+        assert_eq!(service_of(&attrs), None);
     }
 }

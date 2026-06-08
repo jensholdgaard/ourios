@@ -197,7 +197,7 @@ impl ServiceTallies {
 /// `lines` is the denominator for `ourios.miner.params.overflow.utilization`;
 /// `overflow_lines` is its numerator. `confidence` is a bounded
 /// reservoir over the same key, the source for the
-/// `confidence_p50` / `confidence_p01` quantile gauges.
+/// `ourios.miner.confidence.p50` / `ourios.miner.confidence.p01` quantile gauges.
 #[derive(Default)]
 struct ServiceTally {
     lines: u64,
@@ -210,14 +210,15 @@ struct ServiceTally {
 /// from any thread on collection.
 #[derive(Default)]
 struct MinerMetricsState {
-    /// Per-tenant, per-optional-service tallies driving the ratio +
-    /// quantile gauges. Nested (not a flat `(TenantId, _)` key) so the
-    /// common hot-path update borrows the tenant for the outer lookup
+    /// Per-tenant, per-service tallies driving the ratio + quantile
+    /// gauges. Nested (not a flat `(TenantId, _)` key) so the common
+    /// hot-path update borrows the tenant for the outer lookup
     /// (`get_mut(tenant)`) and clones a key only on the first sight of
-    /// a `(tenant, service)` pair. The inner `Option<String>` key is
-    /// `None` for a line whose source carried no `service.name` — the
-    /// line still counts toward the tenant, attributed without a
-    /// service (`ourios.service` omitted, see [`service_attrs`]).
+    /// a `(tenant, service)` pair. Each tenant's [`ServiceTallies`]
+    /// splits a named-service map (`by_name`) from a single
+    /// `no_service` slot for lines whose source carried no
+    /// `service.name` — those still count toward the tenant, attributed
+    /// without a service (`ourios.service` omitted, see [`service_attrs`]).
     by_service: HashMap<TenantId, ServiceTallies>,
     /// Per-tenant template count, mirrored from the cluster so the
     /// `ourios.miner.template.count` observable gauge can report it

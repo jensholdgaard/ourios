@@ -1494,11 +1494,13 @@ property-test oracle and the in-process renderer the miner
 exercises while the template is in hand. The *reader* — the
 read-side path that materialises a stored Parquet row back into
 the effective original line for a query result — is a distinct
-caller, and H7.3 pins the contract it must honour.
+caller, and H7.3 pins the contract it must honour. The contract below
+covers `String`-body rows (`body_kind = String`); structured bodies
+are out of scope (see the end of this subsection).
 
-**The render result is `(bytes, reconstruction)`.** Rendering a
-stored row yields two things: the effective original line **bytes**
-and a per-row **reconstruction signal**
+**For a `String`-body row, the render result is `(bytes,
+reconstruction)`.** Rendering yields two things: the effective
+original line **bytes** and a per-row **reconstruction signal**
 
 ```rust
 enum Reconstruction {

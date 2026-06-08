@@ -177,7 +177,9 @@ impl Reservoir {
             return None;
         }
         let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).expect("confidence values are never NaN"));
+        // `total_cmp` is a total order over f64 (no panic; any stray NaN sorts
+        // to an end) — avoids `partial_cmp(...).expect(...)` on a hot path.
+        sorted.sort_by(f64::total_cmp);
         let n = sorted.len();
         // Nearest-rank: rank = ceil(q * n), clamped to [1, n].
         #[allow(

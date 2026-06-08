@@ -43,6 +43,12 @@ pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 /// `ourios.compaction.sweeps` (counter, unit `{sweep}`).
 pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 
+/// `ourios.miner.alias.assertions` (counter, unit `{assertion}`).
+pub const OURIOS_MINER_ALIAS_ASSERTIONS: &str = "ourios.miner.alias.assertions";
+
+/// `ourios.miner.alias.retractions` (counter, unit `{retraction}`).
+pub const OURIOS_MINER_ALIAS_RETRACTIONS: &str = "ourios.miner.alias.retractions";
+
 /// `ourios.miner.body_retention.utilization` (gauge, unit `1`).
 pub const OURIOS_MINER_BODY_RETENTION_UTILIZATION: &str = "ourios.miner.body_retention.utilization";
 

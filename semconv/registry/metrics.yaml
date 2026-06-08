@@ -228,3 +228,25 @@ groups:
         requirement_level: required
       - ref: ourios.service
         requirement_level: recommended
+
+  - id: metric.ourios.miner.alias.assertions
+    type: metric
+    metric_name: ourios.miner.alias.assertions
+    stability: development
+    brief: Operator-driven template-alias assertions recorded.
+    instrument: counter
+    unit: "{assertion}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+
+  - id: metric.ourios.miner.alias.retractions
+    type: metric
+    metric_name: ourios.miner.alias.retractions
+    stability: development
+    brief: Operator-driven template-alias retractions recorded.
+    instrument: counter
+    unit: "{retraction}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required

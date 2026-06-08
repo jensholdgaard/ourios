@@ -95,6 +95,16 @@ pub(crate) fn service_of(resource_attributes: &[OtlpKeyValue]) -> String {
         .unwrap_or_else(|| SERVICE_UNKNOWN.to_string())
 }
 
+/// Lock the metrics state, recovering the guard if the mutex was poisoned
+/// by an unrelated panic. Telemetry is best-effort: a poisoned lock must
+/// never crash an ingest write or a collection callback.
+fn lock_state(state: &Mutex<MinerMetricsState>) -> std::sync::MutexGuard<'_, MinerMetricsState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Per-`(tenant, service)` rolling tallies for the derived gauges.
 ///
 /// `lines` is the denominator for `ourios.miner.params.overflow.utilization`;
@@ -323,7 +333,7 @@ impl MinerMetrics {
             .u64_observable_gauge(semconv::OURIOS_MINER_TEMPLATE_COUNT)
             .with_unit("{template}")
             .with_callback(move |obs| {
-                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let st = lock_state(&s);
                 if st.template_counts.is_empty() {
                     obs.observe(0, &[KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)]);
                 }
@@ -344,7 +354,7 @@ impl MinerMetrics {
             .f64_observable_gauge(semconv::OURIOS_MINER_BODY_RETENTION_UTILIZATION)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let st = lock_state(&s);
                 if st.body_lines.is_empty() {
                     obs.observe(0.0, &[KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)]);
                 }
@@ -366,7 +376,7 @@ impl MinerMetrics {
             .f64_observable_gauge(semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let st = lock_state(&s);
                 if st.by_service.is_empty() {
                     obs.observe(
                         0.0,
@@ -413,7 +423,7 @@ impl MinerMetrics {
             .f64_observable_gauge(name)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let st = lock_state(&s);
                 let mut emitted = false;
                 for ((tenant, service), tally) in &st.by_service {
                     if let Some(v) = tally.confidence.quantile(q) {
@@ -441,10 +451,7 @@ impl MinerMetrics {
     pub(crate) fn record_line(&self, tenant: &TenantId, service: &str, confidence: f64) {
         self.confidence
             .record(confidence, &service_attrs(tenant, service));
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = lock_state(&self.state);
         *st.body_lines.entry(tenant.clone()).or_insert(0) += 1;
         let tally = st
             .by_service
@@ -476,10 +483,7 @@ impl MinerMetrics {
         }
         self.params_overflow_total
             .add(count, &service_attrs(tenant, service));
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = lock_state(&self.state);
         st.by_service
             .entry((tenant.clone(), service.to_owned()))
             .or_default()
@@ -495,10 +499,7 @@ impl MinerMetrics {
     /// Record one body-retention event for the
     /// `ourios.miner.body_retention.utilization` numerator (§6.3 retention paths).
     pub(crate) fn record_body_retention(&self, tenant: &TenantId) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = lock_state(&self.state);
         *st.body_retentions.entry(tenant.clone()).or_insert(0) += 1;
     }
 
@@ -526,10 +527,7 @@ impl MinerMetrics {
     /// Mirror a tenant's current template count into the state the
     /// `ourios.miner.template.count` observable gauge reads.
     pub(crate) fn set_template_count(&self, tenant: &TenantId, count: u64) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = lock_state(&self.state);
         st.template_counts.insert(tenant.clone(), count);
     }
 }

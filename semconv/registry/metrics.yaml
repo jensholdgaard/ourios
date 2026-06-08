@@ -92,7 +92,7 @@ groups:
     type: metric
     metric_name: ourios.miner.template.count
     stability: development
-    brief: Number of templates currently in a tenant's tree.
+    brief: Number of templates a tenant currently has (Drain-tree leaves plus structured-body templates).
     instrument: gauge
     unit: "{template}"
     attributes:

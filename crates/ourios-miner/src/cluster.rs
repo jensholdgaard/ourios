@@ -40,20 +40,13 @@
 //! The eventual WAL-backed sink replaces the in-memory placeholder
 //! with the RFC §6.4 *ordering-plus-durability-barrier* contract.
 //!
-//! # Not yet emitted
+//! # Out of this crate / not yet wired
 //!
-//! - Three-zone confidence + lossy-zone body retention (RFC §6.3,
-//!   `H1.2`).
-//! - Type-expansion (`TemplateChange::TypeExpanded`); the variant
-//!   exists on [`TemplateChange`] but no widening path emits it yet
-//!   (`H5.2`).
-//! - `reconstruct()` / `lossy_flag` semantics (RFC §6.6).
-//! - Per-parameter 256 B overflow + `OVERFLOW` marker (RFC §6.5).
-//! - `OTel` exposition for `ourios.miner.merges` /
-//!   `ourios.miner.parse_failures` / `ourios.miner.template.count`
-//!   (RFC §6.8).
-//! - Parquet records for the data records themselves (those go
+//! - Parquet records for the mined records themselves (those go
 //!   through `ourios-parquet`).
+//! - A WAL-backed audit/record sink (RFC §6.4); today an in-memory
+//!   placeholder stands in (see above).
+//! - Snapshot + recovery of the cluster state (RFC §6.9).
 //!
 //! [`Tree`]: crate::tree::Tree
 //! [`AuditSink`]: ourios_core::audit::AuditSink

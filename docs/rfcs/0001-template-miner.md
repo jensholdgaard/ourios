@@ -1612,7 +1612,7 @@ they originate from an explicit operator/control-plane call, so they
 do not gate `attach` latency. They do **not** increment
 `ourios.miner.merges` (that counter is reserved for the two structural
 widenings, §6.4); alias activity is counted separately as the
-`alias_assertions_total` / `alias_retractions_total` counters
+`ourios.miner.alias.assertions` / `ourios.miner.alias.retractions` counters
 enumerated in §6.8's telemetry table (mandatory, `ourios.tenant`
 attribute), keeping operator-driven aliasing first-class telemetry
 per `[§3.1]` / §6.3 alongside `ourios.miner.merges`.
@@ -1857,8 +1857,8 @@ exported as **attributes**, not labels — `tenant` is `ourios.tenant`,
 |---|---|---|---|
 | `ourios.miner.template.count` | gauge | `tenant` | `[§3.1]` |
 | `ourios.miner.merges` | counter | `tenant`, `template_change` | `[§3.1]`, H1 |
-| `alias_assertions_total` | counter | `tenant` | `[§3.1]`, §6.7, H5 |
-| `alias_retractions_total` | counter | `tenant` | `[§3.1]`, §6.7, H5 |
+| `ourios.miner.alias.assertions` | counter | `tenant` | `[§3.1]`, §6.7, H5 |
+| `ourios.miner.alias.retractions` | counter | `tenant` | `[§3.1]`, §6.7, H5 |
 | `ourios.miner.confidence` | histogram | `tenant`, `service` | `[§3.1]`, §6.3 |
 | `ourios.miner.confidence.p50` | gauge | `tenant`, `service` | `[§3.1]` |
 | `ourios.miner.confidence.p01` | gauge | `tenant`, `service` | `[§3.1]` |

@@ -440,12 +440,13 @@ fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
     );
 }
 
-/// Scenario RFC0001.8 — `confidence_p50` and `confidence_p01` are emitted as gauges.
+/// Scenario RFC0001.8 — `ourios.miner.confidence.p50` and
+/// `ourios.miner.confidence.p01` are emitted as gauges.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
-/// Ingests a controlled confidence spread for one `(tenant_id,
-/// service)`, collects the exported stream, and asserts the
-/// `confidence_p50` / `confidence_p01` gauges are present for that
+/// Ingests a controlled confidence spread for one `(ourios.tenant,
+/// ourios.service)`, collects the exported stream, and asserts the
+/// `ourios.miner.confidence.p50` / `.p01` gauges are present for that
 /// attribute pair with values equal to the nearest-rank quantile of
 /// the same samples the `confidence` histogram saw (the in-process
 /// reservoir per §6.8).
@@ -528,8 +529,8 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
         "test setup must produce a non-degenerate confidence spread (p50={expected_p50}, p01={expected_p01})",
     );
 
-    // Assert — both gauges present for (tenant_id=acme,
-    // service=checkout) with the expected nearest-rank values.
+    // Assert — both gauges present for (ourios.tenant=acme,
+    // ourios.service=checkout) with the expected nearest-rank values.
     let rms = exporter.get_finished_metrics().expect("metrics exported");
     let gauge_value = |name: &str| -> f64 {
         let data = rms
@@ -568,11 +569,11 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
 
     assert!(
         (gauge_value(ourios_semconv::OURIOS_MINER_CONFIDENCE_P50) - expected_p50).abs() < 1e-6,
-        "confidence_p50 must match the in-process p50 quantile",
+        "ourios.miner.confidence.p50 must match the in-process p50 quantile",
     );
     assert!(
         (gauge_value(ourios_semconv::OURIOS_MINER_CONFIDENCE_P01) - expected_p01).abs() < 1e-6,
-        "confidence_p01 must match the in-process p01 quantile",
+        "ourios.miner.confidence.p01 must match the in-process p01 quantile",
     );
 }
 

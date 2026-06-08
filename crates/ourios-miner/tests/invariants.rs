@@ -32,37 +32,29 @@ fn invariant_3_1_1_default_threshold_is_0_7() {
 /// Scenario §3.1.2 — Mandatory metric set is exposed.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
-/// Installs an SDK in-memory meter provider, constructs a miner
-/// (which registers the §6.8 instrument set on the `ourios.miner`
-/// meter and init-seeds it), collects the exported stream at zero
-/// traffic, and asserts every mandatory §6.8 metric name is present
-/// via its init-seeded data point.
+/// Two-part, per the registry-based §3.1.2 decision:
+///   (a) the mandatory set *is* the generated
+///       `ourios_semconv::OURIOS_MINER_*` constants — the semconv
+///       registry is the source of truth for which metrics the miner
+///       must expose; and
+///   (b) every instrument is registered on the `ourios.miner` meter
+///       and surfaces in the export on its **first real measurement**
+///       — no synthetic zero-traffic points. A small representative
+///       workload exercises every instrument (normal line,
+///       template-widening near-duplicate, oversized-`param` line,
+///       parse-failure line), then `force_flush` and assert each
+///       mandatory name is present.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
 
     use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
 
-    // Arrange — in-memory provider, then the miner (so its
-    // instruments resolve against the global meter the provider
-    // installs). No ingest: §3.1.2 is the zero-traffic guarantee.
-    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
-    let _cluster = MinerCluster::new(MinerConfig::default());
-
-    // Act — collect without any traffic.
-    guard.force_flush().expect("force_flush succeeds");
-
-    // Assert — every mandatory §6.8 metric name is in the stream.
-    let rms = exporter.get_finished_metrics().expect("metrics exported");
-    let names: Vec<String> = rms
-        .iter()
-        .flat_map(ResourceMetrics::scope_metrics)
-        .flat_map(ScopeMetrics::metrics)
-        .map(|m| m.name().to_string())
-        .collect();
-
-    for expected in [
+    // The mandatory §6.8 set, defined by the registry / `ourios-semconv`.
+    const MANDATORY: [&str; 11] = [
         ourios_semconv::OURIOS_MINER_TEMPLATE_COUNT,
         ourios_semconv::OURIOS_MINER_MERGES,
         ourios_semconv::OURIOS_MINER_CONFIDENCE,
@@ -74,7 +66,73 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
         ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION,
         ourios_semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES,
         ourios_semconv::OURIOS_MINER_DURATION,
-    ] {
+    ];
+
+    // (a) Registry defines the set: the constants above are exactly
+    // the dotted `ourios.miner.*` names the registry pins.
+    assert_eq!(
+        MANDATORY,
+        [
+            "ourios.miner.template.count",
+            "ourios.miner.merges",
+            "ourios.miner.confidence",
+            "ourios.miner.confidence.p50",
+            "ourios.miner.confidence.p01",
+            "ourios.miner.body_retention.utilization",
+            "ourios.miner.parse_failures",
+            "ourios.miner.params.overflow",
+            "ourios.miner.params.overflow.utilization",
+            "ourios.miner.template.version_changes",
+            "ourios.miner.duration",
+        ],
+        "the mandatory §6.8 set is the registry / ourios-semconv names",
+    );
+
+    // Arrange — in-memory provider, then the miner (so its
+    // instruments resolve against the global meter the provider
+    // installs). A param above the default 256-byte limit drives the
+    // §6.5 overflow path.
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("acme");
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+    // A 300-digit token masks to a `<NUM>` param (all ASCII digits)
+    // whose value exceeds the default 256-byte limit, so it overflows.
+    let oversized_num = "9".repeat(300);
+
+    // Act — exercise every instrument with real data:
+    //   confidence / confidence.p50 / .p01 / duration / template.count
+    //     / params.overflow.utilization / body_retention.utilization
+    //     — every ingested line feeds these (the gauges read the
+    //     per-line denominators bumped on each ingest).
+    //   merges + template.version_changes — the near-duplicate pair
+    //     widens the first template (the differing literal token
+    //     `alpha`/`beta` becomes a wildcard).
+    //   params.overflow — the oversized `<NUM>` param overflows and
+    //     forces body retention.
+    //   parse_failures + body_retention — the empty line is a §6.2
+    //     step-1 parse failure that retains body.
+    cluster.ingest(&make("user 42 logged in from host alpha"));
+    cluster.ingest(&make("user 99 logged in from host beta"));
+    cluster.ingest(&make(&format!("request id {oversized_num}")));
+    cluster.ingest(&make(""));
+    guard.force_flush().expect("force_flush succeeds");
+
+    // Assert — every mandatory §6.8 metric name is in the stream,
+    // now backed by real data points carrying the required attributes.
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let names: Vec<String> = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(ScopeMetrics::metrics)
+        .map(|m| m.name().to_string())
+        .collect();
+
+    for expected in MANDATORY {
         assert!(
             names.iter().any(|n| n == expected),
             "exported stream missing mandatory §6.8 metric `{expected}`, got {names:?}",

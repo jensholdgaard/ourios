@@ -407,11 +407,19 @@ direction and the primary obligation lives in those other RFCs.
 > - **Then** the effective threshold is `0.7`
 
 > **Scenario §3.1.2 — Mandatory metric set is exposed**
-> - **Given** a running miner
-> - **When** the miner's meter (`global::meter("ourios.miner")`) is
->   collected via an SDK in-memory reader, at zero traffic
+> - **Given** the mandatory set defined by the `ourios.miner.*`
+>   entries in the semconv registry (`semconv/registry/`, surfaced as
+>   the generated `ourios_semconv::OURIOS_MINER_*` constants), each
+>   registered as an instrument on the `ourios.miner` meter when the
+>   miner is constructed
+> - **When** a small representative workload exercises every
+>   instrument (a normal line, a near-duplicate that widens a template,
+>   an oversized-`param` line, and a parse-failure line) and the meter
+>   is collected via an SDK in-memory reader
 > - **Then** the collected metric stream contains every metric named
->   in §6.8's table (each present via its init-seeded data point)
+>   in §6.8's table — each appearing on its **first real measurement**,
+>   carrying the registry's required attributes (no synthetic
+>   zero-traffic points) —
 >   (`ourios.miner.template.count`, `ourios.miner.merges`,
 >   `ourios.miner.confidence`, `ourios.miner.confidence.p50`,
 >   `ourios.miner.confidence.p01`,
@@ -1832,21 +1840,24 @@ is `ourios.miner.template_change` (registry enum
 `semconv/registry/attributes.yaml` and consumed through the generated
 `ourios-semconv` constants.
 
+The **mandatory set is defined by the semconv registry**: the
+`ourios.miner.*` entries in `semconv/registry/`, surfaced as the
+generated `ourios_semconv::OURIOS_MINER_*` constants, are the source
+of truth for which metrics the miner must expose. Each is *registered*
+as an instrument on the `ourios.miner` meter when the miner is
+constructed.
+
 OTel's metric model is **collect-on-read**: a reader / exporter sees
-the data points produced during a collection cycle, not a registry of
-instruments, and a synchronous instrument that has recorded no
-measurement contributes no data point. To preserve §3.1.2's
-"full mandatory set is exposed" guarantee even at zero traffic, the
-miner **emits an initial data point for each mandatory instrument at
-init**, so every metric in the table below appears in the first
-collection cycle regardless of traffic. The per-kind mechanism is an
-implementation detail of the instrumentation slice: a zero `add()`
-seeds additive instruments (counters / up-down-counters) without
-distorting anything, and observable instruments report through their
-callback; histograms are seeded so they surface **without** a
-synthetic `record(0)` polluting their distribution. Verification is
-therefore by *collecting the metric stream* (an SDK in-memory reader
-in tests), not by enumerating registered instruments.
+the data points produced during a collection cycle, and an instrument
+contributes a data point on its **first real measurement**. The miner
+emits **no synthetic zero-traffic points** — so every exported series
+carries the registry's `required` attributes, with no sentinel
+attribute value to collide with a real tenant / service or violate the
+`template_change` enum. §3.1.2 is verified by exercising every
+instrument with a small representative workload and *collecting the
+metric stream* (an SDK in-memory reader in tests): the registry pins
+the mandatory set; the collection proves each instrument is registered
+and emits real data under the required attributes.
 
 The metrics enumerated in `[§3.1]` are mandatory. Full set (the
 dotted-`ourios.miner.*` registry names; the dimensions shown are
@@ -1911,12 +1922,12 @@ live tip: domain events are processed and tree state is mutated
 exactly as in live ingest, but updates to the §6.8 metrics are
 suppressed (counters do not increment, histograms do not observe,
 gauges retain their previous value or, if the miner has never
-served live traffic, their zero / empty initialisation value). The
-instruments' init-seeded data points keep the full §6.8 set visible to
-the exporter during replay — suppressing the *update* path leaves each
-metric at its seeded / last value, so §3.1.2's "full set exposed"
-invariant holds across replay without recording replay-window
-measurements. A single `wal_replay_progress` gauge
+served live traffic, their zero / empty initialisation value).
+Suppressing the *update* path means the replay window contributes no
+data points — each instrument still surfaces on its first **live**
+measurement once replay completes (§3.1.2's registry-defined set is
+satisfied by instrument registration plus real post-replay traffic,
+not by replay-window points). A single `wal_replay_progress` gauge
 (attribute `tenant_id`, value: fraction of the tenant's replay
 window completed in `[0.0, 1.0]`) is exposed during replay so
 operators can see the cold-start curve and confirm replay finished.
@@ -2093,12 +2104,15 @@ resolves bidirectionally between RFC and tests.
   §3.2.1 (default param byte limit = 256),
   §3.2.2 (limit > 1 KiB rejected).
 
-- **Metric collection test**: collect the miner's meter
-  (`global::meter("ourios.miner")`) of a freshly-initialised miner via
-  an SDK in-memory reader and assert the collected stream contains
-  every §6.8 metric name (each present via its init-seeded data
-  point), with the instrument kinds and attributes in §6.8's table,
-  and that the `ourios.miner.confidence.p50` /
+- **Metric collection test**: assert the mandatory set equals the
+  generated `ourios_semconv::OURIOS_MINER_*` constants (the registry
+  is the source of truth), then construct a miner, ingest a small
+  representative workload that exercises every instrument, collect its
+  meter (`global::meter("ourios.miner")`) via an SDK in-memory reader,
+  and assert the collected stream contains every §6.8 metric name
+  (each appearing on its first real measurement, with the required
+  attributes), with the instrument kinds and attributes in §6.8's
+  table, and that the `ourios.miner.confidence.p50` /
   `ourios.miner.confidence.p01` gauges track the same-attributed
   `ourios.miner.confidence` histogram quantiles.
   *Covers:* §3.1.2, RFC0001.8.

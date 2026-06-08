@@ -4,9 +4,19 @@
 //! (`global::meter("ourios.miner")`) per the §6.8 *Export
 //! architecture* API/SDK split: this library depends only on the
 //! lightweight `opentelemetry` API crate; the SDK + OTLP exporter
-//! live in `ourios-telemetry`. With no provider installed every
-//! `record` / `add` is a cheap no-op, so a [`MinerMetrics`] is
-//! always safe to construct and drive.
+//! live in `ourios-telemetry`. With no provider installed the
+//! instrument `record` / `add` calls are cheap no-ops, so a
+//! [`MinerMetrics`] is always safe to construct and drive.
+//!
+//! The in-process observable-gauge state ([`MinerMetricsState`]) is
+//! *not* gated on whether a provider is installed: the per-line
+//! denominator / reservoir updates take the state mutex and touch the
+//! tally maps on every ingest regardless. That cost is unconditional
+//! by design — the gauges are derived in-process (§6.8 / RFC0001.8),
+//! so the state must be maintained to serve a collection that may
+//! arrive at any time — but it is bounded: the hot-path update clones
+//! a key only on first sight of a `(tenant, service)` pair (see
+//! [`tally_mut`]) and the reservoir is capped at [`RESERVOIR_CAP`].
 //!
 //! # Metric names and attributes
 //!

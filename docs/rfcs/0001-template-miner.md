@@ -1538,11 +1538,11 @@ belt-and-braces, not the primary mechanism.
 
 **Structured bodies are out of scope of this amendment.** A
 `body_kind = Structured` row renders its canonically-encoded `body`
-column (the §6.1 canonical-encoding rule); how that render is
-classified under the `Reconstruction` signal is out of scope here.
-This amendment defines the marker for the implemented **`String`**
-path; structured-body rendering and its classification are specified
-with the RFC0001.9 structured short-circuit.
+column (the §6.1 canonical-encoding rule, exercised by the RFC0001.9
+structured short-circuit). This amendment defines the `Reconstruction`
+marker for the implemented **`String`** path only; how a structured
+render maps to a `Reconstruction` signal is left open here, to be
+settled when structured-body rendering is wired.
 
 **Clean path.** For a faithful row (`lossy_flag = false`, no
 `OVERFLOW` param, template available) the reader invokes

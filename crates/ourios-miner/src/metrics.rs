@@ -53,11 +53,6 @@ use ourios_semconv as semconv;
 /// Meter name per RFC 0001 §6.8 (`global::meter("ourios.miner")`).
 const METER_NAME: &str = "ourios.miner";
 
-/// Sentinel attribute value for init-seeded data points — keeps the
-/// mandatory set visible at zero traffic without colliding with any
-/// real `(tenant, service)` series.
-const INIT_SENTINEL: &str = "__init__";
-
 /// Sentinel `service` value for records whose `resource_attributes`
 /// carry no `service.name`. Keeps the per-`(tenant, service)`
 /// breakdown total even when the source did not set the key, rather
@@ -89,7 +84,10 @@ pub(crate) fn service_of(resource_attributes: &[OtlpKeyValue]) -> String {
         .and_then(|kv| kv.value.as_ref())
         .and_then(|av| av.value.as_ref())
         .and_then(|v| match v {
-            any_value::Value::StringValue(s) => Some(s.clone()),
+            // An empty `service.name` is treated as missing (not a real
+            // service), so it folds into `SERVICE_UNKNOWN` rather than
+            // creating an empty-string series.
+            any_value::Value::StringValue(s) if !s.is_empty() => Some(s.clone()),
             _ => None,
         })
         .unwrap_or_else(|| SERVICE_UNKNOWN.to_string())
@@ -146,10 +144,10 @@ struct MinerMetricsState {
 /// allocation-bounded, and correct over its window, with no sketch
 /// approximation error. The `confidence` histogram remains the
 /// §6.8 source of truth; the two gauges are named in-process views
-/// per RFC0001.8. If the deferred §6.8 dotted-semconv redesign
-/// makes p50/p01 backend-derived quantiles over the exported
-/// histogram instead, this in-process reservoir is replaced under
-/// that redesign's own review (the RFC flags this exact fork).
+/// per RFC0001.8. A future contract change could instead make p50/p01
+/// backend-derived quantiles over the exported `confidence` histogram
+/// (independent of the now-landed dotted-semconv naming); if so, this
+/// in-process reservoir is replaced under that change's own review.
 struct Reservoir {
     samples: VecDeque<f64>,
 }
@@ -299,20 +297,18 @@ impl MinerMetrics {
         confidence: &Histogram<f64>,
         miner_duration: &Histogram<f64>,
     ) {
-        let tenant_only = [KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)];
-        let tenant_service = [
-            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
-            KeyValue::new(semconv::OURIOS_SERVICE, INIT_SENTINEL),
-        ];
-        // Seed without the `template_change` attribute: it's a closed enum
-        // (widened/type_expanded) with no sentinel member, so a real value
-        // appears only on a real merge.
-        merges_total.add(0, &tenant_only);
-        parse_failures_total.add(0, &tenant_service);
-        params_overflow_total.add(0, &tenant_service);
-        template_version_changes_total.add(0, &tenant_only);
-        confidence.record(1.0, &tenant_service);
-        miner_duration.record(0.0, &tenant_only);
+        // Attribute-less zero points register each instrument so the
+        // mandatory §6.8 set surfaces at zero traffic (§3.1.2) without
+        // inventing a sentinel attribute value (which would collide with a
+        // real tenant/service or violate the `template_change` enum). Real
+        // series, carrying the registry's required attributes, appear on
+        // real traffic.
+        merges_total.add(0, &[]);
+        parse_failures_total.add(0, &[]);
+        params_overflow_total.add(0, &[]);
+        template_version_changes_total.add(0, &[]);
+        confidence.record(1.0, &[]);
+        miner_duration.record(0.0, &[]);
     }
 
     /// Register the §6.8 observable gauges
@@ -337,7 +333,7 @@ impl MinerMetrics {
             .with_callback(move |obs| {
                 let st = lock_state(&s);
                 if st.template_counts.is_empty() {
-                    obs.observe(0, &[KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)]);
+                    obs.observe(0, &[]);
                 }
                 for (tenant, count) in &st.template_counts {
                     obs.observe(
@@ -358,7 +354,7 @@ impl MinerMetrics {
             .with_callback(move |obs| {
                 let st = lock_state(&s);
                 if st.body_lines.is_empty() {
-                    obs.observe(0.0, &[KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)]);
+                    obs.observe(0.0, &[]);
                 }
                 for (tenant, lines) in &st.body_lines {
                     let retained = st.body_retentions.get(tenant).copied().unwrap_or(0);
@@ -380,13 +376,7 @@ impl MinerMetrics {
             .with_callback(move |obs| {
                 let st = lock_state(&s);
                 if st.by_service.is_empty() {
-                    obs.observe(
-                        0.0,
-                        &[
-                            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
-                            KeyValue::new(semconv::OURIOS_SERVICE, INIT_SENTINEL),
-                        ],
-                    );
+                    obs.observe(0.0, &[]);
                 }
                 for ((tenant, service), tally) in &st.by_service {
                     obs.observe(
@@ -434,13 +424,7 @@ impl MinerMetrics {
                     }
                 }
                 if !emitted {
-                    obs.observe(
-                        0.0,
-                        &[
-                            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
-                            KeyValue::new(semconv::OURIOS_SERVICE, INIT_SENTINEL),
-                        ],
-                    );
+                    obs.observe(0.0, &[]);
                 }
             })
             .build()

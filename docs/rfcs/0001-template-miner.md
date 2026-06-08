@@ -386,8 +386,11 @@ direction and the primary obligation lives in those other RFCs.
 > **Scenario H7.3 — Reader emits body verbatim when lossy_flag is true**
 > - **Given** a record with `lossy_flag = true`
 > - **When** the reader renders the row
-> - **Then** the rendered output is the `body` column verbatim
->   with the §6.6 warning marker
+> - **Then** the rendered bytes are the `body` column verbatim
+>   (byte-for-byte, no prefix or in-band marker)
+> - **And** the rendered row carries the §6.6 reconstruction signal
+>   `Reconstruction::RetainedVerbatim` (the out-of-band warning
+>   marker the §6.6 *Reader render contract* defines)
 > - **And** `reconstruct()` is NOT called for that row
 
 > **Scenario H7.4 — Widened literal slot reconstructs via STR fallback**
@@ -1418,6 +1421,22 @@ any param has `type_tag == OVERFLOW`.
 
 ### 6.6 Body reconstruction `[§3.3]`
 
+> **Amendment 2026-06-08 (reader render contract).** H7.3 (§5)
+> referenced "the §6.6 warning marker," but §6.6 defined no such
+> marker — the prose *Reader behaviour* paragraph it replaced
+> described one only informally. This amendment adds the *Reader
+> render contract* subsection below, defining the marker as a
+> structured, out-of-band per-row `Reconstruction` signal
+> (`Faithful` | `RetainedVerbatim`) the reader attaches to the
+> rendered row — never a mutation of the body bytes — and pinning
+> the lossy short-circuit H7.3 requires (return `body` verbatim,
+> do not call `reconstruct`). The clean-path read-time template
+> lookup (a registry mapping `(template_id, template_version) →
+> tokens` at read time) is explicitly **out of scope** and deferred
+> to the querier's reader-materialisation story (RFC 0007). RFC
+> 0001 stays `specified`; this clarifies the §6.6 contract, it does
+> not change the on-disk schema or the mining algorithm.
+
 **Capture, always.** Every successful tokenization in §6.2 step 1
 populates the `separators` array with the bytes between adjacent
 tokens (and the leading and trailing bytes of the line). The array
@@ -1468,13 +1487,76 @@ reconstruction from template + params + separators is still
 expected to match. The flag is reserved for the cases where the
 record genuinely cannot be reconstructed.
 
-**Reader behaviour.** When rendering rows, the reader checks
-`lossy_flag` first. For lossy rows it emits the `body` verbatim
-with an explicit warning marker ("this row's body cannot be
-reconstructed from the template; the displayed value is the
-original bytes as ingested"). For non-lossy rows it calls
-`reconstruct`. The reader never silently substitutes one for the
-other.
+#### Reader render contract
+
+The functions above run at *write* time: `reconstruct` is the
+property-test oracle and the in-process renderer the miner
+exercises while the template is in hand. The *reader* — the
+read-side path that materialises a stored Parquet row back into
+the effective original line for a query result — is a distinct
+caller, and H7.3 pins the contract it must honour.
+
+**The render result is `(bytes, reconstruction)`.** Rendering a
+stored row yields two things: the effective original line **bytes**
+and a per-row **reconstruction signal**
+
+```
+enum Reconstruction {
+    Faithful,         // bytes == ingested line, reconstructed from template
+    RetainedVerbatim, // bytes are the retained `body` column, not reconstructed
+}
+```
+
+The `Reconstruction` signal **is** the "§6.6 warning marker" that
+H7.3 references. It is structured, out-of-band metadata attached to
+the rendered row — *not* a mutation of the body bytes. A consumer
+(the DSL output layer, RFC 0007; a UI) renders `RetainedVerbatim`
+as a "reconstruction not faithful — original line retained verbatim"
+warning beside the row, exactly as it would render any other per-row
+annotation.
+
+**A body-byte annotation is explicitly rejected as the marker.**
+Prefixing the body with a sentinel string, wrapping it in a marker
+character, or otherwise editing the bytes to carry the warning would
+break the verbatim guarantee: the whole point of the lossy path is
+that an operator asking "show me what was actually logged" gets the
+ingested bytes back unchanged `[§3.3]`. The marker therefore lives
+beside the bytes, never inside them.
+
+**Lossy path (H7.3).** For a row with `lossy_flag = true` — the
+tokenizer-failure / explicit-rejection cases enumerated under
+*`lossy_flag` semantics* above — the reader returns the `body`
+column **verbatim** with `Reconstruction::RetainedVerbatim`, and
+does **not** invoke `reconstruct`: no template lookup, no token
+walk. The same short-circuit applies to the other rows §6.6 and
+§6.5 mark as non-reconstructable when they carry a retained body —
+an `OVERFLOW` param (§6.5), or a `body_kind = Structured` row whose
+canonically-encoded body is itself the authoritative rendering
+(§6.1). `reconstruct`'s own `lossy_flag` / `OVERFLOW` early returns
+remain in place as a **defensive guard** for callers that reach it
+anyway; the reader's contract is to short-circuit *before* that
+call, so the guard is belt-and-braces, not the primary mechanism.
+
+**Clean path.** For a faithful row (`lossy_flag = false`, no
+`OVERFLOW` param, template available) the reader invokes
+`reconstruct(record)` and attaches `Reconstruction::Faithful`. This
+path requires resolving `(template_id, template_version) → tokens`
+against a template registry available at *read* time. That registry
+— how the reader obtains the template a stored row was mined
+against, given that the miner's in-memory tree is an ingest-side
+structure — is a **separate concern and out of scope of this
+amendment**. Today `reconstruct` is exercised only where the
+template is already in hand (the write-side property test H7.1, and
+H7.4); the read-time lookup mechanism is future work, tracked with
+the querier's reader-materialisation story (RFC 0007). This
+amendment pins the render contract and the lossy path; it does
+**not** specify a template-registry design.
+
+The reader never silently substitutes one rendering for the other:
+every rendered row carries its `Reconstruction` signal, and the
+lossy/clean branch is selected solely by the row's `lossy_flag`
+(and the §6.5 / §6.1 non-reconstructable cases), never inferred
+from the bytes.
 
 **Property test.** For every row `r` in the corpus where
 `r.lossy_flag == false`:
@@ -2138,10 +2220,16 @@ resolves bidirectionally between RFC and tests.
   *Covers:* RFC0001.12, RFC0001.13, RFC0001.14, RFC0001.15,
   RFC0001.16.
 
-- **Reader behaviour test**: assert the §6.6 reader emits the
-  `body` column verbatim (with the warning marker) for
-  `lossy_flag = true` rows, and calls `reconstruct()` for the
-  rest. The reader never silently substitutes one for the other.
+- **Reader behaviour test**: assert the §6.6 *Reader render
+  contract* — for a `lossy_flag = true` row the reader returns the
+  `body` bytes verbatim (no in-band prefix/marker) carrying
+  `Reconstruction::RetainedVerbatim`, and does not call
+  `reconstruct()`; for a faithful row it calls `reconstruct()` and
+  carries `Reconstruction::Faithful`. The reader never silently
+  substitutes one rendering for the other, and never mutates the
+  body bytes to carry the marker. (The clean-path read-time
+  template-registry lookup is out of scope of this scenario per
+  §6.6.)
   *Covers:* H7.3.
 
 - **Overflow-path tests**: synthesize a parameter exceeding the

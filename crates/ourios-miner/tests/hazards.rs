@@ -605,8 +605,9 @@ fn h2_1_per_tenant_byte_limit_override_honoured() {
 /// Scenario H2.2 — Per-service overflow rate above 1% raises an alert.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
-/// "Alert" is the `params_overflow_ratio{tenant_id, service}`
-/// gauge crossing the documented `0.01` threshold (Ourios ships the
+/// "Alert" is the `ourios.miner.params.overflow.utilization`
+/// gauge (attributes `ourios.tenant` / `ourios.service`) crossing
+/// the documented `0.01` threshold (Ourios ships the
 /// metric + the alert rule, not an alerting engine). Ingests a
 /// per-service line stream whose overflow rate exceeds 1%, collects
 /// the exported stream, and asserts the gauge for the over-1%
@@ -672,10 +673,10 @@ async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
             .flat_map(ResourceMetrics::scope_metrics)
             .flat_map(ScopeMetrics::metrics)
             .find(|m| m.name() == ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION)
-            .expect("params_overflow_ratio missing from exported stream")
+            .expect("ourios.miner.params.overflow.utilization missing from exported stream")
             .data();
         let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = data else {
-            panic!("params_overflow_ratio should be an f64 gauge");
+            panic!("ourios.miner.params.overflow.utilization should be an f64 gauge");
         };
         gauge
             .data_points()
@@ -697,7 +698,11 @@ async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
                 }
                 tenant_ok && service_ok
             })
-            .unwrap_or_else(|| panic!("params_overflow_ratio missing the (acme, {service}) point"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "ourios.miner.params.overflow.utilization missing the (acme, {service}) point"
+                )
+            })
             .value()
     };
 

@@ -327,11 +327,13 @@ direction and the primary obligation lives in those other RFCs.
 >   instead of the original value
 > - **And** the `body` column contains the original line bytes
 >   regardless of `lossy_flag`
-> - **And** `params_overflow_total{tenant_id, service}` increments
+> - **And** `ourios.miner.params.overflow`
+>   (attributes `ourios.tenant`, `ourios.service`) increments
 
 > **Scenario H2.2 — Per-service overflow rate above 1% raises an alert**
-> - **Given** the `params_overflow_ratio{tenant_id, service}`
->   gauge for some service
+> - **Given** the `ourios.miner.params.overflow.utilization`
+>   gauge (attributes `ourios.tenant`, `ourios.service`)
+>   for some service
 > - **When** the rolling rate exceeds `0.01`
 > - **Then** the documented alert rule fires (the rule ships
 >   alongside §6.5's metric definition)
@@ -410,11 +412,14 @@ direction and the primary obligation lives in those other RFCs.
 >   collected via an SDK in-memory reader, at zero traffic
 > - **Then** the collected metric stream contains every metric named
 >   in §6.8's table (each present via its init-seeded data point)
->   (`template_count`, `merges_total`, `confidence`,
->   `confidence_p50`, `confidence_p01`, `body_retention_ratio`,
->   `parse_failures_total`, `params_overflow_total`,
->   `params_overflow_ratio`, `template_version_changes_total`,
->   `miner_latency_seconds`) with the instrument kinds and
+>   (`ourios.miner.template.count`, `ourios.miner.merges`,
+>   `ourios.miner.confidence`, `ourios.miner.confidence.p50`,
+>   `ourios.miner.confidence.p01`,
+>   `ourios.miner.body_retention.utilization`,
+>   `ourios.miner.parse_failures`, `ourios.miner.params.overflow`,
+>   `ourios.miner.params.overflow.utilization`,
+>   `ourios.miner.template.version_changes`,
+>   `ourios.miner.duration`) with the instrument kinds and
 >   attributes listed there
 
 > **Scenario §3.2.1 — Default per-parameter byte limit is 256**
@@ -494,7 +499,7 @@ direction and the primary obligation lives in those other RFCs.
 > - **When** a line creates the first leaf at that node
 > - **Then** no event is appended to the audit stream for that
 >   creation
-> - **And** `template_count` increments to reflect the new leaf
+> - **And** `ourios.miner.template.count` increments to reflect the new leaf
 
 > **Scenario RFC0001.2 — Degenerate-template guard rejects fully-wildcard widening**
 > - **Given** a leaf whose template, after a candidate widening,
@@ -502,7 +507,7 @@ direction and the primary obligation lives in those other RFCs.
 > - **When** the candidate widening is attempted
 > - **Then** the widening is rejected
 > - **And** the line is treated as a parse failure
->   (`confidence = 0`, body retained, `parse_failures_total`
+>   (`confidence = 0`, body retained, `ourios.miner.parse_failures`
 >   increments)
 > - **And** an audit event with
 >   `event_type = template_widening_rejected_degenerate` records
@@ -556,7 +561,7 @@ direction and the primary obligation lives in those other RFCs.
 >   followed by a `template_type_expanded` event for the type
 >   expansion (in that order)
 
-> **Scenario RFC0001.8 — confidence_p50 and confidence_p01 are emitted as gauges**
+> **Scenario RFC0001.8 — ourios.miner.confidence.p50 and ourios.miner.confidence.p01 are emitted as gauges**
 > - **Given** a running miner with a non-empty `ourios.miner.confidence`
 >   histogram for some `(ourios.tenant, ourios.service)`
 > - **When** the miner's meter is collected via an SDK in-memory reader
@@ -1102,7 +1107,7 @@ For each ingested OTLP `LogRecord`:
         # reconstruction (§6.6) is byte-identical.
         # On failure (malformed UTF-8, embedded NUL, line longer
         # than max-line-bytes): emit a parse-failure record and
-        # increment parse_failures_total. Skip the rest.
+        # increment ourios.miner.parse_failures. Skip the rest.
         # Note: an empty-after-whitespace string (the AnyValue
         # carries `""` or only whitespace) is not a parse failure
         # — it has zero tokens and the miner short-circuits with
@@ -1141,7 +1146,7 @@ For each ingested OTLP `LogRecord`:
                   simSeq(L_masked, leaf.template)
     if candidate is None:
         # no leaves under parent yet; create one. Creation does not
-        # emit an audit event — `template_count` already reflects
+        # emit an audit event — `ourios.miner.template.count` already reflects
         # leaf allocation, and §6.4 reserves the audit stream for
         # widening events whose semantics need cross-referencing.
         leaf = new Leaf(template = L_masked)
@@ -1172,7 +1177,7 @@ For each ingested OTLP `LogRecord`:
                        old_version, new_version = candidate.version,
                        positions_widened = new_wildcards.positions,
                        ...)
-            merges_total.inc()
+            ourios.miner.merges.inc()
 
         # Build the params array. One entry per <*> in the (possibly
         # just-widened) template, in template order. For each slot:
@@ -1221,11 +1226,11 @@ For each ingested OTLP `LogRecord`:
                confidence,
                lossy_flag = false,
                body = L_raw)  # forced body retention
-        body_retention_ratio.observe(retained = true)
+        ourios.miner.body_retention.utilization.observe(retained = true)
         return
 
     # similarity < floor: parse failure
-    parse_failures_total.inc()
+    ourios.miner.parse_failures.inc()
     emit_failure_record(L_raw, reason = "no candidate above floor")
 ```
 
@@ -1234,7 +1239,7 @@ Branching invariants:
 - Step 0's structured short-circuit never enters the Drain
   mining steps (1–5). Structured-Body records do not widen, do
   not emit `template_widened` or `template_type_expanded` audit
-  events, do not contribute to `merges_total`, and never carry
+  events, do not contribute to `ourios.miner.merges`, and never carry
   `params`/`separators`. The structured branch's `[§3.1]`
   preservation is vacuous: no template merge happens, so no
   silent merge is possible.
@@ -1265,8 +1270,8 @@ Branching invariants:
 
 `confidence = simSeq / threshold`. The ratio framing makes the
 decision boundary land at `confidence == 1.0` regardless of the
-configured threshold, which gives `confidence_p50` and
-`confidence_p01` (`[§3.1]` required metrics) a stable interpretation
+configured threshold, which gives `ourios.miner.confidence.p50` and
+`ourios.miner.confidence.p01` (`[§3.1]` required metrics) a stable interpretation
 across tenants with different thresholds: the p01 value tells you
 how close the *bottom 1% of attaches* are to the merge boundary.
 A collapsing p01 means many lines are barely passing — a tuning
@@ -1283,7 +1288,7 @@ Three zones, with concrete defaults:
   reconstruction failure, not on lossy zone alone — the body is
   available either way).
 - `confidence < floor / threshold`: **parse failure**.
-  `parse_failures_total` increments; the line is written to a
+  `ourios.miner.parse_failures` increments; the line is written to a
   failure record with the original bytes intact.
 
 **Defaults.** `threshold = 0.7`, `floor = 0.4`. The threshold floor
@@ -1325,10 +1330,11 @@ the schema:
 ```
 
 `event_type` is the field §6.7's drift-detection query filters on.
-`merges_total` increments on every event whose `event_type` is
-`template_widened` or `template_type_expanded` (the two structural
-widenings); `template_widening_rejected_degenerate` is recorded but
-does not increment `merges_total`. The audit stream is written to
+`ourios.miner.merges` increments on every event whose `event_type`
+is `template_widened` or `template_type_expanded` (the two
+structural widenings); `template_widening_rejected_degenerate` is
+recorded but does not increment `ourios.miner.merges`. The audit
+stream is written to
 the same WAL as the data records and ends up in a dedicated audit
 Parquet file per tenant per compaction window (schema in
 `ourios-parquet`'s RFC, not this one).
@@ -1363,7 +1369,7 @@ stream cannot substantiate.
 template with zero non-wildcard tokens (the entire template becomes
 `<*> <*> … <*>`), the widening is rejected, the line is treated as
 a parse failure (`confidence = 0`, retain body, increment
-`parse_failures_total`), and an audit event with `event_type =
+`ourios.miner.parse_failures`), and an audit event with `event_type =
 template_widening_rejected_degenerate` records the rejection. A
 fully-wildcard template provides no parsing value and would swallow
 arbitrary lines.
@@ -1394,11 +1400,11 @@ any param has `type_tag == OVERFLOW`.
 
 **Telemetry.** Two metrics for `[§3.2]` and hazard H2:
 
-- `params_overflow_total` (counter, attributes `tenant_id`,
-  `service`): increments per overflow.
-- `params_overflow_ratio` (gauge, attributes `tenant_id`,
-  `service`): rolling overflow rate. Alert at `> 0.01` per service
-  per `[§3.2]`.
+- `ourios.miner.params.overflow` (counter, attributes
+  `ourios.tenant`, `ourios.service`): increments per overflow.
+- `ourios.miner.params.overflow.utilization` (gauge, attributes
+  `ourios.tenant`, `ourios.service`): rolling overflow rate. Alert
+  at `> 0.01` per service per `[§3.2]`.
 
 ### 6.6 Body reconstruction `[§3.3]`
 
@@ -1476,7 +1482,7 @@ A template's structural state changes over time as widenings (§6.4)
 and parameter-type expansions accrue. Each change increments
 `template_version` and emits an audit event of type
 `template_widened` or `template_type_expanded`.
-`template_version_changes_total` counts these.
+`ourios.miner.template.version_changes` counts these.
 
 **Two distinct cross-cutting questions.** "Same leaf, different
 structural snapshots" and "different leaves that mean the same
@@ -1604,12 +1610,12 @@ is not acknowledged — there are no in-memory-only aliases. Unlike
 widenings, alias events are **not** emitted on the ingest hot path;
 they originate from an explicit operator/control-plane call, so they
 do not gate `attach` latency. They do **not** increment
-`merges_total` (that counter is reserved for the two structural
+`ourios.miner.merges` (that counter is reserved for the two structural
 widenings, §6.4); alias activity is counted separately as the
 `alias_assertions_total` / `alias_retractions_total` counters
-enumerated in §6.8's telemetry table (mandatory, `tenant_id`
+enumerated in §6.8's telemetry table (mandatory, `ourios.tenant`
 attribute), keeping operator-driven aliasing first-class telemetry
-per `[§3.1]` / §6.3 alongside `merges_total`.
+per `[§3.1]` / §6.3 alongside `ourios.miner.merges`.
 
 *Materialization and storage.* The durable alias **event log** (the
 `alias_asserted` / `alias_retracted` stream above) is the source of
@@ -1810,7 +1816,7 @@ the semantic conventions it MUST be set once on the provider's
 `Resource` and MUST NOT be repeated on individual data points.
 
 The per-measurement dimensions in the table below — among them
-`tenant_id`, the originating **service** of the ingested logs, and
+`ourios.tenant`, the originating **service** of the ingested logs, and
 per-metric dimensions like `event_type` — are **data-point
 attributes**. A single ingester multiplexes many tenants and many
 source services, and `[§3.1]` / `[§3.2]` require per-`(tenant,
@@ -1863,8 +1869,9 @@ exported as **attributes**, not labels — `tenant` is `ourios.tenant`,
 | `ourios.miner.template.version_changes` | counter | `tenant` | `[§3.5]`, H5 |
 | `ourios.miner.duration` | histogram | `tenant` | hot-path budget (D1) |
 
-**`confidence_p50` and `confidence_p01`.** The `confidence`
-histogram is the source of truth; the two gauges are convenient
+**`ourios.miner.confidence.p50` and `ourios.miner.confidence.p01`.**
+The `ourios.miner.confidence` histogram is the source of truth; the
+two gauges are convenient
 named views derived from it in-process. The miner recomputes them
 on a short ticker (default 10 s, configurable; the cost is one
 quantile evaluation over the histogram per tenant per service per
@@ -1898,7 +1905,7 @@ Doing so naively would re-fire every counter increment, every
 histogram observation, and every gauge update for the entire
 replay window, polluting steady-state metrics for the post-restart
 horizon (a 10-minute replay on a high-volume tenant could shift
-`merges_total` by orders of magnitude in a few seconds). The miner
+`ourios.miner.merges` by orders of magnitude in a few seconds). The miner
 therefore runs in **replay mode** until the WAL cursor reaches the
 live tip: domain events are processed and tree state is mutated
 exactly as in live ingest, but updates to the §6.8 metrics are
@@ -2021,9 +2028,10 @@ resolves bidirectionally between RFC and tests.
   *Covers:* H7.1, H7.4, §3.3.1.
 
 - **Corpus tests** on `testdata/corpus/` (fixed, anonymised; see
-  `docs/benchmarks.md` §1): assert bounds on `template_count`,
-  `merges_total`, reconstruction accuracy, parameter overflow
-  rate. Regressions are build failures, not warnings.
+  `docs/benchmarks.md` §1): assert bounds on
+  `ourios.miner.template.count`, `ourios.miner.merges`,
+  reconstruction accuracy, parameter overflow rate. Regressions are
+  build failures, not warnings.
   *Covers:* H1.1 (login/logout corpus arm), H7.1 (corpus arm).
 
 - **Confidence calibration test**: on a labelled subset of the
@@ -2090,8 +2098,9 @@ resolves bidirectionally between RFC and tests.
   an SDK in-memory reader and assert the collected stream contains
   every §6.8 metric name (each present via its init-seeded data
   point), with the instrument kinds and attributes in §6.8's table,
-  and that the `confidence_p50` / `confidence_p01` gauges track the
-  same-attributed `confidence` histogram quantiles.
+  and that the `ourios.miner.confidence.p50` /
+  `ourios.miner.confidence.p01` gauges track the same-attributed
+  `ourios.miner.confidence` histogram quantiles.
   *Covers:* §3.1.2, RFC0001.8.
 
 - **Data-model contract tests**: small unit tests against the

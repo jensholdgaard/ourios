@@ -117,8 +117,8 @@ struct MinerMetricsState {
     /// gauges.
     by_service: HashMap<(TenantId, String), ServiceTally>,
     /// Per-tenant template count, mirrored from the cluster so the
-    /// `template_count` observable gauge can report it without
-    /// borrowing the cluster.
+    /// `ourios.miner.template.count` observable gauge can report it
+    /// without borrowing the cluster.
     template_counts: HashMap<TenantId, u64>,
     /// Per-tenant body-retention numerator / line denominator for
     /// the `ourios.miner.body_retention.utilization` gauge.
@@ -206,8 +206,8 @@ pub(crate) struct MinerMetrics {
 }
 
 /// The five §6.8 observable gauges, retained to keep their callbacks
-/// registered (see [`MinerMetrics`]). `template_count` is the only
-/// `u64` gauge; the fractions and quantiles are `f64`.
+/// registered (see [`MinerMetrics`]). `ourios.miner.template.count`
+/// is the only `u64` gauge; the fractions and quantiles are `f64`.
 struct ObservableGauges {
     _template_count: ObservableGauge<u64>,
     _body_retention_utilization: ObservableGauge<f64>,
@@ -276,9 +276,9 @@ impl MinerMetrics {
     /// take a zero-`add` (no distortion); the histograms are seeded
     /// with their natural sentinel value so they appear without
     /// polluting a real distribution (confidence at the §6.1 `1.0`
-    /// clean sentinel, latency at `0.0`). All seeded points carry an
-    /// `init` sentinel attribute set, distinguishable from real
-    /// traffic.
+    /// clean sentinel, `ourios.miner.duration` at `0.0`). All seeded
+    /// points carry an `init` sentinel attribute set, distinguishable
+    /// from real traffic.
     fn seed_synchronous(
         merges_total: &Counter<u64>,
         parse_failures_total: &Counter<u64>,
@@ -481,7 +481,7 @@ impl MinerMetrics {
             .overflow_lines += 1;
     }
 
-    /// Record one parse-failure line (§6.8 `parse_failures_total`).
+    /// Record one parse-failure line (§6.8 `ourios.miner.parse_failures`).
     pub(crate) fn record_parse_failure(&self, tenant: &TenantId, service: &str) {
         self.parse_failures_total
             .add(1, &service_attrs(tenant, service));
@@ -516,7 +516,7 @@ impl MinerMetrics {
     }
 
     /// Mirror a tenant's current template count into the state the
-    /// `template_count` observable gauge reads.
+    /// `ourios.miner.template.count` observable gauge reads.
     pub(crate) fn set_template_count(&self, tenant: &TenantId, count: u64) {
         let mut st = self.state.lock().expect("metrics state mutex poisoned");
         st.template_counts.insert(tenant.clone(), count);

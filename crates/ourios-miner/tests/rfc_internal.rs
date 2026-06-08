@@ -313,21 +313,11 @@ fn rfc0001_4_confidence_ratio_decision_boundary_at_one() {
     assert_eq!(cluster.parse_failures_total(), 0);
 }
 
-/// Scenario RFC0001.5 — Bare `template_id = X` spans all versions of leaf X.
-/// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn rfc0001_5_bare_template_id_spans_all_versions_of_leaf() {
-    todo!("RFC 0001 §6.7");
-}
-
-/// Scenario RFC0001.6 — Bare `template_id = X` does NOT follow alias chains.
-/// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn rfc0001_6_bare_template_id_does_not_follow_alias_chains() {
-    todo!("RFC 0001 §6.7");
-}
+// RFC0001.5 and RFC0001.6 are querier query-semantics (what `where
+// template_id = X` returns over a written store), not miner behaviour — the
+// miner crate cannot run queries. The real AAA tests live in
+// `crates/ourios-querier/tests/rfc0001_query_semantics.rs`; the greppable
+// `RFC0001.5` / `RFC0001.6` scenario ids resolve there.
 
 /// Scenario RFC0001.7 — Combined widening + type-expansion increments version twice and emits two events in order.
 /// See `docs/rfcs/0001-template-miner.md` §5.

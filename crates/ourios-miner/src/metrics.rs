@@ -625,13 +625,13 @@ mod tests {
         // Nearest-rank p50 over 10 samples = rank ceil(0.5*10)=5 → 5th
         // smallest = 0.5; p01 = rank ceil(0.01*10)=1 → smallest = 0.1.
         // Computed off-lock from a snapshot, as the gauge callback does.
-        assert!((quantile_of(r.snapshot(), 0.50).unwrap() - 0.5).abs() < 1e-9);
-        assert!((quantile_of(r.snapshot(), 0.01).unwrap() - 0.1).abs() < 1e-9);
+        assert!((super::quantile_of(r.snapshot(), 0.50).unwrap() - 0.5).abs() < 1e-9);
+        assert!((super::quantile_of(r.snapshot(), 0.01).unwrap() - 0.1).abs() < 1e-9);
     }
 
     #[test]
     fn reservoir_empty_is_none() {
-        assert!(quantile_of(Reservoir::default().snapshot(), 0.5).is_none());
+        assert!(super::quantile_of(Reservoir::default().snapshot(), 0.5).is_none());
     }
 
     #[test]

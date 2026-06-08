@@ -31,10 +31,55 @@ fn invariant_3_1_1_default_threshold_is_0_7() {
 
 /// Scenario §3.1.2 — Mandatory metric set is exposed.
 /// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
-    todo!("RFC 0001 §6.8");
+///
+/// Installs an SDK in-memory meter provider, constructs a miner
+/// (which registers the §6.8 instrument set on the `ourios.miner`
+/// meter and init-seeds it), collects the exported stream at zero
+/// traffic, and asserts every mandatory §6.8 metric name is present
+/// via its init-seeded data point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
+    use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
+
+    use ourios_core::config::MinerConfig;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — in-memory provider, then the miner (so its
+    // instruments resolve against the global meter the provider
+    // installs). No ingest: §3.1.2 is the zero-traffic guarantee.
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+    let _cluster = MinerCluster::new(MinerConfig::default());
+
+    // Act — collect without any traffic.
+    guard.force_flush().expect("force_flush succeeds");
+
+    // Assert — every mandatory §6.8 metric name is in the stream.
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let names: Vec<String> = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(ScopeMetrics::metrics)
+        .map(|m| m.name().to_string())
+        .collect();
+
+    for expected in [
+        "template_count",
+        "merges_total",
+        "confidence",
+        "confidence_p50",
+        "confidence_p01",
+        "body_retention_ratio",
+        "parse_failures_total",
+        "params_overflow_total",
+        "params_overflow_ratio",
+        "template_version_changes_total",
+        "miner_latency_seconds",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "exported stream missing mandatory §6.8 metric `{expected}`, got {names:?}",
+        );
+    }
 }
 
 /// Scenario §3.2.1 — Default per-parameter byte limit is 256.

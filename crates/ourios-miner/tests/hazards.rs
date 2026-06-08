@@ -604,10 +604,109 @@ fn h2_1_per_tenant_byte_limit_override_honoured() {
 
 /// Scenario H2.2 — Per-service overflow rate above 1% raises an alert.
 /// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
-    todo!("RFC 0001 §6.5");
+///
+/// "Alert" is the `params_overflow_ratio{tenant_id, service}`
+/// gauge crossing the documented `0.01` threshold (Ourios ships the
+/// metric + the alert rule, not an alerting engine). Ingests a
+/// per-service line stream whose overflow rate exceeds 1%, collects
+/// the exported stream, and asserts the gauge for the over-1%
+/// service is above `0.01` while a clean sibling service stays at
+/// `0.0` — the per-service isolation H2.2 hinges on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
+    };
+
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{AnyValue, Body, KeyValue, OtlpLogRecord, any_value};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    const ALERT_THRESHOLD: f64 = 0.01;
+
+    // Arrange — in-memory provider, then the miner.
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let t = TenantId::new("acme");
+
+    let svc_attr = |service: &str| {
+        vec![KeyValue {
+            key: "service.name".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(service.to_string())),
+            }),
+            ..Default::default()
+        }]
+    };
+    let make = |service: &str, text: String| OtlpLogRecord {
+        tenant_id: t.clone(),
+        resource_attributes: svc_attr(service),
+        body: Some(Body::String(text)),
+        ..Default::default()
+    };
+
+    // A param value over the 256 B limit (§6.5) forces an Overflow
+    // marker; each such line counts once toward the service's
+    // overflow numerator.
+    let big = "9".repeat(300);
+
+    // `noisy`: 200 clean lines + 3 overflow lines → 3/203 ≈ 0.0148
+    // > 1%. `quiet`: 100 clean lines, no overflow → 0.0.
+    for i in 0..200 {
+        cluster.ingest(&make("noisy", format!("user {i} logged in")));
+    }
+    for _ in 0..3 {
+        cluster.ingest(&make("noisy", format!("user {big} logged in")));
+    }
+    for i in 0..100 {
+        cluster.ingest(&make("quiet", format!("order {i} shipped")));
+    }
+    guard.force_flush().expect("force_flush succeeds");
+
+    // Act — read the per-service ratio gauge.
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let ratio_for = |service: &str| -> f64 {
+        let data = rms
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .find(|m| m.name() == "params_overflow_ratio")
+            .expect("params_overflow_ratio missing from exported stream")
+            .data();
+        let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = data else {
+            panic!("params_overflow_ratio should be an f64 gauge");
+        };
+        gauge
+            .data_points()
+            .find(|dp| {
+                let mut tenant_ok = false;
+                let mut service_ok = false;
+                for kv in dp.attributes() {
+                    match kv.key.as_str() {
+                        "tenant_id" if kv.value.as_str() == "acme" => tenant_ok = true,
+                        "service" if kv.value.as_str() == service => service_ok = true,
+                        _ => {}
+                    }
+                }
+                tenant_ok && service_ok
+            })
+            .unwrap_or_else(|| panic!("params_overflow_ratio missing the (acme, {service}) point"))
+            .value()
+    };
+
+    // Assert — the over-1% service crosses the alert threshold; the
+    // clean sibling does not (per-service isolation).
+    let noisy = ratio_for("noisy");
+    let quiet = ratio_for("quiet");
+    assert!(
+        noisy > ALERT_THRESHOLD,
+        "noisy service overflow ratio {noisy} must exceed the {ALERT_THRESHOLD} alert threshold",
+    );
+    assert!(
+        quiet <= ALERT_THRESHOLD,
+        "quiet service overflow ratio {quiet} must stay at/under the alert threshold",
+    );
 }
 
 /// Scenario H5.1 — Wildcard widening increments `template_version` and emits `template_widened`.

@@ -16,6 +16,21 @@ ourios-core = { path = "../ourios-core" }
 # pure-Rust path — sufficient for an 8-byte-prefix hash on a
 # per-param hot path, with no platform-specific build assumptions.
 sha2 = { version = "0.10", default-features = false }
+# The OTel metrics **API** only (RFC 0001 §6.8 "Export architecture":
+# library crates depend on the lightweight API and resolve instruments
+# through `global::meter`; the heavy SDK + OTLP exporter live in
+# `ourios-telemetry`). Drives the §6.8 miner instrument set in
+# `crate::metrics`.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+
+[dev-dependencies]
+# `init_in_memory` collects the §6.8 instrument stream through an
+# in-memory reader (no OTLP endpoint) in the §3.1.2 / RFC0001.8 /
+# H2.2 telemetry tests — same pattern as the alias + compaction
+# metrics tests.
+ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
 [lints]
 workspace = true

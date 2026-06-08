@@ -1,0 +1,127 @@
+//! Shared querier integration-test fixtures: a real RFC 0005 store written by
+//! `ourios-parquet`, the same way `tests/execution.rs` builds one, so a
+//! compiled DSL runs against genuine Parquet (predicate pushdown + statistics,
+//! not a mock). Used by both `rfc0002_dsl.rs` and `rfc0001_query_semantics.rs`.
+
+// Each integration-test file (`rfc0002_dsl.rs`, `rfc0001_query_semantics.rs`)
+// compiles this module into its own binary independently, so an item used by
+// only one of them looks dead to the other. This is the standard idiom for a
+// shared `tests/common` module.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use ourios_core::audit::ParamType;
+use ourios_core::otlp::any_value::Value as AvValue;
+use ourios_core::otlp::{AnyValue, KeyValue};
+use ourios_core::record::{BodyKind, MinedRecord, Param};
+use ourios_core::tenant::TenantId;
+use ourios_parquet::{PartitionKey, Writer};
+
+/// 2026-04-02T10:58:00 UTC — the same base instant the execution tests
+/// use, so all fixture rows land in one `hour=` partition unless bumped.
+pub const TS0: u64 = 1_775_127_480_000_000_000;
+/// One hour in nanoseconds.
+pub const HOUR_NS: u64 = 3_600_000_000_000;
+
+pub fn kv(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(AvValue::StringValue(value.to_string())),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A fully-populated fixture record so every first-class field (§6.2) has
+/// a non-trivial value to query: a `service.name` resource attribute, a
+/// `scope`, an explicit severity, and optional trace/span ids.
+#[allow(clippy::too_many_arguments)]
+pub fn rec(
+    tenant: &str,
+    template_id: u64,
+    ts_ns: u64,
+    severity_number: u8,
+    service: &str,
+    scope: &str,
+    trace_id: Option<[u8; 16]>,
+    span_id: Option<[u8; 8]>,
+) -> MinedRecord {
+    MinedRecord {
+        tenant_id: TenantId::new(tenant),
+        template_id,
+        template_version: 1,
+        severity_number,
+        severity_text: None,
+        scope_name: Some(scope.to_string()),
+        scope_version: Some("1.0.0".to_string()),
+        time_unix_nano: ts_ns,
+        observed_time_unix_nano: Some(ts_ns + 1_000),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        resource_attributes: vec![kv("service.name", service)],
+        trace_id,
+        span_id,
+        flags: 0x01,
+        event_name: None,
+        body_kind: BodyKind::String,
+        params: vec![Param {
+            type_tag: ParamType::Num,
+            value: "42".to_string(),
+        }],
+        separators: vec![String::new(), " ".to_string()],
+        body: None,
+        confidence: 1.0,
+        lossy_flag: false,
+    }
+}
+
+/// A minimal record: template 1, INFO, service "api", scope "lib.cart".
+pub fn simple(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
+    rec(tenant, template_id, ts_ns, 9, "api", "lib.cart", None, None)
+}
+
+/// A record with explicit resource attributes (overriding the default
+/// single `service.name`), so a test can give one row a key and another
+/// row none.
+pub fn rec_with_resource(
+    tenant: &str,
+    ts_ns: u64,
+    resource_attributes: Vec<KeyValue>,
+) -> MinedRecord {
+    MinedRecord {
+        resource_attributes,
+        ..rec(tenant, 1, ts_ns, 9, "api", "lib.cart", None, None)
+    }
+}
+
+pub fn write_all(bucket: &Path, recs: &[MinedRecord]) {
+    let mut by_part: HashMap<PartitionKey, Vec<MinedRecord>> = HashMap::new();
+    for r in recs {
+        by_part
+            .entry(PartitionKey::derive(r).expect("derive partition"))
+            .or_default()
+            .push(r.clone());
+    }
+    for (part, rs) in by_part {
+        let mut w = Writer::open(bucket, part).expect("open writer");
+        w.append_records(&rs).expect("append");
+        w.close().expect("close");
+    }
+}
+
+/// A window wide enough that a query with no `range(...)` (which gets the
+/// default look-back ending at `now`) still covers all fixture rows.
+pub const DEFAULT_WINDOW_NS: u64 = 30 * 24 * HOUR_NS;
+/// A `now` reference comfortably after the fixture instants.
+pub const NOW: u64 = TS0 + 24 * HOUR_NS;
+
+/// An empty alias projection: no operator has aliased anything, so every
+/// `resolves_to(n)` compiles to a singleton `template_id IN (n)` list
+/// (behaviorally a bare `template_id == n`), and a bare `template_id == n`
+/// resolves with no alias chain to follow.
+pub fn no_aliases() -> ourios_core::alias::AliasMap {
+    ourios_core::alias::AliasMap::new()
+}

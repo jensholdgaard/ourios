@@ -270,134 +270,13 @@ mod wellformed {
     }
 }
 
-/// Shared fixtures: a real RFC 0005 store written by `ourios-parquet`, the
-/// same way `tests/execution.rs` builds one, so the compiled DSL runs against
-/// genuine Parquet (predicate pushdown + statistics, not a mock).
-#[cfg(test)]
-mod fixtures {
-    use std::collections::HashMap;
-    use std::path::Path;
-
-    use ourios_core::audit::ParamType;
-    use ourios_core::otlp::any_value::Value as AvValue;
-    use ourios_core::otlp::{AnyValue, KeyValue};
-    use ourios_core::record::{BodyKind, MinedRecord, Param};
-    use ourios_core::tenant::TenantId;
-    use ourios_parquet::{PartitionKey, Writer};
-
-    /// 2026-04-02T10:58:00 UTC — the same base instant the execution tests
-    /// use, so all fixture rows land in one `hour=` partition unless bumped.
-    pub const TS0: u64 = 1_775_127_480_000_000_000;
-    /// One hour in nanoseconds.
-    pub const HOUR_NS: u64 = 3_600_000_000_000;
-
-    pub fn kv(key: &str, value: &str) -> KeyValue {
-        KeyValue {
-            key: key.to_string(),
-            value: Some(AnyValue {
-                value: Some(AvValue::StringValue(value.to_string())),
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// A fully-populated fixture record so every first-class field (§6.2) has
-    /// a non-trivial value to query: a `service.name` resource attribute, a
-    /// `scope`, an explicit severity, and optional trace/span ids.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rec(
-        tenant: &str,
-        template_id: u64,
-        ts_ns: u64,
-        severity_number: u8,
-        service: &str,
-        scope: &str,
-        trace_id: Option<[u8; 16]>,
-        span_id: Option<[u8; 8]>,
-    ) -> MinedRecord {
-        MinedRecord {
-            tenant_id: TenantId::new(tenant),
-            template_id,
-            template_version: 1,
-            severity_number,
-            severity_text: None,
-            scope_name: Some(scope.to_string()),
-            scope_version: Some("1.0.0".to_string()),
-            time_unix_nano: ts_ns,
-            observed_time_unix_nano: Some(ts_ns + 1_000),
-            attributes: Vec::new(),
-            dropped_attributes_count: 0,
-            resource_attributes: vec![kv("service.name", service)],
-            trace_id,
-            span_id,
-            flags: 0x01,
-            event_name: None,
-            body_kind: BodyKind::String,
-            params: vec![Param {
-                type_tag: ParamType::Num,
-                value: "42".to_string(),
-            }],
-            separators: vec![String::new(), " ".to_string()],
-            body: None,
-            confidence: 1.0,
-            lossy_flag: false,
-        }
-    }
-
-    /// A minimal record: template 1, INFO, service "api", scope "lib.cart".
-    pub fn simple(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
-        rec(tenant, template_id, ts_ns, 9, "api", "lib.cart", None, None)
-    }
-
-    /// A record with explicit resource attributes (overriding the default
-    /// single `service.name`), so a test can give one row a key and another
-    /// row none.
-    pub fn rec_with_resource(
-        tenant: &str,
-        ts_ns: u64,
-        resource_attributes: Vec<KeyValue>,
-    ) -> MinedRecord {
-        MinedRecord {
-            resource_attributes,
-            ..rec(tenant, 1, ts_ns, 9, "api", "lib.cart", None, None)
-        }
-    }
-
-    pub fn write_all(bucket: &Path, recs: &[MinedRecord]) {
-        let mut by_part: HashMap<PartitionKey, Vec<MinedRecord>> = HashMap::new();
-        for r in recs {
-            by_part
-                .entry(PartitionKey::derive(r).expect("derive partition"))
-                .or_default()
-                .push(r.clone());
-        }
-        for (part, rs) in by_part {
-            let mut w = Writer::open(bucket, part).expect("open writer");
-            w.append_records(&rs).expect("append");
-            w.close().expect("close");
-        }
-    }
-
-    /// A window wide enough that a query with no `range(...)` (which gets the
-    /// default look-back ending at `now`) still covers all fixture rows.
-    pub const DEFAULT_WINDOW_NS: u64 = 30 * 24 * HOUR_NS;
-    /// A `now` reference comfortably after the fixture instants.
-    pub const NOW: u64 = TS0 + 24 * HOUR_NS;
-
-    /// An empty alias projection: no operator has aliased anything, so every
-    /// `resolves_to(n)` compiles to a singleton `template_id IN (n)` list
-    /// (behaviorally a bare `template_id == n`). Used by every test that is
-    /// not specifically exercising alias expansion.
-    pub fn no_aliases() -> ourios_core::alias::AliasMap {
-        ourios_core::alias::AliasMap::new()
-    }
-}
+mod common;
 
 /// Scenario RFC0002.1 — A Branch-B predicate parses and compiles to a filter.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_1_predicate_compiles_to_a_filter() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryRequest};
 
@@ -409,7 +288,7 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
         bucket.path(),
         &[simple("a", 1, TS0), simple("a", 1, TS0 + 1_000_000)],
     );
-    write_all(bucket.path(), &[simple("a", 2, TS0 + fixtures::HOUR_NS)]);
+    write_all(bucket.path(), &[simple("a", 2, TS0 + common::HOUR_NS)]);
     let q = Querier::new(bucket.path());
     let tenant = TenantId::new("a");
 
@@ -421,7 +300,7 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
             &tenant,
             NOW,
             DEFAULT_WINDOW_NS,
-            &fixtures::no_aliases(),
+            &common::no_aliases(),
         )
         .await
         .expect("run_query");
@@ -500,7 +379,7 @@ fn rfc0002_2_string_and_structured_surfaces_agree() {
 /// an error message from the compile path names no engine token (§4.6).
 #[tokio::test]
 async fn rfc0002_3_no_datafusion_leakage() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
@@ -531,7 +410,7 @@ async fn rfc0002_3_no_datafusion_leakage() {
             &tenant,
             NOW,
             DEFAULT_WINDOW_NS,
-            &fixtures::no_aliases(),
+            &common::no_aliases(),
         )
         .await
         .expect_err("an out-of-scope attribute comparison must be rejected");
@@ -552,13 +431,13 @@ async fn rfc0002_3_no_datafusion_leakage() {
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_4_default_time_window() {
-    use fixtures::{HOUR_NS, simple, write_all};
+    use common::{HOUR_NS, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
     // Arrange — `now` and a 1-hour default window. One row sits inside
     // `[now - 1h, now]`; one sits two hours before `now`, outside it.
-    let now = fixtures::TS0 + 10 * HOUR_NS;
+    let now = common::TS0 + 10 * HOUR_NS;
     let window = HOUR_NS;
     let in_window = now - HOUR_NS / 2;
     let out_of_window = now - 2 * HOUR_NS;
@@ -574,7 +453,7 @@ async fn rfc0002_4_default_time_window() {
     // Act — a query with NO range stage (match-all predicate).
     let query = ourios_querier::dsl::parse("true").expect("parse");
     let r = q
-        .run_query(&query, &tenant, now, window, &fixtures::no_aliases())
+        .run_query(&query, &tenant, now, window, &common::no_aliases())
         .await
         .expect("run_query");
 
@@ -591,7 +470,7 @@ async fn rfc0002_4_default_time_window() {
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_5_severity_name_maps_to_severity_number() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -635,7 +514,7 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &fixtures::no_aliases(),
+                &common::no_aliases(),
             )
             .await
             .expect("run_query")
@@ -678,7 +557,7 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
 /// floor. See `docs/rfcs/0002-query-dsl.md` §5 / §6.1.
 #[tokio::test]
 async fn rfc0002_5_named_severity_equality_is_a_band() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -714,7 +593,7 @@ async fn rfc0002_5_named_severity_equality_is_a_band() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &fixtures::no_aliases(),
+                &common::no_aliases(),
             )
             .await
             .expect("run_query")
@@ -749,7 +628,7 @@ async fn rfc0002_5_named_severity_equality_is_a_band() {
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_6_first_class_fields_resolve() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -781,7 +660,7 @@ async fn rfc0002_6_first_class_fields_resolve() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &fixtures::no_aliases(),
+                &common::no_aliases(),
             )
             .await
             .expect("run_query")
@@ -832,7 +711,7 @@ async fn rfc0002_6_first_class_fields_resolve() {
 /// `docs/rfcs/0002-query-dsl.md` §5 and issue #147 (the JSON-LIKE stopgap).
 #[tokio::test]
 async fn rfc0002_6_attr_not_equal_requires_present_key() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, kv, rec_with_resource, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, kv, rec_with_resource, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -860,7 +739,7 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &fixtures::no_aliases(),
+                &common::no_aliases(),
             )
             .await
             .expect("run_query")
@@ -889,7 +768,7 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
 /// `docs/rfcs/0002-query-dsl.md` §5 / hazard `CLAUDE.md` §4.6.
 #[tokio::test]
 async fn rfc0002_6_non_text_operators_rejected() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
@@ -919,7 +798,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &fixtures::no_aliases(),
+                &common::no_aliases(),
             )
             .await
             .expect_err(&format!("{text:?} must be rejected at compile"));
@@ -942,7 +821,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
 /// rejected with a clear error rather than silently dropped.
 #[tokio::test]
 async fn rfc0002_6_unsupported_stage_rejected() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
@@ -967,7 +846,7 @@ async fn rfc0002_6_unsupported_stage_rejected() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &fixtures::no_aliases(),
+                &common::no_aliases(),
             )
             .await
             .expect_err(&format!("{text:?} must be rejected, not dropped"));
@@ -981,15 +860,9 @@ async fn rfc0002_6_unsupported_stage_rejected() {
 
     // A supported pipeline still runs.
     let ok = ourios_querier::dsl::parse("body == \"x\" | limit 5").expect("parse");
-    q.run_query(
-        &ok,
-        &tenant,
-        NOW,
-        DEFAULT_WINDOW_NS,
-        &fixtures::no_aliases(),
-    )
-    .await
-    .expect("range + limit stay supported");
+    q.run_query(&ok, &tenant, NOW, DEFAULT_WINDOW_NS, &common::no_aliases())
+        .await
+        .expect("range + limit stay supported");
 }
 
 /// Scenario RFC0002.7 — Parse/serialise round-trip is idempotent.
@@ -1141,7 +1014,7 @@ fn rfc0002_8_malformed_query_specific_error() {
 /// (the un-expanded singleton), `lossy == true`, and `confidence < 0.7`.
 #[tokio::test]
 async fn rfc0002_9_resolves_to_expands_via_alias_map() {
-    use fixtures::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::alias::{ActorId, AliasMap, Operator};
     use ourios_core::audit::InMemoryAuditSink;
     use ourios_core::tenant::TenantId;
@@ -1160,10 +1033,10 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
         &[
             simple("T", A, TS0),
             simple("T", A, TS0 + 1_000),
-            simple("T", B, TS0 + fixtures::HOUR_NS),
-            simple("T", C, TS0 + 2 * fixtures::HOUR_NS),
+            simple("T", B, TS0 + common::HOUR_NS),
+            simple("T", C, TS0 + 2 * common::HOUR_NS),
             simple("T2", A, TS0),
-            simple("T2", B, TS0 + fixtures::HOUR_NS),
+            simple("T2", B, TS0 + common::HOUR_NS),
             // Distinct-id rows under T so the other template primitives have
             // something to match: one lossy (a lossy String row retains its
             // body, invariant §3.3) and one low-confidence.

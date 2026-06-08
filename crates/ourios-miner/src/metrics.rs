@@ -441,7 +441,10 @@ impl MinerMetrics {
     pub(crate) fn record_line(&self, tenant: &TenantId, service: &str, confidence: f64) {
         self.confidence
             .record(confidence, &service_attrs(tenant, service));
-        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *st.body_lines.entry(tenant.clone()).or_insert(0) += 1;
         let tally = st
             .by_service
@@ -473,7 +476,10 @@ impl MinerMetrics {
         }
         self.params_overflow_total
             .add(count, &service_attrs(tenant, service));
-        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.by_service
             .entry((tenant.clone(), service.to_owned()))
             .or_default()
@@ -489,7 +495,10 @@ impl MinerMetrics {
     /// Record one body-retention event for the
     /// `ourios.miner.body_retention.utilization` numerator (§6.3 retention paths).
     pub(crate) fn record_body_retention(&self, tenant: &TenantId) {
-        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *st.body_retentions.entry(tenant.clone()).or_insert(0) += 1;
     }
 
@@ -517,7 +526,10 @@ impl MinerMetrics {
     /// Mirror a tenant's current template count into the state the
     /// `ourios.miner.template.count` observable gauge reads.
     pub(crate) fn set_template_count(&self, tenant: &TenantId, count: u64) {
-        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.template_counts.insert(tenant.clone(), count);
     }
 }

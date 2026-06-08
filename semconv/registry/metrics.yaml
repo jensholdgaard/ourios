@@ -85,3 +85,146 @@ groups:
     attributes:
       - ref: ourios.tenant
         requirement_level: required
+
+  # Template-miner metrics (RFC 0001 §6.8).
+
+  - id: metric.ourios.miner.template.count
+    type: metric
+    metric_name: ourios.miner.template.count
+    stability: development
+    brief: Number of templates currently in a tenant's tree.
+    instrument: gauge
+    unit: "{template}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+
+  - id: metric.ourios.miner.merges
+    type: metric
+    metric_name: ourios.miner.merges
+    stability: development
+    brief: Template change events (wildcard widening, slot type-expansion).
+    instrument: counter
+    unit: "{merge}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.miner.template_change
+        requirement_level: required
+
+  - id: metric.ourios.miner.parse_failures
+    type: metric
+    metric_name: ourios.miner.parse_failures
+    stability: development
+    brief: Lines that failed to parse and fell back to body retention.
+    instrument: counter
+    unit: "{failure}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
+  - id: metric.ourios.miner.params.overflow
+    type: metric
+    metric_name: ourios.miner.params.overflow
+    stability: development
+    brief: Per-parameter byte-limit overflow events (§3.2).
+    instrument: counter
+    unit: "{overflow}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
+  - id: metric.ourios.miner.template.version_changes
+    type: metric
+    metric_name: ourios.miner.template.version_changes
+    stability: development
+    brief: Template-version increments (schema evolution, §3.5 / H5).
+    instrument: counter
+    unit: "{change}"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+
+  - id: metric.ourios.miner.confidence
+    type: metric
+    metric_name: ourios.miner.confidence
+    stability: development
+    brief: Per-line parse-confidence distribution.
+    instrument: histogram
+    unit: "1"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
+  - id: metric.ourios.miner.duration
+    type: metric
+    metric_name: ourios.miner.duration
+    stability: development
+    brief: Per-line miner processing duration (hot-path budget D1).
+    instrument: histogram
+    unit: "s"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+
+  - id: metric.ourios.miner.confidence.p50
+    type: metric
+    metric_name: ourios.miner.confidence.p50
+    stability: development
+    brief: >-
+      Median parse confidence, an in-process named view of the
+      `ourios.miner.confidence` histogram (RFC 0001 §6.8, RFC0001.8).
+    instrument: gauge
+    unit: "1"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
+  - id: metric.ourios.miner.confidence.p01
+    type: metric
+    metric_name: ourios.miner.confidence.p01
+    stability: development
+    brief: >-
+      1st-percentile parse confidence, an in-process named view of the
+      `ourios.miner.confidence` histogram (RFC 0001 §6.8, RFC0001.8).
+    instrument: gauge
+    unit: "1"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
+  - id: metric.ourios.miner.body_retention.utilization
+    type: metric
+    metric_name: ourios.miner.body_retention.utilization
+    stability: development
+    brief: Fraction of lines that retained their original body (§3.3).
+    instrument: gauge
+    unit: "1"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+
+  - id: metric.ourios.miner.params.overflow.utilization
+    type: metric
+    metric_name: ourios.miner.params.overflow.utilization
+    stability: development
+    brief: >-
+      Fraction of lines with at least one overflowing parameter
+      (§3.2 / H2 per-service overflow alert).
+    instrument: gauge
+    unit: "1"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended

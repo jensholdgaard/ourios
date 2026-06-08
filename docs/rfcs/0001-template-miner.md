@@ -1500,7 +1500,7 @@ caller, and H7.3 pins the contract it must honour.
 stored row yields two things: the effective original line **bytes**
 and a per-row **reconstruction signal**
 
-```
+```rust
 enum Reconstruction {
     Faithful,         // bytes == ingested line, reconstructed from template
     RetainedVerbatim, // bytes are the retained `body` column, not reconstructed
@@ -1511,7 +1511,7 @@ The `Reconstruction` signal **is** the "§6.6 warning marker" that
 H7.3 references. It is structured, out-of-band metadata attached to
 the rendered row — *not* a mutation of the body bytes. A consumer
 (the DSL output layer, RFC 0007; a UI) renders `RetainedVerbatim`
-as a "reconstruction not faithful — original line retained verbatim"
+as a "rendered from the retained `body` bytes, not reconstructed"
 warning beside the row, exactly as it would render any other per-row
 annotation.
 

@@ -268,9 +268,10 @@ impl AuditPayload {
         match self {
             Self::Template { change, .. } => change.counts_as_merge(),
             // Alias activity is counted separately via
-            // `alias_assertions_total` / `alias_retractions_total`
-            // (RFC 0001 §6.7); `merges_total` is reserved for the two
-            // structural widenings.
+            // `ourios.miner.alias.assertions` /
+            // `ourios.miner.alias.retractions` (RFC 0001 §6.7);
+            // `ourios.miner.merges` is reserved for the two structural
+            // widenings.
             Self::AliasAsserted { .. } | Self::AliasRetracted { .. } | Self::Compaction { .. } => {
                 false
             }

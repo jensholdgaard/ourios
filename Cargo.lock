@@ -2656,6 +2656,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "ourios-semconv",
  "ourios-telemetry",
  "serde_json",
  "tokio",

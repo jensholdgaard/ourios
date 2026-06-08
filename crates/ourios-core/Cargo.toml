@@ -34,9 +34,13 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # library crates depend on the lightweight API and resolve instruments
 # through `global::meter`; the heavy SDK + OTLP exporter live in
 # `ourios-telemetry`). Drives the alias map's
-# `alias_assertions_total` / `alias_retractions_total` counters
-# (§6.8 telemetry table).
+# `ourios.miner.alias.assertions` / `ourios.miner.alias.retractions`
+# counters (§6.8 telemetry table).
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# Generated dotted-`ourios.*` semconv name constants for the alias
+# counters' metric names + `ourios.tenant` attribute key (§6.8).
+# Zero-dep leaf crate.
+ourios-semconv = { path = "../ourios-semconv" }
 
 [dev-dependencies]
 # `init_in_memory` collects the alias counters' exported metric stream

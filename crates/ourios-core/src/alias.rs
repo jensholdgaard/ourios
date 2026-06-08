@@ -41,6 +41,7 @@ use std::time::SystemTime;
 
 use opentelemetry::metrics::Counter;
 use opentelemetry::{KeyValue, global};
+use ourios_semconv as semconv;
 
 use crate::audit::{AuditEvent, AuditPayload, AuditSink};
 use crate::tenant::TenantId;
@@ -51,17 +52,6 @@ use crate::tenant::TenantId;
 /// audit stream's per-event size stays bounded regardless of operator
 /// input.
 pub const REASON_BYTE_LIMIT: usize = 256;
-
-/// `alias_assertions_total` (RFC 0001 §6.8 telemetry table). Named with
-/// the pre-redesign identifier the table pins — the dotted-`ourios.*`
-/// semconv conversion is the deferred §6.8 redesign, not this slice.
-const METRIC_ALIAS_ASSERTIONS_TOTAL: &str = "alias_assertions_total";
-/// `alias_retractions_total` (RFC 0001 §6.8 telemetry table).
-const METRIC_ALIAS_RETRACTIONS_TOTAL: &str = "alias_retractions_total";
-/// The `tenant_id` data-point attribute key. Pre-redesign name per the
-/// §6.8 table (the namespaced `ourios.tenant` key is the deferred
-/// dotted-semconv redesign).
-const ATTR_TENANT_ID: &str = "tenant_id";
 
 /// The operator / API principal that issued an alias assertion.
 ///
@@ -212,19 +202,20 @@ impl AliasMap {
     /// provider is installed, so constructing and recording is always
     /// safe).
     ///
-    /// `alias_assertions_total` / `alias_retractions_total` carry a
-    /// `tenant_id` attribute, so a per-tenant point appears on the first
-    /// real assertion / retraction (§6.8 collect-on-read) — they are not
-    /// zero-seeded, which would emit a spurious attribute-less series.
+    /// `ourios.miner.alias.assertions` / `ourios.miner.alias.retractions`
+    /// carry an `ourios.tenant` attribute, so a per-tenant point appears
+    /// on the first real assertion / retraction (§6.8 collect-on-read) —
+    /// they are not zero-seeded, which would emit a spurious
+    /// attribute-less series.
     #[must_use]
     pub fn new() -> Self {
         let meter = global::meter("ourios.miner");
         let assertions_total = meter
-            .u64_counter(METRIC_ALIAS_ASSERTIONS_TOTAL)
+            .u64_counter(semconv::OURIOS_MINER_ALIAS_ASSERTIONS)
             .with_unit("{assertion}")
             .build();
         let retractions_total = meter
-            .u64_counter(METRIC_ALIAS_RETRACTIONS_TOTAL)
+            .u64_counter(semconv::OURIOS_MINER_ALIAS_RETRACTIONS)
             .with_unit("{retraction}")
             .build();
         Self {
@@ -242,7 +233,7 @@ impl AliasMap {
     /// ≥ 2 distinct ids), emits an [`AuditPayload::AliasAsserted`]
     /// event through `sink`, folds the asserted set into the tenant's
     /// classes (union-on-overlap: any pre-existing class sharing a
-    /// member merges in), and increments `alias_assertions_total`.
+    /// member merges in), and increments `ourios.miner.alias.assertions`.
     /// `representative_id` is the operator's anchor id only — membership
     /// is the union, independent of which id was named the anchor.
     ///
@@ -282,7 +273,10 @@ impl AliasMap {
         self.union_in(tenant, &asserted);
         self.assertions_total.add(
             1,
-            &[KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned())],
+            &[KeyValue::new(
+                semconv::OURIOS_TENANT,
+                tenant.as_str().to_owned(),
+            )],
         );
         Ok(())
     }
@@ -293,7 +287,7 @@ impl AliasMap {
     /// derived canonical. Emits an [`AuditPayload::AliasRetracted`]
     /// event through `sink` (with `representative_id = id` as the
     /// operator's anchor and empty `member_ids`), removes `id` from its
-    /// class, and increments `alias_retractions_total`. A class that
+    /// class, and increments `ourios.miner.alias.retractions`. A class that
     /// drops to a single member is no longer an alias set and is
     /// dropped — that lone id then resolves only to itself
     /// (RFC0001.16). The canonical re-derives as `min` of the remainder
@@ -330,7 +324,10 @@ impl AliasMap {
         self.remove_id(tenant, id);
         self.retractions_total.add(
             1,
-            &[KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned())],
+            &[KeyValue::new(
+                semconv::OURIOS_TENANT,
+                tenant.as_str().to_owned(),
+            )],
         );
         Ok(())
     }
@@ -566,12 +563,13 @@ mod tests {
         assert_eq!(replayed.resolves(&t, 2), [2].into_iter().collect());
     }
 
-    // RFC 0001 §6.8 telemetry table: `alias_assertions_total` /
-    // `alias_retractions_total` are mandatory counters with a
-    // `tenant_id` attribute. Collect the exported metric stream through
-    // an in-memory reader (no OTLP endpoint) and assert both surface,
-    // exactly as the compaction-metrics test does. `init_in_memory`
-    // installs the *global* provider, so this is a single-provider test.
+    // RFC 0001 §6.8 telemetry table: `ourios.miner.alias.assertions` /
+    // `ourios.miner.alias.retractions` are mandatory counters with an
+    // `ourios.tenant` attribute. Collect the exported metric stream
+    // through an in-memory reader (no OTLP endpoint) and assert both
+    // surface, exactly as the compaction-metrics test does.
+    // `init_in_memory` installs the *global* provider, so this is a
+    // single-provider test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn alias_counters_are_exported_with_tenant_attribute() {
         use opentelemetry_sdk::metrics::data::{
@@ -600,8 +598,8 @@ mod tests {
             .map(|m| m.name().to_string())
             .collect();
         for expected in [
-            METRIC_ALIAS_ASSERTIONS_TOTAL,
-            METRIC_ALIAS_RETRACTIONS_TOTAL,
+            semconv::OURIOS_MINER_ALIAS_ASSERTIONS,
+            semconv::OURIOS_MINER_ALIAS_RETRACTIONS,
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
@@ -621,17 +619,18 @@ mod tests {
                 panic!("{name} should be a u64 sum");
             };
             sum.data_points().any(|dp| {
-                dp.attributes()
-                    .any(|kv| kv.key.as_str() == ATTR_TENANT_ID && kv.value.as_str() == "acme")
+                dp.attributes().any(|kv| {
+                    kv.key.as_str() == semconv::OURIOS_TENANT && kv.value.as_str() == "acme"
+                })
             })
         };
         assert!(
-            tenant_attr_present(METRIC_ALIAS_ASSERTIONS_TOTAL),
-            "alias_assertions_total must carry the tenant_id attribute",
+            tenant_attr_present(semconv::OURIOS_MINER_ALIAS_ASSERTIONS),
+            "ourios.miner.alias.assertions must carry the ourios.tenant attribute",
         );
         assert!(
-            tenant_attr_present(METRIC_ALIAS_RETRACTIONS_TOTAL),
-            "alias_retractions_total must carry the tenant_id attribute",
+            tenant_attr_present(semconv::OURIOS_MINER_ALIAS_RETRACTIONS),
+            "ourios.miner.alias.retractions must carry the ourios.tenant attribute",
         );
     }
 }

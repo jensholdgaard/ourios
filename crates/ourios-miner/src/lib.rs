@@ -2,6 +2,7 @@
 
 pub mod cluster;
 pub mod mask;
+mod metrics;
 pub mod overflow;
 pub mod reconstruct;
 pub mod sim_seq;

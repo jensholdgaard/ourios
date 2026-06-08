@@ -285,6 +285,19 @@ impl TemplateChange {
     pub fn counts_as_merge(&self) -> bool {
         matches!(self, Self::Widened { .. } | Self::TypeExpanded { .. })
     }
+
+    /// The canonical `event_type` string for this change — the
+    /// `ourios.miner.merges` `ourios.miner.template_change` attribute
+    /// (RFC 0001 §6.8) reads it. Mirrors [`AuditPayload::event_type`]
+    /// for the `Template` payload arm.
+    #[must_use]
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
+            Self::TypeExpanded { .. } => EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
+            Self::RejectedDegenerate { .. } => EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+        }
+    }
 }
 
 /// Type tag for a masked parameter slot.

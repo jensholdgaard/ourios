@@ -442,10 +442,138 @@ fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
 
 /// Scenario RFC0001.8 — `confidence_p50` and `confidence_p01` are emitted as gauges.
 /// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
-    todo!("RFC 0001 §6.8");
+///
+/// Ingests a controlled confidence spread for one `(tenant_id,
+/// service)`, collects the exported stream, and asserts the
+/// `confidence_p50` / `confidence_p01` gauges are present for that
+/// attribute pair with values equal to the nearest-rank quantile of
+/// the same samples the `confidence` histogram saw (the in-process
+/// reservoir per §6.8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
+    };
+
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{AnyValue, Body, KeyValue, OtlpLogRecord, any_value};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Nearest-rank quantile, mirroring `crate::metrics::Reservoir`
+    // (rank = ceil(q * n), clamped to [1, n]). The gauge reads the
+    // same per-line confidences the record sink captures, so
+    // recomputing here is the cross-check RFC0001.8 demands.
+    fn nearest_rank(samples: &[f64], q: f64) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation
+        )]
+        let rank = (q * sorted.len() as f64).ceil().max(1.0) as usize;
+        sorted[rank.min(sorted.len()) - 1]
+    }
+
+    // Arrange — in-memory provider, then the miner with a record
+    // sink so the per-line confidences feeding the gauge are
+    // observable for an independent quantile cross-check.
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+    let sink = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+    let t = TenantId::new("acme");
+    let service = "checkout";
+    let svc_attr = vec![KeyValue {
+        key: "service.name".to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(service.to_string())),
+        }),
+        ..Default::default()
+    }];
+    let make = |text: &str| OtlpLogRecord {
+        tenant_id: t.clone(),
+        resource_attributes: svc_attr.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // Act — a mix of distinct shapes (fresh leaves, confidence
+    // sentinel 1.0) and a low-similarity line that lands in a zone
+    // with a sub-1.0 confidence, so the p50/p01 spread is
+    // non-degenerate. The exact per-line confidences are read back
+    // from the record sink rather than assumed.
+    cluster.ingest(&make("alpha beta gamma delta epsilon"));
+    cluster.ingest(&make("one two three four five"));
+    cluster.ingest(&make("red green blue cyan magenta"));
+    cluster.ingest(&make("alpha beta gamma rho sigma"));
+    cluster.ingest(&make("alpha beta phi rho sigma omega"));
+    guard.force_flush().expect("force_flush succeeds");
+
+    let samples: Vec<f64> = sink
+        .drain()
+        .iter()
+        .map(|r| f64::from(r.confidence))
+        .collect();
+    assert!(!samples.is_empty(), "the miner must emit a record per line");
+    let expected_p50 = nearest_rank(&samples, 0.50);
+    let expected_p01 = nearest_rank(&samples, 0.01);
+    // Guard against a degenerate (all-equal) confidence stream so
+    // the quantile cross-check below is genuinely exercised: a
+    // p50 == p01 single-value distribution would pass trivially.
+    assert!(
+        (expected_p50 - expected_p01).abs() > 1e-9,
+        "test setup must produce a non-degenerate confidence spread (p50={expected_p50}, p01={expected_p01})",
+    );
+
+    // Assert — both gauges present for (tenant_id=acme,
+    // service=checkout) with the expected nearest-rank values.
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let gauge_value = |name: &str| -> f64 {
+        let data = rms
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .find(|m| m.name() == name)
+            .unwrap_or_else(|| panic!("{name} missing from exported stream"))
+            .data();
+        let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = data else {
+            panic!("{name} should be an f64 gauge");
+        };
+        gauge
+            .data_points()
+            .find(|dp| {
+                let mut tenant_ok = false;
+                let mut service_ok = false;
+                for kv in dp.attributes() {
+                    match kv.key.as_str() {
+                        k if k == ourios_semconv::OURIOS_TENANT && kv.value.as_str() == "acme" => {
+                            tenant_ok = true;
+                        }
+                        k if k == ourios_semconv::OURIOS_SERVICE
+                            && kv.value.as_str() == service =>
+                        {
+                            service_ok = true;
+                        }
+                        _ => {}
+                    }
+                }
+                tenant_ok && service_ok
+            })
+            .unwrap_or_else(|| panic!("{name} missing the (acme, checkout) data point"))
+            .value()
+    };
+
+    assert!(
+        (gauge_value(ourios_semconv::OURIOS_MINER_CONFIDENCE_P50) - expected_p50).abs() < 1e-6,
+        "confidence_p50 must match the in-process p50 quantile",
+    );
+    assert!(
+        (gauge_value(ourios_semconv::OURIOS_MINER_CONFIDENCE_P01) - expected_p01).abs() < 1e-6,
+        "confidence_p01 must match the in-process p01 quantile",
+    );
 }
 
 /// Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id.

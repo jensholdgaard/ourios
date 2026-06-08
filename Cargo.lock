@@ -2689,8 +2689,13 @@ dependencies = [
 name = "ourios-miner"
 version = "0.0.0"
 dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
  "ourios-core",
+ "ourios-semconv",
+ "ourios-telemetry",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

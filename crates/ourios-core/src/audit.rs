@@ -268,9 +268,10 @@ impl AuditPayload {
         match self {
             Self::Template { change, .. } => change.counts_as_merge(),
             // Alias activity is counted separately via
-            // `alias_assertions_total` / `alias_retractions_total`
-            // (RFC 0001 §6.7); `merges_total` is reserved for the two
-            // structural widenings.
+            // `ourios.miner.alias.assertions` /
+            // `ourios.miner.alias.retractions` (RFC 0001 §6.7);
+            // `ourios.miner.merges` is reserved for the two structural
+            // widenings.
             Self::AliasAsserted { .. } | Self::AliasRetracted { .. } | Self::Compaction { .. } => {
                 false
             }
@@ -284,6 +285,19 @@ impl TemplateChange {
     #[must_use]
     pub fn counts_as_merge(&self) -> bool {
         matches!(self, Self::Widened { .. } | Self::TypeExpanded { .. })
+    }
+
+    /// The canonical `event_type` string for this change — the
+    /// `ourios.miner.merges` `ourios.miner.template_change` attribute
+    /// (RFC 0001 §6.8) reads it. Mirrors [`AuditPayload::event_type`]
+    /// for the `Template` payload arm.
+    #[must_use]
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
+            Self::TypeExpanded { .. } => EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
+            Self::RejectedDegenerate { .. } => EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+        }
     }
 }
 

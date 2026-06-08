@@ -9,6 +9,27 @@ groups:
         stability: development
         brief: The tenant the telemetry pertains to.
         examples: ["acme", "t-0042"]
+      - id: ourios.service
+        type: string
+        stability: development
+        brief: >-
+          The source service of the ingested logs (the log's own
+          `service.name`), distinct from Ourios's own `service.name`
+          resource attribute.
+        examples: ["checkout", "billing"]
+      - id: ourios.miner.template_change
+        type:
+          members:
+            - id: widened
+              value: "template_widened"
+              stability: development
+              brief: A wildcard position was widened to absorb a new line.
+            - id: type_expanded
+              value: "template_type_expanded"
+              stability: development
+              brief: A slot's type set grew to admit a new parameter type.
+        stability: development
+        brief: The kind of template merge a `ourios.miner.merges` event records.
       - id: ourios.io.direction
         type:
           members:

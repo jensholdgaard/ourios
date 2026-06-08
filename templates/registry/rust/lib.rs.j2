@@ -17,7 +17,7 @@
 
 #![deny(unsafe_code)]
 
-// Metric names (RFC 0009 §3.6).
+// Metric names (RFC 0009 §3.6, RFC 0001 §6.8).
 {% for group in ctx.groups | selectattr("type", "equalto", "metric") %}
 /// `{{ group.metric_name }}` ({{ group.instrument }}, unit `{{ group.unit }}`).
 pub const {{ group.metric_name | screaming_snake_case }}: &str = "{{ group.metric_name }}";

@@ -63,17 +63,17 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
         .collect();
 
     for expected in [
-        "template_count",
-        "merges_total",
-        "confidence",
-        "confidence_p50",
-        "confidence_p01",
-        "body_retention_ratio",
-        "parse_failures_total",
-        "params_overflow_total",
-        "params_overflow_ratio",
-        "template_version_changes_total",
-        "miner_latency_seconds",
+        ourios_semconv::OURIOS_MINER_TEMPLATE_COUNT,
+        ourios_semconv::OURIOS_MINER_MERGES,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P50,
+        ourios_semconv::OURIOS_MINER_CONFIDENCE_P01,
+        ourios_semconv::OURIOS_MINER_BODY_RETENTION_RATIO,
+        ourios_semconv::OURIOS_MINER_PARSE_FAILURES,
+        ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW,
+        ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW_RATIO,
+        ourios_semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES,
+        ourios_semconv::OURIOS_MINER_LATENCY,
     ] {
         assert!(
             names.iter().any(|n| n == expected),

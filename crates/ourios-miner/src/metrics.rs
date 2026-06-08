@@ -8,16 +8,14 @@
 //! `record` / `add` is a cheap no-op, so a [`MinerMetrics`] is
 //! always safe to construct and drive.
 //!
-//! # Metric names and attributes (pre-redesign)
+//! # Metric names and attributes
 //!
-//! The instrument names (`template_count`, `merges_total`, …) and
-//! data-point attribute keys (`tenant_id`, `service`,
-//! `event_type`) are the **flat, pre-redesign** identifiers the
-//! §6.8 table pins. The dotted-`ourios.*` semconv conversion (and
-//! the `semconv/registry/` weaver entries) is the deferred §6.8
-//! redesign, not this slice — exactly as the existing
-//! `alias_assertions_total` / `alias_retractions_total` counters
-//! (`ourios_core::alias`) are named.
+//! Names (`ourios.miner.template.count`, `ourios.miner.merges`, …)
+//! and data-point attribute keys (`ourios.tenant`, `ourios.service`,
+//! `ourios.miner.template_change`) come from the generated
+//! [`ourios_semconv`] constants — the dotted-`ourios.*` weaver
+//! registry (`semconv/registry/`) alongside the compaction set
+//! (RFC 0009 §3.6).
 //!
 //! # Sync vs. observable
 //!
@@ -45,32 +43,15 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 use opentelemetry::{KeyValue, global};
 
 use ourios_core::otlp::{KeyValue as OtlpKeyValue, any_value};
 use ourios_core::tenant::TenantId;
+use ourios_semconv as semconv;
 
 /// Meter name per RFC 0001 §6.8 (`global::meter("ourios.miner")`).
 const METER_NAME: &str = "ourios.miner";
-
-// §6.8 metric names — flat, pre-redesign identifiers.
-const METRIC_TEMPLATE_COUNT: &str = "template_count";
-const METRIC_MERGES_TOTAL: &str = "merges_total";
-const METRIC_CONFIDENCE: &str = "confidence";
-const METRIC_CONFIDENCE_P50: &str = "confidence_p50";
-const METRIC_CONFIDENCE_P01: &str = "confidence_p01";
-const METRIC_BODY_RETENTION_RATIO: &str = "body_retention_ratio";
-const METRIC_PARSE_FAILURES_TOTAL: &str = "parse_failures_total";
-const METRIC_PARAMS_OVERFLOW_TOTAL: &str = "params_overflow_total";
-const METRIC_PARAMS_OVERFLOW_RATIO: &str = "params_overflow_ratio";
-const METRIC_TEMPLATE_VERSION_CHANGES_TOTAL: &str = "template_version_changes_total";
-const METRIC_MINER_LATENCY_SECONDS: &str = "miner_latency_seconds";
-
-// §6.8 data-point attribute keys — flat, pre-redesign.
-const ATTR_TENANT_ID: &str = "tenant_id";
-const ATTR_SERVICE: &str = "service";
-const ATTR_EVENT_TYPE: &str = "event_type";
 
 /// Sentinel attribute value for init-seeded data points — keeps the
 /// mandatory set visible at zero traffic without colliding with any
@@ -166,7 +147,7 @@ struct Reservoir {
 impl Default for Reservoir {
     fn default() -> Self {
         Self {
-            samples: VecDeque::with_capacity(0),
+            samples: VecDeque::with_capacity(RESERVOIR_CAP),
         }
     }
 }
@@ -215,6 +196,24 @@ pub(crate) struct MinerMetrics {
     template_version_changes_total: Counter<u64>,
     confidence: Histogram<f64>,
     miner_latency_seconds: Histogram<f64>,
+    /// The observable gauges are held for the [`MinerMetrics`]'s
+    /// lifetime so their collection callbacks stay registered with
+    /// the meter — dropping a handle deregisters its callback, after
+    /// which the gauge would vanish from the exported stream. The
+    /// values are never read directly; the SDK invokes their
+    /// callbacks on collect.
+    _observable_gauges: ObservableGauges,
+}
+
+/// The five §6.8 observable gauges, retained to keep their callbacks
+/// registered (see [`MinerMetrics`]). `template_count` is the only
+/// `u64` gauge; the ratios and quantiles are `f64`.
+struct ObservableGauges {
+    _template_count: ObservableGauge<u64>,
+    _body_retention_ratio: ObservableGauge<f64>,
+    _params_overflow_ratio: ObservableGauge<f64>,
+    _confidence_p50: ObservableGauge<f64>,
+    _confidence_p01: ObservableGauge<f64>,
 }
 
 impl MinerMetrics {
@@ -226,31 +225,31 @@ impl MinerMetrics {
         let state = Arc::new(Mutex::new(MinerMetricsState::default()));
 
         let merges_total = meter
-            .u64_counter(METRIC_MERGES_TOTAL)
+            .u64_counter(semconv::OURIOS_MINER_MERGES)
             .with_unit("{merge}")
             .build();
         let parse_failures_total = meter
-            .u64_counter(METRIC_PARSE_FAILURES_TOTAL)
+            .u64_counter(semconv::OURIOS_MINER_PARSE_FAILURES)
             .with_unit("{failure}")
             .build();
         let params_overflow_total = meter
-            .u64_counter(METRIC_PARAMS_OVERFLOW_TOTAL)
+            .u64_counter(semconv::OURIOS_MINER_PARAMS_OVERFLOW)
             .with_unit("{overflow}")
             .build();
         let template_version_changes_total = meter
-            .u64_counter(METRIC_TEMPLATE_VERSION_CHANGES_TOTAL)
+            .u64_counter(semconv::OURIOS_MINER_TEMPLATE_VERSION_CHANGES)
             .with_unit("{change}")
             .build();
         let confidence = meter
-            .f64_histogram(METRIC_CONFIDENCE)
+            .f64_histogram(semconv::OURIOS_MINER_CONFIDENCE)
             .with_unit("1")
             .build();
         let miner_latency_seconds = meter
-            .f64_histogram(METRIC_MINER_LATENCY_SECONDS)
+            .f64_histogram(semconv::OURIOS_MINER_LATENCY)
             .with_unit("s")
             .build();
 
-        Self::register_observable_gauges(&meter, &state);
+        let observable_gauges = Self::register_observable_gauges(&meter, &state);
         Self::seed_synchronous(
             &merges_total,
             &parse_failures_total,
@@ -268,6 +267,7 @@ impl MinerMetrics {
             template_version_changes_total,
             confidence,
             miner_latency_seconds,
+            _observable_gauges: observable_gauges,
         }
     }
 
@@ -287,14 +287,14 @@ impl MinerMetrics {
         confidence: &Histogram<f64>,
         miner_latency_seconds: &Histogram<f64>,
     ) {
-        let tenant_only = [KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL)];
+        let tenant_only = [KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)];
         let tenant_event = [
-            KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL),
-            KeyValue::new(ATTR_EVENT_TYPE, INIT_SENTINEL),
+            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
+            KeyValue::new(semconv::OURIOS_MINER_TEMPLATE_CHANGE, INIT_SENTINEL),
         ];
         let tenant_service = [
-            KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL),
-            KeyValue::new(ATTR_SERVICE, INIT_SENTINEL),
+            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
+            KeyValue::new(semconv::OURIOS_SERVICE, INIT_SENTINEL),
         ];
         merges_total.add(0, &tenant_event);
         parse_failures_total.add(0, &tenant_service);
@@ -304,62 +304,76 @@ impl MinerMetrics {
         miner_latency_seconds.record(0.0, &tenant_only);
     }
 
-    /// Register the §6.8 observable gauges (`template_count`,
-    /// `confidence_p50`, `confidence_p01`, `body_retention_ratio`,
-    /// `params_overflow_ratio`) with callbacks over the shared
+    /// Register the §6.8 observable gauges
+    /// (`ourios.miner.template.count`, `…confidence.p50`,
+    /// `…confidence.p01`, `…body_retention.ratio`,
+    /// `…params.overflow.ratio`) with callbacks over the shared
     /// state. Each callback always emits at least one data point
     /// (an `init` sentinel series when state is empty) so the
     /// gauges surface at zero traffic per §3.1.2.
-    fn register_observable_gauges(meter: &Meter, state: &Arc<Mutex<MinerMetricsState>>) {
+    ///
+    /// Returns the gauge handles so the caller can retain them: a
+    /// dropped handle deregisters its callback (see
+    /// [`ObservableGauges`]).
+    fn register_observable_gauges(
+        meter: &Meter,
+        state: &Arc<Mutex<MinerMetricsState>>,
+    ) -> ObservableGauges {
         let s = Arc::clone(state);
-        let _template_count = meter
-            .u64_observable_gauge(METRIC_TEMPLATE_COUNT)
+        let template_count = meter
+            .u64_observable_gauge(semconv::OURIOS_MINER_TEMPLATE_COUNT)
             .with_unit("{template}")
             .with_callback(move |obs| {
-                let st = s.lock().expect("metrics state mutex poisoned");
+                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if st.template_counts.is_empty() {
-                    obs.observe(0, &[KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL)]);
+                    obs.observe(0, &[KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)]);
                 }
                 for (tenant, count) in &st.template_counts {
                     obs.observe(
                         *count,
-                        &[KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned())],
+                        &[KeyValue::new(
+                            semconv::OURIOS_TENANT,
+                            tenant.as_str().to_owned(),
+                        )],
                     );
                 }
             })
             .build();
 
         let s = Arc::clone(state);
-        let _body_retention_ratio = meter
-            .f64_observable_gauge(METRIC_BODY_RETENTION_RATIO)
+        let body_retention_ratio = meter
+            .f64_observable_gauge(semconv::OURIOS_MINER_BODY_RETENTION_RATIO)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = s.lock().expect("metrics state mutex poisoned");
+                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if st.body_lines.is_empty() {
-                    obs.observe(0.0, &[KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL)]);
+                    obs.observe(0.0, &[KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL)]);
                 }
                 for (tenant, lines) in &st.body_lines {
                     let retained = st.body_retentions.get(tenant).copied().unwrap_or(0);
                     obs.observe(
                         ratio(retained, *lines),
-                        &[KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned())],
+                        &[KeyValue::new(
+                            semconv::OURIOS_TENANT,
+                            tenant.as_str().to_owned(),
+                        )],
                     );
                 }
             })
             .build();
 
         let s = Arc::clone(state);
-        let _params_overflow_ratio = meter
-            .f64_observable_gauge(METRIC_PARAMS_OVERFLOW_RATIO)
+        let params_overflow_ratio = meter
+            .f64_observable_gauge(semconv::OURIOS_MINER_PARAMS_OVERFLOW_RATIO)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = s.lock().expect("metrics state mutex poisoned");
+                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if st.by_service.is_empty() {
                     obs.observe(
                         0.0,
                         &[
-                            KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL),
-                            KeyValue::new(ATTR_SERVICE, INIT_SENTINEL),
+                            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
+                            KeyValue::new(semconv::OURIOS_SERVICE, INIT_SENTINEL),
                         ],
                     );
                 }
@@ -372,25 +386,35 @@ impl MinerMetrics {
             })
             .build();
 
-        Self::register_quantile_gauge(meter, state, METRIC_CONFIDENCE_P50, 0.50);
-        Self::register_quantile_gauge(meter, state, METRIC_CONFIDENCE_P01, 0.01);
+        let confidence_p50 =
+            Self::register_quantile_gauge(meter, state, semconv::OURIOS_MINER_CONFIDENCE_P50, 0.50);
+        let confidence_p01 =
+            Self::register_quantile_gauge(meter, state, semconv::OURIOS_MINER_CONFIDENCE_P01, 0.01);
+
+        ObservableGauges {
+            _template_count: template_count,
+            _body_retention_ratio: body_retention_ratio,
+            _params_overflow_ratio: params_overflow_ratio,
+            _confidence_p50: confidence_p50,
+            _confidence_p01: confidence_p01,
+        }
     }
 
     /// Register one confidence-quantile observable gauge
-    /// (`confidence_p50` / `confidence_p01`) over the per-`(tenant,
-    /// service)` reservoir.
+    /// (`ourios.miner.confidence.p50` / `…p01`) over the
+    /// per-`(tenant, service)` reservoir, returning its handle.
     fn register_quantile_gauge(
         meter: &Meter,
         state: &Arc<Mutex<MinerMetricsState>>,
         name: &'static str,
         q: f64,
-    ) {
+    ) -> ObservableGauge<f64> {
         let s = Arc::clone(state);
-        let _gauge = meter
+        meter
             .f64_observable_gauge(name)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = s.lock().expect("metrics state mutex poisoned");
+                let st = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut emitted = false;
                 for ((tenant, service), tally) in &st.by_service {
                     if let Some(v) = tally.confidence.quantile(q) {
@@ -402,13 +426,13 @@ impl MinerMetrics {
                     obs.observe(
                         0.0,
                         &[
-                            KeyValue::new(ATTR_TENANT_ID, INIT_SENTINEL),
-                            KeyValue::new(ATTR_SERVICE, INIT_SENTINEL),
+                            KeyValue::new(semconv::OURIOS_TENANT, INIT_SENTINEL),
+                            KeyValue::new(semconv::OURIOS_SERVICE, INIT_SENTINEL),
                         ],
                     );
                 }
             })
-            .build();
+            .build()
     }
 
     /// Record one ingested line for `(tenant, service)`: bumps the
@@ -432,7 +456,10 @@ impl MinerMetrics {
     pub(crate) fn record_latency(&self, tenant: &TenantId, seconds: f64) {
         self.miner_latency_seconds.record(
             seconds,
-            &[KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned())],
+            &[KeyValue::new(
+                semconv::OURIOS_TENANT,
+                tenant.as_str().to_owned(),
+            )],
         );
     }
 
@@ -467,20 +494,24 @@ impl MinerMetrics {
         *st.body_retentions.entry(tenant.clone()).or_insert(0) += 1;
     }
 
-    /// Record one merge event (§6.8 `merges_total`, `event_type`
-    /// attribute) and one `template_version_changes_total` bump
-    /// (every merge advances `template_version` per §6.7 / H5).
+    /// Record one merge event (§6.8 `ourios.miner.merges`,
+    /// `ourios.miner.template_change` attribute) and one
+    /// `ourios.miner.template.version_changes` bump (every merge
+    /// advances `template_version` per §6.7 / H5).
     pub(crate) fn record_merge(&self, tenant: &TenantId, event_type: &str) {
         self.merges_total.add(
             1,
             &[
-                KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned()),
-                KeyValue::new(ATTR_EVENT_TYPE, event_type.to_owned()),
+                KeyValue::new(semconv::OURIOS_TENANT, tenant.as_str().to_owned()),
+                KeyValue::new(semconv::OURIOS_MINER_TEMPLATE_CHANGE, event_type.to_owned()),
             ],
         );
         self.template_version_changes_total.add(
             1,
-            &[KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned())],
+            &[KeyValue::new(
+                semconv::OURIOS_TENANT,
+                tenant.as_str().to_owned(),
+            )],
         );
     }
 
@@ -492,11 +523,11 @@ impl MinerMetrics {
     }
 }
 
-/// `(tenant_id, service)` data-point attribute pair.
+/// `(ourios.tenant, ourios.service)` data-point attribute pair.
 fn service_attrs(tenant: &TenantId, service: &str) -> [KeyValue; 2] {
     [
-        KeyValue::new(ATTR_TENANT_ID, tenant.as_str().to_owned()),
-        KeyValue::new(ATTR_SERVICE, service.to_owned()),
+        KeyValue::new(semconv::OURIOS_TENANT, tenant.as_str().to_owned()),
+        KeyValue::new(semconv::OURIOS_SERVICE, service.to_owned()),
     ]
 }
 

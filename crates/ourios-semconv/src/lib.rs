@@ -17,7 +17,7 @@
 
 #![deny(unsafe_code)]
 
-// Metric names (RFC 0009 §3.6).
+// Metric names (RFC 0009 §3.6, RFC 0001 §6.8).
 
 /// `ourios.compaction.backlog` (updowncounter, unit `{partition}`).
 pub const OURIOS_COMPACTION_BACKLOG: &str = "ourios.compaction.backlog";
@@ -43,6 +43,39 @@ pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 /// `ourios.compaction.sweeps` (counter, unit `{sweep}`).
 pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 
+/// `ourios.miner.body_retention.ratio` (gauge, unit `1`).
+pub const OURIOS_MINER_BODY_RETENTION_RATIO: &str = "ourios.miner.body_retention.ratio";
+
+/// `ourios.miner.confidence` (histogram, unit `1`).
+pub const OURIOS_MINER_CONFIDENCE: &str = "ourios.miner.confidence";
+
+/// `ourios.miner.confidence.p01` (gauge, unit `1`).
+pub const OURIOS_MINER_CONFIDENCE_P01: &str = "ourios.miner.confidence.p01";
+
+/// `ourios.miner.confidence.p50` (gauge, unit `1`).
+pub const OURIOS_MINER_CONFIDENCE_P50: &str = "ourios.miner.confidence.p50";
+
+/// `ourios.miner.latency` (histogram, unit `s`).
+pub const OURIOS_MINER_LATENCY: &str = "ourios.miner.latency";
+
+/// `ourios.miner.merges` (counter, unit `{merge}`).
+pub const OURIOS_MINER_MERGES: &str = "ourios.miner.merges";
+
+/// `ourios.miner.params.overflow` (counter, unit `{overflow}`).
+pub const OURIOS_MINER_PARAMS_OVERFLOW: &str = "ourios.miner.params.overflow";
+
+/// `ourios.miner.params.overflow.ratio` (gauge, unit `1`).
+pub const OURIOS_MINER_PARAMS_OVERFLOW_RATIO: &str = "ourios.miner.params.overflow.ratio";
+
+/// `ourios.miner.parse_failures` (counter, unit `{failure}`).
+pub const OURIOS_MINER_PARSE_FAILURES: &str = "ourios.miner.parse_failures";
+
+/// `ourios.miner.template.count` (gauge, unit `{template}`).
+pub const OURIOS_MINER_TEMPLATE_COUNT: &str = "ourios.miner.template.count";
+
+/// `ourios.miner.template.version_changes` (counter, unit `{change}`).
+pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES: &str = "ourios.miner.template.version_changes";
+
 /// `ourios.storage.parquet.file.size` (histogram, unit `By`).
 pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.size";
 
@@ -53,6 +86,12 @@ pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
 
 /// `ourios.io.direction` attribute key.
 pub const OURIOS_IO_DIRECTION: &str = "ourios.io.direction";
+
+/// `ourios.miner.template_change` attribute key.
+pub const OURIOS_MINER_TEMPLATE_CHANGE: &str = "ourios.miner.template_change";
+
+/// `ourios.service` attribute key.
+pub const OURIOS_SERVICE: &str = "ourios.service";
 
 /// `ourios.tenant` attribute key.
 pub const OURIOS_TENANT: &str = "ourios.tenant";

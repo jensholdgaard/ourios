@@ -557,21 +557,22 @@ direction and the primary obligation lives in those other RFCs.
 >   expansion (in that order)
 
 > **Scenario RFC0001.8 — confidence_p50 and confidence_p01 are emitted as gauges**
-> - **Given** a running miner with a non-empty `confidence`
->   histogram for some `(tenant_id, service)`
+> - **Given** a running miner with a non-empty `ourios.miner.confidence`
+>   histogram for some `(ourios.tenant, ourios.service)`
 > - **When** the miner's meter is collected via an SDK in-memory reader
-> - **Then** `confidence_p50` and `confidence_p01` (attributes
->   `tenant_id`, `service`) are present as gauges
+> - **Then** `ourios.miner.confidence.p50` and
+>   `ourios.miner.confidence.p01` (attributes `ourios.tenant`,
+>   `ourios.service`) are present as gauges
 > - **And** each value matches the corresponding quantile of the
 >   same-attributed histogram (computed in-process on a short
 >   ticker per §6.8)
 >
-> *(Pending the §6.8 dotted-semconv redesign: this scenario may be
-> superseded if `confidence_p50` / `confidence_p01` become
+> *(The dotted-semconv rename landed in the 2026-06-08 amendment; the
+> open fork is whether `confidence.p50` / `confidence.p01` become
 > backend-derived quantiles over the exported histogram rather than
-> in-process gauges. The change is a contract change to the §3.1.2
-> mandatory set and is made under that redesign's own review, not
-> the 2026-06-03 architecture amendment.)*
+> in-process gauges. That is a contract change to the §3.1.2 mandatory
+> set and would be made — possibly superseding this scenario — under
+> its own review, not folded into the rename.)*
 
 > **Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id**
 > - **Given** an `OtlpLogRecord` whose `body` is
@@ -1744,18 +1745,20 @@ exactly the H5 detection signal.
 > §5 note). This amendment fixes the *export architecture* and the
 > Prometheus-era terminology (registry → meter provider, scrape →
 > OTLP push, labels → attributes) throughout §§6.8–6.9 and the §5
-> scenarios. It deliberately does **not** rename the metrics: the
-> identifiers in the table below stay as-is, pending a dedicated
-> dotted-semconv redesign that converts them to the
-> `ourios.miner.*` scheme, adds them to the `semconv/registry/`
-> weaver registry alongside the compaction set (RFC 0009 §3.6), and
-> resolves the instrument-type and quantile questions that are
-> genuine contract changes to the §3.1.2 mandatory set — including
-> whether `confidence_p50` / `confidence_p01` remain in-process
-> gauges (RFC0001.8) or become collector-/backend-derived quantiles
-> over the exported histogram, the OTLP-native idiom. That redesign
-> moves the mandatory-set contract under its own review rather than
-> riding this architecture change.
+> scenarios.
+>
+> **Amendment 2026-06-08 (dotted-semconv migration — landed).** The
+> metric and attribute names are now the dotted-`ourios.miner.*`
+> scheme, defined in the `semconv/registry/` weaver registry
+> alongside the compaction set (RFC 0009 §3.6) and consumed through
+> the generated `ourios-semconv` constants. The table below lists the
+> registry names. Instrument *kinds* are unchanged from the original
+> set; the `confidence.p50` / `confidence.p01` gauges remain
+> **in-process** views of the `confidence` histogram (RFC0001.8) —
+> the question of whether they become collector-/backend-derived
+> quantiles over the exported histogram is a genuine contract change
+> to the §3.1.2 mandatory set and stays deferred to its own review,
+> not folded into this rename.
 
 #### Export architecture (OTel SDK + OTLP)
 
@@ -1806,11 +1809,12 @@ alert — which a single producer-level resource attribute could not
 provide. The `service` dimension here is the *log's source* service
 (the value §6.1's tenant derivation reads), **distinct from Ourios's
 own `service.name`** — it must not reuse that reserved resource key.
-The table below shows the current attribute names (`tenant_id`,
-`service`); like the metric names, they are converted to the
-namespaced `ourios.*` dotted-semconv scheme by the deferred redesign
-(which fixes the exact key for the source-service dimension) — not
-here.
+It is exported under the dedicated `ourios.service` attribute key;
+the tenant dimension is `ourios.tenant` and the `merges` change-kind
+is `ourios.miner.template_change` (registry enum
+`widened` / `type_expanded`). All three are defined in
+`semconv/registry/attributes.yaml` and consumed through the generated
+`ourios-semconv` constants.
 
 OTel's metric model is **collect-on-read**: a reader / exporter sees
 the data points produced during a collection cycle, not a registry of
@@ -1828,25 +1832,26 @@ synthetic `record(0)` polluting their distribution. Verification is
 therefore by *collecting the metric stream* (an SDK in-memory reader
 in tests), not by enumerating registered instruments.
 
-The metrics enumerated in `[§3.1]` are mandatory. Full set (names and
-instrument kinds pending the dotted-semconv redesign noted above; the
-dimensions shown are exported as **attributes**, not labels):
+The metrics enumerated in `[§3.1]` are mandatory. Full set (the
+dotted-`ourios.miner.*` registry names; the dimensions shown are
+exported as **attributes**, not labels — `tenant` is `ourios.tenant`,
+`service` is `ourios.service`):
 
 | Metric | Instrument kind | Attributes | Source invariant / hazard |
 |---|---|---|---|
-| `template_count` | gauge | `tenant_id` | `[§3.1]` |
-| `merges_total` | counter | `tenant_id`, `event_type` | `[§3.1]`, H1 |
-| `alias_assertions_total` | counter | `tenant_id` | `[§3.1]`, §6.7, H5 |
-| `alias_retractions_total` | counter | `tenant_id` | `[§3.1]`, §6.7, H5 |
-| `confidence` | histogram | `tenant_id`, `service` | `[§3.1]`, §6.3 |
-| `confidence_p50` | gauge | `tenant_id`, `service` | `[§3.1]` |
-| `confidence_p01` | gauge | `tenant_id`, `service` | `[§3.1]` |
-| `body_retention_ratio` | gauge | `tenant_id` | `[§3.1]`, `[§3.3]` |
-| `parse_failures_total` | counter | `tenant_id`, `service` | `[§3.1]` |
-| `params_overflow_total` | counter | `tenant_id`, `service` | `[§3.2]`, H2 |
-| `params_overflow_ratio` | gauge | `tenant_id`, `service` | `[§3.2]`, H2 |
-| `template_version_changes_total` | counter | `tenant_id` | `[§3.5]`, H5 |
-| `miner_latency_seconds` | histogram | `tenant_id` | hot-path budget (D1) |
+| `ourios.miner.template.count` | gauge | `tenant` | `[§3.1]` |
+| `ourios.miner.merges` | counter | `tenant`, `template_change` | `[§3.1]`, H1 |
+| `alias_assertions_total` | counter | `tenant` | `[§3.1]`, §6.7, H5 |
+| `alias_retractions_total` | counter | `tenant` | `[§3.1]`, §6.7, H5 |
+| `ourios.miner.confidence` | histogram | `tenant`, `service` | `[§3.1]`, §6.3 |
+| `ourios.miner.confidence.p50` | gauge | `tenant`, `service` | `[§3.1]` |
+| `ourios.miner.confidence.p01` | gauge | `tenant`, `service` | `[§3.1]` |
+| `ourios.miner.body_retention.ratio` | gauge | `tenant` | `[§3.1]`, `[§3.3]` |
+| `ourios.miner.parse_failures` | counter | `tenant`, `service` | `[§3.1]` |
+| `ourios.miner.params.overflow` | counter | `tenant`, `service` | `[§3.2]`, H2 |
+| `ourios.miner.params.overflow.ratio` | gauge | `tenant`, `service` | `[§3.2]`, H2 |
+| `ourios.miner.template.version_changes` | counter | `tenant` | `[§3.5]`, H5 |
+| `ourios.miner.latency` | histogram | `tenant` | hot-path budget (D1) |
 
 **`confidence_p50` and `confidence_p01`.** The `confidence`
 histogram is the source of truth; the two gauges are convenient

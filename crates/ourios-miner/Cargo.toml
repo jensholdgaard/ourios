@@ -10,6 +10,9 @@ publish = false
 
 [dependencies]
 ourios-core = { path = "../ourios-core" }
+# Generated dotted-`ourios.miner.*` metric + attribute name constants
+# (weaver registry, `semconv/registry/`). RFC 0001 §6.8 names.
+ourios-semconv = { path = "../ourios-semconv" }
 # RFC 0001 §6.5: `Param.value` for `ParamType::Overflow` carries a
 # `(length, sha256_prefix: [u8; 8])` marker. The default-features
 # = false build of `sha2` drops the asm backend and keeps the

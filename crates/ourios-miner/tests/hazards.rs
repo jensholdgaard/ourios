@@ -671,7 +671,7 @@ async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
             .iter()
             .flat_map(ResourceMetrics::scope_metrics)
             .flat_map(ScopeMetrics::metrics)
-            .find(|m| m.name() == "params_overflow_ratio")
+            .find(|m| m.name() == ourios_semconv::OURIOS_MINER_PARAMS_OVERFLOW_RATIO)
             .expect("params_overflow_ratio missing from exported stream")
             .data();
         let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = data else {
@@ -684,8 +684,14 @@ async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
                 let mut service_ok = false;
                 for kv in dp.attributes() {
                     match kv.key.as_str() {
-                        "tenant_id" if kv.value.as_str() == "acme" => tenant_ok = true,
-                        "service" if kv.value.as_str() == service => service_ok = true,
+                        k if k == ourios_semconv::OURIOS_TENANT && kv.value.as_str() == "acme" => {
+                            tenant_ok = true;
+                        }
+                        k if k == ourios_semconv::OURIOS_SERVICE
+                            && kv.value.as_str() == service =>
+                        {
+                            service_ok = true;
+                        }
                         _ => {}
                     }
                 }

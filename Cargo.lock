@@ -2692,6 +2692,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "ourios-core",
+ "ourios-semconv",
  "ourios-telemetry",
  "sha2",
  "tokio",

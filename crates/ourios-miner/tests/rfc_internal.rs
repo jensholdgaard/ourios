@@ -549,8 +549,14 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
                 let mut service_ok = false;
                 for kv in dp.attributes() {
                     match kv.key.as_str() {
-                        "tenant_id" if kv.value.as_str() == "acme" => tenant_ok = true,
-                        "service" if kv.value.as_str() == service => service_ok = true,
+                        k if k == ourios_semconv::OURIOS_TENANT && kv.value.as_str() == "acme" => {
+                            tenant_ok = true;
+                        }
+                        k if k == ourios_semconv::OURIOS_SERVICE
+                            && kv.value.as_str() == service =>
+                        {
+                            service_ok = true;
+                        }
                         _ => {}
                     }
                 }
@@ -561,11 +567,11 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
     };
 
     assert!(
-        (gauge_value("confidence_p50") - expected_p50).abs() < 1e-6,
+        (gauge_value(ourios_semconv::OURIOS_MINER_CONFIDENCE_P50) - expected_p50).abs() < 1e-6,
         "confidence_p50 must match the in-process p50 quantile",
     );
     assert!(
-        (gauge_value("confidence_p01") - expected_p01).abs() < 1e-6,
+        (gauge_value(ourios_semconv::OURIOS_MINER_CONFIDENCE_P01) - expected_p01).abs() < 1e-6,
         "confidence_p01 must match the in-process p01 quantile",
     );
 }

@@ -49,8 +49,9 @@
 //!   (`H5.2`).
 //! - `reconstruct()` / `lossy_flag` semantics (RFC §6.6).
 //! - Per-parameter 256 B overflow + `OVERFLOW` marker (RFC §6.5).
-//! - Prometheus exposition for `merges_total` /
-//!   `parse_failures_total` / `template_count` (RFC §6.8).
+//! - `OTel` exposition for `ourios.miner.merges` /
+//!   `ourios.miner.parse_failures` / `ourios.miner.template.count`
+//!   (RFC §6.8).
 //! - Parquet records for the data records themselves (those go
 //!   through `ourios-parquet`).
 //!
@@ -159,8 +160,9 @@ pub struct MinerCluster {
     // §6.5 / §3.2 counter: per-parameter byte-limit overflow
     // events. Increments by the count of `Overflow`-tagged
     // [`Param`] entries on each emitted record. Read-side
-    // placeholder for the §6.8 `params_overflow_total` *counter*
-    // metric — the §3.2 `params_overflow_ratio` *gauge* is the
+    // placeholder for the §6.8 `ourios.miner.params.overflow`
+    // *counter* metric — the §3.2
+    // `ourios.miner.params.overflow.utilization` *gauge* is the
     // derived rolling ratio that lands alongside it once total
     // emitted params is tracked.
     params_overflow_total: AtomicU64,
@@ -439,9 +441,10 @@ impl MinerCluster {
     /// events per RFC §6.5. Increments by the count of
     /// `Overflow`-tagged [`Param`]s on each emitted record (so a
     /// record with two oversized params bumps the counter by 2).
-    /// Read-side placeholder for the §6.8 `params_overflow_total`
-    /// *counter* metric; the §3.2 `params_overflow_ratio` *gauge*
-    /// is the derived rolling ratio with the `> 0.01` per-service
+    /// Read-side placeholder for the §6.8
+    /// `ourios.miner.params.overflow` *counter* metric; the §3.2
+    /// `ourios.miner.params.overflow.utilization` *gauge* is the
+    /// derived rolling ratio with the `> 0.01` per-service
     /// alert threshold — both ship together once the exporter
     /// lands and are not this method's responsibility.
     #[must_use]
@@ -462,7 +465,13 @@ impl MinerCluster {
     /// record's body must always carry the original line bytes
     /// so `reconstruct()`'s `Overflow` branch (RFC §6.6) has
     /// something to fall back to.
-    fn apply_overflow_retention(&self, record: &OtlpLogRecord, rec: &mut MinedRecord, raw: &str) {
+    fn apply_overflow_retention(
+        &self,
+        record: &OtlpLogRecord,
+        service: &str,
+        rec: &mut MinedRecord,
+        raw: &str,
+    ) {
         let overflow_count = rec
             .params
             .iter()
@@ -474,11 +483,8 @@ impl MinerCluster {
             let count = overflow_count as u64;
             self.params_overflow_total
                 .fetch_add(count, Ordering::Relaxed);
-            self.metrics.record_overflow(
-                &record.tenant_id,
-                &service_of(&record.resource_attributes),
-                count,
-            );
+            self.metrics
+                .record_overflow(&record.tenant_id, service, count);
         }
     }
 
@@ -498,11 +504,11 @@ impl MinerCluster {
     /// `body_retentions_total` metric doc explicitly excludes,
     /// not the §6.3 lossy-zone retention the gauge is meant to
     /// surface. That path uses [`Self::record_tokenizer_failure`].
-    fn record_parse_failure(&self, record: &OtlpLogRecord) {
+    fn record_parse_failure(&self, record: &OtlpLogRecord, service: &str) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .record_parse_failure(&record.tenant_id, &service_of(&record.resource_attributes));
+            .record_parse_failure(&record.tenant_id, service);
         self.metrics.record_body_retention(&record.tenant_id);
     }
 
@@ -516,10 +522,10 @@ impl MinerCluster {
     /// tokenizer failures here would inflate the ratio with
     /// events that aren't body-retention events in the
     /// gauge-contract sense.
-    fn record_tokenizer_failure(&self, record: &OtlpLogRecord) {
+    fn record_tokenizer_failure(&self, record: &OtlpLogRecord, service: &str) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .record_parse_failure(&record.tenant_id, &service_of(&record.resource_attributes));
+            .record_parse_failure(&record.tenant_id, service);
     }
 
     /// Build the OTLP-envelope half of a `MinedRecord` from the
@@ -577,13 +583,12 @@ impl MinerCluster {
     ///
     /// One emitted record is one ingested line, so this is also the
     /// single site that feeds the §6.8 per-line instruments: the
-    /// `confidence` histogram + the p50/p01 reservoir, and the
-    /// per-`(tenant, service)` line denominator for
-    /// `params_overflow_ratio`.
-    fn emit_record(&mut self, record: MinedRecord) {
-        let service = service_of(&record.resource_attributes);
+    /// `ourios.miner.confidence` histogram + the p50/p01 reservoir,
+    /// and the per-`(tenant, service)` line denominator for
+    /// `ourios.miner.params.overflow.utilization`.
+    fn emit_record(&mut self, record: MinedRecord, service: &str) {
         self.metrics
-            .record_line(&record.tenant_id, &service, f64::from(record.confidence));
+            .record_line(&record.tenant_id, service, f64::from(record.confidence));
         self.record_sink.emit(record);
     }
 }
@@ -1115,6 +1120,11 @@ impl MinerCluster {
     /// per-tenant store.
     pub fn ingest(&mut self, record: &OtlpLogRecord) -> u64 {
         let started = std::time::Instant::now();
+        // Resolve the source service once per ingest. It is
+        // constant for the record and feeds every §6.8 per-service
+        // instrument below; the hot-path helpers take it by
+        // reference rather than re-scanning + re-allocating it.
+        let service = service_of(&record.resource_attributes);
         let template_id = match &record.body {
             None => {
                 // The wire delivered no body. Emit a single
@@ -1125,15 +1135,16 @@ impl MinerCluster {
                 // template, so reconstruction is not possible.
                 let mut rec = Self::record_envelope(record, BodyKind::Absent);
                 rec.lossy_flag = true;
-                self.emit_record(rec);
+                self.emit_record(rec, &service);
                 NO_TEMPLATE
             }
-            Some(Body::String(raw)) => self.ingest_string(record, raw),
-            Some(Body::Structured(av)) => self.ingest_structured(record, av),
+            Some(Body::String(raw)) => self.ingest_string(record, &service, raw),
+            Some(Body::Structured(av)) => self.ingest_structured(record, &service, av),
         };
-        // §6.8 `miner_latency_seconds` (hot-path budget D1) and the
-        // `template_count` observable-gauge mirror. Both read the
-        // post-ingest state, so they sit after the body fork.
+        // §6.8 `ourios.miner.duration` histogram (hot-path budget
+        // D1) and the `ourios.miner.template.count` observable-gauge
+        // mirror. Both read the post-ingest state, so they sit after
+        // the body fork.
         self.metrics
             .record_latency(&record.tenant_id, started.elapsed().as_secs_f64());
         // `usize` ≤ `u64` on every supported target; saturate
@@ -1155,7 +1166,7 @@ impl MinerCluster {
     // too_many_lines lint is silenced here rather than
     // fragmenting the per-step structure.
     #[allow(clippy::too_many_lines)]
-    fn ingest_string(&mut self, record: &OtlpLogRecord, raw: &str) -> u64 {
+    fn ingest_string(&mut self, record: &OtlpLogRecord, service: &str, raw: &str) -> u64 {
         // RFC §6.2 step 1 (H7.2): a tokenizer failure (today:
         // embedded NUL byte) routes the line to the parse-failure
         // path with `lossy_flag = true` and the original body
@@ -1171,8 +1182,8 @@ impl MinerCluster {
                 let mut rec = Self::record_envelope(record, BodyKind::String);
                 rec.body = Some(raw.to_string());
                 rec.lossy_flag = true;
-                self.emit_record(rec);
-                self.record_tokenizer_failure(record);
+                self.emit_record(rec, service);
+                self.record_tokenizer_failure(record, service);
                 return NO_TEMPLATE;
             }
         };
@@ -1201,8 +1212,8 @@ impl MinerCluster {
             rec.separators = separators;
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
-            self.emit_record(rec);
-            self.record_parse_failure(record);
+            self.emit_record(rec, service);
+            self.record_parse_failure(record, service);
             return NO_TEMPLATE;
         }
 
@@ -1224,9 +1235,9 @@ impl MinerCluster {
             // §6.5: bump `params_overflow_total` if any param
             // exceeded the byte limit. Body retention is already
             // set above for this parse-failure path.
-            self.apply_overflow_retention(record, &mut rec, raw);
-            self.emit_record(rec);
-            self.record_parse_failure(record);
+            self.apply_overflow_retention(record, service, &mut rec, raw);
+            self.emit_record(rec, service);
+            self.record_parse_failure(record, service);
             return NO_TEMPLATE;
         }
 
@@ -1261,8 +1272,8 @@ impl MinerCluster {
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this fresh-leaf
                 // record if any of its params overflowed.
-                self.apply_overflow_retention(record, &mut rec, raw);
-                self.emit_record(rec);
+                self.apply_overflow_retention(record, service, &mut rec, raw);
+                self.emit_record(rec, service);
                 new_id
             }
             Some(c) => {
@@ -1277,6 +1288,7 @@ impl MinerCluster {
                     // §6.5 capping.
                     ConfidenceZone::Clean => self.attach_and_maybe_widen(
                         record,
+                        service,
                         raw,
                         &masked_strs,
                         &masked.wildcard_positions,
@@ -1315,8 +1327,8 @@ impl MinerCluster {
                         // §6.5: bump `params_overflow_total` for
                         // any overflow params (body is already
                         // retained for the §6.3 reason).
-                        self.apply_overflow_retention(record, &mut rec, raw);
-                        self.emit_record(rec);
+                        self.apply_overflow_retention(record, service, &mut rec, raw);
+                        self.emit_record(rec, service);
                         new_id
                     }
                     // Parse failure: no template allocated.
@@ -1330,9 +1342,9 @@ impl MinerCluster {
                         // §6.5: bump `params_overflow_total` for
                         // any overflow params (body is already
                         // retained for the parse-failure reason).
-                        self.apply_overflow_retention(record, &mut rec, raw);
-                        self.emit_record(rec);
-                        self.record_parse_failure(record);
+                        self.apply_overflow_retention(record, service, &mut rec, raw);
+                        self.emit_record(rec, service);
+                        self.record_parse_failure(record, service);
                         NO_TEMPLATE
                     }
                 }
@@ -1504,6 +1516,7 @@ impl MinerCluster {
     fn attach_and_maybe_widen(
         &mut self,
         record: &OtlpLogRecord,
+        service: &str,
         raw: &str,
         masked_strs: &[&str],
         line_wildcard_positions: &[usize],
@@ -1561,8 +1574,8 @@ impl MinerCluster {
                 rec.confidence = 1.0;
                 // §6.5: force body retention on this clean-reuse
                 // record if any of its aligned params overflowed.
-                self.apply_overflow_retention(record, &mut rec, raw);
-                self.emit_record(rec);
+                self.apply_overflow_retention(record, service, &mut rec, raw);
+                self.emit_record(rec, service);
                 template_id
             }
             AttachPlan::Rejected {
@@ -1600,9 +1613,9 @@ impl MinerCluster {
                 // §6.5: bump `params_overflow_total` if the
                 // line-ordered params contained any oversized
                 // values (body already retained for §6.4).
-                self.apply_overflow_retention(record, &mut rec, raw);
-                self.emit_record(rec);
-                self.record_parse_failure(record);
+                self.apply_overflow_retention(record, service, &mut rec, raw);
+                self.emit_record(rec, service);
+                self.record_parse_failure(record, service);
                 NO_TEMPLATE
             }
             AttachPlan::Mutated {
@@ -1638,8 +1651,8 @@ impl MinerCluster {
                 // §6.5: force body retention on this widened /
                 // type-expanded record if any of its aligned
                 // params overflowed.
-                self.apply_overflow_retention(record, &mut rec, raw);
-                self.emit_record(rec);
+                self.apply_overflow_retention(record, service, &mut rec, raw);
+                self.emit_record(rec, service);
                 template_id
             }
         }
@@ -1654,6 +1667,7 @@ impl MinerCluster {
     fn ingest_structured(
         &mut self,
         record: &OtlpLogRecord,
+        service: &str,
         any_value: &ourios_core::otlp::AnyValue,
     ) -> u64 {
         let key = (record.severity_number, record.scope_name.clone());
@@ -1723,7 +1737,7 @@ impl MinerCluster {
         rec.template_version = 1;
         rec.confidence = 1.0;
         rec.body = Some(String::from_utf8(bytes).expect("serde_json emits valid UTF-8"));
-        self.emit_record(rec);
+        self.emit_record(rec, service);
 
         template_id
     }

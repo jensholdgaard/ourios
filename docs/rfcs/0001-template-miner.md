@@ -1528,14 +1528,22 @@ tokenizer-failure / explicit-rejection cases enumerated under
 *`lossy_flag` semantics* above — the reader returns the `body`
 column **verbatim** with `Reconstruction::RetainedVerbatim`, and
 does **not** invoke `reconstruct`: no template lookup, no token
-walk. The same short-circuit applies to the other rows §6.6 and
-§6.5 mark as non-reconstructable when they carry a retained body —
-an `OVERFLOW` param (§6.5), or a `body_kind = Structured` row whose
-canonically-encoded body is itself the authoritative rendering
-(§6.1). `reconstruct`'s own `lossy_flag` / `OVERFLOW` early returns
-remain in place as a **defensive guard** for callers that reach it
-anyway; the reader's contract is to short-circuit *before* that
-call, so the guard is belt-and-braces, not the primary mechanism.
+walk. The same short-circuit applies to a `String`-body row carrying
+an `OVERFLOW` param (§6.5): its retained body is returned verbatim
+with `Reconstruction::RetainedVerbatim`. `reconstruct`'s own
+`lossy_flag` / `OVERFLOW` early returns remain in place as a
+**defensive guard** for callers that reach it anyway; the reader's
+contract is to short-circuit *before* that call, so the guard is
+belt-and-braces, not the primary mechanism.
+
+**Structured bodies are out of scope of this amendment.** A
+`body_kind = Structured` row renders its canonically-encoded `body`
+column, but whether that is `Reconstruction::Faithful` (the canonical
+JSON round-trips the source `AnyValue`) turns on the OTLP-canonical
+JSON encoding decision (RFC0001.9), which is deferred. This amendment
+defines the `Reconstruction` marker for the implemented **`String`**
+path; structured-body rendering and its classification land with
+RFC0001.9.
 
 **Clean path.** For a faithful row (`lossy_flag = false`, no
 `OVERFLOW` param, template available) the reader invokes
@@ -1553,10 +1561,10 @@ amendment pins the render contract and the lossy path; it does
 **not** specify a template-registry design.
 
 The reader never silently substitutes one rendering for the other:
-every rendered row carries its `Reconstruction` signal, and the
-lossy/clean branch is selected solely by the row's `lossy_flag`
-(and the §6.5 / §6.1 non-reconstructable cases), never inferred
-from the bytes.
+every rendered `String`-body row carries its `Reconstruction` signal,
+and the lossy/clean branch is selected solely by the row's
+`lossy_flag` (and the §6.5 `OVERFLOW` case), never inferred from the
+bytes.
 
 **Property test.** For every row `r` in the corpus where
 `r.lossy_flag == false`:

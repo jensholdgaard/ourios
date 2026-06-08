@@ -207,7 +207,7 @@ groups:
     type: metric
     metric_name: ourios.miner.body_retention.utilization
     stability: development
-    brief: Fraction of lines that retained their original body (§3.3).
+    brief: Fraction of lines whose original body was retained on a §6.3 confidence-zone path (lossy zone or parse failure).
     instrument: gauge
     unit: "1"
     attributes:

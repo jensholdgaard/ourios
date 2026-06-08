@@ -407,11 +407,13 @@ direction and the primary obligation lives in those other RFCs.
 > - **Then** the effective threshold is `0.7`
 
 > **Scenario §3.1.2 — Mandatory metric set is exposed**
-> - **Given** the mandatory set defined by the `ourios.miner.*`
->   entries in the semconv registry (`semconv/registry/`, surfaced as
->   the generated `ourios_semconv::OURIOS_MINER_*` constants), each
->   registered as an instrument on the `ourios.miner` meter when the
->   miner is constructed
+> - **Given** the mandatory set defined by §6.8's table — the
+>   `ourios.miner.*` metric instruments in the semconv registry
+>   (`semconv/registry/`, surfaced as generated `ourios_semconv`
+>   constants) that the miner registers on the `ourios.miner` meter
+>   when it is constructed (the `ourios.miner.alias.*` counters are
+>   registered separately by the alias map, §6.7, and are out of this
+>   scenario's scope)
 > - **When** a small representative workload exercises every
 >   instrument (a normal line, a near-duplicate that widens a template,
 >   an oversized-`param` line, and a parse-failure line) and the meter

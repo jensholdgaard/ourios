@@ -33,10 +33,11 @@ fn invariant_3_1_1_default_threshold_is_0_7() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
 /// Two-part, per the registry-based §3.1.2 decision:
-///   (a) the mandatory set *is* the generated
-///       `ourios_semconv::OURIOS_MINER_*` constants — the semconv
-///       registry is the source of truth for which metrics the miner
-///       must expose; and
+///   (a) the mandatory set is §6.8's miner-instrument metrics — the
+///       eleven `ourios_semconv` `ourios.miner.*` constants the miner
+///       registers (the `OURIOS_MINER_ALIAS_*` counters are registered
+///       by `AliasMap`, §6.7, and are out of this scenario's scope);
+///       the registry is the source of truth; and
 ///   (b) every instrument is registered on the `ourios.miner` meter
 ///       and surfaces in the export on its **first real measurement**
 ///       — no synthetic zero-traffic points. A small representative

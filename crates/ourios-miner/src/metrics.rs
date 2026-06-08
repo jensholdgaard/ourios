@@ -243,26 +243,34 @@ impl Reservoir {
         self.samples.push_back(value);
     }
 
-    /// Exact `q`-quantile (`q` in `[0.0, 1.0]`) over the current
-    /// window via nearest-rank, or `None` when empty.
-    fn quantile(&self, q: f64) -> Option<f64> {
-        if self.samples.is_empty() {
-            return None;
-        }
-        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
-        // `total_cmp` is a total order over f64 (no panic; any stray NaN sorts
-        // to an end) — avoids `partial_cmp(...).expect(...)` on a hot path.
-        sorted.sort_by(f64::total_cmp);
-        let n = sorted.len();
-        // Nearest-rank: rank = ceil(q * n), clamped to [1, n].
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let rank = (q * n as f64).ceil().max(1.0) as usize;
-        Some(sorted[rank.min(n) - 1])
+    /// Copy the current sample window — O(n), no sort — so a collection
+    /// callback can take it under the metrics lock and compute the
+    /// quantile *after* releasing the lock.
+    fn snapshot(&self) -> Vec<f64> {
+        self.samples.iter().copied().collect()
     }
+}
+
+/// Exact nearest-rank `q`-quantile (`q` in `[0.0, 1.0]`) over a sample
+/// window, or `None` when empty. Takes an owned `Vec` and sorts it so the
+/// caller can run it OFF the metrics lock — collection must not block the
+/// ingest hot path on the `O(n log n)` sort.
+fn quantile_of(mut samples: Vec<f64>, q: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    // `total_cmp` is a total order over f64 (no panic; any stray NaN sorts
+    // to an end) — avoids `partial_cmp(...).expect(...)`.
+    samples.sort_by(f64::total_cmp);
+    let n = samples.len();
+    // Nearest-rank: rank = ceil(q * n), clamped to [1, n].
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let rank = (q * n as f64).ceil().max(1.0) as usize;
+    Some(samples[rank.min(n) - 1])
 }
 
 /// The miner's §6.8 instrument set plus the shared state its
@@ -446,12 +454,28 @@ impl MinerMetrics {
             .f64_observable_gauge(name)
             .with_unit("1")
             .with_callback(move |obs| {
-                let st = lock_state(&s);
-                for (tenant, tallies) in &st.by_service {
-                    for (service, tally) in tallies.iter() {
-                        if let Some(v) = tally.confidence.quantile(q) {
-                            obs.observe(v, &service_attrs(tenant, service));
-                        }
+                // Snapshot the sample windows under the lock (cheap O(n)
+                // copy), then sort + compute the quantiles AFTER releasing
+                // it — collection must never block the ingest hot path on
+                // the O(n log n) sort.
+                let snapshots: Vec<(TenantId, Option<String>, Vec<f64>)> = {
+                    let st = lock_state(&s);
+                    st.by_service
+                        .iter()
+                        .flat_map(|(tenant, tallies)| {
+                            tallies.iter().map(move |(service, tally)| {
+                                (
+                                    tenant.clone(),
+                                    service.map(str::to_owned),
+                                    tally.confidence.snapshot(),
+                                )
+                            })
+                        })
+                        .collect()
+                };
+                for (tenant, service, samples) in snapshots {
+                    if let Some(v) = quantile_of(samples, q) {
+                        obs.observe(v, &service_attrs(&tenant, service.as_deref()));
                     }
                 }
             })
@@ -600,13 +624,14 @@ mod tests {
         }
         // Nearest-rank p50 over 10 samples = rank ceil(0.5*10)=5 → 5th
         // smallest = 0.5; p01 = rank ceil(0.01*10)=1 → smallest = 0.1.
-        assert!((r.quantile(0.50).unwrap() - 0.5).abs() < 1e-9);
-        assert!((r.quantile(0.01).unwrap() - 0.1).abs() < 1e-9);
+        // Computed off-lock from a snapshot, as the gauge callback does.
+        assert!((quantile_of(r.snapshot(), 0.50).unwrap() - 0.5).abs() < 1e-9);
+        assert!((quantile_of(r.snapshot(), 0.01).unwrap() - 0.1).abs() < 1e-9);
     }
 
     #[test]
     fn reservoir_empty_is_none() {
-        assert!(Reservoir::default().quantile(0.5).is_none());
+        assert!(quantile_of(Reservoir::default().snapshot(), 0.5).is_none());
     }
 
     #[test]

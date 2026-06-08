@@ -1930,7 +1930,7 @@ data points — each instrument still surfaces on its first **live**
 measurement once replay completes (§3.1.2's registry-defined set is
 satisfied by instrument registration plus real post-replay traffic,
 not by replay-window points). A single `wal_replay_progress` gauge
-(attribute `tenant_id`, value: fraction of the tenant's replay
+(attribute `ourios.tenant`, value: fraction of the tenant's replay
 window completed in `[0.0, 1.0]`) is exposed during replay so
 operators can see the cold-start curve and confirm replay finished.
 This metric is replay-only and is not part of the §3.1 mandatory

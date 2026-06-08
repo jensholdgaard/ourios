@@ -28,16 +28,15 @@
 //! [`MinerMetricsState`] behind a `Mutex`, shared with the
 //! callbacks via `Arc`.
 //!
-//! # Init-seeding
+//! # When instruments appear
 //!
-//! §3.1.2 requires the full mandatory set to appear in the first
-//! collection cycle even at zero traffic. `OTel`'s metric model is
-//! collect-on-read, so a synchronous instrument that never recorded
-//! contributes no data point. The synchronous **counters** are
-//! seeded with a zero-`add` against an `init` sentinel attribute set
-//! so they surface; histograms are seeded the same way and the
-//! observable gauges always emit at least one (sentinel) point. See
-//! [`MinerMetrics::new`].
+//! The mandatory §6.8 set is defined by the [`ourios_semconv`]
+//! registry; each instrument is *registered* on the `ourios.miner`
+//! meter at construction. `OTel`'s metric model is collect-on-read,
+//! so an instrument contributes a data point on its **first real
+//! measurement** — no synthetic zero-traffic points are emitted, so
+//! every exported series carries the registry's `required`
+//! attributes.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -227,9 +226,10 @@ struct ObservableGauges {
 }
 
 impl MinerMetrics {
-    /// Register every §6.8 instrument on the `ourios.miner` meter
-    /// and seed the synchronous instruments so the full mandatory
-    /// set is exposed at zero traffic (§3.1.2).
+    /// Register every §6.8 instrument on the `ourios.miner` meter.
+    /// The mandatory set is defined by the [`ourios_semconv`]
+    /// registry; each instrument surfaces in the export on its first
+    /// real measurement (§3.1.2).
     pub(crate) fn new() -> Self {
         let meter = global::meter(METER_NAME);
         let state = Arc::new(Mutex::new(MinerMetricsState::default()));
@@ -260,14 +260,6 @@ impl MinerMetrics {
             .build();
 
         let observable_gauges = Self::register_observable_gauges(&meter, &state);
-        Self::seed_synchronous(
-            &merges_total,
-            &parse_failures_total,
-            &params_overflow_total,
-            &template_version_changes_total,
-            &confidence,
-            &miner_duration,
-        );
 
         Self {
             state,
@@ -281,43 +273,13 @@ impl MinerMetrics {
         }
     }
 
-    /// Seed the synchronous instruments so they surface in the
-    /// first collection cycle at zero traffic (§3.1.2). Counters
-    /// take a zero-`add` (no distortion); the histograms are seeded
-    /// with their natural sentinel value so they appear without
-    /// polluting a real distribution (confidence at the §6.1 `1.0`
-    /// clean sentinel, `ourios.miner.duration` at `0.0`). All seeded
-    /// points carry an `init` sentinel attribute set, distinguishable
-    /// from real traffic.
-    fn seed_synchronous(
-        merges_total: &Counter<u64>,
-        parse_failures_total: &Counter<u64>,
-        params_overflow_total: &Counter<u64>,
-        template_version_changes_total: &Counter<u64>,
-        confidence: &Histogram<f64>,
-        miner_duration: &Histogram<f64>,
-    ) {
-        // Attribute-less zero points register each instrument so the
-        // mandatory §6.8 set surfaces at zero traffic (§3.1.2) without
-        // inventing a sentinel attribute value (which would collide with a
-        // real tenant/service or violate the `template_change` enum). Real
-        // series, carrying the registry's required attributes, appear on
-        // real traffic.
-        merges_total.add(0, &[]);
-        parse_failures_total.add(0, &[]);
-        params_overflow_total.add(0, &[]);
-        template_version_changes_total.add(0, &[]);
-        confidence.record(1.0, &[]);
-        miner_duration.record(0.0, &[]);
-    }
-
     /// Register the §6.8 observable gauges
     /// (`ourios.miner.template.count`, `…confidence.p50`,
     /// `…confidence.p01`, `…body_retention.utilization`,
     /// `…params.overflow.utilization`) with callbacks over the shared
-    /// state. Each callback always emits at least one data point
-    /// (an `init` sentinel series when state is empty) so the
-    /// gauges surface at zero traffic per §3.1.2.
+    /// state. A callback emits one data point per `(tenant, service)`
+    /// (or per tenant) present in the state — nothing until real
+    /// traffic populates it.
     ///
     /// Returns the gauge handles so the caller can retain them: a
     /// dropped handle deregisters its callback (see
@@ -332,9 +294,6 @@ impl MinerMetrics {
             .with_unit("{template}")
             .with_callback(move |obs| {
                 let st = lock_state(&s);
-                if st.template_counts.is_empty() {
-                    obs.observe(0, &[]);
-                }
                 for (tenant, count) in &st.template_counts {
                     obs.observe(
                         *count,
@@ -353,9 +312,6 @@ impl MinerMetrics {
             .with_unit("1")
             .with_callback(move |obs| {
                 let st = lock_state(&s);
-                if st.body_lines.is_empty() {
-                    obs.observe(0.0, &[]);
-                }
                 for (tenant, lines) in &st.body_lines {
                     let retained = st.body_retentions.get(tenant).copied().unwrap_or(0);
                     obs.observe(
@@ -375,9 +331,6 @@ impl MinerMetrics {
             .with_unit("1")
             .with_callback(move |obs| {
                 let st = lock_state(&s);
-                if st.by_service.is_empty() {
-                    obs.observe(0.0, &[]);
-                }
                 for ((tenant, service), tally) in &st.by_service {
                     obs.observe(
                         ratio(tally.overflow_lines, tally.lines),
@@ -416,35 +369,49 @@ impl MinerMetrics {
             .with_unit("1")
             .with_callback(move |obs| {
                 let st = lock_state(&s);
-                let mut emitted = false;
                 for ((tenant, service), tally) in &st.by_service {
                     if let Some(v) = tally.confidence.quantile(q) {
                         obs.observe(v, &service_attrs(tenant, service));
-                        emitted = true;
                     }
-                }
-                if !emitted {
-                    obs.observe(0.0, &[]);
                 }
             })
             .build()
     }
 
-    /// Record one ingested line for `(tenant, service)`: bumps the
-    /// per-service line denominator (for `ourios.miner.params.overflow.utilization`)
-    /// and observes its `confidence` on both the §6.8 histogram and
-    /// the per-service reservoir feeding the p50/p01 gauges.
+    /// Bump the per-`(tenant, service)` line denominator (for
+    /// `ourios.miner.params.overflow.utilization`) and the per-tenant
+    /// body-line denominator (for
+    /// `ourios.miner.body_retention.utilization`).
+    ///
+    /// **Ordering invariant.** This runs once, at the start of an
+    /// ingest, *before* any numerator bump (`record_overflow`,
+    /// `record_body_retention`) for the same line. The ratio gauges'
+    /// callbacks may collect concurrently from another thread;
+    /// incrementing the denominator first guarantees they never
+    /// observe `numerator > denominator` (utilization > 1) for a line
+    /// in flight.
+    pub(crate) fn record_line_denominator(&self, tenant: &TenantId, service: &str) {
+        let mut st = lock_state(&self.state);
+        *st.body_lines.entry(tenant.clone()).or_insert(0) += 1;
+        st.by_service
+            .entry((tenant.clone(), service.to_owned()))
+            .or_default()
+            .lines += 1;
+    }
+
+    /// Observe one ingested line's `confidence` on both the §6.8
+    /// histogram and the per-`(tenant, service)` reservoir feeding the
+    /// p50/p01 gauges. The line denominator is bumped separately and
+    /// earlier by [`Self::record_line_denominator`].
     pub(crate) fn record_line(&self, tenant: &TenantId, service: &str, confidence: f64) {
         self.confidence
             .record(confidence, &service_attrs(tenant, service));
         let mut st = lock_state(&self.state);
-        *st.body_lines.entry(tenant.clone()).or_insert(0) += 1;
-        let tally = st
-            .by_service
+        st.by_service
             .entry((tenant.clone(), service.to_owned()))
-            .or_default();
-        tally.lines += 1;
-        tally.confidence.observe(confidence);
+            .or_default()
+            .confidence
+            .observe(confidence);
     }
 
     /// Record the miner's per-line processing duration (§6.8 `ourios.miner.duration`).

@@ -582,10 +582,10 @@ impl MinerCluster {
     /// site to change.
     ///
     /// One emitted record is one ingested line, so this is also the
-    /// single site that feeds the §6.8 per-line instruments: the
-    /// `ourios.miner.confidence` histogram + the p50/p01 reservoir,
-    /// and the per-`(tenant, service)` line denominator for
-    /// `ourios.miner.params.overflow.utilization`.
+    /// single site that observes the §6.8 per-line `confidence`
+    /// histogram + p50/p01 reservoir. The ratio-gauge denominators
+    /// are bumped earlier, at the top of [`Self::ingest`], so they
+    /// lead any numerator for the same line.
     fn emit_record(&mut self, record: MinedRecord, service: &str) {
         self.metrics
             .record_line(&record.tenant_id, service, f64::from(record.confidence));
@@ -1125,6 +1125,14 @@ impl MinerCluster {
         // instrument below; the hot-path helpers take it by
         // reference rather than re-scanning + re-allocating it.
         let service = service_of(&record.resource_attributes);
+        // Bump the per-line denominators before any per-line
+        // numerator (overflow / body-retention) for this line. The
+        // ratio-gauge callbacks may collect concurrently; denominator
+        // first keeps utilization ∈ [0, 1] at every collection point.
+        // Exactly one record is emitted per ingest, so this matches
+        // the `record_line` confidence observation one-to-one.
+        self.metrics
+            .record_line_denominator(&record.tenant_id, &service);
         let template_id = match &record.body {
             None => {
                 // The wire delivered no body. Emit a single

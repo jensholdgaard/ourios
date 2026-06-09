@@ -27,6 +27,7 @@
 - [RFC 0007 — Querier](./rfcs/0007-querier.md)
 - [RFC 0008 — Write-ahead log](./rfcs/0008-wal.md)
 - [RFC 0009 — Compaction](./rfcs/0009-compaction.md)
+- [RFC 0010 — Audit-stream queries & template drift](./rfcs/0010-audit-stream-queries.md)
 
 # Talks
 

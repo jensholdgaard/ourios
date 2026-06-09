@@ -187,11 +187,10 @@ mapping stays greppable from either side.
   - **When** the drift query over `[t1, t2]` runs
   - **Then** the out-of-window events do not contribute to any
     `widening_count`
-  - **And** boundary inclusion follows the RFC 0002 §6.1 `range`
-    convention bound-for-bound (the lower bound `from` is included, the
-    upper bound `to` is excluded — the half-open `[from, to)` the RFC 0002
-    range stage compiles to); a template with only a boundary event is
-    present iff that boundary is the included one.
+  - **And** boundary inclusion is half-open `[from, to)` — the lower
+    bound `from` is included, the upper bound `to` is excluded — so a
+    template with only a boundary event is present iff that boundary is
+    the included (lower) one.
 
 - **RFC0010.3 — `event_type` scoping excludes non-widenings `[§6.7]`,
   §3 (out of scope)**
@@ -390,9 +389,8 @@ result shapes distinct keeps invalid mixes unrepresentable.
 - **Window boundaries (RFC0010.2).** `drift` defines its window as
   **half-open `[from, to)`** — lower bound included, upper bound excluded.
   (RFC 0002's `range(from, to)` stage does not pin its boundary semantics
-  today; RFC 0010 fixes half-open for the drift window, and recommends
-  `range` adopt the same once its semantics are nailed down so the two time
-  vocabularies converge.) `from`/`to` reuse the RFC 0002 §7 `time` grammar
+  today; RFC 0010 defines half-open for the drift window independently.)
+  `from`/`to` reuse the RFC 0002 §7 `time` grammar
   (relative durations resolve against query-evaluation `now`; RFC 3339
   timestamps are absolute).
 - **Window → partition prune.** The window's resolved `[t1, t2)` bounds
@@ -453,8 +451,8 @@ test; ids are greppable from the test code.
   including rejection of trailing `|` stages and of a `predicate`/`stages`
   sibling key (the closed-form constraint, §6.1).
 - **Boundary tests (RFC0010.2).** Events placed before, on, and after each
-  window bound; assert the half-open `[from, to)` inclusion matches the
-  RFC 0002 `range` golden behaviour.
+  window bound; assert the half-open `[from, to)` inclusion this RFC
+  defines (§6.5) — lower bound included, upper bound excluded.
 - **Scoping tests (RFC0010.3).** `rejected_degenerate` and `compaction`
   events seeded alongside qualifying ones; assert exclusion and correct
   `widening_count`.

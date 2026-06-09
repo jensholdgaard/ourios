@@ -164,6 +164,7 @@ fn reconstruct_from_template(record: &MinedRecord, template: &[OwnedToken]) -> V
 /// consumer (RFC 0007's DSL output layer; a UI) to flag the row as
 /// "rendered from the retained `body`, not reconstructed."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Reconstruction {
     /// Bytes were rebuilt from `template + params + separators` and
     /// equal the ingested line.
@@ -182,8 +183,13 @@ pub enum Reconstruction {
 ///   ingest, so the retained `body` is returned **verbatim** with
 ///   [`Reconstruction::RetainedVerbatim`]. `reconstruct` is **not**
 ///   invoked — no template lookup, no token walk.
-/// - otherwise: the row is faithful, so this calls [`reconstruct`]
-///   and attaches [`Reconstruction::Faithful`].
+/// - otherwise, when the `template` shape matches the record, the row
+///   is rebuilt from the template and attaches
+///   [`Reconstruction::Faithful`]. A shape mismatch (a corrupt row or a
+///   wrong template lookup) would make `reconstruct` fall back to the
+///   body — which is *not* a faithful reconstruction — so that case
+///   also returns the body verbatim with
+///   [`Reconstruction::RetainedVerbatim`].
 ///
 /// `template` is passed through to `reconstruct` exactly as that
 /// function takes it today; the read-time
@@ -197,18 +203,29 @@ pub enum Reconstruction {
 /// marker for them, so callers route only `String` rows through it.
 #[must_use]
 pub fn render(record: &MinedRecord, template: &[OwnedToken]) -> (Vec<u8>, Reconstruction) {
-    let retain_verbatim = record.lossy_flag
-        || record
+    debug_assert!(
+        matches!(record.body_kind, BodyKind::String),
+        "render is the §6.6 String-body reader path; route Structured/Absent rows through reconstruct"
+    );
+    // `Faithful` must mean the bytes were actually rebuilt from the
+    // template. `reconstruct` falls back to the retained body on a
+    // lossy/overflow row *or* a template-shape mismatch (a corrupt row or
+    // a wrong template lookup); none of those are faithful
+    // reconstructions, so they return the body verbatim with
+    // `RetainedVerbatim` and never walk the template.
+    let faithful = !record.lossy_flag
+        && !record
             .params
             .iter()
-            .any(|p| p.type_tag == ParamType::Overflow);
-    if retain_verbatim {
+            .any(|p| p.type_tag == ParamType::Overflow)
+        && template_shape_matches_record(record, template);
+    if faithful {
+        (reconstruct(record, template), Reconstruction::Faithful)
+    } else {
         (
             body_bytes_or_empty(record),
             Reconstruction::RetainedVerbatim,
         )
-    } else {
-        (reconstruct(record, template), Reconstruction::Faithful)
     }
 }
 
@@ -471,5 +488,31 @@ mod tests {
         let (bytes, marker) = render(&r, &template);
         assert_eq!(bytes, b"user 42 logged in from 10.0.0.1".to_vec());
         assert_eq!(marker, Reconstruction::Faithful);
+    }
+
+    #[test]
+    fn render_clean_string_with_template_shape_mismatch_is_retained_not_faithful() {
+        // A clean (non-lossy, non-overflow) String row whose template
+        // shape does not match the record — here two params against one
+        // wildcard — would make `reconstruct` fall back to the retained
+        // body. `render` must report that as RetainedVerbatim, never
+        // Faithful: labelling fallback bytes "Faithful" would lie about
+        // whether the template was walked.
+        let template = vec![OwnedToken::Fixed("user".to_string()), OwnedToken::Wildcard];
+        let mut r = record_envelope(BodyKind::String);
+        r.params = vec![
+            Param {
+                type_tag: ParamType::Num,
+                value: "1".to_string(),
+            },
+            Param {
+                type_tag: ParamType::Num,
+                value: "2".to_string(),
+            },
+        ];
+        r.body = Some("user 1 and 2".to_string());
+        let (bytes, marker) = render(&r, &template);
+        assert_eq!(bytes, b"user 1 and 2".to_vec());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
     }
 }

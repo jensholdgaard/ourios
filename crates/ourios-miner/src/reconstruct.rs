@@ -156,6 +156,94 @@ fn reconstruct_from_template(record: &MinedRecord, template: &[OwnedToken]) -> V
     out
 }
 
+/// Per-row reconstruction signal for the §6.6 *Reader render
+/// contract*. It is the structured, out-of-band warning marker H7.3
+/// references: metadata attached *beside* the rendered row, never a
+/// mutation of the body bytes. A `RetainedVerbatim` row is rendered
+/// from the retained `body` bytes (when present) without
+/// reconstruction — for a lossy/overflow row that is the ingested line
+/// verbatim `[§3.3]`; the marker tells a consumer (RFC 0007's DSL
+/// output layer; a UI) to flag the row as "rendered from the retained
+/// `body`, not reconstructed."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reconstruction {
+    /// Bytes were rebuilt from `template + params + separators`. With
+    /// the row's correct template they equal the ingested line; `render`
+    /// cannot guarantee equality if a caller supplies a wrong but
+    /// shape-compatible template.
+    Faithful,
+    /// Bytes are the retained `body` column, returned verbatim
+    /// without invoking `reconstruct`.
+    RetainedVerbatim,
+}
+
+/// Render a `String`-body row per the §6.6 *Reader render contract*,
+/// returning the bytes a reader should display — reconstructed when
+/// faithful, otherwise the retained `body` — alongside the per-row
+/// [`Reconstruction`] signal.
+///
+/// - `lossy_flag = true`, or any [`ParamType::Overflow`] param
+///   (§6.5): the row's reconstruction is not guaranteed to equal
+///   ingest, so the retained `body` is returned **verbatim** with
+///   [`Reconstruction::RetainedVerbatim`]. `reconstruct` is **not**
+///   invoked — no template lookup, no token walk.
+/// - otherwise, when the `template` shape matches the record, the row
+///   is rebuilt from the template and attaches
+///   [`Reconstruction::Faithful`]. A shape mismatch (a corrupt row or a
+///   wrong template lookup) would make `reconstruct` fall back to the
+///   body — which is *not* a faithful reconstruction — so that case
+///   also returns the body verbatim with
+///   [`Reconstruction::RetainedVerbatim`].
+///
+/// `template` is the leaf's tokens for the clean-path walk, taken
+/// exactly as [`reconstruct`] takes them today; the read-time
+/// `(template_id, template_version) → tokens` registry the clean
+/// path needs is out of scope of the §6.6 amendment (RFC 0007).
+///
+/// Only `body_kind = String` rows go through `render`: the §6.6
+/// amendment scopes the `Reconstruction` marker to the `String` path.
+/// Structured / Absent rows are out of scope; passing one is a caller
+/// bug and **panics** rather than inventing a marker for them — route
+/// only `String` rows here and handle the rest via [`reconstruct`].
+///
+/// # Panics
+///
+/// If `record.body_kind` is not [`BodyKind::String`].
+#[must_use]
+pub fn render(record: &MinedRecord, template: &[OwnedToken]) -> (Vec<u8>, Reconstruction) {
+    assert!(
+        matches!(record.body_kind, BodyKind::String),
+        "render is the §6.6 String-body reader path; route Structured/Absent rows through reconstruct"
+    );
+    // `Faithful` must mean the bytes were actually rebuilt from the
+    // template. `reconstruct` falls back to the retained body on a
+    // lossy/overflow row *or* a template-shape mismatch (a corrupt row or
+    // a wrong template lookup); none of those are faithful
+    // reconstructions, so they return the body verbatim with
+    // `RetainedVerbatim` and never walk the template.
+    let faithful = !record.lossy_flag
+        && !record
+            .params
+            .iter()
+            .any(|p| p.type_tag == ParamType::Overflow)
+        && template_shape_matches_record(record, template);
+    if faithful {
+        // The faithful guard already established `reconstruct`'s clean-path
+        // preconditions, so call the inner walk directly and skip
+        // re-checking lossy / overflow / shape (a second template scan).
+        (
+            reconstruct_from_template(record, template),
+            Reconstruction::Faithful,
+        )
+    } else {
+        (
+            body_bytes_or_empty(record),
+            Reconstruction::RetainedVerbatim,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +441,96 @@ mod tests {
         r.params = vec![];
 
         assert_eq!(reconstruct(&r, &template), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn render_lossy_string_returns_body_verbatim_with_marker() {
+        // §6.6 reader render contract: a lossy String row returns its
+        // retained body verbatim and the RetainedVerbatim marker.
+        let mut r = record_envelope(BodyKind::String);
+        r.lossy_flag = true;
+        r.body = Some("user 42\u{0000}secret".to_string());
+        let (bytes, marker) = render(&r, &[]);
+        assert_eq!(bytes, b"user 42\0secret".to_vec());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
+    }
+
+    #[test]
+    fn render_overflow_string_returns_body_verbatim_with_marker() {
+        // §6.5 overflow: the value spilled to body, so render returns
+        // body verbatim with RetainedVerbatim rather than rebuilding.
+        let mut r = record_envelope(BodyKind::String);
+        r.params = vec![Param {
+            type_tag: ParamType::Overflow,
+            value: "{length:4096,sha256_prefix:...}".to_string(),
+        }];
+        r.body = Some("user <very-long-blob> ok".to_string());
+        let (bytes, marker) = render(&r, &[]);
+        assert_eq!(bytes, b"user <very-long-blob> ok".to_vec());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
+    }
+
+    #[test]
+    fn render_clean_string_reconstructs_with_faithful_marker() {
+        let template = vec![
+            OwnedToken::Fixed("user".to_string()),
+            OwnedToken::Wildcard,
+            OwnedToken::Fixed("logged".to_string()),
+            OwnedToken::Fixed("in".to_string()),
+            OwnedToken::Fixed("from".to_string()),
+            OwnedToken::Wildcard,
+        ];
+        let mut r = record_envelope(BodyKind::String);
+        r.params = vec![
+            Param {
+                type_tag: ParamType::Num,
+                value: "42".to_string(),
+            },
+            Param {
+                type_tag: ParamType::Ip,
+                value: "10.0.0.1".to_string(),
+            },
+        ];
+        r.separators = vec![
+            String::new(),
+            " ".to_string(),
+            " ".to_string(),
+            " ".to_string(),
+            " ".to_string(),
+            " ".to_string(),
+            String::new(),
+        ];
+        let (bytes, marker) = render(&r, &template);
+        assert_eq!(bytes, b"user 42 logged in from 10.0.0.1".to_vec());
+        assert_eq!(marker, Reconstruction::Faithful);
+    }
+
+    #[test]
+    fn render_clean_string_with_template_shape_mismatch_is_retained_not_faithful() {
+        // A clean (non-lossy, non-overflow) String row whose template
+        // shape does not match the record — here two params against one
+        // wildcard — would make `reconstruct` fall back to the retained
+        // body. `render` must report that as RetainedVerbatim, never
+        // Faithful: labelling fallback bytes "Faithful" would lie about
+        // whether the template was walked.
+        let template = vec![OwnedToken::Fixed("user".to_string()), OwnedToken::Wildcard];
+        let mut r = record_envelope(BodyKind::String);
+        // Valid separators (len == template.len() + 1) so the ONLY shape
+        // mismatch is the wildcard/param count (1 wildcard vs 2 params).
+        r.separators = vec![String::new(), " ".to_string(), String::new()];
+        r.params = vec![
+            Param {
+                type_tag: ParamType::Num,
+                value: "1".to_string(),
+            },
+            Param {
+                type_tag: ParamType::Num,
+                value: "2".to_string(),
+            },
+        ];
+        r.body = Some("user 1 and 2".to_string());
+        let (bytes, marker) = render(&r, &template);
+        assert_eq!(bytes, b"user 1 and 2".to_vec());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
     }
 }

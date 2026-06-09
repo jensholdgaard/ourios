@@ -153,7 +153,7 @@ impl std::fmt::Display for QueryError {
             // No `detail` here on purpose: the underlying engine
             // message would leak `DataFusion`/SQL specifics (§4.6).
             // The detail is preserved on the variant for `Debug`.
-            Self::Storage { .. } => write!(f, "failed to read the log store"),
+            Self::Storage { .. } => write!(f, "failed to read storage"),
         }
     }
 }
@@ -623,7 +623,7 @@ mod tests {
     /// operator-facing `QueryError` message (RFC0007.3 / §4.6).
     /// Lowercase — callers scan against the lowercased message.
     /// None of these collide with the generic Storage message
-    /// ("failed to read the log store").
+    /// ("failed to read storage").
     const ENGINE_LEAK_TOKENS: &[&str] = &[
         "datafusion",
         "arrow",
@@ -663,7 +663,7 @@ mod tests {
                 detail: "Error during planning: SQL ...".into(),
             }
             .to_string(),
-            "failed to read the log store",
+            "failed to read storage",
         );
     }
 

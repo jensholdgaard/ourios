@@ -90,6 +90,12 @@ pub(crate) async fn run_drift(
     now_unix_nano: u64,
 ) -> Result<DriftResult, QueryError> {
     let (start, end) = resolve_window(query, now_unix_nano)?;
+    if start == end {
+        // An empty half-open `[from, to)` window can hold no events, so the
+        // result is empty without any audit-tree IO or DataFusion planning
+        // (RFC0010.5).
+        return Ok(DriftResult::default());
+    }
     let files = audit_files_in_window(bucket_root, tenant, start, end)?;
     if files.is_empty() {
         // No audit files for the window ⇒ empty drift result, not an error
@@ -172,10 +178,11 @@ fn resolve_window(query: &DriftQuery, now: u64) -> Result<(u64, u64), QueryError
 /// Resolve the live audit `*.parquet` files for `tenant` whose day partition
 /// could hold an event in `[start, end)`. Tenancy is the partition root
 /// (RFC0010.4); the day-granularity window prune (RFC 0005 §3.4) skips whole
-/// `year/month/day` partitions that can't overlap the window before any footer
-/// is opened. A missing tenant directory is an empty set (RFC0010.5), not an
-/// error; any other I/O failure is surfaced as [`QueryError::Storage`] rather
-/// than masked as "no drift".
+/// `day=…` partitions that can't overlap the window — the directory is not even
+/// listed, so no footer there is opened. Canonical paths are de-duplicated so a
+/// symlink can't double-count a file. A missing tenant directory is an empty
+/// set (RFC0010.5), not an error; any other I/O failure is surfaced as
+/// [`QueryError::Storage`] rather than masked as "no drift".
 fn audit_files_in_window(
     bucket_root: &Path,
     tenant: &TenantId,
@@ -191,33 +198,34 @@ fn audit_files_in_window(
     let mut files = Vec::new();
     let mut stack = vec![tenant_dir.clone()];
     while let Some(dir) = stack.pop() {
+        // Day-granularity partition prune (RFC 0005 §3.4 / RFC 0010 §6.5):
+        // an out-of-window `day=…` leaf is skipped *before* it is listed, so
+        // its footers are never opened. `day_partition_in_window` is
+        // conservative — a non-leaf or unparseable dir (`year=`, `month=`,
+        // `tenant_id=`) is never pruned, so the walk still descends to the
+        // leaves; only a `day=` leaf whose `[day_start, day_start + 1d)` UTC
+        // span misses `[start, end)` is dropped. The row-level `timestamp`
+        // predicate stays the correctness authority.
+        if !day_partition_in_window(&dir, start, end) {
+            continue;
+        }
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(io_err("read_dir", &dir, &e)),
         };
-        let mut subdirs = Vec::new();
-        let mut parquets = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| io_err("read_dir entry", &dir, &e))?;
             let path = entry.path();
             match entry.file_type() {
-                Ok(ft) if ft.is_dir() => subdirs.push(path),
+                Ok(ft) if ft.is_dir() => stack.push(path),
                 // `*.parquet.tmp` has extension `tmp`, so an uncommitted /
                 // crashed writer's temp file contributes nothing.
-                Ok(_) if path.extension().is_some_and(|x| x == "parquet") => parquets.push(path),
+                Ok(_) if path.extension().is_some_and(|x| x == "parquet") => files.push(path),
                 Ok(_) => {}
                 Err(e) => return Err(io_err("file_type", &path, &e)),
             }
         }
-        // Day-granularity partition prune (RFC 0005 §3.4 / RFC 0010 §6.5): keep
-        // a leaf only if its `[day_start, day_start + 1d)` UTC span overlaps the
-        // window. Conservative — a non-leaf or unparseable path is never pruned,
-        // so the row-level `timestamp` predicate stays the correctness authority.
-        if day_partition_in_window(&dir, start, end) {
-            files.append(&mut parquets);
-        }
-        stack.extend(subdirs);
     }
     if files.is_empty() {
         return Ok(files);
@@ -231,6 +239,10 @@ fn audit_files_in_window(
     let tenant_root = tenant_dir
         .canonicalize()
         .map_err(|e| io_err("canonicalize", &tenant_dir, &e))?;
+    // De-duplicate the canonical paths (mirroring the log path in `lib.rs`):
+    // two names resolving to the same file — e.g. an in-tenant symlink — must
+    // not be read or counted twice.
+    let mut seen = std::collections::HashSet::new();
     let mut validated = Vec::with_capacity(files.len());
     for file in files {
         let abs = file
@@ -245,7 +257,9 @@ fn audit_files_in_window(
                 ),
             });
         }
-        validated.push(abs);
+        if seen.insert(abs.clone()) {
+            validated.push(abs);
+        }
     }
     Ok(validated)
 }

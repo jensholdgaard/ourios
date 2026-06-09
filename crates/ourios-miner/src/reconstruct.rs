@@ -159,10 +159,12 @@ fn reconstruct_from_template(record: &MinedRecord, template: &[OwnedToken]) -> V
 /// Per-row reconstruction signal for the §6.6 *Reader render
 /// contract*. It is the structured, out-of-band warning marker H7.3
 /// references: metadata attached *beside* the rendered row, never a
-/// mutation of the body bytes. A `RetainedVerbatim` row carries the
-/// ingested bytes back unchanged `[§3.3]`; the marker tells a
-/// consumer (RFC 0007's DSL output layer; a UI) to flag the row as
-/// "rendered from the retained `body`, not reconstructed."
+/// mutation of the body bytes. A `RetainedVerbatim` row is rendered
+/// from the retained `body` bytes (when present) without
+/// reconstruction — for a lossy/overflow row that is the ingested line
+/// verbatim `[§3.3]`; the marker tells a consumer (RFC 0007's DSL
+/// output layer; a UI) to flag the row as "rendered from the retained
+/// `body`, not reconstructed."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reconstruction {
@@ -177,7 +179,8 @@ pub enum Reconstruction {
 }
 
 /// Render a `String`-body row per the §6.6 *Reader render contract*,
-/// returning the effective original line bytes alongside the per-row
+/// returning the bytes a reader should display — reconstructed when
+/// faithful, otherwise the retained `body` — alongside the per-row
 /// [`Reconstruction`] signal.
 ///
 /// - `lossy_flag = true`, or any [`ParamType::Overflow`] param

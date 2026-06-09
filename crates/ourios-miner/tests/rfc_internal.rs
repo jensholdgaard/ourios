@@ -570,9 +570,107 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
 /// Scenario RFC0001.9 — `body_kind = Structured` short-circuits to a structured-template id.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn rfc0001_9_structured_body_short_circuits_to_structured_template_id() {
-    todo!("RFC 0001 §6.1 (Body representation), §6.2 (step 0)");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{
+        AnyValue, Body, KeyValue, KeyValueList, OtlpLogRecord, any_value, canonical,
+    };
+    use ourios_core::record::{BodyKind, SharedRecordSink};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+
+    // Arrange — a non-String `AnyValue`: a KvlistValue with two keys
+    // in insertion order `zeta, alpha` so the structured branch
+    // exercises a real structured body whose canonical encoding
+    // preserves received order. RFC §6.2 step 0 must skip
+    // tokenize/mask/descend and route this to a structured-template id
+    // keyed on `(severity_number, scope_name, BodyKind::Structured)`.
+    let int_av = |n: i64| AnyValue {
+        value: Some(any_value::Value::IntValue(n)),
+    };
+    let kvlist = || AnyValue {
+        value: Some(any_value::Value::KvlistValue(KeyValueList {
+            values: vec![
+                KeyValue {
+                    key: "zeta".to_string(),
+                    value: Some(int_av(1)),
+                    ..Default::default()
+                },
+                KeyValue {
+                    key: "alpha".to_string(),
+                    value: Some(int_av(2)),
+                    ..Default::default()
+                },
+            ],
+        })),
+    };
+    let t = TenantId::new("tenant-x");
+    let make = |severity: u8, scope: Option<&str>| OtlpLogRecord {
+        tenant_id: t.clone(),
+        severity_number: severity,
+        scope_name: scope.map(str::to_string),
+        body: Some(Body::Structured(kvlist())),
+        ..Default::default()
+    };
+
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+
+    // Act — two records sharing `(9, "lib.auth")` and one differing
+    // only in scope. The structured-template id semantics: same
+    // (severity, scope) reuses the id, a different (severity, scope)
+    // allocates a fresh one.
+    let id_a1 = cluster.ingest(&make(9, Some("lib.auth")));
+    let id_a2 = cluster.ingest(&make(9, Some("lib.auth")));
+    let id_b = cluster.ingest(&make(9, Some("lib.payments")));
+
+    // Assert — structured-template id semantics.
+    assert_eq!(
+        id_a1, id_a2,
+        "two structured records with the same (severity, scope) must share one structured-template id",
+    );
+    assert_ne!(
+        id_a1, id_b,
+        "a structured record with a different (severity, scope) must get a distinct structured-template id",
+    );
+
+    // Assert — the emitted record shape per §6.1 / §6.2 step 0.
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 3, "one record emitted per ingest");
+    let rec = &emitted[0];
+    assert_eq!(
+        rec.body_kind,
+        BodyKind::Structured,
+        "non-String AnyValue body must emit BodyKind::Structured",
+    );
+    assert_eq!(
+        rec.template_id, id_a1,
+        "the emitted record carries the structured-template id ingest returned",
+    );
+    let body = rec.body.as_deref().expect("structured body is Some");
+    let decoded = canonical::decode_any_value(body.as_bytes()).expect("canonical body decodes");
+    assert_eq!(
+        decoded,
+        kvlist(),
+        "the canonical body round-trips to the original AnyValue",
+    );
+    assert!(
+        !rec.lossy_flag,
+        "RFC §6.1: lossy_flag is always false on BodyKind::Structured",
+    );
+    assert!(
+        rec.params.is_empty(),
+        "RFC §6.1: params is empty on BodyKind::Structured",
+    );
+    assert!(
+        rec.separators.is_empty(),
+        "RFC §6.1: separators is empty on BodyKind::Structured",
+    );
+    assert!(
+        (rec.confidence - 1.0).abs() < f32::EPSILON,
+        "RFC §6.1: confidence is the 1.0 sentinel on BodyKind::Structured",
+    );
 }
 
 /// Scenario RFC0001.10 — `time_unix_nano` is preserved verbatim from the wire.

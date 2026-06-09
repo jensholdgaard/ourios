@@ -429,6 +429,85 @@ pub mod canonical {
             );
         }
 
+        /// Pins the **exact bytes** the Ourios canonical body
+        /// encoding emits per variant — not just struct round-trip.
+        /// This locks the RFC 0001 §6.1 / RFC 0005 §3.3 wire shape
+        /// the `body` column depends on: `lowerCamelCase` field
+        /// names, `int64`/`uint64` as decimal **strings**, `bytes`
+        /// as base64, and — load-bearing — `KvlistValue` /
+        /// `ArrayValue` element order **preserved as received, not
+        /// sorted** (explicitly NOT RFC 8785 / JCS). The kvlist case
+        /// keys `zeta, alpha, mid` are deliberately out of sorted
+        /// order so a future serialiser swap that started sorting
+        /// would fail here.
+        #[test]
+        fn encoder_emits_exact_canonical_bytes_per_variant() {
+            let cases: [(AnyValue, &str); 5] = [
+                (int_av(-42), r#"{"intValue":"-42"}"#),
+                (
+                    AnyValue {
+                        value: Some(any_value::Value::DoubleValue(2.71_f64)),
+                    },
+                    r#"{"doubleValue":2.71}"#,
+                ),
+                (
+                    AnyValue {
+                        value: Some(any_value::Value::BoolValue(true)),
+                    },
+                    r#"{"boolValue":true}"#,
+                ),
+                (
+                    AnyValue {
+                        value: Some(any_value::Value::BytesValue(b"raw\x00bytes".to_vec())),
+                    },
+                    r#"{"bytesValue":"cmF3AGJ5dGVz"}"#,
+                ),
+                (
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(
+                            opentelemetry_proto::tonic::common::v1::ArrayValue {
+                                values: vec![string_av("a"), int_av(1)],
+                            },
+                        )),
+                    },
+                    r#"{"arrayValue":{"values":[{"stringValue":"a"},{"intValue":"1"}]}}"#,
+                ),
+            ];
+            for (av, expected) in cases {
+                let bytes = encode_any_value(&av).expect("encode");
+                let got = String::from_utf8(bytes).expect("serde_json emits UTF-8");
+                assert_eq!(got, expected, "canonical bytes drift for {av:?}");
+            }
+
+            // KvlistValue keys in insertion order `zeta, alpha, mid` —
+            // the encoder must preserve that order, not sort it.
+            let kv = |k: &str, n: i64| KeyValue {
+                key: k.to_string(),
+                value: Some(int_av(n)),
+                ..Default::default()
+            };
+            let kvlist = AnyValue {
+                value: Some(any_value::Value::KvlistValue(
+                    opentelemetry_proto::tonic::common::v1::KeyValueList {
+                        values: vec![kv("zeta", 1), kv("alpha", 2), kv("mid", 3)],
+                    },
+                )),
+            };
+            let bytes = encode_any_value(&kvlist).expect("encode");
+            let got = String::from_utf8(bytes).expect("serde_json emits UTF-8");
+            assert_eq!(
+                got,
+                concat!(
+                    r#"{"kvlistValue":{"values":["#,
+                    r#"{"key":"zeta","value":{"intValue":"1"}},"#,
+                    r#"{"key":"alpha","value":{"intValue":"2"}},"#,
+                    r#"{"key":"mid","value":{"intValue":"3"}}"#,
+                    "]}}",
+                ),
+                "kvlist must preserve received key order (zeta, alpha, mid) — NOT sorted",
+            );
+        }
+
         /// Empty attribute lists encode to a sentinel that
         /// decodes back to an empty `Vec`. The writer special-
         /// cases the empty case (no row-level allocation), but

@@ -193,8 +193,8 @@ pub enum Reconstruction {
 ///   also returns the body verbatim with
 ///   [`Reconstruction::RetainedVerbatim`].
 ///
-/// `template` is passed through to `reconstruct` exactly as that
-/// function takes it today; the read-time
+/// `template` is the leaf's tokens for the clean-path walk, taken
+/// exactly as [`reconstruct`] takes them today; the read-time
 /// `(template_id, template_version) → tokens` registry the clean
 /// path needs is out of scope of the §6.6 amendment (RFC 0007).
 ///
@@ -226,7 +226,13 @@ pub fn render(record: &MinedRecord, template: &[OwnedToken]) -> (Vec<u8>, Recons
             .any(|p| p.type_tag == ParamType::Overflow)
         && template_shape_matches_record(record, template);
     if faithful {
-        (reconstruct(record, template), Reconstruction::Faithful)
+        // The faithful guard already established `reconstruct`'s clean-path
+        // preconditions, so call the inner walk directly and skip
+        // re-checking lossy / overflow / shape (a second template scan).
+        (
+            reconstruct_from_template(record, template),
+            Reconstruction::Faithful,
+        )
     } else {
         (
             body_bytes_or_empty(record),

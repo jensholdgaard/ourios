@@ -184,7 +184,10 @@ pub enum Reconstruction {
 ///   faithful representation of what was logged, so `render` returns
 ///   it with [`Reconstruction::Faithful`]. No template is walked
 ///   (structured rows have none); the canonical encoding is the
-///   §3.3 round-trip guarantee for the structured branch.
+///   §3.3 round-trip guarantee for the structured branch. A
+///   structured row whose `body` is absent (a corrupt/foreign row;
+///   the producer always populates it) is not faithful — it renders
+///   empty with [`Reconstruction::RetainedVerbatim`].
 /// - [`BodyKind::String`] with `lossy_flag = true`, or any
 ///   [`ParamType::Overflow`] param (§6.5): the row's reconstruction
 ///   is not guaranteed to equal ingest, so the retained `body` is
@@ -213,18 +216,21 @@ pub enum Reconstruction {
 #[must_use]
 pub fn render(record: &MinedRecord, template: &[OwnedToken]) -> (Vec<u8>, Reconstruction) {
     match record.body_kind {
-        // The canonical body encoding is bidirectional and
-        // byte-deterministic (§6.1) and `lossy_flag` is always false
-        // for structured rows: the stored body faithfully represents
-        // the logged `AnyValue`, so it renders Faithful without any
-        // template walk.
-        BodyKind::Structured => (body_bytes_or_empty(record), Reconstruction::Faithful),
-        // No wire body, no template: nothing was reconstructed, so the
-        // (empty) body is surfaced verbatim.
-        BodyKind::Absent => (
-            body_bytes_or_empty(record),
-            Reconstruction::RetainedVerbatim,
-        ),
+        // A structured row's `body` is the canonical encoding of the
+        // logged `AnyValue` — bidirectional, byte-deterministic (§6.1),
+        // `lossy_flag` always false — so when present it renders
+        // Faithful without a template walk. A *missing* body (a corrupt
+        // or foreign row; the producer always populates it) is not a
+        // faithful render, so surface empty bytes as RetainedVerbatim
+        // rather than claim Faithful over nothing.
+        BodyKind::Structured => match record.body.as_deref() {
+            Some(body) => (body.as_bytes().to_vec(), Reconstruction::Faithful),
+            None => (Vec::new(), Reconstruction::RetainedVerbatim),
+        },
+        // No wire body: nothing was reconstructed and there is nothing
+        // to retain, so render empty bytes. A stray stored `body` on an
+        // Absent row is a corrupt row — it is not surfaced.
+        BodyKind::Absent => (Vec::new(), Reconstruction::RetainedVerbatim),
         BodyKind::String => {
             // `Faithful` must mean the bytes were actually rebuilt from
             // the template. `reconstruct` falls back to the retained
@@ -576,6 +582,30 @@ mod tests {
         // `RetainedVerbatim` — the honest "not rebuilt from a template"
         // signal.
         let r = record_envelope(BodyKind::Absent);
+        let (bytes, marker) = render(&r, &[]);
+        assert_eq!(bytes, Vec::<u8>::new());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
+    }
+
+    #[test]
+    fn render_structured_without_body_is_not_faithful() {
+        // A structured row whose `body` is absent (a corrupt or foreign
+        // row — the producer always populates it) is NOT a faithful
+        // render: empty bytes must carry `RetainedVerbatim`, never
+        // `Faithful` over nothing.
+        let r = record_envelope(BodyKind::Structured);
+        assert!(r.body.is_none());
+        let (bytes, marker) = render(&r, &[]);
+        assert_eq!(bytes, Vec::<u8>::new());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
+    }
+
+    #[test]
+    fn render_absent_does_not_surface_a_stray_body() {
+        // An Absent row should have no body; a stray stored `body` is a
+        // corrupt row and must not be surfaced — render stays empty.
+        let mut r = record_envelope(BodyKind::Absent);
+        r.body = Some("stray".to_string());
         let (bytes, marker) = render(&r, &[]);
         assert_eq!(bytes, Vec::<u8>::new());
         assert_eq!(marker, Reconstruction::RetainedVerbatim);

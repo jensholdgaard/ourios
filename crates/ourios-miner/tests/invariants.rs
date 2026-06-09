@@ -447,18 +447,9 @@ fn invariant_3_7_2_same_template_two_tenants_distinct_template_ids() {
     );
 }
 
-/// Scenario §3.7.3 — Tenant derivation runs per `ResourceLogs`, not per export batch.
-/// See `docs/rfcs/0001-template-miner.md` §5.
-///
-/// This is the **miner-side** stub: it asserts that when records
-/// from two distinct tenants arrive in the same ingest sequence,
-/// each record lands in its derived tenant's tree. The
-/// **receiver-side** stub — that the wire-decode layer actually
-/// derives `tenant_id` per `ResourceLogs.resource` rather than
-/// per `ExportLogsServiceRequest` — lives with RFC 0003 (see
-/// RFC 0003 §6.3) once the receiver crate exists.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
-    todo!("RFC 0001 §6.1 (Tenant derivation)");
-}
+// Scenario §3.7.3 (tenant derivation runs per `ResourceLogs`) is a
+// receiver/RFC 0003 §6.3 behaviour the miner crate cannot drive — it needs a
+// wire `ExportLogsServiceRequest` decoded and fanned out. As this stub's
+// comment anticipated ("lives with RFC 0003 once the receiver crate
+// exists"), it now lives in
+// `ourios-ingester/tests/invariant_3_7_3_tenant_per_resource_logs.rs`.

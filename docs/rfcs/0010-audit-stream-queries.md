@@ -1,7 +1,7 @@
 ---
 rfc: 0010
 title: Audit-stream queries & template drift
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <Jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-09
@@ -11,7 +11,9 @@ superseded-by: —
 
 # RFC 0010 — Audit-stream queries & template drift
 
-> **Status note.** **`drafted`.** This RFC fills the audit-stream
+> **Status note.** **`specified`.** The dedicated `drift` surface (a
+> contained query head, not the general aggregation pipeline) was
+> maintainer-confirmed 2026-06-09. This RFC fills the audit-stream
 > query gap that RFC 0002 §6.3 deferred ("drift is an audit-stream
 > property, not a column in the RFC 0005 data files, so it needs an
 > audit-stream query path — a future capability"). It specifies a
@@ -47,7 +49,8 @@ worked example of a general audit-stream aggregation engine.
 
 ### 2.1 The gap, precisely
 
-Three accepted/green RFCs leave a single hole between them:
+Three existing RFCs (RFC 0001 `specified`, RFC 0002 `green`, RFC 0005
+`drafted`) leave a single hole between them:
 
 - **RFC 0001 §6.7** ("Drift detection as a first-class query") gives the
   exact semantics as SQL over a `template_audit` relation, then says: *"SQL

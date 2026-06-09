@@ -202,7 +202,7 @@ mapping stays greppable from either side.
   - **And** for a template D with both qualifying and `rejected_degenerate`
     events, `widening_count` counts only the qualifying ones.
 
-- **RFC0010.4 — Tenant isolation `[§3.7]`, RFC0007.5**
+- **RFC0010.4 — Tenant isolation `[CLAUDE.md §3.7]`, RFC0007.5**
   - **Given** qualifying audit events for tenant X and qualifying audit
     events for tenant Y in the same window
   - **When** the drift query runs in tenant X's context
@@ -309,7 +309,7 @@ drift from -7d to now
 > post-deploy H5 check.
 
 ```text
-drift from "2026-06-01T00:00:00Z" to "2026-06-02T00:00:00Z"
+drift from 2026-06-01T00:00:00Z to 2026-06-02T00:00:00Z
 ```
 
 > Drift confined to a single UTC day (an absolute window straddling one
@@ -380,7 +380,7 @@ result shapes distinct keeps invalid mixes unrepresentable.
 
 ### 6.5 Tenancy and window semantics
 
-- **Tenant scoping (§3.7, RFC0010.4).** The tenant is supplied by the
+- **Tenant scoping (`CLAUDE.md` §3.7, RFC0010.4).** The tenant is supplied by the
   executing context, exactly as for RFC 0002/RFC 0007 log queries — never
   expressed in the query text. It compiles to a `tenant_id` partition-key
   filter over the `audit/tenant_id=…` Hive layout (RFC 0005 §3.4), so

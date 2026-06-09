@@ -2170,8 +2170,10 @@ specific serialisation codec.
 
 1. Load the latest snapshot artefact for the tenant, if one exists.
 2. If byte 0 is a **known** version: deserialise the payload,
-   restore the tree, then replay the WAL tail from the snapshot's
-   recorded high-water mark.
+   restore the tree, then replay the WAL to catch it up to the live
+   tail. The target design resumes from the snapshot's recorded
+   high-water mark; **in v1 this is a full WAL replay** (see *v1
+   scope* below).
 3. If byte 0 is an **unknown** version, or the snapshot is absent or
    corrupt: discard it and replay the **full** WAL via
    `Wal::replay` (RFC 0008 §6.1 API, §6.6 recovery procedure),

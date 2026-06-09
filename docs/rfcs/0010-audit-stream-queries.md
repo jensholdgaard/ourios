@@ -62,7 +62,7 @@ Three existing RFCs (RFC 0001 `specified`, RFC 0002 `green`, RFC 0005
   half: *"drift is an audit-stream property, not a column in the RFC 0005
   data files, so it needs an audit-stream query path — a future
   capability, not a row predicate in this grammar."*
-- **RFC 0005 §3.4 / §6** already persists the audit events to a queryable
+- **RFC 0005 §3.4 / §3.7** already persists the audit events to a queryable
   `audit/` Parquet series with the columns the §6.7 query reads
   (`event_type`, `template_id`, `old_version`, `new_version`, `timestamp`,
   …), and `ourios-parquet` ships `ParquetAuditSink` / `AuditReader` /
@@ -142,7 +142,7 @@ relevant facts, cited so the design below is unambiguous:
   day-granularity time bucket derived from `timestamp`. `tenant_id` is a
   row-level REQUIRED column *and* the leading Hive partition key, so a
   per-tenant scan is a partition prune, not a post-filter (§6.5).
-- **Columns (RFC 0005 §6).** `event_type` (REQUIRED `STRING`, the
+- **Columns (RFC 0005 §3.7).** `event_type` (REQUIRED `STRING`, the
   predicate-pushdown surface RFC 0005 names "for the RFC 0001 §6.7 drift
   query"), `event_kind` (REQUIRED `INT32` ordinal), `template_id`
   (`INT64`, OPTIONAL but required-by-convention for the template kinds),
@@ -152,7 +152,7 @@ relevant facts, cited so the design below is unambiguous:
   `triggering_line_*`, `reason`). Drift reads only
   `tenant_id`, `event_type`, `template_id`, `old_version`, `new_version`,
   and `timestamp`.
-- **Event-kind mapping (RFC 0005 §6).** `0 → template_widened`,
+- **Event-kind mapping (RFC 0005 §3.7).** `0 → template_widened`,
   `1 → template_type_expanded`, `2 → template_widening_rejected_degenerate`,
   `3 → compaction`. Drift's `event_type` filter selects ordinals 0 and 1.
 - **Reader (`ourios-parquet`).** `AuditReader::open_partition` is the
@@ -421,7 +421,7 @@ tenant + window) → `Aggregate` (group by `template_id`, the §6.3
 aggregates) → `Sort` (§6.3 ordering). Lowering is the only place DataFusion
 types appear; they never reach the caller (RFC0010.8 / RFC 0007 §6.5).
 Execution is RFC 0007's: partition pruning on `tenant_id` and the time
-keys, `event_type` predicate pushdown (RFC 0005 §6 names `event_type` as
+keys, `event_type` predicate pushdown (RFC 0005 §3.7 names `event_type` as
 the pushdown surface for exactly this query), scan stats surfaced on the
 result.
 
@@ -550,7 +550,7 @@ test; ids are greppable from the test code.
   §6.5 compilation discipline). RFC 0002 §6.3 explicitly deferred the
   audit-stream query path; that deferral is **resolved by this RFC**. RFC
   0002 stays `green` and is not edited here.
-- **RFC 0005 §3.4 / §6** — the `audit/` partition layout and audit-event
+- **RFC 0005 §3.4 / §3.7** — the `audit/` partition layout and audit-event
   schema this RFC reads (`event_type`, `template_id`, `old_version`,
   `new_version`, `timestamp`; the event-kind mapping table). This RFC does
   not redefine the schema.

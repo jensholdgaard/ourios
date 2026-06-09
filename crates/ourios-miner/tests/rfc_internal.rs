@@ -673,13 +673,10 @@ fn rfc0001_9_structured_body_short_circuits_to_structured_template_id() {
     );
 }
 
-/// Scenario RFC0001.10 — `time_unix_nano` is preserved verbatim from the wire.
-/// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
-    todo!("RFC 0001 §6.1 (record schema)");
-}
+// Scenario RFC0001.10 (`time_unix_nano` preserved verbatim) is an end-to-end
+// ingest → Parquet → query scenario the miner crate cannot run; it lives in
+// `ourios-querier/tests/rfc0001_time_preserved.rs` (same relocation as
+// RFC0001.5/.6).
 
 /// Scenario RFC0001.11 — `severity_number = 0` and `scope_name = None` are distinct key buckets.
 /// See `docs/rfcs/0001-template-miner.md` §5.

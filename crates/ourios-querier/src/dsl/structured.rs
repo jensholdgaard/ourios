@@ -17,20 +17,71 @@ use serde::Deserialize;
 
 use super::DslError;
 use super::ir::{
-    AggFn, Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
+    AggFn, Call, CmpOp, DriftQuery, Field, OrdOp, Predicate, Query, SeverityValue, Stage,
+    Statement, Time, Value,
 };
 use super::{parse_severity_name_pub, require_string_operand, validate_sort_key};
+
+/// Parse a structured (JSON) statement — a log query (`{"predicate":…}`) or a
+/// RFC 0010 `drift` query (`{"drift":{"from":…,"to":…}}`) — into a
+/// [`Statement`]. The two are distinct top-level objects: a `{"drift":…}`
+/// carries no `predicate`/`stages` siblings, and a `{"predicate":…}` carries
+/// no `drift` key (each denies the other's keys), so the shape selects the
+/// variant unambiguously (RFC 0010 §6.1).
+///
+/// # Errors
+///
+/// Returns [`DslError`] for malformed JSON or any structure that violates the
+/// §6.4 surface, the §7 grammar it mirrors, or the RFC 0010 §6.1 drift object.
+pub fn parse_structured_statement(json: &str) -> Result<Statement, DslError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| DslError::new(format!("malformed structured query: {e}")))?;
+    // The `drift` key selects the audit-stream variant; otherwise it is a log
+    // query. Dispatching on the key (rather than an untagged enum) keeps the
+    // log-query path's precise per-field deserialisation errors intact.
+    if value.get("drift").is_some() {
+        let envelope: RawDriftEnvelope = serde_json::from_value(value)
+            .map_err(|e| DslError::new(format!("malformed drift query: {e}")))?;
+        return Ok(Statement::Drift(DriftQuery {
+            from: parse_time(&envelope.drift.from)?,
+            to: parse_time(&envelope.drift.to)?,
+        }));
+    }
+    let raw: RawQuery = serde_json::from_value(value)
+        .map_err(|e| DslError::new(format!("malformed structured query: {e}")))?;
+    Ok(Statement::Logs(raw.into_ir()?))
+}
 
 /// Parse a structured (JSON) query into the shared [`Query`] IR.
 ///
 /// # Errors
 ///
 /// Returns [`DslError`] for malformed JSON or any structure that violates the
-/// §6.4 surface or the §7 grammar it mirrors.
+/// §6.4 surface or the §7 grammar it mirrors. A RFC 0010 `drift` object is
+/// rejected here — use [`parse_structured_statement`] to accept it.
 pub fn parse_structured(json: &str) -> Result<Query, DslError> {
-    let raw: RawQuery = serde_json::from_str(json)
-        .map_err(|e| DslError::new(format!("malformed structured query: {e}")))?;
-    raw.into_ir()
+    match parse_structured_statement(json)? {
+        Statement::Logs(query) => Ok(query),
+        Statement::Drift(_) => Err(DslError::new(
+            "`drift` is an audit-stream query, not a log query".to_string(),
+        )),
+    }
+}
+
+/// The RFC 0010 §6.1 drift envelope `{ "drift": { "from", "to" } }`. Denies
+/// unknown keys so a `{"drift":…,"predicate":…}` mix (or a typo'd sibling) is
+/// rejected rather than silently accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDriftEnvelope {
+    drift: RawDrift,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDrift {
+    from: String,
+    to: String,
 }
 
 #[derive(Deserialize)]
@@ -769,5 +820,50 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_structured_drift_object() {
+        // Arrange / Act — the RFC 0010 §6.1 `{ "drift": { "from", "to" } }`.
+        use super::parse_structured_statement;
+        use crate::dsl::ir::{Statement, Time};
+        let s = parse_structured_statement(r#"{"drift":{"from":"-7d","to":"now"}}"#).unwrap();
+        // Assert
+        match s {
+            Statement::Drift(d) => {
+                assert_eq!(
+                    d.from,
+                    Time::Duration {
+                        neg: true,
+                        literal: "7d".into()
+                    }
+                );
+                assert_eq!(d.to, Time::Now);
+            }
+            Statement::Logs(_) => panic!("expected Drift, got Logs"),
+        }
+    }
+
+    #[test]
+    fn rejects_drift_object_mixed_with_predicate_or_stages() {
+        use super::parse_structured_statement;
+        // A drift object admits no predicate/stages sibling (RFC 0010 §6.1).
+        assert!(
+            parse_structured_statement(
+                r#"{"drift":{"from":"-7d","to":"now"},"predicate":{"const":true}}"#
+            )
+            .is_err()
+        );
+        assert!(parse_structured_statement(r#"{"drift":{"from":"-7d"}}"#).is_err());
+        assert!(
+            parse_structured_statement(r#"{"drift":{"from":"-7d","to":"now","step":"5m"}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_structured_rejects_drift_as_a_log_query() {
+        // The log-only `parse_structured` rejects the drift object.
+        assert!(parse_structured(r#"{"drift":{"from":"-7d","to":"now"}}"#).is_err());
     }
 }

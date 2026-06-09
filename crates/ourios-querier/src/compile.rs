@@ -241,7 +241,10 @@ fn resolve_window(
     }
 }
 
-fn resolve_time(time: &Time, now: u64) -> Result<u64, QueryError> {
+/// Resolve a §7 [`Time`] bound to absolute nanoseconds against `now`. Shared
+/// with the RFC 0010 drift path (`crate::drift`), which reuses the same `time`
+/// grammar for its window (RFC 0010 §6.5).
+pub(crate) fn resolve_time(time: &Time, now: u64) -> Result<u64, QueryError> {
     match time {
         Time::Now => Ok(now),
         Time::Duration { neg, literal } => {

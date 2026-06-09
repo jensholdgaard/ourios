@@ -895,13 +895,13 @@ fn h5_2_type_expansion_increments_version_and_emits_template_type_expanded() {
     );
 }
 
-/// Scenario H5.3 — Drift query returns templates that gained a version in window.
-/// See `docs/rfcs/0001-template-miner.md` §5.
-#[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
-fn h5_3_drift_query_returns_templates_that_gained_a_version() {
-    todo!("RFC 0001 §6.7");
-}
+// Scenario H5.3 — Drift query returns templates that gained a version in
+// window (RFC 0001 §6.7) — RELOCATED. The drift query path lives in
+// `ourios-querier`, which the miner crate cannot run, so the real test is
+// `ourios-querier/tests/drift.rs::h5_3_drift_query_returns_templates_that_gained_a_version`
+// (the RFC 0010 §6.1 `drift` surface that RFC 0010 added to discharge this
+// criterion). Cf. RFC0001.5/.6, also relocated to
+// `ourios-querier/tests/rfc0001_query_semantics.rs`.
 
 /// Scenario H7.1 — Reconstruction property holds across the corpus.
 /// See `docs/rfcs/0001-template-miner.md` §5.

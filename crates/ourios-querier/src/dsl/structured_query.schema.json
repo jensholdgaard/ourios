@@ -2,18 +2,42 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ourios.dev/schemas/dsl/structured-query/v1.json",
   "title": "Ourios structured query surface",
-  "description": "RFC 0002 §6.4 — the machine surface MCP agents and programmatic clients target. Validated before parsing; compiles to the same IR as the string DSL (RFC0002.2). Published and versioned with the parser (RFC0002.11).",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["predicate"],
-  "properties": {
-    "predicate": { "$ref": "#/$defs/node" },
-    "stages": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/stage" }
-    }
-  },
+  "description": "The machine surface MCP agents and programmatic clients target. A statement is either a RFC 0002 §6.4 log query ({\"predicate\":…}) or a RFC 0010 §6.1 drift query ({\"drift\":{\"from\",\"to\"}}). Validated before parsing; compiles to the same IR as the string DSL (RFC0002.2 / RFC0010.8). Published and versioned with the parser (RFC0002.11).",
+  "oneOf": [
+    { "$ref": "#/$defs/log_query" },
+    { "$ref": "#/$defs/drift_query" }
+  ],
   "$defs": {
+    "log_query": {
+      "description": "RFC 0002 §6.4 log-record query over the data/ series.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["predicate"],
+      "properties": {
+        "predicate": { "$ref": "#/$defs/node" },
+        "stages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stage" }
+        }
+      }
+    },
+    "drift_query": {
+      "description": "RFC 0010 §6.1 drift query over the audit/ stream. A closed verb head: it carries only the half-open [from, to) window and admits no predicate/stages sibling. from/to are §7 lexical time strings (a relative duration like \"-7d\", \"now\", or an RFC 3339 timestamp).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["drift"],
+      "properties": {
+        "drift": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to"],
+          "properties": {
+            "from": { "type": "string" },
+            "to": { "type": "string" }
+          }
+        }
+      }
+    },
     "field": {
       "description": "A bare top-level field name or a single-key {resource|attr} object.",
       "oneOf": [

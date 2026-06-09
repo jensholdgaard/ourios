@@ -125,3 +125,113 @@ pub const NOW: u64 = TS0 + 24 * HOUR_NS;
 pub fn no_aliases() -> ourios_core::alias::AliasMap {
     ourios_core::alias::AliasMap::new()
 }
+
+// --- RFC 0010 audit-stream fixtures (drift query tests) ---
+
+use ourios_core::audit::{
+    AuditEvent, AuditPayload, AuditSink, TemplateChange, hash_triggering_line,
+};
+use ourios_parquet::ParquetAuditSink;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A `SystemTime` `ns` nanoseconds after the epoch — the audit `timestamp`
+/// field's type. Pairs with the `u64` nanos the drift window is expressed in.
+pub fn at(ns: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(ns)
+}
+
+/// A `template_widened` audit event for `template_id` at `ts_ns`, bumping
+/// `old_version` → `old_version + 1` (a widening always bumps by one).
+pub fn widened(tenant: &str, template_id: u64, old_version: u32, ts_ns: u64) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: at(ts_ns),
+        payload: AuditPayload::Template {
+            template_id,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Widened {
+                old_version,
+                new_version: old_version + 1,
+                old_template: "[\"user\",\"<*>\"]".to_string(),
+                new_template: "[\"user\",\"<*>\",\"<*>\"]".to_string(),
+                positions_widened: vec![1],
+            },
+        },
+    }
+}
+
+/// A `template_type_expanded` audit event for `template_id` at `ts_ns`. The
+/// template literal is unchanged (the §3.7 invariant for this kind), only the
+/// slot's type-set widened.
+pub fn type_expanded(tenant: &str, template_id: u64, old_version: u32, ts_ns: u64) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: at(ts_ns),
+        payload: AuditPayload::Template {
+            template_id,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::TypeExpanded {
+                old_version,
+                new_version: old_version + 1,
+                old_template: "[\"user\",\"<*>\"]".to_string(),
+                new_template: "[\"user\",\"<*>\"]".to_string(),
+                slots_expanded: Vec::new(),
+            },
+        },
+    }
+}
+
+/// A `template_widening_rejected_degenerate` audit event for `template_id` at
+/// `ts_ns` — a *non*-change that must not count toward `widening_count`
+/// (RFC0010.3).
+pub fn rejected_degenerate(tenant: &str, template_id: u64, version: u32, ts_ns: u64) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: at(ts_ns),
+        payload: AuditPayload::Template {
+            template_id,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::RejectedDegenerate {
+                version,
+                current_template: "[\"<*>\"]".to_string(),
+                would_be_template: "[\"<*>\"]".to_string(),
+                would_be_positions: vec![0],
+            },
+        },
+    }
+}
+
+/// A `compaction` audit event at `ts_ns` — not a template change, excluded
+/// from drift by the `event_type` filter (RFC0010.3).
+pub fn compaction(tenant: &str, ts_ns: u64) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: at(ts_ns),
+        payload: AuditPayload::Compaction {
+            partition: "year=2026/month=06/day=01/hour=00".to_string(),
+            input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            output_file: "c.parquet".to_string(),
+            generation: 1,
+            rows: 10,
+        },
+    }
+}
+
+/// Seed audit events into the RFC 0005 `audit/` stream under `bucket` via the
+/// production `ParquetAuditSink` (real Parquet, the same write path drift
+/// reads). Asserts no write failures so a test never silently runs against an
+/// empty stream.
+pub fn write_audit(bucket: &Path, events: &[AuditEvent]) {
+    let mut sink = ParquetAuditSink::new(bucket);
+    for e in events {
+        sink.emit(e.clone());
+    }
+    assert_eq!(
+        sink.write_failures(),
+        0,
+        "audit fixture events must all persist",
+    );
+}

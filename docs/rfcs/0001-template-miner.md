@@ -2170,28 +2170,32 @@ specific serialisation codec.
 
 1. Load the latest snapshot artefact for the tenant, if one exists.
 2. If byte 0 is a **known** version: deserialise the payload,
-   restore the tree, then replay the WAL to catch it up to the live
-   tail. The target design resumes from the snapshot's recorded
-   high-water mark; **in v1 this is a full WAL replay** (see *v1
-   scope* below).
+   restore the tree, then replay **only the WAL tail** from the
+   snapshot's recorded high-water mark. (This restore path is gated
+   on the offset-resume API and is **not** active in v1 — see *v1
+   scope* below.)
 3. If byte 0 is an **unknown** version, or the snapshot is absent or
    corrupt: discard it and replay the **full** WAL via
    `Wal::replay` (RFC 0008 §6.1 API, RFC 0008 §6.6 recovery procedure),
    rebuilding the tree from scratch.
 
-**v1 scope — full replay in both branches.** The resume-from-
-high-water-mark step in (2) requires the RFC 0008 §6.7
-checkpoint / replay-from-offset API (`Wal::checkpoint` and the
+**v1 scope — rebuild from a full replay; do not restore yet.** The
+restore-then-replay-the-tail path in step (2) requires the RFC 0008
+§6.7 checkpoint / replay-from-offset API (`Wal::checkpoint` and the
 `CHECKPOINT` sidecar), which is **not yet implemented**
-(`Wal::checkpoint` is an RFC 0008 red-gate stub). Until that API
-lands, recovery replays the **full** WAL in *both* the known-version
-and unknown-version branches: the version byte and the snapshot
-format land now, and the offset-resume is a deferred optimisation
-tracked against RFC 0008 §6.7. This v1 fully satisfies §3.5.1 (the
-artefact carries a leading version byte) and §3.5.2 (an unknown
-version is rejected and falls back to full WAL replay); the
-high-water mark is recorded by the format so the optimisation can be
-switched on later without a format change.
+(`Wal::checkpoint` is an RFC 0008 red-gate stub). Restoring a tree
+from a snapshot and *then* replaying the full WAL (the only replay
+available without offset support) would **double-apply** every frame
+the snapshot already captured, corrupting the tree. So until
+offset-resume lands, recovery **ignores the snapshot payload and
+rebuilds the tree from a full `Wal::replay` in both branches** — the
+known-version branch does not restore. What lands now is the
+snapshot *format* (the leading version byte and the recorded
+high-water mark) and the version-dispatch + WAL-fallback contract;
+the restore path is switched on, with no format change, once RFC
+0008 §6.7 lands. This v1 fully satisfies §3.5.1 (the artefact
+carries a leading version byte) and §3.5.2 (an unknown version is
+rejected and falls back to full WAL replay).
 
 **Snapshot-load telemetry.** The `wal_replay_progress` gauge
 (above) remains the replay-only signal. A snapshot-load-outcome

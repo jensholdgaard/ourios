@@ -336,3 +336,34 @@ fn rfc0010_8_no_sql_or_datafusion_leakage() {
         }
     }
 }
+
+/// Tenant-isolation backstop (RFC0010.4 / `CLAUDE.md` §3.7): an audit file that
+/// symlinks outside the tenant's canonical `audit/tenant_id=…` root is refused,
+/// mirroring the log-query path's guard — a drift query must never resolve into
+/// another tenant's (or an out-of-tree) audit events.
+#[cfg(unix)]
+#[tokio::test]
+async fn drift_rejects_audit_file_escaping_tenant_root() {
+    // Arrange — a legit in-window audit file (creates the tenant's day dir),
+    // plus a parquet OUTSIDE the tenant partition symlinked into that day dir.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(bucket.path(), &[widened("acme", 1, 1, MID)]);
+    let outside = bucket.path().join("outside.parquet");
+    std::fs::write(&outside, b"not really parquet").expect("write outside");
+    let day_dir = bucket
+        .path()
+        .join("audit/tenant_id=acme/year=2026/month=06/day=01");
+    std::os::unix::fs::symlink(&outside, day_dir.join("leak.parquet")).expect("symlink");
+
+    // Act
+    let result = Querier::new(bucket.path())
+        .run_drift(&drift_one_day(), &TenantId::new("acme"), NOW)
+        .await;
+
+    // Assert — the escaping symlink is rejected loudly, not silently read.
+    let err = result.expect_err("escaping symlink must be rejected");
+    assert!(
+        format!("{err}").contains("escapes tenant partition root"),
+        "unexpected error: {err}"
+    );
+}

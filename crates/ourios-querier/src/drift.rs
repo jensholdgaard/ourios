@@ -189,7 +189,7 @@ fn audit_files_in_window(
     let tenant_dir = bucket_root.join("audit").join(format!("tenant_id={enc}"));
 
     let mut files = Vec::new();
-    let mut stack = vec![tenant_dir];
+    let mut stack = vec![tenant_dir.clone()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -219,7 +219,35 @@ fn audit_files_in_window(
         }
         stack.extend(subdirs);
     }
-    Ok(files)
+    if files.is_empty() {
+        return Ok(files);
+    }
+    // Tenant-isolation backstop (RFC0010.4 / §3.7), mirroring the log
+    // path: every resolved file must canonicalize *under* the tenant's
+    // canonical `audit/tenant_id=…` root. The directory walk is already
+    // partition-local, but a symlinked `*.parquet` could resolve into
+    // another tenant's tree — this `starts_with` check fails such a path
+    // loudly rather than reading another tenant's audit events.
+    let tenant_root = tenant_dir
+        .canonicalize()
+        .map_err(|e| io_err("canonicalize", &tenant_dir, &e))?;
+    let mut validated = Vec::with_capacity(files.len());
+    for file in files {
+        let abs = file
+            .canonicalize()
+            .map_err(|e| io_err("canonicalize", &file, &e))?;
+        if !abs.starts_with(&tenant_root) {
+            return Err(QueryError::Storage {
+                detail: format!(
+                    "resolved audit file {} escapes tenant partition root {}",
+                    abs.display(),
+                    tenant_root.display(),
+                ),
+            });
+        }
+        validated.push(abs);
+    }
+    Ok(validated)
 }
 
 /// One day in nanoseconds — the span a `…/day=DD/` audit partition covers.

@@ -33,7 +33,7 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
     use ourios_querier::Querier;
 
     // Arrange — one record at the exact RFC §5 instant, plus two controls
-    // that must NOT match: `BEFORE` an hour ahead of the window (its hour
+    // that must NOT match: `BEFORE` an hour before the window (its hour
     // partition is dropped by the prune) and `AT_HI` exactly at the
     // exclusive upper bound — whose hour partition *overlaps* the window,
     // so only the row-level half-open `ts < end` predicate (not the

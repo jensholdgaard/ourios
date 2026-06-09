@@ -19,22 +19,14 @@ use crate::tree::OwnedToken;
 ///
 /// - [`BodyKind::Absent`]: no body on the wire; returns empty.
 /// - [`BodyKind::Structured`]: §6.2 step 0 short-circuits to the
-///   canonicalised JSON, which the RFC pseudo-code names as the
-///   source of truth and which this function returns verbatim
-///   from `record.body`. RFC §6.1 pins `lossy_flag = false`
-///   unconditionally for these records — the body field is the
-///   contract.
-///
-///   **Producer-side gap (today).** `MinerCluster::ingest_
-///   structured` emits records with `body = None` because OTLP-
-///   canonical JSON encoding is the follow-up PR named in
-///   `ourios-core::otlp`. Until it ships, `reconstruct` on a
-///   structured record produced by this crate returns empty
-///   bytes — the producer hasn't populated the field yet, not
-///   a contract violation in `reconstruct` itself. The function
-///   is already correct for the post-canonicalisation shape;
-///   when the producer fills in `body`, structured
-///   reconstruction works without another change here.
+///   §6.1 Ourios canonical body encoding of the `AnyValue`, which
+///   the producer (`MinerCluster::ingest_structured`) stores in
+///   `record.body` and which this function returns verbatim. RFC
+///   §6.1 pins `lossy_flag = false` unconditionally for these
+///   records — the body field is the contract. A structured record
+///   whose `body` is absent (e.g. a hand-built record, or a row
+///   that predates the encoder) degrades to empty bytes rather than
+///   panicking.
 /// - [`BodyKind::String`] with `lossy_flag = true` or any
 ///   [`ParamType::Overflow`] entry in `params`: reconstruction is
 ///   not guaranteed to equal ingest, so the function returns the
@@ -178,69 +170,91 @@ pub enum Reconstruction {
     RetainedVerbatim,
 }
 
-/// Render a `String`-body row per the §6.6 *Reader render contract*,
-/// returning the bytes a reader should display — reconstructed when
-/// faithful, otherwise the retained `body` — alongside the per-row
+/// Render a stored row per the §6.6 *Reader render contract*,
+/// returning the bytes a reader should display alongside the per-row
 /// [`Reconstruction`] signal.
 ///
-/// - `lossy_flag = true`, or any [`ParamType::Overflow`] param
-///   (§6.5): the row's reconstruction is not guaranteed to equal
-///   ingest, so the retained `body` is returned **verbatim** with
-///   [`Reconstruction::RetainedVerbatim`]. `reconstruct` is **not**
-///   invoked — no template lookup, no token walk.
-/// - otherwise, when the `template` shape matches the record, the row
-///   is rebuilt from the template and attaches
-///   [`Reconstruction::Faithful`]. A shape mismatch (a corrupt row or a
-///   wrong template lookup) would make `reconstruct` fall back to the
-///   body — which is *not* a faithful reconstruction — so that case
-///   also returns the body verbatim with
+/// Behaviour by [`BodyKind`]:
+///
+/// - [`BodyKind::Structured`]: the row carries the §6.1 Ourios
+///   canonical body encoding of its `AnyValue` in `body`. That
+///   encoding is byte-deterministic and bidirectional
+///   (`stored_bytes ↔ AnyValue`), and §6.1 pins `lossy_flag = false`
+///   unconditionally for these rows: the stored body *is* the
+///   faithful representation of what was logged, so `render` returns
+///   it with [`Reconstruction::Faithful`]. No template is walked
+///   (structured rows have none); the canonical encoding is the
+///   §3.3 round-trip guarantee for the structured branch.
+/// - [`BodyKind::String`] with `lossy_flag = true`, or any
+///   [`ParamType::Overflow`] param (§6.5): the row's reconstruction
+///   is not guaranteed to equal ingest, so the retained `body` is
+///   returned **verbatim** with [`Reconstruction::RetainedVerbatim`].
+///   `reconstruct` is **not** invoked — no template lookup, no token
+///   walk.
+/// - [`BodyKind::String`] otherwise, when the `template` shape matches
+///   the record: rebuilt from the template with
+///   [`Reconstruction::Faithful`]. A shape mismatch (a corrupt row or
+///   a wrong template lookup) would make `reconstruct` fall back to
+///   the body — which is *not* a faithful reconstruction — so that
+///   case returns the body verbatim with
 ///   [`Reconstruction::RetainedVerbatim`].
+/// - [`BodyKind::Absent`]: no body was on the wire and no template was
+///   allocated, so there is nothing to reconstruct. `render` returns
+///   empty bytes with [`Reconstruction::RetainedVerbatim`] — the
+///   honest signal that the (empty) `body` column was surfaced
+///   verbatim, not rebuilt from a template.
 ///
-/// `template` is the leaf's tokens for the clean-path walk, taken
-/// exactly as [`reconstruct`] takes them today; the read-time
-/// `(template_id, template_version) → tokens` registry the clean
-/// path needs is out of scope of the §6.6 amendment (RFC 0007).
-///
-/// Only `body_kind = String` rows go through `render`: the §6.6
-/// amendment scopes the `Reconstruction` marker to the `String` path.
-/// Structured / Absent rows are out of scope; passing one is a caller
-/// bug and **panics** rather than inventing a marker for them — route
-/// only `String` rows here and handle the rest via [`reconstruct`].
-///
-/// # Panics
-///
-/// If `record.body_kind` is not [`BodyKind::String`].
+/// `template` is the leaf's tokens for the `String` clean-path walk,
+/// taken exactly as [`reconstruct`] takes them today; the read-time
+/// `(template_id, template_version) → tokens` registry the clean path
+/// needs is out of scope of the §6.6 amendment (RFC 0007). For
+/// `Structured` / `Absent` rows the template is unused — passing an
+/// empty slice is fine.
 #[must_use]
 pub fn render(record: &MinedRecord, template: &[OwnedToken]) -> (Vec<u8>, Reconstruction) {
-    assert!(
-        matches!(record.body_kind, BodyKind::String),
-        "render is the §6.6 String-body reader path; route Structured/Absent rows through reconstruct"
-    );
-    // `Faithful` must mean the bytes were actually rebuilt from the
-    // template. `reconstruct` falls back to the retained body on a
-    // lossy/overflow row *or* a template-shape mismatch (a corrupt row or
-    // a wrong template lookup); none of those are faithful
-    // reconstructions, so they return the body verbatim with
-    // `RetainedVerbatim` and never walk the template.
-    let faithful = !record.lossy_flag
-        && !record
-            .params
-            .iter()
-            .any(|p| p.type_tag == ParamType::Overflow)
-        && template_shape_matches_record(record, template);
-    if faithful {
-        // The faithful guard already established `reconstruct`'s clean-path
-        // preconditions, so call the inner walk directly and skip
-        // re-checking lossy / overflow / shape (a second template scan).
-        (
-            reconstruct_from_template(record, template),
-            Reconstruction::Faithful,
-        )
-    } else {
-        (
+    match record.body_kind {
+        // The canonical body encoding is bidirectional and
+        // byte-deterministic (§6.1) and `lossy_flag` is always false
+        // for structured rows: the stored body faithfully represents
+        // the logged `AnyValue`, so it renders Faithful without any
+        // template walk.
+        BodyKind::Structured => (body_bytes_or_empty(record), Reconstruction::Faithful),
+        // No wire body, no template: nothing was reconstructed, so the
+        // (empty) body is surfaced verbatim.
+        BodyKind::Absent => (
             body_bytes_or_empty(record),
             Reconstruction::RetainedVerbatim,
-        )
+        ),
+        BodyKind::String => {
+            // `Faithful` must mean the bytes were actually rebuilt from
+            // the template. `reconstruct` falls back to the retained
+            // body on a lossy/overflow row *or* a template-shape
+            // mismatch (a corrupt row or a wrong template lookup); none
+            // of those are faithful reconstructions, so they return the
+            // body verbatim with `RetainedVerbatim` and never walk the
+            // template.
+            let faithful = !record.lossy_flag
+                && !record
+                    .params
+                    .iter()
+                    .any(|p| p.type_tag == ParamType::Overflow)
+                && template_shape_matches_record(record, template);
+            if faithful {
+                // The faithful guard already established `reconstruct`'s
+                // clean-path preconditions, so call the inner walk
+                // directly and skip re-checking lossy / overflow / shape
+                // (a second template scan).
+                (
+                    reconstruct_from_template(record, template),
+                    Reconstruction::Faithful,
+                )
+            } else {
+                (
+                    body_bytes_or_empty(record),
+                    Reconstruction::RetainedVerbatim,
+                )
+            }
+        }
     }
 }
 
@@ -531,6 +545,39 @@ mod tests {
         r.body = Some("user 1 and 2".to_string());
         let (bytes, marker) = render(&r, &template);
         assert_eq!(bytes, b"user 1 and 2".to_vec());
+        assert_eq!(marker, Reconstruction::RetainedVerbatim);
+    }
+
+    #[test]
+    fn render_structured_returns_canonical_body_with_faithful_marker() {
+        // §6.6 + §6.1: a structured row carries the Ourios canonical
+        // body encoding in `body`. That encoding is byte-deterministic
+        // and round-trips the `AnyValue`, and `lossy_flag` is always
+        // false for structured rows, so `render` surfaces the stored
+        // bytes with `Faithful` — no template walk, the canonical body
+        // is itself the §3.3 round-trip.
+        let mut r = record_envelope(BodyKind::Structured);
+        r.confidence = 1.0;
+        r.body = Some(
+            r#"{"kvlistValue":{"values":[{"key":"k","value":{"intValue":"42"}}]}}"#.to_string(),
+        );
+        let (bytes, marker) = render(&r, &[]);
+        assert_eq!(
+            bytes,
+            br#"{"kvlistValue":{"values":[{"key":"k","value":{"intValue":"42"}}]}}"#.to_vec(),
+        );
+        assert_eq!(marker, Reconstruction::Faithful);
+    }
+
+    #[test]
+    fn render_absent_returns_empty_with_retained_marker() {
+        // §6.6: an Absent row had no wire body and no template, so
+        // nothing is reconstructed. `render` returns empty bytes with
+        // `RetainedVerbatim` — the honest "not rebuilt from a template"
+        // signal.
+        let r = record_envelope(BodyKind::Absent);
+        let (bytes, marker) = render(&r, &[]);
+        assert_eq!(bytes, Vec::<u8>::new());
         assert_eq!(marker, Reconstruction::RetainedVerbatim);
     }
 }

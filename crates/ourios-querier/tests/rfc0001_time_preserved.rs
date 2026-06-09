@@ -20,7 +20,7 @@ mod common;
 /// time-range query whose window straddles that instant returns the row
 /// (gates benchmarks B1). The fixture value is the RFC §5 literal
 /// `1_715_700_000_000_000_000` (= 2024-05-14T15:20:00Z); the `range(...)`
-/// window `[2024-05-13T11:33:20Z, 2024-05-15T19:06:40Z]`
+/// window `[2024-05-13T11:33:20Z, 2024-05-15T19:06:40Z)`
 /// (= `1_715_600_000_000_000_000 .. 1_715_800_000_000_000_000`) brackets it.
 /// An explicit `range(...)` fully replaces the default look-back, so the
 /// 2026-based `NOW`/window fixtures don't gate the 2024 instant.
@@ -32,11 +32,16 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
     use ourios_parquet::{PartitionKey, Reader};
     use ourios_querier::Querier;
 
-    // Arrange — one record at the exact RFC §5 instant, plus a control row a
-    // full hour earlier (outside the query window) so a window that ignored
-    // its bounds would over-count.
+    // Arrange — one record at the exact RFC §5 instant, plus two controls
+    // that must NOT match: `BEFORE` an hour ahead of the window (its hour
+    // partition is dropped by the prune) and `AT_HI` exactly at the
+    // exclusive upper bound — whose hour partition *overlaps* the window,
+    // so only the row-level half-open `ts < end` predicate (not the
+    // partition prune) can exclude it. Together they exercise both the
+    // partition prune and the row-level range filter.
     const TS: u64 = 1_715_700_000_000_000_000;
-    const OUTSIDE: u64 = 1_715_600_000_000_000_000 - common::HOUR_NS;
+    const BEFORE: u64 = 1_715_600_000_000_000_000 - common::HOUR_NS;
+    const AT_HI: u64 = 1_715_800_000_000_000_000; // == WINDOW_HI; excluded (half-open)
     // RFC 3339 forms of the §5 window bounds (whole-second instants, so they
     // round-trip to the exact nanos the column stores — RFC 0002 §7 `time`).
     const WINDOW_LO: &str = "2024-05-13T11:33:20Z";
@@ -44,7 +49,14 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
 
     let bucket = tempfile::TempDir::new().expect("temp");
     let target = simple("a", 1, TS);
-    write_all(bucket.path(), &[target.clone(), simple("a", 1, OUTSIDE)]);
+    write_all(
+        bucket.path(),
+        &[
+            target.clone(),
+            simple("a", 1, BEFORE),
+            simple("a", 1, AT_HI),
+        ],
+    );
     let q = Querier::new(bucket.path());
     let tenant = TenantId::new("a");
 
@@ -64,8 +76,11 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
         .await
         .expect("run_query");
 
-    // Assert (query) — exactly the in-window target row is returned; the
-    // hour-earlier control is excluded by the range.
+    // Assert (query) — exactly the in-window target row is returned: the
+    // `BEFORE` row is partition-pruned, and the `AT_HI` row (in an
+    // overlapping partition) is excluded by the half-open row-level
+    // `ts < end` predicate — so the row filter, not just the prune, is
+    // exercised.
     assert_eq!(
         result.rows, 1,
         "the time-range query returns the single in-window row",

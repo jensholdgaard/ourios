@@ -2,7 +2,7 @@
 rfc: 0010
 title: Audit-stream queries & template drift
 status: specified
-author: Jens Holdgaard Pedersen <Jens@holdgaard.org>
+author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-09
 supersedes: —

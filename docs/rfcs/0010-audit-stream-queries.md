@@ -33,7 +33,7 @@ superseded-by: —
 Ourios records every template structural change as a durable audit event
 (RFC 0001 §6.4, persisted by RFC 0005's `audit/` Parquet series). RFC 0001
 §6.7 specifies the operator-facing **drift query** — "templates that
-gained a new version in the window `[t1, t2]`" — but writes it out as SQL
+gained a new version in the window `[t1, t2)`" — but writes it out as SQL
 "for spec clarity", explicitly deferring the user-visible form to "the
 RFC 0002 DSL, not raw SQL". RFC 0002 in turn deferred the audit-stream
 query surface as "a future capability" (§6.3). This RFC is that future
@@ -123,7 +123,7 @@ ship as a closed form without reopening RFC 0002's broader deferred work.
 - **Alias / `resolves_to` membership.** "Is template X aliased to Y" is
   the *cross-alias* axis already served by RFC 0002 `resolves_to` over the
   RFC 0001 §6.7 alias map. `drift` is the orthogonal *cross-version* axis
-  ("did leaf X gain a version in `[t1, t2]`"); see §8 alternative B.
+  ("did leaf X gain a version in `[t1, t2)`"); see §8 alternative B.
 - **Raw SQL / DataFusion passthrough.** Rejected per hazard H6
   (`docs/hazards.md` H6): the DataFusion SQL surface is never exposed. `drift`
   is DSL-only (§8 alternative C).
@@ -167,15 +167,15 @@ scenario discharges a sibling RFC's criterion, both ids are listed so the
 mapping stays greppable from either side.
 
 - **RFC0010.1 — Drift query returns templates that gained a version in
-  the window (discharges RFC 0001 H5.3) `[§6.7]`, hazard H5**
+  the window (discharges RFC 0001 H5.3) `[RFC 0001 §6.7]`, hazard H5**
   - **Given** a tenant's audit stream containing `template_widened` and/or
     `template_type_expanded` events for template A and for template B,
-    all with `timestamp` inside `[t1, t2]`
+    all with `timestamp` inside `[t1, t2)`
   - **When** the drift query `drift from <t1> to <t2>` runs in that
     tenant's context
   - **Then** the result contains exactly one row for A and one row for B
   - **And** each row's `widening_count` equals the number of that
-    template's qualifying events in `[t1, t2]`
+    template's qualifying events in `[t1, t2)`
   - **And** this is the criterion that flips the RFC 0001 H5.3 stub
     (`crates/ourios-miner/tests/hazards.rs::h5_3_drift_query_returns_templates_that_gained_a_version`),
     which is owned by RFC 0001 and satisfied here.
@@ -184,7 +184,7 @@ mapping stays greppable from either side.
   - **Given** a qualifying event whose `timestamp` is strictly before `t1`,
     a second strictly after the window's upper bound, and a third exactly
     on each boundary
-  - **When** the drift query over `[t1, t2]` runs
+  - **When** the drift query over `[t1, t2)` runs
   - **Then** the out-of-window events do not contribute to any
     `widening_count`
   - **And** boundary inclusion is half-open `[from, to)` — the lower
@@ -192,12 +192,12 @@ mapping stays greppable from either side.
     template with only a boundary event is present iff that boundary is
     the included (lower) one.
 
-- **RFC0010.3 — `event_type` scoping excludes non-widenings `[§6.7]`,
+- **RFC0010.3 — `event_type` scoping excludes non-widenings `[RFC 0001 §6.7]`,
   §3 (out of scope)**
   - **Given** a template C with only `template_widening_rejected_degenerate`
-    and/or `compaction` events in `[t1, t2]` (and no `template_widened` /
+    and/or `compaction` events in `[t1, t2)` (and no `template_widened` /
     `template_type_expanded`)
-  - **When** the drift query over `[t1, t2]` runs
+  - **When** the drift query over `[t1, t2)` runs
   - **Then** template C does **not** appear in the result
   - **And** for a template D with both qualifying and `rejected_degenerate`
     events, `widening_count` counts only the qualifying ones.
@@ -211,23 +211,23 @@ mapping stays greppable from either side.
     without a tenant is a usage error, not a cross-tenant scan.
 
 - **RFC0010.5 — Empty result is empty, not an error `[§6.4]`**
-  - **Given** a tenant with no qualifying events in `[t1, t2]` (no audit
+  - **Given** a tenant with no qualifying events in `[t1, t2)` (no audit
     files for the window, or only excluded event types)
-  - **When** the drift query over `[t1, t2]` runs
+  - **When** the drift query over `[t1, t2)` runs
   - **Then** it returns an empty result set, not an error.
 
-- **RFC0010.6 — Result ordering is `widening_count` descending `[§6.7]`**
-  - **Given** templates whose qualifying-event counts in `[t1, t2]` differ
-  - **When** the drift query over `[t1, t2]` runs
+- **RFC0010.6 — Result ordering is `widening_count` descending `[RFC 0001 §6.7]`**
+  - **Given** templates whose qualifying-event counts in `[t1, t2)` differ
+  - **When** the drift query over `[t1, t2)` runs
   - **Then** rows are ordered by `widening_count` descending, matching
     RFC 0001 §6.7's `ORDER BY widening_count DESC`
   - **And** the tie-break among equal counts is deterministic (ascending
     `template_id`) so the result is stable for golden-test pinning.
 
-- **RFC0010.7 — Aggregate version/time bounds per template `[§6.7]`**
+- **RFC0010.7 — Aggregate version/time bounds per template `[RFC 0001 §6.7]`**
   - **Given** template A with qualifying events spanning versions
-    `v_lo … v_hi` and timestamps `ts_lo … ts_hi` inside `[t1, t2]`
-  - **When** the drift query over `[t1, t2]` runs
+    `v_lo … v_hi` and timestamps `ts_lo … ts_hi` inside `[t1, t2)`
+  - **When** the drift query over `[t1, t2)` runs
   - **Then** A's row carries `min_old_version = v_lo`,
     `max_new_version = v_hi`, `first_seen = ts_lo`, `last_seen = ts_hi`,
     matching RFC 0001 §6.7's
@@ -491,7 +491,7 @@ test; ids are greppable from the test code.
   RFC 0001 §6.7). One might argue drift is already covered. It is not:
   `resolves_to` is a *membership* test on the operator-asserted alias map,
   answering "are these the same template", whereas drift is the *windowed
-  rate-of-change* signal "did leaf X gain a version in `[t1, t2]`" — the
+  rate-of-change* signal "did leaf X gain a version in `[t1, t2)`" — the
   cross-version axis RFC 0001 §6.7 keeps explicitly disjoint from the alias
   axis. The two are orthogonal; `resolves_to` cannot express a time window
   or count events, so it cannot answer H5.
@@ -505,7 +505,7 @@ test; ids are greppable from the test code.
   per-row "this template drifted" flag so drift becomes a data-file
   predicate. Rejected: drift is a property of the *audit* timeline, not of
   any single log row; the flag would be window-relative (drift is always
-  "in `[t1, t2]`"), so it cannot be precomputed at write time, and it would
+  "in `[t1, t2)`"), so it cannot be precomputed at write time, and it would
   bloat every data row for a low-frequency query. RFC 0002 §6.3 already
   rules this out ("not a column in the RFC 0005 data files").
 

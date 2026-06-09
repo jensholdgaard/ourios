@@ -322,6 +322,27 @@ fn decode_drift_rows(batches: &[RecordBatch]) -> Result<Vec<DriftRow>, QueryErro
         let first_seen = ts_column(batch, FIRST_SEEN)?;
         let last_seen = ts_column(batch, LAST_SEEN)?;
         for i in 0..batch.num_rows() {
+            // The audit schema marks `template_id` / `old_version` /
+            // `new_version` (and, defensively, the timestamp aggregates)
+            // nullable. The drift filter selects only template events, which
+            // carry these by convention, so a NULL here means a corrupted or
+            // foreign audit file reached the aggregate — surface it rather
+            // than decode NULL silently as `0`.
+            if template_id.is_null(i)
+                || min_old_version.is_null(i)
+                || max_new_version.is_null(i)
+                || first_seen.is_null(i)
+                || last_seen.is_null(i)
+            {
+                return Err(QueryError::Storage {
+                    detail: concat!(
+                        "drift aggregate: NULL in a drift group's ",
+                        "template_id / version / timestamp ",
+                        "(corrupt or foreign audit file)"
+                    )
+                    .to_string(),
+                });
+            }
             let count =
                 u64::try_from(widening_count.value(i)).map_err(|_| QueryError::Storage {
                     detail: "drift aggregate: widening_count is negative".to_string(),
@@ -469,5 +490,49 @@ mod tests {
         assert!(day_partition_in_window(&tenant_dir, 0, 1));
         let foreign: PathBuf = ["some", "other", "dir"].iter().collect();
         assert!(day_partition_in_window(&foreign, 0, 1));
+    }
+
+    #[test]
+    fn decode_drift_rows_rejects_a_null_group_key() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        // A one-row aggregate batch whose `template_id` group key is NULL —
+        // the shape a corrupt/foreign audit file could yield. decode must
+        // surface it, not silently decode NULL as `template_id = 0`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(audit_columns::TEMPLATE_ID, DataType::UInt64, true),
+            Field::new(WIDENING_COUNT, DataType::Int64, false),
+            Field::new(MIN_OLD_VERSION, DataType::UInt32, true),
+            Field::new(MAX_NEW_VERSION, DataType::UInt32, true),
+            Field::new(
+                FIRST_SEEN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(
+                LAST_SEEN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![None::<u64>])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(UInt32Array::from(vec![Some(1_u32)])),
+                Arc::new(UInt32Array::from(vec![Some(2_u32)])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(0_i64)])),
+            ],
+        )
+        .expect("aggregate batch");
+
+        match decode_drift_rows(&[batch]) {
+            Err(QueryError::Storage { detail }) => {
+                assert!(detail.contains("NULL"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected a Storage NULL error, got {other:?}"),
+        }
     }
 }

@@ -14,7 +14,7 @@ mod common;
 use common::{compaction, rejected_degenerate, type_expanded, widened, write_audit};
 use ourios_core::tenant::TenantId;
 use ourios_querier::dsl::{DriftQuery, Statement, parse_statement};
-use ourios_querier::{DriftRow, Querier};
+use ourios_querier::{DriftRow, Querier, QueryError};
 
 /// 2026-06-01T00:00:00Z in nanos — the window lower bound the tests use.
 const T1: u64 = 1_780_272_000_000_000_000;
@@ -360,10 +360,16 @@ async fn drift_rejects_audit_file_escaping_tenant_root() {
         .run_drift(&drift_one_day(), &TenantId::new("acme"), NOW)
         .await;
 
-    // Assert — the escaping symlink is rejected loudly, not silently read.
+    // Assert — the escaping symlink is rejected by the tenant-root backstop
+    // (before any read), not silently read. `Display` deliberately hides the
+    // detail (H6), so match the variant's `detail` to confirm it is the
+    // escape guard firing and not an unrelated storage error.
     let err = result.expect_err("escaping symlink must be rejected");
-    assert!(
-        format!("{err}").contains("escapes tenant partition root"),
-        "unexpected error: {err}"
-    );
+    match err {
+        QueryError::Storage { detail } => assert!(
+            detail.contains("escapes tenant partition root"),
+            "expected the tenant-root escape guard, got: {detail}"
+        ),
+        other => panic!("expected QueryError::Storage, got {other:?}"),
+    }
 }

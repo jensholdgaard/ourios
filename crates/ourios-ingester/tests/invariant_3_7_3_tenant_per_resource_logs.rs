@@ -52,8 +52,10 @@ fn service_name(record: &MinedRecord) -> &str {
 fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     // Arrange — a record sink to inspect what each tenant's tree mined, a
     // real WAL (the pipeline fsyncs before mining), and a pipeline with the
-    // default `service.name` tenant rule. The two groups use distinct body
-    // text per tenant so each tenant's tree allocates its own templates.
+    // default `service.name` tenant rule. Within each tenant the two
+    // lines are deliberately *dissimilar* (well below the §6.2 similarity
+    // threshold) so each mines its own template independent of the
+    // widening config — this is the tenancy scenario, not a widening test.
     let tmp = tempfile::TempDir::new().expect("temp");
     let wal = Wal::open(wal_config(tmp.path())).expect("open WAL");
     let sink = SharedRecordSink::new();
@@ -61,8 +63,8 @@ fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     let mut pipeline = IngestPipeline::new(Box::new(wal), miner, TenantRule::service_name());
 
     let export = request(vec![
-        resource_logs("a", &["a line one", "a line two"]),
-        resource_logs("b", &["b line one", "b line two"]),
+        resource_logs("a", &["alpha connected ok", "disk usage high"]),
+        resource_logs("b", &["bravo handler ready", "queue flushed now"]),
     ]);
 
     // Act
@@ -101,7 +103,8 @@ fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     }
 
     // The per-tenant trees are scoped (`CLAUDE.md` §3.7): each tenant holds
-    // exactly its two distinct templates, and neither tree saw the other's.
+    // exactly its two (deliberately dissimilar) templates and never the
+    // other's — a cross-tenant leak would push a count to 4.
     assert_eq!(
         pipeline.miner().template_count(&tenant_a),
         2,

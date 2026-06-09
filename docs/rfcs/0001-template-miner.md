@@ -957,8 +957,8 @@ received order (above) is the safe, spec-permitted choice. A
 input with no defined semantics. Ourios does **not** silently
 dedup or reorder such input: it **preserves the entries
 verbatim** in the encoding (so the round-trip stays faithful) and
-flags the record as non-conforming, rather than inventing map
-semantics for it.
+makes **no map-semantic guarantee** for it, rather than inventing
+one.
 
 #### Template-key composition
 

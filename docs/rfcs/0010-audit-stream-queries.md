@@ -513,11 +513,12 @@ test; ids are greppable from the test code.
 
 *Must be resolved before `accepted`; none block `specified`.*
 
-- [ ] **Surface fork — confirm the verb head.** §6.1 picks
-      `drift from <t1> to <t2>` (a top-level verb head) over
-      `audit | drift(...)` (a stage on a general audit source). Maintainer
-      to confirm the verb head is the intended surface, given it forecloses
-      composing further stages onto a drift query (by design).
+- [x] **Surface fork — verb head confirmed (maintainer, 2026-06-09).**
+      §6.1's `drift from <t1> to <t2>` top-level verb head (over
+      `audit | drift(...)`, a stage on a general audit source) is the
+      intended surface — it forecloses composing further stages onto a
+      drift query by design, and is NOT the general aggregation pipeline
+      (RFC 0002's deferred work).
 - [ ] **Re-use of `range` vs a head-local window.** §6.1 reuses the
       RFC 0002 `range(from, to)` *bounds* via a `from … to …` clause rather
       than admitting a literal `| range(...)` stage on the drift head.

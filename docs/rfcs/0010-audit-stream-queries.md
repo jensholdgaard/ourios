@@ -144,9 +144,11 @@ relevant facts, cited so the design below is unambiguous:
   per-tenant scan is a partition prune, not a post-filter (§6.5).
 - **Columns (RFC 0005 §3.7).** `event_type` (REQUIRED `STRING`, the
   predicate-pushdown surface RFC 0005 names "for the RFC 0001 §6.7 drift
-  query"), `event_kind` (REQUIRED `INT32` ordinal), `template_id`
-  (`INT64`, OPTIONAL but required-by-convention for the template kinds),
-  `old_version` / `new_version` (`INT32`), `timestamp`
+  query"), `event_kind` (REQUIRED, Arrow `UInt8` / `INTEGER(8, unsigned)`
+  ordinal), `template_id` (`UInt64`, OPTIONAL but required-by-convention
+  for the template kinds), `old_version` / `new_version` (`UInt32`,
+  OPTIONAL — relaxed for the compaction kind, required-by-convention for
+  the template kinds), `timestamp`
   (`TIMESTAMP(NANOS, UTC)`, REQUIRED), and the template-detail columns
   (`old_template`, `new_template`, `positions_widened`, `slots_expanded`,
   `triggering_line_*`, `reason`). Drift reads only

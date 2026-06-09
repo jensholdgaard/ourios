@@ -601,10 +601,9 @@ direction and the primary obligation lives in those other RFCs.
 >   step 0 and allocates or reuses the structured-template id
 >   for `(severity_number, scope_name, BodyKind::Structured)`
 > - **And** the emitted record has `body_kind = Structured`
-> - **And** the `body` column carries the Ourios canonical body
->   encoding of that `AnyValue`, produced at Parquet-write time
->   (the in-memory record carries the decoded `AnyValue` itself
->   per the §6.4 amendment)
+> - **And** the emitted record's `body` carries the Ourios
+>   canonical body encoding of that `AnyValue` (per the §6.1
+>   encoding rule)
 > - **And** `params` and `separators` are empty
 > - **And** `confidence == 1.0` (the §6.1 sentinel)
 > - **And** `lossy_flag == false`
@@ -784,7 +783,7 @@ reconstruction group exists only when the body was mineable
 | Field | Rust type (informal) | Source | Purpose |
 |---|---|---|---|
 | `body_kind` | `BodyKind` | derived from `LogRecord.body` | Discriminator: `String` \| `Structured` (see "Body representation") |
-| `body` | `Option<Bytes>` | `LogRecord.body` | When `body_kind = Structured`: the Ourios canonical body encoding of the `AnyValue` (see "Body representation" for the rule). When `body_kind = String` lossy: the original line bytes. When overflow: per §6.5. |
+| `body` | `Option<String>` | `LogRecord.body` | UTF-8 (the in-memory record type; the RFC 0005 Parquet column is `BYTE_ARRAY`). When `body_kind = Structured`: the Ourios canonical body encoding of the `AnyValue` (see "Body representation" for the rule). When `body_kind = String` lossy: the original line. When overflow: per §6.5. |
 | `params` | `Vec<Param>` | from masking | One entry per `<*>` slot. Always empty when `body_kind = Structured` |
 | `separators` | `Vec<Separator>` | from tokenize | `tokens.len() + 1` entries. Always empty when `body_kind = Structured` |
 | `confidence` | `f32` | miner-derived | `simSeq / threshold` at attach time. `1.0` (sentinel) when `body_kind = Structured` |

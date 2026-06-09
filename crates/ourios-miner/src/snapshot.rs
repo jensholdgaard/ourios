@@ -216,6 +216,7 @@ pub struct WalHighWater {
 /// typed variant the caller dispatches on, and [`recover`] maps all
 /// of them to the same "discard, full-replay" outcome.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SnapshotError {
     /// Byte 0 is a version this build does not understand. Recovery
     /// rejects the artefact and falls back to full WAL replay
@@ -289,6 +290,7 @@ pub fn load_snapshot(bytes: &[u8]) -> Result<SnapshotState, SnapshotError> {
 /// telemetry*). The tree itself always comes from `rebuild` in v1;
 /// this only records *why* the snapshot did not short-circuit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecoveryOutcome {
     /// No snapshot artefact was supplied (cold start, or the cache
     /// file was absent).

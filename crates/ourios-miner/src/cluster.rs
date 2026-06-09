@@ -1812,7 +1812,12 @@ impl MinerCluster {
             };
         };
 
-        let leaves = state
+        // `collect_leaves` and the `structured_templates` map both iterate
+        // in `HashMap` order, which varies across runs — sort by the
+        // cluster-unique `template_id` so the serialized snapshot is
+        // byte-deterministic (no spurious churn between snapshots of an
+        // unchanged tree).
+        let mut leaves: Vec<LeafRecord> = state
             .tree
             .collect_leaves()
             .into_iter()
@@ -1825,8 +1830,9 @@ impl MinerCluster {
                 slot_types: slot_types_vec_to_record(&leaf.slot_types),
             })
             .collect();
+        leaves.sort_by_key(|leaf| leaf.template_id);
 
-        let structured_templates = state
+        let mut structured_templates: Vec<StructuredTemplateRecord> = state
             .structured_templates
             .iter()
             .map(
@@ -1837,6 +1843,7 @@ impl MinerCluster {
                 },
             )
             .collect();
+        structured_templates.sort_by_key(|record| record.template_id);
 
         SnapshotState {
             leaves,
@@ -2059,6 +2066,39 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(cluster.template_count(&t), 2);
         assert_eq!(cluster.merges_total(), 0);
+    }
+
+    #[test]
+    fn snapshot_state_orders_records_by_template_id() {
+        // The tree and the structured-template map both iterate in
+        // `HashMap` order; `snapshot_state` sorts by the cluster-unique
+        // `template_id` so the serialized snapshot is byte-deterministic.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+        for line in [
+            "GET /home 200",
+            "user 42 logged in",
+            "cache evicted 5 keys",
+            "disk usage high",
+        ] {
+            let _ = cluster.ingest(&string_record(&t, line));
+        }
+
+        let state = cluster.snapshot_state(&t);
+
+        assert!(state.leaves.len() >= 2, "needs multiple leaves to order");
+        assert!(
+            state
+                .leaves
+                .windows(2)
+                .all(|w| w[0].template_id <= w[1].template_id),
+            "snapshot leaves must be sorted by template_id, got {:?}",
+            state
+                .leaves
+                .iter()
+                .map(|l| l.template_id)
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

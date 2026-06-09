@@ -601,7 +601,7 @@ direction and the primary obligation lives in those other RFCs.
 >   step 0 and allocates or reuses the structured-template id
 >   for `(severity_number, scope_name, BodyKind::Structured)`
 > - **And** the emitted record has `body_kind = Structured`
-> - **And** the `body` column carries the OTLP-canonical JSON
+> - **And** the `body` column carries the Ourios canonical body
 >   encoding of that `AnyValue`, produced at Parquet-write time
 >   (the in-memory record carries the decoded `AnyValue` itself
 >   per the §6.4 amendment)
@@ -784,7 +784,7 @@ reconstruction group exists only when the body was mineable
 | Field | Rust type (informal) | Source | Purpose |
 |---|---|---|---|
 | `body_kind` | `BodyKind` | derived from `LogRecord.body` | Discriminator: `String` \| `Structured` (see "Body representation") |
-| `body` | `Option<Bytes>` | `LogRecord.body` | When `body_kind = Structured`: the OTLP-canonical JSON encoding of the `AnyValue` (see "Body representation" for the canonical-encoding rule). When `body_kind = String` lossy: the original line bytes. When overflow: per §6.5. |
+| `body` | `Option<Bytes>` | `LogRecord.body` | When `body_kind = Structured`: the Ourios canonical body encoding of the `AnyValue` (see "Body representation" for the rule). When `body_kind = String` lossy: the original line bytes. When overflow: per §6.5. |
 | `params` | `Vec<Param>` | from masking | One entry per `<*>` slot. Always empty when `body_kind = Structured` |
 | `separators` | `Vec<Separator>` | from tokenize | `tokens.len() + 1` entries. Always empty when `body_kind = Structured` |
 | `confidence` | `f32` | miner-derived | `simSeq / threshold` at attach time. `1.0` (sentinel) when `body_kind = Structured` |
@@ -834,7 +834,8 @@ Ourios distinguishes two body shapes at ingest:
 - **`body_kind = Structured`** — `LogRecord.body` is any other
   `AnyValue` variant (kvlist, array, int, double, bool, bytes).
   The miner does **not** run the §6.2 algorithm. The body is
-  encoded canonically (see *Canonical encoding* below) and
+  encoded with the Ourios canonical body encoding (see *The
+  Ourios canonical body encoding* below) and
   stored in the `body` column; no template is mined, no
   `params`/`separators` are emitted. `template_id` is allocated
   per the *Template-key composition* rule below — for this branch
@@ -847,9 +848,9 @@ Ourios distinguishes two body shapes at ingest:
   authoritative; nothing is reconstructed from a template).
 
 This is the **conservative default**. It preserves the structural
-content of the body (the canonical-encoding rule below makes
+content of the body (the Ourios canonical body encoding below makes
 `[§3.3]` reconstruction well-defined for the structured branch:
-`stored_bytes ↔ AnyValue` is bidirectional and deterministic),
+`stored_bytes ↔ AnyValue` is bidirectional and byte-deterministic),
 it avoids inventing template structure for arbitrary `AnyValue`
 trees, and it sidesteps the spec ambiguity of "what is *the*
 template for `{"msg": "x", "user_id": 42}`." A future opt-in
@@ -871,23 +872,93 @@ the canonical encoding (without mining over it) is different
 from this rejected path: storage is faithful, it just doesn't
 get a template extracted.
 
-**Canonical encoding for `body_kind = Structured`.** The `body`
-column carries the **OTLP-canonical JSON encoding** of the
-`AnyValue` per the OTLP specification's HTTP/JSON binding (the
-proto3 JSON mapping with OTLP-specific overrides — e.g.,
-`trace_id`/`span_id` as hex strings, `bytes` as base64).
-Receivers that take input via OTLP/gRPC (protobuf wire format)
-decode the `AnyValue` and re-serialise to canonical JSON before
-storing; receivers that take input via OTLP/HTTP+JSON canonicalise
-the incoming bytes (proto3 JSON allows a small amount of
-latitude — field ordering, whitespace, `int64` as string vs
-number — which canonicalisation removes). Without a canonical
-rule, the `lossy_flag = false` promise for the structured branch
-is unmeetable: two receivers handling the same logical
-`AnyValue` could produce different stored bytes, and queries
-that join records by body content would silently miss matches.
-The OTLP-canonical JSON form makes the round-trip
-`stored_bytes ↔ AnyValue` well-defined and provider-neutral.
+**The Ourios canonical body encoding (`body_kind = Structured`).**
+
+> **Amendment 2026-06-09 (no canonical OTLP JSON exists).** This
+> paragraph previously called the encoding "the OTLP-canonical
+> JSON encoding per the OTLP specification's HTTP/JSON binding,"
+> implying a spec-defined canonical form. **There is none.** Per
+> the OTLP spec, the OTel common docs, and a maintainer answer
+> (Josh Suereth, 2026-06-09): OTLP/JSON is the proto3 JSON
+> mapping plus a short closed list of deviations (hex
+> `trace_id`/`span_id`, integer enums, ignore-unknown-fields,
+> `lowerCamelCase`) — with **no** normative rules on whitespace,
+> key/field ordering, or number canonicalisation, and OTLP does
+> **not** require lossless translation between formats. The text
+> below is reframed to state the rule as an **Ourios-local
+> deterministic encoding**, not an OTLP conformance point, and
+> renamed to "the Ourios canonical body encoding." No code and no
+> RFC `status` change here; the encoder is `ourios-core`'s
+> `otlp::canonical` (a separate follow-up PR aligns its doc
+> comments).
+
+The `body` column carries the **Ourios canonical body
+encoding** of the `AnyValue`: a proto3-JSON form, defined
+below. This is an **Ourios-local deterministic convention, not
+an OTLP-mandated canonical form.** OTLP defines **no** canonical
+or byte-deterministic JSON encoding. Its only normative JSON
+rules are the proto3 JSON mapping (per the protobuf spec) plus a
+short closed list of OTLP-specific deviations — `trace_id` /
+`span_id` as hex strings (not applicable to a body `AnyValue`,
+which carries no IDs), enum values as integers, ignore unknown
+fields, and `lowerCamelCase` field names. The spec is **silent**
+on whitespace, key/field ordering, and number canonicalisation,
+and OTLP does **not** require lossless translation between
+formats. There is therefore no "canonical OTLP JSON" to
+reference; the byte-stable encoding below is Ourios's own, chosen
+so the `body` column is byte-deterministic (storage dedup) and
+the `[§3.3]` reconstruction guarantee is well-defined.
+
+The concrete rule is the proto3 JSON mapping **as emitted by
+`opentelemetry-proto`'s `with-serde` feature via `serde_json`**:
+
+- field names in `lowerCamelCase`;
+- `int64` / `uint64` values as **decimal strings** (proto3 JSON's
+  canonical emit form; decoders accept a JSON number or string);
+- `bytes` as **base64**;
+- `KvlistValue` and `ArrayValue` element order **preserved as
+  received — not sorted** (this is explicitly **not** RFC 8785 /
+  JCS canonical JSON);
+- byte-deterministic because the proto types have a fixed serde
+  field order and `serde_json` serialisation is deterministic.
+
+Canonical byte examples: `{"intValue":"-42"}`,
+`{"doubleValue":2.71}`, `{"boolValue":true}`,
+`{"bytesValue":"<base64>"}`,
+`{"arrayValue":{"values":[…]}}`,
+`{"kvlistValue":{"values":[{"key":"…","value":{…}}]}}`.
+
+**"Deterministic" here means byte-identical.** Re-encoding the
+*same in-memory `AnyValue`* with this encoder yields byte-for-byte
+identical output (within a fixed `opentelemetry-proto` /
+`serde_json` version). This is the byte-level reading, not a
+weaker struct-level one: it is what lets the `body` column be
+deduplicated and lets two receivers handling the same logical
+`AnyValue` produce the same stored bytes. The receiver path:
+OTLP/gRPC (protobuf wire) decodes to an in-memory `AnyValue` and
+re-encodes here; OTLP/HTTP+JSON decodes the incoming JSON to an
+in-memory `AnyValue` and re-encodes the same way, so the stored
+bytes do not depend on the producer's whitespace, field order, or
+`int64`-as-number-vs-string choice.
+
+The faithfulness guarantee — `stored_bytes` decode back to the
+original in-memory `AnyValue` — is an **Ourios** guarantee
+delivered by this encoder/decoder pair, *not* an OTLP lossless
+promise (OTLP makes none). `lossy_flag = false` for structured
+rows rests on this Ourios guarantee, not on any OTLP conformance
+claim.
+
+**Duplicate keys.** OTLP `KvlistValue` is a `repeated KeyValue`
+that the data model treats as a map with **unique** keys; the
+data-model map equality is order-insensitive, but OTLP does
+**not** define wire-order equality, which is why preserving
+received order (above) is the safe, spec-permitted choice. A
+`KvlistValue` carrying **duplicate keys is non-conforming OTLP**
+input with no defined semantics. Ourios does **not** silently
+dedup or reorder such input: it **preserves the entries
+verbatim** in the encoding (so the round-trip stays faithful) and
+flags the record as non-conforming, rather than inventing map
+semantics for it.
 
 #### Template-key composition
 
@@ -1078,17 +1149,21 @@ For each ingested OTLP `LogRecord`:
           # Structured short-circuit per §6.1 *Body
           # representation*. The miner does NOT run the Drain
           # mining steps. body_kind = Structured.
-          encoded = canonicalise_to_otlp_json(record.body)
-              # OTLP-canonical JSON encoding per the OTLP HTTP/JSON
-              # binding (proto3 JSON mapping with OTLP-specific
-              # overrides — hex trace_id/span_id, base64 bytes).
-              # For records arriving over OTLP/gRPC the receiver
-              # decodes protobuf and re-serialises here; for
-              # records arriving over OTLP/HTTP+JSON it
-              # canonicalises the incoming bytes (whitespace,
-              # field-ordering, int64-as-string normalisation).
-              # Without canonicalisation the lossy_flag = false
-              # promise is unmeetable — see §6.1 for the why.
+          encoded = encode_canonical_body(record.body)
+              # Ourios canonical body encoding (a proto3-JSON form;
+              # lowerCamelCase fields, int64/uint64 as decimal
+              # strings, bytes as base64, kvlist/array order
+              # preserved — NOT sorted). This is an Ourios-local
+              # deterministic convention, NOT an OTLP-mandated
+              # canonical form: OTLP defines no canonical JSON and
+              # requires no lossless translation. For records over
+              # OTLP/gRPC the receiver decodes protobuf and
+              # re-encodes here; for OTLP/HTTP+JSON it decodes to
+              # the in-memory AnyValue and re-encodes the same way,
+              # so stored bytes are byte-identical regardless of the
+              # producer's whitespace / field order / int64 form.
+              # The lossy_flag = false promise rests on this Ourios
+              # round-trip guarantee — see §6.1 for the why.
           template_id = allocate_or_reuse_structured_template_id(
               record.severity_number,
               record.scope_name,
@@ -1539,8 +1614,8 @@ contract is to short-circuit *before* that call, so the guard is
 belt-and-braces, not the primary mechanism.
 
 **Structured bodies are out of scope of this amendment.** A
-`body_kind = Structured` row renders its canonically-encoded `body`
-column (the §6.1 canonical-encoding rule, exercised by the RFC0001.9
+`body_kind = Structured` row renders its `body` column from the
+Ourios canonical body encoding (the §6.1 rule, exercised by the RFC0001.9
 structured short-circuit). This amendment defines the `Reconstruction`
 marker for the implemented **`String`** path only; how a structured
 render maps to a `Reconstruction` signal is left open here, to be

@@ -220,21 +220,37 @@ Parquet's flat-nested schema — Parquet supports `LIST` and
 schema declaration, which means no fixed-depth schema can
 faithfully describe arbitrary `AnyValue` trees.
 
+> **Amendment 2026-06-09 (no canonical OTLP JSON exists).** This
+> section previously called the encoding "OTLP-canonical JSON,"
+> implying a spec-defined canonical form. Per an OTel-spec answer
+> (no canonical OTLP JSON; OTLP requires no lossless translation),
+> RFC 0001 §6.1 now frames the rule as **the Ourios canonical body
+> encoding** — an Ourios-local deterministic proto3-JSON
+> convention, not an OTLP conformance point. This section is
+> reworded to defer to that rule and to drop the "canonical OTLP
+> JSON" overclaim. No schema bytes and no `status` change.
+
 **Decision.** `attributes`, `resource_attributes`, and the
 `body` column when `body_kind = Structured` are stored as a
-single `BYTE_ARRAY` of **OTLP-canonical JSON** per RFC 0001 §6.1
-("Canonical encoding for `body_kind = Structured`"). The
-canonical encoding is the proto3 JSON mapping with OTLP's
-specific overrides (`trace_id` / `span_id` as hex strings,
-`bytes` as base64, etc.) — same rule for the three columns so
-operators don't have to remember three encodings.
+single `BYTE_ARRAY` carrying **the Ourios canonical body
+encoding** — RFC 0001 §6.1 ("The Ourios canonical body encoding")
+is the single source of truth for the rule; this section does not
+restate it. In short it is a proto3-JSON form (`lowerCamelCase`
+fields, `int64`/`uint64` as decimal strings, `bytes` as base64,
+`kvlist`/`array` order preserved — not sorted), and it is an
+**Ourios-local deterministic convention, not an OTLP-mandated
+canonical form** (OTLP defines no canonical JSON). The same rule
+applies to all three columns so operators don't have to remember
+three encodings.
 
 The rationale is on three legs:
 
-1. **Faithfulness.** The canonical encoding is bidirectional —
-   `stored_bytes ↔ AnyValue` round-trips deterministically (the
-   normative `[§3.3]` reconstruction guarantee for the structured
-   branch).
+1. **Faithfulness.** The encoding is bidirectional —
+   `stored_bytes ↔ AnyValue` round-trips byte-deterministically
+   (the normative `[§3.3]` reconstruction guarantee for the
+   structured branch). This is an **Ourios** guarantee delivered by
+   RFC 0001 §6.1's encoder, not an OTLP lossless promise (OTLP
+   makes none).
 2. **Schema simplicity.** A single `BYTE_ARRAY` column versus a
    recursive `STRUCT<string_value, int_value, ...,
    array_value: LIST<...>, kvlist_value: LIST<STRUCT<...>>>`
@@ -784,10 +800,11 @@ column the bench won't measure.
 >   element-wise equality for `Vec<T>`
 > - **And** for the canonical-encoded structural columns
 >   (`attributes: Vec<KeyValue>` and `resource_attributes:
->   Vec<KeyValue>` — encoded as canonical JSON `BYTE_ARRAY` on
+>   Vec<KeyValue>` — encoded with the Ourios canonical body
+>   encoding as a `BYTE_ARRAY` on
 >   disk per §3.3), the recovered `Vec<KeyValue>` equals the
->   original under structural equality (the canonical encoding
->   is bidirectional and deterministic per RFC 0001 §6.1, so
+>   original under structural equality (the encoding
+>   is bidirectional and byte-deterministic per RFC 0001 §6.1, so
 >   structural equality is the testable property at the
 >   `MinedRecord` boundary; byte equality on the encoded bytes
 >   follows as a corollary but is not the primary assertion)
@@ -1039,8 +1056,8 @@ are normative for the maturity-stage move from `green` to
   process), §7 (target repository layout — `ourios-parquet` is
   the named crate).
 - RFC 0001 §6.1 (`MinedRecord` data model, OTLP-derived
-  columns, body representation including the OTLP-canonical
-  JSON encoding rule), §6.4 (widening events that this RFC's
+  columns, body representation including the Ourios canonical
+  body encoding rule), §6.4 (widening events that this RFC's
   audit-event stream carries), §6.5 (`OVERFLOW` marker + forced
   body retention — the source of unbounded values in the `body`
   column), §6.6 (reconstruction — the consumer of the schema's
@@ -1074,8 +1091,12 @@ are normative for the maturity-stage move from `green` to
 - OpenTelemetry Logs Data Model — `AnyValue`, normative
   source at
   <https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/data-model.md>.
-- OpenTelemetry Protocol (OTLP) specification — the JSON
-  binding referenced by the canonical-encoding rule for
-  `body_kind = Structured` lives at
+- OpenTelemetry Protocol (OTLP) specification — the proto3-JSON
+  mapping (plus OTLP's closed list of deviations) that the Ourios
+  canonical body encoding for `body_kind = Structured` builds on
+  lives at
   <https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/otlp.md>
-  (see the "OTLP/HTTP" section's proto3-JSON mapping).
+  (see the "OTLP/HTTP" section). OTLP defines **no** canonical /
+  byte-deterministic JSON form and requires no lossless
+  translation; the byte-stable encoding is Ourios-local — see
+  RFC 0001 §6.1.

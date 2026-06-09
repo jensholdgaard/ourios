@@ -191,15 +191,6 @@ fn slot_types_to_record(s: SlotTypes) -> Vec<ParamTypeRecord> {
     s.iter().map(ParamTypeRecord::from).collect()
 }
 
-/// Rebuild a [`SlotTypes`] bitset from its serialised member list.
-/// `SlotTypes::insert` is idempotent and order-insensitive, so the
-/// result is independent of the list order.
-fn slot_types_from_record(types: &[ParamTypeRecord]) -> SlotTypes {
-    types
-        .iter()
-        .fold(SlotTypes::new(), |acc, t| acc.insert(ParamType::from(*t)))
-}
-
 /// WAL high-water mark, mirroring `ourios_wal::WalOffset`'s
 /// `(segment: Uuid, byte)` shape without depending on `ourios-wal`
 /// or `uuid` from the miner crate. The segment id is carried as its
@@ -347,18 +338,12 @@ where
 /// Convert a [`SlotTypes`] vector (the leaf's per-slot type sets)
 /// into the serialisable form.
 #[must_use]
-pub fn slot_types_vec_to_record(slot_types: &[SlotTypes]) -> Vec<Vec<ParamTypeRecord>> {
+pub(crate) fn slot_types_vec_to_record(slot_types: &[SlotTypes]) -> Vec<Vec<ParamTypeRecord>> {
     slot_types
         .iter()
         .copied()
         .map(slot_types_to_record)
         .collect()
-}
-
-/// Inverse of [`slot_types_vec_to_record`].
-#[must_use]
-pub fn slot_types_vec_from_record(records: &[Vec<ParamTypeRecord>]) -> Vec<SlotTypes> {
-    records.iter().map(|r| slot_types_from_record(r)).collect()
 }
 
 #[cfg(test)]
@@ -506,15 +491,17 @@ mod tests {
     }
 
     #[test]
-    fn slot_types_record_round_trips() {
-        // Arrange — a multi-member slot set.
-        let original = SlotTypes::singleton(ParamType::Num).insert(ParamType::Str);
+    fn slot_types_to_record_captures_every_member() {
+        // The serialisable form lists each member of the set (in
+        // `SlotTypes::iter` / canonical `ParamType` order). The
+        // restore-side inverse lands with the recovery restore path
+        // (RFC 0008 §6.7); here we pin the forward encoding `snapshot`
+        // relies on.
+        let record =
+            slot_types_to_record(SlotTypes::singleton(ParamType::Num).insert(ParamType::Str));
 
-        // Act
-        let record = slot_types_to_record(original);
-        let restored = slot_types_from_record(&record);
-
-        // Assert
-        assert_eq!(restored, original);
+        assert_eq!(record.len(), 2);
+        assert!(record.contains(&ParamTypeRecord::Num));
+        assert!(record.contains(&ParamTypeRecord::Str));
     }
 }

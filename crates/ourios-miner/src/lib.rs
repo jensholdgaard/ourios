@@ -6,5 +6,6 @@ mod metrics;
 pub mod overflow;
 pub mod reconstruct;
 pub mod sim_seq;
+pub mod snapshot;
 pub mod tokenize;
 pub mod tree;

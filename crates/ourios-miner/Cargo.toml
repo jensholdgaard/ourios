@@ -25,6 +25,12 @@ sha2 = { version = "0.10", default-features = false }
 # `ourios-telemetry`). Drives the §6.8 miner instrument set in
 # `crate::metrics`.
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# RFC 0001 §6.9 snapshot payload codec. The leading version byte (byte 0)
+# keeps the codec a v1 implementation detail behind the format framing;
+# serde derive + serde_json are the workspace-default serialization stack
+# (same pins as ourios-core / ourios-parquet / ourios-querier).
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # `init_in_memory` collects the §6.8 instrument stream through an

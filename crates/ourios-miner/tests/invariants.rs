@@ -307,17 +307,132 @@ fn invariant_3_3_1_separators_captured_on_every_tokenization() {
 /// Scenario §3.5.1 — Snapshot format carries a leading version byte.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_5_1_snapshot_format_carries_leading_version_byte() {
-    todo!("RFC 0001 §6.9");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::snapshot::{SNAPSHOT_VERSION, snapshot};
+
+    // Arrange — a tenant tree holding a couple of templates.
+    let mut cluster = MinerCluster::new(MinerConfig::default());
+    let tenant = TenantId::new("tenant-snapshot");
+    for text in ["user 42 logged in", "GET /home 200"] {
+        cluster.ingest(&OtlpLogRecord {
+            tenant_id: tenant.clone(),
+            body: Some(Body::String(text.to_string())),
+            ..Default::default()
+        });
+    }
+    let state = cluster.snapshot_state(&tenant);
+    assert!(
+        !state.leaves.is_empty(),
+        "precondition: the tenant must hold at least one template",
+    );
+
+    // Act
+    let bytes = snapshot(&state);
+
+    // Assert — byte 0 is the snapshot format version.
+    assert_eq!(
+        bytes[0], SNAPSHOT_VERSION,
+        "snapshot byte 0 must be the format version, got {:#04x}",
+        bytes[0],
+    );
 }
 
 /// Scenario §3.5.2 — Unknown snapshot version triggers full WAL replay.
 /// See `docs/rfcs/0001-template-miner.md` §5.
+///
+/// v1 recovery (RFC 0001 §6.9 *v1 scope*) rebuilds the tree from a
+/// full `Wal::replay()` in **both** branches; here the WAL is stood
+/// in for by re-ingesting the frames the WAL holds into a fresh
+/// cluster (the `OtlpBatch`-decode + miner-ingest pipeline that the
+/// real replay drives lives in `ourios-ingester`). The stale
+/// snapshot is deliberately built from *different* templates than
+/// the WAL frames, so "recovered == full WAL replay, NOT the stale
+/// snapshot" is a real assertion.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
-    todo!("RFC 0001 §6.9");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::snapshot::{
+        RecoveryOutcome, SnapshotError, load_snapshot, recover, snapshot,
+    };
+
+    let tenant = TenantId::new("tenant-recovery");
+    let rec = |text: &str| OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        body: Some(Body::String(text.to_string())),
+        ..Default::default()
+    };
+
+    // The frames the WAL durably holds (RFC 0001 §3.4): the source
+    // of truth recovery must rebuild from.
+    let wal_frames = ["order 7 shipped", "order 9 shipped"];
+
+    // Arrange — a *stale* snapshot whose tree is unrelated to the
+    // WAL frames, with its version byte set to an unknown value.
+    let stale_snapshot = {
+        let mut other = MinerCluster::new(MinerConfig::default());
+        other.ingest(&rec("login user 1 ok"));
+        let mut bytes = snapshot(&other.snapshot_state(&tenant));
+        bytes[0] = 0xFF;
+        bytes
+    };
+
+    // Act 1 — the unknown version is rejected by the loader.
+    let load_err = load_snapshot(&stale_snapshot).expect_err("unknown version must be rejected");
+
+    // Assert 1 — §3.5.2: rejected as an unknown version.
+    assert!(
+        matches!(load_err, SnapshotError::UnknownVersion(0xFF)),
+        "unknown version byte must surface UnknownVersion(0xFF), got {load_err:?}",
+    );
+
+    // Act 2 — recover from the stale snapshot + the WAL. The rebuild
+    // closure is the full-replay stand-in: it re-ingests every WAL
+    // frame into a fresh cluster and returns the resulting tree state.
+    let (recovered, outcome) = recover(Some(&stale_snapshot), || {
+        let mut replayed = MinerCluster::new(MinerConfig::default());
+        for text in wal_frames {
+            replayed.ingest(&rec(text));
+        }
+        replayed.snapshot_state(&tenant)
+    });
+
+    // The tree a full WAL replay alone would produce — the truth.
+    let from_wal_only = {
+        let mut replayed = MinerCluster::new(MinerConfig::default());
+        for text in wal_frames {
+            replayed.ingest(&rec(text));
+        }
+        replayed.snapshot_state(&tenant)
+    };
+
+    // Assert 2 — the stale snapshot was discarded and the tree came
+    // from the WAL, not the snapshot.
+    assert_eq!(
+        outcome,
+        RecoveryOutcome::UnknownOrCorruptDiscarded,
+        "an unknown-version snapshot must be discarded",
+    );
+    assert_eq!(
+        recovered, from_wal_only,
+        "recovered tree must equal the full WAL replay",
+    );
+    assert_ne!(
+        recovered,
+        load_snapshot(&{
+            let mut valid = stale_snapshot.clone();
+            valid[0] = ourios_miner::snapshot::SNAPSHOT_VERSION;
+            valid
+        })
+        .expect("re-versioned stale payload deserialises"),
+        "recovered tree must NOT be the stale snapshot's content",
+    );
 }
 
 /// Scenario §3.7.1 — Tenants' template trees never cross-pollinate.

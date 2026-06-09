@@ -1783,6 +1783,67 @@ impl MinerCluster {
                 .collect()
         })
     }
+
+    /// Capture one tenant's full template state as a serialisable
+    /// [`SnapshotState`](crate::snapshot::SnapshotState) per RFC 0001
+    /// §6.9. Returns an empty state (no leaves, no structured
+    /// templates) for an unseen tenant.
+    ///
+    /// This is the producer side of the §6.9 snapshot format: it
+    /// captures every `Body::String` leaf (template tokens,
+    /// `template_id`, `template_version`, the `(severity_number,
+    /// scope_name)` template key, and per-slot `slot_types`) plus the
+    /// §6.2 step-0 structured-template-id map. `wal_high_water` is the
+    /// caller's to supply — the cluster does not track WAL offsets —
+    /// so it is left `None` here; the snapshot writer fills it from
+    /// the WAL at the segment-rotation boundary it snapshots on.
+    #[must_use]
+    pub fn snapshot_state(&self, tenant_id: &TenantId) -> crate::snapshot::SnapshotState {
+        use crate::snapshot::{
+            LeafRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
+            slot_types_vec_to_record,
+        };
+
+        let Some(state) = self.tenants.get(tenant_id) else {
+            return SnapshotState {
+                leaves: Vec::new(),
+                structured_templates: Vec::new(),
+                wal_high_water: None,
+            };
+        };
+
+        let leaves = state
+            .tree
+            .collect_leaves()
+            .into_iter()
+            .map(|leaf| LeafRecord {
+                template: leaf.template.iter().map(TokenRecord::from).collect(),
+                template_id: leaf.template_id,
+                template_version: leaf.template_version,
+                severity_number: leaf.severity_number,
+                scope_name: leaf.scope_name.clone(),
+                slot_types: slot_types_vec_to_record(&leaf.slot_types),
+            })
+            .collect();
+
+        let structured_templates = state
+            .structured_templates
+            .iter()
+            .map(
+                |((severity_number, scope_name), template_id)| StructuredTemplateRecord {
+                    severity_number: *severity_number,
+                    scope_name: scope_name.clone(),
+                    template_id: *template_id,
+                },
+            )
+            .collect();
+
+        SnapshotState {
+            leaves,
+            structured_templates,
+            wal_high_water: None,
+        }
+    }
 }
 
 /// Read-only view of a single leaf surfaced by

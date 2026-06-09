@@ -49,9 +49,11 @@ pub fn parse(input: &str) -> Result<Query, DslError> {
     match parse_statement(input)? {
         Statement::Logs(query) => Ok(query),
         Statement::Drift(_) => Err(DslError::new(
-            "`drift` is an audit-stream query, not a log query; it has no place in a \
-             log-record pipeline"
-                .to_string(),
+            concat!(
+                "`drift` is an audit-stream query, not a log query; ",
+                "it has no place in a log-record pipeline"
+            )
+            .to_string(),
         )),
     }
 }
@@ -1496,10 +1498,19 @@ mod tests {
 
     #[test]
     fn drift_is_not_a_reserved_field_in_a_log_query() {
-        // `drift` only heads a statement; mid-pipeline it is an ordinary
-        // (unknown) field name, so a log query never accidentally swallows it.
-        use crate::dsl::ir::Statement;
-        let s = parse_statement("true | limit 5").unwrap();
-        assert!(matches!(s, Statement::Logs(_)));
+        // `drift` is only special as the *leading* verb head (RFC 0010 §6.1):
+        // once a query has started, a `drift` token is an ordinary identifier
+        // (here an attribute key), so a log query never swallows it as a verb.
+        // The query must contain a `drift` token after the head, else the test
+        // wouldn't exercise the thing it names.
+        use crate::dsl::ir::{Field, Predicate, Statement};
+        let s = parse_statement("attr.drift == \"x\" | limit 5").unwrap();
+        let Statement::Logs(query) = s else {
+            panic!("a mid-query `drift` token must stay a Logs query, got {s:?}");
+        };
+        assert!(matches!(
+            query.predicate,
+            Predicate::Comparison { field: Field::Attr(ref k), .. } if k == "drift"
+        ));
     }
 }

@@ -1109,11 +1109,52 @@ fn h7_2_tokenizer_failure_sets_lossy_flag_and_retains_body() {
 }
 
 /// Scenario H7.3 — Reader emits body verbatim when `lossy_flag` is true.
-/// See `docs/rfcs/0001-template-miner.md` §5.
+/// See `docs/rfcs/0001-template-miner.md` §5 and the §6.6
+/// *Reader render contract*.
 #[test]
-#[ignore = "RFC 0001 Red gate — implementation pending"]
 fn h7_3_reader_emits_body_verbatim_when_lossy_flag_is_true() {
-    todo!("RFC 0001 §6.6");
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord};
+    use ourios_core::record::SharedRecordSink;
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::MinerCluster;
+    use ourios_miner::reconstruct::{Reconstruction, render};
+    use ourios_miner::tree::OwnedToken;
+
+    // Arrange — drive the §6.2 step 1 tokenizer-failure path (an
+    // embedded NUL) so the miner emits a String-body record with
+    // `lossy_flag = true` and the original bytes retained in `body`.
+    let records = SharedRecordSink::new();
+    let mut cluster =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+    let t = TenantId::new("tenant-x");
+    let raw = "user 42\u{0000}secret";
+    cluster.ingest(&OtlpLogRecord {
+        tenant_id: t.clone(),
+        body: Some(Body::String(raw.to_string())),
+        ..Default::default()
+    });
+    let emitted = records.drain();
+    assert_eq!(emitted.len(), 1);
+    let rec = &emitted[0];
+    assert!(rec.lossy_flag, "tokenizer failure must set lossy_flag=true");
+
+    // A deliberately wrong template: rebuilding `rec` from it would
+    // yield "WRONG", never the retained body. If `render` invoked
+    // `reconstruct`, the returned bytes could not equal `raw`.
+    let wrong_template = vec![OwnedToken::Fixed("WRONG".to_string())];
+
+    // Act
+    let (bytes, marker) = render(rec, &wrong_template);
+
+    // Assert — bytes are the retained body verbatim (NUL included)
+    // and the marker is RetainedVerbatim. The body-equality is the
+    // proof that `reconstruct` was NOT called: the lossy short-
+    // circuit fired first, so the wrong template was never walked
+    // (a walk would have produced "WRONG" ≠ `raw`). This is H7.3's
+    // "reconstruct is NOT called on a lossy row."
+    assert_eq!(bytes, raw.as_bytes().to_vec());
+    assert_eq!(marker, Reconstruction::RetainedVerbatim);
 }
 
 /// Scenario H7.4 — Widened literal slot reconstructs via STR fallback.

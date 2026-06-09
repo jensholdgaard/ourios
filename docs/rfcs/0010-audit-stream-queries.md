@@ -78,7 +78,7 @@ detection").
 
 ### 2.2 Why at this layer, and why now
 
-Drift detection is hazard **H5** (`CLAUDE.md` §4.5, "Template schema
+Drift detection is hazard **H5** (`docs/hazards.md` H5, "Template schema
 evolution across deploys"): a sudden cluster of `template_widened` events
 correlated with a deploy is the H5 detection signal, and the §3.5 invariant
 ("Parquet schema changes require a migration plan") is the data-side
@@ -125,7 +125,7 @@ ship as a closed form without reopening RFC 0002's broader deferred work.
   RFC 0001 §6.7 alias map. `drift` is the orthogonal *cross-version* axis
   ("did leaf X gain a version in `[t1, t2]`"); see §8 alternative B.
 - **Raw SQL / DataFusion passthrough.** Rejected per hazard H6
-  (`CLAUDE.md` §4.6): the DataFusion SQL surface is never exposed. `drift`
+  (`docs/hazards.md` H6): the DataFusion SQL surface is never exposed. `drift`
   is DSL-only (§8 alternative C).
 - **The compaction-event query surface.** RFC 0005 routes `compaction`
   events through the same audit stream; querying those is a separate
@@ -161,8 +161,8 @@ relevant facts, cited so the design below is unambiguous:
 
 ## 5. Acceptance criteria
 
-Normative scenarios, `docs/rfcs/README.md` §5 format (Given / When / Then /
-And). Each carries a greppable id referenced from the test code. Where a
+Normative scenarios, in the `docs/rfcs/README.md` Required-sections
+acceptance-criteria format (Given / When / Then / And). Each carries a greppable id referenced from the test code. Where a
 scenario discharges a sibling RFC's criterion, both ids are listed so the
 mapping stays greppable from either side.
 
@@ -234,7 +234,7 @@ mapping stays greppable from either side.
     matching RFC 0001 §6.7's
     `MIN(old_version), MAX(new_version), MIN(timestamp), MAX(timestamp)`.
 
-- **RFC0010.8 — No DataFusion/SQL leakage `[§4.6]`, RFC0007.3**
+- **RFC0010.8 — No DataFusion/SQL leakage `[H6]`, RFC0007.3**
   - **Given** the public `drift` surface (string DSL and structured form)
   - **When** a malformed or SQL-shaped drift query is submitted
   - **Then** neither the accepted grammar nor any error `Display` exposes
@@ -387,12 +387,13 @@ result shapes distinct keeps invalid mixes unrepresentable.
   filter over the `audit/tenant_id=…` Hive layout (RFC 0005 §3.4), so
   isolation is a partition prune, not a post-scan filter (RFC 0007 §6.5).
   A drift query with no tenant is a usage error, not a cross-tenant scan.
-- **Window boundaries (RFC0010.2).** `[t1, t2]` compiles to the **same
-  half-open `[from, to)`** the RFC 0002 §6.1 `range(from, to)` stage
-  compiles to — lower bound included, upper bound excluded — so the two
-  time vocabularies agree bound-for-bound and an operator's mental model of
-  `range` carries over. `from`/`to` resolve through the RFC 0002 §7 `time`
-  rules (relative durations resolve against query-evaluation `now`; RFC 3339
+- **Window boundaries (RFC0010.2).** `drift` defines its window as
+  **half-open `[from, to)`** — lower bound included, upper bound excluded.
+  (RFC 0002's `range(from, to)` stage does not pin its boundary semantics
+  today; RFC 0010 fixes half-open for the drift window, and recommends
+  `range` adopt the same once its semantics are nailed down so the two time
+  vocabularies converge.) `from`/`to` reuse the RFC 0002 §7 `time` grammar
+  (relative durations resolve against query-evaluation `now`; RFC 3339
   timestamps are absolute).
 - **Window → partition prune.** The window's resolved `[t1, t2)` bounds
   drive `year`/`month`/`day` partition pruning over the audit layout
@@ -498,7 +499,7 @@ test; ids are greppable from the test code.
   or count events, so it cannot answer H5.
 - **C. Raw SQL / DataFusion passthrough.** Expose the §6.3 SQL (or a
   general SQL endpoint) directly. Zero surface-design cost. Rejected per
-  hazard H6 (`CLAUDE.md` §4.6, "do not leak DataFusion specifics through to
+  hazard H6 (`docs/hazards.md` H6, "do not leak DataFusion specifics through to
   users") and RFC 0002 §10's standing rejection of a SQL default: it binds
   the user surface to DataFusion and reopens the cross-tenant /
   unbounded-scan risks the DSL exists to contain.
@@ -558,8 +559,7 @@ test; ids are greppable from the test code.
   scan stats) that runs the compiled drift query; criteria RFC0007.3
   (no-leakage) and RFC0007.5 (tenant isolation) are the siblings of
   RFC0010.8 and RFC0010.4.
-- `CLAUDE.md` §3.5 (schema migration), §3.7 (multi-tenancy), §4.5 (hazard
-  H5, schema evolution / drift), §4.6 (hazard H6, no DataFusion/SQL
-  leakage); `docs/hazards.md` H5/H6.
+- `CLAUDE.md` §3.5 (schema migration), §3.7 (multi-tenancy); `docs/hazards.md`
+  H5 (schema evolution / drift) + H6 (no DataFusion/SQL leakage).
 - `ourios-parquet` `ParquetAuditSink` / `AuditReader` / `audit_schema()`
   (the persisted, readable audit surface this RFC queries).

@@ -166,8 +166,10 @@ fn reconstruct_from_template(record: &MinedRecord, template: &[OwnedToken]) -> V
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reconstruction {
-    /// Bytes were rebuilt from `template + params + separators` and
-    /// equal the ingested line.
+    /// Bytes were rebuilt from `template + params + separators`. With
+    /// the row's correct template they equal the ingested line; `render`
+    /// cannot guarantee equality if a caller supplies a wrong but
+    /// shape-compatible template.
     Faithful,
     /// Bytes are the retained `body` column, returned verbatim
     /// without invoking `reconstruct`.
@@ -197,13 +199,17 @@ pub enum Reconstruction {
 /// path needs is out of scope of the §6.6 amendment (RFC 0007).
 ///
 /// Only `body_kind = String` rows go through `render`: the §6.6
-/// amendment scopes the `Reconstruction` marker to the `String`
-/// path. Structured / Absent rows are out of scope here and keep
-/// `reconstruct`'s existing behaviour — `render` does not invent a
-/// marker for them, so callers route only `String` rows through it.
+/// amendment scopes the `Reconstruction` marker to the `String` path.
+/// Structured / Absent rows are out of scope; passing one is a caller
+/// bug and **panics** rather than inventing a marker for them — route
+/// only `String` rows here and handle the rest via [`reconstruct`].
+///
+/// # Panics
+///
+/// If `record.body_kind` is not [`BodyKind::String`].
 #[must_use]
 pub fn render(record: &MinedRecord, template: &[OwnedToken]) -> (Vec<u8>, Reconstruction) {
-    debug_assert!(
+    assert!(
         matches!(record.body_kind, BodyKind::String),
         "render is the §6.6 String-body reader path; route Structured/Absent rows through reconstruct"
     );
@@ -500,6 +506,9 @@ mod tests {
         // whether the template was walked.
         let template = vec![OwnedToken::Fixed("user".to_string()), OwnedToken::Wildcard];
         let mut r = record_envelope(BodyKind::String);
+        // Valid separators (len == template.len() + 1) so the ONLY shape
+        // mismatch is the wildcard/param count (1 wildcard vs 2 params).
+        r.separators = vec![String::new(), " ".to_string(), String::new()];
         r.params = vec![
             Param {
                 type_tag: ParamType::Num,

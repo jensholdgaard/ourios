@@ -1139,20 +1139,20 @@ fn h7_3_reader_emits_body_verbatim_when_lossy_flag_is_true() {
     let rec = &emitted[0];
     assert!(rec.lossy_flag, "tokenizer failure must set lossy_flag=true");
 
-    // A deliberately wrong template: rebuilding `rec` from it would
-    // yield "WRONG", never the retained body. If `render` invoked
-    // `reconstruct`, the returned bytes could not equal `raw`.
+    // A deliberately wrong template — render must ignore it on the
+    // lossy path, short-circuiting to the retained body without any
+    // token walk.
     let wrong_template = vec![OwnedToken::Fixed("WRONG".to_string())];
 
     // Act
     let (bytes, marker) = render(rec, &wrong_template);
 
-    // Assert — bytes are the retained body verbatim (NUL included)
-    // and the marker is RetainedVerbatim. The body-equality is the
-    // proof that `reconstruct` was NOT called: the lossy short-
-    // circuit fired first, so the wrong template was never walked
-    // (a walk would have produced "WRONG" ≠ `raw`). This is H7.3's
-    // "reconstruct is NOT called on a lossy row."
+    // Assert — the observable §6.6 contract for a lossy row: the
+    // retained body is returned verbatim (embedded NUL included) with
+    // the RetainedVerbatim marker. H7.3's "reconstruct is NOT called"
+    // is a structural guarantee of render's retain branch (it returns
+    // the body directly), not something output equality can prove —
+    // reconstruct's own lossy fallback would also return the body.
     assert_eq!(bytes, raw.as_bytes().to_vec());
     assert_eq!(marker, Reconstruction::RetainedVerbatim);
 }

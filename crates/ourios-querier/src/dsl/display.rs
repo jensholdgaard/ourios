@@ -9,9 +9,28 @@
 use std::fmt::Write as _;
 
 use super::ir::{
-    AggFn, Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue, Stage, Time,
-    Value,
+    AggFn, Call, CmpOp, DriftQuery, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue,
+    Stage, Statement, Time, Value,
 };
+
+/// Serialise a [`Statement`] (a log query or a RFC 0010 `drift` query) to its
+/// canonical single-line β form. Round-trips through [`super::parse_statement`].
+#[must_use]
+pub fn serialize_statement(statement: &Statement) -> String {
+    match statement {
+        Statement::Logs(query) => serialize(query),
+        Statement::Drift(drift) => serialize_drift(drift),
+    }
+}
+
+/// Serialise a [`DriftQuery`] to `drift from <t1> to <t2>` (RFC 0010 §6.1).
+fn serialize_drift(drift: &DriftQuery) -> String {
+    let mut out = String::from("drift from ");
+    write_time(&mut out, &drift.from);
+    out.push_str(" to ");
+    write_time(&mut out, &drift.to);
+    out
+}
 
 /// Serialise a [`Query`] to its canonical single-line β form.
 #[must_use]

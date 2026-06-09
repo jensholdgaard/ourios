@@ -6,25 +6,56 @@
 
 use super::DslError;
 use super::ir::{
-    AggFn, Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue, Stage, Time,
-    Value,
+    AggFn, Call, CmpOp, DriftQuery, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue,
+    Stage, Statement, Time, Value,
 };
 
-/// Parse a β-surface query string into the shared [`Query`] IR.
+/// Parse a β-surface query string into a [`Statement`] — a log query or a
+/// RFC 0010 `drift` query, dispatched on the leading token (`drift` is the
+/// only verb head; anything else parses as the RFC 0002 `predicate { | stage }`
+/// pipeline).
 ///
 /// # Errors
 ///
-/// Returns [`DslError`] for any lexical or grammatical violation of §7,
-/// citing the offending token/clause.
-pub fn parse(input: &str) -> Result<Query, DslError> {
+/// Returns [`DslError`] for any lexical or grammatical violation of the §7
+/// grammar or the RFC 0010 §6.1 `drift` head, citing the offending
+/// token/clause.
+pub fn parse_statement(input: &str) -> Result<Statement, DslError> {
     let tokens = tokenize(input)?;
     let mut parser = Parser {
         tokens: &tokens,
         pos: 0,
     };
-    let query = parser.parse_query()?;
+    // `drift` is a reserved verb head (RFC 0010 §6.1): a query that opens with
+    // it is a drift query, not a `drift == …` log predicate.
+    let statement = if matches!(parser.peek(), Some(Tok::Ident(s)) if s == "drift") {
+        Statement::Drift(parser.parse_drift_query()?)
+    } else {
+        Statement::Logs(parser.parse_query()?)
+    };
     parser.expect_eof()?;
-    Ok(query)
+    Ok(statement)
+}
+
+/// Parse a β-surface query string into the shared [`Query`] IR (the RFC 0002
+/// log-query pipeline).
+///
+/// # Errors
+///
+/// Returns [`DslError`] for any lexical or grammatical violation of §7,
+/// citing the offending token/clause. A RFC 0010 `drift` head is rejected
+/// here — use [`parse_statement`] to accept it.
+pub fn parse(input: &str) -> Result<Query, DslError> {
+    match parse_statement(input)? {
+        Statement::Logs(query) => Ok(query),
+        Statement::Drift(_) => Err(DslError::new(
+            concat!(
+                "`drift` is an audit-stream query, not a log query; ",
+                "it has no place in a log-record pipeline"
+            )
+            .to_string(),
+        )),
+    }
 }
 
 // ---- tokenizer ----------------------------------------------------------
@@ -486,6 +517,29 @@ impl<'a> Parser<'a> {
             stages.push(self.parse_stage()?);
         }
         Ok(Query { predicate, stages })
+    }
+
+    /// `drift_query = "drift" , "from" , time , "to" , time` (RFC 0010 §6.1).
+    /// A closed verb head: it admits no `|` stages (the projection, grouping,
+    /// and ordering are fixed by §6.3), so a trailing pipe is rejected by the
+    /// caller's `expect_eof`.
+    fn parse_drift_query(&mut self) -> Result<DriftQuery, DslError> {
+        self.pos += 1; // consume `drift`
+        if !self.eat_keyword("from") {
+            return Err(DslError::new(format!(
+                "expected `from` after `drift`, found {}",
+                describe(self.peek())
+            )));
+        }
+        let from = self.parse_time()?;
+        if !self.eat_keyword("to") {
+            return Err(DslError::new(format!(
+                "expected `to` after the drift window's `from` bound, found {}",
+                describe(self.peek())
+            )));
+        }
+        let to = self.parse_time()?;
+        Ok(DriftQuery { from, to })
     }
 
     /// `predicate = or_expr`.
@@ -1389,5 +1443,74 @@ mod tests {
         assert!(validate_sort_key("attr.http.status_code").is_err());
         assert!(validate_sort_key("").is_err());
         assert!(validate_sort_key("3rd").is_err());
+    }
+
+    #[test]
+    fn parses_drift_head_with_all_time_forms() {
+        // Arrange / Act — `drift from <t1> to <t2>` over each §7 time form.
+        use crate::dsl::ir::Statement;
+        let rel = parse_statement("drift from -7d to now").unwrap();
+        let abs =
+            parse_statement("drift from 2026-06-01T00:00:00Z to 2026-06-02T00:00:00Z").unwrap();
+        // Assert
+        match rel {
+            Statement::Drift(d) => {
+                assert_eq!(
+                    d.from,
+                    Time::Duration {
+                        neg: true,
+                        literal: "7d".into()
+                    }
+                );
+                assert_eq!(d.to, Time::Now);
+            }
+            Statement::Logs(_) => panic!("expected Drift, got Logs"),
+        }
+        assert!(matches!(
+            abs,
+            Statement::Drift(d) if matches!(d.from, Time::Timestamp(_)) && matches!(d.to, Time::Timestamp(_))
+        ));
+    }
+
+    #[test]
+    fn drift_head_forecloses_trailing_stages() {
+        // A drift query is a closed verb head (RFC 0010 §6.1): a trailing `|`
+        // stage is rejected, not silently composed.
+        assert!(parse_statement("drift from -7d to now | limit 10").is_err());
+        assert!(parse_statement("drift from -7d to now | count by template_id").is_err());
+    }
+
+    #[test]
+    fn drift_head_requires_from_and_to() {
+        assert!(parse_statement("drift").is_err());
+        assert!(parse_statement("drift from -7d").is_err());
+        assert!(parse_statement("drift -7d to now").is_err());
+        assert!(parse_statement("drift from -7d now").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_drift_as_a_log_query() {
+        // The RFC 0002 `parse` entry stays log-only: a drift head is an error
+        // there (callers wanting it use `parse_statement`).
+        let err = parse("drift from -7d to now").unwrap_err();
+        assert!(err.message().contains("audit-stream"), "{}", err.message());
+    }
+
+    #[test]
+    fn drift_is_not_a_reserved_field_in_a_log_query() {
+        // `drift` is only special as the *leading* verb head (RFC 0010 §6.1):
+        // once a query has started, a `drift` token is an ordinary identifier
+        // (here an attribute key), so a log query never swallows it as a verb.
+        // The query must contain a `drift` token after the head, else the test
+        // wouldn't exercise the thing it names.
+        use crate::dsl::ir::{Field, Predicate, Statement};
+        let s = parse_statement("attr.drift == \"x\" | limit 5").unwrap();
+        let Statement::Logs(query) = s else {
+            panic!("a mid-query `drift` token must stay a Logs query, got {s:?}");
+        };
+        assert!(matches!(
+            query.predicate,
+            Predicate::Comparison { field: Field::Attr(ref k), .. } if k == "drift"
+        ));
     }
 }

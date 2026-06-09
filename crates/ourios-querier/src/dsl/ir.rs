@@ -3,11 +3,37 @@
 //! the §7 grammar exactly; no `datafusion`/`arrow`/SQL type appears here
 //! (hazard `CLAUDE.md` §4.6).
 
-/// A whole query: a predicate followed by ordered pipe stages (§7 `query`).
+/// A top-level statement — either a log-record query (the RFC 0002
+/// `predicate { | stage }` pipeline) or a RFC 0010 `drift` query over the
+/// audit stream. The two are distinct shapes, not a flag on one struct: a
+/// drift query has no predicate and no stages (RFC 0010 §6.1), so mixing the
+/// two is unrepresentable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    /// A log-record query against the `data/` series (RFC 0002).
+    Logs(Query),
+    /// A `drift from <t1> to <t2>` query against the `audit/` series
+    /// (RFC 0010 §6.1).
+    Drift(DriftQuery),
+}
+
+/// A whole log query: a predicate followed by ordered pipe stages (§7 `query`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub predicate: Predicate,
     pub stages: Vec<Stage>,
+}
+
+/// A RFC 0010 `drift` query: the closed-form audit-stream question "which
+/// templates gained a version in the window `[from, to)`" (RFC 0010 §6.1).
+/// It carries only the resolved window — the projection, grouping, and
+/// ordering are fixed by §6.3, so there is nothing else to express and no
+/// `|` stage to compose. `from` / `to` reuse the §7 [`Time`] production
+/// verbatim (RFC 0010 §6.5); the window is half-open `[from, to)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriftQuery {
+    pub from: Time,
+    pub to: Time,
 }
 
 /// A boolean expression over the `OTel` log data model (§7 `predicate`).

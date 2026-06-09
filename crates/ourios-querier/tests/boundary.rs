@@ -67,7 +67,7 @@ async fn rfc0007_3_real_engine_error_does_not_leak() {
             "operator-facing Display leaked engine token {token:?}: {shown:?}",
         );
     }
-    assert_eq!(err.to_string(), "failed to read the log store");
+    assert_eq!(err.to_string(), "failed to read storage");
 
     // The underlying engine detail is preserved for logs (Debug),
     // proving the scrub is a deliberate Display boundary.

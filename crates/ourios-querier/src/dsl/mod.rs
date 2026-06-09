@@ -20,10 +20,10 @@ mod display;
 mod parse;
 mod structured;
 
-pub use display::serialize;
-pub use ir::Query;
-pub use parse::parse;
-pub use structured::parse_structured;
+pub use display::{serialize, serialize_statement};
+pub use ir::{DriftQuery, Query, Statement};
+pub use parse::{parse, parse_statement};
+pub use structured::{parse_structured, parse_structured_statement};
 
 /// The published JSON Schema (draft 2020-12) for the structured query surface
 /// (RFC 0002 §6.4). Versioned alongside the parser and snapshot-tested so any

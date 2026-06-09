@@ -38,7 +38,10 @@
 #![deny(unsafe_code)]
 
 mod compile;
+mod drift;
 pub mod dsl;
+
+pub use drift::{DriftResult, DriftRow};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -150,7 +153,7 @@ impl std::fmt::Display for QueryError {
             // No `detail` here on purpose: the underlying engine
             // message would leak `DataFusion`/SQL specifics (§4.6).
             // The detail is preserved on the variant for `Debug`.
-            Self::Storage { .. } => write!(f, "failed to read the log store"),
+            Self::Storage { .. } => write!(f, "failed to read storage"),
         }
     }
 }
@@ -464,6 +467,36 @@ impl Querier {
         .await
     }
 
+    /// Execute a RFC 0010 `drift` query against the tenant's RFC 0005 `audit/`
+    /// stream and return the per-template [`DriftRow`]s + pruning stats —
+    /// without leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 /
+    /// RFC0010.8).
+    ///
+    /// Drift is the audit-stream sibling of [`run_query`](Self::run_query): it
+    /// scans `audit/tenant_id=<tenant>/`, filters to the widening /
+    /// type-expansion events in the half-open window `[from, to)`, and folds
+    /// them per `template_id` (RFC 0010 §6.3). Tenant isolation is a partition
+    /// prune on the `audit/tenant_id=…` Hive root (RFC0010.4 / §3.7); a drift
+    /// query with no tenant is unrepresentable (the `tenant` argument is
+    /// required). An empty window or a tenant with no qualifying events yields
+    /// an empty [`DriftResult`], never an error (RFC0010.5).
+    ///
+    /// `now_unix_nano` is the wall-clock reference the relative `from`/`to`
+    /// bounds (`-7d`, `now`) resolve against; the caller supplies it so
+    /// execution is deterministic and testable.
+    ///
+    /// # Errors
+    ///
+    /// See [`QueryError`].
+    pub async fn run_drift(
+        &self,
+        query: &dsl::DriftQuery,
+        tenant: &TenantId,
+        now_unix_nano: u64,
+    ) -> Result<DriftResult, QueryError> {
+        drift::run_drift(&self.bucket_root, query, tenant, now_unix_nano).await
+    }
+
     /// Shared scan path for both [`run`](Self::run) and
     /// [`run_query`](Self::run_query): resolve the tenant's live file set
     /// (honouring partition-level time pruning + the RFC 0009 §3.4 manifest),
@@ -590,7 +623,7 @@ mod tests {
     /// operator-facing `QueryError` message (RFC0007.3 / §4.6).
     /// Lowercase — callers scan against the lowercased message.
     /// None of these collide with the generic Storage message
-    /// ("failed to read the log store").
+    /// ("failed to read storage").
     const ENGINE_LEAK_TOKENS: &[&str] = &[
         "datafusion",
         "arrow",
@@ -630,7 +663,7 @@ mod tests {
                 detail: "Error during planning: SQL ...".into(),
             }
             .to_string(),
-            "failed to read the log store",
+            "failed to read storage",
         );
     }
 

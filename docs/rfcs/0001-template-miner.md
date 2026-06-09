@@ -2065,6 +2065,24 @@ boundary at 1.0 (see §6.3): default buckets
 
 ### 6.9 Persistence and recovery
 
+> **Amendment 2026-06-10 (snapshot store / cadence / scope
+> resolved).** The three §9 open questions deferred from this
+> section — *target store*, *cadence*, and *scope* — are now pinned.
+> The snapshot is a **rebuildable recovery-acceleration cache, not
+> durable state** (the WAL is the truth per `[§3.4]`), which is what
+> licenses the choices: **local disk, WAL-adjacent** (object storage
+> deferred, see §9); **per WAL-segment-rotation cadence**, recording
+> the WAL high-water mark; **per-tenant scope**. The format is a
+> leading `u8` version byte then a payload; recovery dispatches on
+> byte 0. In **v1**, recovery replays the **full** WAL in both the
+> known- and unknown-version branches, because the resume-from-
+> high-water-mark optimisation needs the RFC 0008 §6.7 checkpoint /
+> replay-from-offset API, which is not yet implemented; the format
+> records the high-water mark so the optimisation can be switched on
+> later without a format change. This makes the §3.5.1 / §3.5.2
+> acceptance criteria buildable. The matching §9 entries are marked
+> RESOLVED.
+
 **Hot path.** The per-tenant tree lives in process memory on the
 ingester. Tree operations (descend, simSeq, attach, widen) are
 hot-path; persistence does not happen synchronously per line.
@@ -2101,19 +2119,85 @@ operators can see the cold-start curve and confirm replay finished.
 This metric is replay-only and is not part of the §3.1 mandatory
 set; it is documented here, not in §6.8's table.
 
-**Snapshot mechanism (direction).** Periodically, the per-tenant
-trees are serialised to a snapshot artefact. Recovery on ingester
-restart loads the most recent snapshot per tenant and replays the
-WAL from the snapshot's high-water mark. The serialisation format
-includes a leading version byte; readers that encounter an unknown
-version fall back to full WAL replay rather than misinterpreting
-the bytes.
+**Snapshot mechanism.** A snapshot is a **rebuildable
+recovery-acceleration cache, not durable state.** The WAL is the
+durable truth (`[§3.4]`); the snapshot exists only to shorten
+cold-start replay. A lost, absent, or corrupt snapshot is never a
+data-loss event — it degrades to a full WAL replay (the same path a
+miner that never wrote a snapshot takes). This framing is what
+licenses the store and recovery choices below: because the snapshot
+is cache, it may live on local disk, and a reader that cannot trust
+it may discard it without ceremony.
 
-The three sub-questions — *target store* (object storage vs local
-disk vs both), *cadence* (per N lines, per N minutes, per WAL
-segment), and *scope* (per-tenant per-snapshot vs cluster-wide
-rolling) — are deferred to §9. The direction is committed; the
-parameters are not.
+*Target store: local disk (WAL-adjacent); object storage deferred.*
+Snapshots are written to a local artefact next to the WAL (e.g.
+under the WAL root), not to object storage. `[§3.6]` makes local
+disk legitimate here precisely because the snapshot is cache, not
+truth — the constraint `[§3.6]` imposes is that no feature rely on
+local disk being durable *beyond the WAL horizon*, and snapshot
+recovery never does: anything the snapshot would have accelerated is
+still in the WAL. Object-storage snapshots are explicit future work
+(see §9); they would couple to the RFC 0009 §3.4 atomic-publish
+manifest to define a durable, multi-writer publish point, and are
+deferred for that reason.
+
+*Scope: per-tenant.* One snapshot artefact per tenant tree, matching
+`[§3.7]`'s per-tenant trees. Recovery loads the latest snapshot per
+tenant independently; there is no cluster-wide combined artefact.
+
+*Cadence: per WAL-segment rotation.* A snapshot is taken at
+WAL-segment-rotation boundaries. The snapshot records the WAL
+**high-water mark** — the `WalOffset` (RFC 0008 §6.1) up to which
+its tree state reflects appended frames — so that a future
+optimisation can resume replay from there rather than from the start
+of the log.
+
+*Format: a leading `u8` version byte, then the payload.* Byte 0 is
+the snapshot format version; the remaining bytes are that version's
+serialised payload. The payload captures the per-tenant state needed
+to reconstruct the miner: the tree leaves (template token sequence,
+`template_id`, `template_version`, the `(severity_number,
+scope_name)` template key of §6.1, and the per-slot `slot_types`
+of §6.1), the structured-template-id map allocated in §6.2's
+structured short-circuit, and the WAL high-water mark above.
+The concrete payload codec is an implementation detail *behind* the
+version byte — the version byte is what makes format evolution safe,
+so this RFC pins the framing, the captured state, and the rule that
+the reader dispatches on byte 0, and deliberately does not pin a
+specific serialisation codec.
+
+*Recovery algorithm.* On ingester restart, per tenant:
+
+1. Load the latest snapshot artefact for the tenant, if one exists.
+2. If byte 0 is a **known** version: deserialise the payload,
+   restore the tree, then replay the WAL tail from the snapshot's
+   recorded high-water mark.
+3. If byte 0 is an **unknown** version, or the snapshot is absent or
+   corrupt: discard it and replay the **full** WAL via
+   `Wal::replay` (RFC 0008 §6.1 API, §6.6 recovery procedure),
+   rebuilding the tree from scratch.
+
+**v1 scope — full replay in both branches.** The resume-from-
+high-water-mark step in (2) requires the RFC 0008 §6.7
+checkpoint / replay-from-offset API (`Wal::checkpoint` and the
+`CHECKPOINT` sidecar), which is **not yet implemented**
+(`Wal::checkpoint` is an RFC 0008 red-gate stub). Until that API
+lands, recovery replays the **full** WAL in *both* the known-version
+and unknown-version branches: the version byte and the snapshot
+format land now, and the offset-resume is a deferred optimisation
+tracked against RFC 0008 §6.7. This v1 fully satisfies §3.5.1 (the
+artefact carries a leading version byte) and §3.5.2 (an unknown
+version is rejected and falls back to full WAL replay); the
+high-water mark is recorded by the format so the optimisation can be
+switched on later without a format change.
+
+**Snapshot-load telemetry.** The `wal_replay_progress` gauge
+(above) remains the replay-only signal. A snapshot-load-outcome
+signal — distinguishing "snapshot restored," "unknown version →
+full replay," and "absent/corrupt → full replay" — is named here in
+prose; its concrete metric and attribute names go through the
+semconv weaver registry when the slice is implemented (§3.1.2), and
+are not invented as flat names in this RFC.
 
 **Migration.** When the in-memory data model in §6.1 changes (new
 field, retired field, semantic change), the snapshot format's
@@ -2337,21 +2421,36 @@ resolves bidirectionally between RFC and tests.
 Decisions explicitly deferred. Each must be resolved before this
 RFC's status flips to `accepted`.
 
-**Persistence (from §6.9).**
+**Persistence (from §6.9) — RESOLVED (2026-06-10).** The three
+sub-questions are pinned in §6.9; the resolutions are recorded here
+and the remaining future work is the two items below them.
 
-- [ ] Snapshot **target store**: object storage (S3-compatible)
-      only, local disk only, or both with a cache hierarchy?
-      Object storage matches `[§3.6]`; local-disk-only sacrifices
-      durability. The likely answer is "both, with object storage
-      as truth," but the cache rules need spelling out.
-- [ ] Snapshot **cadence**: per N lines, per wall-clock window,
-      per WAL segment rotation, or composite? The right choice
-      depends on the WAL segment size (RFC 0003) and on the
-      acceptable cold-start replay budget.
-- [ ] Snapshot **scope**: one snapshot artefact per tenant per
-      cadence point, or one cluster-wide snapshot containing all
-      tenants? Per-tenant is cleaner under `[§3.7]`; cluster-wide
-      may be cheaper for the long tail of tiny tenants.
+- [x] Snapshot **target store** — **RESOLVED: local disk
+      (WAL-adjacent); object storage deferred.** The snapshot is a
+      rebuildable recovery-acceleration cache, not durable state
+      (the WAL is the truth per `[§3.4]`), so it lives next to the
+      WAL on local disk. `[§3.6]` permits this because recovery
+      never relies on the snapshot surviving — a lost snapshot
+      degrades to a full WAL replay. See §6.9.
+- [x] Snapshot **cadence** — **RESOLVED: per WAL-segment
+      rotation.** A snapshot is taken at segment-rotation boundaries
+      and records the WAL high-water mark (the `WalOffset` it was
+      taken at). See §6.9.
+- [x] Snapshot **scope** — **RESOLVED: per-tenant.** One snapshot
+      artefact per tenant tree, matching `[§3.7]`; recovery loads
+      the latest snapshot per tenant. See §6.9.
+- [ ] **Object-storage snapshots** (remaining future work). Pushing
+      snapshots to object storage would couple to the RFC 0009 §3.4
+      atomic-publish manifest for a durable, multi-writer publish
+      point; deferred until that line settles.
+- [ ] **Resume-from-high-water-mark replay** (remaining future
+      work). v1 recovery replays the full WAL in both the
+      known-version and unknown-version branches because the
+      offset-resume optimisation needs the RFC 0008 §6.7
+      checkpoint / replay-from-offset API (`Wal::checkpoint` + the
+      `CHECKPOINT` sidecar), which is not yet implemented. The
+      snapshot format already records the high-water mark, so
+      enabling the optimisation later needs no format change.
 
 **Algorithm tuning (open until corpus exists).**
 

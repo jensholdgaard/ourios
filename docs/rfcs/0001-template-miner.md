@@ -2176,7 +2176,7 @@ specific serialisation codec.
    scope* below).
 3. If byte 0 is an **unknown** version, or the snapshot is absent or
    corrupt: discard it and replay the **full** WAL via
-   `Wal::replay` (RFC 0008 §6.1 API, §6.6 recovery procedure),
+   `Wal::replay` (RFC 0008 §6.1 API, RFC 0008 §6.6 recovery procedure),
    rebuilding the tree from scratch.
 
 **v1 scope — full replay in both branches.** The resume-from-

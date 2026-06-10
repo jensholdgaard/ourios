@@ -133,7 +133,15 @@ jobs:
           # bring-up is the whole injection — same idea as the
           # collector-overlay step above.
           cfg=demo/src/flagd/demo.flagd.json
-          for flag in $(tr ',' ' ' <<< "$FAILURE_FLAGS"); do
+          # `read -ra` (not command substitution) so glob characters
+          # can't expand against the workspace before validation;
+          # commas normalise to spaces first. Count what is applied —
+          # a whitespace-only input must fail loudly rather than
+          # silently capturing five hours with no errors enabled.
+          IFS=' ' read -ra FLAGS <<< "${FAILURE_FLAGS//,/ }"
+          applied=0
+          for flag in "${FLAGS[@]}"; do
+            [ -n "$flag" ] || continue
             if ! [[ "$flag" =~ ^[A-Za-z0-9_-]+$ ]]; then
               echo "::error::invalid flag name '$flag' (expected [A-Za-z0-9_-]+)"
               exit 1
@@ -155,7 +163,12 @@ jobs:
             jq --arg f "$flag" --arg v "$variant" \
               '.flags[$f].defaultVariant = $v' "$cfg" > "$cfg.tmp"
             mv "$cfg.tmp" "$cfg"
+            applied=$((applied + 1))
           done
+          if [ "$applied" -eq 0 ]; then
+            echo "::error::failure_flags was set but contained no flag names"
+            exit 1
+          fi
           echo '--- effective defaultVariants ---'
           jq '.flags | map_values(.defaultVariant)' "$cfg"
 

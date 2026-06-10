@@ -43,9 +43,13 @@ on:
         default: corpus/otel-demo-v4 corpus/otel-demo-v5
         required: false
       fetch_hdfs:
-        description: Fetch LogHub HDFS_v1 from Zenodo for the B2 arm (bench-time only, never redistributed)
+        # Opt-in: the RFC 0006 loader materialises a corpus in memory,
+        # and HDFS_v1 is 1.47 GiB / 11.2M lines — borderline on a
+        # 7 GiB hosted runner. Dispatch with `true` on a roomier
+        # runner (or once the loader streams) for the full B2 set.
+        description: Fetch LogHub HDFS_v1 from Zenodo for the B2 arm (bench-time only, never redistributed; needs a large-memory runner)
         type: boolean
-        default: true
+        default: false
         required: false
 
 permissions:
@@ -85,6 +89,13 @@ jobs:
           read -ra TAGS <<< "$CORPUS_TAGS"
           DIRS=""
           for TAG in "${TAGS[@]}"; do
+            # The basename becomes a directory under the workspace, so
+            # reject anything that could escape it (`..`, slashes or
+            # dot-leading basenames) before deriving the path.
+            if ! [[ "$TAG" =~ ^corpus/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              echo "::error::invalid corpus tag '$TAG' (expected corpus/<name> with a safe basename)"
+              exit 1
+            fi
             DIR="$GITHUB_WORKSPACE/query-bench-corpus/${TAG##*/}"
             mkdir -p "$DIR"
             # Tolerate absent tags: v5 may still be publishing when

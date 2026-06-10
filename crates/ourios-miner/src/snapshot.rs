@@ -2,8 +2,8 @@
 //! (RFC 0001 §6.9, §3.5.1 / §3.5.2).
 //!
 //! A snapshot is a **rebuildable recovery-acceleration cache, not
-//! durable state** — the WAL is the durable truth (`[CLAUDE.md
-//! §3.4]`). It exists only to shorten cold-start replay; a lost,
+//! durable state** — the WAL is the durable truth
+//! (`CLAUDE.md §3.4`). It exists only to shorten cold-start replay; a lost,
 //! absent, or corrupt snapshot is never a data-loss event, it
 //! degrades to a full WAL replay.
 //!

@@ -45,6 +45,10 @@ on:
         description: Concurrent load-generator users (HTTP, browser traffic off — drives corpus volume)
         default: '40'
         required: false
+      failure_flags:
+        description: Space/comma-separated flagd failure flags to force on (e.g. adFailure paymentFailure) — empty leaves the demo's defaults
+        default: ''
+        required: false
       release_tag:
         description: If set, publish the corpus as assets on a GitHub release at this tag (e.g. corpus/otel-demo-v1)
         default: ''
@@ -112,6 +116,48 @@ jobs:
             demo/src/otel-collector/otelcol-config-extras.yml
           echo '--- effective extras ---'
           cat demo/src/otel-collector/otelcol-config-extras.yml
+
+      - name: Enable failure feature flags
+        if: inputs.failure_flags != ''
+        env:
+          # Via `env:`, not `${{ … }}` splicing into the script —
+          # dispatcher-controlled input, same rule as DEMO_REF.
+          FAILURE_FLAGS: ${{ inputs.failure_flags }}
+        run: |
+          set -euxo pipefail
+          # The demo's default traffic emits no error logs; flagd
+          # failure flags (adFailure, paymentFailure, …) are the
+          # demo-native way to make services emit real errors under
+          # load. flagd bind-mounts demo/src/flagd and reads
+          # demo.flagd.json from it, so patching the file before
+          # bring-up is the whole injection — same idea as the
+          # collector-overlay step above.
+          cfg=demo/src/flagd/demo.flagd.json
+          for flag in $(tr ',' ' ' <<< "$FAILURE_FLAGS"); do
+            if ! [[ "$flag" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              echo "::error::invalid flag name '$flag' (expected [A-Za-z0-9_-]+)"
+              exit 1
+            fi
+            if ! jq -e --arg f "$flag" '.flags | has($f)' "$cfg" >/dev/null; then
+              echo "::error::flagd flag '$flag' not in $cfg at this demo ref; available: $(jq -r '.flags | keys | sort | join(", ")' "$cfg")"
+              exit 1
+            fi
+            # The failing variant is "on" for most flags; the
+            # fractional ones (e.g. paymentFailure at 2.2.0) have
+            # percentage variants instead, where "100%" is the
+            # always-fail one.
+            variant="$(jq -r --arg f "$flag" \
+              '.flags[$f].variants | if has("on") then "on" elif has("100%") then "100%" else empty end' "$cfg")"
+            if [ -z "$variant" ]; then
+              echo "::error::flag '$flag' has no on/100% variant; variants: $(jq -r --arg f "$flag" '.flags[$f].variants | keys | join(", ")' "$cfg")"
+              exit 1
+            fi
+            jq --arg f "$flag" --arg v "$variant" \
+              '.flags[$f].defaultVariant = $v' "$cfg" > "$cfg.tmp"
+            mv "$cfg.tmp" "$cfg"
+          done
+          echo '--- effective defaultVariants ---'
+          jq '.flags | map_values(.defaultVariant)' "$cfg"
 
       - name: Bring up the demo
         working-directory: demo
@@ -232,6 +278,7 @@ jobs:
           # template-injection vector (the same rule the clone +
           # capture steps already follow).
           DEMO_REF: ${{ inputs.demo_ref }}
+          FAILURE_FLAGS: ${{ inputs.failure_flags }}
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/captured"
@@ -241,6 +288,7 @@ jobs:
             echo "# OTel Demo corpus capture"
             echo
             echo "- demo_ref: ${DEMO_REF}"
+            echo "- failure_flags: ${FAILURE_FLAGS:-none}"
             echo "- records (lines): ${lines}"
             echo "- bytes: ${bytes}"
             echo
@@ -277,13 +325,14 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           DEMO_REF: ${{ inputs.demo_ref }}
           DURATION: ${{ inputs.duration_seconds }}
+          FAILURE_FLAGS: ${{ inputs.failure_flags }}
         run: |
           set -euxo pipefail
           gzip -kf logs.jsonl   # logs.jsonl.gz, keep the original
           records="$(wc -l < logs.jsonl)"
           bytes="$(stat -c%s logs.jsonl)"
-          notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- source commit: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
-            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "$GITHUB_SHA" "$records" "$bytes")"
+          notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- failure_flags: %s\n- source commit: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
+            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "${FAILURE_FLAGS:-none}" "$GITHUB_SHA" "$records" "$bytes")"
           # Create the release if it's new, else clobber its
           # assets — re-minting the same tag replaces the corpus
           # in place rather than erroring. On re-mint the notes

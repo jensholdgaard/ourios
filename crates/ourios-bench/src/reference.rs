@@ -19,6 +19,17 @@ pub struct ReferenceCorpus {
 }
 
 impl ReferenceCorpus {
+    /// Assemble from already-compressed per-file zstd blocks (the
+    /// streaming path: `build_b1_store` spools lines to disk and
+    /// compresses one file at a time, so GiB-class corpora never sit
+    /// in memory uncompressed). Each block must hold
+    /// newline-terminated lines, like [`ReferenceCorpus::compress`]
+    /// produces.
+    #[must_use]
+    pub fn from_blocks(blocks: Vec<Vec<u8>>) -> Self {
+        Self { blocks }
+    }
+
     /// Compress each in-window file's raw lines (`files[i]` is one file's
     /// lines) at `level`. Only in-window files should be passed (see the
     /// module's fairness note).

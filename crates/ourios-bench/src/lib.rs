@@ -41,7 +41,7 @@ mod store;
 
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
-pub use store::{BuiltStore, build_query_store};
+pub use store::{B1Store, BuiltStore, build_b1_store, build_query_store};
 
 /// Configuration for one bench invocation.
 ///

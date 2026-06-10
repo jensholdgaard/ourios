@@ -42,6 +42,27 @@ architecture.
 - **Public**: LogPAI corpora (HDFS, BGL, Spark, Apache, OpenSSH,
   Windows) — the same corpora the Drain paper reports on. Lets us
   reproduce published claims as a sanity floor.
+  - **LogHub HDFS_v1** is the first of these wired in, as a
+    *bench-time-fetched* corpus for the query gates:
+    `.github/workflows/query-bench.yml` downloads `HDFS_v1.zip`
+    from the official Zenodo record (record 8196385, DOI
+    `10.5281/zenodo.8196385`, md5-pinned in the workflow), uses
+    the extracted `HDFS.log` (~1.47 GiB plain text — above §8's
+    ≥ 1 GiB canonical minimum) in-job, and discards it with the
+    runner. It is **never redistributed**: not committed (the
+    `testdata/corpus/README.md` anonymisation gate — LogHub data
+    is explicitly not sanitised), not attached to a release, not
+    uploaded as an artifact; only aggregate numbers leave the job.
+    LogHub's license notice, included here as it requires: "The
+    datasets are freely available for research or academic work.
+    For any usage or distribution of the datasets, please refer
+    to the loghub repository URL
+    (<https://github.com/logpai/loghub>) and cite the loghub
+    paper: Jieming Zhu, Shilin He, Pinjia He, Jinyang Liu,
+    Michael R. Lyu. Loghub: A Large Collection of System Log
+    Datasets for AI-driven Log Analytics. In IEEE International
+    Symposium on Software Reliability Engineering (ISSRE), 2023.
+    The above license notice shall be included in all copies."
 - **Self-collected (deferred)**: at least one anonymised corpus per
   target deployment archetype. Proposed set:
   1. Structured Java/Spring service (well-templated, low entropy).
@@ -110,6 +131,22 @@ exploit structure the tree extracted.
   pipeline on predicate queries, DataFusion + Parquet statistics are
   not delivering on the "skip row groups via footer reads" pillar
   (`CLAUDE.md` §2.1). Open an RFC.
+- **Instruments**: B1 is proven *structurally* (deterministically)
+  by `ourios-querier`'s `rfc0007_1_*` tests. The `criterion` bench
+  `crates/ourios-bench/benches/b1.rs` adds the *wall-clock* ratio:
+  a `b1/synthetic` group (controlled pruning instrument vs. an
+  in-process `zstdcat | grep` reference) and a `b1/real-corpus`
+  group (set `OURIOS_B1_CORPUS_DIRS` to a comma-separated list of
+  corpus dirs; skipped when unset). The real arm runs **OTLP
+  corpora only** (`corpus/otel-demo-v*`, which carry real
+  per-record severity): B1's predicate filters on severity, and
+  the RFC 0006 §3.3 plain-text loader assigns every line a fixed
+  severity (`9` / `INFO`), so a severity predicate over a
+  plain-text corpus has no selectivity and such dirs are skipped
+  with a note. CI runs land via
+  `.github/workflows/query-bench.yml` on `ci-runner` — indicative,
+  non-authoritative pending a `baseline-8vcpu-32gib` rerun — and
+  are not recorded in §9.
 
 ### B2 `[THESIS]` — Template-exact queries
 
@@ -129,12 +166,16 @@ exploit structure the tree extracted.
   scanned row groups + bytes stay flat as the corpus grows. The
   `criterion` bench `crates/ourios-bench/benches/b2.rs` adds the
   *wall-clock* view: a `b2/synthetic` group (result held constant,
-  corpus scaled 1×/10×/50×) and a `b2/otel-demo` group over real
+  corpus scaled 1×/10×/50×) and a `b2/real-corpus` group over real
   corpora (set `OURIOS_B2_CORPUS_DIRS` to a comma-separated list of
   corpus dirs; skipped when unset, since the corpora aren't
-  committed). Run with `cargo bench -p ourios-bench --bench b2`.
-  These laptop/CI latencies are **indicative**, not §1-baseline
-  canonical, so they are not recorded in §9.
+  committed). Both loader formats feed it: the OTLP/JSON
+  `corpus/otel-demo-v*` releases and the bench-time-fetched plain-
+  text LogHub HDFS_v1 (§1). Run with
+  `cargo bench -p ourios-bench --bench b2`. CI runs land via
+  `.github/workflows/query-bench.yml` on `ci-runner` — indicative,
+  non-authoritative pending a `baseline-8vcpu-32gib` rerun — and
+  are not recorded in §9.
 
 ### B3 — Substring queries (the hard case)
 
@@ -320,8 +361,11 @@ template + envelope diversity) but **not size-representative** —
 every corpus is well below §8's ≥ 1 GiB canonical minimum, so
 this run is intentionally diagnostic, not a thesis verdict. The
 query-side gates now have instruments — B1 and B2 are proven
-structurally in `ourios-querier`, and B2 has a `criterion` latency
-bench (§B2 "Instruments") — but canonical query numbers on the §1
+structurally in `ourios-querier`, and both have `criterion` latency
+benches with real-corpus arms (§B1/§B2 "Instruments"; OTel-Demo for
+B1, OTel-Demo + the bench-time-fetched LogHub HDFS_v1 for B2, run
+on `ci-runner` via `.github/workflows/query-bench.yml` as
+indicative numbers) — but canonical query numbers on the §1
 hardware against a ≥ 1 GiB corpus are still pending.
 
 Reviewers: a PR that materially affects the hot path must either

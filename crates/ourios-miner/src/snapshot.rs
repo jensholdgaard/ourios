@@ -50,7 +50,7 @@ use crate::tree::OwnedToken;
 /// Snapshot format version written as byte 0 of every artefact
 /// (RFC 0001 §6.9, §3.5.1). [`load_snapshot`] dispatches on this:
 /// a matching byte 0 deserialises the payload; any other value is
-/// an [`SnapshotError::UnknownVersion`] that recovery treats as
+/// a [`SnapshotError::UnknownVersion`] that recovery treats as
 /// "discard and full-replay" (§3.5.2).
 pub const SNAPSHOT_VERSION: u8 = 1;
 
@@ -508,8 +508,8 @@ mod tests {
         let record =
             slot_types_to_record(SlotTypes::singleton(ParamType::Num).insert(ParamType::Str));
 
-        assert_eq!(record.len(), 2);
-        assert!(record.contains(&ParamTypeRecord::Num));
-        assert!(record.contains(&ParamTypeRecord::Str));
+        // Exact order, not just membership — the byte-determinism of the
+        // snapshot rests on `SlotTypes::iter`'s canonical order.
+        assert_eq!(record, vec![ParamTypeRecord::Num, ParamTypeRecord::Str]);
     }
 }

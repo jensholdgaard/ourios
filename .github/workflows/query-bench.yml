@@ -86,6 +86,10 @@ jobs:
         # real-corpus arms can't find the corpora.
         run: |
           set -euo pipefail
+          # Pre-init so an empty/whitespace input degrades to a zero
+          # iteration loop and the explicit no-corpus error below, on
+          # any bash version.
+          TAGS=()
           read -ra TAGS <<< "$CORPUS_TAGS"
           DIRS=""
           for TAG in "${TAGS[@]}"; do
@@ -215,7 +219,7 @@ jobs:
             echo
             echo 'Criterion timings (indicative, ci-runner):'
             echo '```'
-            grep -B1 -E 'time:\s+\[' query-bench.log 2>/dev/null \
+            grep -B1 -E 'time:[[:space:]]+\[' query-bench.log 2>/dev/null \
               || echo '(no timings — the run failed before producing them)'
             echo '```'
             echo

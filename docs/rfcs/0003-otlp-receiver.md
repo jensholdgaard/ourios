@@ -34,7 +34,8 @@ operator-configured rule (RFC 0001 §6.1 *Tenant derivation*),
 materialises each `LogRecord.body` into the
 `Body::String(String) | Body::Structured(AnyValue)` fork (the
 decoded `AnyValue` rides through verbatim — canonicalisation
-is deferred to the storage layer per the amended §6.4), fans
+happens once, at ingest, inside the miner, per the amended
+§6.4), fans
 the batch out into per-tenant streams of `OtlpLogRecord`, hands
 each stream to `ourios-miner`, and
 acknowledges the OTLP request only after the WAL-before-ack
@@ -80,12 +81,12 @@ load-bearing decision: the receiver is where:
   *Tenant derivation*) and the batch fans out into per-tenant
   streams.
 - `body.kind = Structured` records have their `AnyValue` body
-  carried verbatim into `Body::Structured(AnyValue)` — the
-  amended §6.4 defers OTLP-canonical JSON conversion to the
-  storage layer (Parquet writer), where the round-trip
-  `stored_bytes ↔ AnyValue` per RFC 0001 §6.1 *Body
-  representation* makes the `lossy_flag = false` promise
-  meetable.
+  carried verbatim into `Body::Structured(AnyValue)` — per the
+  amended §6.4 the receiver never canonicalises; the miner
+  encodes the tree to the Ourios canonical body encoding at
+  ingest, whose round-trip `stored_bytes ↔ AnyValue` per
+  RFC 0001 §6.1 *Body representation* makes the
+  `lossy_flag = false` promise meetable.
 - The acknowledgement-after-durability sequencing (`[§3.4]`)
   is enforced.
 
@@ -372,8 +373,9 @@ concurrency).
 >   names) and each is independently decoded by the receiver
 > - **Then** the two derived `OtlpLogRecord` sequences are
 >   equal at the `AnyValue` tree level — no byte-level
->   canonicalisation is asserted at this layer (canonical-JSON
->   equivalence is the Parquet writer's contract per §6.4)
+>   canonicalisation is asserted at this layer (byte-level
+>   equivalence under the Ourios canonical body encoding is
+>   the miner's ingest contract per the amended §6.4)
 > - **And** the JSON decoder accepts whitespace and field-
 >   ordering variation (insignificant per proto3-JSON)
 > - **And** the JSON decoder ignores unknown fields anywhere
@@ -654,7 +656,7 @@ batch** with a transport-level error naming the failing
 `resource_logs[]`) and the missing attribute key. Per-Resource
 partial acceptance is reserved for a future RFC (see §9).
 
-### 6.4 AnyValue canonicalisation is deferred to the storage layer
+### 6.4 AnyValue canonicalisation happens once, at ingest
 
 > **Amendment (PR introducing `ourios-core::otlp::OtlpLogRecord`).**
 > This subsection originally pinned the receiver as the place
@@ -663,36 +665,68 @@ partial acceptance is reserved for a future RFC (see §9).
 > pre-cached `Bytes`. The amended position carries the
 > `AnyValue` *itself* on the in-memory record and defers
 > canonicalisation to the storage layer (Parquet writer,
-> when it lands). Rationale below.
+> when it lands).
+
+> **Amendment 2026-06-10 (canonicalisation happens at ingest).**
+> The amendment above predated the implementation and placed the
+> single canonicalisation pass at Parquet-write time. The merged
+> implementation runs it at **ingest**: the miner's
+> `ingest_structured` encodes the `AnyValue` the receiver
+> delivered with the Ourios canonical body encoding (RFC 0001
+> §6.1 *The Ourios canonical body encoding*), and the mined
+> record carries those bytes from there — WAL, flush, and the
+> Parquet writer (RFC 0005 §3.3) persist them verbatim. What the
+> amendment above got right is preserved: the receiver still
+> does not canonicalise, and the "mine inner field" optionality
+> is intact because the miner *receives the decoded tree* — the
+> encode point sits after any future inner-field hook would run.
+> This note reconciles the text below to the implemented
+> behaviour; the rationale is rewritten accordingly.
 
 The receiver hands the miner an `OtlpLogRecord` whose body, when
 present and structured, carries the decoded `AnyValue` verbatim
-(`Body::Structured(AnyValue)`). The miner runs the §6.2 step-0
-short-circuit on the discriminator alone; it does not walk the
-`AnyValue` tree. Canonicalisation to OTLP-canonical JSON
-(per RFC 0001 §6.1 *Body representation*) happens once, at
-Parquet-write time.
+(`Body::Structured(AnyValue)`) — unchanged from the first
+amendment. The miner's §6.2 step-0 short-circuit dispatches on
+the discriminator alone; only after taking the structured branch
+does `ingest_structured` encode the tree, once, via
+`ourios_core::otlp::canonical::encode_any_value` (infallible for
+every `AnyValue` the type system admits) into the Ourios
+canonical body encoding per RFC 0001 §6.1 *Body representation*.
+The record carries the encoded bytes in its `body` field from
+that point on; the Parquet writer stores them verbatim in the
+RFC 0005 §3.3 `body` column.
 
 Rationale:
 
-- **Optionality.** RFC 0001 §6.1 reserves a future "mine inner
-  field" mode (e.g. mine `body.kvlist["msg"]` as the line if
-  present) gated on corpus evidence. That mode needs the
-  structured tree, not pre-cached bytes. Carrying `AnyValue`
-  preserves the option without committing to the design.
+- **Optionality is not lost.** RFC 0001 §6.1 reserves a future
+  "mine inner field" mode (e.g. mine `body.kvlist["msg"]` as
+  the line if present) gated on corpus evidence. That mode
+  needs the structured tree — and `ingest_structured`
+  *receives* the structured tree: the receiver hands
+  `Body::Structured(AnyValue)` through untouched, so the exact
+  place such a mode would hook in still sees the `AnyValue`.
+  Only the **stored** form is the canonical bytes; encoding at
+  ingest forecloses nothing.
 - **Single canonicalisation pass.** Whether the body arrived
-  as gRPC-protobuf or HTTP-JSON, the storage layer performs
-  exactly one canonicalisation step at write time. The
-  receiver no longer has to know two canonicalisation
-  strategies (re-serialise vs normalise); the storage layer
-  owns the one canonical mapping per RFC 0001 §6.1.
+  as gRPC-protobuf or HTTP-JSON, exactly one encode runs —
+  once per structured record, at ingest. There is one
+  transport-agnostic encoder (`ourios-core`'s
+  `otlp::canonical`, operating on the decoded `AnyValue`);
+  neither the receiver nor the writer needs to know a second
+  strategy, and the writer's contract shrinks to "persist the
+  bytes."
 - **Miner hot path is unchanged.** The §6.2 step-0
-  short-circuit only inspects the discriminator
-  (`Body::Structured(_)` vs `Body::String(_)`); no
-  `AnyValue` walking, no allocation in the structured branch.
-  The hot-path argument that originally favoured pre-caching
-  was speculative — until corpus benchmarks say otherwise,
-  carrying the tree costs nothing the miner cares about.
+  short-circuit still inspects only the discriminator
+  (`Body::Structured(_)` vs `Body::String(_)`) before
+  branching; no `AnyValue` walking decides the dispatch. The
+  encode cost scales with body size, but it is paid exactly
+  once per structured record regardless of which layer pays
+  it — moving it to write time would buy no work back, while
+  costing a rework of `MinedRecord`, the miner's snapshot
+  serialisation (RFC 0001 §6.9), and the render path
+  (RFC 0001 §6.6), all of which carry the encoded `body`
+  today. That churn would purchase only a mode with no RFC
+  and no named consumer.
 
 For `Body::String(s)`, no canonicalisation is ever needed; the
 unwrapped string is passed through as `L_raw`.
@@ -919,6 +953,19 @@ re-introduces the WAL-before-ack problem of §7.2.
 
 ### 7.5 Synchronous AnyValue canonicalisation in the miner or the receiver
 
+> **Amendment 2026-06-10 (canonicalisation happens at ingest).**
+> The conclusion this section originally reached —
+> "canonicalise at the storage layer (Parquet writer)" — was
+> superseded by the implementation; see the amended §6.4. The
+> grounds on which variant (a) was rejected dissolved once
+> RFC 0001 §6.1's 2026-06-09 amendment pinned a single
+> transport-agnostic encoder over the decoded `AnyValue`
+> (`ourios-core`'s `otlp::canonical`): the miner needs no
+> transport knowledge, and the encode cost is once per
+> structured record regardless of which layer pays it. The
+> original text is preserved below as the record of the
+> evaluation.
+
 Two related alternatives evaluated together:
 
 **(a) Canonicalise in the miner.** **Rejected** because the
@@ -928,6 +975,8 @@ doing serialisation work there scales with body size on every
 structured record. The miner would also need to know the
 source transport (the two transports need different
 canonicalisation strategies), which is a layering inversion.
+*(Superseded — see the amendment note above: this is the
+implemented design.)*
 
 **(b) Canonicalise in the receiver before materialising
 `OtlpLogRecord`.** This was the original §6.4 stance and was
@@ -936,13 +985,11 @@ the basis on which §7.5(a) was rejected. **Reversed** by the
 the future "mine inner field" mode (RFC 0001 §6.1) which
 needs the structured tree, not pre-cached bytes; it also
 splits canonicalisation knowledge across two transports
-unnecessarily. The current commitment is **canonicalise at
-the storage layer** (Parquet writer), where the OTel
-JSON-encoding overrides (hex IDs, base64 bytes) live in one
-place and run once per record at write time.
-
-The miner-as-canonicaliser variant (a) remains rejected on
-its original grounds.
+unnecessarily. *(Still rejected — the receiver continues to
+hand the decoded `AnyValue` through verbatim. Only the
+"canonicalise at the storage layer" conclusion that this
+paragraph originally drew is superseded, per the amendment
+note above.)*
 
 ## 8. Testing strategy
 
@@ -1078,12 +1125,16 @@ scenarios — `#[ignore]`'d stubs first, implementations second).
   Parquet schema will need the two fields added. Tracked here
   so a future RFC does not re-derive the question.
 - [x] ~~**Where exactly does canonicalisation cost land?**~~
-  *Resolved by the §6.4 amendment:* canonicalisation runs at
-  the storage layer (Parquet writer) at write time. The
-  receiver carries the decoded `AnyValue` verbatim; the miner
-  doesn't canonicalise. Whether the storage layer batches
-  canonicalisation or runs it per record is a Parquet-writer
-  RFC concern, not a receiver concern.
+  *Resolved (2026-06-10 §6.4 amendment, reconciling to the
+  implementation):* canonicalisation runs at **ingest** — the
+  miner's `ingest_structured` encodes the decoded `AnyValue`
+  with the Ourios canonical body encoding (RFC 0001 §6.1) and
+  the record carries the bytes from there; the Parquet writer
+  (RFC 0005 §3.3) persists them verbatim. The receiver carries
+  the decoded `AnyValue` verbatim and never canonicalises. The
+  cost is once per structured record either way; placing it at
+  ingest keeps `MinedRecord`, the snapshot format, and the
+  render path on a single stored form.
 - [ ] **`dropped_attributes_count` semantics on truncation.**
   Preserve verbatim from the wire (current §6 design), sum
   across records, or recompute if the receiver itself drops

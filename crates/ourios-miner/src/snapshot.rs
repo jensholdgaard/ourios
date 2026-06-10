@@ -218,6 +218,10 @@ pub enum SnapshotError {
     Corrupt(String),
     /// The artefact was empty — no version byte to dispatch on.
     Empty,
+    /// The payload failed to encode in [`snapshot`]. Not expected for
+    /// the plain mirror types, but surfaced rather than silently
+    /// writing a truncated artefact every reader would reject.
+    Serialize(String),
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -228,6 +232,7 @@ impl std::fmt::Display for SnapshotError {
             }
             Self::Corrupt(detail) => write!(f, "corrupt snapshot payload: {detail}"),
             Self::Empty => f.write_str("empty snapshot artefact (no version byte)"),
+            Self::Serialize(detail) => write!(f, "snapshot payload failed to encode: {detail}"),
         }
     }
 }
@@ -237,20 +242,20 @@ impl std::error::Error for SnapshotError {}
 /// Serialise one tenant's [`SnapshotState`] into the wire artefact:
 /// `[SNAPSHOT_VERSION][payload]` (RFC 0001 §6.9, §3.5.1). Byte 0 is
 /// always [`SNAPSHOT_VERSION`].
-#[must_use]
-pub fn snapshot(state: &SnapshotState) -> Vec<u8> {
-    // The leaf / param mirror types are infallible to serialise
-    // (plain owned data, no maps with non-string keys), so
-    // `serde_json::to_vec` cannot fail here; fall back to an empty
-    // payload rather than panicking on the unreachable error so the
-    // recovery path stays panic-free end to end (a v1 reader treats
-    // a too-short / unparseable artefact as "discard, full-replay").
-    let mut out = Vec::new();
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Serialize`] if the payload fails to
+/// encode. The mirror types are plain owned data so this is not
+/// expected in practice, but surfacing it beats writing a truncated
+/// `[SNAPSHOT_VERSION]` artefact that every reader would reject as
+/// corrupt, forcing perpetual full replays.
+pub fn snapshot(state: &SnapshotState) -> Result<Vec<u8>, SnapshotError> {
+    let payload = serde_json::to_vec(state).map_err(|e| SnapshotError::Serialize(e.to_string()))?;
+    let mut out = Vec::with_capacity(payload.len() + 1);
     out.push(SNAPSHOT_VERSION);
-    if let Ok(payload) = serde_json::to_vec(state) {
-        out.extend_from_slice(&payload);
-    }
-    out
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
 /// Read the version byte and, when it matches [`SNAPSHOT_VERSION`],
@@ -396,7 +401,7 @@ mod tests {
         let state = sample_state();
 
         // Act
-        let bytes = snapshot(&state);
+        let bytes = snapshot(&state).expect("snapshot encodes");
 
         // Assert — §3.5.1: byte 0 is the format version.
         assert_eq!(bytes[0], SNAPSHOT_VERSION);
@@ -408,7 +413,7 @@ mod tests {
         let state = sample_state();
 
         // Act
-        let bytes = snapshot(&state);
+        let bytes = snapshot(&state).expect("snapshot encodes");
         let restored = load_snapshot(&bytes).expect("known version deserialises");
 
         // Assert — the format deserialises to an equal state.
@@ -419,7 +424,7 @@ mod tests {
     fn load_snapshot_rejects_unknown_version() {
         // Arrange — a valid snapshot with byte 0 corrupted to an
         // unknown version.
-        let mut bytes = snapshot(&sample_state());
+        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
         bytes[0] = 0xFF;
 
         // Act
@@ -465,7 +470,7 @@ mod tests {
         // Arrange — a well-formed snapshot. v1 must NOT restore from
         // it: the rebuild closure's value is what comes back, and the
         // outcome records that the known-version payload was discarded.
-        let bytes = snapshot(&sample_state());
+        let bytes = snapshot(&sample_state()).expect("snapshot encodes");
 
         // Act
         let (tree, outcome) = recover(Some(&bytes), || 7u32);
@@ -478,7 +483,7 @@ mod tests {
     #[test]
     fn recover_with_unknown_version_discards_and_rebuilds() {
         // Arrange — unknown version byte.
-        let mut bytes = snapshot(&sample_state());
+        let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
         bytes[0] = 0xFF;
 
         // Act

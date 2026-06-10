@@ -331,7 +331,7 @@ fn invariant_3_5_1_snapshot_format_carries_leading_version_byte() {
     );
 
     // Act
-    let bytes = snapshot(&state);
+    let bytes = snapshot(&state).expect("snapshot encodes");
 
     // Assert — byte 0 is the snapshot format version.
     assert_eq!(
@@ -378,7 +378,7 @@ fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
     let stale_snapshot = {
         let mut other = MinerCluster::new(MinerConfig::default());
         other.ingest(&rec("login user 1 ok"));
-        let mut bytes = snapshot(&other.snapshot_state(&tenant));
+        let mut bytes = snapshot(&other.snapshot_state(&tenant)).expect("snapshot encodes");
         bytes[0] = 0xFF;
         bytes
     };

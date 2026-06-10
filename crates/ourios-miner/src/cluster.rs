@@ -2083,6 +2083,11 @@ mod tests {
         ] {
             let _ = cluster.ingest(&string_record(&t, line));
         }
+        // Distinct (severity, scope) keys populate the structured-template
+        // map so its ordering is exercised too.
+        for (severity, scope) in [(9, Some("lib.a")), (5, Some("lib.b")), (13, None)] {
+            let _ = cluster.ingest(&structured_record(&t, severity, scope));
+        }
 
         let state = cluster.snapshot_state(&t);
 
@@ -2097,6 +2102,22 @@ mod tests {
                 .leaves
                 .iter()
                 .map(|l| l.template_id)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            state.structured_templates.len() >= 2,
+            "needs multiple structured templates to order",
+        );
+        assert!(
+            state
+                .structured_templates
+                .windows(2)
+                .all(|w| w[0].template_id <= w[1].template_id),
+            "structured templates must be sorted by template_id, got {:?}",
+            state
+                .structured_templates
+                .iter()
+                .map(|s| s.template_id)
                 .collect::<Vec<_>>(),
         );
     }

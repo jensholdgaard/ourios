@@ -36,6 +36,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The [workspace.lints.rustdoc] denies (broken intra-doc links
+      # etc., #124) fail this build, so doc rot is caught in CI, not
+      # in review comments.
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   test:
     name: cargo test
     runs-on: ubuntu-latest

@@ -208,7 +208,7 @@ impl Writer {
     /// a `RecordBatch`, and forwards to `ArrowWriter::write`.
     ///
     /// **Row-group sizing.** Internally chunks `records` into
-    /// sub-batches of [`SUB_BATCH_ROWS`] (1024) rows and runs a
+    /// sub-batches of `SUB_BATCH_ROWS` (1024) rows and runs a
     /// flush-when-over-threshold check before each sub-batch
     /// write. RFC 0005 §3.5 pins the row-group target at 128 MiB
     /// – 1 GiB uncompressed; chunking + per-sub-batch flush
@@ -230,7 +230,7 @@ impl Writer {
     ///
     /// `append_records` is **not all-or-nothing** across the
     /// sub-batches it issues internally. The slice is chunked
-    /// into [`SUB_BATCH_ROWS`]-sized pieces; if chunk *N* writes
+    /// into `SUB_BATCH_ROWS`-sized pieces; if chunk *N* writes
     /// successfully and chunk *N+1*'s `mined_records_to_batch`
     /// then errors with `Batch`, the rows from chunks `0..N` have
     /// already landed in the in-progress row group. Callers that
@@ -467,7 +467,7 @@ pub enum WriterError {
         op: &'static str,
         /// The primary path the operation was acting on. For
         /// `rename`, this is the *destination*; the source
-        /// path lives in [`Self::source_path`] (when set).
+        /// path lives in `Self::source_path` (when set).
         path: PathBuf,
         /// Secondary path for two-path operations (only
         /// populated for `rename`, where it carries the source

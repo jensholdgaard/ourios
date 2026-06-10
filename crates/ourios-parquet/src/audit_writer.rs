@@ -169,7 +169,7 @@ impl AuditWriter {
     ///
     /// `append_events` is **not all-or-nothing** across the
     /// sub-batches it issues internally. The slice is chunked
-    /// into [`SUB_BATCH_ROWS`]-sized pieces; if chunk *N* writes
+    /// into `SUB_BATCH_ROWS`-sized pieces; if chunk *N* writes
     /// successfully and chunk *N+1*'s `audit_events_to_batch`
     /// then errors with `Batch`, the events from chunks `0..N`
     /// have already landed in the in-progress row group. Callers

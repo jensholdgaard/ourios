@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt --all --check)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl logs *)",
+      "mcp__github__get_file_contents",
+      "mcp__github__search_code",
+      "mcp__github__pull_request_read",
+      "mcp__github__search_repositories",
+      "mcp__kubernetes__pods_log",
+      "mcp__kubernetes__resources_get",
+      "mcp__kubernetes__resources_list",
+      "mcp__kubernetes__pods_list_in_namespace",
+      "mcp__kubernetes__events_list",
+      "mcp__azure-devops__repo_get_file_content",
+      "mcp__azure-devops__repo_list_directory"
+    ]
+  },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  }
+}

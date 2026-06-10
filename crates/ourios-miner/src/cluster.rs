@@ -1,6 +1,6 @@
 //! Per-tenant template cluster.
 //!
-//! Holds one [`TenantState`] per [`TenantId`] (`[CLAUDE.md §3.7]`):
+//! Holds one `TenantState` per [`TenantId`] (`[CLAUDE.md §3.7]`):
 //! every ingested record is keyed on its tenant, and per-tenant
 //! template *stores* are isolated — no template ever crosses
 //! tenants. The `template_id` allocator, by contrast, is
@@ -91,7 +91,7 @@ pub const NO_TEMPLATE: u64 = 0;
 
 /// A multi-tenant in-memory miner.
 ///
-/// Holds one [`TenantState`] per [`TenantId`]; per-tenant state
+/// Holds one `TenantState` per [`TenantId`]; per-tenant state
 /// is allocated lazily on the first `ingest` call for that
 /// tenant. Tenant deprovisioning (`TenantPaused`,
 /// `TenantDeleted`) is RFC 0001 §9 territory and not in this
@@ -306,7 +306,7 @@ impl MinerCluster {
     }
 
     /// Register a per-tenant [`MinerConfig`] override per RFC 0004
-    /// §3.4. The override is captured by [`TenantState`] at lazy
+    /// §3.4. The override is captured by `TenantState` at lazy
     /// allocation (i.e. on the first ingest for `tenant_id`); set
     /// it before the tenant is first observed.
     ///
@@ -1750,7 +1750,7 @@ impl MinerCluster {
     /// (tree leaves + structured-template entries). Returns 0 for
     /// a tenant the cluster has never seen.
     ///
-    /// O(1): served from the [`TenantState::template_count`]
+    /// O(1): served from the `TenantState::template_count`
     /// cache rather than walking the tree.
     #[must_use]
     pub fn template_count(&self, tenant_id: &TenantId) -> usize {

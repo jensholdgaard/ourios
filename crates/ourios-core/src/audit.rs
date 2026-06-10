@@ -368,7 +368,7 @@ pub struct SlotExpansion {
 /// The byte layout is private; the public surface is value-based
 /// (`singleton`, `insert`, `contains`, `iter`, `is_empty`, `union`)
 /// so the layout can change without breaking callers. A new
-/// `ParamType` variant forces an update to [`SlotTypes::bit`] —
+/// `ParamType` variant forces an update to `SlotTypes::bit` —
 /// the compiler enforces totality via the exhaustive match. Eight
 /// variants fit a `u8`; if the alphabet grows past eight, widen the
 /// backing integer here (the same exhaustive match will fail to
@@ -478,7 +478,7 @@ pub struct AuditEvent {
     pub payload: AuditPayload,
 }
 
-/// Truncated blake3 of `bytes` for [`AuditEvent::triggering_line_hash`].
+/// Truncated blake3 of `bytes` for `AuditEvent::triggering_line_hash`.
 ///
 /// Returns the first 16 bytes of the blake3 digest. Centralised here
 /// so every producer (and the future WAL-side joiner) uses the same
@@ -495,7 +495,7 @@ pub fn hash_triggering_line(bytes: &[u8]) -> [u8; 16] {
 /// First 256 *bytes* of `raw`, truncated at the nearest preceding
 /// UTF-8 char boundary so the result is always valid `String`.
 ///
-/// Helper for populating [`AuditEvent::triggering_line_sample`] per
+/// Helper for populating `AuditEvent::triggering_line_sample` per
 /// the RFC §6.4 "first 256 B of `L_raw`" rule. Bytes — not chars —
 /// so the bound on the audit-stream's per-event size is predictable
 /// regardless of the input's multibyte content.
@@ -599,7 +599,7 @@ impl AuditSink for InMemoryAuditSink {
 /// still has a handle for inspection.
 ///
 /// `Clone` yields another handle to the *same* buffer — that's the
-/// whole point: hand one clone to [`MinerCluster::with_audit_sink`]
+/// whole point: hand one clone to `MinerCluster::with_audit_sink`
 /// and keep another to drain after the act. `InMemoryAuditSink`
 /// alone would require `&mut self` to drain, which the trait-object
 /// indirection on the producer side rules out.

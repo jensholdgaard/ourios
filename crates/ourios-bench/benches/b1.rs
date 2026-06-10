@@ -19,17 +19,27 @@
 //! every line. Two timings land in the group, `ourios` and
 //! `zstd-grep-reference`; the B1 ratio is `reference / ourios`.
 //!
-//! `b1/otel-demo` is deferred to the corpus run: it needs the OTLP/JSON
-//! corpus loader's per-record severity (the plain-text loader forces
-//! INFO) plus in-window raw-line extraction with a real time window —
-//! wired when the staged corpus lands, not here.
+//! `b1/real-corpus` (only when `OURIOS_B1_CORPUS_DIRS` is set) — the
+//! same two timings over real corpora, one pair per dir. The store is
+//! built by [`ourios_bench::build_b1_store`], which also renders the
+//! reference (`<severity_text> <body>` per record — the flat file a
+//! traditional logger would have written, one zstd block per hour)
+//! and picks the severity to query (`ERROR`, or the busiest
+//! error-band text). The query window is the corpus's full timestamp
+//! span, so the reference scans the same in-window set. **OTLP
+//! corpora only**: the RFC 0006 §3.3 plain-text loader fixes every
+//! line at severity `9` / `INFO`, so a severity predicate over a
+//! plain-text corpus has no selectivity — such dirs are skipped with
+//! a note rather than benchmarking a meaningless full-match query
+//! (parsing severities out of raw text would be unspecified
+//! behaviour, not a loader the RFC pins).
 
 use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use ourios_bench::ReferenceCorpus;
+use ourios_bench::{ReferenceCorpus, build_b1_store};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
@@ -191,5 +201,162 @@ fn synthetic(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, synthetic);
+/// Real corpora, one `ourios` / `zstd-grep-reference` timing pair per
+/// directory in `OURIOS_B1_CORPUS_DIRS` (comma-separated; skipped
+/// entirely when unset — the corpora aren't committed, CI / a local
+/// operator stages them). Dirs without severity selectivity (plain
+/// text — see the module doc), without error-band rows, or without a
+/// usable timestamp span are skipped with a note.
+fn real_corpus(c: &mut Criterion) {
+    let Ok(raw) = std::env::var("OURIOS_B1_CORPUS_DIRS") else {
+        eprintln!(
+            "b1/real-corpus: OURIOS_B1_CORPUS_DIRS unset — skipping (synthetic group still runs)"
+        );
+        return;
+    };
+    let dirs: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("tokio runtime");
+
+    let mut group = c.benchmark_group("b1/real-corpus");
+    // GiB-class corpora make one reference scan multi-second; the
+    // default 100 samples would run for hours. 10 (criterion's
+    // minimum) keeps the indicative timing affordable.
+    group.sample_size(10);
+    for dir in dirs {
+        let path = Path::new(dir);
+        if !path.is_dir() {
+            eprintln!("b1/real-corpus: {dir} is not a directory — skipping");
+            continue;
+        }
+        let bucket = tempfile::TempDir::new().expect("temp bucket");
+        let built = build_b1_store(path, bucket.path(), ZSTD_LEVEL).expect("build b1 store");
+        let Some((severity, query)) = severity_query(&built, dir) else {
+            continue;
+        };
+
+        let querier = Querier::new(bucket.path());
+        probe_real_corpus(&rt, &querier, &built, &severity, &query, dir);
+
+        let id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(dir)
+            .to_string();
+        group.bench_function(BenchmarkId::new("ourios", &id), |b| {
+            b.iter(|| {
+                let r = rt.block_on(querier.run(query.clone())).expect("query");
+                black_box(r.rows);
+            });
+        });
+        group.bench_function(BenchmarkId::new("zstd-grep-reference", &id), |b| {
+            b.iter(|| {
+                let n = built
+                    .reference
+                    .count_lines_containing(&severity)
+                    .expect("reference");
+                black_box(n);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The B1 query for a built real-corpus store: the chosen error-band
+/// severity over the corpus's full timestamp span, half-open
+/// (`max + 1` keeps the last record in-window; clamped like b2's
+/// windowed arm so a near-2262 corpus can't push the bound past the
+/// querier's i64 range). `None` (with a skip note) when the corpus
+/// has no severity selectivity (single `severity_text` — the RFC 0006
+/// §3.3 plain-text case), no error-band rows, or no usable span.
+fn severity_query(built: &ourios_bench::B1Store, dir: &str) -> Option<(String, QueryRequest)> {
+    if built.distinct_severities < 2 {
+        eprintln!(
+            "b1/real-corpus: {dir} carries a single severity_text — no severity \
+             selectivity (the RFC 0006 §3.3 plain-text loader forces INFO); B1 needs \
+             an OTLP corpus with real severities — skipping"
+        );
+        return None;
+    }
+    let Some((severity, _)) = built.query_severity.clone() else {
+        eprintln!("b1/real-corpus: {dir} has no error-band severity_text rows — skipping");
+        return None;
+    };
+    if built.min_time_unix_nano == 0 || built.zero_ts_rows > 0 {
+        eprintln!(
+            "b1/real-corpus: {dir} — no usable timestamp span ({} zero-ts rows); the B1 \
+             query needs a real time window — skipping",
+            built.zero_ts_rows,
+        );
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)] // i64::MAX as u64 is exact
+    let window_end = built
+        .max_time_unix_nano
+        .saturating_add(1)
+        .min(i64::MAX as u64);
+    let query = QueryRequest {
+        tenant: TenantId::new(built.tenant),
+        time_range: Some((built.min_time_unix_nano, window_end)),
+        template_id: None,
+        severity_text: Some(severity.clone()),
+    };
+    Some((severity, query))
+}
+
+/// Sanity + visibility before timing: the Ourios result must be
+/// exactly the corpus's row count at the chosen severity
+/// (tenant/window/predicate wired correctly), and the reference grep
+/// may legitimately exceed it (a body can contain the token) but
+/// never undercount — every matching record's reference line is
+/// severity-prefixed.
+fn probe_real_corpus(
+    rt: &tokio::runtime::Runtime,
+    querier: &Querier,
+    built: &ourios_bench::B1Store,
+    severity: &str,
+    query: &QueryRequest,
+    dir: &str,
+) {
+    let probe = rt
+        .block_on(querier.run(query.clone()))
+        .expect("probe query");
+    let expected_rows = built.query_severity.as_ref().map_or(0, |(_, rows)| *rows);
+    assert_eq!(
+        probe.rows, expected_rows,
+        "the severity query must return the corpus's rows at that severity",
+    );
+    let ref_count = built
+        .reference
+        .count_lines_containing(severity)
+        .expect("reference");
+    assert!(
+        ref_count >= probe.rows,
+        "reference grep ({ref_count}) must not undercount the severity rows ({})",
+        probe.rows,
+    );
+    eprintln!(
+        "b1/real-corpus: {dir} — {} rows, {} files; severity {severity:?} over the full \
+         span → {} rows (reference grep: {ref_count}); ourios scanned {}/{} row groups, \
+         {} B; reference scans {} compressed B",
+        built.rows,
+        built.files,
+        probe.rows,
+        probe.stats.row_groups_scanned,
+        probe.stats.row_groups_scanned + probe.stats.row_groups_pruned,
+        probe.stats.bytes_read,
+        built.reference.compressed_bytes(),
+    );
+}
+
+criterion_group!(benches, synthetic, real_corpus);
 criterion_main!(benches);

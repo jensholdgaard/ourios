@@ -14,19 +14,38 @@ name: Query bench
 # Whichever corpus it runs against, the numbers are INDICATIVE only: a
 # hosted runner is not the `docs/benchmarks.md` §1 hardware baseline
 # (`baseline-8vcpu-32gib`), so wall-clock latencies here are not
-# authoritative. The structural metrics (pruned row groups, scanned
-# bytes) are hardware-independent and are the honest signal; the
-# criterion timings are context.
+# authoritative — they carry the `ci-runner` tag pending an
+# authoritative rerun on baseline-class hardware. The structural
+# metrics (pruned row groups, scanned bytes) are hardware-independent
+# and are the honest signal; the criterion timings are context.
 #
-# `workflow_dispatch`-only: the query benches load + mine a full corpus
-# and build a Parquet store, too slow for the per-PR loop.
+# Corpus staging (maintainer decisions, 2026-06-10):
+#
+# - OTel Demo: the frozen `corpus/otel-demo-v*` release assets
+#   (OTLP/JSON) — fed to both B1 and B2. Missing tags (e.g. a v5 not
+#   yet published) are skipped with a warning.
+# - LogHub HDFS_v1: fetched at bench time from the official Zenodo
+#   record, checksum-pinned, used in-job only, and discarded with the
+#   runner — NEVER redistributed (see the license notice on the step
+#   below and `docs/benchmarks.md` §1). Plain text, so it feeds B2
+#   only: B1's predicate filters on severity and the RFC 0006 §3.3
+#   plain-text loader fixes every line at `9` / `INFO` — no
+#   selectivity for a severity predicate.
+#
+# `workflow_dispatch`-only: the query benches load + mine full corpora
+# and build Parquet stores, too slow for the per-PR loop.
 
 on:
   workflow_dispatch:
     inputs:
-      corpus_release_tag:
-        description: Release tag to fetch the frozen otel-demo corpus from
-        default: corpus/otel-demo-v1
+      otel_corpus_tags:
+        description: Space-separated release tags of frozen OTel-Demo corpora (missing tags skipped with a warning)
+        default: corpus/otel-demo-v4 corpus/otel-demo-v5
+        required: false
+      fetch_hdfs:
+        description: Fetch LogHub HDFS_v1 from Zenodo for the B2 arm (bench-time only, never redistributed)
+        type: boolean
+        default: true
         required: false
 
 permissions:
@@ -50,35 +69,110 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Fetch OTel Demo corpus (frozen release asset)
+      - name: Fetch OTel Demo corpora (frozen release assets)
         id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
-          # `env:` not `${{ }}` splicing — the tag is a
-          # dispatcher-controllable input, so keep it out of the shell
-          # source (template-injection rule, mirrors bench.yml).
-          CORPUS_TAG: ${{ inputs.corpus_release_tag }}
-        # Absolute path: the criterion benches run with CWD set to the
+          # `env:` not `${{ }}` splicing — the tags are a
+          # dispatcher-controllable input, so keep them out of the
+          # shell source (template-injection rule, mirrors bench.yml).
+          CORPUS_TAGS: ${{ inputs.otel_corpus_tags }}
+        # Absolute paths: the criterion benches run with CWD set to the
         # crate dir, so `OURIOS_B*_CORPUS_DIRS` must be absolute or the
-        # otel-demo arm can't find the corpus.
+        # real-corpus arms can't find the corpora.
         run: |
-          set -euxo pipefail
-          CORPUS_DIR="$GITHUB_WORKSPACE/query-bench-corpus/otel-demo"
-          mkdir -p "$CORPUS_DIR"
-          gh release download "$CORPUS_TAG" --pattern 'logs.jsonl.gz' --dir "$CORPUS_DIR"
-          gunzip -f "$CORPUS_DIR/logs.jsonl.gz"
-          echo "fetched $(wc -l < "$CORPUS_DIR/logs.jsonl") records, \
-                $(stat -c%s "$CORPUS_DIR/logs.jsonl") bytes from $CORPUS_TAG"
-          echo "corpus_dir=$CORPUS_DIR" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          read -ra TAGS <<< "$CORPUS_TAGS"
+          DIRS=""
+          for TAG in "${TAGS[@]}"; do
+            DIR="$GITHUB_WORKSPACE/query-bench-corpus/${TAG##*/}"
+            mkdir -p "$DIR"
+            # Tolerate absent tags: v5 may still be publishing when
+            # this dispatches; the run proceeds on what exists.
+            if ! gh release download "$TAG" --pattern 'logs.jsonl.gz' --dir "$DIR"; then
+              echo "::warning::release $TAG not found — skipping that corpus"
+              rmdir "$DIR"
+              continue
+            fi
+            gunzip -f "$DIR/logs.jsonl.gz"
+            echo "fetched $TAG: $(wc -l < "$DIR/logs.jsonl") records, \
+                  $(stat -c%s "$DIR/logs.jsonl") bytes"
+            DIRS="${DIRS:+$DIRS,}$DIR"
+          done
+          if [ -z "$DIRS" ]; then
+            echo "::error::no OTel-Demo corpus could be fetched (tags: $CORPUS_TAGS)"
+            exit 1
+          fi
+          echo "otel_dirs=$DIRS" >> "$GITHUB_OUTPUT"
+
+      # LICENSE / CITATION NOTICE — LogHub (https://github.com/logpai/loghub):
+      #
+      #   "The datasets are freely available for research or academic
+      #    work. For any usage or distribution of the datasets, please
+      #    refer to the loghub repository URL
+      #    (https://github.com/logpai/loghub) and cite the loghub paper:
+      #    Jieming Zhu, Shilin He, Pinjia He, Jinyang Liu, Michael R.
+      #    Lyu. Loghub: A Large Collection of System Log Datasets for
+      #    AI-driven Log Analytics. In IEEE International Symposium on
+      #    Software Reliability Engineering (ISSRE), 2023. The above
+      #    license notice shall be included in all copies."
+      #
+      # The corpus is fetched at bench time from the official Zenodo
+      # record and used in-job only; it is NEVER redistributed — not
+      # committed (testdata/corpus/README.md anonymisation gate: LogHub
+      # data is explicitly not sanitised), not attached to a release,
+      # not uploaded as an artifact. Only aggregate numbers leave the
+      # job. See docs/benchmarks.md §1.
+      - name: Fetch LogHub HDFS_v1 (Zenodo, bench-time only — never redistributed)
+        id: hdfs
+        if: inputs.fetch_hdfs
+        run: |
+          set -euo pipefail
+          # Pinned to Zenodo record 8196385 (loghub v8,
+          # DOI 10.5281/zenodo.8196385); md5 from the record's file
+          # listing. A new loghub release mints a new record id, so a
+          # silent upstream content change cannot slip past this pin.
+          HDFS_URL='https://zenodo.org/records/8196385/files/HDFS_v1.zip?download=1'
+          HDFS_MD5='76a24b4d9a6164d543fb275f89773260'
+          curl -fL --retry 3 -o /tmp/HDFS_v1.zip "$HDFS_URL"
+          echo "$HDFS_MD5  /tmp/HDFS_v1.zip" | md5sum -c -
+          DIR="$GITHUB_WORKSPACE/query-bench-corpus/loghub-hdfs-v1"
+          mkdir -p "$DIR"
+          # The corpus loader dispatches plain text on `*.txt`
+          # (RFC 0006 §3.3), so the extracted HDFS.log is staged under
+          # that extension. `unzip -p` streams the one member we use;
+          # the rest of the archive (anomaly labels) is never written.
+          MEMBER="$(unzip -Z1 /tmp/HDFS_v1.zip | grep -E '(^|/)HDFS\.log$' | head -n1 || true)"
+          if [ -z "$MEMBER" ]; then
+            echo "::error::HDFS.log not found in HDFS_v1.zip"
+            exit 1
+          fi
+          unzip -p /tmp/HDFS_v1.zip "$MEMBER" > "$DIR/hdfs-v1.txt"
+          rm -f /tmp/HDFS_v1.zip
+          echo "staged HDFS_v1: $(wc -l < "$DIR/hdfs-v1.txt") lines, \
+                $(stat -c%s "$DIR/hdfs-v1.txt") bytes"
+          echo "hdfs_dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Compose per-gate corpus lists
+        id: corpus
+        env:
+          OTEL_DIRS: ${{ steps.fetch.outputs.otel_dirs }}
+          HDFS_DIR: ${{ steps.hdfs.outputs.hdfs_dir }}
+        # B1 gets the OTLP corpora only (severity selectivity — see the
+        # header comment); B2 gets everything.
+        run: |
+          set -euo pipefail
+          echo "b1_dirs=$OTEL_DIRS" >> "$GITHUB_OUTPUT"
+          echo "b2_dirs=${OTEL_DIRS}${HDFS_DIR:+,$HDFS_DIR}" >> "$GITHUB_OUTPUT"
 
       - name: Run B1/B2 query benches
         # `pipefail` so a bench panic (e.g. the windowed-arm prune
         # assertion) fails the job rather than being swallowed by `tee`.
-        # The corpus dir is a trusted step output (not raw input), so
+        # The corpus dirs are trusted step outputs (not raw inputs), so
         # `${{ }}` here is not a template-injection vector.
         env:
-          OURIOS_B1_CORPUS_DIRS: ${{ steps.fetch.outputs.corpus_dir }}
-          OURIOS_B2_CORPUS_DIRS: ${{ steps.fetch.outputs.corpus_dir }}
+          OURIOS_B1_CORPUS_DIRS: ${{ steps.corpus.outputs.b1_dirs }}
+          OURIOS_B2_CORPUS_DIRS: ${{ steps.corpus.outputs.b2_dirs }}
         run: |
           set -euo pipefail
           # `rust-cache` restores `target/`, which can carry criterion
@@ -92,12 +186,26 @@ jobs:
         if: always()
         run: |
           {
-            echo '## ourios query bench — B1/B2 (separate artifact, NOT §9)'
+            echo '## ourios query bench — B1/B2'
+            echo
+            echo '**Hardware: `ci-runner` (indicative — non-authoritative pending `baseline-8vcpu-32gib`).**'
+            echo
+            echo 'Corpora staged (raw on-disk bytes; per-corpus breakdown below):'
+            echo '```'
+            du -b --max-depth=1 "$GITHUB_WORKSPACE/query-bench-corpus" 2>/dev/null \
+              || echo '(no corpus staged)'
+            echo '```'
             echo
             echo 'Structural metrics (hardware-independent — the honest signal):'
             echo '```'
-            grep -E 'b1/synthetic:|b2/otel-demo:' query-bench.log 2>/dev/null \
+            grep -E 'b1/synthetic:|b1/real-corpus:|b2/real-corpus:' query-bench.log 2>/dev/null \
               || echo '(no structural lines — the run failed before producing them)'
+            echo '```'
+            echo
+            echo 'Criterion timings (indicative, ci-runner):'
+            echo '```'
+            grep -B1 -E 'time:\s+\[' query-bench.log 2>/dev/null \
+              || echo '(no timings — the run failed before producing them)'
             echo '```'
             echo
             echo '> **Indicative only, and a SEPARATE artifact.** A hosted runner is not'
@@ -106,6 +214,11 @@ jobs:
             echo '> are **not** recorded in benchmarks.md §9 (reserved for A1/C1/C2;'
             echo '> recording B1/B2 there would need an RFC 0006 amendment). Full criterion'
             echo '> output + the bench log are uploaded as the `query-bench` artifact.'
+            echo '>'
+            echo '> **LogHub HDFS_v1** is fetched from Zenodo at bench time and discarded'
+            echo '> with the runner; only aggregate numbers appear here and in the artifact.'
+            echo '> The corpus bytes are never uploaded or redistributed (license notice on'
+            echo '> the fetch step; citation in `docs/benchmarks.md` §1).'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload query-bench artifact

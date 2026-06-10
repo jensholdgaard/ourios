@@ -13,9 +13,13 @@
 //!   templates in other hours (own files ⇒ own row groups, pruned
 //!   by `template_id` statistics). If the inverted-index-collapse
 //!   thesis holds, latency stays ~flat as the corpus grows.
-//! - `b2/otel-demo` (only when `OURIOS_B2_CORPUS_DIRS` is set) — the
-//!   real corpora (`corpus/otel-demo-v*`), one bench id per dir. See
-//!   the env var's use below.
+//! - `b2/real-corpus` (only when `OURIOS_B2_CORPUS_DIRS` is set) — the
+//!   real corpora, one bench id per dir. Both loader formats work
+//!   here: OTLP/JSON (`corpus/otel-demo-v*`) and plain text (e.g.
+//!   the bench-time-fetched `LogHub` `HDFS_v1` — see
+//!   `docs/benchmarks.md` §1), since the template-exact query doesn't
+//!   depend on the §3.3 envelope defaults. See the env var's use
+//!   below.
 
 use std::hint::black_box;
 use std::path::Path;
@@ -151,10 +155,10 @@ fn synthetic(c: &mut Criterion) {
 /// entirely when the env var is unset (the corpora aren't committed;
 /// CI / a local operator stages them and points this at them, e.g.
 /// `OURIOS_B2_CORPUS_DIRS=corpus/otel-demo-v1,corpus/otel-demo-v4`).
-fn otel_demo(c: &mut Criterion) {
+fn real_corpus(c: &mut Criterion) {
     let Ok(raw) = std::env::var("OURIOS_B2_CORPUS_DIRS") else {
         eprintln!(
-            "b2/otel-demo: OURIOS_B2_CORPUS_DIRS unset — skipping (synthetic group still runs)"
+            "b2/real-corpus: OURIOS_B2_CORPUS_DIRS unset — skipping (synthetic group still runs)"
         );
         return;
     };
@@ -171,17 +175,22 @@ fn otel_demo(c: &mut Criterion) {
         .build()
         .expect("tokio runtime");
 
-    let mut group = c.benchmark_group("b2/otel-demo");
+    let mut group = c.benchmark_group("b2/real-corpus");
+    // GiB-class corpora (HDFS_v1 is ~1.5 GiB) make one probe + query
+    // iteration expensive; 10 samples (criterion's minimum) keeps the
+    // indicative timing affordable. The synthetic group keeps the
+    // default sampling.
+    group.sample_size(10);
     for dir in dirs {
         let path = Path::new(dir);
         if !path.is_dir() {
-            eprintln!("b2/otel-demo: {dir} is not a directory — skipping");
+            eprintln!("b2/real-corpus: {dir} is not a directory — skipping");
             continue;
         }
         let bucket = tempfile::TempDir::new().expect("temp bucket");
         let built = build_query_store(path, bucket.path()).expect("build query store");
         if built.busiest_template_rows == 0 {
-            eprintln!("b2/otel-demo: {dir} produced no rows — skipping");
+            eprintln!("b2/real-corpus: {dir} produced no rows — skipping");
             continue;
         }
         let querier = Querier::new(bucket.path());
@@ -199,7 +208,7 @@ fn otel_demo(c: &mut Criterion) {
             "the busiest-template query must return its rows (tenant/template wired correctly)",
         );
         eprintln!(
-            "b2/otel-demo: {dir} — {} rows, {} files; tenant {:?}; querying template {} \
+            "b2/real-corpus: {dir} — {} rows, {} files; tenant {:?}; querying template {} \
              → {} rows; scanned {}/{} row groups, {} B",
             built.rows,
             built.files,
@@ -265,7 +274,7 @@ fn first_hour_window(
 ) -> Option<QueryRequest> {
     if built.min_time_unix_nano == 0 || built.files < 2 {
         eprintln!(
-            "b2/otel-demo: {dir} — single-partition or no timestamp span; skipping windowed arm"
+            "b2/real-corpus: {dir} — single-partition or no timestamp span; skipping windowed arm"
         );
         return None;
     }
@@ -295,7 +304,7 @@ fn first_hour_window(
         probe.stats,
     );
     eprintln!(
-        "b2/otel-demo: {dir} — windowed 1h [{}, {}) → {} rows; DataFusion saw {} row groups \
+        "b2/real-corpus: {dir} — windowed 1h [{}, {}) → {} rows; DataFusion saw {} row groups \
          (scanned {}, {} B) vs {} unwindowed → {} row groups pruned by the time window \
          (across {} partitions)",
         hour_start,
@@ -311,5 +320,5 @@ fn first_hour_window(
     Some(windowed)
 }
 
-criterion_group!(benches, synthetic, otel_demo);
+criterion_group!(benches, synthetic, real_corpus);
 criterion_main!(benches);

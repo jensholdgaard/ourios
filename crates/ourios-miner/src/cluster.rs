@@ -1783,6 +1783,74 @@ impl MinerCluster {
                 .collect()
         })
     }
+
+    /// Capture one tenant's full template state as a serialisable
+    /// [`SnapshotState`](crate::snapshot::SnapshotState) per RFC 0001
+    /// §6.9. Returns an empty state (no leaves, no structured
+    /// templates) for an unseen tenant.
+    ///
+    /// This is the producer side of the §6.9 snapshot format: it
+    /// captures every `Body::String` leaf (template tokens,
+    /// `template_id`, `template_version`, the `(severity_number,
+    /// scope_name)` template key, and per-slot `slot_types`) plus the
+    /// §6.2 step-0 structured-template-id map. `wal_high_water` is the
+    /// caller's to supply — the cluster does not track WAL offsets —
+    /// so it is left `None` here; the snapshot writer fills it from
+    /// the WAL at the segment-rotation boundary it snapshots on.
+    #[must_use]
+    pub fn snapshot_state(&self, tenant_id: &TenantId) -> crate::snapshot::SnapshotState {
+        use crate::snapshot::{
+            LeafRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
+            slot_types_vec_to_record,
+        };
+
+        let Some(state) = self.tenants.get(tenant_id) else {
+            return SnapshotState {
+                leaves: Vec::new(),
+                structured_templates: Vec::new(),
+                wal_high_water: None,
+            };
+        };
+
+        // `collect_leaves` and the `structured_templates` map both iterate
+        // in `HashMap` order, which varies across runs — sort by the
+        // cluster-unique `template_id` so the serialized snapshot is
+        // byte-deterministic (no spurious churn between snapshots of an
+        // unchanged tree).
+        let mut leaves: Vec<LeafRecord> = state
+            .tree
+            .collect_leaves()
+            .into_iter()
+            .map(|leaf| LeafRecord {
+                template: leaf.template.iter().map(TokenRecord::from).collect(),
+                template_id: leaf.template_id,
+                template_version: leaf.template_version,
+                severity_number: leaf.severity_number,
+                scope_name: leaf.scope_name.clone(),
+                slot_types: slot_types_vec_to_record(&leaf.slot_types),
+            })
+            .collect();
+        leaves.sort_by_key(|leaf| leaf.template_id);
+
+        let mut structured_templates: Vec<StructuredTemplateRecord> = state
+            .structured_templates
+            .iter()
+            .map(
+                |((severity_number, scope_name), template_id)| StructuredTemplateRecord {
+                    severity_number: *severity_number,
+                    scope_name: scope_name.clone(),
+                    template_id: *template_id,
+                },
+            )
+            .collect();
+        structured_templates.sort_by_key(|record| record.template_id);
+
+        SnapshotState {
+            leaves,
+            structured_templates,
+            wal_high_water: None,
+        }
+    }
 }
 
 /// Read-only view of a single leaf surfaced by
@@ -1998,6 +2066,60 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(cluster.template_count(&t), 2);
         assert_eq!(cluster.merges_total(), 0);
+    }
+
+    #[test]
+    fn snapshot_state_orders_records_by_template_id() {
+        // The tree and the structured-template map both iterate in
+        // `HashMap` order; `snapshot_state` sorts by the cluster-unique
+        // `template_id` so the serialized snapshot is byte-deterministic.
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+        for line in [
+            "GET /home 200",
+            "user 42 logged in",
+            "cache evicted 5 keys",
+            "disk usage high",
+        ] {
+            let _ = cluster.ingest(&string_record(&t, line));
+        }
+        // Distinct (severity, scope) keys populate the structured-template
+        // map so its ordering is exercised too.
+        for (severity, scope) in [(9, Some("lib.a")), (5, Some("lib.b")), (13, None)] {
+            let _ = cluster.ingest(&structured_record(&t, severity, scope));
+        }
+
+        let state = cluster.snapshot_state(&t);
+
+        assert!(state.leaves.len() >= 2, "needs multiple leaves to order");
+        assert!(
+            state
+                .leaves
+                .windows(2)
+                .all(|w| w[0].template_id <= w[1].template_id),
+            "snapshot leaves must be sorted by template_id, got {:?}",
+            state
+                .leaves
+                .iter()
+                .map(|l| l.template_id)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            state.structured_templates.len() >= 2,
+            "needs multiple structured templates to order",
+        );
+        assert!(
+            state
+                .structured_templates
+                .windows(2)
+                .all(|w| w[0].template_id <= w[1].template_id),
+            "structured templates must be sorted by template_id, got {:?}",
+            state
+                .structured_templates
+                .iter()
+                .map(|s| s.template_id)
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

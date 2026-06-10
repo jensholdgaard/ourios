@@ -2695,6 +2695,8 @@ dependencies = [
  "ourios-core",
  "ourios-semconv",
  "ourios-telemetry",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
 ]

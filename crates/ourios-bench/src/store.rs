@@ -118,15 +118,18 @@ pub struct B1Store {
     pub distinct_severities: usize,
     /// The `severity_text` the B1 query should filter on and its
     /// exact row count (the expected query result). `"ERROR"` when
-    /// present; otherwise the busiest text in the OTLP error band
-    /// (severity number 17..=20); `None` when no error-band rows
-    /// carry a severity text.
+    /// that text appears at any severity number (the query filters on
+    /// text); otherwise the busiest text in the OTLP error band
+    /// (severity number 17..=20); `None` when neither yields a text.
     pub query_severity: Option<(String, u64)>,
-    /// The `zstdcat | grep` baseline input: every record rendered as
-    /// the flat-text line a traditional logger would have written
+    /// The `zstdcat | grep` baseline input: every record with a
+    /// non-zero timestamp rendered as the flat-text line a
+    /// traditional logger would have written
     /// (`<severity_text> <body>`), compressed one block per hour —
     /// the hour granularity mirrors the store's partitioning, i.e.
-    /// the `*.zst` segments `files_in_range.zst` would name.
+    /// the `*.zst` segments `files_in_range.zst` would name. Zero-ts
+    /// rows are excluded: they sit outside any window and the bench
+    /// skips such corpora.
     pub reference: ReferenceCorpus,
 }
 
@@ -151,7 +154,9 @@ pub fn build_b1_store(
 ) -> Result<B1Store, BenchError> {
     let mut severity_rows: BTreeMap<String, u64> = BTreeMap::new();
     let mut error_band_rows: BTreeMap<String, u64> = BTreeMap::new();
-    let mut hour_lines: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut spool = HourSpool::new().map_err(|e| BenchError::Pipeline {
+        detail: format!("create B1 reference spool: {e}"),
+    })?;
     let mut zero_ts_rows = 0u64;
 
     let core = build_store(corpus_dir, bucket_root, |input, emitted| {
@@ -162,28 +167,36 @@ pub fn build_b1_store(
             }
         }
         if emitted.time_unix_nano == 0 {
+            // Out-of-window by definition (the B1 arm skips any corpus
+            // carrying zero-ts rows); keep the reference strictly
+            // in-window rather than spooling lines no query scans.
             zero_ts_rows += 1;
+            return Ok(());
         }
         let line = reference_line(input)?;
-        hour_lines
-            .entry(emitted.time_unix_nano / HOUR_NS)
-            .or_default()
-            .push(line);
+        spool
+            .append(emitted.time_unix_nano / HOUR_NS, &line)
+            .map_err(|e| BenchError::Pipeline {
+                detail: format!("spool B1 reference line: {e}"),
+            })?;
         Ok(())
     })?;
 
-    let blocks: Vec<Vec<String>> = hour_lines.into_values().collect();
-    let reference = ReferenceCorpus::compress(&blocks, reference_zstd_level).map_err(|e| {
-        BenchError::Pipeline {
-            detail: format!("compress B1 reference corpus: {e}"),
-        }
-    })?;
+    let reference =
+        spool
+            .into_reference(reference_zstd_level)
+            .map_err(|e| BenchError::Pipeline {
+                detail: format!("compress B1 reference corpus: {e}"),
+            })?;
 
-    // Prefer the literal "ERROR" of the §3 B1 query shape; otherwise
-    // the busiest error-band text (real corpora spell the level
-    // per-SDK: "Error", "error", …). BTreeMap iteration + strict `>`
-    // make ties deterministic (first text in lexicographic order).
-    let query_severity = if error_band_rows.contains_key("ERROR") {
+    // Prefer the literal "ERROR" of the §3 B1 query shape wherever it
+    // appears — the query filters on severity *text*, so a corpus
+    // mapping "ERROR" to a nonstandard severity_number still
+    // qualifies. Otherwise the busiest error-band text (real corpora
+    // spell the level per-SDK: "Error", "error", …). BTreeMap
+    // iteration + strict `>` make ties deterministic (first text in
+    // lexicographic order).
+    let query_severity = if severity_rows.contains_key("ERROR") {
         Some("ERROR".to_string())
     } else {
         let mut best: Option<(&String, u64)> = None;
@@ -235,6 +248,61 @@ fn reference_line(input: &OtlpLogRecord) -> Result<String, BenchError> {
         Some(text) => format!("{text} {body}"),
         None => body,
     })
+}
+
+/// Spools B1 reference lines to one temp file per hour, so building
+/// the reference stays memory-bounded at GiB corpus scale (buffering
+/// every line as a `String` would hold the whole corpus — plus
+/// allocator overhead — in RAM and OOM a CI runner). Compression
+/// happens at the end, one hour at a time, with a single zstd
+/// encoder alive at once. Open handles scale with *distinct hours*
+/// (a capture-shaped corpus spans a handful), not with records.
+struct HourSpool {
+    dir: tempfile::TempDir,
+    hours: BTreeMap<u64, std::io::BufWriter<std::fs::File>>,
+}
+
+impl HourSpool {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            dir: tempfile::TempDir::new()?,
+            hours: BTreeMap::new(),
+        })
+    }
+
+    fn append(&mut self, hour: u64, line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let writer = match self.hours.entry(hour) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let file = std::fs::File::create(self.dir.path().join(hour.to_string()))?;
+                e.insert(std::io::BufWriter::new(file))
+            }
+        };
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")
+    }
+
+    /// Flush every spool file and compress each into one reference
+    /// block (hour order — `BTreeMap` keys — for determinism). The
+    /// spool dir is dropped, and with it the uncompressed bytes.
+    fn into_reference(self, level: i32) -> std::io::Result<ReferenceCorpus> {
+        let mut blocks = Vec::with_capacity(self.hours.len());
+        for (hour, writer) in self.hours {
+            drop(
+                writer
+                    .into_inner()
+                    .map_err(std::io::IntoInnerError::into_error)?,
+            );
+            let path = self.dir.path().join(hour.to_string());
+            let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)?;
+            std::io::copy(&mut reader, &mut encoder)?;
+            blocks.push(encoder.finish()?);
+        }
+        Ok(ReferenceCorpus::from_blocks(blocks))
+    }
 }
 
 /// Span / size summary shared by both store builders.
@@ -489,6 +557,67 @@ mod tests {
             built.query_severity,
             Some(("Error".to_string(), 2)),
             "the busiest error-band text is chosen; Critical (21) is outside the band",
+        );
+    }
+
+    /// The query filters on severity *text*, so the literal "ERROR"
+    /// wins even when the corpus maps it to a severity number outside
+    /// the OTLP error band — it must not lose to a band text or make
+    /// the corpus skip.
+    #[test]
+    fn b1_store_prefers_error_text_even_outside_the_band() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        let base = crate::corpus::TIME_BASELINE_NS;
+        let jsonl = format!(
+            "{}\n{}\n",
+            logs_data_line(3, "ERROR", 9, base),
+            logs_data_line(2, "Error", 17, base + 1_000),
+        );
+        std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+
+        assert_eq!(
+            built.query_severity,
+            Some(("ERROR".to_string(), 3)),
+            "literal ERROR wins regardless of its severity number",
+        );
+    }
+
+    /// Zero-ts rows sit outside any query window (the B1 arm skips
+    /// corpora carrying them), so they must not leak into the
+    /// reference corpus either.
+    #[test]
+    fn b1_reference_excludes_zero_ts_rows() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        let base = crate::corpus::TIME_BASELINE_NS;
+        let jsonl = format!(
+            "{}\n{}\n",
+            logs_data_line(1, "ERRZERO", 17, 0),
+            logs_data_line(2, "ERROR", 17, base),
+        );
+        std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+
+        assert_eq!(built.zero_ts_rows, 1);
+        assert_eq!(
+            built
+                .reference
+                .count_lines_containing("ERRZERO")
+                .expect("reference grep"),
+            0,
+            "the zero-ts record's line is not spooled into the reference",
+        );
+        assert_eq!(
+            built
+                .reference
+                .count_lines_containing("ERROR")
+                .expect("reference grep"),
+            2,
+            "in-window rows are unaffected",
         );
     }
 

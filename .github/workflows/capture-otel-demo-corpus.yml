@@ -67,10 +67,12 @@ jobs:
   capture:
     name: capture demo corpus
     runs-on: ubuntu-latest
-    # Image pulls (~20 services) + warmup + capture window. 45m
-    # is a generous ceiling; a hung step shouldn't burn toward
-    # GitHub's 6h job limit.
-    timeout-minutes: 45
+    # Image pulls (~20 services) + warmup + slice/publish (~75m of
+    # generous headroom) on top of the requested capture window —
+    # a fixed 45m ceiling killed every long capture dispatched from
+    # main (the v4 4h run only survived via a never-merged branch
+    # tweak). GitHub's hard 6h job cap still bounds a hung run.
+    timeout-minutes: ${{ fromJSON(inputs.duration_seconds || '600') / 60 + 75 }}
     env:
       # Host directory bind-mounted into the collector at
       # `/capture` (see the compose override). The fileexporter

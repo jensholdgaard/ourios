@@ -55,11 +55,14 @@ use crate::tree::OwnedToken;
 pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// One tenant's full snapshot payload (the bytes after the version
-/// byte). Reconstructs the miner's per-tenant state on recovery.
+/// byte) — the per-tenant state a restore would rebuild the miner
+/// from.
 ///
 /// `leaves` and `structured_templates` are `Vec`s (not maps) so the
-/// serialised form is order-deterministic for a given build order;
-/// the recovery path rebuilds the in-memory `HashMap`s from them.
+/// serialised form is order-deterministic for a given build order.
+/// v1 recovery does **not** restore from a snapshot (it full-replays
+/// the WAL); the restore path that rebuilds the in-memory `HashMap`s
+/// from these lands with RFC 0008 §6.7 offset-resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotState {
     /// Every `Body::String` leaf in the tenant's tree.

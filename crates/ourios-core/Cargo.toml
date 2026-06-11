@@ -25,7 +25,7 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 # §6.4. Truncated blake3 (first 16 bytes) joins audit events back to
 # the data record(s) that triggered them in the §6.7 drift query.
 blake3 = { version = "1", default-features = false }
-# Drives the RFC 0005 §3.3 OTLP-canonical-JSON encoders / decoders
+# Drives the RFC 0005 §3.3 Ourios-canonical-JSON encoders / decoders
 # (`otlp::canonical`). Pairs with `opentelemetry-proto`'s `with-serde`
 # derives so the spec mapping stays single-sourced through the proto
 # crate. `float_roundtrip` is load-bearing, not an optimisation

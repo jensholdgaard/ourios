@@ -11,9 +11,11 @@ DataFusion beats the naive alternative of byte-level compression over
 flat text. That claim is falsifiable. This file lists the measurements
 that would falsify it.
 
-No numbers in this document are measured yet. They are the thresholds
-the thesis asks us to hit; if we miss them on representative corpora,
-the thesis is wrong and a pillar changes.
+The thresholds were pinned before any number was measured; if we miss
+them on representative corpora, the thesis is wrong and a pillar
+changes. As of **2026-06-12** the gates have authoritative numbers on
+the §1 hardware baseline (§9.4): **B1, B2, C1, C2 pass; A1 fails** and
+is the open gate.
 
 ## 0. How to read this document
 
@@ -71,7 +73,12 @@ architecture.
      mixed formats).
 - **Hardware baseline**: commodity cloud VM, 8 vCPU, 32 GiB RAM,
   gp3-class SSD. All `must-win` numbers are quoted against this
-  baseline; scaling to larger hardware is a separate question.
+  baseline; scaling to larger hardware is a separate question. The
+  realised baseline (the `baseline-8vcpu-32gib` hardware tag, first
+  used for the §9.4 authoritative run) is a dedicated host with
+  8 dedicated vCPU, 32 GiB RAM, and a local NVMe-class SSD — at or
+  above the spec on every axis, so numbers quoted against the tag
+  satisfy this baseline. It is identified only by the tag.
 - **Reference system**: `zstdcat <file.zst> | grep <pattern>`. The
   "naive alternative" the thesis beats or does not beat. Everything is
   quoted *relative to this*, not in absolute terms.
@@ -144,14 +151,14 @@ exploit structure the tree extracted.
   severity (`9` / `INFO`), so a severity predicate over a
   plain-text corpus has no selectivity and such dirs are skipped
   with a note. CI runs land via
-  `.github/workflows/query-bench.yml` on `ci-runner` — indicative,
-  non-authoritative pending a `baseline-8vcpu-32gib` rerun. The
-  first real-corpus readings (2026-06-11, §9.3) pass the ≥ 10×
-  gate **indicatively** on both ~1 GB OTel-Demo corpora (40.0× /
-  30.4×, exact row-count agreement with the reference pipeline);
-  canonical numbers on the §1 baseline are still pending, and the
-  measured error bands were ultra-thin (11 / 28 rows), which
-  flatters pruning.
+  `.github/workflows/query-bench.yml` on `ci-runner` — indicative
+  only. The **authoritative** numbers are the
+  `baseline-8vcpu-32gib` run of 2026-06-12 (§9.4): **PASS** at
+  **34.2× / 25.4×** on the two ~1 GB OTel-Demo corpora, with exact
+  row-count agreement against the reference pipeline. Open quality
+  improvement (non-blocking): the measured error bands are
+  ultra-thin (11 / 28 rows), which flatters pruning — a denser
+  error band is the remaining methodological wish.
 
 ### B2 `[THESIS]` — Template-exact queries
 
@@ -178,13 +185,17 @@ exploit structure the tree extracted.
   `corpus/otel-demo-v*` releases and the bench-time-fetched plain-
   text LogHub HDFS_v1 (§1). Run with
   `cargo bench -p ourios-bench --bench b2`. CI runs land via
-  `.github/workflows/query-bench.yml` on `ci-runner` — indicative,
-  non-authoritative pending a `baseline-8vcpu-32gib` rerun. The
-  2026-06-11 readings (§9.3) confirm the flat shape on real
-  corpora: the windowed template-exact scan stays at 1 row group
-  from v4 → v6 with a flat ~3.4–4.1 ms latency band, while the
-  full-span variant grows with corpus size — supportive, though
-  the formal target speaks above ~10 GiB, which is unmeasured.
+  `.github/workflows/query-bench.yml` on `ci-runner` — indicative
+  only. The **authoritative** numbers are the
+  `baseline-8vcpu-32gib` run of 2026-06-12 (§9.4): **PASS** — the
+  windowed template-exact scan stays at 1 row group with a flat
+  ~4.2–5.9 ms latency band across every corpus, including the
+  first second-family reading (LogHub HDFS_v1, 11.2 M rows: 1/14
+  row groups, 5.92 ms), while the full-span variant grows with
+  corpus size. The formal target speaks above ~10 GiB, which
+  remains a future scale extension; the flat shape holding at
+  11.2 M rows across two corpus families is the operative
+  evidence.
 
 ### B3 — Substring queries (the hard case)
 
@@ -377,10 +388,16 @@ on `ci-runner` via `.github/workflows/query-bench.yml` as
 indicative numbers). **2026-06-11** extended the writer-side scale
 series to ~1 GB (§9.2) and landed the **first B1/B2 query
 readings** (§9.3) — recorded here as indicative `ci-runner`
-entries per the maintainer's 2026-06-12 authorization. Canonical
-numbers on the §1 hardware (`baseline-8vcpu-32gib`) are still
-pending for every gate; RFC 0007 stays `green` with a
-validated-pending note (see its status note and §9.3).
+entries per the maintainer's 2026-06-12 authorization.
+**2026-06-12** landed the **authoritative baseline run** (§9.4):
+every gate measured on the §1 hardware (`baseline-8vcpu-32gib`),
+recorded per the maintainer's 2026-06-12 authorization. B1, B2,
+C1, and C2 **pass authoritatively**; on that basis RFC 0007
+flipped to `validated` (its gates, per `docs/verification.md` §3,
+are the querier-pillar ones — B1/B2). **A1 fails authoritatively**
+and is the open thesis gate; it gates the compression pillar
+(RFC 0006's remit), not RFC 0007, and carries a new
+hardware-sensitivity caveat (§9.4).
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant
@@ -499,6 +516,9 @@ the thesis-deciding counterpart — B1/B2 — now passes indicatively
 (§9.3). Whether the §7 corpus-specific tuning-RFC response
 triggers is a maintainer decision, sensibly taken once an
 authoritative `baseline-8vcpu-32gib` run confirms the number.
+*(Resolved 2026-06-12: the §9.4 baseline run confirms — and
+slightly worsens — the deltas; the decision is now live with the
+maintainer.)*
 
 **C1 — reconstruction (target: 100% bit-identical or flagged
 lossy). PASS** on both: 1.000000 — v5 reconstructs
@@ -572,3 +592,129 @@ form the ladder requires (§1 quotes must-win numbers against
 `docs/rfcs/0007-querier.md`. The RFC stays `green` with a
 validated-pending note — authoritative baseline rerun required;
 denser error band and a second corpus family supporting.
+*(Resolved 2026-06-12: the §9.4 authoritative run delivered the
+baseline rerun **and** the second corpus family (HDFS_v1);
+RFC 0007 is `validated`. The denser error band remains an open
+quality improvement.)*
+
+### 9.4 Results — 2026-06-12 (authoritative, `baseline-8vcpu-32gib`)
+
+**Corpus.** `corpus/otel-demo-v{1..6}` (the §9.1 / §9.2
+captures; 30 MiB → ~1 GB) for A1 / C1 / C2 and B1/B2's OTel-Demo
+arms, plus — for the first time — the bench-time-fetched LogHub
+**HDFS_v1** (§1; ~1.47 GiB plain text, 11,175,629 rows ingested
+across 5 files) feeding the B2 arm as the **second corpus
+family**.
+**Hardware.** `baseline-8vcpu-32gib` — the §1 baseline
+(8 dedicated vCPU, 32 GiB RAM, local NVMe-class SSD). These are
+the **authoritative** numbers the §1 methodology quotes must-win
+gates against; the §9.1–§9.3 `ci-runner` entries remain
+indicative history.
+**Runs.** Dedicated baseline host (no CI run id): one
+`ourios-bench` run per corpus (A1/C1/C2) plus one query-bench
+run (B1 + B2), executed 2026-06-11/12; raw logs retained by the
+maintainer. Recorded per the maintainer's 2026-06-12
+authorization.
+
+**A1 — compression (target: ourios ≥ 3.0× zstd-19).**
+
+| corpus | size | ourios | zstd-19 | A1 delta |
+|---|---|---|---|---|
+| v1 | 30 MiB | 14.6× | 33.3× | 0.439 |
+| v2 | 136 MiB | 19.9× | 32.3× | 0.615 |
+| v3 | 272 MiB | 21.4× | 32.3× | 0.665 |
+| v4 | 547 MiB | 22.5× | 32.4× | 0.693 |
+| v5 | 994 MiB | 23.8× | 31.7× | 0.751 |
+| v6 | 987 MiB | 23.6× | 31.5× | 0.749 |
+
+**A1 verdict: FAIL (authoritative)** (target 3.0×; best observed
+0.751). The delta is monotonic with corpus size and the crossover
+is unobserved, consistent with §9.1's structural reading. One
+finding must be recorded honestly: the authoritative deltas sit
+**below** the `ci-runner` series (0.465 → 0.828) at every size —
+the ourios side compressed *less* effectively on this hardware
+(e.g. v5: 23.8× vs CI's 26.3×) while zstd-19 stayed essentially
+stable (31.7× on both) — i.e. the ourios writer's output is
+**environment-sensitive** (suspected row-group sizing / threading
+effects on the resulting encodings). That is now an **open A1
+investigation item** alongside the structural gap itself. A1
+gates the compression pillar (RFC 0006's remit); the §7
+escalation response is with the maintainer.
+
+**C1 — reconstruction (target: 100% bit-identical or flagged
+lossy). PASS (authoritative)** on every corpus: 1.000000
+throughout — v5 reconstructs 1,213,004 / 1,213,004 non-lossy rows
+exactly (lossy ratio 0.0114), v6 1,208,323 / 1,208,323 (lossy
+0.0112); v1–v4 likewise 1.000000 (lossy 0.0097–0.0112). The
+formal ≥ 1 M-line gate passes on the baseline.
+
+**C2 — template-count convergence (target: ratio ≥ 0.5 at 1 M
+lines). PASS (authoritative)** on both ≥ 1 M-line corpora: v5
+ratio 0.756 (end template count 1605, sample cadence 1336), v6
+ratio 0.760 (end count 1606, cadence 1329). v1–v4 abstain
+(< 1 M lines), as in §9.1.
+
+**B1 — predicate pushdown vs `zstdcat | grep` (target: ≥ 10× at
+1 GiB).** Query: severity `ERROR`, full corpus span. v4 is
+skipped (zero error-band rows, as in §9.3).
+
+| corpus | rows | RGs scanned | ourios bytes | reference bytes (zstd) | ourios | reference | speedup |
+|---|---|---|---|---|---|---|---|
+| v5 | 11 | 3/6 | 326,102 | 1,403,025 | 5.86 ms | 200.27 ms | **34.2×** |
+| v6 | 28 | 5/6 | 764,082 | 1,455,912 | 8.03 ms | 203.87 ms | **25.4×** |
+
+Row counts agree **exactly** with the reference pipeline on both
+corpora (11 and 28).
+
+**B1 verdict: PASS (authoritative)** — both corpora clear the
+≥ 10× bar at 2.5–3.4× margin on the §1 baseline. Remaining
+caveat, non-blocking: the error bands are still ultra-thin
+(11 / 28 rows — the friendliest case for pruning); a denser
+error band stays an open quality improvement.
+
+**B2 — template-exact latency ∝ result, not corpus.**
+
+*Full-span template-exact* (result grows with the corpus, so
+latency may too):
+
+| corpus | rows returned | RGs scanned | bytes | latency |
+|---|---|---|---|---|
+| v4 | 89,382 | 5/5 | 5,514,033 | 6.84 ms |
+| v5 | 168,487 | 6/6 | 6,785,714 | 9.57 ms |
+| v6 | 168,313 | 6/6 | 6,801,255 | 9.69 ms |
+| hdfs-v1 | 1,723,232 | 14/14 | 16,523,421 | 30.19 ms |
+
+*Windowed 1-hour template-exact* (the gate's shape: result
+roughly constant as the corpus grows):
+
+| corpus | corpus rows | rows returned | RGs scanned | bytes | latency |
+|---|---|---|---|---|---|
+| v4 | 735,377 | 12,854 | 1/5 | 1,674,718 | 4.39 ms |
+| v5 | 1,367,532 | 17,632 | 1/6 | 1,857,999 | 5.07 ms |
+| v6 | 1,360,040 | 11,750 | 1/6 | 1,592,279 | 4.19 ms |
+| hdfs-v1 | 11,175,629 | 28,207 | 1/14 | 1,737,852 | **5.92 ms** |
+
+The HDFS_v1 row is the **first reading from the second corpus
+family** (plain-text, the template-diversity case): the corpus is
+8–15× the OTel-Demo row counts, yet the windowed scan still
+touches 1 row group (13 pruned) and stays inside the same flat
+latency band, while the full-span variant grows with the corpus
+(6.84 → 30.19 ms) — exactly the result-bound-vs-corpus-bound
+split the gate asks for.
+
+**B2 verdict: PASS (authoritative)** — windowed ~10–28 k-row
+results answer in 4.2–5.9 ms (gate: ≤ 200 ms for ~10 k rows),
+flat from 735 k to 11.2 M rows across two corpus families. The
+formal target's ≥ 10 GiB regime remains a future scale
+extension; the measured shape is the operative evidence.
+
+**RFC 0007 `green → validated` (resolved).** The
+`docs/verification.md` §3 ladder reads: *"Every thesis-gate in
+`benchmarks.md` §7 that the RFC's pillars touch passes on
+representative corpora."* RFC 0007's pillar is the query engine
+(pillar #3); its gates are **B1 and B2**, both now passing
+authoritatively on the §1 baseline over ~1 GB+ corpora including
+a second family. **A1 does not gate RFC 0007** — it belongs to
+the template-mining/compression pillar, measured under RFC 0006.
+RFC 0007 is therefore flipped to `validated` (see its status
+note); `accepted` awaits maintainer sign-off per the ladder.

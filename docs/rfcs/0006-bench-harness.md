@@ -26,8 +26,10 @@ any code is written, because the difference between "the thesis
 holds" being a real claim and a vibe lives in those
 definitions. `B1` and `B2` (predicate-pushdown and
 template-exact query latency) are excluded: they need the
-DataFusion querier (`ourios-querier`, future RFC 0007) and
-land in a follow-up extension PR once the querier is live.
+DataFusion querier (`ourios-querier`, RFC 0007) and landed in
+follow-up extensions once the querier was live — both are now
+measured authoritatively (`docs/benchmarks.md` §9.4; RFC 0007
+is `validated`).
 
 ## 2. Motivation
 
@@ -90,7 +92,8 @@ ingest loop that A1 also runs to produce its Parquet output.
 Splitting them optimises for short documents and loses the
 cross-cutting constraints. The querier (and the B1/B2
 methodology it carries) is a genuinely separate concern with
-no shared code path and lives in RFC 0007 (future).
+no shared code path and lives in RFC 0007 (since shipped and
+`validated`).
 
 ## 3. Proposed design
 
@@ -136,7 +139,8 @@ This RFC pins:
 This RFC does **not** pin:
 
 - `B1` / `B2` measurement — both need
-  `ourios-querier` (future RFC 0007).
+  `ourios-querier` (RFC 0007, where they since landed;
+  authoritative results in `docs/benchmarks.md` §9.4).
 - ~~The OTLP-LogsData corpus migration (`docs/roadmap.md`
   §4's "OTLP `LogsData` (canonical JSON or protobuf)"
   goal).~~ **Landed in PR-K2 (2026-05-28).** The loader now
@@ -219,9 +223,10 @@ matching the existing test fixtures) and advances by a fixed
 1 ms per line. The advancement is artificial; this RFC accepts
 the artificiality because A1 / C1 / C2 are time-insensitive (no
 gate measures throughput or query latency against a time
-range). A future RFC 0007 measurement extension to B1/B2 will
-revisit time-stamp synthesis since predicate-pushdown latency
-depends on the time-range distribution.
+range). The RFC 0007 measurement extension to B1/B2 revisited
+time-stamp synthesis as anticipated, since predicate-pushdown
+latency depends on the time-range distribution: the B1/B2
+real-corpus arms window on the records' real timestamps.
 
 The default tenant means every record lands in the same
 partition. This is a simplification — the writer's atomic

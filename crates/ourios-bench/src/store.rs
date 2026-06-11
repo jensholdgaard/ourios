@@ -45,12 +45,16 @@ pub struct BuiltStore {
     /// How many rows that busiest template has (the result size a
     /// `template_id = busiest_template_id` query returns).
     pub busiest_template_rows: u64,
-    /// Smallest non-zero `time_unix_nano` written (`0` if none) — the
-    /// start of the corpus's time span, for picking a B2 query window.
-    pub min_time_unix_nano: u64,
-    /// Largest `time_unix_nano` written (`0` if none) — the end of the
-    /// corpus's time span.
-    pub max_time_unix_nano: u64,
+    /// Smallest non-zero **effective** timestamp written (`0` if none) —
+    /// the start of the corpus's time span, for picking a B2 query
+    /// window. Effective per RFC 0005 §3.2 (amendment 2026-06-11):
+    /// `time_unix_nano`, else `observed_time_unix_nano` — the value the
+    /// query window actually filters, derived via the same
+    /// `ourios_parquet::effective_time_unix_nano` the writer stores.
+    pub min_effective_time_unix_nano: u64,
+    /// Largest effective timestamp written (`0` if none) — the end of
+    /// the corpus's time span.
+    pub max_effective_time_unix_nano: u64,
 }
 
 /// Load the corpus at `corpus_dir`, mine it, and write the emitted
@@ -72,7 +76,7 @@ pub struct BuiltStore {
 pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltStore, BenchError> {
     let mut counts: HashMap<u64, u64> = HashMap::new();
 
-    let core = build_store(corpus_dir, bucket_root, |_input, emitted| {
+    let core = build_store(corpus_dir, bucket_root, |_input, emitted, _effective| {
         *counts.entry(emitted.template_id).or_insert(0) += 1;
         Ok(())
     })?;
@@ -86,8 +90,8 @@ pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltS
         files: core.files,
         busiest_template_id,
         busiest_template_rows,
-        min_time_unix_nano: core.min_time_unix_nano,
-        max_time_unix_nano: core.max_time_unix_nano,
+        min_effective_time_unix_nano: core.min_effective_time_unix_nano,
+        max_effective_time_unix_nano: core.max_effective_time_unix_nano,
     })
 }
 
@@ -102,15 +106,21 @@ pub struct B1Store {
     pub rows: u64,
     /// Number of partition files written.
     pub files: u64,
-    /// Smallest non-zero `time_unix_nano` written (`0` if none).
-    pub min_time_unix_nano: u64,
-    /// Largest `time_unix_nano` written (`0` if none).
-    pub max_time_unix_nano: u64,
-    /// Rows whose `time_unix_nano` was `0` on the wire. B1 queries a
-    /// real time window; such rows sit outside any window derived
-    /// from the span above, so the bench skips the corpus when this
-    /// is non-zero rather than benchmarking a mismatched result.
-    pub zero_ts_rows: u64,
+    /// Smallest non-zero effective timestamp written (`0` if none) —
+    /// see [`BuiltStore::min_effective_time_unix_nano`].
+    pub min_effective_time_unix_nano: u64,
+    /// Largest effective timestamp written (`0` if none).
+    pub max_effective_time_unix_nano: u64,
+    /// Rows whose **effective** timestamp is `0` — neither
+    /// `time_unix_nano` nor `observed_time_unix_nano` carried a value
+    /// (RFC 0005 §3.2 rule 7: the B1 guard keys off the effective
+    /// span). B1 queries a real time window; such rows sit outside any
+    /// window derived from the span above, so the bench skips the
+    /// corpus when this is non-zero rather than benchmarking a
+    /// mismatched result. Observed-only corpora (the ~15 % real-corpus
+    /// case the amendment exists for) keep this at `0` and stay
+    /// B1-eligible.
+    pub zero_effective_ts_rows: u64,
     /// Distinct `severity_text` values seen. `< 2` means a severity
     /// predicate has no selectivity (the RFC 0006 §3.3 plain-text
     /// loader fixes every line at `INFO`, so plain-text corpora
@@ -123,13 +133,13 @@ pub struct B1Store {
     /// (severity number 17..=20); `None` when neither yields a text.
     pub query_severity: Option<(String, u64)>,
     /// The `zstdcat | grep` baseline input: every record with a
-    /// non-zero timestamp rendered as the flat-text line a
+    /// non-zero effective timestamp rendered as the flat-text line a
     /// traditional logger would have written
     /// (`<severity_text> <body>`), compressed one block per hour —
     /// the hour granularity mirrors the store's partitioning, i.e.
-    /// the `*.zst` segments `files_in_range.zst` would name. Zero-ts
-    /// rows are excluded: they sit outside any window and the bench
-    /// skips such corpora.
+    /// the `*.zst` segments `files_in_range.zst` would name.
+    /// Zero-effective-ts rows are excluded: they sit outside any
+    /// window and the bench skips such corpora.
     pub reference: ReferenceCorpus,
 }
 
@@ -157,25 +167,27 @@ pub fn build_b1_store(
     let mut spool = HourSpool::new().map_err(|e| BenchError::Pipeline {
         detail: format!("create B1 reference spool: {e}"),
     })?;
-    let mut zero_ts_rows = 0u64;
+    let mut zero_effective_ts_rows = 0u64;
 
-    let core = build_store(corpus_dir, bucket_root, |input, emitted| {
+    let core = build_store(corpus_dir, bucket_root, |input, emitted, effective| {
         if let Some(text) = &emitted.severity_text {
             *severity_rows.entry(text.clone()).or_insert(0) += 1;
             if ERROR_BAND.contains(&emitted.severity_number) {
                 *error_band_rows.entry(text.clone()).or_insert(0) += 1;
             }
         }
-        if emitted.time_unix_nano == 0 {
-            // Out-of-window by definition (the B1 arm skips any corpus
-            // carrying zero-ts rows); keep the reference strictly
-            // in-window rather than spooling lines no query scans.
-            zero_ts_rows += 1;
+        if effective == 0 {
+            // Genuinely timeless (neither wire timestamp set) —
+            // out-of-window by definition (the B1 arm skips any corpus
+            // carrying zero-effective-ts rows); keep the reference
+            // strictly in-window rather than spooling lines no query
+            // scans.
+            zero_effective_ts_rows += 1;
             return Ok(());
         }
         let line = reference_line(input)?;
         spool
-            .append(emitted.time_unix_nano / HOUR_NS, &line)
+            .append(effective / HOUR_NS, &line)
             .map_err(|e| BenchError::Pipeline {
                 detail: format!("spool B1 reference line: {e}"),
             })?;
@@ -216,9 +228,9 @@ pub fn build_b1_store(
         tenant: crate::corpus::BENCH_TENANT,
         rows: core.rows,
         files: core.files,
-        min_time_unix_nano: core.min_time_unix_nano,
-        max_time_unix_nano: core.max_time_unix_nano,
-        zero_ts_rows,
+        min_effective_time_unix_nano: core.min_effective_time_unix_nano,
+        max_effective_time_unix_nano: core.max_effective_time_unix_nano,
+        zero_effective_ts_rows,
         distinct_severities: severity_rows.len(),
         query_severity,
         reference,
@@ -309,19 +321,21 @@ impl HourSpool {
 struct StoreCore {
     rows: u64,
     files: u64,
-    min_time_unix_nano: u64,
-    max_time_unix_nano: u64,
+    min_effective_time_unix_nano: u64,
+    max_effective_time_unix_nano: u64,
 }
 
 /// The shared load → mine → write pipeline behind
 /// [`build_query_store`] and [`build_b1_store`]. `observe` runs once
-/// per successfully-appended record; its first error aborts the
-/// build (surfaced after the harness loop, same stash pattern as
-/// `a1::A1Accumulator`).
+/// per successfully-appended record — its third argument is the
+/// record's effective timestamp (the shared writer/partition
+/// derivation, so the bookkeeping can never disagree with the
+/// store) — and its first error aborts the build (surfaced after the
+/// harness loop, same stash pattern as `a1::A1Accumulator`).
 fn build_store(
     corpus_dir: &Path,
     bucket_root: &Path,
-    mut observe: impl FnMut(&OtlpLogRecord, &MinedRecord) -> Result<(), BenchError>,
+    mut observe: impl FnMut(&OtlpLogRecord, &MinedRecord, u64) -> Result<(), BenchError>,
 ) -> Result<StoreCore, BenchError> {
     // A reused bucket would let the querier enumerate a prior run's
     // Parquet too, mixing corpora and skewing both the row counts
@@ -342,10 +356,11 @@ fn build_store(
 
     let mut writers: HashMap<PartitionKey, Writer> = HashMap::new();
     let mut rows: u64 = 0;
-    // Track the corpus's `time_unix_nano` span so the benches can pick
-    // a real time window. Only non-zero timestamps count (a `0` falls
-    // back to observed/epoch for partitioning — not a meaningful
-    // window bound).
+    // Track the corpus's *effective*-timestamp span so the benches can
+    // pick a real time window — the query window filters the effective
+    // column (RFC 0002 §6.2 / RFC 0005 §3.2). Only non-zero values
+    // count (`0` means genuinely timeless: the epoch partition, not a
+    // meaningful window bound).
     let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
     // The harness callback returns `()`, so a write/observe error is
@@ -357,14 +372,17 @@ fn build_store(
         if first_err.is_some() {
             return;
         }
-        let appended = append_record(&mut writers, bucket_root, emitted)
-            .and_then(|()| observe(input, emitted));
+        let appended = effective_nanos(emitted).and_then(|effective| {
+            append_record(&mut writers, bucket_root, emitted)?;
+            observe(input, emitted, effective)?;
+            Ok(effective)
+        });
         match appended {
-            Ok(()) => {
+            Ok(effective) => {
                 rows += 1;
-                if emitted.time_unix_nano != 0 {
-                    min_ts = min_ts.min(emitted.time_unix_nano);
-                    max_ts = max_ts.max(emitted.time_unix_nano);
+                if effective != 0 {
+                    min_ts = min_ts.min(effective);
+                    max_ts = max_ts.max(effective);
                 }
             }
             Err(e) => first_err = Some(e),
@@ -382,8 +400,8 @@ fn build_store(
         })?;
     }
 
-    // No non-zero timestamp seen ⇒ no meaningful span (report 0, 0).
-    let (min_time_unix_nano, max_time_unix_nano) = if min_ts == u64::MAX {
+    // No non-zero effective timestamp ⇒ no meaningful span (0, 0).
+    let (min_effective_time_unix_nano, max_effective_time_unix_nano) = if min_ts == u64::MAX {
         (0, 0)
     } else {
         (min_ts, max_ts)
@@ -392,8 +410,26 @@ fn build_store(
     Ok(StoreCore {
         rows,
         files,
-        min_time_unix_nano,
-        max_time_unix_nano,
+        min_effective_time_unix_nano,
+        max_effective_time_unix_nano,
+    })
+}
+
+/// The record's RFC 0005 §3.2 effective timestamp in the `u64` wire
+/// domain — `ourios_parquet::effective_time_unix_nano`, the same
+/// derivation the writer stores and the partition tuple uses, so the
+/// bench's span / eligibility bookkeeping can never disagree with
+/// what the query window filters.
+fn effective_nanos(emitted: &MinedRecord) -> Result<u64, BenchError> {
+    let effective =
+        ourios_parquet::effective_time_unix_nano(emitted).map_err(|e| BenchError::Pipeline {
+            detail: format!("effective timestamp derive failed: {e}"),
+        })?;
+    // The derivation validates both candidates against the u64→i64
+    // overflow contract, so the i64 is never negative; keep the
+    // conversion total anyway rather than panicking.
+    u64::try_from(effective).map_err(|_| BenchError::Pipeline {
+        detail: format!("effective timestamp {effective} is negative"),
     })
 }
 
@@ -468,9 +504,12 @@ mod tests {
         let built = build_query_store(corpus.path(), bucket.path()).expect("build");
 
         assert_eq!(built.rows, 3, "one record per line");
-        assert_eq!(built.min_time_unix_nano, TIME_BASELINE_NS, "span start");
         assert_eq!(
-            built.max_time_unix_nano,
+            built.min_effective_time_unix_nano, TIME_BASELINE_NS,
+            "span start"
+        );
+        assert_eq!(
+            built.max_effective_time_unix_nano,
             TIME_BASELINE_NS + 2 * TIME_INCREMENT_NS,
             "span end (3rd line)",
         );
@@ -496,6 +535,79 @@ mod tests {
         )
     }
 
+    /// Like [`logs_data_line`], but **observed-only**: `timeUnixNano`
+    /// is absent from the wire (the OTLP "source timestamp unknown"
+    /// case), `observedTimeUnixNano` carries `base + i` ns.
+    fn observed_only_logs_data_line(n: usize, text: &str, number: u8, base: u64) -> String {
+        let records: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    "{{\"observedTimeUnixNano\":\"{}\",\"severityNumber\":{number},\
+                     \"severityText\":\"{text}\",\
+                     \"body\":{{\"stringValue\":\"{text} event {i}\"}}}}",
+                    base + u64::try_from(i).expect("usize fits in u64"),
+                )
+            })
+            .collect();
+        format!(
+            "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{}]}}]}}]}}",
+            records.join(","),
+        )
+    }
+
+    /// RFC 0005 §3.2 rule 7 (the RFC0005.13 bench follow-up) — an
+    /// observed-only corpus (`timeUnixNano` absent, ~15 % of real
+    /// OTel-Demo records) is **B1-eligible**: the bookkeeping keys
+    /// off the effective timestamp, so `zero_effective_ts_rows`
+    /// stays 0, the span derives from the observed values, and every
+    /// line lands in the reference corpus. These are exactly the
+    /// outputs the `benches/b1.rs` `severity_query` guard checks.
+    #[test]
+    fn b1_store_with_observed_only_rows_is_eligible() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        let base = crate::corpus::TIME_BASELINE_NS;
+        let jsonl = format!(
+            "{}\n{}\n",
+            observed_only_logs_data_line(5, "INFO", 9, base),
+            observed_only_logs_data_line(3, "ERROR", 17, base + 1_000),
+        );
+        std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+
+        // The b1 eligibility guard: a usable span and no
+        // zero-effective-ts rows.
+        assert_eq!(
+            built.zero_effective_ts_rows, 0,
+            "observed-only rows have a non-zero effective timestamp",
+        );
+        assert_eq!(
+            built.min_effective_time_unix_nano, base,
+            "span start derives from the observed fallback",
+        );
+        assert_eq!(
+            built.max_effective_time_unix_nano,
+            base + 1_002,
+            "span end is the last ERROR record's observed instant",
+        );
+        // The query predicate and the reference corpus both see the
+        // full row set — nothing was dropped as out-of-window.
+        assert_eq!(
+            built.query_severity,
+            Some(("ERROR".to_string(), 3)),
+            "the B1 predicate is unaffected by the timestamp source",
+        );
+        assert_eq!(
+            built
+                .reference
+                .count_lines_containing("ERROR")
+                .expect("reference grep"),
+            3,
+            "observed-only rows are spooled into the reference",
+        );
+    }
+
     /// B1 store over an OTLP corpus with a real severity mix: the
     /// "ERROR" text is preferred for the query predicate, its row
     /// count is exact, the severity distribution is visible (the
@@ -517,7 +629,7 @@ mod tests {
         let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
 
         assert_eq!(built.rows, 8);
-        assert_eq!(built.zero_ts_rows, 0);
+        assert_eq!(built.zero_effective_ts_rows, 0);
         assert_eq!(built.distinct_severities, 2, "INFO + ERROR");
         assert_eq!(
             built.query_severity,
@@ -532,7 +644,7 @@ mod tests {
             3,
             "every ERROR record's reference line carries the token",
         );
-        assert_eq!(built.min_time_unix_nano, base, "span start");
+        assert_eq!(built.min_effective_time_unix_nano, base, "span start");
     }
 
     /// Without a literal "ERROR" text, the busiest error-band
@@ -589,7 +701,7 @@ mod tests {
     /// corpora carrying them), so they must not leak into the
     /// reference corpus either.
     #[test]
-    fn b1_reference_excludes_zero_ts_rows() {
+    fn b1_reference_excludes_zero_effective_ts_rows() {
         let corpus = tempfile::TempDir::new().expect("corpus dir");
         let base = crate::corpus::TIME_BASELINE_NS;
         let jsonl = format!(
@@ -602,7 +714,7 @@ mod tests {
 
         let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
 
-        assert_eq!(built.zero_ts_rows, 1);
+        assert_eq!(built.zero_effective_ts_rows, 1);
         assert_eq!(
             built
                 .reference
@@ -662,7 +774,13 @@ mod tests {
         let built = build_query_store(corpus.path(), bucket.path()).expect("build");
 
         assert_eq!(built.rows, 1, "the one record is written");
-        assert_eq!(built.min_time_unix_nano, 0, "no non-zero timestamp → 0");
-        assert_eq!(built.max_time_unix_nano, 0, "no non-zero timestamp → 0");
+        assert_eq!(
+            built.min_effective_time_unix_nano, 0,
+            "no non-zero timestamp → 0"
+        );
+        assert_eq!(
+            built.max_effective_time_unix_nano, 0,
+            "no non-zero timestamp → 0"
+        );
     }
 }

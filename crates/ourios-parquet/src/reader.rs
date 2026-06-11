@@ -1054,6 +1054,13 @@ mod tests {
                     b.append_null();
                     Arc::new(b.finish())
                 }
+                "effective_time_unix_nano" => {
+                    // Equals the row's non-zero `time_unix_nano`
+                    // (the §3.2 derivation with observed = None).
+                    let mut b = TimestampNanosecondBuilder::new().with_timezone("UTC");
+                    b.append_value(1_775_127_480_000_000_000);
+                    Arc::new(b.finish())
+                }
                 "severity_number" => {
                     let mut b = UInt8Builder::new();
                     b.append_value(9);

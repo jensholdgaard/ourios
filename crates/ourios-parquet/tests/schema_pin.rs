@@ -114,6 +114,13 @@ fn rfc0005_10_data_schema_matches_pinned_field_list() {
             DataType::Timestamp(TimeUnit::Nanosecond, Some(utc())),
             true,
         ),
+        // OPTIONAL, writer-derived (RFC 0005 §3.2 amendment
+        // 2026-06-11); absent only in pre-amendment files.
+        Field::new(
+            "effective_time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(utc())),
+            true,
+        ),
         Field::new("severity_number", DataType::UInt8, false),
         Field::new("severity_text", DataType::Utf8, true),
         Field::new("scope_name", DataType::Utf8, true),

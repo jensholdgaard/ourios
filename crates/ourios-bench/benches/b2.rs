@@ -272,13 +272,14 @@ fn first_hour_window(
     dir: &str,
     baseline_row_groups: u64,
 ) -> Option<QueryRequest> {
-    if built.min_time_unix_nano == 0 || built.files < 2 {
+    if built.min_effective_time_unix_nano == 0 || built.files < 2 {
         eprintln!(
             "b2/real-corpus: {dir} — single-partition or no timestamp span; skipping windowed arm"
         );
         return None;
     }
-    let hour_start = built.min_time_unix_nano - (built.min_time_unix_nano % HOUR_NS);
+    let hour_start =
+        built.min_effective_time_unix_nano - (built.min_effective_time_unix_nano % HOUR_NS);
     // Clamp the window end into the querier's i64-nanosecond range, so a
     // corpus near the year-2262 boundary can't push the bound past
     // i64::MAX (which the querier rejects as InvalidQuery, panicking the

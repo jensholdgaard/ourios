@@ -78,7 +78,9 @@ pub struct QueryRequest {
     /// structurally — the querier only ever reads under this
     /// tenant's partition directory (`CLAUDE.md` §3.7; RFC0007.5).
     pub tenant: TenantId,
-    /// Optional `[start, end)` `time_unix_nano` bounds.
+    /// Optional `[start, end)` bounds over the **effective** timestamp
+    /// (`effective_time_unix_nano`, falling back to `time_unix_nano` for
+    /// pre-amendment files — RFC 0005 §3.2 / §3.9, amendment 2026-06-11).
     pub time_range: Option<(u64, u64)>,
     /// Optional template-exact filter (B2 — `template_id` equality).
     pub template_id: Option<u64>,
@@ -347,6 +349,47 @@ fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
     df.schema().fields().iter().any(|f| f.name() == column)
 }
 
+/// The row-level time-window filter `[start, end)` over the **effective**
+/// timestamp (RFC 0002 §6.2 / RFC 0005 §3.2, amendment 2026-06-11), with the
+/// §3.9 rule-2 carve-out for files that predate the
+/// `effective_time_unix_nano` column. Shared by the `QueryRequest` path and
+/// the DSL compiler so both windows have identical semantics.
+///
+/// The carve-out is the explicit exception to the
+/// absent-OPTIONAL-column ⇒ predicate-false convention (RFC0007.4): for
+/// pre-amendment files the window applies `effective := time_unix_nano` —
+/// exactly the pre-amendment behaviour — because compiling the window to
+/// `false` would silently hide every old file from every query.
+///
+/// - Column absent from the (post-union) schema ⇒ every file predates the
+///   amendment ⇒ filter `time_unix_nano` directly (prunable, as before).
+/// - Column present ⇒ a *mixed* scan is still possible: `DataFusion` fills
+///   the column with NULL for files that lack it, and NULL fails both window
+///   comparisons — the forbidden silent-hiding outcome. Post-amendment
+///   writers always populate the column (§3.2: NULL appears only in
+///   pre-amendment files), so `IS NULL` identifies exactly the rows needing
+///   the `time_unix_nano` fallback. The `OR` shape (rather than a
+///   `coalesce`) keeps the predicate inside `DataFusion`'s pruning grammar:
+///   min/max statistics prune the effective branch and null counts collapse
+///   the fallback branch on post-amendment row groups — the B1 mechanism
+///   (RFC 0005 §3.2 rule 3).
+fn time_window_filter(
+    df: &datafusion::dataframe::DataFrame,
+    start: u64,
+    end: u64,
+) -> Result<datafusion::logical_expr::Expr, QueryError> {
+    let lo = lit(time_bound_scalar(start)?);
+    let hi = lit(time_bound_scalar(end)?);
+    let ts = || col(columns::TIME_UNIX_NANO);
+    let ts_window = ts().gt_eq(lo.clone()).and(ts().lt(hi.clone()));
+    if !has_column(df, columns::EFFECTIVE_TIME_UNIX_NANO) {
+        return Ok(ts_window);
+    }
+    let eff = || col(columns::EFFECTIVE_TIME_UNIX_NANO);
+    let eff_window = eff().gt_eq(lo).and(eff().lt(hi));
+    Ok(eff_window.or(eff().is_null().and(ts_window)))
+}
+
 /// Apply the [`QueryRequest`] predicate set as `DataFusion` filters. Returns
 /// `Ok(None)` when a `severity_text` filter targets an absent OPTIONAL column
 /// (provably empty — short-circuit).
@@ -355,13 +398,8 @@ fn apply_request_filters(
     request: &QueryRequest,
 ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError> {
     if let Some((start, end)) = request.time_range {
-        df = df
-            .filter(
-                col(columns::TIME_UNIX_NANO)
-                    .gt_eq(lit(time_bound_scalar(start)?))
-                    .and(col(columns::TIME_UNIX_NANO).lt(lit(time_bound_scalar(end)?))),
-            )
-            .map_err(storage_err)?;
+        let window = time_window_filter(&df, start, end)?;
+        df = df.filter(window).map_err(storage_err)?;
     }
     if let Some(template_id) = request.template_id {
         df = df

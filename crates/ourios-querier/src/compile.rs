@@ -25,6 +25,12 @@
 //! | `lossy` | `lossy_flag` | `Boolean` |
 //! | `flags` | `flags` | `UInt32` |
 //!
+//! The `range(...)` time window is **not** the bare `ts` field: it compiles
+//! against the derived `effective_time_unix_nano` column (RFC 0002 §6.2
+//! amendment 2026-06-11) via [`crate::time_window_filter`], with the
+//! RFC 0005 §3.9 `effective := time_unix_nano` fallback for files that
+//! predate the column.
+//!
 //! `service`, `resource.<k>`, and `attr.<k>` have **no dedicated column** in
 //! the RFC 0005 schema: resource/log attributes are stored as a single
 //! OTLP-canonical-JSON `Utf8` column (`resource_attributes` / `attributes`).
@@ -173,13 +179,11 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         alias_classes,
         limit,
     } = plan;
-    let mut df = df
-        .filter(
-            col(columns::TIME_UNIX_NANO)
-                .gt_eq(lit(time_bound_scalar(start)?))
-                .and(col(columns::TIME_UNIX_NANO).lt(lit(time_bound_scalar(end)?))),
-        )
-        .map_err(crate::storage_err)?;
+    // The window filters the *effective* timestamp (RFC 0002 §6.2 amendment
+    // 2026-06-11), with the RFC 0005 §3.9 fallback for pre-amendment files;
+    // the bare `ts` field stays `time_unix_nano`, the verbatim wire value.
+    let window_filter = crate::time_window_filter(&df, start, end)?;
+    let mut df = df.filter(window_filter).map_err(crate::storage_err)?;
 
     match compile_predicate(&predicate, &df, &alias_classes)? {
         // `true` ⇒ match-all ⇒ no predicate filter (window only).

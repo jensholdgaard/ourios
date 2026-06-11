@@ -36,7 +36,7 @@ use ourios_core::audit::ParamType;
 use ourios_core::otlp::KeyValue;
 use ourios_core::record::{BodyKind, MinedRecord};
 
-use crate::partition::TimestampOverflowError;
+use crate::partition::{TimestampOverflowError, effective_time_unix_nano};
 use crate::{columns, data_schema};
 
 /// Build an Arrow `RecordBatch` matching `data_schema()` from a
@@ -208,6 +208,7 @@ struct Builders {
     template_version: UInt32Builder,
     time_unix_nano: TimestampNanosecondBuilder,
     observed_time_unix_nano: TimestampNanosecondBuilder,
+    effective_time_unix_nano: TimestampNanosecondBuilder,
     severity_number: UInt8Builder,
     severity_text: StringBuilder,
     scope_name: StringBuilder,
@@ -245,6 +246,8 @@ impl Builders {
             template_version: UInt32Builder::with_capacity(cap),
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(cap).with_timezone("UTC"),
             observed_time_unix_nano: TimestampNanosecondBuilder::with_capacity(cap)
+                .with_timezone("UTC"),
+            effective_time_unix_nano: TimestampNanosecondBuilder::with_capacity(cap)
                 .with_timezone("UTC"),
             severity_number: UInt8Builder::with_capacity(cap),
             severity_text: StringBuilder::with_capacity(cap, 0),
@@ -301,6 +304,13 @@ impl Builders {
             }
             None => self.observed_time_unix_nano.append_null(),
         }
+
+        // Derived via the same function the §3.4 partition tuple
+        // uses (RFC 0005 §3.2 amendment 2026-06-11), so the stored
+        // column and the partition bucket can never disagree. Always
+        // populated — NULL appears only in pre-amendment files.
+        self.effective_time_unix_nano
+            .append_value(effective_time_unix_nano(r)?);
 
         self.severity_number.append_value(r.severity_number);
         append_option_str(&mut self.severity_text, r.severity_text.as_deref());
@@ -393,6 +403,7 @@ impl Builders {
             Arc::new(self.template_version.finish()),
             Arc::new(self.time_unix_nano.finish()),
             Arc::new(self.observed_time_unix_nano.finish()),
+            Arc::new(self.effective_time_unix_nano.finish()),
             Arc::new(self.severity_number.finish()),
             Arc::new(self.severity_text.finish()),
             Arc::new(self.scope_name.finish()),

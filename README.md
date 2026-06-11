@@ -1,16 +1,21 @@
 # Ourios
 
+[![CI](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml/badge.svg)](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust: stable](https://img.shields.io/badge/rust-stable%20%C2%B7%20MSRV%201.85-orange.svg)](rust-toolchain.toml)
+[![Docs: mdBook](https://img.shields.io/badge/docs-mdBook-brightgreen.svg)](docs/SUMMARY.md)
+
 > **οὔριος** · _the fair, following wind that fills a ship's sail._
 > Logs flow forward, under fair wind, with minimal friction.
 
 **Ourios is a log storage and query backend** built on three off-the-shelf
 parts:
 
-- **Apache Parquet** — columnar storage on object storage, with predicate
-  pushdown via row-group statistics, bloom filters, and page indexes.
+- **Apache Parquet** — columnar storage, with predicate pushdown via
+  row-group statistics, bloom filters, and page indexes.
 - **A Drain-derived online template miner** — collapses log lines to
-  `(template_id, params)` at ingest time, giving 50–200× compression
-  before any byte-level codec runs.
+  `(template_id, params)` at ingest time, before any byte-level codec
+  runs.
 - **Apache DataFusion** — a production-ready vectorised SQL execution
   engine. We hand it logical plans; it does the work.
 
@@ -22,11 +27,14 @@ they don't exist.
 
 ---
 
-> [!IMPORTANT]
-> **Status: draft.** No code exists yet. This repository currently
-> contains the design specification, the invariants we commit to, the
-> hazards we refuse to paper over, and the RFC process by which we will
-> build the rest. If you are here to run a binary, you are early.
+> [!NOTE]
+> **Status: pre-release, under active RFC-driven development.** The
+> ingest path (OTLP → WAL → miner → Parquet) and the query path
+> (logs DSL → DataFusion) are implemented and tested behind RFC
+> acceptance gates; the performance thesis is being measured in
+> [`docs/benchmarks.md`](docs/benchmarks.md). There is no packaged
+> release yet — if you are here to download a binary, you are still
+> early, but the code is real.
 
 ---
 
@@ -46,29 +54,31 @@ logs that other backends ignore:
 
 1. Log lines are generated from a small number of `printf` templates.
    Store the template once, store the parameters per occurrence, save
-   50–200× on the bytes.
+   on the bytes.
 2. The most common log query shape is "filter by time + attributes, fetch
    a bounded result." This is exactly what Parquet + DataFusion is
    already good at when the file layout is right.
 
-See `docs/architecture/overview.md` for the long version.
-
 ## Two features nobody else has
 
-- **`template:<id>` queries.** Filter by the mined template, not just by
-  string match. "Show me every occurrence of the login-error template
-  across every service" is a single bloom-filter probe per Parquet file.
-- **`templates_drift(<service>)`.** Show templates that appeared or
-  disappeared across a deploy boundary. A deploy that changes a log line
-  from "user logged in" to "user authenticated" shows up here. This is
-  how you catch log-schema drift at the time of the change instead of
-  discovering it three weeks later when your alert stops firing.
+- **Template-exact queries.** `template_id == 42` filters by the mined
+  template, not by string match — "every occurrence of the login-error
+  template, across every service" prunes to the row groups whose bloom
+  filters can contain it. `resolves_to(42)` expands an operator-asserted
+  alias set, so a template that was renamed across a deploy still answers
+  as one query.
+- **Drift as a first-class query.** `drift from -7d to now` reads the
+  miner's audit stream and reports the templates that appeared, widened,
+  or changed in the window. A deploy that changes a log line from "user
+  logged in" to "user authenticated" shows up here — at the time of the
+  change, not three weeks later when your alert stops firing.
 
 ## Non-goals
 
 - Metrics and traces. OTLP logs only. Traces are linked by `trace_id`
   but not stored.
-- Managed-service features. We ship a binary and a Helm chart.
+- Managed-service features. We ship a binary and (eventually) a Helm
+  chart.
 - Being a SIEM. No correlation engine, no detection rules, no alerting
   DSL beyond what Grafana/Prometheus already provide.
 - Being a Loki / Mimir / ClickHouse replacement in their full scope. If
@@ -79,86 +89,150 @@ See `docs/architecture/overview.md` for the long version.
 ## Architecture, in one picture
 
 ```
-                  ┌──────────────────────────────────────────────┐
-  OTel collector  │  OTLP gRPC / HTTP                            │
-  ─────────────►  │       │                                      │
-                  │       ▼                                      │
-                  │  ┌─────────────┐   ┌──────────┐   ┌────────┐ │
-                  │  │ template    │──►│   WAL    │──►│ Arrow  │ │
-                  │  │ miner       │   │ (fsync)  │   │ batches│ │
-                  │  │ (per-tenant)│   └──────────┘   └────┬───┘ │
-                  │  └─────────────┘                        │     │
-                  │         ingester                         ▼     │
-                  │                                   ┌───────────┐│
-                  │                                   │ Parquet   ││
-                  │                                   │  writer   ││
-                  │                                   └─────┬─────┘│
-                  └─────────────────────────────────────────┼──────┘
-                                                            ▼
-                                                    ┌───────────────┐
-                                                    │  S3 / object  │
-                                                    │    storage    │
-                                                    └───────┬───────┘
+                  ┌──────────────────────────────────────────────────┐
+  OTel collector  │  OTLP gRPC (:4317) / HTTP (:4318)                │
+  ─────────────►  │       │                                          │
+                  │       ▼                                          │
+                  │  ┌───────────┐   ┌─────────────┐   ┌───────────┐ │
+                  │  │   WAL     │──►│ template    │──►│  Parquet  │ │
+                  │  │ (fsync,   │   │ miner       │   │  writer   │ │
+                  │  │ then ack) │   │ (per-tenant)│   └─────┬─────┘ │
+                  │  └───────────┘   └─────────────┘         │       │
+                  │                    ingester              │       │
+                  └──────────────────────────────────────────┼───────┘
+                                                             ▼
+                                                  ┌────────────────────┐
+                                                  │   Parquet store    │
+                                                  │ (per-tenant, hour- │
+                                                  │   partitioned)     │
+                                                  └─────────┬──────────┘
                                                             ▲
-                  ┌─────────────────────────────────────────┼──────┐
-                  │                                   ┌─────┴─────┐│
-                  │                                   │  Parquet  ││
-                  │                                   │   reader  ││
-                  │                                   └─────┬─────┘│
-                  │                                         │      │
-                  │  ┌─────────────┐   ┌──────────────┐    │      │
-   logs DSL    ─► │  │   parser    │──►│  DataFusion  │◄───┘      │
-   query       ◄─ │  │ (LogQL-ish) │   │  logical plan│           │
-   response       │  └─────────────┘   └──────────────┘           │
-                  │                       querier                 │
-                  └──────────────────────────────────────────────┘
+                  ┌─────────────────────────────────────────┼───────┐
+                  │                                  ┌──────┴─────┐ │
+                  │                                  │  Parquet   │ │
+                  │                                  │   reader   │ │
+                  │                                  └──────┬─────┘ │
+                  │  ┌──────────────┐  ┌──────────────┐     │       │
+   logs DSL    ─► │  │  DSL parser  │─►│  DataFusion  │◄────┘       │
+   query       ◄─ │  │ (own grammar)│  │  logical plan│             │
+   response       │  └──────────────┘  └──────────────┘             │
+                  │                      querier                    │
+                  └─────────────────────────────────────────────────┘
 ```
+
+The order on the ingest side is load-bearing: a batch is fsync'd to the
+WAL **before** it is acknowledged and before the miner touches it
+(WAL-before-ack, `CLAUDE.md` §3.4). The Parquet store is a local
+filesystem today; object storage as the durable tier is the design
+target ([RFC 0005](docs/rfcs/0005-parquet-storage.md)).
+
+## What is implemented
+
+Everything below is built RFC-first: each RFC pins `Given / When / Then`
+acceptance scenarios, which land as failing (red-gate) tests before the
+code that turns them green. Statuses live in each RFC's frontmatter
+([`docs/rfcs/`](docs/rfcs/README.md)).
+
+- **Template miner** ([RFC 0001](docs/rfcs/0001-template-miner.md)) —
+  per-tenant Drain-derived trees keyed by `(severity_number,
+  scope_name)`, three-zone confidence matching, byte-identical
+  reconstruction (lossy lines flagged and retained verbatim), the
+  Ourios canonical body encoding for structured bodies, snapshot +
+  WAL-replay recovery, an operator-driven audited alias map, and
+  `ourios.miner.*` telemetry defined through an OTel weaver registry.
+- **WAL** ([RFC 0008](docs/rfcs/0008-wal.md)) — append / sync / replay /
+  segment rotation, with a SIGKILL crash-recovery test in CI.
+  Checkpointing and truncation are still open.
+- **OTLP receiver** ([RFC 0003](docs/rfcs/0003-otlp-receiver.md)) —
+  gRPC + HTTP, the full compliance-scenario set green, tenant
+  derivation per `ResourceLogs`.
+- **Parquet storage** ([RFC 0005](docs/rfcs/0005-parquet-storage.md)) —
+  per-tenant hour-partitioned files, canonical-JSON attribute and body
+  columns, effective-timestamp windowing, an audit-event stream, and
+  background compaction ([RFC 0009](docs/rfcs/0009-compaction.md)).
+- **Querier + logs DSL** ([RFC 0002](docs/rfcs/0002-query-dsl.md),
+  [RFC 0007](docs/rfcs/0007-querier.md)) — a pipe-composable DSL with
+  its own grammar (no DataFusion or SQL leaking through):
+  `severity >= error`, `template_id == 42`, `resolves_to(42)`,
+  half-open `range(...)`, `| count by template_id | sort count desc |
+  limit 10`, plus a structured JSON query surface and the
+  `drift from <t1> to <t2>` audit query
+  ([RFC 0010](docs/rfcs/0010-audit-stream-queries.md)).
+- **Server binary** — one binary; the OTLP-receiver and compaction
+  roles are served today, the served querier role is pending.
+
+## How it measures
+
+[`docs/benchmarks.md`](docs/benchmarks.md) §9 is the live scoreboard —
+every claim below is recorded there with its run IDs and caveats. The
+numbers so far are **indicative** (`ci-runner` hardware, not the
+benchmark-baseline machine; an authoritative `baseline-8vcpu-32gib`
+rerun is in progress):
+
+- **Query pushdown (B1):** severity-needle queries over a ~1 GB corpus
+  run 30–40× faster than a `zstdcat | grep` reference pipeline, with
+  exactly matching row counts.
+- **Windowed template queries (B2):** latency stays flat (~3–4 ms) as
+  the corpus doubles — result-bound, not corpus-bound.
+- **Reconstruction (C1):** 1.000000 — every one of 1.2M+ non-lossy rows
+  reconstructs bit-identically; lossy rows are flagged and retained.
+- **Compression (A1):** honest miss so far — ourios is ~0.82× of
+  monolithic zstd-19 at ~1 GB, against a ≥ 3.0× gate. The gap is the
+  structural price of a queryable columnar layout; the thesis currently
+  rests on B1/B2, and §9 says so plainly.
 
 ## Repository layout
 
 ```
-crates/    # Rust workspace (empty for now)
-deploy/    # Helm chart (empty for now)
-docs/      # Architecture, hazards, RFCs, glossary
-testdata/  # Anonymised log corpora for miner evaluation (empty for now)
-.claude/   # Claude Code skills specific to this project
+crates/      # Rust workspace: ourios-{core,miner,wal,parquet,ingester,
+             #   querier,server,bench,semconv,telemetry}
+docs/        # mdBook source: architecture, hazards, RFCs, benchmarks,
+             #   roadmap, glossary, talks
+semconv/     # OTel semantic-convention registry (weaver source of truth)
+templates/   # weaver codegen templates for crates/ourios-semconv
+testdata/    # anonymised seed corpora; the ~1 GB bench corpora are
+             #   captured by CI workflows and published as corpus/* tags
 ```
 
-See `CLAUDE.md` for the full development contract and invariants.
+See [`CLAUDE.md`](CLAUDE.md) for the full development contract and
+invariants.
 
 ## Documentation
 
-- `docs/architecture/overview.md` — the deep dive. Start here.
-- `docs/architecture/storage-layout.md` — Parquet schema and partitioning.
-- `docs/architecture/template-miner.md` — Drain-derived design decisions.
-- `docs/architecture/ingest-path.md` — OTLP → WAL → Parquet.
-- `docs/architecture/query-path.md` — DataFusion + logs DSL.
-- `docs/hazards.md` — where projects in this space die, and how we won't.
-- `docs/glossary.md` — terms of art (Parquet, Drain, row group, …).
-- `docs/rfcs/README.md` — how we make decisions.
+The docs are an mdBook (`book.toml`; source under `docs/`):
+
+- [`docs/rfcs/`](docs/rfcs/README.md) — how we make decisions, and the
+  ten RFCs that specify everything implemented so far.
+- [`docs/hazards.md`](docs/hazards.md) — where projects in this space
+  die, and how we won't.
+- [`docs/benchmarks.md`](docs/benchmarks.md) — the thesis gates and the
+  measurements against them.
+- [`docs/verification.md`](docs/verification.md) — how an RFC criterion
+  becomes a red-gate test becomes a green one.
+- [`docs/roadmap.md`](docs/roadmap.md) — the path to an MVP.
+- [`docs/architecture/otlp-log-format.md`](docs/architecture/otlp-log-format.md)
+  — OTLP's log data model vs. the miner's view of it.
+- [`docs/glossary.md`](docs/glossary.md) — terms of art (Parquet, Drain,
+  row group, …).
+- [`docs/talks/`](docs/talks/0001-template-miner.md) — lecture-length
+  explanations, starting with the template miner.
 
 ## Governance and contributing
 
-- `GOVERNANCE.md` — how decisions get made.
-- `CONTRIBUTING.md` — how to contribute (including the RFC process).
-- `CODE_OF_CONDUCT.md` — CNCF-aligned.
-- `SECURITY.md` — vulnerability reporting.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (including
+  the RFC process).
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — CNCF-aligned.
+- [`SECURITY.md`](SECURITY.md) — vulnerability reporting.
 
 ## Licensing
 
-Apache License 2.0. See `LICENSE`.
+Apache License 2.0. See [`LICENSE`](LICENSE).
 
 ## Acknowledgements
 
 - The Parquet project and the Apache Arrow ecosystem for making columnar
-  storage on object storage a solved problem.
+  storage a solved problem.
 - Pinjia He et al. for the original Drain paper (ICSE 2017) and IBM for
   Drain3.
 - The DataFusion and InfluxData teams for proving that a fast, vectorised,
   pluggable query engine can ship as an open-source library.
-
----
-
-*Ourios is a draft specification and a direction of travel. It is not,
-yet, a working backend. If you would like it to be, see
-`docs/rfcs/README.md`.*

@@ -232,9 +232,12 @@ follows §3.4 (the partition layout), not §3.8 (the row schema).
 >    redundancy costs ≈ 8 B/row before encoding and almost always
 >    equals `time_unix_nano`, so `DELTA_BINARY_PACKED` + ZSTD
 >    collapse it (§3.6). A real column is what makes the window
->    predicate pruneable: a query-time `coalesce(time_unix_nano,
->    observed_time_unix_nano)` expression would defeat row-group
->    min/max pruning, which is the B1 mechanism.
+>    predicate pruneable: a query-time fallback expression
+>    (`CASE WHEN time_unix_nano != 0 THEN time_unix_nano ELSE
+>    observed_time_unix_nano END` — `time_unix_nano` is REQUIRED
+>    with `0` as the unknown sentinel, so a plain `coalesce`
+>    would never fall back) would defeat row-group min/max
+>    pruning, which is the B1 mechanism.
 > 4. **Partitioning.** The §3.4 time-fallback derivation is this
 >    rule; the partition tuple and the stored column never
 >    disagree. Records with neither timestamp still land under
@@ -489,7 +492,7 @@ Per-column encoding decisions, anchored to query patterns
 | `tenant_id` | yes | no | no | Exactly one distinct value per file in valid data (§3.4 places each file under a single `tenant_id=…` partition, §3.9 errors on row-vs-path mismatch); dictionary encoding collapses the column to a one-entry dictionary plus an indexed RLE stream |
 | `template_id` | yes | yes | **yes** | B2 (`where template_id = X`) is bloom-friendly; high cardinality but small relative to row count |
 | `template_version` | yes | yes | no | Always small per template |
-| `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page enables B1 range pruning |
+| `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page is what the window predicate prunes on in pre-amendment files (the §3.9 absent-column fallback) — `effective_time_unix_nano` below is the primary window column since the 2026-06-11 amendment |
 | `observed_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`; the observation timeline is also broadly monotonic, so delta encoding pays |
 | `effective_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`, which it almost always equals — `DELTA_BINARY_PACKED` collapses the redundancy. Min/max per page is what makes the B1 time-window predicate pruneable on this column (amendment 2026-06-11) |
 | `severity_number` | yes | yes | no | 0..24 — dict alone is enough |

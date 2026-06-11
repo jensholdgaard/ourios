@@ -372,7 +372,9 @@ prior draft:
 > §3.2 (amendment of the same date), the time window now compiles
 > against the derived `effective_time_unix_nano` column
 > (`time_unix_nano` when non-zero, else
-> `observed_time_unix_nano`), so records whose source timestamp
+> `observed_time_unix_nano.unwrap_or(0)` — RFC 0005 §3.2 is the
+> normative derivation; a record with neither timestamp stays at
+> `0`), so records whose source timestamp
 > is unknown (`time_unix_nano = 0` — ~15 % of real OTel-Demo
 > corpora, per the OTLP logs data model's "Use `Timestamp` if it
 > is present, otherwise use `ObservedTimestamp`" recommendation)
@@ -382,7 +384,11 @@ prior draft:
 > column existed the window applies `effective :=
 > time_unix_nano` (the RFC 0005 §3.9 documented default — exactly
 > the pre-amendment behaviour), **not** the absent-OPTIONAL-column
-> ⇒ predicate-false convention.
+> ⇒ predicate-false convention. The window bounds are
+> **half-open** — `range(from, to)` selects
+> `from <= effective < to` — matching the querier's implemented
+> predicate and RFC 0010's locally-pinned `[from, to)` (which
+> noted this RFC had not pinned boundary semantics; it now does).
 
 `trace_id` / `span_id` literals are **hex strings** (32 and 16 hex digits
 respectively, no separators), **parsed case-insensitively** so uppercase

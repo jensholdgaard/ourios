@@ -25,8 +25,10 @@
 //! reference (`<severity_text> <body>` per record — the flat file a
 //! traditional logger would have written, one zstd block per hour)
 //! and picks the severity to query (`ERROR`, or the busiest
-//! error-band text). The query window is the corpus's full timestamp
-//! span, so the reference scans the same in-window set. **OTLP
+//! error-band text). The query window is the corpus's full
+//! *effective*-timestamp span (RFC 0005 §3.2 — `timeUnixNano`, else
+//! `observedTimeUnixNano`), so the reference scans the same in-window
+//! set and observed-only corpora are B1-eligible. **OTLP
 //! corpora only**: the RFC 0006 §3.3 plain-text loader fixes every
 //! line at severity `9` / `INFO`, so a severity predicate over a
 //! plain-text corpus has no selectivity — such dirs are skipped with
@@ -272,7 +274,9 @@ fn real_corpus(c: &mut Criterion) {
 }
 
 /// The B1 query for a built real-corpus store: the chosen error-band
-/// severity over the corpus's full timestamp span, half-open
+/// severity over the corpus's full *effective*-timestamp span
+/// (RFC 0005 §3.2 amendment 2026-06-11 — observed-only corpora are
+/// B1-eligible; only genuinely timeless rows disqualify), half-open
 /// (`max + 1` keeps the last record in-window; clamped like b2's
 /// windowed arm so a near-2262 corpus can't push the bound past the
 /// querier's i64 range). `None` (with a skip note) when the corpus
@@ -291,22 +295,23 @@ fn severity_query(built: &ourios_bench::B1Store, dir: &str) -> Option<(String, Q
         eprintln!("b1/real-corpus: {dir} has no error-band severity_text rows — skipping");
         return None;
     };
-    if built.min_time_unix_nano == 0 || built.zero_ts_rows > 0 {
+    if built.min_effective_time_unix_nano == 0 || built.zero_effective_ts_rows > 0 {
         eprintln!(
-            "b1/real-corpus: {dir} — no usable timestamp span ({} zero-ts rows); the B1 \
-             query needs a real time window — skipping",
-            built.zero_ts_rows,
+            "b1/real-corpus: {dir} — no usable effective-timestamp span ({} \
+             zero-effective-ts rows, i.e. neither timeUnixNano nor \
+             observedTimeUnixNano); the B1 query needs a real time window — skipping",
+            built.zero_effective_ts_rows,
         );
         return None;
     }
     #[allow(clippy::cast_sign_loss)] // i64::MAX as u64 is exact
     let window_end = built
-        .max_time_unix_nano
+        .max_effective_time_unix_nano
         .saturating_add(1)
         .min(i64::MAX as u64);
     let query = QueryRequest {
         tenant: TenantId::new(built.tenant),
-        time_range: Some((built.min_time_unix_nano, window_end)),
+        time_range: Some((built.min_effective_time_unix_nano, window_end)),
         template_id: None,
         severity_text: Some(severity.clone()),
     };

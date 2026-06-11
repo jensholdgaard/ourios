@@ -363,8 +363,35 @@ prior draft:
 | `trace_id`, `span_id` | the dedicated columns (log↔trace correlation) |
 | `scope` | `scope_name` |
 | `severity` | `severity_number` (via the §6.1 mapping) |
-| `ts` | `time_unix_nano` (the event timestamp; what `range(...)` filters) |
+| `ts` | `time_unix_nano` (the verbatim event timestamp) |
 | `observed_ts` | `observed_time_unix_nano` |
+
+> **Amendment 2026-06-11 — `range(...)` filters the effective
+> timestamp.** This table previously noted that `ts` /
+> `time_unix_nano` is "what `range(...)` filters". Per RFC 0005
+> §3.2 (amendment of the same date), the time window **shall**
+> compile against the derived `effective_time_unix_nano` column —
+> `time_unix_nano` when non-zero, else
+> `observed_time_unix_nano.unwrap_or(0)` (RFC 0005 §3.2 is the
+> normative derivation; a record with neither timestamp stays at
+> `0`). The implementing slice follows this amendment; until it
+> lands, the querier filters `time_unix_nano` directly. The change
+> makes records whose source timestamp
+> is unknown (`time_unix_nano = 0` — ~15 % of real OTel-Demo
+> corpora, per the OTLP logs data model's "Use `Timestamp` if it
+> is present, otherwise use `ObservedTimestamp`" recommendation)
+> addressable by time. The bare `ts` field is unchanged — it
+> still resolves to `time_unix_nano`, the verbatim wire value
+> (RFC 0001 scenario RFC0001.10). For files written before the
+> column existed the window applies `effective :=
+> time_unix_nano` (the RFC 0005 §3.9 documented default — exactly
+> the pre-amendment behaviour), **not** the absent-OPTIONAL-column
+> ⇒ predicate-false convention. The window bounds are
+> **half-open** — `range(from, to)` selects
+> `from <= effective < to`. The half-open shape is what the
+> querier already implements today (over `time_unix_nano`) and
+> matches RFC 0010's locally-pinned `[from, to)` (which noted
+> this RFC had not pinned boundary semantics; it now does).
 
 `trace_id` / `span_id` literals are **hex strings** (32 and 16 hex digits
 respectively, no separators), **parsed case-insensitively** so uppercase

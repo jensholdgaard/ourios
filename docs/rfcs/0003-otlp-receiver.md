@@ -791,6 +791,19 @@ violate `[§3.4]`.
 > the record, since the §6.2 step-0 fork only needs to read
 > the discriminator.
 
+> **Amendment 2026-06-11 — the effective timestamp is derived
+> downstream, not here.** RFC 0005 §3.2 (amendment of the same
+> date) adds a writer-derived `effective_time_unix_nano` Parquet
+> column (`time_unix_nano` when non-zero, else
+> `observed_time_unix_nano.unwrap_or(0)` — RFC 0005 §3.2 is the
+> normative derivation). The receiver's contract is
+> **unchanged**: `time_unix_nano` is carried verbatim from the
+> wire including `0` (RFC 0001 scenario RFC0001.10), and the
+> wire-`0` → `None` rule for `observed_time_unix_nano` stands.
+> No effective-timestamp field is materialised on
+> `OtlpLogRecord`; the derivation happens at the Parquet writer
+> from the two fields below, and never overwrites either.
+
 The receiver materialises each wire-level `LogRecord` (plus its
 inherited `Resource` and `InstrumentationScope` context) into a
 single owned struct. The authoritative definition lives in the

@@ -39,16 +39,19 @@ jobs:
   docs:
     name: cargo doc
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The [workspace.lints.rustdoc] denies (broken intra-doc links
-      # etc., #124) fail this build, so doc rot is caught in CI, not
-      # in review comments.
+      # The [workspace.lints.rustdoc] levels are the single source of
+      # truth: the deny-level lints (broken intra-doc links etc.,
+      # #124) fail this build on their own; no RUSTDOCFLAGS override,
+      # so `bare_urls = "warn"` stays advisory in CI too.
       - run: cargo doc --workspace --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
 
   test:
     name: cargo test

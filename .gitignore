@@ -22,6 +22,10 @@
 # scheduled-task lock file is per-machine ephemera that leaked into
 # PR #62 once and shouldn't again.
 /.claude/scheduled_tasks.lock
+# Per-machine permission allowlist — same leak class (swept into a
+# PR by `git add -A` once); the tracked `.claude/` content above is
+# unaffected.
+/.claude/settings.json
 
 # Cargo.lock is NOT ignored — Ourios is a binary (CLAUDE.md §1) and its
 # lockfile is part of the reproducible-build contract.

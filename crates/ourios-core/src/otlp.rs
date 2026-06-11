@@ -93,11 +93,11 @@ pub struct OtlpLogRecord {
 /// The `body.kind` fork from RFC 0001 §6.2 step 0.
 ///
 /// The `Structured` variant carries the decoded `AnyValue` rather
-/// than its Ourios-canonical JSON encoding — canonicalisation is
-/// deferred to the storage layer so the in-memory record stays
-/// optionality-rich (a future "mine inner field" mode per
-/// RFC 0001 §6.1 needs the structured tree, not pre-cached
-/// bytes). RFC 0003 §6.4 carries the corresponding amendment.
+/// than its Ourios-canonical JSON encoding — the receiver hands the
+/// miner the tree verbatim, and canonicalisation happens once, at
+/// ingest, inside the miner (RFC 0003 §6.4). Keeping the tree on the
+/// in-memory record is what preserves a future "mine inner field"
+/// mode (RFC 0001 §6.1): any such hook runs before the encode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     /// `LogRecord.body` was `AnyValue::String` — the unwrapped
@@ -111,14 +111,11 @@ pub enum Body {
     /// sentinel template id per §6.1 *Template-key composition*.
     ///
     /// **Wire-export round-trip rule (RFC 0003 implementer note).**
-    /// The *target* on-disk encoding for `MinedRecord.body` on
-    /// `Structured` rows is the Ourios-canonical JSON per RFC 0005 §3.3.
-    /// The *current* miner implementation (in
-    /// `ourios-miner::cluster::ingest_structured`) writes the
-    /// `Debug` rendering of the decoded `AnyValue` (`format!(
-    /// "{any_value:?}")`) as an interim placeholder — the
-    /// canonicalisation PR replaces it before any wire-export
-    /// path lands. Either way, the future OTLP exporter MUST
+    /// The on-disk encoding for `MinedRecord.body` on `Structured`
+    /// rows is the Ourios-canonical JSON per RFC 0005 §3.3, produced
+    /// by `ourios-miner::cluster::ingest_structured` via this
+    /// module's `canonical::encode_any_value`. The future OTLP
+    /// exporter MUST
     /// decode the stored bytes back into the matching `AnyValue`
     /// variant (the `opentelemetry_proto::tonic::common::v1::
     /// any_value::Value` enum — `KvlistValue`, `ArrayValue`,

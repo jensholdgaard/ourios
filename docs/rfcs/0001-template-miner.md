@@ -891,6 +891,25 @@ get a template extracted.
 > `otlp::canonical` (a separate follow-up PR aligns its doc
 > comments).
 
+> **Amendment 2026-06-11 (doubles round-trip bit-exactly — #130).**
+> The rule below previously left `double` precision implicit, and
+> `decode(encode(x))` drifted 1–2 ULP for ~12% of arbitrary finite
+> `f64`. Investigating #130 located the loss on the **decode**
+> side, not the encoder: the emitter already produces
+> shortest-round-trip digits (`serde_json`'s Ryu `f64` formatter —
+> `with-serde` adds no custom double formatter), but `serde_json`'s
+> default float *parsing* is approximate. The rule now pins both
+> halves: doubles are emitted as shortest-round-trip JSON numbers
+> and decoded with correctly-rounded float parsing (`serde_json`'s
+> `float_roundtrip` feature, declared load-bearing in
+> `ourios-core`), so the `f64` round-trip is exact for every
+> finite double — the faithfulness guarantee below holds for
+> arbitrary doubles, not just "nice" ones. Non-finite doubles
+> (`NaN`, ±∞) have no JSON-number form and encode as `null` —
+> bytes that do **not** decode back; that pre-existing gap is
+> explicitly out of scope here and stays open. No RFC `status`
+> change.
+
 The `body` column carries the **Ourios canonical body
 encoding** of the `AnyValue`: a proto3-JSON form, defined
 below. This is an **Ourios-local deterministic convention, not
@@ -914,6 +933,10 @@ The concrete rule is the proto3 JSON mapping **as emitted by
 - field names in `lowerCamelCase`;
 - `int64` / `uint64` values as **decimal strings** (proto3 JSON's
   canonical emit form; decoders accept a JSON number or string);
+- `double` values as JSON numbers in **shortest-round-trip**
+  form, decoded with correctly-rounded float parsing —
+  `decode(encode(x))` is bit-exact for every finite `f64`
+  (#130; see the 2026-06-11 amendment above);
 - `bytes` as **base64**;
 - `KvlistValue` and `ArrayValue` element order **preserved as
   received — not sorted** (this is explicitly **not** RFC 8785 /

@@ -199,7 +199,7 @@ impl Body {
 ///
 /// The "canonical" rule is the proto3 JSON mapping plus OTLP's
 /// specific overrides (camelCase fields, `string`-encoded
-/// `uint64`s, base64 for `bytes`, etc.). The
+/// `int64`s, base64 for `bytes`, etc.). The
 /// `opentelemetry-proto` crate's `with-serde` feature already
 /// implements that spec on its proto types — these helpers are
 /// thin wrappers so callers don't reach for `serde_json`
@@ -211,6 +211,21 @@ impl Body {
 /// a fixed field order and `serde_json` is deterministic, so
 /// re-encoding the same in-memory tree produces byte-identical
 /// output across runs — required by RFC0006.7 reproducibility.
+///
+/// **`f64` exactness (#130).** The encode side already emits
+/// shortest-round-trip digits (doubles go through `serde_json`'s
+/// Ryu `f64` serializer). The lossy half was **decode**:
+/// `serde_json`'s default float parsing is approximate, drifting
+/// `decode(encode(x))` by 1–2 ULP for ~12% of arbitrary finite
+/// `f64`. This crate therefore requires `serde_json`'s
+/// `float_roundtrip` feature (declared in `Cargo.toml`), which
+/// makes float parsing correctly rounded and the finite-`f64`
+/// round-trip bit-exact — the RFC 0001 §6.1 faithfulness
+/// guarantee (`lossy_flag = false`) rests on it. Pinned by the
+/// `finite_doubles_round_trip_bit_exact` property test below.
+/// Non-finite doubles (`NaN`, ±∞) have no JSON-number form and
+/// encode as `null` — bytes that do **not** decode; a known,
+/// pre-existing gap independent of #130.
 ///
 /// **Note on "canonical".** RFC 0005 §3.3 uses "canonical" to
 /// mean "the single normative encoding the writer / reader
@@ -226,9 +241,10 @@ pub mod canonical {
     /// Encoders are infallible on every `AnyValue` /
     /// `Vec<KeyValue>` the type system admits —
     /// `opentelemetry-proto`'s `with-serde` ships custom
-    /// serializers for the proto3-JSON oddities (`f64::NAN`
-    /// → `"NaN"` string, `i64` → string-encoded JSON number,
-    /// `bytes` → base64) so the recursive primitives never
+    /// serializers for the proto3-JSON oddities (`i64` →
+    /// string-encoded JSON number, `bytes` → base64; non-finite
+    /// `f64` falls back to `serde_json`'s `null`, not the proto3
+    /// `"NaN"` strings) so the recursive primitives never
     /// panic or return an error. The `Encode` arm exists only
     /// for `Result`-symmetry with `Decode` and as a defence-
     /// in-depth surface if a future `opentelemetry-proto`
@@ -257,7 +273,7 @@ pub mod canonical {
         }
     }
 
-    /// Encode one `AnyValue` to its OTLP-canonical JSON bytes.
+    /// Encode one `AnyValue` to its Ourios-canonical JSON bytes.
     /// Used by the writer / miner for `body_kind = Structured`
     /// rows (the `body` column stores these bytes).
     ///
@@ -287,7 +303,7 @@ pub mod canonical {
 
     /// Encode a `Vec<KeyValue>` (the in-memory shape of
     /// `attributes` / `resource_attributes`) to its
-    /// OTLP-canonical JSON bytes. Stored verbatim in the
+    /// Ourios-canonical JSON bytes. Stored verbatim in the
     /// matching `BYTE_ARRAY` column by the writer.
     ///
     /// # Errors
@@ -519,6 +535,117 @@ pub mod canonical {
             assert_eq!(bytes, b"[]");
             let back = decode_attributes(&bytes).expect("decode");
             assert!(back.is_empty());
+        }
+
+        fn double_av(x: f64) -> AnyValue {
+            AnyValue {
+                value: Some(any_value::Value::DoubleValue(x)),
+            }
+        }
+
+        /// #130 regression: without `serde_json`'s
+        /// `float_roundtrip` feature, decoding the repro value's
+        /// stored bytes came back one ULP off (`…255e99` →
+        /// `…257e99`) — the default float parser is approximate.
+        /// Every finite `f64` must round-trip bit-exactly, the
+        /// sign of `-0.0` included.
+        #[test]
+        fn doubles_round_trip_bit_exact_including_issue_130_repro() {
+            for x in [
+                -1.537_408_465_042_525_5e99,
+                -0.0,
+                0.0,
+                f64::MAX,
+                f64::MIN_POSITIVE,
+                5e-324,
+            ] {
+                let bytes = encode_any_value(&double_av(x)).expect("encode");
+                let back = decode_any_value(&bytes).expect("decode");
+                let Some(any_value::Value::DoubleValue(y)) = back.value else {
+                    panic!("decoded variant drifted for {x:?}");
+                };
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "f64 round-trip not bit-exact for {x:?}: got {y:?} via {}",
+                    String::from_utf8_lossy(&bytes),
+                );
+            }
+        }
+
+        /// Non-finite doubles have no JSON-number form; the
+        /// `with-serde` encoder emits `{"doubleValue":null}` for
+        /// them (captured empirically — **not** the proto3-JSON
+        /// `"NaN"` / `"Infinity"` strings). Pinned so an upstream
+        /// change can't drift stored bytes silently. Decoding
+        /// these bytes fails — a known, pre-existing gap
+        /// independent of #130.
+        #[test]
+        fn nonfinite_doubles_encode_to_the_null_shape() {
+            for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let bytes = encode_any_value(&double_av(x)).expect("encode");
+                assert_eq!(bytes, br#"{"doubleValue":null}"#, "drift for {x:?}");
+            }
+        }
+
+        /// Walks to the single double planted by the round-trip
+        /// property below, whatever nesting it sits at.
+        fn planted_double_bits(av: &AnyValue) -> u64 {
+            match &av.value {
+                Some(any_value::Value::DoubleValue(x)) => x.to_bits(),
+                Some(any_value::Value::ArrayValue(array)) => planted_double_bits(&array.values[0]),
+                Some(any_value::Value::KvlistValue(kvlist)) => planted_double_bits(
+                    kvlist.values[0]
+                        .value
+                        .as_ref()
+                        .expect("kv carries the double"),
+                ),
+                other => panic!("expected the planted double, got {other:?}"),
+            }
+        }
+
+        proptest::proptest! {
+            /// RFC 0001 §6.1 faithfulness for arbitrary finite
+            /// doubles (#130): `decode(encode(x))` is bit-exact at
+            /// top level and nested inside array / kvlist.
+            #[test]
+            fn finite_doubles_round_trip_bit_exact(bits in proptest::prelude::any::<u64>()) {
+                let x = f64::from_bits(bits);
+                proptest::prop_assume!(x.is_finite());
+
+                let nestings = [
+                    double_av(x),
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(
+                            opentelemetry_proto::tonic::common::v1::ArrayValue {
+                                values: vec![double_av(x)],
+                            },
+                        )),
+                    },
+                    AnyValue {
+                        value: Some(any_value::Value::KvlistValue(
+                            opentelemetry_proto::tonic::common::v1::KeyValueList {
+                                values: vec![KeyValue {
+                                    key: "k".to_string(),
+                                    value: Some(double_av(x)),
+                                    ..Default::default()
+                                }],
+                            },
+                        )),
+                    },
+                ];
+                for av in nestings {
+                    let bytes = encode_any_value(&av).expect("encode");
+                    let back = decode_any_value(&bytes).expect("decode");
+                    proptest::prop_assert_eq!(
+                        planted_double_bits(&back),
+                        x.to_bits(),
+                        "not bit-exact for {:?} via {}",
+                        x,
+                        String::from_utf8_lossy(&bytes),
+                    );
+                }
+            }
         }
     }
 }

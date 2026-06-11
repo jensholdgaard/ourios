@@ -635,10 +635,11 @@ fn writer_properties(zstd: ZstdLevel) -> WriterProperties {
     // (`attributes`, `trace_id`, `span_id`) or non-text numeric
     // columns where dict-encoding adds overhead without payoff
     // (`time_unix_nano`, `observed_time_unix_nano`,
-    // `confidence`).
+    // `effective_time_unix_nano`, `confidence`).
     for no_dict_col in [
         crate::columns::TIME_UNIX_NANO,
         crate::columns::OBSERVED_TIME_UNIX_NANO,
+        crate::columns::EFFECTIVE_TIME_UNIX_NANO,
         crate::columns::ATTRIBUTES,
         crate::columns::TRACE_ID,
         crate::columns::SPAN_ID,

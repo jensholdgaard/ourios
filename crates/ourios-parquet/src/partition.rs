@@ -76,7 +76,7 @@ impl PartitionKey {
     /// timestamp exceeds `i64::MAX` — the writer-rejects-overflow
     /// contract from RFC 0005 §3.2.
     pub fn derive(record: &MinedRecord) -> Result<Self, TimestampOverflowError> {
-        let chosen = choose_partition_timestamp(record)?;
+        let chosen = effective_time_unix_nano(record)?;
         // chosen is already i64-safe (checked above); `chrono::
         // DateTime::from_timestamp_nanos` accepts i64.
         let dt = DateTime::<Utc>::from_timestamp_nanos(chosen);
@@ -182,12 +182,23 @@ fn hour_span_ns(year: i32, month: u32, day: u32, hour: u32) -> Option<(u64, u64)
     Some((lo, lo.saturating_add(HOUR_NANOS)))
 }
 
-/// Choose the nanosecond timestamp for partition derivation per
-/// §3.4: prefer `time_unix_nano` if non-zero, else
-/// `observed_time_unix_nano` if non-zero, else the 1970 epoch
-/// (returned as `0_i64`). Each candidate is checked against the
-/// `u64`→`i64` overflow contract before being adopted.
-fn choose_partition_timestamp(record: &MinedRecord) -> Result<i64, TimestampOverflowError> {
+/// The RFC 0005 §3.2 **effective timestamp** (amendment
+/// 2026-06-11): `time_unix_nano` if non-zero, else
+/// `observed_time_unix_nano` if non-zero, else `0` (the 1970
+/// epoch). Each candidate is checked against the §3.2 `u64`→`i64`
+/// overflow contract before being adopted.
+///
+/// This single function feeds both the §3.4 partition derivation
+/// ([`PartitionKey::derive`]) and the stored
+/// `effective_time_unix_nano` column (the record-batch writer), so
+/// the partition tuple and the column can never disagree — the
+/// §3.4 "never disagree" rule is structural, not a convention.
+///
+/// # Errors
+///
+/// Returns [`TimestampOverflowError`] if the chosen nanosecond
+/// timestamp exceeds `i64::MAX`.
+pub fn effective_time_unix_nano(record: &MinedRecord) -> Result<i64, TimestampOverflowError> {
     if record.time_unix_nano != 0 {
         return i64::try_from(record.time_unix_nano).map_err(|_| TimestampOverflowError {
             field: "time_unix_nano",

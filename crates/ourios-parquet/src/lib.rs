@@ -46,8 +46,8 @@ pub use compaction::{
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError};
 pub use partition::{
-    PartitionKey, TimestampOverflowError, hour_partition_in_window, percent_decode_tenant,
-    percent_encode_tenant,
+    PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
+    percent_decode_tenant, percent_encode_tenant,
 };
 pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};
@@ -66,6 +66,7 @@ pub mod columns {
     pub const TEMPLATE_VERSION: &str = "template_version";
     pub const TIME_UNIX_NANO: &str = "time_unix_nano";
     pub const OBSERVED_TIME_UNIX_NANO: &str = "observed_time_unix_nano";
+    pub const EFFECTIVE_TIME_UNIX_NANO: &str = "effective_time_unix_nano";
     pub const SEVERITY_NUMBER: &str = "severity_number";
     pub const SEVERITY_TEXT: &str = "severity_text";
     pub const SCOPE_NAME: &str = "scope_name";
@@ -144,6 +145,15 @@ pub fn data_schema() -> SchemaRef {
         ),
         Field::new(
             columns::OBSERVED_TIME_UNIX_NANO,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(utc.clone())),
+            true,
+        ),
+        // OPTIONAL per §3.8 rule 1 (additive amendment 2026-06-11);
+        // the writer always populates it, NULL appears only in
+        // pre-amendment files (the §3.9 rule-2 read default is the
+        // row's `time_unix_nano`, not `None`).
+        Field::new(
+            columns::EFFECTIVE_TIME_UNIX_NANO,
             DataType::Timestamp(TimeUnit::Nanosecond, Some(utc)),
             true,
         ),

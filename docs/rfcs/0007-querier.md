@@ -25,6 +25,28 @@ superseded-by: —
 > advances to `green`. `validated` (the B1/B2 thesis-gate measurement,
 > `docs/benchmarks.md`) and `accepted` follow per the
 > `docs/rfcs/README.md` ladder.
+>
+> **Validated assessment (2026-06-12).** The first B1/B2 measurements
+> exist (`docs/benchmarks.md` §9.3; query-bench runs 27379085890 +
+> 27357104694, recorded per maintainer authorization of 2026-06-12):
+> B1 clears its ≥ 10× gate at **40.0× / 30.4×** on two ~1 GB
+> OTel-Demo corpora with exact row-count agreement against the
+> reference pipeline, and B2's windowed scan stays **flat** (1 row
+> group, ~3.4–4.1 ms) from v4 → v6 while the full-span variant grows
+> with the corpus. What the ladder requires that is **not** yet met:
+> `validated` reads "thesis-gates pass on representative corpora"
+> against `docs/benchmarks.md` §1, which quotes every must-win number
+> on `baseline-8vcpu-32gib` — all runs so far are `ci-runner`
+> (indicative). Further weaknesses, stated plainly: the B1 error
+> bands are ultra-thin (11 / 28 rows — the friendliest case for
+> pruning), both corpora sit just under §8's 1 GiB binary minimum,
+> and only one corpus family has fed the gates (OTel-Demo; the
+> LogHub HDFS_v1 B2 arm hasn't run). The status therefore **stays
+> `green`**. Validated-pending checklist: (1) authoritative rerun on
+> `baseline-8vcpu-32gib` — required; (2) a denser error band (or a
+> less extreme B1 selectivity point) — supporting; (3) a second
+> corpus family for B2 (HDFS_v1 via the query-bench `fetch_hdfs`
+> arm) — supporting.
 
 ## 1. Summary
 

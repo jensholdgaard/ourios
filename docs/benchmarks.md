@@ -145,8 +145,13 @@ exploit structure the tree extracted.
   plain-text corpus has no selectivity and such dirs are skipped
   with a note. CI runs land via
   `.github/workflows/query-bench.yml` on `ci-runner` — indicative,
-  non-authoritative pending a `baseline-8vcpu-32gib` rerun — and
-  are not recorded in §9.
+  non-authoritative pending a `baseline-8vcpu-32gib` rerun. The
+  first real-corpus readings (2026-06-11, §9.3) pass the ≥ 10×
+  gate **indicatively** on both ~1 GB OTel-Demo corpora (40.0× /
+  30.4×, exact row-count agreement with the reference pipeline);
+  canonical numbers on the §1 baseline are still pending, and the
+  measured error bands were ultra-thin (11 / 28 rows), which
+  flatters pruning.
 
 ### B2 `[THESIS]` — Template-exact queries
 
@@ -174,8 +179,12 @@ exploit structure the tree extracted.
   text LogHub HDFS_v1 (§1). Run with
   `cargo bench -p ourios-bench --bench b2`. CI runs land via
   `.github/workflows/query-bench.yml` on `ci-runner` — indicative,
-  non-authoritative pending a `baseline-8vcpu-32gib` rerun — and
-  are not recorded in §9.
+  non-authoritative pending a `baseline-8vcpu-32gib` rerun. The
+  2026-06-11 readings (§9.3) confirm the flat shape on real
+  corpora: the windowed template-exact scan stays at 1 row group
+  from v4 → v6 with a flat ~3.4–4.1 ms latency band, while the
+  full-span variant grows with corpus size — supportive, though
+  the formal target speaks above ~10 GiB, which is unmeasured.
 
 ### B3 — Substring queries (the hard case)
 
@@ -365,8 +374,13 @@ structurally in `ourios-querier`, and both have `criterion` latency
 benches with real-corpus arms (§B1/§B2 "Instruments"; OTel-Demo for
 B1, OTel-Demo + the bench-time-fetched LogHub HDFS_v1 for B2, run
 on `ci-runner` via `.github/workflows/query-bench.yml` as
-indicative numbers) — but canonical query numbers on the §1
-hardware against a ≥ 1 GiB corpus are still pending.
+indicative numbers). **2026-06-11** extended the writer-side scale
+series to ~1 GB (§9.2) and landed the **first B1/B2 query
+readings** (§9.3) — recorded here as indicative `ci-runner`
+entries per the maintainer's 2026-06-12 authorization. Canonical
+numbers on the §1 hardware (`baseline-8vcpu-32gib`) are still
+pending for every gate; RFC 0007 stays `green` with a
+validated-pending note (see its status note and §9.3).
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant
@@ -451,3 +465,110 @@ this is "corpus-specific," not the two-gate pillar-level pause. C1 + C2 support 
 The production ZSTD-3 default is retained: the codec gain is small,
 saturates by level 9, and the residual gap is structural, so a
 higher default isn't worth the ingest-CPU.
+
+### 9.2 Results — 2026-06-11 (diagnostic, `ci-runner`) — A1 / C1 / C2 at ~1 GB
+
+**Corpus.** `corpus/otel-demo-v5` (1,042,274,219 B) and
+`corpus/otel-demo-v6` (1,034,615,505 B) — same capture pipeline as
+§9.1, extending the scale series to ~1 GB (both within 4% of, but
+still just under, §8's ≥ 1 GiB binary minimum). v6 was captured
+with the OTel Demo failure flags enabled (`adFailure cartFailure
+productCatalogFailure`), so it carries a real error band; v5 is an
+unflagged capture.
+**Hardware.** `ci-runner` — indicative, not the §1 baseline.
+**Runs.** `bench.yml` 27370641352 (v5), 27373716667 (v6).
+
+**A1 — compression (target: ourios ≥ 3.0× zstd-19).**
+
+| corpus | size | run | ourios | zstd-19 | A1 delta |
+|---|---|---|---|---|---|
+| v5 | 1,042,274,219 B | 27370641352 | 26.3× | 31.7× | 0.828 |
+| v6 | 1,034,615,505 B | 27373716667 | 26.0× | 31.5× | 0.824 |
+
+**A1 verdict: FAIL** (target 3.0×). The scale series now reads
+0.465 (v1, 30 MiB) → 0.666 (v2) → 0.725 (v3) → 0.758 (v4) →
+0.828 (v5) / 0.824 (v6): the delta is size-driven and still
+rising, but decelerating — the crossover is not reached at ~1 GB,
+consistent with §9.1's structural reading (ourios asymptotes
+~26×; zstd-19 stays flat ~32×). v5 ≈ v6 shows the failure-flag
+error band does not perturb A1. This is the first A1 miss at
+(essentially) canonical size, so §9.1's "size-non-representative"
+mitigation no longer applies; it remains a single-gate fail (no
+§7 two-gate pause), the §9.1 structural explanation stands, and
+the thesis-deciding counterpart — B1/B2 — now passes indicatively
+(§9.3). Whether the §7 corpus-specific tuning-RFC response
+triggers is a maintainer decision, sensibly taken once an
+authoritative `baseline-8vcpu-32gib` run confirms the number.
+
+**C1 — reconstruction (target: 100% bit-identical or flagged
+lossy). PASS** on both: 1.000000 — v5 reconstructs
+1,213,004 / 1,213,004 non-lossy rows exactly (lossy ratio
+0.0114); v6 1,208,323 / 1,208,323 (lossy 0.0112).
+
+**C2 — template-count convergence (target: ratio ≥ 0.5 at 1 M
+lines). PASS** on both — and for the first time on ≥ 1 M-line
+corpora, so the formal gate applies rather than §9.1's
+abstention: v5 convergence ratio 0.756 (end count 1605, sample
+cadence 1336); v6 ratio 0.760 (end count 1606, cadence 1329).
+
+### 9.3 Results — 2026-06-11 (indicative, `ci-runner`) — first B1 / B2 query readings
+
+**Corpus.** `corpus/otel-demo-v{4,5,6}` (the §9.1 / §9.2
+captures). The LogHub HDFS_v1 B2 arm did not run (`fetch_hdfs`
+off — memory-bound on the hosted runner), so only one corpus
+family has fed the query gates.
+**Hardware.** `ci-runner` — indicative, not the §1 baseline.
+**Runs.** `query-bench.yml` 27379085890 (B1 + the B2 structural
+metrics, after the effective-timestamp stack #178/#179) and
+27357104694 (the prior run; its windowed / full-span latencies
+are quoted where noted).
+**Recording.** B1/B2 entries land in §9 per the maintainer's
+2026-06-12 authorization. RFC 0006 never reserved §9 (its §1
+anticipated B1/B2 landing "in a follow-up extension PR once the
+querier is live" — RFC 0007); the workflow itself never writes
+§9 — every entry here is curated by hand.
+
+**B1 — predicate pushdown vs `zstdcat | grep` (target: ≥ 10× at
+1 GiB).** Query: severity `ERROR`, full corpus span. Run
+27379085890:
+
+| corpus | rows | RGs scanned | ourios bytes | reference bytes (zstd) | ourios | reference | speedup |
+|---|---|---|---|---|---|---|---|
+| v5 | 11 | 3/6 | 326,102 | 1,403,025 | 6.14 ms | 245.5 ms | 40.0× |
+| v6 | 28 | 5/6 | 764,082 | 1,455,912 | 8.50 ms | 258.5 ms | 30.4× |
+
+Row counts agree **exactly** with the reference pipeline on both
+corpora. v4 is skipped: the unflagged 100-user capture genuinely
+contains zero error-band rows, so the predicate selects nothing.
+
+**B1 verdict: PASS (indicative)** — both corpora clear the ≥ 10×
+bar at 3–4× margin, on the first real-corpus reading. Caveats,
+stated plainly: `ci-runner`, not the §1 baseline; the error
+bands are ultra-thin (11 / 28 rows — extreme selectivity is the
+friendliest case for pruning); both corpora sit just under the
+§8 1 GiB minimum. An authoritative `baseline-8vcpu-32gib` rerun
+(ideally with a denser error band) is required before this
+counts as the canonical B1 number.
+
+**B2 — template-exact latency ∝ result, not corpus.** Windowed
+1-hour template-exact query, result roughly constant as the
+corpus grows. Structural metrics (run 27379085890): scanned row
+groups stay **flat at 1** — v4 1/5, v5 1/6 (17,632 rows,
+1.86 MB), v6 1/6 (11,750 rows, 1.59 MB). Wall-clock (prior run
+27357104694): windowed latencies sit in a flat ~3.4–4.1 ms band
+(v4 3.59 / v5 4.13 / v6 3.40 ms) while the full-span variant
+grows with corpus size (7.3 / 10.6 / 10.6 ms) — exactly the
+result-bound-vs-corpus-bound split the gate asks for.
+
+**B2 verdict: PASS (supportive, indicative)** — the flat shape
+is confirmed on real corpora at ~1 GB; the formal target speaks
+above ~10 GiB, which remains unmeasured, and the second corpus
+family (HDFS_v1) hasn't fed the arm yet.
+
+**RFC 0007 validated assessment.** These are the measurements
+the RFC 0007 `green → validated` gate needs, but not yet in the
+form the ladder requires (§1 quotes must-win numbers against
+`baseline-8vcpu-32gib`): see the status note in
+`docs/rfcs/0007-querier.md`. The RFC stays `green` with a
+validated-pending note — authoritative baseline rerun required;
+denser error band and a second corpus family supporting.

@@ -1,15 +1,19 @@
 name: Query bench
 
-# On-demand B1/B2 query-gate measurement, producing a SEPARATE
-# query-results artifact — deliberately NOT recorded in
-# `docs/benchmarks.md` §9.
+# On-demand B1/B2 query-gate measurement, producing a separate
+# query-results artifact.
 #
-# §9 is reserved for the writer-side gates A1/C1/C2 (RFC 0006 §5);
-# recording B1/B2 there would change the thesis-gate contract and
-# require an RFC 0006 amendment (maintainer decision, deferred). So
-# this workflow uploads the structural query metrics — B1 pruned
-# fraction + the B2 partition-pruning row-group counts — as a build
-# artifact + a job summary, never touching §9.
+# Runs the maintainer selects ARE recorded in `docs/benchmarks.md`
+# §9 as indicative `ci-runner` entries (maintainer authorization,
+# 2026-06-12; first recording: §9.3). RFC 0006 never reserved §9 —
+# its §1 explicitly anticipated B1/B2 landing "in a follow-up
+# extension PR once the querier is live" (now RFC 0007) — so no
+# RFC 0006 amendment is needed; the earlier "reserved for A1/C1/C2"
+# note here was a workflow-comment convention only. Recording stays
+# a deliberate human act: this workflow uploads the structural
+# query metrics — B1 pruned fraction + the B2 partition-pruning
+# row-group counts — as a build artifact + a job summary, and never
+# writes §9 itself.
 #
 # Whichever corpus it runs against, the numbers are INDICATIVE only: a
 # hosted runner is not the `docs/benchmarks.md` §1 hardware baseline
@@ -223,12 +227,12 @@ jobs:
               || echo '(no timings — the run failed before producing them)'
             echo '```'
             echo
-            echo '> **Indicative only, and a SEPARATE artifact.** A hosted runner is not'
-            echo '> the `docs/benchmarks.md` §1 baseline (`baseline-8vcpu-32gib`), so the'
-            echo '> criterion wall-clock numbers are not authoritative. These B1/B2 results'
-            echo '> are **not** recorded in benchmarks.md §9 (reserved for A1/C1/C2;'
-            echo '> recording B1/B2 there would need an RFC 0006 amendment). Full criterion'
-            echo '> output + the bench log are uploaded as the `query-bench` artifact.'
+            echo '> **Indicative only.** A hosted runner is not the `docs/benchmarks.md` §1'
+            echo '> baseline (`baseline-8vcpu-32gib`), so the criterion wall-clock numbers'
+            echo '> are not authoritative. Runs the maintainer selects are recorded in'
+            echo '> docs/benchmarks.md §9 as indicative `ci-runner` entries (curated by hand —'
+            echo '> this workflow never writes §9 itself). Full criterion output + the'
+            echo '> bench log are uploaded as the `query-bench` artifact.'
             echo '>'
             echo '> **LogHub HDFS_v1** is fetched from Zenodo at bench time and discarded'
             echo '> with the runner; only aggregate numbers appear here and in the artifact.'

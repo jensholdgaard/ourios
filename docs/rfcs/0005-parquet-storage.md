@@ -232,7 +232,7 @@ follows §3.4 (the partition layout), not §3.8 (the row schema).
 >    redundancy costs ≈ 8 B/row before encoding and almost always
 >    equals `time_unix_nano`, so `DELTA_BINARY_PACKED` + ZSTD
 >    collapse it (§3.6). A real column is what makes the window
->    predicate pruneable: a query-time fallback expression
+>    predicate prunable: a query-time fallback expression
 >    (`CASE WHEN time_unix_nano != 0 THEN time_unix_nano ELSE
 >    observed_time_unix_nano END` — `time_unix_nano` is REQUIRED
 >    with `0` as the unknown sentinel, so a plain `coalesce`
@@ -494,7 +494,7 @@ Per-column encoding decisions, anchored to query patterns
 | `template_version` | yes | yes | no | Always small per template |
 | `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page is what the window predicate prunes on in pre-amendment files (the §3.9 absent-column fallback) — `effective_time_unix_nano` below is the primary window column since the 2026-06-11 amendment |
 | `observed_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`; the observation timeline is also broadly monotonic, so delta encoding pays |
-| `effective_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`, which it almost always equals — `DELTA_BINARY_PACKED` collapses the redundancy. Min/max per page is what makes the B1 time-window predicate pruneable on this column (amendment 2026-06-11) |
+| `effective_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`, which it almost always equals — `DELTA_BINARY_PACKED` collapses the redundancy. Min/max per page is what makes the B1 time-window predicate prunable on this column (amendment 2026-06-11) |
 | `severity_number` | yes | yes | no | 0..24 — dict alone is enough |
 | `severity_text` | yes | yes | no | Bounded set in practice |
 | `scope_name` | yes | yes | no | Bounded per deployment |

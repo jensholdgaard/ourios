@@ -380,7 +380,7 @@ prior draft:
 > is unknown (`time_unix_nano = 0` — ~15 % of real OTel-Demo
 > corpora, per the OTLP logs data model's "Use `Timestamp` if it
 > is present, otherwise use `ObservedTimestamp`" recommendation)
-> are addressable by time. The bare `ts` field is unchanged — it
+> addressable by time. The bare `ts` field is unchanged — it
 > still resolves to `time_unix_nano`, the verbatim wire value
 > (RFC 0001 scenario RFC0001.10). For files written before the
 > column existed the window applies `effective :=

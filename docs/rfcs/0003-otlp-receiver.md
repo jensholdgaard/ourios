@@ -795,7 +795,8 @@ violate `[§3.4]`.
 > downstream, not here.** RFC 0005 §3.2 (amendment of the same
 > date) adds a writer-derived `effective_time_unix_nano` Parquet
 > column (`time_unix_nano` when non-zero, else
-> `observed_time_unix_nano`). The receiver's contract is
+> `observed_time_unix_nano.unwrap_or(0)` — RFC 0005 §3.2 is the
+> normative derivation). The receiver's contract is
 > **unchanged**: `time_unix_nano` is carried verbatim from the
 > wire including `0` (RFC 0001 scenario RFC0001.10), and the
 > wire-`0` → `None` rule for `observed_time_unix_nano` stands.

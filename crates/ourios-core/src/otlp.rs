@@ -93,7 +93,7 @@ pub struct OtlpLogRecord {
 /// The `body.kind` fork from RFC 0001 §6.2 step 0.
 ///
 /// The `Structured` variant carries the decoded `AnyValue` rather
-/// than its OTLP-canonical JSON encoding — canonicalisation is
+/// than its Ourios-canonical JSON encoding — canonicalisation is
 /// deferred to the storage layer so the in-memory record stays
 /// optionality-rich (a future "mine inner field" mode per
 /// RFC 0001 §6.1 needs the structured tree, not pre-cached
@@ -112,7 +112,7 @@ pub enum Body {
     ///
     /// **Wire-export round-trip rule (RFC 0003 implementer note).**
     /// The *target* on-disk encoding for `MinedRecord.body` on
-    /// `Structured` rows is OTLP-canonical JSON per RFC 0005 §3.3.
+    /// `Structured` rows is the Ourios-canonical JSON per RFC 0005 §3.3.
     /// The *current* miner implementation (in
     /// `ourios-miner::cluster::ingest_structured`) writes the
     /// `Debug` rendering of the decoded `AnyValue` (`format!(
@@ -192,7 +192,7 @@ impl Body {
     }
 }
 
-/// RFC 0005 §3.3 OTLP-canonical-JSON encoding for the columns
+/// RFC 0005 §3.3 Ourios-canonical-JSON encoding for the columns
 /// the writer stores as `BYTE_ARRAY`: `attributes`,
 /// `resource_attributes`, and the `body` column for
 /// `body_kind = Structured`.
@@ -259,8 +259,8 @@ pub mod canonical {
     impl core::fmt::Display for CanonicalJsonError {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
-                Self::Encode(e) => write!(f, "OTLP-canonical JSON encode: {e}"),
-                Self::Decode(e) => write!(f, "OTLP-canonical JSON decode: {e}"),
+                Self::Encode(e) => write!(f, "Ourios-canonical JSON encode: {e}"),
+                Self::Decode(e) => write!(f, "Ourios-canonical JSON decode: {e}"),
             }
         }
     }
@@ -585,6 +585,12 @@ pub mod canonical {
             for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let bytes = encode_any_value(&double_av(x)).expect("encode");
                 assert_eq!(bytes, br#"{"doubleValue":null}"#, "drift for {x:?}");
+                // The other half of the pinned gap: those bytes do not
+                // decode, so non-finite doubles never round-trip.
+                assert!(
+                    decode_any_value(&bytes).is_err(),
+                    "the null shape unexpectedly decoded for {x:?}",
+                );
             }
         }
 

@@ -230,7 +230,7 @@ jobs:
             echo '> **Indicative only.** A hosted runner is not the `docs/benchmarks.md` §1'
             echo '> baseline (`baseline-8vcpu-32gib`), so the criterion wall-clock numbers'
             echo '> are not authoritative. Runs the maintainer selects are recorded in'
-            echo '> benchmarks.md §9 as indicative `ci-runner` entries (curated by hand —'
+            echo '> docs/benchmarks.md §9 as indicative `ci-runner` entries (curated by hand —'
             echo '> this workflow never writes §9 itself). Full criterion output + the'
             echo '> bench log are uploaded as the `query-bench` artifact.'
             echo '>'

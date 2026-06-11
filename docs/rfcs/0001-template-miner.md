@@ -778,6 +778,21 @@ reconstruction group exists only when the body was mineable
 | `flags` | `u32` | `LogRecord.flags` | Lower 8 bits = W3C trace flags |
 | `event_name` | `Option<String>` | `LogRecord.event_name` | Identifier for structured-event records |
 
+> **Amendment 2026-06-11 — the effective timestamp lives in
+> RFC 0005, not here.** RFC 0005 §3.2 (amendment of the same
+> date) adds a **writer-derived** `effective_time_unix_nano`
+> Parquet column — `time_unix_nano` when non-zero, else
+> `observed_time_unix_nano`, else `0` — following the OTLP logs
+> data model's recommendation ("Use `Timestamp` if it is present,
+> otherwise use `ObservedTimestamp`"). The record shape above is
+> **unchanged**: the miner emits no new field, the Parquet writer
+> computes the column from the two timestamp fields already
+> listed, and the wire `time_unix_nano` is stored verbatim
+> including `0` — scenario RFC0001.10 (verbatim preservation)
+> remains intact and normative. Time partitioning and the DSL
+> time window key off the derived column (RFC 0005 §3.4 /
+> RFC 0002 §6.2).
+
 **Body and miner-derived reconstruction:**
 
 | Field | Rust type (informal) | Source | Purpose |

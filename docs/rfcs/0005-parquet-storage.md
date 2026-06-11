@@ -142,9 +142,10 @@ authoritative: the reader resolves `tenant_id` from the row,
 treats the partition path as a partition-pruning index, and
 **errors** on row-vs-path mismatch (§3.9). The time-bucket parts
 (`year`, `month`, `day`, `hour`) are *pure-partition* pseudo-
-columns derived from `time_unix_nano` rendered as UTC; they are
-not stored row-level and their schema-evolution contract follows
-§3.4 (the partition layout), not §3.8 (the row schema).
+columns derived from the effective timestamp (§3.4; equal to
+`time_unix_nano` whenever that is non-zero) rendered as UTC; they
+are not stored row-level and their schema-evolution contract
+follows §3.4 (the partition layout), not §3.8 (the row schema).
 
 **Identity** (RFC 0001 §6.1 "Identity and partitioning"):
 
@@ -158,8 +159,9 @@ not stored row-level and their schema-evolution contract follows
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
 |---|---|---|---|---|
-| `time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | `0` = unknown (OTLP convention); time partition key derived from this. See "u64 → i64 overflow contract" below |
+| `time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | REQUIRED | `0` = unknown (OTLP convention); preserved verbatim from the wire (RFC 0001 scenario RFC0001.10). The time partition key derives from the effective timestamp (§3.4; equal to this column whenever it is non-zero). See "u64 → i64 overflow contract" below |
 | `observed_time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | OPTIONAL | Same overflow contract as `time_unix_nano` |
+| `effective_time_unix_nano` | `TIMESTAMP(NANOS, isAdjustedToUTC=true)` | `INT64` | OPTIONAL | **Writer-derived** (amendment 2026-06-11, §3.8 rule 1): `time_unix_nano` when non-zero, else `observed_time_unix_nano`, else `0`. Drives the time partition key (§3.4) and the DSL time window (RFC 0002 §6.2). Never overwrites the wire `time_unix_nano`. Absent-column default is the row's `time_unix_nano` (§3.9), not `None` |
 | `severity_number` | `INTEGER(8, signed=false)` | `INT32` | REQUIRED | OTLP `SeverityNumber` 0..24; part of template key |
 | `severity_text` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
 | `scope_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | Part of template key |
@@ -171,6 +173,89 @@ not stored row-level and their schema-evolution contract follows
 | `span_id` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(8)` | OPTIONAL | Same opaque-byte contract as `trace_id`; no Parquet logical type exists for 8-byte opaque ids |
 | `flags` | `INTEGER(32, signed=false)` | `INT32` | REQUIRED | Lower 8 bits = W3C trace flags |
 | `event_name` | `STRING` | `BYTE_ARRAY` | OPTIONAL | |
+
+> **Amendment 2026-06-11 — `effective_time_unix_nano` (derived
+> event-or-observed timestamp).** Measured across the OTel-Demo
+> corpora (v5: 205,155 records; v6: 202,484), ~15 % of records
+> carry `timeUnixNano` absent/`0` — and 100 % of those carry
+> `observedTimeUnixNano` (verified by sampling). Under the
+> pre-amendment contract those records are unaddressable by time:
+> the DSL window filters `time_unix_nano`, so they fall outside
+> every real query window, and the bench's zero-timestamp guard
+> correctly refuses such corpora — blocking B1, the last
+> unmeasured thesis gate. The OTLP logs data model anticipates
+> exactly this case. Its `Timestamp` field definition reads:
+>
+> > Time when the event occurred measured by the origin clock,
+> > i.e. the time at the source. This field is optional, it may
+> > be missing if the source timestamp is unknown.
+>
+> and its `ObservedTimestamp` field definition reads:
+>
+> > Time when the event was observed by the collection system.
+> > […] This field SHOULD be set once the event is observed by
+> > OpenTelemetry.
+> >
+> > For converting OpenTelemetry log data to formats that support
+> > only one timestamp or when receiving OpenTelemetry log data
+> > by recipients that support only one timestamp internally the
+> > following logic is recommended:
+> >
+> > - Use `Timestamp` if it is present, otherwise use
+> >   `ObservedTimestamp`.
+>
+> This amendment adopts that recommendation as a **derived,
+> additive** column, per the maintainer decision of 2026-06-11
+> (option 1: ingest-side, derived — not overwriting the wire
+> value):
+>
+> 1. **Derivation rule.** `effective_time_unix_nano :=
+>    time_unix_nano if time_unix_nano != 0 else
+>    observed_time_unix_nano.unwrap_or(0)`. The Parquet writer
+>    computes it from the row's two existing timestamp fields
+>    when serialising — the *same* rule the §3.4 partition
+>    derivation already runs, now stored so queries can use it.
+>    `MinedRecord` (RFC 0001 §6.1) is unchanged; no new miner or
+>    receiver field exists, and the column is therefore outside
+>    the RFC0005.1 round-trip surface (derivable, not carried —
+>    its own assertions live in RFC0005.13). Both source fields
+>    are already covered by the §3.2 `u64`→`i64` overflow
+>    contract, so the derived value is always in-range.
+> 2. **Derived, never overwriting.** The wire `time_unix_nano` is
+>    stored verbatim, including `0` — RFC 0001 scenario
+>    RFC0001.10 (verbatim preservation) is explicitly intact.
+> 3. **Storage.** A new OPTIONAL column per §3.8 rule 1 (additive;
+>    old files lack it, the §3.9 default applies). Post-amendment
+>    writers always populate it (required-by-convention; `0`
+>    means genuinely timeless, mirroring the `time_unix_nano`
+>    sentinel); `NULL` appears only in pre-amendment files. The
+>    redundancy costs ≈ 8 B/row before encoding and almost always
+>    equals `time_unix_nano`, so `DELTA_BINARY_PACKED` + ZSTD
+>    collapse it (§3.6). A real column is what makes the window
+>    predicate pruneable: a query-time `coalesce(time_unix_nano,
+>    observed_time_unix_nano)` expression would defeat row-group
+>    min/max pruning, which is the B1 mechanism.
+> 4. **Partitioning.** The §3.4 time-fallback derivation is this
+>    rule; the partition tuple and the stored column never
+>    disagree. Records with neither timestamp still land under
+>    the 1970 epoch partition exactly as before — only genuinely
+>    timeless records remain there.
+> 5. **Query semantics.** The DSL time window (`range(...)`)
+>    filters `effective_time_unix_nano` (RFC 0002 §6.2, amended
+>    the same date). The bare `ts` field still resolves to
+>    `time_unix_nano`, the verbatim wire value.
+> 6. **Old-file read rule (the migration story).** Files written
+>    before this amendment lack the column; the reader's
+>    documented default (§3.9 rule 2) is `effective :=
+>    time_unix_nano` — exactly the pre-amendment behaviour, so
+>    historical files keep answering time-window queries
+>    identically. No file rewrite is needed.
+> 7. **Bench follow-up.** The B1 zero-timestamp guard
+>    subsequently keys off the effective span — a code follow-up,
+>    not part of this amendment.
+>
+> This resolves the measured v5/v6 corpus blocker. Acceptance is
+> pinned by scenario RFC0005.13 (§5).
 
 **Body and miner-derived columns** (RFC 0001 §6.1 "Body and
 miner-derived reconstruction"):
@@ -309,15 +394,21 @@ Where:
   Both writer and reader use this exact algorithm; the
   RFC0005.5 acceptance criterion's non-ASCII sub-test pins
   it.
-- `year` / `month` / `day` / `hour` are derived from
-  `time_unix_nano` rendered as UTC. Audit-event partitioning
+- `year` / `month` / `day` / `hour` are derived from the
+  effective timestamp (the next bullet; equal to
+  `time_unix_nano` whenever that is non-zero) rendered as UTC.
+  Audit-event partitioning
   stops at `day=DD` because audit volume is far lower than data
   volume; an hour-level partition for audit would produce many
   tiny files for no win.
 - **`time_unix_nano = 0` (OTLP "unknown" sentinel).** The
   writer derives the partition tuple by first checking
   `time_unix_nano`; if it is `0`, the writer falls back to
-  `observed_time_unix_nano`. If `observed_time_unix_nano` is
+  `observed_time_unix_nano`. This derivation is the **effective
+  timestamp** of the 2026-06-11 §3.2 amendment; the writer
+  stores the same value in the `effective_time_unix_nano`
+  column, so the partition tuple and the stored column never
+  disagree. If `observed_time_unix_nano` is
   also absent or `0`, the record is placed under the epoch
   partition `year=1970/month=01/day=01/hour=00/` — operators
   see "unknown-time records cluster under 1970-01-01" as the
@@ -400,6 +491,7 @@ Per-column encoding decisions, anchored to query patterns
 | `template_version` | yes | yes | no | Always small per template |
 | `time_unix_nano` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding (the writer's default for monotonic INT64 timestamps) plus ZSTD compression; min/max per page enables B1 range pruning |
 | `observed_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`; the observation timeline is also broadly monotonic, so delta encoding pays |
+| `effective_time_unix_nano` | no | yes | no | Same encoding/compression as `time_unix_nano`, which it almost always equals — `DELTA_BINARY_PACKED` collapses the redundancy. Min/max per page is what makes the B1 time-window predicate pruneable on this column (amendment 2026-06-11) |
 | `severity_number` | yes | yes | no | 0..24 — dict alone is enough |
 | `severity_text` | yes | yes | no | Bounded set in practice |
 | `scope_name` | yes | yes | no | Bounded per deployment |
@@ -652,6 +744,20 @@ The reader has three normative requirements:
      values older files wrote. Together these cover the entire
      amendment surface; there is no "REQUIRED-added-in-amendment"
      case to default.
+
+     **Exception — `effective_time_unix_nano` (amendment
+     2026-06-11):** the documented default when the column is
+     absent (a file written before the amendment) is **the row's
+     `time_unix_nano`**, not `None` — i.e. `effective :=
+     time_unix_nano`, which is exactly the pre-amendment
+     behaviour, so historical files keep answering time-window
+     queries identically. Consumers that compile predicates over
+     this column (the RFC 0002 §6.2 time window) MUST apply this
+     substitution per-file; the querier's general
+     absent-OPTIONAL-column ⇒ predicate-false convention
+     (RFC 0007 / RFC0007.4) does **not** apply to the time-window
+     filter — compiling the window to `false` on old files would
+     silently hide all pre-amendment data from every query.
    - The baseline REQUIRED columns *still* declared REQUIRED — the
      reader errors if they are missing. A file missing a baseline
      REQUIRED column (the common envelope: `tenant_id`,
@@ -933,6 +1039,24 @@ column the bench won't measure.
 >   `compaction_*` columns as `None` — i.e. the writer keeps each
 >   kind's required-by-convention columns non-null (§3.8 rule 6)
 
+> **Scenario RFC0005.13 — Effective-timestamp fallback (amendment 2026-06-11)**
+> - **Given** a record with `time_unix_nano = 0` and
+>   `observed_time_unix_nano = T` (non-zero)
+> - **When** the writer flushes it and a time-window query whose
+>   window contains `T` runs over the store
+> - **Then** the stored `effective_time_unix_nano` equals `T`
+> - **And** the file lands under the partition tuple derived from
+>   `T` (§3.4)
+> - **And** the query returns the row — the time window filters
+>   `effective_time_unix_nano` (RFC 0002 §6.2)
+> - **And** the stored `time_unix_nano` is still `0` — the wire
+>   value is never overwritten (RFC 0001 scenario RFC0001.10)
+> - **And** given a pre-amendment file lacking the
+>   `effective_time_unix_nano` column, the same time-window
+>   semantics apply with `effective := time_unix_nano` (§3.9) —
+>   i.e. exactly the pre-amendment behaviour, no error, no hidden
+>   rows
+
 ## 6. Testing strategy
 
 - **RFC0005.1** — property test in
@@ -997,6 +1121,16 @@ column the bench won't measure.
   via `AuditReader`, and assert each kind's columns are populated
   / null per §3.7 (the relaxed template columns non-null only for
   template kinds; `compaction_*` non-null only for `compaction`).
+- **RFC0005.13** — integration test spanning
+  `crates/ourios-parquet` (writer derivation + the §3.9
+  absent-column default) and `crates/ourios-querier` (the
+  time-window filter): write a `time_unix_nano = 0` record with
+  `observed_time_unix_nano` set, assert the stored column, the
+  partition path, the window hit, and the verbatim zero; then
+  build a pre-amendment-shaped file (no
+  `effective_time_unix_nano` column) with the `parquet` crate
+  directly, per the RFC0005.2 pattern, and assert the window
+  filter behaves as `effective := time_unix_nano`.
 
 Criterion benchmarks (in `ourios-bench`, Phase 3 territory) will
 measure A1 (compression ratio) and B1/B2 (predicate-pushdown

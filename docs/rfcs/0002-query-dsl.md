@@ -363,8 +363,26 @@ prior draft:
 | `trace_id`, `span_id` | the dedicated columns (log↔trace correlation) |
 | `scope` | `scope_name` |
 | `severity` | `severity_number` (via the §6.1 mapping) |
-| `ts` | `time_unix_nano` (the event timestamp; what `range(...)` filters) |
+| `ts` | `time_unix_nano` (the verbatim event timestamp) |
 | `observed_ts` | `observed_time_unix_nano` |
+
+> **Amendment 2026-06-11 — `range(...)` filters the effective
+> timestamp.** This table previously noted that `ts` /
+> `time_unix_nano` is "what `range(...)` filters". Per RFC 0005
+> §3.2 (amendment of the same date), the time window now compiles
+> against the derived `effective_time_unix_nano` column
+> (`time_unix_nano` when non-zero, else
+> `observed_time_unix_nano`), so records whose source timestamp
+> is unknown (`time_unix_nano = 0` — ~15 % of real OTel-Demo
+> corpora, per the OTLP logs data model's "Use `Timestamp` if it
+> is present, otherwise use `ObservedTimestamp`" recommendation)
+> are addressable by time. The bare `ts` field is unchanged — it
+> still resolves to `time_unix_nano`, the verbatim wire value
+> (RFC 0001 scenario RFC0001.10). For files written before the
+> column existed the window applies `effective :=
+> time_unix_nano` (the RFC 0005 §3.9 documented default — exactly
+> the pre-amendment behaviour), **not** the absent-OPTIONAL-column
+> ⇒ predicate-false convention.
 
 `trace_id` / `span_id` literals are **hex strings** (32 and 16 hex digits
 respectively, no separators), **parsed case-insensitively** so uppercase

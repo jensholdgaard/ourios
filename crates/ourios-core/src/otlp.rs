@@ -195,8 +195,8 @@ impl Body {
 /// `body_kind = Structured`.
 ///
 /// The "canonical" rule is the proto3 JSON mapping plus OTLP's
-/// specific overrides (camelCase fields, `string`-encoded
-/// `int64`s, base64 for `bytes`, etc.). The
+/// specific overrides (camelCase fields, `int64`s as decimal
+/// strings, base64 for `bytes`, etc.). The
 /// `opentelemetry-proto` crate's `with-serde` feature already
 /// implements that spec on its proto types — these helpers are
 /// thin wrappers so callers don't reach for `serde_json`
@@ -239,7 +239,7 @@ pub mod canonical {
     /// `Vec<KeyValue>` the type system admits —
     /// `opentelemetry-proto`'s `with-serde` ships custom
     /// serializers for the proto3-JSON oddities (`i64` →
-    /// string-encoded JSON number, `bytes` → base64; non-finite
+    /// decimal string, `bytes` → base64; non-finite
     /// `f64` falls back to `serde_json`'s `null`, not the proto3
     /// `"NaN"` strings) so the recursive primitives never
     /// panic or return an error. The `Encode` arm exists only

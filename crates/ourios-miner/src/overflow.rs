@@ -14,7 +14,7 @@
 //! cardinality destroys Parquet's dictionary encoding and bloats
 //! files. The byte-limit + spill-to-body contract is the answer
 //! to the canonical "stack trace in a `params` slot" hazard
-//! ([`docs/hazards.md`] H2).
+//! (`docs/hazards.md` H2).
 
 use sha2::{Digest, Sha256};
 

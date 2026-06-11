@@ -3,7 +3,7 @@
 //! The A1 path measures the bytes a corpus compresses to; the B1/B2
 //! latency benches need to *query* the same corpus, so they need the
 //! mined records laid down as a real partitioned Parquet store they
-//! can point a [`ourios_querier::Querier`] at. Both public builders
+//! can point a `ourios_querier::Querier` at. Both public builders
 //! reuse the same corpus loader and miner harness the gates run on
 //! (so the store matches what A1 measured), then write every emitted
 //! record via per-partition [`Writer`]s (the same streaming write A1
@@ -32,7 +32,7 @@ const ERROR_BAND: std::ops::RangeInclusive<u8> = 17..=20;
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltStore {
     /// Tenant every record was written under (the corpus loader is
-    /// single-tenant — [`crate::corpus`]'s `BENCH_TENANT`). A query must
+    /// single-tenant — `crate::corpus`'s `BENCH_TENANT`). A query must
     /// use this tenant or it scans nothing (RFC0007.5 isolation).
     pub tenant: &'static str,
     /// Total rows written across all partitions.
@@ -55,7 +55,7 @@ pub struct BuiltStore {
 
 /// Load the corpus at `corpus_dir`, mine it, and write the emitted
 /// records as a partitioned RFC 0005 Parquet store under
-/// `bucket_root` (which a [`ourios_querier::Querier`] can then be
+/// `bucket_root` (which a `ourios_querier::Querier` can then be
 /// rooted at). Returns a [`BuiltStore`] summary.
 ///
 /// # Errors

@@ -497,7 +497,7 @@ fn append_slots(builder: &mut GenericListBuilder<i32, StructBuilder>, slots: &[S
 ///
 /// # Panics
 ///
-/// Structurally impossible. The inner [`ReasonPayload`] is two
+/// Structurally impossible. The inner `ReasonPayload` is two
 /// owned-or-borrowed scalars; `serde_json::to_string` only fails
 /// when the `Serialize` impl produces an error (e.g. an
 /// invalid-UTF-8 map key) which neither field can ever do.

@@ -22,5 +22,16 @@ repository = "https://github.com/jensholdgaard/ourios"
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+# Rustdoc breakage (broken intra-doc links etc.) kept reaching review
+# as Copilot comments the compiler could have raised first (#124).
+# All member crates declare `[lints] workspace = true`, so this
+# propagates without per-crate edits; `cargo doc --workspace
+# --no-deps --all-features` is the local check.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "warn"
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

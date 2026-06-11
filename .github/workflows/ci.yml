@@ -36,6 +36,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The [workspace.lints.rustdoc] levels are the single source of
+      # truth: the deny-level lints (broken intra-doc links etc.,
+      # #124) fail this build on their own; no RUSTDOCFLAGS override,
+      # so `bare_urls = "warn"` stays advisory in CI too.
+      - run: cargo doc --workspace --no-deps --all-features
+
   test:
     name: cargo test
     runs-on: ubuntu-latest
@@ -155,7 +172,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, book, semconv]
+    needs: [fmt, clippy, docs, test, book, semconv]
     if: always()
     steps:
       - name: Verify required checks

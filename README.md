@@ -1,9 +1,16 @@
 # Ourios
 
 [![CI](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml/badge.svg)](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjensholdgaard%2Fourios%2Fbadges%2Fcoverage.json)](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jensholdgaard/ourios/badge)](https://scorecard.dev/viewer/?uri=github.com/jensholdgaard/ourios)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: stable](https://img.shields.io/badge/rust-stable%20%C2%B7%20MSRV%201.85-orange.svg)](rust-toolchain.toml)
 [![Docs: mdBook](https://img.shields.io/badge/docs-mdBook-brightgreen.svg)](docs/SUMMARY.md)
+<!-- OpenSSF Best Practices: requires maintainer registration at
+     https://www.bestpractices.dev — add the badge here once the
+     project is enrolled. Codecov likewise needs the maintainer to
+     install the app; the coverage badge above is self-hosted. -->
+
 
 > **οὔριος** · _the fair, following wind that fills a ship's sail._
 > Logs flow forward, under fair wind, with minimal friction.

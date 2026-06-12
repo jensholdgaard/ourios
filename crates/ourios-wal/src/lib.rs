@@ -433,6 +433,21 @@ impl Wal {
                 unreachable!("create_fresh_segment only surfaces OpenError::Io")
             }
         };
+        // The header must be durable BEFORE the directory entry: the
+        // parent fsync below makes the new file name survive a power
+        // cut, and a surviving entry whose 24 B header bytes were
+        // lost would fail the next `Wal::open`'s header read — a
+        // benign crash turned into OpenError::Corrupt. (`open`'s own
+        // fresh segment doesn't carry this ordering: nothing fsyncs
+        // its directory entry until the first `sync`, which
+        // fdatasyncs the segment first.)
+        if let Err(source) = file.sync_data() {
+            self.quiesced = true;
+            return Err(AppendError::Io {
+                op: "fdatasync(rotation: fresh segment header)",
+                source,
+            });
+        }
         if let Err(source) = sync_parent_dir(&self.config.root) {
             // The fresh header-only segment is left in place: replay
             // reads it as zero frames, and unlinking it here could

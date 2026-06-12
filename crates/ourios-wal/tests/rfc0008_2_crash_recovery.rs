@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
 
 fn default_config(root: &Path) -> WalConfig {
     WalConfig {
@@ -44,7 +44,12 @@ struct CollectingSink {
 }
 
 impl FrameSink for CollectingSink {
-    fn consume(&mut self, kind: FrameKind, payload: &[u8]) -> Result<(), RecoveryError> {
+    fn consume(
+        &mut self,
+        _offset: WalOffset,
+        kind: FrameKind,
+        payload: &[u8],
+    ) -> Result<(), RecoveryError> {
         self.frames.push((kind, payload.to_vec()));
         Ok(())
     }

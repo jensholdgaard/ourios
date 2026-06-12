@@ -177,6 +177,15 @@ fn rfc0005_10_audit_schema_matches_pinned_field_list() {
         Field::new("compaction_output_file", DataType::Utf8, true),
         Field::new("compaction_generation", DataType::UInt64, true),
         Field::new("compaction_rows", DataType::UInt64, true),
+        // Alias columns (RFC 0001 §6.7 / RFC 0005 §3.7 amendment
+        // 2026-06-12): OPTIONAL, NULL for all other kinds.
+        Field::new("alias_representative_id", DataType::UInt64, true),
+        Field::new(
+            "alias_member_ids",
+            DataType::List(Arc::new(Field::new("element", DataType::UInt64, false))),
+            true,
+        ),
+        Field::new("alias_actor", DataType::Utf8, true),
     ];
     check_schema_against(&expected, &audit_schema());
 }

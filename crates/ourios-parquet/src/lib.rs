@@ -109,6 +109,11 @@ pub mod audit_columns {
     pub const COMPACTION_OUTPUT_FILE: &str = "compaction_output_file";
     pub const COMPACTION_GENERATION: &str = "compaction_generation";
     pub const COMPACTION_ROWS: &str = "compaction_rows";
+    // Alias-event columns (RFC 0005 §3.7 amendment 2026-06-12 /
+    // RFC 0001 §6.7); NULL for all other kinds.
+    pub const ALIAS_REPRESENTATIVE_ID: &str = "alias_representative_id";
+    pub const ALIAS_MEMBER_IDS: &str = "alias_member_ids";
+    pub const ALIAS_ACTOR: &str = "alias_actor";
 }
 
 /// Build the data-file Arrow schema per RFC 0005 §3.2.
@@ -257,5 +262,21 @@ pub fn audit_schema() -> SchemaRef {
         Field::new(audit_columns::COMPACTION_OUTPUT_FILE, DataType::Utf8, true),
         Field::new(audit_columns::COMPACTION_GENERATION, DataType::UInt64, true),
         Field::new(audit_columns::COMPACTION_ROWS, DataType::UInt64, true),
+        // Alias-event columns (RFC 0001 §6.7 / §3.7 amendment
+        // 2026-06-12): OPTIONAL, NULL for all other kinds;
+        // required-by-convention non-null for kinds 4–5 (the
+        // member list possibly empty — an empty list is valid and
+        // distinct from NULL).
+        Field::new(
+            audit_columns::ALIAS_REPRESENTATIVE_ID,
+            DataType::UInt64,
+            true,
+        ),
+        Field::new(
+            audit_columns::ALIAS_MEMBER_IDS,
+            DataType::List(Arc::new(Field::new("element", DataType::UInt64, false))),
+            true,
+        ),
+        Field::new(audit_columns::ALIAS_ACTOR, DataType::Utf8, true),
     ]))
 }

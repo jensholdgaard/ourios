@@ -60,7 +60,7 @@ async fn rows_in_window(bucket: &Path, lo: u64, hi: u64) -> u64 {
             &TenantId::new("a"),
             NOW,
             DEFAULT_WINDOW_NS,
-            &no_aliases(),
+            Some(&no_aliases()),
         )
         .await
         .expect("run_query")
@@ -219,7 +219,7 @@ async fn rfc0005_13_effective_window_prunes_row_groups() {
             &TenantId::new("a"),
             NOW,
             DEFAULT_WINDOW_NS,
-            &no_aliases(),
+            Some(&no_aliases()),
         )
         .await
         .expect("run_query");

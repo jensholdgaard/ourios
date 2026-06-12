@@ -141,6 +141,21 @@ pub(crate) fn compile(
     })
 }
 
+/// Whether the predicate contains any `resolves_to(n)` call. The caller uses
+/// this to skip the RFC 0005 §3.7.1 alias-map derivation (an audit-tree scan)
+/// for the queries that would never consult the map.
+pub(crate) fn uses_resolves_to(p: &Predicate) -> bool {
+    match p {
+        Predicate::Call(Call::ResolvesTo(_)) => true,
+        Predicate::Not(inner) => uses_resolves_to(inner),
+        Predicate::And(terms) | Predicate::Or(terms) => terms.iter().any(uses_resolves_to),
+        Predicate::Bool(_)
+        | Predicate::Comparison { .. }
+        | Predicate::Severity { .. }
+        | Predicate::Call(_) => false,
+    }
+}
+
 /// Walk the predicate IR and, for each `resolves_to(n)`, record the tenant's
 /// alias expansion `n → resolves(tenant, n)` (RFC 0001 §6.7). Per-tenant
 /// resolution `[§3.7]` happens here once; the result rides the [`Plan`].

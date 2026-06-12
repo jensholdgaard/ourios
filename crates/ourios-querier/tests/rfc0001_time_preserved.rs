@@ -71,7 +71,7 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
             &tenant,
             NOW,
             common::DEFAULT_WINDOW_NS,
-            &no_aliases(),
+            Some(&no_aliases()),
         )
         .await
         .expect("run_query");

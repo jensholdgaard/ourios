@@ -300,7 +300,7 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
             &tenant,
             NOW,
             DEFAULT_WINDOW_NS,
-            &common::no_aliases(),
+            Some(&common::no_aliases()),
         )
         .await
         .expect("run_query");
@@ -410,7 +410,7 @@ async fn rfc0002_3_no_datafusion_leakage() {
             &tenant,
             NOW,
             DEFAULT_WINDOW_NS,
-            &common::no_aliases(),
+            Some(&common::no_aliases()),
         )
         .await
         .expect_err("an out-of-scope attribute comparison must be rejected");
@@ -453,7 +453,7 @@ async fn rfc0002_4_default_time_window() {
     // Act — a query with NO range stage (match-all predicate).
     let query = ourios_querier::dsl::parse("true").expect("parse");
     let r = q
-        .run_query(&query, &tenant, now, window, &common::no_aliases())
+        .run_query(&query, &tenant, now, window, Some(&common::no_aliases()))
         .await
         .expect("run_query");
 
@@ -514,7 +514,7 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &common::no_aliases(),
+                Some(&common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -593,7 +593,7 @@ async fn rfc0002_5_named_severity_equality_is_a_band() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &common::no_aliases(),
+                Some(&common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -660,7 +660,7 @@ async fn rfc0002_6_first_class_fields_resolve() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &common::no_aliases(),
+                Some(&common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -739,7 +739,7 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &common::no_aliases(),
+                Some(&common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -798,7 +798,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &common::no_aliases(),
+                Some(&common::no_aliases()),
             )
             .await
             .expect_err(&format!("{text:?} must be rejected at compile"));
@@ -846,7 +846,7 @@ async fn rfc0002_6_unsupported_stage_rejected() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                &common::no_aliases(),
+                Some(&common::no_aliases()),
             )
             .await
             .expect_err(&format!("{text:?} must be rejected, not dropped"));
@@ -860,9 +860,15 @@ async fn rfc0002_6_unsupported_stage_rejected() {
 
     // A supported pipeline still runs.
     let ok = ourios_querier::dsl::parse("body == \"x\" | limit 5").expect("parse");
-    q.run_query(&ok, &tenant, NOW, DEFAULT_WINDOW_NS, &common::no_aliases())
-        .await
-        .expect("range + limit stay supported");
+    q.run_query(
+        &ok,
+        &tenant,
+        NOW,
+        DEFAULT_WINDOW_NS,
+        Some(&common::no_aliases()),
+    )
+    .await
+    .expect("range + limit stay supported");
 }
 
 /// Scenario RFC0002.7 — Parse/serialise round-trip is idempotent.
@@ -1068,7 +1074,7 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
 
     let rows = async |text: &str, tenant: &TenantId, map: &AliasMap| {
         let query = ourios_querier::dsl::parse(text).expect("parse");
-        q.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, map)
+        q.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, Some(map))
             .await
             .expect("run_query")
             .rows

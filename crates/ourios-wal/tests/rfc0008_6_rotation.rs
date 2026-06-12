@@ -120,8 +120,9 @@ fn rfc0008_6_time_cap_rotates_without_drop_or_duplicate() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let mut wal = Wal::open(config(tmp.path(), MIN_SEGMENT_SIZE_BYTES, 1)).expect("open");
 
-    // The empty segment crosses the age cap first: no rotation —
-    // the first frame still lands in it.
+    // The empty segment crosses the 1 s age cap first: no rotation —
+    // the first frame still lands in it (the empty-segment skip is
+    // what protects it; the age alone is already past the cap).
     std::thread::sleep(Duration::from_millis(1_200));
     let first = wal.append(FrameKind::OtlpBatch, &[0xAA]).expect("first");
     assert_eq!(
@@ -130,9 +131,9 @@ fn rfc0008_6_time_cap_rotates_without_drop_or_duplicate() {
         "an over-age but empty segment is not rotated",
     );
 
-    // Now it holds a frame and is over the cap: the next append
-    // rotates.
-    std::thread::sleep(Duration::from_millis(1_200));
+    // Now it holds a frame and its age (1.2 s) exceeds the cap: the
+    // very next append rotates — sub-second precision, no
+    // whole-second truncation delaying the cap.
     let second = wal.append(FrameKind::OtlpBatch, &[0xBB]).expect("second");
     wal.sync().expect("sync");
 

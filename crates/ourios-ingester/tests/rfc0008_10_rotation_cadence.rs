@@ -75,12 +75,13 @@ fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
     let state = load_snapshot(bytes).expect("known version");
     let mark = state.wal_high_water.expect("stamped with a horizon");
     assert_eq!(
-        (mark.segment.as_str(), mark.byte),
-        (
-            rotation_point.segment.to_string().as_str(),
-            rotation_point.byte,
-        ),
-        "the artefact records the rotation-point high-water (old segment's last durable offset)",
+        mark.segment,
+        rotation_point.segment.to_string(),
+        "the artefact records the rotation-point segment (the just-closed one)",
+    );
+    assert_eq!(
+        mark.byte, rotation_point.byte,
+        "…at the old segment's last durable byte",
     );
     assert_eq!(
         state.leaves.len(),

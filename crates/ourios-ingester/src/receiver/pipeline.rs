@@ -177,7 +177,24 @@ impl IngestPipeline {
             (self.rotation_hook.as_mut(), before, self.last_durable)
             && prev.segment != now.segment
         {
-            hook(&self.miner, prev);
+            // A hook panic must not unwind `ingest`: the batch is
+            // already durable and the unwind would poison the shared
+            // pipeline mutex, halting all future ingestion over a
+            // best-effort cache write. `AssertUnwindSafe` is sound
+            // for the pipeline's own state — the hook sees the miner
+            // through `&MinerCluster`, so no pipeline mutation can be
+            // torn mid-panic; the hook's own captures are its to keep
+            // consistent (it stays installed and is only ever invoked
+            // best-effort).
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hook(&self.miner, prev);
+            }));
+            if outcome.is_err() {
+                eprintln!(
+                    "rotation hook panicked; continuing — the snapshot \
+                     is a rebuildable cache (recovery falls back to the WAL)"
+                );
+            }
         }
 
         // Step 5: hand records to the miner (only after durability, so a
@@ -392,5 +409,43 @@ mod tests {
         // Batch 3: same segment — no further firing.
         pipeline.ingest(request()).expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
+    }
+
+    /// A panicking hook must not unwind `ingest`: the batch is
+    /// already durable, and the unwind would poison the shared
+    /// pipeline mutex and halt all future ingestion over a
+    /// best-effort cache write.
+    #[test]
+    fn rotation_hook_panic_does_not_fail_the_ingest() {
+        let in_first = WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 100,
+        };
+        let in_second = WalOffset {
+            segment: uuid::Uuid::from_u128(2),
+            byte: 40,
+        };
+        let mut pipeline = IngestPipeline::new(
+            Box::new(SequenceJournal {
+                offsets: vec![in_first, in_second, in_second],
+            }),
+            MinerCluster::new(MinerConfig::default()),
+            TenantRule::service_name(),
+        )
+        .with_rotation_hook(Box::new(|_, _| panic!("snapshot writer blew up")));
+
+        pipeline.ingest(request()).expect("batch 1");
+        // Batch 2 rotates and the hook panics — the ingest still acks
+        // and the records still reach the miner.
+        assert_eq!(pipeline.ingest(request()).expect("batch 2 acks"), 1);
+        assert_eq!(
+            pipeline
+                .miner()
+                .template_count(&ourios_core::tenant::TenantId::new("checkout")),
+            1,
+            "the rotating batch's records reached the miner despite the panic",
+        );
+        // The pipeline stays usable afterwards.
+        assert_eq!(pipeline.ingest(request()).expect("batch 3 acks"), 1);
     }
 }

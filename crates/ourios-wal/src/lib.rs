@@ -396,8 +396,8 @@ impl Wal {
         if current_len <= SEGMENT_HEADER_LEN as u64 {
             return false;
         }
-        segment_age_secs(self.current_segment_uuid)
-            .is_some_and(|age| age > self.config.segment_age_secs)
+        segment_age(self.current_segment_uuid)
+            .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
     }
 
     /// Close the current segment and open a fresh one (§6.5):
@@ -1071,20 +1071,19 @@ fn sync_parent_dir(root: &std::path::Path) -> std::io::Result<()> {
     File::open(root)?.sync_all()
 }
 
-/// Age of a segment in whole seconds, from the `UUIDv7`'s
-/// embedded millisecond timestamp — the instant the header was
-/// written (§6.5's "since its header was written"), with no
-/// extra persisted state and surviving reopen. `None` for a
-/// non-v7 UUID or a clock reading behind the mint time (skew);
-/// the caller treats `None` as "not age-rotatable", the
+/// Age of a segment, from the `UUIDv7`'s embedded millisecond
+/// timestamp — the instant the header was written (§6.5's
+/// "since its header was written"), with no extra persisted
+/// state and surviving reopen. A full `Duration` rather than
+/// whole seconds: truncation would delay the age cap by up to
+/// a second past the configured bound. `None` for a non-v7
+/// UUID or a clock reading behind the mint time (skew); the
+/// caller treats `None` as "not age-rotatable", the
 /// conservative direction.
-fn segment_age_secs(segment: uuid::Uuid) -> Option<u64> {
+fn segment_age(segment: uuid::Uuid) -> Option<std::time::Duration> {
     let (secs, nanos) = segment.get_timestamp()?.to_unix();
     let created = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
-    std::time::SystemTime::now()
-        .duration_since(created)
-        .ok()
-        .map(|age| age.as_secs())
+    std::time::SystemTime::now().duration_since(created).ok()
 }
 
 /// Recovery-time consumer the [`Wal::replay`] scan hands

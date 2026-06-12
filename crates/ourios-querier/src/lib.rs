@@ -37,6 +37,7 @@
 
 #![deny(unsafe_code)]
 
+mod audit_scan;
 mod compile;
 mod drift;
 pub mod dsl;

@@ -20,11 +20,12 @@
 use std::path::Component;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ourios_core::alias::ActorId;
 use ourios_core::audit::{
     AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange, hash_triggering_line,
 };
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{AuditReader, AuditWriter, PartitionKey};
+use ourios_parquet::{AuditReader, AuditWriter, PartitionKey, audit_columns};
 use tempfile::TempDir;
 
 fn ts(offset_secs: u64) -> SystemTime {
@@ -277,6 +278,128 @@ fn rfc0005_7_rejection_variant_round_trips_via_reason_column() {
     assert_eq!(current_template, "[\"only-literal\",\"<*>\"]");
     assert_eq!(would_be_template, "[\"<*>\",\"<*>\"]");
     assert_eq!(would_be_positions, &vec![0]);
+}
+
+/// An `alias_asserted` audit event (RFC 0001 §6.7 / RFC 0005 §3.7
+/// amendment 2026-06-12). `member_ids` deliberately carries a
+/// duplicate and an unsorted order — the writer stores the list
+/// verbatim, so the round trip must preserve it exactly.
+fn alias_asserted_event(tenant: &str) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(1_775_127_520),
+        payload: AuditPayload::AliasAsserted {
+            representative_id: 30,
+            member_ids: vec![20, 10, 20],
+            actor: ActorId::new("op-alice").expect("non-empty actor"),
+            reason: "deploy 2026-06 re-split the login template".to_string(),
+        },
+    }
+}
+
+/// An `alias_retracted` audit event with the empty member list (the
+/// common single-id retraction) and no reason — exercising the §3.7
+/// empty-list-vs-NULL distinction and the `"" ↔ NULL` reason rule.
+fn alias_retracted_event(tenant: &str) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(1_775_127_530),
+        payload: AuditPayload::AliasRetracted {
+            representative_id: 20,
+            member_ids: Vec::new(),
+            actor: ActorId::new("op-bob").expect("non-empty actor"),
+            reason: String::new(),
+        },
+    }
+}
+
+/// Scenario RFC0005.14 — alias audit events round-trip and back the
+/// v1 map derivation (amendment 2026-06-12; the derivation half lives
+/// in `ourios-querier`). Per the RFC0005.12 pattern: write an
+/// `alias_asserted`, an `alias_retracted`, and a `template_widened`
+/// event through `AuditWriter`, read back via `AuditReader`, and
+/// assert each kind's columns populated / null per §3.7 — the full
+/// asserted set verbatim, the empty-list retraction (≠ NULL), the
+/// actor, and the `"" ↔ NULL` reason round trip.
+#[test]
+fn rfc0005_14_alias_audit_events_round_trip() {
+    // Arrange — one of each alias kind plus a template event in the
+    // same partition.
+    let bucket = TempDir::new().unwrap();
+    let template = three_variants("acme").remove(0);
+    let asserted = alias_asserted_event("acme");
+    let retracted = alias_retracted_event("acme");
+    let events = vec![template.clone(), asserted.clone(), retracted.clone()];
+    let partition = audit_partition_for(&events[0]);
+    let mut writer = AuditWriter::open(bucket.path(), partition.clone()).expect("open");
+    writer.append_events(&events).expect("append");
+    let written = writer.close().expect("close");
+
+    // Act
+    let reader = AuditReader::open_partition(&written.path, partition).expect("open_partition");
+    let round_tripped = reader.read_all().expect("read_all");
+
+    // Assert — full equality: the member set verbatim (order and the
+    // duplicate preserved), the actor, the non-empty reason; the
+    // retraction's empty member list reads back as an empty list (the
+    // decode requires non-NULL for alias kinds, so equality proves it
+    // was stored as a list, not NULL); its on-disk NULL reason decodes
+    // to the in-memory empty string.
+    assert_eq!(round_tripped, events);
+
+    // And the §3.8-rule-6 per-kind NULL discipline at the raw column
+    // level: the template row's alias_* columns are NULL, the alias
+    // rows' template / compaction columns are NULL.
+    let file = std::fs::File::open(&written.path).expect("open raw");
+    let batches: Vec<_> =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("builder")
+            .build()
+            .expect("reader")
+            .collect::<Result<_, _>>()
+            .expect("batches");
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    let null_at = |column: &str, row: usize| {
+        use arrow_array::Array;
+        let idx = batch.schema().index_of(column).expect("column exists");
+        batch.column(idx).is_null(row)
+    };
+    // Row 0 is the template event; rows 1–2 are the alias events.
+    for column in [
+        audit_columns::ALIAS_REPRESENTATIVE_ID,
+        audit_columns::ALIAS_MEMBER_IDS,
+        audit_columns::ALIAS_ACTOR,
+    ] {
+        assert!(
+            null_at(column, 0),
+            "{column} must be NULL on a template row"
+        );
+        assert!(!null_at(column, 1), "{column} must be set on an alias row");
+        assert!(!null_at(column, 2), "{column} must be set on an alias row");
+    }
+    for column in [
+        audit_columns::TEMPLATE_ID,
+        audit_columns::OLD_VERSION,
+        audit_columns::NEW_VERSION,
+        audit_columns::OLD_TEMPLATE,
+        audit_columns::NEW_TEMPLATE,
+        audit_columns::POSITIONS_WIDENED,
+        audit_columns::SLOTS_EXPANDED,
+        audit_columns::TRIGGERING_LINE_HASH,
+        audit_columns::COMPACTION_PARTITION,
+        audit_columns::COMPACTION_INPUT_FILES,
+        audit_columns::COMPACTION_OUTPUT_FILE,
+        audit_columns::COMPACTION_GENERATION,
+        audit_columns::COMPACTION_ROWS,
+    ] {
+        assert!(null_at(column, 1), "{column} must be NULL on an alias row");
+        assert!(null_at(column, 2), "{column} must be NULL on an alias row");
+    }
+    // The `"" ↔ NULL` reason rule on disk: non-empty reason stored,
+    // empty reason stored as NULL.
+    assert!(!null_at(audit_columns::REASON, 1));
+    assert!(null_at(audit_columns::REASON, 2));
 }
 
 /// RFC0005.12 — a `compaction` audit event round-trips with its

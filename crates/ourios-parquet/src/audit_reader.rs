@@ -16,15 +16,14 @@
 //! sample`, `reason`) surface as `None`; missing baseline REQUIRED
 //! columns are a hard read error.
 //!
-//! **Unknown `event_kind` ordinals** are currently surfaced as a
-//! [`AuditReaderError::UnknownEventKind`] hard error. The audit
-//! event enum [`AuditPayload`] has no catch-all variant; a
-//! future RFC 0005 §3.8 amendment that adds a new ordinal will
-//! either extend the enum (and this match) or introduce an
-//! `Unknown(u8)` variant analogous to [`ParamType::Unknown`]. The
-//! data side handles the analogous case (`params.type_tag = 99`)
-//! via `ParamType::Unknown`; the audit side defers the choice
-//! until a real new variant lands.
+//! **Unknown `event_kind` ordinals** surface as
+//! [`AuditPayload::Unknown`] — an opaque envelope-only event — never
+//! as a file failure, per RFC 0005 §3.7's unknown-`event_kind`
+//! tolerance rule (amendment 2026-06-12, the rule pinned when kinds
+//! 4–5 landed). This is the [`ParamType::Unknown`] discipline applied
+//! to the kind enum: every future §3.8 ordinal addition stays
+//! non-breaking for readers, and folds defined over named kinds
+//! ignore unknown rows by construction.
 
 use std::fmt;
 use std::fs::File;
@@ -35,6 +34,7 @@ use std::time::{Duration, SystemTime};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, RecordBatch, StructArray};
+use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
 use ourios_core::tenant::TenantId;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
@@ -42,7 +42,8 @@ use parquet::errors::ParquetError;
 
 use crate::audit_columns;
 use crate::audit_record_batch::{
-    EVENT_KIND_COMPACTION, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
+    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
@@ -159,14 +160,6 @@ pub enum AuditReaderError {
         column: &'static str,
         detail: String,
     },
-    /// `event_kind` ordinal isn't one of the §3.7 mapping
-    /// table's values. Until a future amendment adds an
-    /// `AuditPayload::Unknown` variant, unknown ordinals are
-    /// a hard error.
-    UnknownEventKind {
-        row_index: usize,
-        ordinal: u8,
-    },
     /// `timestamp` nanos couldn't be converted to `SystemTime`
     /// (negative — pre-epoch — or out of `Duration` range).
     TimestampDecode {
@@ -200,13 +193,6 @@ impl fmt::Display for AuditReaderError {
             Self::Conversion { column, detail } => {
                 write!(f, "column `{column}` conversion failed: {detail}")
             }
-            Self::UnknownEventKind { row_index, ordinal } => write!(
-                f,
-                "row {row_index}: unknown event_kind ordinal {ordinal} — the §3.7 mapping \
-                 table pins 0 / 1 / 2; reading an unknown ordinal needs an \
-                 AuditPayload::Unknown variant which is deferred until a real new variant \
-                 lands via a §3.8 amendment",
-            ),
             Self::TimestampDecode { row_index, nanos } => write!(
                 f,
                 "row {row_index}: timestamp = {nanos} ns can't be converted to SystemTime \
@@ -244,7 +230,6 @@ impl std::error::Error for AuditReaderError {
             Self::Parquet(e) => Some(e),
             Self::MissingRequiredColumn { .. }
             | Self::Conversion { .. }
-            | Self::UnknownEventKind { .. }
             | Self::TimestampDecode { .. }
             | Self::PartitionMismatch { .. } => None,
         }
@@ -304,10 +289,11 @@ fn batch_to_audit_events(
     let timestamp = required_timestamp(batch, audit_columns::TIMESTAMP, row_offset)?;
     let event_kind = required_u8(batch, audit_columns::EVENT_KIND, row_offset)?;
     // `event_type` is required-and-redundant (kept in sync with
-    // `event_kind` by the writer). Surface it for sanity-check
-    // diagnostics but use `event_kind` as the source of truth
-    // for variant dispatch.
-    let _event_type = required_string(batch, audit_columns::EVENT_TYPE, row_offset)?;
+    // `event_kind` by the writer); `event_kind` is the source of
+    // truth for variant dispatch. The string is preserved verbatim
+    // on the unknown-kind tolerance path (§3.7) so a read-then-write
+    // round-trips the envelope.
+    let event_type = required_string(batch, audit_columns::EVENT_TYPE, row_offset)?;
     // Template-group columns — OPTIONAL since the §3.7 amendment
     // (NULL on `compaction` rows). Required-by-convention for the
     // template kinds; [`require_at`] errors if a template row finds
@@ -332,6 +318,10 @@ fn batch_to_audit_events(
         optional_string(batch, audit_columns::COMPACTION_OUTPUT_FILE)?.unwrap_or_default();
     let compaction_generation = optional_u64(batch, audit_columns::COMPACTION_GENERATION)?;
     let compaction_rows = optional_u64(batch, audit_columns::COMPACTION_ROWS)?;
+    // Alias-group columns (RFC 0001 §6.7 / §3.7 amendment 2026-06-12).
+    let alias_representative_id = optional_u64(batch, audit_columns::ALIAS_REPRESENTATIVE_ID)?;
+    let alias_member_ids = optional_u64_list(batch, audit_columns::ALIAS_MEMBER_IDS)?;
+    let alias_actor = optional_string(batch, audit_columns::ALIAS_ACTOR)?.unwrap_or_default();
 
     for i in 0..n {
         let file_row = row_offset + i;
@@ -362,44 +352,32 @@ fn batch_to_audit_events(
                     change: decode_template_change(&cols, i, file_row)?,
                 }
             }
-            EVENT_KIND_COMPACTION => AuditPayload::Compaction {
-                partition: require_at(
-                    &compaction_partition,
-                    i,
-                    audit_columns::COMPACTION_PARTITION,
-                    file_row,
-                )?,
-                input_files: require_at(
-                    &compaction_input_files,
-                    i,
-                    audit_columns::COMPACTION_INPUT_FILES,
-                    file_row,
-                )?,
-                output_file: require_at(
-                    &compaction_output_file,
-                    i,
-                    audit_columns::COMPACTION_OUTPUT_FILE,
-                    file_row,
-                )?,
-                generation: require_at(
-                    &compaction_generation,
-                    i,
-                    audit_columns::COMPACTION_GENERATION,
-                    file_row,
-                )?,
-                rows: require_at(
-                    &compaction_rows,
-                    i,
-                    audit_columns::COMPACTION_ROWS,
-                    file_row,
-                )?,
-            },
-            other => {
-                return Err(AuditReaderError::UnknownEventKind {
-                    row_index: file_row,
-                    ordinal: other,
-                });
+            EVENT_KIND_COMPACTION => {
+                let cols = CompactionColumns {
+                    partition: &compaction_partition,
+                    input_files: &compaction_input_files,
+                    output_file: &compaction_output_file,
+                    generation: &compaction_generation,
+                    rows: &compaction_rows,
+                };
+                decode_compaction_payload(&cols, i, file_row)?
             }
+            kind @ (EVENT_KIND_ALIAS_ASSERTED | EVENT_KIND_ALIAS_RETRACTED) => {
+                let cols = AliasColumns {
+                    representative_id: &alias_representative_id,
+                    member_ids: &alias_member_ids,
+                    actor: &alias_actor,
+                    reason: &reason,
+                };
+                decode_alias_payload(kind, &cols, i, file_row)?
+            }
+            // RFC 0005 §3.7 unknown-event_kind tolerance (amendment
+            // 2026-06-12): an ordinal above the known range surfaces
+            // as an opaque envelope-only event, never a file failure.
+            other => AuditPayload::Unknown {
+                event_kind: other,
+                event_type: event_type[i].clone(),
+            },
         };
 
         events.push(AuditEvent {
@@ -422,6 +400,114 @@ struct TemplateColumns<'a> {
     positions_widened: &'a [Vec<u16>],
     slots_expanded: &'a [Vec<SlotExpansion>],
     reason: &'a [Option<String>],
+}
+
+/// Borrowed per-column slices the compaction-payload decoder reads
+/// (RFC 0009 §3.6 / §3.7 amendment 2026-06-03). All five columns are
+/// required-by-convention non-null for kind 3.
+struct CompactionColumns<'a> {
+    partition: &'a [Option<String>],
+    input_files: &'a [Option<Vec<String>>],
+    output_file: &'a [Option<String>],
+    generation: &'a [Option<u64>],
+    rows: &'a [Option<u64>],
+}
+
+/// Rebuild the compaction payload for row `i` from the
+/// `compaction_*` columns.
+fn decode_compaction_payload(
+    cols: &CompactionColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    Ok(AuditPayload::Compaction {
+        partition: require_at(
+            cols.partition,
+            i,
+            audit_columns::COMPACTION_PARTITION,
+            file_row,
+        )?,
+        input_files: require_at(
+            cols.input_files,
+            i,
+            audit_columns::COMPACTION_INPUT_FILES,
+            file_row,
+        )?,
+        output_file: require_at(
+            cols.output_file,
+            i,
+            audit_columns::COMPACTION_OUTPUT_FILE,
+            file_row,
+        )?,
+        generation: require_at(
+            cols.generation,
+            i,
+            audit_columns::COMPACTION_GENERATION,
+            file_row,
+        )?,
+        rows: require_at(cols.rows, i, audit_columns::COMPACTION_ROWS, file_row)?,
+    })
+}
+
+/// Borrowed per-column slices the alias-payload decoder reads
+/// (RFC 0001 §6.7 / §3.7 amendment 2026-06-12).
+struct AliasColumns<'a> {
+    representative_id: &'a [Option<u64>],
+    member_ids: &'a [Option<Vec<u64>>],
+    actor: &'a [Option<String>],
+    reason: &'a [Option<String>],
+}
+
+/// Rebuild the alias payload for row `i` from the `alias_*` columns.
+/// All three alias columns are required-by-convention non-null for
+/// kinds 4–5; `member_ids` may be the valid empty list (distinct from
+/// NULL), and an on-disk NULL `reason` decodes to the in-memory empty
+/// string (the §3.7 `"" ↔ NULL` round-trip rule).
+fn decode_alias_payload(
+    kind: u8,
+    cols: &AliasColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    let representative_id = require_at(
+        cols.representative_id,
+        i,
+        audit_columns::ALIAS_REPRESENTATIVE_ID,
+        file_row,
+    )?;
+    let member_ids = require_at(
+        cols.member_ids,
+        i,
+        audit_columns::ALIAS_MEMBER_IDS,
+        file_row,
+    )?;
+    let actor_str = require_at(cols.actor, i, audit_columns::ALIAS_ACTOR, file_row)?;
+    // Aliasing is never anonymous (RFC 0001 §6.7); an empty actor is
+    // a writer-invariant violation.
+    let actor = ActorId::new(actor_str).map_err(|e| AuditReaderError::Conversion {
+        column: audit_columns::ALIAS_ACTOR,
+        detail: format!("row {file_row}: {e}"),
+    })?;
+    let reason = cols
+        .reason
+        .get(i)
+        .and_then(Clone::clone)
+        .unwrap_or_default();
+    if kind == EVENT_KIND_ALIAS_ASSERTED {
+        Ok(AuditPayload::AliasAsserted {
+            representative_id,
+            member_ids,
+            actor,
+            reason,
+        })
+    } else {
+        Ok(AuditPayload::AliasRetracted {
+            representative_id,
+            member_ids,
+            actor,
+            reason,
+        })
+    }
 }
 
 /// Value at `col[i]`, or a `Conversion` error if it is absent / NULL —
@@ -1036,11 +1122,59 @@ fn optional_string_list(
                 return Err(AuditReaderError::Conversion {
                     column: name,
                     detail: format!(
-                        "row {row_idx} element {i}: NULL but the element field is non-nullable",
+                        "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
                     ),
                 });
             }
             row.push(strs.value(i).to_string());
+        }
+        out.push(Some(row));
+    }
+    Ok(out)
+}
+
+/// Per-row `Option<Vec<u64>>` for the nullable `alias_member_ids`
+/// `LIST<UInt64>` column. NULL list ⇒ `None` (not an alias row);
+/// empty list ⇒ `Some(vec![])` — the §3.7 empty-vs-NULL distinction.
+/// The element field is non-nullable, so a NULL element is a corrupt
+/// row.
+fn optional_u64_list(
+    batch: &RecordBatch,
+    name: &'static str,
+) -> Result<Vec<Option<Vec<u64>>>, AuditReaderError> {
+    let Some(col) = optional_column(batch, name) else {
+        return Ok(Vec::new());
+    };
+    let list = col
+        .as_list_opt::<i32>()
+        .ok_or_else(|| AuditReaderError::Conversion {
+            column: name,
+            detail: "column is not a LIST<UInt64> as declared".to_string(),
+        })?;
+    let mut out = Vec::with_capacity(list.len());
+    for row_idx in 0..list.len() {
+        if list.is_null(row_idx) {
+            out.push(None);
+            continue;
+        }
+        let elements = list.value(row_idx);
+        let ids = elements.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+            AuditReaderError::Conversion {
+                column: name,
+                detail: "list element is not UInt64".to_string(),
+            }
+        })?;
+        let mut row = Vec::with_capacity(ids.len());
+        for i in 0..ids.len() {
+            if ids.is_null(i) {
+                return Err(AuditReaderError::Conversion {
+                    column: name,
+                    detail: format!(
+                        "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
+                    ),
+                });
+            }
+            row.push(ids.value(i));
         }
         out.push(Some(row));
     }
@@ -1081,43 +1215,77 @@ mod tests {
         }
     }
 
-    /// Pins file-global row indexing in `batch_to_audit_events`:
-    /// a forged batch where row 0 carries an unknown `event_kind`
-    /// must report `row_index = row_offset` (not `0`) on the
-    /// returned `UnknownEventKind` error. This is the multi-batch
-    /// invariant — without the
-    /// `row_offset + i` addition, a later-batch error in a real
-    /// file would point at row 0 of every batch instead of the
-    /// running file-level offset.
+    /// FLIPPED from expect-error (`UnknownEventKind`) to
+    /// expect-opaque-event per the RFC-gated contract change in
+    /// RFC 0005 §3.7 (amendment 2026-06-12, PR #183): a reader
+    /// encountering an `event_kind` ordinal above its known range
+    /// MUST NOT fail the file — the row surfaces as an opaque
+    /// envelope-only [`AuditPayload::Unknown`]. The old test pinned
+    /// the documented deferral ("hard error until a real new variant
+    /// lands"); kinds 4–5 were that variant, so the deferral is
+    /// resolved and the old assertion is exactly the behaviour the
+    /// amendment removes (`CLAUDE.md` §6.2).
     #[test]
-    fn batch_to_audit_events_reports_file_global_row_index_on_unknown_event_kind() {
+    fn batch_to_audit_events_surfaces_unknown_event_kind_as_opaque_event() {
+        // Arrange — replace the event_kind column with a single 99
+        // ordinal (outside the §3.7 mapping table), keeping every
+        // other column intact.
         let valid = audit_events_to_batch(&[widened_event("acme")]).expect("batch builds");
         let event_kind_idx = valid
             .schema()
             .index_of(audit_columns::EVENT_KIND)
             .expect("schema has event_kind");
-
-        // Replace the event_kind column with a single 99 ordinal —
-        // outside the §3.7 mapping table — keeping every other
-        // column intact.
         let mut columns: Vec<ArrayRef> = valid.columns().to_vec();
         columns[event_kind_idx] = Arc::new(UInt8Array::from(vec![99u8]));
         let forged =
             RecordBatch::try_new(valid.schema(), columns).expect("forged batch type-checks");
 
-        // Pretend this batch is the second batch of a longer file —
-        // the prior batches contributed 50 rows.
-        let err = batch_to_audit_events(&forged, 50).expect_err("unknown event_kind must error");
-        match err {
-            AuditReaderError::UnknownEventKind { row_index, ordinal } => {
-                assert_eq!(
-                    row_index, 50,
-                    "row index must be file-global, not batch-local"
-                );
-                assert_eq!(ordinal, 99);
+        // Act — decoding must NOT fail the batch.
+        let events = batch_to_audit_events(&forged, 50).expect("unknown kind must not error");
+
+        // Assert — the row decodes to the opaque envelope: the raw
+        // ordinal plus the stored event_type string verbatim, with
+        // the envelope fields (tenant, timestamp) preserved.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tenant_id.as_str(), "acme");
+        assert_eq!(events[0].timestamp, widened_event("acme").timestamp);
+        match &events[0].payload {
+            AuditPayload::Unknown {
+                event_kind,
+                event_type,
+            } => {
+                assert_eq!(*event_kind, 99);
+                // The forged batch kept the original string column —
+                // preserved verbatim, not re-derived from the ordinal.
+                assert_eq!(event_type, "template_widened");
             }
-            other => panic!("expected UnknownEventKind, got {other:?}"),
+            other => panic!("expected AuditPayload::Unknown, got {other:?}"),
         }
+    }
+
+    /// The opaque-envelope event round-trips: a read-then-write of an
+    /// [`AuditPayload::Unknown`] row preserves the envelope verbatim
+    /// (RFC 0005 §3.7 unknown-`event_kind` tolerance) and leaves
+    /// every payload column NULL, so re-decoding yields the same
+    /// opaque event.
+    #[test]
+    fn unknown_event_round_trips_envelope_only() {
+        // Arrange — an opaque event as a reader would surface it.
+        let unknown = AuditEvent {
+            tenant_id: ourios_core::tenant::TenantId::new("acme"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: AuditPayload::Unknown {
+                event_kind: 42,
+                event_type: "some_future_kind".to_string(),
+            },
+        };
+
+        // Act — write it back out and decode again.
+        let batch = audit_events_to_batch(std::slice::from_ref(&unknown)).expect("batch builds");
+        let events = batch_to_audit_events(&batch, 0).expect("decode");
+
+        // Assert — byte-for-byte envelope preservation.
+        assert_eq!(events, vec![unknown]);
     }
 
     /// `decode_timestamp` rejects negative i64 nanos as

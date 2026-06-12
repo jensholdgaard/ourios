@@ -37,6 +37,8 @@
 
 #![deny(unsafe_code)]
 
+mod alias_store;
+mod audit_scan;
 mod compile;
 mod drift;
 pub mod dsl;
@@ -469,15 +471,19 @@ impl Querier {
     /// `[now - default_window_nanos, now]` (RFC 0002 §4 P5 — **never** an
     /// unbounded scan).
     ///
-    /// `alias_map` is the in-memory RFC 0001 §6.7 alias projection the caller
-    /// holds for this querier process; `resolves_to(n)` expands through
+    /// `alias_map` selects where the RFC 0001 §6.7 alias projection comes
+    /// from. `None` — the production default — derives the requesting
+    /// tenant's map from its audit stream at compile time per RFC 0005
+    /// §3.7.1 (the audit stream is the alias store in v1; the scan is
+    /// skipped entirely when the query has no `resolves_to`).
+    /// `Some(map)` injects a caller-held projection instead — the
+    /// test/operator override, bypassing storage. Either way,
+    /// `resolves_to(n)` expands through
     /// [`AliasMap::resolves`](ourios_core::alias::AliasMap::resolves) for
     /// `tenant`, so a `template_id` an operator aliased matches its whole
-    /// equivalence class. An id in no class resolves to `{id}` — a singleton
+    /// equivalence class; an id in no class resolves to `{id}` — a singleton
     /// `template_id IN (n)`, behaviorally identical to a bare
-    /// `template_id == n`. The map is a
-    /// projection injected by the caller; this path adds no on-disk loading
-    /// (physical storage is the RFC 0005 split, sibling to #147).
+    /// `template_id == n`.
     ///
     /// # Errors
     ///
@@ -490,15 +496,31 @@ impl Querier {
         tenant: &TenantId,
         now_unix_nano: u64,
         default_window_nanos: u64,
-        alias_map: &ourios_core::alias::AliasMap,
+        alias_map: Option<&ourios_core::alias::AliasMap>,
     ) -> Result<QueryResult, QueryError> {
-        let plan = compile::compile(
-            query,
-            tenant,
-            now_unix_nano,
-            default_window_nanos,
-            alias_map,
-        )?;
+        // Error precedence: stage-support and window/limit validation
+        // runs before the alias-map derivation below, so those query
+        // errors surface without paying the audit-tree IO (or its
+        // Storage errors). Predicate compilation needs the map, so its
+        // errors necessarily come after. `compile` re-runs the same
+        // pure validation internally — one source of truth, negligible
+        // cost.
+        compile::validate(query, now_unix_nano, default_window_nanos)?;
+        let derived;
+        let map = match alias_map {
+            Some(map) => map,
+            None if compile::uses_resolves_to(&query.predicate) => {
+                derived = alias_store::derive_alias_map(&self.bucket_root, tenant)?;
+                &derived
+            }
+            // No `resolves_to` ⇒ the map is never consulted; an empty
+            // projection avoids the audit-tree scan.
+            None => {
+                derived = ourios_core::alias::AliasMap::new();
+                &derived
+            }
+        };
+        let plan = compile::compile(query, tenant, now_unix_nano, default_window_nanos, map)?;
         self.execute(tenant, Some(plan.window), move |df| {
             compile::apply(df, plan)
         })

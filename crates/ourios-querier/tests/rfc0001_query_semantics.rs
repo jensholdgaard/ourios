@@ -50,7 +50,7 @@ async fn rfc0001_5_bare_template_id_spans_all_versions_of_leaf() {
     // resolution is involved — this is by-construction).
     let query = ourios_querier::dsl::parse(&format!("template_id == {X}")).expect("parse");
     let result = q
-        .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS, &no_aliases())
+        .run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS, Some(&no_aliases()))
         .await
         .expect("run_query");
 
@@ -107,7 +107,7 @@ async fn rfc0001_6_bare_template_id_does_not_follow_alias_chains() {
 
     let rows = async |text: &str| {
         let query = ourios_querier::dsl::parse(text).expect("parse");
-        q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS, &aliases)
+        q.run_query(&query, &tenant, NOW, DEFAULT_WINDOW_NS, Some(&aliases))
             .await
             .expect("run_query")
             .rows

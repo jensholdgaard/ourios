@@ -536,6 +536,7 @@ fn audit_writer_properties() -> Result<WriterProperties, AuditWriterError> {
         audit_columns::TRIGGERING_LINE_HASH,
         audit_columns::TRIGGERING_LINE_SAMPLE,
         audit_columns::REASON,
+        audit_columns::ALIAS_ACTOR,
     ] {
         builder = builder.set_column_statistics_enabled(
             ColumnPath::new(vec![no_page_idx_col.to_string()]),
@@ -571,6 +572,18 @@ fn audit_writer_properties() -> Result<WriterProperties, AuditWriterError> {
             "list".to_string(),
             "element".to_string(),
             "types_added".to_string(),
+            "list".to_string(),
+            "element".to_string(),
+        ]),
+        EnabledStatistics::Chunk,
+    );
+    // `alias_member_ids` "(list values)" gets `Page index = no` on
+    // its list leaf per the §3.7 table (amendment 2026-06-12);
+    // `alias_representative_id` keeps the page-index default
+    // (`Page index = yes`, same shape as `template_id`).
+    builder = builder.set_column_statistics_enabled(
+        ColumnPath::new(vec![
+            audit_columns::ALIAS_MEMBER_IDS.to_string(),
             "list".to_string(),
             "element".to_string(),
         ]),

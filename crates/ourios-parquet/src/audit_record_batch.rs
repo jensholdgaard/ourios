@@ -16,6 +16,16 @@
 //! | `TemplateTypeExpanded` | `1` | `[]` | event's slots | both = pre = post | `NULL` |
 //! | `TemplateWideningRejectedDegenerate` | `2` | `[]` | `[]` | both = `current_template` | JSON of `would_be_*` |
 //!
+//! The `Compaction` (kind `3`) and `AliasAsserted` / `AliasRetracted`
+//! (kinds `4` / `5`) variants populate only their own kind-prefixed
+//! `compaction_*` / `alias_*` columns plus the envelope; every other
+//! payload column is `NULL` (§3.8 rule 6, per kind). For the alias
+//! kinds the `member_ids` list is stored **verbatim** (no sort/dedup —
+//! the semantic value is the set `{representative_id} ∪ member_ids`,
+//! folded by consumers), an empty list is valid and distinct from
+//! `NULL`, and the in-memory empty-string `reason` maps to `NULL` on
+//! disk (`"" ↔ NULL`, RFC 0005 §3.7 amendment 2026-06-12).
+//!
 //! **Rejection-variant `reason` payload.** The in-memory
 //! [`TemplateChange::RejectedDegenerate`] carries
 //! `would_be_template: String` and `would_be_positions: Vec<u16>`,
@@ -56,10 +66,11 @@ use crate::audit_schema;
 /// `ourios-core`; re-exported here so the reader's ordinal match and
 /// existing call sites resolve them at their established path.
 pub use ourios_core::audit::{
-    EVENT_KIND_COMPACTION, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
-    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_COMPACTION,
-    EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
-    EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
+    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_ALIAS_ASSERTED,
+    EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
+    EVENT_TYPE_TEMPLATE_WIDENED, EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 
 /// Build an Arrow `RecordBatch` matching [`audit_schema`] from a
@@ -110,17 +121,6 @@ pub enum AuditBatchError {
         old_template: String,
         new_template: String,
     },
-    /// An `alias_asserted` / `alias_retracted` event (RFC 0001 §6.7)
-    /// was handed to the audit-Parquet writer, whose §3.7 schema has
-    /// no columns to represent the alias payload (`representative_id`,
-    /// `member_ids`, `actor`, `reason`). Adding those columns is the
-    /// RFC 0005 storage split (sibling to issue #147), deliberately
-    /// out of scope for the alias write-path slice — so the writer
-    /// rejects rather than inventing columns or dropping the event
-    /// silently. Carries the offending `event_type` for diagnostics.
-    /// Alias events are durable via the alias event log; their
-    /// audit-Parquet materialization waits for that split.
-    AliasEventNotYetPersistable { event_type: &'static str },
     /// Arrow rejected the constructed `RecordBatch` (column-length
     /// mismatch, schema-shape mismatch). Internal bug if it ever
     /// fires — the array builders are constructed against
@@ -152,13 +152,6 @@ impl fmt::Display for AuditBatchError {
                  = {new_template:?}, but RFC 0005 §3.7 requires they be equal for this \
                  variant (template tokens don't change)",
             ),
-            Self::AliasEventNotYetPersistable { event_type } => write!(
-                f,
-                "audit event {event_type} (RFC 0001 §6.7 alias write path) is not yet \
-                 representable in the audit-Parquet schema; the alias columns are the RFC \
-                 0005 storage split (issue #147 sibling). Alias events are durable via the \
-                 alias event log, not this writer.",
-            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -169,8 +162,7 @@ impl std::error::Error for AuditBatchError {
         match self {
             Self::PreEpochTimestamp
             | Self::TimestampOverflow { .. }
-            | Self::TemplateMustNotChange { .. }
-            | Self::AliasEventNotYetPersistable { .. } => None,
+            | Self::TemplateMustNotChange { .. } => None,
             Self::Arrow(e) => Some(e),
         }
     }
@@ -219,6 +211,9 @@ struct Builders {
     compaction_output_file: StringBuilder,
     compaction_generation: UInt64Builder,
     compaction_rows: UInt64Builder,
+    alias_representative_id: UInt64Builder,
+    alias_member_ids: GenericListBuilder<i32, UInt64Builder>,
+    alias_actor: StringBuilder,
 }
 
 impl Builders {
@@ -272,6 +267,13 @@ impl Builders {
             compaction_output_file: StringBuilder::with_capacity(cap, 0),
             compaction_generation: UInt64Builder::with_capacity(cap),
             compaction_rows: UInt64Builder::with_capacity(cap),
+            alias_representative_id: UInt64Builder::with_capacity(cap),
+            alias_member_ids: GenericListBuilder::new(UInt64Builder::new()).with_field(Field::new(
+                "element",
+                DataType::UInt64,
+                false,
+            )),
+            alias_actor: StringBuilder::with_capacity(cap, 0),
         }
     }
 
@@ -291,9 +293,11 @@ impl Builders {
                 triggering_line_sample,
                 change,
             } => {
-                // Template events leave the compaction columns NULL
-                // (§3.7 amendment 2026-06-03).
+                // Template events leave the compaction and alias
+                // columns NULL (§3.7 amendments 2026-06-03 /
+                // 2026-06-12).
                 self.append_compaction_nulls();
+                self.append_alias_nulls();
                 self.template_id.append_value(*template_id);
                 self.triggering_line_hash
                     .append_value(triggering_line_hash)
@@ -304,15 +308,50 @@ impl Builders {
                 }
                 self.append_template_change(change)?;
             }
-            AuditPayload::AliasAsserted { .. } | AuditPayload::AliasRetracted { .. } => {
-                // RFC 0001 §6.7 alias events have no audit-Parquet
-                // columns yet — that schema extension is the RFC 0005
-                // split (#147 sibling). Reject rather than persist a
-                // lossy row; alias events are durable via the alias
-                // event log meanwhile.
-                return Err(AuditBatchError::AliasEventNotYetPersistable {
-                    event_type: e.payload.event_type(),
-                });
+            AuditPayload::AliasAsserted {
+                representative_id,
+                member_ids,
+                actor,
+                reason,
+            }
+            | AuditPayload::AliasRetracted {
+                representative_id,
+                member_ids,
+                actor,
+                reason,
+            } => {
+                // Alias events (RFC 0001 §6.7 / §3.7 amendment
+                // 2026-06-12) populate only the envelope, the
+                // `alias_*` columns, and `reason`. `member_ids` is
+                // stored verbatim (no sort/dedup — round-trip is
+                // exact; consumers fold it as a set), an empty list
+                // is valid and distinct from NULL, and the in-memory
+                // empty-string `reason` maps to NULL (`"" ↔ NULL`).
+                self.append_template_nulls();
+                self.append_compaction_nulls();
+                if reason.is_empty() {
+                    self.reason.append_null();
+                } else {
+                    self.reason.append_value(reason);
+                }
+                self.alias_representative_id
+                    .append_value(*representative_id);
+                for id in member_ids {
+                    self.alias_member_ids.values().append_value(*id);
+                }
+                self.alias_member_ids.append(true);
+                self.alias_actor.append_value(actor.as_str());
+            }
+            AuditPayload::Unknown { .. } => {
+                // §3.7 unknown-event_kind tolerance: a read-then-write
+                // of a row a future writer produced preserves the
+                // envelope verbatim (`event_kind` / `event_type` are
+                // already appended from the payload accessors above)
+                // with every payload column NULL.
+                self.append_template_nulls();
+                self.append_compaction_nulls();
+                self.append_alias_nulls();
+                self.reason.append_null();
             }
             AuditPayload::Compaction {
                 partition,
@@ -322,8 +361,13 @@ impl Builders {
                 rows,
             } => {
                 // Compaction events leave every template-specific
-                // column NULL (§3.7 relaxed them to OPTIONAL).
+                // and alias column NULL (§3.7 relaxed the former to
+                // OPTIONAL; the latter are alias-kind-only), and the
+                // facts live in the `compaction_*` columns — `reason`
+                // stays NULL.
                 self.append_template_nulls();
+                self.append_alias_nulls();
+                self.reason.append_null();
                 self.compaction_partition.append_value(partition);
                 append_string_list(&mut self.compaction_input_files, input_files);
                 self.compaction_output_file.append_value(output_file);
@@ -407,7 +451,11 @@ impl Builders {
         Ok(())
     }
 
-    /// NULL every template-specific column — for a `compaction` row.
+    /// NULL every template-specific column — for a non-template row.
+    /// `reason` is *not* part of this group: it is the shared
+    /// justification/diagnostic column, populated per kind by the
+    /// caller (the rejection JSON for kind 2, the operator's
+    /// justification for kinds 4–5, NULL otherwise).
     fn append_template_nulls(&mut self) {
         self.template_id.append_null();
         self.old_version.append_null();
@@ -418,16 +466,22 @@ impl Builders {
         self.slots_expanded.append_null();
         self.triggering_line_hash.append_null();
         self.triggering_line_sample.append_null();
-        self.reason.append_null();
     }
 
-    /// NULL every compaction-specific column — for a template row.
+    /// NULL every compaction-specific column — for a non-compaction row.
     fn append_compaction_nulls(&mut self) {
         self.compaction_partition.append_null();
         self.compaction_input_files.append_null();
         self.compaction_output_file.append_null();
         self.compaction_generation.append_null();
         self.compaction_rows.append_null();
+    }
+
+    /// NULL every alias-specific column — for a non-alias row.
+    fn append_alias_nulls(&mut self) {
+        self.alias_representative_id.append_null();
+        self.alias_member_ids.append_null();
+        self.alias_actor.append_null();
     }
 
     fn finish(mut self) -> Vec<ArrayRef> {
@@ -451,6 +505,9 @@ impl Builders {
             Arc::new(self.compaction_output_file.finish()),
             Arc::new(self.compaction_generation.finish()),
             Arc::new(self.compaction_rows.finish()),
+            Arc::new(self.alias_representative_id.finish()),
+            Arc::new(self.alias_member_ids.finish()),
+            Arc::new(self.alias_actor.finish()),
         ]
     }
 }
@@ -616,6 +673,32 @@ mod tests {
         }
     }
 
+    /// An `alias_asserted` / `alias_retracted` audit event (RFC 0001
+    /// §6.7) for the §3.7 alias kinds.
+    fn alias_event(asserted: bool, member_ids: Vec<u64>, reason: &str) -> AuditEvent {
+        let actor = ourios_core::alias::ActorId::new("op-alice").expect("non-empty actor");
+        let payload = if asserted {
+            AuditPayload::AliasAsserted {
+                representative_id: 1,
+                member_ids,
+                actor,
+                reason: reason.to_string(),
+            }
+        } else {
+            AuditPayload::AliasRetracted {
+                representative_id: 1,
+                member_ids,
+                actor,
+                reason: reason.to_string(),
+            }
+        };
+        AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: ts(1_775_127_700),
+            payload,
+        }
+    }
+
     #[test]
     fn builds_batch_for_one_of_each_variant() {
         let batch = audit_events_to_batch(&[
@@ -623,9 +706,11 @@ mod tests {
             type_expanded_event(),
             rejection_event(),
             compaction_event(),
+            alias_event(true, vec![2, 3], "deploy re-split the login template"),
+            alias_event(false, vec![], ""),
         ])
         .expect("batch builds");
-        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(batch.num_rows(), 6);
         assert_eq!(batch.schema(), audit_schema());
     }
 
@@ -664,29 +749,48 @@ mod tests {
         assert!(matches!(err, AuditBatchError::PreEpochTimestamp));
     }
 
+    /// FLIPPED from `alias_events_are_rejected_pending_the_rfc_0005_split`
+    /// per the RFC-gated contract change in RFC 0005 §3.7 (amendment
+    /// 2026-06-12, PR #183): the interim `AliasEventNotYetPersistable`
+    /// rejection is retired now that the `alias_*` columns exist, so
+    /// the writer maps kinds 4–5 instead of erroring. The old test's
+    /// assertion ("alias events are not persistable") is exactly the
+    /// behaviour the amendment removes (`CLAUDE.md` §6.2).
     #[test]
-    fn alias_events_are_rejected_pending_the_rfc_0005_split() {
-        // RFC 0001 §6.7 alias events have no audit-Parquet columns yet
-        // (the RFC 0005 storage split). The writer must reject them
-        // rather than persist a lossy row or panic; they stay durable
-        // via the alias event log meanwhile.
-        let asserted = AuditEvent {
-            tenant_id: TenantId::new("acme"),
-            timestamp: ts(1_775_127_600),
-            payload: AuditPayload::AliasAsserted {
-                representative_id: 1,
-                member_ids: vec![2],
-                actor: ourios_core::alias::ActorId::new("op").expect("non-empty actor"),
-                reason: String::new(),
-            },
-        };
-        let err = audit_events_to_batch(std::slice::from_ref(&asserted))
-            .expect_err("alias events are not yet persistable");
-        assert!(matches!(
-            err,
-            AuditBatchError::AliasEventNotYetPersistable {
-                event_type: "alias_asserted"
-            }
-        ));
+    fn alias_events_build_a_batch_with_kinds_4_and_5() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt8Type;
+
+        // Arrange — one assertion (kind 4) and one retraction (kind 5).
+        let events = [
+            alias_event(true, vec![2], "merge"),
+            alias_event(false, vec![], ""),
+        ];
+
+        // Act.
+        let batch = audit_events_to_batch(&events).expect("alias events are persistable");
+
+        // Assert — the §3.7 dual-column mapping carries ordinals 4 / 5
+        // and the paired canonical strings.
+        let kind_idx = batch
+            .schema()
+            .index_of(crate::audit_columns::EVENT_KIND)
+            .expect("event_kind column");
+        let kinds = batch
+            .column(kind_idx)
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec();
+        assert_eq!(
+            kinds,
+            vec![EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED]
+        );
+        let type_idx = batch
+            .schema()
+            .index_of(crate::audit_columns::EVENT_TYPE)
+            .expect("event_type column");
+        let types = batch.column(type_idx).as_string::<i32>();
+        assert_eq!(types.value(0), EVENT_TYPE_ALIAS_ASSERTED);
+        assert_eq!(types.value(1), EVENT_TYPE_ALIAS_RETRACTED);
     }
 }

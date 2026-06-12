@@ -292,7 +292,7 @@ impl Wal {
     /// is fsync'd before the frame lands — so a frame never
     /// straddles segments and never lands in a segment without a
     /// durable directory entry. A failed rotation quiesces the
-    /// WAL (see [`AppendError::QuiescedAfterRotationFsyncFailure`]).
+    /// WAL (see [`AppendError::QuiescedAfterRotationFailure`]).
     ///
     /// If `write_frame` fails after partial bytes have hit the
     /// segment, the file is best-effort truncated back to its
@@ -316,7 +316,7 @@ impl Wal {
     /// rather than guarding a real failure mode.
     pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
         if self.quiesced {
-            return Err(AppendError::QuiescedAfterRotationFsyncFailure);
+            return Err(AppendError::QuiescedAfterRotationFailure);
         }
         if payload.len() > MAX_FRAME_BYTES {
             return Err(AppendError::TooLarge {
@@ -409,7 +409,7 @@ impl Wal {
     /// directory so the new entry is durable before any frame
     /// lands in it. Any step failing quiesces the WAL: every
     /// subsequent `append` returns
-    /// [`AppendError::QuiescedAfterRotationFsyncFailure`] until an
+    /// [`AppendError::QuiescedAfterRotationFailure`] until an
     /// operator intervenes. (`sync` stays available — the old
     /// segment is still the append target, and acking frames
     /// already written to it is safe.)
@@ -1169,7 +1169,7 @@ pub enum AppendError {
     /// are accepted. The append that triggered the failed
     /// rotation surfaced the underlying [`AppendError::Io`];
     /// every append after it gets this variant.
-    QuiescedAfterRotationFsyncFailure,
+    QuiescedAfterRotationFailure,
 }
 
 /// Errors from [`Wal::sync`].
@@ -1191,8 +1191,8 @@ impl std::fmt::Display for AppendError {
                 write!(f, "frame payload {len} B exceeds the {limit} B limit")
             }
             Self::Io { op, source } => write!(f, "WAL append failed at {op}: {source}"),
-            Self::QuiescedAfterRotationFsyncFailure => {
-                write!(f, "WAL is quiesced after a rotation fsync failure (§6.5)")
+            Self::QuiescedAfterRotationFailure => {
+                write!(f, "WAL is quiesced after a rotation failure (§6.5)")
             }
         }
     }
@@ -1202,7 +1202,7 @@ impl std::error::Error for AppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::TooLarge { .. } | Self::QuiescedAfterRotationFsyncFailure => None,
+            Self::TooLarge { .. } | Self::QuiescedAfterRotationFailure => None,
         }
     }
 }

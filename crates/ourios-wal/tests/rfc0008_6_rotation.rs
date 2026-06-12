@@ -150,13 +150,13 @@ fn rfc0008_6_time_cap_rotates_without_drop_or_duplicate() {
 
 /// Quiesce arm: a rotation step failing surfaces as a hard
 /// `AppendError`, and every subsequent append is refused with
-/// `QuiescedAfterRotationFsyncFailure` until an operator
+/// `QuiescedAfterRotationFailure` until an operator
 /// intervenes — even after the underlying condition clears.
 /// `sync` stays available: the old segment is still the append
 /// target and acking frames already written to it is safe.
 #[cfg(unix)]
 #[test]
-fn rfc0008_6_rotation_fsync_failure_quiesces_the_wal() {
+fn rfc0008_6_rotation_failure_quiesces_the_wal() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -188,7 +188,7 @@ fn rfc0008_6_rotation_fsync_failure_quiesces_the_wal() {
         .append(FrameKind::OtlpBatch, &[0xCC])
         .expect_err("quiesced WAL refuses appends");
     assert!(
-        matches!(err, AppendError::QuiescedAfterRotationFsyncFailure),
+        matches!(err, AppendError::QuiescedAfterRotationFailure),
         "subsequent appends get the quiesce variant, got {err:?}",
     );
     assert!(

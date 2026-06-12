@@ -498,11 +498,13 @@ impl Querier {
         default_window_nanos: u64,
         alias_map: Option<&ourios_core::alias::AliasMap>,
     ) -> Result<QueryResult, QueryError> {
-        // Error precedence: an invalid query fails with its compile
-        // error before the alias-map derivation below pays any
-        // audit-tree IO (or surfaces its Storage errors). `compile`
-        // re-runs the same pure validation internally — one source of
-        // truth, negligible cost.
+        // Error precedence: stage-support and window/limit validation
+        // runs before the alias-map derivation below, so those query
+        // errors surface without paying the audit-tree IO (or its
+        // Storage errors). Predicate compilation needs the map, so its
+        // errors necessarily come after. `compile` re-runs the same
+        // pure validation internally — one source of truth, negligible
+        // cost.
         compile::validate(query, now_unix_nano, default_window_nanos)?;
         let derived;
         let map = match alias_map {

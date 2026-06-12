@@ -1122,7 +1122,7 @@ fn optional_string_list(
                 return Err(AuditReaderError::Conversion {
                     column: name,
                     detail: format!(
-                        "row {row_idx} element {i}: NULL but the element field is non-nullable",
+                        "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
                     ),
                 });
             }
@@ -1170,7 +1170,7 @@ fn optional_u64_list(
                 return Err(AuditReaderError::Conversion {
                     column: name,
                     detail: format!(
-                        "row {row_idx} element {i}: NULL but the element field is non-nullable",
+                        "batch row {row_idx} element {i}: NULL but the element field is non-nullable",
                     ),
                 });
             }

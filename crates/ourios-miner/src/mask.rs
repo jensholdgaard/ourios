@@ -107,7 +107,7 @@ pub fn mask<'a>(tokens: &[&'a str]) -> Masked<'a> {
 /// (§6.2 step 5b), `Overflow` by the byte-limit check (§6.5),
 /// `Hex` / `Ts` / `Path` by future masking-rule PRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum MaskTag {
+pub(crate) enum MaskTag {
     Uuid,
     Ip,
     Num,
@@ -117,7 +117,7 @@ impl MaskTag {
     /// The tag string this variant emits in the masked-token
     /// sequence (`<UUID>`, `<IP>`, `<NUM>`). Total — every
     /// `MaskTag` has a tag by construction.
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Uuid => "<UUID>",
             Self::Ip => "<IP>",
@@ -133,6 +133,22 @@ impl From<MaskTag> for ParamType {
             MaskTag::Ip => Self::Ip,
             MaskTag::Num => Self::Num,
         }
+    }
+}
+
+/// The tag string `mask()` emits for `t`, or `None` when `t` is
+/// not a mask-emitted type. The partial inverse of
+/// `From<MaskTag> for ParamType`: only `Uuid` / `Ip` / `Num` have
+/// a tag; every other `ParamType` arises from widening, overflow,
+/// or future masking rules and never appears as a masked token.
+/// Snapshot restore uses this to reconstruct the descend-path tag
+/// string a path-position wildcard was created with.
+pub(crate) fn tag_str_for(t: ParamType) -> Option<&'static str> {
+    match t {
+        ParamType::Uuid => Some(MaskTag::Uuid.as_str()),
+        ParamType::Ip => Some(MaskTag::Ip.as_str()),
+        ParamType::Num => Some(MaskTag::Num.as_str()),
+        _ => None,
     }
 }
 
@@ -391,5 +407,27 @@ mod tests {
         assert_eq!(ParamType::from(MaskTag::Uuid), ParamType::Uuid);
         assert_eq!(ParamType::from(MaskTag::Ip), ParamType::Ip);
         assert_eq!(ParamType::from(MaskTag::Num), ParamType::Num);
+    }
+
+    // Pin `tag_str_for` as the partial inverse of the two mappings
+    // above: exactly the mask-emitted types get a tag string,
+    // matching what `classify` emits; every other `ParamType` gets
+    // `None` (so snapshot restore rejects a path-position wildcard
+    // that could not have come from mask emission).
+    #[test]
+    fn tag_str_for_maps_only_mask_emitted_types() {
+        assert_eq!(tag_str_for(ParamType::Uuid), Some("<UUID>"));
+        assert_eq!(tag_str_for(ParamType::Ip), Some("<IP>"));
+        assert_eq!(tag_str_for(ParamType::Num), Some("<NUM>"));
+        for t in [
+            ParamType::Hex,
+            ParamType::Ts,
+            ParamType::Path,
+            ParamType::Str,
+            ParamType::Overflow,
+            ParamType::Unknown(99),
+        ] {
+            assert_eq!(tag_str_for(t), None, "{t:?} is not mask-emitted");
+        }
     }
 }

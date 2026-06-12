@@ -169,6 +169,53 @@ fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     assert_equivalent(&recovered, &control);
 }
 
+/// A known-version artefact with no recorded high-water mark is
+/// discarded, not restored: a restore without a horizon cannot
+/// suppress, so replay would re-feed every frame the snapshot already
+/// folded (the v1 double-apply hazard; §6.9 maps it to the discard
+/// class). The tenant full-replays to the from-scratch state.
+#[test]
+fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
+    // Arrange: a WAL with two batches and a snapshot written without
+    // a high-water mark (degraded-shutdown shape).
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let root = tmp.path();
+    let snapshots_root = root.join("snapshots");
+    let rule = TenantRule::service_name();
+
+    let batches = [
+        request(vec![resource_logs("checkout", &["user 1 logged in"])]),
+        request(vec![resource_logs("checkout", &["user 2 logged in"])]),
+    ];
+    let mut pipeline = open_pipeline(root);
+    for r in &batches {
+        pipeline.ingest(r.clone()).expect("ingest");
+    }
+    recovery::write_snapshots(&snapshots_root, pipeline.miner(), None)
+        .expect("snapshot without a high-water mark");
+    drop(pipeline);
+
+    let mut control = MinerCluster::new(MinerConfig::default());
+    let total_records = ingest_all(&mut control, &batches);
+
+    // Act
+    let mut wal = Wal::open(wal_config(root)).expect("reopen WAL");
+    let mut recovered = MinerCluster::new(MinerConfig::default());
+    let report =
+        recovery::recover(&mut wal, &snapshots_root, &mut recovered, &rule).expect("recover");
+
+    // Assert: discarded (not restored without suppression), nothing
+    // suppressed, full-replay state equals the control.
+    assert_eq!(report.tenants.len(), 1);
+    assert_eq!(
+        report.tenants[0].outcome,
+        RecoveryOutcome::UnknownOrCorruptDiscarded,
+    );
+    assert_eq!(report.records_suppressed_for_miner, 0);
+    assert_eq!(report.records_fed_to_miner, total_records);
+    assert_equivalent(&recovered, &control);
+}
+
 /// Mint a closed segment holding one `OtlpBatch` frame per request:
 /// build it in a scratch root through the public API, then move the
 /// file into `dest_root` (rotation, RFC0008.6, is not implemented

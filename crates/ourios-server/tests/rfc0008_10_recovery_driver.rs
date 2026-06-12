@@ -227,3 +227,81 @@ async fn rfc0008_10_recovery_runs_before_serving_and_shutdown_snapshots_are_cohe
         );
     }
 }
+
+/// A process that serves zero requests must still stamp its shutdown
+/// snapshots with the replay high-water mark (the recovery-seeded
+/// `last_durable`) — an unstamped artefact is discarded at the next
+/// start, degrading every restart-without-traffic to a full replay.
+#[tokio::test]
+async fn rfc0008_10_shutdown_without_live_traffic_stamps_the_recovered_high_water() {
+    // Arrange: a WAL with one durable frame, no snapshot.
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal_root: PathBuf = tmp.path().join("wal");
+    let snapshots_root = wal_root.join("snapshots");
+
+    let batch = export_request("checkout", &["user 1 logged in"]);
+    let durable = {
+        let mut wal = Wal::open(wal_config(&wal_root)).expect("open WAL");
+        wal.append(FrameKind::OtlpBatch, &batch.encode_to_vec())
+            .expect("append");
+        wal.sync().expect("sync")
+    };
+
+    // Act: spawn, wait for the bound-address report (recovery is
+    // complete by then), SIGTERM without sending a single request.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .env("OURIOS_BUCKET_ROOT", tmp.path())
+        .env("OURIOS_RECEIVER_ENABLED", "1")
+        .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")
+        .env("OURIOS_RECEIVER_HTTP_ADDR", "127.0.0.1:0")
+        .env("OURIOS_WAL_ROOT", &wal_root)
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ourios-server");
+
+    let stdout = child.stdout.take().expect("server stdout piped");
+    let mut lines = BufReader::new(stdout).lines();
+    let read_addr = async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read server stdout")
+                .expect("server stdout closed before reporting addresses");
+            if line.starts_with("receiver HTTP listening on ") {
+                break;
+            }
+        }
+    };
+    timeout(Duration::from_secs(15), read_addr)
+        .await
+        .expect("server reports its bound address before timeout");
+
+    let pid = child.id().expect("server pid");
+    let kill_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .expect("run kill -TERM");
+    assert!(kill_status.success(), "kill -TERM, got {kill_status:?}");
+    let status = timeout(Duration::from_secs(15), child.wait())
+        .await
+        .expect("server exits before timeout")
+        .expect("await server exit");
+    assert!(status.success(), "clean exit, got {status:?}");
+
+    // Assert: the shutdown-written artefact carries the replayed
+    // frame's offset as its high-water mark.
+    let artefacts = snapshot_store::load_all(&snapshots_root).expect("load shutdown snapshots");
+    assert_eq!(artefacts.len(), 1);
+    let (state, outcome) = ourios_miner::snapshot::recover(Some(&artefacts[0].1));
+    assert_eq!(outcome, RecoveryOutcome::Restored);
+    let high_water = state
+        .expect("known-version artefact decodes")
+        .wal_high_water
+        .expect("the zero-request shutdown snapshot still records a high-water mark");
+    assert_eq!(high_water.segment, durable.segment.to_string());
+    assert_eq!(high_water.byte, durable.byte);
+}

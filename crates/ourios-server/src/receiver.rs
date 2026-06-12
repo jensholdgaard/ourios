@@ -127,8 +127,14 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         eprintln!("post-recovery snapshot write failed (next start full-replays): {e}");
     }
 
-    let pipeline: SharedPipeline =
-        Arc::new(Mutex::new(IngestPipeline::new(Box::new(wal), miner, rule)));
+    // Seed the durable mark from replay so a process serving zero
+    // requests still stamps its shutdown snapshots with a concrete
+    // horizon — an unstamped snapshot is discarded at the next start
+    // (RFC 0001 §6.9), which would overwrite the post-recovery
+    // artefacts with full-replay-only ones.
+    let pipeline: SharedPipeline = Arc::new(Mutex::new(
+        IngestPipeline::new(Box::new(wal), miner, rule).with_last_durable(report.max_delivered),
+    ));
 
     // gRPC: bind first so `:0` resolves to a real port before serving.
     let grpc_incoming = TcpIncoming::bind(config.grpc_addr)

@@ -55,7 +55,7 @@
 //! [`AuditSink`]: ourios_core::audit::AuditSink
 //! [`TemplateChange`]: ourios_core::audit::TemplateChange
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_core::audit::{
@@ -1893,11 +1893,20 @@ impl MinerCluster {
         let prefix_depth = usize::from(config.prefix_depth);
         let mut tenant = TenantState::new(config);
 
+        // Ids are unique cluster-wide and the structured map keys on
+        // (severity, scope); a duplicate of either could not have
+        // come from a live tree, and silently keeping one of the two
+        // entries would desync `template_count` from the tree.
+        let mut seen_ids: HashSet<u64> = HashSet::new();
+
         for record in &state.leaves {
-            // Live ingest guarantees ≥ 1 token (tokenize) and one
-            // slot-type set per wildcard, never empty (every slot
-            // carries at least its creation type). A record breaking
-            // either could not have come from a live tree.
+            if !seen_ids.insert(record.template_id) {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!("template_id {} appears more than once", record.template_id),
+                });
+            }
+            // Live ingest guarantees ≥ 1 token (tokenize); an empty
+            // template could not have come from a live tree.
             if record.template.is_empty() {
                 return Err(RestoreError::Inconsistent {
                     detail: format!("template_id {}: empty template", record.template_id),
@@ -1908,28 +1917,7 @@ impl MinerCluster {
                 .iter()
                 .filter(|t| matches!(t, OwnedToken::Wildcard))
                 .count();
-            if record.slot_types.len() != wildcard_count {
-                return Err(RestoreError::Inconsistent {
-                    detail: format!(
-                        "template_id {}: {} slot-type sets for {wildcard_count} wildcard slots",
-                        record.template_id,
-                        record.slot_types.len(),
-                    ),
-                });
-            }
-            let mut slot_types = Vec::with_capacity(record.slot_types.len());
-            for (slot, recorded) in record.slot_types.iter().enumerate() {
-                let mut types = recorded.iter().copied().map(ParamType::from);
-                let Some(first) = types.next() else {
-                    return Err(RestoreError::Inconsistent {
-                        detail: format!(
-                            "template_id {} slot {slot}: empty recorded type set",
-                            record.template_id,
-                        ),
-                    });
-                };
-                slot_types.push(types.fold(SlotTypes::singleton(first), SlotTypes::insert));
-            }
+            let slot_types = restore_slot_types(record, wildcard_count)?;
 
             // `descend_mut` reads the slice length as the length
             // bucket and only the first `min(prefix_depth, len)`
@@ -1972,10 +1960,24 @@ impl MinerCluster {
         }
 
         for record in &state.structured_templates {
-            tenant.structured_templates.insert(
-                (record.severity_number, record.scope_name.clone()),
-                record.template_id,
-            );
+            if !seen_ids.insert(record.template_id) {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!("template_id {} appears more than once", record.template_id),
+                });
+            }
+            let key = (record.severity_number, record.scope_name.clone());
+            if tenant
+                .structured_templates
+                .insert(key, record.template_id)
+                .is_some()
+            {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!(
+                        "structured key (severity {}, scope {:?}) appears more than once",
+                        record.severity_number, record.scope_name,
+                    ),
+                });
+            }
         }
         // Mirror live ingest's cache invariant: every fresh
         // allocation — tree leaf or structured-map entry — counts.
@@ -1996,6 +1998,39 @@ impl MinerCluster {
         self.tenants.insert(tenant_id.clone(), tenant);
         Ok(())
     }
+}
+
+/// Rebuild a leaf's per-slot type sets from the recorded snapshot
+/// during [`MinerCluster::restore_tenant`], rejecting a set count
+/// that disagrees with the wildcard count or an empty recorded set
+/// (live ingest produces neither).
+fn restore_slot_types(
+    record: &crate::snapshot::LeafRecord,
+    wildcard_count: usize,
+) -> Result<Vec<SlotTypes>, RestoreError> {
+    if record.slot_types.len() != wildcard_count {
+        return Err(RestoreError::Inconsistent {
+            detail: format!(
+                "template_id {}: {} slot-type sets for {wildcard_count} wildcard slots",
+                record.template_id,
+                record.slot_types.len(),
+            ),
+        });
+    }
+    let mut slot_types = Vec::with_capacity(record.slot_types.len());
+    for (slot, recorded) in record.slot_types.iter().enumerate() {
+        let mut types = recorded.iter().copied().map(ParamType::from);
+        let Some(first) = types.next() else {
+            return Err(RestoreError::Inconsistent {
+                detail: format!(
+                    "template_id {} slot {slot}: empty recorded type set",
+                    record.template_id,
+                ),
+            });
+        };
+        slot_types.push(types.fold(SlotTypes::singleton(first), SlotTypes::insert));
+    }
+    Ok(slot_types)
 }
 
 /// Resolve the descend-path component for a wildcard at a prefix
@@ -2197,7 +2232,9 @@ mod tests {
     use ourios_core::otlp::{AnyValue, any_value::Value as AvValue};
     use ourios_core::record::SharedRecordSink;
 
-    use crate::snapshot::{LeafRecord, ParamTypeRecord, SnapshotState, TokenRecord};
+    use crate::snapshot::{
+        LeafRecord, ParamTypeRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
+    };
 
     /// Test helper — a `Body::String` record for `tenant` carrying
     /// `text` and default severity (UNSPECIFIED) / scope (None).
@@ -2448,6 +2485,79 @@ mod tests {
             .restore_tenant(&TenantId::new("tenant-x"), &state)
             .expect_err("a Str slot at a path position must be inconsistent");
         assert!(matches!(err, RestoreError::Inconsistent { .. }));
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_template_id() {
+        // Ids are unique cluster-wide; the same id on a leaf and a
+        // structured template could not come from a live tree.
+        let state = SnapshotState {
+            leaves: vec![LeafRecord {
+                template: vec![
+                    TokenRecord::Fixed("disk".to_string()),
+                    TokenRecord::Fixed("full".to_string()),
+                ],
+                template_id: 7,
+                template_version: 1,
+                severity_number: 0,
+                scope_name: None,
+                slot_types: vec![],
+            }],
+            structured_templates: vec![StructuredTemplateRecord {
+                severity_number: 9,
+                scope_name: None,
+                template_id: 7,
+            }],
+            wal_high_water: None,
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a duplicate template_id must be inconsistent");
+        match err {
+            RestoreError::Inconsistent { detail } => {
+                assert!(detail.contains('7'), "detail names the id, got {detail:?}");
+            }
+            other => panic!("expected Inconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_structured_key() {
+        // The structured map keys on (severity, scope); a duplicate
+        // key would silently drop one entry while template_count
+        // counted both.
+        let state = SnapshotState {
+            leaves: vec![],
+            structured_templates: vec![
+                StructuredTemplateRecord {
+                    severity_number: 9,
+                    scope_name: Some("lib.a".to_string()),
+                    template_id: 1,
+                },
+                StructuredTemplateRecord {
+                    severity_number: 9,
+                    scope_name: Some("lib.a".to_string()),
+                    template_id: 2,
+                },
+            ],
+            wal_high_water: None,
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a duplicate structured key must be inconsistent");
+        match err {
+            RestoreError::Inconsistent { detail } => {
+                assert!(
+                    detail.contains('9') && detail.contains("lib.a"),
+                    "detail names the key, got {detail:?}",
+                );
+            }
+            other => panic!("expected Inconsistent, got {other:?}"),
+        }
     }
 
     #[test]

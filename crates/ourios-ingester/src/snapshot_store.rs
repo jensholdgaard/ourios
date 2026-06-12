@@ -113,7 +113,17 @@ pub fn load_all(root: &Path) -> Result<Vec<(TenantId, Vec<u8>)>, SnapshotStoreEr
     };
     let mut out = Vec::new();
     for entry in entries {
-        let path = entry.map_err(io("read_dir entry"))?.path();
+        let entry = entry.map_err(io("read_dir entry"))?;
+        // A directory named `*.snap` is not an artefact; skip it
+        // rather than fail recovery on the read below.
+        if !entry
+            .file_type()
+            .map_err(io("file_type(snapshot entry)"))?
+            .is_file()
+        {
+            continue;
+        }
+        let path = entry.path();
         if path.extension().is_none_or(|e| e != EXTENSION) {
             continue;
         }
@@ -231,6 +241,20 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp");
         std::fs::write(tmp.path().join("README.md"), b"not a snapshot").expect("write");
         std::fs::write(tmp.path().join("not ours.snap"), b"junk").expect("write");
+        write(tmp.path(), &TenantId::new("checkout"), &state(1)).expect("write");
+
+        // Act + Assert
+        let loaded = load_all(tmp.path()).expect("load_all");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.as_str(), "checkout");
+    }
+
+    #[test]
+    fn load_all_skips_non_file_snap_entries() {
+        // Arrange — a *directory* named like an artefact next to a
+        // valid one; reading it as a file would abort recovery.
+        let tmp = tempfile::TempDir::new().expect("temp");
+        std::fs::create_dir(tmp.path().join("junk.snap")).expect("mkdir");
         write(tmp.path(), &TenantId::new("checkout"), &state(1)).expect("write");
 
         // Act + Assert

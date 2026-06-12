@@ -93,6 +93,18 @@ impl IngestPipeline {
         }
     }
 
+    /// Seed the durable high-water mark from startup recovery
+    /// (`RecoveryReport::max_delivered`). Without the seed, a process
+    /// that serves zero requests writes shutdown snapshots with no
+    /// high-water mark, forcing the next start to discard them and
+    /// full-replay (RFC 0001 §6.9). A later [`Journal::sync`] offset
+    /// supersedes the seed.
+    #[must_use]
+    pub fn with_last_durable(mut self, offset: Option<WalOffset>) -> Self {
+        self.last_durable = offset;
+        self
+    }
+
     /// Ingest one decoded export per the §6.5 sequence: fan out, append
     /// the export as a single `OtlpBatch` frame, **fsync**, then hand the
     /// records to the miner, then ack. Returns the number of records
@@ -195,5 +207,96 @@ impl std::error::Error for ReceiveError {
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use ourios_core::config::MinerConfig;
+
+    /// Persists nothing; `sync` reports the configured offset.
+    struct FixedSyncJournal {
+        offset: Option<WalOffset>,
+    }
+
+    impl Journal for FixedSyncJournal {
+        fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
+            Ok(self.offset)
+        }
+    }
+
+    fn pipeline(sync_offset: Option<WalOffset>) -> IngestPipeline {
+        IngestPipeline::new(
+            Box::new(FixedSyncJournal {
+                offset: sync_offset,
+            }),
+            MinerCluster::new(MinerConfig::default()),
+            TenantRule::service_name(),
+        )
+    }
+
+    fn offset(byte: u64) -> WalOffset {
+        WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte,
+        }
+    }
+
+    fn string_value(s: &str) -> AnyValue {
+        AnyValue {
+            value: Some(Value::StringValue(s.to_owned())),
+        }
+    }
+
+    fn request() -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_owned(),
+                        value: Some(string_value("checkout")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(string_value("user 1 logged in")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn seeded_last_durable_holds_until_a_sync_supersedes_it() {
+        let seed = offset(10);
+        let synced = offset(64);
+        let mut pipeline = pipeline(Some(synced)).with_last_durable(Some(seed));
+
+        assert_eq!(pipeline.last_durable(), Some(seed));
+        pipeline.ingest(request()).expect("ingest");
+        assert_eq!(pipeline.last_durable(), Some(synced));
+    }
+
+    #[test]
+    fn seeded_last_durable_survives_a_sync_without_an_offset() {
+        let seed = offset(10);
+        let mut pipeline = pipeline(None).with_last_durable(Some(seed));
+
+        pipeline.ingest(request()).expect("ingest");
+        assert_eq!(pipeline.last_durable(), Some(seed));
     }
 }

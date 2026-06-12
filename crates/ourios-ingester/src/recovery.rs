@@ -99,9 +99,9 @@ impl std::error::Error for RecoveryDriverError {
 /// before opening any listener (RFC0008.10 — no live append
 /// interleaves with replay) and logs each `stale_gap` tenant.
 ///
-/// A snapshot whose recorded high-water segment fails UUID parsing,
-/// or whose payload `MinerCluster::restore_tenant` rejects, is
-/// treated exactly like a corrupt artefact: discarded,
+/// A snapshot whose recorded high-water mark is absent or fails UUID
+/// parsing, or whose payload `MinerCluster::restore_tenant` rejects,
+/// is treated exactly like a corrupt artefact: discarded,
 /// [`RecoveryOutcome::UnknownOrCorruptDiscarded`], full replay for
 /// that tenant (RFC 0001 §6.9 — inconsistent means corrupt).
 ///
@@ -124,17 +124,21 @@ pub fn recover(
     for (tenant_id, bytes) in artefacts {
         let outcome = match ourios_miner::snapshot::recover(Some(&bytes)) {
             (Some(state), RecoveryOutcome::Restored) => {
+                // A restorable snapshot requires a concrete horizon:
+                // restoring without one cannot suppress, so replay
+                // would re-feed every frame the snapshot already
+                // folded — exactly the v1 double-apply hazard. §6.9
+                // maps a missing horizon to the discard class, same
+                // as an unparseable one.
                 match parse_high_water(state.wal_high_water.as_ref()) {
-                    Ok(horizon) => match miner.restore_tenant(&tenant_id, &state) {
+                    Some(horizon) => match miner.restore_tenant(&tenant_id, &state) {
                         Ok(()) => {
-                            if let Some(horizon) = horizon {
-                                horizons.insert(tenant_id.clone(), horizon);
-                            }
+                            horizons.insert(tenant_id.clone(), horizon);
                             RecoveryOutcome::Restored
                         }
                         Err(_) => RecoveryOutcome::UnknownOrCorruptDiscarded,
                     },
-                    Err(()) => RecoveryOutcome::UnknownOrCorruptDiscarded,
+                    None => RecoveryOutcome::UnknownOrCorruptDiscarded,
                 }
             }
             (_, outcome) => outcome,
@@ -158,28 +162,9 @@ pub fn recover(
     };
     wal.replay(&mut sink).map_err(RecoveryDriverError::Replay)?;
 
-    // Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
-    // below the checkpoint whose segment never surfaced during
-    // replay means frames in `(S, oldest surviving)` are gone.
-    // Internally unreachable: the §6.7 retain floor (min over tenant
-    // horizons) keeps any segment holding frames above the floor,
-    // and a lagging tenant's own `S.segment` is protected by its own
-    // membership in the min — so a hit means external mutation of
-    // `wal_root`, and the warning names the gap rather than staying
-    // silent (hazard #5; the re-minting drift is observable via the
-    // RFC 0010 drift query). The rule has no steady-state false
-    // positive: in normal operation `S`'s segment either survives
-    // (seen during replay) or was reclaimed only after the
-    // checkpoint passed it, in which case `S ≥` every reclaimed
-    // frame and `S < checkpoint` fails.
     for tenant in &mut tenants {
         if let Some(horizon) = horizons.get(&tenant.tenant_id) {
-            tenant.stale_gap = match parquet_horizon {
-                Some(checkpoint) => {
-                    *horizon < checkpoint && !sink.segments_seen.contains(&horizon.segment)
-                }
-                None => false,
-            };
+            tenant.stale_gap = stale_gap(*horizon, parquet_horizon, &sink.segments_seen);
         }
     }
 
@@ -220,20 +205,41 @@ pub fn write_snapshots(
     Ok(())
 }
 
-/// Parse a snapshot's recorded high-water mark into a [`WalOffset`].
-/// `Err(())` (an unparseable segment UUID) is the caller's
-/// discard-as-corrupt signal.
-fn parse_high_water(high_water: Option<&WalHighWater>) -> Result<Option<WalOffset>, ()> {
-    match high_water {
-        None => Ok(None),
-        Some(hw) => match uuid::Uuid::parse_str(&hw.segment) {
-            Ok(segment) => Ok(Some(WalOffset {
-                segment,
-                byte: hw.byte,
-            })),
-            Err(_) => Err(()),
-        },
+/// Stale-gap detection (RFC 0001 §3.5.4): a restored horizon `S`
+/// below the checkpoint whose segment never surfaced during replay
+/// means frames in `(S, oldest surviving)` are gone. Internally
+/// unreachable: the §6.7 retain floor (min over tenant horizons)
+/// keeps any segment holding frames above the floor, and a lagging
+/// tenant's own `S.segment` is protected by its own membership in
+/// the min — so a hit means external mutation of `wal_root`, and the
+/// warning names the gap rather than staying silent (hazard #5; the
+/// re-minting drift is observable via the RFC 0010 drift query). The
+/// rule has no steady-state false positive: in normal operation
+/// `S`'s segment either survives (seen during replay) or was
+/// reclaimed only after the checkpoint passed it, in which case
+/// `S ≥` every reclaimed frame and `S < checkpoint` fails.
+fn stale_gap(
+    horizon: WalOffset,
+    checkpoint: Option<WalOffset>,
+    segments_seen: &HashSet<uuid::Uuid>,
+) -> bool {
+    match checkpoint {
+        Some(checkpoint) => horizon < checkpoint && !segments_seen.contains(&horizon.segment),
+        None => false,
     }
+}
+
+/// Parse a snapshot's recorded high-water mark into a [`WalOffset`].
+/// `None` — the mark is absent or its segment UUID is unparseable —
+/// is the caller's discard-as-corrupt signal: a restorable snapshot
+/// requires a concrete horizon.
+fn parse_high_water(high_water: Option<&WalHighWater>) -> Option<WalOffset> {
+    let hw = high_water?;
+    let segment = uuid::Uuid::parse_str(&hw.segment).ok()?;
+    Some(WalOffset {
+        segment,
+        byte: hw.byte,
+    })
 }
 
 /// The §6.6 [`FrameSink`]: per `OtlpBatch` frame, decode →
@@ -301,5 +307,97 @@ fn reject(offset: WalOffset, error: &dyn std::fmt::Display) -> RecoveryError {
             "OtlpBatch frame at {}+{}: {error}",
             offset.segment, offset.byte
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ourios_core::config::MinerConfig;
+
+    const SEGMENT: &str = "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0";
+
+    fn offset(segment: &str, byte: u64) -> WalOffset {
+        WalOffset {
+            segment: uuid::Uuid::parse_str(segment).expect("test uuid"),
+            byte,
+        }
+    }
+
+    #[test]
+    fn parse_high_water_accepts_a_concrete_mark() {
+        let hw = WalHighWater {
+            segment: SEGMENT.to_string(),
+            byte: 64,
+        };
+        assert_eq!(parse_high_water(Some(&hw)), Some(offset(SEGMENT, 64)));
+    }
+
+    #[test]
+    fn parse_high_water_rejects_an_unparseable_segment() {
+        let hw = WalHighWater {
+            segment: "not-a-uuid".to_string(),
+            byte: 64,
+        };
+        assert_eq!(parse_high_water(Some(&hw)), None);
+    }
+
+    #[test]
+    fn parse_high_water_rejects_an_absent_mark() {
+        // A restorable snapshot requires a concrete horizon (the
+        // double-apply hazard); absent maps to the same discard
+        // signal as unparseable.
+        assert_eq!(parse_high_water(None), None);
+    }
+
+    #[test]
+    fn stale_gap_flags_a_horizon_below_the_checkpoint_whose_segment_is_unseen() {
+        let s = offset("00000000-0000-7000-8000-000000000001", 10);
+        let x = offset("00000000-0000-7000-8000-000000000002", 5);
+        let seen = HashSet::from([x.segment]);
+        assert!(stale_gap(s, Some(x), &seen));
+    }
+
+    #[test]
+    fn stale_gap_is_false_without_a_checkpoint() {
+        let s = offset("00000000-0000-7000-8000-000000000001", 10);
+        assert!(!stale_gap(s, None, &HashSet::new()));
+    }
+
+    #[test]
+    fn stale_gap_is_false_when_the_horizon_segment_survived() {
+        let s = offset("00000000-0000-7000-8000-000000000001", 10);
+        let x = offset("00000000-0000-7000-8000-000000000002", 5);
+        let seen = HashSet::from([s.segment, x.segment]);
+        assert!(!stale_gap(s, Some(x), &seen));
+    }
+
+    #[test]
+    fn sink_rejects_a_malformed_payload_naming_the_offset() {
+        let mut miner = MinerCluster::new(MinerConfig::default());
+        let rule = TenantRule::service_name();
+        let horizons = HashMap::new();
+        let mut sink = DriverSink {
+            miner: &mut miner,
+            rule: &rule,
+            horizons: &horizons,
+            frames_delivered: 0,
+            records_fed: 0,
+            records_suppressed: 0,
+            segments_seen: HashSet::new(),
+            max_delivered: None,
+        };
+
+        // A truncated varint key cannot decode as a protobuf message.
+        let err = sink
+            .consume(offset(SEGMENT, 128), FrameKind::OtlpBatch, &[0xFF; 4])
+            .expect_err("malformed payload must be rejected");
+        let RecoveryError::SinkRejected { detail } = err else {
+            panic!("expected SinkRejected, got {err:?}");
+        };
+        assert!(
+            detail.contains(&format!("{SEGMENT}+128")),
+            "detail names the offset, got {detail:?}",
+        );
     }
 }

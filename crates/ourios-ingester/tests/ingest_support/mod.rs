@@ -61,9 +61,9 @@ impl Journal for SpyJournal {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), ReceiveError> {
+    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
         self.log.lock().expect("call log").push(JournalCall::Sync);
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -180,8 +180,8 @@ impl Journal for CapturingJournal {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), ReceiveError> {
-        Ok(())
+    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
+        Ok(None)
     }
 }
 

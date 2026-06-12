@@ -16,7 +16,10 @@
 //! - **WAL-before-ack** (RFC 0008 / `CLAUDE.md` §3.4) — durability
 //!   before acknowledgement, via the shipped `ourios-wal`. Wired into
 //!   the ingest path by [`receiver::pipeline`]: every non-empty batch is
-//!   appended + fsync'd before its ack (RFC0003.1).
+//!   appended + fsync'd before its ack (RFC0003.1). The startup side is
+//!   [`recovery`] — the RFC 0008 §6.6 driver restoring per-tenant miner
+//!   snapshots ([`snapshot_store`], RFC 0001 §6.9) and replaying the WAL
+//!   under per-consumer suppression horizons (RFC0008.10).
 //! - **Background compaction** (RFC 0009 §3.2, `specified`) — the only
 //!   subsystem implemented in this scaffold. [`compactor`] sweeps the
 //!   store for sealed, candidate partitions
@@ -32,6 +35,10 @@
 pub mod compactor;
 pub mod metrics;
 pub mod receiver;
+pub mod recovery;
+pub mod snapshot_store;
 
 pub use compactor::{Compactor, IngestError, SweepReport, run_sweep};
 pub use metrics::CompactionMetrics;
+pub use recovery::{RecoveryDriverError, RecoveryReport, TenantRecovery};
+pub use snapshot_store::SnapshotStoreError;

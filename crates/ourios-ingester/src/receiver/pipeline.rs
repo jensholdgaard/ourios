@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, Wal};
+use ourios_wal::{FrameKind, Wal, WalOffset};
 use prost::Message;
 
 use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
@@ -43,12 +43,16 @@ pub trait Journal: Send {
     /// [`ReceiveError::WalAppend`] on a persistence failure.
     fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError>;
 
-    /// Fsync — appended frames are durable when this returns `Ok`.
+    /// Fsync — appended frames are durable when this returns `Ok`,
+    /// yielding the durable high-water offset when the journal has
+    /// one (the WAL does; test spies that persist nothing return
+    /// `None`). The snapshot writer records this offset as the
+    /// snapshot's WAL high-water mark (RFC 0001 §6.9).
     ///
     /// # Errors
     ///
     /// [`ReceiveError::WalSync`] on an fsync failure.
-    fn sync(&mut self) -> Result<(), ReceiveError>;
+    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError>;
 }
 
 impl Journal for Wal {
@@ -58,8 +62,8 @@ impl Journal for Wal {
             .map_err(ReceiveError::WalAppend)
     }
 
-    fn sync(&mut self) -> Result<(), ReceiveError> {
-        Wal::sync(self).map(|_| ()).map_err(ReceiveError::WalSync)
+    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
+        Wal::sync(self).map(Some).map_err(ReceiveError::WalSync)
     }
 }
 
@@ -73,6 +77,7 @@ pub struct IngestPipeline {
     journal: Box<dyn Journal>,
     miner: MinerCluster,
     rule: TenantRule,
+    last_durable: Option<WalOffset>,
 }
 
 impl IngestPipeline {
@@ -84,6 +89,7 @@ impl IngestPipeline {
             journal,
             miner,
             rule,
+            last_durable: None,
         }
     }
 
@@ -121,7 +127,9 @@ impl IngestPipeline {
         // Step 3: append the export as one OtlpBatch frame. Step 4: fsync
         // — the batch is durable before the ack below.
         self.journal.append_batch(&payload)?;
-        self.journal.sync()?;
+        if let Some(offset) = self.journal.sync()? {
+            self.last_durable = Some(offset);
+        }
 
         // Step 5: hand records to the miner (only after durability, so a
         // crash between fsync and here replays from the WAL).
@@ -137,6 +145,14 @@ impl IngestPipeline {
     #[must_use]
     pub fn miner(&self) -> &MinerCluster {
         &self.miner
+    }
+
+    /// The journal's durable high-water offset after the most recent
+    /// acked batch, when known — what a snapshot taken now records as
+    /// its WAL high-water mark (RFC 0001 §6.9).
+    #[must_use]
+    pub fn last_durable(&self) -> Option<WalOffset> {
+        self.last_durable
     }
 }
 

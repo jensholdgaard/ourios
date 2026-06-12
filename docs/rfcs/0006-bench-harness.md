@@ -26,8 +26,8 @@ any code is written, because the difference between "the thesis
 holds" being a real claim and a vibe lives in those
 definitions. `B1` and `B2` (predicate-pushdown and
 template-exact query latency) are excluded: they need the
-DataFusion querier (`ourios-querier`, RFC 0007) and landed in
-follow-up extensions once the querier was live — both are now
+DataFusion querier (`ourios-querier`, RFC 0007) and therefore
+landed in follow-up extensions once the querier was live — both are now
 measured authoritatively (`docs/benchmarks.md` §9.4; RFC 0007
 is `validated`).
 

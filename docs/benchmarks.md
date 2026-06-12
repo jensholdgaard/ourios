@@ -71,7 +71,7 @@ architecture.
   2. Go service under Kubernetes (heterogeneous, mid entropy).
   3. Heterogeneous k8s aggregate across many services (high entropy,
      mixed formats).
-- **Hardware baseline**: commodity cloud VM, 8 vCPU, 32 GiB RAM,
+- **Hardware baseline**: a commodity 8 vCPU / 32 GiB RAM host with
   gp3-class SSD. All `must-win` numbers are quoted against this
   baseline; scaling to larger hardware is a separate question. The
   realised baseline (the `baseline-8vcpu-32gib` hardware tag, first
@@ -190,8 +190,8 @@ exploit structure the tree extracted.
   `baseline-8vcpu-32gib` run of 2026-06-12 (§9.4): **PASS** — the
   windowed template-exact scan stays at 1 row group with a flat
   ~4.2–5.9 ms latency band across every corpus, including the
-  first second-family reading (LogHub HDFS_v1, 11.2 M rows: 1/14
-  row groups, 5.92 ms), while the full-span variant grows with
+  first reading from a second corpus family (LogHub HDFS_v1,
+  11.2 M rows: 1/14 row groups, 5.92 ms), while the full-span variant grows with
   corpus size. The formal target speaks above ~10 GiB, which
   remains a future scale extension; the flat shape holding at
   11.2 M rows across two corpus families is the operative

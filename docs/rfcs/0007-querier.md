@@ -1,7 +1,7 @@
 ---
 rfc: 0007
 title: Querier — DataFusion execution frontend for the logs DSL
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-01
@@ -11,42 +11,35 @@ superseded-by: —
 
 # RFC 0007 — Querier: DataFusion execution frontend for the logs DSL
 
-> **Status note.** **`green`** — the §5 acceptance criteria
-> RFC0007.1–.5 all have live passing tests
-> (`crates/ourios-querier/tests/{execution,boundary,forward_compat}.rs`
-> and the `crates/ourios-querier/src/lib.rs` no-leakage unit test;
-> `crates/ourios-querier/tests/acceptance.rs` is now a pointer to them).
-> It pins the *execution* layer — how a compiled query
-> runs against the RFC 0005 Parquet contract with predicate pushdown, and
-> how the B1/B2 thesis gates are measured. The status was held at
-> `specified` by the prove-thesis gate (it deliberately did not re-decide
-> the DSL surface); that gate is now cleared — RFC 0002 §3 landed
-> (Branch B, #143) and the DSL is fully `green` (#154) — so this RFC
-> advances to `green`. `validated` (the B1/B2 thesis-gate measurement,
-> `docs/benchmarks.md`) and `accepted` follow per the
-> `docs/rfcs/README.md` ladder.
->
-> **Validated assessment (2026-06-12).** The first B1/B2 measurements
-> exist (`docs/benchmarks.md` §9.3; query-bench runs 27379085890 +
-> 27357104694, recorded per maintainer authorization of 2026-06-12):
-> B1 clears its ≥ 10× gate at **40.0× / 30.4×** on two ~1 GB
-> OTel-Demo corpora with exact row-count agreement against the
-> reference pipeline, and B2's windowed scan stays **flat** (1 row
-> group, ~3.4–4.1 ms) from v4 → v6 while the full-span variant grows
-> with the corpus. What the ladder requires that is **not** yet met:
-> `validated` reads "thesis-gates pass on representative corpora"
-> against `docs/benchmarks.md` §1, which quotes every must-win number
-> on `baseline-8vcpu-32gib` — all runs so far are `ci-runner`
-> (indicative). Further weaknesses, stated plainly: the B1 error
-> bands are ultra-thin (11 / 28 rows — the friendliest case for
-> pruning), both corpora sit just under §8's 1 GiB binary minimum,
-> and only one corpus family has fed the gates (OTel-Demo; the
-> LogHub HDFS_v1 B2 arm hasn't run). The status therefore **stays
-> `green`**. Validated-pending checklist: (1) authoritative rerun on
-> `baseline-8vcpu-32gib` — required; (2) a denser error band (or a
-> less extreme B1 selectivity point) — supporting; (3) a second
-> corpus family for B2 (HDFS_v1 via the query-bench `fetch_hdfs`
-> arm) — supporting.
+> **Status note.** **`validated`** (2026-06-12, per the maintainer's
+> authorization of the same date). The `docs/verification.md` §3
+> ladder requires for `validated` that *"every thesis-gate in
+> `benchmarks.md` §7 that the RFC's pillars touch passes on
+> representative corpora."* This RFC's pillar is the query engine
+> (pillar #3 — DataFusion); the gates it touches are **B1 and B2**,
+> and both now pass **authoritatively** on the §1 hardware baseline
+> (`baseline-8vcpu-32gib`), measured over ~1 GB+ corpora **including
+> a second corpus family** — LogHub HDFS_v1, 11.2 M rows
+> (`docs/benchmarks.md` §9.4): B1 at **34.2× / 25.4×** against the
+> ≥ 10× gate with exact row-count agreement vs the reference
+> pipeline; B2's windowed template-exact scan **flat** at 1 row
+> group / 4.2–5.9 ms from 735 k to 11.2 M rows while the full-span
+> variant grows with the corpus. **A1's authoritative FAIL does not
+> gate this RFC**: the ladder scopes validation to the gates the
+> RFC's pillars touch, and A1 belongs to the template-mining /
+> compression pillar (measured under RFC 0006), where its
+> escalation is handled. The prior validated-pending checklist
+> resolves as: (1) authoritative `baseline-8vcpu-32gib` rerun —
+> **✓ done** (§9.4); (2) denser error band — **still open**, a
+> non-blocking quality improvement (the §9.4 B1 bands remain
+> 11 / 28 rows); (3) second corpus family for B2 — **✓ done**
+> (HDFS_v1 via the query-bench arm). Earlier history: the §5
+> acceptance criteria RFC0007.1–.5 went `green` via
+> `crates/ourios-querier/tests/{execution,boundary,forward_compat}.rs`
+> and the `crates/ourios-querier/src/lib.rs` no-leakage unit test
+> (`tests/acceptance.rs` is a pointer to them); the first indicative
+> `ci-runner` B1/B2 readings are §9.3. `accepted` follows on
+> maintainer sign-off per the `docs/rfcs/README.md` ladder.
 
 ## 1. Summary
 

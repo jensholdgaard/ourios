@@ -344,14 +344,16 @@ fn invariant_3_5_1_snapshot_format_carries_leading_version_byte() {
 /// Scenario §3.5.2 — Unknown snapshot version triggers full WAL replay.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
-/// v1 recovery (RFC 0001 §6.9 *v1 scope*) rebuilds the tree from a
-/// full `Wal::replay()` in **both** branches; here the WAL is stood
-/// in for by re-ingesting the frames the WAL holds into a fresh
-/// cluster (the `OtlpBatch`-decode + miner-ingest pipeline that the
-/// real replay drives lives in `ourios-ingester`). The stale
-/// snapshot is deliberately built from *different* templates than
-/// the WAL frames, so "recovered == full WAL replay, NOT the stale
-/// snapshot" is a real assertion.
+/// Under the RFC 0001 §6.9 v2 amendment (restore switched on) the
+/// unknown-version branch still discards the artefact and falls
+/// back to a full WAL replay: `recover` returns no state, and the
+/// driver rebuilds by re-ingesting every WAL frame — stood in here
+/// by a fresh cluster (the `OtlpBatch`-decode + miner-ingest
+/// pipeline that the real replay drives lives in
+/// `ourios-ingester`). The stale snapshot is deliberately built
+/// from *different* templates than the WAL frames, so "recovered
+/// == full WAL replay, NOT the stale snapshot" is a real
+/// assertion.
 #[test]
 fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
     use ourios_core::config::MinerConfig;
@@ -392,16 +394,23 @@ fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
         "unknown version byte must surface UnknownVersion(0xFF), got {load_err:?}",
     );
 
-    // Act 2 — recover from the stale snapshot + the WAL. The rebuild
-    // closure is the full-replay stand-in: it re-ingests every WAL
-    // frame into a fresh cluster and returns the resulting tree state.
-    let (recovered, outcome) = recover(Some(&stale_snapshot), || {
+    // Act 2 — recovery dispatches on the version byte: the unknown
+    // version yields no state, telling the driver to full-replay.
+    let (restored, outcome) = recover(Some(&stale_snapshot));
+    assert_eq!(
+        restored, None,
+        "an unknown-version snapshot must not restore",
+    );
+
+    // The full-replay fallback the driver runs on `None`: re-ingest
+    // every WAL frame into a fresh cluster.
+    let recovered = {
         let mut replayed = MinerCluster::new(MinerConfig::default());
         for text in wal_frames {
             replayed.ingest(&rec(text));
         }
         replayed.snapshot_state(&tenant)
-    });
+    };
 
     // The tree a full WAL replay alone would produce — the truth.
     let from_wal_only = {

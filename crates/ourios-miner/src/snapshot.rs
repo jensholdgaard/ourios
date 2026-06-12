@@ -1,4 +1,4 @@
-//! Per-tenant template-tree snapshot format + v1 recovery
+//! Per-tenant template-tree snapshot format + recovery dispatch
 //! (RFC 0001 §6.9, §3.5.1 / §3.5.2).
 //!
 //! A snapshot is a **rebuildable recovery-acceleration cache, not
@@ -24,23 +24,24 @@
 //! structured-template-id map (§6.2 step-0 short-circuit), and the
 //! WAL high-water mark.
 //!
-//! # v1 recovery — rebuild from a full replay; do not restore yet
+//! # Recovery — restore active per the §6.9 v2 amendment
 //!
-//! [`recover`] **ignores the snapshot payload and rebuilds the tree
-//! from a full WAL replay in both branches.** The known-version
-//! branch does **not** restore. This is a correctness constraint,
-//! not a simplification: the restore-then-replay-the-tail path of
-//! RFC 0001 §6.9 step (2) needs the RFC 0008 §6.7 checkpoint /
-//! replay-from-offset API (`Wal::checkpoint`), which is an RFC 0008
-//! red-gate stub. Restoring a tree from a snapshot and *then*
-//! replaying the full WAL — the only replay available without
-//! offset support — would **double-apply** every frame the snapshot
-//! already captured, corrupting the tree. So until offset-resume
-//! lands, recovery discards the snapshot payload and rebuilds from
-//! the WAL. What lands now is the snapshot *format* (the leading
-//! version byte and the recorded high-water mark) and the
-//! version-dispatch + WAL-fallback contract; the restore path is
-//! switched on, with no format change, once RFC 0008 §6.7 lands.
+//! [`recover`] dispatches on the version byte: a known-version
+//! snapshot deserialises and is **returned for restore** (RFC 0001
+//! §6.9 step 2, switched on by the 2026-06-12 v2 amendment now that
+//! the RFC 0008 §6.7 checkpoint + offset-carrying-sink API has
+//! landed); an absent, unknown-version, or corrupt artefact yields
+//! `None` and the caller full-replays the WAL (step 3). The caller
+//! — the ingester's recovery driver — restores the returned state
+//! into the cluster and replays only the WAL tail above the
+//! state's `wal_high_water` mark.
+//!
+//! Historical note: v1 deliberately refused to restore. Without the
+//! RFC 0008 §6.7 offset-resume API the only replay available was the
+//! full WAL, and restoring a tree and *then* full-replaying would
+//! have double-applied every frame the snapshot already captured,
+//! corrupting the tree. The v2 amendment resolves the hazard by
+//! routing (per-consumer offset horizons), not by refusing.
 
 use ourios_core::audit::{ParamType, SlotTypes};
 use serde::{Deserialize, Serialize};
@@ -60,9 +61,8 @@ pub const SNAPSHOT_VERSION: u8 = 1;
 ///
 /// `leaves` and `structured_templates` are `Vec`s (not maps) so the
 /// serialised form is order-deterministic for a given build order.
-/// v1 recovery does **not** restore from a snapshot (it full-replays
-/// the WAL); the restore path that rebuilds the in-memory `HashMap`s
-/// from these lands with RFC 0008 §6.7 offset-resume.
+/// `MinerCluster::restore_tenant` rebuilds the in-memory tree and
+/// maps from these on the known-version recovery path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotState {
     /// Every `Body::String` leaf in the tenant's tree.
@@ -74,9 +74,9 @@ pub struct SnapshotState {
     /// map's identity (RFC 0001 §6.1).
     pub structured_templates: Vec<StructuredTemplateRecord>,
     /// WAL high-water mark this snapshot's tree state reflects, or
-    /// `None` if no offset was recorded. Captured so a future
-    /// optimisation can resume replay from here (RFC 0008 §6.7)
-    /// rather than from the start of the log; v1 does not use it.
+    /// `None` if no offset was recorded. On the known-version
+    /// recovery path the driver replays only the WAL tail above
+    /// this mark (RFC 0008 §6.7 offset-resume).
     pub wal_high_water: Option<WalHighWater>,
 }
 
@@ -263,9 +263,9 @@ pub fn snapshot(state: &SnapshotState) -> Result<Vec<u8>, SnapshotError> {
 
 /// Read the version byte and, when it matches [`SNAPSHOT_VERSION`],
 /// deserialise the payload (RFC 0001 §6.9 recovery step). Does
-/// **not** decide whether to use the result — [`recover`] owns the
-/// v1 "discard and full-replay regardless" policy. This function is
-/// the version-dispatch surface §3.5.2 exercises.
+/// **not** decide what to do with the result — [`recover`] owns the
+/// restore-vs-discard dispatch. This function is the
+/// version-dispatch surface §3.5.2 exercises.
 ///
 /// # Errors
 ///
@@ -284,63 +284,52 @@ pub fn load_snapshot(bytes: &[u8]) -> Result<SnapshotState, SnapshotError> {
     }
 }
 
-/// Outcome of a v1 recovery: which fallback path produced the tree,
-/// for snapshot-load telemetry (RFC 0001 §6.9 *Snapshot-load
-/// telemetry*). The tree itself always comes from `rebuild` in v1;
-/// this only records *why* the snapshot did not short-circuit it.
+/// Which recovery path ran, for snapshot-load telemetry (RFC 0001
+/// §6.9 *Snapshot-load telemetry*): restore-then-tail-replay versus
+/// the two full-replay fallbacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryOutcome {
     /// No snapshot artefact was supplied (cold start, or the cache
-    /// file was absent).
+    /// file was absent); the caller full-replays the WAL.
     NoSnapshot,
-    /// A snapshot was supplied and its version byte was known. In
-    /// v1 the payload is still discarded and the tree is rebuilt
-    /// from the WAL (the restore path is gated on RFC 0008 §6.7).
-    KnownVersionDiscarded,
+    /// A known-version snapshot deserialised; its state is returned
+    /// for restore and the caller replays only the WAL tail above
+    /// the state's recorded high-water mark (§6.9 step 2).
+    Restored,
     /// A snapshot was supplied but its version byte was unknown or
-    /// its payload was corrupt; it was discarded (§3.5.2).
+    /// its payload was corrupt; it was discarded (§3.5.2) and the
+    /// caller full-replays the WAL.
     UnknownOrCorruptDiscarded,
 }
 
-/// Recover one tenant's tree state on ingester restart (RFC 0001
-/// §6.9 recovery algorithm).
+/// Recover one tenant's snapshot state on ingester restart (RFC 0001
+/// §6.9 recovery algorithm, restore active per the 2026-06-12 v2
+/// amendment).
 ///
-/// **v1 behaviour: always rebuild from a full WAL replay; never
-/// restore from the snapshot.** `rebuild` is the caller-supplied
-/// full-replay closure — in production the ingester's
-/// `Wal::replay`-driven path that re-runs `OtlpBatch` frames back
-/// through the miner from the start of the log. This function still
-/// calls [`load_snapshot`] to exercise and observe the
-/// version-dispatch (known → [`RecoveryOutcome::KnownVersionDiscarded`],
-/// unknown / corrupt / empty → [`RecoveryOutcome::UnknownOrCorruptDiscarded`]),
-/// but the dispatch result is **not** used to skip the replay.
+/// Dispatch:
 ///
-/// The miner crate deliberately does not depend on `ourios-wal`:
-/// the `OtlpBatch`-decode + tenant-fan-out + miner-ingest pipeline
-/// the full replay drives lives in the ingester (`ourios-ingester`),
-/// and the snapshot *format* + version-dispatch + WAL-fallback
-/// *decision* are what this slice owns. Passing the replay in as a
-/// closure keeps both on the correct side of the crate boundary.
+/// - `None` → `(None, NoSnapshot)`.
+/// - Known version byte → `(Some(state), Restored)`.
+/// - Unknown version, corrupt payload, or empty artefact →
+///   `(None, UnknownOrCorruptDiscarded)`.
 ///
-/// The known-version restore path (deserialise the payload, restore
-/// the tree, then replay only the WAL tail from `wal_high_water`)
-/// activates — with no format change — once the RFC 0008 §6.7
-/// offset-resume API lands. Restoring here and *then* full-replaying
-/// would double-apply every captured frame and corrupt the tree, so
-/// v1 must discard the payload in both branches.
-pub fn recover<T, F>(snapshot_bytes: Option<&[u8]>, rebuild: F) -> (T, RecoveryOutcome)
-where
-    F: FnOnce() -> T,
-{
-    let outcome = match snapshot_bytes {
-        None => RecoveryOutcome::NoSnapshot,
+/// The caller — the ingester's recovery driver — restores a returned
+/// state into the cluster (`MinerCluster::restore_tenant`) and
+/// replays only the WAL tail above `state.wal_high_water`; on `None`
+/// it full-replays the WAL. The miner crate deliberately does not
+/// depend on `ourios-wal`: the replay pipeline lives in the
+/// ingester, and the snapshot format + version-dispatch + restore
+/// surface are what this crate owns.
+#[must_use]
+pub fn recover(snapshot_bytes: Option<&[u8]>) -> (Option<SnapshotState>, RecoveryOutcome) {
+    match snapshot_bytes {
+        None => (None, RecoveryOutcome::NoSnapshot),
         Some(bytes) => match load_snapshot(bytes) {
-            Ok(_state) => RecoveryOutcome::KnownVersionDiscarded,
-            Err(_e) => RecoveryOutcome::UnknownOrCorruptDiscarded,
+            Ok(state) => (Some(state), RecoveryOutcome::Restored),
+            Err(_e) => (None, RecoveryOutcome::UnknownOrCorruptDiscarded),
         },
-    };
-    (rebuild(), outcome)
+    }
 }
 
 /// Convert a [`SlotTypes`] vector (the leaf's per-slot type sets)
@@ -459,42 +448,47 @@ mod tests {
     }
 
     #[test]
-    fn recover_with_no_snapshot_rebuilds_and_reports_no_snapshot() {
-        // Arrange + Act — v1 always rebuilds via the closure.
-        let (tree, outcome) = recover(None, || 42u32);
+    fn recover_with_no_snapshot_reports_no_snapshot() {
+        // Arrange + Act — no artefact: the caller full-replays.
+        let (state, outcome) = recover(None);
 
         // Assert
-        assert_eq!(tree, 42);
+        assert_eq!(state, None);
         assert_eq!(outcome, RecoveryOutcome::NoSnapshot);
     }
 
+    /// Replaces `recover_with_known_version_still_rebuilds_from_
+    /// closure`, which asserted the v1 discard contract (known
+    /// version → payload discarded, full rebuild). That contract was
+    /// retired by the RFC 0001 §6.9 v2 amendment (2026-06-12): with
+    /// RFC 0008 §6.7 offset-resume landed, a known-version snapshot
+    /// is returned for restore and the driver replays only the WAL
+    /// tail above its high-water mark.
     #[test]
-    fn recover_with_known_version_still_rebuilds_from_closure() {
-        // Arrange — a well-formed snapshot. v1 must NOT restore from
-        // it: the rebuild closure's value is what comes back, and the
-        // outcome records that the known-version payload was discarded.
+    fn recover_with_known_version_returns_the_state_for_restore() {
+        // Arrange — a well-formed snapshot.
         let bytes = snapshot(&sample_state()).expect("snapshot encodes");
 
         // Act
-        let (tree, outcome) = recover(Some(&bytes), || 7u32);
+        let (state, outcome) = recover(Some(&bytes));
 
-        // Assert — rebuilt value, not anything derived from the snapshot.
-        assert_eq!(tree, 7);
-        assert_eq!(outcome, RecoveryOutcome::KnownVersionDiscarded);
+        // Assert — the deserialised state comes back for restore.
+        assert_eq!(state, Some(sample_state()));
+        assert_eq!(outcome, RecoveryOutcome::Restored);
     }
 
     #[test]
-    fn recover_with_unknown_version_discards_and_rebuilds() {
+    fn recover_with_unknown_version_discards() {
         // Arrange — unknown version byte.
         let mut bytes = snapshot(&sample_state()).expect("snapshot encodes");
         bytes[0] = 0xFF;
 
         // Act
-        let (tree, outcome) = recover(Some(&bytes), || 9u32);
+        let (state, outcome) = recover(Some(&bytes));
 
-        // Assert — the stale snapshot is discarded; the tree comes
-        // from the rebuild closure (the WAL, in production).
-        assert_eq!(tree, 9);
+        // Assert — the stale snapshot is discarded; the caller
+        // rebuilds from the WAL (full replay, §3.5.2).
+        assert_eq!(state, None);
         assert_eq!(outcome, RecoveryOutcome::UnknownOrCorruptDiscarded);
     }
 
@@ -502,9 +496,8 @@ mod tests {
     fn slot_types_to_record_captures_every_member() {
         // The serialisable form lists each member of the set (in
         // `SlotTypes::iter` / canonical `ParamType` order). The
-        // restore-side inverse lands with the recovery restore path
-        // (RFC 0008 §6.7); here we pin the forward encoding `snapshot`
-        // relies on.
+        // restore-side inverse lives in `MinerCluster::restore_tenant`;
+        // here we pin the forward encoding `snapshot` relies on.
         let record =
             slot_types_to_record(SlotTypes::singleton(ParamType::Num).insert(ParamType::Str));
 

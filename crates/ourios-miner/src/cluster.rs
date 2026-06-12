@@ -46,13 +46,16 @@
 //!   through `ourios-parquet`).
 //! - A WAL-backed audit/record sink (RFC §6.4); today an in-memory
 //!   placeholder stands in (see above).
-//! - Snapshot + recovery of the cluster state (RFC §6.9).
+//! - The §6.9 recovery driver (snapshot load + WAL-tail replay)
+//!   lives in the ingester; the cluster's halves of that contract
+//!   are [`MinerCluster::snapshot_state`] and
+//!   [`MinerCluster::restore_tenant`].
 //!
 //! [`Tree`]: crate::tree::Tree
 //! [`AuditSink`]: ourios_core::audit::AuditSink
 //! [`TemplateChange`]: ourios_core::audit::TemplateChange
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ourios_core::audit::{
@@ -66,7 +69,7 @@ use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::record::{BodyKind, MinedRecord, NoOpRecordSink, Param, RecordSink};
 use ourios_core::tenant::TenantId;
 
-use crate::mask::mask;
+use crate::mask::{mask, tag_str_for};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
 use crate::tokenize::tokenize;
@@ -1851,7 +1854,236 @@ impl MinerCluster {
             wal_high_water: None,
         }
     }
+
+    /// Every tenant with allocated state, sorted for determinism —
+    /// the snapshot writer iterates this to produce one artefact
+    /// per tenant in a stable order.
+    #[must_use]
+    pub fn tenant_ids(&self) -> Vec<TenantId> {
+        let mut ids: Vec<TenantId> = self.tenants.keys().cloned().collect();
+        ids.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+
+    /// Restore one tenant's template state from a deserialised
+    /// snapshot — RFC 0001 §6.9 step (2)'s tree restore, active per
+    /// the 2026-06-12 v2 amendment. The caller (the ingester's
+    /// recovery driver) runs this **before** any live ingest for
+    /// `tenant_id`, then replays only the WAL tail above the
+    /// snapshot's recorded high-water mark.
+    ///
+    /// # Errors
+    ///
+    /// - [`RestoreError::TenantAlreadyLive`] if the tenant already
+    ///   has state — restoring over a live tree would double-apply
+    ///   the lines the snapshot captured.
+    /// - [`RestoreError::Inconsistent`] if the snapshot violates a
+    ///   live-tree invariant. The driver maps this to *discard and
+    ///   full-replay* — §6.9 treats a semantically inconsistent
+    ///   snapshot exactly like a corrupt one.
+    pub fn restore_tenant(
+        &mut self,
+        tenant_id: &TenantId,
+        state: &crate::snapshot::SnapshotState,
+    ) -> Result<(), RestoreError> {
+        if self.tenants.contains_key(tenant_id) {
+            return Err(RestoreError::TenantAlreadyLive);
+        }
+        let config = self.effective_config(tenant_id);
+        let prefix_depth = usize::from(config.prefix_depth);
+        let mut tenant = TenantState::new(config);
+
+        // Ids are unique cluster-wide and the structured map keys on
+        // (severity, scope); a duplicate of either could not have
+        // come from a live tree, and silently keeping one of the two
+        // entries would desync `template_count` from the tree.
+        let mut seen_ids: HashSet<u64> = HashSet::new();
+
+        for record in &state.leaves {
+            if !seen_ids.insert(record.template_id) {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!("template_id {} appears more than once", record.template_id),
+                });
+            }
+            // Live ingest guarantees ≥ 1 token (tokenize); an empty
+            // template could not have come from a live tree.
+            if record.template.is_empty() {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!("template_id {}: empty template", record.template_id),
+                });
+            }
+            let template: Vec<OwnedToken> = record.template.iter().map(OwnedToken::from).collect();
+            let wildcard_count = template
+                .iter()
+                .filter(|t| matches!(t, OwnedToken::Wildcard))
+                .count();
+            let slot_types = restore_slot_types(record, wildcard_count)?;
+
+            // `descend_mut` reads the slice length as the length
+            // bucket and only the first `min(prefix_depth, len)`
+            // entries as the prefix path, so positions past the path
+            // take a filler. A path-position wildcard can only arise
+            // from mask emission at leaf creation, and every line
+            // reaching the leaf carries the identical masked tag
+            // there — widening and type-expansion are impossible at
+            // path positions because tree candidates share their
+            // first walk_depth masked tokens by construction. Its
+            // recorded slot set is therefore a singleton of a
+            // mask-emitted type, whose tag string is the path
+            // component.
+            let walk_depth = prefix_depth.min(template.len());
+            let mut masked: Vec<&str> = Vec::with_capacity(template.len());
+            let mut slot = 0usize;
+            for (position, token) in template.iter().enumerate() {
+                match token {
+                    OwnedToken::Fixed(s) => masked.push(s),
+                    OwnedToken::Wildcard if position < walk_depth => {
+                        masked.push(path_tag(record, slot, position)?);
+                        slot += 1;
+                    }
+                    OwnedToken::Wildcard => {
+                        masked.push("<*>");
+                        slot += 1;
+                    }
+                }
+            }
+
+            let parent = tenant.tree.descend_mut(&masked, prefix_depth);
+            parent.leaves.push(Leaf {
+                template,
+                template_id: record.template_id,
+                template_version: record.template_version,
+                severity_number: record.severity_number,
+                scope_name: record.scope_name.clone(),
+                slot_types,
+            });
+        }
+
+        for record in &state.structured_templates {
+            if !seen_ids.insert(record.template_id) {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!("template_id {} appears more than once", record.template_id),
+                });
+            }
+            let key = (record.severity_number, record.scope_name.clone());
+            if tenant
+                .structured_templates
+                .insert(key, record.template_id)
+                .is_some()
+            {
+                return Err(RestoreError::Inconsistent {
+                    detail: format!(
+                        "structured key (severity {}, scope {:?}) appears more than once",
+                        record.severity_number, record.scope_name,
+                    ),
+                });
+            }
+        }
+        // Mirror live ingest's cache invariant: every fresh
+        // allocation — tree leaf or structured-map entry — counts.
+        tenant.template_count = state.leaves.len() + state.structured_templates.len();
+
+        // The id allocator is cluster-wide; without this bump a
+        // post-restore allocation would collide with a restored id.
+        let max_restored = state
+            .leaves
+            .iter()
+            .map(|l| l.template_id)
+            .chain(state.structured_templates.iter().map(|s| s.template_id))
+            .max();
+        if let Some(max_restored) = max_restored {
+            self.next_template_id = self.next_template_id.max(max_restored + 1);
+        }
+
+        self.tenants.insert(tenant_id.clone(), tenant);
+        Ok(())
+    }
 }
+
+/// Rebuild a leaf's per-slot type sets from the recorded snapshot
+/// during [`MinerCluster::restore_tenant`], rejecting a set count
+/// that disagrees with the wildcard count or an empty recorded set
+/// (live ingest produces neither).
+fn restore_slot_types(
+    record: &crate::snapshot::LeafRecord,
+    wildcard_count: usize,
+) -> Result<Vec<SlotTypes>, RestoreError> {
+    if record.slot_types.len() != wildcard_count {
+        return Err(RestoreError::Inconsistent {
+            detail: format!(
+                "template_id {}: {} slot-type sets for {wildcard_count} wildcard slots",
+                record.template_id,
+                record.slot_types.len(),
+            ),
+        });
+    }
+    let mut slot_types = Vec::with_capacity(record.slot_types.len());
+    for (slot, recorded) in record.slot_types.iter().enumerate() {
+        let mut types = recorded.iter().copied().map(ParamType::from);
+        let Some(first) = types.next() else {
+            return Err(RestoreError::Inconsistent {
+                detail: format!(
+                    "template_id {} slot {slot}: empty recorded type set",
+                    record.template_id,
+                ),
+            });
+        };
+        slot_types.push(types.fold(SlotTypes::singleton(first), SlotTypes::insert));
+    }
+    Ok(slot_types)
+}
+
+/// Resolve the descend-path component for a wildcard at a prefix
+/// position during [`MinerCluster::restore_tenant`]. See the
+/// path-position rationale at the call site.
+fn path_tag(
+    record: &crate::snapshot::LeafRecord,
+    slot: usize,
+    position: usize,
+) -> Result<&'static str, RestoreError> {
+    let tag = match record.slot_types[slot].as_slice() {
+        [single] => tag_str_for(ParamType::from(*single)),
+        _ => None,
+    };
+    tag.ok_or_else(|| RestoreError::Inconsistent {
+        detail: format!(
+            "template_id {} slot {slot} at path position {position}: \
+             type set {:?} is not a singleton mask-emitted type",
+            record.template_id, record.slot_types[slot],
+        ),
+    })
+}
+
+/// Errors from [`MinerCluster::restore_tenant`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RestoreError {
+    /// The tenant already has live state. Restore runs before live
+    /// ingest; restoring over a live tree would double-apply the
+    /// lines the snapshot captured.
+    TenantAlreadyLive,
+    /// The snapshot violates a live-tree invariant. The recovery
+    /// driver maps this to *discard and full-replay* — RFC 0001
+    /// §6.9 treats a semantically inconsistent snapshot exactly
+    /// like a corrupt one.
+    Inconsistent {
+        /// Names the offending `template_id` and slot.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TenantAlreadyLive => {
+                f.write_str("tenant already has live state; restore must precede ingest")
+            }
+            Self::Inconsistent { detail } => write!(f, "inconsistent snapshot: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
 
 /// Read-only view of a single leaf surfaced by
 /// [`MinerCluster::templates_for`]. Carries the four fields a
@@ -2000,6 +2232,10 @@ mod tests {
     use ourios_core::otlp::{AnyValue, any_value::Value as AvValue};
     use ourios_core::record::SharedRecordSink;
 
+    use crate::snapshot::{
+        LeafRecord, ParamTypeRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
+    };
+
     /// Test helper — a `Body::String` record for `tenant` carrying
     /// `text` and default severity (UNSPECIFIED) / scope (None).
     /// Keeps tests focused on their assertions rather than on
@@ -2119,6 +2355,258 @@ mod tests {
                 .iter()
                 .map(|s| s.template_id)
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    // ---------- §6.9 restore (RFC 0001 v2 amendment) ----------
+
+    #[test]
+    fn restore_round_trips_snapshot_state() {
+        let mut original = MinerCluster::new(MinerConfig::default());
+        let t = TenantId::new("tenant-x");
+        // Varied shapes: typed wildcards (NUM, UUID), a widened slot
+        // ("in"/"out" → Str wildcard past the prefix path), and a
+        // no-wildcard leaf.
+        for line in [
+            "user 42 logged in",
+            "user 17 logged out",
+            "GET /home 200",
+            "request 550e8400-e29b-41d4-a716-446655440000 accepted",
+        ] {
+            let _ = original.ingest(&string_record(&t, line));
+        }
+        for (severity, scope) in [(9, Some("lib.a")), (13, None)] {
+            let _ = original.ingest(&structured_record(&t, severity, scope));
+        }
+        let s1 = original.snapshot_state(&t);
+
+        let mut restored = MinerCluster::new(MinerConfig::default());
+        restored
+            .restore_tenant(&t, &s1)
+            .expect("restore succeeds on a live-produced snapshot");
+
+        assert_eq!(restored.snapshot_state(&t), s1);
+        assert_eq!(restored.template_count(&t), original.template_count(&t));
+    }
+
+    #[test]
+    fn restored_tree_continues_identically() {
+        let t = TenantId::new("tenant-x");
+        let mut original = MinerCluster::new(MinerConfig::default());
+        for line in ["user 42 logged in", "GET /home 200"] {
+            let _ = original.ingest(&string_record(&t, line));
+        }
+        let mut restored = MinerCluster::new(MinerConfig::default());
+        restored
+            .restore_tenant(&t, &original.snapshot_state(&t))
+            .expect("restore succeeds");
+
+        // §3.5.3 equivalence at the miner level: the same follow-up
+        // lines must match the same templates AND allocate the same
+        // fresh ids in both clusters.
+        for line in [
+            "user 17 logged in",    // attaches to the restored leaf
+            "cache evicted 5 keys", // allocates a fresh id
+        ] {
+            let rec = string_record(&t, line);
+            assert_eq!(
+                original.ingest(&rec),
+                restored.ingest(&rec),
+                "line {line:?}"
+            );
+        }
+        assert_eq!(restored.snapshot_state(&t), original.snapshot_state(&t));
+    }
+
+    #[test]
+    fn restore_with_wildcard_in_prefix_path() {
+        // The first token masks (IPv4) → the leaf carries Wildcard
+        // at path position 0; restore must rebuild the descend path
+        // from the slot's mask tag.
+        let t = TenantId::new("tenant-x");
+        let mut original = MinerCluster::new(MinerConfig::default());
+        let id = original.ingest(&string_record(&t, "10.0.0.1 connection accepted"));
+        let s1 = original.snapshot_state(&t);
+        assert!(
+            matches!(s1.leaves[0].template[0], TokenRecord::Wildcard),
+            "precondition: the leaf must carry a wildcard at path position 0",
+        );
+
+        let mut restored = MinerCluster::new(MinerConfig::default());
+        restored.restore_tenant(&t, &s1).expect("restore succeeds");
+        assert_eq!(restored.snapshot_state(&t), s1);
+
+        // A new matching line attaches to the restored leaf: same
+        // id, no new template, version unchanged.
+        let id2 = restored.ingest(&string_record(&t, "10.0.0.2 connection accepted"));
+        assert_eq!(id2, id);
+        assert_eq!(restored.template_count(&t), 1);
+        assert_eq!(restored.templates_for(&t)[0].template_version, 1);
+    }
+
+    #[test]
+    fn restore_rejects_live_tenant() {
+        let t = TenantId::new("tenant-x");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        let _ = cluster.ingest(&string_record(&t, "hello world"));
+        let snapshot = cluster.snapshot_state(&t);
+
+        let err = cluster
+            .restore_tenant(&t, &snapshot)
+            .expect_err("restoring over a live tenant must fail");
+        assert!(matches!(err, RestoreError::TenantAlreadyLive));
+    }
+
+    #[test]
+    fn restore_rejects_inconsistent_slot() {
+        // A path-position wildcard can only arise from mask
+        // emission, so its recorded slot set must be a singleton
+        // mask-emitted type; `[Str]` at position 0 cannot come
+        // from a live tree.
+        let state = SnapshotState {
+            leaves: vec![LeafRecord {
+                template: vec![
+                    TokenRecord::Wildcard,
+                    TokenRecord::Fixed("connection".to_string()),
+                    TokenRecord::Fixed("accepted".to_string()),
+                ],
+                template_id: 1,
+                template_version: 1,
+                severity_number: 0,
+                scope_name: None,
+                slot_types: vec![vec![ParamTypeRecord::Str]],
+            }],
+            structured_templates: vec![],
+            wal_high_water: None,
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a Str slot at a path position must be inconsistent");
+        assert!(matches!(err, RestoreError::Inconsistent { .. }));
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_template_id() {
+        // Ids are unique cluster-wide; the same id on a leaf and a
+        // structured template could not come from a live tree.
+        let state = SnapshotState {
+            leaves: vec![LeafRecord {
+                template: vec![
+                    TokenRecord::Fixed("disk".to_string()),
+                    TokenRecord::Fixed("full".to_string()),
+                ],
+                template_id: 7,
+                template_version: 1,
+                severity_number: 0,
+                scope_name: None,
+                slot_types: vec![],
+            }],
+            structured_templates: vec![StructuredTemplateRecord {
+                severity_number: 9,
+                scope_name: None,
+                template_id: 7,
+            }],
+            wal_high_water: None,
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a duplicate template_id must be inconsistent");
+        match err {
+            RestoreError::Inconsistent { detail } => {
+                assert!(detail.contains('7'), "detail names the id, got {detail:?}");
+            }
+            other => panic!("expected Inconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_structured_key() {
+        // The structured map keys on (severity, scope); a duplicate
+        // key would silently drop one entry while template_count
+        // counted both.
+        let state = SnapshotState {
+            leaves: vec![],
+            structured_templates: vec![
+                StructuredTemplateRecord {
+                    severity_number: 9,
+                    scope_name: Some("lib.a".to_string()),
+                    template_id: 1,
+                },
+                StructuredTemplateRecord {
+                    severity_number: 9,
+                    scope_name: Some("lib.a".to_string()),
+                    template_id: 2,
+                },
+            ],
+            wal_high_water: None,
+        };
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let err = cluster
+            .restore_tenant(&TenantId::new("tenant-x"), &state)
+            .expect_err("a duplicate structured key must be inconsistent");
+        match err {
+            RestoreError::Inconsistent { detail } => {
+                assert!(
+                    detail.contains('9') && detail.contains("lib.a"),
+                    "detail names the key, got {detail:?}",
+                );
+            }
+            other => panic!("expected Inconsistent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_bumps_the_id_allocator() {
+        // The allocator is cluster-wide; a restored id must never
+        // be re-minted for a new template.
+        let state = SnapshotState {
+            leaves: vec![LeafRecord {
+                template: vec![
+                    TokenRecord::Fixed("disk".to_string()),
+                    TokenRecord::Fixed("usage".to_string()),
+                    TokenRecord::Fixed("high".to_string()),
+                ],
+                template_id: 7,
+                template_version: 1,
+                severity_number: 0,
+                scope_name: None,
+                slot_types: vec![],
+            }],
+            structured_templates: vec![],
+            wal_high_water: None,
+        };
+        let t = TenantId::new("tenant-x");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        cluster
+            .restore_tenant(&t, &state)
+            .expect("restore succeeds");
+
+        let new_id = cluster.ingest(&string_record(&t, "cache evicted 5 keys"));
+        assert!(
+            new_id >= 8,
+            "new template must not collide with restored id 7, got {new_id}",
+        );
+    }
+
+    #[test]
+    fn tenant_ids_returns_sorted_tenants() {
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+        for name in ["tenant-b", "tenant-a", "tenant-c"] {
+            let _ = cluster.ingest(&string_record(&TenantId::new(name), "hello world"));
+        }
+
+        assert_eq!(
+            cluster.tenant_ids(),
+            vec![
+                TenantId::new("tenant-a"),
+                TenantId::new("tenant-b"),
+                TenantId::new("tenant-c"),
+            ],
         );
     }
 

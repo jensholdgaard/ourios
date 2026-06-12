@@ -78,6 +78,10 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # socket transport is stood up in this slice (the service is exercised
 # in-process).
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+# Parse the snapshot-recorded WAL high-water segment id back into the
+# `uuid::Uuid` of `ourios_wal::WalOffset` (RFC 0001 §6.9 / RFC 0008
+# §6.6). Same major as ourios-wal's, so the types unify.
+uuid = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

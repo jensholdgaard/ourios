@@ -11,15 +11,19 @@
 //! runs, exactly as in a crash.
 //!
 //! Usage: `wal_crash_fixture <wal_root> <op>...`, where each
-//! `<op>` is either the literal `SYNC` or `<kind>:<hexpayload>`
-//! (`kind` ∈ {`otlp`, `audit`}). The fixture applies the ops in
-//! order, prints `READY` to stdout (flushed) so the parent knows
-//! every op — including the final sync — is done, then blocks
-//! forever so the parent can kill it at that deterministic point.
+//! `<op>` is the literal `SYNC`, the literal `CHECKPOINT`
+//! (checkpoint at the offset of the most recent append — the
+//! RFC0008.7 arm-2 hook; the offset is echoed to stdout as
+//! `CHECKPOINTED <segment_uuid> <byte>` so the parent can assert
+//! against the exact value), or `<kind>:<hexpayload>` (`kind` ∈
+//! {`otlp`, `audit`}). The fixture applies the ops in order,
+//! prints `READY` to stdout (flushed) so the parent knows every
+//! op — including the final sync — is done, then blocks forever
+//! so the parent can kill it at that deterministic point.
 
 use std::io::Write;
 
-use ourios_wal::{FrameKind, Wal, WalConfig};
+use ourios_wal::{FrameKind, Wal, WalConfig, WalOffset};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -34,19 +38,24 @@ fn main() {
     };
     let mut wal = Wal::open(config).expect("fixture: Wal::open");
 
+    let mut last_append: Option<WalOffset> = None;
     for op in args {
         if op == "SYNC" {
             wal.sync().expect("fixture: sync");
+        } else if op == "CHECKPOINT" {
+            let offset = last_append.expect("fixture: CHECKPOINT requires a prior append");
+            wal.checkpoint(offset).expect("fixture: checkpoint");
+            println!("CHECKPOINTED {} {}", offset.segment, offset.byte);
         } else {
             let (kind_str, hex) = op
                 .split_once(':')
-                .expect("fixture: op must be SYNC or <kind>:<hex>");
+                .expect("fixture: op must be SYNC, CHECKPOINT, or <kind>:<hex>");
             let kind = match kind_str {
                 "otlp" => FrameKind::OtlpBatch,
                 "audit" => FrameKind::AuditEvent,
                 other => panic!("fixture: unknown frame kind {other:?}"),
             };
-            wal.append(kind, &decode_hex(hex)).expect("fixture: append");
+            last_append = Some(wal.append(kind, &decode_hex(hex)).expect("fixture: append"));
         }
     }
 

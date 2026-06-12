@@ -14,7 +14,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ourios_wal::{CorruptionReason, FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
+use ourios_wal::{
+    CorruptionReason, FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset,
+};
 
 /// On-disk layout sizes (RFC 0008 §6.2.1 / §6.2.2), mirrored
 /// here because the crate-internal constants are `pub(crate)`
@@ -47,7 +49,12 @@ struct CollectingSink {
 }
 
 impl FrameSink for CollectingSink {
-    fn consume(&mut self, kind: FrameKind, payload: &[u8]) -> Result<(), RecoveryError> {
+    fn consume(
+        &mut self,
+        _offset: WalOffset,
+        kind: FrameKind,
+        payload: &[u8],
+    ) -> Result<(), RecoveryError> {
         self.frames.push((kind, payload.to_vec()));
         Ok(())
     }

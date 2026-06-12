@@ -14,7 +14,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_core::config::MinerConfig;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
 
 use ourios_ingester::receiver::{IngestPipeline, Journal, ReceiveError, TenantRule};
 
@@ -84,7 +84,12 @@ pub fn replay_frames(root: &Path) -> Vec<(FrameKind, Vec<u8>)> {
     #[derive(Default)]
     struct CollectingSink(Vec<(FrameKind, Vec<u8>)>);
     impl FrameSink for CollectingSink {
-        fn consume(&mut self, kind: FrameKind, payload: &[u8]) -> Result<(), RecoveryError> {
+        fn consume(
+            &mut self,
+            _offset: WalOffset,
+            kind: FrameKind,
+            payload: &[u8],
+        ) -> Result<(), RecoveryError> {
             self.0.push((kind, payload.to_vec()));
             Ok(())
         }

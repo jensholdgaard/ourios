@@ -1,13 +1,13 @@
 //! `ourios-wal` — RFC 0008 write-ahead log.
 //!
 //! **Status: red gate (closing).** `open`, `append`, `sync`,
-//! and `replay` are implemented; `checkpoint` and `metrics`
-//! still return `unimplemented!()` pending their slices
-//! (RFC0008.7 / §6.8). The `#[ignore]`'d integration tests
+//! `replay`, `checkpoint`, `housekeeping`, and `metrics` are
+//! implemented. The remaining `#[ignore]`'d integration tests
 //! under `crates/ourios-wal/tests/` enumerate the RFC 0008 §5
-//! acceptance criteria (RFC0008.1 through .9) that the
-//! implementation work has to satisfy before the RFC moves
-//! `red → green`. See RFC 0008 for the design contract.
+//! acceptance criteria still pending (rotation, batched-fsync
+//! latency, and the remaining corruption / O(N) arms) before
+//! the RFC moves `red → green`. See RFC 0008 for the design
+//! contract.
 //!
 //! The shape of the public API follows §6.1 verbatim — the
 //! same `(WalOffset, FrameKind, FrameSink, Wal)` surface the
@@ -23,6 +23,7 @@ use std::path::PathBuf;
 
 use ourios_core::audit::AuditEvent;
 
+pub(crate) mod checkpoint;
 pub(crate) mod frame;
 pub(crate) mod segment;
 
@@ -164,10 +165,8 @@ pub struct Wal {
     /// end-of-file regardless of the user-space cursor.
     current_segment: File,
     /// Path of the file the `current_segment` handle points
-    /// at. Kept alongside the handle for diagnostic messages
-    /// and the post-rotation parent-dir `fsync` (§6.3) that
-    /// lands with `sync` in the next slice.
-    #[allow(dead_code)]
+    /// at. Housekeeping (§6.7) skips it unconditionally — the
+    /// append target is never unlinked.
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
     /// filename's stem and the segment's in-file header per
@@ -189,6 +188,19 @@ pub struct Wal {
     /// power loss — a §3.4 violation. One extra fsync per
     /// process start is the cheap, conservative guard.
     dir_fsync_pending: bool,
+    /// The `CHECKPOINT` sidecar's offset, read at `open` and
+    /// advanced by `checkpoint` (§6.7). `None` = first-run /
+    /// pre-checkpoint. This is the recovery driver's
+    /// Parquet-side suppression horizon ([`Self::last_checkpoint`])
+    /// and one of housekeeping's two truncation bounds.
+    checkpoint: Option<WalOffset>,
+    /// §6.8 counters. `unflushed_bytes` is the H3 detection
+    /// metric: grows on `append`, resets on a successful
+    /// `sync`.
+    appends_total: u64,
+    syncs_total: u64,
+    unflushed_bytes: u64,
+    corrupt_frames_total: u64,
 }
 
 impl Wal {
@@ -216,6 +228,12 @@ impl Wal {
             op: "create_dir_all(wal_root)",
             source,
         })?;
+        // §6.6 step 1: a present-but-invalid sidecar aborts here
+        // (before any recovery) rather than being silently
+        // treated as None — that would drop the Parquet
+        // suppression horizon and duplicate every
+        // already-published record on the data side.
+        let checkpoint = checkpoint::read(&config.root)?;
         let existing_segments = list_segments(&config.root)?;
         let (current_segment, current_segment_path, current_segment_uuid) =
             if let Some(newest) = existing_segments.into_iter().next_back() {
@@ -233,6 +251,11 @@ impl Wal {
             // an acked frame's segment is guaranteed a durable
             // directory entry (see the field doc — §3.4).
             dir_fsync_pending: true,
+            checkpoint,
+            appends_total: 0,
+            syncs_total: 0,
+            unflushed_bytes: 0,
+            corrupt_frames_total: 0,
         })
     }
 
@@ -317,6 +340,8 @@ impl Wal {
         let post_write_byte = pre_write_byte
             + frame::FRAME_HEADER_LEN as u64
             + u64::try_from(payload.len()).expect("payload.len() fits u64 (≤ MAX_FRAME_BYTES)");
+        self.appends_total += 1;
+        self.unflushed_bytes += post_write_byte - pre_write_byte;
         Ok(WalOffset {
             segment: self.current_segment_uuid,
             byte: post_write_byte,
@@ -371,6 +396,8 @@ impl Wal {
                 source,
             })?
             .len();
+        self.syncs_total += 1;
+        self.unflushed_bytes = 0;
         Ok(WalOffset {
             segment: self.current_segment_uuid,
             byte,
@@ -379,17 +406,118 @@ impl Wal {
 
     /// Record that records ≤ `durable_to` are on object
     /// storage; segments wholly below this offset may be
-    /// reclaimed. Persists the offset to the `CHECKPOINT`
-    /// sidecar per §6.7 (atomic write + fsync + parent-dir
-    /// fsync) — durability of the checkpoint itself is what
-    /// stops the post-restart at-least-once replay from
-    /// duplicating already-published records.
+    /// reclaimed by [`Self::housekeeping`]. Persists the offset
+    /// to the `CHECKPOINT` sidecar per §6.7 (atomic write +
+    /// fsync + parent-dir fsync) — durability of the checkpoint
+    /// itself is what lets the post-restart recovery driver
+    /// suppress already-published records on its Parquet path
+    /// (replay is at-least-once and delivers every surviving
+    /// frame; the driver's suppression is the only dedup).
+    ///
+    /// Advance is monotonic: a `durable_to` below the current
+    /// checkpoint is rejected; re-asserting the current value
+    /// is an idempotent no-op.
     ///
     /// # Errors
     ///
-    /// See [`CheckpointError`].
-    pub fn checkpoint(&mut self, _durable_to: WalOffset) -> Result<(), CheckpointError> {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.1 / §6.7)");
+    /// See [`CheckpointError`]. On error the in-memory
+    /// checkpoint is **not** advanced — the WAL conservatively
+    /// keeps all segments rather than risk a post-crash
+    /// data-side dup.
+    pub fn checkpoint(&mut self, durable_to: WalOffset) -> Result<(), CheckpointError> {
+        if let Some(current) = self.checkpoint {
+            if durable_to < current {
+                return Err(CheckpointError::NonMonotonic {
+                    current,
+                    attempted: durable_to,
+                });
+            }
+            if durable_to == current {
+                return Ok(());
+            }
+        }
+        checkpoint::write(&self.config.root, durable_to)?;
+        self.checkpoint = Some(durable_to);
+        Ok(())
+    }
+
+    /// The `CHECKPOINT` sidecar's offset (`None` =
+    /// pre-first-checkpoint). The recovery driver reads it once
+    /// at startup as its Parquet-side suppression horizon
+    /// (§6.6) — `replay` itself delivers every surviving frame.
+    #[must_use]
+    pub fn last_checkpoint(&self) -> Option<WalOffset> {
+        self.checkpoint
+    }
+
+    /// Reclaim disk (§6.7): unlink every segment whose
+    /// **highest** frame offset is ≤ the checkpoint **and**,
+    /// when `retain_floor` is `Some`, ≤ the floor — i.e. wholly
+    /// below `min(checkpoint, floor)`. The caller passes the
+    /// latest durable miner snapshot's high-water mark as the
+    /// floor so truncation never destroys a frame no snapshot
+    /// has captured (RFC 0001 §6.9 — the hazard-#5 retain
+    /// rule); `None` means no snapshot consumer exists and the
+    /// checkpoint alone governs. Whole segments only; the
+    /// current append segment is never unlinked. A no-op before
+    /// the first checkpoint.
+    ///
+    /// The timer lives in the caller (`wal_housekeeping_secs`);
+    /// this is one pass.
+    ///
+    /// # Errors
+    ///
+    /// See [`HousekeepingError`].
+    pub fn housekeeping(
+        &mut self,
+        retain_floor: Option<WalOffset>,
+    ) -> Result<(), HousekeepingError> {
+        let Some(cp) = self.checkpoint else {
+            return Ok(());
+        };
+        let bound = match retain_floor {
+            Some(floor) => cp.min(floor),
+            None => cp,
+        };
+        let io = |op: &'static str, source| HousekeepingError::Io { op, source };
+        let segments = list_segments(&self.config.root).map_err(|e| match e {
+            OpenError::Io { op, source } => io(op, source),
+            OpenError::InvalidConfig { .. } | OpenError::Corrupt { .. } => {
+                unreachable!("list_segments only surfaces OpenError::Io")
+            }
+        })?;
+        let mut unlinked_any = false;
+        for path in segments {
+            if path == self.current_segment_path {
+                continue;
+            }
+            // A closed segment's highest frame offset is its file
+            // length (append offsets are post-frame bytes). The
+            // UUID comes from the in-file header, not the
+            // filename, mirroring `open_existing_segment` — a
+            // renamed file is still judged by its true identity.
+            let mut handle = File::open(&path).map_err(|e| io("open(segment)", e))?;
+            let header = segment::read_header(&mut handle).map_err(|e| {
+                io(
+                    "read_header(segment)",
+                    std::io::Error::new(ErrorKind::InvalidData, format!("{}: {e}", path.display())),
+                )
+            })?;
+            let len = handle.metadata().map_err(|e| io("stat(segment)", e))?.len();
+            let highest = WalOffset {
+                segment: header.segment_uuid,
+                byte: len,
+            };
+            if highest <= bound {
+                std::fs::remove_file(&path).map_err(|e| io("unlink(segment)", e))?;
+                unlinked_any = true;
+            }
+        }
+        if unlinked_any {
+            sync_parent_dir(&self.config.root)
+                .map_err(|e| io("fsync(wal_root after housekeeping)", e))?;
+        }
+        Ok(())
     }
 
     /// Walk every surviving segment in chronological order,
@@ -415,10 +543,16 @@ impl Wal {
     /// instead RFC0008.5 corruption (its rotation fsync should
     /// have completed), so it halts the walk.
     ///
-    /// Checkpoint-skip (§6.6 step 1 — skipping frames at or below
-    /// the `CHECKPOINT` offset) lands with the checkpoint sidecar
-    /// (RFC0008.7); until then no sidecar exists, so `cp` is
-    /// `None` and every surviving frame is delivered.
+    /// Every well-formed surviving frame is delivered — including
+    /// frames at or below the checkpoint that a straddling or
+    /// floor-retained segment holds (§6.6, 2026-06-12 amendment).
+    /// Suppression is per consumer, in the recovery driver: the
+    /// Parquet path consumes only frames above
+    /// [`Self::last_checkpoint`], the miner only frames above its
+    /// restored snapshot's high-water mark. An in-`replay` skip
+    /// would make a lagging snapshot's retained frames
+    /// undeliverable, which is exactly the gap the §6.7 retain
+    /// floor exists to close.
     ///
     /// # Errors
     ///
@@ -436,9 +570,15 @@ impl Wal {
         let newest_idx = segments.len().checked_sub(1);
         for (idx, path) in segments.iter().enumerate() {
             let is_newest = Some(idx) == newest_idx;
-            match replay_segment(path, is_newest, sink)? {
-                SegmentScan::CleanTail => {}
-                SegmentScan::TornTail { valid_to } => self.heal_newest_segment(valid_to)?,
+            match replay_segment(path, is_newest, sink) {
+                Ok(SegmentScan::CleanTail) => {}
+                Ok(SegmentScan::TornTail { valid_to }) => self.heal_newest_segment(valid_to)?,
+                Err(e) => {
+                    if matches!(e, RecoveryError::Corrupt { .. }) {
+                        self.corrupt_frames_total += 1;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -472,10 +612,41 @@ impl Wal {
         Ok(())
     }
 
-    /// Snapshot of the OTel-meter metrics per §6.8.
+    /// Snapshot of the §6.8 metrics. `disk_bytes` and
+    /// `segment_count` are computed from a best-effort directory
+    /// walk (an unreadable entry is skipped rather than failing
+    /// the whole snapshot — this is a dashboard read, not a
+    /// correctness path); the counters are exact.
     #[must_use]
     pub fn metrics(&self) -> WalMetrics {
-        unimplemented!("RFC 0008 red gate — implementation pending (§6.8)");
+        let mut disk_bytes = 0u64;
+        let mut segment_count = 0u32;
+        if let Ok(entries) = std::fs::read_dir(&self.config.root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                {
+                    disk_bytes += meta.len();
+                    if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("wal"))
+                    {
+                        segment_count += 1;
+                    }
+                }
+            }
+        }
+        WalMetrics {
+            appends_total: self.appends_total,
+            syncs_total: self.syncs_total,
+            unflushed_bytes: self.unflushed_bytes,
+            disk_bytes,
+            segment_count,
+            checkpoint_segment: self.checkpoint.map(|o| o.segment),
+            checkpoint_byte: self.checkpoint.map_or(0, |o| o.byte),
+            corrupt_frames_total: self.corrupt_frames_total,
+        }
     }
 }
 
@@ -702,10 +873,19 @@ fn replay_segment<S: FrameSink>(
         let frame_start = pos;
         match frame::read_frame(&mut reader) {
             Ok((kind, payload)) => {
-                sink.consume(kind, &payload)?;
                 pos += frame::FRAME_HEADER_LEN as u64
                     + u64::try_from(payload.len())
                         .expect("payload.len() fits u64 (read_frame capped it at MAX_FRAME_BYTES)");
+                // Post-frame byte = the append-offset `append`
+                // returned for this frame (§6.1).
+                sink.consume(
+                    WalOffset {
+                        segment: segment_uuid,
+                        byte: pos,
+                    },
+                    kind,
+                    &payload,
+                )?;
             }
             // Short read with bytes still remaining (`pos <
             // file_len`, guaranteed by the guard above) = a torn
@@ -774,15 +954,24 @@ fn sync_parent_dir(root: &std::path::Path) -> std::io::Result<()> {
 /// `OtlpBatch` frames re-run through the decoder + tenant
 /// fan-out + miner-ingest pipeline; `AuditEvent` frames
 /// deserialise and reinject into the audit-event Parquet
-/// writer's queue.
+/// writer's queue. The frame's offset is what lets the driver
+/// suppress per consumer (Parquet above the checkpoint, miner
+/// above its snapshot's high-water mark — §6.6).
 pub trait FrameSink {
-    /// Consume one recovered frame.
+    /// Consume one recovered frame. `offset` is the frame's
+    /// append-offset — the same [`WalOffset`] [`Wal::append`]
+    /// returned for it.
     ///
     /// # Errors
     ///
     /// Any error the recovery driver surfaces (decoder
     /// failure, downstream pipeline rejection).
-    fn consume(&mut self, kind: FrameKind, payload: &[u8]) -> Result<(), RecoveryError>;
+    fn consume(
+        &mut self,
+        offset: WalOffset,
+        kind: FrameKind,
+        payload: &[u8],
+    ) -> Result<(), RecoveryError>;
 }
 
 /// OTel-meter snapshot per §6.8. Renders as
@@ -909,6 +1098,35 @@ pub enum CheckpointError {
         current: WalOffset,
         attempted: WalOffset,
     },
+}
+
+/// Errors from [`Wal::housekeeping`].
+#[derive(Debug)]
+pub enum HousekeepingError {
+    /// Filesystem I/O failure (segment listing, header read,
+    /// unlink, or the post-unlink directory fsync). The pass is
+    /// safe to retry on the next cadence tick — unlinking whole
+    /// segments is idempotent.
+    Io {
+        op: &'static str,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for HousekeepingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { op, source } => write!(f, "WAL housekeeping failed at {op}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for HousekeepingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+        }
+    }
 }
 
 /// Errors from [`Wal::replay`].

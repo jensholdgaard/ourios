@@ -26,7 +26,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_ingester::receiver::decode_protobuf;
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig};
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
 use prost::Message;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -86,7 +86,12 @@ async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
 #[derive(Default)]
 struct CollectingSink(Vec<(FrameKind, Vec<u8>)>);
 impl FrameSink for CollectingSink {
-    fn consume(&mut self, kind: FrameKind, payload: &[u8]) -> Result<(), RecoveryError> {
+    fn consume(
+        &mut self,
+        _offset: WalOffset,
+        kind: FrameKind,
+        payload: &[u8],
+    ) -> Result<(), RecoveryError> {
         self.0.push((kind, payload.to_vec()));
         Ok(())
     }

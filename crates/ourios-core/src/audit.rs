@@ -171,6 +171,21 @@ pub enum AuditPayload {
         /// Operator-supplied justification, ≤ 256 B. Empty when none.
         reason: String,
     },
+    /// Reader-side catch-all per RFC 0005 §3.7's unknown-`event_kind`
+    /// tolerance rule (amendment 2026-06-12): an `event_kind` ordinal
+    /// above the reader's known range MUST NOT fail the file — the row
+    /// surfaces as this opaque envelope-only event. Carries the raw
+    /// ordinal and the stored `event_type` string verbatim so a
+    /// read-then-write round-trips them (the [`ParamType::Unknown`]
+    /// discipline applied to the kind enum). Folds defined over named
+    /// kinds (the alias projection, the RFC 0010 drift filter) ignore
+    /// it by construction; producers never construct it.
+    Unknown {
+        /// The stored ordinal, outside the §3.7 mapping table.
+        event_kind: u8,
+        /// The stored `event_type` string, preserved verbatim.
+        event_type: String,
+    },
     /// A compaction consolidated a sealed partition's files
     /// (RFC 0009 §3.6). Carries no template identity.
     Compaction {
@@ -239,13 +254,16 @@ impl AuditPayload {
             Self::AliasAsserted { .. } => EVENT_KIND_ALIAS_ASSERTED,
             Self::AliasRetracted { .. } => EVENT_KIND_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_KIND_COMPACTION,
+            Self::Unknown { event_kind, .. } => *event_kind,
         }
     }
 
     /// The canonical `event_type` string paired with
-    /// [`Self::event_kind`].
+    /// [`Self::event_kind`] — or, for [`Self::Unknown`], the stored
+    /// string preserved verbatim (which is why this returns `&str`
+    /// rather than `&'static str`).
     #[must_use]
-    pub fn event_type(&self) -> &'static str {
+    pub fn event_type(&self) -> &str {
         match self {
             Self::Template { change, .. } => match change {
                 TemplateChange::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
@@ -257,6 +275,7 @@ impl AuditPayload {
             Self::AliasAsserted { .. } => EVENT_TYPE_ALIAS_ASSERTED,
             Self::AliasRetracted { .. } => EVENT_TYPE_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_TYPE_COMPACTION,
+            Self::Unknown { event_type, .. } => event_type,
         }
     }
 
@@ -271,10 +290,11 @@ impl AuditPayload {
             // `ourios.miner.alias.assertions` /
             // `ourios.miner.alias.retractions` (RFC 0001 §6.7);
             // `ourios.miner.merges` is reserved for the two structural
-            // widenings.
-            Self::AliasAsserted { .. } | Self::AliasRetracted { .. } | Self::Compaction { .. } => {
-                false
-            }
+            // widenings. An unknown kind cannot be assumed to be one.
+            Self::AliasAsserted { .. }
+            | Self::AliasRetracted { .. }
+            | Self::Compaction { .. }
+            | Self::Unknown { .. } => false,
         }
     }
 }

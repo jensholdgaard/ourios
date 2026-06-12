@@ -342,6 +342,17 @@ impl Builders {
                 self.alias_member_ids.append(true);
                 self.alias_actor.append_value(actor.as_str());
             }
+            AuditPayload::Unknown { .. } => {
+                // §3.7 unknown-event_kind tolerance: a read-then-write
+                // of a row a future writer produced preserves the
+                // envelope verbatim (`event_kind` / `event_type` are
+                // already appended from the payload accessors above)
+                // with every payload column NULL.
+                self.append_template_nulls();
+                self.append_compaction_nulls();
+                self.append_alias_nulls();
+                self.reason.append_null();
+            }
             AuditPayload::Compaction {
                 partition,
                 input_files,

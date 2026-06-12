@@ -396,7 +396,11 @@ impl AliasMap {
                     self.remove_id(&event.tenant_id, id);
                 }
             }
-            AuditPayload::Template { .. } | AuditPayload::Compaction { .. } => {}
+            // RFC 0005 §3.7: a fold defined over named kinds ignores
+            // unknown kinds by construction.
+            AuditPayload::Template { .. }
+            | AuditPayload::Compaction { .. }
+            | AuditPayload::Unknown { .. } => {}
         }
     }
 

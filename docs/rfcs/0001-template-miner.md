@@ -470,6 +470,35 @@ direction and the primary obligation lives in those other RFCs.
 > - **And** the miner falls back to full WAL replay rather than
 >   misinterpreting the bytes
 
+> **Scenario §3.5.3 — Known-version restore + tail replay is equivalent to a full rebuild (2026-06-12 amendment)**
+> - **Given** a tenant tree snapshotted at WAL high-water mark
+>   `S`, with further frames appended after `S`
+> - **When** recovery restores the snapshot and replays only the
+>   frames above `S`
+> - **Then** the recovered tree state (leaves, `template_id`s,
+>   `template_version`s, slot types, structured-template-id map)
+>   equals the control tree built by ingesting every record from
+>   scratch
+> - **And** no frame at or below `S` reaches the miner (no
+>   double-apply — the v1 hazard that gated restore)
+
+> **Scenario §3.5.4 — Stale snapshot degrades loudly, not silently (2026-06-12 amendment)**
+> - **Given** a snapshot at high-water mark `S`, a Parquet
+>   checkpoint at `X > S`, and a WAL whose surviving segments
+>   start above `S` but retain every frame above `X` (externally
+>   truncated — WAL segment files manually unlinked; the RFC 0008
+>   §6.7 retain floor prevents this arising internally, and
+>   legitimate housekeeping never removes a frame above `X`)
+> - **When** recovery runs
+> - **Then** the snapshot is restored and the surviving frames are
+>   replayed under the per-consumer horizons (the data side is
+>   complete: every missing frame was ≤ `X`, hence already in
+>   Parquet)
+> - **And** a structured warning is emitted naming the gap between
+>   `S` and the oldest surviving frame, so the possible template
+>   re-minting inside it is surfaced (hazard #5, observable via the
+>   RFC 0010 drift query) rather than silent
+
 > **Scenario §3.7.1 — Tenants' template trees never cross-pollinate**
 > - **Given** a `MinerCluster` ingesting interleaved lines from
 >   synthetic tenants A and B
@@ -2142,6 +2171,46 @@ boundary at 1.0 (see §6.3): default buckets
 > acceptance criteria buildable. The matching §9 entries are marked
 > RESOLVED.
 
+> **Amendment 2026-06-12 (v2 — restore switched on).** The RFC 0008
+> §6.7 checkpoint / offset-carrying-sink API this section was gated
+> on is now specified to land (RFC 0008's same-day §6.1/§6.7
+> amendment is the other half of this design), so the known-version
+> branch of the recovery algorithm below **restores the tree and
+> replays only the WAL tail** above the snapshot's recorded
+> high-water mark `S` — exactly as written in step (2), with no
+> format change (the mark has been in the payload since v1). Three
+> rules complete the design. **Per-consumer horizons:** RFC 0008's
+> `replay` delivers every surviving frame with its offset; the
+> recovery driver suppresses per consumer — the Parquet path
+> consumes only frames above the RFC 0008 checkpoint `X` (below it
+> they are already published), the miner only frames above `S`
+> (below it they are already folded into the snapshot;
+> re-feeding would double-apply — the v1 hazard, now resolved by
+> routing rather than by refusing to restore). The rule covers both
+> orderings: in the steady state `S ≥ X` the miner consumes a
+> suffix of what Parquet consumes; with a **lagging snapshot**
+> (`S < X`) the miner additionally consumes the `(S, X]` frames the
+> floor retained, closing its state gap while Parquet suppresses
+> them. **Truncation floor:** the ingester passes the latest
+> durable snapshot's `S` to `Wal::housekeeping` as a retain floor,
+> so the WAL never unlinks a frame no snapshot has captured
+> (RFC 0008 §6.7 — closes the `S < X` template-drift hole, hazard
+> #5). **Stale-snapshot fallback:** if recovery nevertheless finds
+> the WAL truncated past `S` (external mutation — segment files
+> manually unlinked from `wal_root`; the floor prevents the gap
+> arising internally), it restores the snapshot, replays the
+> surviving frames above `S`, and emits a structured warning naming
+> the gap. The data side is complete **provided the truncation did
+> not exceed `X`** — legitimate housekeeping never unlinks a frame
+> above the checkpoint, so everything missing is in Parquet; manual
+> deletion beyond `X` would be unrecoverable acknowledged-data
+> loss, which is exactly why segment removal is reserved to
+> housekeeping and never an operator action. Templates first seen
+> inside the `(S, X]` gap may re-mint (drift surfaced via RFC 0010,
+> not silent). New acceptance criteria: §3.5.3
+> (restore-equivalence), §3.5.4 (stale-snapshot fallback); the
+> end-to-end driver contract is RFC 0008's RFC0008.10.
+
 **Hot path.** The per-tenant tree lives in process memory on the
 ingester. Tree operations (descend, simSeq, attach, widen) are
 hot-path; persistence does not happen synchronously per line.
@@ -2229,32 +2298,37 @@ specific serialisation codec.
 
 1. Load the latest snapshot artefact for the tenant, if one exists.
 2. If byte 0 is a **known** version: deserialise the payload,
-   restore the tree, then replay **only the WAL tail** from the
-   snapshot's recorded high-water mark. (This restore path is gated
-   on the offset-resume API and is **not** active in v1 — see *v1
-   scope* below.)
+   restore the tree, then replay **only the WAL tail** above the
+   snapshot's recorded high-water mark `S` — the driver delivers
+   each replayed frame to the miner only when its offset is > `S`
+   (per-consumer routing, RFC 0008 §6.6; active as of the
+   2026-06-12 v2 amendment above). If the surviving WAL no longer
+   reaches back to `S`, apply the *stale-snapshot fallback* of the
+   v2 amendment: restore, replay what survives, warn.
 3. If byte 0 is an **unknown** version, or the snapshot is absent or
    corrupt: discard it and replay the **full** WAL via
    `Wal::replay` (RFC 0008 §6.1 API, RFC 0008 §6.6 recovery procedure),
    rebuilding the tree from scratch.
 
-**v1 scope — rebuild from a full replay; do not restore yet.** The
-restore-then-replay-the-tail path in step (2) requires the RFC 0008
-§6.7 checkpoint / replay-from-offset API (`Wal::checkpoint` and the
-`CHECKPOINT` sidecar), which is **not yet implemented**
-(`Wal::checkpoint` is an RFC 0008 red-gate stub). Restoring a tree
-from a snapshot and *then* replaying the full WAL (the only replay
-available without offset support) would **double-apply** every frame
-the snapshot already captured, corrupting the tree. So until
-offset-resume lands, recovery **ignores the snapshot payload and
-rebuilds the tree from a full `Wal::replay` in both branches** — the
-known-version branch does not restore. What lands now is the
+**v1 scope — rebuild from a full replay; do not restore yet.**
+*(Superseded by the 2026-06-12 v2 amendment above — restore is now
+switched on; this paragraph is retained as the record of why v1
+refused to restore.)* The restore-then-replay-the-tail path in
+step (2) requires the RFC 0008 §6.7 checkpoint /
+replay-from-offset API (`Wal::checkpoint` and the `CHECKPOINT`
+sidecar), which was not yet implemented at the time. Restoring a
+tree from a snapshot and *then* replaying the full WAL (the only
+replay available without offset support) would **double-apply**
+every frame the snapshot already captured, corrupting the tree. So
+until offset-resume landed, recovery ignored the snapshot payload
+and rebuilt the tree from a full `Wal::replay` in both branches —
+the known-version branch did not restore. What landed in v1 was the
 snapshot *format* (the leading version byte and the recorded
 high-water mark) and the version-dispatch + WAL-fallback contract;
-the restore path is switched on, with no format change, once RFC
-0008 §6.7 lands. This v1 fully satisfies §3.5.1 (the artefact
-carries a leading version byte) and §3.5.2 (an unknown version is
-rejected and falls back to full WAL replay).
+v2 switches the restore path on with no format change, exactly as
+planned. v1 fully satisfied §3.5.1 (the artefact carries a leading
+version byte) and §3.5.2 (an unknown version is rejected and falls
+back to full WAL replay).
 
 **Snapshot-load telemetry.** The `wal_replay_progress` gauge
 (above) remains the replay-only signal. A snapshot-load-outcome
@@ -2414,6 +2488,19 @@ resolves bidirectionally between RFC and tests.
   extended to cover the miner's persistence layer.
   *Covers:* §3.5.1, §3.5.2.
 
+- **Restore-equivalence test**: snapshot a tree at high-water
+  mark `S`, append further frames, recover via
+  restore-plus-tail-replay, and assert tree-state equality
+  against a from-scratch control (the recovered state is compared
+  field-by-field via the §6.9 snapshot payload of both trees, so
+  the comparison itself can't hide drift). A counter on the test
+  sink asserts no frame ≤ `S` reached the miner. The
+  stale-snapshot arm deletes the segments holding `(S, tail]`'s
+  prefix, recovers, and asserts the structured warning names the
+  gap while the surviving frames still fold.
+  *Covers:* §3.5.3, §3.5.4 (the end-to-end driver half is
+  RFC 0008's RFC0008.10).
+
 - **Configuration tests**: assert default values and the rejection
   of out-of-bounds settings at startup.
   *Covers:* §3.1.1 (default threshold = 0.7),
@@ -2508,14 +2595,15 @@ and the remaining future work is the two items below them.
       snapshots to object storage would couple to the RFC 0009 §3.4
       atomic-publish manifest for a durable, multi-writer publish
       point; deferred until that line settles.
-- [ ] **Resume-from-high-water-mark replay** (remaining future
-      work). v1 recovery replays the full WAL in both the
-      known-version and unknown-version branches because the
-      offset-resume optimisation needs the RFC 0008 §6.7
-      checkpoint / replay-from-offset API (`Wal::checkpoint` + the
-      `CHECKPOINT` sidecar), which is not yet implemented. The
-      snapshot format already records the high-water mark, so
-      enabling the optimisation later needs no format change.
+- [x] **Resume-from-high-water-mark replay** — **RESOLVED
+      (2026-06-12): switched on as §6.9 v2.** The RFC 0008 §6.7
+      checkpoint / offset-carrying-sink API is specified (RFC 0008's
+      same-day amendment); the known-version branch restores and
+      replays only the tail above the snapshot's high-water mark,
+      with per-consumer routing, a housekeeping retain floor, and a
+      stale-snapshot fallback. No format change was needed — exactly
+      as this entry predicted. Acceptance: §3.5.3 / §3.5.4 +
+      RFC0008.10. See the §6.9 v2 amendment.
 
 **Algorithm tuning (open until corpus exists).**
 

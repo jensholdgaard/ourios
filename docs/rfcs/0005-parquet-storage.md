@@ -621,7 +621,7 @@ add-new-column / migrate / drop).
 > columns rather than overloading the template columns or packing a
 > blob into `reason`:
 >
-> - **`alias_member_ids` is a `LIST<INT64>`, not canonical JSON.**
+> - **`alias_member_ids` is a `LIST<INTEGER(64, signed=false)>`, not canonical JSON.**
 >   The §3.3-style canonical-JSON `Utf8` alternative was considered
 >   and rejected on the same grounds the 2026-06-03 amendment
 >   rejected a structured `reason`: a list of ids is first-class
@@ -790,11 +790,16 @@ derivation:
    representative derived as `min(members)`. Those semantics are
    owned by RFC 0001 §6.7 and implemented by
    `ourios-core::alias::AliasMap`; this RFC references them and
-   does not restate them. Same-nanosecond ties fold in within-file
-   row order (the sink's append order); the control plane is the
-   single writer of alias events, so ties are not expected in
-   practice and only an assert/retract pair over the same ids in
-   the same nanosecond would be sensitive to the tiebreak.
+   does not restate them. The fold order is total and
+   deterministic: `(timestamp, file path lexicographic,
+   within-file row index)` — same-nanosecond ties within one file
+   fold in row order (the sink's append order), and ties across
+   files break on the lexicographic file path (audit file names
+   are unique per flush, so the order is stable across re-scans).
+   The control plane is the single writer of alias events, so
+   ties are not expected in practice; only an assert/retract pair
+   over the same ids in the same nanosecond would be sensitive to
+   the tiebreak.
 3. Hand the folded map to the RFC 0002 `resolves_to` compilation
    (RFC0002.9), which expands by set membership exactly as before —
    the derivation changes where the map *comes from*, not what it

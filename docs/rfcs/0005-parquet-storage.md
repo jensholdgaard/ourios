@@ -528,7 +528,9 @@ originals land, and those *are* unbounded by construction.
 The audit stream carries the template events that RFC 0001 §6.4 names —
 `TemplateWidened`, `TemplateTypeExpanded`,
 `TemplateWideningRejectedDegenerate` — plus, per the 2026-06-03
-amendment below, the `Compaction` event of RFC 0009 §3.6, each with
+amendment below, the `Compaction` event of RFC 0009 §3.6, and, per
+the 2026-06-12 amendment below, the `alias_asserted` /
+`alias_retracted` operator events of RFC 0001 §6.7, each with
 a kind tag and a timestamp. The contract from RFC 0001 §9 ("Cross-RFC
 contracts pending") is fulfilled by this file series.
 
@@ -558,6 +560,8 @@ mapping:
 | `1` | `template_type_expanded` | `TemplateTypeExpanded` | RFC 0001 §6.4 |
 | `2` | `template_widening_rejected_degenerate` | `TemplateWideningRejectedDegenerate` | RFC 0001 §6.4 |
 | `3` | `compaction` | `Compaction` | RFC 0009 §3.6 (amendment 2026-06-03) |
+| `4` | `alias_asserted` | `AliasAsserted` | RFC 0001 §6.7 (amendment 2026-06-12) |
+| `5` | `alias_retracted` | `AliasRetracted` | RFC 0001 §6.7 (amendment 2026-06-12) |
 
 Adding a new ordinal is a §3.8 additive amendment; the mapping
 table is the source of truth and a new ordinal lands as a new
@@ -601,6 +605,90 @@ add-new-column / migrate / drop).
 > no-dictionary / no-index encoding policy below — still far better
 > than being unparseable inside a `reason` blob.
 
+> **Amendment 2026-06-12 — alias audit events (issue #148).**
+> RFC 0001 §6.7 (amendment 2026-06-07) routes operator alias
+> assertions through this same stream and its §9 resolution hands
+> the storage half to "the RFC 0005 line". This amendment is that
+> half: the events get a home here, and §3.7.1 below pins how the
+> querier turns them into the per-tenant alias map in v1. Two new
+> kinds, `alias_asserted` (4) and `alias_retracted` (5), join the
+> mapping table (§3.8 rule 1 territory — the ordinals match the
+> constants `ourios-core::audit` already pins). An alias event
+> shares the common envelope (`tenant_id`, `timestamp`,
+> `event_kind`, `event_type`) and carries the RFC 0001 §6.7 payload
+> in new **OPTIONAL** `alias_*` columns (§3.8 rule 1), following the
+> compaction amendment's pattern of kind-prefixed first-class
+> columns rather than overloading the template columns or packing a
+> blob into `reason`:
+>
+> - **`alias_member_ids` is a `LIST<INT64>`, not canonical JSON.**
+>   The §3.3-style canonical-JSON `Utf8` alternative was considered
+>   and rejected on the same grounds the 2026-06-03 amendment
+>   rejected a structured `reason`: a list of ids is first-class
+>   queryable (equality / array-containment — "which assertions
+>   ever touched template X") where a JSON blob is opaque to the
+>   query engine, and the §3.7 precedent for set-valued payload
+>   fields of scalars is already `LIST` (`positions_widened`,
+>   `compaction_input_files`). Canonical JSON earns its keep only
+>   for *nested* values (`attributes`, the template token arrays);
+>   a flat id set is not one. Schema evolution is unaffected
+>   either way — the column is OPTIONAL per §3.8 rule 1, so old
+>   files simply lack it and read back as `None`.
+> - **`representative_id` gets its own column**
+>   (`alias_representative_id`) rather than reusing `template_id`.
+>   `template_id`'s contract is "the leaf the event applies to",
+>   and the 2026-06-03 convention pins the template columns as
+>   required-by-convention for kinds 0–2 / `NULL` otherwise;
+>   stretching that to "non-null for alias kinds too, with anchor
+>   semantics" would fork the column's meaning by kind. The
+>   kind-prefixed column keeps each kind's payload→column mapping
+>   uniform: every kind populates exactly its own prefix plus the
+>   envelope.
+> - **`reason` is reused**, not duplicated: it is already the
+>   generic OPTIONAL justification/diagnostic column. For alias
+>   kinds it carries the operator-supplied justification (RFC 0001
+>   §6.7, ≤ 256 B); the in-memory empty-string-when-none convention
+>   maps to `NULL` on disk (round-trip rule: `"" ↔ NULL`).
+>
+> The semantic value of an alias row is the **asserted set**
+> `{alias_representative_id} ∪ alias_member_ids` (RFC 0001 §6.7);
+> the writer stores the event's `member_ids` verbatim (no
+> sort/dedup normalization — round-trip is exact) and consumers
+> fold it as a set, so element order and duplicates carry no
+> meaning. An empty list is valid and distinct from `NULL`
+> (`member_ids: vec![]` on a single-id retraction ↔ empty list;
+> `NULL` means "not an alias row"), mirroring the
+> `positions_widened` empty-list convention. Alias rows leave every
+> template-specific and `compaction_*` column `NULL`; conversely
+> the `alias_*` columns are `NULL` for kinds 0–3 and
+> *required-by-convention non-null for kinds 4–5*
+> (`alias_member_ids` possibly empty, `reason` per the operator's
+> optional input) — the §3.8 rule 6 convention, writer-enforced and
+> test-pinned (RFC0005.14).
+>
+> **Unknown-`event_kind` tolerance.** Today's `AuditReader`
+> hard-errors on an ordinal outside the mapping table
+> (`AuditReaderError::UnknownEventKind`), with a documented
+> deferral of the catch-all decision "until a real new variant
+> lands". Kinds 4–5 are that variant, so the rule is now pinned:
+> a reader encountering an `event_kind` ordinal above its known
+> range MUST NOT fail the file — it surfaces the row as an opaque
+> unknown-kind event (envelope only), the `ParamType::Unknown` /
+> §3.9 discipline applied to the kind enum, so every future §3.8
+> ordinal addition stays non-breaking for readers. Tolerance is
+> not semantics: a fold defined over named kinds (the §3.7.1 alias
+> fold reads kinds 4–5; the RFC 0010 drift query filters
+> `event_type` strings) ignores unknown kinds by construction, and
+> a future kind that participates in an existing fold must amend
+> that fold's spec. For *already-deployed* readers (which still
+> hard-error) the exposure is bounded by §3.8 rule 6's
+> version-together argument: rows with kinds 4–5 are written only
+> by post-amendment writers, so no previously-deployed reader is
+> expected to encounter them. The implementation slice for this
+> amendment (issue #148) extends the reader's ordinal match to
+> kinds 4–5, lands the tolerance rule, and retires the writer's
+> interim `AliasEventNotYetPersistable` rejection.
+
 The row-level audit columns are:
 
 | Column | Parquet logical type | Physical type | Repetition | Notes |
@@ -618,19 +706,23 @@ The row-level audit columns are:
 | `slots_expanded` | `LIST<STRUCT<slot_index: INT32, types_added: LIST<INT32>>>` | as schema | OPTIONAL† | Written for template kinds; the list is empty for `TemplateWidened` and `TemplateWideningRejectedDegenerate`. For `TemplateTypeExpanded`, one element per slot whose type set grew, each carrying the wildcard-slot ordinal plus the `ParamType` ordinals added (RFC 0001 §6.4 `slots_expanded: Vec<SlotExpansion>`; `SlotExpansion = { slot_index, types_added }`) |
 | `triggering_line_hash` | (no logical type) | `FIXED_LEN_BYTE_ARRAY(16)` | OPTIONAL† | Blake3 hash of the raw triggering line `L_raw` (RFC 0001 §6.4 `triggering_line_hash: [u8; 16]`); enables cross-referencing the audit event with the data record that caused it |
 | `triggering_line_sample` | `STRING` | `BYTE_ARRAY` | OPTIONAL | First 256 bytes of `L_raw`, UTF-8 lossy-decoded if necessary (RFC 0001 §6.4 `triggering_line_sample: Option<String>`); `NULL` when the sample was redacted for retention policy |
-| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | `NULL` for variants other than `TemplateWideningRejectedDegenerate`; the degenerate-template guard's diagnostic string otherwise. `NULL` for `compaction` — the `compaction_*` columns carry the facts |
-| `compaction_partition` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The compacted data partition, as the canonical `year=…/month=…/day=…/hour=…` key under the row's `tenant_id` (RFC 0009 §3.4). `NULL` for template kinds |
-| `compaction_input_files` | `LIST<STRING>` | as schema | OPTIONAL | **Compaction only.** The input file names that were merged away (RFC 0009 §3.6 `ourios.compaction.files`). `NULL` for template kinds |
-| `compaction_output_file` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The consolidated output file name (the sole live file after the commit). `NULL` for template kinds |
-| `compaction_generation` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** The manifest generation the consolidation committed at (RFC 0009 §3.4). `NULL` for template kinds |
-| `compaction_rows` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** Rows in the consolidated file — equal to the total input rows, the conserved count (RFC0009.2). `NULL` for template kinds |
+| `reason` | `STRING` | `BYTE_ARRAY` | OPTIONAL | The degenerate-template guard's diagnostic string for `TemplateWideningRejectedDegenerate`; the operator-supplied justification (≤ 256 B, RFC 0001 §6.7; `"" ↔ NULL`) for the alias kinds (4–5); `NULL` otherwise (`NULL` for `compaction` — the `compaction_*` columns carry the facts) |
+| `compaction_partition` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The compacted data partition, as the canonical `year=…/month=…/day=…/hour=…` key under the row's `tenant_id` (RFC 0009 §3.4). `NULL` for all other kinds |
+| `compaction_input_files` | `LIST<STRING>` | as schema | OPTIONAL | **Compaction only.** The input file names that were merged away (RFC 0009 §3.6 `ourios.compaction.files`). `NULL` for all other kinds |
+| `compaction_output_file` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The consolidated output file name (the sole live file after the commit). `NULL` for all other kinds |
+| `compaction_generation` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** The manifest generation the consolidation committed at (RFC 0009 §3.4). `NULL` for all other kinds |
+| `compaction_rows` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** Rows in the consolidated file — equal to the total input rows, the conserved count (RFC0009.2). `NULL` for all other kinds |
+| `alias_representative_id` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Alias kinds (4–5) only.** The operator's anchor id for the assertion/retraction — one member of the asserted set, *not* the set's derived canonical (RFC 0001 §6.7). `NULL` for kinds 0–3 |
+| `alias_member_ids` | `LIST<INTEGER(64, signed=false)>` | as schema | OPTIONAL | **Alias kinds (4–5) only.** The other ids in the asserted set (RFC 0001 §6.7 `member_ids: Vec<u64>`), stored verbatim; the semantic value is the set `{alias_representative_id} ∪ alias_member_ids`. Empty list is valid (single-id retraction) and distinct from `NULL`. `NULL` for kinds 0–3 |
+| `alias_actor` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Alias kinds (4–5) only.** The principal that issued the assertion — aliasing is never anonymous (RFC 0001 §6.7 `actor: ActorId`, non-empty). `NULL` for kinds 0–3 |
 
 **OPTIONAL†** marks columns relaxed from REQUIRED by the
 2026-06-03 amendment (§3.8 rule 6). They are
 *required-by-convention for the template event kinds* (`event_kind`
 0–2): the writer MUST populate them there and a test asserts it, so
-the template-event contract is unchanged; they are `NULL` only for
-`compaction` (kind 3). Existing audit files keep their non-null
+the template-event contract is unchanged; they are `NULL` for
+`compaction` (kind 3) and, per the 2026-06-12 amendment, the alias
+kinds (4–5). Existing audit files keep their non-null
 values and read back as `Some` — no data migration.
 
 The canonical-JSON encoding of `old_template` / `new_template`
@@ -646,7 +738,7 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 |---|---|---|---|---|
 | `tenant_id` | yes | no | no | Bounded per cluster |
 | `timestamp` | no | yes | no | `DELTA_BINARY_PACKED` Parquet encoding plus ZSTD compression (same shape as data-file `time_unix_nano`); page index supports time-range pruning on drift queries |
-| `event_kind` | yes | yes | no | A small bounded set (four ordinals today), plus future ordinals |
+| `event_kind` | yes | yes | no | A small bounded set (six ordinals today), plus future ordinals |
 | `event_type` | yes | yes | no | Same bounded set as `event_kind`; predicate-pushdown surface for the RFC 0001 §6.7 drift query |
 | `template_id` | yes | yes | no | Bounded by tenant template count; bloom filter is unnecessary at audit volume |
 | `old_version`, `new_version` | yes | no | no | Small per template |
@@ -661,6 +753,9 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 | `compaction_output_file` | no | no | no | UUID file name, near-random — dict loses |
 | `compaction_generation` | yes | no | no | Small monotonic integers per partition |
 | `compaction_rows` | no | no | no | High-cardinality counts; neither dict nor index earns its keep |
+| `alias_representative_id` | yes | yes | no | Bounded by tenant template count — same shape as `template_id` |
+| `alias_member_ids` (list values) | yes | no | no | Same bounded id space; list volume is tiny (rare operator actions) |
+| `alias_actor` | yes | no | no | A small set of operators / API principals per tenant |
 
 Compression codec follows §3.5 (`ZSTD-3` across every column).
 Anything not in the table above takes the writer's defaults; the
@@ -673,6 +768,56 @@ across crashes by routing audit events through the same WAL
 path as data records (a contract that lands with the post-MVP
 `ourios-wal` crate; until then audit-event durability is
 in-memory and the corpus bench accepts that).
+
+#### 3.7.1 v1 reader-side alias-map derivation (amendment 2026-06-12)
+
+In v1 there is **no persisted per-tenant alias-map artifact**: the
+audit stream *is* the alias store, and the querier **derives** the
+requesting tenant's alias map at query-compile time. The
+derivation:
+
+1. Scan the tenant's `audit/` partition subtree for rows with
+   `event_kind ∈ {4, 5}` — pruned by the `tenant_id` partition key
+   plus the `event_kind` / `event_type` dictionary and page-index
+   columns (the same partition-pruned scan shape as the RFC 0010
+   drift query). Alias events are rare operator actions, not
+   ingest-volume data, so the scan is small by construction.
+2. Fold the matching events in `timestamp` (event-time) order
+   through the RFC 0001 §6.7 projection semantics — each
+   `alias_asserted` unions its asserted set into one equivalence
+   class (merging classes that share a member), each
+   `alias_retracted` removes its asserted set's ids, canonical
+   representative derived as `min(members)`. Those semantics are
+   owned by RFC 0001 §6.7 and implemented by
+   `ourios-core::alias::AliasMap`; this RFC references them and
+   does not restate them. Same-nanosecond ties fold in within-file
+   row order (the sink's append order); the control plane is the
+   single writer of alias events, so ties are not expected in
+   practice and only an assert/retract pair over the same ids in
+   the same nanosecond would be sensitive to the tiebreak.
+3. Hand the folded map to the RFC 0002 `resolves_to` compilation
+   (RFC0002.9), which expands by set membership exactly as before —
+   the derivation changes where the map *comes from*, not what it
+   means.
+
+**Consistency bound.** The derived map reflects exactly the alias
+events durably written *and flushed to the audit stream* at scan
+time. This is the eventual-consistency stance RFC 0001 §6.7
+already takes (bounded under-inclusion for a not-yet-visible
+assertion, bounded over-inclusion for a not-yet-visible
+retraction, never cross-tenant, never a phantom grouping); in v1
+the staleness window is audit-flush visibility rather than a
+snapshot/projection-rebuild cadence.
+
+**The cached artifact is deferred, not designed away.** A
+materialized per-tenant alias-map file would be a pure
+recovery/latency cache over this derivation — its file format,
+publish point, and refresh cadence ride the RFC 0009 §3.4
+atomic-publish manifest fork (issues #94 / #147) and are *not*
+pinned here. Because the audit stream remains the source of truth
+either way, introducing the cache later changes no query-visible
+semantics — the same "v1 full-replay now, accelerate later, no
+format change" shape RFC 0001 §6.9 pinned for the miner snapshot.
 
 ### 3.8 Schema-evolution policy
 
@@ -1060,6 +1205,28 @@ column the bench won't measure.
 >   i.e. exactly the pre-amendment behaviour, no error, no hidden
 >   rows
 
+> **Scenario RFC0005.14 — Alias audit events round-trip and back the v1 map derivation (amendment 2026-06-12)**
+> - **Given** an `alias_asserted` event (`event_kind = 4`,
+>   `event_type = "alias_asserted"`) carrying a representative id,
+>   a member-id set, an actor, and a reason, written through the
+>   audit sink
+> - **When** the tenant's audit stream is read back
+> - **Then** the event round-trips with its full asserted set,
+>   actor, and reason intact (`reason` round-trips `"" ↔ NULL`;
+>   an empty `member_ids` reads back as an empty list, not `NULL`)
+> - **And** every template-specific and `compaction_*` column reads
+>   back as `None` / null, and a `template_widened` event in the
+>   same stream reads its `alias_*` columns back as `None` (§3.8
+>   rule 6, per kind)
+> - **And** given a stream carrying `alias_asserted(A, {B})`
+>   followed by the matching `alias_retracted` for tenant `T`,
+>   when the querier derives `T`'s alias map at compile time
+>   (§3.7.1), then `resolves_to(A)` reflects exactly the folded
+>   state per RFC 0001 §6.7 (assert-then-retract → `{A}`)
+> - **And** a second tenant's alias events contribute nothing to
+>   `T`'s derived map (`CLAUDE.md` §3.7; RFC 0001 scenario
+>   RFC0001.14 at the storage layer)
+
 ## 6. Testing strategy
 
 - **RFC0005.1** — property test in
@@ -1134,6 +1301,20 @@ column the bench won't measure.
   `effective_time_unix_nano` column) with the `parquet` crate
   directly, per the RFC0005.2 pattern, and assert the window
   filter behaves as `effective := time_unix_nano`.
+- **RFC0005.14** — lands with the issue-#148 implementation
+  slice. Round-trip test in `crates/ourios-parquet/tests/audit.rs`
+  per the RFC0005.12 pattern: write `alias_asserted` /
+  `alias_retracted` and a `template_widened` event through
+  `AuditWriter`, read back via `AuditReader`, assert each kind's
+  columns populated / null per §3.7 (including the `"" ↔ NULL`
+  `reason` rule and the empty-vs-`NULL` `alias_member_ids`
+  distinction). Derivation test in `crates/ourios-querier`:
+  fold a written assert/retract stream into the tenant's
+  `AliasMap` per §3.7.1 and assert `resolves_to` over the result,
+  with a second tenant's events on disk to pin isolation. The
+  unknown-kind tolerance rule is pinned by extending the existing
+  forged-ordinal reader test (`audit_reader.rs`) from
+  expect-error to expect-opaque-event.
 
 Criterion benchmarks (in `ourios-bench`, Phase 3 territory) will
 measure A1 (compression ratio) and B1/B2 (predicate-pushdown
@@ -1199,8 +1380,10 @@ are normative for the maturity-stage move from `green` to
   body retention — the source of unbounded values in the `body`
   column), §6.6 (reconstruction — the consumer of the schema's
   `params` / `separators` / `lossy_flag` columns), §6.7
-  (template versioning), §9 (cross-RFC contracts pending —
-  audit-event Parquet stream).
+  (template versioning; the 2026-06-07 alias write path whose
+  `alias_asserted` / `alias_retracted` events the §3.7 stream
+  persists and whose projection semantics §3.7.1 folds), §9
+  (cross-RFC contracts pending — audit-event Parquet stream).
 - RFC 0002 (query DSL, drafted) — Phase 3 consumer of the
   reader.
 - RFC 0003 (OTLP receiver, drafted) — Phase 3 producer of

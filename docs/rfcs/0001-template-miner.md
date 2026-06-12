@@ -1894,6 +1894,24 @@ is always a *previously asserted* membership, never a phantom one.
 The bound on the window (snapshot cadence) is a storage/serving-layer
 knob, deferred to the RFC 0005 storage decision (see §9).
 
+> **Amendment 2026-06-12 — the storage decision is made (v1), by
+> the RFC 0005 line.** `alias_asserted` / `alias_retracted` persist
+> as `event_kind` 4 / 5 on the RFC 0005 §3.7 audit stream, and in
+> v1 the querier **derives** the per-tenant alias map at
+> query-compile time by scanning the tenant's audit stream for
+> those kinds and folding them through this section's projection
+> semantics (RFC 0005 §3.7.1) — there is no persisted map artifact
+> yet, so "the projection is rebuilt and republished" above reads,
+> in v1, "the audit events are durably written and flushed"; the
+> staleness bound is audit-flush visibility rather than a
+> snapshot/rebuild cadence, with the same bounded
+> under-/over-inclusion directions. The cached per-tenant artifact
+> (file/format/cadence) stays deferred behind the RFC 0009 §3.4
+> manifest fork; because the event log remains the source of truth,
+> adding the cache later changes no query-visible semantics — the
+> same v1-full-replay-now / accelerate-later shape as §6.9's
+> snapshot.
+
 *Reader / query contract.* RFC 0002's `template_id.resolves_to(X)`
 (RFC0002.9, §5.4) loads the requesting tenant's alias map at compile
 time and expands `X` to its alias-set membership: `template_id IN
@@ -2556,7 +2574,13 @@ and the remaining future work is the two items below them.
       **physical alias-map file/format and snapshot cadence** are a
       storage decision owned by the RFC 0005 line, not RFC 0001 —
       RFC 0001 owns the model, the write path, and the criteria
-      (sibling to the issue #147 split).
+      (sibling to the issue #147 split). *Update 2026-06-12:* the
+      RFC 0005 line has made the v1 half of that decision — alias
+      events persist as kinds 4–5 on the RFC 0005 §3.7 audit
+      stream, and the querier derives the map by folding that
+      stream at compile time (RFC 0005 §3.7.1; §6.7 amendment of
+      the same date). The cached per-tenant artifact remains
+      deferred behind the RFC 0009 §3.4 manifest fork.
 
 **Cross-RFC contracts pending.**
 

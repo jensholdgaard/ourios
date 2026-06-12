@@ -265,6 +265,37 @@ fn rfc0008_7_retain_floor_holds_back_truncation_until_it_advances() {
     );
 }
 
+/// The live append segment is identified by its header UUID,
+/// not its path: even renamed out from under the writer — and
+/// even when the checkpoint covers its every frame — it is
+/// never unlinked. Unlinking it would leave the writer
+/// appending into an unlinked inode no later `Wal::open` would
+/// see.
+#[test]
+fn rfc0008_7_housekeeping_never_unlinks_a_renamed_current_segment() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let mut wal = Wal::open(default_config(tmp.path())).expect("open");
+    let off = wal.append(FrameKind::OtlpBatch, b"x").expect("append");
+    wal.sync().expect("sync");
+    // The current segment's highest frame is exactly the
+    // checkpoint — wholly ≤ bound, so only the identity guard
+    // protects it.
+    wal.checkpoint(off).expect("checkpoint");
+
+    let seg = segment_files(tmp.path())
+        .into_iter()
+        .next()
+        .expect("the one segment");
+    let renamed = tmp.path().join("0-renamed.wal");
+    std::fs::rename(&seg, &renamed).expect("rename live segment");
+
+    wal.housekeeping(None).expect("housekeeping");
+    assert!(
+        renamed.exists(),
+        "the renamed live append segment survives — identity is the header UUID, not the path",
+    );
+}
+
 /// Spawn the crash fixture against `root`, applying `ops`, wait
 /// for its `READY` line, then SIGKILL it. Returns the offset
 /// echoed by a `CHECKPOINT` op, if any.

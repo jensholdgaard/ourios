@@ -165,8 +165,12 @@ pub struct Wal {
     /// end-of-file regardless of the user-space cursor.
     current_segment: File,
     /// Path of the file the `current_segment` handle points
-    /// at. Housekeeping (§6.7) skips it unconditionally — the
-    /// append target is never unlinked.
+    /// at. Kept alongside the handle for diagnostic messages
+    /// and the post-rotation parent-dir `fsync` (§6.3) that
+    /// lands with rotation. Housekeeping deliberately does NOT
+    /// key on it — the append target is identified by its
+    /// header UUID so a rename can't slip it past the guard.
+    #[allow(dead_code)]
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
     /// filename's stem and the segment's in-file header per
@@ -488,14 +492,14 @@ impl Wal {
         })?;
         let mut unlinked_any = false;
         for path in segments {
-            if path == self.current_segment_path {
-                continue;
-            }
-            // A closed segment's highest frame offset is its file
-            // length (append offsets are post-frame bytes). The
-            // UUID comes from the in-file header, not the
+            // Segment identity is the in-file header UUID, not the
             // filename, mirroring `open_existing_segment` — a
             // renamed file is still judged by its true identity.
+            // That includes the *current* segment: skipping it by
+            // path would let a rename slip the live append target
+            // past the guard, and unlinking it leaves the writer
+            // appending into an unlinked inode no later `open`
+            // would ever see.
             let mut handle = File::open(&path).map_err(|e| io("open(segment)", e))?;
             let header = segment::read_header(&mut handle).map_err(|e| {
                 io(
@@ -503,6 +507,11 @@ impl Wal {
                     std::io::Error::new(ErrorKind::InvalidData, format!("{}: {e}", path.display())),
                 )
             })?;
+            if header.segment_uuid == self.current_segment_uuid {
+                continue;
+            }
+            // A closed segment's highest frame offset is its file
+            // length (append offsets are post-frame bytes).
             let len = handle.metadata().map_err(|e| io("stat(segment)", e))?.len();
             let highest = WalOffset {
                 segment: header.segment_uuid,

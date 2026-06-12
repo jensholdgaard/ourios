@@ -1845,7 +1845,10 @@ which id any event named as its anchor. A class that drops to a
 single member is no longer an alias set (that lone id resolves only
 to itself, RFC0001.16). The folded result is persisted as a **per-tenant
 artifact** (one map per tenant, not per partition) that the querier
-reads at compile time. Three venues were considered:
+reads at compile time — note: that persisted artifact is the *deferred
+cache* of the 2026-06-12 amendment below; in v1 the querier folds the
+map directly from the audit stream and no artifact exists yet. Three
+venues were considered:
 
 - **Per-tenant projection from the audit/alias event log (chosen).**
   Aliases are a tenant-scoped projection rebuilt from the durable

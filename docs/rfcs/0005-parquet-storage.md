@@ -660,7 +660,7 @@ add-new-column / migrate / drop).
 > `NULL` means "not an alias row"), mirroring the
 > `positions_widened` empty-list convention. Alias rows leave every
 > template-specific and `compaction_*` column `NULL`; conversely
-> the `alias_*` columns are `NULL` for kinds 0–3 and
+> the `alias_*` columns are `NULL` for all other kinds and
 > *required-by-convention non-null for kinds 4–5*
 > (`alias_member_ids` possibly empty, `reason` per the operator's
 > optional input) — the §3.8 rule 6 convention, writer-enforced and
@@ -712,9 +712,9 @@ The row-level audit columns are:
 | `compaction_output_file` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Compaction only.** The consolidated output file name (the sole live file after the commit). `NULL` for all other kinds |
 | `compaction_generation` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** The manifest generation the consolidation committed at (RFC 0009 §3.4). `NULL` for all other kinds |
 | `compaction_rows` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Compaction only.** Rows in the consolidated file — equal to the total input rows, the conserved count (RFC0009.2). `NULL` for all other kinds |
-| `alias_representative_id` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Alias kinds (4–5) only.** The operator's anchor id for the assertion/retraction — one member of the asserted set, *not* the set's derived canonical (RFC 0001 §6.7). `NULL` for kinds 0–3 |
-| `alias_member_ids` | `LIST<INTEGER(64, signed=false)>` | as schema | OPTIONAL | **Alias kinds (4–5) only.** The other ids in the asserted set (RFC 0001 §6.7 `member_ids: Vec<u64>`), stored verbatim; the semantic value is the set `{alias_representative_id} ∪ alias_member_ids`. Empty list is valid (single-id retraction) and distinct from `NULL`. `NULL` for kinds 0–3 |
-| `alias_actor` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Alias kinds (4–5) only.** The principal that issued the assertion — aliasing is never anonymous (RFC 0001 §6.7 `actor: ActorId`, non-empty). `NULL` for kinds 0–3 |
+| `alias_representative_id` | `INTEGER(64, signed=false)` | `INT64` | OPTIONAL | **Alias kinds (4–5) only.** The operator's anchor id for the assertion/retraction — one member of the asserted set, *not* the set's derived canonical (RFC 0001 §6.7). `NULL` for all other kinds |
+| `alias_member_ids` | `LIST<INTEGER(64, signed=false)>` | as schema | OPTIONAL | **Alias kinds (4–5) only.** The other ids in the asserted set (RFC 0001 §6.7 `member_ids: Vec<u64>`), stored verbatim; the semantic value is the set `{alias_representative_id} ∪ alias_member_ids`. Empty list is valid (single-id retraction) and distinct from `NULL`. `NULL` for all other kinds |
+| `alias_actor` | `STRING` | `BYTE_ARRAY` | OPTIONAL | **Alias kinds (4–5) only.** The principal that issued the assertion — aliasing is never anonymous (RFC 0001 §6.7 `actor: ActorId`, non-empty). `NULL` for all other kinds |
 
 **OPTIONAL†** marks columns relaxed from REQUIRED by the
 2026-06-03 amendment (§3.8 rule 6). They are
@@ -747,7 +747,7 @@ under §3.1's "RFC pins per-column encoding policy" commitment):
 | `slots_expanded` (list / struct values) | yes | no | no | Same |
 | `triggering_line_hash` | no | no | no | Near-random 16 bytes, dict loses |
 | `triggering_line_sample` | no | no | no | High-entropy text, dict loses |
-| `reason` | yes | no | no | A small set of guard diagnostic strings in practice |
+| `reason` | yes | no | no | Guard diagnostic strings plus, since the alias kinds, operator-supplied justifications — free text but rare and ≤ 256 B, so dict still pays at audit-event volumes |
 | `compaction_partition` | yes | yes | no | Bounded per tenant; page index supports range pruning on the compacted partition |
 | `compaction_input_files` (list values) | no | no | no | UUID file names, near-random — dict loses |
 | `compaction_output_file` | no | no | no | UUID file name, near-random — dict loses |

@@ -1122,6 +1122,87 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
     );
 }
 
+/// Scenario RFC0002.9, storage-backed (RFC 0005 §3.7.1 / RFC0005.14;
+/// issue #148 step 3): the same `resolves_to` expansion as the test
+/// above, but with NO injected map — the alias assertion is written
+/// to the real RFC 0005 `audit/` stream via the production
+/// `ParquetAuditSink`, and the querier DERIVES tenant `T`'s map from
+/// storage at compile time. `resolves_to(A)` returns A ∪ {B} while
+/// bare `template_id == A` stays exactly A, and the assertion under
+/// `T` is invisible to `T2`'s derived map (`CLAUDE.md` §3.7).
+#[tokio::test]
+async fn rfc0002_9_storage_backed_resolves_to_expands_via_derived_map() {
+    use common::{DEFAULT_WINDOW_NS, NOW, TS0, at, simple, write_all, write_audit};
+    use ourios_core::alias::ActorId;
+    use ourios_core::audit::{AuditEvent, AuditPayload};
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::Querier;
+
+    // Arrange — the same three-template fixture under T (A, B, C) plus
+    // the same ids under T2, and ONE alias assertion B ≡ A for T,
+    // persisted through the audit sink rather than handed in.
+    const A: u64 = 10;
+    const B: u64 = 20;
+    const C: u64 = 30;
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            simple("T", A, TS0),
+            simple("T", A, TS0 + 1_000),
+            simple("T", B, TS0 + common::HOUR_NS),
+            simple("T", C, TS0 + 2 * common::HOUR_NS),
+            simple("T2", A, TS0),
+            simple("T2", B, TS0 + common::HOUR_NS),
+        ],
+    );
+    write_audit(
+        bucket.path(),
+        &[AuditEvent {
+            tenant_id: TenantId::new("T"),
+            timestamp: at(TS0),
+            payload: AuditPayload::AliasAsserted {
+                representative_id: A,
+                member_ids: vec![B],
+                actor: ActorId::new("op-test").expect("actor"),
+                reason: "deploy re-split the login template".to_string(),
+            },
+        }],
+    );
+    let q = Querier::new(bucket.path());
+    let t = TenantId::new("T");
+    let t2 = TenantId::new("T2");
+
+    // No injected map: `None` selects the §3.7.1 storage derivation.
+    let rows = async |text: &str, tenant: &TenantId| {
+        let query = ourios_querier::dsl::parse(text).expect("parse");
+        q.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, None)
+            .await
+            .expect("run_query")
+            .rows
+    };
+
+    // Act / Assert — resolves_to(A) expands via the DERIVED {A,B}
+    // class: 2 A-rows + 1 B-row, C excluded …
+    assert_eq!(
+        rows("resolves_to(10)", &t).await,
+        3,
+        "resolves_to(A) expands via the storage-derived map",
+    );
+    // … while bare template_id == A stays exactly A.
+    assert_eq!(
+        rows("template_id == 10", &t).await,
+        2,
+        "template_id == A is unaffected by the derived alias class",
+    );
+    // T's stored assertion never folds into T2's derived map.
+    assert_eq!(
+        rows("resolves_to(10)", &t2).await,
+        1,
+        "the stored T alias must not leak into T2's derived map",
+    );
+}
+
 /// Scenario RFC0002.10 — A query is a YAML-safe single-line scalar.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 ///

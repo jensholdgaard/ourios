@@ -483,17 +483,21 @@ direction and the primary obligation lives in those other RFCs.
 >   double-apply — the v1 hazard that gated restore)
 
 > **Scenario §3.5.4 — Stale snapshot degrades loudly, not silently (2026-06-12 amendment)**
-> - **Given** a snapshot at high-water mark `S` and a WAL whose
->   surviving segments no longer reach back to `S` (externally
->   truncated — the RFC 0008 §6.7 retain floor prevents this
->   arising internally)
+> - **Given** a snapshot at high-water mark `S`, a Parquet
+>   checkpoint at `X > S`, and a WAL whose surviving segments
+>   start above `S` but retain every frame above `X` (externally
+>   truncated — WAL segment files manually unlinked; the RFC 0008
+>   §6.7 retain floor prevents this arising internally, and
+>   legitimate housekeeping never removes a frame above `X`)
 > - **When** recovery runs
-> - **Then** the snapshot is restored and the surviving frames
->   above `S` are replayed (the data side is complete — everything
->   truncated was at or below the Parquet checkpoint)
-> - **And** a structured warning is emitted naming the gap, so the
->   possible template re-minting inside it is surfaced (hazard #5,
->   observable via the RFC 0010 drift query) rather than silent
+> - **Then** the snapshot is restored and the surviving frames are
+>   replayed under the per-consumer horizons (the data side is
+>   complete: every missing frame was ≤ `X`, hence already in
+>   Parquet)
+> - **And** a structured warning is emitted naming the gap between
+>   `S` and the oldest surviving frame, so the possible template
+>   re-minting inside it is surfaced (hazard #5, observable via the
+>   RFC 0010 drift query) rather than silent
 
 > **Scenario §3.7.1 — Tenants' template trees never cross-pollinate**
 > - **Given** a `MinerCluster` ingesting interleaved lines from
@@ -2175,27 +2179,37 @@ boundary at 1.0 (see §6.3): default buckets
 > replays only the WAL tail** above the snapshot's recorded
 > high-water mark `S` — exactly as written in step (2), with no
 > format change (the mark has been in the payload since v1). Three
-> rules complete the design. **Per-consumer horizons:** the recovery
-> driver routes each delivered frame by its offset — the Parquet
-> path consumes every frame above the RFC 0008 checkpoint `X`, the
-> miner only frames above `S`; frames in `(X, S]` are already folded
-> into the snapshot and re-feeding them would double-apply (the v1
-> hazard, now resolved by routing rather than by refusing to
-> restore). **Truncation floor:** the ingester passes the latest
+> rules complete the design. **Per-consumer horizons:** RFC 0008's
+> `replay` delivers every surviving frame with its offset; the
+> recovery driver suppresses per consumer — the Parquet path
+> consumes only frames above the RFC 0008 checkpoint `X` (below it
+> they are already published), the miner only frames above `S`
+> (below it they are already folded into the snapshot;
+> re-feeding would double-apply — the v1 hazard, now resolved by
+> routing rather than by refusing to restore). The rule covers both
+> orderings: in the steady state `S ≥ X` the miner consumes a
+> suffix of what Parquet consumes; with a **lagging snapshot**
+> (`S < X`) the miner additionally consumes the `(S, X]` frames the
+> floor retained, closing its state gap while Parquet suppresses
+> them. **Truncation floor:** the ingester passes the latest
 > durable snapshot's `S` to `Wal::housekeeping` as a retain floor,
 > so the WAL never unlinks a frame no snapshot has captured
 > (RFC 0008 §6.7 — closes the `S < X` template-drift hole, hazard
 > #5). **Stale-snapshot fallback:** if recovery nevertheless finds
-> the WAL truncated past `S` (external mutation — an operator
-> deleting snapshot artefacts; the floor prevents it arising
-> internally), it restores the snapshot, replays the surviving
-> frames above `S`, and emits a structured warning naming the gap —
-> the data side is complete (everything truncated was ≤ `X`, hence
-> in Parquet), and templates first seen inside the gap may re-mint
-> (drift surfaced via RFC 0010, not silent). New acceptance
-> criteria: §3.5.3 (restore-equivalence), §3.5.4 (stale-snapshot
-> fallback); the end-to-end driver contract is RFC 0008's
-> RFC0008.10.
+> the WAL truncated past `S` (external mutation — segment files
+> manually unlinked from `wal_root`; the floor prevents the gap
+> arising internally), it restores the snapshot, replays the
+> surviving frames above `S`, and emits a structured warning naming
+> the gap. The data side is complete **provided the truncation did
+> not exceed `X`** — legitimate housekeeping never unlinks a frame
+> above the checkpoint, so everything missing is in Parquet; manual
+> deletion beyond `X` would be unrecoverable acknowledged-data
+> loss, which is exactly why segment removal is reserved to
+> housekeeping and never an operator action. Templates first seen
+> inside the `(S, X]` gap may re-mint (drift surfaced via RFC 0010,
+> not silent). New acceptance criteria: §3.5.3
+> (restore-equivalence), §3.5.4 (stale-snapshot fallback); the
+> end-to-end driver contract is RFC 0008's RFC0008.10.
 
 **Hot path.** The per-tenant tree lives in process memory on the
 ingester. Tree operations (descend, simSeq, attach, widen) are

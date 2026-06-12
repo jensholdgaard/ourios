@@ -134,8 +134,22 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // horizon — an unstamped snapshot is discarded at the next start
     // (RFC 0001 §6.9), which would overwrite the post-recovery
     // artefacts with full-replay-only ones.
+    //
+    // The rotation hook is the §6.9 *primary* cadence point: every WAL
+    // segment rotation persists per-tenant snapshots at the
+    // rotation-point high-water mark. Best-effort, like the other
+    // cadence points — a snapshot is a rebuildable cache.
+    let hook_root = snapshots_root.clone();
     let pipeline: SharedPipeline = Arc::new(Mutex::new(
-        IngestPipeline::new(Box::new(wal), miner, rule).with_last_durable(report.max_delivered),
+        IngestPipeline::new(Box::new(wal), miner, rule)
+            .with_last_durable(report.max_delivered)
+            .with_rotation_hook(Box::new(move |miner, mark| {
+                if let Err(e) = recovery::write_snapshots(&hook_root, miner, Some(mark)) {
+                    eprintln!(
+                        "rotation snapshot write failed (recovery falls back to the WAL): {e}"
+                    );
+                }
+            })),
     ));
 
     // gRPC: bind first so `:0` resolves to a real port before serving.

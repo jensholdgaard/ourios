@@ -1,13 +1,14 @@
 //! `ourios-wal` — RFC 0008 write-ahead log.
 //!
-//! **Status: red gate (closing).** `open`, `append`, `sync`,
-//! `replay`, `checkpoint`, `housekeeping`, and `metrics` are
-//! implemented. The remaining `#[ignore]`'d integration tests
-//! under `crates/ourios-wal/tests/` enumerate the RFC 0008 §5
-//! acceptance criteria still pending (rotation, batched-fsync
-//! latency, and the remaining corruption / O(N) arms) before
-//! the RFC moves `red → green`. See RFC 0008 for the design
-//! contract.
+//! **Status: red gate (closing).** `open`, `append` (with §6.5
+//! rotation), `sync`, `replay`, `checkpoint`, `housekeeping`,
+//! and `metrics` are implemented. The remaining `#[ignore]`'d
+//! integration tests under `crates/ourios-wal/tests/` enumerate
+//! the RFC 0008 §5 acceptance criteria still pending
+//! (wal-before-ack, recovery O(N), the remaining torn-write /
+//! corruption arms, batched-fsync latency, unflushed-bytes
+//! bound) before the RFC moves `red → green`. See RFC 0008 for
+//! the design contract.
 //!
 //! The shape of the public API follows §6.1 verbatim — the
 //! same `(WalOffset, FrameKind, FrameSink, Wal)` surface the
@@ -165,11 +166,10 @@ pub struct Wal {
     /// end-of-file regardless of the user-space cursor.
     current_segment: File,
     /// Path of the file the `current_segment` handle points
-    /// at. Kept alongside the handle for diagnostic messages
-    /// and the post-rotation parent-dir `fsync` (§6.3) that
-    /// lands with rotation. Housekeeping deliberately does NOT
-    /// key on it — the append target is identified by its
-    /// header UUID so a rename can't slip it past the guard.
+    /// at, swapped on rotation. Kept for diagnostic messages;
+    /// housekeeping deliberately does NOT key on it — the
+    /// append target is identified by its header UUID so a
+    /// rename can't slip it past the guard.
     #[allow(dead_code)]
     current_segment_path: PathBuf,
     /// `UUIDv7` of the current segment — same value as the
@@ -198,9 +198,17 @@ pub struct Wal {
     /// Parquet-side suppression horizon ([`Self::last_checkpoint`])
     /// and one of housekeeping's two truncation bounds.
     checkpoint: Option<WalOffset>,
+    /// A rotation step failed (§6.5): the closing segment's
+    /// `fdatasync`, the fresh segment's creation, or the
+    /// parent-dir `fsync`. Once set, every `append` is refused
+    /// until an operator intervenes — continuing would risk
+    /// either a torn tail on a *closed* segment (which recovery
+    /// treats as RFC0008.5 corruption) or a frame landing in a
+    /// segment whose directory entry is not durable.
+    quiesced: bool,
     /// §6.8 counters. `unflushed_bytes` is the H3 detection
     /// metric: grows on `append`, resets on a successful
-    /// `sync`.
+    /// `sync` (or on the closing `fdatasync` of a rotation).
     appends_total: u64,
     syncs_total: u64,
     unflushed_bytes: u64,
@@ -255,6 +263,7 @@ impl Wal {
             // an acked frame's segment is guaranteed a durable
             // directory entry (see the field doc — §3.4).
             dir_fsync_pending: true,
+            quiesced: false,
             checkpoint,
             appends_total: 0,
             syncs_total: 0,
@@ -274,6 +283,16 @@ impl Wal {
     /// compose naturally on this semantics: a `WalOffset`
     /// returned by `append` then `sync` means "everything
     /// strictly below this byte is on disk".
+    ///
+    /// Rotation (§6.5) happens here, *before* the write: when the
+    /// segment would exceed `wal_segment_size_bytes` with this
+    /// frame, or its age (from the `UUIDv7` mint time) exceeds
+    /// `wal_segment_age_secs`, the segment is closed (final
+    /// `fdatasync`), a fresh one is created, and the parent dir
+    /// is fsync'd before the frame lands — so a frame never
+    /// straddles segments and never lands in a segment without a
+    /// durable directory entry. A failed rotation quiesces the
+    /// WAL (see [`AppendError::QuiescedAfterRotationFailure`]).
     ///
     /// If `write_frame` fails after partial bytes have hit the
     /// segment, the file is best-effort truncated back to its
@@ -296,6 +315,9 @@ impl Wal {
     /// always succeeds; the `expect` documents the invariant
     /// rather than guarding a real failure mode.
     pub fn append(&mut self, kind: FrameKind, payload: &[u8]) -> Result<WalOffset, AppendError> {
+        if self.quiesced {
+            return Err(AppendError::QuiescedAfterRotationFailure);
+        }
         if payload.len() > MAX_FRAME_BYTES {
             return Err(AppendError::TooLarge {
                 len: payload.len(),
@@ -313,7 +335,7 @@ impl Wal {
         // notes), so `stream_position` can be 0 or stale on a
         // file we haven't seeked into. File metadata length is
         // truth.
-        let pre_write_byte = self
+        let mut pre_write_byte = self
             .current_segment
             .metadata()
             .map_err(|source| AppendError::Io {
@@ -321,6 +343,16 @@ impl Wal {
                 source,
             })?
             .len();
+        let frame_len = frame::FRAME_HEADER_LEN as u64
+            + u64::try_from(payload.len()).expect("payload.len() fits u64 (≤ MAX_FRAME_BYTES)");
+        // §6.5: rotate *before* the write, so a frame never
+        // straddles segments — the size check includes the frame
+        // about to land. The §6.9 segment-size lower bound
+        // guarantees any legal frame fits a fresh segment.
+        if self.rotation_due(pre_write_byte, frame_len) {
+            self.rotate()?;
+            pre_write_byte = SEGMENT_HEADER_LEN as u64;
+        }
         if let Err(source) = frame::write_frame(&mut self.current_segment, kind, payload) {
             // Best-effort truncate-back. If the rollback itself
             // fails the segment is left with a partial frame at
@@ -341,15 +373,96 @@ impl Wal {
         // payload. Computed rather than re-stat'd to avoid a
         // second syscall — the `MAX_FRAME_BYTES` invariant
         // guarantees this sum fits a u64.
-        let post_write_byte = pre_write_byte
-            + frame::FRAME_HEADER_LEN as u64
-            + u64::try_from(payload.len()).expect("payload.len() fits u64 (≤ MAX_FRAME_BYTES)");
+        let post_write_byte = pre_write_byte + frame_len;
         self.appends_total += 1;
-        self.unflushed_bytes += post_write_byte - pre_write_byte;
+        self.unflushed_bytes += frame_len;
         Ok(WalOffset {
             segment: self.current_segment_uuid,
             byte: post_write_byte,
         })
+    }
+
+    /// §6.5's two triggers, checked before the write lands.
+    /// `current_len + frame_len` is the size the segment *would*
+    /// reach; the age comes from the `UUIDv7`'s embedded
+    /// timestamp — the instant the header was written, which
+    /// survives reopen without persisting anything extra. An
+    /// empty segment never age-rotates: there is no recovery
+    /// window to bound, only file churn.
+    fn rotation_due(&self, current_len: u64, frame_len: u64) -> bool {
+        if current_len + frame_len > self.config.segment_size_bytes {
+            return true;
+        }
+        if current_len <= SEGMENT_HEADER_LEN as u64 {
+            return false;
+        }
+        segment_age(self.current_segment_uuid)
+            .is_some_and(|age| age > std::time::Duration::from_secs(self.config.segment_age_secs))
+    }
+
+    /// Close the current segment and open a fresh one (§6.5):
+    /// `fdatasync` the old segment (the last fsync it ever
+    /// receives — a torn tail on a *closed* segment is RFC0008.5
+    /// corruption, so closing without it would convert a benign
+    /// crash into a recovery halt), create the new `UUIDv7`
+    /// segment with its 24 B header, then `fsync` the parent
+    /// directory so the new entry is durable before any frame
+    /// lands in it. Any step failing quiesces the WAL: every
+    /// subsequent `append` returns
+    /// [`AppendError::QuiescedAfterRotationFailure`] until an
+    /// operator intervenes. (`sync` stays available — the old
+    /// segment is still the append target, and acking frames
+    /// already written to it is safe.)
+    fn rotate(&mut self) -> Result<(), AppendError> {
+        if let Err(source) = self.current_segment.sync_data() {
+            self.quiesced = true;
+            return Err(AppendError::Io {
+                op: "fdatasync(rotation: close segment)",
+                source,
+            });
+        }
+        // The closing fdatasync flushed everything appended so far.
+        self.unflushed_bytes = 0;
+        let (file, path, uuid) = match create_fresh_segment(&self.config.root) {
+            Ok(fresh) => fresh,
+            Err(OpenError::Io { op, source }) => {
+                self.quiesced = true;
+                return Err(AppendError::Io { op, source });
+            }
+            Err(OpenError::InvalidConfig { .. } | OpenError::Corrupt { .. }) => {
+                unreachable!("create_fresh_segment only surfaces OpenError::Io")
+            }
+        };
+        // The header must be durable BEFORE the directory entry: the
+        // parent fsync below makes the new file name survive a power
+        // cut, and a surviving entry whose 24 B header bytes were
+        // lost would fail the next `Wal::open`'s header read — a
+        // benign crash turned into OpenError::Corrupt. (`open`'s own
+        // fresh segment doesn't carry this ordering: nothing fsyncs
+        // its directory entry until the first `sync`, which
+        // fdatasyncs the segment first.)
+        if let Err(source) = file.sync_data() {
+            self.quiesced = true;
+            return Err(AppendError::Io {
+                op: "fdatasync(rotation: fresh segment header)",
+                source,
+            });
+        }
+        if let Err(source) = sync_parent_dir(&self.config.root) {
+            // The fresh header-only segment is left in place: replay
+            // reads it as zero frames, and unlinking it here could
+            // itself fail. The quiesce is what protects correctness.
+            self.quiesced = true;
+            return Err(AppendError::Io {
+                op: "fsync(wal_root after rotation)",
+                source,
+            });
+        }
+        self.current_segment = file;
+        self.current_segment_path = path;
+        self.current_segment_uuid = uuid;
+        self.dir_fsync_pending = false;
+        Ok(())
     }
 
     /// Fsync the current segment (and, on the first `sync`
@@ -958,6 +1071,21 @@ fn sync_parent_dir(root: &std::path::Path) -> std::io::Result<()> {
     File::open(root)?.sync_all()
 }
 
+/// Age of a segment, from the `UUIDv7`'s embedded millisecond
+/// timestamp — the instant the header was written (§6.5's
+/// "since its header was written"), with no extra persisted
+/// state and surviving reopen. A full `Duration` rather than
+/// whole seconds: truncation would delay the age cap by up to
+/// a second past the configured bound. `None` for a non-v7
+/// UUID or a clock reading behind the mint time (skew); the
+/// caller treats `None` as "not age-rotatable", the
+/// conservative direction.
+fn segment_age(segment: uuid::Uuid) -> Option<std::time::Duration> {
+    let (secs, nanos) = segment.get_timestamp()?.to_unix();
+    let created = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    std::time::SystemTime::now().duration_since(created).ok()
+}
+
 /// Recovery-time consumer the [`Wal::replay`] scan hands
 /// frames to. Implemented by the ingester's recovery driver:
 /// `OtlpBatch` frames re-run through the decoder + tenant
@@ -1033,10 +1161,14 @@ pub enum AppendError {
         op: &'static str,
         source: std::io::Error,
     },
-    /// A prior rotation failed its fsync and the WAL is
-    /// quiesced per §6.5 — operator intervention is required
-    /// before further appends are accepted.
-    QuiescedAfterRotationFsyncFailure,
+    /// A prior rotation failed (the closing segment's
+    /// `fdatasync`, the fresh segment's creation, or the
+    /// parent-dir `fsync`) and the WAL is quiesced per §6.5 —
+    /// operator intervention is required before further appends
+    /// are accepted. The append that triggered the failed
+    /// rotation surfaced the underlying [`AppendError::Io`];
+    /// every append after it gets this variant.
+    QuiescedAfterRotationFailure,
 }
 
 /// Errors from [`Wal::sync`].
@@ -1058,8 +1190,8 @@ impl std::fmt::Display for AppendError {
                 write!(f, "frame payload {len} B exceeds the {limit} B limit")
             }
             Self::Io { op, source } => write!(f, "WAL append failed at {op}: {source}"),
-            Self::QuiescedAfterRotationFsyncFailure => {
-                write!(f, "WAL is quiesced after a rotation fsync failure (§6.5)")
+            Self::QuiescedAfterRotationFailure => {
+                write!(f, "WAL is quiesced after a rotation failure (§6.5)")
             }
         }
     }
@@ -1069,7 +1201,7 @@ impl std::error::Error for AppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::TooLarge { .. } | Self::QuiescedAfterRotationFsyncFailure => None,
+            Self::TooLarge { .. } | Self::QuiescedAfterRotationFailure => None,
         }
     }
 }

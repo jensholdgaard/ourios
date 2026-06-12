@@ -129,9 +129,11 @@ logs that other backends ignore:
 
 The order on the ingest side is load-bearing: a batch is fsync'd to the
 WAL **before** it is acknowledged and before the miner touches it
-(WAL-before-ack, `CLAUDE.md` §3.4). The Parquet store is a local
-filesystem today; object storage as the durable tier is the design
-target ([RFC 0005](docs/rfcs/0005-parquet-storage.md)).
+(WAL-before-ack, `CLAUDE.md` §3.4). The durability contract for the
+Parquet store is object storage as the source of truth (`CLAUDE.md`
+§3.6, [RFC 0005](docs/rfcs/0005-parquet-storage.md)); the current
+implementation writes that store to a local filesystem, an
+implementation detail on the way to the contract, not a change to it.
 
 ## What is implemented
 

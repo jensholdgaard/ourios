@@ -144,6 +144,10 @@ jobs:
     name: coverage (informational)
     runs-on: ubuntu-latest
     continue-on-error: true
+    permissions:
+      # The badge-publish step below writes coverage.json to the
+      # `badges` branch via the contents API; everything else is read.
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -164,6 +168,33 @@ jobs:
             lcov.info
             coverage-html
           if-no-files-found: error
+      # Self-hosted README coverage badge: a shields.io endpoint JSON
+      # on the `badges` branch, refreshed on every push to main. No
+      # external coverage service is wired; the artifact above stays
+      # the full report and the percentage stays non-gating
+      # (CLAUDE.md §6.2 — not a number to game).
+      - name: Publish coverage badge (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pct=$(cargo llvm-cov report --json --summary-only \
+            | jq -r '.data[0].totals.lines.percent * 10 | round / 10')
+          color=$(awk -v p="$pct" 'BEGIN{print (p>=80)?"brightgreen":(p>=60)?"yellow":"orange"}')
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' \
+            "$pct" "$color" > coverage.json
+          # Ensure the badges branch exists (first run only), then
+          # upsert via the contents API (sha required for updates).
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref=refs/heads/badges -f sha="$GITHUB_SHA" 2>/dev/null || true
+          sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/coverage.json?ref=badges" \
+            --jq .sha 2>/dev/null || true)
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/coverage.json" \
+            -f message="coverage badge: ${pct}%" -f branch=badges \
+            -f content="$(base64 -w0 coverage.json)" \
+            ${sha:+-f sha=$sha} >/dev/null
+          echo "badge published: ${pct}%"
 
   # Aggregate result so branch-protection rules need only require
   # a single check. Skipped Cargo jobs (pre-first-crate) pass through.

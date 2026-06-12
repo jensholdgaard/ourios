@@ -1,0 +1,37 @@
+name: OpenSSF Scorecard
+
+# Supply-chain / repo-hygiene analysis published to the OpenSSF
+# Scorecard API (the README badge reads from it) and to GitHub
+# code scanning. Weekly + on pushes to main; results are public,
+# matching the public repo.
+
+on:
+  schedule:
+    - cron: '30 2 * * 1'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Publishing to the scorecard API uses OIDC; the SARIF upload
+      # feeds the code-scanning tab.
+      id-token: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

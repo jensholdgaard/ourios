@@ -54,11 +54,13 @@ pub struct ReceiverHandle {
 
 impl ReceiverHandle {
     /// Signal both listeners to stop and await their graceful shutdown.
-    /// Once both tasks return they have dropped their pipeline handles,
-    /// releasing the single `Wal`. Then write the shutdown snapshots
-    /// (the second §6.9 cadence point) — best-effort: a snapshot is a
-    /// rebuildable cache, so a failed write degrades the next start to
-    /// a full replay, never a shutdown error.
+    /// Once both tasks return, this handle holds the last reference to
+    /// the pipeline (and so to the single `Wal`), with no contention
+    /// left on its mutex; the shutdown snapshots are written at that
+    /// point (the second §6.9 cadence point) — best-effort: a snapshot
+    /// is a rebuildable cache, so a failed write degrades the next
+    /// start to a full replay, never a shutdown error. The `Wal` is
+    /// released when the handle drops after this returns.
     pub async fn shutdown(self) -> Result<(), String> {
         // A send error just means both listeners already stopped — nothing
         // left to signal.

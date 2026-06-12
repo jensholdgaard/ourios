@@ -60,10 +60,10 @@ fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
     );
 
     // Crossing the age cap makes batch B rotate; the hook fires
-    // before B's records reach the miner. (Age is whole seconds
-    // from the segment UUID's mint time and the cap is strict, so
-    // > 2 s of wall time guarantees age ≥ 2 > 1.)
-    std::thread::sleep(Duration::from_millis(2_200));
+    // before B's records reach the miner. (Age is a full Duration
+    // from the segment UUID's millisecond mint time, so 1.2 s of
+    // wall time is comfortably past the strict 1 s cap.)
+    std::thread::sleep(Duration::from_millis(1_200));
     pipeline
         .ingest(request(vec![resource_logs("svc", &["payment 9 settled"])]))
         .expect("batch B");

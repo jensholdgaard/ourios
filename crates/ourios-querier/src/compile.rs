@@ -90,13 +90,17 @@ const NS_PER_SECOND: u64 = 1_000_000_000;
 /// stage, or the tenant default `[now - W, now]` when absent — RFC 0002 §4
 /// P5, never unbounded) and capture the predicate + `limit` for deferred
 /// `Expr` building.
-pub(crate) fn compile(
+/// The map-independent half of [`compile`]: stage support, window
+/// resolution, and the limit bound. `run_query` calls this *before*
+/// deriving the alias map so an invalid query fails with its compile
+/// error rather than first paying (or surfacing errors from) the
+/// audit-tree scan; `compile` runs it again internally — it is pure
+/// and cheap, and one source of truth beats a split.
+pub(crate) fn validate(
     query: &Query,
-    tenant: &TenantId,
     now_unix_nano: u64,
     default_window_nanos: u64,
-    alias_map: &AliasMap,
-) -> Result<Plan, QueryError> {
+) -> Result<((u64, u64), Option<usize>), QueryError> {
     // This slice executes only the `range` (time window) and `limit` stages.
     // The aggregation / sort / projection / render stages parse into a valid
     // IR but are not yet wired to execution; reject them explicitly so a
@@ -128,6 +132,17 @@ pub(crate) fn compile(
         })?),
         None => None,
     };
+    Ok((window, limit))
+}
+
+pub(crate) fn compile(
+    query: &Query,
+    tenant: &TenantId,
+    now_unix_nano: u64,
+    default_window_nanos: u64,
+    alias_map: &AliasMap,
+) -> Result<Plan, QueryError> {
+    let (window, limit) = validate(query, now_unix_nano, default_window_nanos)?;
     // Eagerly resolve every `resolves_to(n)` against the tenant's alias map
     // so the deferred predicate compilation in `apply` is tenant-agnostic.
     let mut alias_classes = BTreeMap::new();

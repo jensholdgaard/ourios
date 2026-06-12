@@ -93,6 +93,27 @@ pub(crate) fn audit_files(
     let tenant_root = tenant_dir
         .canonicalize()
         .map_err(|e| io_err("canonicalize", &tenant_dir, &e))?;
+    // The trust anchor is the bucket root, not the tenant dir itself:
+    // if `audit/tenant_id=…` (or `audit/`) were a symlink into another
+    // tenant's subtree, canonicalizing it as the root would make every
+    // foreign file pass `starts_with`. Requiring the canonical tenant
+    // dir to equal the path constructed under the canonical bucket
+    // root rejects a symlinked tenant root outright.
+    let bucket_canonical = bucket_root
+        .canonicalize()
+        .map_err(|e| io_err("canonicalize", bucket_root, &e))?;
+    let expected_root = bucket_canonical
+        .join("audit")
+        .join(format!("tenant_id={enc}"));
+    if tenant_root != expected_root {
+        return Err(QueryError::Storage {
+            detail: format!(
+                "audit tenant root {} resolves outside its expected partition path {}",
+                tenant_root.display(),
+                expected_root.display(),
+            ),
+        });
+    }
     // De-duplicate the canonical paths (mirroring the log path in
     // `lib.rs`): two names resolving to the same file — e.g. an
     // in-tenant symlink — must not be read or counted twice.

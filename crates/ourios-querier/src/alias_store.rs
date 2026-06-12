@@ -60,7 +60,7 @@ pub(crate) fn derive_alias_map(
             if event.tenant_id != *tenant {
                 return Err(QueryError::Storage {
                     detail: format!(
-                        "audit file {} carries a row for tenant {:?} under tenant {:?}'s \
+                        "audit file {} carries a row for tenant {} under tenant {}'s \
                          partition root",
                         path.display(),
                         event.tenant_id.as_str(),

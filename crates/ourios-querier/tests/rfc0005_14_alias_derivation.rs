@@ -201,11 +201,14 @@ async fn cross_file_same_timestamp_tiebreak_retract_first() {
 #[tokio::test]
 async fn second_tenants_alias_events_never_fold_into_the_derived_map() {
     // Arrange — T has data rows but NO alias events; T2 asserts the
-    // very same {A, B} class under its own partition root (plus a
-    // data row so the fixture tenant is real).
+    // very same {A, B} class under its own partition root, with one A
+    // row and one B row of its own.
     let bucket = tempfile::TempDir::new().expect("temp");
     write_data_rows(bucket.path());
-    write_all(bucket.path(), &[simple("T2", A, TS0)]);
+    write_all(
+        bucket.path(),
+        &[simple("T2", A, TS0), simple("T2", B, TS0 + 1_000)],
+    );
     write_audit_file_named(
         bucket.path(),
         &alias_asserted("T2", A, vec![B], TS0),
@@ -213,8 +216,75 @@ async fn second_tenants_alias_events_never_fold_into_the_derived_map() {
     );
 
     // Act / Assert — T's derived map is empty: resolves_to(A) is the
-    // singleton {A}, matching only A's two rows. T2's own map *does*
-    // hold the class, but T2 has only one A row to match.
+    // singleton {A}, matching only A's two rows. T2's own map holds
+    // the {A, B} class, so its A row AND its B row both match — which
+    // distinguishes a genuinely derived map from an empty one.
     assert_eq!(resolves_to_a_rows(bucket.path(), "T").await, 2);
-    assert_eq!(resolves_to_a_rows(bucket.path(), "T2").await, 1);
+    assert_eq!(resolves_to_a_rows(bucket.path(), "T2").await, 2);
+}
+
+/// A symlinked tenant *root* must be rejected outright: if
+/// `audit/tenant_id=EVIL` is a symlink into another tenant's subtree,
+/// canonicalizing it as the trust anchor would make every foreign file
+/// pass the per-file `starts_with` backstop. The scan anchors trust at
+/// the bucket root instead and fails loudly (`CLAUDE.md` §3.7).
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_tenant_root_is_rejected() {
+    // Arrange — T's real audit partition holds an alias event; EVIL's
+    // audit tenant root is a symlink straight to T's.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_data_rows(bucket.path());
+    write_all(bucket.path(), &[simple("EVIL", A, TS0)]);
+    write_audit_file_named(
+        bucket.path(),
+        &alias_asserted("T", A, vec![B], TS0),
+        "a.parquet",
+    );
+    let audit = bucket.path().join("audit");
+    std::os::unix::fs::symlink(audit.join("tenant_id=T"), audit.join("tenant_id=EVIL"))
+        .expect("symlink");
+
+    // Act / Assert — the derivation refuses the scan instead of
+    // folding T's events into EVIL's map.
+    let query = ourios_querier::dsl::parse(&format!("resolves_to({A})")).expect("parse");
+    let err = Querier::new(bucket.path())
+        .run_query(&query, &TenantId::new("EVIL"), NOW, DEFAULT_WINDOW_NS, None)
+        .await
+        .expect_err("a symlinked tenant root must not be scanned");
+    match err {
+        ourios_querier::QueryError::Storage { detail } => assert!(
+            detail.contains("resolves outside its expected partition path"),
+            "unexpected detail: {detail}",
+        ),
+        other => panic!("expected Storage, got {other:?}"),
+    }
+}
+
+/// Error precedence: an invalid query fails with its compile error
+/// *before* the alias-map derivation pays any audit-tree IO — even
+/// when that derivation would itself error (here the tenant's audit
+/// root is a plain file, so a scan would surface `Storage`).
+#[tokio::test]
+async fn invalid_query_fails_before_alias_derivation() {
+    // Arrange — poison the audit tree so any scan errors.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_data_rows(bucket.path());
+    let audit = bucket.path().join("audit");
+    std::fs::create_dir_all(&audit).expect("audit dir");
+    std::fs::write(audit.join("tenant_id=T"), b"not a directory").expect("poison");
+
+    // Act / Assert — `count` parses but is not yet executable; the
+    // compile error must win over the broken audit tree's Storage
+    // error, proving validation runs before derivation.
+    let query = ourios_querier::dsl::parse(&format!("resolves_to({A}) | count by template_id"))
+        .expect("parse");
+    let err = Querier::new(bucket.path())
+        .run_query(&query, &TenantId::new("T"), NOW, DEFAULT_WINDOW_NS, None)
+        .await
+        .expect_err("unsupported stage must fail");
+    assert!(
+        matches!(err, ourios_querier::QueryError::InvalidQuery { .. }),
+        "expected InvalidQuery to precede the audit scan's Storage error, got {err:?}",
+    );
 }

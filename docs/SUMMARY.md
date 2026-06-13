@@ -28,6 +28,7 @@
 - [RFC 0008 — Write-ahead log](./rfcs/0008-wal.md)
 - [RFC 0009 — Compaction](./rfcs/0009-compaction.md)
 - [RFC 0010 — Audit-stream queries & template drift](./rfcs/0010-audit-stream-queries.md)
+- [RFC 0011 — A1 re-scope](./rfcs/0011-a1-rescope.md)
 
 # Talks
 

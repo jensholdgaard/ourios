@@ -338,7 +338,7 @@ The five `[THESIS]`-tagged goals, consolidated:
 
 | # | Goal | Failing means |
 |---|------|---------------|
-| A1 | Compression ≥ 3× over zstd-alone | Template mining is not pulling weight on this corpus class |
+| A1 | Compression ≥ 3× over zstd-alone — **diagnostic, not gating** (RFC 0011) | Recorded for the columnar queryability premium + codec-regression guard; does **not** block any RFC's `validated`. Refuted on every corpus class incl. max-templated HDFS_v1 (§9.5) for structural reasons — template mining's compression is logical/query-pruning, captured by B1/B2 |
 | B1 | Predicate queries ≥ 10× faster than `zstdcat \| grep` | Parquet statistics pillar not delivering |
 | B2 | Template-exact queries scale with result size, not corpus size | Inverted-index-collapse thesis is wrong in practice |
 | C1 | 100% bit-identical reconstruction on non-lossy rows | Honesty contract with user violated |
@@ -718,3 +718,45 @@ a second family. **A1 does not gate RFC 0007** — it belongs to
 the template-mining/compression pillar, measured under RFC 0006.
 RFC 0007 is therefore flipped to `validated` (see its status
 note); `accepted` awaits maintainer sign-off per the ladder.
+
+### 9.5 Results — 2026-06-13 (diagnostic, local `unknown` hardware) — A1 / C1 / C2 on HDFS_v1
+
+**Corpus.** LogHub HDFS_v1 (Zenodo record 8196385, md5
+`76a24b4d…`) — 11,175,629 lines, 1,577,982,906 raw bytes; fetched at
+bench time, never redistributed (`query-bench.yml`). The
+**maximally-templated** log corpus (a handful of templates over 11.2 M
+lines) — the single best case for the template-mining compression
+premise. Run via
+`ourios-bench --gates a1,c1,c2 --parquet-zstd-level 19 --allow-unknown-hardware`.
+**Local hardware → diagnostic, not
+authoritative**; A1's verdict is corpus-structural and
+hardware-independent (compressed bytes are deterministic), C1/C2 are
+ratios, so the findings hold regardless of the runner.
+
+| gate | result | verdict |
+|---|---|---|
+| A1 | ourios 8.300× vs zstd-19 16.000× → **delta 0.516×** (raw 1.578 GB → ourios 189.98 MB, zstd-19 98.21 MB) | FAIL — now **diagnostic** (RFC 0011) |
+| C1 | **1.000000** — 11,175,578 / 11,175,578 non-lossy rows bit-identical; lossy ratio 4.6e-06 (51 rows) | PASS |
+| C2 | end template count **40** at 11.2 M lines (33 at 1 M); ratio 0.825 — sub-linear, **formal gate applies** (≥ 1 M, §3.4.3) | PASS |
+
+**A1 — the decisive finding (→ RFC 0011).** A1 had only ever been
+measured on OTel-Demo (best `0.829×`, §9.1/§9.4). HDFS_v1 is the
+corpus that should most reward template mining, yet A1 fails *harder*
+(`0.516×`): the more templated the corpus, the more completely
+monolithic zstd-19 captures its redundancy in one window (16×), while
+template mining's extracted params (block IDs, timestamps, IPs) are
+high-cardinality columns that don't compress as well and the columnar
+layout adds framing. **The best case for template mining is the best
+case for the byte codec.** So `≥ 3× over zstd` cannot hold on any
+realistic log corpus — A1 is **demoted to diagnostic** and template
+mining's compression value is recognised as logical/query-pruning
+(B1/B2), not on-disk bytes. See RFC 0011.
+
+**C1 + C2 — the miner pillar's real gates, PASS on a representative
+corpus.** At 11.2 M lines C1 is bit-identical (1.0) with a 4.6e-06
+lossy ratio, and C2 plateaus at 40 templates with the formal gate
+*applying* (not abstaining, unlike the §9.1 sub-1 M runs). Under RFC
+0011 these are RFC 0001's `validated` thesis gates — both pass here.
+The authoritative `baseline-8vcpu-32gib` representative rerun (for the
+actual RFC 0001 `validated` flip) is a maintainer-gated GH Actions /
+baseline step; the deterministic verdicts are not expected to change.

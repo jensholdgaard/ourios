@@ -62,7 +62,12 @@ goals, or post-MVP shipping concerns.
 
 ## 3. Current state (as of 2026-05-22)
 
-**RFC 0001 §5 scenarios green: 18 / 35.** RFC 0001 status: `red`.
+**RFC 0001 §5 scenarios green: 35 / 35 — RFC 0001 status: `green`**
+(2026-06-13; every scenario has a live passing test, incl. the
+cross-crate criteria relocated to `ourios-querier`/`ourios-ingester`).
+`validated` waits on the A1 compression thesis-gate (parked pending a
+larger corpus); see the RFC's status note. RFC 0008 is likewise now
+`green` (all §5 arms .1–.10).
 RFC 0005 §5 scenarios green: **10 / 11** (RFC0005.6 — the
 ≥256 MiB row-group sizing scenario — defers until a corpus run
 exists; see `docs/rfcs/0005-parquet-storage.md` §6). RFC 0005

@@ -21,15 +21,14 @@
 //!
 //! Read order in `frame::read_frame` (mirrored from
 //! `src/frame.rs`): `len` (→ `OversizeLen`) is checked first, then
-//! `kind` (→ `UnknownKind`), then `_pad` (→ `NonZeroPad`), then the
-//! payload read + CRC (→ `CrcMismatch`). So a raw byte flip in a
-//! header field that precedes the CRC check is caught by *that
-//! field's* check, never `CrcMismatch` — except a payload flip,
-//! which only the CRC catches. The kind/pad/len arms forge a
-//! header with a CRC recomputed over the tampered `kind||pad||
-//! payload` so the intended check is the one that fires (the same
-//! construction `frame.rs`'s own `read_frame_rejects_*` unit
-//! tests use).
+//! `kind` (→ `UnknownKind`), then `_pad` (→ `NonZeroPad`), and only
+//! *after* the payload read is the CRC checked (→ `CrcMismatch`).
+//! So the `len`/`kind`/`_pad` arms are caught by their own field
+//! check, which fires **before** the CRC is ever consulted — the
+//! CRC value is irrelevant to those three. The `CrcMismatch` arm
+//! is the only one the CRC catches, and it flips a *payload* byte
+//! (every header field stays valid). The forged headers mirror
+//! `frame.rs`'s own `read_frame_rejects_*` unit tests.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

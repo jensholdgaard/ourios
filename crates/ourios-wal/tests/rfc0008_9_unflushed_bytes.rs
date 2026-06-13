@@ -84,11 +84,13 @@ proptest! {
                     wal.sync().expect("sync");
                 }
             }
+            // One `metrics()` per boundary — it directory-scans for
+            // disk_bytes/segment_count, so calling it twice (assert +
+            // message) would double that I/O in a tight loop.
+            let unflushed = wal.metrics().unflushed_bytes;
             prop_assert!(
-                wal.metrics().unflushed_bytes <= bound,
-                "unflushed_bytes {} exceeded 2 × segment_size {}",
-                wal.metrics().unflushed_bytes,
-                bound,
+                unflushed <= bound,
+                "unflushed_bytes {unflushed} exceeded 2 × segment_size {bound}",
             );
         }
     }

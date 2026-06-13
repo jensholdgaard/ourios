@@ -2,7 +2,9 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-05-22** — after Phase 2 closed
+> Last updated: **2026-06-13** — RFC 0001 + RFC 0008 advanced to `green`
+> on the maturity ladder (§3); the §§4+ phase narrative below predates
+> this and is not re-verified here
 > (PR #41 RFC 0005, then PR-D through PR-G landed
 > `ourios-parquet` end-to-end: schemas, writer, reader, audit
 > stream). The deferred-capabilities table in §5 is unchanged:

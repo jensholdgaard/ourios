@@ -60,9 +60,9 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-05-22)
+## 3. Current state (as of 2026-06-13)
 
-**RFC 0001 §5 scenarios green: 35 / 35 — RFC 0001 status: `green`**
+**RFC 0001 §5 scenarios green: 42 / 42 — RFC 0001 status: `green`**
 (2026-06-13; every scenario has a live passing test, incl. the
 cross-crate criteria relocated to `ourios-querier`/`ourios-ingester`).
 `validated` waits on the A1 compression thesis-gate (parked pending a

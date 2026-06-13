@@ -97,6 +97,21 @@ impl Journal for Wal {
 /// requests run concurrently, so the miner needs its own serialization),
 /// and the tenant-derivation `TenantRule`.
 ///
+/// Releases the in-order miner hand-off to `seq + 1` on drop — so the
+/// gate advances on *every* exit from the post-durability region,
+/// including a panic in the miner path (which would otherwise leave the
+/// gate stuck and deadlock all later ingests).
+struct IngestGateGuard<'a> {
+    coordinator: &'a CommitCoordinator,
+    seq: u64,
+}
+
+impl Drop for IngestGateGuard<'_> {
+    fn drop(&mut self) {
+        self.coordinator.complete_ingest(self.seq);
+    }
+}
+
 /// No `Debug`: `MinerCluster` holds the per-tenant Drain trees and does
 /// not implement it.
 pub struct IngestPipeline {
@@ -209,6 +224,15 @@ impl IngestPipeline {
         // seq and MUST run even on a sync failure (which ingests nothing)
         // so the gate never stalls.
         self.coordinator.await_ingest_turn(seq).await;
+        // Release the gate to `seq + 1` on *every* exit from here —
+        // including a panic in the miner path (the miner has `expect`s on
+        // its invariants). Without this a panic would leave the gate stuck
+        // at `seq` and deadlock all later ingests; the guard's `Drop` runs
+        // during unwinding.
+        let _gate = IngestGateGuard {
+            coordinator: &self.coordinator,
+            seq,
+        };
         let ack = match outcome.result {
             Ok(now) => {
                 // §6.9 rotation cadence: a segment change since the prior
@@ -241,7 +265,7 @@ impl IngestPipeline {
             // reaches neither the miner nor the durable mark.
             Err(e) => Err(e),
         };
-        self.coordinator.complete_ingest(seq);
+        // `_gate` releases the hand-off to `seq + 1` as it drops here.
         ack
     }
 

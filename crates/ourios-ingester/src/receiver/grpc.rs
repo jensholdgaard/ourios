@@ -41,15 +41,26 @@ impl LogsService for LogsReceiver {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         let export = request.into_inner();
-        match self.pipeline.ingest(export).await {
-            Ok(_) => Ok(Response::new(ExportLogsServiceResponse::default())),
+        // Run the ingest on its own task so a panic in the pipeline/miner
+        // (e.g. an internal `expect` invariant) is contained as a
+        // `JoinError` → `INTERNAL` rather than unwinding into tonic and
+        // dropping the connection — preserving the handler's no-panic
+        // contract. `ingest` is async now (it awaits the batched fsync),
+        // so this is `spawn`, not `spawn_blocking`.
+        let pipeline = self.pipeline.clone();
+        match tokio::spawn(async move { pipeline.ingest(export).await }).await {
+            Ok(Ok(_)) => Ok(Response::new(ExportLogsServiceResponse::default())),
             // A Resource that doesn't resolve to a tenant is a client
             // error; the whole batch is rejected (RFC0003.4). The error's
             // Display names the failing ResourceLogs index + attribute.
-            Err(ReceiveError::TenantResolution(e)) => Err(Status::invalid_argument(e.to_string())),
+            Ok(Err(ReceiveError::TenantResolution(e))) => {
+                Err(Status::invalid_argument(e.to_string()))
+            }
             // A WAL append/sync failure — server-side; the batch was not
             // acked (§3.4). Surface the (Display-able) detail.
-            Err(e) => Err(Status::internal(e.to_string())),
+            Ok(Err(e)) => Err(Status::internal(e.to_string())),
+            // The ingest task panicked; contain it as INTERNAL.
+            Err(join) => Err(Status::internal(format!("ingest task failed: {join}"))),
         }
     }
 }

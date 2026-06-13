@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ourios_wal::WalOffset;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::receiver::pipeline::{Journal, ReceiveError};
 
@@ -114,10 +114,12 @@ pub struct CommitCoordinator {
     /// Broadcasts each flush outcome to waiters.
     outcome_tx: watch::Sender<FlushOutcome>,
     /// Cuts a pending windowed flush short when the segment-fill
-    /// threshold is reached. One armed flush task `select!`s on its
-    /// window timer and this notify, so a fill cut wakes it instead of
-    /// spawning a redundant flush per appended frame.
-    fill: Notify,
+    /// threshold is reached. A monotonically-bumped counter rather than a
+    /// `Notify`: the armed flush task subscribes at spawn and `select!`s
+    /// on its window timer vs. a change here, so a fill cut wakes *that*
+    /// task — and, unlike `Notify`'s stored permits, a fill bump from an
+    /// earlier cycle can't linger and spuriously cut a later window short.
+    fill: watch::Sender<u64>,
     /// The in-order miner hand-off gate: the next append `seq` cleared to
     /// run its post-durability miner step. A `commit`'s caller awaits its
     /// turn on this and advances it, so the miner ingests in exact
@@ -144,6 +146,7 @@ impl CommitCoordinator {
         // The ingest gate starts at 1 — the first `seq` handed out — so
         // the first commit runs its miner step immediately.
         let (ingest_gate, _ingest_rx) = watch::channel(1u64);
+        let (fill, _fill_rx) = watch::channel(0u64);
         Arc::new(Self {
             journal: Mutex::new(journal),
             window,
@@ -154,7 +157,7 @@ impl CommitCoordinator {
                 appended_seq: 0,
             }),
             outcome_tx,
-            fill: Notify::new(),
+            fill,
             ingest_gate,
         })
     }
@@ -269,18 +272,23 @@ impl CommitCoordinator {
                 true
             }
         };
-        // Cut a pending (or about-to-be-spawned) windowed flush short.
-        // `notify_one` leaves a permit if the flush task hasn't reached
-        // its `select!` yet, so the cut is never lost.
+        // Subscribe the about-to-spawn task's fill receiver *before* the
+        // bump below, so an immediate cut at arm time is observed by it
+        // (a later `.changed()` only fires for bumps after the subscribe).
+        let fill_rx = spawn.then(|| self.fill.subscribe());
+        // Cut a pending windowed flush short (the already-running task's
+        // receiver, subscribed at its own spawn, sees this bump). A bump
+        // with no flush armed is harmless: the next task subscribes after
+        // it, so it doesn't carry over.
         if immediate {
-            self.fill.notify_one();
+            self.fill.send_modify(|n| *n += 1);
         }
-        if spawn {
+        if let Some(mut fill_rx) = fill_rx {
             let coordinator = Arc::clone(self);
             tokio::spawn(async move {
                 tokio::select! {
                     () = tokio::time::sleep(coordinator.window) => {}
-                    () = coordinator.fill.notified() => {}
+                    _ = fill_rx.changed() => {}
                 }
                 coordinator.flush().await;
             });

@@ -108,14 +108,18 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
 
     // WAL-before-ack ingest. The fsync is batched by the group-commit
     // coordinator (RFC0008.8), which offloads its blocking `sync`, so the
-    // handler just awaits.
-    match state.pipeline.ingest(request).await {
-        Ok(_) => success_response(format),
+    // handler just awaits. Run it on its own task so a panic in the
+    // pipeline/miner is contained as a 500 (the handler promises not to
+    // panic) rather than aborting the connection.
+    let pipeline = state.pipeline.clone();
+    match tokio::spawn(async move { pipeline.ingest(request).await }).await {
+        Ok(Ok(_)) => success_response(format),
         // A Resource that doesn't resolve to a tenant is a client error
         // (the whole batch is rejected, RFC0003.4).
-        Err(ReceiveError::TenantResolution(_)) => StatusCode::BAD_REQUEST.into_response(),
-        // A WAL failure is server-side; the batch was not acked (§3.4).
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(ReceiveError::TenantResolution(_))) => StatusCode::BAD_REQUEST.into_response(),
+        // A WAL failure (or a panicked ingest task) is server-side; the
+        // batch was not acked (§3.4).
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

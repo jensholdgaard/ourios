@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Template miner (Drain-derived online log parsing)
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -10,6 +10,38 @@ superseded-by: —
 ---
 
 # RFC 0001 — Template miner
+
+> **Status note.** **`green`** (2026-06-13, per the maintainer's
+> authorization of the same date). The `docs/verification.md` §3 /
+> `docs/rfcs/README.md` ladder defines `green` as *all §5 acceptance
+> criteria pass (unit + property + corpus tests green)*. Every §5
+> scenario now has a live, passing test — zero `#[ignore]`/`todo!()`
+> stubs remain:
+> - **Miner-internal + hazard/invariant** (`ourios-miner` tests):
+>   tokenize/mask/sim-seq, the three-zone confidence model, fresh-leaf
+>   + widening + type-expansion with audit events, the
+>   `(severity_number, scope_name)` template key (H1.4/H1.5,
+>   RFC0001.11), the 256 B param-overflow spill (H2.1) + telemetry
+>   (§3.1.2/RFC0001.8, the weaver `ourios.miner.*` registry),
+>   bit-identical reconstruction + the H7.3 render contract,
+>   structured-body canonical encoding (RFC0001.9), and the §6.9
+>   snapshot format + recovery (§3.5.1–.4, incl. the v2 restore).
+> - **Relocated cross-crate criteria** (the behaviour lives outside
+>   the miner crate): query semantics RFC0001.5/.6 + time-preserved
+>   RFC0001.10 (`ourios-querier`/`ourios-ingester`), §3.7.3 per-
+>   ResourceLogs tenant derivation (`ourios-ingester`), drift H5.3 via
+>   RFC 0010 (`ourios-querier`), and the §6.7 alias-index storage
+>   discharged by RFC 0005 §3.7 (#183/#184).
+>
+> **Not yet `validated`.** The ladder reserves `validated` for *every
+> thesis-gate the RFC's pillars touch passing on representative
+> corpora* (`benchmarks.md` §7). The template-mining pillar (#2)
+> touches **A1** (compression crossover) and **C1** (reconstruction
+> fidelity). C1 passes authoritatively (`1.000000`, `benchmarks.md`
+> §9). A1 is an authoritative **FAIL** with a hardware-/corpus-size
+> sensitivity open item (parked pending a > 1 GB corpus, per the
+> maintainer), so `validated` waits on A1 — it does **not** block
+> `green`, which is an acceptance-criteria gate, not a thesis gate.
 
 > **How to read this document.** §§1–4 are the design contract — the
 > *what* and the *why*. §5 lists the normative `Given / When / Then`

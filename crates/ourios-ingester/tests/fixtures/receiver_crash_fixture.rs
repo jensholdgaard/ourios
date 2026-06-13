@@ -13,6 +13,7 @@
 //! restart's `replay` must still find the frame (at-least-once).
 
 use std::io::Write;
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -20,7 +21,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_core::config::MinerConfig;
-use ourios_ingester::receiver::{IngestPipeline, TenantRule};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{Wal, WalConfig};
 
@@ -30,21 +31,25 @@ fn string_value(s: &str) -> AnyValue {
     }
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let root = std::env::args()
         .nth(1)
         .expect("fixture: missing <wal_root> arg");
-    let wal = Wal::open(WalConfig {
+    let config = WalConfig {
         root: root.into(),
         batch_window_ms: 100,
         segment_size_bytes: 128 * 1024 * 1024,
         segment_age_secs: 600,
         housekeeping_secs: 60,
         macos_full_fsync: false,
-    })
-    .expect("fixture: Wal::open");
-    let mut pipeline = IngestPipeline::new(
-        Box::new(wal),
+    };
+    let window = Duration::from_millis(config.batch_window_ms);
+    let segment_size_bytes = config.segment_size_bytes;
+    let wal = Wal::open(config).expect("fixture: Wal::open");
+    let coordinator = CommitCoordinator::new(Box::new(wal), window, segment_size_bytes);
+    let pipeline = IngestPipeline::new(
+        coordinator,
         MinerCluster::new(MinerConfig::default()),
         TenantRule::service_name(),
     );
@@ -71,7 +76,7 @@ fn main() {
     };
 
     // Append + fsync the batch (durable) — the receiver would now ack.
-    let ingested = pipeline.ingest(request).expect("fixture: ingest");
+    let ingested = pipeline.ingest(request).await.expect("fixture: ingest");
     assert_eq!(ingested, 1, "fixture ingested one record");
 
     // Signal durability, then park so the parent kills us *after* the

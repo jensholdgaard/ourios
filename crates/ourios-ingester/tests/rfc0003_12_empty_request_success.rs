@@ -12,8 +12,8 @@ use ourios_core::tenant::TenantId;
 
 /// Scenario RFC0003.12 — Empty `ExportLogsServiceRequest` returns success without WAL write.
 /// See `docs/rfcs/0003-otlp-receiver.md` §5.
-#[test]
-fn rfc0003_12_empty_request_succeeds_without_persisting() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0003_12_empty_request_succeeds_without_persisting() {
     let empty_shapes = [
         // (i) no ResourceLogs at all.
         request(vec![]),
@@ -27,11 +27,12 @@ fn rfc0003_12_empty_request_succeeds_without_persisting() {
         // Arrange: a spy Journal so we can assert the WAL is touched not
         // at all (no append *and* no sync — stronger than "no frame").
         let log: CallLog = CallLog::default();
-        let mut pipeline = spy_pipeline(log.clone());
+        let pipeline = spy_pipeline(log.clone());
 
         // Act
         let ingested = pipeline
             .ingest(export)
+            .await
             .expect("an empty request is accepted");
 
         // Assert: success with zero records, the WAL untouched, and the
@@ -42,7 +43,7 @@ fn rfc0003_12_empty_request_succeeds_without_persisting() {
             "an empty request neither appends nor syncs the WAL",
         );
         assert_eq!(
-            pipeline.miner().template_count(&TenantId::new("svc")),
+            pipeline.with_miner(|m| m.template_count(&TenantId::new("svc"))),
             0,
             "no record reached the miner",
         );

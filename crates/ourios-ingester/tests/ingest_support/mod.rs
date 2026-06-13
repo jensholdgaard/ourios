@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -16,7 +17,9 @@ use ourios_core::config::MinerConfig;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
 
-use ourios_ingester::receiver::{IngestPipeline, Journal, ReceiveError, TenantRule};
+use ourios_ingester::receiver::{
+    CommitCoordinator, IngestPipeline, Journal, ReceiveError, TenantRule,
+};
 
 pub fn wal_config(root: &Path) -> WalConfig {
     WalConfig {
@@ -29,12 +32,28 @@ pub fn wal_config(root: &Path) -> WalConfig {
     }
 }
 
+/// Build a group-commit coordinator over `journal` with the test
+/// `wal_config`'s window + segment-fill threshold. A short window keeps
+/// the integration tests fast.
+pub fn coordinator(journal: Box<dyn Journal>) -> Arc<CommitCoordinator> {
+    let config = wal_config(Path::new("."));
+    CommitCoordinator::new(
+        journal,
+        Duration::from_millis(config.batch_window_ms),
+        config.segment_size_bytes,
+    )
+}
+
 /// A pipeline over a fresh `Wal` at `root`, a default `MinerCluster`, and
 /// the default `service.name` tenant rule.
 pub fn open_pipeline(root: &Path) -> IngestPipeline {
     let wal = Wal::open(wal_config(root)).expect("open WAL");
     let miner = MinerCluster::new(MinerConfig::default());
-    IngestPipeline::new(Box::new(wal), miner, TenantRule::service_name())
+    IngestPipeline::new(
+        coordinator(Box::new(wal)),
+        miner,
+        TenantRule::service_name(),
+    )
 }
 
 /// One observed `Journal` call, in order.
@@ -53,6 +72,7 @@ pub type CallLog = Arc<Mutex<Vec<JournalCall>>>;
 /// all (RFC0003.12).
 struct SpyJournal {
     log: CallLog,
+    byte: u64,
 }
 
 impl Journal for SpyJournal {
@@ -61,9 +81,19 @@ impl Journal for SpyJournal {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
         self.log.lock().expect("call log").push(JournalCall::Sync);
-        Ok(None)
+        // A synthetic, monotonically-advancing offset: the spy persists
+        // nothing, but the coordinator needs a concrete durable mark.
+        self.byte += 1;
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: self.byte,
+        })
+    }
+
+    fn unflushed_bytes(&self) -> u64 {
+        0
     }
 }
 
@@ -72,7 +102,7 @@ impl Journal for SpyJournal {
 pub fn spy_pipeline(log: CallLog) -> IngestPipeline {
     let miner = MinerCluster::new(MinerConfig::default());
     IngestPipeline::new(
-        Box::new(SpyJournal { log }),
+        coordinator(Box::new(SpyJournal { log, byte: 0 })),
         miner,
         TenantRule::service_name(),
     )
@@ -165,10 +195,12 @@ use tower::ServiceExt;
 /// The `OtlpBatch` payloads a [`capturing_pipeline`] appended, in order.
 pub type Captured = Arc<Mutex<Vec<Vec<u8>>>>;
 
-/// A `Journal` that records appended payloads (and fsyncs nothing), so a
-/// test can recover what the pipeline ingested without a real WAL.
+/// A `Journal` that records appended payloads (and persists nothing,
+/// reporting a synthetic durable offset), so a test can recover what the
+/// pipeline ingested without a real WAL.
 struct CapturingJournal {
     captured: Captured,
+    byte: u64,
 }
 
 impl Journal for CapturingJournal {
@@ -180,15 +212,23 @@ impl Journal for CapturingJournal {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
-        Ok(None)
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        self.byte += 1;
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: self.byte,
+        })
+    }
+
+    fn unflushed_bytes(&self) -> u64 {
+        0
     }
 }
 
 /// A shared pipeline over a *real* `Wal` at `root` (for concurrency +
 /// durability assertions; drop all clones before `replay_frames`).
 pub fn shared_wal_pipeline(root: &Path) -> SharedPipeline {
-    Arc::new(Mutex::new(open_pipeline(root)))
+    Arc::new(open_pipeline(root))
 }
 
 /// A shared pipeline whose `Journal` captures appended payloads, plus the
@@ -197,13 +237,14 @@ pub fn capturing_pipeline() -> (SharedPipeline, Captured) {
     let captured = Captured::default();
     let miner = MinerCluster::new(MinerConfig::default());
     let pipeline = IngestPipeline::new(
-        Box::new(CapturingJournal {
+        coordinator(Box::new(CapturingJournal {
             captured: captured.clone(),
-        }),
+            byte: 0,
+        })),
         miner,
         TenantRule::service_name(),
     );
-    (Arc::new(Mutex::new(pipeline)), captured)
+    (Arc::new(pipeline), captured)
 }
 
 /// Build a `POST` request with optional `Content-Type`/`Content-Encoding`.

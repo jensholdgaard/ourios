@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ingest_support::{request, resource_logs, wal_config};
+use ingest_support::{coordinator, request, resource_logs, wal_config};
 use ourios_ingester::receiver::{IngestPipeline, TenantRule};
 use ourios_ingester::{recovery, snapshot_store};
 use ourios_miner::cluster::MinerCluster;
@@ -31,7 +31,7 @@ fn rotating_pipeline(root: &Path, snapshots_root: &Path) -> IngestPipeline {
     .expect("open WAL");
     let hook_root = snapshots_root.to_path_buf();
     IngestPipeline::new(
-        Box::new(wal),
+        coordinator(Box::new(wal)),
         MinerCluster::new(ourios_core::config::MinerConfig::default()),
         TenantRule::service_name(),
     )
@@ -40,16 +40,17 @@ fn rotating_pipeline(root: &Path, snapshots_root: &Path) -> IngestPipeline {
     }))
 }
 
-#[test]
-fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let snapshots_root = tmp.path().join("snapshots");
-    let mut pipeline = rotating_pipeline(tmp.path(), &snapshots_root);
+    let pipeline = rotating_pipeline(tmp.path(), &snapshots_root);
 
     // Batch A lands in the first segment; the durable mark after it
     // is the rotation-point high-water the hook must stamp.
     pipeline
         .ingest(request(vec![resource_logs("svc", &["user 1 logged in"])]))
+        .await
         .expect("batch A");
     let rotation_point = pipeline.last_durable().expect("durable after batch A");
     assert!(
@@ -66,6 +67,7 @@ fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
     std::thread::sleep(Duration::from_millis(1_200));
     pipeline
         .ingest(request(vec![resource_logs("svc", &["payment 9 settled"])]))
+        .await
         .expect("batch B");
 
     let artefacts = snapshot_store::load_all(&snapshots_root).expect("load");
@@ -92,9 +94,7 @@ fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
 
     // The post-rotation state is intact: both batches in the miner.
     assert_eq!(
-        pipeline
-            .miner()
-            .template_count(&ourios_core::tenant::TenantId::new("svc")),
+        pipeline.with_miner(|m| m.template_count(&ourios_core::tenant::TenantId::new("svc"))),
         2,
         "batch B still reached the miner after the hook",
     );
@@ -102,16 +102,16 @@ fn rotation_writes_snapshots_at_the_rotation_point_high_water() {
 
 /// The hook only fires on a rotation — steady-state batches in one
 /// segment write nothing.
-#[test]
-fn no_rotation_means_no_cadence_write() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_rotation_means_no_cadence_write() {
     let tmp = tempfile::TempDir::new().expect("temp");
     let snapshots_root = tmp.path().join("snapshots");
     let hook_root = snapshots_root.clone();
     let fired = Arc::new(Mutex::new(0u32));
     let count = fired.clone();
     let wal = Wal::open(wal_config(tmp.path())).expect("open WAL");
-    let mut pipeline = IngestPipeline::new(
-        Box::new(wal),
+    let pipeline = IngestPipeline::new(
+        coordinator(Box::new(wal)),
         MinerCluster::new(ourios_core::config::MinerConfig::default()),
         TenantRule::service_name(),
     )
@@ -123,6 +123,7 @@ fn no_rotation_means_no_cadence_write() {
     for body in ["a 1", "b 2", "c 3"] {
         pipeline
             .ingest(request(vec![resource_logs("svc", &[body])]))
+            .await
             .expect("ingest");
     }
     assert_eq!(*fired.lock().expect("lock"), 0, "no rotation, no firing");

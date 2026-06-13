@@ -55,8 +55,8 @@ fn assert_equivalent(recovered: &MinerCluster, control: &MinerCluster) {
 /// Scenario §3.5.3 — Known-version restore + tail replay is
 /// equivalent to a full rebuild.
 /// See `docs/rfcs/0001-template-miner.md` §3.5.
-#[test]
-fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
     // Arrange: ingest two batches through the live pipeline, snapshot
     // at the durable mark S, then ingest two more above S.
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -79,16 +79,24 @@ fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
         request(vec![resource_logs("billing", &["charge 12 EUR accepted"])]),
     ];
 
-    let mut pipeline = open_pipeline(root);
+    let pipeline = open_pipeline(root);
     for r in &pre {
-        pipeline.ingest(r.clone()).expect("ingest pre-S batch");
+        pipeline
+            .ingest(r.clone())
+            .await
+            .expect("ingest pre-S batch");
     }
     let s = pipeline
         .last_durable()
         .expect("a synced batch yields the durable mark");
-    recovery::write_snapshots(&snapshots_root, pipeline.miner(), Some(s)).expect("snapshot at S");
+    pipeline
+        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, Some(s)))
+        .expect("snapshot at S");
     for r in &post {
-        pipeline.ingest(r.clone()).expect("ingest post-S batch");
+        pipeline
+            .ingest(r.clone())
+            .await
+            .expect("ingest post-S batch");
     }
     drop(pipeline);
 
@@ -124,8 +132,8 @@ fn rfc0001_3_5_3_restore_plus_tail_replay_equals_full_rebuild() {
 /// Scenario §3.5.2 (through the driver) — a corrupt-version artefact
 /// is discarded and that tenant full-replays to the same state as a
 /// from-scratch rebuild.
-#[test]
-fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
     // Arrange: a WAL with two batches and a snapshot artefact whose
     // version byte is unknown.
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -137,9 +145,9 @@ fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
         request(vec![resource_logs("checkout", &["user 2 logged in"])]),
     ];
-    let mut pipeline = open_pipeline(root);
+    let pipeline = open_pipeline(root);
     for r in &batches {
-        pipeline.ingest(r.clone()).expect("ingest");
+        pipeline.ingest(r.clone()).await.expect("ingest");
     }
     drop(pipeline);
 
@@ -174,8 +182,8 @@ fn rfc0001_3_5_2_corrupt_version_discards_and_full_replays() {
 /// suppress, so replay would re-feed every frame the snapshot already
 /// folded (the v1 double-apply hazard; §6.9 maps it to the discard
 /// class). The tenant full-replays to the from-scratch state.
-#[test]
-fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
     // Arrange: a WAL with two batches and a snapshot written without
     // a high-water mark (degraded-shutdown shape).
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -187,11 +195,12 @@ fn rfc0001_3_5_snapshot_without_a_horizon_discards_and_full_replays() {
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
         request(vec![resource_logs("checkout", &["user 2 logged in"])]),
     ];
-    let mut pipeline = open_pipeline(root);
+    let pipeline = open_pipeline(root);
     for r in &batches {
-        pipeline.ingest(r.clone()).expect("ingest");
+        pipeline.ingest(r.clone()).await.expect("ingest");
     }
-    recovery::write_snapshots(&snapshots_root, pipeline.miner(), None)
+    pipeline
+        .with_miner(|m| recovery::write_snapshots(&snapshots_root, m, None))
         .expect("snapshot without a high-water mark");
     drop(pipeline);
 
@@ -326,8 +335,8 @@ fn rfc0001_3_5_4_externally_truncated_wal_flags_a_stale_gap() {
 
 /// No-snapshot cold start: full replay, an empty tenants list, and
 /// equivalence with the from-scratch control.
-#[test]
-fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
     // Arrange: a WAL with batches and no snapshots dir at all.
     let tmp = tempfile::TempDir::new().expect("temp");
     let root = tmp.path();
@@ -337,9 +346,9 @@ fn rfc0001_3_5_cold_start_without_snapshots_full_replays() {
         request(vec![resource_logs("checkout", &["user 1 logged in"])]),
         request(vec![resource_logs("billing", &["charge 9 EUR accepted"])]),
     ];
-    let mut pipeline = open_pipeline(root);
+    let pipeline = open_pipeline(root);
     for r in &batches {
-        pipeline.ingest(r.clone()).expect("ingest");
+        pipeline.ingest(r.clone()).await.expect("ingest");
     }
     drop(pipeline);
 

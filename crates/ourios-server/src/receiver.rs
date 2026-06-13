@@ -13,13 +13,14 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_core::config::MinerConfig;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
-use ourios_ingester::receiver::{IngestPipeline, SharedPipeline, TenantRule};
+use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{Wal, WalConfig};
@@ -73,27 +74,21 @@ impl ReceiverHandle {
             .await
             .map_err(|e| format!("HTTP listener task: {e}"))?
             .map_err(|e| format!("HTTP listener: {e}"))?;
-        // Both listener tasks are gone, so the lock is uncontended; a
-        // poisoned mutex means a listener panicked mid-ingest and the
-        // miner state is suspect — skip the snapshot (full replay next
-        // start) rather than persist it.
-        match self.pipeline.lock() {
-            Ok(pipeline) => {
-                if let Err(e) = recovery::write_snapshots(
-                    &self.snapshots_root,
-                    pipeline.miner(),
-                    pipeline.last_durable(),
-                ) {
-                    eprintln!("shutdown snapshot write failed (next start full-replays): {e}");
-                }
+        // Both listener tasks are gone, so the pipeline's inner locks are
+        // uncontended. `with_miner` recovers a poisoned miner mutex
+        // (`PoisonError::into_inner`) — at shutdown the listeners are
+        // already stopped, so any poison is from a past panic on a path
+        // that left the miner consistent by construction (the rotation
+        // hook is caught, and `ingest` mutates the miner only after the
+        // batch is durable); the recovered state is the best snapshot we
+        // can write, and a bad one only degrades the next start to a full
+        // replay (the snapshot is a rebuildable cache).
+        let last_durable = self.pipeline.last_durable();
+        self.pipeline.with_miner(|miner| {
+            if let Err(e) = recovery::write_snapshots(&self.snapshots_root, miner, last_durable) {
+                eprintln!("shutdown snapshot write failed (next start full-replays): {e}");
             }
-            Err(_) => {
-                eprintln!(
-                    "pipeline mutex poisoned at shutdown; skipping snapshot write \
-                     (next start full-replays)"
-                );
-            }
-        }
+        });
         Ok(())
     }
 }
@@ -106,6 +101,10 @@ impl ReceiverHandle {
 /// serving running on spawned tasks until [`ReceiverHandle::shutdown`].
 pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
+    // The §3.4 group-commit knobs, captured before `config.wal` is moved
+    // into `Wal::open`: the batch window and the segment-fill early-cut.
+    let batch_window = Duration::from_millis(config.wal.batch_window_ms);
+    let segment_size_bytes = config.wal.segment_size_bytes;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
     let mut miner = MinerCluster::new(MinerConfig::default());
     let rule = TenantRule::service_name();
@@ -140,8 +139,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // rotation-point high-water mark. Best-effort, like the other
     // cadence points — a snapshot is a rebuildable cache.
     let hook_root = snapshots_root.clone();
-    let pipeline: SharedPipeline = Arc::new(Mutex::new(
-        IngestPipeline::new(Box::new(wal), miner, rule)
+    // The group-commit coordinator owns the single-writer WAL and folds
+    // concurrent appends into one fsync per `wal_batch_window_ms`
+    // (RFC0008.8); the pipeline owns the miner + the rotation hook.
+    let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
+    let pipeline: SharedPipeline = Arc::new(
+        IngestPipeline::new(coordinator, miner, rule)
             .with_last_durable(report.max_delivered)
             .with_rotation_hook(Box::new(move |miner, mark| {
                 if let Err(e) = recovery::write_snapshots(&hook_root, miner, Some(mark)) {
@@ -150,7 +153,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
                     );
                 }
             })),
-    ));
+    );
 
     // gRPC: bind first so `:0` resolves to a real port before serving.
     let grpc_incoming = TcpIncoming::bind(config.grpc_addr)

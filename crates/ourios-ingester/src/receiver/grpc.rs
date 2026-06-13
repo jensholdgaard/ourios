@@ -9,9 +9,9 @@
 //! - WAL failure → `INTERNAL` (the batch was not acked, §3.4);
 //! - success → an empty `ExportLogsServiceResponse`.
 //!
-//! Like the HTTP handler, the blocking `ingest` (WAL append + fsync) runs
-//! via `spawn_blocking` so it doesn't stall the async runtime, and a
-//! poisoned lock is recovered (the handler never panics).
+//! `ingest` is async (its fsync is batched by the group-commit
+//! coordinator — RFC0008.8 — which offloads the blocking `sync` itself),
+//! so the handler simply `.await`s it; the handler never panics.
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -41,17 +41,14 @@ impl LogsService for LogsReceiver {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         let export = request.into_inner();
+        // Run the ingest on its own task so a panic in the pipeline/miner
+        // (e.g. an internal `expect` invariant) is contained as a
+        // `JoinError` → `INTERNAL` rather than unwinding into tonic and
+        // dropping the connection — preserving the handler's no-panic
+        // contract. `ingest` is async now (it awaits the batched fsync),
+        // so this is `spawn`, not `spawn_blocking`.
         let pipeline = self.pipeline.clone();
-        // Offload the blocking WAL append + fsync (mirrors the HTTP path).
-        let outcome = tokio::task::spawn_blocking(move || {
-            pipeline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ingest(export)
-        })
-        .await;
-
-        match outcome {
+        match tokio::spawn(async move { pipeline.ingest(export).await }).await {
             Ok(Ok(_)) => Ok(Response::new(ExportLogsServiceResponse::default())),
             // A Resource that doesn't resolve to a tenant is a client
             // error; the whole batch is rejected (RFC0003.4). The error's
@@ -62,8 +59,7 @@ impl LogsService for LogsReceiver {
             // A WAL append/sync failure — server-side; the batch was not
             // acked (§3.4). Surface the (Display-able) detail.
             Ok(Err(e)) => Err(Status::internal(e.to_string())),
-            // The blocking ingest task panicked (a `spawn_blocking` task
-            // can't be cancelled); `JoinError`'s Display is short + safe.
+            // The ingest task panicked; contain it as INTERNAL.
             Err(join) => Err(Status::internal(format!("ingest task failed: {join}"))),
         }
     }

@@ -17,22 +17,22 @@ use ourios_wal::FrameKind;
 
 /// Scenario RFC0003.1 — WAL-before-ack.
 /// See `docs/rfcs/0003-otlp-receiver.md` §5.
-#[test]
-fn rfc0003_1_no_ack_until_the_batch_is_durable() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0003_1_no_ack_until_the_batch_is_durable() {
     // Arrange
     let tmp = tempfile::TempDir::new().expect("temp");
-    let mut pipeline = open_pipeline(tmp.path());
+    let pipeline = open_pipeline(tmp.path());
     let export = request(vec![resource_logs("checkout", &["user 1 logged in"])]);
 
     // Act
-    let ingested = pipeline.ingest(export).expect("the batch is acked");
+    let ingested = pipeline.ingest(export).await.expect("the batch is acked");
 
     // Assert: the ack reflects one record, which reached the miner only
     // after durability (§6.5 step ordering). One distinct line → one
     // template.
     assert_eq!(ingested, 1);
     assert_eq!(
-        pipeline.miner().template_count(&TenantId::new("checkout")),
+        pipeline.with_miner(|m| m.template_count(&TenantId::new("checkout"))),
         1,
         "the one record reached the miner as one template",
     );
@@ -58,15 +58,15 @@ fn rfc0003_1_no_ack_until_the_batch_is_durable() {
 
 /// Scenario RFC0003.1 — the ack is gated on the WAL fsync.
 /// See `docs/rfcs/0003-otlp-receiver.md` §5.
-#[test]
-fn rfc0003_1_ack_is_gated_on_the_wal_fsync() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0003_1_ack_is_gated_on_the_wal_fsync() {
     // Arrange: a spy Journal records the order of WAL calls.
     let log: CallLog = CallLog::default();
-    let mut pipeline = spy_pipeline(log.clone());
+    let pipeline = spy_pipeline(log.clone());
     let export = request(vec![resource_logs("checkout", &["user 1 logged in"])]);
 
     // Act
-    pipeline.ingest(export).expect("the batch is acked");
+    pipeline.ingest(export).await.expect("the batch is acked");
 
     // Assert: before returning Ok, the pipeline appended the frame and
     // then fsync'd it — the ack is gated on `sync`, not merely on the

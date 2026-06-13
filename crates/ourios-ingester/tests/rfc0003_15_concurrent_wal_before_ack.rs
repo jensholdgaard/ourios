@@ -1,9 +1,10 @@
 //! RFC0003.15 — Concurrent `Export` calls each obey WAL-before-ack independently.
 //!
-//! N concurrent gRPC `Export` calls share one pipeline (the single-writer
-//! WAL serializes them behind the mutex). Each call appends + fsyncs its
-//! own batch before acking, so all N succeed and the WAL ends with
-//! exactly N durable `OtlpBatch` frames — none lost or interleaved away.
+//! N concurrent gRPC `Export` calls share one pipeline (the group-commit
+//! coordinator serializes appends to the single-writer WAL and folds
+//! their fsyncs into a window — RFC0008.8). Each call is durable before
+//! it acks, so all N succeed and the WAL ends with exactly N durable
+//! `OtlpBatch` frames — none lost or interleaved away.
 
 mod ingest_support;
 

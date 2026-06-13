@@ -38,9 +38,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ourios_wal::WalOffset;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::receiver::pipeline::{Journal, ReceiveError};
+
+/// The result of a [`CommitCoordinator::commit`]: the durability outcome
+/// plus the append **sequence number** the frame consumed, if any.
+///
+/// `seq` is `Some` once the frame was appended (whether its covering
+/// `sync` then succeeded or failed) and `None` only when the `append`
+/// itself failed (no sequence consumed). The caller drives the
+/// **in-order miner hand-off** with it: every `seq`-bearing outcome —
+/// success *or* sync failure — must pass [`CommitCoordinator::await_ingest_turn`]
+/// then [`CommitCoordinator::complete_ingest`] in `seq` order, so the
+/// miner sees records in exact WAL-append order (template-id stability /
+/// snapshot-restore §3.5.3) even though the fsyncs batched concurrently.
+pub struct CommitOutcome {
+    pub seq: Option<u64>,
+    pub result: Result<WalOffset, ReceiveError>,
+}
 
 /// Outcome of one flush, broadcast to every waiting `commit`.
 ///
@@ -97,6 +113,16 @@ pub struct CommitCoordinator {
     flush_state: Mutex<FlushState>,
     /// Broadcasts each flush outcome to waiters.
     outcome_tx: watch::Sender<FlushOutcome>,
+    /// Cuts a pending windowed flush short when the segment-fill
+    /// threshold is reached. One armed flush task `select!`s on its
+    /// window timer and this notify, so a fill cut wakes it instead of
+    /// spawning a redundant flush per appended frame.
+    fill: Notify,
+    /// The in-order miner hand-off gate: the next append `seq` cleared to
+    /// run its post-durability miner step. A `commit`'s caller awaits its
+    /// turn on this and advances it, so the miner ingests in exact
+    /// WAL-append order despite concurrent, batched commits.
+    ingest_gate: watch::Sender<u64>,
 }
 
 impl CommitCoordinator {
@@ -115,6 +141,9 @@ impl CommitCoordinator {
                 byte: 0,
             }),
         });
+        // The ingest gate starts at 1 — the first `seq` handed out — so
+        // the first commit runs its miner step immediately.
+        let (ingest_gate, _ingest_rx) = watch::channel(1u64);
         Arc::new(Self {
             journal: Mutex::new(journal),
             window,
@@ -125,22 +154,28 @@ impl CommitCoordinator {
                 appended_seq: 0,
             }),
             outcome_tx,
+            fill: Notify::new(),
+            ingest_gate,
         })
     }
 
-    /// Append `payload` and return only once it is durable (§3.4).
+    /// Append `payload` and return once its durability is decided (§3.4).
     ///
     /// Concurrent calls batch: each appends under the journal lock, then
-    /// one windowed `sync` covers them all. Returns the durable
-    /// high-water [`WalOffset`] after the covering `sync` succeeds.
+    /// one windowed `sync` covers them all. The returned [`CommitOutcome`]
+    /// carries the append `seq` (so the caller can drive the in-order
+    /// miner hand-off — [`Self::await_ingest_turn`] / [`Self::complete_ingest`])
+    /// and the durable high-water [`WalOffset`] once the covering `sync`
+    /// succeeds.
     ///
-    /// # Errors
-    ///
-    /// - [`ReceiveError::WalAppend`] if the append itself fails (this
-    ///   frame is not durable and is not acked).
-    /// - [`ReceiveError::WalSync`] if the covering `sync` fails — every
-    ///   waiter whose frame was in that sync returns this and does not ack.
-    pub async fn commit(self: &Arc<Self>, payload: &[u8]) -> Result<WalOffset, ReceiveError> {
+    /// The `result` is:
+    /// - [`ReceiveError::WalAppend`] (with `seq: None`) if the append
+    ///   itself fails — no frame, no sequence, not acked.
+    /// - [`ReceiveError::WalSync`] (with `seq: Some`) if the covering
+    ///   `sync` fails — the frame consumed a sequence but is not durable;
+    ///   the caller still drives the gate (in order) so it doesn't stall
+    ///   later sequences, and does not ack.
+    pub async fn commit(self: &Arc<Self>, payload: &[u8]) -> CommitOutcome {
         // Subscribe *before* appending so no flush outcome can slip
         // between the append and the first wait (lost-wakeup safety: the
         // receiver exists and holds the value the wait loop re-checks).
@@ -151,7 +186,13 @@ impl CommitCoordinator {
         // lock is held so the seq ↔ append ordering is atomic.
         let (seq, unflushed) = {
             let mut journal = self.lock_journal();
-            journal.append_batch(payload)?;
+            if let Err(e) = journal.append_batch(payload) {
+                // No sequence consumed: append never happened.
+                return CommitOutcome {
+                    seq: None,
+                    result: Err(e),
+                };
+            }
             let mut state = self.lock_flush_state();
             let seq = state.next_seq;
             state.next_seq += 1;
@@ -168,46 +209,79 @@ impl CommitCoordinator {
         // value before the first `.changed().await` — a flush may already
         // have completed between the append and here, so awaiting first
         // would be a lost wakeup.
-        loop {
+        let result = loop {
             if let Some(result) = covered_outcome(&rx.borrow_and_update(), seq) {
-                return result;
+                break result;
             }
             // Only `None` once the sender is dropped, which the
             // coordinator (held by the pipeline) outlives for any live
             // commit; treat it as a sync failure rather than panic.
             if rx.changed().await.is_err() {
-                return Err(sync_failure_error("commit coordinator stopped"));
+                break Err(sync_failure_error("commit coordinator stopped"));
+            }
+        };
+        CommitOutcome {
+            seq: Some(seq),
+            result,
+        }
+    }
+
+    /// Await this `seq`'s turn in the in-order miner hand-off: returns
+    /// once every lower sequence has completed its post-durability step.
+    /// The miner thus sees records in exact WAL-append order even though
+    /// the fsyncs batched concurrently (template-id stability /
+    /// snapshot-restore §3.5.3). Must be paired with
+    /// [`Self::complete_ingest`] (called for **every** `seq`-bearing
+    /// outcome, success or sync failure, so the gate never stalls).
+    pub async fn await_ingest_turn(&self, seq: u64) {
+        let mut rx = self.ingest_gate.subscribe();
+        // The gate is monotonic; `>= seq` means it's reached this seq
+        // (each seq is unique, so it's exactly this caller's turn).
+        // Check the current value before awaiting (lost-wakeup safety).
+        while *rx.borrow_and_update() < seq {
+            if rx.changed().await.is_err() {
+                return;
             }
         }
     }
 
+    /// Release the in-order hand-off to the next sequence. Called after a
+    /// `seq`'s post-durability miner step (or immediately, with no miner
+    /// step, for a sync-failed `seq`) so `seq + 1` may proceed.
+    pub fn complete_ingest(&self, seq: u64) {
+        self.ingest_gate.send_modify(|next| *next = seq + 1);
+    }
+
     /// Arm a windowed flush if one is not already pending. The first
-    /// arriver after a flush sets the flag and spawns the timer task;
-    /// concurrent arrivals within the window observe the flag set and
-    /// ride the same flush. `immediate` (segment-fill early cut) flushes
-    /// now instead of waiting out the window.
+    /// arriver after a flush sets the flag and spawns **one** flush task
+    /// that waits out the window *or* a fill cut, whichever comes first;
+    /// concurrent arrivals ride it. `immediate` (the segment-fill early
+    /// cut) wakes the pending flush via [`Self::fill`] instead of
+    /// spawning another — so a burst of fill-crossing appends produces at
+    /// most one extra flush task, not one per append.
     fn arm_flush(self: &Arc<Self>, immediate: bool) {
-        {
+        let spawn = {
             let mut state = self.lock_flush_state();
             if state.flush_pending {
-                // A flush is already scheduled; this append rides it.
-                // (An immediate cut still only needs one flush — the
-                // armed one will sync everything appended so far.)
-                if !immediate {
-                    return;
-                }
+                false
             } else {
                 state.flush_pending = true;
+                true
             }
-        }
-
-        let coordinator = Arc::clone(self);
+        };
+        // Cut a pending (or about-to-be-spawned) windowed flush short.
+        // `notify_one` leaves a permit if the flush task hasn't reached
+        // its `select!` yet, so the cut is never lost.
         if immediate {
-            tokio::spawn(async move { coordinator.flush().await });
-        } else {
-            let window = self.window;
+            self.fill.notify_one();
+        }
+        if spawn {
+            let coordinator = Arc::clone(self);
             tokio::spawn(async move {
-                tokio::time::sleep(window).await;
+                tokio::select! {
+                    () = tokio::time::sleep(coordinator.window) => {}
+                    () = coordinator.fill.notified() => {}
+                }
                 coordinator.flush().await;
             });
         }
@@ -387,7 +461,7 @@ mod tests {
             handles.push(tokio::spawn(async move { c.commit(b"frame").await }));
         }
         for h in handles {
-            h.await.expect("join").expect("commit Ok");
+            h.await.expect("join").result.expect("commit Ok");
         }
         assert_eq!(appends.load(Ordering::SeqCst), 16, "every frame appended");
         // 16 commits in one ~20 ms window fsync far fewer than 16 times —
@@ -407,7 +481,11 @@ mod tests {
         for h in handles {
             let outcome = h.await.expect("join");
             assert!(
-                matches!(outcome, Err(ReceiveError::WalSync(_))),
+                outcome.seq.is_some(),
+                "the frame appended (consumed a seq) before its sync failed",
+            );
+            assert!(
+                matches!(outcome.result, Err(ReceiveError::WalSync(_))),
                 "a frame in a failed sync is not acked",
             );
         }
@@ -416,7 +494,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_single_commit_is_durable_before_returning() {
         let (coordinator, appends, syncs) = spy(false);
-        let offset = coordinator.commit(b"frame").await.expect("commit Ok");
+        let offset = coordinator
+            .commit(b"frame")
+            .await
+            .result
+            .expect("commit Ok");
         assert_eq!(appends.load(Ordering::SeqCst), 1);
         assert_eq!(syncs.load(Ordering::SeqCst), 1, "one append, one sync");
         assert_eq!(offset.byte, b"frame".len() as u64);
@@ -451,7 +533,7 @@ mod tests {
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             for h in handles {
-                h.await.expect("join").expect("commit Ok");
+                h.await.expect("join").result.expect("commit Ok");
             }
         })
         .await
@@ -481,6 +563,7 @@ mod tests {
         let offset = tokio::time::timeout(Duration::from_secs(5), coordinator.commit(b"abcd"))
             .await
             .expect("fill cut resolves well within the window")
+            .result
             .expect("commit Ok");
         assert_eq!(offset.byte, 4);
         assert_eq!(syncs.load(Ordering::SeqCst), 1);

@@ -187,35 +187,62 @@ impl IngestPipeline {
         }
 
         // Steps 3–4: append the export as one OtlpBatch frame and await
-        // its (batched) fsync — the batch is durable before the ack
-        // below. The previous durable mark is snapshotted before the
-        // commit so a rotation under this batch is detectable.
-        let before = *self.lock_last_durable();
-        let now = self.coordinator.commit(&payload).await?;
-        *self.lock_last_durable() = Some(now);
+        // its (batched) fsync — concurrent requests fold into one window's
+        // fsync (RFC0008.8). The frame's append `seq` orders the miner
+        // hand-off below.
+        let outcome = self.coordinator.commit(&payload).await;
+        let Some(seq) = outcome.seq else {
+            // The append itself failed: no sequence consumed, so this
+            // request is not part of the WAL order and never reaches the
+            // miner gate. Not acked (§3.4). (`result` is the append error;
+            // the `Ok` arm is unreachable without a seq — map it to 0.)
+            return outcome.result.map(|_| 0);
+        };
 
-        // Step 5 (+ §6.9 rotation cadence): hand the records to the miner
-        // under the miner lock. A segment change between the previous
-        // durable offset and this one means the WAL rotated under this
-        // batch; fire the hook with the rotation-point high-water mark
-        // (the old segment's last durable offset) BEFORE this batch's
-        // records reach the miner, so a snapshot taken by the hook
-        // reflects exactly the frames at or below that mark. Holding the
-        // miner lock across the hook keeps the "hook sees the miner
-        // before the rotating batch" ordering atomic against any
-        // concurrent ingest.
-        let mut miner = self.lock_miner();
-        if let Some(prev) = before
-            && prev.segment != now.segment
-        {
-            self.fire_rotation_hook(&miner, prev);
-        }
-        for record in &records {
-            miner.ingest(record);
-        }
-
-        // Step 6: ack.
-        Ok(records.len())
+        // Step 5: hand the records to the miner **in WAL-append order**.
+        // The fsyncs batched concurrently, but the miner must see records
+        // in `seq` order — template ids are assigned first-seen, so an
+        // out-of-order live tree wouldn't match a WAL-order replay
+        // (snapshot-restore §3.5.3). `await_ingest_turn` blocks until every
+        // lower seq has finished here, so this whole region runs
+        // single-file in append order; `complete_ingest` releases the next
+        // seq and MUST run even on a sync failure (which ingests nothing)
+        // so the gate never stalls.
+        self.coordinator.await_ingest_turn(seq).await;
+        let ack = match outcome.result {
+            Ok(now) => {
+                // §6.9 rotation cadence: a segment change since the prior
+                // (now strictly-previous) durable mark means the WAL
+                // rotated under this batch; fire the hook with the
+                // rotation-point high-water mark BEFORE this batch's
+                // records reach the miner, so a snapshot it takes reflects
+                // exactly the frames at or below that mark. In-order, so
+                // `before` is exactly the preceding seq's offset and no
+                // higher seq has ingested yet.
+                let before = *self.lock_last_durable();
+                {
+                    let mut miner = self.lock_miner();
+                    if let Some(prev) = before
+                        && prev.segment != now.segment
+                    {
+                        self.fire_rotation_hook(&miner, prev);
+                    }
+                    for record in &records {
+                        miner.ingest(record);
+                    }
+                }
+                // Only successful commits advance the durable mark, so the
+                // snapshot high-water never passes a failed sync — its tail
+                // replay re-covers those frames (no §3.5.3 divergence).
+                *self.lock_last_durable() = Some(now);
+                Ok(records.len())
+            }
+            // Sync failed: the frame is not durable and not acked; it
+            // reaches neither the miner nor the durable mark.
+            Err(e) => Err(e),
+        };
+        self.coordinator.complete_ingest(seq);
+        ack
     }
 
     /// Fire the rotation hook over the current miner, swallowing a panic.

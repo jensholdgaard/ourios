@@ -8,6 +8,13 @@
 //! to the miner (§6.5 step ordering). An empty batch takes the
 //! fast path: success with no WAL write (RFC0003.12).
 //!
+//! Durability is delegated to the [`crate::receiver::commit::CommitCoordinator`]:
+//! the per-request `append` + windowed group `sync` (RFC0008.8 batched
+//! fsync) live there, so concurrent requests fold into one fsync per
+//! window while each still acks only after a covering `sync` succeeds.
+//! The pipeline owns the miner (behind a mutex) and the §6.9 rotation
+//! hook; the coordinator owns the single-writer WAL.
+//!
 //! The live gRPC/HTTP transports wrap this layer; they hand it a decoded
 //! request and map its `Result` to the transport-level response.
 
@@ -18,6 +25,7 @@ use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, Wal, WalOffset};
 use prost::Message;
 
+use crate::receiver::commit::CommitCoordinator;
 use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
 
 /// The §6.9 rotation-cadence callback: receives the miner as it
@@ -25,21 +33,23 @@ use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
 /// [`IngestPipeline::with_rotation_hook`].
 pub type RotationHook = Box<dyn FnMut(&MinerCluster, WalOffset) + Send>;
 
-/// The ingest pipeline shared across a listener's requests. The
-/// single-writer WAL forces serialization; concurrent requests queue on
-/// the mutex (the lock never spans an `.await`, so `std::sync::Mutex`
-/// suffices). Used by both the HTTP and gRPC transports.
-pub type SharedPipeline = Arc<Mutex<IngestPipeline>>;
+/// The ingest pipeline shared across a listener's requests. Concurrency
+/// is handled by the pipeline's own inner locks (the group-commit
+/// coordinator serializes the single-writer WAL; the miner sits behind a
+/// mutex), so the shared handle is a plain `Arc` — no outer mutex, so
+/// concurrent requests batch their fsyncs (RFC0008.8) instead of
+/// serializing end to end. Used by both the HTTP and gRPC transports.
+pub type SharedPipeline = Arc<IngestPipeline>;
 
 /// The durability sink the pipeline appends to and fsyncs through.
 ///
 /// Abstracted (rather than a concrete `Wal`) so the WAL-before-ack
-/// ordering can be exercised with a spy that records the `append`/`sync`
-/// calls (RFC0003.1/.12 per §8). The only production implementation is
-/// [`Wal`].
+/// ordering can be exercised with a spy that records / counts the
+/// `append`/`sync` calls and can be made to fail (RFC0003.1/.12,
+/// RFC0008.8 per §8). The only production implementation is [`Wal`].
 ///
-/// `Send` so the pipeline can live behind a shared `Arc<Mutex<_>>` as
-/// state in the async HTTP/gRPC listeners.
+/// `Send` so it can live behind the coordinator's `Mutex<Box<dyn Journal>>`
+/// as shared state in the async HTTP/gRPC listeners.
 pub trait Journal: Send {
     /// Append one `OtlpBatch` frame carrying `payload` (not yet durable).
     ///
@@ -49,15 +59,20 @@ pub trait Journal: Send {
     fn append_batch(&mut self, payload: &[u8]) -> Result<(), ReceiveError>;
 
     /// Fsync — appended frames are durable when this returns `Ok`,
-    /// yielding the durable high-water offset when the journal has
-    /// one (the WAL does; test spies that persist nothing return
-    /// `None`). The snapshot writer records this offset as the
+    /// yielding the durable high-water offset. The real WAL always has
+    /// one (RFC 0008 §6.3); the group-commit coordinator compares it
+    /// against waiters and the snapshot writer records it as the
     /// snapshot's WAL high-water mark (RFC 0001 §6.9).
     ///
     /// # Errors
     ///
     /// [`ReceiveError::WalSync`] on an fsync failure.
-    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError>;
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError>;
+
+    /// The WAL's current unflushed-bytes counter (RFC 0008 §6.8), read
+    /// by the coordinator's segment-fill early cut ("until the segment
+    /// fills", §3.4). Cheap — an in-memory counter, no syscall.
+    fn unflushed_bytes(&self) -> u64;
 }
 
 impl Journal for Wal {
@@ -67,36 +82,45 @@ impl Journal for Wal {
             .map_err(ReceiveError::WalAppend)
     }
 
-    fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
-        Wal::sync(self).map(Some).map_err(ReceiveError::WalSync)
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        Wal::sync(self).map_err(ReceiveError::WalSync)
+    }
+
+    fn unflushed_bytes(&self) -> u64 {
+        self.metrics().unflushed_bytes
     }
 }
 
-/// The ingester's WAL-before-ack ingest path. Owns the durability
-/// [`Journal`], the per-process `MinerCluster`, and the
-/// tenant-derivation `TenantRule`.
+/// The ingester's WAL-before-ack ingest path. Owns the group-commit
+/// [`CommitCoordinator`] (which owns the durability [`Journal`]), the
+/// per-process `MinerCluster` (behind a mutex — the coordinator lets
+/// requests run concurrently, so the miner needs its own serialization),
+/// and the tenant-derivation `TenantRule`.
 ///
 /// No `Debug`: `MinerCluster` holds the per-tenant Drain trees and does
 /// not implement it.
 pub struct IngestPipeline {
-    journal: Box<dyn Journal>,
-    miner: MinerCluster,
+    coordinator: Arc<CommitCoordinator>,
+    miner: Mutex<MinerCluster>,
     rule: TenantRule,
-    last_durable: Option<WalOffset>,
-    rotation_hook: Option<RotationHook>,
+    /// The durable high-water mark after the most recent acked batch (or
+    /// the startup seed). Behind a mutex: concurrent acks update it, and
+    /// the rotation-detection read-then-write must see a consistent value.
+    last_durable: Mutex<Option<WalOffset>>,
+    rotation_hook: Mutex<Option<RotationHook>>,
 }
 
 impl IngestPipeline {
-    /// Build a pipeline over a durability [`Journal`] (production: a
-    /// `Box<Wal>`), a `MinerCluster`, and a tenant-derivation rule.
+    /// Build a pipeline over a group-commit `coordinator`, a
+    /// `MinerCluster`, and a tenant-derivation rule.
     #[must_use]
-    pub fn new(journal: Box<dyn Journal>, miner: MinerCluster, rule: TenantRule) -> Self {
+    pub fn new(coordinator: Arc<CommitCoordinator>, miner: MinerCluster, rule: TenantRule) -> Self {
         Self {
-            journal,
-            miner,
+            coordinator,
+            miner: Mutex::new(miner),
             rule,
-            last_durable: None,
-            rotation_hook: None,
+            last_durable: Mutex::new(None),
+            rotation_hook: Mutex::new(None),
         }
     }
 
@@ -111,8 +135,8 @@ impl IngestPipeline {
     /// hook's to handle — a snapshot is a rebuildable cache, never
     /// worth failing the ack over.
     #[must_use]
-    pub fn with_rotation_hook(mut self, hook: RotationHook) -> Self {
-        self.rotation_hook = Some(hook);
+    pub fn with_rotation_hook(self, hook: RotationHook) -> Self {
+        *self.lock_hook() = Some(hook);
         self
     }
 
@@ -120,21 +144,24 @@ impl IngestPipeline {
     /// (`RecoveryReport::max_delivered`). Without the seed, a process
     /// that serves zero requests writes shutdown snapshots with no
     /// high-water mark, forcing the next start to discard them and
-    /// full-replay (RFC 0001 §6.9). A later [`Journal::sync`] offset
-    /// supersedes the seed.
+    /// full-replay (RFC 0001 §6.9). A later commit offset supersedes the
+    /// seed.
     #[must_use]
-    pub fn with_last_durable(mut self, offset: Option<WalOffset>) -> Self {
-        self.last_durable = offset;
+    pub fn with_last_durable(self, offset: Option<WalOffset>) -> Self {
+        *self.lock_last_durable() = offset;
         self
     }
 
     /// Ingest one decoded export per the §6.5 sequence: fan out, append
-    /// the export as a single `OtlpBatch` frame, **fsync**, then hand the
-    /// records to the miner, then ack. Returns the number of records
-    /// ingested (`0` for the empty fast path).
+    /// the export as a single `OtlpBatch` frame, **fsync** (batched via
+    /// the group-commit coordinator), then hand the records to the miner,
+    /// then ack. Returns the number of records ingested (`0` for the
+    /// empty fast path).
     ///
-    /// The fsync (step 4) completes before this returns `Ok`, so the
-    /// caller never acks a batch that isn't durable (`[§3.4]`).
+    /// The covering fsync completes before this returns `Ok`, so the
+    /// caller never acks a batch that isn't durable (`[§3.4]`). `&self`
+    /// (not `&mut`): concurrency is the inner locks' job, so concurrent
+    /// requests batch into one window's fsync (RFC0008.8).
     ///
     /// # Errors
     ///
@@ -143,7 +170,7 @@ impl IngestPipeline {
     ///   write (RFC0003.4).
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
-    pub fn ingest(&mut self, request: ExportLogsServiceRequest) -> Result<usize, ReceiveError> {
+    pub async fn ingest(&self, request: ExportLogsServiceRequest) -> Result<usize, ReceiveError> {
         // Encode before fan-out consumes the request: the WAL frame is a
         // protobuf `ExportLogsServiceRequest` (§6.5 step 3). Byte-equality
         // to the wire isn't required — recoverability is.
@@ -159,58 +186,67 @@ impl IngestPipeline {
             return Ok(0);
         }
 
-        // Step 3: append the export as one OtlpBatch frame. Step 4: fsync
-        // — the batch is durable before the ack below.
-        let before = self.last_durable;
-        self.journal.append_batch(&payload)?;
-        if let Some(offset) = self.journal.sync()? {
-            self.last_durable = Some(offset);
-        }
+        // Steps 3–4: append the export as one OtlpBatch frame and await
+        // its (batched) fsync — the batch is durable before the ack
+        // below. The previous durable mark is snapshotted before the
+        // commit so a rotation under this batch is detectable.
+        let before = *self.lock_last_durable();
+        let now = self.coordinator.commit(&payload).await?;
+        *self.lock_last_durable() = Some(now);
 
-        // §6.9 rotation cadence: a segment change between the previous
+        // Step 5 (+ §6.9 rotation cadence): hand the records to the miner
+        // under the miner lock. A segment change between the previous
         // durable offset and this one means the WAL rotated under this
-        // batch. Fire the hook with the rotation-point high-water mark
+        // batch; fire the hook with the rotation-point high-water mark
         // (the old segment's last durable offset) BEFORE this batch's
-        // records reach the miner — a snapshot taken by the hook then
-        // reflects exactly the frames at or below that mark.
-        if let (Some(hook), Some(prev), Some(now)) =
-            (self.rotation_hook.as_mut(), before, self.last_durable)
+        // records reach the miner, so a snapshot taken by the hook
+        // reflects exactly the frames at or below that mark. Holding the
+        // miner lock across the hook keeps the "hook sees the miner
+        // before the rotating batch" ordering atomic against any
+        // concurrent ingest.
+        let mut miner = self.lock_miner();
+        if let Some(prev) = before
             && prev.segment != now.segment
         {
-            // A hook panic must not unwind `ingest`: the batch is
-            // already durable and the unwind would poison the shared
-            // pipeline mutex, halting all future ingestion over a
-            // best-effort cache write. `AssertUnwindSafe` is sound
-            // for the pipeline's own state — the hook sees the miner
-            // through `&MinerCluster`, so no pipeline mutation can be
-            // torn mid-panic; the hook's own captures are its to keep
-            // consistent (it stays installed and is only ever invoked
-            // best-effort).
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                hook(&self.miner, prev);
-            }));
-            if outcome.is_err() {
-                eprintln!(
-                    "rotation hook panicked; continuing — the snapshot \
-                     is a rebuildable cache (recovery falls back to the WAL)"
-                );
-            }
+            self.fire_rotation_hook(&miner, prev);
         }
-
-        // Step 5: hand records to the miner (only after durability, so a
-        // crash between fsync and here replays from the WAL).
         for record in &records {
-            self.miner.ingest(record);
+            miner.ingest(record);
         }
 
         // Step 6: ack.
         Ok(records.len())
     }
 
-    /// The pipeline's miner, for inspection (tests; future metrics).
-    #[must_use]
-    pub fn miner(&self) -> &MinerCluster {
-        &self.miner
+    /// Fire the rotation hook over the current miner, swallowing a panic.
+    fn fire_rotation_hook(&self, miner: &MinerCluster, mark: WalOffset) {
+        let mut hook = self.lock_hook();
+        let Some(hook) = hook.as_mut() else {
+            return;
+        };
+        // A hook panic must not unwind `ingest`: the batch is already
+        // durable and the unwind would poison the shared miner mutex,
+        // halting all future ingestion over a best-effort cache write.
+        // `AssertUnwindSafe` is sound here — the hook sees the miner
+        // through `&MinerCluster`, so no pipeline mutation can be torn
+        // mid-panic; the hook's own captures are its to keep consistent
+        // (it stays installed and is only ever invoked best-effort).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook(miner, mark);
+        }));
+        if outcome.is_err() {
+            eprintln!(
+                "rotation hook panicked; continuing — the snapshot \
+                 is a rebuildable cache (recovery falls back to the WAL)"
+            );
+        }
+    }
+
+    /// Run `f` against the pipeline's miner under the miner lock — for
+    /// the shutdown-snapshot path (which needs `&MinerCluster`) and
+    /// tests.
+    pub fn with_miner<R>(&self, f: impl FnOnce(&MinerCluster) -> R) -> R {
+        f(&self.lock_miner())
     }
 
     /// The journal's durable high-water offset after the most recent
@@ -218,7 +254,25 @@ impl IngestPipeline {
     /// its WAL high-water mark (RFC 0001 §6.9).
     #[must_use]
     pub fn last_durable(&self) -> Option<WalOffset> {
+        *self.lock_last_durable()
+    }
+
+    fn lock_miner(&self) -> std::sync::MutexGuard<'_, MinerCluster> {
+        self.miner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_last_durable(&self) -> std::sync::MutexGuard<'_, Option<WalOffset>> {
         self.last_durable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_hook(&self) -> std::sync::MutexGuard<'_, Option<RotationHook>> {
+        self.rotation_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -266,6 +320,9 @@ impl std::error::Error for ReceiveError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use super::*;
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -273,28 +330,57 @@ mod tests {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ourios_core::config::MinerConfig;
 
-    /// Persists nothing; `sync` reports the configured offset.
+    /// Persists nothing; `sync` reports the configured offset and counts
+    /// its calls, so a test can assert WAL-before-ack ordering and
+    /// per-batch (not per-record) fsync.
     struct FixedSyncJournal {
-        offset: Option<WalOffset>,
+        offset: WalOffset,
+        appends: Arc<AtomicU64>,
+        syncs: Arc<AtomicU64>,
     }
 
     impl Journal for FixedSyncJournal {
         fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+            self.appends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
+        fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
             Ok(self.offset)
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
         }
     }
 
-    fn pipeline(sync_offset: Option<WalOffset>) -> IngestPipeline {
-        IngestPipeline::new(
+    fn pipeline_with(
+        sync_offset: WalOffset,
+        appends: Arc<AtomicU64>,
+        syncs: Arc<AtomicU64>,
+    ) -> IngestPipeline {
+        let coordinator = CommitCoordinator::new(
             Box::new(FixedSyncJournal {
                 offset: sync_offset,
+                appends,
+                syncs,
             }),
+            Duration::from_millis(5),
+            u64::MAX,
+        );
+        IngestPipeline::new(
+            coordinator,
             MinerCluster::new(MinerConfig::default()),
             TenantRule::service_name(),
+        )
+    }
+
+    fn pipeline(sync_offset: WalOffset) -> IngestPipeline {
+        pipeline_with(
+            sync_offset,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         )
     }
 
@@ -334,30 +420,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn seeded_last_durable_holds_until_a_sync_supersedes_it() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_synced_batch_advances_the_durable_mark() {
         let seed = offset(10);
         let synced = offset(64);
-        let mut pipeline = pipeline(Some(synced)).with_last_durable(Some(seed));
+        let pipeline = pipeline(synced).with_last_durable(Some(seed));
 
         assert_eq!(pipeline.last_durable(), Some(seed));
-        pipeline.ingest(request()).expect("ingest");
+        pipeline.ingest(request()).await.expect("ingest");
         assert_eq!(pipeline.last_durable(), Some(synced));
-    }
-
-    #[test]
-    fn seeded_last_durable_survives_a_sync_without_an_offset() {
-        let seed = offset(10);
-        let mut pipeline = pipeline(None).with_last_durable(Some(seed));
-
-        pipeline.ingest(request()).expect("ingest");
-        assert_eq!(pipeline.last_durable(), Some(seed));
     }
 
     /// `sync` reports offsets from a queue, so a segment change can be
     /// staged mid-sequence.
     struct SequenceJournal {
-        offsets: Vec<WalOffset>,
+        offsets: Mutex<Vec<WalOffset>>,
     }
 
     impl Journal for SequenceJournal {
@@ -365,13 +442,33 @@ mod tests {
             Ok(())
         }
 
-        fn sync(&mut self) -> Result<Option<WalOffset>, ReceiveError> {
-            Ok(Some(self.offsets.remove(0)))
+        fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+            Ok(self.offsets.lock().expect("offsets").remove(0))
+        }
+
+        fn unflushed_bytes(&self) -> u64 {
+            0
         }
     }
 
-    #[test]
-    fn rotation_hook_fires_once_with_the_old_segments_last_durable_offset() {
+    fn sequence_pipeline(offsets: Vec<WalOffset>, hook: RotationHook) -> IngestPipeline {
+        let coordinator = CommitCoordinator::new(
+            Box::new(SequenceJournal {
+                offsets: Mutex::new(offsets),
+            }),
+            Duration::from_millis(5),
+            u64::MAX,
+        );
+        IngestPipeline::new(
+            coordinator,
+            MinerCluster::new(MinerConfig::default()),
+            TenantRule::service_name(),
+        )
+        .with_rotation_hook(hook)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotation_hook_fires_once_with_the_old_segments_last_durable_offset() {
         let in_first = WalOffset {
             segment: uuid::Uuid::from_u128(1),
             byte: 100,
@@ -382,41 +479,37 @@ mod tests {
         };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = calls.clone();
-        let mut pipeline = IngestPipeline::new(
-            Box::new(SequenceJournal {
-                offsets: vec![in_first, in_second, in_second],
+        let pipeline = sequence_pipeline(
+            vec![in_first, in_second, in_second],
+            Box::new(move |miner, mark| {
+                // Capture the miner's template count at hook time: the
+                // rotating batch must not have reached it yet.
+                let count = miner.template_count(&ourios_core::tenant::TenantId::new("checkout"));
+                seen.lock().expect("lock").push((mark, count));
             }),
-            MinerCluster::new(MinerConfig::default()),
-            TenantRule::service_name(),
-        )
-        .with_rotation_hook(Box::new(move |miner, mark| {
-            // Capture the miner's template count at hook time: the
-            // rotating batch must not have reached it yet.
-            let count = miner.template_count(&ourios_core::tenant::TenantId::new("checkout"));
-            seen.lock().expect("lock").push((mark, count));
-        }));
+        );
 
         // Batch 1: no previous durable offset — never a rotation.
-        pipeline.ingest(request()).expect("batch 1");
+        pipeline.ingest(request()).await.expect("batch 1");
         assert!(calls.lock().expect("lock").is_empty());
 
         // Batch 2: segment changed — the hook fires once with the OLD
         // segment's last durable offset, before batch 2 hits the miner
         // (the template count is still batch 1's).
-        pipeline.ingest(request()).expect("batch 2");
+        pipeline.ingest(request()).await.expect("batch 2");
         assert_eq!(*calls.lock().expect("lock"), vec![(in_first, 1)]);
 
         // Batch 3: same segment — no further firing.
-        pipeline.ingest(request()).expect("batch 3");
+        pipeline.ingest(request()).await.expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
     }
 
     /// A panicking hook must not unwind `ingest`: the batch is
     /// already durable, and the unwind would poison the shared
-    /// pipeline mutex and halt all future ingestion over a
+    /// miner mutex and halt all future ingestion over a
     /// best-effort cache write.
-    #[test]
-    fn rotation_hook_panic_does_not_fail_the_ingest() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotation_hook_panic_does_not_fail_the_ingest() {
         let in_first = WalOffset {
             segment: uuid::Uuid::from_u128(1),
             byte: 100,
@@ -425,27 +518,23 @@ mod tests {
             segment: uuid::Uuid::from_u128(2),
             byte: 40,
         };
-        let mut pipeline = IngestPipeline::new(
-            Box::new(SequenceJournal {
-                offsets: vec![in_first, in_second, in_second],
-            }),
-            MinerCluster::new(MinerConfig::default()),
-            TenantRule::service_name(),
-        )
-        .with_rotation_hook(Box::new(|_, _| panic!("snapshot writer blew up")));
+        let pipeline = sequence_pipeline(
+            vec![in_first, in_second, in_second],
+            Box::new(|_, _| panic!("snapshot writer blew up")),
+        );
 
-        pipeline.ingest(request()).expect("batch 1");
+        pipeline.ingest(request()).await.expect("batch 1");
         // Batch 2 rotates and the hook panics — the ingest still acks
         // and the records still reach the miner.
-        assert_eq!(pipeline.ingest(request()).expect("batch 2 acks"), 1);
+        assert_eq!(pipeline.ingest(request()).await.expect("batch 2 acks"), 1);
         assert_eq!(
-            pipeline
-                .miner()
-                .template_count(&ourios_core::tenant::TenantId::new("checkout")),
+            pipeline.with_miner(|m| {
+                m.template_count(&ourios_core::tenant::TenantId::new("checkout"))
+            }),
             1,
             "the rotating batch's records reached the miner despite the panic",
         );
         // The pipeline stays usable afterwards.
-        assert_eq!(pipeline.ingest(request()).expect("batch 3 acks"), 1);
+        assert_eq!(pipeline.ingest(request()).await.expect("batch 3 acks"), 1);
     }
 }

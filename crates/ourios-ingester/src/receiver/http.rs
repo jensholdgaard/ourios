@@ -10,9 +10,10 @@
 //! / encoding → 415, malformed body → 400, oversize → 413, an
 //! unconfigured path → 404, tenant-resolution failure → 400. No panics.
 //!
-//! The pipeline is shared behind a `Mutex` — the WAL is a single writer
-//! (RFC 0008 §3.1), so concurrent requests serialize on it. The lock is
-//! never held across an `.await`, so a plain `std::sync::Mutex` suffices.
+//! The pipeline is shared behind a plain `Arc`: its group-commit
+//! coordinator serializes the single-writer WAL internally (RFC 0008
+//! §3.1) while letting concurrent requests batch their fsyncs
+//! (RFC0008.8). `ingest` is async, so the handler simply `.await`s it.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -105,27 +106,16 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // WAL-before-ack ingest. `ingest` does blocking I/O (WAL append +
-    // fsync), so run it on a blocking thread rather than stalling the
-    // async runtime. The lock spans only the synchronous call, and a
-    // poisoned lock is recovered (the handler promises not to panic).
-    let pipeline = state.pipeline;
-    let outcome = tokio::task::spawn_blocking(move || {
-        pipeline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ingest(request)
-    })
-    .await;
-
-    match outcome {
-        Ok(Ok(_)) => success_response(format),
+    // WAL-before-ack ingest. The fsync is batched by the group-commit
+    // coordinator (RFC0008.8), which offloads its blocking `sync`, so the
+    // handler just awaits.
+    match state.pipeline.ingest(request).await {
+        Ok(_) => success_response(format),
         // A Resource that doesn't resolve to a tenant is a client error
         // (the whole batch is rejected, RFC0003.4).
-        Ok(Err(ReceiveError::TenantResolution(_))) => StatusCode::BAD_REQUEST.into_response(),
-        // A WAL failure (or a panic in the blocking task) is server-side;
-        // the batch was not acked (§3.4).
-        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(ReceiveError::TenantResolution(_)) => StatusCode::BAD_REQUEST.into_response(),
+        // A WAL failure is server-side; the batch was not acked (§3.4).
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

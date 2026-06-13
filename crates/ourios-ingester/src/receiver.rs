@@ -19,6 +19,10 @@
 //! - [`pipeline`] — the §6.5 WAL-before-ack ingest path
 //!   ([`pipeline::IngestPipeline`]): fan out → append one `OtlpBatch`
 //!   frame → fsync → miner → ack (RFC0003.1/.12).
+//! - [`commit`] — the RFC0008.8 group-commit coordinator
+//!   ([`commit::CommitCoordinator`]): windowed batched fsync that folds
+//!   N concurrent appends into one `sync` per `wal_batch_window_ms`
+//!   (or until the segment fills) while keeping the §3.4 ack gate.
 //! - [`http`] — the OTLP/HTTP listener ([`http::router`]) wrapping the
 //!   pipeline: `Content-Type`/`Content-Encoding` dispatch, controlled
 //!   transport errors, configurable path (RFC0003.11 HTTP arms / .13 /
@@ -27,6 +31,7 @@
 //!   wrapping the same pipeline: controlled `Status` mapping + concurrent
 //!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
+pub mod commit;
 pub mod decode;
 pub mod grpc;
 pub mod http;
@@ -34,6 +39,7 @@ pub mod materialize;
 pub mod pipeline;
 pub mod tenant;
 
+pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
 pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};

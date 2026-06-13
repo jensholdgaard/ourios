@@ -12,7 +12,7 @@
 
 mod ingest_support;
 
-use ingest_support::{request, resource_logs, wal_config};
+use ingest_support::{coordinator, request, resource_logs, wal_config};
 use ourios_core::config::MinerConfig;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;
@@ -48,8 +48,8 @@ fn service_name(record: &MinedRecord) -> &str {
 /// every record under `ResourceLogs[0]` must be mined under tenant `a` and
 /// every record under `ResourceLogs[1]` under tenant `b`, with no record in
 /// the wrong tenant's tree.
-#[test]
-fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     // Arrange — a record sink to inspect what each tenant's tree mined, a
     // real WAL (the pipeline fsyncs before mining), and a pipeline with the
     // default `service.name` tenant rule. Within each tenant the two
@@ -60,7 +60,11 @@ fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     let wal = Wal::open(wal_config(tmp.path())).expect("open WAL");
     let sink = SharedRecordSink::new();
     let miner = MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
-    let mut pipeline = IngestPipeline::new(Box::new(wal), miner, TenantRule::service_name());
+    let pipeline = IngestPipeline::new(
+        coordinator(Box::new(wal)),
+        miner,
+        TenantRule::service_name(),
+    );
 
     let export = request(vec![
         resource_logs("a", &["alpha connected ok", "disk usage high"]),
@@ -68,7 +72,7 @@ fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     ]);
 
     // Act
-    let ingested = pipeline.ingest(export).expect("the batch is acked");
+    let ingested = pipeline.ingest(export).await.expect("the batch is acked");
 
     // Assert — four records ingested; partition the mined records by the
     // tenant the miner tagged them with.
@@ -106,12 +110,12 @@ fn invariant_3_7_3_tenant_derivation_runs_per_resource_logs() {
     // exactly its two (deliberately dissimilar) templates and never the
     // other's — a cross-tenant leak would push a count to 4.
     assert_eq!(
-        pipeline.miner().template_count(&tenant_a),
+        pipeline.with_miner(|m| m.template_count(&tenant_a)),
         2,
         "tenant `a`'s tree mined only its own two lines",
     );
     assert_eq!(
-        pipeline.miner().template_count(&tenant_b),
+        pipeline.with_miner(|m| m.template_count(&tenant_b)),
         2,
         "tenant `b`'s tree mined only its own two lines",
     );

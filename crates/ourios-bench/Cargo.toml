@@ -67,6 +67,11 @@ tempfile = "3"
 criterion = "0.5"
 ourios-querier = { path = "../ourios-querier" }
 tokio = { version = "1", default-features = false, features = ["rt"] }
+# RFC0008.3 recovery-non-amplification bench: times `Wal::replay`
+# over N ∈ {1, 4, 16} segments. Supportive wall-clock evidence
+# (the O(N) shape) mirroring b1/b2's role; the structural side is
+# pinned by `ourios-wal`'s `rfc0008_3_*` integration tests.
+ourios-wal = { path = "../ourios-wal" }
 
 [[bench]]
 name = "b1"
@@ -74,6 +79,10 @@ harness = false
 
 [[bench]]
 name = "b2"
+harness = false
+
+[[bench]]
+name = "recovery"
 harness = false
 
 [lints]

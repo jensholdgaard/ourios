@@ -46,6 +46,9 @@ ourios-core = { path = "../ourios-core" }
 [dev-dependencies]
 # Scratch directories for the segment-on-disk tests.
 tempfile = "3"
+# Property test for the RFC0008.9 `wal_unflushed_bytes` bound
+# under a randomised frame-arrival pattern.
+proptest = "1"
 
 [lints]
 workspace = true

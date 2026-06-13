@@ -2641,6 +2641,7 @@ dependencies = [
  "ourios-miner",
  "ourios-parquet",
  "ourios-querier",
+ "ourios-wal",
  "serde",
  "serde_json",
  "tempfile",
@@ -2777,6 +2778,7 @@ version = "0.0.0"
 dependencies = [
  "crc32c",
  "ourios-core",
+ "proptest",
  "tempfile",
  "uuid",
 ]

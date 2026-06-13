@@ -221,8 +221,9 @@ fn rfc0008_4_partial_tail_on_older_segment_is_rfc0008_5_corruption() {
     let tmp = tempfile::TempDir::new().expect("temp");
     build_closed_segment(tmp.path(), &[b"older-one", b"older-two"]);
     build_closed_segment(tmp.path(), &[b"newer-one"]);
-    // The fresh open will mint a third (newest) segment; the two
-    // above are both closed/older. We corrupt the oldest.
+    // `Wal::open` reopens the lexicographically-greatest existing
+    // segment (`newer-one`) as the append target; the earlier
+    // `older-*` segment is closed. We corrupt that closed one.
     let older = segment_files(tmp.path())
         .into_iter()
         .next()

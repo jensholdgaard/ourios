@@ -101,8 +101,9 @@ fn recovery(c: &mut Criterion) {
                     tmp
                 },
                 |tmp| {
-                    // A fresh open mints the newest (header-only) append
-                    // segment; the N built above are all closed.
+                    // `Wal::open` reopens the lexicographically-greatest
+                    // of the N segments as the append target; replay
+                    // then walks all N.
                     let mut wal = Wal::open(config(tmp.path())).expect("open");
                     let mut sink = CountingSink::default();
                     wal.replay(&mut sink).expect("replay");

@@ -95,9 +95,9 @@ fn rfc0008_3_recovery_emits_no_per_record_fsync() {
     build_closed_segment(tmp.path(), &[b"a1", b"a2", b"a3"]);
     build_closed_segment(tmp.path(), &[b"b1", b"b2"]);
     build_closed_segment(tmp.path(), &[b"c1", b"c2", b"c3", b"c4"]);
-    // The fresh open mints a fourth (newest, header-only) segment
-    // as the append target; the three above are all closed.
-
+    // `Wal::open` reopens the lexicographically-greatest existing
+    // segment (the third) as the append target; the two earlier
+    // ones are closed. Replay walks all three.
     let mut wal = Wal::open(default_config(tmp.path())).expect("open");
     let syncs_before = wal.metrics().syncs_total;
 

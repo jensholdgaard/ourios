@@ -33,15 +33,22 @@ superseded-by: —
 >   RFC 0010 (`ourios-querier`), and the §6.7 alias-index storage
 >   discharged by RFC 0005 §3.7 (#183/#184).
 >
-> **Not yet `validated`.** The ladder reserves `validated` for *every
-> thesis-gate the RFC's pillars touch passing on representative
-> corpora* (`benchmarks.md` §7). The template-mining pillar (#2)
-> touches **A1** (compression crossover) and **C1** (reconstruction
-> fidelity). C1 passes authoritatively (`1.000000`, `benchmarks.md`
-> §9). A1 is an authoritative **FAIL** with a hardware-/corpus-size
-> sensitivity open item (parked pending a > 1 GB corpus, per the
-> maintainer), so `validated` waits on A1 — it does **not** block
-> `green`, which is an acceptance-criteria gate, not a thesis gate.
+> **Path to `validated` (re-scoped by RFC 0011).** The ladder reserves
+> `validated` for *every thesis-gate the RFC's pillars touch passing on
+> representative corpora* (`benchmarks.md` §7). The template-mining
+> pillar's gates are now **C1** (reconstruction fidelity) and **C2**
+> (template-count convergence) — both **pass** on a representative
+> ≥ 1 M-line corpus (HDFS_v1: C1 `1.000000`, C2 a 40-template plateau at
+> 11.2 M lines with the formal gate applying — `benchmarks.md` §9.5).
+> **A1 (compression vs zstd) is demoted to a diagnostic, not a gate**
+> (RFC 0011): it fails on every corpus class including the
+> maximally-templated one, for structural reasons — template mining's
+> compression is logical/query-pruning (B1/B2), not on-disk bytes. So
+> `validated` is no longer blocked by A1; it awaits (1) RFC 0011's
+> acceptance and (2) an authoritative `baseline-8vcpu-32gib`
+> representative C1/C2 rerun (the local §9.5 verdicts are deterministic
+> and not expected to change). `green` was never blocked by A1 — it is
+> an acceptance-criteria gate, not a thesis gate.
 
 > **How to read this document.** §§1–4 are the design contract — the
 > *what* and the *why*. §5 lists the normative `Given / When / Then`

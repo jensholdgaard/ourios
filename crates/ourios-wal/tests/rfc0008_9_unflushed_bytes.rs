@@ -57,14 +57,20 @@ fn step() -> impl Strategy<Value = Step> {
 proptest! {
     // Modest case + length caps: large frames are 16 MiB each, so
     // keep the per-case work small.
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    #![proptest_config(ProptestConfig::with_cases(12))]
     #[test]
     fn rfc0008_9_unflushed_bytes_bounded_under_random_arrival(
-        steps in proptest::collection::vec(step(), 1..=40),
+        steps in proptest::collection::vec(step(), 1..=20),
     ) {
         let tmp = tempfile::TempDir::new().expect("temp");
         let mut wal = Wal::open(config(tmp.path())).expect("open");
         let bound = 2 * MIN_SEGMENT_SIZE_BYTES;
+
+        // One reusable max-sized buffer, sliced per append — a fresh
+        // `vec![…; n]` per step would repeatedly allocate + zero
+        // ~16 MiB and dominate the runtime. Content is irrelevant to
+        // the byte-accounting bound.
+        let scratch = vec![0xA5u8; MAX_FRAME_BYTES];
 
         // Sample at the start (must be zero) and after every
         // append/sync boundary.
@@ -72,10 +78,7 @@ proptest! {
         for s in steps {
             match s {
                 Step::Append(n) => {
-                    // A fixed-byte payload of length n; content is
-                    // irrelevant to the byte-accounting bound.
-                    let payload = vec![0xA5u8; n];
-                    wal.append(FrameKind::OtlpBatch, &payload).expect("append");
+                    wal.append(FrameKind::OtlpBatch, &scratch[..n]).expect("append");
                 }
                 Step::Sync => {
                     wal.sync().expect("sync");

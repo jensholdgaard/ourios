@@ -87,9 +87,9 @@ fn rfc0008_1_ack_only_after_sync_returns_ok() {
 
 /// Append-fault arm: an oversize payload faults the real `append`
 /// path (`AppendError::TooLarge`). The gate must suppress the ack
-/// — and `sync` is never even consulted for a batch whose append
-/// failed, so we pair the failed append with a `sync` we don't
-/// run.
+/// — a failed append is never even followed by a `sync`, so we
+/// pair it with an arbitrary `Ok` sync to prove the append failure
+/// alone is decisive.
 #[test]
 fn rfc0008_1_append_fault_suppresses_ack() {
     let tmp = tempfile::TempDir::new().expect("temp");
@@ -105,11 +105,14 @@ fn rfc0008_1_append_fault_suppresses_ack() {
         "oversize payload faults append: {appended:?}",
     );
 
-    // The append failed, so the batch never reaches `sync`. The
-    // gate's other half is irrelevant — pair the failed append
-    // with an arbitrary Ok sync to prove the append failure alone
-    // suppresses the ack.
-    let sync_ok: Result<WalOffset, SyncError> = wal.sync();
+    // The append failed, so the batch never reaches `sync` — pair
+    // it with an arbitrary `Ok` sync (no filesystem touch) to prove
+    // the append failure alone suppresses the ack, independent of
+    // any later WAL state.
+    let sync_ok: Result<WalOffset, SyncError> = Ok(WalOffset {
+        segment: uuid::Uuid::now_v7(),
+        byte: 0,
+    });
     if try_ack(&appended, &sync_ok) {
         ack_allowed.store(true, Ordering::SeqCst);
     }

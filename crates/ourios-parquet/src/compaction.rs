@@ -1070,6 +1070,66 @@ mod tests {
         );
     }
 
+    /// RFC0009.1 — compaction drives the H4 small-file **count** down. A
+    /// partition fragmented into more than `CompactionPolicy::min_files`
+    /// files (the over-fragmentation trigger) collapses to a single file,
+    /// dropping the per-tenant small-file count that H4's "fewer than 5 %
+    /// of files below 128 MiB" signal tracks. At unit scale the
+    /// consolidated file is itself small — the file-*size* distribution is
+    /// the §6 corpus test's job; this asserts the file-count lever and row
+    /// conservation across the collapse. The input count derives from the
+    /// policy so it can't drift out of sync with the default.
+    #[test]
+    fn rfc0009_1_many_small_files_collapse_to_one() {
+        let policy = CompactionPolicy::default();
+        // One past the over-fragmentation trigger. Every record uses the
+        // same in-hour timestamp, so all inputs belong to one partition
+        // regardless of how large `min_files` is — a per-record time step
+        // could otherwise spill past the hour and trip the RFC0009.5
+        // row-vs-path check for a reason unrelated to this test.
+        let n = policy.min_files + 1;
+        let bucket = tempfile::tempdir().expect("temp");
+        for i in 0..n {
+            let template_id = u64::try_from(i + 1).expect("small count");
+            write_file(bucket.path(), &[rec(template_id, TS0)]);
+        }
+        let dir = partition().data_path(bucket.path());
+        let before = live_files(&dir).expect("before");
+        assert_eq!(before.len(), n, "one small file per write");
+        assert!(before.len() > policy.min_files, "starts over-fragmented");
+
+        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        assert_eq!(outcome.files_before, n);
+        assert_eq!(
+            outcome.rows,
+            u64::try_from(n).expect("small count"),
+            "all rows carried",
+        );
+
+        let after = live_files(&dir).expect("after");
+        assert_eq!(after.len(), 1, "collapsed to a single live file");
+        assert!(
+            after.len() <= policy.min_files,
+            "no longer over-fragmented (H4 small-file count down)",
+        );
+        // H4 counts *physical* files (footer reads), so the inputs must
+        // actually be gone — not merely manifest-excluded orphans that
+        // `live_files` would hide. Assert both: the GC removed them and
+        // exactly one `.parquet` remains on disk.
+        assert_eq!(outcome.gc_failures, 0, "every superseded input removed");
+        let on_disk = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .map(|e| e.expect("read_dir entry"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+            .count();
+        assert_eq!(on_disk, 1, "exactly one physical .parquet file remains");
+        let rows = Reader::open_partition(&after[0], partition())
+            .expect("open")
+            .read_all()
+            .expect("read");
+        assert_eq!(rows.len(), n, "row conservation across the collapse");
+    }
+
     #[test]
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).

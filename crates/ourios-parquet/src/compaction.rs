@@ -959,14 +959,29 @@ mod tests {
             "post-commit reader sees the consolidated rows, ignoring orphans",
         );
         let gc = gc_orphans(&dir).expect("gc");
-        assert_eq!(gc, OrphanGc { reclaimed: 2, failures: 0 }, "two orphan inputs reclaimed");
-        assert_eq!(live_files(&dir).expect("live").len(), 1, "consolidated stays live");
+        assert_eq!(
+            gc,
+            OrphanGc {
+                reclaimed: 2,
+                failures: 0
+            },
+            "two orphan inputs reclaimed"
+        );
+        assert_eq!(
+            live_files(&dir).expect("live").len(),
+            1,
+            "consolidated stays live"
+        );
         assert_eq!(
             read_partition_rows(bucket.path()),
             originals,
             "GC left the live data exactly intact",
         );
-        assert_eq!(gc_orphans(&dir).expect("gc again"), OrphanGc::default(), "idempotent");
+        assert_eq!(
+            gc_orphans(&dir).expect("gc again"),
+            OrphanGc::default(),
+            "idempotent"
+        );
 
         // --- Arm B: crash BEFORE the commit swap ---
         // (manifest still names the inputs; the freshly written
@@ -992,9 +1007,24 @@ mod tests {
             "pre-commit reader sees only the inputs (consolidated invisible)",
         );
         let gc = gc_orphans(&dir).expect("gc");
-        assert_eq!(gc, OrphanGc { reclaimed: 1, failures: 0 }, "orphan consolidated reclaimed");
-        assert_eq!(live_files(&dir).expect("live").len(), inputs.len(), "inputs stay live");
-        assert_eq!(read_partition_rows(bucket.path()), originals, "inputs intact");
+        assert_eq!(
+            gc,
+            OrphanGc {
+                reclaimed: 1,
+                failures: 0
+            },
+            "orphan consolidated reclaimed"
+        );
+        assert_eq!(
+            live_files(&dir).expect("live").len(),
+            inputs.len(),
+            "inputs stay live"
+        );
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            originals,
+            "inputs intact"
+        );
 
         // --- Arm C: stray `.parquet.tmp` with NO manifest (glob live set) ---
         // Every `.parquet` is live (no manifest), so only the interrupted
@@ -1002,13 +1032,31 @@ mod tests {
         let bucket = tempfile::tempdir().expect("temp");
         write_file(bucket.path(), &[rec(9, TS0)]);
         let dir = partition().data_path(bucket.path());
-        std::fs::write(dir.join("0190abcd-dead-7eef-8aaa-000000000000.parquet.tmp"), b"torn")
-            .expect("stray tmp");
+        std::fs::write(
+            dir.join("0190abcd-dead-7eef-8aaa-000000000000.parquet.tmp"),
+            b"torn",
+        )
+        .expect("stray tmp");
         let before = read_partition_rows(bucket.path());
         let gc = gc_orphans(&dir).expect("gc");
-        assert_eq!(gc, OrphanGc { reclaimed: 1, failures: 0 }, "only the .tmp reclaimed");
-        assert_eq!(live_files(&dir).expect("live").len(), 1, "the live .parquet is untouched");
-        assert_eq!(read_partition_rows(bucket.path()), before, "glob data intact");
+        assert_eq!(
+            gc,
+            OrphanGc {
+                reclaimed: 1,
+                failures: 0
+            },
+            "only the .tmp reclaimed"
+        );
+        assert_eq!(
+            live_files(&dir).expect("live").len(),
+            1,
+            "the live .parquet is untouched"
+        );
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            before,
+            "glob data intact"
+        );
     }
 
     #[test]

@@ -1236,8 +1236,12 @@ mod tests {
         // row-vs-path check; it never merges rows across partition keys.
         let err = compact_partition(bucket.path(), &partition()).expect_err("must reject");
         assert!(
-            matches!(err, CompactionError::Read(_)),
-            "mis-partitioned input aborts via row-vs-path, got {err:?}",
+            matches!(
+                err,
+                CompactionError::Read(ReaderError::PartitionMismatch { .. })
+            ),
+            "aborts specifically on the §3.9 row-vs-path check, not some other \
+             read failure; got {err:?}",
         );
     }
 

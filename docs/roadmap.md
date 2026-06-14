@@ -77,105 +77,75 @@ goals, or post-MVP shipping concerns.
 
 ## 3. Current state (as of 2026-06-14)
 
-**RFC 0001 §5 scenarios green: 42 / 42 — RFC 0001 status: `accepted`**
-(2026-06-14, maintainer sign-off; reached `validated` the same day —
-every scenario has a live passing test, incl. the cross-crate criteria
-relocated to `ourios-querier`/`ourios-ingester`). `validated` rested on
-the C1/C2 thesis-gates passing on the representative LogHub HDFS_v1 corpus
-(≈ 1.47 GiB — above `benchmarks.md` §8's ≥ 1 GiB canonical floor; its
-11.2 M lines also clear C2's ≥ 1 M-line formal-gate threshold),
-authoritatively on the `benchmarks.md` §1 baseline hardware (§9.6); A1 is
-a diagnostic, not a gate (RFC 0011, also `accepted` 2026-06-14). See the
-RFC's status note. **RFC 0008 is `accepted`** too (all §5 arms .1–.10
-green; `validated` vacuous — no thesis gate).
-RFC 0005 §5 scenarios green: **10 / 11** (RFC0005.6 — the
-≥256 MiB row-group sizing scenario — defers until a corpus run
-exists; see `docs/rfcs/0005-parquet-storage.md` §6). RFC 0005
-status: still `drafted` in frontmatter; a follow-up maintainer
-sign-off bumps it to `green` once RFC0005.6 has a corpus
-fixture or is explicitly deferred via the §7 open-question on
-slow-test CI cadence.
+**The thesis is proven on representative corpora.** All four gating
+thesis-gates pass authoritatively on the `benchmarks.md` §1 baseline
+hardware (the §9.4 / §9.6 runs), so the MVP thesis-proving bar (§2) is met:
 
-What the code does today:
+| Gate | Result | Source |
+|---|---|---|
+| **B1** predicate-pushdown | **PASS** — 34.2× / 25.4× vs `zstdcat \| grep` at ~1 GB, exact row-count agreement | §9.4 |
+| **B2** template-exact | **PASS** — windowed latency flat across 0.57→1.04 GB; flat on HDFS_v1 (11.2 M rows, 1/14 row groups) | §9.4 |
+| **C1** reconstruction | **PASS** — `1.000000` on HDFS_v1 (11.2 M lines, authoritative) | §9.6 |
+| **C2** template convergence | **PASS** — 40-template plateau, sub-linear, formal gate applies | §9.6 |
 
-- **`ourios-core`** — `MinerConfig` + `TenantConfig` per-tenant
-  overrides (RFC 0004), `TenantId` newtype, `OtlpLogRecord` /
-  `AnyValue` (RFC 0001 §6.1 OTLP-aligned record shape),
-  `MinedRecord` with the full RFC 0001 §6.1 / RFC 0005 §3.2
-  column set (severity, scope, attributes, resource attributes,
-  trace / span / flags, event name, body kind + raw body,
-  params + separators, confidence, lossy flag), `AuditEvent` /
-  `AuditEventKind` / `ParamType` / `SlotExpansion` with the
-  `ParamType::Unknown(i32)` §3.9 catch-all, `audit::AuditSink`
-  trait + `InMemoryAuditSink` / `NoOpAuditSink` placeholders,
-  `confidence` / `clock` primitives.
-- **`ourios-miner`** —
-  - `tokenize` (Unicode-whitespace splitting, separators
-    captured and threaded through `reconstruct()`).
-  - `mask` — the private `MaskTag` enum carries the
-    mask-emitted subset (`Uuid`, `Ip`, `Num`); `ParamType` in
-    `ourios-core` carries the full RFC 0001 §6.1 alphabet
-    (including the reserved `Hex` / `Ts` / `Path` and the
-    non-mask-emitted `Str` / `Overflow`). `Str` is produced by
-    widening (§6.2 step 5b — slot type expansion); `Overflow`
-    is produced by the per-parameter byte-limit check (§6.5,
-    in `overflow`). `Hex` / `Ts` / `Path` are reserved with no
-    emitter yet.
-  - `sim_seq` + `confidence_ratio` + `Token` (RFC §3.2 / §6.3
-    primitives, driving best-candidate attach selection).
-  - `tree` — Drain prefix tree with descend + descend_mut.
-  - `MinerCluster` + `TenantState` — best-candidate attach via
-    `sim_seq`, widening with `TemplateWidened` audit, type
-    expansion with `TemplateTypeExpanded` audit, degenerate-
-    template guard with `TemplateWideningRejectedDegenerate`
-    audit, three-zone confidence branching (clean / lossy /
-    parse-failure), per-parameter byte-limit + OVERFLOW marker
-    + forced body retention.
-  - `reconstruct()` — bit-identical reconstruction from
-    template + params + separators when `lossy_flag = false`;
-    returns the retained body verbatim when `lossy_flag = true`.
-    The H7.1 corpus property test is green.
-- **`ourios-parquet`** — RFC 0005 §3 fully implemented:
-  - `data_schema()` / `audit_schema()` Arrow schemas pinned by
-    `tests/schema_pin.rs` (RFC0005.10).
-  - `Writer` — `Writer::open` → `append_records` → `close` with
-    atomic `<uuid>.parquet.tmp` + rename publish, `Drop` cleanup,
-    §3.5 row-group flush at 128 MiB, §3.6 per-column encoding
-    policy (dict + page index + `template_id` bloom filter), and
-    a `Poisoned` state on `ArrowWriter` write/flush errors that
-    refuses to publish.
-  - `Reader::open_partition` / `open_file` / `read_all` with the
-    §3.9 forward-/backward-compatibility contract (unknown
-    columns ignored, missing OPTIONAL → `None`, missing baseline
-    REQUIRED → hard error) and §3.4 row-vs-path validation
-    (tenant + UTC year/month/day/hour).
-  - `AuditWriter` / `AuditReader` for the §3.7 audit-event file
-    series, partitioned at `audit/tenant_id=…/year=…/month=…/
-    day=…/` (no hour segment per §3.4), with the same atomic
-    publish + poisoning contract as the data writer.
-  - `PartitionKey::derive` + `data_path` / `audit_path` with
-    percent-encoded tenant IDs.
-- **Crates not yet on disk.** `ourios-wal`, `ourios-ingester`,
-  `ourios-querier`, `ourios-server`, `ourios-bench` are listed
-  in the workspace `Cargo.toml` as comments. Per §5 the WAL,
-  ingester, server, and full snapshot mechanism are deferred
-  post-MVP; the querier and bench are the Phase 3 work.
+**A1** (compression vs zstd) *fails*, but RFC 0011 (`accepted`)
+reclassified it a recorded **diagnostic**, not a gate: the failure is
+structural and template mining's value is logical / query-pruning,
+captured by B1/B2 (see `benchmarks.md` §2 / §7).
 
-What's specifically remaining for the thesis gates (B1, B2, C1, C2 — A1
-is a recorded diagnostic per RFC 0011, not a gate):
+**RFC ladder status:**
 
-| Gate | Blocker(s) |
-|---|---|
-| **B1** | `ourios-querier` (DataFusion table provider over the Parquet partition layout); predicate-pushdown wiring against `time_unix_nano` / `tenant_id`. Reader already enforces row-vs-path validation. |
-| **B2** | Same as B1 plus `template_id` as a queryable column (the column is in the schema and is the §3.6 bloom-filter target — the wiring is what's missing). |
-| **C1** | Bench harness that exercises the H7.1 reconstruction property on a corpus end-to-end (the unit-level property test is green; the gate measures it at corpus scale). |
-| **C2** | Bench harness that measures template-count convergence over a representative corpus — algorithm primitives are in place (widening + type expansion + degenerate guard); the measurement is the missing piece. |
+| RFC | Area | Status |
+|---|---|---|
+| 0001 | Template miner | **`accepted`** |
+| 0002 | Query DSL | `green` |
+| 0003 | OTLP receiver (gRPC + HTTP) | `green` |
+| 0004 | Configuration policy | `green` |
+| 0005 | Parquet storage | `drafted` — 10/11 §5 (RFC0005.6 row-group sizing deferred to a corpus run; a maintainer sign-off bumps it to `green`) |
+| 0006 | Bench harness | `green` |
+| 0007 | Querier (DataFusion + logs DSL) | **`validated`** |
+| 0008 | WAL | **`accepted`** |
+| 0009 | Background compaction | `specified` — gated on the §3.4 atomic-publish manifest fork |
+| 0010 | Audit-stream / drift queries | `specified` — the `drift` surface is implemented; general audit aggregation deferred |
+| 0011 | A1 re-scope | **`accepted`** |
 
-For `cargo test --all-features`'s outer-loop view: **225 passed
-/ 18 ignored**. The 17 ignored test stubs (plus one doctest)
-map to RFC 0001 §5 scenarios whose dependencies (`§6.8`
-metrics surface, `§6.9` snapshot mechanism, RFC 0002 drift
-query) are post-Phase-1 or post-MVP work.
+**Crates — all ten product crates are implemented** (`ourios-core`,
+`-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`, `-server`,
+`-bench`, `-semconv`, `-telemetry`):
+
+- **`ourios-miner`** — the Drain-derived miner, RFC 0001 `accepted`:
+  `(severity, scope)` keying, three-zone confidence, widening +
+  type-expansion with audit events, 256 B param-overflow spill,
+  bit-identical reconstruction + the H7.3 render contract, structured-body
+  canonical encoding, and §6.9 snapshot + v2 restore. Zero
+  `#[ignore]`/`todo!()` acceptance stubs.
+- **`ourios-wal`** — RFC 0008 `accepted`: append/sync, crash recovery (the
+  real-SIGKILL CI gate), snapshot-restore, segment rotation, group-commit
+  batched fsync, checkpoint-driven truncation; §5 arms .1–.10 green.
+- **`ourios-parquet`** — RFC 0005 §3: atomic-publish writer + reader with
+  the §3.9 compat contract, the §3.7 audit-event series, and the §3.6
+  encoding policy (dict + page index + `template_id` bloom filter).
+- **`ourios-ingester`** — RFC 0003 `green`: the OTLP gRPC + HTTP receiver
+  with WAL-before-ack, per-`ResourceLogs` tenant derivation, the windowed
+  group-commit coordinator, and the startup recovery driver; also hosts
+  the RFC 0009 compaction runner.
+- **`ourios-querier`** — RFC 0007 `validated` / RFC 0002 `green`: the logs
+  DSL over DataFusion with predicate + partition (time-window) pruning,
+  alias resolution, and the RFC 0010 drift query.
+- **`ourios-bench`** — RFC 0006 `green`: drives the A1/B1/B2/C1/C2
+  measurements over OTLP-Demo + LogHub corpora and records results to
+  `benchmarks.md` §9.
+- **`ourios-core`** / **`-semconv`** / **`-telemetry`** / **`-server`** —
+  shared types + tenancy + record/audit shapes; the weaver-generated OTel
+  name constants; the OTel metrics/export surface; the two-role binary.
+
+The full `cargo test --all-features` suite is green in CI (the `cargo
+test` + coverage jobs gate every PR on the exact head).
+
+**What remains** is post-MVP shipping shape (§5 — Helm chart, the
+production deployment surface) plus the open RFCs above: RFC 0005 →
+`green`, RFC 0009 compaction (the manifest fork), and the items tracked
+in the RFCs' §9 open-questions.
 
 ---
 

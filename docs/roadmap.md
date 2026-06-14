@@ -139,8 +139,9 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
   shared types + tenancy + record/audit shapes; the weaver-generated OTel
   name constants; the OTel metrics/export surface; the two-role binary.
 
-The full `cargo test --all-features` suite is green in CI (the `cargo
-test` + coverage jobs gate every PR on the exact head).
+The full `cargo test --all-features` suite is green in CI — the `cargo
+test` job gates every PR on the exact head; the coverage job runs
+alongside it but is informational (`continue-on-error`), not gating.
 
 **What remains** is post-MVP shipping shape (§5 — Helm chart, the
 production deployment surface) plus the open RFCs above: RFC 0005 →

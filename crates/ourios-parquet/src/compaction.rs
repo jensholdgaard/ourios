@@ -1182,6 +1182,20 @@ mod tests {
         // Output carries the full (union) schema and reads without error.
         let live = live_files(&dir).expect("live");
         assert_eq!(live.len(), 1, "consolidated to one file");
+        // Assert the union directly: the consolidated Parquet schema
+        // carries the amended column file B lacked (not B's reduced one).
+        let out = std::fs::File::open(&live[0]).expect("open output");
+        let out_schema =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(out)
+                .expect("output reader builder")
+                .schema()
+                .clone();
+        assert!(
+            out_schema
+                .index_of(crate::columns::EFFECTIVE_TIME_UNIX_NANO)
+                .is_ok(),
+            "consolidated output carries the union (amended) schema",
+        );
         let rows = Reader::open_partition(&live[0], partition())
             .expect("open union output")
             .read_all()

@@ -410,5 +410,6 @@ mode (informal `meta:` RFC waiver per maintainer discussion of the same
 date; precedent: b50067d). 2026-06-14 revision rewords §2 pillar #2 so the
 50–200× reads as a **logical** reduction (query pruning, benchmark gates
 B1/B2) rather than an on-disk-bytes-beat-the-codec claim, per **RFC 0012**
-(maintainer-approved `meta:` RFC) propagating RFC 0011's A1 demotion. This document is load-bearing; further changes require a `meta:`
-RFC and majority maintainer approval.*
+(maintainer-approved `meta:` RFC) propagating RFC 0011's A1 demotion.
+This document is load-bearing; further changes require a `meta:` RFC and
+majority maintainer approval.*

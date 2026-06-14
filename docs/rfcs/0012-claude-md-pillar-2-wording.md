@@ -36,8 +36,8 @@ line becomes one row keyed by a small, stable `template_id`), and its
 *value* is realised as **query pruning** — the benchmark gates B1/B2 — not
 as fewer on-disk bytes than a codec. This RFC amends pillar #2 to say so,
 so the project's canonical thesis statement matches its measured reality,
-and reconciles the coupled echoes of the same framing elsewhere in the
-docs (`benchmarks.md` §2 and RFC 0001's summary).
+and reconciles the coupled echoes of the same framing elsewhere
+(`benchmarks.md` §2, `README.md`, and RFC 0001's summary).
 
 ## 2. Motivation
 
@@ -80,7 +80,8 @@ forecloses that.
 
 ### 3.1 The CLAUDE.md §2 pillar-#2 change
 
-Replace the current pillar #2 (`CLAUDE.md` lines 53–56):
+Replace the current pillar #2 (`CLAUDE.md` §2, the "Drain-derived online
+template mining" item):
 
 > 2. **Drain-derived online template mining.** Log lines collapse to
 >    `(template_id, params)` at ingest time. This is where the 50–200×
@@ -106,26 +107,36 @@ preserved verbatim — it is load-bearing in its own right and unaffected.
 
 ### 3.2 The coupled documentation reconciliations
 
-The same on-disk/byte-level framing echoes in two other places; both are
-reconciled in the same enactment so the docs stay consistent (neither is
-load-bearing in the `CLAUDE.md` sense, so both ride normal doc PRs):
+The same on-disk/byte-level framing echoes in three other docs; all are
+reconciled in the same enactment so the docs stay consistent (none is
+load-bearing in the `CLAUDE.md` sense, so they ride normal doc PRs). The
+authoritative list is whatever the RFC0012.2 framing-grep (§5) surfaces —
+as of drafting, the phrase "before any byte-level codec" / "over a
+competent byte codec" appears in exactly these (plus RFC 0011 and this RFC,
+which quote it to describe the change):
 
-1. **`benchmarks.md` §2** — the A1 "Why this bar" bullet (lines 124–126)
-   paraphrases the pillar as *the project's headline claim (§2, CLAUDE.md)
-   is "50–200× over raw, ≥ 5× over a competent byte codec."* That
-   paraphrase (a) attaches a "≥ 5× over a competent byte codec" multiplier
-   the pillar never literally stated and (b) is the byte-vs-codec framing
-   RFC 0011 demoted. Reword it to the logical-reduction / diagnostic
-   framing.
-2. **`docs/rfcs/0001-template-miner.md` §1** — its summary states *"The
-   compression target is 50–200× over raw bytes before any byte-level
-   codec runs."* Same byte-level framing. RFC 0001 is `accepted`, but this
-   is a **factual** thesis-statement correction (not a change to its design
-   or §5 acceptance criteria), so reconcile it to the logical-reduction
-   framing with a one-line note pointing at RFC 0011. (If the maintainer
-   prefers to leave an accepted RFC's prose untouched, the alternative is a
-   dated editorial note rather than a reword — maintainer's call at
-   enactment.)
+1. **`benchmarks.md` §2** — the A1 "Why this bar" bullet paraphrases the
+   pillar as *the project's headline claim (§2, CLAUDE.md) is "50–200× over
+   raw, ≥ 5× over a competent byte codec."* That paraphrase (a) attaches a
+   "≥ 5× over a competent byte codec" multiplier the pillar never literally
+   stated and (b) is the byte-vs-codec framing RFC 0011 demoted. Reword to
+   the logical-reduction / diagnostic framing.
+2. **`README.md`** — the "Drain-derived online template miner" bullet says
+   lines collapse to `(template_id, params)` *"before any byte-level codec
+   runs."* Same fix: it is the logical reduction, before the codec in the
+   *pipeline* but not a bytes-vs-codec claim.
+3. **`docs/rfcs/0001-template-miner.md` §1** — its summary states *"The
+   compression target is 50–200× over raw bytes before any byte-level codec
+   runs."* Same framing. RFC 0001 is `accepted`, but this is a **factual**
+   thesis-statement correction (not a change to its design or §5 acceptance
+   criteria), so reconcile it to the logical-reduction framing with a
+   one-line note pointing at RFC 0011. (If the maintainer prefers to leave
+   an accepted RFC's prose untouched, the alternative is a dated editorial
+   note rather than a reword — maintainer's call at enactment.)
+
+Only the **framing** is reconciled; bare mentions of the *50–200×*
+**figure** as a logical reduction (e.g. `docs/roadmap.md`, other RFCs) are
+correct and are left alone.
 
 ### 3.3 What does **not** change
 
@@ -167,17 +178,20 @@ load-bearing in the `CLAUDE.md` sense, so both ride normal doc PRs):
 >   verbatim
 
 > **Scenario RFC0012.2 — no on-disk-bytes framing of the 50–200× remains.**
-> - **Given** `CLAUDE.md`, `docs/benchmarks.md`, and
->   `docs/rfcs/0001-template-miner.md`
+> - **Given** the repo docs (`CLAUDE.md`, `README.md`, `docs/benchmarks.md`,
+>   `docs/rfcs/0001-template-miner.md`)
 > - **When** this RFC is enacted
 > - **Then** no passage frames template mining's 50–200× as **on-disk
 >   bytes** beaten "before any byte-level codec runs" or as "≥ N× over a
->   byte codec" — both coupled echoes (`benchmarks.md` §2's A1 "Why this
->   bar" bullet and RFC 0001 §1's summary) are reconciled per §3.2
-> - **And** a repo-wide grep for `50.200` / `byte.level codec` /
->   `competent byte codec` returns only logical-reduction / diagnostic
->   framings (excepting RFC 0011 / this RFC, which quote the old wording
->   to describe the change)
+>   byte codec" — all coupled echoes (§3.2: `benchmarks.md` §2, `README.md`,
+>   RFC 0001 §1) are reconciled
+> - **And** a repo-wide grep for the **framing phrases** —
+>   `before any byte-level codec` and `over a competent byte codec` —
+>   returns only RFC 0011 / this RFC (which quote the old wording to
+>   describe the change). The check is on the *framing*, **not** the bare
+>   `50.200` figure: mentions of the *50–200× figure* as a logical
+>   reduction (e.g. `docs/roadmap.md`, `docs/rfcs/0005-parquet-storage.md`)
+>   are correct and expected to remain.
 
 > **Scenario RFC0012.3 — consistency with the accepted A1 re-scope.**
 > - **Given** RFC 0011 (`accepted`), `benchmarks.md` §7's gate table

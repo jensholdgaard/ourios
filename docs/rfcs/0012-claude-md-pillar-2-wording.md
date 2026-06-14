@@ -178,7 +178,8 @@ here so the enactment is complete and the two documents stay consistent.
 
 There is no code test: this RFC changes prose in two living documents. The
 acceptance criteria (§5) are **doc-state assertions**, verified by review +
-the §5.2 grep, exactly as RFC 0011's RFC0011.1–.3 were. Two notes:
+the grep in Scenario RFC0012.2, exactly as RFC 0011's RFC0011.1–.3 were.
+Two notes:
 
 - Unlike new OTel names (semconv `weaver registry generate` no-diff CI) or
   RFC acceptance scenarios (greppable test ids), `CLAUDE.md` carries **no

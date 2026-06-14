@@ -13,27 +13,37 @@ that would falsify it.
 
 The thresholds were pinned before any number was measured; if we miss
 them on representative corpora, the thesis is wrong and a pillar
-changes. As of **2026-06-12** the gates have authoritative numbers on
-the §1 hardware baseline (§9.4): **B1, B2, C1, C2 pass; A1 fails** and
-is the open gate.
+changes. As of **2026-06-14** the four gating thesis-gates **B1, B2, C1,
+C2 all pass** on the §1 hardware baseline (§9.4/§9.6). **A1 fails but no
+longer gates** — RFC 0011 (`accepted`) reclassified the
+compression-vs-zstd ratio as a recorded diagnostic (its failure is
+structural; see §2 / the §7 table).
 
 ## 0. How to read this document
 
 Every goal below carries two labels.
 
-- **Scope** — `thesis-gate` or `tuning-goal`.
+- **Scope** — `thesis-gate`, `tuning-goal`, or `diagnostic`.
   - A `thesis-gate` failing on representative corpora means a pillar
     (`CLAUDE.md` §2) is wrong. The response is an RFC, not a sprint.
   - A `tuning-goal` failing means the design is sound but the
     implementation needs work. The response is a PR.
-- **Bar** — `must-win`, `should-win`, or `stretch`.
+  - A `diagnostic` is measured and recorded but gates nothing — it
+    characterises a property or guards against regression. A1 was
+    reclassified here by RFC 0011 (`accepted`); see §2.
+- **Bar** — `must-win`, `should-win`, `stretch`, or `informational`.
   - `must-win` — shipping without it is shipping a broken claim.
   - `should-win` — expected on representative corpora; explained when
     missed.
   - `stretch` — aspirational; missing is not a bug.
+  - `informational` — a `diagnostic`'s bar: the number is recorded for
+    insight, never blocks.
 
 A goal with scope `thesis-gate` and bar `must-win` is load-bearing for
-the whole project. There are five of those below, marked `[THESIS]`.
+the whole project. **Four** of those below are gating — B1, B2, C1, C2,
+each marked `[THESIS]`. A1 keeps the `[THESIS]` tag (a thesis-relevant
+measurement) but RFC 0011 (`accepted`) set its **scope to `diagnostic`**:
+it is recorded, not gating (see its section below and the §7 table).
 
 ## 1. Corpora and methodology
 
@@ -93,8 +103,16 @@ codecs run.
 
 ### A1 `[THESIS]` — End-to-end compression ratio vs. zstd-alone
 
-- **Scope**: thesis-gate.
-- **Bar**: must-win.
+> **Demoted to a diagnostic (RFC 0011, `accepted`).** A1 is refuted on
+> every corpus class — including the maximally-templated one — for
+> structural reasons, so it no longer gates any RFC's `validated`. It is
+> still measured and recorded (§7 table / §9 series) as the columnar
+> queryability premium and a codec-regression guard. The scope, bar,
+> target, and falsifier below are retained as the diagnostic's reference
+> line — now **informational**, not gating.
+
+- **Scope**: diagnostic (RFC 0011; originally `thesis-gate`).
+- **Bar**: informational (RFC 0011; originally `must-win`).
 - **Metric**: `bytes(raw_corpus) / bytes(ourios_parquet_directory)`
   compared to `bytes(raw_corpus) / bytes(zstd_compressed_corpus)`.
 - **Target**: Ourios ratio ≥ **3×** the zstd-alone ratio, on every
@@ -394,10 +412,12 @@ every gate measured on the §1 hardware (`baseline-8vcpu-32gib`),
 recorded per the maintainer's 2026-06-12 authorization. B1, B2,
 C1, and C2 **pass authoritatively**; on that basis RFC 0007
 flipped to `validated` (its gates, per `docs/verification.md` §3,
-are the querier-pillar ones — B1/B2). **A1 fails authoritatively**
-and is the open thesis gate; it gates the compression pillar
-(RFC 0006's remit), not RFC 0007, and carries a new
-hardware-sensitivity caveat (§9.4).
+are the querier-pillar ones — B1/B2). **A1 fails authoritatively** and
+carries a hardware-sensitivity caveat (§9.4). *(A1 was subsequently
+reclassified a recorded **diagnostic**, not a gate — RFC 0011,
+`accepted` 2026-06-14. The A1 readings throughout §9 are diagnostic; A1
+gates nothing, and the "open gate" / "must-win" framing in the dated
+entries below is superseded.)*
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant

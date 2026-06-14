@@ -1082,13 +1082,16 @@ mod tests {
     #[test]
     fn rfc0009_1_many_small_files_collapse_to_one() {
         let policy = CompactionPolicy::default();
-        // One past the over-fragmentation trigger; each file is a single
-        // tiny record, far below the small-file threshold.
+        // One past the over-fragmentation trigger. Every record uses the
+        // same in-hour timestamp, so all inputs belong to one partition
+        // regardless of how large `min_files` is — a per-record time step
+        // could otherwise spill past the hour and trip the RFC0009.5
+        // row-vs-path check for a reason unrelated to this test.
         let n = policy.min_files + 1;
         let bucket = tempfile::tempdir().expect("temp");
         for i in 0..n {
-            let i = u64::try_from(i).expect("small count");
-            write_file(bucket.path(), &[rec(i + 1, TS0 + i * 1_000_000)]);
+            let template_id = u64::try_from(i + 1).expect("small count");
+            write_file(bucket.path(), &[rec(template_id, TS0)]);
         }
         let dir = partition().data_path(bucket.path());
         let before = live_files(&dir).expect("before");

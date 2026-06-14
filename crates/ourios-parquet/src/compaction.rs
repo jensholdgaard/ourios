@@ -283,6 +283,98 @@ pub fn compact_partition(
     })
 }
 
+/// Outcome of a [`gc_orphans`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OrphanGc {
+    /// Orphan files unlinked this pass.
+    pub reclaimed: u64,
+    /// Orphans whose unlink failed (left for a later pass, not an error).
+    pub failures: u64,
+}
+
+/// Reclaim a partition's **orphan** files — those a compaction left when
+/// it crashed before its in-process GC finished (RFC0009.4). The commit
+/// point is the atomic manifest swap (§3.4), so a crash always freezes a
+/// partition at a clean generation; what it can leave behind is dead
+/// files the manifest does not name. When a `manifest.json` is present it
+/// is authoritative (RFC0009.3): every `*.parquet` on disk **not** named
+/// by it is provably dead — a pre-commit consolidated file, or a
+/// superseded input the post-commit GC never reached — and any
+/// `*.parquet.tmp` is an interrupted [`Writer`] publish. Both are safe to
+/// unlink. With **no** manifest the glob is the live set, so no
+/// `*.parquet` is an orphan and only stray `*.parquet.tmp` are reclaimed.
+///
+/// Idempotent, never touches a live file, and safe to run on any sealed
+/// partition at any time — so orphans left by a crash are *reclaimable*
+/// (RFC0009.4) on the next sweep.
+///
+/// # Errors
+///
+/// [`CompactionError::Manifest`] if the partition's `manifest.json` can't
+/// be read, or [`CompactionError::Io`] if the directory scan itself
+/// fails. A failed unlink of an individual orphan is counted in
+/// [`OrphanGc::failures`], not surfaced — an orphan that outlives one
+/// pass is reclaimed by the next.
+pub fn gc_orphans(partition_dir: &Path) -> Result<OrphanGc, CompactionError> {
+    let live: Option<std::collections::HashSet<String>> = Manifest::read(partition_dir)
+        .map_err(CompactionError::Manifest)?
+        .map(|m| m.files.into_iter().collect());
+    let entries = match std::fs::read_dir(partition_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OrphanGc::default()),
+        Err(source) => {
+            return Err(CompactionError::Io {
+                op: "read_dir",
+                path: partition_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut gc = OrphanGc::default();
+    for entry in entries {
+        let entry = entry.map_err(|source| CompactionError::Io {
+            op: "read_dir entry",
+            path: partition_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let is_file = entry
+            .file_type()
+            .map_err(|source| CompactionError::Io {
+                op: "file_type",
+                path: path.clone(),
+                source,
+            })?
+            .is_file();
+        if !is_file {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // `.parquet.tmp` is always a dead interrupted publish. A
+        // `.parquet` is an orphan only when a manifest names a set that
+        // excludes it (no manifest ⇒ glob ⇒ every `.parquet` is live).
+        // Anything else (`manifest.json`, a future sidecar) is not ours.
+        let orphan = if name.ends_with(".parquet.tmp") {
+            true
+        } else if name.ends_with(".parquet") {
+            live.as_ref().is_some_and(|l| !l.contains(name))
+        } else {
+            false
+        };
+        if orphan {
+            match std::fs::remove_file(&path) {
+                Ok(()) => gc.reclaimed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => gc.failures += 1,
+            }
+        }
+    }
+    Ok(gc)
+}
+
 /// On-disk size of `path` in bytes, best-effort: a `stat` failure
 /// yields `0`. Used only for `ourios.compaction.io` /
 /// `ourios.storage.parquet.file.size` volume — a metric inaccuracy on
@@ -827,6 +919,154 @@ mod tests {
         assert_eq!(
             post, originals,
             "post-commit reader sees the consolidated rows"
+        );
+    }
+
+    /// RFC0009.4 — crash safety (shared note). The only commit point is
+    /// the atomic manifest swap, so a crash always freezes the partition
+    /// at a clean generation (the no-torn-read half is `atomic_publish_…`
+    /// above). These three tests assert the other half: the dead files a
+    /// crash leaves are *reclaimable* by `gc_orphans`, which never removes
+    /// a live file. Each builds the exact on-disk state a `SIGKILL` at
+    /// that point would leave — faithful because the commit is a single
+    /// `rename`.
+    ///
+    /// Crash AFTER the commit swap, before input GC: the manifest names
+    /// the consolidated file; the superseded inputs are still on disk (the
+    /// post-commit generation with orphans).
+    #[test]
+    fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
+        let bucket = tempfile::tempdir().expect("temp");
+        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
+        let dir = partition().data_path(bucket.path());
+        let originals = read_partition_rows(bucket.path());
+        let mut w = Writer::open(bucket.path(), partition()).expect("writer");
+        w.append_records(&originals).expect("append");
+        let consolidated = w.close().expect("close");
+        let consolidated_name = consolidated
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 name")
+            .to_string();
+        Manifest {
+            generation: 2,
+            files: vec![consolidated_name],
+        }
+        .write_atomic(&dir)
+        .expect("commit manifest");
+        // Reader is already at the clean post generation despite orphans.
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            originals,
+            "post-commit reader sees the consolidated rows, ignoring orphans",
+        );
+        let gc = gc_orphans(&dir).expect("gc");
+        assert_eq!(
+            gc,
+            OrphanGc {
+                reclaimed: 2,
+                failures: 0
+            },
+            "two orphan inputs reclaimed"
+        );
+        assert_eq!(
+            live_files(&dir).expect("live").len(),
+            1,
+            "consolidated stays live"
+        );
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            originals,
+            "GC left the live data exactly intact",
+        );
+        assert_eq!(
+            gc_orphans(&dir).expect("gc again"),
+            OrphanGc::default(),
+            "idempotent"
+        );
+    }
+
+    /// RFC0009.4 — crash BEFORE the commit swap: the manifest still names
+    /// the inputs; the freshly written consolidated file is a dead orphan
+    /// (the pre-commit generation). See the post-commit test for the
+    /// shared crash-safety note.
+    #[test]
+    fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
+        let bucket = tempfile::tempdir().expect("temp");
+        write_file(bucket.path(), &[rec(7, TS0), rec(7, TS0 + 1_000_000)]);
+        write_file(bucket.path(), &[rec(8, TS0 + 2_000_000)]);
+        let dir = partition().data_path(bucket.path());
+        let inputs = live_files(&dir).expect("inputs");
+        let originals = read_partition_rows(bucket.path());
+        Manifest {
+            generation: 1,
+            files: file_names(&inputs).expect("names"),
+        }
+        .write_atomic(&dir)
+        .expect("bootstrap manifest");
+        let mut w = Writer::open(bucket.path(), partition()).expect("writer");
+        w.append_records(&originals).expect("append");
+        w.close().expect("close"); // consolidated on disk, NOT in manifest
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            originals,
+            "pre-commit reader sees only the inputs (consolidated invisible)",
+        );
+        let gc = gc_orphans(&dir).expect("gc");
+        assert_eq!(
+            gc,
+            OrphanGc {
+                reclaimed: 1,
+                failures: 0
+            },
+            "orphan consolidated reclaimed"
+        );
+        assert_eq!(
+            live_files(&dir).expect("live").len(),
+            inputs.len(),
+            "inputs stay live"
+        );
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            originals,
+            "inputs intact"
+        );
+    }
+
+    /// RFC0009.4 — a stray `*.parquet.tmp` with NO manifest (glob live
+    /// set): every `.parquet` is live, so only the interrupted `.tmp`
+    /// publish is reclaimed. See the post-commit test for the shared note.
+    #[test]
+    fn rfc0009_4_stray_tmp_reclaimed_under_glob_fallback() {
+        let bucket = tempfile::tempdir().expect("temp");
+        write_file(bucket.path(), &[rec(9, TS0)]);
+        let dir = partition().data_path(bucket.path());
+        std::fs::write(
+            dir.join("0190abcd-dead-7eef-8aaa-000000000000.parquet.tmp"),
+            b"torn",
+        )
+        .expect("stray tmp");
+        let before = read_partition_rows(bucket.path());
+        let gc = gc_orphans(&dir).expect("gc");
+        assert_eq!(
+            gc,
+            OrphanGc {
+                reclaimed: 1,
+                failures: 0
+            },
+            "only the .tmp reclaimed"
+        );
+        assert_eq!(
+            live_files(&dir).expect("live").len(),
+            1,
+            "the live .parquet is untouched"
+        );
+        assert_eq!(
+            read_partition_rows(bucket.path()),
+            before,
+            "glob data intact"
         );
     }
 

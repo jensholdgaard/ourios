@@ -41,8 +41,8 @@ pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile};
 pub use compaction::{
-    Committed, CompactionError, CompactionOutcome, CompactionPolicy, compact_partition,
-    plan_candidates,
+    Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, compact_partition,
+    gc_orphans, plan_candidates,
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError};
 pub use partition::{

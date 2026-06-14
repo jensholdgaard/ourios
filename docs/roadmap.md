@@ -3,8 +3,8 @@
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
 > Last updated: **2026-06-14** — RFC 0001 advanced to `validated` on the
-> maturity ladder (C1/C2 pass authoritatively on §1 baseline hardware,
-> `benchmarks.md` §9.6; A1 is diagnostic per RFC 0011). RFC 0008 is
+> maturity ladder (C1/C2 pass authoritatively on the `benchmarks.md` §1
+> baseline hardware, §9.6; A1 is diagnostic per RFC 0011). RFC 0008 is
 > `green`. The §§4+ phase narrative below predates this and is not
 > re-verified here
 > (PR #41 RFC 0005, then PR-D through PR-G landed
@@ -70,9 +70,10 @@ goals, or post-MVP shipping concerns.
 (2026-06-14; every scenario has a live passing test, incl. the
 cross-crate criteria relocated to `ourios-querier`/`ourios-ingester`).
 `validated` reached: the C1/C2 thesis-gates pass on the representative
-LogHub HDFS_v1 corpus (≈ 1.47 GiB — above §8's ≥ 1 GiB canonical floor;
-its 11.2 M lines also clear C2's ≥ 1 M-line formal-gate threshold),
-authoritatively on the §1 baseline hardware (`benchmarks.md` §9.6); A1 is
+LogHub HDFS_v1 corpus (≈ 1.47 GiB — above `benchmarks.md` §8's ≥ 1 GiB
+canonical floor; its 11.2 M lines also clear C2's ≥ 1 M-line formal-gate
+threshold), authoritatively on the `benchmarks.md` §1 baseline hardware
+(§9.6); A1 is
 a diagnostic, not a gate (RFC 0011). See
 the RFC's status note. RFC 0008 is likewise `green` (all §5 arms .1–.10).
 RFC 0005 §5 scenarios green: **10 / 11** (RFC0005.6 — the

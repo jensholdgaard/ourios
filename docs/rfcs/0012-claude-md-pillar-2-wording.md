@@ -230,13 +230,13 @@ Two notes:
 
 - [ ] **Maintainer approval (majority).** `CLAUDE.md`'s footer requires it
       for any change; this RFC cannot be enacted without it.
-- [ ] **Does `CLAUDE.md` §1's thesis sentence want a parallel touch?** It
-      reads "collapses … the compression layer … into one stack." That is
-      defensible as written (the *stack* unifies layers; Parquet/zstd is
-      the byte-compression layer, template mining the logical one), so this
-      RFC leaves it alone — but if the maintainer reads "the compression
-      layer" as implying template mining *is* the compressor, a one-clause
-      clarification there is in scope for the same enactment.
+- [x] **Does `CLAUDE.md` §1's thesis sentence want a parallel touch?**
+      **Resolved 2026-06-14 — yes (maintainer).** Both the §1 thesis
+      sentence and `README.md`'s parallel one now carry a one-clause
+      clarification that the "compression" collapsed is Parquet's byte
+      codec plus the miner's *logical* reduction (query pruning), not
+      bytes that beat a codec. The load-bearing sentence itself is kept;
+      only the clarifying clause was added.
 - [ ] **Footer changelog line.** `CLAUDE.md`'s footer records each meta
       change with its commit range and rationale; the enacting PR should
       add the 2026-06-14 line (and bump "Last updated") in the same diff.

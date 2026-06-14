@@ -29,9 +29,11 @@ parts:
 
 The thesis: this combination collapses the inverted index, the compression
 layer, the storage tier, and the query engine into roughly 15–20k lines of
-Rust plus thin glue. The novel work is gluing the parts together honestly
-and handling the failure modes of template mining rather than pretending
-they don't exist.
+Rust plus thin glue. (Compression here is Parquet's byte codec plus the
+miner's *logical* template reduction — the query-pruning win noted above,
+not bytes that beat a codec.) The novel work is gluing the parts together
+honestly and handling the failure modes of template mining rather than
+pretending they don't exist.
 
 ---
 

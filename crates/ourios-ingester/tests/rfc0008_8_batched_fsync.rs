@@ -9,8 +9,8 @@
 //!
 //! Three arms over the live [`CommitCoordinator`] backed by a real `Wal`
 //! in a tempdir:
-//! - **P99 ack latency tracks the batch window** across three settings,
-//!   and clearly *scales* with the window (the robust ordering check);
+//! - **ack latency tracks the batch window** across three settings,
+//!   measured exactly under a paused virtual clock;
 //! - **syncs advance per-batch, not per-record** (`appends_per_sync ≫ 1`);
 //! - the **§3.4 gate**: a `commit` returns `Ok` only after a `sync` that
 //!   covered its frame returned `Ok` (proven via a spy sink that records
@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ourios_ingester::receiver::commit::CommitCoordinator;
 use ourios_ingester::receiver::{Journal, ReceiveError};
@@ -45,32 +45,42 @@ fn real_coordinator(root: &Path, window_ms: u64) -> Arc<CommitCoordinator> {
     CommitCoordinator::new(Box::new(wal), Duration::from_millis(window_ms), u64::MAX)
 }
 
-/// The p99 of `samples` (nearest-rank), in milliseconds.
-fn p99_ms(mut samples: Vec<Duration>) -> f64 {
-    assert!(!samples.is_empty());
-    samples.sort_unstable();
-    // Nearest-rank: ⌈0.99·n⌉, integer-only so there's no float-cast
-    // truncation. (n·99 fits a usize for any realistic sample count.)
-    let rank = samples.len().saturating_mul(99).div_ceil(100);
-    let idx = rank.saturating_sub(1).min(samples.len() - 1);
-    samples[idx].as_secs_f64() * 1_000.0
-}
+/// Scenario RFC0008.8 — ack latency tracks the configured batch window.
+/// See `docs/rfcs/0008-wal.md` §5.
+///
+/// Driven under a **paused virtual clock** (`start_paused`): tokio
+/// auto-advances time to the next pending timer whenever the runtime is
+/// otherwise idle, so the only time that elapses is the coordinator's own
+/// `tokio::time::sleep(window)`. The real fsync (offloaded to
+/// `spawn_blocking`) runs in wall-clock time but does **not** advance the
+/// virtual clock, so measuring with `tokio::time::Instant` yields the
+/// commit's *batch wait* exactly — none of the scheduler/instrumentation
+/// jitter that made a wall-clock P99 flaky (it broke both the required and
+/// the coverage CI jobs before this rewrite).
+///
+/// The contract: a batch of commits fired at the same instant all ride one
+/// window, so each waits exactly that window for the shared sync — ack
+/// latency *equals* the configured window and scales 1:1 across the spec's
+/// `{10, 100, 1000}` ms settings. A per-record-fsync implementation would
+/// ack each commit immediately (≈ 0), independent of the window; that the
+/// latency *is* the window is exactly "the window dominates." Batching
+/// itself — `appends_per_sync ≫ 1` — is pinned counter-exactly by the
+/// sibling test. (Virtual time also makes the spec's real values free to
+/// use: zero wall-clock cost, no documented deviation.)
+#[tokio::test(start_paused = true)]
+async fn rfc0008_8_ack_latency_tracks_the_batch_window() {
+    for window_ms in [10u64, 100, 1000] {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let coordinator = real_coordinator(tmp.path(), window_ms);
 
-/// Drive `coordinator` with steadily-arriving concurrent commits for
-/// `rounds` rounds of `concurrency` commits each, an `inter_arrival`
-/// pause between rounds, and return each commit's individual ack latency.
-async fn measure_latencies(
-    coordinator: &Arc<CommitCoordinator>,
-    rounds: u32,
-    concurrency: u32,
-    inter_arrival: Duration,
-) -> Vec<Duration> {
-    let mut handles = Vec::new();
-    for _ in 0..rounds {
-        for _ in 0..concurrency {
-            let c = Arc::clone(coordinator);
+        // Fire a batch of commits at the same virtual instant: they all arm
+        // (or ride) one window, so each waits exactly `window` for the
+        // shared sync that acks them.
+        let mut handles = Vec::new();
+        for _ in 0..8u32 {
+            let c = Arc::clone(&coordinator);
             handles.push(tokio::spawn(async move {
-                let start = Instant::now();
+                let start = tokio::time::Instant::now();
                 c.commit(b"a steady-state OTLP batch frame")
                     .await
                     .result
@@ -78,74 +88,17 @@ async fn measure_latencies(
                 start.elapsed()
             }));
         }
-        tokio::time::sleep(inter_arrival).await;
-    }
-    let mut out = Vec::with_capacity(handles.len());
-    for h in handles {
-        out.push(h.await.expect("commit task joins"));
-    }
-    out
-}
 
-/// Scenario RFC0008.8 — P99 ack latency tracks the configured batch
-/// window. See `docs/rfcs/0008-wal.md` §5.
-///
-/// Spec values are `{10, 100, 1000}` ms; to keep CI under a few seconds
-/// we exercise `{10, 50, 150}` ms (documented deviation). The contract is
-/// that **P99 ack latency tracks (is dominated by) the configured
-/// window, not per-record fsync** — and the CI-robust, spec-faithful way
-/// to prove that is the **scaling ordering** `p99(10) < p99(50) <
-/// p99(150)`: a per-record-fsync implementation would show a ~constant
-/// P99 (≈ one fsync) across the three windows, so the fact that P99 rises
-/// monotonically *with* the window is exactly "the window dominates."
-///
-/// We deliberately do **not** assert an absolute per-window band. The
-/// spec's ±30 % holds on dedicated hardware, but on a shared CI runner
-/// the per-flush *fixed* overhead (timer granularity + one fsync +
-/// task scheduling) does not scale with the window and dominates the
-/// small settings — a 50 ms window legitimately tails to ~150 ms under
-/// load. A tight upper band there tests the runner, not the coordinator.
-/// We instead pin (a) the scaling ordering and (b) a lower bound at the
-/// largest window, where the window is well above the fixed floor, so a
-/// P99 ≥ half the window shows commits really do wait ~a window (batched)
-/// rather than acking at per-record speed. (Batching itself —
-/// `appends_per_sync ≫ 1` — is pinned counter-exactly by the sibling
-/// test, with no timing.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rfc0008_8_p99_latency_tracks_batch_window() {
-    let windows = [10u64, 50, 150];
-    let mut p99s = Vec::new();
-    for window_ms in windows {
-        let tmp = tempfile::TempDir::new().expect("temp");
-        let coordinator = real_coordinator(tmp.path(), window_ms);
-        // Arrivals every ~window/4 so several commits ride each window and
-        // each waits a roughly-uniform fraction of it. Enough rounds for a
-        // stable tail.
-        let inter_arrival = Duration::from_millis((window_ms / 4).max(1));
-        let samples = measure_latencies(&coordinator, 40, 8, inter_arrival).await;
-        p99s.push(p99_ms(samples));
+        for h in handles {
+            let latency = h.await.expect("commit task joins");
+            assert_eq!(
+                latency,
+                Duration::from_millis(window_ms),
+                "ack latency must equal the {window_ms}ms batch window \
+                 (batched, not per-record); got {latency:?}",
+            );
+        }
     }
-
-    // (a) The load-bearing proof: P99 rises monotonically with the window
-    // — it tracks the window, not a per-record fsync cost (which would be
-    // ~constant across the three). Robust to scheduler noise.
-    assert!(
-        p99s[0] < p99s[1] && p99s[1] < p99s[2],
-        "P99 must scale with the batch window, got {p99s:?} for {windows:?} ms",
-    );
-
-    // (b) At the largest window (fixed overhead is a small fraction there)
-    // the P99 is at least half the window: commits wait ~a window —
-    // batched — not acked at per-record speed. A lower bound is robust:
-    // CI jitter only *raises* P99.
-    let largest = f64::from(u32::try_from(windows[2]).expect("small window"));
-    assert!(
-        p99s[2] >= largest * 0.5,
-        "P99 at the {}ms window was {:.1}ms (< half the window) — \
-         acks aren't waiting for the batch window",
-        windows[2],
-        p99s[2],
-    );
 }
 
 /// Scenario RFC0008.8 — `wal_syncs_total` advances per-batch, not

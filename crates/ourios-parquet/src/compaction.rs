@@ -285,6 +285,7 @@ pub fn compact_partition(
 
 /// Outcome of a [`gc_orphans`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OrphanGc {
     /// Orphan files unlinked this pass.
     pub reclaimed: u64,
@@ -310,10 +311,11 @@ pub struct OrphanGc {
 ///
 /// # Errors
 ///
-/// [`CompactionError::Io`] if the directory scan itself fails. A failed
-/// unlink of an individual orphan is counted in [`OrphanGc::failures`],
-/// not surfaced — an orphan that outlives one pass is reclaimed by the
-/// next.
+/// [`CompactionError::Manifest`] if the partition's `manifest.json` can't
+/// be read, or [`CompactionError::Io`] if the directory scan itself
+/// fails. A failed unlink of an individual orphan is counted in
+/// [`OrphanGc::failures`], not surfaced — an orphan that outlives one
+/// pass is reclaimed by the next.
 pub fn gc_orphans(partition_dir: &Path) -> Result<OrphanGc, CompactionError> {
     let live: Option<std::collections::HashSet<String>> = Manifest::read(partition_dir)
         .map_err(CompactionError::Manifest)?

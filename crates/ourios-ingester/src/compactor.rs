@@ -175,7 +175,10 @@ pub fn run_sweep(
             // a live file; a scan error is recorded, not fatal.
             match gc_orphans(&partition.data_path(bucket_root)) {
                 Ok(gc) => report.orphans_reclaimed += gc.reclaimed,
-                Err(e) => report.errors.push(format!("gc-orphans {tenant:?}: {e}")),
+                Err(e) => report.errors.push(format!(
+                    "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
+                    partition.year, partition.month, partition.day, partition.hour,
+                )),
             }
             match compact_partition(bucket_root, &partition) {
                 Ok(outcome) => {

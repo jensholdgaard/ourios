@@ -920,18 +920,20 @@ mod tests {
         );
     }
 
-    /// RFC0009.4 — crash safety. The only commit point is the atomic
-    /// manifest swap, so a crash always freezes the partition at a clean
-    /// generation (the no-torn-read half is `atomic_publish_…` above).
-    /// This asserts the other half: the dead files a crash leaves behind
-    /// are *reclaimable* by `gc_orphans`, which never removes a live file.
-    /// Each arm builds the exact on-disk state a `SIGKILL` at that point
-    /// would leave — faithful because the commit is a single `rename`.
+    /// RFC0009.4 — crash safety (shared note). The only commit point is
+    /// the atomic manifest swap, so a crash always freezes the partition
+    /// at a clean generation (the no-torn-read half is `atomic_publish_…`
+    /// above). These three tests assert the other half: the dead files a
+    /// crash leaves are *reclaimable* by `gc_orphans`, which never removes
+    /// a live file. Each builds the exact on-disk state a `SIGKILL` at
+    /// that point would leave — faithful because the commit is a single
+    /// `rename`.
+    ///
+    /// Crash AFTER the commit swap, before input GC: the manifest names
+    /// the consolidated file; the superseded inputs are still on disk (the
+    /// post-commit generation with orphans).
     #[test]
-    fn rfc0009_4_orphans_reclaimable_and_live_files_untouched() {
-        // --- Arm A: crash AFTER the commit swap, before input GC ---
-        // (manifest names the consolidated file; the superseded inputs are
-        // still on disk — the post-commit generation with orphans.)
+    fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
         let bucket = tempfile::tempdir().expect("temp");
         write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
         write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
@@ -982,10 +984,14 @@ mod tests {
             OrphanGc::default(),
             "idempotent"
         );
+    }
 
-        // --- Arm B: crash BEFORE the commit swap ---
-        // (manifest still names the inputs; the freshly written
-        // consolidated file is a dead orphan — the pre-commit generation.)
+    /// RFC0009.4 — crash BEFORE the commit swap: the manifest still names
+    /// the inputs; the freshly written consolidated file is a dead orphan
+    /// (the pre-commit generation). See the post-commit test for the
+    /// shared crash-safety note.
+    #[test]
+    fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
         let bucket = tempfile::tempdir().expect("temp");
         write_file(bucket.path(), &[rec(7, TS0), rec(7, TS0 + 1_000_000)]);
         write_file(bucket.path(), &[rec(8, TS0 + 2_000_000)]);
@@ -1025,10 +1031,13 @@ mod tests {
             originals,
             "inputs intact"
         );
+    }
 
-        // --- Arm C: stray `.parquet.tmp` with NO manifest (glob live set) ---
-        // Every `.parquet` is live (no manifest), so only the interrupted
-        // `.tmp` publish is reclaimed.
+    /// RFC0009.4 — a stray `*.parquet.tmp` with NO manifest (glob live
+    /// set): every `.parquet` is live, so only the interrupted `.tmp`
+    /// publish is reclaimed. See the post-commit test for the shared note.
+    #[test]
+    fn rfc0009_4_stray_tmp_reclaimed_under_glob_fallback() {
         let bucket = tempfile::tempdir().expect("temp");
         write_file(bucket.path(), &[rec(9, TS0)]);
         let dir = partition().data_path(bucket.path());

@@ -1,7 +1,7 @@
 ---
 rfc: 0011
 title: A1 re-scope — template-mining compression is logical (query-pruning), not byte-level
-status: drafted
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-13
@@ -11,6 +11,16 @@ superseded-by: —
 
 # RFC 0011 — A1 re-scope
 
+> **Status note.** **`accepted`** (2026-06-14, maintainer sign-off). A
+> tuning RFC, so it advances directly to the terminal status once its §5
+> criteria are enacted: RFC0011.1 (A1 is diagnostic, not gating),
+> RFC0011.2 (the miner's thesis gates are C1 + C2), and RFC0011.3 (the A1
+> diagnostic is still recorded) are all in force — the `docs/benchmarks.md`
+> §7 gate table marks A1 diagnostic, RFC 0001's `validated` is judged on
+> C1/C2, and §9.5/§9.6 record the A1 readings. Accepting ratifies the
+> re-scope that RFC 0001's `validated`/`accepted` (also 2026-06-14) rests
+> on.
+>
 > **How to read this document.** This is a **tuning RFC** spawned by the
 > `docs/benchmarks.md` §7 escalation path: a thesis gate (A1) failed and
 > the failure analysis is in, so the gate is reconciled with the evidence

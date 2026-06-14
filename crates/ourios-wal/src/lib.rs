@@ -1,14 +1,15 @@
 //! `ourios-wal` — RFC 0008 write-ahead log.
 //!
-//! **Status: red gate (closing).** `open`, `append` (with §6.5
-//! rotation), `sync`, `replay`, `checkpoint`, `housekeeping`,
-//! and `metrics` are implemented. The remaining `#[ignore]`'d
-//! integration tests under `crates/ourios-wal/tests/` enumerate
-//! the RFC 0008 §5 acceptance criteria still pending
-//! (wal-before-ack, recovery O(N), the remaining torn-write /
-//! corruption arms, batched-fsync latency, unflushed-bytes
-//! bound) before the RFC moves `red → green`. See RFC 0008 for
-//! the design contract.
+//! **Status: RFC 0008 `accepted`.** All §5 acceptance arms (.1–.10) are
+//! green with no `#[ignore]`'d stubs remaining: `open`, `append` (with
+//! §6.5 rotation), `sync`, `replay`, `checkpoint`, `housekeeping`, and
+//! `metrics` back wal-before-ack, crash recovery (the real-SIGKILL CI
+//! gate), recovery O(N), torn-write heal, corruption halt, segment
+//! rotation, checkpoint + durable sidecar, batched-fsync group commit,
+//! the unflushed-bytes bound, and the startup recovery driver. The one
+//! deferral is the §9 corruption *audit event* (`encode_audit_event`
+//! stays `unimplemented!()` pending a system-scoped-audit design). See
+//! RFC 0008 for the design contract.
 //!
 //! The shape of the public API follows §6.1 verbatim — the
 //! same `(WalOffset, FrameKind, FrameSink, Wal)` surface the

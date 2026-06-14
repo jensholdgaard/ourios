@@ -188,10 +188,10 @@ correct and are left alone.
 > - **And** a repo-wide grep for the **framing phrases** —
 >   `before any byte-level codec` and `over a competent byte codec` —
 >   returns only RFC 0011 / this RFC (which quote the old wording to
->   describe the change). The check is on the *framing*, **not** the bare
->   `50.200` figure: mentions of the *50–200× figure* as a logical
->   reduction (e.g. `docs/roadmap.md`, `docs/rfcs/0005-parquet-storage.md`)
->   are correct and expected to remain.
+>   describe the change). The check is on the **framing**, not on the
+>   *50–200× figure* itself: mentions of that figure as a logical reduction
+>   (e.g. `docs/roadmap.md`, `docs/rfcs/0005-parquet-storage.md`) are
+>   correct and expected to remain.
 
 > **Scenario RFC0012.3 — consistency with the accepted A1 re-scope.**
 > - **Given** RFC 0011 (`accepted`), `benchmarks.md` §7's gate table

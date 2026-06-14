@@ -758,5 +758,35 @@ lossy ratio, and C2 plateaus at 40 templates with the formal gate
 *applying* (not abstaining, unlike the §9.1 sub-1 M runs). Under RFC
 0011 these are RFC 0001's `validated` thesis gates — both pass here.
 The authoritative `baseline-8vcpu-32gib` representative rerun (for the
-actual RFC 0001 `validated` flip) is a maintainer-gated GH Actions /
-baseline step; the deterministic verdicts are not expected to change.
+actual RFC 0001 `validated` flip) followed on 2026-06-14 (§9.6); as
+expected of deterministic verdicts, the numbers are identical.
+
+### 9.6 Results — 2026-06-14 (authoritative, `baseline-8vcpu-32gib`) — C1 / C2 on HDFS_v1
+
+**Corpus.** LogHub HDFS_v1 (Zenodo record 8196385, md5
+`76a24b4d…`) — 11,175,629 lines, 1,577,982,906 raw bytes; fetched at
+bench time on the baseline host, md5-verified, never redistributed.
+**Hardware.** `baseline-8vcpu-32gib` — the §1 baseline (8 dedicated
+vCPU, 32 GiB RAM, local SSD), provisioned for this run and torn down
+immediately after. These are the **authoritative** C1 / C2 numbers
+for RFC 0001's `validated` gates.
+**Run.** Dedicated baseline host (no CI run id): one `ourios-bench
+--gates c1,c2 --hardware-kind baseline-8vcpu-32gib` run at git
+`9a57ace`; results JSON retained by the maintainer
+(`2026-06-14T00-36-23.225Z-9a57ace.json`). A1 was deliberately **not**
+run — it is diagnostic, not gating (RFC 0011); the §9.5 diagnostic A1
+reading stands.
+
+| gate | result | verdict |
+|---|---|---|
+| C1 | **1.000000** — 11,175,578 / 11,175,578 non-lossy rows reconstruct bit-identically; lossy ratio 4.6e-06 (51 rows) | PASS |
+| C2 | end template count **40** at 11.2 M lines (33 at 1 M); ratio 0.825 — sub-linear, **formal gate applies** (≥ 1 M, §3.4.3) | PASS |
+
+**Authoritative confirmation.** The verdicts match §9.5's local
+diagnostic run bit-for-bit — expected, since C1 (reconstruction
+fidelity) and C2 (template-count convergence) are deterministic
+functions of (corpus, miner) with no wall-clock or hardware-sensitive
+component (contrast A1's writer-environment sensitivity, §9.4). The
+value of this run is the authoritative `hardware_kind` stamp on the
+two gates that, under RFC 0011, define RFC 0001's `validated`: **both
+PASS on a representative ≥ 1 M-line corpus on §1 baseline hardware.**

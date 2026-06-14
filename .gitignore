@@ -16,6 +16,8 @@
 *.swp
 *~
 
+.env
+
 # Claude Code runtime artefacts (per-session PID / lock files). The
 # `.claude/` tree carries tracked content (`.claude/skills/` slash-
 # command definitions, the personal `settings.local.json`), but the

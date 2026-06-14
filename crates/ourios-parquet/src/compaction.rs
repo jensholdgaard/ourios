@@ -1130,6 +1130,79 @@ mod tests {
         assert_eq!(rows.len(), n, "row conservation across the collapse");
     }
 
+    /// RFC0009.6 — forward-compatible (union-schema) merge. Inputs that
+    /// span a schema amendment — one written with the current full schema,
+    /// one a pre-amendment file missing an OPTIONAL column — compact into a
+    /// single file carrying the union schema, read back without error
+    /// (RFC 0005 §3.9), with every row preserved. Compaction reads each
+    /// input through `Reader` (which fills a missing OPTIONAL as the §3.9
+    /// default) and rewrites via `Writer` (the full schema), so the output
+    /// is the superset.
+    #[test]
+    fn rfc0009_6_merges_inputs_spanning_a_schema_amendment() {
+        use parquet::arrow::ArrowWriter;
+
+        let bucket = tempfile::tempdir().expect("temp");
+        // File A — current full schema.
+        write_file(bucket.path(), &[rec(1, TS0)]);
+        let dir = partition().data_path(bucket.path());
+
+        // File B — a pre-amendment file missing the OPTIONAL
+        // `effective_time_unix_nano` column (added 2026-06-11). Built by
+        // projecting a full batch down by that one column, so no arrays
+        // are hand-rolled. Same tenant + hour as A, so the row-vs-path
+        // check (RFC0009.5) passes via the surviving `time_unix_nano`.
+        let full = crate::mined_records_to_batch(&[rec(2, TS0)]).expect("full batch");
+        let drop = full
+            .schema()
+            .index_of(crate::columns::EFFECTIVE_TIME_UNIX_NANO)
+            .expect("amended column present in the full schema");
+        let keep: Vec<usize> = (0..full.num_columns()).filter(|&i| i != drop).collect();
+        let reduced = full
+            .project(&keep)
+            .expect("project off the OPTIONAL column");
+        assert!(
+            reduced
+                .schema()
+                .index_of(crate::columns::EFFECTIVE_TIME_UNIX_NANO)
+                .is_err(),
+            "file B is missing the OPTIONAL column",
+        );
+        let path_b = dir.join("0190abcd-0000-7000-8000-000000000002.parquet");
+        let file_b = std::fs::File::create(&path_b).expect("create B");
+        let mut w = ArrowWriter::try_new(file_b, reduced.schema(), None).expect("arrow writer");
+        w.write(&reduced).expect("write B");
+        w.close().expect("close B");
+
+        // Two inputs with differing schemas → union merge.
+        let outcome = compact_partition(bucket.path(), &partition()).expect("union merge");
+        assert_eq!(outcome.files_before, 2);
+        assert_eq!(outcome.rows, 2, "both rows carried across the union merge");
+
+        // Output carries the full (union) schema and reads without error.
+        let live = live_files(&dir).expect("live");
+        assert_eq!(live.len(), 1, "consolidated to one file");
+        // Assert the union directly: the consolidated Parquet schema
+        // carries the amended column file B lacked (not B's reduced one).
+        let out = std::fs::File::open(&live[0]).expect("open output");
+        let out_schema =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(out)
+                .expect("output reader builder")
+                .schema()
+                .clone();
+        assert!(
+            out_schema
+                .index_of(crate::columns::EFFECTIVE_TIME_UNIX_NANO)
+                .is_ok(),
+            "consolidated output carries the union (amended) schema",
+        );
+        let rows = Reader::open_partition(&live[0], partition())
+            .expect("open union output")
+            .read_all()
+            .expect("read union output");
+        assert_eq!(rows.len(), 2, "every row preserved across the amendment");
+    }
+
     #[test]
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).

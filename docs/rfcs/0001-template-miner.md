@@ -17,9 +17,11 @@ superseded-by: —
 > thesis-gate the RFC's pillars touch passing on representative corpora*
 > (`benchmarks.md` §7). The template-mining pillar's gates are **C1**
 > (reconstruction fidelity) and **C2** (template-count convergence) —
-> both pass on a representative ≥ 1 M-line corpus, **authoritatively on
-> the §1 baseline hardware**: C1 `1.000000`, C2 a 40-template plateau at
-> 11.2 M lines with the formal gate applying (LogHub HDFS_v1; diagnostic
+> both pass on the representative LogHub HDFS_v1 corpus (≈ 1.47 GiB,
+> 11.2 M lines — above `benchmarks.md` §8's ≥ 1 GiB canonical floor, so
+> representative; and well past C2's ≥ 1 M-line *formal-gate* threshold,
+> so that gate applies rather than abstains), **authoritatively on the §1
+> baseline hardware**: C1 `1.000000`, C2 a 40-template plateau (diagnostic
 > local run `benchmarks.md` §9.5, authoritative `baseline-8vcpu-32gib`
 > rerun §9.6 — identical verdicts, as expected of deterministic gates).
 > **A1 (compression vs zstd) is a diagnostic, not a gate** (RFC 0011,

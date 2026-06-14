@@ -69,9 +69,11 @@ goals, or post-MVP shipping concerns.
 **RFC 0001 §5 scenarios green: 42 / 42 — RFC 0001 status: `validated`**
 (2026-06-14; every scenario has a live passing test, incl. the
 cross-crate criteria relocated to `ourios-querier`/`ourios-ingester`).
-`validated` reached: the C1/C2 thesis-gates pass on a representative
-≥ 1 M-line corpus, authoritatively on the §1 baseline hardware
-(`benchmarks.md` §9.6); A1 is a diagnostic, not a gate (RFC 0011). See
+`validated` reached: the C1/C2 thesis-gates pass on the representative
+LogHub HDFS_v1 corpus (≈ 1.47 GiB — above §8's ≥ 1 GiB canonical floor;
+its 11.2 M lines also clear C2's ≥ 1 M-line formal-gate threshold),
+authoritatively on the §1 baseline hardware (`benchmarks.md` §9.6); A1 is
+a diagnostic, not a gate (RFC 0011). See
 the RFC's status note. RFC 0008 is likewise `green` (all §5 arms .1–.10).
 RFC 0005 §5 scenarios green: **10 / 11** (RFC0005.6 — the
 ≥256 MiB row-group sizing scenario — defers until a corpus run

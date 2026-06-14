@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Template miner (Drain-derived online log parsing)
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -11,44 +11,39 @@ superseded-by: —
 
 # RFC 0001 — Template miner
 
-> **Status note.** **`green`** (2026-06-13, per the maintainer's
+> **Status note.** **`validated`** (2026-06-14, per the maintainer's
 > authorization of the same date). The `docs/verification.md` §3 /
-> `docs/rfcs/README.md` ladder defines `green` as *all §5 acceptance
-> criteria pass (unit + property + corpus tests green)*. Every §5
-> scenario now has a live, passing test — zero `#[ignore]`/`todo!()`
-> stubs remain:
-> - **Miner-internal + hazard/invariant** (`ourios-miner` tests):
->   tokenize/mask/sim-seq, the three-zone confidence model, fresh-leaf
->   + widening + type-expansion with audit events, the
->   `(severity_number, scope_name)` template key (H1.4/H1.5,
->   RFC0001.11), the 256 B param-overflow spill (H2.1) + telemetry
->   (§3.1.2/RFC0001.8, the weaver `ourios.miner.*` registry),
->   bit-identical reconstruction + the H7.3 render contract,
->   structured-body canonical encoding (RFC0001.9), and the §6.9
->   snapshot format + recovery (§3.5.1–.4, incl. the v2 restore).
-> - **Relocated cross-crate criteria** (the behaviour lives outside
->   the miner crate): query semantics RFC0001.5/.6 + time-preserved
->   RFC0001.10 (`ourios-querier`/`ourios-ingester`), §3.7.3 per-
->   ResourceLogs tenant derivation (`ourios-ingester`), drift H5.3 via
->   RFC 0010 (`ourios-querier`), and the §6.7 alias-index storage
->   discharged by RFC 0005 §3.7 (#183/#184).
+> `docs/rfcs/README.md` ladder reserves `validated` for *every
+> thesis-gate the RFC's pillars touch passing on representative corpora*
+> (`benchmarks.md` §7). The template-mining pillar's gates are **C1**
+> (reconstruction fidelity) and **C2** (template-count convergence) —
+> both pass on a representative ≥ 1 M-line corpus, **authoritatively on
+> the §1 baseline hardware**: C1 `1.000000`, C2 a 40-template plateau at
+> 11.2 M lines with the formal gate applying (LogHub HDFS_v1; diagnostic
+> local run `benchmarks.md` §9.5, authoritative `baseline-8vcpu-32gib`
+> rerun §9.6 — identical verdicts, as expected of deterministic gates).
+> **A1 (compression vs zstd) is a diagnostic, not a gate** (RFC 0011,
+> already encoded in the §7 gate table): it fails on every corpus class
+> including the maximally-templated one, for structural reasons —
+> template mining's compression is logical/query-pruning (B1/B2), not
+> on-disk bytes.
 >
-> **Path to `validated` (re-scoped by RFC 0011).** The ladder reserves
-> `validated` for *every thesis-gate the RFC's pillars touch passing on
-> representative corpora* (`benchmarks.md` §7). The template-mining
-> pillar's gates are now **C1** (reconstruction fidelity) and **C2**
-> (template-count convergence) — both **pass** on a representative
-> ≥ 1 M-line corpus (HDFS_v1: C1 `1.000000`, C2 a 40-template plateau at
-> 11.2 M lines with the formal gate applying — `benchmarks.md` §9.5).
-> **A1 (compression vs zstd) is demoted to a diagnostic, not a gate**
-> (RFC 0011): it fails on every corpus class including the
-> maximally-templated one, for structural reasons — template mining's
-> compression is logical/query-pruning (B1/B2), not on-disk bytes. So
-> `validated` is no longer blocked by A1; it awaits (1) RFC 0011's
-> acceptance and (2) an authoritative `baseline-8vcpu-32gib`
-> representative C1/C2 rerun (the local §9.5 verdicts are deterministic
-> and not expected to change). `green` was never blocked by A1 — it is
-> an acceptance-criteria gate, not a thesis gate.
+> Reached `green` first (2026-06-13): all §5 acceptance criteria pass
+> with live tests (zero `#[ignore]`/`todo!()` stubs) —
+> miner-internal (tokenize/mask/sim-seq, the three-zone confidence
+> model, fresh-leaf + widening + type-expansion with audit events, the
+> `(severity_number, scope_name)` template key, the 256 B param-overflow
+> spill + telemetry, bit-identical reconstruction + the H7.3 render
+> contract, structured-body canonical encoding, the §6.9 snapshot +
+> v2 restore) plus the relocated cross-crate criteria (query semantics
+> RFC0001.5/.6, time-preserved RFC0001.10, §3.7.3 per-ResourceLogs
+> tenant derivation, drift H5.3 via RFC 0010, the §6.7 alias index via
+> RFC 0005 §3.7).
+>
+> **Terminal step:** `accepted` is the maintainer's final sign-off
+> (`docs/rfcs/README.md`). NB the A1 re-scope's own RFC (RFC 0011) is
+> still `drafted`; the §7 gate table already reflects the demotion, but
+> RFC 0011 should be accepted to fully ratify that chain.
 
 > **How to read this document.** §§1–4 are the design contract — the
 > *what* and the *why*. §5 lists the normative `Given / When / Then`

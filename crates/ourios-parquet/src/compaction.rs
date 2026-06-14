@@ -1112,6 +1112,17 @@ mod tests {
             after.len() <= policy.min_files,
             "no longer over-fragmented (H4 small-file count down)",
         );
+        // H4 counts *physical* files (footer reads), so the inputs must
+        // actually be gone — not merely manifest-excluded orphans that
+        // `live_files` would hide. Assert both: the GC removed them and
+        // exactly one `.parquet` remains on disk.
+        assert_eq!(outcome.gc_failures, 0, "every superseded input removed");
+        let on_disk = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .map(|e| e.expect("read_dir entry"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+            .count();
+        assert_eq!(on_disk, 1, "exactly one physical .parquet file remains");
         let rows = Reader::open_partition(&after[0], partition())
             .expect("open")
             .read_all()

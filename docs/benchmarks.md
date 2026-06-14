@@ -41,9 +41,9 @@ Every goal below carries two labels.
 
 A goal with scope `thesis-gate` and bar `must-win` is load-bearing for
 the whole project. **Four** of those below are gating — B1, B2, C1, C2,
-each marked `[THESIS]`. A1 also carries the `[THESIS]` scope but RFC 0011
-(`accepted`) demoted it to a recorded **diagnostic**: it no longer gates
-(see its section below and the §7 table).
+each marked `[THESIS]`. A1 keeps the `[THESIS]` tag (a thesis-relevant
+measurement) but RFC 0011 (`accepted`) set its **scope to `diagnostic`**:
+it is recorded, not gating (see its section below and the §7 table).
 
 ## 1. Corpora and methodology
 
@@ -412,10 +412,12 @@ every gate measured on the §1 hardware (`baseline-8vcpu-32gib`),
 recorded per the maintainer's 2026-06-12 authorization. B1, B2,
 C1, and C2 **pass authoritatively**; on that basis RFC 0007
 flipped to `validated` (its gates, per `docs/verification.md` §3,
-are the querier-pillar ones — B1/B2). **A1 fails authoritatively**
-and is the open thesis gate; it gates the compression pillar
-(RFC 0006's remit), not RFC 0007, and carries a new
-hardware-sensitivity caveat (§9.4).
+are the querier-pillar ones — B1/B2). **A1 fails authoritatively** and
+carries a hardware-sensitivity caveat (§9.4). *(A1 was subsequently
+reclassified a recorded **diagnostic**, not a gate — RFC 0011,
+`accepted` 2026-06-14. The A1 readings throughout §9 are diagnostic; A1
+gates nothing, and the "open gate" / "must-win" framing in the dated
+entries below is superseded.)*
 
 Reviewers: a PR that materially affects the hot path must either
 (a) cite the benchmark result and its delta against the relevant

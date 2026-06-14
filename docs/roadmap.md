@@ -161,11 +161,11 @@ What the code does today:
   ingester, server, and full snapshot mechanism are deferred
   post-MVP; the querier and bench are the Phase 3 work.
 
-What's specifically remaining for the thesis gates:
+What's specifically remaining for the thesis gates (B1, B2, C1, C2 — A1
+is a recorded diagnostic per RFC 0011, not a gate):
 
 | Gate | Blocker(s) |
 |---|---|
-| **A1** | `ourios-bench` corpus runner driving the miner → Parquet path; A1's compression ratio is measured by the bench. Writer + reader are in place. |
 | **B1** | `ourios-querier` (DataFusion table provider over the Parquet partition layout); predicate-pushdown wiring against `time_unix_nano` / `tenant_id`. Reader already enforces row-vs-path validation. |
 | **B2** | Same as B1 plus `template_id` as a queryable column (the column is in the schema and is the §3.6 bloom-filter target — the wiring is what's missing). |
 | **C1** | Bench harness that exercises the H7.1 reconstruction property on a corpus end-to-end (the unit-level property test is green; the gate measures it at corpus scale). |

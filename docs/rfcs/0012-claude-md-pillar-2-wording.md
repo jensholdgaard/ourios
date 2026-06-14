@@ -36,7 +36,8 @@ line becomes one row keyed by a small, stable `template_id`), and its
 *value* is realised as **query pruning** — the benchmark gates B1/B2 — not
 as fewer on-disk bytes than a codec. This RFC amends pillar #2 to say so,
 so the project's canonical thesis statement matches its measured reality,
-and reconciles the one coupled paraphrase in `benchmarks.md` §2.
+and reconciles the coupled echoes of the same framing elsewhere in the
+docs (`benchmarks.md` §2 and RFC 0001's summary).
 
 ## 2. Motivation
 
@@ -103,17 +104,28 @@ with:
 The final sentence (the "single biggest engineering risk" line) is
 preserved verbatim — it is load-bearing in its own right and unaffected.
 
-### 3.2 The coupled `benchmarks.md` §2 reconciliation
+### 3.2 The coupled documentation reconciliations
 
-`benchmarks.md` §2's A1 "Why this bar" bullet (lines 124–126) paraphrases
-the pillar as *the project's headline claim (§2, CLAUDE.md) is "50–200×
-over raw, ≥ 5× over a competent byte codec."* That paraphrase (a) attaches
-a "≥ 5× over a competent byte codec" multiplier the pillar never literally
-stated and (b) is the byte-vs-codec framing RFC 0011 demoted. It is
-updated in the same enactment to point at the logical-reduction framing
-and the diagnostic. `benchmarks.md` is **not** load-bearing in the
-`CLAUDE.md` sense, so its edit rides a normal doc PR — but it is listed
-here so the enactment is complete and the two documents stay consistent.
+The same on-disk/byte-level framing echoes in two other places; both are
+reconciled in the same enactment so the docs stay consistent (neither is
+load-bearing in the `CLAUDE.md` sense, so both ride normal doc PRs):
+
+1. **`benchmarks.md` §2** — the A1 "Why this bar" bullet (lines 124–126)
+   paraphrases the pillar as *the project's headline claim (§2, CLAUDE.md)
+   is "50–200× over raw, ≥ 5× over a competent byte codec."* That
+   paraphrase (a) attaches a "≥ 5× over a competent byte codec" multiplier
+   the pillar never literally stated and (b) is the byte-vs-codec framing
+   RFC 0011 demoted. Reword it to the logical-reduction / diagnostic
+   framing.
+2. **`docs/rfcs/0001-template-miner.md` §1** — its summary states *"The
+   compression target is 50–200× over raw bytes before any byte-level
+   codec runs."* Same byte-level framing. RFC 0001 is `accepted`, but this
+   is a **factual** thesis-statement correction (not a change to its design
+   or §5 acceptance criteria), so reconcile it to the logical-reduction
+   framing with a one-line note pointing at RFC 0011. (If the maintainer
+   prefers to leave an accepted RFC's prose untouched, the alternative is a
+   dated editorial note rather than a reword — maintainer's call at
+   enactment.)
 
 ### 3.3 What does **not** change
 
@@ -155,15 +167,17 @@ here so the enactment is complete and the two documents stay consistent.
 >   verbatim
 
 > **Scenario RFC0012.2 — no on-disk-bytes framing of the 50–200× remains.**
-> - **Given** `CLAUDE.md` and `docs/benchmarks.md`
+> - **Given** `CLAUDE.md`, `docs/benchmarks.md`, and
+>   `docs/rfcs/0001-template-miner.md`
 > - **When** this RFC is enacted
 > - **Then** no passage frames template mining's 50–200× as **on-disk
 >   bytes** beaten "before any byte-level codec runs" or as "≥ N× over a
->   byte codec" — `benchmarks.md` §2's A1 "Why this bar" bullet is
->   reconciled per §3.2
-> - **And** a grep for `50.200` / `byte.level codec` / `competent byte
->   codec` across both files returns only logical-reduction / diagnostic
->   framings
+>   byte codec" — both coupled echoes (`benchmarks.md` §2's A1 "Why this
+>   bar" bullet and RFC 0001 §1's summary) are reconciled per §3.2
+> - **And** a repo-wide grep for `50.200` / `byte.level codec` /
+>   `competent byte codec` returns only logical-reduction / diagnostic
+>   framings (excepting RFC 0011 / this RFC, which quote the old wording
+>   to describe the change)
 
 > **Scenario RFC0012.3 — consistency with the accepted A1 re-scope.**
 > - **Given** RFC 0011 (`accepted`), `benchmarks.md` §7's gate table

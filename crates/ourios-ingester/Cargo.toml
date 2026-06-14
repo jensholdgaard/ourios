@@ -97,8 +97,9 @@ ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # The SDK data types (`ResourceMetrics` etc.) the metrics test reads.
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 # The metrics test collects via the in-memory reader's periodic-export
-# path, which needs a multi-thread runtime.
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros"] }
+# path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
+# latency test a paused virtual clock for deterministic, jitter-free timing.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 
 [lints]
 workspace = true

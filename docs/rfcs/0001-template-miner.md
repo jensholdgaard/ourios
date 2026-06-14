@@ -1,7 +1,7 @@
 ---
 rfc: 0001
 title: Template miner (Drain-derived online log parsing)
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-04-24
@@ -11,9 +11,11 @@ superseded-by: —
 
 # RFC 0001 — Template miner
 
-> **Status note.** **`validated`** (2026-06-14, per the maintainer's
-> authorization of the same date). The `docs/verification.md` §3 /
-> `docs/rfcs/README.md` ladder reserves `validated` for *every
+> **Status note.** **`accepted`** (2026-06-14, maintainer sign-off — the
+> terminal ladder status per `docs/rfcs/README.md`). Reached `validated`
+> the same day on the evidence below; `accepted` records the maintainer's
+> final sign-off on the template-mining pillar. The `docs/verification.md`
+> §3 / `docs/rfcs/README.md` ladder reserves `validated` for *every
 > thesis-gate the RFC's pillars touch passing on representative corpora*
 > (`benchmarks.md` §7). The template-mining pillar's gates are **C1**
 > (reconstruction fidelity) and **C2** (template-count convergence) —

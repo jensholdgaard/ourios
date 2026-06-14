@@ -121,9 +121,12 @@ codecs run.
 - **Falsifier**: if any representative corpus yields ≤ 2× improvement
   over zstd-alone, the template-mining pillar is not pulling its
   weight on that class of logs. Open an RFC.
-- **Why this bar**: the project's headline claim (§2, CLAUDE.md) is
-  "50–200× over raw, ≥ 5× over a competent byte codec." Below 3× the
-  headline is dishonest.
+- **Why recorded** (diagnostic, not a bar): `CLAUDE.md` §2 pillar #2
+  describes a **logical** 50–200× reduction (lines → `(template_id,
+  params)`) whose payoff is query pruning (B1/B2), *not* on-disk bytes vs
+  a byte codec. A1 tracks the on-disk ratio as the columnar queryability
+  premium + a codec-regression guard; RFC 0011 (`accepted`) demoted it
+  from a gate to this diagnostic.
 
 ### A2 — Bytes per line, amortised
 

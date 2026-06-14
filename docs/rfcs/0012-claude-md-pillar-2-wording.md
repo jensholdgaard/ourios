@@ -1,7 +1,7 @@
 ---
 rfc: 0012
 title: "meta: CLAUDE.md §2 pillar-#2 wording — template mining's 50–200× is a logical reduction, not on-disk bytes"
-status: drafted
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-14
@@ -10,6 +10,15 @@ superseded-by: —
 ---
 
 # RFC 0012 — meta: CLAUDE.md §2 pillar-#2 wording
+
+> **Status note. `accepted` (2026-06-14, maintainer-approved + enacted.)**
+> The `CLAUDE.md` §2 pillar-#2 reword (§3.1) and all three coupled
+> reconciliations (§3.2 — `benchmarks.md` §2, `README.md`, RFC 0001 §1)
+> were applied in the enacting PR; RFC 0001's accepted prose took the
+> recommended factual reword (with the RFC 0011 pointer). The §7 footer
+> changelog line + `Last updated` bump landed in the same diff. This
+> meta-RFC required majority maintainer approval per `CLAUDE.md`'s footer;
+> that gate is satisfied.
 
 > **This is a `meta:` RFC.** It proposes a change to `CLAUDE.md`, which
 > its own footer declares load-bearing: *"This document is load-bearing;

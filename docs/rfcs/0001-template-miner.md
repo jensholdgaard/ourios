@@ -80,8 +80,10 @@ rather than a property-test exception `[§3.3]`, bounds parameter
 values at 256 B with overflow to a side `body` column `[§3.2]`, and
 tracks template structural changes via a monotonic `template_version`
 so that schema drift across deploys is a first-class query rather than
-a silent count drop `[§3.5]`. The compression target is 50–200× over
-raw bytes before any byte-level codec runs.
+a silent count drop `[§3.5]`. The 50–200× figure is a **logical**
+reduction (lines → `(template_id, params)`), realised as query pruning
+(gates B1/B2), not on-disk bytes versus a byte codec — see RFC 0011, which
+demoted the compression-vs-zstd ratio (A1) to a diagnostic.
 
 ## 2. Motivation
 

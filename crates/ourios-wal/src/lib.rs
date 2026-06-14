@@ -75,11 +75,10 @@ pub enum FrameKind {
     /// `ExportLogsServiceRequest` protobuf bytes the receiver
     /// decoded, verbatim.
     OtlpBatch = 0x01,
-    /// One serialised [`AuditEvent`]. Encoding choice is
-    /// deferred to the encoder implementation PR per RFC
-    /// 0008 §9 (this PR is the red-gate scaffold — the
-    /// encoder lands together with the matching `#[ignore]`
-    /// removal in the next PR).
+    /// One serialised [`AuditEvent`]. The exact encoding is still
+    /// deferred per RFC 0008 §9 — `encode_audit_event` is
+    /// `unimplemented!()` pending the system-scoped-audit design — but
+    /// the frame layout does not depend on it.
     AuditEvent = 0x02,
 }
 

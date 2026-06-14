@@ -1070,6 +1070,47 @@ mod tests {
         );
     }
 
+    /// RFC0009.1 — compaction drives the H4 small-file count down. A
+    /// partition fragmented into many sub-128 MiB files (over the
+    /// `CompactionPolicy::min_files` over-fragmentation trigger) collapses
+    /// to a single file, so the partition stops contributing to H4's
+    /// "fewer than 5 % of files below 128 MiB" tenant signal. (The
+    /// corpus-scale histogram is the §6 corpus test; this is the unit-scale
+    /// file-count lever, with row conservation across the collapse.)
+    #[test]
+    fn rfc0009_1_many_small_files_collapse_to_one() {
+        let policy = CompactionPolicy::default();
+        let bucket = tempfile::tempdir().expect("temp");
+        // Five small files — over the `min_files` (4) fragmentation
+        // trigger, each far below the 128 MiB small-file threshold.
+        for i in 0..5u64 {
+            write_file(bucket.path(), &[rec(i + 1, TS0 + i * 1_000_000)]);
+        }
+        let dir = partition().data_path(bucket.path());
+        let before = live_files(&dir).expect("before");
+        assert_eq!(before.len(), 5, "five small input files");
+        assert!(
+            before.len() > policy.min_files,
+            "starts over the H4 fragmentation trigger",
+        );
+
+        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        assert_eq!(outcome.files_before, 5);
+        assert_eq!(outcome.rows, 5, "all rows carried");
+
+        let after = live_files(&dir).expect("after");
+        assert_eq!(after.len(), 1, "collapsed to a single live file");
+        assert!(
+            after.len() <= policy.min_files,
+            "no longer over-fragmented (H4 small-file count down)",
+        );
+        let rows = Reader::open_partition(&after[0], partition())
+            .expect("open")
+            .read_all()
+            .expect("read");
+        assert_eq!(rows.len(), 5, "row conservation across the collapse");
+    }
+
     #[test]
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).

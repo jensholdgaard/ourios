@@ -1070,33 +1070,38 @@ mod tests {
         );
     }
 
-    /// RFC0009.1 — compaction drives the H4 small-file count down. A
-    /// partition fragmented into many sub-128 MiB files (over the
-    /// `CompactionPolicy::min_files` over-fragmentation trigger) collapses
-    /// to a single file, so the partition stops contributing to H4's
-    /// "fewer than 5 % of files below 128 MiB" tenant signal. (The
-    /// corpus-scale histogram is the §6 corpus test; this is the unit-scale
-    /// file-count lever, with row conservation across the collapse.)
+    /// RFC0009.1 — compaction drives the H4 small-file **count** down. A
+    /// partition fragmented into more than `CompactionPolicy::min_files`
+    /// files (the over-fragmentation trigger) collapses to a single file,
+    /// dropping the per-tenant small-file count that H4's "fewer than 5 %
+    /// of files below 128 MiB" signal tracks. At unit scale the
+    /// consolidated file is itself small — the file-*size* distribution is
+    /// the §6 corpus test's job; this asserts the file-count lever and row
+    /// conservation across the collapse. The input count derives from the
+    /// policy so it can't drift out of sync with the default.
     #[test]
     fn rfc0009_1_many_small_files_collapse_to_one() {
         let policy = CompactionPolicy::default();
+        // One past the over-fragmentation trigger; each file is a single
+        // tiny record, far below the small-file threshold.
+        let n = policy.min_files + 1;
         let bucket = tempfile::tempdir().expect("temp");
-        // Five small files — over the `min_files` (4) fragmentation
-        // trigger, each far below the 128 MiB small-file threshold.
-        for i in 0..5u64 {
+        for i in 0..n {
+            let i = u64::try_from(i).expect("small count");
             write_file(bucket.path(), &[rec(i + 1, TS0 + i * 1_000_000)]);
         }
         let dir = partition().data_path(bucket.path());
         let before = live_files(&dir).expect("before");
-        assert_eq!(before.len(), 5, "five small input files");
-        assert!(
-            before.len() > policy.min_files,
-            "starts over the H4 fragmentation trigger",
-        );
+        assert_eq!(before.len(), n, "one small file per write");
+        assert!(before.len() > policy.min_files, "starts over-fragmented");
 
         let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
-        assert_eq!(outcome.files_before, 5);
-        assert_eq!(outcome.rows, 5, "all rows carried");
+        assert_eq!(outcome.files_before, n);
+        assert_eq!(
+            outcome.rows,
+            u64::try_from(n).expect("small count"),
+            "all rows carried",
+        );
 
         let after = live_files(&dir).expect("after");
         assert_eq!(after.len(), 1, "collapsed to a single live file");
@@ -1108,7 +1113,7 @@ mod tests {
             .expect("open")
             .read_all()
             .expect("read");
-        assert_eq!(rows.len(), 5, "row conservation across the collapse");
+        assert_eq!(rows.len(), n, "row conservation across the collapse");
     }
 
     #[test]

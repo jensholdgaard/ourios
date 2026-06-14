@@ -397,6 +397,7 @@ mod tests {
             files_compacted: 7,
             rows_compacted: 100,
             gc_failures: 1,
+            orphans_reclaimed: 0,
             errors: Vec::new(),
             compaction_events: Vec::new(),
             bytes_read: 4096,

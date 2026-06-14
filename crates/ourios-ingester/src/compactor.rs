@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionPolicy, PartitionKey, compact_partition,
+    Committed, CompactionError, CompactionPolicy, PartitionKey, compact_partition, gc_orphans,
     percent_decode_tenant, plan_candidates,
 };
 
@@ -79,6 +79,11 @@ pub struct SweepReport {
     /// Superseded inputs that couldn't be removed post-commit (orphans
     /// a later sweep/GC reclaims; see `CompactionOutcome.gc_failures`).
     pub gc_failures: usize,
+    /// Orphan files (dead inputs / consolidated / `*.tmp` left by a
+    /// crashed prior compaction) reclaimed this sweep by `gc_orphans`
+    /// (RFC0009.4 — crash safety: orphans are reclaimable on a later
+    /// sweep). Counts only candidate partitions visited this sweep.
+    pub orphans_reclaimed: u64,
     /// Per-tenant / per-partition failures encountered, formatted for
     /// logging. A sweep is **resilient**: one bad tenant or partition
     /// is recorded here and skipped, never aborting the rest (else a
@@ -165,6 +170,13 @@ pub fn run_sweep(
         let candidates_found = candidates.len();
         let mut compacted_here = 0usize;
         for partition in candidates {
+            // Reclaim orphans a prior crashed compaction of this partition
+            // left (RFC0009.4). Manifest-authoritative, so it never touches
+            // a live file; a scan error is recorded, not fatal.
+            match gc_orphans(&partition.data_path(bucket_root)) {
+                Ok(gc) => report.orphans_reclaimed += gc.reclaimed,
+                Err(e) => report.errors.push(format!("gc-orphans {tenant:?}: {e}")),
+            }
             match compact_partition(bucket_root, &partition) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {

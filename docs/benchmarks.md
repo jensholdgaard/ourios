@@ -13,24 +13,31 @@ that would falsify it.
 
 The thresholds were pinned before any number was measured; if we miss
 them on representative corpora, the thesis is wrong and a pillar
-changes. As of **2026-06-12** the gates have authoritative numbers on
-the §1 hardware baseline (§9.4): **B1, B2, C1, C2 pass; A1 fails** and
-is the open gate.
+changes. As of **2026-06-14** the four gating thesis-gates **B1, B2, C1,
+C2 all pass** on the §1 hardware baseline (§9.4/§9.6). **A1 fails but no
+longer gates** — RFC 0011 (`accepted`) reclassified the
+compression-vs-zstd ratio as a recorded diagnostic (its failure is
+structural; see §2 / the §7 table).
 
 ## 0. How to read this document
 
 Every goal below carries two labels.
 
-- **Scope** — `thesis-gate` or `tuning-goal`.
+- **Scope** — `thesis-gate`, `tuning-goal`, or `diagnostic`.
   - A `thesis-gate` failing on representative corpora means a pillar
     (`CLAUDE.md` §2) is wrong. The response is an RFC, not a sprint.
   - A `tuning-goal` failing means the design is sound but the
     implementation needs work. The response is a PR.
-- **Bar** — `must-win`, `should-win`, or `stretch`.
+  - A `diagnostic` is measured and recorded but gates nothing — it
+    characterises a property or guards against regression. A1 was
+    reclassified here by RFC 0011 (`accepted`); see §2.
+- **Bar** — `must-win`, `should-win`, `stretch`, or `informational`.
   - `must-win` — shipping without it is shipping a broken claim.
   - `should-win` — expected on representative corpora; explained when
     missed.
   - `stretch` — aspirational; missing is not a bug.
+  - `informational` — a `diagnostic`'s bar: the number is recorded for
+    insight, never blocks.
 
 A goal with scope `thesis-gate` and bar `must-win` is load-bearing for
 the whole project. **Four** of those below are gating — B1, B2, C1, C2,

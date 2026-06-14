@@ -91,9 +91,6 @@ impl OwnedToken {
 /// **by wildcard-slot ordinal** (left-to-right), not by template
 /// position. The cluster uses it to fire `TemplateTypeExpanded`
 /// audit events when a new `ParamType` lands at a known slot.
-///
-/// Retained-body counts (the rest of the §6.1 leaf payload) will be
-/// added when the body-retention PR lands.
 #[derive(Debug, Clone)]
 pub struct Leaf {
     pub template: Vec<OwnedToken>,

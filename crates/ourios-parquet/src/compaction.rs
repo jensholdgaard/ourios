@@ -1203,6 +1203,48 @@ mod tests {
         assert_eq!(rows.len(), 2, "every row preserved across the amendment");
     }
 
+    /// RFC0009.5 — tenant + partition isolation. Compaction reads every
+    /// input through `Reader::open_partition`, which enforces the RFC 0005
+    /// §3.9 row-vs-path contract, so an input file holding a row that
+    /// belongs to a *different* time bucket (or tenant) aborts the
+    /// compaction instead of being silently merged across the boundary.
+    #[test]
+    fn rfc0009_5_mis_partitioned_input_aborts_rather_than_merging() {
+        use parquet::arrow::ArrowWriter;
+
+        let bucket = tempfile::tempdir().expect("temp");
+        // A legitimate input for partition P.
+        write_file(bucket.path(), &[rec(1, TS0)]);
+        let dir = partition().data_path(bucket.path());
+
+        // A second file dropped into P's directory whose row belongs to a
+        // *different* hour (TS0 + 2 h) — a mis-partitioned input.
+        let foreign = rec(2, TS0 + 2 * HOUR_NANOS);
+        assert_ne!(
+            PartitionKey::derive(&foreign).expect("derive foreign"),
+            partition(),
+            "the foreign row really maps to another partition",
+        );
+        let batch = crate::mined_records_to_batch(&[foreign]).expect("batch");
+        let path = dir.join("0190abcd-0000-7000-8000-0000000000f0.parquet");
+        let file = std::fs::File::create(&path).expect("create foreign");
+        let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("writer");
+        w.write(&batch).expect("write foreign");
+        w.close().expect("close foreign");
+
+        // Two inputs, one mis-partitioned → compaction aborts on the
+        // row-vs-path check; it never merges rows across partition keys.
+        let err = compact_partition(bucket.path(), &partition()).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                CompactionError::Read(ReaderError::PartitionMismatch { .. })
+            ),
+            "aborts specifically on the §3.9 row-vs-path check, not some other \
+             read failure; got {err:?}",
+        );
+    }
+
     #[test]
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).

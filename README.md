@@ -21,8 +21,8 @@ parts:
 - **Apache Parquet** — columnar storage, with predicate pushdown via
   row-group statistics, bloom filters, and page indexes.
 - **A Drain-derived online template miner** — collapses log lines to
-  `(template_id, params)` at ingest time, before any byte-level codec
-  runs.
+  `(template_id, params)` at ingest time: a *logical* 50–200× reduction
+  that drives query pruning (not a bytes-vs-codec claim; see RFC 0011).
 - **Apache DataFusion** — a production-ready vectorised SQL execution
   engine. We hand it logical plans; it does the work.
 

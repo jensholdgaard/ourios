@@ -51,9 +51,16 @@ decision, not a PR-level one.
    and page indexes. Query performance comes from skipping row groups via
    footer reads, not from scanning.
 2. **Drain-derived online template mining.** Log lines collapse to
-   `(template_id, params)` at ingest time. This is where the 50–200×
-   compression comes from — before any byte-level codec runs. Correctness
-   of this layer is the single biggest engineering risk in the project.
+   `(template_id, params)` at ingest time — a **logical** 50–200×
+   reduction (many near-identical lines become rows keyed by one small,
+   stable `template_id`). That reduction is what lets a selective query
+   read a handful of row groups instead of scanning the corpus, so the
+   payoff is **query pruning** (pillar #1's footer-skip; benchmark gates
+   B1/B2), **not** fewer on-disk bytes than a byte codec — RFC 0011
+   showed a whole-stream codec captures the same redundancy, so the
+   on-disk-compression-vs-zstd ratio (A1) is a recorded diagnostic, not a
+   gate. Correctness of this layer is the single biggest engineering risk
+   in the project.
 3. **DataFusion as the query engine.** We do not write a vectorised
    execution engine. We hand DataFusion logical plans and let it work.
 
@@ -394,11 +401,14 @@ the wrong thing.
 
 ---
 
-*Last updated: 2026-05-13. Original draft 2026-04-23. 2026-04-26 revision
+*Last updated: 2026-06-14. Original draft 2026-04-23. 2026-04-26 revision
 aligned §7 with the present-day repo and added §6.7 + an mdBook entry to
 §6.6 (commits 1c806f5..84eed86). 2026-05-13 revision adds the "Tests are
 specifications, not friction" bullet to §6.2, codifying a discipline
 called out by Dave Farley as a recurring AI-assisted-development failure
 mode (informal `meta:` RFC waiver per maintainer discussion of the same
-date; precedent: b50067d). This document is load-bearing; further changes
-require a `meta:` RFC and majority maintainer approval.*
+date; precedent: b50067d). 2026-06-14 revision rewords §2 pillar #2 so the
+50–200× reads as a **logical** reduction (query pruning, benchmark gates
+B1/B2) rather than an on-disk-bytes-beat-the-codec claim, per **RFC 0012**
+(maintainer-approved `meta:` RFC) propagating RFC 0011's A1 demotion. This document is load-bearing; further changes require a `meta:`
+RFC and majority maintainer approval.*

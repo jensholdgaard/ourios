@@ -25,9 +25,11 @@ queries via DataFusion with aggressive predicate pushdown.
 
 The thesis: **Parquet + template mining + DataFusion collapses the
 inverted index, the compression layer, the storage tier, and the query
-engine into one stack of off-the-shelf parts plus thin glue.** Our job is
-the glue, plus the honest handling of the places where template mining can
-go wrong.
+engine into one stack of off-the-shelf parts plus thin glue.** Here
+"compression" is Parquet's byte codec plus the miner's *logical* template
+reduction (§2 pillar #2) — the value of which is query pruning, not
+on-disk bytes that beat a codec. Our job is the glue, plus the honest
+handling of the places where template mining can go wrong.
 
 ### Is not
 - Not a metrics backend. OTLP metrics and traces are out of scope.
@@ -407,9 +409,10 @@ aligned §7 with the present-day repo and added §6.7 + an mdBook entry to
 specifications, not friction" bullet to §6.2, codifying a discipline
 called out by Dave Farley as a recurring AI-assisted-development failure
 mode (informal `meta:` RFC waiver per maintainer discussion of the same
-date; precedent: b50067d). 2026-06-14 revision rewords §2 pillar #2 so the
-50–200× reads as a **logical** reduction (query pruning, benchmark gates
-B1/B2) rather than an on-disk-bytes-beat-the-codec claim, per **RFC 0012**
-(maintainer-approved `meta:` RFC) propagating RFC 0011's A1 demotion.
+date; precedent: b50067d). 2026-06-14 revision rewords §2 pillar #2 (and
+clarifies the §1 thesis sentence) so the 50–200× reads as a **logical**
+reduction (query pruning, benchmark gates B1/B2) rather than an
+on-disk-bytes-beat-the-codec claim, per **RFC 0012** (maintainer-approved
+`meta:` RFC) propagating RFC 0011's A1 demotion.
 This document is load-bearing; further changes require a `meta:` RFC and
 majority maintainer approval.*

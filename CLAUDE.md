@@ -1,8 +1,11 @@
 # CLAUDE.md — Ourios
 
-> Status: **draft**. This is a greenfield project. Nothing has been
-> implemented yet. These directives exist to make sure the first ten
-> thousand lines are written with the same care as the hundred-thousandth.
+> Status: **pre-release, under active RFC-driven development.** The ingest
+> path (OTLP → WAL → miner → Parquet) and the query path (logs DSL →
+> DataFusion) are implemented and tested behind RFC acceptance gates; the
+> performance thesis is being validated in `docs/benchmarks.md`. These
+> directives exist to make sure every line is written with the same care
+> as the first — and the hundred-thousandth.
 
 You are contributing to **Ourios**, a log storage and query backend built
 on Apache Parquet, a Drain3-derived template miner, and Apache DataFusion.
@@ -413,6 +416,9 @@ date; precedent: b50067d). 2026-06-14 revision rewords §2 pillar #2 (and
 clarifies the §1 thesis sentence) so the 50–200× reads as a **logical**
 reduction (query pruning, benchmark gates B1/B2) rather than an
 on-disk-bytes-beat-the-codec claim, per **RFC 0012** (maintainer-approved
-`meta:` RFC) propagating RFC 0011's A1 demotion.
+`meta:` RFC) propagating RFC 0011's A1 demotion. Same-date banner refresh
+(the "draft / nothing implemented yet" status was stale — the ingest +
+query stack is built and tested behind RFC gates) lands as an informal
+`meta:` RFC waiver per maintainer request (precedent: b50067d).
 This document is load-bearing; further changes require a `meta:` RFC and
 majority maintainer approval.*

@@ -45,19 +45,29 @@ critical path as short and honest as possible.
 
 ## 2. The MVP gate: thesis benchmarks
 
-Five `[THESIS]`-marked goals in
+**Four** gating `[THESIS]` goals in
 [`benchmarks.md`](./benchmarks.md) define MVP-done. Hitting all
-five on a representative corpus means the thesis holds; missing
+four on a representative corpus means the thesis holds; missing
 any of them means a pillar (`CLAUDE.md` §2) is wrong and a PR
 won't fix it — an RFC will.
 
 | Gate | What it measures | Why it matters |
 |---|---|---|
-| **A1** | End-to-end compression ratio vs. zstd-alone over flat text | Pillar 1 (Parquet) + Pillar 2 (template mining) stack, or they don't |
 | **B1** | Predicate-pushdown query latency on time/template/tenant filters | Pillar 1 (footer reads + min/max stats skip row groups) actually skips |
 | **B2** | Template-exact query latency (`where template_id = X`) | Pillar 2's `template_id` column is a usable index, not a curiosity |
 | **C1** | Bit-identical reconstruction rate over the corpus | The hardest invariant (`CLAUDE.md` §3.3) holds in practice, not just in unit tests |
 | **C2** | Template-count convergence (Drain finds a small, stable number of templates) | Pillar 2 (template mining) extracts the structure we believed was there |
+
+**A1** (end-to-end compression vs. zstd-alone) *was* a fifth gating
+goal, but **RFC 0011 (`accepted`) demoted it to a recorded
+diagnostic**: it is refuted on every corpus class — including the
+maximally-templated one — for structural reasons (the more templated a
+corpus, the more a whole-stream byte codec captures the same
+redundancy), so template mining's compression value is *logical* /
+query-pruning, captured by B1/B2, not on-disk bytes vs a codec. A1 is
+still measured and recorded (`benchmarks.md` §7/§9 — the columnar
+queryability premium + a codec-regression guard) but **does not block
+MVP-done or any RFC's `validated`**.
 
 `A2`, `B3`, `C3`, `C4`, `D*`, `E*` in `benchmarks.md` are
 relevant but not MVP-blocking — they're tuning goals, honesty

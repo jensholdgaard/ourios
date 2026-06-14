@@ -33,7 +33,10 @@ Every goal below carries two labels.
   - `stretch` — aspirational; missing is not a bug.
 
 A goal with scope `thesis-gate` and bar `must-win` is load-bearing for
-the whole project. There are five of those below, marked `[THESIS]`.
+the whole project. **Four** of those below are gating — B1, B2, C1, C2,
+each marked `[THESIS]`. A1 also carries the `[THESIS]` scope but RFC 0011
+(`accepted`) demoted it to a recorded **diagnostic**: it no longer gates
+(see its section below and the §7 table).
 
 ## 1. Corpora and methodology
 
@@ -93,8 +96,16 @@ codecs run.
 
 ### A1 `[THESIS]` — End-to-end compression ratio vs. zstd-alone
 
-- **Scope**: thesis-gate.
-- **Bar**: must-win.
+> **Demoted to a diagnostic (RFC 0011, `accepted`).** A1 is refuted on
+> every corpus class — including the maximally-templated one — for
+> structural reasons, so it no longer gates any RFC's `validated`. It is
+> still measured and recorded (§7 table / §9 series) as the columnar
+> queryability premium and a codec-regression guard. The scope, bar,
+> target, and falsifier below are retained as the diagnostic's reference
+> line — now **informational**, not gating.
+
+- **Scope**: diagnostic (RFC 0011; originally `thesis-gate`).
+- **Bar**: informational (RFC 0011; originally `must-win`).
 - **Metric**: `bytes(raw_corpus) / bytes(ourios_parquet_directory)`
   compared to `bytes(raw_corpus) / bytes(zstd_compressed_corpus)`.
 - **Target**: Ourios ratio ≥ **3×** the zstd-alone ratio, on every

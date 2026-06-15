@@ -399,6 +399,13 @@ fn b2_post_compaction(c: &mut Criterion) {
         p_unc.rows, p_cmp.rows,
         "compaction must not change the query result set",
     );
+    // Guard against a vacuous 0==0 pass (tenant/template mismatch, writer
+    // failure): every row is template 1, so the query must return them all.
+    assert_eq!(
+        p_unc.rows,
+        B2_POST_FILES * ROWS_PER_FILE,
+        "b2-post query must return every built row (setup wired correctly)",
+    );
     eprintln!(
         "b2-post-compaction: {} rows; uncompacted scanned {} row groups ({} B) across {B2_POST_FILES} \
          files → compacted scanned {} row groups ({} B) in 1 file",

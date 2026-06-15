@@ -622,6 +622,12 @@ pub fn encode_records_to_parquet(
     let mut writer = ArrowWriter::try_new(Vec::new(), data_schema(), Some(props))
         .map_err(WriterError::Parquet)?;
     for chunk in records.chunks(SUB_BATCH_ROWS) {
+        // §3.5 row-group sizing: seal a row group once the in-progress
+        // buffer crosses the threshold (same guard as `Writer::append_chunks`)
+        // so large inputs don't produce one oversized row group.
+        if writer.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            writer.flush().map_err(WriterError::Parquet)?;
+        }
         let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
         writer.write(&batch).map_err(WriterError::Parquet)?;
     }

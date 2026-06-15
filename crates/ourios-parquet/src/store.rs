@@ -195,19 +195,14 @@ mod tests {
     /// A byte object round-trips through the local backend, and a delete
     /// removes it. (Foundation for the RFC0013 consumer migration; the §5
     /// scenarios turn green as the writer/reader move onto `Store`.)
-    #[test]
-    fn local_store_put_get_delete_round_trip() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_store_put_get_delete_round_trip() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let store = Store::local(dir.path()).expect("local store");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let key = "data/tenant_id=t/year=2026/x.parquet";
-            store.put(key, b"hello-ourios".to_vec()).await.expect("put");
-            assert_eq!(store.get(key).await.expect("get"), b"hello-ourios");
-            store.delete(key).await.expect("delete");
-            assert!(store.get(key).await.is_err(), "object gone after delete");
-        });
+        let key = "data/tenant_id=t/year=2026/x.parquet";
+        store.put(key, b"hello-ourios".to_vec()).await.expect("put");
+        assert_eq!(store.get(key).await.expect("get"), b"hello-ourios");
+        store.delete(key).await.expect("delete");
+        assert!(store.get(key).await.is_err(), "object gone after delete");
     }
 }

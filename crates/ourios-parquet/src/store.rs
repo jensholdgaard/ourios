@@ -24,19 +24,30 @@ use object_store::path::Path as ObjectPath;
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
 /// same code path targets `LocalFileSystem` or `AmazonS3` / S3-compatible.
+///
+/// **`red` caveat:** `prefix` is reserved and currently always empty, and
+/// [`Store::object_store`] returns the raw backend with **no prefix
+/// scoping**. Per-tenant/prefix isolation (RFC0013.5) is wired at `green` —
+/// do **not** assume this type enforces isolation yet.
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<dyn ObjectStore>,
+    /// Reserved key prefix (the store root). Always empty at `red`; honoured
+    /// once the consumers migrate onto [`Store`] at `green`.
     prefix: ObjectPath,
 }
 
 /// Configuration for the S3 / S3-compatible backend (RFC0013.7). Populated
 /// from RFC 0004 config at `green`; a placeholder here so the `red`
 /// constructor signature is stable.
+///
+/// `Default` is a `red` placeholder only — it yields an **empty `bucket`**,
+/// which is not valid; callers must set a non-empty `bucket` (the `green`
+/// `s3()` will reject an empty one).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct S3Config {
-    /// Bucket name.
+    /// Bucket name (required; the empty `Default` is a `red` placeholder).
     pub bucket: String,
     /// Optional endpoint override for S3-compatible stores (`MinIO`, R2, …).
     pub endpoint: Option<String>,
@@ -104,6 +115,9 @@ impl Store {
     /// fails gracefully. At `green` this becomes [`StoreError::Backend`] if
     /// the `object_store` `AmazonS3` backend cannot be constructed (bad
     /// endpoint, credentials, or bucket).
+    // `red` stub: `cfg` is unused until the `green` AmazonS3 impl consumes
+    // it (`needless_pass_by_value` fires because we never read it). The
+    // signature is fixed now so consumers can be written against it.
     #[allow(clippy::needless_pass_by_value, unused_variables)]
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
         // RFC0013 green: build AmazonS3 from cfg + RFC 0004 creds.

@@ -3,7 +3,7 @@
 //! `Store.get` → `Reader::open_bytes` → decode, with the rows recovered
 //! intact. Foundation for migrating the writer/reader off filesystem paths
 //! onto `Store`; uses the `LocalFileSystem` backend (the S3 backend +
-//! testcontainer lane lands in a later green slice).
+//! `testcontainers` lane lands in a later green slice).
 
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};

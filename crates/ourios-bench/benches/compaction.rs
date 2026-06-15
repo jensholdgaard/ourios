@@ -240,7 +240,11 @@ fn small_file_collapse(c: &mut Criterion) {
 /// criterion micro-sweep above). Defaults: 16 files × 16 000 rows × 2 KiB
 /// body ≈ 0.5 GiB of input, tunable via the matching env vars.
 fn baseline_params() -> Option<(u64, u64, usize)> {
-    std::env::var_os("OURIOS_COMPACTION_BASELINE")?;
+    // Require an explicit `=1` (not mere presence) so `…=0` can't silently
+    // suppress the CI criterion sweeps.
+    if std::env::var("OURIOS_COMPACTION_BASELINE").ok().as_deref() != Some("1") {
+        return None;
+    }
     let var = |k: &str, d: u64| {
         std::env::var(k)
             .ok()
@@ -263,6 +267,13 @@ fn baseline(_c: &mut Criterion) {
     let Some((files, rows, body)) = baseline_params() else {
         return; // CI mode — the criterion groups above run instead
     };
+    // Below 2 files (or 0 rows) `compact_partition` no-ops, which would make
+    // the D2/D3 numbers below meaningless — fail loudly on a misconfig.
+    assert!(
+        files >= 2,
+        "baseline needs >=2 input files to compact (got {files})"
+    );
+    assert!(rows > 0, "baseline needs rows > 0 (got {rows})");
     let dir = tempfile::TempDir::new().expect("temp bucket");
     eprintln!(
         "compaction/baseline: building {files} files × {rows} rows × {body} B body \
@@ -272,11 +283,16 @@ fn baseline(_c: &mut Criterion) {
 
     let t0 = Instant::now();
     let outcome = compact_partition(dir.path(), &part).expect("compact");
-    let secs = t0.elapsed().as_secs_f64();
+    // Clamp so a sub-microsecond run can't print an infinite/NaN MiB/s.
+    let secs = t0.elapsed().as_secs_f64().max(1e-9);
 
     let read_mib = outcome.bytes_read as f64 / (1024.0 * 1024.0);
     let out_mib = outcome.bytes_written as f64 / (1024.0 * 1024.0);
     let in_band = (256.0..=2048.0).contains(&out_mib);
+    // One live file after compaction, so the D3 "% under 128 MiB" is 0 or 100
+    // depending on whether this run was dialed to band scale — compute it
+    // rather than assume.
+    let pct_under_128 = if out_mib < 128.0 { 100.0 } else { 0.0 };
     eprintln!(
         "compaction/baseline D2: compacted {} files ({read_mib:.1} MiB read) → 1 in {secs:.2}s \
          = {:.1} MiB/s; {} rows conserved",
@@ -286,7 +302,7 @@ fn baseline(_c: &mut Criterion) {
     );
     eprintln!(
         "compaction/baseline D3: output 1 file {out_mib:.1} MiB — \
-         {} the 256 MiB–2 GiB band (0% of live files under 128 MiB after compaction)",
+         {} the 256 MiB–2 GiB band; {pct_under_128:.0}% of live files under 128 MiB after compaction",
         if in_band { "IN" } else { "OUTSIDE" },
     );
 }

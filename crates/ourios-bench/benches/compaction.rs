@@ -36,6 +36,7 @@ use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{PartitionKey, Writer, compact_partition};
+use ourios_querier::{Querier, QueryRequest};
 
 /// Anchored in 2026 so the derived partition path is stable; all records
 /// fall in one hour ⇒ one partition (the small-file problem is *within* a
@@ -49,6 +50,8 @@ const ROWS_PER_FILE: u64 = 2_000;
 const D2_BACKLOGS: [u64; 2] = [8, 32];
 /// Representative backlog for the D3 collapse measurement.
 const D3_FILES: u64 = 64;
+/// Small-file count for the B2-post-compaction query comparison.
+const B2_POST_FILES: u64 = 32;
 /// Bytes per MiB, for the D3 integer-byte size-band classification.
 const MIB: u64 = 1 << 20;
 
@@ -344,10 +347,89 @@ fn baseline(_c: &mut Criterion) {
     );
 }
 
+fn template_exact(tenant: &str, template_id: u64) -> QueryRequest {
+    QueryRequest {
+        tenant: TenantId::new(tenant),
+        time_range: None,
+        template_id: Some(template_id),
+        severity_text: None,
+    }
+}
+
+/// B2-post-compaction (RFC0009.7): the same template-exact query over a
+/// partition of `N` small files vs the single consolidated file compaction
+/// produces. Compaction conserves the rows, so the query returns the same
+/// result either way — the latency drop is the per-file footer/metadata-read
+/// overhead compaction removes (the PR #92 B2 finding that motivated RFC
+/// 0009). The printed row-group / byte counts are hardware-independent; the
+/// criterion latencies are indicative. Skipped in band-scale baseline mode.
+fn b2_post_compaction(c: &mut Criterion) {
+    if baseline_params().is_some() {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("tokio runtime");
+
+    // Uncompacted: N small files (no manifest ⇒ the reader globs all N live).
+    let uncompacted = tempfile::TempDir::new().expect("temp bucket");
+    build_backlog(uncompacted.path(), B2_POST_FILES);
+
+    // Compacted: the same N files consolidated to one (manifest ⇒ the reader
+    // resolves the single live file; the superseded inputs are ignored).
+    let compacted = tempfile::TempDir::new().expect("temp bucket");
+    let part = build_backlog(compacted.path(), B2_POST_FILES);
+    let outcome = compact_partition(compacted.path(), &part).expect("compact");
+    assert!(
+        outcome.committed.is_some(),
+        "b2-post setup must actually compact (not a no-op)"
+    );
+
+    let q_unc = Querier::new(uncompacted.path());
+    let q_cmp = Querier::new(compacted.path());
+    let req = template_exact("c", 1);
+
+    let p_unc = rt
+        .block_on(q_unc.run(req.clone()))
+        .expect("probe uncompacted");
+    let p_cmp = rt
+        .block_on(q_cmp.run(req.clone()))
+        .expect("probe compacted");
+    assert_eq!(
+        p_unc.rows, p_cmp.rows,
+        "compaction must not change the query result set",
+    );
+    eprintln!(
+        "b2-post-compaction: {} rows; uncompacted scanned {} row groups ({} B) across {B2_POST_FILES} \
+         files → compacted scanned {} row groups ({} B) in 1 file",
+        p_unc.rows,
+        p_unc.stats.row_groups_scanned,
+        p_unc.stats.bytes_read,
+        p_cmp.stats.row_groups_scanned,
+        p_cmp.stats.bytes_read,
+    );
+
+    let mut group = c.benchmark_group("b2-post-compaction");
+    group.bench_function("uncompacted", |b| {
+        b.iter(|| {
+            let r = rt.block_on(q_unc.run(req.clone())).expect("query");
+            black_box(r.rows);
+        });
+    });
+    group.bench_function("compacted", |b| {
+        b.iter(|| {
+            let r = rt.block_on(q_cmp.run(req.clone())).expect("query");
+            black_box(r.rows);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     compaction_throughput,
     small_file_collapse,
+    b2_post_compaction,
     baseline
 );
 criterion_main!(benches);

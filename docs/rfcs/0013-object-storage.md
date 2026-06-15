@@ -70,7 +70,7 @@ abstraction, used end to end, that we already ship.
 
 ### 2.3 Why now
 
-The thesis is proven (B1/B2/C1/C2 pass on baseline; `benchmarks.md` §3) and
+The thesis is proven (B1/B2/C1/C2 pass on baseline; `benchmarks.md` §9.4/§9.6) and
 the RFC ladder is green-or-beyond. The next milestone is **deployability**,
 and this is its load-bearing, architectural-pillar-level prerequisite —
 hence an RFC (`CLAUDE.md` §5.1) rather than a PR.
@@ -104,7 +104,7 @@ flowchart LR
     subgraph consumers [ourios-parquet / ourios-server consumers]
         W[Writer] & R[Reader] & C[compact_partition] & A[ParquetAuditSink]
     end
-    consumers --> S[Store handle\nArc&lt;dyn ObjectStore&gt; + prefix]
+    consumers --> S[Store handle\nan object_store handle + key prefix]
     S --> L[LocalFileSystem\ndev / test / CI]
     S --> O[AmazonS3 / S3-compatible\nproduction]
     Q[ourios-querier] -. registers same store .-> DF[DataFusion] --> S

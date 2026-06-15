@@ -49,6 +49,8 @@ const ROWS_PER_FILE: u64 = 2_000;
 const D2_BACKLOGS: [u64; 2] = [8, 32];
 /// Representative backlog for the D3 collapse measurement.
 const D3_FILES: u64 = 64;
+/// Bytes per MiB, for the D3 integer-byte size-band classification.
+const MIB: u64 = 1 << 20;
 
 /// `len` bytes of pseudo-random printable ASCII (same generator shape as
 /// the RFC0005.6 sizing test). Used only by the band-scale baseline mode so
@@ -252,7 +254,10 @@ fn baseline_params() -> Option<(u64, u64, usize)> {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|_| panic!("{k}={v:?} is not a valid u64")),
-        Err(_) => d,
+        // Default only when the var is genuinely absent; a present-but-non-UTF-8
+        // value is a misconfig, not "use the default".
+        Err(std::env::VarError::NotPresent) => d,
+        Err(std::env::VarError::NotUnicode(v)) => panic!("{k}={v:?} is not valid UTF-8"),
     };
     let files = var("OURIOS_COMPACTION_FILES", 16);
     let rows = var("OURIOS_COMPACTION_ROWS", 16_000);
@@ -308,13 +313,18 @@ fn baseline(_c: &mut Criterion) {
         "compaction must conserve every row",
     );
 
+    // Classify in integer bytes to avoid float-boundary misclassification at
+    // 128 MiB / 256 MiB / 2 GiB; floats are display-only.
+    let in_band = (256 * MIB..=2048 * MIB).contains(&outcome.bytes_written);
+    // One live file after compaction, so the D3 "% under 128 MiB" is 0 or 100
+    // depending on whether this run was dialed to band scale.
+    let pct_under_128 = if outcome.bytes_written < 128 * MIB {
+        100.0
+    } else {
+        0.0
+    };
     let read_mib = outcome.bytes_read as f64 / (1024.0 * 1024.0);
     let out_mib = outcome.bytes_written as f64 / (1024.0 * 1024.0);
-    let in_band = (256.0..=2048.0).contains(&out_mib);
-    // One live file after compaction, so the D3 "% under 128 MiB" is 0 or 100
-    // depending on whether this run was dialed to band scale — compute it
-    // rather than assume.
-    let pct_under_128 = if out_mib < 128.0 { 100.0 } else { 0.0 };
     eprintln!(
         "compaction/baseline D2: compacted {} files ({read_mib:.1} MiB read) → 1 in {secs:.2}s \
          = {:.1} MiB/s; {} rows conserved",

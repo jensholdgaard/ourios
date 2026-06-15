@@ -1,0 +1,76 @@
+name: Compaction bench (D2/D3)
+
+# Synthetic, corpus-free criterion bench for RFC 0009 D2/D3 — compaction
+# throughput and small-file collapse (`crates/ourios-bench/benches/compaction.rs`,
+# `docs/benchmarks.md` D2/D3). `workflow_dispatch`-only: like the query
+# benches, the ci-runner wall-clock is indicative, non-authoritative — the
+# §1 baseline (`baseline-8vcpu-32gib`) + real corpus volume are needed for
+# the authoritative numbers (the D3 256 MiB–2 GiB size band in particular).
+# Unlike query-bench this stages no corpus, so it is cheap to run.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compaction-bench:
+    name: D2/D3 compaction bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run D2/D3 compaction bench
+        run: |
+          set -euo pipefail
+          # rust-cache restores target/, which can carry a prior run's
+          # criterion results — clear so the artifact holds only this run.
+          rm -rf target/criterion
+          cargo bench -p ourios-bench --bench compaction -- \
+            --warm-up-time 1 --measurement-time 3 2>&1 | tee compaction-bench.log
+
+      - name: Write job summary (D2/D3)
+        if: always()
+        run: |
+          {
+            echo '## ourios compaction bench — D2/D3'
+            echo
+            echo '**Hardware: `ci-runner` (indicative — non-authoritative pending `baseline-8vcpu-32gib`).**'
+            echo
+            echo 'D2 read/write volume + D3 small-file collapse (structural, hardware-independent):'
+            echo '```'
+            grep -E 'd2/compaction-throughput:|d3/small-file-collapse:' compaction-bench.log 2>/dev/null \
+              || echo '(no measurement lines — the run failed before producing them)'
+            echo '```'
+            echo
+            echo 'Criterion timings (indicative, ci-runner) — divide bytes_read by the time for MiB/s:'
+            echo '```'
+            grep -B1 -E 'time:[[:space:]]+\[' compaction-bench.log 2>/dev/null \
+              || echo '(no timings — the run failed before producing them)'
+            echo '```'
+            echo
+            echo '> **Indicative only.** A hosted runner is not the `docs/benchmarks.md` §1'
+            echo '> baseline. The D3 absolute 256 MiB–2 GiB size band needs real corpus volume'
+            echo '> on `baseline-8vcpu-32gib`; this synthetic run shows the structural count'
+            echo '> collapse (N live files → 1, rows conserved) and the throughput shape only.'
+            echo '> Runs the maintainer selects are recorded by hand in docs/benchmarks.md §9.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: compaction-bench
+          path: |
+            compaction-bench.log
+            target/criterion
+          if-no-files-found: warn

@@ -19,8 +19,9 @@ superseded-by: —
 > RFC 0005 data + audit Parquet and the RFC 0009 manifest live on an
 > S3-compatible bucket in production and on local disk in dev/test —
 > **without changing the on-disk layout or a single stored row**. §§1–4, 7–8
-> are filled for `drafted`; §5/§6 are preliminary and finalised at
-> `specified`.
+> are filled; §5 acceptance criteria use the standard Given/When/Then/And
+> scenario format (refined at `specified` once the backend trait shape is
+> fixed); §6 testing is preliminary.
 
 ## 1. Summary
 
@@ -44,8 +45,9 @@ bytes themselves.
 
 `CLAUDE.md` §3.6: *"Local disk is cache and WAL. Parquet on S3 is the truth.
 Never design a feature that requires local disk to be durable beyond the WAL
-horizon."* Today the store is **local-filesystem only** — `grep` finds no
-`object_store`/S3 usage; every consumer takes a `&Path` bucket root. That is
+horizon."* Today the store is **local-filesystem only** — no first-party
+`object_store`/S3 usage in our Rust source (it is present only *transitively*,
+via DataFusion; §2.2); every consumer takes a `&Path` bucket root. That is
 fine for the thesis-proving MVP (which ran on single hosts), but it makes
 Ourios undeployable to a cluster: pods are ephemeral, and acknowledged data
 must outlive any one node. Durable shared object storage is the spine of the
@@ -172,26 +174,67 @@ region, bucket, prefix, credentials) flows through RFC 0004.
   RFC 0005 §4.1 (the manifest in RFC 0009 is the minimal piece we actually
   need). Out of scope; not reopened here.
 
-## 5. Acceptance criteria (preliminary — finalised at `specified`)
+## 5. Acceptance criteria
 
-- **RFC0013.1 — S3 round-trip.** *Given* a `MinedRecord` batch *when* written
-  and read through the `AmazonS3` backend (a MinIO/localstack testcontainer)
-  *then* rows + bytes match the local backend byte-for-byte.
-- **RFC0013.2 — local backend, no regression.** The existing RFC 0005 / 0009
-  suites pass unchanged against the `LocalFileSystem` backend after the seam
-  refactor.
-- **RFC0013.3 — atomic publish under contention.** Two concurrent
-  `compact_partition` runs on one partition → exactly one manifest generation
-  wins; no torn, doubled, or lost rows; the loser retries or no-ops.
-- **RFC0013.4 — manifest swap via conditional PUT.** Generation publish uses
-  create-if-absent + compare-and-swap, with no `rename` dependency.
-- **RFC0013.5 — tenant isolation across the key prefix** (`CLAUDE.md` §3.7).
-- **RFC0013.6 — WAL stays local** (`CLAUDE.md` §3.4): the backend carries
-  data/audit/manifest only.
-- **RFC0013.7 — S3-compatible endpoints** (MinIO/R2) work via endpoint
-  override, configured through RFC 0004.
-- **RFC0013.8 — reader forward-compat** (RFC 0005 §3.9) holds over the object
-  store.
+Normative scenarios in the `docs/rfcs/README.md` Given/When/Then/And format;
+each id is referenced from the test code. Refined at `specified` once the
+backend trait shape (§7) is fixed, but the scenarios below are the binding
+contract.
+
+> **RFC0013.1 — Round-trip through the S3 backend**
+> - **Given** a `MinedRecord` batch covering every RFC 0005 §3.2 column
+> - **When** it is written and then read back through the `AmazonS3` backend
+>   (a MinIO / localstack testcontainer)
+> - **Then** the recovered rows and Parquet bytes equal those from the
+>   `LocalFileSystem` backend, byte for byte.
+
+> **RFC0013.2 — Local backend regresses nothing**
+> - **Given** the existing RFC 0005 and RFC 0009 acceptance suites
+> - **When** they run against the `LocalFileSystem` backend after the seam
+>   refactor
+> - **Then** every one passes unchanged (the abstraction is behaviour-
+>   preserving for the local case).
+
+> **RFC0013.3 — Atomic publish under contention**
+> - **Given** two `compact_partition` runs racing on one partition's manifest
+> - **When** both attempt to publish a new generation
+> - **Then** exactly one wins; no query observes a torn, doubled, or missing
+>   row; **and** the loser either retries against the new generation or
+>   no-ops.
+
+> **RFC0013.4 — Manifest swap needs no `rename`**
+> - **Given** an object store with no POSIX `rename`
+> - **When** a generation is published
+> - **Then** it uses conditional PUT — create-if-absent (`If-None-Match`) and
+>   compare-and-swap (`If-Match`) — with no `rename` dependency anywhere on
+>   the publish path.
+
+> **RFC0013.5 — Tenant isolation across the key prefix**
+> - **Given** data + audit objects for tenants X and Y under the configured
+>   prefix
+> - **When** an operation runs in tenant X's context
+> - **Then** it addresses only X's key sub-prefix; no read or write touches
+>   Y's keys (`CLAUDE.md` §3.7).
+
+> **RFC0013.6 — WAL stays local**
+> - **Given** a server configured with an object-storage backend
+> - **When** it ingests and acknowledges a batch
+> - **Then** only the RFC 0005 data/audit Parquet and the RFC 0009 manifest
+>   reach the object store; the WAL remains on local disk (the §3.4
+>   durability horizon is unchanged).
+
+> **RFC0013.7 — S3-compatible endpoints via override**
+> - **Given** an S3-compatible store (e.g. MinIO) configured through RFC 0004
+>   with an endpoint override
+> - **When** the backend reads and writes
+> - **Then** it works against that endpoint exactly as against AWS S3.
+
+> **RFC0013.8 — Reader forward-compat over the object store**
+> - **Given** objects written by an older/newer schema (absent / unknown
+>   columns, per RFC 0005 §3.9)
+> - **When** the current reader reads them through the object-storage backend
+> - **Then** the §3.9 contract holds (absent columns default, unknown columns
+>   ignored) — no error.
 
 ## 6. Testing strategy (preliminary)
 

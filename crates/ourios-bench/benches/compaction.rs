@@ -243,9 +243,14 @@ fn small_file_collapse(c: &mut Criterion) {
 /// body ≈ 0.5 GiB of input, tunable via the matching env vars.
 fn baseline_params() -> Option<(u64, u64, usize)> {
     // Require an explicit `=1` (not mere presence) so `…=0` can't silently
-    // suppress the CI criterion sweeps.
-    if std::env::var("OURIOS_COMPACTION_BASELINE").ok().as_deref() != Some("1") {
-        return None;
+    // suppress the CI criterion sweeps. A non-UTF-8 value fails fast, like the
+    // other baseline vars — not silently treated as "unset".
+    match std::env::var("OURIOS_COMPACTION_BASELINE") {
+        Ok(v) if v == "1" => {}
+        Ok(_) | Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(v)) => {
+            panic!("OURIOS_COMPACTION_BASELINE={v:?} is not valid UTF-8")
+        }
     }
     // Fail fast on a present-but-unparsable value (an authoritative run must
     // not silently fall back to a default and report misleading scale); use

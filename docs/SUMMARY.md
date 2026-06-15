@@ -30,6 +30,7 @@
 - [RFC 0010 — Audit-stream queries & template drift](./rfcs/0010-audit-stream-queries.md)
 - [RFC 0011 — A1 re-scope](./rfcs/0011-a1-rescope.md)
 - [RFC 0012 — meta: CLAUDE.md §2 pillar-#2 wording](./rfcs/0012-claude-md-pillar-2-wording.md)
+- [RFC 0013 — Object storage (S3-compatible)](./rfcs/0013-object-storage.md)
 
 # Talks
 

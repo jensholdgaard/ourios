@@ -101,7 +101,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0002 | Query DSL | `green` |
 | 0003 | OTLP receiver (gRPC + HTTP) | `green` |
 | 0004 | Configuration policy | `green` |
-| 0005 | Parquet storage | `drafted` — 10/11 §5 (RFC0005.6 row-group sizing deferred to a corpus run; a maintainer sign-off bumps it to `green`) |
+| 0005 | Parquet storage | **`green`** — all 14 §5 scenarios pass; RFC0005.6 row-group sizing is the `#[ignore]`d `tests/sizing.rs` (manual `cargo test --ignored`, not CI-gated per §7) |
 | 0006 | Bench harness | `green` |
 | 0007 | Querier (DataFusion + logs DSL) | **`validated`** |
 | 0008 | WAL | **`accepted`** |

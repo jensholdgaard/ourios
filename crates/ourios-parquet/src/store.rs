@@ -52,12 +52,17 @@ pub struct S3Config {
 pub enum StoreError {
     /// Backend construction failed (bad root, credentials, endpoint, …).
     Backend(object_store::Error),
+    /// A backend constructor not yet implemented at this RFC 0013 stage.
+    /// Returned (rather than panicking) so an accidental call fails
+    /// gracefully while `red`.
+    Unimplemented(&'static str),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backend(e) => write!(f, "object-store backend: {e}"),
+            Self::Unimplemented(what) => write!(f, "not implemented (RFC 0013 red): {what}"),
         }
     }
 }
@@ -66,6 +71,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(e) => Some(e),
+            Self::Unimplemented(_) => None,
         }
     }
 }
@@ -93,12 +99,17 @@ impl Store {
     /// and the RFC 0004 credentials.
     ///
     /// # Errors
-    /// [`StoreError::Backend`] if the backend cannot be constructed (bad
-    /// endpoint, credentials, or bucket). (Unimplemented at `red`.)
+    /// At `red`, always [`StoreError::Unimplemented`] — returned rather than
+    /// panicking so an accidental call (e.g. from another workspace crate)
+    /// fails gracefully. At `green` this becomes [`StoreError::Backend`] if
+    /// the `object_store` `AmazonS3` backend cannot be constructed (bad
+    /// endpoint, credentials, or bucket).
     #[allow(clippy::needless_pass_by_value, unused_variables)]
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
         // RFC0013 green: build AmazonS3 from cfg + RFC 0004 creds.
-        unimplemented!("RFC0013 green: AmazonS3 / S3-compatible backend")
+        Err(StoreError::Unimplemented(
+            "RFC0013 green: AmazonS3 / S3-compatible backend",
+        ))
     }
 
     /// The underlying [`ObjectStore`], for handing to `DataFusion`'s table

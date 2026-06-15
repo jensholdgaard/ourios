@@ -15,11 +15,58 @@
 //! (not a new crate): `ourios-querier`, `-ingester`, and `-server` already
 //! depend on this crate, so the type is visible to every storage consumer.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use tokio::runtime::Runtime;
+
+/// Shared runtime that drives the async `object_store` calls from the **sync**
+/// storage API (`Writer`, `Reader`, `compaction`, and the manifest are sync;
+/// `object_store` is async, and compaction must reach S3 per RFC0013.3, so the
+/// bridge can't be a local-only `std::fs` shortcut).
+///
+/// One process-wide multi-threaded(1-worker) runtime so concurrent `block_on`
+/// from the storage call sites is safe (each runs on its own thread; see
+/// [`block_on_off_runtime`]).
+fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(StoreError::Runtime)?;
+    // A racing thread may have initialised it first; if so our runtime is
+    // dropped and we use theirs (the configuration is identical).
+    let _ = RT.set(rt);
+    RT.get()
+        .ok_or_else(|| StoreError::Runtime(std::io::Error::other("bridge runtime vanished")))
+}
+
+/// Drive `fut` to completion synchronously, running `block_on` on a **fresh OS
+/// thread** rather than the caller's. A plain thread never inherits the tokio
+/// runtime context, so this is safe even when the caller is *inside* a runtime
+/// (e.g. a `#[tokio::test]` that opens the reader, or any future async
+/// consumer) — `block_on` on the calling thread would panic "runtime within a
+/// runtime" there. [`std::thread::scope`] lets `fut` borrow the caller's
+/// `self`/`key` while still running off-thread.
+fn block_on_off_runtime<F>(fut: F) -> Result<F::Output, StoreError>
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    let rt = bridge_runtime()?;
+    Ok(std::thread::scope(|s| {
+        s.spawn(|| rt.block_on(fut))
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }))
+}
 
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
@@ -67,6 +114,9 @@ pub enum StoreError {
     /// Returned (rather than panicking) so an accidental call fails
     /// gracefully while `red`.
     Unimplemented(&'static str),
+    /// The sync→async bridge runtime could not be built (resource
+    /// exhaustion). Surfaced by the `*_blocking` methods.
+    Runtime(std::io::Error),
 }
 
 impl std::fmt::Display for StoreError {
@@ -74,6 +124,7 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Backend(e) => write!(f, "object-store backend: {e}"),
             Self::Unimplemented(what) => write!(f, "not implemented (RFC 0013 red): {what}"),
+            Self::Runtime(e) => write!(f, "object-store bridge runtime: {e}"),
         }
     }
 }
@@ -83,6 +134,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Backend(e) => Some(e),
             Self::Unimplemented(_) => None,
+            Self::Runtime(e) => Some(e),
         }
     }
 }
@@ -186,6 +238,28 @@ impl Store {
             .await
             .map_err(StoreError::Backend)
     }
+
+    /// Blocking [`Self::get`] for the **sync** storage call sites (`Reader`,
+    /// compaction). Safe to call from any thread, including inside a tokio
+    /// runtime — the `block_on` runs off-thread (see [`block_on_off_runtime`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::get`].
+    pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        block_on_off_runtime(self.get(key))?
+    }
+
+    /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
+    /// compaction). Safe to call from inside a tokio runtime (see
+    /// [`Self::get_blocking`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::put`].
+    pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        block_on_off_runtime(self.put(key, bytes))?
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +278,40 @@ mod tests {
         assert_eq!(store.get(key).await.expect("get"), b"hello-ourios");
         store.delete(key).await.expect("delete");
         assert!(store.get(key).await.is_err(), "object gone after delete");
+    }
+
+    /// The sync `*_blocking` bridge round-trips a byte object — the path the
+    /// sync `Writer` / `Reader` / compaction take onto `Store`. Runs on a
+    /// plain test thread (no ambient runtime), exercising `block_on`.
+    #[test]
+    fn blocking_bridge_put_get_round_trip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "data/tenant_id=t/year=2026/x.parquet";
+        store
+            .put_blocking(key, b"hello-blocking".to_vec())
+            .expect("put_blocking");
+        assert_eq!(
+            store.get_blocking(key).expect("get_blocking"),
+            b"hello-blocking"
+        );
+    }
+
+    /// The `*_blocking` bridge is safe to call from *within* a tokio runtime —
+    /// some consumers (e.g. a `#[tokio::test]` that reads back via `Reader`)
+    /// do exactly that. The `block_on` runs off the caller's thread, so it
+    /// must not panic "runtime within a runtime".
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_bridge_is_safe_inside_a_runtime() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "data/tenant_id=t/year=2026/x.parquet";
+        store
+            .put_blocking(key, b"inside-runtime".to_vec())
+            .expect("put_blocking");
+        assert_eq!(
+            store.get_blocking(key).expect("get_blocking"),
+            b"inside-runtime"
+        );
     }
 }

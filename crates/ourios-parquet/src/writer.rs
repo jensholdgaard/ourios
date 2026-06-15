@@ -603,6 +603,33 @@ fn append_chunks(
     Ok(())
 }
 
+/// Encode `records` to a complete in-memory Parquet file (the RFC 0013
+/// buffer-and-put write path: the async edge then `Store.put`s the bytes).
+/// Same schema, codec, and §3.6 encoding policy as the file-based [`Writer`]
+/// — it differs only in target (`Vec<u8>` instead of a `File`). Row-group
+/// sizing (§3.5) still applies within the buffer via `ArrowWriter`.
+///
+/// # Errors
+/// [`WriterError::Parquet`] if `zstd_level` is out of range or encoding
+/// fails; [`WriterError::Batch`] if a record can't be converted to an Arrow
+/// batch.
+pub fn encode_records_to_parquet(
+    records: &[MinedRecord],
+    zstd_level: i32,
+) -> Result<Vec<u8>, WriterError> {
+    let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
+    let props = writer_properties(zstd);
+    let mut writer = ArrowWriter::try_new(Vec::new(), data_schema(), Some(props))
+        .map_err(WriterError::Parquet)?;
+    for chunk in records.chunks(SUB_BATCH_ROWS) {
+        let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
+        writer.write(&batch).map_err(WriterError::Parquet)?;
+    }
+    // `into_inner` flushes the final row group, writes the footer, and
+    // returns the buffer — the complete Parquet bytes.
+    writer.into_inner().map_err(WriterError::Parquet)
+}
+
 /// Build the [`WriterProperties`] that encode RFC 0005 §3.5
 /// (compression codec) and §3.6 (per-column encoding policy).
 /// `zstd` is the already-validated compression level (the caller

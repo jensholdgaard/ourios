@@ -1,16 +1,17 @@
 name: Build and deploy docs
 
-# Wired but not yet triggered on push. Flip the commented block below
-# once GitHub Pages is enabled in the repo settings and the first
-# release milestone has landed.
+# Builds the mdBook and deploys to GitHub Pages. The §6.7 gate (the
+# `ourios-wal` crash-recovery test landing) has cleared and Pages is
+# enabled (Settings → Pages → Source: GitHub Actions), so docs now
+# deploy automatically on pushes to main that touch the doc sources.
 on:
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'docs/**'
-  #     - 'book.toml'
-  #     - '.github/workflows/pages.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/pages.yml'
 
 permissions:
   contents: read

@@ -241,7 +241,7 @@ impl Store {
 
     /// Blocking [`Self::get`] for the **sync** storage call sites (`Reader`,
     /// compaction). Safe to call from any thread, including inside a tokio
-    /// runtime — the `block_on` runs off-thread (see [`block_on_off_runtime`]).
+    /// runtime — the `block_on` runs off the caller's thread.
     ///
     /// # Errors
     /// [`StoreError::Runtime`] if the bridge runtime can't be built;

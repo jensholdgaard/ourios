@@ -28,7 +28,6 @@
 //!   surface records rather than making up defaults.
 
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +44,7 @@ use parquet::errors::ParquetError;
 
 use crate::columns;
 use crate::partition::{PartitionKey, TimestampOverflowError};
+use crate::store::{Store, StoreError};
 
 /// Streaming Parquet reader for one data file.
 ///
@@ -91,22 +91,8 @@ impl Reader {
     ///
     /// Same set as [`Self::open_partition`].
     pub fn open_file(path: &Path) -> Result<Self, ReaderError> {
-        let file = File::open(path).map_err(|source| ReaderError::Io {
-            op: "open",
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(ReaderError::Parquet)?;
-        require_baseline_columns(builder.schema())?;
-        let inner = builder.build().map_err(ReaderError::Parquet)?;
-
-        Ok(Self {
-            inner,
-            partition: None,
-            file_path: path.to_path_buf(),
-        })
+        let bytes = read_object(path)?;
+        Self::from_bytes(bytes, path.to_path_buf())
     }
 
     /// Open a reader over in-memory Parquet `bytes` — the RFC 0013
@@ -120,6 +106,14 @@ impl Reader {
     /// [`ReaderError::MissingRequiredColumn`] if a baseline REQUIRED column
     /// is absent (§3.9).
     pub fn open_bytes(bytes: bytes::Bytes) -> Result<Self, ReaderError> {
+        Self::from_bytes(bytes, PathBuf::from("<object-store>"))
+    }
+
+    /// Build a reader over in-memory Parquet `bytes`, recording `file_path`
+    /// for diagnostics (the real path on the [`Self::open_file`] /
+    /// [`Self::open_partition`] seam, a sentinel on [`Self::open_bytes`]).
+    /// Applies the §3.9 baseline-column check; leaves `partition` unset.
+    fn from_bytes(bytes: bytes::Bytes, file_path: PathBuf) -> Result<Self, ReaderError> {
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(ReaderError::Parquet)?;
         require_baseline_columns(builder.schema())?;
@@ -128,7 +122,7 @@ impl Reader {
         Ok(Self {
             inner,
             partition: None,
-            file_path: PathBuf::from("<object-store>"),
+            file_path,
         })
     }
 
@@ -180,7 +174,8 @@ impl Reader {
 /// Errors produced by [`Reader`].
 #[derive(Debug)]
 pub enum ReaderError {
-    /// Filesystem I/O failure (file open, footer read).
+    /// Object-store read I/O failure (store open, object fetch, or key
+    /// derivation). `op` names which step failed.
     Io {
         op: &'static str,
         path: PathBuf,
@@ -231,7 +226,7 @@ impl fmt::Display for ReaderError {
         match self {
             Self::Io { op, path, source } => write!(
                 f,
-                "filesystem I/O on `{op}` at {}: {source}",
+                "object-store read I/O on `{op}` at {}: {source}",
                 path.display(),
             ),
             Self::Parquet(e) => write!(f, "parquet reader: {e}"),
@@ -311,6 +306,46 @@ fn validate_row_vs_partition(
         });
     }
     Ok(())
+}
+
+/// Read a data file's bytes through the object-storage [`Store`] seam
+/// (RFC 0013): a `LocalFileSystem`-backed store rooted at the file's parent
+/// directory, keyed by the file name. The sync read path (compaction, tests)
+/// thus goes through the same seam the S3 backend will, while keeping the
+/// `&Path` API — `Store.get` is async, so this uses the blocking bridge.
+fn read_object(path: &Path) -> Result<bytes::Bytes, ReaderError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| ReaderError::Io {
+            op: "derive object key",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file name is empty or not valid UTF-8",
+            ),
+        })?;
+    let store = Store::local(parent).map_err(|e| store_io_err("open store", path, e))?;
+    let bytes = store
+        .get_blocking(name)
+        .map_err(|e| store_io_err("fetch object", path, e))?;
+    Ok(bytes::Bytes::from(bytes))
+}
+
+/// Map a [`StoreError`] from the read seam onto [`ReaderError::Io`], preserving
+/// the file path and op for diagnostics. The `StoreError` is wrapped as the
+/// `io::Error`'s source (not stringified), so the backend cause stays
+/// inspectable through the error chain.
+fn store_io_err(op: &'static str, path: &Path, err: StoreError) -> ReaderError {
+    ReaderError::Io {
+        op,
+        path: path.to_path_buf(),
+        source: io::Error::other(err),
+    }
 }
 
 /// RFC 0005 §3.9: every baseline REQUIRED (non-nullable) column must be

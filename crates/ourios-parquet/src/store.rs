@@ -15,11 +15,56 @@
 //! (not a new crate): `ourios-querier`, `-ingester`, and `-server` already
 //! depend on this crate, so the type is visible to every storage consumer.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+/// Drive `fut` to completion synchronously — the bridge from the **sync**
+/// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
+/// `object_store` (compaction must reach S3 per RFC0013.3, so a local-only
+/// `std::fs` shortcut won't do).
+///
+/// Everything happens on a **fresh OS thread**: a single-threaded runtime is
+/// built, drives `fut`, and is dropped, all on a thread that never carries the
+/// caller's tokio context. That makes the bridge safe from any call site —
+/// including *inside* a runtime (a `#[tokio::test]` that opens the reader, or
+/// a future async consumer), where calling `block_on` (or dropping a runtime)
+/// on the caller's own thread would panic. [`std::thread::scope`] lets `fut`
+/// borrow the caller's `self`/`key` while still running off-thread.
+///
+/// `fut` already yields a [`StoreError`] result, returned directly; the extra
+/// error modes are building the bridge thread or its runtime
+/// ([`StoreError::Runtime`]). A panic *inside* `fut` is not swallowed — it is
+/// re-raised on the caller's thread via [`std::panic::resume_unwind`]. No
+/// `enable_all()`: the local backend drives I/O via `spawn_blocking`, which
+/// needs only the bare runtime; the S3 backend adds `enable_all()` and the
+/// `net`/`io`/`time` tokio features in the slice that introduces it.
+fn block_on_off_runtime<T>(
+    fut: impl Future<Output = Result<T, StoreError>> + Send,
+) -> Result<T, StoreError>
+where
+    T: Send,
+{
+    std::thread::scope(|s| {
+        // `Builder::spawn_scoped` (not `Scope::spawn`) so OS thread-creation
+        // failure surfaces as `StoreError::Runtime` rather than panicking.
+        let handle = std::thread::Builder::new()
+            .name("ourios-store-bridge".into())
+            .spawn_scoped(s, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map_err(StoreError::Runtime)?;
+                rt.block_on(fut)
+            })
+            .map_err(StoreError::Runtime)?;
+        handle
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
 
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
@@ -67,6 +112,9 @@ pub enum StoreError {
     /// Returned (rather than panicking) so an accidental call fails
     /// gracefully while `red`.
     Unimplemented(&'static str),
+    /// The sync→async bridge thread or runtime could not be built (resource
+    /// exhaustion). Surfaced by the `*_blocking` methods.
+    Runtime(std::io::Error),
 }
 
 impl std::fmt::Display for StoreError {
@@ -74,6 +122,7 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Backend(e) => write!(f, "object-store backend: {e}"),
             Self::Unimplemented(what) => write!(f, "not implemented (RFC 0013 red): {what}"),
+            Self::Runtime(e) => write!(f, "object-store bridge runtime: {e}"),
         }
     }
 }
@@ -83,6 +132,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Backend(e) => Some(e),
             Self::Unimplemented(_) => None,
+            Self::Runtime(e) => Some(e),
         }
     }
 }
@@ -186,6 +236,28 @@ impl Store {
             .await
             .map_err(StoreError::Backend)
     }
+
+    /// Blocking [`Self::get`] for the **sync** storage call sites (`Reader`,
+    /// compaction). Safe to call from any thread, including inside a tokio
+    /// runtime — the `block_on` runs off the caller's thread.
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::get`].
+    pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        block_on_off_runtime(self.get(key))
+    }
+
+    /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
+    /// compaction). Safe to call from inside a tokio runtime (see
+    /// [`Self::get_blocking`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::put`].
+    pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        block_on_off_runtime(self.put(key, bytes))
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +276,40 @@ mod tests {
         assert_eq!(store.get(key).await.expect("get"), b"hello-ourios");
         store.delete(key).await.expect("delete");
         assert!(store.get(key).await.is_err(), "object gone after delete");
+    }
+
+    /// The sync `*_blocking` bridge round-trips a byte object — the path the
+    /// sync `Writer` / `Reader` / compaction take onto `Store`. Runs on a
+    /// plain test thread (no ambient runtime), exercising `block_on`.
+    #[test]
+    fn blocking_bridge_put_get_round_trip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "data/tenant_id=t/year=2026/x.parquet";
+        store
+            .put_blocking(key, b"hello-blocking".to_vec())
+            .expect("put_blocking");
+        assert_eq!(
+            store.get_blocking(key).expect("get_blocking"),
+            b"hello-blocking"
+        );
+    }
+
+    /// The `*_blocking` bridge is safe to call from *within* a tokio runtime —
+    /// some consumers (e.g. a `#[tokio::test]` that reads back via `Reader`)
+    /// do exactly that. The `block_on` runs off the caller's thread, so it
+    /// must not panic "runtime within a runtime".
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_bridge_is_safe_inside_a_runtime() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "data/tenant_id=t/year=2026/x.parquet";
+        store
+            .put_blocking(key, b"inside-runtime".to_vec())
+            .expect("put_blocking");
+        assert_eq!(
+            store.get_blocking(key).expect("get_blocking"),
+            b"inside-runtime"
+        );
     }
 }

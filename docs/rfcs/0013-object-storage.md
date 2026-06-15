@@ -1,7 +1,7 @@
 ---
 rfc: 0013
 title: Object-storage backend (S3-compatible) for the Parquet store
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-15
@@ -11,17 +11,24 @@ superseded-by: —
 
 # RFC 0013 — Object-storage backend (S3-compatible) for the Parquet store
 
-> **Status note.** **`drafted`** (2026-06-15). The first shipping-milestone
+> **Status note.** **`specified`** (2026-06-15). The first shipping-milestone
 > spine: today the writer/reader/compactor/audit-sink address a single local
 > filesystem `bucket_root: &Path`, but `CLAUDE.md` §3.6 declares object
 > storage the source of truth. This RFC abstracts the storage seam behind
 > the Apache `object_store` crate (already in our tree via DataFusion) so the
 > RFC 0005 data + audit Parquet and the RFC 0009 manifest live on an
 > S3-compatible bucket in production and on local disk in dev/test —
-> **without changing the on-disk layout or a single stored row**. §§1–4, 7–8
-> are filled; §5 acceptance criteria use the standard Given/When/Then/And
-> scenario format (refined at `specified` once the backend trait shape is
-> fixed); §6 testing is preliminary.
+> **without changing the on-disk layout or a single stored row**.
+>
+> §5 has eight Given/When/Then/And scenarios (RFC0013.1–.8) covering every
+> invariant/hazard the RFC touches — §3.6 (object-storage truth +
+> WAL-stays-local), §3.7 (tenant isolation), the RFC 0009 atomic-publish, and
+> the RFC 0005 §3.9 forward-compat contract — each mapped to a test technique
+> in §6 and testable in principle. The §7 open questions (crate shape, lease
+> mechanism, conditional-PUT portability, multipart threshold, credentials,
+> read cache, migration) are `red`/`accepted`-stage **design + implementation**
+> choices, not `specified`-blocking. Next: `specified → red` (failing test
+> stubs) on the maintainer's go.
 
 ## 1. Summary
 
@@ -238,13 +245,34 @@ contract.
 > - **Then** the §3.9 contract holds (absent columns default, unknown columns
 >   ignored) — no error.
 
-## 6. Testing strategy (preliminary)
+## 6. Testing strategy
 
-`testcontainers` (MinIO or localstack) for the S3 integration scenarios
-(RFC0013.1/.3/.4/.5/.7/.8); the existing RFC 0005/0009 tests re-run against
-both backends via a parametrised harness (RFC0013.2); a `proptest` for the
-conditional-PUT race (RFC0013.3). The `LocalFileSystem` backend keeps the
-current fast unit/proptest path so CI stays corpus-free and quick.
+Mapped to `CLAUDE.md` §6.2. The `LocalFileSystem` backend keeps the current
+fast, corpus-free unit/proptest path; the `AmazonS3` backend is exercised
+against a MinIO/localstack container (`testcontainers`, which supports any
+OCI runtime — Docker on the CI runner, `nerdctl`/containerd or Podman
+locally). Per scenario:
+
+- **RFC0013.1 / .7 / .8** (S3 round-trip / S3-compatible endpoint / reader
+  forward-compat over the store) — integration tests against the S3
+  container, reusing the RFC 0005 round-trip and §3.9 fixtures behind the
+  backend trait.
+- **RFC0013.2** (local backend regresses nothing) — the existing RFC 0005 +
+  RFC 0009 suites re-run against `LocalFileSystem` via a parametrised harness
+  (one suite, two backends).
+- **RFC0013.3** (atomic publish under contention) — a `proptest` /
+  concurrency test driving N racing publishers at the S3 container, asserting
+  exactly-one-wins and no torn / doubled / missing rows.
+- **RFC0013.4** (manifest swap, no `rename`) — integration test asserting the
+  publish path uses conditional PUT (`PutMode::Create` /
+  `PutMode::Update{ETag}`) and never a `rename`.
+- **RFC0013.5** (tenant isolation) — integration test interleaving two
+  tenants' objects under the prefix; asserts no cross-prefix access.
+- **RFC0013.6** (WAL stays local) — after ingest + ack, assert WAL frames are
+  on local disk and only data/audit/manifest objects reached the store.
+
+The S3 integration lane is `#[ignore]` / feature-gated, so the default
+`cargo test` stays container-free; CI runs it explicitly.
 
 ## 7. Open questions
 

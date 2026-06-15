@@ -245,15 +245,19 @@ fn baseline_params() -> Option<(u64, u64, usize)> {
     if std::env::var("OURIOS_COMPACTION_BASELINE").ok().as_deref() != Some("1") {
         return None;
     }
-    let var = |k: &str, d: u64| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
+    // Fail fast on a present-but-unparsable value (an authoritative run must
+    // not silently fall back to a default and report misleading scale); use
+    // the default only when the var is absent.
+    let var = |k: &str, d: u64| match std::env::var(k) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("{k}={v:?} is not a valid u64")),
+        Err(_) => d,
     };
     let files = var("OURIOS_COMPACTION_FILES", 16);
     let rows = var("OURIOS_COMPACTION_ROWS", 16_000);
-    let body = usize::try_from(var("OURIOS_COMPACTION_BODY_BYTES", 2_048)).unwrap_or(2_048);
+    let body = usize::try_from(var("OURIOS_COMPACTION_BODY_BYTES", 2_048))
+        .expect("OURIOS_COMPACTION_BODY_BYTES fits usize");
     Some((files, rows, body))
 }
 
@@ -285,6 +289,24 @@ fn baseline(_c: &mut Criterion) {
     let outcome = compact_partition(dir.path(), &part).expect("compact");
     // Clamp so a sub-microsecond run can't print an infinite/NaN MiB/s.
     let secs = t0.elapsed().as_secs_f64().max(1e-9);
+
+    // Verify the run did what the D2/D3 lines below claim — a no-op or a
+    // short read would otherwise print authoritative-looking but bogus
+    // numbers.
+    assert!(
+        outcome.committed.is_some(),
+        "baseline compaction was a no-op (nothing consolidated)"
+    );
+    assert_eq!(
+        outcome.files_before,
+        usize::try_from(files).expect("files fits usize"),
+        "compaction must see every built file as live",
+    );
+    assert_eq!(
+        outcome.rows,
+        files * rows,
+        "compaction must conserve every row",
+    );
 
     let read_mib = outcome.bytes_read as f64 / (1024.0 * 1024.0);
     let out_mib = outcome.bytes_written as f64 / (1024.0 * 1024.0);

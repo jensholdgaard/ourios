@@ -35,11 +35,13 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 /// on the caller's own thread would panic. [`std::thread::scope`] lets `fut`
 /// borrow the caller's `self`/`key` while still running off-thread.
 ///
-/// `fut` already yields a [`StoreError`] result, returned directly; the only
-/// extra failure is building the per-call runtime. No `enable_all()`: the
-/// local backend drives I/O via `spawn_blocking`, which needs only the bare
-/// runtime; the S3 backend adds `enable_all()` and the `net`/`io`/`time` tokio
-/// features in the slice that introduces it.
+/// `fut` already yields a [`StoreError`] result, returned directly; the extra
+/// error modes are building the bridge thread or its runtime
+/// ([`StoreError::Runtime`]). A panic *inside* `fut` is not swallowed — it is
+/// re-raised on the caller's thread via [`std::panic::resume_unwind`]. No
+/// `enable_all()`: the local backend drives I/O via `spawn_blocking`, which
+/// needs only the bare runtime; the S3 backend adds `enable_all()` and the
+/// `net`/`io`/`time` tokio features in the slice that introduces it.
 fn block_on_off_runtime<T>(
     fut: impl Future<Output = Result<T, StoreError>> + Send,
 ) -> Result<T, StoreError>

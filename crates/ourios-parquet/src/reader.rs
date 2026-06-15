@@ -174,7 +174,8 @@ impl Reader {
 /// Errors produced by [`Reader`].
 #[derive(Debug)]
 pub enum ReaderError {
-    /// Filesystem I/O failure (file open, footer read).
+    /// Object-store read I/O failure (store open, object fetch, or key
+    /// derivation). `op` names which step failed.
     Io {
         op: &'static str,
         path: PathBuf,
@@ -225,7 +226,7 @@ impl fmt::Display for ReaderError {
         match self {
             Self::Io { op, path, source } => write!(
                 f,
-                "filesystem I/O on `{op}` at {}: {source}",
+                "object-store read I/O on `{op}` at {}: {source}",
                 path.display(),
             ),
             Self::Parquet(e) => write!(f, "parquet reader: {e}"),
@@ -321,17 +322,17 @@ fn read_object(path: &Path) -> Result<bytes::Bytes, ReaderError> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| ReaderError::Io {
-            op: "object key",
+            op: "derive object key",
             path: path.to_path_buf(),
             source: io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file name is empty or not valid UTF-8",
             ),
         })?;
-    let store = Store::local(parent).map_err(|e| store_io_err("open", path, e))?;
+    let store = Store::local(parent).map_err(|e| store_io_err("open store", path, e))?;
     let bytes = store
         .get_blocking(name)
-        .map_err(|e| store_io_err("get", path, e))?;
+        .map_err(|e| store_io_err("fetch object", path, e))?;
     Ok(bytes::Bytes::from(bytes))
 }
 

@@ -28,6 +28,7 @@
 
 use std::hint::black_box;
 use std::path::Path;
+use std::time::Instant;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
@@ -48,8 +49,35 @@ const ROWS_PER_FILE: u64 = 2_000;
 const D2_BACKLOGS: [u64; 2] = [8, 32];
 /// Representative backlog for the D3 collapse measurement.
 const D3_FILES: u64 = 64;
+/// Bytes per MiB, for the D3 integer-byte size-band classification.
+const MIB: u64 = 1 << 20;
+
+/// `len` bytes of pseudo-random printable ASCII (same generator shape as
+/// the RFC0005.6 sizing test). Used only by the band-scale baseline mode so
+/// the consolidated file reaches the D3 256 MiB–2 GiB band — high entropy
+/// keeps the on-disk volume from compressing away. CI mode uses no body.
+// The `>> 56 as u8` deliberately keeps the top byte as a pseudo-random
+// value; truncation is the intent.
+#[allow(clippy::cast_possible_truncation)]
+fn high_entropy_body(seed: u64, len: usize) -> String {
+    let mut s = String::with_capacity(len);
+    let mut x: u64 = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    for _ in 0..len {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        s.push((((x >> 56) as u8 & 0x3F) + b' ') as char);
+    }
+    s
+}
 
 fn rec(i: u64) -> MinedRecord {
+    rec_sized(i, 0)
+}
+
+/// A record; with `body_bytes > 0` it carries a high-entropy body of that
+/// size (band-scale baseline mode), else no body (CI mode).
+fn rec_sized(i: u64, body_bytes: usize) -> MinedRecord {
     MinedRecord {
         tenant_id: TenantId::new("c"),
         template_id: 1,
@@ -74,7 +102,7 @@ fn rec(i: u64) -> MinedRecord {
             value: "42".to_string(),
         }],
         separators: vec![String::new(), " ".to_string()],
-        body: None,
+        body: (body_bytes > 0).then(|| high_entropy_body(i, body_bytes)),
         confidence: 1.0,
         lossy_flag: false,
     }
@@ -86,10 +114,21 @@ fn rec(i: u64) -> MinedRecord {
 /// of them as live (RFC 0009 reader-first / glob-fallback) — exactly the
 /// sealed-but-uncompacted backlog compaction consolidates.
 fn build_backlog(bucket: &Path, num_files: u64) -> PartitionKey {
+    build_backlog_sized(bucket, num_files, ROWS_PER_FILE, 0)
+}
+
+fn build_backlog_sized(
+    bucket: &Path,
+    num_files: u64,
+    rows_per_file: u64,
+    body_bytes: usize,
+) -> PartitionKey {
     let partition = PartitionKey::derive(&rec(0)).expect("derive partition");
     for f in 0..num_files {
-        let base = f * ROWS_PER_FILE;
-        let records: Vec<MinedRecord> = (0..ROWS_PER_FILE).map(|i| rec(base + i)).collect();
+        let base = f * rows_per_file;
+        let records: Vec<MinedRecord> = (0..rows_per_file)
+            .map(|i| rec_sized(base + i, body_bytes))
+            .collect();
         let mut w = Writer::open(bucket, partition.clone()).expect("open writer");
         w.append_records(&records).expect("append");
         w.close().expect("close");
@@ -98,6 +137,9 @@ fn build_backlog(bucket: &Path, num_files: u64) -> PartitionKey {
 }
 
 fn compaction_throughput(c: &mut Criterion) {
+    if baseline_params().is_some() {
+        return; // band-scale baseline mode runs the one-shot instead
+    }
     let mut group = c.benchmark_group("d2/compaction-throughput");
     // Each iteration rebuilds the backlog (compaction is destructive — it
     // consolidates to one file, so a second compaction would be a no-op),
@@ -141,6 +183,9 @@ fn compaction_throughput(c: &mut Criterion) {
 }
 
 fn small_file_collapse(c: &mut Criterion) {
+    if baseline_params().is_some() {
+        return; // band-scale baseline mode runs the one-shot instead
+    }
     // One-shot D3 measurement: build a representative backlog, consolidate,
     // and report the collapse. Done before the timed group so the print is
     // emitted once with a clean (untimed) outcome.
@@ -189,5 +234,120 @@ fn small_file_collapse(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, compaction_throughput, small_file_collapse);
+/// Band-scale baseline parameters, read from the environment. Returns
+/// `Some((files, rows_per_file, body_bytes))` when `OURIOS_COMPACTION_BASELINE`
+/// is set — the authoritative `baseline-8vcpu-32gib` run sets these to a
+/// volume large enough that the consolidated file reaches the D3
+/// 256 MiB–2 GiB band (`docs/benchmarks.md` D3). Unset ⇒ CI mode (the
+/// criterion micro-sweep above). Defaults: 16 files × 16 000 rows × 2 KiB
+/// body ≈ 0.5 GiB of input, tunable via the matching env vars.
+fn baseline_params() -> Option<(u64, u64, usize)> {
+    // Require an explicit `=1` (not mere presence) so `…=0` can't silently
+    // suppress the CI criterion sweeps. A non-UTF-8 value fails fast, like the
+    // other baseline vars — not silently treated as "unset".
+    match std::env::var("OURIOS_COMPACTION_BASELINE") {
+        Ok(v) if v == "1" => {}
+        Ok(_) | Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(v)) => {
+            panic!("OURIOS_COMPACTION_BASELINE={v:?} is not valid UTF-8")
+        }
+    }
+    // Fail fast on a present-but-unparsable value (an authoritative run must
+    // not silently fall back to a default and report misleading scale); use
+    // the default only when the var is absent.
+    let var = |k: &str, d: u64| match std::env::var(k) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("{k}={v:?} is not a valid u64")),
+        // Default only when the var is genuinely absent; a present-but-non-UTF-8
+        // value is a misconfig, not "use the default".
+        Err(std::env::VarError::NotPresent) => d,
+        Err(std::env::VarError::NotUnicode(v)) => panic!("{k}={v:?} is not valid UTF-8"),
+    };
+    let files = var("OURIOS_COMPACTION_FILES", 16);
+    let rows = var("OURIOS_COMPACTION_ROWS", 16_000);
+    let body = usize::try_from(var("OURIOS_COMPACTION_BODY_BYTES", 2_048))
+        .expect("OURIOS_COMPACTION_BODY_BYTES fits usize");
+    Some((files, rows, body))
+}
+
+/// One-shot band-scale measurement (not a criterion sweep — the input is
+/// too large to rebuild per sample). Builds one backlog, times a single
+/// `compact_partition`, and prints the authoritative D2 throughput (MiB/s)
+/// + D3 size band (output file bytes, in-band check, count collapse).
+// Byte counts → f64 for a MiB/s print; precision loss is irrelevant here.
+#[allow(clippy::cast_precision_loss)]
+fn baseline(_c: &mut Criterion) {
+    let Some((files, rows, body)) = baseline_params() else {
+        return; // CI mode — the criterion groups above run instead
+    };
+    // Below 2 files (or 0 rows) `compact_partition` no-ops, which would make
+    // the D2/D3 numbers below meaningless — fail loudly on a misconfig.
+    assert!(
+        files >= 2,
+        "baseline needs >=2 input files to compact (got {files})"
+    );
+    assert!(rows > 0, "baseline needs rows > 0 (got {rows})");
+    let dir = tempfile::TempDir::new().expect("temp bucket");
+    eprintln!(
+        "compaction/baseline: building {files} files × {rows} rows × {body} B body \
+         in one partition…"
+    );
+    let part = build_backlog_sized(dir.path(), files, rows, body);
+
+    let t0 = Instant::now();
+    let outcome = compact_partition(dir.path(), &part).expect("compact");
+    // Clamp so a sub-microsecond run can't print an infinite/NaN MiB/s.
+    let secs = t0.elapsed().as_secs_f64().max(1e-9);
+
+    // Verify the run did what the D2/D3 lines below claim — a no-op or a
+    // short read would otherwise print authoritative-looking but bogus
+    // numbers.
+    assert!(
+        outcome.committed.is_some(),
+        "baseline compaction was a no-op (nothing consolidated)"
+    );
+    assert_eq!(
+        outcome.files_before,
+        usize::try_from(files).expect("files fits usize"),
+        "compaction must see every built file as live",
+    );
+    assert_eq!(
+        outcome.rows,
+        files * rows,
+        "compaction must conserve every row",
+    );
+
+    // Classify in integer bytes to avoid float-boundary misclassification at
+    // 128 MiB / 256 MiB / 2 GiB; floats are display-only.
+    let in_band = (256 * MIB..=2048 * MIB).contains(&outcome.bytes_written);
+    // One live file after compaction, so the D3 "% under 128 MiB" is 0 or 100
+    // depending on whether this run was dialed to band scale.
+    let pct_under_128 = if outcome.bytes_written < 128 * MIB {
+        100.0
+    } else {
+        0.0
+    };
+    let read_mib = outcome.bytes_read as f64 / (1024.0 * 1024.0);
+    let out_mib = outcome.bytes_written as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "compaction/baseline D2: compacted {} files ({read_mib:.1} MiB read) → 1 in {secs:.2}s \
+         = {:.1} MiB/s; {} rows conserved",
+        outcome.files_before,
+        read_mib / secs,
+        outcome.rows,
+    );
+    eprintln!(
+        "compaction/baseline D3: output 1 file {out_mib:.1} MiB — \
+         {} the 256 MiB–2 GiB band; {pct_under_128:.0}% of live files under 128 MiB after compaction",
+        if in_band { "IN" } else { "OUTSIDE" },
+    );
+}
+
+criterion_group!(
+    benches,
+    compaction_throughput,
+    small_file_collapse,
+    baseline
+);
 criterion_main!(benches);

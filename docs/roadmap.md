@@ -105,7 +105,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0006 | Bench harness | `green` |
 | 0007 | Querier (DataFusion + logs DSL) | **`validated`** |
 | 0008 | WAL | **`accepted`** |
-| 0009 | Background compaction | `specified` — gated on the §3.4 atomic-publish manifest fork |
+| 0009 | Background compaction | **`green`** — §5 RFC0009.1–.6 pass (manifest + `gc_orphans` + sweep; #206/#207/#208/#209); .7 (D2/D3 benches) deferred to `validated` |
 | 0010 | Audit-stream / drift queries | `specified` — the `drift` surface is implemented; general audit aggregation deferred |
 | 0011 | A1 re-scope | **`accepted`** |
 
@@ -145,8 +145,8 @@ alongside it but is informational (`continue-on-error`), not gating.
 
 **What remains** is post-MVP shipping shape (§5 — Helm chart, the
 production deployment surface) plus the open RFCs above: RFC 0005 →
-`green`, RFC 0009 compaction (the manifest fork), and the items tracked
-in the RFCs' §9 open-questions.
+`green`, RFC 0009 → `validated` (the D2/D3 compaction benches), and the
+items tracked in the RFCs' §7/§9 open-questions.
 
 ---
 

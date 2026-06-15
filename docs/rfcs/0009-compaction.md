@@ -1,7 +1,7 @@
 ---
 rfc: 0009
 title: Background compaction — small-file consolidation
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-02
@@ -11,20 +11,34 @@ superseded-by: —
 
 # RFC 0009 — Background compaction: small-file consolidation
 
-> **Status note.** `specified` — §§1–8 are filled and the §5
-> acceptance criteria cover every invariant and hazard this RFC
-> touches (the `specified` gate per `docs/rfcs/README.md`). The
-> load-bearing decision — the **atomic-publish protocol** (§3.4) — is
-> **resolved**: a per-partition **manifest** with an atomic
-> generation swap. The committed consequences are (a) the RFC 0007
-> querier resolves a partition's live files through the manifest
-> (glob-fallback when absent), sequenced reader-first; and (b) the
-> manifest is a new additive, back-compatible RFC 0005 artifact. The
-> open items in §7 are now implementation details (serialization,
-> the S3 atomic-swap primitive, the single-writer lease, cadence
-> defaults), not design forks. The RFC cannot flip to `red` until
-> test stubs exist (and the RFC 0007 reader-side manifest support
-> lands first).
+> **Status note.** **`green`** (2026-06-15) — every RFC0009 §5 acceptance
+> criterion has a live, passing test: **.1** small-file count collapses
+> (`rfc0009_1_*`), **.2** row conservation (`compaction_conserves_every_row`
+> proptest), **.3** atomic publish / no torn read (`atomic_publish_…` +
+> the `ourios-querier` `rfc0009_3_*` manifest tests), **.4** crash safety
+> (`rfc0009_4_*` — `gc_orphans` reclaims orphans, reads stay at a clean
+> generation), **.5** tenant/partition isolation (`rfc0009_5_*` — a
+> mis-partitioned input aborts on the §3.9 row-vs-path check), **.6**
+> union-schema merge across an amendment (`rfc0009_6_*`). The atomic-publish
+> protocol (§3.4) is the per-partition manifest + atomic generation swap;
+> the querier resolves live files reader-first (glob-fallback when absent);
+> the runner lives in `ourios-ingester` (`run_sweep`/`Compactor`) with the
+> §3.6 OTel metrics + audit event.
+>
+> **RFC0009.7 is the `validated`-side measure, not a `green` gate.** Per
+> §6 it is the D2/D3 `criterion` benches (compaction throughput, file
+> count under load) + a post-compaction re-run of the RFC 0007 §6 B2
+> latency bench — wall-clock, deferred exactly as RFC 0007's B1/B2 were;
+> its *structural* half (file count falls under compaction) is evidenced
+> by RFC0009.1.
+>
+> **Open for `validated` / follow-up (§7):** the D2/D3 benches; and the §7
+> implementation items — late-arriving data re-flagging an already-compacted
+> partition (the manifest is authoritative, so a new write into such a
+> partition must be picked up by the candidate scan / folded into the
+> manifest — confirm `plan_candidates` covers it), the S3 atomic-swap
+> primitive + single-writer lease for object storage (local FS uses
+> `rename`), and the RFC 0004 cadence defaults.
 
 ## 1. Summary
 

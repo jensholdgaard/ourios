@@ -271,8 +271,8 @@ locally). Per scenario:
 - **RFC0013.6** (WAL stays local) — after ingest + ack, assert WAL frames are
   on local disk and only data/audit/manifest objects reached the store.
 
-The S3 integration lane is `#[ignore]` / feature-gated so the default `cargo
-test` stays container-free; CI runs it explicitly.
+The S3 integration lane is `#[ignore]` / feature-gated, so the default
+`cargo test` stays container-free; CI runs it explicitly.
 
 ## 7. Open questions
 

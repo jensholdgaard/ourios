@@ -16,10 +16,11 @@ ignore = [
 ]
 
 [licenses]
-# Allow-list of OSI-permissive licenses compatible with the project's
-# Apache-2.0 licensing. A dependency under any license not listed here fails
-# the check and must be reviewed — either add it with justification or drop
-# the dependency. `exceptions` is for per-crate SPDX clarifications.
+# Allow-list of permissive and public-domain-equivalent licenses compatible
+# with the project's Apache-2.0 licensing. A dependency under any license not
+# listed here fails the check and must be reviewed — either add it with
+# justification or drop the dependency. `exceptions` is for per-crate SPDX
+# clarifications.
 allow = [
     "Apache-2.0",
     "MIT",
@@ -29,11 +30,14 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
-    "MPL-2.0",
     "CC0-1.0",
 ]
 confidence-threshold = 0.8
 exceptions = []
+# The allow-list is a stable permissive baseline; the set of licenses actually
+# encountered varies by target/platform, so don't warn on allowed-but-unused
+# entries (they are not policy violations).
+unused-allowed-license = "allow"
 
 [bans]
 # Duplicate versions are a warning, not an error: transitive version churn is

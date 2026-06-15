@@ -813,3 +813,39 @@ component (contrast A1's writer-environment sensitivity, §9.4). The
 value of this run is the authoritative `hardware_kind` stamp on the
 two gates that, under RFC 0011, define RFC 0001's `validated`: **both
 PASS on a representative ≥ 1 M-line corpus on §1 baseline hardware.**
+
+### 9.7 Results — 2026-06-15 (authoritative, `baseline-8vcpu-32gib`) — D2 / D3 / B2-post (RFC 0009 compaction)
+
+**Hardware.** `baseline-8vcpu-32gib` — the §1 baseline (8 dedicated
+vCPU, 32 GiB RAM, local SSD), provisioned for this run and torn down
+immediately after. These are the **authoritative** D2 / D3 / B2-post
+numbers for RFC 0009's `validated` measure (RFC0009.7).
+**Run.** Dedicated baseline host (no CI run id): the `ourios-bench`
+`compaction` bench at git `4d52288`. Two invocations — the band-scale
+one-shot (`OURIOS_COMPACTION_BASELINE=1`, `FILES=32`, `ROWS=4800`,
+`BODY_BYTES=4096`) for D2/D3, then the `b2-post-compaction` criterion
+group. Synthetic (no corpus): D2/D3 drive one partition of 32 small
+files (~485 MiB) through `compact_partition`; B2-post queries
+32-files-vs-1-file with the result set held constant.
+
+| measure | result | verdict |
+|---|---|---|
+| **D2** compaction throughput | 32 files (485.2 MiB) → 1 in 2.91 s = **166.8 MiB/s**; 153,600 rows conserved | keeps up — single-partition / single-threaded, ≫ any per-partition seal rate, so the backlog drains |
+| **D3** small-file size band | output **456.7 MiB** — **IN** the 256 MiB–2 GiB band; **0%** of live files < 128 MiB (target < 5%) | PASS |
+| **B2-post** query latency | template query: uncompacted **12.78 ms** (32 row groups, 33.5 MiB read, 32 files) → compacted **2.10 ms** (1 row group, 1.05 MiB, 1 file) = **6.1×** | PASS |
+
+**Reading.** D3 is the headline: a band-scale compaction lands its
+output squarely in the H4 256 MiB–2 GiB target with zero sub-128 MiB
+files — the small-file problem, eliminated. D2 shows consolidation
+runs at ~167 MiB/s on one partition/thread, far above any plausible
+per-partition seal rate, so a backlog drains (the "keeps up"
+property). B2-post quantifies the query payoff that motivated RFC 0009
+(the PR #92 B2 finding that per-file footer/metadata reads dominate):
+collapsing 32 files → 1 cuts the footer reads ~6× on this query. The
+structural reductions (32 → 1 files / row groups, rows conserved) are
+hardware-independent and also pinned in `ourios-parquet`'s
+`rfc0009_1_*` / `compaction_conserves_every_row` tests; these
+wall-clock figures are the baseline-hardware stamp for RFC 0009's
+`validated`. The full sustained-ingest soak (D2's "backlog returns to
+zero in a one-hour window at D1's rate") and D1 itself remain unrun —
+the throughput here is the RFC0009.7 D2 measure, not that soak.

@@ -2,7 +2,9 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-06-14** — RFC 0001, RFC 0008, and RFC 0011 flipped
+> Last updated: **2026-06-15** — RFC 0005 (Parquet storage) flipped to
+> `green` (the RFC0005.6 row-group-sizing test landed). Earlier, on
+> 2026-06-14, RFC 0001, RFC 0008, and RFC 0011 flipped
 > to `accepted` (maintainer sign-off). RFC 0001 reached `validated` first
 > (C1/C2 pass authoritatively on the `benchmarks.md` §1 baseline hardware,
 > §9.6; A1 is diagnostic per RFC 0011); RFC 0008's `validated` is vacuous
@@ -75,7 +77,7 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-06-14)
+## 3. Current state (as of 2026-06-15)
 
 **The thesis is proven on representative corpora.** All four gating
 thesis-gates pass authoritatively on the `benchmarks.md` §1 baseline
@@ -101,7 +103,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0002 | Query DSL | `green` |
 | 0003 | OTLP receiver (gRPC + HTTP) | `green` |
 | 0004 | Configuration policy | `green` |
-| 0005 | Parquet storage | `drafted` — 10/11 §5 (RFC0005.6 row-group sizing deferred to a corpus run; a maintainer sign-off bumps it to `green`) |
+| 0005 | Parquet storage | **`green`** — all 14 §5 scenarios pass; RFC0005.6 row-group sizing is the `#[ignore]`d `tests/sizing.rs` (manual `cargo test -p ourios-parquet --ignored`, not CI-gated per §7) |
 | 0006 | Bench harness | `green` |
 | 0007 | Querier (DataFusion + logs DSL) | **`validated`** |
 | 0008 | WAL | **`accepted`** |

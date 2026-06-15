@@ -1,7 +1,7 @@
 ---
 rfc: 0005
 title: Parquet storage — schema, writer, reader, audit stream
-status: drafted
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-05-19
@@ -10,6 +10,35 @@ superseded-by: —
 ---
 
 # RFC 0005 — Parquet storage: schema, writer, reader, audit stream
+
+> **Status note.** **`green`** (2026-06-15) — every RFC0005 §5 acceptance
+> criterion has a live, passing test. The prior `drafted` label was stale:
+> the storage layer (schema, writer, reader, audit stream) landed early
+> (PR #41 + the PR-D..G `ourios-parquet` series), and the ladder label was
+> never advanced; this flip records reality. Scenario → test:
+> **.1** round-trip of every §3.2 column (`rfc0005_1_*`), **.2/.3/.4**
+> missing-OPTIONAL / unknown-column / missing-REQUIRED reader tolerance
+> (`rfc0005_2/3/4_*`), **.5** partition layout incl. non-ASCII tenant
+> (`rfc0005_5_*`), **.6** row-group size inside the H4 band (`rfc0005_6_*`,
+> see below), **.7** audit as a separate file series (`rfc0005_7_*`),
+> **.8** no body/params dictionary (`rfc0005_8_*`), **.9** unknown
+> `ParamType` → `Unknown` (`rfc0005_9_*`), **.10** schema is greppable /
+> immutable (`rfc0005_10_*`), **.11** row-vs-path validation on data +
+> audit (`rfc0005_11_*`), **.12** compaction audit round-trip
+> (`rfc0005_12_*`), **.13** effective-timestamp fallback (`rfc0005_13_*`,
+> parquet + querier), **.14** alias audit events back the v1 map
+> (`rfc0005_14_*`).
+>
+> **RFC0005.6 is an `#[ignore]`d heavyweight test** (`tests/sizing.rs`):
+> it pushes >256 MiB through the production writer and asserts every
+> non-final row group's uncompressed `total_byte_size` ∈ [128 MiB, 1 GiB]
+> per §3.5 / H4. Per §6 it is not run by CI (the project has no
+> `schedule:` trigger — §7 open question); verify it manually with
+> `cargo test -p ourios-parquet --ignored` (~7 s dev / ~1 s release).
+>
+> **Open for follow-up (§7, non-gating):** compression-codec tuning
+> (pending A1), bloom-filter FPR (pending B2), audit-event retention, and
+> a scheduled-CI cadence for the slow sizing test.
 
 ## 1. Summary
 

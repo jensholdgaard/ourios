@@ -1,0 +1,193 @@
+//! D2 / D3 — background-compaction throughput & small-file collapse
+//! (RFC 0009 §6 / RFC0009.7; `docs/benchmarks.md` D2/D3).
+//!
+//! Supportive, **non-gating**, **indicative** wall-clock evidence for the
+//! validated-side measure of RFC 0009. The *structural* side — that
+//! compaction consolidates a partition's live files into one and conserves
+//! every row — is pinned deterministically in `ourios-parquet`'s
+//! `rfc0009_1_*` / `compaction_conserves_every_row` tests; here we measure
+//! the thing those can't: how fast the consolidation runs, and the
+//! file-count collapse as a ratio.
+//!
+//! Two groups:
+//!
+//! - `d2/compaction-throughput` — time `compact_partition` over a backlog
+//!   of `N` small files in one partition, swept across `N`. The per-call
+//!   wall-clock, divided into the printed `bytes_read`, is the D2
+//!   throughput (MiB/s); it should stay roughly linear in backlog bytes.
+//! - `d3/small-file-collapse` — time the same consolidation for one
+//!   representative backlog and print the D3 distribution: live files
+//!   before → after (N → 1) and rows conserved.
+//!
+//! **Scale caveat (`ci-runner`).** D3's absolute target — output files in
+//! the 256 MiB–2 GiB band, < 5% under 128 MiB (`docs/benchmarks.md` D3) —
+//! needs real corpus *volume* and the `baseline-8vcpu-32gib` host; a
+//! synthetic CI run produces sub-MiB files, so here D3 is the *structural*
+//! collapse (count + row conservation), not the size band. The size-band
+//! number is a later authoritative-baseline measurement.
+
+use std::hint::black_box;
+use std::path::Path;
+
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+
+use ourios_core::audit::ParamType;
+use ourios_core::record::{BodyKind, MinedRecord, Param};
+use ourios_core::tenant::TenantId;
+use ourios_parquet::{PartitionKey, Writer, compact_partition};
+
+/// Anchored in 2026 so the derived partition path is stable; all records
+/// fall in one hour ⇒ one partition (the small-file problem is *within* a
+/// partition).
+const TS0: u64 = 1_775_127_480_000_000_000;
+/// Rows per small input file. Modest — the point is the file *count*, not
+/// per-file size; every input lands far under the 128 MiB small-file
+/// threshold, i.e. a genuine compaction candidate.
+const ROWS_PER_FILE: u64 = 2_000;
+/// Backlog sizes (live files in one partition) for the D2 sweep.
+const D2_BACKLOGS: [u64; 2] = [8, 32];
+/// Representative backlog for the D3 collapse measurement.
+const D3_FILES: u64 = 64;
+
+fn rec(i: u64) -> MinedRecord {
+    MinedRecord {
+        tenant_id: TenantId::new("c"),
+        template_id: 1,
+        template_version: 1,
+        severity_number: 9,
+        severity_text: Some("INFO".to_string()),
+        scope_name: Some("lib.cart".to_string()),
+        scope_version: Some("1.0.0".to_string()),
+        // Keep every record inside one hour so all files share a partition.
+        time_unix_nano: TS0 + i * 1_000,
+        observed_time_unix_nano: Some(TS0 + i * 1_000 + 1),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        resource_attributes: Vec::new(),
+        trace_id: None,
+        span_id: None,
+        flags: 0x01,
+        event_name: None,
+        body_kind: BodyKind::String,
+        params: vec![Param {
+            type_tag: ParamType::Num,
+            value: "42".to_string(),
+        }],
+        separators: vec![String::new(), " ".to_string()],
+        body: None,
+        confidence: 1.0,
+        lossy_flag: false,
+    }
+}
+
+/// Write `num_files` small Parquet files into one partition (each a
+/// separate `Writer` cycle ⇒ a separate `<uuid>.parquet`), returning the
+/// shared partition key. No manifest is written, so the reader globs all
+/// of them as live (RFC 0009 reader-first / glob-fallback) — exactly the
+/// sealed-but-uncompacted backlog compaction consolidates.
+fn build_backlog(bucket: &Path, num_files: u64) -> PartitionKey {
+    let partition = PartitionKey::derive(&rec(0)).expect("derive partition");
+    for f in 0..num_files {
+        let base = f * ROWS_PER_FILE;
+        let records: Vec<MinedRecord> = (0..ROWS_PER_FILE).map(|i| rec(base + i)).collect();
+        let mut w = Writer::open(bucket, partition.clone()).expect("open writer");
+        w.append_records(&records).expect("append");
+        w.close().expect("close");
+    }
+    partition
+}
+
+fn compaction_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("d2/compaction-throughput");
+    // Each iteration rebuilds the backlog (compaction is destructive — it
+    // consolidates to one file, so a second compaction would be a no-op),
+    // so keep the sample count modest.
+    group.sample_size(10);
+    for num_files in D2_BACKLOGS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_files),
+            &num_files,
+            |b, &nf| {
+                b.iter_batched(
+                    || {
+                        let dir = tempfile::TempDir::new().expect("temp bucket");
+                        let part = build_backlog(dir.path(), nf);
+                        (dir, part)
+                    },
+                    |(dir, part)| {
+                        let outcome = compact_partition(dir.path(), &part).expect("compact");
+                        black_box(outcome.rows);
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+    group.finish();
+
+    // Print the read volume per backlog so the criterion wall-clock can be
+    // turned into a MiB/s throughput (D2). One extra build+compact outside
+    // the timed loop — cheap relative to the sweep above.
+    for num_files in D2_BACKLOGS {
+        let dir = tempfile::TempDir::new().expect("temp bucket");
+        let part = build_backlog(dir.path(), num_files);
+        let outcome = compact_partition(dir.path(), &part).expect("compact");
+        eprintln!(
+            "d2/compaction-throughput: {num_files} files → {} rows; read {} B, wrote {} B \
+             (divide the criterion time for {num_files} into bytes_read for MiB/s)",
+            outcome.rows, outcome.bytes_read, outcome.bytes_written,
+        );
+    }
+}
+
+fn small_file_collapse(c: &mut Criterion) {
+    // One-shot D3 measurement: build a representative backlog, consolidate,
+    // and report the collapse. Done before the timed group so the print is
+    // emitted once with a clean (untimed) outcome.
+    let dir = tempfile::TempDir::new().expect("temp bucket");
+    let part = build_backlog(dir.path(), D3_FILES);
+    let outcome = compact_partition(dir.path(), &part).expect("compact");
+    assert!(
+        outcome.committed.is_some(),
+        "a {D3_FILES}-file backlog must compact (not a no-op)",
+    );
+    assert_eq!(
+        outcome.files_before,
+        usize::try_from(D3_FILES).expect("backlog fits usize"),
+        "every written file should be live (no manifest ⇒ all globbed)",
+    );
+    assert_eq!(
+        outcome.rows,
+        D3_FILES * ROWS_PER_FILE,
+        "compaction must conserve every row",
+    );
+    eprintln!(
+        "d3/small-file-collapse: {} live files → 1 ({} rows conserved); output {} B. \
+         NOTE: the absolute 256 MiB–2 GiB size band (benchmarks.md D3) needs real corpus \
+         volume on baseline-8vcpu-32gib — this synthetic ci-runner run shows the structural \
+         count collapse only.",
+        outcome.files_before, outcome.rows, outcome.bytes_written,
+    );
+
+    // A timed data point for the representative backlog too.
+    let mut group = c.benchmark_group("d3/small-file-collapse");
+    group.sample_size(10);
+    group.bench_function(BenchmarkId::from_parameter(D3_FILES), |b| {
+        b.iter_batched(
+            || {
+                let d = tempfile::TempDir::new().expect("temp bucket");
+                let p = build_backlog(d.path(), D3_FILES);
+                (d, p)
+            },
+            |(d, p)| {
+                let o = compact_partition(d.path(), &p).expect("compact");
+                black_box(o.rows);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(benches, compaction_throughput, small_file_collapse);
+criterion_main!(benches);

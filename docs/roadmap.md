@@ -3,7 +3,8 @@
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
 > Last updated: **2026-06-15** — RFC 0013 (object storage, S3-compatible)
-> drafted → `specified` (first shipping-milestone spine); RFC 0009 (background
+> drafted → `specified` → `red` (first shipping-milestone spine; `store`
+> module skeleton + §5 stubs landed); RFC 0009 (background
 > compaction) flipped to `validated` (RFC0009.7 D2/D3/B2-post measured on
 > `baseline-8vcpu-32gib`, §9.7); RFC 0005 (Parquet storage) and RFC 0010
 > (audit-stream / drift
@@ -115,7 +116,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0009 | Background compaction | **`validated`** — §5 RFC0009.1–.6 pass; RFC0009.7 D2/D3/B2-post measured authoritatively on `baseline-8vcpu-32gib` (§9.7: D3 in 256 MiB–2 GiB band, D2 166.8 MiB/s, B2-post ≈6.1×) |
 | 0010 | Audit-stream / drift queries | **`green`** — all 8 §5 scenarios pass (`crates/ourios-querier/tests/drift.rs`); discharges RFC 0001 H5.3; §9 items are `accepted`-gating; general audit aggregation deferred (§3.2) |
 | 0011 | A1 re-scope | **`accepted`** |
-| 0013 | Object storage (S3-compatible) | `specified` — first shipping-milestone spine; `object_store` behind the `&Path` seam, conditional-PUT atomic publish; §5 has 8 Given/When/Then scenarios; §7 design questions are `red`/`accepted`-stage |
+| 0013 | Object storage (S3-compatible) | `red` — first shipping-milestone spine; `store` module skeleton in `ourios-parquet` (`object_store` direct dep, `local()` wired) + 8 `#[ignore]`d §5 stubs; crate-shape resolved (module, not a crate). `green` = S3 backend + conditional-PUT publish + consumer migration |
 
 **Crates — all ten product crates are implemented** (`ourios-core`,
 `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`, `-server`,

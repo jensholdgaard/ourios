@@ -99,29 +99,36 @@ impl Reader {
 
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(file).map_err(ReaderError::Parquet)?;
-
-        // RFC 0005 §3.9: missing baseline REQUIRED columns →
-        // hard error. Walk the expected schema and check each
-        // non-nullable field is present in the file.
-        let file_schema = builder.schema();
-        for expected_field in crate::data_schema().fields() {
-            if !expected_field.is_nullable()
-                && file_schema
-                    .column_with_name(expected_field.name())
-                    .is_none()
-            {
-                return Err(ReaderError::MissingRequiredColumn {
-                    name: expected_field.name().clone(),
-                });
-            }
-        }
-
+        require_baseline_columns(builder.schema())?;
         let inner = builder.build().map_err(ReaderError::Parquet)?;
 
         Ok(Self {
             inner,
             partition: None,
             file_path: path.to_path_buf(),
+        })
+    }
+
+    /// Open a reader over in-memory Parquet `bytes` — the RFC 0013
+    /// buffer-and-put read path (`Store.get` yields the object's bytes,
+    /// decoded in memory). Applies the same RFC 0005 §3.9 baseline-column
+    /// check as [`Self::open_file`]; no row-vs-path validation (there is no
+    /// partition path on this path).
+    ///
+    /// # Errors
+    /// [`ReaderError::Parquet`] if the bytes are not a valid Parquet file;
+    /// [`ReaderError::MissingRequiredColumn`] if a baseline REQUIRED column
+    /// is absent (§3.9).
+    pub fn open_bytes(bytes: bytes::Bytes) -> Result<Self, ReaderError> {
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(ReaderError::Parquet)?;
+        require_baseline_columns(builder.schema())?;
+        let inner = builder.build().map_err(ReaderError::Parquet)?;
+
+        Ok(Self {
+            inner,
+            partition: None,
+            file_path: PathBuf::from("<object-store>"),
         })
     }
 
@@ -302,6 +309,24 @@ fn validate_row_vs_partition(
             expected: expected.clone(),
             actual,
         });
+    }
+    Ok(())
+}
+
+/// RFC 0005 §3.9: every baseline REQUIRED (non-nullable) column must be
+/// present in the file's schema, else a hard error. Shared by
+/// [`Reader::open_file`] and [`Reader::open_bytes`].
+fn require_baseline_columns(file_schema: &arrow_schema::Schema) -> Result<(), ReaderError> {
+    for expected_field in crate::data_schema().fields() {
+        if !expected_field.is_nullable()
+            && file_schema
+                .column_with_name(expected_field.name())
+                .is_none()
+        {
+            return Err(ReaderError::MissingRequiredColumn {
+                name: expected_field.name().clone(),
+            });
+        }
     }
     Ok(())
 }

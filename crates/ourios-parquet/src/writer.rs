@@ -603,6 +603,39 @@ fn append_chunks(
     Ok(())
 }
 
+/// Encode `records` to a complete in-memory Parquet file (the RFC 0013
+/// buffer-and-put write path: the async edge then `Store.put`s the bytes).
+/// Same schema, codec, and §3.6 encoding policy as the file-based [`Writer`]
+/// — it differs only in target (`Vec<u8>` instead of a `File`). Row-group
+/// sizing (§3.5) still applies within the buffer via `ArrowWriter`.
+///
+/// # Errors
+/// [`WriterError::Parquet`] if `zstd_level` is out of range or encoding
+/// fails; [`WriterError::Batch`] if a record can't be converted to an Arrow
+/// batch.
+pub fn encode_records_to_parquet(
+    records: &[MinedRecord],
+    zstd_level: i32,
+) -> Result<Vec<u8>, WriterError> {
+    let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
+    let props = writer_properties(zstd);
+    let mut writer = ArrowWriter::try_new(Vec::new(), data_schema(), Some(props))
+        .map_err(WriterError::Parquet)?;
+    for chunk in records.chunks(SUB_BATCH_ROWS) {
+        // §3.5 row-group sizing: seal a row group once the in-progress
+        // buffer crosses the threshold (same guard as `Writer::append_chunks`)
+        // so large inputs don't produce one oversized row group.
+        if writer.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+            writer.flush().map_err(WriterError::Parquet)?;
+        }
+        let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
+        writer.write(&batch).map_err(WriterError::Parquet)?;
+    }
+    // `into_inner` flushes the final row group, writes the footer, and
+    // returns the buffer — the complete Parquet bytes.
+    writer.into_inner().map_err(WriterError::Parquet)
+}
+
 /// Build the [`WriterProperties`] that encode RFC 0005 §3.5
 /// (compression codec) and §3.6 (per-column encoding policy).
 /// `zstd` is the already-validated compression level (the caller
@@ -718,4 +751,151 @@ fn writer_properties(zstd: ZstdLevel) -> WriterProperties {
     builder = builder.set_column_bloom_filter_enabled(template_id, true);
 
     builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use ourios_core::audit::ParamType;
+    use ourios_core::record::{BodyKind, MinedRecord, Param};
+    use ourios_core::tenant::TenantId;
+
+    use super::*;
+    use crate::Reader;
+
+    const TS0: u64 = 1_775_127_480_000_000_000;
+
+    fn rec(template_id: u64, ts_ns: u64) -> MinedRecord {
+        MinedRecord {
+            tenant_id: TenantId::new("a"),
+            template_id,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: Some("INFO".to_string()),
+            scope_name: Some("lib.cart".to_string()),
+            scope_version: Some("1.0.0".to_string()),
+            time_unix_nano: ts_ns,
+            observed_time_unix_nano: Some(ts_ns + 1_000),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0x01,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: "42".to_string(),
+            }],
+            separators: vec![String::new(), " ".to_string()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        }
+    }
+
+    /// Encode → decode through the in-memory buffer path round-trips every
+    /// row byte-for-byte (the RFC 0013 buffer-and-put contract at the API
+    /// boundary, independent of the integration test's `Store` hop).
+    #[test]
+    fn encode_round_trips_through_open_bytes() {
+        let records: Vec<MinedRecord> = (0..300).map(|i| rec(i % 7, TS0 + i * 1_000)).collect();
+        let encoded = encode_records_to_parquet(&records, DEFAULT_ZSTD_LEVEL).expect("encode");
+        let decoded = Reader::open_bytes(bytes::Bytes::from(encoded))
+            .expect("open_bytes")
+            .read_all()
+            .expect("read_all");
+        assert_eq!(decoded, records, "every row recovered byte-for-byte");
+    }
+
+    /// An empty input is still a valid, complete Parquet file (footer +
+    /// schema, zero rows) — the writer must not require at least one batch.
+    #[test]
+    fn encode_empty_yields_readable_zero_rows() {
+        let encoded = encode_records_to_parquet(&[], DEFAULT_ZSTD_LEVEL).expect("encode empty");
+        let decoded = Reader::open_bytes(bytes::Bytes::from(encoded))
+            .expect("open_bytes")
+            .read_all()
+            .expect("read_all");
+        assert!(decoded.is_empty(), "no rows out for no rows in");
+    }
+
+    /// An out-of-range zstd level fails up front (mirrors the file writer's
+    /// validate-before-work contract) rather than producing a bad file.
+    #[test]
+    fn encode_rejects_invalid_zstd_level() {
+        let err = encode_records_to_parquet(&[rec(1, TS0)], 99).expect_err("level 99 invalid");
+        assert!(matches!(err, WriterError::Parquet(_)), "got {err:?}");
+    }
+
+    // The §3.5 128 MiB row-group flush guard inside `encode_records_to_parquet`
+    // is the same predicate as `Writer::append_chunks`; the file-path sizing
+    // assertion (RFC0005.6, `#[ignore]`d — needs a multi-hundred-MiB corpus)
+    // covers that threshold. These colocated tests lock the round-trip,
+    // empty-input, and validation invariants that are cheap to exercise.
+
+    fn prop_rec(
+        template_id: u64,
+        ts_ns: u64,
+        severity_number: u8,
+        param_value: &str,
+    ) -> MinedRecord {
+        MinedRecord {
+            template_id,
+            time_unix_nano: ts_ns,
+            observed_time_unix_nano: Some(ts_ns + 1_000),
+            severity_number,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: param_value.to_string(),
+            }],
+            ..rec(template_id, ts_ns)
+        }
+    }
+
+    fn row_key(r: &MinedRecord) -> (u64, u64, u8, &str) {
+        (
+            r.template_id,
+            r.time_unix_nano,
+            r.severity_number,
+            r.params[0].value.as_str(),
+        )
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Round-trip invariant: for any record set, encoding to in-memory
+        /// Parquet then decoding recovers exactly the same multiset of rows
+        /// (count + content). Only the fields below vary; the rest stay at
+        /// the clean-round-trip shape so equality reflects the codec, not
+        /// fixture edge cases.
+        #[test]
+        fn encode_round_trip_preserves_rows(
+            rows in proptest::collection::vec(
+                (
+                    proptest::prelude::any::<u64>(),
+                    0u64..3_600_000_000_000u64,
+                    proptest::prelude::any::<u8>(),
+                    "[0-9]{1,12}",
+                ),
+                0..=64usize,
+            )
+        ) {
+            let mut expected: Vec<MinedRecord> = rows
+                .iter()
+                .map(|(tid, off, sev, val)| prop_rec(*tid, TS0 + off, *sev, val))
+                .collect();
+            let encoded = encode_records_to_parquet(&expected, DEFAULT_ZSTD_LEVEL)
+                .expect("encode");
+            let mut got = Reader::open_bytes(bytes::Bytes::from(encoded))
+                .expect("open_bytes")
+                .read_all()
+                .expect("read_all");
+            proptest::prop_assert_eq!(got.len(), expected.len(), "row count preserved");
+            got.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+            expected.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+            proptest::prop_assert_eq!(got, expected, "every row preserved (value-equal)");
+        }
+    }
 }

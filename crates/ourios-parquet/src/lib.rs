@@ -53,7 +53,10 @@ pub use partition::{
 pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};
 pub use store::{S3Config, Store, StoreError};
-pub use writer::{DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile};
+pub use writer::{
+    DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile,
+    encode_records_to_parquet,
+};
 
 use std::sync::Arc;
 

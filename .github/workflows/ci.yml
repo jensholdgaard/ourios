@@ -152,9 +152,15 @@ jobs:
   # specifications, not a number to game (a `--fail-under` gate would
   # pressure toward shallow tests). `cargo test` (above) remains the
   # real gate. The lcov + HTML report are uploaded as a build artifact.
+  #
+  # Runs on pushes to main only: on a PR this job re-runs the whole suite
+  # under llvm-cov instrumentation, duplicating the gating `test` job for a
+  # report that is published from main anyway. Keeping it main-only drops
+  # that duplicate PR run while preserving the gate and the badge.
   coverage:
     name: coverage (informational)
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     continue-on-error: true
     permissions:
       # The badge-publish step below writes coverage.json to the
@@ -187,9 +193,9 @@ jobs:
       # on the `badges` branch, refreshed on every push to main. No
       # external coverage service is wired; the artifact above stays
       # the full report and the percentage stays non-gating
-      # (CLAUDE.md §6.2 — not a number to game).
-      - name: Publish coverage badge (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # (CLAUDE.md §6.2 — not a number to game). The job-level `if`
+      # already restricts the whole job to main, so no step guard here.
+      - name: Publish coverage badge
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

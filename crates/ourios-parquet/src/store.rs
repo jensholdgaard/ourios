@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
-use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
@@ -138,5 +138,76 @@ impl Store {
     #[must_use]
     pub fn prefix(&self) -> &ObjectPath {
         &self.prefix
+    }
+
+    /// Resolve a `/`-delimited `key` to an absolute object path under the
+    /// store prefix. At `red` the prefix is empty, so this is just the key;
+    /// once prefix scoping is wired (RFC0013.5) the prefix segments lead.
+    fn resolve(&self, key: &str) -> ObjectPath {
+        self.prefix
+            .parts()
+            .chain(ObjectPath::from(key).parts())
+            .collect()
+    }
+
+    /// Write `bytes` to `key`.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if the put fails.
+    pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        self.inner
+            .put(&self.resolve(key), PutPayload::from(bytes))
+            .await
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
+    /// Read the whole object at `key`.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if the object is missing or the read fails.
+    pub async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
+        let got = self
+            .inner
+            .get(&self.resolve(key))
+            .await
+            .map_err(StoreError::Backend)?;
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Delete the object at `key`.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if the delete fails.
+    pub async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner
+            .delete(&self.resolve(key))
+            .await
+            .map_err(StoreError::Backend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Store;
+
+    /// A byte object round-trips through the local backend, and a delete
+    /// removes it. (Foundation for the RFC0013 consumer migration; the §5
+    /// scenarios turn green as the writer/reader move onto `Store`.)
+    #[test]
+    fn local_store_put_get_delete_round_trip() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let key = "data/tenant_id=t/year=2026/x.parquet";
+            store.put(key, b"hello-ourios".to_vec()).await.expect("put");
+            assert_eq!(store.get(key).await.expect("get"), b"hello-ourios");
+            store.delete(key).await.expect("delete");
+            assert!(store.get(key).await.is_err(), "object gone after delete");
+        });
     }
 }

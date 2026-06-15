@@ -144,6 +144,21 @@ jobs:
             exit 1
           fi
 
+  # Supply-chain gate via cargo-deny: RustSec advisories, the license
+  # allow-list, banned/duplicate crates, and crate sources. Config is
+  # deny.toml at the repo root. A required check (in `ci-success`'s `needs`).
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
   # Informational coverage report — deliberately NOT gating. It is
   # absent from `ci-success`'s `needs`, and `continue-on-error` makes
   # a coverage hiccup neutral, so it never blocks a merge. Coverage
@@ -224,7 +239,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, docs, test, book, semconv]
+    needs: [fmt, clippy, docs, test, book, semconv, deny]
     if: always()
     steps:
       - name: Verify required checks

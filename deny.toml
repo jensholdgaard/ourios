@@ -1,0 +1,51 @@
+# cargo-deny configuration — the supply-chain gate run by the `cargo-deny`
+# CI job and locally via `cargo deny check`. Four checks: security
+# advisories, license compatibility, banned/duplicate crates, and crate
+# sources. Lint levels: deny (fails) | warn (notes) | allow (silent).
+
+[advisories]
+# RustSec advisory DB. Vulnerabilities always fail in this schema; yanked
+# crates also fail. `ignore` holds advisories we have reviewed and accepted
+# (each entry should carry a `# reason:` note); empty means none accepted.
+yanked = "deny"
+ignore = [
+    # paste: unmaintained (RUSTSEC-2024-0436), no security vulnerability. A
+    # deep transitive proc-macro dep of arrow/datafusion; nothing for us to
+    # fix until upstream drops it. Re-evaluate when that happens.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# Allow-list of OSI-permissive licenses compatible with the project's
+# Apache-2.0 licensing. A dependency under any license not listed here fails
+# the check and must be reviewed — either add it with justification or drop
+# the dependency. `exceptions` is for per-crate SPDX clarifications.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# Duplicate versions are a warning, not an error: transitive version churn is
+# common and not itself a defect. Wildcard version requirements on crates.io
+# deps are denied; intra-workspace path deps may use them.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io (and explicitly allow-listed git sources, if ever needed)
+# are permitted as crate origins.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

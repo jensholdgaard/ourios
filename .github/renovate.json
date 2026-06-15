@@ -15,7 +15,7 @@
       "matchManagers": ["github-actions"],
       "groupName": "github-actions",
       "pinDigests": true,
-      "matchUpdateTypes": ["digest", "pinDigest", "patch", "minor"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
       "automerge": true
     },
     {

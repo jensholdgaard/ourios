@@ -8,7 +8,7 @@
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{DEFAULT_ZSTD_LEVEL, Reader, Store, encode_records_to_parquet};
+use ourios_parquet::{DEFAULT_ZSTD_LEVEL, PartitionKey, Reader, Store, encode_records_to_parquet};
 
 fn rec(i: u64) -> MinedRecord {
     MinedRecord {
@@ -49,9 +49,18 @@ async fn records_round_trip_through_store_buffer_and_put() {
     let bytes = encode_records_to_parquet(&records, DEFAULT_ZSTD_LEVEL).expect("encode");
     let dir = tempfile::TempDir::new().expect("temp dir");
     let store = Store::local(dir.path()).expect("local store");
-    let key = "data/tenant_id=t/year=2026/month=04/day=01/hour=00/file.parquet";
-    store.put(key, bytes).await.expect("put");
-    let got = store.get(key).await.expect("get");
+
+    // Key derived from the records' own partition (Hive path under an empty
+    // root), so the partition segments match the fixture timestamps.
+    let partition = PartitionKey::derive(&records[0]).expect("derive partition");
+    let key = format!(
+        "{}/file.parquet",
+        partition
+            .data_path(std::path::Path::new(""))
+            .to_string_lossy()
+    );
+    store.put(&key, bytes).await.expect("put");
+    let got = store.get(&key).await.expect("get");
 
     let decoded = Reader::open_bytes(bytes::Bytes::from(got))
         .expect("open_bytes")

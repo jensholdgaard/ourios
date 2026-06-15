@@ -20,8 +20,9 @@ superseded-by: —
 > 12.78 ms → 2.10 ms (≈6.1×) as 32 files / row groups collapse to 1. The
 > sustained-ingest soak (D2's literal one-hour window at D1's rate) and D1
 > itself remain unrun — the throughput is the RFC0009.7 D2 measure, not that
-> soak. Before that, **`green`** (2026-06-15) — every RFC0009 §5 acceptance
-> criterion has a live, passing test: **.1** small-file count collapses
+> soak. The prior `green` status (flipped earlier the same day) rested on
+> every RFC0009 §5 acceptance criterion having a live, passing test: **.1**
+> small-file count collapses
 > (`rfc0009_1_*`), **.2** row conservation (`compaction_conserves_every_row`
 > proptest), **.3** atomic publish / no torn read (`atomic_publish_…` +
 > the `ourios-querier` `rfc0009_3_*` manifest tests), **.4** crash safety

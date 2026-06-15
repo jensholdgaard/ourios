@@ -822,8 +822,8 @@ immediately after. These are the **authoritative** D2 / D3 / B2-post
 numbers for RFC 0009's `validated` measure (RFC0009.7).
 **Run.** Dedicated baseline host (no CI run id): the `ourios-bench`
 `compaction` bench at git `4d52288`. Two invocations — the band-scale
-one-shot (`OURIOS_COMPACTION_BASELINE=1`, `FILES=32 ROWS=4800
-BODY_BYTES=4096`) for D2/D3, then the `b2-post-compaction` criterion
+one-shot (`OURIOS_COMPACTION_BASELINE=1`, `FILES=32`, `ROWS=4800`,
+`BODY_BYTES=4096`) for D2/D3, then the `b2-post-compaction` criterion
 group. Synthetic (no corpus): D2/D3 drive one partition of 32 small
 files (~485 MiB) through `compact_partition`; B2-post queries
 32-files-vs-1-file with the result set held constant.

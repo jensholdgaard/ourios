@@ -25,8 +25,9 @@ superseded-by: —
 
 ## 1. Summary
 
-Ourios's storage layer addresses a single local-filesystem `bucket_root:
-&Path`, threaded through `ourios-parquet` (writer, reader, compaction,
+Ourios's storage layer addresses a single local-filesystem
+`bucket_root: &Path`, threaded through `ourios-parquet` (writer, reader,
+compaction,
 manifest, audit sink) and `ourios-server`. `CLAUDE.md` §3.6 makes object
 storage — "Parquet on S3" — the source of truth, with local disk only a
 cache and the WAL horizon. This RFC introduces an **object-storage backend**
@@ -95,8 +96,9 @@ Adopt `object_store::ObjectStore` (async `put`/`get`/`list`/`delete` over an
 `object_store::path::Path` — a UTF-8, `/`-delimited key). The RFC 0005 Hive
 layout (`data/tenant_id=…/year=…/…/<uuid>.parquet`,
 `audit/tenant_id=…/…`) maps **directly** onto object keys under a configured
-prefix — no layout change. A thin `Store` handle wraps an `Arc<dyn
-ObjectStore>` + a key prefix and is threaded where `bucket_root: &Path` is
+prefix — no layout change. A thin `Store` handle wraps an
+`Arc<dyn ObjectStore>` + a key prefix and is threaded where
+`bucket_root: &Path` is
 today.
 
 ```mermaid
@@ -184,7 +186,7 @@ contract.
 > **RFC0013.1 — Round-trip through the S3 backend**
 > - **Given** a `MinedRecord` batch covering every RFC 0005 §3.2 column
 > - **When** it is written and then read back through the `AmazonS3` backend
->   (a MinIO / localstack testcontainer)
+>   (a MinIO / localstack container via the `testcontainers` crate)
 > - **Then** the recovered rows and Parquet bytes equal those from the
 >   `LocalFileSystem` backend, byte for byte.
 

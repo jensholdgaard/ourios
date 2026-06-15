@@ -9,16 +9,19 @@
   "labels": ["dependencies"],
   "prConcurrentLimit": 5,
   "schedule": ["before 06:00 on monday"],
+  "automergeStrategy": "squash",
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
       "groupName": "github-actions",
-      "pinDigests": true
+      "pinDigests": true,
+      "automerge": true
     },
     {
       "matchManagers": ["cargo"],
       "groupName": "cargo (minor/patch)",
-      "matchUpdateTypes": ["minor", "patch"]
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
     }
   ]
 }

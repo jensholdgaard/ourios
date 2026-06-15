@@ -1,7 +1,7 @@
 ---
 rfc: 0010
 title: Audit-stream queries & template drift
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-09
@@ -11,22 +11,34 @@ superseded-by: —
 
 # RFC 0010 — Audit-stream queries & template drift
 
-> **Status note.** **`specified`.** The dedicated `drift` surface (a
-> contained query head, not the general aggregation pipeline) was
-> maintainer-confirmed 2026-06-09. This RFC fills the audit-stream
-> query gap that RFC 0002 §6.3 deferred ("drift is an audit-stream
-> property, not a column in the RFC 0005 data files, so it needs an
-> audit-stream query path — a future capability"). It specifies a
-> first-class, contained **`drift`** query over the per-tenant RFC 0005
-> `audit/` Parquet stream, encapsulating the fixed aggregation that
-> RFC 0001 §6.7 wrote out as SQL "for spec clarity". The §5 criteria
-> below flip RFC 0001 scenario **H5.3**
-> (`crates/ourios-miner/tests/hazards.rs::h5_3_drift_query_returns_templates_that_gained_a_version`,
-> currently `#[ignore]` / `todo!()`). This RFC **extends** RFC 0002 (it
-> does not reopen or renumber it; RFC 0002 stays `green`) and **reads**
-> the RFC 0005 audit schema (it does not redefine it). Hazard 6
-> (`CLAUDE.md` §4 — no DataFusion/SQL leakage) constrains the surface:
-> drift is exposed through the DSL, never as raw SQL.
+> **Status note.** **`green`** (2026-06-15) — all eight §5 acceptance
+> scenarios (RFC0010.1–.8) have live, passing tests in
+> `crates/ourios-querier/tests/drift.rs`: drift returns drifted templates
+> with counts (.1), half-open `[from, to)` window (.2), `event_type`
+> scoping excludes non-widenings (.3), tenant isolation (.4),
+> empty-is-empty-not-error (.5), `widening_count` desc / `template_id` asc
+> ordering (.6), aggregate version/time bounds (.7), no DataFusion/SQL
+> leakage (.8). The dedicated `drift` surface (a contained query head, not
+> the general aggregation pipeline) was maintainer-confirmed 2026-06-09;
+> this RFC fills the audit-stream query gap RFC 0002 §6.3 deferred,
+> encapsulating the fixed aggregation RFC 0001 §6.7 wrote out as SQL "for
+> spec clarity".
+>
+> **RFC0010.1 discharges RFC 0001 H5.3.** That hazard test was *relocated*
+> out of `crates/ourios-miner/tests/hazards.rs` (now a relocation pointer
+> there) to `crates/ourios-querier/tests/drift.rs::h5_3_drift_query_returns_templates_that_gained_a_version`,
+> where the `drift` surface lives — it is no longer `#[ignore]` / `todo!()`.
+>
+> This RFC **extends** RFC 0002 (it does not reopen or renumber it; RFC 0002
+> stays `green`) and **reads** the RFC 0005 audit schema (it does not
+> redefine it). Hazard 6 (`CLAUDE.md` §4 — no DataFusion/SQL leakage)
+> constrains the surface: drift is exposed through the DSL, never as raw SQL.
+>
+> **Open for `accepted` (non-gating for `green`, per §9):** the verb-head
+> fork is resolved; the remaining §9 items (range-clause vs stage token,
+> mandatory vs default window, tie-break stability, cross-kind version
+> aggregation) are maintainer confirmations. General audit aggregation
+> stays out of scope (§3.2).
 
 ## 1. Summary
 

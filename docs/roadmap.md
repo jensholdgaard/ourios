@@ -2,8 +2,9 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-06-15** — RFC 0005 (Parquet storage) flipped to
-> `green` (the RFC0005.6 row-group-sizing test landed). Earlier, on
+> Last updated: **2026-06-15** — RFC 0005 (Parquet storage) and RFC 0010
+> (audit-stream / drift queries) flipped to `green` (RFC0005.6 row-group
+> sizing landed; RFC 0010's eight §5 drift scenarios all pass). Earlier, on
 > 2026-06-14, RFC 0001, RFC 0008, and RFC 0011 flipped
 > to `accepted` (maintainer sign-off). RFC 0001 reached `validated` first
 > (C1/C2 pass authoritatively on the `benchmarks.md` §1 baseline hardware,
@@ -108,7 +109,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0007 | Querier (DataFusion + logs DSL) | **`validated`** |
 | 0008 | WAL | **`accepted`** |
 | 0009 | Background compaction | **`green`** — §5 RFC0009.1–.6 pass (manifest + `gc_orphans` + sweep; #206/#207/#208/#209); .7 (D2/D3 benches) deferred to `validated` |
-| 0010 | Audit-stream / drift queries | `specified` — the `drift` surface is implemented; general audit aggregation deferred |
+| 0010 | Audit-stream / drift queries | **`green`** — all 8 §5 scenarios pass (`crates/ourios-querier/tests/drift.rs`); discharges RFC 0001 H5.3; §9 items are `accepted`-gating; general audit aggregation deferred (§3.2) |
 | 0011 | A1 re-scope | **`accepted`** |
 
 **Crates — all ten product crates are implemented** (`ourios-core`,

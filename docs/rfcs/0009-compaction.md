@@ -1,7 +1,7 @@
 ---
 rfc: 0009
 title: Background compaction — small-file consolidation
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-02
@@ -11,7 +11,16 @@ superseded-by: —
 
 # RFC 0009 — Background compaction: small-file consolidation
 
-> **Status note.** **`green`** (2026-06-15) — every RFC0009 §5 acceptance
+> **Status note.** **`validated`** (2026-06-15) — the RFC0009.7 D2/D3/B2-post
+> benches were measured authoritatively on `baseline-8vcpu-32gib`
+> (`benchmarks.md` §9.7, git `4d52288`): **D3** PASS (a band-scale compaction
+> output lands at 456.7 MiB, IN the 256 MiB–2 GiB H4 band, 0% under 128 MiB);
+> **D2** compaction throughput 166.8 MiB/s single-partition (≫ any
+> per-partition seal rate → backlog drains); **B2-post** query latency
+> 12.78 ms → 2.10 ms (≈6.1×) as 32 files / row groups collapse to 1. The
+> sustained-ingest soak (D2's literal one-hour window at D1's rate) and D1
+> itself remain unrun — the throughput is the RFC0009.7 D2 measure, not that
+> soak. Before that, **`green`** (2026-06-15) — every RFC0009 §5 acceptance
 > criterion has a live, passing test: **.1** small-file count collapses
 > (`rfc0009_1_*`), **.2** row conservation (`compaction_conserves_every_row`
 > proptest), **.3** atomic publish / no torn read (`atomic_publish_…` +
@@ -25,20 +34,22 @@ superseded-by: —
 > the runner lives in `ourios-ingester` (`run_sweep`/`Compactor`) with the
 > §3.6 OTel metrics + audit event.
 >
-> **RFC0009.7 is the `validated`-side measure, not a `green` gate.** Per
-> §6 it is the D2/D3 `criterion` benches (compaction throughput, file
-> count under load) + a post-compaction re-run of the RFC 0007 §6 B2
-> latency bench — wall-clock, deferred exactly as RFC 0007's B1/B2 were;
-> its *structural* half (file count falls under compaction) is evidenced
-> by RFC0009.1.
+> **RFC0009.7 — measured.** The D2/D3 `criterion` benches (compaction
+> throughput, small-file size band) + the post-compaction B2 re-run live in
+> `ourios-bench`'s `compaction` bench — CI-indicative via
+> `compaction-bench.yml`, authoritative on `baseline-8vcpu-32gib` in §9.7.
+> Its *structural* half (file count falls under compaction, every row
+> conserved) is also pinned deterministically by RFC0009.1 /
+> `compaction_conserves_every_row`.
 >
-> **Open for `validated` / follow-up (§7):** the D2/D3 benches; and the §7
-> implementation items — late-arriving data re-flagging an already-compacted
-> partition (the manifest is authoritative, so a new write into such a
-> partition must be picked up by the candidate scan / folded into the
-> manifest — confirm `plan_candidates` covers it), the S3 atomic-swap
-> primitive + single-writer lease for object storage (local FS uses
-> `rename`), and the RFC 0004 cadence defaults.
+> **Open follow-ups (§7, post-`validated`):** the full D2 sustained-ingest
+> soak (backlog-returns-to-zero in a one-hour window at D1's rate) + a
+> measured D1; late-arriving data re-flagging an already-compacted partition
+> (the manifest is authoritative, so a new write into such a partition must
+> be picked up by the candidate scan / folded into the manifest — confirm
+> `plan_candidates` covers it); the S3 atomic-swap primitive + single-writer
+> lease for object storage (local FS uses `rename`); and the RFC 0004 cadence
+> defaults.
 
 ## 1. Summary
 

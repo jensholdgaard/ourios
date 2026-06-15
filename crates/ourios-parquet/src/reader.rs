@@ -328,22 +328,22 @@ fn read_object(path: &Path) -> Result<bytes::Bytes, ReaderError> {
                 "file name is empty or not valid UTF-8",
             ),
         })?;
-    let store = Store::local(parent).map_err(|e| store_io_err("open", path, &e))?;
+    let store = Store::local(parent).map_err(|e| store_io_err("open", path, e))?;
     let bytes = store
         .get_blocking(name)
-        .map_err(|e| store_io_err("get", path, &e))?;
+        .map_err(|e| store_io_err("get", path, e))?;
     Ok(bytes::Bytes::from(bytes))
 }
 
 /// Map a [`StoreError`] from the read seam onto [`ReaderError::Io`], preserving
-/// the file path and op for diagnostics. No consumer inspects the io kind of a
-/// read failure (compaction wraps it opaquely; the querier reads via
-/// `DataFusion`), so the backend cause rides in the message.
-fn store_io_err(op: &'static str, path: &Path, err: &StoreError) -> ReaderError {
+/// the file path and op for diagnostics. The `StoreError` is wrapped as the
+/// `io::Error`'s source (not stringified), so the backend cause stays
+/// inspectable through the error chain.
+fn store_io_err(op: &'static str, path: &Path, err: StoreError) -> ReaderError {
     ReaderError::Io {
         op,
         path: path.to_path_buf(),
-        source: io::Error::other(err.to_string()),
+        source: io::Error::other(err),
     }
 }
 

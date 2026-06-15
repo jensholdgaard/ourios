@@ -47,14 +47,20 @@ where
     T: Send,
 {
     std::thread::scope(|s| {
-        s.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .map_err(StoreError::Runtime)?;
-            rt.block_on(fut)
-        })
-        .join()
-        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+        // `Builder::spawn_scoped` (not `Scope::spawn`) so OS thread-creation
+        // failure surfaces as `StoreError::Runtime` rather than panicking.
+        let handle = std::thread::Builder::new()
+            .name("ourios-store-bridge".into())
+            .spawn_scoped(s, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map_err(StoreError::Runtime)?;
+                rt.block_on(fut)
+            })
+            .map_err(StoreError::Runtime)?;
+        handle
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     })
 }
 
@@ -104,7 +110,7 @@ pub enum StoreError {
     /// Returned (rather than panicking) so an accidental call fails
     /// gracefully while `red`.
     Unimplemented(&'static str),
-    /// The sync→async bridge runtime could not be built (resource
+    /// The sync→async bridge thread or runtime could not be built (resource
     /// exhaustion). Surfaced by the `*_blocking` methods.
     Runtime(std::io::Error),
 }

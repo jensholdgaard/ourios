@@ -34,6 +34,7 @@ pub mod manifest;
 pub mod partition;
 pub mod reader;
 pub mod record_batch;
+pub mod store;
 pub mod writer;
 
 pub use audit_reader::{AuditReader, AuditReaderError};
@@ -51,6 +52,7 @@ pub use partition::{
 };
 pub use reader::{Reader, ReaderError};
 pub use record_batch::{BatchError, mined_records_to_batch};
+pub use store::{S3Config, Store, StoreError};
 pub use writer::{DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile};
 
 use std::sync::Arc;

@@ -21,6 +21,12 @@ ourios-core = { path = "../ourios-core" }
 arrow-array = { version = "55", default-features = false }
 arrow-schema = { version = "55", default-features = false }
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
+# Object-storage backend (RFC 0013) — one trait over LocalFileSystem (dev/
+# test) and S3-compatible stores. Already in the workspace tree via
+# DataFusion (the querier); declared here directly as the storage seam's
+# home. `0.13` unifies with that transitive version. The `aws` feature (for
+# the AmazonS3 backend) is added with the `green` S3 implementation.
+object_store = { version = "0.13" }
 # UUIDv7 file naming per RFC 0005 §3.4 — timestamp-in-high-bits
 # means lexicographic sort = creation-order.
 uuid = { version = "1", default-features = false, features = ["v7", "std"] }

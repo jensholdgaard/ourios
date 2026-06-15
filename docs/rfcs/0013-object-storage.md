@@ -1,7 +1,7 @@
 ---
 rfc: 0013
 title: Object-storage backend (S3-compatible) for the Parquet store
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-15
@@ -11,7 +11,7 @@ superseded-by: —
 
 # RFC 0013 — Object-storage backend (S3-compatible) for the Parquet store
 
-> **Status note.** **`specified`** (2026-06-15). The first shipping-milestone
+> **Status note.** **`red`** (2026-06-15). The first shipping-milestone
 > spine: today the writer/reader/compactor/audit-sink address a single local
 > filesystem `bucket_root: &Path`, but `CLAUDE.md` §3.6 declares object
 > storage the source of truth. This RFC abstracts the storage seam behind
@@ -20,15 +20,20 @@ superseded-by: —
 > S3-compatible bucket in production and on local disk in dev/test —
 > **without changing the on-disk layout or a single stored row**.
 >
-> §5 has eight Given/When/Then/And scenarios (RFC0013.1–.8) covering every
-> invariant/hazard the RFC touches — §3.6 (object-storage truth +
-> WAL-stays-local), §3.7 (tenant isolation), the RFC 0009 atomic-publish, and
-> the RFC 0005 §3.9 forward-compat contract — each mapped to a test technique
-> in §6 and testable in principle. The §7 open questions (crate shape, lease
-> mechanism, conditional-PUT portability, multipart threshold, credentials,
-> read cache, migration) are `red`/`accepted`-stage **design + implementation**
-> choices, not `specified`-blocking. Next: `specified → red` (failing test
-> stubs) on the maintainer's go.
+> `red` scaffold landed: the `store` module in `ourios-parquet`
+> (`object_store` now a direct dep) with the `Store` type + the
+> `LocalFileSystem`-backed `local()` constructor wired and the `s3()` /
+> consumer-migration paths stubbed; the eight §5 scenarios are encoded as
+> `#[ignore]`d stubs in `tests/rfc0013_object_store.rs` (so CI stays green
+> while the backend is built). The **crate-shape** open question is resolved
+> — a module, not a new crate (§3.7).
+>
+> **`green` work:** implement the S3 backend (`object_store` `aws` feature) +
+> conditional-PUT atomic publish (RFC0013.3/.4); migrate the
+> writer/reader/compaction/audit consumers from `bucket_root: &Path` onto
+> `Store`; un-`#[ignore]` the §5 stubs one by one. The remaining §7 questions
+> (lease mechanism, conditional-PUT portability, multipart threshold,
+> credentials, read cache, migration) are decided across the `green` PRs.
 
 ## 1. Summary
 
@@ -158,13 +163,17 @@ No change to the RFC 0005 schema, the Parquet bytes, the partition layout, or
 the reader's §3.9 forward-compat contract. This RFC is purely about *where*
 the bytes are stored; an operator's existing data semantics are untouched.
 
-### 3.7 Crate shape
+### 3.7 Crate shape — resolved: a module in `ourios-parquet`
 
-The backend lives behind a `Store` type in `ourios-parquet` (it owns the
-writer/reader), exposed to `ourios-server` and `ourios-querier`. Whether this
-warrants a dedicated `ourios-store` crate (a `CLAUDE.md` §7 architectural
-commitment) or a module is §7's first open question. Configuration (endpoint,
-region, bucket, prefix, credentials) flows through RFC 0004.
+The backend is a `store` **module in `ourios-parquet`** (not a new crate),
+exposing a `Store` type. Resolved at `red` against the less-committing
+option (`CLAUDE.md` §7: a new crate is an architectural commitment): the
+dependency graph confirms it — `ourios-querier`, `-ingester`, and `-server`
+already depend on `ourios-parquet`, so the type is visible to every storage
+consumer without a new crate. If a future consumer needs the store *without*
+the Parquet writer/reader, extracting an `ourios-store` crate is a
+mechanical follow-up. Configuration (endpoint, region, bucket, prefix,
+credentials) flows through RFC 0004.
 
 ## 4. Alternatives considered
 
@@ -276,8 +285,8 @@ The S3 integration lane is `#[ignore]` / feature-gated, so the default
 
 ## 7. Open questions
 
-- [ ] **Crate shape** — a dedicated `ourios-store` crate (§7 architectural
-  commitment) or a module in `ourios-parquet`?
+- [x] **Crate shape** — resolved at `red`: a `store` module in
+  `ourios-parquet` (no new crate; dep-graph-confirmed, §3.7).
 - [ ] **Single-writer lease** — is conditional-PUT contention on the manifest
   sufficient, or is a separate lease object needed (RFC 0009 §7)?
 - [ ] **Conditional-PUT portability** — do `If-None-Match`/`If-Match` cover

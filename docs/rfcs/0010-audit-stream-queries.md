@@ -25,8 +25,8 @@ superseded-by: —
 > spec clarity".
 >
 > **RFC0010.1 discharges RFC 0001 H5.3.** That hazard test was *relocated*
-> out of `ourios-miner/tests/hazards.rs` (now a relocation pointer there)
-> to `ourios-querier/tests/drift.rs::h5_3_drift_query_returns_templates_that_gained_a_version`,
+> out of `crates/ourios-miner/tests/hazards.rs` (now a relocation pointer
+> there) to `crates/ourios-querier/tests/drift.rs::h5_3_drift_query_returns_templates_that_gained_a_version`,
 > where the `drift` surface lives — it is no longer `#[ignore]` / `todo!()`.
 >
 > This RFC **extends** RFC 0002 (it does not reopen or renumber it; RFC 0002

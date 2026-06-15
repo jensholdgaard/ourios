@@ -109,7 +109,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0007 | Querier (DataFusion + logs DSL) | **`validated`** |
 | 0008 | WAL | **`accepted`** |
 | 0009 | Background compaction | **`green`** — §5 RFC0009.1–.6 pass (manifest + `gc_orphans` + sweep; #206/#207/#208/#209); .7 (D2/D3 benches) deferred to `validated` |
-| 0010 | Audit-stream / drift queries | **`green`** — all 8 §5 scenarios pass (`ourios-querier/tests/drift.rs`); discharges RFC 0001 H5.3; §9 items are `accepted`-gating; general audit aggregation deferred (§3.2) |
+| 0010 | Audit-stream / drift queries | **`green`** — all 8 §5 scenarios pass (`crates/ourios-querier/tests/drift.rs`); discharges RFC 0001 H5.3; §9 items are `accepted`-gating; general audit aggregation deferred (§3.2) |
 | 0011 | A1 re-scope | **`accepted`** |
 
 **Crates — all ten product crates are implemented** (`ourios-core`,

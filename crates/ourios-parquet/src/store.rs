@@ -16,56 +16,46 @@
 //! depend on this crate, so the type is visible to every storage consumer.
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use tokio::runtime::Runtime;
 
-/// Shared runtime that drives the async `object_store` calls from the **sync**
-/// storage API (`Writer`, `Reader`, `compaction`, and the manifest are sync;
-/// `object_store` is async, and compaction must reach S3 per RFC0013.3, so the
-/// bridge can't be a local-only `std::fs` shortcut).
+/// Drive `fut` to completion synchronously — the bridge from the **sync**
+/// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
+/// `object_store` (compaction must reach S3 per RFC0013.3, so a local-only
+/// `std::fs` shortcut won't do).
 ///
-/// One process-wide multi-threaded(1-worker) runtime so concurrent `block_on`
-/// from the storage call sites is safe (each runs on its own thread; see
-/// [`block_on_off_runtime`]).
-fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    if let Some(rt) = RT.get() {
-        return Ok(rt);
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .map_err(StoreError::Runtime)?;
-    // A racing thread may have initialised it first; if so our runtime is
-    // dropped and we use theirs (the configuration is identical).
-    let _ = RT.set(rt);
-    RT.get()
-        .ok_or_else(|| StoreError::Runtime(std::io::Error::other("bridge runtime vanished")))
-}
-
-/// Drive `fut` to completion synchronously, running `block_on` on a **fresh OS
-/// thread** rather than the caller's. A plain thread never inherits the tokio
-/// runtime context, so this is safe even when the caller is *inside* a runtime
-/// (e.g. a `#[tokio::test]` that opens the reader, or any future async
-/// consumer) — `block_on` on the calling thread would panic "runtime within a
-/// runtime" there. [`std::thread::scope`] lets `fut` borrow the caller's
-/// `self`/`key` while still running off-thread.
-fn block_on_off_runtime<F>(fut: F) -> Result<F::Output, StoreError>
+/// Everything happens on a **fresh OS thread**: a single-threaded runtime is
+/// built, drives `fut`, and is dropped, all on a thread that never carries the
+/// caller's tokio context. That makes the bridge safe from any call site —
+/// including *inside* a runtime (a `#[tokio::test]` that opens the reader, or
+/// a future async consumer), where calling `block_on` (or dropping a runtime)
+/// on the caller's own thread would panic. [`std::thread::scope`] lets `fut`
+/// borrow the caller's `self`/`key` while still running off-thread.
+///
+/// `fut` already yields a [`StoreError`] result, returned directly; the only
+/// extra failure is building the per-call runtime. No `enable_all()`: the
+/// local backend drives I/O via `spawn_blocking`, which needs only the bare
+/// runtime; the S3 backend adds `enable_all()` and the `net`/`io`/`time` tokio
+/// features in the slice that introduces it.
+fn block_on_off_runtime<T>(
+    fut: impl Future<Output = Result<T, StoreError>> + Send,
+) -> Result<T, StoreError>
 where
-    F: Future + Send,
-    F::Output: Send,
+    T: Send,
 {
-    let rt = bridge_runtime()?;
-    Ok(std::thread::scope(|s| {
-        s.spawn(|| rt.block_on(fut))
-            .join()
-            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-    }))
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(StoreError::Runtime)?;
+            rt.block_on(fut)
+        })
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
 }
 
 /// A handle to the object store backing a tenant store's Parquet + manifest
@@ -247,7 +237,7 @@ impl Store {
     /// [`StoreError::Runtime`] if the bridge runtime can't be built;
     /// otherwise as [`Self::get`].
     pub fn get_blocking(&self, key: &str) -> Result<Vec<u8>, StoreError> {
-        block_on_off_runtime(self.get(key))?
+        block_on_off_runtime(self.get(key))
     }
 
     /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
@@ -258,7 +248,7 @@ impl Store {
     /// [`StoreError::Runtime`] if the bridge runtime can't be built;
     /// otherwise as [`Self::put`].
     pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
-        block_on_off_runtime(self.put(key, bytes))?
+        block_on_off_runtime(self.put(key, bytes))
     }
 }
 

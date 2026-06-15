@@ -307,9 +307,6 @@ fn validate_row_vs_partition(
     Ok(())
 }
 
-/// RFC 0005 §3.9: every baseline REQUIRED (non-nullable) column must be
-/// present in the file's schema, else a hard error. Shared by
-/// [`Reader::open_file`] and [`Reader::open_bytes`].
 /// Read a data file's bytes through the object-storage [`Store`] seam
 /// (RFC 0013): a `LocalFileSystem`-backed store rooted at the file's parent
 /// directory, keyed by the file name. The sync read path (compaction, tests)
@@ -350,6 +347,9 @@ fn store_io_err(op: &'static str, path: &Path, err: &StoreError) -> ReaderError 
     }
 }
 
+/// RFC 0005 §3.9: every baseline REQUIRED (non-nullable) column must be
+/// present in the file's schema, else a hard error. Shared by
+/// [`Reader::open_file`] and [`Reader::open_bytes`].
 fn require_baseline_columns(file_schema: &arrow_schema::Schema) -> Result<(), ReaderError> {
     for expected_field in crate::data_schema().fields() {
         if !expected_field.is_nullable()

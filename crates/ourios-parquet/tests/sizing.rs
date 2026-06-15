@@ -68,8 +68,13 @@ fn high_entropy_body(seed: usize) -> String {
 fn sized_record(seed: usize) -> MinedRecord {
     MinedRecord {
         tenant_id: TenantId::new("tenant-sizing"),
-        template_id: 1,
-        template_version: 1,
+        // A parse-failure row: no template matched (id/version 0,
+        // confidence 0.0), so the original line is retained in `body`
+        // and the row is flagged lossy (RFC 0001 §6.6). This keeps the
+        // populated `body`, the empty `separators`, and `lossy_flag`
+        // mutually consistent.
+        template_id: 0,
+        template_version: 0,
         severity_number: 9,
         severity_text: None,
         scope_name: None,
@@ -85,10 +90,10 @@ fn sized_record(seed: usize) -> MinedRecord {
         event_name: None,
         body_kind: BodyKind::String,
         params: Vec::new(),
-        separators: vec![String::new()],
+        separators: Vec::new(),
         body: Some(high_entropy_body(seed)),
-        confidence: 0.5,
-        lossy_flag: true, // body retained per §6.3 lossy-zone
+        confidence: 0.0,
+        lossy_flag: true,
     }
 }
 

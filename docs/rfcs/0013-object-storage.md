@@ -249,9 +249,9 @@ contract.
 
 Mapped to `CLAUDE.md` §6.2. The `LocalFileSystem` backend keeps the current
 fast, corpus-free unit/proptest path; the `AmazonS3` backend is exercised
-against a MinIO/localstack container (`testcontainers` — Docker in CI,
-containerd/`nerdctl` locally per the project's container preference). Per
-scenario:
+against a MinIO/localstack container (`testcontainers`, which supports any
+OCI runtime — Docker on the CI runner, `nerdctl`/containerd or Podman
+locally). Per scenario:
 
 - **RFC0013.1 / .7 / .8** (S3 round-trip / S3-compatible endpoint / reader
   forward-compat over the store) — integration tests against the S3
@@ -264,8 +264,8 @@ scenario:
   concurrency test driving N racing publishers at the S3 container, asserting
   exactly-one-wins and no torn / doubled / missing rows.
 - **RFC0013.4** (manifest swap, no `rename`) — integration test asserting the
-  publish path uses conditional PUT (`PutMode::Create` / `Update`) and never a
-  `rename`.
+  publish path uses conditional PUT (`PutMode::Create` /
+  `PutMode::Update{ETag}`) and never a `rename`.
 - **RFC0013.5** (tenant isolation) — integration test interleaving two
   tenants' objects under the prefix; asserts no cross-prefix access.
 - **RFC0013.6** (WAL stays local) — after ingest + ack, assert WAL frames are

@@ -51,13 +51,15 @@ async fn records_round_trip_through_store_buffer_and_put() {
     let store = Store::local(dir.path()).expect("local store");
 
     // Key derived from the records' own partition (Hive path under an empty
-    // root), so the partition segments match the fixture timestamps.
+    // root), so the partition segments match the fixture timestamps. Object
+    // keys are "/"-delimited, so normalise the PathBuf's OS separator
+    // (`data_path` joins with the platform separator) for portability.
     let partition = PartitionKey::derive(&records[0]).expect("derive partition");
+    let rel = partition.data_path(std::path::Path::new(""));
     let key = format!(
         "{}/file.parquet",
-        partition
-            .data_path(std::path::Path::new(""))
-            .to_string_lossy()
+        rel.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
     );
     store.put(&key, bytes).await.expect("put");
     let got = store.get(&key).await.expect("get");

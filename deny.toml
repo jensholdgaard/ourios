@@ -9,9 +9,9 @@
 # (each entry should carry a `# reason:` note); empty means none accepted.
 yanked = "deny"
 ignore = [
-    # paste: unmaintained (RUSTSEC-2024-0436), no security vulnerability. A
-    # deep transitive proc-macro dep of arrow/datafusion; nothing for us to
-    # fix until upstream drops it. Re-evaluate when that happens.
+    # reason: paste is unmaintained (RUSTSEC-2024-0436) but carries no security
+    # vulnerability — a deep transitive proc-macro of arrow/datafusion that we
+    # cannot replace until upstream drops it. Re-evaluate when that happens.
     "RUSTSEC-2024-0436",
 ]
 

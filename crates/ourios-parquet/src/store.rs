@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 /// Drive `fut` to completion synchronously — the bridge from the **sync**
 /// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
@@ -134,6 +134,15 @@ impl std::error::Error for StoreError {
             Self::Unimplemented(_) => None,
             Self::Runtime(e) => Some(e),
         }
+    }
+}
+
+impl StoreError {
+    /// True if this is a "no such object" backend error — the caller may
+    /// treat the object as absent (see [`Store::get_blocking_opt`]).
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Backend(object_store::Error::NotFound { .. }))
     }
 }
 
@@ -258,11 +267,54 @@ impl Store {
     pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         block_on_off_runtime(self.put(key, bytes))
     }
+
+    /// Write `bytes` to `key` only if no object exists there
+    /// (create-if-absent — `If-None-Match: *`). The local-testable half of
+    /// RFC 0013 conditional PUT; the compare-and-swap half (`If-Match`) needs
+    /// an S3 backend, since `LocalFileSystem` rejects `PutMode::Update`.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if an object already exists at `key`, or the
+    /// put otherwise fails.
+    pub async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        self.inner
+            .put_opts(
+                &self.resolve(key),
+                PutPayload::from(bytes),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
+    /// Read the object at `key`, mapping a missing object to `None` rather
+    /// than an error — for sync call sites where absence is expected (e.g. a
+    /// partition with no manifest yet).
+    ///
+    /// # Errors
+    /// As [`Self::get_blocking`], except a not-found object yields `Ok(None)`.
+    pub fn get_blocking_opt(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.get_blocking(key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Blocking [`Self::put_if_absent`] for the sync storage call sites.
+    ///
+    /// # Errors
+    /// As [`Self::put_if_absent`], plus [`StoreError::Runtime`] if the bridge
+    /// runtime can't be built.
+    pub fn put_if_absent_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        block_on_off_runtime(self.put_if_absent(key, bytes))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
+    use super::{Store, StoreError};
 
     /// A byte object round-trips through the local backend, and a delete
     /// removes it. (Foundation for the RFC0013 consumer migration; the §5
@@ -310,6 +362,48 @@ mod tests {
         assert_eq!(
             store.get_blocking(key).expect("get_blocking"),
             b"inside-runtime"
+        );
+    }
+
+    /// `get_blocking_opt` maps a missing object to `None` (the manifest's
+    /// "no manifest yet" case) and yields the bytes when present.
+    #[test]
+    fn get_blocking_opt_maps_missing_to_none() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        assert_eq!(
+            store.get_blocking_opt("manifest.json").expect("get_opt"),
+            None,
+            "absent object is None, not an error"
+        );
+        store
+            .put_blocking("manifest.json", b"{}".to_vec())
+            .expect("put");
+        assert_eq!(
+            store.get_blocking_opt("manifest.json").expect("get_opt"),
+            Some(b"{}".to_vec()),
+        );
+    }
+
+    /// `put_if_absent` (create-if-absent) writes when the key is free and
+    /// refuses to clobber an existing object — the local-testable half of
+    /// RFC 0013 conditional PUT.
+    #[test]
+    fn put_if_absent_refuses_to_clobber() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "manifest.json";
+        store
+            .put_if_absent_blocking(key, b"first".to_vec())
+            .expect("first create");
+        let err = store
+            .put_if_absent_blocking(key, b"second".to_vec())
+            .expect_err("create over an existing object must fail");
+        assert!(matches!(err, StoreError::Backend(_)), "got {err:?}");
+        assert_eq!(
+            store.get_blocking(key).expect("get"),
+            b"first",
+            "the original object is untouched"
         );
     }
 }

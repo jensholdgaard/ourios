@@ -19,8 +19,8 @@ superseded-by: —
 > buffer-and-put `Writer`), but nothing carries a mined record to a Parquet
 > object on the store. This RFC specifies the missing piece: a buffering
 > `RecordSink` and the **flush policy** that governs when buffered records
-> become a Parquet object — a §4 (small-file) / §3.4 (WAL-durability) /
-> §3.7 (multi-tenancy) decision that no existing RFC covers.
+> become a Parquet object — a `CLAUDE.md` §4 (small-file) / §3.4
+> (WAL-durability) / §3.7 (multi-tenancy) decision that no existing RFC covers.
 >
 > **Scope is deliberately narrow:** the flush policy + the sink. Wiring the
 > server to construct/inject a `Store` (RFC 0004 config, local vs S3) and
@@ -34,13 +34,13 @@ A buffering `RecordSink` implementation — the production data write path —
 accumulates mined `MinedRecord`s per partition and flushes each partition to a
 Parquet object on the RFC 0013 `Store` seam. The flush policy is **hybrid**: a
 partition flushes when its buffered bytes reach a size target (toward RFC 0005
-§3.5's file-size band) **or** its oldest buffered record exceeds a max age,
+§3.5's file-size band) **or** its oldest buffered record reaches a max age,
 **and** every partition force-flushes when the WAL segment rotates (RFC 0008).
 Total buffered bytes are bounded by a hard ceiling: exceeding it forces an
 early flush (and, at the hard limit, applies backpressure to ingest). The sink
 reuses RFC 0008's batch-window / rotation machinery rather than inventing a
 parallel cadence. Records reach the sink only after the WAL is durable
-(§3.4), so an un-flushed buffer is always recoverable by WAL replay.
+(`CLAUDE.md` §3.4), so an un-flushed buffer is always recoverable by WAL replay.
 
 ## 2. Motivation
 
@@ -59,14 +59,14 @@ explicitly **not when records are flushed to a file** — confirmed a genuine
 gap). It is the natural home for three hazards that no other RFC binds
 together:
 
-- **§4 small-file problem.** Flush too eagerly and the store fills with tiny
+- **`CLAUDE.md` §4 small-file problem.** Flush too eagerly and the store fills with tiny
   Parquet objects that defeat predicate pushdown and lean entirely on
   compaction (RFC 0009) to recover. The flush policy is the first line of
   defence; compaction is the second.
-- **§3.4 WAL-before-ack durability.** The sink buffers *acknowledged* data in
+- **`CLAUDE.md` §3.4 WAL-before-ack durability.** The sink buffers *acknowledged* data in
   memory. The buffer must never be the durability of record — that is the
   WAL's job. A crash mid-buffer must lose nothing acknowledged.
-- **§3.7 multi-tenancy.** Buffers are keyed by `PartitionKey`, which carries
+- **`CLAUDE.md` §3.7 multi-tenancy.** Buffers are keyed by `PartitionKey`, which carries
   `tenant_id`; flushing one partition must never touch another tenant's data.
 
 **Why not defer to compaction.** Compaction *fixes* small files after the
@@ -85,7 +85,7 @@ MinedRecord)`. It owns:
   `PartitionBuffer` accumulates `MinedRecord`s plus a running estimate of its
   encoded size and the wall-clock time of its oldest record. The
   `PartitionKey` (RFC 0005 §3.4) carries `tenant_id`, so buffers are
-  tenant-scoped by construction (§3.7).
+  tenant-scoped by construction (`CLAUDE.md` §3.7).
 - **A handle to the `Store`** (RFC 0013) — the flush target.
 - **Flush configuration** (RFC 0004): the size target, the max buffer age,
   and the global buffered-bytes ceiling.
@@ -100,7 +100,8 @@ A partition flushes when **any** of:
 1. **Size** — its buffered (estimated) bytes reach the size target. The target
    sits inside RFC 0005 §3.5's 256 MiB–2 GiB file band so a single buffer
    becomes one right-sized object.
-2. **Age** — its oldest buffered record's age reaches `max_buffer_age`. This
+2. **Age** — its oldest buffered record's age reaches `max_buffer_age`
+   (inclusive: flush when age ≥ the configured max). This
    bounds the staleness of low-volume tenants/partitions whose size trigger
    would otherwise never fire.
 3. **WAL segment rotation** — when the WAL segment seals (RFC 0008's rotation
@@ -140,7 +141,7 @@ ceiling:
 This makes the in-memory buffer a bounded, best-effort accelerator on top of
 the WAL, never an unbounded liability (cf. §3.2's hazard list).
 
-### 3.5 Durability and crash recovery (§3.4)
+### 3.5 Durability and crash recovery (`CLAUDE.md` §3.4)
 
 Records reach the sink **only after** the WAL has durably committed them
 (`ourios-ingester` pipeline: append + fsync → ingest gate → miner → sink — the
@@ -186,12 +187,12 @@ argument trivial; we keep it.
 **WAL-segment-rotation only.** Flush exactly when a segment seals. Simplest
 recovery story (Parquet boundary ≡ WAL boundary) and bounded buffering, but
 file size is hostage to the WAL rotation cadence — tuned for *durability
-latency*, not for the §4 256 MiB–2 GiB target. Rejected as the *sole* trigger;
+latency*, not for the `CLAUDE.md` §4 256 MiB–2 GiB target. Rejected as the *sole* trigger;
 kept as the force-flush bound in the hybrid.
 
 **Stream per batch (the A1-bench pattern).** Open a `Writer` per partition,
 append each OTLP batch, close on rotation. Minimal sink logic, but produces
-many small files between compactions — it leans the entire §4 mitigation onto
+many small files between compactions — it leans the entire `CLAUDE.md` §4 mitigation onto
 compaction and pays the small-file cost (PUTs, manifest churn, footer reads)
 in the interim. Rejected for production; it remains the bench's expedient.
 
@@ -204,14 +205,15 @@ bounded accelerator and an OOM risk; we keep it.
 
 > Sketch for the `drafted` stage; finalized and made greppable
 > (`RFC0014.<m>`, `docs/verification.md` §2) at `specified`. One scenario per
-> hazard/invariant this RFC touches (§4, §3.4, §3.7).
+> hazard/invariant this RFC touches (`CLAUDE.md` §4, §3.4, §3.7).
 
 - **RFC0014.1 — size trigger.** *Given* a partition whose buffered records
   reach the size target, *when* the next record is emitted, *then* the
-  partition flushes to exactly one Parquet object sized within the §3.5 band
+  partition flushes to exactly one Parquet object sized within the RFC 0005
+  §3.5 band
   and the buffer is cleared.
 - **RFC0014.2 — age trigger.** *Given* a low-volume partition below the size
-  target, *when* its oldest record exceeds `max_buffer_age`, *then* it flushes
+  target, *when* its oldest record's age reaches `max_buffer_age`, *then* it flushes
   on the next batch-window tick.
 - **RFC0014.3 — rotation force-flush.** *Given* buffered records across
   several partitions, *when* the WAL segment rotates, *then* every partition
@@ -220,10 +222,10 @@ bounded accelerator and an OOM risk; we keep it.
   ceiling, *when* more records arrive, *then* the sink early-flushes to stay
   under the ceiling; *and* at the hard limit it applies backpressure rather
   than exceeding it.
-- **RFC0014.5 — no acknowledged-data loss (§3.4).** *Given* a non-empty buffer,
+- **RFC0014.5 — no acknowledged-data loss (`CLAUDE.md` §3.4).** *Given* a non-empty buffer,
   *when* the process crashes, *then* WAL replay re-mines every un-flushed
   acknowledged record — no acknowledged record is lost.
-- **RFC0014.6 — tenant isolation (§3.7).** *Given* buffered records for tenants
+- **RFC0014.6 — tenant isolation (`CLAUDE.md` §3.7).** *Given* buffered records for tenants
   X and Y, *when* one partition flushes, *then* the produced object holds only
   that partition's (single tenant's) rows; no buffer or flush crosses tenants.
 

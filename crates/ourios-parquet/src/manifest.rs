@@ -245,8 +245,8 @@ impl Manifest {
     /// # Errors
     ///
     /// [`ManifestError::InvalidFilename`] / [`ManifestError::DuplicateFilename`]
-    /// if the live set is invalid; [`ManifestError::Io`] on a non-precondition
-    /// backend failure.
+    /// if the live set is invalid; [`ManifestError::Parse`] if serialization
+    /// fails; [`ManifestError::Io`] on a non-precondition backend failure.
     pub fn publish_cas(
         &self,
         store: &Store,

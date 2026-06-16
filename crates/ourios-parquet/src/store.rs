@@ -23,7 +23,7 @@ use std::sync::{Arc, OnceLock};
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use tokio::runtime::Runtime;
 
 /// The process-wide runtime that drives the async `object_store` calls behind
@@ -96,6 +96,11 @@ where
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     })
 }
+
+/// Object bytes paired with the backend's `ETag` (the compare-and-swap token),
+/// as returned by [`Store::get_with_etag`]. The `ETag` is `None` when the
+/// backend doesn't expose one.
+pub type EtaggedBytes = (Vec<u8>, Option<String>);
 
 /// A handle to the object store backing a tenant store's Parquet + manifest
 /// objects, addressed by key under `prefix`. Wraps an [`ObjectStore`] so the
@@ -211,6 +216,27 @@ impl StoreError {
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Backend(object_store::Error::NotFound { .. }))
+    }
+
+    /// True if a conditional update (`If-Match`) failed its precondition —
+    /// the object's `ETag` changed under us, i.e. a compare-and-swap lost the
+    /// race (see [`Store::put_if_match`]).
+    #[must_use]
+    pub fn is_precondition(&self) -> bool {
+        matches!(
+            self,
+            Self::Backend(object_store::Error::Precondition { .. })
+        )
+    }
+
+    /// True if a create-if-absent (`If-None-Match`) failed because the object
+    /// already exists (see [`Store::put_if_absent`]).
+    #[must_use]
+    pub fn is_already_exists(&self) -> bool {
+        matches!(
+            self,
+            Self::Backend(object_store::Error::AlreadyExists { .. })
+        )
     }
 }
 
@@ -409,6 +435,81 @@ impl Store {
     /// runtime can't be built.
     pub fn put_if_absent_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         block_on_off_runtime(self.put_if_absent(key, bytes))
+    }
+
+    /// Read the object at `key` together with its current `ETag` (the
+    /// compare-and-swap token for a later [`Self::put_if_match`]); the `ETag`
+    /// is `None` when the backend doesn't expose one.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub async fn get_with_etag(&self, key: &str) -> Result<EtaggedBytes, StoreError> {
+        let got = self
+            .inner
+            .get(&self.resolve(key))
+            .await
+            .map_err(StoreError::Backend)?;
+        let e_tag = got.meta.e_tag.clone();
+        let bytes = got.bytes().await.map_err(StoreError::Backend)?;
+        Ok((bytes.to_vec(), e_tag))
+    }
+
+    /// Compare-and-swap write: replace `key` only if its current `ETag` still
+    /// matches `e_tag` (`If-Match`). Used to publish a new manifest generation
+    /// atomically without a `rename` (RFC0013.3/.4). Needs a backend that
+    /// supports conditional update — S3-compatible stores do;
+    /// `LocalFileSystem` does not.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] whose [`StoreError::is_precondition`] is true if
+    /// the `ETag` no longer matches (the swap lost the race); otherwise as a
+    /// failed put.
+    pub async fn put_if_match(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        e_tag: &str,
+    ) -> Result<(), StoreError> {
+        let opts = PutOptions::from(PutMode::Update(UpdateVersion {
+            e_tag: Some(e_tag.to_string()),
+            version: None,
+        }));
+        self.inner
+            .put_opts(&self.resolve(key), PutPayload::from(bytes), opts)
+            .await
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
+    /// Blocking [`Self::get_with_etag`], mapping a missing object to `None`
+    /// (the manifest's "no manifest yet" case) for sync call sites.
+    ///
+    /// # Errors
+    /// As [`Self::get_with_etag`], except a not-found object yields `Ok(None)`;
+    /// plus [`StoreError::Runtime`] if the bridge runtime can't be built.
+    pub fn get_with_etag_blocking_opt(
+        &self,
+        key: &str,
+    ) -> Result<Option<EtaggedBytes>, StoreError> {
+        match block_on_off_runtime(self.get_with_etag(key)) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Blocking [`Self::put_if_match`] for the sync storage call sites.
+    ///
+    /// # Errors
+    /// As [`Self::put_if_match`], plus [`StoreError::Runtime`] if the bridge
+    /// runtime can't be built.
+    pub fn put_if_match_blocking(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        e_tag: &str,
+    ) -> Result<(), StoreError> {
+        block_on_off_runtime(self.put_if_match(key, bytes, e_tag))
     }
 }
 

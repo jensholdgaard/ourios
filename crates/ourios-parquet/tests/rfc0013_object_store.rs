@@ -1,12 +1,13 @@
 //! RFC 0013 — object-storage backend acceptance scenarios (§5).
 //!
-//! **Status: `red`.** These are the failing stubs that drive the `green`
-//! implementation: each encodes one RFC0013.§5 scenario and currently
-//! `todo!()`s. They are `#[ignore]`d so the default `cargo test` (and CI)
-//! stays green while the backend is built — `green` replaces each body with
-//! a real assertion and removes the `#[ignore]`. The S3-backed scenarios run
-//! against a MinIO/localstack container (`testcontainers`); the local-backend
-//! scenarios re-run the RFC 0005 / 0009 contract through `Store`.
+//! Local-backend scenarios (`.2`, `.5`) run in the default `cargo test`. The
+//! S3-backed scenarios (`.1`, `.3`, `.4`, `.7`) are `#[ignore]`d and run only
+//! in the `s3-integration` CI job (testcontainers + `LocalStack`, which needs a
+//! Docker-API runtime); the job invokes them by name via `--ignored`. `.6`
+//! (WAL-stays-local) stays a `todo!()` stub pending the server wiring the
+//! object-store backend; `.8` (reader forward-compat) is covered by the
+//! colocated reader §3.9 tests (`rfc0005_2`/`_3`/`_4`), which read through the
+//! same `Store` seam.
 //!
 //! See `docs/rfcs/0013-object-storage.md` §5/§6.
 
@@ -16,7 +17,8 @@ use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    DEFAULT_ZSTD_LEVEL, PartitionKey, Reader, S3Config, Store, Writer, encode_records_to_parquet,
+    DEFAULT_ZSTD_LEVEL, Manifest, PartitionKey, Published, Reader, S3Config, Store, Writer,
+    encode_records_to_parquet,
 };
 use testcontainers_modules::localstack::LocalStack;
 use testcontainers_modules::testcontainers::core::ExecCommand;
@@ -178,19 +180,119 @@ fn rfc0013_2_local_backend_regresses_nothing() {
 /// Scenario RFC0013.3 — two `compact_partition` runs racing on one partition: exactly
 /// one manifest generation wins; no torn / doubled / missing rows.
 /// See `docs/rfcs/0013-object-storage.md` §5.
-#[test]
-#[ignore = "RFC0013.3 — red until conditional-PUT atomic publish lands"]
-fn rfc0013_3_atomic_publish_under_contention() {
-    todo!("RFC0013.3: exactly-one-wins under concurrent publishers")
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "RFC0013.3 — S3 integration; run via the `s3-integration` CI job"]
+async fn rfc0013_3_atomic_publish_under_contention() {
+    const KEY: &str = "data/tenant_id=t/year=2026/month=04/day=02/hour=10/manifest.json";
+    let (_node, s3) = localstack_s3("ourios-it-cas3").await;
+
+    // Seed generation 1, then capture its ETag.
+    let seed = Manifest {
+        generation: 1,
+        files: vec!["seed.parquet".to_string()],
+    };
+    assert_eq!(
+        seed.publish_cas(&s3, KEY, None).expect("seed"),
+        Published::Won
+    );
+    let (_, etag) = Manifest::read_with_etag(&s3, KEY)
+        .expect("read")
+        .expect("present");
+    let etag = etag.expect("S3 exposes an ETag");
+
+    // Two writers race to swap gen 1 → gen 2 against the *same* ETag.
+    let (sa, sb) = (s3.clone(), s3.clone());
+    let (ea, eb) = (etag.clone(), etag.clone());
+    let a = tokio::task::spawn_blocking(move || {
+        Manifest {
+            generation: 2,
+            files: vec!["a.parquet".to_string()],
+        }
+        .publish_cas(&sa, KEY, Some(&ea))
+    });
+    let b = tokio::task::spawn_blocking(move || {
+        Manifest {
+            generation: 2,
+            files: vec!["b.parquet".to_string()],
+        }
+        .publish_cas(&sb, KEY, Some(&eb))
+    });
+    let ra = a.await.expect("join a").expect("publish a");
+    let rb = b.await.expect("join b").expect("publish b");
+
+    // Exactly one wins; the other loses the compare-and-swap.
+    let wins = [ra, rb].iter().filter(|p| **p == Published::Won).count();
+    assert_eq!(wins, 1, "exactly one publisher wins (a={ra:?}, b={rb:?})");
+
+    // The published generation is a consistent, un-torn gen 2 (one writer's).
+    let (final_m, _) = Manifest::read_with_etag(&s3, KEY)
+        .expect("read")
+        .expect("present");
+    assert_eq!(final_m.generation, 2);
+    assert!(
+        final_m.files == vec!["a.parquet".to_string()]
+            || final_m.files == vec!["b.parquet".to_string()],
+        "no torn / doubled state, got {:?}",
+        final_m.files,
+    );
 }
 
 /// Scenario RFC0013.4 — generation publish uses conditional PUT (`PutMode::Create` /
 /// `Update{ETag}`) with no `rename` dependency.
 /// See `docs/rfcs/0013-object-storage.md` §5.
-#[test]
-#[ignore = "RFC0013.4 — red until the manifest swap uses conditional PUT"]
-fn rfc0013_4_manifest_swap_via_conditional_put() {
-    todo!("RFC0013.4: publish path uses PutMode::Create/Update, never rename")
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0013.4 — S3 integration; run via the `s3-integration` CI job"]
+async fn rfc0013_4_manifest_swap_via_conditional_put() {
+    const KEY: &str = "data/tenant_id=t/year=2026/month=04/day=02/hour=10/manifest.json";
+    let (_node, s3) = localstack_s3("ourios-it-cas4").await;
+
+    // First publish: create-if-absent (`If-None-Match`).
+    let gen1 = Manifest {
+        generation: 1,
+        files: vec!["a.parquet".to_string()],
+    };
+    assert_eq!(
+        gen1.publish_cas(&s3, KEY, None).expect("create"),
+        Published::Won
+    );
+    // Create-if-absent again now loses — the object exists.
+    assert_eq!(
+        gen1.publish_cas(&s3, KEY, None).expect("re-create"),
+        Published::Lost,
+    );
+
+    // Swap to gen 2 via compare-and-swap (`If-Match` on the read ETag).
+    let (read, etag) = Manifest::read_with_etag(&s3, KEY)
+        .expect("read")
+        .expect("present");
+    assert_eq!(read.generation, 1);
+    let etag = etag.expect("S3 exposes an ETag");
+    let gen2 = Manifest {
+        generation: 2,
+        files: vec!["b.parquet".to_string()],
+    };
+    assert_eq!(
+        gen2.publish_cas(&s3, KEY, Some(&etag)).expect("swap"),
+        Published::Won,
+    );
+
+    // A swap against the now-stale ETag loses (no blind overwrite, no rename).
+    let stale = Manifest {
+        generation: 3,
+        files: vec!["c.parquet".to_string()],
+    };
+    assert_eq!(
+        stale
+            .publish_cas(&s3, KEY, Some(&etag))
+            .expect("stale swap"),
+        Published::Lost,
+    );
+
+    let (final_m, _) = Manifest::read_with_etag(&s3, KEY)
+        .expect("read")
+        .expect("present");
+    assert_eq!(final_m.generation, 2);
+    assert_eq!(final_m.files, vec!["b.parquet".to_string()]);
 }
 
 /// Scenario RFC0013.5 — operations in tenant X's context address only X's key

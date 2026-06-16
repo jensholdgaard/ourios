@@ -84,9 +84,10 @@ const SUB_BATCH_ROWS: usize = 1024;
 /// into place, so an enumerating reader sees either nothing or a
 /// logically complete `<uuid>.parquet` — never a partial file. A
 /// writer dropped without [`Writer::close`] (panic, early-return)
-/// simply discards its buffer; nothing is published and the
-/// partition directory is left untouched. This satisfies RFC 0005
-/// §7's "atomic-publish convention" open-question item.
+/// simply discards its buffer; no object is ever published (the
+/// partition directory is created at [`Writer::open`], but holds no
+/// file unless `close` succeeds). This satisfies RFC 0005 §7's
+/// "atomic-publish convention" open-question item.
 ///
 /// **The atomic publish is logical, not crash-durable.** The store
 /// put is not `fsync`-ed; a host crash between the put and the OS's
@@ -531,8 +532,12 @@ fn append_chunks(
         inner.write(&batch).map_err(WriterError::Parquet)?;
         // Count rows only once the sub-batch has been accepted, so a
         // mid-slice `Batch`/`Parquet` failure leaves `num_rows`
-        // reflecting exactly what landed in the buffer.
-        *num_rows += i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+        // reflecting exactly what landed in the buffer. `chunk.len()`
+        // is bounded by `SUB_BATCH_ROWS` (1024), so the cast to `i64`
+        // is lossless.
+        #[allow(clippy::cast_possible_wrap)]
+        let written = chunk.len() as i64;
+        *num_rows += written;
     }
     // Final post-write check so the next `append_records` call
     // doesn't inherit an over-threshold buffer.

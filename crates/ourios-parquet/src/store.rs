@@ -134,8 +134,10 @@ pub struct S3Config {
 
 impl S3Config {
     /// Config for `bucket` (required); endpoint, region, and prefix start
-    /// unset — add them with the `with_*` builders. `S3Config` is
-    /// `#[non_exhaustive]`, so this is the constructor external callers use.
+    /// unset — add them with the `with_*` builders. The preferred way to build
+    /// an `S3Config` (it's `#[non_exhaustive]`, so external callers can't use a
+    /// struct literal; `S3Config::default()` plus setting the public fields
+    /// also works, but `bucket` then defaults to the invalid empty string).
     #[must_use]
     pub fn new(bucket: impl Into<String>) -> Self {
         Self {

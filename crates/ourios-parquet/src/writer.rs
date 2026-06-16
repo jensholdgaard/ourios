@@ -35,7 +35,6 @@
 //! [`CLAUDE.md`]: ../../../../CLAUDE.md
 
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -50,6 +49,7 @@ use uuid::Uuid;
 use crate::data_schema;
 use crate::partition::PartitionKey;
 use crate::record_batch::{BatchError, mined_records_to_batch};
+use crate::store::Store;
 
 /// RFC 0005 §3.5 — uncompressed bytes per row group, lower
 /// threshold. The writer flushes a row group when
@@ -72,50 +72,55 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 /// the 1 GiB ceiling still uncrossed.
 const SUB_BATCH_ROWS: usize = 1024;
 
-/// Streaming Parquet writer for one partition's data file.
+/// Buffer-and-put Parquet writer for one partition's data file
+/// (RFC 0013 object-storage seam).
 ///
-/// One [`Writer`] writes one Parquet file. The writer publishes
-/// **atomically**: bytes are written to a `<uuid>.parquet.tmp`
-/// path while the writer is open; [`Writer::close`] renames the
-/// temp file to the final `<uuid>.parquet` only after the footer
-/// is written and the file is closed. Readers that enumerate the
-/// partition can rely on "every `*.parquet` file has a logically
-/// complete footer" — they filter the `.parquet.tmp` suffix out.
-/// If the writer is dropped without [`Writer::close`] (panic,
-/// early-return), [`Drop`] removes the `.parquet.tmp` file so an
-/// aborted write doesn't pollute the partition directory with an
-/// unreadable file. This satisfies RFC 0005 §7's "atomic-publish
-/// convention (write to a temp path, rename on close)"
-/// open-question item.
+/// One [`Writer`] writes one Parquet file. Rows are encoded into an
+/// in-memory buffer as they arrive (row groups still flush per the
+/// §3.5 sizing rule, into the buffer); [`Writer::close`] writes the
+/// finished bytes to the object store under the partition's key.
+/// The store [`put`](Store::put_blocking) is the **commit point**:
+/// the local backend stages to a private temp object and renames it
+/// into place, so an enumerating reader sees either nothing or a
+/// logically complete `<uuid>.parquet` — never a partial file. A
+/// writer dropped without [`Writer::close`] (panic, early-return)
+/// simply discards its buffer; no object is ever published (the
+/// partition directory is created at [`Writer::open`], but holds no
+/// file unless `close` succeeds). This satisfies RFC 0005 §7's
+/// "atomic-publish convention" open-question item.
 ///
-/// **The atomic publish is logical, not crash-durable.** Neither
-/// the data pages nor the rename metadata are
-/// [`File::sync_all`]-ed; a host crash or power loss between the
-/// rename and the OS's next page-cache flush could leave the
-/// renamed file with truncated or zero-padded contents on disk.
-/// Crash-survival durability is the WAL's domain (`CLAUDE.md`
-/// §3.4 "WAL-before-ack"); see [`Writer::close`]'s rustdoc for
-/// the full reasoning.
+/// **The atomic publish is logical, not crash-durable.** The store
+/// put is not `fsync`-ed; a host crash between the put and the OS's
+/// next page-cache flush could lose the file. Crash-survival
+/// durability is the WAL's domain (`CLAUDE.md` §3.4
+/// "WAL-before-ack"); see [`Writer::close`]'s rustdoc for the full
+/// reasoning.
 pub struct Writer {
-    inner: Option<ArrowWriter<File>>,
+    inner: Option<ArrowWriter<Vec<u8>>>,
     partition: PartitionKey,
     flush_uuid: Uuid,
-    /// Final `<uuid>.parquet` path the file moves to on close.
+    /// Object store rooted at `bucket_root`; the finished file is
+    /// `put` to [`Self::key`] on close.
+    store: Store,
+    /// `/`-delimited object key the file is published to, relative to
+    /// the store root (`data/tenant_id=…/year=…/…/<uuid>.parquet`).
+    key: String,
+    /// Absolute path the published file lands at (store root joined
+    /// with [`Self::key`]) — surfaced in [`WrittenFile`] for readers.
     final_path: PathBuf,
-    /// `<uuid>.parquet.tmp` path the writer actually writes to.
-    /// `None` once [`Self::close`] renames it away; the [`Drop`]
-    /// impl uses `None` as the "already published; nothing to
-    /// clean up" signal.
-    temp_path: Option<PathBuf>,
+    /// Running count of rows written so far (incremented per
+    /// sub-batch as each `write` succeeds); reported by
+    /// [`Self::close`]. Tracked directly because `into_inner` returns
+    /// the buffer, not file metadata.
+    num_rows: i64,
     /// Set to `true` once any `ArrowWriter::write` /
     /// `ArrowWriter::flush` call returns `Err`. The underlying
     /// `ArrowWriter`'s buffer state is undefined after such a
     /// failure (the row group may be partially written), so
-    /// [`Self::close`] refuses to publish — renaming the temp file
-    /// into place would silently land a potentially-corrupted
-    /// data file. The temp file is left on disk for diagnosis
-    /// (the [`Drop`] impl skips its usual cleanup when poisoned).
-    /// Mirrors [`crate::audit_writer::AuditWriter`]'s contract.
+    /// [`Self::close`] refuses to publish — putting a potentially
+    /// corrupted buffer would land a bad data file. The buffer is
+    /// discarded (there is no on-disk artifact to inspect). Mirrors
+    /// [`crate::audit_writer::AuditWriter`]'s contract.
     poisoned: bool,
 }
 
@@ -144,8 +149,8 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// - [`WriterError::Io`] when the partition directory or
-    ///   target file cannot be created.
+    /// - [`WriterError::Io`] when the partition directory can't be
+    ///   created or the object store can't be opened at `bucket_root`.
     /// - [`WriterError::Parquet`] when `zstd_level` is outside the
     ///   valid ZSTD range or `ArrowWriter` setup fails.
     pub fn open_with_zstd_level(
@@ -153,50 +158,53 @@ impl Writer {
         partition: PartitionKey,
         zstd_level: i32,
     ) -> Result<Self, WriterError> {
-        // Validate the codec level *before* touching the
-        // filesystem so invalid input fails fast without creating
-        // the partition directory or a temp file. The validated
-        // level flows into `writer_properties` so it isn't
-        // re-checked.
+        // Validate the codec level up front so invalid input fails
+        // fast. The validated level flows into `writer_properties` so
+        // it isn't re-checked.
         let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
+        // Ensure the store root (and the partition dir) exist:
+        // `Store::local` canonicalises `bucket_root`, which must
+        // therefore exist; the object-store `put` on close creates any
+        // remaining parents.
         let dir = partition.data_path(bucket_root);
         std::fs::create_dir_all(&dir).map_err(|source| WriterError::Io {
             op: "create_dir_all",
             path: dir.clone(),
-            source_path: None,
             source,
+        })?;
+        let store = Store::local(bucket_root).map_err(|e| WriterError::Io {
+            op: "open store",
+            path: bucket_root.to_path_buf(),
+            source: io::Error::other(e),
         })?;
         let flush_uuid = Uuid::now_v7();
         let final_path = dir.join(format!("{flush_uuid}.parquet"));
-        let temp_path = dir.join(format!("{flush_uuid}.parquet.tmp"));
-        let file = File::create(&temp_path).map_err(|source| WriterError::Io {
-            op: "create",
-            path: temp_path.clone(),
-            source_path: None,
-            source,
-        })?;
+        // The object key is the partition's Hive path (relative to the
+        // store root) plus the file name, with `/` separators —
+        // object keys are `/`-delimited regardless of the host OS.
+        let key = format!(
+            "{}/{}.parquet",
+            partition
+                .data_path(Path::new(""))
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            flush_uuid
+        );
 
-        // From this point on, the `.parquet.tmp` file exists on
-        // disk. If anything below errors, no `Writer` is
-        // constructed and `Drop` therefore never runs — we'd
-        // leak the temp file unless we clean it up explicitly.
-        // (The codec level was already validated before any
-        // filesystem work, so building props is infallible here.)
         let props = writer_properties(zstd);
-        let inner = match ArrowWriter::try_new(file, data_schema(), Some(props)) {
-            Ok(w) => w,
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(WriterError::Parquet(e));
-            }
-        };
+        // Buffer-and-put: encode into memory; nothing hits the store
+        // until `close`. A construction failure leaves no artifact.
+        let inner = ArrowWriter::try_new(Vec::new(), data_schema(), Some(props))
+            .map_err(WriterError::Parquet)?;
 
         Ok(Self {
             inner: Some(inner),
             partition,
             flush_uuid,
+            store,
+            key,
             final_path,
-            temp_path: Some(temp_path),
+            num_rows: 0,
             poisoned: false,
         })
     }
@@ -222,9 +230,8 @@ impl Writer {
     /// undefined state — the partial row group can't be safely
     /// recovered. When that happens, the writer marks itself
     /// poisoned and [`Self::close`] subsequently returns
-    /// [`WriterError::Poisoned`] instead of renaming the temp
-    /// file into place. The `.parquet.tmp` stays on disk for
-    /// diagnosis. `PartitionMismatch` and `Batch` errors do
+    /// [`WriterError::Poisoned`] instead of publishing the buffer.
+    /// `PartitionMismatch` and `Batch` errors do
     /// **not** poison: the writer remains usable for a follow-up
     /// `append_records` call.
     ///
@@ -294,152 +301,101 @@ impl Writer {
             .as_mut()
             .expect("inner ArrowWriter is Some until Writer::close is called");
         // Run the Parquet-touching loop in a helper that takes a
-        // `&mut ArrowWriter<File>` so the outer `self.poisoned =
+        // `&mut ArrowWriter<Vec<u8>>` so the outer `self.poisoned =
         // true` assignment can run after the borrow on `self.inner`
-        // ends. Poison only on Parquet errors — `Batch` errors
-        // come from `mined_records_to_batch`, which runs on a
-        // single chunk and doesn't touch `inner` itself; the
-        // buffer's state at the moment a `Batch` error fires is
-        // whatever earlier chunks left it (clean, or holding
-        // already-written rows from this same call). Either way
-        // a follow-up `append_records` is safe — the contract
-        // is "writer remains usable", not "no rows persisted".
-        let result = append_chunks(inner, records);
+        // ends. `num_rows` is a disjoint field, so it can be borrowed
+        // alongside `inner`; the helper bumps it per successfully
+        // written sub-batch. Poison only on Parquet errors — `Batch`
+        // errors come from `mined_records_to_batch`, which runs on a
+        // single chunk and doesn't touch `inner` itself; the buffer's
+        // state at the moment a `Batch` error fires is whatever earlier
+        // chunks left it (clean, or holding already-written rows from
+        // this same call). Either way a follow-up `append_records` is
+        // safe — the contract is "writer remains usable", not "no rows
+        // persisted".
+        let result = append_chunks(inner, records, &mut self.num_rows);
         if matches!(result, Err(WriterError::Parquet(_))) {
             self.poisoned = true;
         }
         result
     }
 
-    /// Close the writer, finalising the Parquet footer on the
-    /// temp file and atomically renaming it to the final path.
-    /// Must be called for the file to land at its final name;
-    /// dropping without `close` leaves only a `.parquet.tmp`
-    /// that the [`Drop`] impl deletes.
+    /// Close the writer, finalising the Parquet footer in the
+    /// in-memory buffer and publishing the bytes to the object store
+    /// under the partition's key. Must be called for the file to be
+    /// published; dropping without `close` discards the buffer and
+    /// publishes nothing.
     ///
     /// **Atomic publish is logical, not crash-durable.** Once
-    /// this method returns, the final-path file has a complete
-    /// Parquet footer and any subsequent reader can open it.
-    /// However, neither the data pages nor the rename metadata
-    /// are [`File::sync_all`]-ed before this call returns — a
-    /// host crash or power loss between rename and the OS's
-    /// next page-cache flush could leave the renamed file with
-    /// truncated or zero-padded contents on disk. Crash-survival
-    /// durability is the WAL's domain (`CLAUDE.md` §3.4
-    /// "WAL-before-ack"); the Parquet writer is the storage tier
-    /// and assumes its records are recoverable via WAL replay
-    /// after a crash.
+    /// this method returns, the published object has a complete
+    /// Parquet footer and any subsequent reader can open it. The
+    /// store `put` is not `fsync`-ed, though — a host crash between
+    /// the put and the OS's next page-cache flush could lose the
+    /// file. Crash-survival durability is the WAL's domain
+    /// (`CLAUDE.md` §3.4 "WAL-before-ack"); the Parquet writer is the
+    /// storage tier and assumes its records are recoverable via WAL
+    /// replay after a crash.
     ///
-    /// **Poisoning check.** If a prior `append_records` returned
-    /// a [`WriterError::Parquet`] error, the writer is poisoned
-    /// and this method refuses to publish — returns
-    /// [`WriterError::Poisoned`] without touching `inner` /
-    /// `temp_path`, so the [`Drop`] impl's poisoned branch leaves
-    /// the temp file on disk for diagnosis.
+    /// **Poisoning check.** If a prior `append_records` returned a
+    /// [`WriterError::Parquet`] error, the writer is poisoned and this
+    /// method refuses to publish — returns [`WriterError::Poisoned`]
+    /// and discards the buffer (there is no on-disk artifact to leave
+    /// behind, unlike the former temp-file scheme).
     ///
     /// # Errors
     ///
     /// - [`WriterError::Poisoned`] when a prior `append_records`
-    ///   failed with a Parquet error (temp file left on disk).
+    ///   failed with a Parquet error.
     /// - [`WriterError::Parquet`] when the footer write fails.
-    /// - [`WriterError::Io`] when the atomic rename from the
-    ///   temp filename to the final path fails (the temp file
-    ///   is left in place for diagnosis in that case).
+    /// - [`WriterError::Io`] when the store `put` fails. Nothing is
+    ///   published in that case (object-store puts are atomic).
     ///
     /// # Panics
     ///
-    /// Structurally impossible. `inner` / `temp_path` are
-    /// populated by [`Writer::open`] and only consumed here;
-    /// `close` takes `self` by value so it can't run twice.
+    /// Structurally impossible. `inner` is populated by
+    /// [`Writer::open`] and only consumed here; `close` takes `self`
+    /// by value so it can't run twice.
     pub fn close(mut self) -> Result<WrittenFile, WriterError> {
         if self.poisoned {
-            // Refuse to publish a possibly-partial file. Don't
-            // take `inner` / `temp_path` — `Drop` sees
-            // `poisoned = true` and leaves the .parquet.tmp on
-            // disk for diagnosis.
+            // Refuse to publish a possibly-partial buffer.
             return Err(WriterError::Poisoned);
         }
-        // Take both `inner` and `temp_path` BEFORE attempting
-        // any fallible work. If `inner.close()` or
-        // `fs::rename` then errors, `self.temp_path` is already
-        // `None` so the [`Drop`] impl won't delete the
-        // partially-written `.parquet.tmp` file on the way out
-        // — the file stays on disk for diagnosis / recovery,
-        // matching the # Errors clause above. This ordering is
-        // load-bearing: a failed `close` that destroyed its own
-        // artifact would be the worst-case failure mode.
         let inner = self
             .inner
             .take()
             .expect("Writer::close consumes self; inner is Some on entry");
-        let temp_path = self
-            .temp_path
-            .take()
-            .expect("temp_path is Some until close consumes it");
-        let metadata = inner.close().map_err(WriterError::Parquet)?;
-        std::fs::rename(&temp_path, &self.final_path).map_err(|source| WriterError::Io {
-            op: "rename",
-            path: self.final_path.clone(),
-            source_path: Some(temp_path.clone()),
-            source,
-        })?;
+        // `into_inner` writes the footer and returns the finished
+        // bytes; the `put` is the atomic commit point.
+        let bytes = inner.into_inner().map_err(WriterError::Parquet)?;
+        self.store
+            .put_blocking(&self.key, bytes)
+            .map_err(|e| WriterError::Io {
+                op: "put",
+                path: self.final_path.clone(),
+                source: io::Error::other(e),
+            })?;
         Ok(WrittenFile {
             path: self.final_path.clone(),
             partition: self.partition.clone(),
             flush_uuid: self.flush_uuid,
-            num_rows: metadata.num_rows,
+            num_rows: self.num_rows,
         })
     }
 
-    /// Inspector for the absolute path the writer will publish
-    /// to after [`Self::close`]. While the writer is open, the
-    /// actual bytes live at `<this path>.tmp`; useful for tests
-    /// that want to assert the final landing site without
-    /// reading the file.
+    /// Inspector for the absolute path the writer publishes to on
+    /// [`Self::close`] (the store root joined with the object key);
+    /// useful for tests that assert the landing site without reading
+    /// the file. The bytes only exist there after a successful
+    /// `close` — while the writer is open they live in memory.
     #[must_use]
     pub fn final_path(&self) -> &Path {
         &self.final_path
     }
 }
 
-impl Drop for Writer {
-    fn drop(&mut self) {
-        if self.poisoned {
-            // A poisoned writer preserves its `.parquet.tmp` for
-            // diagnosis. Release the file handle (drop inner) but
-            // leave the temp file on disk — `close()` already
-            // returned `Poisoned` without consuming `temp_path`,
-            // so it's still `Some(...)` here. We deliberately do
-            // not `remove_file` it.
-            drop(self.inner.take());
-            return;
-        }
-        // If `close` consumed the writer cleanly, `temp_path`
-        // is `None` and the rename has already happened.
-        // Otherwise the writer was dropped mid-stream (panic,
-        // `?` early-return, etc.); remove the `.parquet.tmp`
-        // file so the partition directory doesn't accrue
-        // unreadable Parquet files an enumeration reader would
-        // trip over.
-        if let Some(temp) = self.temp_path.take() {
-            // Drop the `ArrowWriter` *before* `remove_file`:
-            // on Windows the underlying `File` holds an
-            // exclusive handle and `remove_file` on the path
-            // would fail while the writer is still alive.
-            // (Custom `Drop::drop` runs first; struct fields
-            // are only dropped after this function returns —
-            // we have to release the file handle explicitly.)
-            drop(self.inner.take());
-            // Best-effort: ignore I/O errors here — there's no
-            // recovery path from a destructor, and the worst-
-            // case outcome is a stray `.parquet.tmp` that
-            // operators clean up by hand. We deliberately do
-            // not log; the WAL / ingest layer above is the
-            // place for that.
-            let _ = std::fs::remove_file(&temp);
-        }
-    }
-}
+// No `Drop`: a writer abandoned without `close` just drops its
+// in-memory buffer — nothing was ever written to the store, so there
+// is no temp artifact to clean up (unlike the former temp-file scheme).
 
 /// Result of a successful [`Writer::close`].
 #[derive(Debug)]
@@ -457,23 +413,17 @@ pub struct WrittenFile {
 /// Errors produced by [`Writer`].
 #[derive(Debug)]
 pub enum WriterError {
-    /// Filesystem I/O failure. Carries the operation name and
-    /// the path(s) involved so logs and recovery scripts can
-    /// pinpoint which step failed and which `.parquet.tmp` (if
-    /// any) is left on disk for diagnosis.
+    /// I/O failure preparing or publishing the file. Carries the
+    /// operation name and the path so logs pinpoint which step failed.
     Io {
         /// Short operation name (e.g. `"create_dir_all"`,
-        /// `"create"`, `"rename"`).
+        /// `"open store"`, `"put"`).
         op: &'static str,
-        /// The primary path the operation was acting on. For
-        /// `rename`, this is the *destination*; the source
-        /// path lives in `Self::source_path` (when set).
+        /// The path the operation was acting on (the partition
+        /// directory, the store root, or the published object path).
         path: PathBuf,
-        /// Secondary path for two-path operations (only
-        /// populated for `rename`, where it carries the source
-        /// `.parquet.tmp` path that's left on disk).
-        source_path: Option<PathBuf>,
-        /// Underlying `io::Error`.
+        /// Underlying `io::Error` (an object-store error is wrapped
+        /// via [`io::Error::other`] for the `put` step).
         source: io::Error,
     },
     /// Parquet writer failure (footer write, codec failure).
@@ -496,32 +446,17 @@ pub enum WriterError {
     /// error, leaving the underlying writer's buffer in an
     /// undefined state. [`Writer::close`] refuses to publish to
     /// protect against landing a partial / corrupted data file;
-    /// the `.parquet.tmp` is preserved on disk for diagnosis.
-    /// Mirrors [`crate::audit_writer::AuditWriterError::Poisoned`].
+    /// the buffer is discarded. Mirrors
+    /// [`crate::audit_writer::AuditWriterError::Poisoned`].
     Poisoned,
 }
 
 impl fmt::Display for WriterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io {
-                op,
-                path,
-                source_path,
-                source,
-            } => match source_path {
-                Some(src) => write!(
-                    f,
-                    "filesystem I/O on `{op}` from {} to {}: {source}",
-                    src.display(),
-                    path.display(),
-                ),
-                None => write!(
-                    f,
-                    "filesystem I/O on `{op}` at {}: {source}",
-                    path.display(),
-                ),
-            },
+            Self::Io { op, path, source } => {
+                write!(f, "writer I/O on `{op}` at {}: {source}", path.display())
+            }
             Self::Parquet(e) => write!(f, "parquet writer: {e}"),
             Self::Batch(e) => write!(f, "record batch: {e}"),
             Self::PartitionMismatch {
@@ -575,8 +510,9 @@ impl std::error::Error for WriterError {
 /// crosses [`ROW_GROUP_FLUSH_BYTES`] (128 MiB). Symmetric helper
 /// to the audit writer's `append_chunks`.
 fn append_chunks(
-    inner: &mut ArrowWriter<File>,
+    inner: &mut ArrowWriter<Vec<u8>>,
     records: &[MinedRecord],
+    num_rows: &mut i64,
 ) -> Result<(), WriterError> {
     // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
     // flush-if-over-threshold check before every sub-batch.
@@ -594,6 +530,14 @@ fn append_chunks(
         }
         let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
         inner.write(&batch).map_err(WriterError::Parquet)?;
+        // Count rows only once the sub-batch has been accepted, so a
+        // mid-slice `Batch`/`Parquet` failure leaves `num_rows`
+        // reflecting exactly what landed in the buffer. `chunk.len()`
+        // is bounded by `SUB_BATCH_ROWS` (1024), so the cast to `i64`
+        // is lossless.
+        #[allow(clippy::cast_possible_wrap)]
+        let written = chunk.len() as i64;
+        *num_rows += written;
     }
     // Final post-write check so the next `append_records` call
     // doesn't inherit an over-threshold buffer.
@@ -603,11 +547,10 @@ fn append_chunks(
     Ok(())
 }
 
-/// Encode `records` to a complete in-memory Parquet file (the RFC 0013
-/// buffer-and-put write path: the async edge then `Store.put`s the bytes).
-/// Same schema, codec, and §3.6 encoding policy as the file-based [`Writer`]
-/// — it differs only in target (`Vec<u8>` instead of a `File`). Row-group
-/// sizing (§3.5) still applies within the buffer via `ArrowWriter`.
+/// Encode `records` to a complete in-memory Parquet file in one shot — the
+/// stateless counterpart to [`Writer`] (which buffers across `append_records`
+/// calls then `put`s on close). Same schema, codec, and §3.6 encoding policy;
+/// row-group sizing (§3.5) still applies within the buffer via `ArrowWriter`.
 ///
 /// # Errors
 /// [`WriterError::Parquet`] if `zstd_level` is out of range or encoding

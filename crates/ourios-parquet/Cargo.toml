@@ -32,12 +32,14 @@ object_store = { version = "0.13" }
 # arrow/parquet tree; declared directly.
 bytes = { version = "1", default-features = false }
 # Drives the async `object_store` calls from the sync storage API
-# (`Store::*_blocking` bridge — `Writer`/`Reader`/compaction are sync,
-# `object_store` is async). Only `rt`: the bridge builds a `current_thread`
-# runtime per call on its own thread. The S3 backend adds `enable_all()` and the
-# `net`/`io`/`time` features in its slice. Already in the workspace tree via
-# DataFusion / object_store.
-tokio = { version = "1", default-features = false, features = ["rt"] }
+# (`Store::*_blocking` bridge — `Writer`/`Reader`/compaction/manifest are sync,
+# `object_store` is async). `rt-multi-thread` because the bridge shares one
+# process-wide runtime and drives it with `block_on` from many threads
+# concurrently (parallel queries resolving manifests); a multi-thread runtime
+# supports that, a current-thread one does not. The S3 backend adds
+# `enable_all()` and the `net`/`io`/`time` features in its slice. Already in the
+# workspace tree via DataFusion / object_store.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
 # UUIDv7 file naming per RFC 0005 §3.4 — timestamp-in-high-bits
 # means lexicographic sort = creation-order.
 uuid = { version = "1", default-features = false, features = ["v7", "std"] }

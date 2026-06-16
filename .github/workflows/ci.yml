@@ -73,6 +73,32 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --all-features
 
+  # RFC 0013 S3 integration tests (RFC0013.1/.7, later .3/.4): spin LocalStack
+  # (S3-compatible, Apache-2.0) via testcontainers and drive `Store::s3` at it
+  # through the endpoint override. The tests are `#[ignore]`d (they need a
+  # Docker-API runtime, which GitHub Actions has but local containerd does
+  # not), so this job runs them explicitly by name via `--ignored`. The
+  # `AWS_*` env feeds object_store's credential chain — LocalStack accepts any
+  # credentials. A required check (in `ci-success`'s `needs`).
+  s3-integration:
+    name: s3 integration (localstack)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: >
+          cargo test -p ourios-parquet --test rfc0013_object_store --
+          --ignored --exact
+          rfc0013_1_round_trip_through_s3_backend
+          rfc0013_7_s3_compatible_endpoint_via_override
+
   book:
     name: mdbook build
     runs-on: ubuntu-latest
@@ -246,7 +272,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, docs, test, book, semconv, deny]
+    needs: [fmt, clippy, docs, test, book, semconv, deny, s3-integration]
     if: always()
     steps:
       - name: Verify required checks

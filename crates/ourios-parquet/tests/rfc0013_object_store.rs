@@ -12,7 +12,53 @@
 
 // Anchor the stubs to the public surface so they fail to compile if the
 // `Store` seam is removed out from under them.
-use ourios_parquet::{S3Config, Store};
+use ourios_core::audit::ParamType;
+use ourios_core::record::{BodyKind, MinedRecord, Param};
+use ourios_core::tenant::TenantId;
+use ourios_parquet::{PartitionKey, Reader, S3Config, Store, Writer};
+
+/// A clean-round-trip record for `tenant` at a fixed in-hour offset `i`.
+fn rec_for(tenant: &str, i: u64) -> MinedRecord {
+    MinedRecord {
+        tenant_id: TenantId::new(tenant),
+        template_id: 1,
+        template_version: 1,
+        severity_number: 9,
+        severity_text: Some("INFO".to_string()),
+        scope_name: Some("lib.cart".to_string()),
+        scope_version: Some("1.0.0".to_string()),
+        time_unix_nano: 1_775_127_480_000_000_000 + i * 1_000,
+        observed_time_unix_nano: Some(1_775_127_480_000_000_000 + i * 1_000 + 1),
+        attributes: Vec::new(),
+        dropped_attributes_count: 0,
+        resource_attributes: Vec::new(),
+        trace_id: None,
+        span_id: None,
+        flags: 0x01,
+        event_name: None,
+        body_kind: BodyKind::String,
+        params: vec![Param {
+            type_tag: ParamType::Num,
+            value: format!("{i}"),
+        }],
+        separators: vec![String::new(), " ".to_string()],
+        body: None,
+        confidence: 1.0,
+        lossy_flag: false,
+    }
+}
+
+/// Write `records` (one partition) through the Store-backed [`Writer`] and
+/// return the published absolute path.
+fn write_through_store(
+    bucket: &std::path::Path,
+    partition: &PartitionKey,
+    records: &[MinedRecord],
+) -> std::path::PathBuf {
+    let mut writer = Writer::open(bucket, partition.clone()).expect("open writer");
+    writer.append_records(records).expect("append");
+    writer.close().expect("close").path
+}
 
 /// Scenario RFC0013.1 — a `MinedRecord` batch written and read through the `AmazonS3`
 /// backend recovers byte-for-byte against the local backend.
@@ -28,9 +74,24 @@ fn rfc0013_1_round_trip_through_s3_backend() {
 /// `LocalFileSystem` backend after the seam refactor.
 /// See `docs/rfcs/0013-object-storage.md` §5.
 #[test]
-#[ignore = "RFC0013.2 — red until the consumers run through Store"]
 fn rfc0013_2_local_backend_regresses_nothing() {
-    todo!("RFC0013.2: RFC0005/0009 suites green via the LocalFileSystem Store")
+    // The Writer (encode + `Store.put`) and Reader (`Store.get` + decode) are
+    // the LocalFileSystem-backed seam the existing RFC 0005 / 0009 suites
+    // (round_trip, sizing, partition_layout, manifest, compaction) now run
+    // through by default — a clean round-trip here is the behaviour-preserving
+    // evidence for the local case.
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let records: Vec<MinedRecord> = (0..200).map(|i| rec_for("tenant-a", i)).collect();
+    let partition = PartitionKey::derive(&records[0]).expect("derive partition");
+    let path = write_through_store(dir.path(), &partition, &records);
+    let got = Reader::open_partition(&path, partition)
+        .expect("open_partition")
+        .read_all()
+        .expect("read_all");
+    assert_eq!(
+        got, records,
+        "round-trips byte-for-byte through the local Store"
+    );
 }
 
 /// Scenario RFC0013.3 — two `compact_partition` runs racing on one partition: exactly
@@ -55,9 +116,54 @@ fn rfc0013_4_manifest_swap_via_conditional_put() {
 /// sub-prefix; no read/write touches tenant Y's keys (`CLAUDE.md` §3.7).
 /// See `docs/rfcs/0013-object-storage.md` §5.
 #[test]
-#[ignore = "RFC0013.5 — red until tenant key-prefix scoping is wired"]
 fn rfc0013_5_tenant_isolation_across_prefix() {
-    todo!("RFC0013.5: no cross-tenant key access")
+    use std::path::PathBuf;
+
+    // Two tenants' data in one store, same time bucket. Each tenant's file
+    // lands under its own `data/tenant_id=<tenant>/…` key sub-prefix (the
+    // partition key carries the tenant id), and reading one tenant's partition
+    // surfaces only that tenant's rows — no cross-tenant key access.
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let x: Vec<MinedRecord> = (0..50).map(|i| rec_for("tenant-x", i)).collect();
+    let y: Vec<MinedRecord> = (0..50).map(|i| rec_for("tenant-y", i)).collect();
+    let px = PartitionKey::derive(&x[0]).expect("derive x");
+    let py = PartitionKey::derive(&y[0]).expect("derive y");
+    let xpath = write_through_store(dir.path(), &px, &x);
+    let ypath = write_through_store(dir.path(), &py, &y);
+
+    // Component-wise prefix check (portable across path separators).
+    let rel = |p: &std::path::Path| {
+        p.strip_prefix(dir.path())
+            .expect("under bucket")
+            .to_path_buf()
+    };
+    let tenant_prefix =
+        |t: &str| -> PathBuf { ["data", &format!("tenant_id={t}")].iter().collect() };
+    assert!(
+        rel(&xpath).starts_with(tenant_prefix("tenant-x")),
+        "tenant-x file under its own prefix: {:?}",
+        rel(&xpath),
+    );
+    assert!(
+        rel(&ypath).starts_with(tenant_prefix("tenant-y")),
+        "tenant-y file under its own prefix: {:?}",
+        rel(&ypath),
+    );
+    assert!(
+        !rel(&xpath).starts_with(tenant_prefix("tenant-y")),
+        "tenant-x must not land under tenant-y's prefix",
+    );
+
+    // Reading tenant-x's partition surfaces only tenant-x rows.
+    let gx = Reader::open_partition(&xpath, px)
+        .expect("open x")
+        .read_all()
+        .expect("read x");
+    assert_eq!(gx.len(), x.len());
+    assert!(
+        gx.iter().all(|r| r.tenant_id.as_str() == "tenant-x"),
+        "no tenant-y rows leak into a tenant-x read",
+    );
 }
 
 /// Scenario RFC0013.6 — with an object-storage backend, only data/audit/manifest
@@ -83,7 +189,18 @@ fn rfc0013_7_s3_compatible_endpoint_via_override() {
 /// columns default, unknown columns ignored) holds over the object store.
 /// See `docs/rfcs/0013-object-storage.md` §5.
 #[test]
-#[ignore = "RFC0013.8 — red until the reader resolves objects through Store"]
+#[ignore = "RFC0013.8 — substantively covered by the colocated reader §3.9 tests \
+            (rfc0005_2/3/4), which now read through the Store seam; a dedicated \
+            variant-schema integration test is deferred (low marginal value)"]
 fn rfc0013_8_reader_forward_compat_over_store() {
-    todo!("RFC0013.8: RFC0005 §3.9 holds reading through the object store")
+    // The reader's open path (`open_file`/`open_partition`/`open_bytes`) now
+    // resolves bytes through `Store`, so the §3.9 forward-compat contract —
+    // absent OPTIONAL columns default, unknown columns ignored, absent REQUIRED
+    // columns error — is already exercised over the store by the colocated
+    // reader tests `rfc0005_2_missing_optional_column_surfaces_as_none`,
+    // `rfc0005_3_unknown_column_is_silently_ignored`, and
+    // `rfc0005_4_missing_required_column_returns_hard_error` (which build
+    // variant-schema Parquet via test-only Arrow helpers). A duplicate
+    // integration test would re-create that machinery for no added coverage.
+    todo!("RFC0013.8: dedicated variant-schema integration test (deferred)")
 }

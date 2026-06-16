@@ -206,6 +206,76 @@ impl Manifest {
             .map_err(store_io)?;
         Ok(())
     }
+
+    /// Read the manifest at `key` in `store` together with its `ETag` — the
+    /// compare-and-swap token for [`Self::publish_cas`]. `Ok(None)` when
+    /// absent (the pre-compaction case). The `ETag` is `None` only if the
+    /// backend doesn't expose one (S3-compatible stores do).
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::Io`] on a read failure, [`ManifestError::Parse`] /
+    /// validation errors on a corrupt manifest.
+    pub fn read_with_etag(
+        store: &Store,
+        key: &str,
+    ) -> Result<Option<(Self, Option<String>)>, ManifestError> {
+        match store.get_with_etag_blocking_opt(key).map_err(store_io)? {
+            Some((bytes, e_tag)) => {
+                let manifest: Self =
+                    serde_json::from_slice(&bytes).map_err(ManifestError::Parse)?;
+                manifest.validate()?;
+                Ok(Some((manifest, e_tag)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Publish this manifest to `key` in `store` as a generation swap via
+    /// **conditional PUT** — no `rename` anywhere on the path (RFC0013.4).
+    /// `expected` is the `ETag` of the generation being replaced (from
+    /// [`Self::read_with_etag`]); pass `None` for the first publish, which
+    /// create-if-absents instead. Returns [`Published::Lost`] when another
+    /// writer published first — the create/compare-and-swap precondition
+    /// failed (RFC0013.3); the caller re-reads and retries or no-ops.
+    ///
+    /// Requires a backend that supports conditional update (S3-compatible);
+    /// `LocalFileSystem` does not (use [`Self::write_atomic`] there).
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::InvalidFilename`] / [`ManifestError::DuplicateFilename`]
+    /// if the live set is invalid; [`ManifestError::Parse`] if serialization
+    /// fails; [`ManifestError::Io`] on a non-precondition backend failure.
+    pub fn publish_cas(
+        &self,
+        store: &Store,
+        key: &str,
+        expected: Option<&str>,
+    ) -> Result<Published, ManifestError> {
+        self.validate()?;
+        let bytes = self.to_json().map_err(ManifestError::Parse)?;
+        let result = match expected {
+            None => store.put_if_absent_blocking(key, bytes),
+            Some(e_tag) => store.put_if_match_blocking(key, bytes, e_tag),
+        };
+        match result {
+            Ok(()) => Ok(Published::Won),
+            Err(e) if e.is_precondition() || e.is_already_exists() => Ok(Published::Lost),
+            Err(e) => Err(store_io(e)),
+        }
+    }
+}
+
+/// Outcome of a compare-and-swap manifest publish ([`Manifest::publish_cas`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Published {
+    /// This writer's generation was published.
+    Won,
+    /// Another writer published first (the create / compare-and-swap
+    /// precondition failed). The caller re-reads the new generation and
+    /// retries, or no-ops if that generation already covers its work.
+    Lost,
 }
 
 #[cfg(test)]

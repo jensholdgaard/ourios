@@ -73,7 +73,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --all-features
 
-  # RFC 0013 S3 integration tests (RFC0013.1/.7, later .3/.4): spin LocalStack
+  # RFC 0013 S3 integration tests (RFC0013.1/.3/.4/.7): spin LocalStack
   # (S3-compatible, Apache-2.0) via testcontainers and drive `Store::s3` at it
   # through the endpoint override. The tests are `#[ignore]`d (they need a
   # Docker-API runtime, which GitHub Actions has but local containerd does
@@ -97,6 +97,8 @@ jobs:
           cargo test -p ourios-parquet --test rfc0013_object_store --
           --ignored --exact
           rfc0013_1_round_trip_through_s3_backend
+          rfc0013_3_atomic_publish_under_contention
+          rfc0013_4_manifest_swap_via_conditional_put
           rfc0013_7_s3_compatible_endpoint_via_override
 
   book:

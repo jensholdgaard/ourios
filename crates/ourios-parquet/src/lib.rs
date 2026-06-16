@@ -45,7 +45,7 @@ pub use compaction::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, compact_partition,
     gc_orphans, plan_candidates,
 };
-pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError};
+pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 pub use partition::{
     PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
     percent_decode_tenant, percent_encode_tenant,

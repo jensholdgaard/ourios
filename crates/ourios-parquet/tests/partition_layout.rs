@@ -179,42 +179,54 @@ fn writer_rejects_records_outside_its_partition() {
     }
 }
 
-/// Atomic-publish contract (RFC 0005 §7): a writer dropped
-/// without [`Writer::close`] removes its `.parquet.tmp` so the
-/// partition directory never accrues unreadable / header-only
-/// Parquet files. Successful close renames the temp file to its
-/// final `<uuid>.parquet` name.
+/// Atomic-publish contract (RFC 0005 §7, RFC 0013 buffer-and-put):
+/// the writer buffers rows in memory and publishes the finished file
+/// to the object store only on [`Writer::close`]. Nothing lands under
+/// the partition path before close, and a writer dropped without
+/// close publishes nothing — there is **no on-disk temp artifact**.
+///
+/// Contract change from the former temp-file scheme: before RFC 0013
+/// the writer streamed to a `<uuid>.parquet.tmp` and renamed it on
+/// close, leaving a `.tmp` on disk while open (and the `Drop` impl
+/// cleaned it up). Buffer-and-put removes the temp file entirely —
+/// bytes live in memory until the store `put`, which is itself atomic
+/// (the local backend stages + renames internally), preserving the
+/// "readers see a complete file or nothing" guarantee.
 #[test]
-fn writer_atomic_publish_on_close_and_cleanup_on_drop() {
+fn writer_publishes_only_on_close_and_drop_publishes_nothing() {
     let bucket = TempDir::new().unwrap();
     let bucket_path = bucket.path();
 
     let opening = empty_record("tenant-a", 1_775_127_480_000_000_000);
     let partition = PartitionKey::derive(&opening).expect("derive partition");
 
-    // 1. Drop without close → no leftover files in the
-    //    partition directory.
+    // 1. While open — even after appending — nothing is published:
+    //    neither the final `<uuid>.parquet` nor any `.parquet.tmp`.
     {
         let mut writer = Writer::open(bucket_path, partition.clone()).unwrap();
         writer
             .append_records(std::slice::from_ref(&opening))
             .unwrap();
-        let temp_glimpse = writer.final_path().with_extension("parquet.tmp");
+        let final_path = writer.final_path().to_path_buf();
         assert!(
-            temp_glimpse.exists(),
-            "writer must use a `.parquet.tmp` filename while open",
+            !final_path.exists(),
+            "buffer-and-put publishes nothing before close, found {final_path:?}",
         );
-        // Explicit drop without close.
+        assert!(
+            !final_path.with_extension("parquet.tmp").exists(),
+            "buffer-and-put leaves no `.parquet.tmp` on disk",
+        );
+        // 2. Drop without close → still nothing published.
         drop(writer);
         assert!(
-            !temp_glimpse.exists(),
-            "Drop must clean up the .parquet.tmp file when close wasn't called",
+            !final_path.exists(),
+            "dropping without close must publish nothing, found {final_path:?}",
         );
     }
 
-    // 2. Open a fresh writer, write, close. Final file exists
-    //    at the `<uuid>.parquet` name; no `.parquet.tmp` is left
-    //    behind.
+    // 3. Open a fresh writer, write, close. The final file is
+    //    published atomically at the `<uuid>.parquet` name; no
+    //    `.parquet.tmp` is left behind.
     let mut writer = Writer::open(bucket_path, partition).unwrap();
     writer.append_records(&[opening]).unwrap();
     let written = writer.close().expect("close");
@@ -225,10 +237,9 @@ fn writer_atomic_publish_on_close_and_cleanup_on_drop() {
         "published file MUST have the .parquet extension, got {:?}",
         written.path,
     );
-    let stray_tmp = written.path.with_extension("parquet.tmp");
     assert!(
-        !stray_tmp.exists(),
-        "no .parquet.tmp must remain after successful close, found {stray_tmp:?}",
+        !written.path.with_extension("parquet.tmp").exists(),
+        "no `.parquet.tmp` must exist after a buffer-and-put close",
     );
 }
 

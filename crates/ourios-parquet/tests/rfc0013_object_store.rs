@@ -41,7 +41,7 @@ async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, Store) {
         .expect("container port");
     let endpoint = format!("http://{host}:{port}");
 
-    let mb = container
+    let mut mb = container
         .exec(ExecCommand::new([
             "awslocal".to_string(),
             "s3".to_string(),
@@ -50,10 +50,17 @@ async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, Store) {
         ]))
         .await
         .expect("exec awslocal s3 mb");
+    // Drain both streams before reading the exit code — testcontainers reports
+    // `exit_code()` as `None` until the exec's output has been consumed.
+    let stdout =
+        String::from_utf8_lossy(&mb.stdout_to_vec().await.expect("mb stdout")).into_owned();
+    let stderr =
+        String::from_utf8_lossy(&mb.stderr_to_vec().await.expect("mb stderr")).into_owned();
+    let code = mb.exit_code().await.expect("mb exit code");
     assert_eq!(
-        mb.exit_code().await.expect("mb exit code"),
+        code,
         Some(0),
-        "awslocal s3 mb must succeed",
+        "awslocal s3 mb failed (code {code:?}): stdout={stdout:?} stderr={stderr:?}",
     );
 
     let store = Store::s3(

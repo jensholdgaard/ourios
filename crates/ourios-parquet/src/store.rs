@@ -16,49 +16,74 @@
 //! depend on this crate, so the type is visible to every storage consumer.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use tokio::runtime::Runtime;
+
+/// The process-wide runtime that drives the async `object_store` calls behind
+/// the sync storage API. Built once, lazily, via `get_or_init` so there is no
+/// init-race that could drop a surplus runtime on a caller's thread (an
+/// earlier manual `get`/`set` did, panicking when the loser was inside a tokio
+/// runtime). The runtime lives for the process and is never dropped, so the
+/// "drop a runtime in async context" hazard can't arise.
+///
+/// Multi-threaded(1-worker) so concurrent `block_on` from many bridge threads
+/// (parallel queries / tests) is safe. No `enable_all()`: the local backend
+/// drives I/O via `spawn_blocking`, which needs only the bare runtime; the S3
+/// backend adds `enable_all()` plus the `net`/`io`/`time` tokio features in the
+/// slice that introduces it.
+fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
+    static RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
+    match RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+    }) {
+        Ok(rt) => Ok(rt),
+        // Build failure is cached (a permanent resource exhaustion); rebuild a
+        // fresh `io::Error` since it isn't `Clone`.
+        Err(e) => Err(StoreError::Runtime(std::io::Error::new(
+            e.kind(),
+            e.to_string(),
+        ))),
+    }
+}
 
 /// Drive `fut` to completion synchronously — the bridge from the **sync**
 /// storage API (`Writer`, `Reader`, `compaction`, the manifest) to async
 /// `object_store` (compaction must reach S3 per RFC0013.3, so a local-only
 /// `std::fs` shortcut won't do).
 ///
-/// Everything happens on a **fresh OS thread**: a single-threaded runtime is
-/// built, drives `fut`, and is dropped, all on a thread that never carries the
-/// caller's tokio context. That makes the bridge safe from any call site —
-/// including *inside* a runtime (a `#[tokio::test]` that opens the reader, or
-/// a future async consumer), where calling `block_on` (or dropping a runtime)
-/// on the caller's own thread would panic. [`std::thread::scope`] lets `fut`
-/// borrow the caller's `self`/`key` while still running off-thread.
+/// `block_on` runs on a **fresh OS thread** (the shared [`bridge_runtime`] is
+/// driven from there), not the caller's. A plain thread never carries the
+/// caller's tokio context, so this is safe from any call site — including
+/// *inside* a runtime (e.g. the querier resolving manifests on its async task,
+/// or a `#[tokio::test]`), where `block_on` on the caller's own thread would
+/// panic. [`std::thread::scope`] lets `fut` borrow the caller's `self`/`key`
+/// while still running off-thread. Reusing the shared runtime keeps the
+/// per-call cost to one thread spawn (no per-call runtime build), which matters
+/// on the query path (`resolve_live_files` reads one manifest per partition).
 ///
 /// `fut` already yields a [`StoreError`] result, returned directly; the extra
-/// error modes are building the bridge thread or its runtime
+/// error modes are building the bridge thread or runtime
 /// ([`StoreError::Runtime`]). A panic *inside* `fut` is not swallowed — it is
-/// re-raised on the caller's thread via [`std::panic::resume_unwind`]. No
-/// `enable_all()`: the local backend drives I/O via `spawn_blocking`, which
-/// needs only the bare runtime; the S3 backend adds `enable_all()` and the
-/// `net`/`io`/`time` tokio features in the slice that introduces it.
+/// re-raised on the caller's thread via [`std::panic::resume_unwind`].
 fn block_on_off_runtime<T>(
     fut: impl Future<Output = Result<T, StoreError>> + Send,
 ) -> Result<T, StoreError>
 where
     T: Send,
 {
+    let rt = bridge_runtime()?;
     std::thread::scope(|s| {
         // `Builder::spawn_scoped` (not `Scope::spawn`) so OS thread-creation
         // failure surfaces as `StoreError::Runtime` rather than panicking.
         let handle = std::thread::Builder::new()
             .name("ourios-store-bridge".into())
-            .spawn_scoped(s, || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .map_err(StoreError::Runtime)?;
-                rt.block_on(fut)
-            })
+            .spawn_scoped(s, || rt.block_on(fut))
             .map_err(StoreError::Runtime)?;
         handle
             .join()
@@ -134,6 +159,15 @@ impl std::error::Error for StoreError {
             Self::Unimplemented(_) => None,
             Self::Runtime(e) => Some(e),
         }
+    }
+}
+
+impl StoreError {
+    /// True if this is a "no such object" backend error — the caller may
+    /// treat the object as absent (see [`Store::get_blocking_opt`]).
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Backend(object_store::Error::NotFound { .. }))
     }
 }
 
@@ -258,11 +292,54 @@ impl Store {
     pub fn put_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
         block_on_off_runtime(self.put(key, bytes))
     }
+
+    /// Write `bytes` to `key` only if no object exists there
+    /// (create-if-absent — `If-None-Match: *`). The local-testable half of
+    /// RFC 0013 conditional PUT; the compare-and-swap half (`If-Match`) needs
+    /// an S3 backend, since `LocalFileSystem` rejects `PutMode::Update`.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] if an object already exists at `key`, or the
+    /// put otherwise fails.
+    pub async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        self.inner
+            .put_opts(
+                &self.resolve(key),
+                PutPayload::from(bytes),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .map_err(StoreError::Backend)?;
+        Ok(())
+    }
+
+    /// Read the object at `key`, mapping a missing object to `None` rather
+    /// than an error — for sync call sites where absence is expected (e.g. a
+    /// partition with no manifest yet).
+    ///
+    /// # Errors
+    /// As [`Self::get_blocking`], except a not-found object yields `Ok(None)`.
+    pub fn get_blocking_opt(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        match self.get_blocking(key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Blocking [`Self::put_if_absent`] for the sync storage call sites.
+    ///
+    /// # Errors
+    /// As [`Self::put_if_absent`], plus [`StoreError::Runtime`] if the bridge
+    /// runtime can't be built.
+    pub fn put_if_absent_blocking(&self, key: &str, bytes: Vec<u8>) -> Result<(), StoreError> {
+        block_on_off_runtime(self.put_if_absent(key, bytes))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
+    use super::{Store, StoreError};
 
     /// A byte object round-trips through the local backend, and a delete
     /// removes it. (Foundation for the RFC0013 consumer migration; the §5
@@ -310,6 +387,48 @@ mod tests {
         assert_eq!(
             store.get_blocking(key).expect("get_blocking"),
             b"inside-runtime"
+        );
+    }
+
+    /// `get_blocking_opt` maps a missing object to `None` (the manifest's
+    /// "no manifest yet" case) and yields the bytes when present.
+    #[test]
+    fn get_blocking_opt_maps_missing_to_none() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        assert_eq!(
+            store.get_blocking_opt("manifest.json").expect("get_opt"),
+            None,
+            "absent object is None, not an error"
+        );
+        store
+            .put_blocking("manifest.json", b"{}".to_vec())
+            .expect("put");
+        assert_eq!(
+            store.get_blocking_opt("manifest.json").expect("get_opt"),
+            Some(b"{}".to_vec()),
+        );
+    }
+
+    /// `put_if_absent` (create-if-absent) writes when the key is free and
+    /// refuses to clobber an existing object — the local-testable half of
+    /// RFC 0013 conditional PUT.
+    #[test]
+    fn put_if_absent_refuses_to_clobber() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "manifest.json";
+        store
+            .put_if_absent_blocking(key, b"first".to_vec())
+            .expect("first create");
+        let err = store
+            .put_if_absent_blocking(key, b"second".to_vec())
+            .expect_err("create over an existing object must fail");
+        assert!(matches!(err, StoreError::Backend(_)), "got {err:?}");
+        assert_eq!(
+            store.get_blocking(key).expect("get"),
+            b"first",
+            "the original object is untouched"
         );
     }
 }

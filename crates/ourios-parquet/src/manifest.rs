@@ -17,6 +17,14 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::store::{Store, StoreError};
+
+/// Map a [`StoreError`] from the manifest seam onto [`ManifestError::Io`],
+/// keeping the backend cause in the error chain.
+fn store_io(err: StoreError) -> ManifestError {
+    ManifestError::Io(std::io::Error::other(err))
+}
+
 /// Canonical manifest filename inside a partition directory.
 pub const MANIFEST_FILENAME: &str = "manifest.json";
 
@@ -103,7 +111,8 @@ fn is_partition_local_parquet(name: &str) -> bool {
 }
 
 impl Manifest {
-    /// Read `<partition_dir>/manifest.json`.
+    /// Read `<partition_dir>/manifest.json` through the object-storage
+    /// [`Store`] seam (RFC 0013).
     ///
     /// `Ok(None)` when the manifest is absent — the pre-compaction
     /// (and current) case, where the reader falls back to globbing
@@ -114,15 +123,24 @@ impl Manifest {
     /// [`ManifestError`] if the file exists but can't be read, or its
     /// bytes aren't valid manifest JSON.
     pub fn read(partition_dir: &Path) -> Result<Option<Self>, ManifestError> {
-        match std::fs::read(partition_dir.join(MANIFEST_FILENAME)) {
-            Ok(bytes) => {
+        // A missing partition directory means no manifest (matches the prior
+        // `std::fs` NotFound→None). Checked up front because `Store::local`
+        // canonicalises its root and would error on an absent directory.
+        if !partition_dir.try_exists().map_err(ManifestError::Io)? {
+            return Ok(None);
+        }
+        let store = Store::local(partition_dir).map_err(store_io)?;
+        match store
+            .get_blocking_opt(MANIFEST_FILENAME)
+            .map_err(store_io)?
+        {
+            Some(bytes) => {
                 let manifest: Self =
                     serde_json::from_slice(&bytes).map_err(ManifestError::Parse)?;
                 manifest.validate()?;
                 Ok(Some(manifest))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ManifestError::Io(e)),
+            None => Ok(None),
         }
     }
 
@@ -157,35 +175,35 @@ impl Manifest {
         serde_json::to_vec(self)
     }
 
-    /// Atomically (re)write the partition's manifest: serialize to a
-    /// sibling `manifest.json.tmp`, then `rename` it over
-    /// `manifest.json`. The rename is the **commit point** (RFC 0009
-    /// §3.4) — a *concurrent reader* observes either the old manifest
-    /// or the new one, never a partial write. The manifest is
-    /// validated before any bytes hit disk, so an invalid set is never
-    /// published.
+    /// Atomically (re)write the partition's manifest through the
+    /// object-storage [`Store`] seam (RFC 0013). The `Store` put is the
+    /// **commit point** (RFC 0009 §3.4): the local backend stages to a
+    /// private temp object and renames it into place, so a *concurrent
+    /// reader* observes either the old manifest or the new one, never a
+    /// partial write. The manifest is validated before any bytes are
+    /// written, so an invalid set is never published.
     ///
-    /// This is atomic, **not** crash-durable: without an `fsync` of the
-    /// file and its directory, a host crash mid-write can still leave a
-    /// truncated or missing `manifest.json` (the same caveat as the
-    /// `Writer`). That is safe by construction — a reader with no
-    /// manifest falls back to the `*.parquet` glob, and a compaction
-    /// that crashed before this commit left its inputs intact — so the
-    /// worst case is reverting to the prior generation, never data
-    /// loss. Durable fsync is a later refinement.
+    /// On the local backend this is last-writer-wins `Overwrite`, atomic but
+    /// **not** crash-durable (no `fsync`) — the same contract as before the
+    /// seam, and the same caveat as the `Writer`. That is safe by
+    /// construction: a reader with no manifest falls back to the `*.parquet`
+    /// glob, and a compaction that crashed before this commit left its inputs
+    /// intact, so the worst case is reverting to the prior generation, never
+    /// data loss. Compare-and-swap (generation CAS, `If-Match`) lands with the
+    /// S3 backend — `LocalFileSystem` does not support conditional update.
     ///
     /// # Errors
     ///
     /// [`ManifestError::InvalidFilename`] if any entry isn't a
-    /// partition-local `*.parquet` name; [`ManifestError::Io`] on a
-    /// write or rename failure.
+    /// partition-local `*.parquet` name; [`ManifestError::Io`] on a write
+    /// failure.
     pub fn write_atomic(&self, partition_dir: &Path) -> Result<(), ManifestError> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(ManifestError::Parse)?;
-        let tmp = partition_dir.join(format!("{MANIFEST_FILENAME}.tmp"));
-        let final_path = partition_dir.join(MANIFEST_FILENAME);
-        std::fs::write(&tmp, &bytes).map_err(ManifestError::Io)?;
-        std::fs::rename(&tmp, &final_path).map_err(ManifestError::Io)?;
+        let bytes = self.to_json().map_err(ManifestError::Parse)?;
+        let store = Store::local(partition_dir).map_err(store_io)?;
+        store
+            .put_blocking(MANIFEST_FILENAME, bytes)
+            .map_err(store_io)?;
         Ok(())
     }
 }

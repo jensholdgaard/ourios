@@ -3,13 +3,15 @@
 //! RFC 0009 manifest live on local disk (dev/test) or an S3-compatible
 //! bucket (production), without changing the on-disk layout.
 //!
-//! **Status: `red` (RFC 0013).** This is the skeleton the `green` work fills:
-//! the [`Store`] type and its constructors exist and the `LocalFileSystem`
-//! backend is wired, but the S3 backend, the conditional-PUT atomic publish
-//! (RFC0013.3/.4), and the migration of the writer/reader/compaction/audit
-//! consumers from `bucket_root: &Path` onto [`Store`] are not done. The §5
-//! acceptance scenarios are encoded as `#[ignore]`d stubs in
-//! `tests/rfc0013_object_store.rs` and turn green as the backend lands.
+//! **Status: `green`, in progress (RFC 0013).** Landed: the [`Store`] type,
+//! both backends ([`Store::local`] and [`Store::s3`] — S3-compatible via an
+//! endpoint override), the byte I/O surface (async `put`/`get`/`delete` plus
+//! the sync `*_blocking` bridge), create-if-absent conditional PUT
+//! ([`Store::put_if_absent`]), and the reader + manifest consumers reading and
+//! writing through the seam. Still to come: the manifest generation-swap CAS
+//! (`If-Match`, RFC0013.3/.4), the writer's migration onto the seam, and the
+//! live S3 acceptance tests (RFC0013.1/.7). The §5 scenarios are `#[ignore]`d
+//! stubs in `tests/rfc0013_object_store.rs` and turn green as each lands.
 //!
 //! Per RFC 0013 §3.7 the backend is a **module here in `ourios-parquet`**
 //! (not a new crate): `ourios-querier`, `-ingester`, and `-server` already
@@ -213,7 +215,11 @@ impl Store {
             region,
             prefix,
         } = cfg;
-        if bucket.trim().is_empty() {
+        // Trim once and use the trimmed value for both the check and the
+        // builder, so a whitespace-padded bucket can't pass validation and then
+        // fail opaquely at request time.
+        let bucket = bucket.trim().to_owned();
+        if bucket.is_empty() {
             return Err(StoreError::Config(
                 "S3 bucket name must not be empty".to_string(),
             ));
@@ -380,7 +386,7 @@ mod tests {
         let cfg = S3Config {
             bucket: "ourios-test".to_string(),
             endpoint: Some("https://s3.example.invalid".to_string()),
-            region: Some("eu-central".to_string()),
+            region: Some("eu-central-1".to_string()),
             prefix: Some("ourios".to_string()),
         };
         let store = Store::s3(cfg).expect("s3 construct");

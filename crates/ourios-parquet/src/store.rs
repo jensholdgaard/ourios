@@ -18,6 +18,7 @@
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
+use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -31,15 +32,18 @@ use tokio::runtime::Runtime;
 /// "drop a runtime in async context" hazard can't arise.
 ///
 /// Multi-threaded(1-worker) so concurrent `block_on` from many bridge threads
-/// (parallel queries / tests) is safe. No `enable_all()`: the local backend
-/// drives I/O via `spawn_blocking`, which needs only the bare runtime; the S3
-/// backend adds `enable_all()` plus the `net`/`io`/`time` tokio features in the
-/// slice that introduces it.
+/// (parallel queries / tests) is safe. `enable_all()` so the runtime carries
+/// the IO + time drivers the `AmazonS3` backend's HTTP client needs; the local
+/// backend uses only `spawn_blocking` and ignores them.
 fn bridge_runtime() -> Result<&'static Runtime, StoreError> {
     static RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
     match RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
+            // `enable_all` so the runtime carries the IO + time drivers the
+            // `AmazonS3` backend's HTTP client (reqwest/hyper) needs; the local
+            // backend ignores them.
+            .enable_all()
             .build()
     }) {
         Ok(rt) => Ok(rt),
@@ -99,7 +103,7 @@ where
 /// [`Store::object_store`] returns the raw backend with **no prefix
 /// scoping**. Per-tenant/prefix isolation (RFC0013.5) is wired at `green` —
 /// do **not** assume this type enforces isolation yet.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Store {
     inner: Arc<dyn ObjectStore>,
     /// Reserved key prefix (the store root). Always empty at `red`; honoured
@@ -107,17 +111,16 @@ pub struct Store {
     prefix: ObjectPath,
 }
 
-/// Configuration for the S3 / S3-compatible backend (RFC0013.7). Populated
-/// from RFC 0004 config at `green`; a placeholder here so the `red`
-/// constructor signature is stable.
+/// Non-secret addressing for the S3 / S3-compatible backend (RFC0013.7) —
+/// bucket, endpoint, region, and key prefix. Credentials are resolved by
+/// [`Store::s3`] from the AWS credential chain, not carried here.
 ///
-/// `Default` is a `red` placeholder only — it yields an **empty `bucket`**,
-/// which is not valid; callers must set a non-empty `bucket` (the `green`
-/// `s3()` will reject an empty one).
+/// `Default` yields an **empty `bucket`**, which is not valid; [`Store::s3`]
+/// rejects it with [`StoreError::Config`].
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct S3Config {
-    /// Bucket name (required; the empty `Default` is a `red` placeholder).
+    /// Bucket name (required; an empty value is rejected by [`Store::s3`]).
     pub bucket: String,
     /// Optional endpoint override for S3-compatible stores (`MinIO`, R2, …).
     pub endpoint: Option<String>,
@@ -133,21 +136,20 @@ pub struct S3Config {
 pub enum StoreError {
     /// Backend construction failed (bad root, credentials, endpoint, …).
     Backend(object_store::Error),
-    /// A backend constructor not yet implemented at this RFC 0013 stage.
-    /// Returned (rather than panicking) so an accidental call fails
-    /// gracefully while `red`.
-    Unimplemented(&'static str),
     /// The sync→async bridge thread or runtime could not be built (resource
     /// exhaustion). Surfaced by the `*_blocking` methods.
     Runtime(std::io::Error),
+    /// Backend configuration was invalid before any backend was constructed
+    /// (e.g. an empty S3 bucket name).
+    Config(String),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backend(e) => write!(f, "object-store backend: {e}"),
-            Self::Unimplemented(what) => write!(f, "not implemented (RFC 0013 red): {what}"),
             Self::Runtime(e) => write!(f, "object-store bridge runtime: {e}"),
+            Self::Config(detail) => write!(f, "object-store config: {detail}"),
         }
     }
 }
@@ -156,8 +158,8 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(e) => Some(e),
-            Self::Unimplemented(_) => None,
             Self::Runtime(e) => Some(e),
+            Self::Config(_) => None,
         }
     }
 }
@@ -187,27 +189,55 @@ impl Store {
         })
     }
 
-    /// S3 / S3-compatible backend (RFC0013.1/.4/.7).
+    /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
+    /// S3-compatible endpoint (Hetzner, R2, …) via [`S3Config::endpoint`].
     ///
-    /// `red`: not yet built — the `green` implementation constructs an
-    /// `object_store::aws::AmazonS3` (behind the `aws` feature) from `cfg`
-    /// and the RFC 0004 credentials.
+    /// Credentials come from the standard AWS credential chain
+    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env, shared profile, or
+    /// instance metadata) — `cfg` only carries the non-secret addressing
+    /// (bucket, endpoint, region, prefix). Threading explicit RFC 0004
+    /// credentials is a later refinement. The backend keeps `object_store`'s
+    /// default `S3ConditionalPut::ETagMatch`, the `If-Match` CAS the manifest
+    /// generation-swap needs (RFC0013.3/.4).
+    ///
+    /// Construction does not contact the endpoint — credentials and
+    /// connectivity are resolved on the first request.
     ///
     /// # Errors
-    /// At `red`, always [`StoreError::Unimplemented`] — returned rather than
-    /// panicking so an accidental call (e.g. from another workspace crate)
-    /// fails gracefully. At `green` this becomes [`StoreError::Backend`] if
-    /// the `object_store` `AmazonS3` backend cannot be constructed (bad
-    /// endpoint, credentials, or bucket).
-    // `red` stub: `cfg` is unused until the `green` AmazonS3 impl consumes
-    // it (`needless_pass_by_value` fires because we never read it). The
-    // signature is fixed now so consumers can be written against it.
-    #[allow(clippy::needless_pass_by_value, unused_variables)]
+    /// [`StoreError::Config`] if `cfg.bucket` is empty; [`StoreError::Backend`]
+    /// if the `AmazonS3` backend cannot be built from `cfg`.
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
-        // RFC0013 green: build AmazonS3 from cfg + RFC 0004 creds.
-        Err(StoreError::Unimplemented(
-            "RFC0013 green: AmazonS3 / S3-compatible backend",
-        ))
+        let S3Config {
+            bucket,
+            endpoint,
+            region,
+            prefix,
+        } = cfg;
+        if bucket.trim().is_empty() {
+            return Err(StoreError::Config(
+                "S3 bucket name must not be empty".to_string(),
+            ));
+        }
+        // Base off the AWS credential chain; explicit `cfg` fields override.
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+        if let Some(endpoint) = endpoint {
+            // S3-compatible dev endpoints are often plain HTTP; object_store
+            // refuses HTTP unless explicitly allowed.
+            let allow_http = endpoint.starts_with("http://");
+            builder = builder.with_endpoint(endpoint);
+            if allow_http {
+                builder = builder.with_allow_http(true);
+            }
+        }
+        if let Some(region) = region {
+            builder = builder.with_region(region);
+        }
+        let s3 = builder.build().map_err(StoreError::Backend)?;
+        let prefix = prefix.map_or_else(ObjectPath::default, ObjectPath::from);
+        Ok(Self {
+            inner: Arc::new(s3),
+            prefix,
+        })
     }
 
     /// The underlying [`ObjectStore`], for handing to `DataFusion`'s table
@@ -339,7 +369,31 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::{Store, StoreError};
+    use super::{S3Config, Store, StoreError};
+
+    /// `Store::s3` builds an `AmazonS3` backend from addressing config without
+    /// contacting the endpoint (creds/connectivity resolve on first request),
+    /// so construction succeeds offline for a valid bucket + S3-compatible
+    /// endpoint.
+    #[test]
+    fn s3_constructs_from_a_valid_config() {
+        let cfg = S3Config {
+            bucket: "ourios-test".to_string(),
+            endpoint: Some("https://s3.example.invalid".to_string()),
+            region: Some("eu-central".to_string()),
+            prefix: Some("ourios".to_string()),
+        };
+        let store = Store::s3(cfg).expect("s3 construct");
+        assert_eq!(store.prefix().as_ref(), "ourios", "prefix is honoured");
+    }
+
+    /// An empty bucket is rejected up front with [`StoreError::Config`] rather
+    /// than deferring to an opaque backend error.
+    #[test]
+    fn s3_rejects_an_empty_bucket() {
+        let err = Store::s3(S3Config::default()).expect_err("empty bucket must fail");
+        assert!(matches!(err, StoreError::Config(_)), "got {err:?}");
+    }
 
     /// A byte object round-trips through the local backend, and a delete
     /// removes it. (Foundation for the RFC0013 consumer migration; the §5

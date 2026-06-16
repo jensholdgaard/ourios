@@ -24,9 +24,11 @@ parquet = { version = "55", default-features = false, features = ["arrow", "zstd
 # Object-storage backend (RFC 0013) — one trait over LocalFileSystem (dev/
 # test) and S3-compatible stores. Already in the workspace tree via
 # DataFusion (the querier); declared here directly as the storage seam's
-# home. `0.13` unifies with that transitive version. The `aws` feature (for
-# the AmazonS3 backend) is added with the `green` S3 implementation.
-object_store = { version = "0.13" }
+# home. `0.13` unifies with that transitive version. `aws` pulls in the
+# `AmazonS3` backend (RFC0013.1/.7) — it defaults conditional PUT to
+# `S3ConditionalPut::ETagMatch`, the `If-Match` CAS the manifest swap needs
+# (RFC0013.3/.4).
+object_store = { version = "0.13", features = ["aws"] }
 # `bytes::Bytes` is the `parquet` reader's in-memory `ChunkReader` source for
 # the RFC 0013 buffer-and-put read path (`Reader::open_bytes`). Already in the
 # arrow/parquet tree; declared directly.
@@ -34,12 +36,12 @@ bytes = { version = "1", default-features = false }
 # Drives the async `object_store` calls from the sync storage API
 # (`Store::*_blocking` bridge — `Writer`/`Reader`/compaction/manifest are sync,
 # `object_store` is async). `rt-multi-thread` because the bridge shares one
-# process-wide runtime and drives it with `block_on` from many threads
-# concurrently (parallel queries resolving manifests); a multi-thread runtime
-# supports that, a current-thread one does not. The S3 backend adds
-# `enable_all()` and the `net`/`io`/`time` features in its slice. Already in the
-# workspace tree via DataFusion / object_store.
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
+# process-wide runtime driven by `block_on` from many threads concurrently
+# (parallel queries resolving manifests). `net` (+ its IO driver) and `time` so
+# the bridge runtime's `enable_all()` can drive the `AmazonS3` backend's HTTP
+# client (reqwest/hyper). Already in the workspace tree via DataFusion /
+# object_store.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time"] }
 # UUIDv7 file naming per RFC 0005 §3.4 — timestamp-in-high-bits
 # means lexicographic sort = creation-order.
 uuid = { version = "1", default-features = false, features = ["v7", "std"] }

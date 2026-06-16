@@ -272,7 +272,11 @@ async fn rfc0013_7_s3_compatible_endpoint_via_override() {
         .expect("put");
     assert_eq!(s3.get(key).await.expect("get"), b"endpoint-override");
     s3.delete(key).await.expect("delete");
-    assert!(s3.get(key).await.is_err(), "object gone after delete");
+    let err = s3.get(key).await.expect_err("object gone after delete");
+    assert!(
+        err.is_not_found(),
+        "post-delete get should be NotFound, got {err:?}",
+    );
 }
 
 /// Scenario RFC0013.8 — the RFC 0005 §3.9 reader forward-compat contract (absent

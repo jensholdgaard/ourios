@@ -15,7 +15,62 @@
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{PartitionKey, Reader, S3Config, Store, Writer};
+use ourios_parquet::{
+    DEFAULT_ZSTD_LEVEL, PartitionKey, Reader, S3Config, Store, Writer, encode_records_to_parquet,
+};
+use testcontainers_modules::localstack::LocalStack;
+use testcontainers_modules::testcontainers::core::ExecCommand;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+
+/// Start a `LocalStack` S3 container, create `bucket` with the image's own
+/// `awslocal` (no S3-client dependency), and return the running container
+/// (the caller keeps it alive — dropping it stops `LocalStack`) paired with a
+/// `Store::s3` pointed at it via the endpoint override. Credentials come from
+/// the `AWS_*` env the `s3-integration` CI job sets.
+async fn localstack_s3(bucket: &str) -> (ContainerAsync<LocalStack>, Store) {
+    let container = LocalStack::default()
+        .with_env_var("SERVICES", "s3")
+        .start()
+        .await
+        .expect("start localstack");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(4566)
+        .await
+        .expect("container port");
+    let endpoint = format!("http://{host}:{port}");
+
+    let mut mb = container
+        .exec(ExecCommand::new([
+            "awslocal".to_string(),
+            "s3".to_string(),
+            "mb".to_string(),
+            format!("s3://{bucket}"),
+        ]))
+        .await
+        .expect("exec awslocal s3 mb");
+    // Drain both streams before reading the exit code — testcontainers reports
+    // `exit_code()` as `None` until the exec's output has been consumed.
+    let stdout =
+        String::from_utf8_lossy(&mb.stdout_to_vec().await.expect("mb stdout")).into_owned();
+    let stderr =
+        String::from_utf8_lossy(&mb.stderr_to_vec().await.expect("mb stderr")).into_owned();
+    let code = mb.exit_code().await.expect("mb exit code");
+    assert_eq!(
+        code,
+        Some(0),
+        "awslocal s3 mb failed (code {code:?}): stdout={stdout:?} stderr={stderr:?}",
+    );
+
+    let store = Store::s3(
+        S3Config::new(bucket)
+            .with_endpoint(endpoint)
+            .with_region("us-east-1"),
+    )
+    .expect("build s3 store");
+    (container, store)
+}
 
 /// A clean-round-trip record for `tenant` at a fixed in-hour offset `i`.
 fn rec_for(tenant: &str, i: u64) -> MinedRecord {
@@ -63,11 +118,37 @@ fn write_through_store(
 /// Scenario RFC0013.1 — a `MinedRecord` batch written and read through the `AmazonS3`
 /// backend recovers byte-for-byte against the local backend.
 /// See `docs/rfcs/0013-object-storage.md` §5.
-#[test]
-#[ignore = "RFC0013.1 — red until the S3 backend + writer/reader migration land"]
-fn rfc0013_1_round_trip_through_s3_backend() {
-    let _ = Store::s3;
-    todo!("RFC0013.1: S3 round-trip == local round-trip (MinIO testcontainer)")
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0013.1 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn rfc0013_1_round_trip_through_s3_backend() {
+    let records: Vec<MinedRecord> = (0..300).map(|i| rec_for("tenant-a", i)).collect();
+    let bytes = encode_records_to_parquet(&records, DEFAULT_ZSTD_LEVEL).expect("encode");
+    let key = "data/tenant_id=tenant-a/year=2026/month=04/day=02/hour=10/file.parquet";
+
+    let (_node, s3) = localstack_s3("ourios-it-roundtrip").await;
+    s3.put(key, bytes.clone()).await.expect("s3 put");
+    let s3_bytes = s3.get(key).await.expect("s3 get");
+
+    // The same bytes through the local backend.
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let local = Store::local(dir.path()).expect("local store");
+    local.put(key, bytes.clone()).await.expect("local put");
+    let local_bytes = local.get(key).await.expect("local get");
+
+    assert_eq!(s3_bytes, bytes, "S3 returns the written bytes");
+    assert_eq!(
+        s3_bytes, local_bytes,
+        "S3 and local recover identical bytes"
+    );
+
+    let decoded = Reader::open_bytes(bytes::Bytes::from(s3_bytes))
+        .expect("open_bytes")
+        .read_all()
+        .expect("read_all");
+    assert_eq!(
+        decoded, records,
+        "records recover byte-for-byte through the S3 backend"
+    );
 }
 
 /// Scenario RFC0013.2 — the existing RFC 0005 / 0009 suites pass unchanged against the
@@ -179,10 +260,23 @@ fn rfc0013_6_wal_stays_local() {
 /// Scenario RFC0013.7 — an S3-compatible store (`MinIO`) configured via an endpoint
 /// override (RFC 0004) reads and writes exactly as AWS S3.
 /// See `docs/rfcs/0013-object-storage.md` §5.
-#[test]
-#[ignore = "RFC0013.7 — red until the S3 backend honours endpoint overrides"]
-fn rfc0013_7_s3_compatible_endpoint_via_override() {
-    todo!("RFC0013.7: MinIO endpoint override works like AWS S3")
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0013.7 — S3 integration; run via the `s3-integration` CI job"]
+async fn rfc0013_7_s3_compatible_endpoint_via_override() {
+    // The store is configured purely through `S3Config::endpoint` (the RFC 0004
+    // override) pointing at LocalStack; put/get/delete behave like AWS S3.
+    let (_node, s3) = localstack_s3("ourios-it-endpoint").await;
+    let key = "data/tenant_id=t/probe.bin";
+    s3.put(key, b"endpoint-override".to_vec())
+        .await
+        .expect("put");
+    assert_eq!(s3.get(key).await.expect("get"), b"endpoint-override");
+    s3.delete(key).await.expect("delete");
+    let err = s3.get(key).await.expect_err("object gone after delete");
+    assert!(
+        err.is_not_found(),
+        "post-delete get should be NotFound, got {err:?}",
+    );
 }
 
 /// Scenario RFC0013.8 — the RFC 0005 §3.9 reader forward-compat contract (absent

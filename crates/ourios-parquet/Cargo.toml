@@ -72,9 +72,17 @@ tempfile = "3"
 # Property tests for the compaction row-conservation invariant
 # (RFC0009.2 / CLAUDE.md §6.2 — invariants get a property test).
 proptest = "1"
-# Async runtime for the RFC 0013 `Store` round-trip test (the I/O surface
-# is async via `object_store`). Already in the workspace tree.
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# Async runtime for the RFC 0013 `Store` round-trip tests (the I/O surface is
+# async via `object_store`). `rt-multi-thread` so the S3 integration tests'
+# `#[tokio::test(flavor = "multi_thread")]` is self-contained rather than
+# relying on the main dependency's feature set. Already in the workspace tree.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+# RFC 0013 S3 integration tests: spin LocalStack (S3-compatible, Apache-2.0)
+# via testcontainers and point `Store::s3` at it through the endpoint override.
+# The S3 tests are `#[ignore]`d (run only by the `s3-integration` CI job via
+# `--ignored` + a name filter, where a Docker-API runtime is available); the
+# default `cargo test` compiles but skips them.
+testcontainers-modules = { version = "0.15", features = ["localstack"] }
 
 [lints]
 workspace = true

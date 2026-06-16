@@ -132,6 +132,45 @@ pub struct S3Config {
     pub prefix: Option<String>,
 }
 
+impl S3Config {
+    /// Config for `bucket` (required); endpoint, region, and prefix start
+    /// unset — add them with the `with_*` builders. The preferred way to build
+    /// an `S3Config` (it's `#[non_exhaustive]`, so external callers can't use a
+    /// struct literal; `S3Config::default()` plus setting the public fields
+    /// also works, but `bucket` then defaults to the invalid empty string).
+    #[must_use]
+    pub fn new(bucket: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            endpoint: None,
+            region: None,
+            prefix: None,
+        }
+    }
+
+    /// Set the endpoint override for an S3-compatible store (Hetzner, R2,
+    /// `LocalStack`, …).
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Set the region.
+    #[must_use]
+    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    /// Set the key prefix (the store root within the bucket).
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+}
+
 /// Errors from constructing or addressing a [`Store`].
 #[derive(Debug)]
 #[non_exhaustive]
@@ -383,12 +422,10 @@ mod tests {
     /// endpoint.
     #[test]
     fn s3_constructs_from_a_valid_config() {
-        let cfg = S3Config {
-            bucket: "ourios-test".to_string(),
-            endpoint: Some("https://s3.example.invalid".to_string()),
-            region: Some("eu-central-1".to_string()),
-            prefix: Some("ourios".to_string()),
-        };
+        let cfg = S3Config::new("ourios-test")
+            .with_endpoint("https://s3.example.invalid")
+            .with_region("eu-central-1")
+            .with_prefix("ourios");
         let store = Store::s3(cfg).expect("s3 construct");
         assert_eq!(store.prefix().as_ref(), "ourios", "prefix is honoured");
     }

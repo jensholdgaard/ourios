@@ -1,7 +1,7 @@
 ---
 rfc: 0014
 title: Ingest write path — record sink and flush policy
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-17
@@ -11,7 +11,7 @@ superseded-by: —
 
 # RFC 0014 — Ingest write path: record sink and flush policy
 
-> **Status note.** **`drafted`** (2026-06-17). The conspicuous gap in the
+> **Status note.** **`specified`** (2026-06-17). The conspicuous gap in the
 > ingest stack: today the miner (RFC 0001) emits each mined `MinedRecord`
 > into a `RecordSink`, and **production wires `NoOpRecordSink` — the records
 > are dropped.** Every other layer is built and tested (OTLP → WAL → miner;
@@ -27,6 +27,14 @@ superseded-by: —
 > migrating compaction's manifest publish to `Manifest::publish_cas` on S3
 > (RFC0013.3/.4) are **follow-on** work, tracked as open questions, not part
 > of this RFC's acceptance.
+>
+> **`specified`** finalizes the §5 acceptance criteria (RFC0014.1–.6,
+> greppable + testable) and §6 testing strategy, and settles the two
+> criteria-shaping design questions: rotation force-flushes **every** partition
+> (§3.2, RFC0014.3), and the memory ceiling is **hard** — `emit` blocks rather
+> than exceed it (§3.4, RFC0014.4). The remaining §7 questions (defaults,
+> early-flush victim, rotation-hook surface, size estimation) are tuning /
+> implementation detail, decided across the `red`/`green` PRs.
 
 ## 1. Summary
 
@@ -105,11 +113,15 @@ A partition flushes when **any** of:
    bounds the staleness of low-volume tenants/partitions whose size trigger
    would otherwise never fire.
 3. **WAL segment rotation** — when the WAL segment seals (RFC 0008's rotation
-   hook), **all** partitions force-flush. This aligns the published-Parquet
+   hook), **every** partition force-flushes, *including* sub-threshold
+   low-volume partitions (no size gate). This aligns the published-Parquet
    horizon with a WAL boundary: once a segment is sealed *and* its mined
    records flushed, recovery never needs that segment for data (only the
-   still-open tail's records are buffered-but-unflushed). It also caps the
-   amount of acknowledged-but-unpublished data to roughly one segment.
+   still-open tail's records are buffered-but-unflushed), and the
+   acknowledged-but-unpublished data is capped at roughly one segment. The
+   cost — small files from tiny partitions — is deliberately accepted and left
+   to compaction (RFC 0009) to consolidate; the clean recovery invariant is
+   worth more than avoiding a few small objects.
 
 A flush encodes the partition's buffered records to a Parquet object
 (`encode_records_to_parquet` + `Store.put`, the RFC 0013 buffer-and-put path,
@@ -133,10 +145,12 @@ ceiling:
   sink force-flushes the largest (or oldest) partition(s) ahead of their size
   trigger, reclaiming memory without blocking ingest.
 - **Hard limit (backpressure).** If early flush cannot keep the total under
-  the ceiling (e.g. a flush is slow or the store is unavailable), the sink
-  applies backpressure to the ingest path so the buffer cannot grow unbounded.
-  Because ack already happened (post-WAL), backpressure here throttles
-  *mining/flushing*, not durability — no acknowledged data is at risk.
+  the ceiling (e.g. a flush is slow or the store is unavailable), `emit`
+  **blocks** until an in-flight flush frees enough memory — so the buffer can
+  **never exceed** the ceiling (a hard, not soft, bound). Because the OTLP ack
+  already happened (post-WAL), this blocks only *mining/flushing* throughput,
+  not durability — no acknowledged data is at risk; the cost is added ingest
+  latency under sustained overload.
 
 This makes the in-memory buffer a bounded, best-effort accelerator on top of
 the WAL, never an unbounded liability (cf. §3.2's hazard list).
@@ -203,35 +217,36 @@ bounded accelerator and an OOM risk; we keep it.
 
 ## 5. Acceptance criteria
 
-> Sketch for the `drafted` stage; finalized and made greppable
-> (`RFC0014.<m>`, `docs/verification.md` §2) at `specified`. One scenario per
-> hazard/invariant this RFC touches (`CLAUDE.md` §4, §3.4, §3.7).
+> Normative scenarios; ids `RFC0014.<m>` are referenced from the test code
+> (`docs/verification.md` §2). One scenario per hazard/invariant this RFC
+> touches (`CLAUDE.md` §4 small-file, §3.4 WAL-durability, §3.7 multi-tenancy).
 
 - **RFC0014.1 — size trigger.** *Given* a partition whose buffered records
   reach the size target, *when* the next record is emitted, *then* the
   partition flushes to exactly one Parquet object sized within the RFC 0005
-  §3.5 band
-  and the buffer is cleared.
+  §3.5 band, *and* the buffer is cleared.
 - **RFC0014.2 — age trigger.** *Given* a low-volume partition below the size
-  target, *when* its oldest record's age reaches `max_buffer_age`, *then* it flushes
-  on the next batch-window tick.
-- **RFC0014.3 — rotation force-flush.** *Given* buffered records across
-  several partitions, *when* the WAL segment rotates, *then* every partition
-  flushes, and no buffered record predates the sealed segment.
-- **RFC0014.4 — memory ceiling.** *Given* buffered bytes approaching the
-  ceiling, *when* more records arrive, *then* the sink early-flushes to stay
-  under the ceiling; *and* at the hard limit it applies backpressure rather
-  than exceeding it.
-- **RFC0014.5 — no acknowledged-data loss (`CLAUDE.md` §3.4).** *Given* a non-empty buffer,
-  *when* the process crashes, *then* WAL replay re-mines every un-flushed
-  acknowledged record — no acknowledged record is lost.
-- **RFC0014.6 — tenant isolation (`CLAUDE.md` §3.7).** *Given* buffered records for tenants
-  X and Y, *when* one partition flushes, *then* the produced object holds only
-  that partition's (single tenant's) rows; no buffer or flush crosses tenants.
+  target, *when* its oldest record's age reaches `max_buffer_age`, *then* it
+  flushes on the next batch-window tick.
+- **RFC0014.3 — rotation force-flush (`CLAUDE.md` §4).** *Given* buffered
+  records across several partitions — *including* low-volume, sub-threshold
+  ones — *when* the WAL segment rotates, *then* **every** partition flushes,
+  *and* no buffered record predates the sealed segment.
+- **RFC0014.4 — bounded memory (`CLAUDE.md` §4).** *Given* buffered bytes
+  approaching the ceiling, *when* more records arrive, *then* the sink
+  early-flushes to stay under it; *and* at the hard limit `emit` blocks until a
+  flush frees memory, *so that* total buffered bytes never exceed the ceiling.
+- **RFC0014.5 — no acknowledged-data loss (`CLAUDE.md` §3.4).** *Given* a
+  non-empty buffer, *when* the process crashes, *then* WAL replay re-mines
+  every un-flushed acknowledged record — no acknowledged record is lost.
+- **RFC0014.6 — tenant isolation (`CLAUDE.md` §3.7).** *Given* buffered records
+  for tenants X and Y, *when* one partition flushes, *then* the produced object
+  holds only that partition's (single tenant's) rows; no buffer or flush
+  crosses tenants.
 
 ## 6. Testing strategy
 
-> Mapped to `CLAUDE.md` §6.2; finalized at `specified`.
+> Mapped to `CLAUDE.md` §6.2.
 
 - **Unit tests** for each flush trigger (RFC0014.1–.3) and the ceiling
   (RFC0014.4), driving the sink with synthetic `MinedRecord` streams and a
@@ -250,24 +265,32 @@ bounded accelerator and an OOM risk; we keep it.
 
 ## 7. Open questions
 
+Resolved at `specified` (2026-06-17):
+
+- [x] **Rotation force-flush scope** → flush **every** partition, including
+      sub-threshold ones (§3.2 trigger 3). The clean recovery invariant
+      (RFC0014.3) is worth more than avoiding a few small files; compaction
+      (RFC 0009) consolidates them. (This also settles the
+      "small files from low-volume partitions, acceptable?" question — yes.)
+- [x] **Backpressure mechanism** → at the hard ceiling, `emit` **blocks**
+      until a flush frees memory, so the buffer never exceeds the ceiling
+      (§3.4). The OTLP ack already happened (post-WAL), so blocking throttles
+      mining throughput, not durability.
+
+Carried into `red`/`green` (tuning + implementation detail):
+
 - [ ] Default values: size target, `max_buffer_age`, and the buffered-bytes
       ceiling (tune against representative corpora; RFC 0004 config knobs).
 - [ ] Early-flush victim selection at the ceiling: largest partition vs oldest
-      vs a hybrid; and the soft-vs-hard threshold gap.
+      vs a hybrid; and the soft-pressure threshold below the hard ceiling.
 - [ ] Exact integration surface with RFC 0008's rotation hook and batch-window
       tick — does the sink subscribe, or does the pipeline drive it?
-- [ ] Backpressure mechanism: how the sink signals the ingest path (and how
-      that interacts with RFC 0003's OTLP response semantics) without ever
-      compromising the already-given ack.
 - [ ] Size estimation: cheap running estimate vs encoding to measure; accuracy
       vs cost on the hot path.
 - [ ] **Follow-on (out of this RFC's acceptance):** server constructs/injects a
       `Store` (local vs S3 via RFC 0004); compaction's manifest publish adopts
       `Manifest::publish_cas` on S3 (RFC0013.3/.4); together these green
       RFC0013.6.
-- [ ] Interaction with compaction: do rotation force-flushes of low-volume
-      partitions produce small files that compaction must mop up, and is that
-      acceptable, or should rotation skip below-threshold partitions?
 
 ## 8. References
 

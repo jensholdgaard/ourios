@@ -12,7 +12,7 @@
 //! is blocked on rotation itself, RFC0008.6).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquet
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::Store;
-use ourios_wal::{Wal, WalConfig};
+use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -88,6 +88,45 @@ fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -
     })
 }
 
+/// Flush the sink, then write the per-tenant miner snapshot **only if the sink
+/// fully drained**.
+///
+/// This is the no-loss invariant (`CLAUDE.md` §3.4). `flush_all` retains any
+/// partition whose store write failed (the WAL is the durability of record, so
+/// a flush failure is non-fatal). Writing the snapshot anyway would advance the
+/// miner's snapshot horizon past records that never reached the store — and
+/// recovery suppresses frames at or below that horizon, so on the next start
+/// they would never be re-emitted into a fresh sink. That is data loss when the
+/// store is unavailable. Skipping the snapshot instead degrades the next start
+/// to a fuller replay (which re-mines + re-emits the un-flushed records and
+/// retries the flush), never loss. Best-effort, like every RFC 0001 §6.9
+/// cadence point; `cadence` names the call site for the log line.
+///
+/// Returns whether the sink fully drained — i.e. whether the snapshot was
+/// written (vs skipped to preserve no-loss). Callers log via `cadence`; the
+/// value is for tests today and sink-flush metrics later (RFC 0014 §6.3).
+fn flush_then_snapshot(
+    sink: &SharedParquetSink,
+    snapshots_root: &Path,
+    miner: &MinerCluster,
+    high_water: Option<WalOffset>,
+    cadence: &str,
+) -> bool {
+    sink.flush_all();
+    let buffered = sink.buffered_records();
+    if buffered != 0 {
+        eprintln!(
+            "{cadence}: sink retained {buffered} record(s) (store unavailable?); skipping the \
+             snapshot so recovery re-mines them — no acknowledged data is lost (the WAL is durable)"
+        );
+        return false;
+    }
+    if let Err(e) = recovery::write_snapshots(snapshots_root, miner, high_water) {
+        eprintln!("{cadence} snapshot write failed (next start full-replays): {e}");
+    }
+    true
+}
+
 /// Where the receiver role binds, the WAL it persists to, and the object
 /// store its mined data lands in.
 pub struct ReceiverConfig {
@@ -141,15 +180,10 @@ impl ReceiverHandle {
             .map_err(|e| format!("HTTP listener task: {e}"))?
             .map_err(|e| format!("HTTP listener: {e}"))?;
         // Both listeners are stopped, so no more records reach the sink. Stop
-        // the age-sweep task and drain every buffered partition to the store
-        // before the shutdown snapshot below — the same flush-before-snapshot
-        // ordering the post-recovery and rotation cadence points use, so the
-        // miner's snapshot horizon never outruns the sink's flushed horizon
-        // (the no-loss invariant; see `serve`). An abort `JoinError` is the
-        // expected outcome and is ignored.
+        // the age-sweep task, then drain the sink and snapshot below. An abort
+        // `JoinError` is the expected outcome and is ignored.
         self.flush_tick.abort();
         let _ = self.flush_tick.await;
-        self.sink.flush_all();
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -158,12 +192,18 @@ impl ReceiverHandle {
         // hook is caught, and `ingest` mutates the miner only after the
         // batch is durable); the recovered state is the best snapshot we
         // can write, and a bad one only degrades the next start to a full
-        // replay (the snapshot is a rebuildable cache).
+        // replay (the snapshot is a rebuildable cache). `flush_then_snapshot`
+        // drains the sink first and writes the snapshot only if it drained —
+        // the no-loss invariant (see `serve`).
         let last_durable = self.pipeline.last_durable();
         self.pipeline.with_miner(|miner| {
-            if let Err(e) = recovery::write_snapshots(&self.snapshots_root, miner, last_durable) {
-                eprintln!("shutdown snapshot write failed (next start full-replays): {e}");
-            }
+            flush_then_snapshot(
+                &self.sink,
+                &self.snapshots_root,
+                miner,
+                last_durable,
+                "shutdown",
+            );
         });
         Ok(())
     }
@@ -222,17 +262,18 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             tenant.tenant_id.as_str(),
         );
     }
-    // Drain the replayed tail before the post-recovery snapshot, so the
-    // recorded horizon never outruns the sink's flushed horizon (the no-loss
-    // invariant — see the rotation hook). Not serving yet, so this blocking
+    // Post-recovery cadence point (RFC 0001 §6.9): drain the replayed tail,
+    // then persist what replay rebuilt so a crash before the next cadence point
+    // doesn't redo it. `flush_then_snapshot` gates the snapshot on the drain
+    // succeeding (the no-loss invariant). Not serving yet, so the blocking
     // flush contends with nothing.
-    sink.flush_all();
-    // Post-recovery cadence point (RFC 0001 §6.9): persist what replay
-    // rebuilt so a crash before the next cadence point doesn't redo it.
-    // Best-effort — the snapshot is a rebuildable cache.
-    if let Err(e) = recovery::write_snapshots(&snapshots_root, &miner, report.max_delivered) {
-        eprintln!("post-recovery snapshot write failed (next start full-replays): {e}");
-    }
+    flush_then_snapshot(
+        &sink,
+        &snapshots_root,
+        &miner,
+        report.max_delivered,
+        "post-recovery",
+    );
 
     // Seed the durable mark from replay so a process serving zero
     // requests still stamps its shutdown snapshots with a concrete
@@ -254,19 +295,17 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         IngestPipeline::new(coordinator, miner, rule)
             .with_last_durable(report.max_delivered)
             .with_rotation_hook(Box::new(move |miner, mark| {
-                // Force-flush every partition before snapshotting the miner at
-                // the rotation mark. The hook fires before the new segment's
+                // Force-flush every partition, then snapshot at the rotation
+                // mark only if the sink drained (`flush_then_snapshot` — the
+                // no-loss invariant). The hook fires before the new segment's
                 // first record reaches the miner, so the buffer holds exactly
-                // the sealed segment's records; flushing them first keeps the
-                // snapshot horizon at or below the sink's flushed horizon, so
-                // recovery's miner-gated replay re-emits every un-flushed
-                // acknowledged record (RFC0014.3/.5, `CLAUDE.md` §3.4).
-                hook_sink.flush_all();
-                if let Err(e) = recovery::write_snapshots(&hook_root, miner, Some(mark)) {
-                    eprintln!(
-                        "rotation snapshot write failed (recovery falls back to the WAL): {e}"
-                    );
-                }
+                // the sealed segment's records (RFC0014.3/.5, `CLAUDE.md` §3.4).
+                // This runs on the request path (inside `ingest`) and does
+                // blocking Parquet/store I/O, so `block_in_place` lets the
+                // runtime relocate other tasks off this worker.
+                tokio::task::block_in_place(|| {
+                    flush_then_snapshot(&hook_sink, &hook_root, miner, Some(mark), "rotation");
+                });
             })),
     );
 
@@ -325,4 +364,115 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         sink,
         flush_tick,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use ourios_core::audit::ParamType;
+    use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
+    use ourios_core::tenant::TenantId;
+
+    use super::*;
+
+    fn rec() -> MinedRecord {
+        MinedRecord {
+            tenant_id: TenantId::new("checkout"),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 1_775_127_480_000_000_000,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: "1".to_string(),
+            }],
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        }
+    }
+
+    fn never_flush() -> FlushConfig {
+        FlushConfig {
+            target_bytes: usize::MAX,
+            max_buffer_age: Duration::from_secs(86_400),
+            ceiling_bytes: usize::MAX,
+        }
+    }
+
+    fn buffered_sink(store_root: &Path) -> SharedParquetSink {
+        std::fs::create_dir_all(store_root).expect("create store root");
+        let sink = SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(store_root).expect("store"),
+            never_flush(),
+        ));
+        let mut producer = sink.clone();
+        producer.emit(rec());
+        producer.emit(rec());
+        assert_eq!(
+            sink.buffered_records(),
+            2,
+            "records buffered, not yet flushed"
+        );
+        sink
+    }
+
+    #[test]
+    fn flush_then_snapshot_drains_and_snapshots_when_the_store_accepts_writes() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let sink = buffered_sink(&tmp.path().join("store"));
+        let miner = MinerCluster::new(MinerConfig::default());
+
+        let drained =
+            flush_then_snapshot(&sink, &tmp.path().join("snapshots"), &miner, None, "test");
+
+        assert!(drained, "a working store drains the sink");
+        assert_eq!(sink.buffered_records(), 0, "the buffer cleared on flush");
+    }
+
+    #[test]
+    fn flush_then_snapshot_skips_the_snapshot_when_the_sink_cannot_drain() {
+        // The no-loss guard (`CLAUDE.md` §3.4): when the store rejects writes,
+        // the records stay buffered (durable in the WAL) and the snapshot is
+        // skipped, so the miner's horizon can't advance past un-flushed data
+        // and recovery will re-mine them.
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        let sink = buffered_sink(&store_root);
+
+        // Make `put_blocking` fail deterministically: replace the store root
+        // directory with a regular file, so writing under it errors.
+        std::fs::remove_dir_all(&store_root).expect("remove store dir");
+        std::fs::write(&store_root, b"not a directory").expect("write sabotage file");
+
+        let snapshots_root = tmp.path().join("snapshots");
+        let miner = MinerCluster::new(MinerConfig::default());
+        let drained = flush_then_snapshot(&sink, &snapshots_root, &miner, None, "test");
+
+        assert!(!drained, "an unavailable store does not drain the sink");
+        assert_eq!(
+            sink.buffered_records(),
+            2,
+            "records are retained, not lost — the WAL is the durability of record",
+        );
+        let snapshot_written = std::fs::read_dir(&snapshots_root)
+            .ok()
+            .is_some_and(|mut d| d.next().is_some());
+        assert!(
+            !snapshot_written,
+            "the snapshot is skipped, so the horizon cannot advance past un-flushed data",
+        );
+    }
 }

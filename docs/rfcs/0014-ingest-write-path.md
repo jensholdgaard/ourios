@@ -117,7 +117,7 @@ A partition flushes when **any** of:
    low-volume partitions (no size gate). This aligns the published-Parquet
    horizon with a WAL boundary: once a segment is sealed *and* its mined
    records flushed, recovery never needs that segment for data (only the
-   still-open tail's records are buffered-but-unflushed), and the
+   still-open tail's records are buffered-but-un-flushed), and the
    acknowledged-but-unpublished data is capped at roughly one segment. The
    cost — small files from tiny partitions — is deliberately accepted and left
    to compaction (RFC 0009) to consolidate; the clean recovery invariant is

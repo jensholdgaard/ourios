@@ -268,7 +268,9 @@ impl RecordSink for ParquetRecordSink {
         // retained below (the WAL is the durability of record), and the
         // ceiling may be transiently exceeded (counted via `flush_errors`)
         // instead of deadlocking the ingest path.
-        while self.total_bytes + est > self.config.ceiling_bytes && self.flush_largest() {}
+        while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes
+            && self.flush_largest()
+        {}
 
         let buf = self
             .buffers
@@ -279,9 +281,12 @@ impl RecordSink for ParquetRecordSink {
                 oldest: Instant::now(),
             });
         buf.records.push(record);
-        buf.est_bytes += est;
+        // Saturating (matching `saturating_sub` on flush) so the byte counters
+        // stay monotonic and the triggers can't be corrupted by wraparound
+        // under prolonged retention (e.g. a store outage).
+        buf.est_bytes = buf.est_bytes.saturating_add(est);
         let over_target = buf.est_bytes >= self.config.target_bytes;
-        self.total_bytes += est;
+        self.total_bytes = self.total_bytes.saturating_add(est);
 
         // Size trigger (RFC0014.1): the emit that crosses the target flushes.
         if over_target {

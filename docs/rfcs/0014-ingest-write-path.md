@@ -222,39 +222,39 @@ bounded accelerator and an OOM risk; we keep it.
 > (`docs/verification.md` §2). One scenario per hazard/invariant this RFC
 > touches (`CLAUDE.md` §4 small-file, §3.4 WAL-durability, §3.7 multi-tenancy).
 
-> **RFC0014.1 — Size trigger**
-> - **Given** a partition whose buffered records reach the size target
-> - **When** the next record is emitted
-> - **Then** the partition flushes to exactly one Parquet object sized within
->   the RFC 0005 §3.5 band
+> **Scenario RFC0014.1 — Size trigger**
+> - **Given** a partition whose buffered bytes are just below the size target
+> - **When** a record is emitted that brings the buffer to or over the target
+> - **Then** `emit` flushes the partition to exactly one Parquet object
+>   sized within the RFC 0005 §3.5 band
 > - **And** the buffer is cleared
 
-> **RFC0014.2 — Age trigger**
+> **Scenario RFC0014.2 — Age trigger**
 > - **Given** a low-volume partition below the size target
 > - **When** its oldest record's age reaches `max_buffer_age`
 > - **Then** it flushes on the next batch-window tick
 
-> **RFC0014.3 — Rotation force-flush (`CLAUDE.md` §4)**
+> **Scenario RFC0014.3 — Rotation force-flush (`CLAUDE.md` §4)**
 > - **Given** buffered records across several partitions, including low-volume
 >   sub-threshold ones
 > - **When** the WAL segment rotates
 > - **Then** every partition flushes
 > - **And** no buffered record predates the sealed segment
 
-> **RFC0014.4 — Bounded memory (`CLAUDE.md` §4)**
+> **Scenario RFC0014.4 — Bounded memory (`CLAUDE.md` §4)**
 > - **Given** buffered bytes approaching the ceiling
 > - **When** more records arrive
 > - **Then** the sink early-flushes to stay under it
 > - **And** at the hard limit `emit` blocks until a flush frees memory, so
 >   total buffered bytes never exceed the ceiling
 
-> **RFC0014.5 — No acknowledged-data loss (`CLAUDE.md` §3.4)**
+> **Scenario RFC0014.5 — No acknowledged-data loss (`CLAUDE.md` §3.4)**
 > - **Given** a non-empty buffer
 > - **When** the process crashes
 > - **Then** WAL replay re-mines every un-flushed acknowledged record
 > - **And** no acknowledged record is lost
 
-> **RFC0014.6 — Tenant isolation (`CLAUDE.md` §3.7)**
+> **Scenario RFC0014.6 — Tenant isolation (`CLAUDE.md` §3.7)**
 > - **Given** buffered records for tenants X and Y
 > - **When** one partition flushes
 > - **Then** the produced object holds only that partition's (single tenant's)

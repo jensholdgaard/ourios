@@ -2,7 +2,7 @@
 //! scenarios (§5).
 //!
 //! **Status: `red`.** These are the failing stubs that drive the `green`
-//! implementation: each encodes one RFC0014.§5 scenario and currently
+//! implementation: each encodes one RFC 0014 §5 scenario and currently
 //! `todo!()`s. They are `#[ignore]`d so the default `cargo test` (and CI)
 //! stays green while the buffering `ParquetRecordSink` is built — `green`
 //! replaces each body with a real assertion against the sink (per-partition

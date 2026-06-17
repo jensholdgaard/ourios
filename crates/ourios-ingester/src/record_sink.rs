@@ -261,10 +261,20 @@ impl ParquetRecordSink {
 /// one to `MinerCluster::with_record_sink` and keep another to drive the
 /// triggers (same pattern as `SharedRecordSink` / `SharedAuditSink`).
 ///
-/// The flush triggers and `emit` are short critical sections on one mutex;
-/// the only lock order is miner → sink (the pipeline holds the miner lock
-/// while it `emit`s and while the rotation hook flushes), and the tick takes
-/// the sink alone, so there is no cycle.
+/// All access serializes on one mutex. `emit` is a short critical section, but
+/// the flush triggers are **not**: `flush_all` / `flush_aged` hold the lock
+/// across `encode_records_to_parquet` + `Store::put_blocking` (see
+/// [`ParquetRecordSink::flush_all`]), so a flush against a slow store blocks
+/// every concurrent `emit` and trigger for the duration of the I/O. Callers
+/// must treat them as blocking sections (the server runs them via
+/// `block_in_place` / `spawn_blocking`). With the local backend a flush is
+/// sub-millisecond, so this is benign; the encode+put is worth moving outside
+/// the lock (drain under the lock, do I/O unlocked, re-lock to settle counters)
+/// when the S3 backend lands (RFC 0014 §7 / RFC 0013), where PUTs are slow.
+///
+/// The only lock order is miner → sink (the pipeline holds the miner lock while
+/// it `emit`s and while the rotation hook flushes); the tick takes the sink
+/// alone, so there is no cycle.
 #[derive(Clone)]
 pub struct SharedParquetSink {
     inner: Arc<Mutex<ParquetRecordSink>>,

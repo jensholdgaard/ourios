@@ -66,6 +66,9 @@ fn flush_config() -> FlushConfig {
 fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SINK_FLUSH_TICK);
+        // A slow sweep (e.g. against S3) must not make the interval "catch up"
+        // with back-to-back flushes; keep a steady cadence from the last tick.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // the first tick is immediate; skip it
         loop {
             tokio::select! {
@@ -102,9 +105,12 @@ fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -
 /// retries the flush), never loss. Best-effort, like every RFC 0001 §6.9
 /// cadence point; `cadence` names the call site for the log line.
 ///
-/// Returns whether the sink fully drained — i.e. whether the snapshot was
-/// written (vs skipped to preserve no-loss). Callers log via `cadence`; the
-/// value is for tests today and sink-flush metrics later (RFC 0014 §6.3).
+/// Returns whether the sink fully drained: `true` means the buffer cleared and
+/// the snapshot was *attempted* (a write failure there is a separate, logged,
+/// rebuildable-cache miss — it does not endanger no-loss, since the data is in
+/// the store); `false` means records were retained and the snapshot was
+/// skipped. Callers log via `cadence`; the value is for tests today and
+/// sink-flush metrics later (RFC 0014 §6.3).
 fn flush_then_snapshot(
     sink: &SharedParquetSink,
     snapshots_root: &Path,
@@ -196,14 +202,16 @@ impl ReceiverHandle {
         // drains the sink first and writes the snapshot only if it drained —
         // the no-loss invariant (see `serve`).
         let last_durable = self.pipeline.last_durable();
-        self.pipeline.with_miner(|miner| {
-            flush_then_snapshot(
-                &self.sink,
-                &self.snapshots_root,
-                miner,
-                last_durable,
-                "shutdown",
-            );
+        tokio::task::block_in_place(|| {
+            self.pipeline.with_miner(|miner| {
+                flush_then_snapshot(
+                    &self.sink,
+                    &self.snapshots_root,
+                    miner,
+                    last_durable,
+                    "shutdown",
+                );
+            });
         });
         Ok(())
     }
@@ -265,15 +273,17 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // Post-recovery cadence point (RFC 0001 §6.9): drain the replayed tail,
     // then persist what replay rebuilt so a crash before the next cadence point
     // doesn't redo it. `flush_then_snapshot` gates the snapshot on the drain
-    // succeeding (the no-loss invariant). Not serving yet, so the blocking
-    // flush contends with nothing.
-    flush_then_snapshot(
-        &sink,
-        &snapshots_root,
-        &miner,
-        report.max_delivered,
-        "post-recovery",
-    );
+    // succeeding (the no-loss invariant); `block_in_place` keeps its blocking
+    // Parquet/store I/O off a runtime worker, as at the other cadence points.
+    tokio::task::block_in_place(|| {
+        flush_then_snapshot(
+            &sink,
+            &snapshots_root,
+            &miner,
+            report.max_delivered,
+            "post-recovery",
+        );
+    });
 
     // Seed the durable mark from replay so a process serving zero
     // requests still stamps its shutdown snapshots with a concrete

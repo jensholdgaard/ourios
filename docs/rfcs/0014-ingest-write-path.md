@@ -221,28 +221,44 @@ bounded accelerator and an OOM risk; we keep it.
 > (`docs/verification.md` §2). One scenario per hazard/invariant this RFC
 > touches (`CLAUDE.md` §4 small-file, §3.4 WAL-durability, §3.7 multi-tenancy).
 
-- **RFC0014.1 — size trigger.** *Given* a partition whose buffered records
-  reach the size target, *when* the next record is emitted, *then* the
-  partition flushes to exactly one Parquet object sized within the RFC 0005
-  §3.5 band, *and* the buffer is cleared.
-- **RFC0014.2 — age trigger.** *Given* a low-volume partition below the size
-  target, *when* its oldest record's age reaches `max_buffer_age`, *then* it
-  flushes on the next batch-window tick.
-- **RFC0014.3 — rotation force-flush (`CLAUDE.md` §4).** *Given* buffered
-  records across several partitions — *including* low-volume, sub-threshold
-  ones — *when* the WAL segment rotates, *then* **every** partition flushes,
-  *and* no buffered record predates the sealed segment.
-- **RFC0014.4 — bounded memory (`CLAUDE.md` §4).** *Given* buffered bytes
-  approaching the ceiling, *when* more records arrive, *then* the sink
-  early-flushes to stay under it; *and* at the hard limit `emit` blocks until a
-  flush frees memory, *so that* total buffered bytes never exceed the ceiling.
-- **RFC0014.5 — no acknowledged-data loss (`CLAUDE.md` §3.4).** *Given* a
-  non-empty buffer, *when* the process crashes, *then* WAL replay re-mines
-  every un-flushed acknowledged record — no acknowledged record is lost.
-- **RFC0014.6 — tenant isolation (`CLAUDE.md` §3.7).** *Given* buffered records
-  for tenants X and Y, *when* one partition flushes, *then* the produced object
-  holds only that partition's (single tenant's) rows; no buffer or flush
-  crosses tenants.
+> **RFC0014.1 — Size trigger**
+> - **Given** a partition whose buffered records reach the size target
+> - **When** the next record is emitted
+> - **Then** the partition flushes to exactly one Parquet object sized within
+>   the RFC 0005 §3.5 band
+> - **And** the buffer is cleared
+
+> **RFC0014.2 — Age trigger**
+> - **Given** a low-volume partition below the size target
+> - **When** its oldest record's age reaches `max_buffer_age`
+> - **Then** it flushes on the next batch-window tick
+
+> **RFC0014.3 — Rotation force-flush (`CLAUDE.md` §4)**
+> - **Given** buffered records across several partitions, including low-volume
+>   sub-threshold ones
+> - **When** the WAL segment rotates
+> - **Then** every partition flushes
+> - **And** no buffered record predates the sealed segment
+
+> **RFC0014.4 — Bounded memory (`CLAUDE.md` §4)**
+> - **Given** buffered bytes approaching the ceiling
+> - **When** more records arrive
+> - **Then** the sink early-flushes to stay under it
+> - **And** at the hard limit `emit` blocks until a flush frees memory, so
+>   total buffered bytes never exceed the ceiling
+
+> **RFC0014.5 — No acknowledged-data loss (`CLAUDE.md` §3.4)**
+> - **Given** a non-empty buffer
+> - **When** the process crashes
+> - **Then** WAL replay re-mines every un-flushed acknowledged record
+> - **And** no acknowledged record is lost
+
+> **RFC0014.6 — Tenant isolation (`CLAUDE.md` §3.7)**
+> - **Given** buffered records for tenants X and Y
+> - **When** one partition flushes
+> - **Then** the produced object holds only that partition's (single tenant's)
+>   rows
+> - **And** no buffer or flush crosses tenants
 
 ## 6. Testing strategy
 
@@ -265,19 +281,9 @@ bounded accelerator and an OOM risk; we keep it.
 
 ## 7. Open questions
 
-Resolved at `specified` (2026-06-17):
-
-- [x] **Rotation force-flush scope** → flush **every** partition, including
-      sub-threshold ones (§3.2 trigger 3). The clean recovery invariant
-      (RFC0014.3) is worth more than avoiding a few small files; compaction
-      (RFC 0009) consolidates them. (This also settles the
-      "small files from low-volume partitions, acceptable?" question — yes.)
-- [x] **Backpressure mechanism** → at the hard ceiling, `emit` **blocks**
-      until a flush frees memory, so the buffer never exceeds the ceiling
-      (§3.4). The OTLP ack already happened (post-WAL), so blocking throttles
-      mining throughput, not durability.
-
-Carried into `red`/`green` (tuning + implementation detail):
+> The two criteria-shaping questions (rotation force-flush scope, backpressure
+> mechanism) were resolved at `specified` — see the status note and §3.2/§3.4.
+> What remains is tuning + implementation detail, decided across `red`/`green`:
 
 - [ ] Default values: size target, `max_buffer_age`, and the buffered-bytes
       ceiling (tune against representative corpora; RFC 0004 config knobs).

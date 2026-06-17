@@ -113,7 +113,12 @@ fn rfc0014_1_size_trigger() {
         records.len(),
         "every record published, none lost"
     );
-    got.sort_by_key(|r| r.params[0].value.parse::<u64>().unwrap_or_default());
+    got.sort_by_key(|r| {
+        r.params[0]
+            .value
+            .parse::<u64>()
+            .expect("param round-trips as a parseable number")
+    });
     assert_eq!(got, records, "rows recovered byte-for-byte");
 }
 
@@ -257,14 +262,21 @@ fn rfc0014_6_tenant_isolation() {
             "each object holds exactly one tenant: {tenants:?}"
         );
     }
-    let x = files
+    let rows: Vec<&MinedRecord> = files.iter().flatten().collect();
+    let tenants: std::collections::BTreeSet<&str> =
+        rows.iter().map(|r| r.tenant_id.as_str()).collect();
+    assert_eq!(
+        tenants,
+        ["tenant-x", "tenant-y"].into_iter().collect(),
+        "exactly the two emitted tenants, no extras",
+    );
+    assert_eq!(rows.len(), 20, "no extra rows beyond the 20 emitted");
+    let x = rows
         .iter()
-        .flatten()
         .filter(|r| r.tenant_id.as_str() == "tenant-x")
         .count();
-    let y = files
+    let y = rows
         .iter()
-        .flatten()
         .filter(|r| r.tenant_id.as_str() == "tenant-y")
         .count();
     assert_eq!((x, y), (10, 10), "both tenants' rows present, unmixed");

@@ -38,15 +38,19 @@ pub struct FlushConfig {
     /// Age trigger: a partition flushes once its oldest buffered record's age
     /// reaches this (inclusive), bounding low-volume staleness.
     pub max_buffer_age: Duration,
-    /// Hard ceiling on total buffered bytes across all partitions; `emit`
-    /// flushes inline to stay at or under it.
+    /// Ceiling on total buffered bytes across all partitions; `emit` flushes
+    /// inline to stay at or under it whenever the store accepts writes. On a
+    /// flush failure the buffer is retained (the WAL is the durability of
+    /// record) and the ceiling may be transiently exceeded — surfaced as a
+    /// flush error — rather than stalling ingest.
     pub ceiling_bytes: usize,
 }
 
 /// A failed flush of one partition. Non-fatal — the buffer is retained and the
-/// WAL remains the durability of record.
+/// WAL remains the durability of record. Internal: the public `emit` / tick /
+/// rotation surface is infallible (errors are swallowed + counted).
 #[derive(Debug)]
-pub enum FlushError {
+enum FlushError {
     /// Encoding the buffered records to Parquet failed.
     Encode(WriterError),
     /// Writing the encoded object to the store failed.
@@ -252,9 +256,14 @@ impl RecordSink for ParquetRecordSink {
         };
         let est = estimate_bytes(&record);
 
-        // Ceiling (RFC0014.4): make room before appending so the total never
-        // exceeds the ceiling. Stop if nothing more can be flushed (store down
-        // / single oversized buffer) rather than spinning.
+        // Ceiling (RFC0014.4): flush the largest partition inline to make room
+        // before appending, so buffered bytes stay at or under the ceiling
+        // whenever the store accepts writes. If a flush fails (store
+        // unavailable) or nothing more can be flushed (a single oversized
+        // buffer), the loop stops rather than spinning — the record is still
+        // retained below (the WAL is the durability of record), and the
+        // ceiling may be transiently exceeded (counted via `flush_errors`)
+        // instead of deadlocking the ingest path.
         while self.total_bytes + est > self.config.ceiling_bytes && self.flush_largest() {}
 
         let buf = self

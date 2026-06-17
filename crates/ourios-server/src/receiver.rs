@@ -128,7 +128,7 @@ fn flush_then_snapshot(
         return false;
     }
     if let Err(e) = recovery::write_snapshots(snapshots_root, miner, high_water) {
-        eprintln!("{cadence} snapshot write failed (next start full-replays): {e}");
+        eprintln!("{cadence} snapshot write failed (next start may replay more from the WAL): {e}");
     }
     true
 }

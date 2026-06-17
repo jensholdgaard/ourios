@@ -1,7 +1,7 @@
 ---
 rfc: 0014
 title: Ingest write path — record sink and flush policy
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-17
@@ -11,10 +11,11 @@ superseded-by: —
 
 # RFC 0014 — Ingest write path: record sink and flush policy
 
-> **Status note.** **`red`** (2026-06-17). The conspicuous gap in the
-> ingest stack: today the miner (RFC 0001) emits each mined `MinedRecord`
-> into a `RecordSink`, and **production wires `NoOpRecordSink` — the records
-> are dropped.** Every other layer is built and tested (OTLP → WAL → miner;
+> **Status note.** **`green`** (2026-06-17; `red`/`specified` same day). The
+> conspicuous gap in the ingest stack is closed: the miner (RFC 0001) emits
+> each mined `MinedRecord` into a `RecordSink`, and **production formerly wired
+> `NoOpRecordSink` — the records were dropped.** Every other layer was built
+> and tested (OTLP → WAL → miner;
 > Parquet writer/reader; compaction; the RFC 0013 object-storage seam with a
 > buffer-and-put `Writer`), but nothing carries a mined record to a Parquet
 > object on the store. This RFC specifies the missing piece: a buffering
@@ -36,10 +37,28 @@ superseded-by: —
 > early-flush victim, rotation-hook surface, size estimation) are tuning /
 > implementation detail, decided across the `red`/`green` PRs.
 >
-> **`red`** lands the six `#[ignore]`d acceptance stubs (RFC0014.1–.6) in
-> `crates/ourios-ingester/tests/rfc0014_ingest_write_path.rs` (CI stays green).
-> `green` builds the buffering `ParquetRecordSink` and wires it into the miner
-> in place of `NoOpRecordSink`.
+> **`red`** landed the six `#[ignore]`d acceptance stubs (RFC0014.1–.6) in
+> `crates/ourios-ingester/tests/rfc0014_ingest_write_path.rs`. **`green`**
+> built the buffering `ParquetRecordSink` (the hybrid size/age/rotation flush
+> policy + the hard ceiling), then wired it into the miner in place of
+> `NoOpRecordSink` via a `SharedParquetSink` the server constructs and the
+> pipeline drives (`flush_all` on rotation, `flush_aged` on a batch-window age
+> sweep, a drain on graceful shutdown). All six §5 scenarios pass: RFC0014.1–.4
+> and .6 drive the sink directly against a `LocalFileSystem`-backed `Store`;
+> RFC0014.5 (no acknowledged-data loss) is a real-process SIGKILL crash test
+> (`tests/rfc0014_5_crash_no_loss.rs`) that extends the RFC 0008 harness —
+> after a crash with a non-empty buffer, WAL replay re-mines every un-flushed
+> acknowledged record into a fresh sink, which flushes them to the store.
+>
+> No-loss rests on a single ordering rule the server applies at every
+> miner-snapshot cadence point (post-recovery, rotation, shutdown): **flush the
+> sink before writing the snapshot**, so the miner's snapshot horizon never
+> outruns the sink's flushed horizon and recovery's miner-gated replay covers
+> every un-flushed record. Semantics are at-least-once (a pre-crash flush may
+> re-flush on recovery; nothing is lost). The §7 follow-ons (S3 `Store`
+> selection via RFC 0004; compaction's `publish_cas` adoption) and the
+> exactly-once dedup of cross-crash duplicates remain open, outside this RFC's
+> acceptance.
 
 ## 1. Summary
 
@@ -289,18 +308,25 @@ bounded accelerator and an OOM risk; we keep it.
 
 > Tuning + implementation detail, decided across `red`/`green`:
 
-- [ ] Default values: size target, `max_buffer_age`, and the buffered-bytes
-      ceiling (tune against representative corpora; RFC 0004 config knobs).
-- [ ] Early-flush victim selection at the ceiling: largest partition vs oldest
-      vs a hybrid; and the soft pressure threshold below the hard ceiling.
-- [ ] Exact integration surface with RFC 0008's rotation hook and batch-window
-      tick — does the sink subscribe, or does the pipeline drive it?
-- [ ] Size estimation: cheap running estimate vs encoding to measure; accuracy
-      vs cost on the hot path.
-- [ ] **Follow-on (out of this RFC's acceptance):** server constructs/injects a
-      `Store` (local vs S3 via RFC 0004); compaction's manifest publish adopts
-      `Manifest::publish_cas` on S3 (RFC0013.3/.4); together these green
-      RFC0013.6.
+- [x] Default values: go-live values set in `ourios-server` (size target
+      256 MiB, `max_buffer_age` 300 s, ceiling 1 GiB, age sweep every 30 s).
+      Promoting them to RFC 0004 config knobs and tuning against representative
+      corpora remains open.
+- [x] Early-flush victim selection at the ceiling: **largest partition**
+      (`flush_largest`) — reclaims the most memory per flush. A soft pressure
+      threshold below the hard ceiling was not needed and is not implemented.
+- [x] Integration surface with RFC 0008's rotation hook and batch-window tick:
+      **the pipeline/server drives the sink** (it does not subscribe) —
+      `flush_all` from the rotation hook, `flush_aged` from a server-owned age
+      sweep — keeping the sink ignorant of the WAL.
+- [x] Size estimation: a **cheap running estimate** (`estimate_bytes` over the
+      large variable-length fields), not encoding to measure — bounds memory
+      and roughly right-sizes files without hot-path cost.
+- [ ] **Follow-on (out of this RFC's acceptance):** the server constructs a
+      local `Store` today; S3 selection (RFC 0004) is still open. Compaction's
+      manifest publish adopting `Manifest::publish_cas` on S3 (RFC0013.3/.4)
+      also remains. RFC0013.6 is already greened (server-wiring landed). The
+      exactly-once dedup of cross-crash at-least-once duplicates is open too.
 
 ## 8. References
 

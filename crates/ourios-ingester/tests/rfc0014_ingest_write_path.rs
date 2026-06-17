@@ -222,15 +222,12 @@ fn rfc0014_4_bounded_memory() {
     );
 }
 
-/// Scenario RFC0014.5 — No acknowledged-data loss: a crash with a non-empty
-/// buffer loses nothing — WAL replay re-mines every un-flushed acknowledged
-/// record (`CLAUDE.md` §3.4).
-/// See `docs/rfcs/0014-ingest-write-path.md` §5.
-#[test]
-#[ignore = "RFC0014.5 — green part 2: wire the sink into the ingest pipeline + extend the RFC 0008 crash harness"]
-fn rfc0014_5_no_acknowledged_data_loss() {
-    todo!("RFC0014.5: crash mid-buffer loses no acknowledged data (WAL replay)")
-}
+// Scenario RFC0014.5 (no acknowledged-data loss across a crash) is a
+// real-process crash test and lives in its own file,
+// `rfc0014_5_crash_no_loss.rs`: it SIGKILLs a fixture holding the acked batch
+// in an un-flushed buffer and proves WAL replay re-mines every record. It
+// extends the RFC 0008 crash harness rather than driving the sink in-process
+// like the scenarios above.
 
 /// Scenario RFC0014.6 — Tenant isolation: a flush produces an object holding
 /// only one tenant's rows; no buffer or flush crosses tenants (`CLAUDE.md` §3.7).

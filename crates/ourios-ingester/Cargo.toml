@@ -23,6 +23,18 @@ test = false
 bench = false
 doctest = false
 
+# Crash-with-a-non-empty-buffer fixture spawned (and SIGKILL'd) by
+# tests/rfc0014_5_crash_no_loss.rs — mirrors receiver_crash_fixture but wires
+# the miner to a ParquetRecordSink, so the acked-but-un-flushed records sit in
+# the volatile buffer at crash time and recovery must rebuild them from the WAL
+# (RFC0014.5 / CLAUDE.md §3.4).
+[[bin]]
+name = "receiver_sink_crash_fixture"
+path = "tests/fixtures/receiver_sink_crash_fixture.rs"
+test = false
+bench = false
+doctest = false
+
 [dependencies]
 # Shared types (TenantId, config) for the ingest path.
 ourios-core = { path = "../ourios-core" }

@@ -1,7 +1,7 @@
 ---
 rfc: 0014
 title: Ingest write path — record sink and flush policy
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-17
@@ -11,7 +11,7 @@ superseded-by: —
 
 # RFC 0014 — Ingest write path: record sink and flush policy
 
-> **Status note.** **`specified`** (2026-06-17). The conspicuous gap in the
+> **Status note.** **`red`** (2026-06-17). The conspicuous gap in the
 > ingest stack: today the miner (RFC 0001) emits each mined `MinedRecord`
 > into a `RecordSink`, and **production wires `NoOpRecordSink` — the records
 > are dropped.** Every other layer is built and tested (OTLP → WAL → miner;
@@ -35,6 +35,11 @@ superseded-by: —
 > than exceed it (§3.4, RFC0014.4). The remaining §7 questions (defaults,
 > early-flush victim, rotation-hook surface, size estimation) are tuning /
 > implementation detail, decided across the `red`/`green` PRs.
+>
+> **`red`** lands the six `#[ignore]`d acceptance stubs (RFC0014.1–.6) in
+> `crates/ourios-ingester/tests/rfc0014_ingest_write_path.rs` (CI stays green).
+> `green` builds the buffering `ParquetRecordSink` and wires it into the miner
+> in place of `NoOpRecordSink`.
 
 ## 1. Summary
 

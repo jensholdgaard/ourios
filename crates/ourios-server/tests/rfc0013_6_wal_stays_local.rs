@@ -112,11 +112,11 @@ fn has_extension(path: &Path, ext: &str) -> bool {
 #[tokio::test]
 async fn rfc0013_6_wal_stays_local() {
     // Arrange: disjoint store and WAL roots so "in the store" vs "on local
-    // disk" is unambiguous.
+    // disk" is unambiguous. Neither is pre-created — the server must create the
+    // store root itself (a not-yet-created `OURIOS_BUCKET_ROOT` is valid).
     let tmp = tempfile::TempDir::new().expect("temp");
     let bucket_root = tmp.path().join("store");
     let wal_root = tmp.path().join("wal");
-    std::fs::create_dir_all(&bucket_root).expect("create store root");
 
     let batch = export_request("checkout", &["user 1 logged in", "user 2 logged in"]);
 

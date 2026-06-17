@@ -69,7 +69,19 @@ fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -
         tick.tick().await; // the first tick is immediate; skip it
         loop {
             tokio::select! {
-                _ = tick.tick() => sink.flush_aged(),
+                _ = tick.tick() => {
+                    // `flush_aged` encodes Parquet and does blocking store I/O
+                    // (more so against S3), so run it on the blocking pool
+                    // rather than stalling a runtime worker. A `JoinError`
+                    // means the runtime is shutting down — stop sweeping.
+                    let sink = sink.clone();
+                    if tokio::task::spawn_blocking(move || sink.flush_aged())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 _ = shutdown.changed() => break,
             }
         }
@@ -176,7 +188,16 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // backend for now — S3 selection (RFC 0004) is the RFC 0014 §7 follow-on.
     // The store is rooted at `bucket_root`; the WAL stays under `wal.root` on
     // local disk, so only Parquet/audit/manifest objects reach the store
-    // (RFC0013.6 / `CLAUDE.md` §3.6).
+    // (RFC0013.6 / `CLAUDE.md` §3.6). The local `object_store` backend requires
+    // its root to exist, so create it first — `OURIOS_BUCKET_ROOT` may point at
+    // a not-yet-created path (e.g. a fresh dev/test dir), as it could before
+    // the receiver opened a store at startup.
+    std::fs::create_dir_all(&config.bucket_root).map_err(|e| {
+        format!(
+            "create data store root {}: {e}",
+            config.bucket_root.display()
+        )
+    })?;
     let store = Store::local(&config.bucket_root)
         .map_err(|e| format!("open data store at {}: {e}", config.bucket_root.display()))?;
     let sink = SharedParquetSink::new(ParquetRecordSink::new(store, flush_config()));

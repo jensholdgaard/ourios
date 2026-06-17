@@ -35,6 +35,7 @@
 pub mod compactor;
 pub mod metrics;
 pub mod receiver;
+pub mod record_sink;
 pub mod recovery;
 pub mod snapshot_store;
 

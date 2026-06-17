@@ -81,7 +81,7 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 # Parse the snapshot-recorded WAL high-water segment id back into the
 # `uuid::Uuid` of `ourios_wal::WalOffset` (RFC 0001 §6.9 / RFC 0008
 # §6.6). Same major as ourios-wal's, so the types unify.
-uuid = { version = "1", default-features = false, features = ["std"] }
+uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]
 tempfile = "3"

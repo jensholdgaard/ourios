@@ -191,6 +191,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 grpc_addr: params.grpc_addr,
                 http_addr: params.http_addr,
                 wal: wal_config(&params.wal_root),
+                // The data store the receiver's RFC 0014 write path lands
+                // Parquet in — the same root the compactor sweeps (cloned
+                // because `bucket_root` is moved into the compactor below).
+                bucket_root: config.bucket_root.clone(),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);

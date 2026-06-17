@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use ourios_core::record::{MinedRecord, RecordSink};
@@ -250,6 +251,84 @@ impl ParquetRecordSink {
     }
 }
 
+/// A cloneable handle to one shared [`ParquetRecordSink`].
+///
+/// The ingest path has two writers to the same sink: the miner `emit`s mined
+/// records through its `Box<dyn RecordSink>`, while the pipeline drives the
+/// flush triggers the sink itself can't observe — [`Self::flush_all`] on WAL
+/// segment rotation (RFC0014.3) and [`Self::flush_aged`] on the batch-window
+/// tick (RFC0014.2). `Clone` yields another handle to the *same* sink: hand
+/// one to `MinerCluster::with_record_sink` and keep another to drive the
+/// triggers (same pattern as `SharedRecordSink` / `SharedAuditSink`).
+///
+/// All access serializes on one mutex. `emit` is a short critical section, but
+/// the flush triggers are **not**: `flush_all` / `flush_aged` hold the lock
+/// across `encode_records_to_parquet` + `Store::put_blocking` (see
+/// [`ParquetRecordSink::flush_all`]), so a flush against a slow store blocks
+/// every concurrent `emit` and trigger for the duration of the I/O. Callers
+/// must treat them as blocking sections (the server runs them via
+/// `block_in_place` / `spawn_blocking`). With the local backend a flush is
+/// sub-millisecond, so this is benign; the encode+put is worth moving outside
+/// the lock (drain under the lock, do I/O unlocked, re-lock to settle counters)
+/// when the S3 backend lands (RFC 0014 §7 / RFC 0013), where PUTs are slow.
+///
+/// The only lock order is miner → sink (the pipeline holds the miner lock while
+/// it `emit`s and while the rotation hook flushes); the tick takes the sink
+/// alone, so there is no cycle.
+#[derive(Clone)]
+pub struct SharedParquetSink {
+    inner: Arc<Mutex<ParquetRecordSink>>,
+}
+
+impl SharedParquetSink {
+    /// Wrap `sink` in a shared, cloneable handle.
+    #[must_use]
+    pub fn new(sink: ParquetRecordSink) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(sink)),
+        }
+    }
+
+    /// Lock the sink, recovering a poisoned mutex. A poison means a past panic
+    /// while a flush was in flight; the buffer + counters remain structurally
+    /// consistent (the WAL is the durability of record), so recovering the
+    /// inner sink is safer than panicking the ingest path (`CLAUDE.md` §3.4,
+    /// and the same posture `receiver` takes on the miner mutex).
+    fn lock(&self) -> std::sync::MutexGuard<'_, ParquetRecordSink> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Force-flush every buffered partition — the WAL-segment-rotation trigger
+    /// (RFC0014.3) and the graceful-shutdown drain.
+    pub fn flush_all(&self) {
+        self.lock().flush_all();
+    }
+
+    /// Flush partitions past `max_buffer_age` — the batch-window tick
+    /// (RFC0014.2).
+    pub fn flush_aged(&self) {
+        self.lock().flush_aged();
+    }
+
+    /// Successful partition flushes so far (observability + tests).
+    #[must_use]
+    pub fn flushes(&self) -> u64 {
+        self.lock().flushes()
+    }
+
+    /// Records currently buffered (not yet flushed) across all partitions.
+    #[must_use]
+    pub fn buffered_records(&self) -> usize {
+        self.lock().buffered_records()
+    }
+}
+
+impl RecordSink for SharedParquetSink {
+    fn emit(&mut self, record: MinedRecord) {
+        self.lock().emit(record);
+    }
+}
+
 impl RecordSink for ParquetRecordSink {
     fn emit(&mut self, record: MinedRecord) {
         let Ok(key) = PartitionKey::derive(&record) else {
@@ -292,5 +371,71 @@ impl RecordSink for ParquetRecordSink {
         if over_target {
             self.flush_partition_swallow(&key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ourios_core::audit::ParamType;
+    use ourios_core::record::{BodyKind, Param};
+    use ourios_core::tenant::TenantId;
+
+    use super::*;
+
+    fn rec(tenant: &str) -> MinedRecord {
+        MinedRecord {
+            tenant_id: TenantId::new(tenant),
+            template_id: 1,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            time_unix_nano: 1_775_127_480_000_000_000,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: BodyKind::String,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: "1".to_string(),
+            }],
+            separators: vec![String::new(), String::new()],
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        }
+    }
+
+    fn never_flush() -> FlushConfig {
+        FlushConfig {
+            target_bytes: usize::MAX,
+            max_buffer_age: Duration::from_secs(86_400),
+            ceiling_bytes: usize::MAX,
+        }
+    }
+
+    #[test]
+    fn shared_handle_emits_and_flushes_one_buffer() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let handle = SharedParquetSink::new(ParquetRecordSink::new(store, never_flush()));
+
+        // The miner's clone emits; the pipeline's clone observes + drives the
+        // flush trigger — same underlying sink.
+        let mut producer = handle.clone();
+        producer.emit(rec("tenant-a"));
+        producer.emit(rec("tenant-a"));
+        assert_eq!(handle.buffered_records(), 2, "clones share one buffer");
+        assert_eq!(handle.flushes(), 0, "no trigger fired yet");
+
+        handle.flush_all(); // the rotation trigger, via the pipeline's handle
+        assert_eq!(handle.flushes(), 1);
+        assert_eq!(handle.buffered_records(), 0, "flush drained the buffer");
     }
 }

@@ -136,7 +136,7 @@ fn rfc0014_5_no_acknowledged_data_loss() {
     .expect("startup recovery");
     assert_eq!(
         report.records_fed_to_miner, 2,
-        "replay re-mined both frames"
+        "replay re-mined both records"
     );
     sink.flush_all();
 

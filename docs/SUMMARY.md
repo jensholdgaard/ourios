@@ -31,6 +31,7 @@
 - [RFC 0011 — A1 re-scope](./rfcs/0011-a1-rescope.md)
 - [RFC 0012 — meta: CLAUDE.md §2 pillar-#2 wording](./rfcs/0012-claude-md-pillar-2-wording.md)
 - [RFC 0013 — Object storage (S3-compatible)](./rfcs/0013-object-storage.md)
+- [RFC 0014 — Ingest write path (record sink & flush)](./rfcs/0014-ingest-write-path.md)
 
 # Talks
 

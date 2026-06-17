@@ -73,7 +73,7 @@ async fn http_post_logs(addr: SocketAddr, body: &[u8]) -> String {
     );
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(body).await.expect("write body");
-    stream.flush().await.ok();
+    stream.flush().await.expect("flush HTTP request");
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
@@ -87,11 +87,10 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        // Fail loudly: in a controlled temp tree a read error is a real test
+        // problem (setup/permissions/race), not something to skip past.
+        for entry in std::fs::read_dir(&dir).expect("read test directory") {
+            let path = entry.expect("read directory entry").path();
             if path.is_dir() {
                 stack.push(path);
             } else {

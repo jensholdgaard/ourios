@@ -159,8 +159,8 @@ pub struct ReceiverHandle {
     /// shutdown snapshot, to keep the miner's snapshot horizon at or below the
     /// sink's flushed horizon (the no-loss invariant; see [`serve`]).
     sink: SharedParquetSink,
-    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); aborted on
-    /// shutdown.
+    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
+    /// clean exit on shutdown via the `shutdown` watch signal.
     flush_tick: JoinHandle<()>,
 }
 
@@ -185,10 +185,14 @@ impl ReceiverHandle {
             .await
             .map_err(|e| format!("HTTP listener task: {e}"))?
             .map_err(|e| format!("HTTP listener: {e}"))?;
-        // Both listeners are stopped, so no more records reach the sink. Stop
-        // the age-sweep task, then drain the sink and snapshot below. An abort
-        // `JoinError` is the expected outcome and is ignored.
-        self.flush_tick.abort();
+        // Both listeners are stopped, so no more records reach the sink. The
+        // `shutdown.send` above already signalled the age-sweep task; await it
+        // (rather than abort it) so an in-flight `spawn_blocking` flush runs to
+        // completion and the task exits via its `shutdown.changed()` arm. An
+        // abort would cancel the async task but leave that blocking flush
+        // holding the sink mutex, which the drain below would then wait on
+        // anyway. A `JoinError` (the task panicked) is ignored — the drain
+        // below still runs.
         let _ = self.flush_tick.await;
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex

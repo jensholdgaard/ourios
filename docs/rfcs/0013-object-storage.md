@@ -1,7 +1,7 @@
 ---
 rfc: 0013
 title: Object-storage backend (S3-compatible) for the Parquet store
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-15
@@ -11,29 +11,33 @@ superseded-by: —
 
 # RFC 0013 — Object-storage backend (S3-compatible) for the Parquet store
 
-> **Status note.** **`red`** (2026-06-15). The first shipping-milestone
-> spine: today the writer/reader/compactor/audit-sink address a single local
-> filesystem `bucket_root: &Path`, but `CLAUDE.md` §3.6 declares object
-> storage the source of truth. This RFC abstracts the storage seam behind
-> the Apache `object_store` crate (already in our tree via DataFusion) so the
-> RFC 0005 data + audit Parquet and the RFC 0009 manifest live on an
+> **Status note.** **`green`** (2026-06-17; `red` 2026-06-15). The first
+> shipping-milestone spine: the writer/reader/compactor/audit-sink addressed a
+> single local filesystem `bucket_root: &Path`, but `CLAUDE.md` §3.6 declares
+> object storage the source of truth. This RFC abstracts the storage seam
+> behind the Apache `object_store` crate (already in our tree via DataFusion)
+> so the RFC 0005 data + audit Parquet and the RFC 0009 manifest live on an
 > S3-compatible bucket in production and on local disk in dev/test —
 > **without changing the on-disk layout or a single stored row**.
 >
-> `red` scaffold landed: the `store` module in `ourios-parquet`
-> (`object_store` now a direct dep) with the `Store` type + the
-> `LocalFileSystem`-backed `local()` constructor wired and the `s3()` /
-> consumer-migration paths stubbed; the eight §5 scenarios are encoded as
-> `#[ignore]`d stubs in `tests/rfc0013_object_store.rs` (so CI stays green
-> while the backend is built). The **crate-shape** open question is resolved
-> — a module, not a new crate (§3.7).
+> All eight §5 scenarios pass. The S3-backed scenarios (RFC0013.1/.3/.4/.7)
+> run in the `s3-integration` CI job against `LocalStack` (testcontainers);
+> the local-backend and tenant scenarios (.2/.5) and the reader
+> forward-compat scenario (.8, via the colocated RFC 0005 reader tests) run in
+> the default `cargo test`; and RFC0013.6 (WAL stays local) is greened end to
+> end through the served binary in `ourios-server`
+> (`tests/rfc0013_6_wal_stays_local.rs`), which wires the `Store` into the
+> RFC 0014 data write path and asserts only Parquet/manifest objects reach the
+> store while the WAL `*.wal` segments stay on local disk. The **crate-shape**
+> open question resolved to a module, not a new crate (§3.7).
 >
-> **`green` work:** implement the S3 backend (`object_store` `aws` feature) +
-> conditional-PUT atomic publish (RFC0013.3/.4); migrate the
-> writer/reader/compaction/audit consumers from `bucket_root: &Path` onto
-> `Store`; un-`#[ignore]` the §5 stubs one by one. The remaining §7 questions
-> (lease mechanism, conditional-PUT portability, multipart threshold,
-> credentials, read cache, migration) are decided across the `green` PRs.
+> Landed across `green`: the S3 backend (`object_store` `aws` feature) +
+> conditional-PUT atomic publish (`Manifest::publish_cas`, RFC0013.3/.4); the
+> writer/reader/compaction/audit consumers migrated from `bucket_root: &Path`
+> onto `Store`; and the §7 questions (conditional-PUT portability, credentials
+> via the `object_store` chain, endpoint override) decided. Deferred to their
+> own follow-ups (not RFC0013 acceptance): a single-writer lease, the
+> multipart-upload threshold, and a read cache.
 
 ## 1. Summary
 

@@ -4,8 +4,10 @@
 //! S3-backed scenarios (`.1`, `.3`, `.4`, `.7`) are `#[ignore]`d and run only
 //! in the `s3-integration` CI job (testcontainers + `LocalStack`, which needs a
 //! Docker-API runtime); the job invokes them by name via `--ignored`. `.6`
-//! (WAL-stays-local) stays a `todo!()` stub pending the server wiring the
-//! object-store backend; `.8` (reader forward-compat) is covered by the
+//! (WAL-stays-local) is greened end to end in `ourios-server`
+//! (`tests/rfc0013_6_wal_stays_local.rs`), which wires this `Store` into the
+//! server's RFC 0014 data write path — it can't live here, where there is no
+//! WAL or server to observe. `.8` (reader forward-compat) is covered by the
 //! colocated reader §3.9 tests (`rfc0005_2`/`_3`/`_4`), which read through the
 //! same `Store` seam.
 //!
@@ -349,15 +351,11 @@ fn rfc0013_5_tenant_isolation_across_prefix() {
     );
 }
 
-/// Scenario RFC0013.6 — with an object-storage backend, only data/audit/manifest
-/// objects reach the store; the WAL stays on local disk (`CLAUDE.md` §3.4).
-/// See `docs/rfcs/0013-object-storage.md` §5.
-#[test]
-#[ignore = "RFC0013.6 — red until the server wires the object-store backend"]
-fn rfc0013_6_wal_stays_local() {
-    let _ = S3Config::default();
-    todo!("RFC0013.6: WAL frames local; only Parquet/manifest in the store")
-}
+// Scenario RFC0013.6 (WAL stays local) is greened end to end in `ourios-server`
+// (`tests/rfc0013_6_wal_stays_local.rs`): it spawns the served binary with this
+// `Store` wired into the RFC 0014 write path and asserts only Parquet/manifest
+// objects reach the store while the WAL `*.wal` segments stay on local disk.
+// It can't live in this crate, which has no WAL or server to observe.
 
 /// Scenario RFC0013.7 — an S3-compatible store (`MinIO`) configured via an endpoint
 /// override (RFC 0004) reads and writes exactly as AWS S3.

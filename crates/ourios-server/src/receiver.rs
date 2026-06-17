@@ -21,8 +21,10 @@ use ourios_core::config::MinerConfig;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
+use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
+use ourios_parquet::Store;
 use ourios_wal::{Wal, WalConfig};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -34,11 +36,56 @@ use tonic::transport::server::TcpIncoming;
 /// (RFC 0001 §6.9 *Target store*).
 const SNAPSHOTS_DIR: &str = "snapshots";
 
-/// Where the receiver role binds, and the WAL it persists to.
+/// RFC 0014 §3 flush-policy defaults for the receiver's data sink. These are
+/// go-live starting points; tuning against representative corpora — and
+/// exposing them as RFC 0004 config knobs — is RFC 0014 §7.
+///
+/// `target_bytes` is the per-partition in-memory estimate that triggers a
+/// flush, aimed at the RFC 0005 §3.5 file-size band; `max_buffer_age` bounds
+/// how long a low-volume partition's data stays unqueryable; `ceiling_bytes`
+/// is the hard cap on total buffered bytes (RFC0014.4).
+const SINK_TARGET_BYTES: usize = 256 * 1024 * 1024;
+const SINK_MAX_BUFFER_AGE: Duration = Duration::from_secs(300);
+const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
+/// How often the age sweep runs (≤ `SINK_MAX_BUFFER_AGE`): an aged partition
+/// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.
+const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
+
+fn flush_config() -> FlushConfig {
+    FlushConfig {
+        target_bytes: SINK_TARGET_BYTES,
+        max_buffer_age: SINK_MAX_BUFFER_AGE,
+        ceiling_bytes: SINK_CEILING_BYTES,
+    }
+}
+
+/// The age-sweep task (RFC0014.2): every [`SINK_FLUSH_TICK`], flush partitions
+/// whose oldest record has reached `max_buffer_age`, so a low-volume partition
+/// becomes queryable without waiting for a WAL rotation. Stops when `shutdown`
+/// fires; the shutdown path then drains the sink fully (`flush_all`).
+fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SINK_FLUSH_TICK);
+        tick.tick().await; // the first tick is immediate; skip it
+        loop {
+            tokio::select! {
+                _ = tick.tick() => sink.flush_aged(),
+                _ = shutdown.changed() => break,
+            }
+        }
+    })
+}
+
+/// Where the receiver role binds, the WAL it persists to, and the object
+/// store its mined data lands in.
 pub struct ReceiverConfig {
     pub grpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub wal: WalConfig,
+    /// Root of the data store (RFC 0013). The data write path (RFC 0014)
+    /// flushes Parquet here; the WAL stays under `wal.root` on local disk
+    /// (RFC0013.6 / `CLAUDE.md` §3.4, §3.6).
+    pub bucket_root: PathBuf,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -51,6 +98,13 @@ pub struct ReceiverHandle {
     http: JoinHandle<std::io::Result<()>>,
     pipeline: SharedPipeline,
     snapshots_root: PathBuf,
+    /// The data sink (RFC 0014). Drained on graceful shutdown, before the
+    /// shutdown snapshot, to keep the miner's snapshot horizon at or below the
+    /// sink's flushed horizon (the no-loss invariant; see [`serve`]).
+    sink: SharedParquetSink,
+    /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); aborted on
+    /// shutdown.
+    flush_tick: JoinHandle<()>,
 }
 
 impl ReceiverHandle {
@@ -74,6 +128,16 @@ impl ReceiverHandle {
             .await
             .map_err(|e| format!("HTTP listener task: {e}"))?
             .map_err(|e| format!("HTTP listener: {e}"))?;
+        // Both listeners are stopped, so no more records reach the sink. Stop
+        // the age-sweep task and drain every buffered partition to the store
+        // before the shutdown snapshot below — the same flush-before-snapshot
+        // ordering the post-recovery and rotation cadence points use, so the
+        // miner's snapshot horizon never outruns the sink's flushed horizon
+        // (the no-loss invariant; see `serve`). An abort `JoinError` is the
+        // expected outcome and is ignored.
+        self.flush_tick.abort();
+        let _ = self.flush_tick.await;
+        self.sink.flush_all();
         // Both listener tasks are gone, so the pipeline's inner locks are
         // uncontended. `with_miner` recovers a poisoned miner mutex
         // (`PoisonError::into_inner`) — at shutdown the listeners are
@@ -106,7 +170,23 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let batch_window = Duration::from_millis(config.wal.batch_window_ms);
     let segment_size_bytes = config.wal.segment_size_bytes;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
-    let mut miner = MinerCluster::new(MinerConfig::default());
+
+    // The production data write path (RFC 0014): mined records buffer per
+    // partition and flush to Parquet objects on the RFC 0013 store. Local
+    // backend for now — S3 selection (RFC 0004) is the RFC 0014 §7 follow-on.
+    // The store is rooted at `bucket_root`; the WAL stays under `wal.root` on
+    // local disk, so only Parquet/audit/manifest objects reach the store
+    // (RFC0013.6 / `CLAUDE.md` §3.6).
+    let store = Store::local(&config.bucket_root)
+        .map_err(|e| format!("open data store at {}: {e}", config.bucket_root.display()))?;
+    let sink = SharedParquetSink::new(ParquetRecordSink::new(store, flush_config()));
+
+    // Wire the sink into the miner *before* recovery: replay re-mines the
+    // un-flushed tail through `miner.ingest`, which re-emits it into the sink
+    // (RFC0014.5 — recovery rebuilds the in-memory buffer the crash dropped;
+    // the records are durable in the WAL, never in the buffer).
+    let mut miner =
+        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
     let rule = TenantRule::service_name();
 
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &rule)
@@ -121,6 +201,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             tenant.tenant_id.as_str(),
         );
     }
+    // Drain the replayed tail before the post-recovery snapshot, so the
+    // recorded horizon never outruns the sink's flushed horizon (the no-loss
+    // invariant — see the rotation hook). Not serving yet, so this blocking
+    // flush contends with nothing.
+    sink.flush_all();
     // Post-recovery cadence point (RFC 0001 §6.9): persist what replay
     // rebuilt so a crash before the next cadence point doesn't redo it.
     // Best-effort — the snapshot is a rebuildable cache.
@@ -139,6 +224,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // rotation-point high-water mark. Best-effort, like the other
     // cadence points — a snapshot is a rebuildable cache.
     let hook_root = snapshots_root.clone();
+    let hook_sink = sink.clone();
     // The group-commit coordinator owns the single-writer WAL and folds
     // concurrent appends into one fsync per `wal_batch_window_ms`
     // (RFC0008.8); the pipeline owns the miner + the rotation hook.
@@ -147,6 +233,14 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         IngestPipeline::new(coordinator, miner, rule)
             .with_last_durable(report.max_delivered)
             .with_rotation_hook(Box::new(move |miner, mark| {
+                // Force-flush every partition before snapshotting the miner at
+                // the rotation mark. The hook fires before the new segment's
+                // first record reaches the miner, so the buffer holds exactly
+                // the sealed segment's records; flushing them first keeps the
+                // snapshot horizon at or below the sink's flushed horizon, so
+                // recovery's miner-gated replay re-emits every un-flushed
+                // acknowledged record (RFC0014.3/.5, `CLAUDE.md` §3.4).
+                hook_sink.flush_all();
                 if let Err(e) = recovery::write_snapshots(&hook_root, miner, Some(mark)) {
                     eprintln!(
                         "rotation snapshot write failed (recovery falls back to the WAL): {e}"
@@ -171,6 +265,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         .map_err(|e| format!("HTTP local_addr: {e}"))?;
 
     let (shutdown, shutdown_rx) = watch::channel(());
+
+    let flush_tick = spawn_age_sweep(sink.clone(), shutdown_rx.clone());
 
     let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()));
     let grpc = tokio::spawn({
@@ -205,5 +301,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         http,
         pipeline,
         snapshots_root,
+        sink,
+        flush_tick,
     })
 }

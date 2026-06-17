@@ -82,7 +82,8 @@ fn sink(dir: &Path, config: FlushConfig) -> ParquetRecordSink {
     ParquetRecordSink::new(Store::local(dir).expect("local store"), config)
 }
 
-const HUGE: usize = 1 << 40;
+/// A "never trigger" sentinel for the size/ceiling knobs (pointer-width safe).
+const HUGE: usize = usize::MAX;
 const FOREVER: Duration = Duration::from_secs(86_400);
 
 /// Scenario RFC0014.1 — Size trigger: the emit that crosses the size target

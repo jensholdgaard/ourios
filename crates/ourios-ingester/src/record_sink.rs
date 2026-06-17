@@ -7,9 +7,11 @@
 //! its oldest record reaches [`FlushConfig::max_buffer_age`] (age, evaluated by
 //! [`ParquetRecordSink::flush_aged`] on the batch-window tick), or when the WAL
 //! segment rotates ([`ParquetRecordSink::flush_all`], force-flushing *every*
-//! partition). Total buffered bytes are kept under
-//! [`FlushConfig::ceiling_bytes`] by flushing the largest partition inline
-//! before `emit` would exceed it (RFC 0014 §3.4 — a hard ceiling).
+//! partition). Buffered bytes are kept under [`FlushConfig::ceiling_bytes`]
+//! by flushing the largest partition inline before `emit` would exceed it
+//! (RFC 0014 §3.4) — a hard ceiling whenever the store accepts writes; a flush
+//! failure retains the buffer and may transiently exceed it rather than
+//! stalling ingest (see [`FlushConfig::ceiling_bytes`]).
 //!
 //! Records reach the sink only after the WAL is durable (`CLAUDE.md` §3.4), so
 //! a buffer is a bounded accelerator, never the durability of record: a crash
@@ -39,10 +41,11 @@ pub struct FlushConfig {
     /// reaches this (inclusive), bounding low-volume staleness.
     pub max_buffer_age: Duration,
     /// Ceiling on total buffered bytes across all partitions; `emit` flushes
-    /// inline to stay at or under it whenever the store accepts writes. On a
-    /// flush failure the buffer is retained (the WAL is the durability of
-    /// record) and the ceiling may be transiently exceeded — surfaced as a
-    /// flush error — rather than stalling ingest.
+    /// inline to stay at or under it whenever the store accepts writes. If a
+    /// flush fails, or a single record alone exceeds the ceiling (nothing left
+    /// to flush), the buffer is retained (the WAL is the durability of record)
+    /// and the ceiling may be transiently exceeded — rather than stalling
+    /// ingest. (A failed flush attempt is also counted as a flush error.)
     pub ceiling_bytes: usize,
 }
 
@@ -94,9 +97,10 @@ pub struct ParquetRecordSink {
     derive_errors: u64,
 }
 
-/// Cheap per-record footprint estimate driving the size trigger + ceiling. Not
-/// the exact encoded (compressed) size — a conservative over-estimate is fine
-/// for triggering; precise estimation is RFC 0014 §7.
+/// Cheap per-record footprint estimate driving the size trigger + ceiling — a
+/// rough heuristic over the larger variable-length fields, not the exact
+/// encoded (compressed) size and not every field. Good enough to bound memory
+/// and roughly right-size files; precise estimation is RFC 0014 §7.
 fn estimate_bytes(r: &MinedRecord) -> usize {
     let opt = |o: &Option<String>| o.as_ref().map_or(0, String::len);
     // Fixed per-record overhead plus the variable-length payloads.

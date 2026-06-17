@@ -149,8 +149,9 @@ ceiling:
   **blocks** until an in-flight flush frees enough memory — so the buffer can
   **never exceed** the ceiling (a hard, not soft, bound). Because the OTLP ack
   already happened (post-WAL), this blocks only *mining/flushing* throughput,
-  not durability — no acknowledged data is at risk; the cost is added ingest
-  latency under sustained overload.
+  not durability — no acknowledged data is at risk. The client-facing ack is
+  already sent, so the cost under sustained overload is increased WAL→Parquet
+  publish lag (internal backlog), not client-facing ingest latency.
 
 This makes the in-memory buffer a bounded, best-effort accelerator on top of
 the WAL, never an unbounded liability (cf. §3.2's hazard list).
@@ -281,14 +282,12 @@ bounded accelerator and an OOM risk; we keep it.
 
 ## 7. Open questions
 
-> The two criteria-shaping questions (rotation force-flush scope, backpressure
-> mechanism) were resolved at `specified` — see the status note and §3.2/§3.4.
-> What remains is tuning + implementation detail, decided across `red`/`green`:
+> Tuning + implementation detail, decided across `red`/`green`:
 
 - [ ] Default values: size target, `max_buffer_age`, and the buffered-bytes
       ceiling (tune against representative corpora; RFC 0004 config knobs).
 - [ ] Early-flush victim selection at the ceiling: largest partition vs oldest
-      vs a hybrid; and the soft-pressure threshold below the hard ceiling.
+      vs a hybrid; and the soft pressure threshold below the hard ceiling.
 - [ ] Exact integration surface with RFC 0008's rotation hook and batch-window
       tick — does the sink subscribe, or does the pipeline drive it?
 - [ ] Size estimation: cheap running estimate vs encoding to measure; accuracy

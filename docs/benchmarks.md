@@ -853,9 +853,9 @@ the throughput here is the RFC0009.7 D2 measure, not that soak.
 ### 9.8 Results — 2026-06-18 (authoritative, `baseline-8vcpu-32gib`) — ingest write-path + recovery (criterion) and real-corpus A1 / C1 / C2 + B1 / B2
 
 **Hardware.** `baseline-8vcpu-32gib` — the §1 baseline (8 dedicated
-vCPU AMD EPYC-Milan, 32 GiB, local SSD), provisioned for this run and
-torn down immediately after. Two dedicated-vCPU cloud hosts (one per
-invocation set), both git `d3f2cae`.
+vCPU, 32 GiB RAM, local SSD), provisioned for this run and torn down
+immediately after. Two such hosts (one per invocation set), both at
+git `d3f2cae`.
 **Run.** (a) the self-contained `ourios-bench` criterion benches
 `ingest_write_path` (RFC 0014) and `recovery` (RFC0008.3) — synthetic,
 no corpus — at full criterion settings; (b) the `ourios-bench` binary

@@ -1,0 +1,70 @@
+name: Ingest bench
+
+# Manually-triggered wall-clock criterion micro-benches for the ingest
+# write path (RFC 0014 — `ingest_write_path`: OTLP→WAL append+fsync,
+# WAL→Parquet sink emit+flush) and WAL recovery (RFC0008.3 — `recovery`:
+# replay non-amplification). The other `ourios-bench` criterion targets
+# already have runners — b1/b2 in `query-bench.yml`, compaction in
+# `compaction-bench.yml` — so this covers the remaining two.
+#
+# Numbers are **indicative diagnostics**: GitHub's shared runners have
+# variable CPU, so they aren't comparable across runs and aren't the
+# `docs/benchmarks.md` §1 baseline (`baseline-8vcpu-32gib`) — the
+# authoritative baseline-hardware run is a separate, opt-in job. Not gating;
+# runs only on demand.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ingest-bench:
+    name: ingest + recovery benches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Free runner disk space
+        run: .github/scripts/free-disk-space.sh
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run ingest_write_path + recovery benches
+        run: |
+          set -euo pipefail
+          # rust-cache restores target/, which can carry a prior run's
+          # criterion results — clear so the artifact holds only this run.
+          # (`pipefail` so a bench failure isn't masked by the `tee` pipe.)
+          rm -rf target/criterion
+          cargo bench -p ourios-bench --bench ingest_write_path --bench recovery -- \
+            --warm-up-time 1 --measurement-time 3 2>&1 | tee ingest-bench.log
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## ourios-bench — ingest write-path + recovery (criterion)'
+            echo
+            echo '```'
+            grep -E 'time:|thrpt:|^[A-Za-z0-9_]+/' ingest-bench.log 2>/dev/null \
+              || tail -n 120 ingest-bench.log 2>/dev/null \
+              || echo '(no output — the run failed before producing one)'
+            echo '```'
+            echo
+            echo '> **Indicative only** — shared-runner CPU is variable; not comparable'
+            echo '> across runs and not the `docs/benchmarks.md` §1 baseline.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload criterion report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ingest-bench
+          path: |
+            target/criterion
+            ingest-bench.log
+          if-no-files-found: warn

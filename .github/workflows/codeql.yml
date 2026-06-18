@@ -37,7 +37,10 @@ jobs:
     # PRs, and the weekly schedule still give full coverage.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
-      # Upload the SARIF result to the code-scanning tab.
+      # Job-level permissions replace the workflow-level block, so list
+      # every scope the job needs: read the repo for checkout/extraction
+      contents: read
+      # and write the SARIF result to the code-scanning tab.
       security-events: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

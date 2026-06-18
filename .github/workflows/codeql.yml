@@ -1,0 +1,57 @@
+name: CodeQL
+
+# Static analysis (SAST) via CodeQL on the Rust sources. Results feed
+# the code-scanning tab and satisfy Scorecard's SAST check. Runs on PRs
+# into main, on pushes to main, and weekly so new query packs catch
+# previously-clean code.
+#
+# `build-mode: none` — CodeQL's Rust extractor reads the sources without
+# a cargo build, so this stays fast and needs no toolchain setup. Switch
+# to `manual`/`autobuild` only if a query needs build-derived facts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '27 3 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel on main — each push's SARIF upload must complete so no
+  # commit's analysis is dropped (matches ci.yml). Branches/PRs cancel.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-latest
+    # Fork PRs get a read-only GITHUB_TOKEN, so the SARIF upload below
+    # can't be granted security-events: write and would fail. Skip the
+    # job for cross-repo PRs; pushes to main (after merge), same-repo
+    # PRs, and the weekly schedule still give full coverage.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      # Job-level permissions replace the workflow-level block, so list
+      # every scope the job needs: read the repo for checkout/extraction
+      contents: read
+      # and write the SARIF result to the code-scanning tab.
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
+        with:
+          languages: rust
+          build-mode: none
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
+        with:
+          category: "/language:rust"

@@ -11,14 +11,17 @@
 //!   `LocalFileSystem` store (encode + put). Mirrors `ourios.sink.flush.*`.
 //!   Throughput is reported in records.
 //!
-//! Both rebuild their fixture in the (untimed) `iter_batched` setup so only
-//! the durable append / the emit + flush is measured.
+//! Both use `iter_custom` and time only the durable append / the emit + flush
+//! with an explicit `Instant` — fixture build **and** teardown (`TempDir`
+//! delete, file close, Parquet unlink) fall outside the measured span, and
+//! only one fixture is alive at a time (no accumulation of open WALs / temp
+//! dirs across a sample batch).
 
 use std::hint::black_box;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
@@ -81,27 +84,28 @@ fn wal_append(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(FRAME_LEN as u64));
     let payload = vec![0xA5u8; FRAME_LEN];
     group.bench_function("batch", |b| {
-        b.iter_batched(
-            || {
-                // Keep the `TempDir` alive alongside the `Wal` — dropping it
-                // would delete the segment directory mid-measurement. Warm up
-                // with one append + sync: the *first* sync on a fresh WAL also
-                // fsyncs the segment directory (entry durability), which
-                // steady-state syncs don't, so doing it here (untimed) isolates
-                // the steady-state per-batch append + fsync cost.
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                // Untimed setup. Warm up with one append + sync: the *first*
+                // sync on a fresh WAL also fsyncs the segment directory (entry
+                // durability), which steady-state syncs don't — so it stays out
+                // of the measured span, isolating the steady-state cost.
                 let dir = tempfile::TempDir::new().expect("temp");
                 let mut wal = Wal::open(wal_config(dir.path())).expect("open");
                 wal.append(FrameKind::OtlpBatch, &payload)
                     .expect("warm append");
                 wal.sync().expect("warm sync");
-                (dir, wal)
-            },
-            |(_dir, mut wal)| {
+
+                // Timed: one steady-state append + fsync (the durable-ack unit).
+                let start = Instant::now();
                 wal.append(FrameKind::OtlpBatch, &payload).expect("append");
                 black_box(wal.sync().expect("sync"));
-            },
-            BatchSize::SmallInput,
-        );
+                total += start.elapsed();
+                // `wal` + `dir` drop here, after the timer — teardown untimed.
+            }
+            total
+        });
     });
     group.finish();
 }
@@ -113,12 +117,16 @@ fn sink_write(c: &mut Criterion) {
         let records: Vec<MinedRecord> = (0..n as u64).map(rec).collect();
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &records, |b, records| {
-            b.iter_batched(
-                || {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    // Untimed setup. Size never triggers mid-stream (target =
+                    // MAX), so the whole batch buffers and one explicit
+                    // `flush_all` writes it. The batch is cloned here because
+                    // production `emit` takes owned records — keeping the clone
+                    // out of the measured span.
                     let dir = tempfile::TempDir::new().expect("temp");
-                    // Size never triggers mid-stream: emit the whole batch,
-                    // then time one explicit flush of the full partition.
-                    let sink = ParquetRecordSink::new(
+                    let mut sink = ParquetRecordSink::new(
                         Store::local(dir.path()).expect("store"),
                         FlushConfig {
                             target_bytes: usize::MAX,
@@ -126,20 +134,21 @@ fn sink_write(c: &mut Criterion) {
                             ceiling_bytes: usize::MAX,
                         },
                     );
-                    // Clone the batch in the untimed setup — production `emit`
-                    // takes owned records, so the timed routine emits by value
-                    // (no clone cost polluting the WAL→Parquet signal).
-                    (dir, sink, records.clone())
-                },
-                |(_dir, mut sink, batch)| {
+                    let batch = records.clone();
+
+                    // Timed: emit the owned batch + flush to one Parquet object.
+                    let start = Instant::now();
                     for r in batch {
                         sink.emit(r);
                     }
                     sink.flush_all();
                     black_box(sink.flushes());
-                },
-                BatchSize::SmallInput,
-            );
+                    total += start.elapsed();
+                    // `sink` + `dir` drop here, after the timer — teardown
+                    // (Parquet unlink, dir delete) untimed.
+                }
+                total
+            });
         });
     }
     group.finish();

@@ -862,7 +862,7 @@ no corpus — at full criterion settings; (b) the `ourios-bench` binary
 `--gates a1,c1,c2` against two real corpora, plus the `b1`/`b2`
 criterion benches (`--warm-up-time 1 --measurement-time 3`, matching
 `query-bench.yml`) over those corpora. Corpora: **LogHub HDFS_v1**
-(Zenodo record 8196385, md5-pinned — 11,175,629 lines / 1.58 GiB of
+(Zenodo record 8196385, md5-pinned — 11,175,629 lines / 1.47 GiB of
 **real Hadoop production logs**, above §8's ≥ 1 GiB canonical minimum)
 and the frozen **OTel-Demo v1** (`corpus/otel-demo-v1`, 38,782 lines /
 31.5 MiB). HDFS is fetched in-job and never redistributed (§1).
@@ -886,7 +886,7 @@ indicative `ci-runner` figures.
 
 | corpus | A1 (ourios vs zstd-19 → delta) | C1 reconstruction | C2 convergence |
 |---|---|---|---|
-| **HDFS_v1** (11.18 M lines, 1.58 GiB) | 6.21× vs 16.0× → 0.386 — **FAIL** (diagnostic) | **1.000000** (11,175,578 / 11,175,578) — **PASS** | ratio **0.825**, 40 templates — **PASS** |
+| **HDFS_v1** (11.18 M lines, 1.47 GiB) | 6.21× vs 16.0× → 0.386 — **FAIL** (diagnostic) | **1.000000** (11,175,578 / 11,175,578) — **PASS** | ratio **0.825**, 40 templates — **PASS** |
 | OTel-Demo v1 (38.8 K lines) | 14.6× vs 33.3× → 0.438 — **FAIL** (diagnostic) | 1.000000 (lossy ratio 0.0097) — **PASS** | **ABSTAIN** (< 1 M lines), 282 templates |
 
 C1 reconstructs **every** non-lossy row bit-for-bit across 11 M real

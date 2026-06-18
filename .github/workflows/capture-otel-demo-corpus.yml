@@ -55,9 +55,7 @@ on:
         required: false
 
 permissions:
-  # `write` so the optional publish step can create/update the
-  # corpus release. The workflow is manual-dispatch only.
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -67,6 +65,10 @@ jobs:
   capture:
     name: capture demo corpus
     runs-on: ubuntu-latest
+    permissions:
+      # `write` so the optional `release_tag` publish step can
+      # create/update the corpus release. Manual-dispatch only.
+      contents: write
     # Just under GitHub's hard 6h job cap. The previous fixed 45m
     # ceiling killed every long capture dispatched from main (the
     # v4 4h run only survived via a never-merged branch tweak), and

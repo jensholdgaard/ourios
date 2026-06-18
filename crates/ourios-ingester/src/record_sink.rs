@@ -31,6 +31,8 @@ use ourios_parquet::{
 };
 use uuid::Uuid;
 
+use crate::metrics::SinkMetrics;
+
 /// Flush-policy knobs (RFC 0014 §3; RFC 0004 config at the call site).
 #[derive(Debug, Clone)]
 pub struct FlushConfig {
@@ -96,6 +98,9 @@ pub struct ParquetRecordSink {
     records_flushed: u64,
     flush_errors: u64,
     derive_errors: u64,
+    /// RFC 0014 §6.3 instruments (flush throughput/latency by trigger,
+    /// errors, buffer occupancy). No-op when no meter provider is installed.
+    metrics: SinkMetrics,
 }
 
 /// Cheap per-record footprint estimate driving the size trigger + ceiling — a
@@ -141,6 +146,7 @@ impl ParquetRecordSink {
             records_flushed: 0,
             flush_errors: 0,
             derive_errors: 0,
+            metrics: SinkMetrics::new(),
         }
     }
 
@@ -179,7 +185,7 @@ impl ParquetRecordSink {
     pub fn flush_all(&mut self) {
         let keys: Vec<PartitionKey> = self.buffers.keys().cloned().collect();
         for key in keys {
-            self.flush_partition_swallow(&key);
+            self.flush_partition_swallow(&key, "rotation");
         }
     }
 
@@ -194,14 +200,19 @@ impl ParquetRecordSink {
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys {
-            self.flush_partition_swallow(&key);
+            self.flush_partition_swallow(&key, "age");
         }
     }
 
     /// Encode + put one partition's buffer. On success the buffer is removed
     /// and the counters advance; the caller (via [`Self::flush_partition_swallow`])
     /// retains it on error.
-    fn flush_partition(&mut self, key: &PartitionKey) -> Result<(), FlushError> {
+    fn flush_partition(
+        &mut self,
+        key: &PartitionKey,
+        trigger: &'static str,
+    ) -> Result<(), FlushError> {
+        let flush_start = Instant::now();
         let bytes = match self.buffers.get(key) {
             Some(buf) if !buf.records.is_empty() => {
                 encode_records_to_parquet(&buf.records, DEFAULT_ZSTD_LEVEL)
@@ -212,20 +223,27 @@ impl ParquetRecordSink {
         self.store
             .put_blocking(&object_key(key), bytes)
             .map_err(FlushError::Store)?;
+        let elapsed = flush_start.elapsed();
         if let Some(buf) = self.buffers.remove(key) {
             self.total_bytes = self.total_bytes.saturating_sub(buf.est_bytes);
             self.flushes += 1;
             self.records_flushed += buf.records.len() as u64;
+            self.metrics
+                .record_flush(trigger, buf.records.len(), elapsed);
+            self.metrics
+                .add_buffered(-i64::try_from(buf.est_bytes).unwrap_or(i64::MAX));
         }
         Ok(())
     }
 
     /// [`Self::flush_partition`] for the infallible `emit` / tick / rotation
     /// paths: a failed flush retains the buffer (the WAL is the durability of
-    /// record) and is counted for observability.
-    fn flush_partition_swallow(&mut self, key: &PartitionKey) {
-        if self.flush_partition(key).is_err() {
+    /// record) and is counted for observability. `trigger` records *why* the
+    /// flush happened (RFC 0014 §3.2).
+    fn flush_partition_swallow(&mut self, key: &PartitionKey, trigger: &'static str) {
+        if self.flush_partition(key, trigger).is_err() {
             self.flush_errors += 1;
+            self.metrics.record_flush_error();
         }
     }
 
@@ -242,10 +260,11 @@ impl ParquetRecordSink {
         else {
             return false;
         };
-        if self.flush_partition(&key).is_ok() {
+        if self.flush_partition(&key, "ceiling").is_ok() {
             true
         } else {
             self.flush_errors += 1;
+            self.metrics.record_flush_error();
             false
         }
     }
@@ -335,6 +354,7 @@ impl RecordSink for ParquetRecordSink {
             // Un-partitionable (timestamp overflow, §3.4 fallback exhausted):
             // can't route it. The WAL still holds it; count and drop here.
             self.derive_errors += 1;
+            self.metrics.record_derive_error();
             return;
         };
         let est = estimate_bytes(&record);
@@ -366,10 +386,12 @@ impl RecordSink for ParquetRecordSink {
         buf.est_bytes = buf.est_bytes.saturating_add(est);
         let over_target = buf.est_bytes >= self.config.target_bytes;
         self.total_bytes = self.total_bytes.saturating_add(est);
+        self.metrics
+            .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
 
         // Size trigger (RFC0014.1): the emit that crosses the target flushes.
         if over_target {
-            self.flush_partition_swallow(&key);
+            self.flush_partition_swallow(&key, "size");
         }
     }
 }

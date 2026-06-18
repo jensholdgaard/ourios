@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opentelemetry::metrics::{Counter, Histogram, ObservableUpDownCounter};
+use opentelemetry::metrics::{Counter, Histogram, ObservableUpDownCounter, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 use ourios_semconv as semconv;
 
@@ -241,6 +241,148 @@ impl CompactionMetrics {
 }
 
 impl Default for CompactionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Ingest-path instruments (RFC 0014 §6.3 / `CLAUDE.md` §3.4): throughput
+/// plus the WAL-before-ack durability latency. Built once per pipeline on
+/// the global `ourios.ingest` meter; recording is a no-op when no provider
+/// is installed (RFC 0001 §6.8 API/SDK split). System-aggregate (no
+/// tenant/service attributes) so a performance run reads throughput directly.
+#[derive(Debug)]
+pub struct IngestMetrics {
+    records: Counter<u64>,
+    batches: Counter<u64>,
+    append_duration: Histogram<f64>,
+}
+
+impl IngestMetrics {
+    /// Build the ingest instruments with their registry units.
+    #[must_use]
+    pub fn new() -> Self {
+        let meter = global::meter("ourios.ingest");
+        let records = meter
+            .u64_counter(semconv::OURIOS_INGEST_RECORDS)
+            .with_unit("{record}")
+            .build();
+        let batches = meter
+            .u64_counter(semconv::OURIOS_INGEST_BATCHES)
+            .with_unit("{batch}")
+            .build();
+        let append_duration = meter
+            .f64_histogram(semconv::OURIOS_WAL_APPEND_DURATION)
+            .with_unit("s")
+            .build();
+        // Seed the attribute-free counters so they are visible before the
+        // first batch (collect-on-read); the histogram surfaces on a real
+        // sample.
+        records.add(0, &[]);
+        batches.add(0, &[]);
+        Self {
+            records,
+            batches,
+            append_duration,
+        }
+    }
+
+    /// Record one durably-acknowledged batch: `record_count` log records
+    /// made durable in `elapsed` (the append + fsync / WAL-before-ack
+    /// latency). Call only on a successful, acked commit.
+    pub fn record_batch(&self, record_count: usize, elapsed: Duration) {
+        self.batches.add(1, &[]);
+        self.records.add(to_u64(record_count), &[]);
+        self.append_duration.record(elapsed.as_secs_f64(), &[]);
+    }
+}
+
+impl Default for IngestMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Record-sink instruments (RFC 0014 §6.3): flush throughput + latency by
+/// trigger, flush/derive errors, and current buffer occupancy. Built once
+/// per sink on the global `ourios.sink` meter.
+#[derive(Debug)]
+pub struct SinkMetrics {
+    flush_duration: Histogram<f64>,
+    flush_records: Counter<u64>,
+    flush_errors: Counter<u64>,
+    derive_errors: Counter<u64>,
+    buffer_usage: UpDownCounter<i64>,
+}
+
+impl SinkMetrics {
+    /// Build the sink instruments with their registry units.
+    #[must_use]
+    pub fn new() -> Self {
+        let meter = global::meter("ourios.sink");
+        let flush_duration = meter
+            .f64_histogram(semconv::OURIOS_SINK_FLUSH_DURATION)
+            .with_unit("s")
+            .build();
+        let flush_records = meter
+            .u64_counter(semconv::OURIOS_SINK_FLUSH_RECORDS)
+            .with_unit("{record}")
+            .build();
+        let flush_errors = meter
+            .u64_counter(semconv::OURIOS_SINK_FLUSH_ERRORS)
+            .with_unit("{error}")
+            .build();
+        let derive_errors = meter
+            .u64_counter(semconv::OURIOS_SINK_DERIVE_ERRORS)
+            .with_unit("{error}")
+            .build();
+        let buffer_usage = meter
+            .i64_up_down_counter(semconv::OURIOS_SINK_BUFFER_USAGE)
+            .with_unit("By")
+            .build();
+        // Seed the attribute-free instruments so they're visible before the
+        // first flush; `flush_duration` / `flush_records` carry the required
+        // `trigger` attribute and surface on the first real flush.
+        flush_errors.add(0, &[]);
+        derive_errors.add(0, &[]);
+        buffer_usage.add(0, &[]);
+        Self {
+            flush_duration,
+            flush_records,
+            flush_errors,
+            derive_errors,
+            buffer_usage,
+        }
+    }
+
+    /// A successful partition flush of `record_count` rows, caused by
+    /// `trigger` (`size` | `age` | `rotation` | `ceiling`), taking `elapsed`.
+    pub fn record_flush(&self, trigger: &'static str, record_count: usize, elapsed: Duration) {
+        let attrs = [KeyValue::new(semconv::OURIOS_SINK_FLUSH_TRIGGER, trigger)];
+        self.flush_duration.record(elapsed.as_secs_f64(), &attrs);
+        self.flush_records.add(to_u64(record_count), &attrs);
+    }
+
+    /// A failed partition flush (encode or store error); the buffer is
+    /// retained and retried (the WAL is the durability of record).
+    pub fn record_flush_error(&self) {
+        self.flush_errors.add(1, &[]);
+    }
+
+    /// A record dropped from the sink because its partition key could not
+    /// be derived (the WAL still holds it).
+    pub fn record_derive_error(&self) {
+        self.derive_errors.add(1, &[]);
+    }
+
+    /// Adjust the buffered-bytes gauge by `delta` — positive when a record
+    /// is appended, negative when a partition flushes.
+    pub fn add_buffered(&self, delta: i64) {
+        self.buffer_usage.add(delta, &[]);
+    }
+}
+
+impl Default for SinkMetrics {
     fn default() -> Self {
         Self::new()
     }

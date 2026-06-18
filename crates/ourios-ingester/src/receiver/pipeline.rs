@@ -19,12 +19,14 @@
 //! request and map its `Result` to the transport-level response.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, Wal, WalOffset};
 use prost::Message;
 
+use crate::metrics::IngestMetrics;
 use crate::receiver::commit::CommitCoordinator;
 use crate::receiver::tenant::{TenantResolutionError, TenantRule, fan_out};
 
@@ -123,6 +125,9 @@ pub struct IngestPipeline {
     /// the rotation-detection read-then-write must see a consistent value.
     last_durable: Mutex<Option<WalOffset>>,
     rotation_hook: Mutex<Option<RotationHook>>,
+    /// Ingest throughput + WAL-before-ack latency instruments (RFC 0014
+    /// §6.3). Recorded only on a durably-acked batch.
+    metrics: IngestMetrics,
 }
 
 impl IngestPipeline {
@@ -136,6 +141,7 @@ impl IngestPipeline {
             rule,
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
+            metrics: IngestMetrics::new(),
         }
     }
 
@@ -205,7 +211,12 @@ impl IngestPipeline {
         // its (batched) fsync — concurrent requests fold into one window's
         // fsync (RFC0008.8). The frame's append `seq` orders the miner
         // hand-off below.
+        let commit_start = Instant::now();
         let outcome = self.coordinator.commit(&payload).await;
+        // The WAL-before-ack latency: time until the batch is durable
+        // (includes the group-commit window + fsync). Recorded below only
+        // on a successful, acked commit.
+        let append_elapsed = commit_start.elapsed();
         let Some(seq) = outcome.seq else {
             // The append itself failed: no sequence consumed, so this
             // request is not part of the WAL order and never reaches the
@@ -259,6 +270,8 @@ impl IngestPipeline {
                 // snapshot high-water never passes a failed sync — its tail
                 // replay re-covers those frames (no §3.5.3 divergence).
                 *self.lock_last_durable() = Some(now);
+                // Throughput + WAL-before-ack latency for this acked batch.
+                self.metrics.record_batch(records.len(), append_elapsed);
                 Ok(records.len())
             }
             // Sync failed: the frame is not durable and not acked; it

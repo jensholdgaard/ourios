@@ -142,8 +142,14 @@ fn sink_write(c: &mut Criterion) {
                         sink.emit(r);
                     }
                     sink.flush_all();
-                    black_box(sink.flushes());
                     total += start.elapsed();
+                    // Untimed: `flush_all` swallows encode/store errors and
+                    // retains the buffer, so assert the partition actually
+                    // drained — otherwise a silent failure would report
+                    // throughput for an error path. (`flush_all`'s store write
+                    // is a real side effect, so it isn't elided without a
+                    // `black_box`.)
+                    assert_eq!(sink.buffered_records(), 0, "sink flush did not drain");
                     // `sink` + `dir` drop here, after the timer — teardown
                     // (Parquet unlink, dir delete) untimed.
                 }

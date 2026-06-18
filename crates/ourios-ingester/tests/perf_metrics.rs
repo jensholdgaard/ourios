@@ -113,7 +113,10 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
         panic!("buffer.usage should be an i64 sum (UpDownCounter)");
     };
     assert_eq!(
-        usage.data_points().map(|dp| dp.value()).sum::<i64>(),
+        usage
+            .data_points()
+            .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+            .sum::<i64>(),
         60,
         "buffer.usage nets +100 -40",
     );
@@ -125,7 +128,9 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
         panic!("flush.duration should be an f64 histogram");
     };
     assert_eq!(
-        hist.data_points().map(|dp| dp.count()).sum::<u64>(),
+        hist.data_points()
+            .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+            .sum::<u64>(),
         2,
         "two flushes recorded (size + rotation)",
     );

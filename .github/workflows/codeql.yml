@@ -23,12 +23,19 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel on main — each push's SARIF upload must complete so no
+  # commit's analysis is dropped (matches ci.yml). Branches/PRs cancel.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   analyze:
     name: analyze (rust)
     runs-on: ubuntu-latest
+    # Fork PRs get a read-only GITHUB_TOKEN, so the SARIF upload below
+    # can't be granted security-events: write and would fail. Skip the
+    # job for cross-repo PRs; pushes to main (after merge), same-repo
+    # PRs, and the weekly schedule still give full coverage.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       # Upload the SARIF result to the code-scanning tab.
       security-events: write

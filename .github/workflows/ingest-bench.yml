@@ -28,6 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # No authenticated git ops here — don't leave the token in
+          # `.git/config` (matches `compaction-bench.yml`).
+          persist-credentials: false
       - name: Free runner disk space
         run: .github/scripts/free-disk-space.sh
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input

@@ -43,6 +43,12 @@ pub const OURIOS_COMPACTION_ROWS: &str = "ourios.compaction.rows";
 /// `ourios.compaction.sweeps` (counter, unit `{sweep}`).
 pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 
+/// `ourios.ingest.batches` (counter, unit `{batch}`).
+pub const OURIOS_INGEST_BATCHES: &str = "ourios.ingest.batches";
+
+/// `ourios.ingest.records` (counter, unit `{record}`).
+pub const OURIOS_INGEST_RECORDS: &str = "ourios.ingest.records";
+
 /// `ourios.miner.alias.assertions` (counter, unit `{assertion}`).
 pub const OURIOS_MINER_ALIAS_ASSERTIONS: &str = "ourios.miner.alias.assertions";
 
@@ -83,8 +89,26 @@ pub const OURIOS_MINER_TEMPLATE_COUNT: &str = "ourios.miner.template.count";
 /// `ourios.miner.template.version_changes` (counter, unit `{change}`).
 pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES: &str = "ourios.miner.template.version_changes";
 
+/// `ourios.sink.buffer.usage` (updowncounter, unit `By`).
+pub const OURIOS_SINK_BUFFER_USAGE: &str = "ourios.sink.buffer.usage";
+
+/// `ourios.sink.derive.errors` (counter, unit `{error}`).
+pub const OURIOS_SINK_DERIVE_ERRORS: &str = "ourios.sink.derive.errors";
+
+/// `ourios.sink.flush.duration` (histogram, unit `s`).
+pub const OURIOS_SINK_FLUSH_DURATION: &str = "ourios.sink.flush.duration";
+
+/// `ourios.sink.flush.errors` (counter, unit `{error}`).
+pub const OURIOS_SINK_FLUSH_ERRORS: &str = "ourios.sink.flush.errors";
+
+/// `ourios.sink.flush.records` (counter, unit `{record}`).
+pub const OURIOS_SINK_FLUSH_RECORDS: &str = "ourios.sink.flush.records";
+
 /// `ourios.storage.parquet.file.size` (histogram, unit `By`).
 pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.size";
+
+/// `ourios.wal.append.duration` (histogram, unit `s`).
+pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
 
 // Attribute keys.
 
@@ -99,6 +123,9 @@ pub const OURIOS_MINER_TEMPLATE_CHANGE: &str = "ourios.miner.template_change";
 
 /// `ourios.service` attribute key.
 pub const OURIOS_SERVICE: &str = "ourios.service";
+
+/// `ourios.sink.flush.trigger` attribute key.
+pub const OURIOS_SINK_FLUSH_TRIGGER: &str = "ourios.sink.flush.trigger";
 
 /// `ourios.tenant` attribute key.
 pub const OURIOS_TENANT: &str = "ourios.tenant";

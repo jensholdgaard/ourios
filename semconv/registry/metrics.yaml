@@ -250,3 +250,86 @@ groups:
     attributes:
       - ref: ourios.tenant
         requirement_level: required
+
+  # Ingest write path (RFC 0014 §6.3 / RFC 0008): throughput + the
+  # WAL-before-ack durability latency. Aggregate (no tenant/service
+  # attributes) so a performance run reads system throughput directly.
+  - id: metric.ourios.ingest.records
+    type: metric
+    metric_name: ourios.ingest.records
+    stability: development
+    brief: Log records accepted by the ingest pipeline (post-WAL-durable).
+    instrument: counter
+    unit: "{record}"
+
+  - id: metric.ourios.ingest.batches
+    type: metric
+    metric_name: ourios.ingest.batches
+    stability: development
+    brief: OTLP batches accepted by the ingest pipeline.
+    instrument: counter
+    unit: "{batch}"
+
+  - id: metric.ourios.wal.append.duration
+    type: metric
+    metric_name: ourios.wal.append.duration
+    stability: development
+    brief: >-
+      Wall-clock time to append a batch to the WAL and make it durable
+      (append + fsync) — the WAL-before-ack latency (`CLAUDE.md` §3.4).
+    instrument: histogram
+    unit: "s"
+
+  # RFC 0014 record sink (the data write path). `flush.trigger` tells why
+  # a partition flushed; the histogram's count is the flush count.
+  - id: metric.ourios.sink.flush.duration
+    type: metric
+    metric_name: ourios.sink.flush.duration
+    stability: development
+    brief: Wall-clock time to encode + write one partition's Parquet object.
+    instrument: histogram
+    unit: "s"
+    attributes:
+      - ref: ourios.sink.flush.trigger
+        requirement_level: required
+
+  - id: metric.ourios.sink.flush.records
+    type: metric
+    metric_name: ourios.sink.flush.records
+    stability: development
+    brief: Records written out across sink flushes.
+    instrument: counter
+    unit: "{record}"
+    attributes:
+      - ref: ourios.sink.flush.trigger
+        requirement_level: required
+
+  - id: metric.ourios.sink.flush.errors
+    type: metric
+    metric_name: ourios.sink.flush.errors
+    stability: development
+    brief: >-
+      Failed partition flushes (encode or store error). The buffer is
+      retained and retried — the WAL is the durability of record.
+    instrument: counter
+    unit: "{error}"
+
+  - id: metric.ourios.sink.derive.errors
+    type: metric
+    metric_name: ourios.sink.derive.errors
+    stability: development
+    brief: >-
+      Records dropped from the sink because a partition key could not be
+      derived (the WAL still holds them).
+    instrument: counter
+    unit: "{error}"
+
+  - id: metric.ourios.sink.buffer.usage
+    type: metric
+    metric_name: ourios.sink.buffer.usage
+    stability: development
+    brief: >-
+      Estimated bytes currently buffered across all partitions, against
+      the hard ceiling (RFC0014.4).
+    instrument: updowncounter
+    unit: "By"

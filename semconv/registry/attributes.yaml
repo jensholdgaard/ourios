@@ -62,3 +62,33 @@ groups:
               brief: A partition skipped due to an error (resilient sweep).
         stability: development
         brief: The outcome of a compaction sweep or partition.
+      - id: ourios.sink.flush.trigger
+        type:
+          members:
+            - id: size
+              value: "size"
+              stability: development
+              brief: >-
+                The partition's buffered bytes reached the size target
+                (RFC 0014 §3.2) — the healthy, right-sizing path.
+            - id: age
+              value: "age"
+              stability: development
+              brief: >-
+                The partition's oldest record reached `max_buffer_age`
+                (the batch-window age sweep) — bounds low-volume staleness.
+            - id: rotation
+              value: "rotation"
+              stability: development
+              brief: >-
+                Every partition force-flushed because the WAL segment
+                rotated (also covers the graceful-shutdown and
+                post-recovery drains — all flush every partition).
+            - id: ceiling
+              value: "ceiling"
+              stability: development
+              brief: >-
+                An inline flush to keep total buffered bytes under the
+                hard ceiling (RFC0014.4) — indicates memory backpressure.
+        stability: development
+        brief: Why the record sink flushed a partition (RFC 0014 §3.2).

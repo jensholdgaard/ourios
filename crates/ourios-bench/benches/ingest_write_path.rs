@@ -84,9 +84,16 @@ fn wal_append(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // Keep the `TempDir` alive alongside the `Wal` — dropping it
-                // would delete the segment directory mid-measurement.
+                // would delete the segment directory mid-measurement. Warm up
+                // with one append + sync: the *first* sync on a fresh WAL also
+                // fsyncs the segment directory (entry durability), which
+                // steady-state syncs don't, so doing it here (untimed) isolates
+                // the steady-state per-batch append + fsync cost.
                 let dir = tempfile::TempDir::new().expect("temp");
-                let wal = Wal::open(wal_config(dir.path())).expect("open");
+                let mut wal = Wal::open(wal_config(dir.path())).expect("open");
+                wal.append(FrameKind::OtlpBatch, &payload)
+                    .expect("warm append");
+                wal.sync().expect("warm sync");
                 (dir, wal)
             },
             |(_dir, mut wal)| {
@@ -119,11 +126,14 @@ fn sink_write(c: &mut Criterion) {
                             ceiling_bytes: usize::MAX,
                         },
                     );
-                    (dir, sink)
+                    // Clone the batch in the untimed setup — production `emit`
+                    // takes owned records, so the timed routine emits by value
+                    // (no clone cost polluting the WAL→Parquet signal).
+                    (dir, sink, records.clone())
                 },
-                |(_dir, mut sink)| {
-                    for r in records {
-                        sink.emit(r.clone());
+                |(_dir, mut sink, batch)| {
+                    for r in batch {
+                        sink.emit(r);
                     }
                     sink.flush_all();
                     black_box(sink.flushes());

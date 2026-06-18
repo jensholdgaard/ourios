@@ -854,7 +854,7 @@ the throughput here is the RFC0009.7 D2 measure, not that soak.
 
 **Hardware.** `baseline-8vcpu-32gib` — the §1 baseline (8 dedicated
 vCPU AMD EPYC-Milan, 32 GiB, local SSD), provisioned for this run and
-torn down immediately after. Two Hetzner `ccx33` hosts (one per
+torn down immediately after. Two dedicated-vCPU cloud hosts (one per
 invocation set), both git `d3f2cae`.
 **Run.** (a) the self-contained `ourios-bench` criterion benches
 `ingest_write_path` (RFC 0014) and `recovery` (RFC0008.3) — synthetic,

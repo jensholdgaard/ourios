@@ -55,9 +55,7 @@ on:
         required: false
 
 permissions:
-  # `write` so the optional publish step can create/update the
-  # corpus release. The workflow is manual-dispatch only.
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -67,6 +65,12 @@ jobs:
   capture:
     name: capture demo corpus
     runs-on: ubuntu-latest
+    permissions:
+      # Read-only: this job runs ~20 third-party demo container
+      # images for hours, so it must not hold a write-capable token.
+      # Publishing the release is split into the `publish` job below,
+      # which gets `contents: write` and runs no third-party code.
+      contents: read
     # Just under GitHub's hard 6h job cap. The previous fixed 45m
     # ceiling killed every long capture dispatched from main (the
     # v4 4h run only survived via a never-merged branch tweak), and
@@ -329,18 +333,35 @@ jobs:
             captured/manifest.md
           if-no-files-found: warn
 
+  publish:
+    name: publish corpus release
+    needs: capture
+    # Only when a tag is given. Split from `capture` so the
+    # write-capable token is held only by this job, which runs no
+    # third-party code — just downloads the captured artifact and
+    # cuts the release.
+    if: inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download captured corpus
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: otel-demo-corpus
+          path: captured
       - name: Publish corpus release
-        # Only when a tag is given. Freezes the corpus as a
-        # versioned, reproducible artifact `bench.yml` fetches
-        # (so every bench run sees identical bytes — the RFC 0006
-        # §J4 reproducibility discipline). Provenance (demo ref,
-        # load, window, source commit, size) goes in the notes.
-        if: inputs.release_tag != ''
+        # Freezes the corpus as a versioned, reproducible artifact
+        # `bench.yml` fetches (so every bench run sees identical
+        # bytes — the RFC 0006 §J4 reproducibility discipline).
+        # Provenance (demo ref, load, window, source commit, size)
+        # goes in the notes.
         working-directory: captured
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           DEMO_REF: ${{ inputs.demo_ref }}
+          LOCUST_USERS: ${{ inputs.locust_users }}
           DURATION: ${{ inputs.duration_seconds }}
           FAILURE_FLAGS: ${{ inputs.failure_flags }}
         run: |

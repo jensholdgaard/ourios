@@ -4,11 +4,14 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   changelog:
     runs-on: ubuntu-latest
+    permissions:
+      # `write` so `action-gh-release` can create the GitHub Release.
+      contents: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

@@ -3001,6 +3001,7 @@ dependencies = [
  "criterion",
  "opentelemetry-proto",
  "ourios-core",
+ "ourios-ingester",
  "ourios-miner",
  "ourios-parquet",
  "ourios-querier",

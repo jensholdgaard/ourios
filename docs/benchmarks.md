@@ -849,3 +849,74 @@ wall-clock figures are the baseline-hardware stamp for RFC 0009's
 `validated`. The full sustained-ingest soak (D2's "backlog returns to
 zero in a one-hour window at D1's rate") and D1 itself remain unrun —
 the throughput here is the RFC0009.7 D2 measure, not that soak.
+
+### 9.8 Results — 2026-06-18 (authoritative, `baseline-8vcpu-32gib`) — ingest write-path + recovery (criterion) and real-corpus A1 / C1 / C2 + B1 / B2
+
+**Hardware.** `baseline-8vcpu-32gib` — the §1 baseline (8 dedicated
+vCPU AMD EPYC-Milan, 32 GiB, local SSD), provisioned for this run and
+torn down immediately after. Two Hetzner `ccx33` hosts (one per
+invocation set), both git `d3f2cae`.
+**Run.** (a) the self-contained `ourios-bench` criterion benches
+`ingest_write_path` (RFC 0014) and `recovery` (RFC0008.3) — synthetic,
+no corpus — at full criterion settings; (b) the `ourios-bench` binary
+`--gates a1,c1,c2` against two real corpora, plus the `b1`/`b2`
+criterion benches (`--warm-up-time 1 --measurement-time 3`, matching
+`query-bench.yml`) over those corpora. Corpora: **LogHub HDFS_v1**
+(Zenodo record 8196385, md5-pinned — 11,175,629 lines / 1.58 GiB of
+**real Hadoop production logs**, above §8's ≥ 1 GiB canonical minimum)
+and the frozen **OTel-Demo v1** (`corpus/otel-demo-v1`, 38,782 lines /
+31.5 MiB). HDFS is fetched in-job and never redistributed (§1).
+
+**(a) Ingest write path + recovery — supportive wall-clock (criterion).**
+
+| bench | median | throughput |
+|---|---|---|
+| `wal_append/batch` — OTLP→WAL append + fsync (the WAL-before-ack unit) | **372 µs** | 10.5 MiB/s |
+| `sink_write/1000` — WAL→Parquet emit + flush (RFC 0014) | 2.64 ms | 379 K rec/s |
+| `sink_write/10000` | **12.24 ms** | **817 K rec/s** |
+| `recovery/{1,4,16}` — WAL replay over N segments (RFC0008.3) | 169 µs → 507 µs → **1.87 ms** | ~O(N), no amplification |
+
+Single-threaded micro-benches on synthetic records — *supportive*
+wall-clock (the structural sides are pinned by `ourios-ingester`'s
+RFC 0014 / `ourios-wal`'s RFC0008.3 tests), not gates. Dedicated
+hardware ran ~20–30 % faster with much lower variance than the
+indicative `ci-runner` figures.
+
+**(b) Thesis gates A1 / C1 / C2 on real corpora.**
+
+| corpus | A1 (ourios vs zstd-19 → delta) | C1 reconstruction | C2 convergence |
+|---|---|---|---|
+| **HDFS_v1** (11.18 M lines, 1.58 GiB) | 6.21× vs 16.0× → 0.386 — **FAIL** (diagnostic) | **1.000000** (11,175,578 / 11,175,578) — **PASS** | ratio **0.825**, 40 templates — **PASS** |
+| OTel-Demo v1 (38.8 K lines) | 14.6× vs 33.3× → 0.438 — **FAIL** (diagnostic) | 1.000000 (lossy ratio 0.0097) — **PASS** | **ABSTAIN** (< 1 M lines), 282 templates |
+
+C1 reconstructs **every** non-lossy row bit-for-bit across 11 M real
+production lines — the §3.3 invariant holds on real data at scale. C2
+converges on HDFS (40 templates over 11 M lines; ratio 0.825 ≥ the
+threshold) — the template-mining thesis on a real corpus. A1 fails as
+expected: it is a recorded **diagnostic, not a gate** (RFC 0011) —
+template mining's value is query pruning (B1/B2), not on-disk bytes
+beating a whole-stream codec.
+
+**(c) Query gates B1 / B2 on real corpora.**
+
+| bench | result | timing | pruning |
+|---|---|---|---|
+| `b1/synthetic` | 2000 rows | ourios 2.93 ms vs zstd-grep ref 118 µs | pruned 1/2 row groups, read 7.8 KB |
+| `b2/synthetic/{2k,20k,100k}` | result held constant | 2.13 / 4.67 / 11.32 ms | sub-linear in corpus size |
+| `b2/real-corpus/HDFS` (template 1, ubiquitous) | 1.72 M rows | 30.8 ms | 14/14 row groups (no prune — template is everywhere) |
+| **`b2/real-corpus/HDFS` windowed 1 h** | 28,207 rows | **6.1 ms** | **13/14 row groups pruned by the time window** (~5× faster) |
+
+The windowed HDFS arm is the headline: a time-bounded query on the
+real 11 M-line corpus prunes **13 of 14 row groups** via Parquet
+min/max statistics — the predicate-pushdown thesis (pillar #1) on real
+production data, ~5× faster than the unwindowed scan. (B1's real-corpus
+arm skipped: OTel-Demo v1 has no error-band `severity_text` rows for
+the selectivity probe.) B1/B2's structural pruning is the gate (pinned
+in `ourios-querier`); these are the baseline-hardware wall-clock stamp.
+
+**Not committed by the bench tooling** — this is the curated narrative;
+the managed `BENCH-RESULTS` region above is for `--update-benchmarks-md`
+runs. The b1/b2 criterion timings use the reduced
+`--warm-up-time 1 --measurement-time 3` (matching `query-bench.yml`);
+the structural pruning/template numbers are exact and
+criterion-setting-independent.

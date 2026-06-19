@@ -100,14 +100,15 @@ fixed string, the target uses the `arbitrary` crate to build an
 `OtlpLogRecord` whose body is a **`String`** (the Drain template path —
 the fuzz bytes become the log line; attributes are derived alongside),
 calls `MinerCluster::ingest`, then `render`s the mined record back and
-asserts the §3.3 contract: when `render` returns
-`Reconstruction::Faithful` the bytes are byte-identical to the original
-string body; otherwise it returns `Reconstruction::RetainedVerbatim`
-(the body was surfaced verbatim, not rebuilt — §3.3's "retain the
-original body" path). A `Faithful` result whose bytes differ from the
-original body makes the target panic, which libFuzzer reports as a crash
-— turning the fuzzer into a search for reconstruction bugs, not just for
-`unwrap`s.
+asserts the §3.3 contract: the rendered bytes equal the original string
+body **in both outcomes** — whether `render` reports
+`Reconstruction::Faithful` (rebuilt from the template) or
+`Reconstruction::RetainedVerbatim` (the original body surfaced verbatim,
+not rebuilt). §3.3 guarantees a string line is either reconstructed
+exactly or has its original body retained, so *either* a faithful-rebuild
+mismatch *or* a retention failure is a violation — and makes the target
+panic, which libFuzzer reports as a crash. That turns the fuzzer into a
+search for reconstruction bugs, not just for `unwrap`s.
 
 The target is deliberately scoped to **string** bodies: that is the
 template-mining + line-reconstruction path the §3.3 invariant governs.
@@ -140,14 +141,24 @@ grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.
 ### 3.4 CI — phased
 
 **Phase 1 (this RFC's `green`): `.github/workflows/fuzz.yml`.** A bounded
-smoke-fuzz job, nightly toolchain, that for each target runs
-`cargo +nightly fuzz run <target> -- -max_total_time=<N>`. It triggers
-on PRs that touch `ourios-miner` / `ourios-ingester` / `ourios-wal` and
-on a daily schedule. A crash fails the job; the crashing input is
-uploaded as an artifact. The job also runs `cargo +nightly fuzz build`
-unconditionally so a target that stops compiling is caught even when not
-run. Top-level `contents: read`, job-scoped escalation only if needed
-(the workflow-token least-privilege pattern the other workflows follow).
+smoke-fuzz job on a pinned nightly toolchain that runs **all four**
+targets — the parser targets are cheap, so there is no reason to gate
+on the miner alone. Each target runs for a short PR budget and a longer
+scheduled budget, e.g.:
+
+```sh
+# PR (per target): ~60 s. Daily schedule: ~300 s.
+cargo +nightly-2026-06-01 fuzz run <target> -- -max_total_time=60
+```
+
+It triggers on PRs that touch `ourios-miner` / `ourios-ingester` /
+`ourios-wal` and on a daily schedule. A crash fails the job; the
+crashing input is uploaded as an artifact. The job also runs
+`cargo +nightly fuzz build` for every target unconditionally, so a
+target that stops compiling is caught even on runs where it is not
+executed. Top-level `contents: read`, job-scoped escalation only if
+needed (the workflow-token least-privilege pattern the other workflows
+follow).
 
 **Phase 2 (follow-up PR): ClusterFuzzLite.** `.clusterfuzzlite/`
 (`Dockerfile` + `build.sh` building the same cargo-fuzz targets) plus
@@ -175,17 +186,29 @@ smoothest `cargo` integration, and is the engine ClusterFuzzLite and
 OSS-Fuzz drive for Rust. Choosing it keeps Phase 1 and Phase 2 on one
 engine.
 
-**proptest only, no coverage-guided fuzzing.** proptest is retained and
-valued, but its generators are hand-authored and do not instrument the
-binary to steer toward new branches. It cannot substitute for
-coverage-guided exploration of the parser/miner input space; the two are
-kept as complementary layers.
+**Just extend proptest, no coverage-guided fuzzing.** The obvious
+cheaper move is to widen the existing `proptest` suites rather than add a
+fuzz toolchain. We keep and value proptest, but it cannot replace
+fuzzing here: its inputs come from hand-authored `Strategy` generators
+that sample a distribution *we* describe, with no feedback from the code
+under test. A coverage-guided fuzzer instruments the binary and mutates
+toward unexecuted branches, reaching the malformed-but-structurally-valid
+inputs (truncated protobuf, CRC-valid-but-broken frames, non-UTF-8 body
+bytes) that a generator only hits by luck. proptest pins the invariants
+we can describe; the fuzzer finds the ones we did not think to write a
+strategy for. They are complementary layers, not substitutes — which is
+also why the `miner_roundtrip` oracle deliberately reuses the same §3.3
+assertion the proptest suite already encodes.
 
-**OSS-Fuzz instead of ClusterFuzzLite.** OSS-Fuzz requires a project to
-be widely used or critical to the ecosystem; a pre-release backend will
-not be accepted. ClusterFuzzLite is the self-hosted, runs-in-our-own-CI
-equivalent and is available today. OSS-Fuzz remains a future option once
-Ourios ships and has users.
+**OSS-Fuzz from day one instead of ClusterFuzzLite.** OSS-Fuzz is the
+richer option — Google-hosted compute, long-running campaigns, automatic
+bug filing — and remains the goal once Ourios ships. But acceptance
+requires a project to be widely used or critical to the ecosystem, which
+a pre-release backend is not, and onboarding adds an external dependency
+and review loop we do not control. ClusterFuzzLite is the same engine
+(libFuzzer) running in our own CI with our own corpus, available today
+and detected by Scorecard; it is the pragmatic Phase 2, with OSS-Fuzz
+held as a post-ship upgrade.
 
 **A `fuzzing` feature inside each crate instead of a separate `fuzz/`
 member.** Folding targets into the shipping crates would drag the
@@ -205,14 +228,18 @@ the find.
 > - **When** the target builds an `OtlpLogRecord` with a
 >   **`String`** body from the arbitrary input, ingests it, and
 >   renders the mined record back
-> - **Then** the target asserts that when `render` reports
->   `Reconstruction::Faithful` the rendered bytes equal the
->   original string body, **and** that any other case reports
->   `Reconstruction::RetainedVerbatim` (the retained body, not a
->   reconstruction)
-> - **And** an input for which a `Faithful` record renders to
->   bytes unequal to its string body makes the target panic (a
->   libFuzzer crash), surfacing the reconstruction bug
+> - **Then** the rendered bytes equal the original string body in
+>   **both** outcomes — whether `render` reports
+>   `Reconstruction::Faithful` (rebuilt from the template) or
+>   `Reconstruction::RetainedVerbatim` (the original body returned
+>   verbatim) — since §3.3 guarantees a string line is either
+>   reconstructed exactly or has its original body retained
+> - **And** the `Reconstruction` marker is asserted to be one of
+>   those two variants, recording which path produced the bytes
+> - **And** *any* input whose rendered bytes differ from the
+>   original string body makes the target panic (a libFuzzer
+>   crash) — a faithful-rebuild mismatch **and** a retention
+>   failure are both §3.3 violations
 > - **And** the assertion references the §3.3 invariant id so the
 >   mapping back to `CLAUDE.md` is greppable
 
@@ -299,18 +326,24 @@ greppable (`docs/verification.md` §2).
 
 ## 7. Open questions
 
-- [ ] **Nightly pin**: float `nightly`, or pin a dated
-  `nightly-YYYY-MM-DD` for reproducibility and let Renovate bump it?
-  (Lean: pin dated.)
-- [ ] **Smoke-fuzz budget**: `-max_total_time` per target in PR CI
-  (e.g. 60 s) vs the daily schedule (e.g. 5–10 min)? Balance signal
-  against CI minutes.
-- [ ] **`OtlpLogRecord` construction**: can `arbitrary` be `derive`d on
-  the relevant `ourios-core` types, or is a hand-written `Arbitrary`
-  impl (or a local newtype) needed given its field types?
-- [ ] **`read_frame` exposure**: `#[doc(hidden)] pub` shim vs a
-  `fuzzing` cargo feature on `ourios-wal`? (Lean: doc-hidden shim, to
-  avoid feature-flag sprawl — confirm no clippy/API-surface concern.)
+Resolved at review (maintainer sign-off, 2026-06-19) — recorded here as
+decisions, to be applied in the implementation PRs:
+
+- [x] **Nightly pin** → **pin a dated `nightly-YYYY-MM-DD`** in the fuzz
+  job (not a floating `nightly`), for reproducibility; Renovate bumps
+  it like the other pinned toolchains.
+- [x] **Smoke-fuzz budget** → **~60 s per target on PRs, ~300 s on the
+  daily schedule** (see §3.4). Revisit if CI minutes or signal warrant.
+- [x] **`read_frame` exposure** → a **`fuzzing` cargo feature** on
+  `ourios-wal` gating the `pub` export, rather than a `#[doc(hidden)]`
+  shim — slightly cleaner and reusable for future non-fuzz tests.
+- [x] **`OtlpLogRecord` construction** → expect a **hand-written
+  `Arbitrary` impl** (or a thin newtype) for the string-body path,
+  rather than relying on `derive` across the body variants, if a derive
+  proves messy.
+
+Still open, deferred to the implementation PRs:
+
 - [ ] **A second miner target** driving *sequences* of records, to fuzz
   template **merge** behaviour (§3.1), not just single-line round-trip?
   Possible Phase 1.5.

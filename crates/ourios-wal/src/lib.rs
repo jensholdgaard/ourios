@@ -26,7 +26,13 @@ use std::path::PathBuf;
 use ourios_core::audit::AuditEvent;
 
 pub(crate) mod checkpoint;
+// `frame` is crate-internal, but the `fuzzing` feature exposes it so the
+// `fuzz/` cargo-fuzz targets can drive `read_frame` directly (RFC 0015).
+// Not part of the stable public API.
+#[cfg(not(feature = "fuzzing"))]
 pub(crate) mod frame;
+#[cfg(feature = "fuzzing")]
+pub mod frame;
 pub(crate) mod segment;
 
 use segment::{SEGMENT_HEADER_LEN, SegmentHeader, write_header};

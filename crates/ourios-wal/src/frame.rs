@@ -10,13 +10,16 @@
 //!
 //! Per-frame header = **12 B** (4 + 1 + 3 + 4). The CRC covers
 //! `kind || _pad || payload` (not `len`, not its own bytes) —
-//! same shape Kafka uses on record batches. Length validation
-//! against [`MAX_FRAME_BYTES`](crate::MAX_FRAME_BYTES) is the
-//! caller's job; helpers here treat already-checked input.
+//! same shape Kafka uses on record batches. The write helpers
+//! (`write_frame`) treat already-checked input; `read_frame`
+//! validates the on-disk length against [`MAX_FRAME_BYTES`]
+//! itself, since it parses untrusted bytes.
 //!
-//! This module is `pub(crate)` — `Wal::append` (write side) and
-//! `Wal::replay` (read side, follow-up slice) compose against
-//! it without needing to know the byte layout.
+//! This module is `pub(crate)` by default — `Wal::append` (write
+//! side) and `Wal::replay` (read side) compose against it without
+//! needing the byte layout. The `fuzzing` feature re-exports it as
+//! `pub` so the `fuzz/` `wal_frame` target can drive `read_frame`
+//! directly (RFC 0015); that is not a stable public API.
 
 use std::io::{Read, Write};
 
@@ -37,8 +40,12 @@ const FRAME_PAD_ZEROS: [u8; 3] = [0, 0, 0];
 /// RFC0008.5 sub-case so the recovery driver's audit-event
 /// emission, and the integration tests, can match on the
 /// specific reason rather than string-search a message.
+// `non_exhaustive` because the `fuzzing` feature exposes this publicly
+// (RFC 0015) and the RFC0008.5 sub-cases may grow; in-crate matches stay
+// exhaustive without a wildcard.
 #[derive(Debug)]
-pub(crate) enum FrameError {
+#[non_exhaustive]
+pub enum FrameError {
     /// The 4-byte CRC field didn't match the recomputed
     /// CRC32-C over `kind || pad || payload`. The frame's
     /// contents differ from what was written — typical cause
@@ -158,7 +165,16 @@ pub(crate) fn write_frame<W: Write>(
 /// arms on failure. Each error variant maps to one §6.2.2
 /// sub-case — recovery uses the variant to populate the
 /// matching `CorruptionReason` for the audit event.
-pub(crate) fn read_frame<R: Read>(r: &mut R) -> Result<(FrameKind, Vec<u8>), FrameError> {
+///
+/// # Errors
+///
+/// Returns [`FrameError::Io`] if the reader is short or errors,
+/// [`FrameError::OversizeLen`] if the length prefix exceeds the
+/// maximum frame size, [`FrameError::NonZeroPad`] if a reserved
+/// pad byte is set, [`FrameError::UnknownKind`] for an unrecognised
+/// frame kind, and [`FrameError::CrcMismatch`] if the payload CRC
+/// does not match.
+pub fn read_frame<R: Read>(r: &mut R) -> Result<(FrameKind, Vec<u8>), FrameError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     r.read_exact(&mut header).map_err(FrameError::Io)?;
     let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);

@@ -12,6 +12,10 @@ members = [
     "crates/ourios-telemetry",
     "crates/ourios-wal",
 ]
+# The cargo-fuzz harness (RFC 0015) is its own standalone workspace: it
+# builds only under nightly with libFuzzer sanitizers, so it must not be
+# part of the stable workspace that `cargo build`/`cargo test` walks.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"

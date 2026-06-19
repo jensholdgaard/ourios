@@ -15,11 +15,11 @@ spec:
     {{- include "ourios.selectorLabels" . | nindent 4 }}
   ports:
     - name: otlp-grpc
-      port: {{ .Values.service.grpcPort }}
+      port: {{ include "ourios.grpcPort" . }}
       targetPort: otlp-grpc
       protocol: TCP
     - name: otlp-http
-      port: {{ .Values.service.httpPort }}
+      port: {{ include "ourios.httpPort" . }}
       targetPort: otlp-http
       protocol: TCP
     # DEFERRED — the query listener port (4319) and its Service entry land

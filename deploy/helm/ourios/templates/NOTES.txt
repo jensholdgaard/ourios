@@ -9,8 +9,8 @@ object-storage root:
 
 The OTLP receiver role is ENABLED. Send OTLP logs to the Service:
 
-  gRPC: {{ include "ourios.fullname" . }}:{{ .Values.service.grpcPort }}
-  HTTP: {{ include "ourios.fullname" . }}:{{ .Values.service.httpPort }}
+  gRPC: {{ include "ourios.fullname" . }}:{{ include "ourios.grpcPort" . }}
+  HTTP: {{ include "ourios.fullname" . }}:{{ include "ourios.httpPort" . }}
 
 The write-ahead log is mounted at {{ .Values.wal.mountPath }}
 {{- if .Values.wal.persistence.enabled }} (PersistentVolumeClaim, {{ .Values.wal.persistence.size }}).

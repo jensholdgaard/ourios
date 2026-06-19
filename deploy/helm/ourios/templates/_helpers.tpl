@@ -58,6 +58,22 @@ is empty.
 {{- end }}
 
 {{/*
+Port portion of the receiver gRPC bind address (OURIOS_RECEIVER_GRPC_ADDR).
+Splits on ":" and takes the last field so the container/Service port can never
+drift from the address the server actually binds.
+*/}}
+{{- define "ourios.grpcPort" -}}
+{{- (splitList ":" .Values.ourios.receiver.grpcAddr) | last -}}
+{{- end }}
+
+{{/*
+Port portion of the receiver HTTP bind address (OURIOS_RECEIVER_HTTP_ADDR).
+*/}}
+{{- define "ourios.httpPort" -}}
+{{- (splitList ":" .Values.ourios.receiver.httpAddr) | last -}}
+{{- end }}
+
+{{/*
 Name of the service account to use.
 */}}
 {{- define "ourios.serviceAccountName" -}}

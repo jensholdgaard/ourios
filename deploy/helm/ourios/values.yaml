@@ -119,23 +119,13 @@ wal:
 
 service:
   type: ClusterIP
-  # OTLP receiver ports. Rendered only when ourios.receiver.enabled is true.
-  grpcPort: 4317
-  httpPort: 4318
+  # OTLP receiver Service ports are derived from the port portion of
+  # ourios.receiver.grpcAddr / httpAddr so they cannot drift from the
+  # address the server actually binds. Rendered only when the receiver is
+  # enabled.
   annotations: {}
   # DEFERRED — the query Service port (4319) lands with RFC 0016. Not exposed
   # now; do not add a querier port until that RFC merges.
-
-# Ingress is disabled by default. OTLP ingest is typically reached in-cluster
-# or via a gateway/LoadBalancer, not an HTTP Ingress.
-ingress:
-  enabled: false
-
-# Horizontal Pod Autoscaling is disabled by default. The receiver role's WAL
-# is per-replica local disk (RWO PVC), so autoscaling the receiver needs
-# careful thought; leave this off until that is designed.
-autoscaling:
-  enabled: false
 
 resources:
   requests:

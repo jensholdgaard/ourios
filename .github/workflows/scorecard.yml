@@ -32,6 +32,13 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
+          # The default GITHUB_TOKEN can't read branch-protection
+          # settings, so the Branch-Protection check errors out (-1).
+          # A fine-grained PAT with `Administration: read` (stored as
+          # the SCORECARD_TOKEN repo secret) lets the check read the
+          # rules. Until that secret exists this falls back to
+          # github.token — no break, Branch-Protection just stays -1.
+          repo_token: ${{ secrets.SCORECARD_TOKEN || github.token }}
       - uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
         with:
           sarif_file: results.sarif

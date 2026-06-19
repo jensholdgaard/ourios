@@ -156,23 +156,25 @@ grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.
 **Phase 1 (this RFC's `green`): `.github/workflows/fuzz.yml`.** A bounded
 smoke-fuzz job on a pinned nightly toolchain, run as a matrix over **all
 four** targets — the parser targets are cheap, so there is no reason to
-gate on the miner alone. Each matrix job runs its target for a short PR
-budget and a longer scheduled budget, e.g.:
+gate on the miner alone. Each matrix job runs its target for the budget
+of the triggering event, e.g.:
 
 ```sh
-# PR (per target): ~60 s. Daily schedule: ~300 s. --target forces the
-# gnu host triple (cargo-fuzz otherwise picks musl, whose static libc
-# is incompatible with the ASan sanitizer).
-cargo +nightly-2026-06-01 fuzz run <target> --target "$host" -- -max_total_time=60
+# Daily schedule: ~300 s per target. Manual dispatch: ~60 s. --target
+# forces the gnu host triple (cargo-fuzz otherwise picks musl, whose
+# static libc is incompatible with the ASan sanitizer).
+cargo +nightly-2026-06-01 fuzz run <target> --target "$host" -- -max_total_time=300
 ```
 
-It triggers on PRs that touch `ourios-miner` / `ourios-ingester` /
-`ourios-wal` / `fuzz/` and on a daily schedule. `fuzz run` builds before
-it runs, so a target that stops compiling fails its job; because every
-target is always in the matrix (`fail-fast: false`), all four are built
-and run on every invocation. A crash fails that target's job and uploads
-the reproducer as an artifact. Top-level `contents: read` (the
-workflow-token least-privilege pattern the other workflows follow).
+It runs on a **daily `schedule` and on `workflow_dispatch`** —
+deliberately *not* on `pull_request`: the sanitizer build is too heavy
+for per-change CI, and continuous per-change fuzzing is Phase 2's job
+(ClusterFuzzLite). `fuzz run` builds before it runs, so a target that
+stops compiling fails its job; because every target is always in the
+matrix (`fail-fast: false`), all four are built and run on every
+invocation. A crash fails that target's job and uploads the reproducer
+as an artifact. Top-level `contents: read` (the workflow-token
+least-privilege pattern the other workflows follow).
 
 **Phase 2 (follow-up PR): ClusterFuzzLite.** `.clusterfuzzlite/`
 (`Dockerfile` + `build.sh` building the same cargo-fuzz targets) plus

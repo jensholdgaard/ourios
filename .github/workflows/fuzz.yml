@@ -9,15 +9,12 @@ name: Fuzz
 # `+nightly-<date>` invocation, so the stable pin in `rust-toolchain.toml`
 # still governs every shipping crate. Not a required check.
 
+# Deliberately NOT on `pull_request`: the sanitizer build (datafusion
+# under ASan, minutes per target) is too heavy for per-change CI.
+# Bounded smoke-fuzz runs daily; continuous per-change fuzzing is Phase 2
+# (ClusterFuzzLite, RFC0015.7). Use `workflow_dispatch` for an on-demand
+# run against a branch.
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - "crates/ourios-miner/**"
-      - "crates/ourios-ingester/**"
-      - "crates/ourios-wal/**"
-      - "fuzz/**"
-      - ".github/workflows/fuzz.yml"
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
@@ -59,7 +56,7 @@ jobs:
           tool: cargo-fuzz@0.13.2
       - name: Smoke-fuzz ${{ matrix.target }}
         env:
-          # 60 s per target on PRs; 300 s on the daily schedule.
+          # 300 s per target on the daily schedule; 60 s on a manual dispatch.
           BUDGET: ${{ github.event_name == 'schedule' && '300' || '60' }}
         run: |
           set -euo pipefail

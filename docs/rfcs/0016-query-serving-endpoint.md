@@ -84,8 +84,9 @@ A single querier role, mirroring the receiver:
   the OTLP gRPC path is an *ingest* concern, not a query one.
 - Env-gated exactly like the receiver: `OURIOS_QUERIER_ENABLED`
   (`1`/`true`/`yes`), `OURIOS_QUERIER_HTTP_ADDR` (default `0.0.0.0:4319`),
-  reusing `OURIOS_BUCKET_ROOT` for the store. The two roles compose: a
-  binary may run receiver-only, querier-only, or both.
+  reusing `OURIOS_BUCKET_ROOT` for the store. Background compaction always
+  runs; the receiver and querier are the env-gated roles, so a binary may
+  run receiver-only, querier-only, or both (with compaction in every case).
 
 ### 3.3 Request
 
@@ -102,11 +103,16 @@ The parsed `Statement` dispatches: `Logs(Query)` → `run_query`,
 (wall clock) and the configured default time window to the executor, as
 the DSL compiler expects.
 
-**Tenancy.** Tenant is required (the engine already enforces it
-structurally — `QueryError::TenantRequired`, partition-rooted scan). v1
-takes it from a required `X-Ourios-Tenant` header (kept out of the query
-body so the DSL grammar stays tenant-agnostic). Authn/z beyond
-tenant-scoping is out of scope for v1 (§7).
+**Tenancy.** Tenant is required. The querier role takes it from a
+required `X-Ourios-Tenant` header (kept out of the query body so the DSL
+grammar stays tenant-agnostic) and **the server rejects a missing/empty
+header with `400` before invoking the engine** — `Querier::run_query`/
+`run_drift` take a `TenantId` parameter, so a tenant is always supplied
+to the engine (the engine's defined `QueryError::TenantRequired` variant
+is thus a guard that the server's header check makes unreachable in
+practice). The engine then enforces isolation structurally via the
+partition-rooted scan (RFC0007.5). Authn/z beyond tenant-scoping is out
+of scope for v1 (§7).
 
 ### 3.4 Response
 
@@ -124,7 +130,8 @@ ever appears** in a response. Mapping:
 
 - DSL parse/validation (`DslError`, `QueryError::InvalidQuery`) → `400`
   with a structured `{ "error": { "kind": ..., "message": ... } }`.
-- `QueryError::TenantRequired` / missing header → `400`.
+- Missing/empty `X-Ourios-Tenant` header → `400`, returned by the
+  server's header check before the engine is invoked (§3.3).
 - Execution failure (`QueryError::Storage`) → `500`, message scrubbed of
   engine internals (its `Display` already withholds DataFusion text per
   RFC0007.3 / H6).
@@ -182,8 +189,8 @@ querier-only or receiver-only deployment is a real operational shape.
 > - **Given** two tenants with disjoint data in the store
 > - **When** a query is sent with `X-Ourios-Tenant: A`
 > - **Then** only tenant A's rows are ever read or returned, and a
->   request with no tenant header is rejected `400`
->   (`TenantRequired`) without scanning any data
+>   request with no tenant header is rejected `400` by the server's
+>   header check, without scanning any data
 
 > **Scenario RFC0016.3 — a drift query routes to the drift path**
 > - **Given** an audit stream with template widening events

@@ -72,7 +72,8 @@ cargo-fuzz convention (`cargo fuzz init`). It is:
 - **opts out of the workspace `unsafe_code = "deny"` lint** (root
   `Cargo.toml` `[workspace.lints.rust]`; every shipping crate inherits
   it via `[lints] workspace = true`), because the
-  `libfuzzer-sys::fuzz_target!` macro expands to `unsafe` glue. `CLAUDE.md`
+  `libfuzzer_sys::fuzz_target!` macro (the `libfuzzer-sys` crate) expands
+  to `unsafe` glue. `CLAUDE.md`
   §6.1 permits a per-crate waiver where an RFC justifies one (it cites a
   possible `ourios-parquet` zero-copy need as the example; no crate
   carries such a waiver today — every crate root, `ourios-parquet`

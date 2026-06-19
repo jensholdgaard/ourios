@@ -15,7 +15,7 @@
 
 name: Release
 permissions:
-  "contents": "write"
+  "contents": "read"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -263,6 +263,11 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
+    # Only the host job creates the GitHub Release (`gh release create`),
+    # so it gets contents:write while the workflow default stays read
+    # (preserves the repo's Token-Permissions posture).
+    permissions:
+      "contents": "write"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:

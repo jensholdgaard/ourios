@@ -135,13 +135,18 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 
 ### 3.3 Seed corpora
 
-Each target gets a seed corpus under `fuzz/corpus/<target>/`:
+Committed seeds live under `fuzz/seeds/<target>/` (a tracked directory,
+distinct from the gitignored working corpus `fuzz/corpus/<target>/`).
+The CI job copies the seeds into the working corpus before each run, so
+the committed inputs bootstrap coverage without the evolving corpus
+churning the repo:
 
-- `miner_roundtrip` and `otlp_json` seed from a small committed slice of
-  the anonymised lines already in `testdata/corpus/`;
-- `otlp_protobuf` seeds from a handful of valid `ExportLogsServiceRequest`
-  encodings emitted by an existing ingester test;
-- `wal_frame` seeds from valid frames written by the WAL writer.
+- `miner_roundtrip` seeds from a few real-shaped log lines;
+- `otlp_json` seeds from a minimal `ExportLogsServiceRequest` (an empty
+  `{"resourceLogs":[]}`);
+- `otlp_protobuf` and `wal_frame` start from libFuzzer's generated
+  inputs in Phase 1; binary seeds (valid protobuf encodings / valid
+  frames) can be added later.
 
 Committed seeds are kept minimal (enough to bootstrap coverage); the
 grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.

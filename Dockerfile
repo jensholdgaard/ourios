@@ -15,9 +15,13 @@ COPY . .
 # crate registry + compiled deps across builds (esp. the slow QEMU arm64
 # leg); the binary is copied out of the cached `target/` so the runtime
 # COPY can pick it up (cache mounts don't persist into the layer).
+# The registry/git caches are arch-independent (downloaded sources) and
+# safely shared; `target/` holds arch-specific objects, so it's keyed per
+# $TARGETARCH to keep the amd64 + arm64 legs from sharing one dir.
+ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/build/target,id=ourios-target-${TARGETARCH} \
     cargo build --release --locked -p ourios-server \
     && cp /build/target/release/ourios-server /ourios-server
 

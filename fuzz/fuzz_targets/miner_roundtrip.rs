@@ -9,7 +9,7 @@
 //! from the template) or `RetainedVerbatim` (original body retained) — a
 //! mismatch in either case is a §3.3 violation and crashes the target.
 
-use arbitrary::{Arbitrary, Unstructured};
+use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use ourios_core::config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
@@ -19,10 +19,13 @@ use ourios_miner::cluster::MinerCluster;
 use ourios_miner::reconstruct;
 
 fuzz_target!(|data: &[u8]| {
-    let mut u = Unstructured::new(data);
-    let Ok(line) = String::arbitrary(&mut u) else {
-        return;
-    };
+    // Use the whole input as the candidate log line (lossy UTF-8). This
+    // never discards an input — unlike `String::arbitrary`, which errors
+    // on bytes it can't structure and would throw away coverage. (Future
+    // richer targets can pull structured fields off the front of `u`
+    // before taking the rest as the body — see RFC 0015 §7.)
+    let u = Unstructured::new(data);
+    let line = String::from_utf8_lossy(u.take_rest()).into_owned();
 
     let sink = SharedRecordSink::new();
     let mut miner =

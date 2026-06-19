@@ -10,13 +10,16 @@
 //!
 //! Per-frame header = **12 B** (4 + 1 + 3 + 4). The CRC covers
 //! `kind || _pad || payload` (not `len`, not its own bytes) —
-//! same shape Kafka uses on record batches. Length validation
-//! against [`MAX_FRAME_BYTES`] is the
-//! caller's job; helpers here treat already-checked input.
+//! same shape Kafka uses on record batches. The write helpers
+//! (`write_frame`) treat already-checked input; `read_frame`
+//! validates the on-disk length against [`MAX_FRAME_BYTES`]
+//! itself, since it parses untrusted bytes.
 //!
-//! This module is `pub(crate)` — `Wal::append` (write side) and
-//! `Wal::replay` (read side, follow-up slice) compose against
-//! it without needing to know the byte layout.
+//! This module is `pub(crate)` by default — `Wal::append` (write
+//! side) and `Wal::replay` (read side) compose against it without
+//! needing the byte layout. The `fuzzing` feature re-exports it as
+//! `pub` so the `fuzz/` `wal_frame` target can drive `read_frame`
+//! directly (RFC 0015); that is not a stable public API.
 
 use std::io::{Read, Write};
 

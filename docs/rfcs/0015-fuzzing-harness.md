@@ -1,7 +1,7 @@
 ---
 rfc: 0015
 title: Fuzzing harness — cargo-fuzz targets & ClusterFuzzLite CI
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-19
@@ -135,13 +135,18 @@ shim (or a `fuzzing` cargo feature) — resolved in §7.
 
 ### 3.3 Seed corpora
 
-Each target gets a seed corpus under `fuzz/corpus/<target>/`:
+Committed seeds live under `fuzz/seeds/<target>/` (a tracked directory,
+distinct from the gitignored working corpus `fuzz/corpus/<target>/`).
+The CI job copies the seeds into the working corpus before each run, so
+the committed inputs bootstrap coverage without the evolving corpus
+churning the repo:
 
-- `miner_roundtrip` and `otlp_json` seed from a small committed slice of
-  the anonymised lines already in `testdata/corpus/`;
-- `otlp_protobuf` seeds from a handful of valid `ExportLogsServiceRequest`
-  encodings emitted by an existing ingester test;
-- `wal_frame` seeds from valid frames written by the WAL writer.
+- `miner_roundtrip` seeds from a few real-shaped log lines;
+- `otlp_json` seeds from a minimal `ExportLogsServiceRequest` (an empty
+  `{"resourceLogs":[]}`);
+- `otlp_protobuf` and `wal_frame` start from libFuzzer's generated
+  inputs in Phase 1; binary seeds (valid protobuf encodings / valid
+  frames) can be added later.
 
 Committed seeds are kept minimal (enough to bootstrap coverage); the
 grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.
@@ -149,24 +154,25 @@ grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.
 ### 3.4 CI — phased
 
 **Phase 1 (this RFC's `green`): `.github/workflows/fuzz.yml`.** A bounded
-smoke-fuzz job on a pinned nightly toolchain that runs **all four**
-targets — the parser targets are cheap, so there is no reason to gate
-on the miner alone. Each target runs for a short PR budget and a longer
-scheduled budget, e.g.:
+smoke-fuzz job on a pinned nightly toolchain, run as a matrix over **all
+four** targets — the parser targets are cheap, so there is no reason to
+gate on the miner alone. Each matrix job runs its target for a short PR
+budget and a longer scheduled budget, e.g.:
 
 ```sh
-# PR (per target): ~60 s. Daily schedule: ~300 s.
-cargo +nightly-2026-06-01 fuzz run <target> -- -max_total_time=60
+# PR (per target): ~60 s. Daily schedule: ~300 s. --target forces the
+# gnu host triple (cargo-fuzz otherwise picks musl, whose static libc
+# is incompatible with the ASan sanitizer).
+cargo +nightly-2026-06-01 fuzz run <target> --target "$host" -- -max_total_time=60
 ```
 
 It triggers on PRs that touch `ourios-miner` / `ourios-ingester` /
-`ourios-wal` and on a daily schedule. A crash fails the job; the
-crashing input is uploaded as an artifact. The job also runs
-`cargo +nightly fuzz build` for every target unconditionally, so a
-target that stops compiling is caught even on runs where it is not
-executed. Top-level `contents: read`, job-scoped escalation only if
-needed (the workflow-token least-privilege pattern the other workflows
-follow).
+`ourios-wal` / `fuzz/` and on a daily schedule. `fuzz run` builds before
+it runs, so a target that stops compiling fails its job; because every
+target is always in the matrix (`fail-fast: false`), all four are built
+and run on every invocation. A crash fails that target's job and uploads
+the reproducer as an artifact. Top-level `contents: read` (the
+workflow-token least-privilege pattern the other workflows follow).
 
 **Phase 2 (follow-up PR): ClusterFuzzLite.** `.clusterfuzzlite/`
 (`Dockerfile` + `build.sh` building the same cargo-fuzz targets) plus
@@ -181,10 +187,11 @@ backend is an open question (§7).
 
 When the fuzzer finds a crash, the workflow per `CLAUDE.md` §6.2 is:
 minimise the reproducer (`cargo fuzz tmin`), commit it as a permanent
-seed under `fuzz/corpus/<target>/` (or a dedicated `regressions/`
-subdir), then fix the bug. The seed stays forever, re-checked on every
-run — a found bug becomes a standing specification, never silently
-dropped.
+seed under the tracked `fuzz/seeds/<target>/` (the working
+`fuzz/corpus/` is gitignored, so a reproducer parked there would not
+persist — §3.3), then fix the bug. The seed stays forever, re-checked
+on every run — a found bug becomes a standing specification, never
+silently dropped.
 
 ## 4. Alternatives considered
 

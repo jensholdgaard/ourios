@@ -90,22 +90,31 @@ reaching a stable entry point with minimal glue.
 
 | Target | Entry point | Crate | Oracle |
 |---|---|---|---|
-| `miner_roundtrip` ⭐ | `MinerCluster::ingest` → `reconstruct::render` | `ourios-miner` | **invariant**: when `render` reports `Reconstruction::Faithful` the bytes equal the original body; otherwise it reports `Reconstruction::RetainedVerbatim` (the body was retained, not reconstructed — §3.3's escape hatch) |
+| `miner_roundtrip` ⭐ | `MinerCluster::ingest` → `reconstruct::render` on a **string-body** record | `ourios-miner` | **invariant**: when `render` reports `Reconstruction::Faithful` the bytes equal the original string body; otherwise it reports `Reconstruction::RetainedVerbatim` (the body was retained, not reconstructed — §3.3's escape hatch) |
 | `otlp_json` | `decode_json(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
 | `otlp_protobuf` | `decode_protobuf(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
 | `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
 
 **`miner_roundtrip` is the centerpiece.** Rather than feed the miner a
-fixed string, the target uses the `arbitrary` crate to derive an
-`OtlpLogRecord` (body + attributes) from the fuzz bytes, calls
-`MinerCluster::ingest`, then `render`s the mined record back and asserts
-the §3.3 contract: when `render` returns `Reconstruction::Faithful` the
-bytes are byte-identical to the ingested body; otherwise it returns
-`Reconstruction::RetainedVerbatim` (the body was surfaced verbatim, not
-rebuilt — §3.3's "retain the original body" path). A `Faithful` result
-whose bytes differ from the ingested body makes the target panic, which
-libFuzzer reports as a crash — turning the fuzzer into a search for
-reconstruction bugs, not just for `unwrap`s.
+fixed string, the target uses the `arbitrary` crate to build an
+`OtlpLogRecord` whose body is a **`String`** (the Drain template path —
+the fuzz bytes become the log line; attributes are derived alongside),
+calls `MinerCluster::ingest`, then `render`s the mined record back and
+asserts the §3.3 contract: when `render` returns
+`Reconstruction::Faithful` the bytes are byte-identical to the original
+string body; otherwise it returns `Reconstruction::RetainedVerbatim`
+(the body was surfaced verbatim, not rebuilt — §3.3's "retain the
+original body" path). A `Faithful` result whose bytes differ from the
+original body makes the target panic, which libFuzzer reports as a crash
+— turning the fuzzer into a search for reconstruction bugs, not just for
+`unwrap`s.
+
+The target is deliberately scoped to **string** bodies: that is the
+template-mining + line-reconstruction path the §3.3 invariant governs.
+Structured (`kvlist`/array) bodies take the §6.1 canonical-encoding path
+(`lossy_flag = false`, no template walk), whose round-trip is a distinct
+property — a candidate for a separate target (§7), not folded into this
+oracle.
 
 The three parser targets are panic-oracles on untrusted-input
 boundaries: a decoder must reject garbage with a typed error, never
@@ -138,7 +147,7 @@ on a daily schedule. A crash fails the job; the crashing input is
 uploaded as an artifact. The job also runs `cargo +nightly fuzz build`
 unconditionally so a target that stops compiling is caught even when not
 run. Top-level `contents: read`, job-scoped escalation only if needed
-(per the #251 least-privilege pattern).
+(the workflow-token least-privilege pattern the other workflows follow).
 
 **Phase 2 (follow-up PR): ClusterFuzzLite.** `.clusterfuzzlite/`
 (`Dockerfile` + `build.sh` building the same cargo-fuzz targets) plus
@@ -193,15 +202,16 @@ the find.
 > **Scenario RFC0015.1 — miner round-trip target enforces the §3.3 invariant**
 > - **Given** the `miner_roundtrip` target and a `MinerCluster`
 >   built from `MinerConfig::default()`
-> - **When** the target is run on an arbitrary input that it
->   decodes into an `OtlpLogRecord`, ingests, and renders back
+> - **When** the target builds an `OtlpLogRecord` with a
+>   **`String`** body from the arbitrary input, ingests it, and
+>   renders the mined record back
 > - **Then** the target asserts that when `render` reports
 >   `Reconstruction::Faithful` the rendered bytes equal the
->   ingested body, **and** that any other case reports
+>   original string body, **and** that any other case reports
 >   `Reconstruction::RetainedVerbatim` (the retained body, not a
 >   reconstruction)
 > - **And** an input for which a `Faithful` record renders to
->   bytes unequal to its body makes the target panic (a
+>   bytes unequal to its string body makes the target panic (a
 >   libFuzzer crash), surfacing the reconstruction bug
 > - **And** the assertion references the §3.3 invariant id so the
 >   mapping back to `CLAUDE.md` is greppable
@@ -242,7 +252,7 @@ the find.
 > - **And** a crash fails the job and uploads the crashing input
 >   as an artifact
 > - **And** the job uses top-level `contents: read` (least
->   privilege, per the #251 pattern)
+>   privilege, matching the other workflows)
 
 > **Scenario RFC0015.6 — a found crash becomes a permanent regression seed**
 > - **Given** the fuzzer has found and the team has fixed a crash
@@ -304,6 +314,9 @@ greppable (`docs/verification.md` §2).
 - [ ] **A second miner target** driving *sequences* of records, to fuzz
   template **merge** behaviour (§3.1), not just single-line round-trip?
   Possible Phase 1.5.
+- [ ] **A structured-body round-trip target** exercising the §6.1
+  canonical encoding (`AnyValue ↔ stored bytes` determinism), separate
+  from `miner_roundtrip`'s string-body scope? Possible Phase 1.5.
 - [ ] **Phase 2 corpus-persistence backend**: GitHub Actions cache vs a
   dedicated storage branch/bucket for ClusterFuzzLite?
 - [ ] **`unsafe` waiver** for `fuzz/`: confirm that having the fuzz

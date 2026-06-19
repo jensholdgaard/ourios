@@ -22,8 +22,9 @@ JSON. It mirrors the receiver role's `serve(config) -> Handle` topology
 DSL is the public contract; DataFusion never surfaces (H6). This
 closes the core product loop — **ingest → store → query** — and is the
 keystone the deferred Perses datasource plugin waits on. Returning actual
-log rows depends on the RFC 0007 §4.1 typed-row execution payload, whose
-sequencing relative to this RFC is the central open question (§3.1, §7).
+log rows depends on the typed-row payload + read-time render registry
+delivered by **RFC 0017**, the engine-layer prerequisite that lands
+before this transport (§3.1).
 
 ## 2. Motivation
 
@@ -52,24 +53,20 @@ the thesis holds, so the DSL can become the real, public query contract.
 
 `Querier::run_query` today returns `QueryResult { rows: u64, stats:
 QueryStats }`, where `rows` is a **count** and `stats` reports
-`row_groups_{scanned,pruned}` + `bytes_read`. RFC 0007 §4.1 defers the
-**typed-row payload** ("lands with the execution slice"). A serving
-endpoint that returns only counts + pruning stats — never the actual log
-lines — has little operator value.
+`row_groups_{scanned,pruned}` + `bytes_read`. RFC 0007 §4.1 ("Crate
+shape") *specifies* `QueryResult` as "typed rows + stats", but the engine
+**currently returns only the count** — the typed-row payload is
+unimplemented (RFC 0007 §8 flags streaming-vs-materialised as the open
+question). A serving endpoint that returns only counts + pruning stats —
+never the actual log lines — has little operator value.
 
-This RFC therefore takes returning **log rows** as a requirement, which
-makes the RFC 0007 §4.1 typed-row execution slice a **prerequisite**. Two
-ways to sequence it (resolved in review, §7):
-
-- **(a) Prerequisite RFC 0007 amendment** — land the typed-row payload as
-  an engine-layer slice under RFC 0007 first; RFC 0016 is then a thin
-  transport over it. *(Recommended — keeps the engine/transport split
-  clean and matches the existing RFC ownership.)*
-- **(b) Fold into RFC 0016** — this RFC carries both the row payload and
-  the transport. Larger, blurs the RFC 0007 boundary.
-
-Either way the endpoint's contract is the same; §5 is written assuming
-rows are available.
+This RFC therefore takes returning **rendered log rows** as a
+requirement, which makes the typed-row payload a **prerequisite**. That
+payload — plus the read-time template registry needed to render each
+line — is delivered by **RFC 0017** (read-time template registry &
+query-row rendering), landing as the engine-layer slice before this
+transport. §5 below is written assuming `QueryResult.records` (RFC 0017)
+is available.
 
 ### 3.2 Transport — HTTP/JSON, one querier role
 
@@ -116,8 +113,8 @@ of scope for v1 (§7).
 
 ### 3.4 Response
 
-`200` with `application/json`: the matching rows (shape from the §4.1
-payload) plus the pruning stats (`row_groups_scanned`,
+`200` with `application/json`: the matching rows (the `LogRow` shape from
+RFC 0017) plus the pruning stats (`row_groups_scanned`,
 `row_groups_pruned`, `bytes_read`) so callers see the pillar-1 win
 directly. Result-encoding details (a JSON array vs NDJSON streaming for
 large results, the default `limit` and its hard cap) are §7 open
@@ -161,8 +158,8 @@ until a concrete gRPC consumer exists.
 the engine *exactly as it is today* (return `rows: u64` + stats), defer
 log-line retrieval. Rejected as the primary plan: an endpoint that can't
 return logs isn't a usable query API and wouldn't justify the packaging
-work that follows. Recorded because it is the minimal fallback if the
-§4.1 payload slips.
+work that follows. Recorded because it is the minimal fallback if RFC
+0017's row payload slips.
 
 **Serve queries from the receiver process / always-on.** Folding the
 query listener into the receiver role couples ingest and read scaling and
@@ -251,8 +248,9 @@ spec-to-test mapping is greppable (`docs/verification.md` §2).
 
 ## 7. Open questions
 
-- [ ] **Typed-row payload sequencing (§3.1)** — land RFC 0007 §4.1 as a
-  prerequisite engine slice (recommended), or fold it into this RFC?
+- [x] **Typed-row payload sequencing (§3.1)** → resolved: the payload +
+  render registry land first as **RFC 0017** (engine-layer slice), and
+  this RFC is the thin transport over it.
 - [ ] **Result encoding for large results** — a single JSON array, or
   NDJSON streaming once row counts are large? And the default `limit` +
   its hard cap.
@@ -269,10 +267,12 @@ spec-to-test mapping is greppable (`docs/verification.md` §2).
 ## 8. References
 
 - RFC 0002 (query DSL — the public query grammar), RFC 0007 (querier
-  engine + §4.1 typed-row payload deferral + §8 serving-role open
-  question), RFC 0003 (OTLP receiver — the `serve`/`Handle` + env-gating
-  pattern this mirrors), RFC 0010 (drift queries), RFC 0001 §6.8 (OTel
-  metric surface).
+  engine — §4.1 specifies `QueryResult` as typed rows + stats, §8 flags
+  the serving role + result materialisation), RFC 0017 (the typed-row
+  payload + read-time render registry this transport returns), RFC 0003
+  (OTLP receiver — the `serve`/`Handle` + env-gating pattern this
+  mirrors), RFC 0010 (drift queries), RFC 0001 §6.8 (OTel metric
+  surface).
 - `CLAUDE.md` §1 (not a managed service), §3.7 (multi-tenancy on every
   data path), §6.3 (observability), H6 (query DSL vs DataFusion
   SQL surface — do not leak engine specifics).

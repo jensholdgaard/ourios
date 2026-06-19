@@ -93,7 +93,7 @@ reaching a stable entry point with minimal glue.
 | `miner_roundtrip` ⭐ | `ingest` (with an observable `RecordSink`) → drain the `MinedRecord` → `templates_for` → `reconstruct::render`, on a **string-body** record | `ourios-miner` | **invariant**: the rendered bytes equal the original string body whether `render` reports `Reconstruction::Faithful` (rebuilt) or `Reconstruction::RetainedVerbatim` (retained) — §3.3 |
 | `otlp_json` | `decode_json(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
 | `otlp_protobuf` | `decode_protobuf(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
-| `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
+| `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` — today `pub(crate)`, exposed to the target via the `fuzzing` feature (§3.2, §7) | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
 
 **`miner_roundtrip` is the centerpiece.** Rather than feed the miner a
 fixed string, the target uses the `arbitrary` crate to build an
@@ -336,8 +336,9 @@ greppable (`docs/verification.md` §2).
 
 ## 7. Open questions
 
-Resolved at review (maintainer sign-off, 2026-06-19) — recorded here as
-decisions, to be applied in the implementation PRs:
+Maintainer review (2026-06-19) gave direction on the following;
+recorded here as the planned approach for the implementation PRs (to be
+confirmed as the RFC advances toward `green`):
 
 - [x] **Nightly pin** → **pin a dated `nightly-YYYY-MM-DD`** in the fuzz
   job (not a floating `nightly`), for reproducibility; Renovate bumps

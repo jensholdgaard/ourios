@@ -1,0 +1,12 @@
+# Keep the ClusterFuzzLite build context (RFC 0015 Phase 2) small: the
+# `.clusterfuzzlite/Dockerfile` does `COPY . $SRC/ourios`, so exclude VCS
+# data, build outputs, and the fuzz working dirs (the committed sources,
+# fuzz/fuzz_targets, fuzz/seeds, and the manifests are all kept).
+.git/
+target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+book/
+scratch/

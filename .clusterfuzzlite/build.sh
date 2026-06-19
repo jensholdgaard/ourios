@@ -6,12 +6,17 @@ cd "$SRC/ourios"
 
 cargo fuzz build -O --debug-assertions
 
-fuzz_target_output_dir=fuzz/target/x86_64-unknown-linux-gnu/release
 for f in fuzz/fuzz_targets/*.rs; do
   target=$(basename "${f%.*}")
-  cp "$fuzz_target_output_dir/$target" "$OUT/"
-  # Stage committed seeds as <target>_seed_corpus.zip (OSS-Fuzz convention).
-  if [ -d "fuzz/seeds/$target" ]; then
+  # cargo-fuzz writes to fuzz/target/<triple>/release/<target>; locate the
+  # binary regardless of which target triple it selected (don't hardcode
+  # the triple).
+  bin=$(find fuzz/target -type f -path "*/release/$target" | head -n1)
+  cp "$bin" "$OUT/"
+  # Stage committed seeds as <target>_seed_corpus.zip (OSS-Fuzz convention),
+  # guarding against an absent or empty seed dir (an empty glob would abort
+  # the build under `set -e`).
+  if [ -d "fuzz/seeds/$target" ] && [ -n "$(ls -A "fuzz/seeds/$target")" ]; then
     zip -j "$OUT/${target}_seed_corpus.zip" "fuzz/seeds/$target"/* >/dev/null
   fi
 done

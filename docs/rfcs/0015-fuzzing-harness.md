@@ -90,19 +90,22 @@ reaching a stable entry point with minimal glue.
 
 | Target | Entry point | Crate | Oracle |
 |---|---|---|---|
-| `miner_roundtrip` ⭐ | `MinerCluster::ingest` → `reconstruct::render` | `ourios-miner` | **invariant**: rendered bytes equal the original body, or the record is flagged `Reconstruction::Lossy` |
+| `miner_roundtrip` ⭐ | `MinerCluster::ingest` → `reconstruct::render` | `ourios-miner` | **invariant**: when `render` reports `Reconstruction::Faithful` the bytes equal the original body; otherwise it reports `Reconstruction::RetainedVerbatim` (the body was retained, not reconstructed — §3.3's escape hatch) |
 | `otlp_json` | `decode_json(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
 | `otlp_protobuf` | `decode_protobuf(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
-| `wal_frame` | `frame::read_frame(Cursor<&[u8]>)` | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
+| `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
 
 **`miner_roundtrip` is the centerpiece.** Rather than feed the miner a
 fixed string, the target uses the `arbitrary` crate to derive an
 `OtlpLogRecord` (body + attributes) from the fuzz bytes, calls
 `MinerCluster::ingest`, then `render`s the mined record back and asserts
-the §3.3 contract: the reconstruction is byte-identical to the ingested
-body **or** the record carries the lossy flag. A violating input makes
-the target panic, which libFuzzer reports as a crash — turning the
-fuzzer into a search for reconstruction bugs, not just for `unwrap`s.
+the §3.3 contract: when `render` returns `Reconstruction::Faithful` the
+bytes are byte-identical to the ingested body; otherwise it returns
+`Reconstruction::RetainedVerbatim` (the body was surfaced verbatim, not
+rebuilt — §3.3's "retain the original body" path). A `Faithful` result
+whose bytes differ from the ingested body makes the target panic, which
+libFuzzer reports as a crash — turning the fuzzer into a search for
+reconstruction bugs, not just for `unwrap`s.
 
 The three parser targets are panic-oracles on untrusted-input
 boundaries: a decoder must reject garbage with a typed error, never
@@ -192,10 +195,12 @@ the find.
 >   built from `MinerConfig::default()`
 > - **When** the target is run on an arbitrary input that it
 >   decodes into an `OtlpLogRecord`, ingests, and renders back
-> - **Then** the target asserts the rendered bytes equal the
->   ingested body, **or** the rendered record reports
->   `Reconstruction::Lossy`
-> - **And** an input for which a non-lossy record renders to
+> - **Then** the target asserts that when `render` reports
+>   `Reconstruction::Faithful` the rendered bytes equal the
+>   ingested body, **and** that any other case reports
+>   `Reconstruction::RetainedVerbatim` (the retained body, not a
+>   reconstruction)
+> - **And** an input for which a `Faithful` record renders to
 >   bytes unequal to its body makes the target panic (a
 >   libFuzzer crash), surfacing the reconstruction bug
 > - **And** the assertion references the §3.3 invariant id so the

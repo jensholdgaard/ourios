@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ourios.fullname" . }}
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{- if and .Values.ourios.receiver.enabled .Values.wal.persistence.enabled }}
+  # The receiver role's WAL is a single ReadWriteOnce PVC. Recreate avoids
+  # two pods racing for the same volume during a rollout (the WAL is per-pod
+  # local disk, not shared state). Scaling the receiver past one replica
+  # needs a StatefulSet with per-replica WAL volumes — out of scope here.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ourios.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ourios.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ourios.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: ourios-server
+          image: {{ include "ourios.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Object-storage root — source of truth for data + audit events
+            # (S3-compatible; a config value, NOT a volume). Required.
+            - name: OURIOS_BUCKET_ROOT
+              value: {{ required "ourios.bucketRoot is required (OURIOS_BUCKET_ROOT — the object-storage root)" .Values.ourios.bucketRoot | quote }}
+            {{- with .Values.ourios.compactionIntervalSecs }}
+            - name: OURIOS_COMPACTION_INTERVAL_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.ourios.receiver.enabled }}
+            - name: OURIOS_RECEIVER_ENABLED
+              value: "1"
+            - name: OURIOS_RECEIVER_GRPC_ADDR
+              value: {{ .Values.ourios.receiver.grpcAddr | quote }}
+            - name: OURIOS_RECEIVER_HTTP_ADDR
+              value: {{ .Values.ourios.receiver.httpAddr | quote }}
+            # WAL root — local disk, required when the receiver is enabled
+            # (WAL-before-ack durability). Mounted from the `wal` volume below.
+            - name: OURIOS_WAL_ROOT
+              value: {{ .Values.wal.mountPath | quote }}
+            {{- end }}
+            {{- with .Values.ourios.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            # DEFERRED — the querier role's OURIOS_QUERIER_* env vars land with
+            # RFC 0016 (query-serving endpoint). Do not add them ahead of it.
+          {{- if .Values.ourios.receiver.enabled }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            # DEFERRED — query listener (4319) lands with RFC 0016.
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.ourios.receiver.enabled }}
+          volumeMounts:
+            - name: wal
+              mountPath: {{ .Values.wal.mountPath }}
+          {{- end }}
+      {{- if .Values.ourios.receiver.enabled }}
+      volumes:
+        - name: wal
+          {{- if .Values.wal.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "ourios.fullname" . }}-wal
+          {{- else }}
+          # emptyDir: acknowledged batches are LOST on pod reschedule. Dev only.
+          emptyDir: {}
+          {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

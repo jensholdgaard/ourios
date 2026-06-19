@@ -1,0 +1,21 @@
+{{- if and .Values.ourios.receiver.enabled .Values.wal.persistence.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ourios.fullname" . }}-wal
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+  {{- with .Values.wal.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.wal.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.wal.persistence.size | quote }}
+  {{- if .Values.wal.persistence.storageClass }}
+  storageClassName: {{ .Values.wal.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

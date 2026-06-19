@@ -1,0 +1,28 @@
+{{- if .Values.ourios.receiver.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ourios.fullname" . }}
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ourios.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: otlp-grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: {{ .Values.service.httpPort }}
+      targetPort: otlp-http
+      protocol: TCP
+    # DEFERRED — the query listener port (4319) and its Service entry land
+    # with RFC 0016 (query-serving endpoint, status: drafted). Do not add a
+    # querier port here until that RFC merges.
+{{- end }}

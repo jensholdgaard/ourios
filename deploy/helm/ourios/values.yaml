@@ -1,0 +1,164 @@
+# Default values for the ourios chart.
+# This is a YAML-formatted file. Values declared here are the contract with
+# the templates; the env-var names below are the server's actual contract
+# (crates/ourios-server/src/main.rs).
+
+# -- Number of ourios-server replicas. The server always runs the background
+# compaction role; see the note on `wal` and `bucket` below before scaling
+# the receiver role past 1 (each replica writes its own WAL).
+replicaCount: 1
+
+image:
+  # The GHCR image published by the container-image track.
+  repository: ghcr.io/jensholdgaard/ourios
+  pullPolicy: IfNotPresent
+  # Image tag. Defaults to the chart's appVersion when left empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Whether to create a ServiceAccount.
+  create: true
+  # -- Annotations to add to the ServiceAccount (e.g. an IRSA / Workload
+  # Identity role binding granting the pod access to the object-storage bucket).
+  annotations: {}
+  # -- ServiceAccount name. Generated from the fullname when empty.
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -------------------------------------------------------------------------
+# Ourios server configuration.
+#
+# The server is configured ENTIRELY by environment variables. Two storage
+# concepts are deliberately distinct and must not be conflated:
+#
+#   * bucket   — the object-storage root (OURIOS_BUCKET_ROOT). This is the
+#                source of truth for both Parquet data and audit events
+#                (CLAUDE.md §3.6). It is S3-compatible object storage, so it
+#                is a CONFIG VALUE (a URI/path), NOT a Kubernetes volume.
+#
+#   * wal      — the write-ahead log root (OURIOS_WAL_ROOT). This is LOCAL
+#                disk, required only when the receiver role is enabled
+#                (CLAUDE.md §3.4 WAL-before-ack). It is backed by a
+#                PersistentVolumeClaim so an acknowledged batch survives a
+#                pod restart and crash recovery can replay it.
+# -------------------------------------------------------------------------
+ourios:
+  # -- REQUIRED. Object-storage root the compactor sweeps and the receiver
+  # write path lands Parquet + audit events in (OURIOS_BUCKET_ROOT). For an
+  # S3-compatible store this is a URI; for a local/dev store it is a path
+  # under the (ephemeral) container filesystem. There is no sane default —
+  # the server refuses to start without it — so this MUST be set per install.
+  bucketRoot: ""
+
+  # -- Compaction sweep cadence in seconds (OURIOS_COMPACTION_INTERVAL_SECS).
+  # Optional; the server defaults to 300s when unset.
+  compactionIntervalSecs: ""
+
+  receiver:
+    # -- Enable the OTLP receiver role (OURIOS_RECEIVER_ENABLED). When false,
+    # the pod runs the compaction role only and exposes no listeners.
+    enabled: true
+    # -- gRPC OTLP bind address (OURIOS_RECEIVER_GRPC_ADDR).
+    grpcAddr: "0.0.0.0:4317"
+    # -- HTTP OTLP bind address (OURIOS_RECEIVER_HTTP_ADDR).
+    httpAddr: "0.0.0.0:4318"
+
+  # -- Extra environment variables passed verbatim to the container, e.g.
+  # OTEL_EXPORTER_OTLP_ENDPOINT for the server's own telemetry, or
+  # object-store credentials (AWS_ACCESS_KEY_ID, ...). List of {name, value}
+  # or {name, valueFrom}.
+  extraEnv: []
+
+  # ----------------------------------------------------------------------
+  # DEFERRED — query-serving role (RFC 0016, status: drafted).
+  # The HTTP query listener (port 4319) and its OURIOS_QUERIER_* env surface
+  # are intentionally NOT wired here. Do not invent that surface ahead of the
+  # RFC. When RFC 0016 merges, add the querier env vars, a Service port, and
+  # a `querier:` block under this key.
+  # ----------------------------------------------------------------------
+  # querier:
+  #   enabled: false
+
+# Write-ahead-log persistence (local disk, receiver role only — see the
+# `ourios` block above). The mount path is wired to OURIOS_WAL_ROOT.
+wal:
+  # -- Mount path for the WAL inside the container; passed as OURIOS_WAL_ROOT.
+  mountPath: /var/lib/ourios/wal
+  persistence:
+    # -- Use a PersistentVolumeClaim for the WAL. Strongly recommended: with
+    # this false the WAL falls back to an emptyDir and acknowledged batches
+    # are LOST on pod reschedule, violating the WAL-before-ack durability
+    # contract (CLAUDE.md §3.4). emptyDir is for throwaway/dev only.
+    enabled: true
+    # -- StorageClass for the WAL PVC. Empty uses the cluster default.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+    # -- Annotations for the WAL PVC.
+    annotations: {}
+
+service:
+  type: ClusterIP
+  # OTLP receiver ports. Rendered only when ourios.receiver.enabled is true.
+  grpcPort: 4317
+  httpPort: 4318
+  annotations: {}
+  # DEFERRED — the query Service port (4319) lands with RFC 0016. Not exposed
+  # now; do not add a querier port until that RFC merges.
+
+# Ingress is disabled by default. OTLP ingest is typically reached in-cluster
+# or via a gateway/LoadBalancer, not an HTTP Ingress.
+ingress:
+  enabled: false
+
+# Horizontal Pod Autoscaling is disabled by default. The receiver role's WAL
+# is per-replica local disk (RWO PVC), so autoscaling the receiver needs
+# careful thought; leave this off until that is designed.
+autoscaling:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+livenessProbe:
+  tcpSocket:
+    port: otlp-grpc
+  initialDelaySeconds: 10
+  periodSeconds: 20
+readinessProbe:
+  tcpSocket:
+    port: otlp-grpc
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# -- Graceful shutdown window. The server drains receiver listeners and
+# flushes telemetry on SIGTERM; give it room before SIGKILL.
+terminationGracePeriodSeconds: 60

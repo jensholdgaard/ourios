@@ -1,0 +1,26 @@
+apiVersion: v2
+name: ourios
+description: |
+  Ourios — a log storage and query backend on Apache Parquet, a Drain-derived
+  template miner, and Apache DataFusion. This chart deploys the single
+  ourios-server binary running its always-on background compaction role and,
+  optionally, the OTLP receiver role (gRPC 4317 + HTTP 4318). The query-serving
+  role is deferred until RFC 0016 merges.
+type: application
+# Chart version — bump on every chart change (SemVer), independent of the app.
+version: 0.1.0
+# The Ourios release this chart targets. Pre-release: the project is under
+# active RFC-driven development and has not cut a tagged release yet.
+appVersion: "0.0.0"
+home: https://github.com/jensholdgaard/ourios
+sources:
+  - https://github.com/jensholdgaard/ourios
+keywords:
+  - logs
+  - observability
+  - otlp
+  - parquet
+  - datafusion
+maintainers:
+  - name: Jens Holdgaard Pedersen
+    url: https://github.com/jensholdgaard

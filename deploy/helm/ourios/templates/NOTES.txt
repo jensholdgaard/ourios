@@ -1,0 +1,25 @@
+Ourios {{ .Chart.AppVersion }} has been deployed as release "{{ .Release.Name }}".
+
+The ourios-server pod always runs the background compaction role over the
+object-storage root:
+
+  OURIOS_BUCKET_ROOT = {{ .Values.ourios.bucketRoot | default "(UNSET — install will fail; set ourios.bucketRoot)" }}
+
+{{- if .Values.ourios.receiver.enabled }}
+
+The OTLP receiver role is ENABLED. Send OTLP logs to the Service:
+
+  gRPC: {{ include "ourios.fullname" . }}:{{ .Values.service.grpcPort }}
+  HTTP: {{ include "ourios.fullname" . }}:{{ .Values.service.httpPort }}
+
+The write-ahead log is mounted at {{ .Values.wal.mountPath }}
+{{- if .Values.wal.persistence.enabled }} (PersistentVolumeClaim, {{ .Values.wal.persistence.size }}).
+{{- else }} (emptyDir — WARNING: acknowledged batches are lost on pod reschedule; dev only).
+{{- end }}
+{{- else }}
+
+The OTLP receiver role is DISABLED — this pod runs compaction only.
+{{- end }}
+
+NOTE: the query-serving role (RFC 0016) is not yet available; no query
+endpoint is exposed by this chart.

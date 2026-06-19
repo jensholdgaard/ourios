@@ -91,9 +91,12 @@ A single querier role, mirroring the receiver:
 (`dsl::parse_statement` for the text grammar, `parse_structured_statement`
 for the JSON form), so the endpoint accepts either by `Content-Type`:
 
-- `application/json` → `{ "query": "<dsl text>" }` *or* the structured
-  JSON IR (per RFC 0002's structured surface);
-- `text/plain` → the raw DSL statement.
+- `text/plain` → the raw DSL statement, parsed by `parse_statement`;
+- `application/json` → either a `{ "query": "<dsl text>" }` wrapper (the
+  text grammar, unwrapped then `parse_statement`) **or** RFC 0002's
+  structured-IR JSON (the top-level IR object, parsed by
+  `parse_structured_statement`) — these are distinct shapes; the endpoint
+  distinguishes them by whether the body is the `{"query": …}` wrapper.
 
 The parsed `Statement` dispatches: `Logs(Query)` → `run_query`,
 `Drift(DriftQuery)` → `run_drift` (RFC 0010). The server supplies `now`
@@ -138,7 +141,9 @@ ever appears** in a response. Mapping:
 The querier role emits metrics through the OTel meter surface (RFC 0001
 §6.8 model — per the established "OTel meters, not the Prometheus client"
 direction): query count, latency histogram, and the pruning ratio
-(`row_groups_pruned / scanned`) so the thesis win is observable in
+(`row_groups_pruned / (row_groups_scanned + row_groups_pruned)` — the
+fraction of total row groups skipped, matching `QueryStats`) so the
+thesis win is observable in
 production. New metric/attribute names go through `semconv/registry/` +
 weaver (no hand-written flat names).
 

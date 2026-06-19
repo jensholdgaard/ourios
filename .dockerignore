@@ -1,8 +1,11 @@
-# Keep the ClusterFuzzLite build context (RFC 0015 Phase 2) small: the
-# `.clusterfuzzlite/Dockerfile` does `COPY . $SRC/ourios`, so exclude VCS
-# data, build outputs, and the fuzz working dirs (the committed sources,
-# fuzz/fuzz_targets, fuzz/seeds, and the manifests are all kept).
+# Keep Docker build contexts small (the production Dockerfile and
+# `.clusterfuzzlite/Dockerfile` both `COPY .`): exclude VCS data, build
+# outputs, the fuzz working dirs, and everything not needed to compile
+# the workspace — so a docs/CI/chart change doesn't invalidate the image
+# build context. The committed sources (crates/, fuzz/fuzz_targets,
+# fuzz/seeds) and the manifests (Cargo.toml/Cargo.lock) are kept.
 .git/
+.github/
 target/
 fuzz/target/
 fuzz/corpus/
@@ -10,3 +13,8 @@ fuzz/artifacts/
 fuzz/coverage/
 book/
 scratch/
+docs/
+deploy/
+.clusterfuzzlite/
+*.md
+LICENSE

@@ -122,10 +122,12 @@ questions. Drift queries return the RFC 0010 `DriftResult` shape.
 All errors are Ourios-owned; **no DataFusion type, SQL string, or plan
 ever appears** in a response. Mapping:
 
-- DSL parse/validation (`DslError`, `QueryError::Compile`) → `400` with a
-  structured `{ "error": { "kind": ..., "message": ... } }`.
+- DSL parse/validation (`DslError`, `QueryError::InvalidQuery`) → `400`
+  with a structured `{ "error": { "kind": ..., "message": ... } }`.
 - `QueryError::TenantRequired` / missing header → `400`.
-- Execution failure → `500`, message scrubbed of engine internals.
+- Execution failure (`QueryError::Storage`) → `500`, message scrubbed of
+  engine internals (its `Display` already withholds DataFusion text per
+  RFC0007.3 / H6).
 
 ### 3.6 Observability
 
@@ -138,8 +140,8 @@ weaver (no hand-written flat names).
 
 ## 4. Alternatives considered
 
-**SQL passthrough.** Expose DataFusion SQL directly. Rejected by hazard
-#6 and RFC 0007's "Not a SQL endpoint" line — leaking the engine's SQL
+**SQL passthrough.** Expose DataFusion SQL directly. Rejected by H6 and
+RFC 0007's "Not a SQL endpoint" line — leaking the engine's SQL
 surface couples the public API to an implementation detail and forfeits
 the DSL's template-aware primitives (`resolves_to`, `lossy`, drift).
 

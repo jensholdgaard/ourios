@@ -4,15 +4,20 @@
 # only glibc + the binary. Distroless `cc-debian12` is multi-arch, so the
 # CI build cross-builds linux/amd64 + linux/arm64 from one Dockerfile.
 
-# Builder: pinned to the workspace MSRV (Cargo.toml `rust-version = 1.85`).
-FROM rust:1.85-bookworm AS builder
+# Builder: pinned to the workspace MSRV (Cargo.toml `rust-version = 1.85`)
+# by digest for reproducibility; the tag comment lets Renovate's docker
+# manager bump it.
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS builder
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p ourios-server
+# `--locked` so a stale Cargo.lock fails the build instead of being
+# silently updated inside the image.
+RUN cargo build --release --locked -p ourios-server
 
 # Runtime: distroless `cc` carries glibc (the builder is glibc, not musl)
 # and is published multi-arch, so it works under the QEMU cross-build.
-FROM gcr.io/distroless/cc-debian12
+# Digest-pinned for reproducibility (Renovate bumps via the tag comment).
+FROM gcr.io/distroless/cc-debian12@sha256:d703b626ba455c4e6c6fbe5f36e6f427c85d51445598d564652a2f334179f96e
 COPY --from=builder /build/target/release/ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
 # the future query endpoint (RFC 0016) and is intentionally not exposed

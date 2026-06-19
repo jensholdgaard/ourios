@@ -56,6 +56,10 @@ jobs:
           # BuildKit-generated supply-chain attestations.
           provenance: mode=max
           sbom: true
+          # GHA layer cache — the arm64 leg cross-builds under QEMU, so
+          # caching across runs keeps the build off the CI timeout.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 

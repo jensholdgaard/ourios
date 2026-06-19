@@ -186,10 +186,11 @@ backend is an open question (§7).
 
 When the fuzzer finds a crash, the workflow per `CLAUDE.md` §6.2 is:
 minimise the reproducer (`cargo fuzz tmin`), commit it as a permanent
-seed under `fuzz/corpus/<target>/` (or a dedicated `regressions/`
-subdir), then fix the bug. The seed stays forever, re-checked on every
-run — a found bug becomes a standing specification, never silently
-dropped.
+seed under the tracked `fuzz/seeds/<target>/` (the working
+`fuzz/corpus/` is gitignored, so a reproducer parked there would not
+persist — §3.3), then fix the bug. The seed stays forever, re-checked
+on every run — a found bug becomes a standing specification, never
+silently dropped.
 
 ## 4. Alternatives considered
 

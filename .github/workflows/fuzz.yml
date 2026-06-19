@@ -71,8 +71,11 @@ jobs:
           host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
           mkdir -p "fuzz/corpus/${target}"
           # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
+          # Copy the directory contents (`/.`) so an empty/odd glob can't
+          # silently skip seeding; errors surface under `set -e` rather
+          # than being swallowed.
           if [ -d "fuzz/seeds/${target}" ]; then
-            cp -n "fuzz/seeds/${target}"/* "fuzz/corpus/${target}/" 2>/dev/null || true
+            cp -rn "fuzz/seeds/${target}/." "fuzz/corpus/${target}/"
           fi
           # `fuzz run` also builds, so a target that stops compiling fails
           # here too.

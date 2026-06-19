@@ -1,7 +1,7 @@
 ---
 rfc: 0015
 title: Fuzzing harness — cargo-fuzz targets & ClusterFuzzLite CI
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-19

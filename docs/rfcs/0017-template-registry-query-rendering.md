@@ -27,14 +27,17 @@ template's **initial creation is unaudited today** — so this RFC also
 creation. The querier then returns Ourios-owned `LogRow`s (a new
 `records: Vec<LogRow>` on `QueryResult`, alongside the existing `rows`
 count), each carrying the rendered line + reconstruction marker. This
-discharges RFC 0007 §4.1 (typed-row payload) and the deferred query-time
-rendering, and is the prerequisite for RFC 0016's HTTP endpoint to return
-actual logs.
+delivers the typed-row payload RFC 0007 §4.1 ("Crate shape") *specifies*
+but the engine never implemented (it returns only a count), plus the
+query-time rendering that needs it, and is the prerequisite for RFC
+0016's HTTP endpoint to return actual logs.
 
 ## 2. Motivation
 
 A query returns `QueryResult { rows: u64, stats }` today — a count, no
-rows (RFC 0007 §4.1 deferred the "typed-row payload"). RFC 0016's
+rows. RFC 0007 §4.1 *specifies* `QueryResult` as "typed rows + stats",
+but the engine implemented only the count; the typed-row payload was
+never built (RFC 0007 §8 left result materialisation open). RFC 0016's
 query-serving endpoint is hollow without real rows, and the *point* of an
 operator query is to see the **logs**, which means reconstructing each
 line from `(template_id, params, separators)` per the §3.3 bit-identical
@@ -271,7 +274,8 @@ is greppable (`docs/verification.md` §2).
   (audit stream); RFC 0005 §3.7 (audit schema; the append-only
   event-type rule, the canonical token encoding), §3.7.1 (derive-from-
   audit model; the deferred cached artifact / manifest fork #94/#147);
-  RFC 0007 §4.1 (typed-row payload), §8 (read-time registry open
+  RFC 0007 §4.1 (specifies `QueryResult` as typed rows + stats — the
+  payload this RFC implements), §8 (result-materialisation open
   question); RFC 0002 (`render` stage); RFC 0010 (drift, the other
   audit-derived query); RFC 0016 (the query-serving endpoint that
   consumes `records`).

@@ -69,11 +69,16 @@ cargo-fuzz convention (`cargo fuzz init`). It is:
   developers running fuzz locally. This is a contained, documented
   deviation from the §6.1 stable pin — it never touches the binaries we
   ship;
-- **exempt from the workspace `#![deny(unsafe_code)]`** (`CLAUDE.md`
-  §6.1), because the `libfuzzer-sys::fuzz_target!` macro expands to
-  `unsafe` glue. The exemption is scoped to `fuzz/` exactly as
-  `ourios-parquet`'s is scoped to that crate; our harness bodies stay
-  safe.
+- **opts out of the workspace `unsafe_code = "deny"` lint** (root
+  `Cargo.toml` `[workspace.lints.rust]`; every shipping crate inherits
+  it via `[lints] workspace = true`), because the
+  `libfuzzer-sys::fuzz_target!` macro expands to `unsafe` glue. `CLAUDE.md`
+  §6.1 permits a per-crate waiver where an RFC justifies one (it cites a
+  possible `ourios-parquet` zero-copy need as the example; no crate
+  carries such a waiver today — every crate root, `ourios-parquet`
+  included, is `#![deny(unsafe_code)]`). This RFC is that justification,
+  scoped to `fuzz/` alone — the member simply does not inherit the
+  workspace lint; our harness bodies stay safe.
 
 Adding this member is a `CLAUDE.md` §7 new-crate decision; this RFC is
 that decision's record.
@@ -296,9 +301,10 @@ greppable (`docs/verification.md` §2).
   Possible Phase 1.5.
 - [ ] **Phase 2 corpus-persistence backend**: GitHub Actions cache vs a
   dedicated storage branch/bucket for ClusterFuzzLite?
-- [ ] **`unsafe` exemption** for `fuzz/`: confirm scoping the
-  `deny(unsafe_code)` waiver to the fuzz member (as for
-  `ourios-parquet`) is acceptable.
+- [ ] **`unsafe` waiver** for `fuzz/`: confirm that having the fuzz
+  member opt out of the workspace `unsafe_code = "deny"` lint (the first
+  such waiver in the repo) is acceptable, given the `fuzz_target!` macro
+  requires it.
 
 ## 8. References
 

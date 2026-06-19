@@ -7,6 +7,12 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# We hand-edit the generated `release.yml` to meet repo conventions
+# (SHA-pinned actions, least-privilege per-job permissions, the v* tag
+# glob, the attest subject-path / cyclonedx-find fixes). `allow-dirty`
+# tells `dist plan`/`generate` not to fail on those deviations. Re-apply
+# the edits if you ever regenerate.
+allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax). Ourios

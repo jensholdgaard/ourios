@@ -43,6 +43,12 @@ crc32c = "0.6"
 # defers to this RFC (§6.4 audit-ordering barrier).
 ourios-core = { path = "../ourios-core" }
 
+[features]
+# Exposes the crate-internal `frame` module (`read_frame`, `FrameError`)
+# for the `fuzz/` cargo-fuzz `wal_frame` target (RFC 0015). Off by
+# default; not part of the stable public API.
+fuzzing = []
+
 [dev-dependencies]
 # Scratch directories for the segment-on-disk tests.
 tempfile = "3"

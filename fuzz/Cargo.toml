@@ -1,0 +1,57 @@
+# cargo-fuzz harness for Ourios (RFC 0015). Standalone workspace — built
+# only under nightly with libFuzzer sanitizers, never by the stable
+# workspace (`exclude = ["fuzz"]` in the root Cargo.toml). Not published;
+# not subject to the workspace `unsafe_code = "deny"` lint, since the
+# `fuzz_target!` macro expands to `unsafe` glue (RFC 0015 §3.1).
+[package]
+name = "ourios-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+ourios-core = { path = "../crates/ourios-core" }
+ourios-miner = { path = "../crates/ourios-miner" }
+ourios-ingester = { path = "../crates/ourios-ingester" }
+ourios-wal = { path = "../crates/ourios-wal", features = ["fuzzing"] }
+
+# Drain-template + bit-identical reconstruction round-trip (§3.3 / §3.1).
+[[bin]]
+name = "miner_roundtrip"
+path = "fuzz_targets/miner_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Untrusted-input boundary: OTLP/JSON decode must never panic.
+[[bin]]
+name = "otlp_json"
+path = "fuzz_targets/otlp_json.rs"
+test = false
+doc = false
+bench = false
+
+# Untrusted-input boundary: OTLP/protobuf decode must never panic.
+[[bin]]
+name = "otlp_protobuf"
+path = "fuzz_targets/otlp_protobuf.rs"
+test = false
+doc = false
+bench = false
+
+# WAL frame decode: malformed bytes must yield a typed FrameError, never UB.
+[[bin]]
+name = "wal_frame"
+path = "fuzz_targets/wal_frame.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace (belt-and-suspenders with the root
+# `exclude`): this manifest is its own single-package workspace root.
+[workspace]

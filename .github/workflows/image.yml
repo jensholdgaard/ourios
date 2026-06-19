@@ -1,0 +1,65 @@
+name: Container image
+
+# Build, push, and sign the production `ourios-server` OCI image (first
+# shipping milestone, workstream A). Multi-arch (linux/amd64 + arm64 via
+# QEMU), pushed to GHCR, signed keyless with cosign (Sigstore OIDC, no
+# key secret). Triggered by version tags; `workflow_dispatch` lets the
+# image be verified post-merge without cutting a tag (the local
+# environment has no Docker, mirroring the ClusterFuzzLite setup).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Least privilege at the top; the build job widens to what it needs.
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: build, push, sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Push the image + attestations to GHCR.
+      packages: write
+      # Keyless cosign signing via the Sigstore OIDC flow.
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/jensholdgaard/ourios
+
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # BuildKit-generated supply-chain attestations.
+          provenance: mode=max
+          sbom: true
+
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: cosign sign (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/jensholdgaard/ourios@${DIGEST}"

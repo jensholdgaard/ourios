@@ -1,0 +1,35 @@
+name: ClusterFuzzLite coverage
+
+# Weekly line-coverage report for the RFC 0015 fuzz corpus (Phase 2):
+# how much of the mined/parsed code paths the accumulated corpus reaches.
+# Schedule + dispatch only — never per-PR (RFC 0015 §3.4).
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build fuzzers (coverage)
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: coverage
+      - name: Run fuzzers (coverage)
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: coverage
+          sanitizer: coverage

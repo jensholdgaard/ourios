@@ -176,14 +176,20 @@ invocation. A crash fails that target's job and uploads the reproducer
 as an artifact. Top-level `contents: read` (the workflow-token
 least-privilege pattern the other workflows follow).
 
-**Phase 2 (follow-up PR): ClusterFuzzLite.** `.clusterfuzzlite/`
-(`Dockerfile` + `build.sh` building the same cargo-fuzz targets) plus
-`cflite_pr.yml` (short PR fuzzing against the persisted corpus),
-`cflite_batch.yml` (longer scheduled runs that grow and persist the
-corpus), and a coverage job. ClusterFuzzLite is what Scorecard's
-`Fuzzing` check detects (it cannot see a bare cargo-fuzz directory), so
-Phase 2 is what moves that check 0 → positive. Corpus-persistence
-backend is an open question (§7).
+**Phase 2: ClusterFuzzLite.** `.clusterfuzzlite/` (`Dockerfile` on the
+OSS-Fuzz `base-builder-rust` image + `build.sh` that `cargo fuzz build`s
+the same targets and stages them with their seed corpora) plus
+`cflite_batch.yml` (scheduled continuous fuzzing that grows and persists
+the corpus) and `cflite_coverage.yml` (weekly corpus line-coverage).
+Both run on `schedule` + `workflow_dispatch` only — **no PR-fuzzing
+workflow**, consistent with the per-PR rule above. The corpus persists
+in the **GitHub Actions cache** (no external storage backend), resolving
+the §7 open question. ClusterFuzzLite is what Scorecard's `Fuzzing`
+check detects (via `.clusterfuzzlite/Dockerfile`; it cannot see a bare
+cargo-fuzz directory), so Phase 2 is what moves that check 0 → positive
+(RFC0015.7). The cflite container build is verified by dispatching
+`cflite_batch` after merge — it cannot run on the introducing PR with no
+PR trigger.
 
 ### 3.5 Regression discipline
 
@@ -371,8 +377,9 @@ Still open, deferred to the implementation PRs:
 - [ ] **A structured-body round-trip target** exercising the §6.1
   canonical encoding (`AnyValue ↔ stored bytes` determinism), separate
   from `miner_roundtrip`'s string-body scope? Possible Phase 1.5.
-- [ ] **Phase 2 corpus-persistence backend**: GitHub Actions cache vs a
-  dedicated storage branch/bucket for ClusterFuzzLite?
+- [x] **Phase 2 corpus-persistence backend** → **GitHub Actions cache**
+  (ephemeral, in-repo, no external storage or secrets), chosen over a
+  storage branch/bucket. Implemented in `cflite_batch.yml`.
 - [ ] **`unsafe` waiver** for `fuzz/`: confirm that having the fuzz
   member opt out of the workspace `unsafe_code = "deny"` lint (the first
   such waiver in the repo) is acceptable, given the `fuzz_target!` macro

@@ -90,7 +90,7 @@ reaching a stable entry point with minimal glue.
 
 | Target | Entry point | Crate | Oracle |
 |---|---|---|---|
-| `miner_roundtrip` ⭐ | `MinerCluster::ingest` → `reconstruct::render` on a **string-body** record | `ourios-miner` | **invariant**: when `render` reports `Reconstruction::Faithful` the bytes equal the original string body; otherwise it reports `Reconstruction::RetainedVerbatim` (the body was retained, not reconstructed — §3.3's escape hatch) |
+| `miner_roundtrip` ⭐ | `ingest` (with an observable `RecordSink`) → drain the `MinedRecord` → `templates_for` → `reconstruct::render`, on a **string-body** record | `ourios-miner` | **invariant**: the rendered bytes equal the original string body whether `render` reports `Reconstruction::Faithful` (rebuilt) or `Reconstruction::RetainedVerbatim` (retained) — §3.3 |
 | `otlp_json` | `decode_json(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
 | `otlp_protobuf` | `decode_protobuf(&[u8])` | `ourios-ingester` | no panic; `Ok`/`Err` both fine |
 | `wal_frame` | `frame::read_frame(&mut Cursor::new(data))` | `ourios-wal` | no panic; malformed input yields a typed `FrameError`, never UB |
@@ -98,17 +98,24 @@ reaching a stable entry point with minimal glue.
 **`miner_roundtrip` is the centerpiece.** Rather than feed the miner a
 fixed string, the target uses the `arbitrary` crate to build an
 `OtlpLogRecord` whose body is a **`String`** (the Drain template path —
-the fuzz bytes become the log line; attributes are derived alongside),
-calls `MinerCluster::ingest`, then `render`s the mined record back and
-asserts the §3.3 contract: the rendered bytes equal the original string
-body **in both outcomes** — whether `render` reports
-`Reconstruction::Faithful` (rebuilt from the template) or
-`Reconstruction::RetainedVerbatim` (the original body surfaced verbatim,
-not rebuilt). §3.3 guarantees a string line is either reconstructed
-exactly or has its original body retained, so *either* a faithful-rebuild
-mismatch *or* a retention failure is a violation — and makes the target
-panic, which libFuzzer reports as a crash. That turns the fuzzer into a
-search for reconstruction bugs, not just for `unwrap`s.
+the fuzz bytes become the log line; attributes are derived alongside).
+`MinerCluster::ingest` returns only a `template_id`, so the harness
+follows the miner's real read-back path (the one
+`crates/ourios-miner/tests/invariants.rs` uses): the cluster is built
+with an observable `RecordSink` (`SharedRecordSink`), `ingest` is called,
+the emitted `MinedRecord` is drained from the sink, the leaf's template
+tokens are looked up via `MinerCluster::templates_for(tenant)` matching
+the record's `(template_id, template_version)`, and `reconstruct::render`
+is called with that record and those tokens. It then asserts the §3.3
+contract: the rendered bytes equal the original string body **in both
+outcomes** — whether `render` reports `Reconstruction::Faithful` (rebuilt
+from the template) or `Reconstruction::RetainedVerbatim` (the original
+body surfaced verbatim, not rebuilt). §3.3 guarantees a string line is
+either reconstructed exactly or has its original body retained, so
+*either* a faithful-rebuild mismatch *or* a retention failure is a
+violation — and makes the target panic, which libFuzzer reports as a
+crash. That turns the fuzzer into a search for reconstruction bugs, not
+just for `unwrap`s.
 
 The target is deliberately scoped to **string** bodies: that is the
 template-mining + line-reconstruction path the §3.3 invariant governs.
@@ -224,10 +231,13 @@ the find.
 
 > **Scenario RFC0015.1 — miner round-trip target enforces the §3.3 invariant**
 > - **Given** the `miner_roundtrip` target and a `MinerCluster`
->   built from `MinerConfig::default()`
+>   built from `MinerConfig::default()` with an observable
+>   `RecordSink` attached
 > - **When** the target builds an `OtlpLogRecord` with a
->   **`String`** body from the arbitrary input, ingests it, and
->   renders the mined record back
+>   **`String`** body from the arbitrary input, ingests it,
+>   drains the emitted `MinedRecord` from the sink, looks up the
+>   leaf tokens via `templates_for` for the record's
+>   `(template_id, template_version)`, and calls `render`
 > - **Then** the rendered bytes equal the original string body in
 >   **both** outcomes — whether `render` reports
 >   `Reconstruction::Faithful` (rebuilt from the template) or

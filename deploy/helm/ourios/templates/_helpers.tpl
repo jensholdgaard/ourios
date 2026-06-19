@@ -63,14 +63,22 @@ Splits on ":" and takes the last field so the container/Service port can never
 drift from the address the server actually binds.
 */}}
 {{- define "ourios.grpcPort" -}}
-{{- (splitList ":" .Values.ourios.receiver.grpcAddr) | last -}}
+{{- $port := (splitList ":" .Values.ourios.receiver.grpcAddr) | last -}}
+{{- if not (regexMatch "^[0-9]+$" $port) -}}
+{{- fail (printf "ourios.receiver.grpcAddr (%q) must end in a numeric port, e.g. 0.0.0.0:4317" .Values.ourios.receiver.grpcAddr) -}}
+{{- end -}}
+{{- $port -}}
 {{- end }}
 
 {{/*
 Port portion of the receiver HTTP bind address (OURIOS_RECEIVER_HTTP_ADDR).
 */}}
 {{- define "ourios.httpPort" -}}
-{{- (splitList ":" .Values.ourios.receiver.httpAddr) | last -}}
+{{- $port := (splitList ":" .Values.ourios.receiver.httpAddr) | last -}}
+{{- if not (regexMatch "^[0-9]+$" $port) -}}
+{{- fail (printf "ourios.receiver.httpAddr (%q) must end in a numeric port, e.g. 0.0.0.0:4318" .Values.ourios.receiver.httpAddr) -}}
+{{- end -}}
+{{- $port -}}
 {{- end }}
 
 {{/*

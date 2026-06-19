@@ -1,4 +1,4 @@
-{{- if and (gt (int .Values.replicaCount) 1) .Values.wal.persistence.enabled -}}
+{{- if and .Values.ourios.receiver.enabled (gt (int .Values.replicaCount) 1) .Values.wal.persistence.enabled -}}
 {{- fail "replicaCount > 1 with wal.persistence.enabled is unsupported: the receiver's local WAL is single-writer and backed by one ReadWriteOnce PVC, which cannot mount to multiple pods. For HA, run a StatefulSet with per-replica WAL volumes or front external object storage — see CLAUDE.md §3.4 (WAL-before-ack)." -}}
 {{- end -}}
 apiVersion: apps/v1
@@ -50,7 +50,7 @@ spec:
             # Object-storage root — source of truth for data + audit events
             # (S3-compatible; a config value, NOT a volume). Required.
             - name: OURIOS_BUCKET_ROOT
-              value: {{ required "ourios.bucketRoot is required (OURIOS_BUCKET_ROOT — the object-storage root)" .Values.ourios.bucketRoot | quote }}
+              value: {{ required "ourios.bucketRoot is required (OURIOS_BUCKET_ROOT — where the server writes Parquet)" .Values.ourios.bucketRoot | quote }}
             {{- with .Values.ourios.compactionIntervalSecs }}
             - name: OURIOS_COMPACTION_INTERVAL_SECS
               value: {{ . | quote }}

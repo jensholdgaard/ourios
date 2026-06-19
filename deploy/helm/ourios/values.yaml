@@ -62,11 +62,14 @@ securityContext:
 #                pod restart and crash recovery can replay it.
 # -------------------------------------------------------------------------
 ourios:
-  # -- REQUIRED. Object-storage root the compactor sweeps and the receiver
-  # write path lands Parquet + audit events in (OURIOS_BUCKET_ROOT). For an
-  # S3-compatible store this is a URI; for a local/dev store it is a path
-  # under the (ephemeral) container filesystem. There is no sane default —
-  # the server refuses to start without it — so this MUST be set per install.
+  # -- REQUIRED. Where the server writes Parquet + audit events and the
+  # compactor sweeps (OURIOS_BUCKET_ROOT). NOTE: the binary uses a *local
+  # filesystem* store today (it `create_dir_all`s this path), so it must
+  # point at persistent storage — mount a volume and set this to a path on
+  # it, or acknowledge data is lost on pod restart. S3-compatible object
+  # storage (a URI here) is RFC 0013, in progress; until it lands, treat
+  # this as a local path. No default — the server refuses to start without
+  # it, so it MUST be set per install.
   bucketRoot: ""
 
   # -- Compaction sweep cadence in seconds (OURIOS_COMPACTION_INTERVAL_SECS).

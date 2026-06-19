@@ -12,6 +12,10 @@ for f in fuzz/fuzz_targets/*.rs; do
   # binary regardless of which target triple it selected (don't hardcode
   # the triple).
   bin=$(find fuzz/target -type f -path "*/release/$target" | head -n1)
+  if [ -z "$bin" ]; then
+    echo "build.sh: no built binary found for fuzz target '$target'" >&2
+    exit 1
+  fi
   cp "$bin" "$OUT/"
   # Stage committed seeds as <target>_seed_corpus.zip (OSS-Fuzz convention),
   # guarding against an absent or empty seed dir (an empty glob would abort

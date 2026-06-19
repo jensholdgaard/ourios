@@ -11,7 +11,7 @@ for f in fuzz/fuzz_targets/*.rs; do
   # cargo-fuzz writes to fuzz/target/<triple>/release/<target>; locate the
   # binary regardless of which target triple it selected (don't hardcode
   # the triple).
-  bin=$(find fuzz/target -type f -path "*/release/$target" | head -n1)
+  bin=$(find fuzz/target -type f -path "*/release/$target" -print -quit)
   if [ -z "$bin" ]; then
     echo "build.sh: no built binary found for fuzz target '$target'" >&2
     exit 1

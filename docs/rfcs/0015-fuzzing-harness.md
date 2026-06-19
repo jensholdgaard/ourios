@@ -154,24 +154,25 @@ grown corpus is persisted by ClusterFuzzLite in Phase 2, not committed.
 ### 3.4 CI — phased
 
 **Phase 1 (this RFC's `green`): `.github/workflows/fuzz.yml`.** A bounded
-smoke-fuzz job on a pinned nightly toolchain that runs **all four**
-targets — the parser targets are cheap, so there is no reason to gate
-on the miner alone. Each target runs for a short PR budget and a longer
-scheduled budget, e.g.:
+smoke-fuzz job on a pinned nightly toolchain, run as a matrix over **all
+four** targets — the parser targets are cheap, so there is no reason to
+gate on the miner alone. Each matrix job runs its target for a short PR
+budget and a longer scheduled budget, e.g.:
 
 ```sh
-# PR (per target): ~60 s. Daily schedule: ~300 s.
-cargo +nightly-2026-06-01 fuzz run <target> -- -max_total_time=60
+# PR (per target): ~60 s. Daily schedule: ~300 s. --target forces the
+# gnu host triple (cargo-fuzz otherwise picks musl, whose static libc
+# is incompatible with the ASan sanitizer).
+cargo +nightly-2026-06-01 fuzz run <target> --target "$host" -- -max_total_time=60
 ```
 
 It triggers on PRs that touch `ourios-miner` / `ourios-ingester` /
-`ourios-wal` and on a daily schedule. A crash fails the job; the
-crashing input is uploaded as an artifact. The job also runs
-`cargo +nightly fuzz build` for every target unconditionally, so a
-target that stops compiling is caught even on runs where it is not
-executed. Top-level `contents: read`, job-scoped escalation only if
-needed (the workflow-token least-privilege pattern the other workflows
-follow).
+`ourios-wal` / `fuzz/` and on a daily schedule. `fuzz run` builds before
+it runs, so a target that stops compiling fails its job; because every
+target is always in the matrix (`fail-fast: false`), all four are built
+and run on every invocation. A crash fails that target's job and uploads
+the reproducer as an artifact. Top-level `contents: read` (the
+workflow-token least-privilege pattern the other workflows follow).
 
 **Phase 2 (follow-up PR): ClusterFuzzLite.** `.clusterfuzzlite/`
 (`Dockerfile` + `build.sh` building the same cargo-fuzz targets) plus

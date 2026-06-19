@@ -1,7 +1,7 @@
 ---
 rfc: 0016
 title: Query-serving endpoint — the HTTP query API over the logs DSL
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-19
@@ -19,7 +19,7 @@ DSL query (RFC 0002), executes it through `Querier::run_query` /
 `run_drift`, and returns the matching log rows plus pruning statistics as
 JSON. It mirrors the receiver role's `serve(config) -> Handle` topology
 (RFC 0003) — env-gated, graceful-shutdown, its own listen address. The
-DSL is the public contract; DataFusion never surfaces (hazard #6). This
+DSL is the public contract; DataFusion never surfaces (H6). This
 closes the core product loop — **ingest → store → query** — and is the
 keystone the deferred Perses datasource plugin waits on. Returning actual
 log rows depends on the RFC 0007 §4.1 typed-row execution payload, whose
@@ -117,7 +117,7 @@ directly. Result-encoding details (a JSON array vs NDJSON streaming for
 large results, the default `limit` and its hard cap) are §7 open
 questions. Drift queries return the RFC 0010 `DriftResult` shape.
 
-### 3.5 Error model (hazard #6)
+### 3.5 Error model (H6)
 
 All errors are Ourios-owned; **no DataFusion type, SQL string, or plan
 ever appears** in a response. Mapping:
@@ -195,7 +195,7 @@ querier-only or receiver-only deployment is a real operational shape.
 >   is posted
 > - **Then** the response is `400` with an Ourios-owned error body,
 >   and **no** DataFusion type, SQL string, or plan text appears in
->   the response (hazard #6)
+>   the response (H6)
 
 > **Scenario RFC0016.5 — role gating and graceful shutdown**
 > - **Given** `OURIOS_QUERIER_ENABLED` unset
@@ -230,7 +230,7 @@ querier-only or receiver-only deployment is a real operational shape.
   at the API layer.
 - **RFC0016.4** — table of malformed statements → 400; a grep-style
   assertion that the response body contains no `DataFusion` / `SQL` /
-  `LogicalPlan` substrings (hazard #6 guard).
+  `LogicalPlan` substrings (H6 guard).
 - **RFC0016.5 / .7** — process-level tests: env permutations
   (neither / one / both roles), bind assertions, and a
   SIGINT-drains-cleanly check (the receiver already has this pattern).
@@ -265,7 +265,7 @@ spec-to-test mapping is greppable (`docs/verification.md` §2).
   pattern this mirrors), RFC 0010 (drift queries), RFC 0001 §6.8 (OTel
   metric surface).
 - `CLAUDE.md` §1 (not a managed service), §3.7 (multi-tenancy on every
-  data path), §6.3 (observability), hazard #6 (query DSL vs DataFusion
+  data path), §6.3 (observability), H6 (query DSL vs DataFusion
   SQL surface — do not leak engine specifics).
 - `docs/roadmap.md` §5 (Perses datasource plugin parked behind a stable
   query API); `crates/ourios-querier/src/lib.rs` (`Querier::run_query`,

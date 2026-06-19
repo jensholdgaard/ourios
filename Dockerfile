@@ -23,4 +23,7 @@ COPY --from=builder /build/target/release/ourios-server /usr/local/bin/ourios-se
 # the future query endpoint (RFC 0016) and is intentionally not exposed
 # yet.
 EXPOSE 4317 4318
+# Run as distroless's built-in nonroot user (uid 65532) — the numeric
+# form lets a Kubernetes `runAsNonRoot` securityContext verify it.
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/ourios-server"]

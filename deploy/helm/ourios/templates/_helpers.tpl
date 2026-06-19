@@ -67,6 +67,9 @@ drift from the address the server actually binds.
 {{- if not (regexMatch "^[0-9]+$" $port) -}}
 {{- fail (printf "ourios.receiver.grpcAddr (%q) must end in a numeric port, e.g. 0.0.0.0:4317" .Values.ourios.receiver.grpcAddr) -}}
 {{- end -}}
+{{- if or (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail (printf "ourios.receiver.grpcAddr port (%s) must be in 1..65535" $port) -}}
+{{- end -}}
 {{- $port -}}
 {{- end }}
 
@@ -77,6 +80,9 @@ Port portion of the receiver HTTP bind address (OURIOS_RECEIVER_HTTP_ADDR).
 {{- $port := (splitList ":" .Values.ourios.receiver.httpAddr) | last -}}
 {{- if not (regexMatch "^[0-9]+$" $port) -}}
 {{- fail (printf "ourios.receiver.httpAddr (%q) must end in a numeric port, e.g. 0.0.0.0:4318" .Values.ourios.receiver.httpAddr) -}}
+{{- end -}}
+{{- if or (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail (printf "ourios.receiver.httpAddr port (%s) must be in 1..65535" $port) -}}
 {{- end -}}
 {{- $port -}}
 {{- end }}

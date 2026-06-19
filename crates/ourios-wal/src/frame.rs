@@ -37,7 +37,11 @@ const FRAME_PAD_ZEROS: [u8; 3] = [0, 0, 0];
 /// RFC0008.5 sub-case so the recovery driver's audit-event
 /// emission, and the integration tests, can match on the
 /// specific reason rather than string-search a message.
+// `non_exhaustive` because the `fuzzing` feature exposes this publicly
+// (RFC 0015) and the RFC0008.5 sub-cases may grow; in-crate matches stay
+// exhaustive without a wildcard.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FrameError {
     /// The 4-byte CRC field didn't match the recomputed
     /// CRC32-C over `kind || pad || payload`. The frame's

@@ -64,6 +64,11 @@ jobs:
         run: |
           set -euo pipefail
           target='${{ matrix.target }}'
+          # Force the gnu host triple. Left to default, cargo-fuzz picks
+          # the musl target on the runner, whose statically-linked libc is
+          # incompatible with the ASan sanitizer ("sanitizer is incompatible
+          # with statically linked libc").
+          host="$(rustc "+${NIGHTLY}" -vV | sed -n 's/^host: //p')"
           mkdir -p "fuzz/corpus/${target}"
           # Seed the working corpus from the committed seeds (RFC 0015 §3.3).
           if [ -d "fuzz/seeds/${target}" ]; then
@@ -71,7 +76,7 @@ jobs:
           fi
           # `fuzz run` also builds, so a target that stops compiling fails
           # here too.
-          cargo "+${NIGHTLY}" fuzz run "${target}" -- -max_total_time="${BUDGET}"
+          cargo "+${NIGHTLY}" fuzz run "${target}" --target "${host}" -- -max_total_time="${BUDGET}"
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

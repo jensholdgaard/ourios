@@ -18,14 +18,21 @@ use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;
 use ourios_miner::reconstruct;
 
+// Realistic log lines are small; cap the candidate body so a pathological
+// multi-MB input can't dominate iteration time / memory during fuzzing.
+// 4 KiB still exercises tokenization, the 256-byte param overflow, and
+// reconstruction comfortably.
+const MAX_LINE_BYTES: usize = 4096;
+
 fuzz_target!(|data: &[u8]| {
-    // Use the whole input as the candidate log line (lossy UTF-8). This
+    // Use the input as the candidate log line (lossy UTF-8), capped. This
     // never discards an input — unlike `String::arbitrary`, which errors
     // on bytes it can't structure and would throw away coverage. (Future
     // richer targets can pull structured fields off the front of `u`
     // before taking the rest as the body — see RFC 0015 §7.)
     let u = Unstructured::new(data);
-    let line = String::from_utf8_lossy(u.take_rest()).into_owned();
+    let rest = u.take_rest();
+    let line = String::from_utf8_lossy(&rest[..rest.len().min(MAX_LINE_BYTES)]).into_owned();
 
     let sink = SharedRecordSink::new();
     let mut miner =

@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# `publish = false` (all crates are pre-release 0.0.0) otherwise hides the
+# binary from cargo-dist; `dist = true` opts this one package back in as the
+# sole distributable artifact for `v*` tag releases.
+[package.metadata.dist]
+dist = true
+
 [[bin]]
 name = "ourios-server"
 path = "src/main.rs"

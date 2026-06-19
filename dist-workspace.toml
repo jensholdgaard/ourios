@@ -1,0 +1,25 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax). Ourios
+# ships a Linux server backend, so v0 builds Linux only (no macOS/Windows).
+# gnu only for v0: musl is deferred because the cross-build could not be
+# verified clean in this environment (see PR notes), and shipping an
+# unverified target into a tag-triggered pipeline is not worth it for v0.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Generate a CycloneDX SBOM alongside every release (cargo-cyclonedx).
+cargo-cyclonedx = true
+# Emit GitHub build provenance attestations for every release asset; these
+# signed artifacts are what flips OpenSSF Scorecard's Signed-Releases check.
+github-attestations = true

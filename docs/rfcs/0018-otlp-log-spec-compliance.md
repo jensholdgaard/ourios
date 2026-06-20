@@ -195,12 +195,20 @@ Change to **preserve verbatim**:
 
 - `0..=24` (defined) and `25..=255` (out of the named ranges but storable
   and monotone-meaningful) → stored as the wire value;
-- a record with `severity_number` outside `0..=24` increments an anomaly
-  metric (`ingest.severity_out_of_range`), and `severity_text` is retained,
-  so the violation is observable, not masked;
-- only the values a `u8` physically cannot hold (negative, `> 255`) become
-  `0` + the same anomaly count — here the storage invariant wins (§3.0
-  point 1's limit).
+- a record with `severity_number` outside `0..=24` is recorded on the
+  existing `ourios.ingest.records` counter with the standard **`error.type`**
+  attribute set to `severity_out_of_range` — the OTel "recording errors on
+  metrics" convention (one counter for success + anomaly, reason on a
+  low-cardinality `error.type`; success records carry no `error.type`), not
+  a bespoke counter. `severity_text` is retained, so the violation is
+  observable, not masked;
+- the values a `u8` physically cannot hold (negative, `> 255`) become `0` —
+  here the storage invariant wins (§3.0 point 1's limit). Because they
+  narrow to `0`, they are indistinguishable post-narrowing from a genuine
+  UNSPECIFIED and so are **not** separately attributed on the counter (an
+  accepted limitation: such values are degenerate corruption, not a
+  meaningful severity); the `25..=255` case — the one an operator actually
+  sees — is fully attributed.
 
 Severity comparisons (RFC 0002, which correctly compares on
 `SeverityNumber`) stay monotone and correct: `severity >= ERROR` still
@@ -291,12 +299,12 @@ back-reference.
 >   (out of the named ranges but `u8`-storable)
 > - **When** the receiver materialises them
 > - **Then** the stored `severity_number` is `25` / `200` verbatim
->   (never silently clamped to `0`), the `ingest.severity_out_of_range`
->   anomaly metric is incremented, and a `severity >= ERROR` query still
->   matches them (monotonicity preserved)
+>   (never silently clamped to `0`), the `ourios.ingest.records` counter
+>   records them with `error.type = severity_out_of_range`, and a
+>   `severity >= ERROR` query still matches them (monotonicity preserved)
 > - **And** a value a `u8` cannot hold (negative, `> 255`) maps to `0`
->   with the same anomaly count — the storage invariant, not a
->   correction
+>   (the storage invariant, not a correction); narrowed to `0`, it is not
+>   separately attributed (the §3.5 accepted limitation)
 
 ## 6. Testing strategy
 
@@ -315,11 +323,14 @@ back-reference.
   doubles, replacing the current "encodes to null" assertion with a
   round-trip one.
 - **RFC0018.6** — a receiver test feeding `severity_number` 25 and 200 and
-  asserting they are **preserved** (not clamped) + the
-  `ingest.severity_out_of_range` counter increments; plus a negative / `>255`
-  case asserting `0` + counter (the storage-invariant limit). Replaces the
-  prior clamp-to-0 assertion in `severity_to_u8`'s tests (a contract change —
-  the old test asserted the behaviour this RFC overturns; CLAUDE.md §6.2).
+  asserting they are **preserved** (not clamped), that the
+  `ourios.ingest.records` counter records them with
+  `error.type = severity_out_of_range` (in-memory `MeterProvider`, mirroring
+  the compaction-metric test), and that a `severity >= ERROR` query still
+  matches them (monotonicity); plus a negative / `>255` case asserting `0`
+  (the storage-invariant limit). Replaces the prior clamp-to-0 assertion in
+  `severity_to_u8`'s tests (a contract change — the old test asserted the
+  behaviour this RFC overturns; CLAUDE.md §6.2).
 
 Each scenario id (`RFC0018.N`) is referenced from its test so the mapping
 is greppable (`docs/verification.md` §2).

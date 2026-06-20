@@ -75,14 +75,23 @@ fn rfc0003_9_edge_fields_pass_through_without_coalescing() {
     );
 }
 
-/// Scenario RFC0003.9 — out-of-range `severity_number` narrows to UNSPECIFIED.
-/// See `docs/rfcs/0003-otlp-receiver.md` §5.
+/// Scenario RFC0003.9 — out-of-range `severity_number` is **preserved**, not
+/// narrowed (RFC 0018 §3.5 supersedes the prior clamp-to-UNSPECIFIED: the
+/// receiver is a faithful witness — §3.0 — so out-of-named-range values pass
+/// through, more consistent with RFC0003.9's own "edge fields pass through
+/// unchanged" theme). Only the extremes a `u8` cannot hold (negative, `>255`)
+/// narrow to `0`, where the storage invariant wins.
+/// See `docs/rfcs/0003-otlp-receiver.md` §5; `docs/rfcs/0018-otlp-log-spec-compliance.md` §3.5.
 #[test]
-fn rfc0003_9_out_of_range_severity_narrows_to_unspecified() {
-    // Valid OTLP severity is 0..=24; values outside that range (incl.
-    // u8-representable 25..=255, negative, and > 255) normalise to
-    // 0/UNSPECIFIED so the OtlpLogRecord 0..=24 contract holds.
-    for (wire, expected) in [(0i32, 0u8), (24, 24), (25, 0), (1000, 0), (-5, 0)] {
+fn rfc0003_9_out_of_range_severity_is_preserved() {
+    for (wire, expected) in [
+        (0i32, 0u8),
+        (24, 24),
+        (25, 25),   // out of the named range, but u8-storable → preserved
+        (200, 200), // preserved
+        (1000, 0),  // not u8-storable → storage-invariant narrow to 0
+        (-5, 0),    // not u8-storable → 0
+    ] {
         let record = LogRecord {
             severity_number: wire,
             ..Default::default()
@@ -90,7 +99,7 @@ fn rfc0003_9_out_of_range_severity_narrows_to_unspecified() {
         let materialized = materialize_record(record, &[], "", None, "", TenantId::new("tenant-a"));
         assert_eq!(
             materialized.severity_number, expected,
-            "severity_number {wire} narrows to {expected}",
+            "severity_number {wire} → {expected} (preserve verbatim; non-u8 → 0)",
         );
     }
 }

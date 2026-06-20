@@ -109,14 +109,26 @@ pub fn materialize_resource_logs(
     records
 }
 
-/// Narrow proto's `i32` `severity_number` to the schema's `u8`. Valid
-/// OTLP severity is `0..=24` (`0` = UNSPECIFIED); any value outside that
-/// range — invalid-but-`u8`-representable (`25..=255`), negative, or
-/// `> 255` — maps to `0`/UNSPECIFIED, so the `OtlpLogRecord` contract the
-/// miner's template key and the Parquet schema rely on holds at this
-/// boundary.
+/// Narrow proto's `i32` `severity_number` to the schema's `u8`, **preserving**
+/// the wire value (RFC 0018 §3.5 — faithful witness, §3.0). Valid OTLP
+/// severity is `0..=24` (`0` = UNSPECIFIED); out-of-named-range values
+/// (`25..=255`) are kept verbatim (monotone-meaningful and surfaced via the
+/// ingest counter's `error.type = severity_out_of_range`, not silently
+/// clamped). Only the extremes a `u8` cannot hold — negative or `> 255` —
+/// narrow to `0`, where the storage invariant wins.
 fn severity_to_u8(n: i32) -> u8 {
-    u8::try_from(n).ok().filter(|v| *v <= 24).unwrap_or(0)
+    u8::try_from(n).unwrap_or(0)
+}
+
+/// Whether a stored `severity_number` is outside the OTLP `0..=24` range
+/// (RFC 0018 §3.5). Drives the `error.type = severity_out_of_range` attribute
+/// on the ingest counter. Operates on the *preserved* `u8`: `25..=255` is
+/// detected here; the negative / `> 255` extremes narrowed to `0` are out of
+/// range too but indistinguishable post-narrowing, so attribution is
+/// best-effort over the `u8`-storable band (see §3.5).
+#[must_use]
+pub(crate) fn severity_is_out_of_range(severity_number: u8) -> bool {
+    severity_number > 24
 }
 
 /// Proto scalar `0` → `None`, else `Some` — the RFC0003.9 narrowing of a

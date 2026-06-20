@@ -289,13 +289,44 @@ impl IngestMetrics {
 
     /// Record one durably-acknowledged batch: `record_count` log records
     /// made durable in `elapsed` (the append + fsync / WAL-before-ack
-    /// latency). Call only on a successful, acked commit.
-    pub fn record_batch(&self, record_count: usize, elapsed: Duration) {
+    /// latency), of which `severity_out_of_range` carried an out-of-`0..=24`
+    /// `SeverityNumber`. Call only on a successful, acked commit.
+    ///
+    /// Per the OpenTelemetry "recording errors on metrics" convention, the
+    /// `ourios.ingest.records` counter carries the standard `error.type`
+    /// attribute: in-range records record with it **absent** (success),
+    /// out-of-range ones with `error.type = severity_out_of_range`
+    /// (RFC 0018 §3.5) — one counter, reason on a low-cardinality attribute,
+    /// not a bespoke metric.
+    pub fn record_batch(
+        &self,
+        record_count: usize,
+        severity_out_of_range: usize,
+        elapsed: Duration,
+    ) {
         self.batches.add(1, &[]);
-        self.records.add(to_u64(record_count), &[]);
+        let in_range = record_count.saturating_sub(severity_out_of_range);
+        if in_range > 0 {
+            self.records.add(to_u64(in_range), &[]);
+        }
+        if severity_out_of_range > 0 {
+            self.records.add(
+                to_u64(severity_out_of_range),
+                &[KeyValue::new(ERROR_TYPE, SEVERITY_OUT_OF_RANGE)],
+            );
+        }
         self.append_duration.record(elapsed.as_secs_f64(), &[]);
     }
 }
+
+/// The OpenTelemetry-standard `error.type` attribute key (semconv, stable).
+/// Deliberately **not** in the Ourios weaver registry — it is an upstream
+/// OpenTelemetry attribute used here per the "recording errors on metrics"
+/// convention, not an Ourios-coined name.
+const ERROR_TYPE: &str = "error.type";
+/// The domain-specific `error.type` value for an out-of-`0..=24`
+/// `SeverityNumber` (RFC 0018 §3.5). `error.type`'s value space is open.
+const SEVERITY_OUT_OF_RANGE: &str = "severity_out_of_range";
 
 impl Default for IngestMetrics {
     fn default() -> Self {

@@ -56,7 +56,7 @@ async fn ingest_and_sink_metrics_export_under_their_registry_names() {
     let sink = SinkMetrics::new();
 
     // Act — record a representative slice of the perf signals.
-    ingest.record_batch(10, Duration::from_millis(2));
+    ingest.record_batch(10, 0, Duration::from_millis(2));
     sink.record_flush("size", 5, Duration::from_millis(7));
     sink.record_flush("rotation", 3, Duration::from_millis(9));
     sink.record_flush_error();

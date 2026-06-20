@@ -135,15 +135,19 @@ untouched) and **adds `records: Vec<LogRow>`** (the returned rows, ≤
 `limit`). `LogRow` is Ourios-owned (H6 — no arrow/DataFusion type crosses
 the boundary). The endpoint (RFC 0016) serialises `records`.
 
-`QueryResult` is **not** `#[non_exhaustive]` today
-(`crates/ourios-querier/src/lib.rs:117` — only `QueryError` is), so adding
-a public field is a Rust semver break for downstream struct literals /
-destructuring. This RFC therefore also marks `QueryResult`
-`#[non_exhaustive]` as part of the change — pre-release is the moment to
-do it, and it future-proofs the further fields the execution slice will
-add. The change is *behaviour*-compatible (B1/B2 and existing tests read
-`rows`/`stats`, which are unchanged); "B1/B2-compatible", not "non-breaking
-at the type level".
+**Priority: OTLP fidelity outranks downstream API stability.** Ourios is
+pre-release and OTLP-native; where faithful OTLP shape requires changing
+or breaking a public type, that is acceptable — we do **not** compromise
+the LogRecord shape to preserve a Rust API. `QueryResult` is not
+`#[non_exhaustive]` today (`crates/ourios-querier/src/lib.rs:117` — only
+`QueryError` is), so adding a public field is a Rust semver break for
+downstream struct literals / destructuring. That break is fine on its own
+terms; we mark `QueryResult` `#[non_exhaustive]` here as plain
+hygiene (it future-proofs the further fields the execution slice will
+add), not because compatibility constrains the design. The change is in
+any case *behaviour*-compatible — B1/B2 and existing tests read
+`rows`/`stats`, which are unchanged — so "B1/B2-compatible" is the precise
+claim, not "non-breaking at the type level".
 
 **OTLP fidelity is a first-class requirement of this RFC, not a v1
 best-effort.** Ourios is an OTLP-native log backend, so a returned row

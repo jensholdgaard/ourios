@@ -15,7 +15,9 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_core::config::MinerConfig;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, SyncError, Wal, WalConfig, WalOffset};
+use ourios_wal::{
+    AppendError, FrameKind, FrameSink, RecoveryError, SyncError, Wal, WalConfig, WalOffset,
+};
 
 use ourios_ingester::receiver::{
     CommitCoordinator, IngestPipeline, Journal, ReceiveError, TenantRule,
@@ -137,6 +139,58 @@ pub fn failing_sync_pipeline() -> IngestPipeline {
         miner,
         TenantRule::service_name(),
     )
+}
+
+/// A `Journal` whose **append** fails with a configurable [`AppendError`] —
+/// distinguishes a transient append I/O failure (retryable) from an
+/// oversize payload (`TooLarge`, a permanent client error) for the RFC 0018
+/// §3.2 mapping.
+struct FailingAppendJournal {
+    error: fn() -> AppendError,
+}
+
+impl Journal for FailingAppendJournal {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+        Err(ReceiveError::WalAppend((self.error)()))
+    }
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        // Unreachable in practice (the append fails first), but the trait
+        // requires it.
+        Ok(WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 0,
+        })
+    }
+    fn unflushed_bytes(&self) -> u64 {
+        0
+    }
+}
+
+fn failing_append_pipeline(error: fn() -> AppendError) -> IngestPipeline {
+    let miner = MinerCluster::new(MinerConfig::default());
+    IngestPipeline::new(
+        coordinator(Box::new(FailingAppendJournal { error })),
+        miner,
+        TenantRule::service_name(),
+    )
+}
+
+/// A pipeline whose append fails with a transient I/O error
+/// (`AppendError::Io`) — the retryable-WAL path (`UNAVAILABLE` / 503).
+pub fn failing_append_pipeline_transient() -> IngestPipeline {
+    failing_append_pipeline(|| AppendError::Io {
+        op: "write",
+        source: std::io::Error::other("injected append failure"),
+    })
+}
+
+/// A pipeline whose append fails with `AppendError::TooLarge` — a permanent
+/// client sizing error (`INVALID_ARGUMENT` / 413), never retryable.
+pub fn oversize_append_pipeline() -> IngestPipeline {
+    failing_append_pipeline(|| AppendError::TooLarge {
+        len: 32 * 1024 * 1024,
+        limit: 16 * 1024 * 1024,
+    })
 }
 
 /// Reopen the WAL at `root` and return its recovered frames. (Call after

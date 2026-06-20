@@ -117,12 +117,18 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         // A Resource that doesn't resolve to a tenant is a client error
         // (the whole batch is rejected, RFC0003.4).
         Ok(Err(ReceiveError::TenantResolution(_))) => StatusCode::BAD_REQUEST.into_response(),
-        // A WAL append/sync failure is *transient* server-side; the batch was
-        // not acked (§3.4), so the client SHOULD retry. 503 is retryable per
-        // the OTLP failures table — non-retryable 500 would make compliant
-        // clients drop data they should re-send (RFC 0018 §3.2). Matched
-        // per-variant (exhaustive over `ReceiveError` in-crate): a future
-        // `#[non_exhaustive]` variant breaks the build here, forcing a
+        // A payload over the WAL frame ceiling (16 MiB) is a *permanent*
+        // client sizing error: 413, not the retryable 503 below — retrying
+        // the same oversized body can never succeed (RFC 0018 §3.2).
+        Ok(Err(ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }))) => {
+            StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        }
+        // Any other WAL append/sync failure is *transient* server-side; the
+        // batch was not acked (§3.4), so the client SHOULD retry. 503 is
+        // retryable per the OTLP failures table — non-retryable 500 would make
+        // compliant clients drop data they should re-send (RFC 0018 §3.2).
+        // Matched per-variant (exhaustive over `ReceiveError` in-crate): a
+        // future `#[non_exhaustive]` variant breaks the build here, forcing a
         // retryable-vs-not decision rather than defaulting either way.
         Ok(Err(ReceiveError::WalAppend(_) | ReceiveError::WalSync(_))) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()

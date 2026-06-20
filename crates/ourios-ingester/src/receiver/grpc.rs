@@ -6,9 +6,11 @@
 //! result to a tonic `Status`:
 //! - tenant-resolution failure → `INVALID_ARGUMENT` (naming the failing
 //!   `ResourceLogs` index + attribute, RFC0003.4/.11);
-//! - WAL append/sync failure → `UNAVAILABLE` — a transient failure (the
-//!   batch was not acked, §3.4), so retryable per the OTLP failures table
-//!   (RFC 0018 §3.2);
+//! - an oversize payload (`AppendError::TooLarge`, > 16 MiB) →
+//!   `INVALID_ARGUMENT` — a permanent client sizing error, non-retryable;
+//! - any other WAL append/sync failure → `UNAVAILABLE` — a transient
+//!   failure (the batch was not acked, §3.4), so retryable per the OTLP
+//!   failures table (RFC 0018 §3.2);
 //! - a panicked ingest task → `INTERNAL` (a genuine, non-retryable bug);
 //! - success → an empty `ExportLogsServiceResponse`.
 //!
@@ -59,11 +61,18 @@ impl LogsService for LogsReceiver {
             Ok(Err(ReceiveError::TenantResolution(e))) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            // A WAL append/sync failure — a *transient* server-side failure;
-            // the batch was not acked (§3.4), so the client SHOULD retry.
-            // `UNAVAILABLE` is retryable per the OTLP failures table; mapping
-            // it to non-retryable `INTERNAL` would make compliant clients
-            // drop data they should re-send (RFC 0018 §3.2). Matched
+            // A payload over the WAL frame ceiling (16 MiB) is a *permanent*
+            // client sizing error, not a transient outage — retrying the same
+            // oversized batch can never succeed, so it maps non-retryable
+            // (`INVALID_ARGUMENT`), distinct from the transient-WAL arm below.
+            Ok(Err(e @ ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }))) => {
+                Err(Status::invalid_argument(e.to_string()))
+            }
+            // A transient WAL failure (append I/O, post-rotation quiesce, or
+            // fsync) — the batch was not acked (§3.4), so the client SHOULD
+            // retry. `UNAVAILABLE` is retryable per the OTLP failures table;
+            // mapping it to non-retryable `INTERNAL` would make compliant
+            // clients drop data they should re-send (RFC 0018 §3.2). Matched
             // explicitly per-variant (not a catch-all): within this crate the
             // arms are exhaustive over `ReceiveError`, so a future
             // `#[non_exhaustive]` variant breaks the build here and forces an

@@ -114,27 +114,31 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     let pipeline = state.pipeline.clone();
     match tokio::spawn(async move { pipeline.ingest(request).await }).await {
         Ok(Ok(_)) => success_response(format),
-        // A Resource that doesn't resolve to a tenant is a client error
-        // (the whole batch is rejected, RFC0003.4).
-        Ok(Err(ReceiveError::TenantResolution(_))) => StatusCode::BAD_REQUEST.into_response(),
-        // A payload over the WAL frame ceiling (16 MiB) is a *permanent*
-        // client sizing error: 413, not the retryable 503 below — retrying
-        // the same oversized body can never succeed (RFC 0018 §3.2).
-        Ok(Err(ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }))) => {
-            StatusCode::PAYLOAD_TOO_LARGE.into_response()
-        }
-        // Any other WAL append/sync failure is *transient* server-side; the
-        // batch was not acked (§3.4), so the client SHOULD retry. 503 is
-        // retryable per the OTLP failures table — non-retryable 500 would make
-        // compliant clients drop data they should re-send (RFC 0018 §3.2).
-        // Matched per-variant (exhaustive over `ReceiveError` in-crate): a
-        // future `#[non_exhaustive]` variant breaks the build here, forcing a
-        // retryable-vs-not decision rather than defaulting either way.
-        Ok(Err(ReceiveError::WalAppend(_) | ReceiveError::WalSync(_))) => {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+        Ok(Err(e)) => ingest_error_status(&e).into_response(),
         // The ingest task panicked — a genuine, non-retryable internal bug.
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Map a settled ingest failure to its HTTP status (RFC 0018 §3.2).
+///
+/// Permanent client errors are non-retryable but split by class:
+/// tenant-resolution failure → `400`; an oversize payload
+/// (`AppendError::TooLarge`, over the 16 MiB WAL frame ceiling) → `413`. Any
+/// other WAL append/sync failure is *transient* (the batch was not acked,
+/// §3.4) → retryable `503`, so compliant clients re-send rather than drop
+/// data (a non-retryable `500` would tell them to drop it).
+///
+/// Matched per-variant (exhaustive over `ReceiveError` in-crate): a future
+/// `#[non_exhaustive]` variant breaks the build here, forcing a
+/// retryable-vs-not decision rather than defaulting either way.
+fn ingest_error_status(error: &ReceiveError) -> StatusCode {
+    match error {
+        ReceiveError::TenantResolution(_) => StatusCode::BAD_REQUEST,
+        ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        ReceiveError::WalAppend(_) | ReceiveError::WalSync(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -221,5 +225,51 @@ fn success_response(format: WireFormat) -> Response {
             // body.
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReceiveError, StatusCode, ingest_error_status};
+    use crate::receiver::tenant::TenantResolutionError;
+    use ourios_wal::{AppendError, SyncError};
+
+    #[test]
+    fn tenant_resolution_is_400() {
+        let e = ReceiveError::TenantResolution(TenantResolutionError::for_test("service.name"));
+        assert_eq!(ingest_error_status(&e), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn oversize_payload_is_413() {
+        let e = ReceiveError::WalAppend(AppendError::TooLarge {
+            len: 32 * 1024 * 1024,
+            limit: 16 * 1024 * 1024,
+        });
+        assert_eq!(ingest_error_status(&e), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn transient_wal_append_is_503() {
+        let e = ReceiveError::WalAppend(AppendError::Io {
+            op: "write",
+            source: std::io::Error::other("io"),
+        });
+        assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn quiesced_wal_append_is_503() {
+        let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
+        assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn transient_wal_sync_is_503() {
+        let e = ReceiveError::WalSync(SyncError::Io {
+            op: "fdatasync",
+            source: std::io::Error::other("io"),
+        });
+        assert_eq!(ingest_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

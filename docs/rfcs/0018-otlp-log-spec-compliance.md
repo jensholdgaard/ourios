@@ -143,12 +143,13 @@ Amend the RFC 0003 error-mapping contract to distinguish *transient* from
   [otlp/#otlpgrpc-throttling](https://opentelemetry.io/docs/specs/otlp/#otlpgrpc-throttling));
   HTTP `503` (optionally `429` for saturation) with an optional
   `Retry-After` header.
-- **Permanent** (malformed payload, tenant-resolution failure, **and an
-  oversize payload** — `AppendError::TooLarge`, a batch over the 16 MiB WAL
-  frame ceiling) → gRPC `INVALID_ARGUMENT` / HTTP `413`. An oversize batch is
-  a client sizing error, *not* a WAL outage: retrying it byte-identical can
-  never succeed, so it MUST stay non-retryable even though it surfaces as a
-  `WalAppend` error.
+- **Permanent** failures stay non-retryable, but are not a single HTTP code:
+  malformed payload and tenant-resolution failure → HTTP `400` (gRPC
+  `INVALID_ARGUMENT`), while an **oversize payload** (`AppendError::TooLarge`,
+  a batch over the 16 MiB WAL frame ceiling) → HTTP `413` (gRPC
+  `INVALID_ARGUMENT`). An oversize batch is a client sizing error, *not* a
+  WAL outage: retrying it byte-identical can never succeed, so it MUST stay
+  non-retryable even though it surfaces as a `WalAppend` error.
 
 The 429/503 *throttling* surface itself remains a **SHOULD** and may stay
 minimal (no rate-limiter yet, RFC 0003 §6.7); the binding change here is

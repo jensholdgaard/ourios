@@ -10,12 +10,19 @@
 //!
 //! See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5/§6.
 
+use std::time::Duration;
+
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_sdk::metrics::data::{
+    AggregatedMetrics, MetricData, ResourceMetrics, SumDataPoint,
+};
 use ourios_core::tenant::TenantId;
-use ourios_ingester::receiver::materialize_resource_logs;
+use ourios_ingester::metrics::IngestMetrics;
+use ourios_ingester::receiver::{materialize_record, materialize_resource_logs};
+use ourios_semconv as semconv;
 
 fn kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
@@ -92,11 +99,80 @@ fn rfc0018_3_transient_failure_is_retryable() {
 /// query still matches the preserved 25 / 200 (monotonicity), and a value a
 /// `u8` cannot hold (negative, > 255) maps to 0 + the same anomaly count.
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
-#[test]
-#[ignore = "RFC0018.6 — red until severity preserve+flag replaces the clamp-to-0 (green)"]
-fn rfc0018_6_out_of_range_severity_preserved() {
-    todo!(
-        "RFC0018.6: 25/200 preserved + anomaly metric; severity >= ERROR still \
-         matches them (monotonicity); non-u8 -> 0 (storage invariant)"
-    )
+/// Sum of `ourios.ingest.records` datapoints, filtered by `error.type`:
+/// `None` → success points (the attribute absent); `Some(v)` → points whose
+/// `error.type` equals `v`.
+fn ingest_records_sum(rms: &[ResourceMetrics], error_type: Option<&str>) -> u64 {
+    let data = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|m| m.name() == semconv::OURIOS_INGEST_RECORDS)
+        .map(opentelemetry_sdk::metrics::data::Metric::data)
+        .expect("ourios.ingest.records exported");
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = data else {
+        panic!("ourios.ingest.records should be a u64 sum");
+    };
+    sum.data_points()
+        .filter(|dp| {
+            let et = dp
+                .attributes()
+                .find(|kv| kv.key.as_str() == "error.type")
+                .map(|kv| kv.value.as_str().into_owned());
+            match error_type {
+                None => et.is_none(),
+                Some(v) => et.as_deref() == Some(v),
+            }
+        })
+        .map(SumDataPoint::value)
+        .sum()
+}
+
+/// Scenario RFC0018.6 — out-of-range `SeverityNumber` is preserved, not clamped:
+/// the receiver preserves `25` / `200` verbatim (non-`u8` → `0`), and the
+/// `ourios.ingest.records` counter records out-of-range records with
+/// `error.type = severity_out_of_range` (in-range ones carry no `error.type`).
+/// Monotonicity (`severity >= ERROR` still matches the preserved `25`) is the
+/// querier's `SeverityNumber` comparison — covered in
+/// `ourios-querier/tests/rfc0018_severity.rs`.
+/// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rfc0018_6_out_of_range_severity_preserved() {
+    // Receiver: preserve the wire value (non-u8 extremes narrow to 0).
+    for (wire, expected) in [(25i32, 25u8), (200, 200), (1000, 0), (-5, 0)] {
+        let m = materialize_record(
+            LogRecord {
+                severity_number: wire,
+                ..Default::default()
+            },
+            &[],
+            "",
+            None,
+            "",
+            TenantId::new("tenant-a"),
+        );
+        assert_eq!(
+            m.severity_number, expected,
+            "severity {wire} preserved as {expected} (non-u8 → 0)",
+        );
+    }
+
+    // Metric: a 4-record batch, 2 out-of-range, splits onto the records
+    // counter via error.type (OTel "recording errors on metrics" convention).
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test-rfc0018-6");
+    let ingest = IngestMetrics::new();
+    ingest.record_batch(4, 2, Duration::from_millis(1));
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+
+    assert_eq!(
+        ingest_records_sum(&rms, None),
+        2,
+        "in-range records carry no error.type",
+    );
+    assert_eq!(
+        ingest_records_sum(&rms, Some("severity_out_of_range")),
+        2,
+        "out-of-range records tagged error.type = severity_out_of_range",
+    );
 }

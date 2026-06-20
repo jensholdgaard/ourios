@@ -271,7 +271,16 @@ impl IngestPipeline {
                 // replay re-covers those frames (no §3.5.3 divergence).
                 *self.lock_last_durable() = Some(now);
                 // Throughput + WAL-before-ack latency for this acked batch.
-                self.metrics.record_batch(records.len(), append_elapsed);
+                // RFC 0018 §3.5: tag out-of-range-severity records on the
+                // ingest counter via `error.type` (post-materialise on the
+                // preserved `u8`; the rare non-`u8` extremes narrowed to 0
+                // aren't separately attributed — accepted limitation).
+                let severity_out_of_range = records
+                    .iter()
+                    .filter(|r| super::severity_is_out_of_range(r.severity_number))
+                    .count();
+                self.metrics
+                    .record_batch(records.len(), severity_out_of_range, append_elapsed);
                 Ok(records.len())
             }
             // Sync failed: the frame is not durable and not acked; it

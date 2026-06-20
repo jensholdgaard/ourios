@@ -150,6 +150,7 @@ fn name_to_field(name: &str) -> Result<Field, DslError> {
         "trace_id" => Field::TraceId,
         "span_id" => Field::SpanId,
         "scope" => Field::Scope,
+        "event_name" => Field::EventName,
         "flags" => Field::Flags,
         "service" => Field::Service,
         "template_id" => Field::TemplateId,

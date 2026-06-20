@@ -106,6 +106,7 @@ pub enum Field {
     TraceId,
     SpanId,
     Scope,
+    EventName,
     Flags,
     Service,
     TemplateId,
@@ -132,6 +133,7 @@ impl Field {
                 | Self::TraceId
                 | Self::SpanId
                 | Self::Scope
+                | Self::EventName
                 | Self::Service
                 | Self::Resource(_)
                 | Self::Attr(_)

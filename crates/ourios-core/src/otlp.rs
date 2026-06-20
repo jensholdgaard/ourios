@@ -229,9 +229,14 @@ impl Body {
 /// round-trip bit-exact — the RFC 0001 §6.1 faithfulness
 /// guarantee (`lossy_flag = false`) rests on it. Pinned by the
 /// `finite_doubles_round_trip_bit_exact` property test below.
-/// Non-finite doubles (`NaN`, ±∞) have no JSON-number form and
-/// encode as `null` — bytes that do **not** decode; a known,
-/// pre-existing gap independent of #130.
+/// Non-finite doubles (`NaN`, ±∞) have no JSON-number form, so
+/// `serde_json` alone would render them as `null` (lossy). The
+/// canonical codec detects a non-finite double and routes it
+/// through a guarded path that emits **and** decodes the proto3-
+/// JSON string forms `"NaN"`/`"Infinity"`/`"-Infinity"`, so they
+/// round-trip (RFC 0018 §3.4); the finite case stays on the exact
+/// serde above. Pinned by the `nonfinite_doubles_round_trip_via_proto3_strings`
+/// test below.
 ///
 /// **Note on "canonical".** RFC 0005 §3.3 uses "canonical" to
 /// mean "the single normative encoding the writer / reader
@@ -248,9 +253,10 @@ pub mod canonical {
     /// `Vec<KeyValue>` the type system admits —
     /// `opentelemetry-proto`'s `with-serde` ships custom
     /// serializers for the proto3-JSON oddities (`i64` →
-    /// decimal string, `bytes` → base64; non-finite
-    /// `f64` falls back to `serde_json`'s `null`, not the proto3
-    /// `"NaN"` strings) so the recursive primitives never
+    /// decimal string, `bytes` → base64), and the canonical codec
+    /// handles non-finite `f64` itself via a guarded path emitting
+    /// the proto3 `"NaN"`/`"Infinity"`/`"-Infinity"` string forms
+    /// (RFC 0018 §3.4), so the recursive primitives never
     /// panic or return an error. The `Encode` arm exists only
     /// for `Result`-symmetry with `Decode` and as a defence-
     /// in-depth surface if a future `opentelemetry-proto`

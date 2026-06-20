@@ -47,11 +47,15 @@ fn rfc0018_3_transient_failure_is_retryable() {
 
 /// Scenario RFC0018.6 — out-of-range `SeverityNumber` is preserved, not clamped:
 /// `severity_number` 25 / 200 are stored verbatim (never silently clamped to 0),
-/// the `ingest.severity_out_of_range` metric increments, and a value a `u8` cannot
-/// hold (negative, > 255) maps to 0 + the same anomaly count.
+/// the `ingest.severity_out_of_range` metric increments, a `severity >= ERROR`
+/// query still matches the preserved 25 / 200 (monotonicity), and a value a
+/// `u8` cannot hold (negative, > 255) maps to 0 + the same anomaly count.
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
 #[test]
 #[ignore = "RFC0018.6 — red until severity preserve+flag replaces the clamp-to-0 (green)"]
 fn rfc0018_6_out_of_range_severity_preserved() {
-    todo!("RFC0018.6: 25/200 preserved + anomaly metric; non-u8 -> 0 (storage invariant)")
+    todo!(
+        "RFC0018.6: 25/200 preserved + anomaly metric; severity >= ERROR still \
+         matches them (monotonicity); non-u8 -> 0 (storage invariant)"
+    )
 }

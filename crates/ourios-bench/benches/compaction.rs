@@ -89,6 +89,9 @@ fn rec_sized(i: u64, body_bytes: usize) -> MinedRecord {
         severity_text: Some("INFO".to_string()),
         scope_name: Some("lib.cart".to_string()),
         scope_version: Some("1.0.0".to_string()),
+        scope_attributes: Vec::new(),
+        resource_schema_url: None,
+        scope_schema_url: None,
         // Keep every record inside one hour so all files share a partition.
         time_unix_nano: TS0 + i * 1_000,
         observed_time_unix_nano: Some(TS0 + i * 1_000 + 1),

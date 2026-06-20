@@ -68,6 +68,15 @@ pub struct OtlpLogRecord {
     pub scope_name: Option<String>,
     /// `InstrumentationScope.version`.
     pub scope_version: Option<String>,
+    /// `InstrumentationScope.attributes` — the scope's own attribute set
+    /// (RFC 0018 §3.1). Distinct from the log record's `attributes`.
+    pub scope_attributes: Vec<KeyValue>,
+    /// `ResourceLogs.schema_url` — the Telemetry Schema URL of the resource
+    /// group, when set (RFC 0018 §3.1).
+    pub resource_schema_url: Option<String>,
+    /// `ScopeLogs.schema_url` — the Telemetry Schema URL of the scope group,
+    /// when set (RFC 0018 §3.1).
+    pub scope_schema_url: Option<String>,
     /// Per-occurrence structured context.
     pub attributes: Vec<KeyValue>,
     /// Truncation indicator from the wire.

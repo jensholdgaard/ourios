@@ -226,6 +226,9 @@ struct Builders {
     separators: GenericListBuilder<i32, BinaryBuilder>,
     confidence: Float32Builder,
     lossy_flag: BooleanBuilder,
+    scope_attributes: StringBuilder,
+    resource_schema_url: StringBuilder,
+    scope_schema_url: StringBuilder,
 }
 
 impl Builders {
@@ -280,6 +283,9 @@ impl Builders {
             )),
             confidence: Float32Builder::with_capacity(cap),
             lossy_flag: BooleanBuilder::with_capacity(cap),
+            scope_attributes: StringBuilder::with_capacity(cap, 0),
+            resource_schema_url: StringBuilder::with_capacity(cap, 0),
+            scope_schema_url: StringBuilder::with_capacity(cap, 0),
         }
     }
 
@@ -387,6 +393,20 @@ impl Builders {
         self.confidence.append_value(r.confidence);
         self.lossy_flag.append_value(r.lossy_flag);
 
+        // RFC 0018 §3.1 — scope attributes ride the canonical-JSON encoding
+        // (`[]` when empty, like `attributes`); the two schema_urls are plain
+        // optional strings.
+        append_attributes(
+            &mut self.scope_attributes,
+            columns::SCOPE_ATTRIBUTES,
+            &r.scope_attributes,
+        )?;
+        append_option_str(
+            &mut self.resource_schema_url,
+            r.resource_schema_url.as_deref(),
+        );
+        append_option_str(&mut self.scope_schema_url, r.scope_schema_url.as_deref());
+
         Ok(())
     }
 
@@ -421,6 +441,9 @@ impl Builders {
             Arc::new(self.separators.finish()),
             Arc::new(self.confidence.finish()),
             Arc::new(self.lossy_flag.finish()),
+            Arc::new(self.scope_attributes.finish()),
+            Arc::new(self.resource_schema_url.finish()),
+            Arc::new(self.scope_schema_url.finish()),
         ]
     }
 }
@@ -560,6 +583,9 @@ mod tests {
             severity_text: None,
             scope_name: None,
             scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
             time_unix_nano: 1,
             observed_time_unix_nano: None,
             attributes: Vec::new(),

@@ -22,7 +22,7 @@ fn rfc0003_8_string_body_is_unwrapped_verbatim() {
         }),
         ..Default::default()
     };
-    let materialized = materialize_record(record, &[], None, TenantId::new("tenant-a"));
+    let materialized = materialize_record(record, &[], "", None, "", TenantId::new("tenant-a"));
     assert_eq!(
         materialized.body,
         Some(Body::String(raw)),
@@ -38,7 +38,7 @@ fn rfc0003_8_absent_body_is_none() {
         body: None,
         ..Default::default()
     };
-    let materialized = materialize_record(record, &[], None, TenantId::new("tenant-a"));
+    let materialized = materialize_record(record, &[], "", None, "", TenantId::new("tenant-a"));
     assert_eq!(
         materialized.body, None,
         "a record with no body materialises to body = None, not an empty string",

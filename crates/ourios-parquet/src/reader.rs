@@ -369,6 +369,9 @@ fn require_baseline_columns(file_schema: &arrow_schema::Schema) -> Result<(), Re
 /// Convert one Arrow `RecordBatch` to a `Vec<MinedRecord>` per
 /// RFC 0005 §3.2. Handles the §3.9 "missing OPTIONAL column →
 /// `None`" rule by checking column presence before unpacking.
+// One linear column-by-column unpack — the length is inherent to the wide
+// RFC 0005 §3.2 row schema (one read per column), not extractable logic.
+#[allow(clippy::too_many_lines)]
 fn batch_to_mined_records(
     batch: &RecordBatch,
     // File-global row offset of `batch`'s first row, threaded
@@ -405,6 +408,11 @@ fn batch_to_mined_records(
     let trace_id = optional_fixed_bytes16(batch, columns::TRACE_ID)?;
     let span_id = optional_fixed_bytes8(batch, columns::SPAN_ID)?;
     let event_name = optional_string(batch, columns::EVENT_NAME)?;
+    // RFC 0018 §3.1 — additive OPTIONAL columns; absent in pre-amendment files
+    // (the §3.9 missing-column carve-out yields `None`).
+    let scope_attributes = optional_string(batch, columns::SCOPE_ATTRIBUTES)?;
+    let resource_schema_url = optional_string(batch, columns::RESOURCE_SCHEMA_URL)?;
+    let scope_schema_url = optional_string(batch, columns::SCOPE_SCHEMA_URL)?;
     let body = optional_binary(batch, columns::BODY)?;
 
     // List columns — `params` and `separators` are REQUIRED in
@@ -441,6 +449,9 @@ fn batch_to_mined_records(
                 },
             )?
         };
+
+        let decoded_scope_attrs =
+            decode_optional_scope_attributes(scope_attributes.as_ref(), i, row_offset)?;
 
         let t_ns = u64::try_from(time_unix_nano[i]).map_err(|_| ReaderError::Conversion {
             column: columns::TIME_UNIX_NANO,
@@ -481,6 +492,9 @@ fn batch_to_mined_records(
             severity_text: severity_text.as_ref().and_then(|c| c[i].clone()),
             scope_name: scope_name.as_ref().and_then(|c| c[i].clone()),
             scope_version: scope_version.as_ref().and_then(|c| c[i].clone()),
+            scope_attributes: decoded_scope_attrs,
+            resource_schema_url: resource_schema_url.as_ref().and_then(|c| c[i].clone()),
+            scope_schema_url: scope_schema_url.as_ref().and_then(|c| c[i].clone()),
             time_unix_nano: t_ns,
             observed_time_unix_nano: observed_t,
             attributes: decoded_attrs,
@@ -905,6 +919,31 @@ fn required_column<'a>(
     Ok(batch.column(idx).as_ref())
 }
 
+/// RFC 0018 §3.1 — decode the per-row `scope_attributes` value: an absent
+/// column, a NULL cell, or `"[]"` all mean "no scope attributes" (empty vec);
+/// any other value is canonical JSON to decode.
+fn decode_optional_scope_attributes(
+    scope_attributes: Option<&Vec<Option<String>>>,
+    i: usize,
+    row_offset: usize,
+) -> Result<Vec<ourios_core::otlp::KeyValue>, ReaderError> {
+    let Some(col) = scope_attributes else {
+        return Ok(Vec::new());
+    };
+    match col[i].as_deref() {
+        None | Some("[]") => Ok(Vec::new()),
+        Some(s) => {
+            ourios_core::otlp::canonical::decode_attributes(s.as_bytes()).map_err(|source| {
+                ReaderError::AttributeDecode {
+                    column: columns::SCOPE_ATTRIBUTES,
+                    row_index: row_offset + i,
+                    source,
+                }
+            })
+        }
+    }
+}
+
 fn optional_string(
     batch: &RecordBatch,
     name: &'static str,
@@ -1224,6 +1263,18 @@ mod tests {
                     b.append_value("some-future-thing");
                     Arc::new(b.finish())
                 }
+                "scope_attributes" => {
+                    // RFC 0018 §3.1 — canonical-JSON, empty → "[]".
+                    let mut b = StringBuilder::new();
+                    b.append_value("[]");
+                    Arc::new(b.finish())
+                }
+                "resource_schema_url" | "scope_schema_url" => {
+                    // RFC 0018 §3.1 — OPTIONAL, absent → null.
+                    let mut b = StringBuilder::new();
+                    b.append_null();
+                    Arc::new(b.finish())
+                }
                 other => panic!("unhandled column in builder: {other}"),
             };
             arrays.push(arr);
@@ -1449,6 +1500,9 @@ mod tests {
             severity_text: None,
             scope_name: None,
             scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
             time_unix_nano: 1_775_127_480_000_000_000,
             observed_time_unix_nano: None,
             attributes: Vec::new(),

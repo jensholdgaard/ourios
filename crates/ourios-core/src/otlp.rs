@@ -241,7 +241,7 @@ impl Body {
 /// the encode → store → decode round-trip is asserted at the
 /// `AnyValue` / `Vec<KeyValue>` level (not on bytes).
 pub mod canonical {
-    use super::{AnyValue, KeyValue};
+    use super::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
 
     /// Error returned by the canonical encoders / decoders.
     /// Encoders are infallible on every `AnyValue` /
@@ -292,7 +292,17 @@ pub mod canonical {
     /// `opentelemetry-proto` release adds a fallible
     /// serializer.
     pub fn encode_any_value(value: &AnyValue) -> Result<Vec<u8>, CanonicalJsonError> {
-        serde_json::to_vec(value).map_err(CanonicalJsonError::Encode)
+        // Fast path (the common case): `opentelemetry-proto`'s `with-serde`
+        // is exact for finite `AnyValue`s. Only when a non-finite double is
+        // present do we route through the robust encoder, which emits the
+        // proto3-JSON string forms (`"NaN"`/`"Infinity"`/`"-Infinity"`) that
+        // `serde_json` would otherwise lossily render as `null` (RFC 0018
+        // §3.4).
+        if has_nonfinite(value) {
+            serde_json::to_vec(&av_to_json(value)).map_err(CanonicalJsonError::Encode)
+        } else {
+            serde_json::to_vec(value).map_err(CanonicalJsonError::Encode)
+        }
     }
 
     /// Inverse of [`encode_any_value`]. Used by the reader to
@@ -304,7 +314,20 @@ pub mod canonical {
     /// corruption or a foreign producer that doesn't honour the
     /// §3.3 spec).
     pub fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, CanonicalJsonError> {
-        serde_json::from_slice(bytes).map_err(CanonicalJsonError::Decode)
+        match serde_json::from_slice::<AnyValue>(bytes) {
+            Ok(av) => Ok(av),
+            // `opentelemetry-proto`'s deserializer rejects the proto3-JSON
+            // non-finite string forms ("invalid type: string, expected
+            // f64"). Re-parse as a generic JSON tree and convert ourselves,
+            // honouring `"NaN"`/`"Infinity"`/`"-Infinity"` (RFC 0018 §3.4).
+            // Genuinely corrupt bytes fail the generic parse too → original
+            // error.
+            Err(fast) => {
+                let json = serde_json::from_slice::<serde_json::Value>(bytes)
+                    .map_err(|_| CanonicalJsonError::Decode(fast))?;
+                json_to_av(&json).map_err(CanonicalJsonError::Decode)
+            }
+        }
     }
 
     /// Encode a `Vec<KeyValue>` (the in-memory shape of
@@ -318,7 +341,15 @@ pub mod canonical {
     /// at infallible serializers (see [`encode_any_value`] /
     /// the [`CanonicalJsonError`] doc).
     pub fn encode_attributes(attrs: &[KeyValue]) -> Result<Vec<u8>, CanonicalJsonError> {
-        serde_json::to_vec(attrs).map_err(CanonicalJsonError::Encode)
+        if attrs
+            .iter()
+            .any(|kv| kv.value.as_ref().is_some_and(has_nonfinite))
+        {
+            let arr = serde_json::Value::Array(attrs.iter().map(kv_to_json).collect());
+            serde_json::to_vec(&arr).map_err(CanonicalJsonError::Encode)
+        } else {
+            serde_json::to_vec(attrs).map_err(CanonicalJsonError::Encode)
+        }
     }
 
     /// Inverse of [`encode_attributes`]. The reader uses this
@@ -329,7 +360,165 @@ pub mod canonical {
     ///
     /// [`CanonicalJsonError::Decode`] on malformed bytes.
     pub fn decode_attributes(bytes: &[u8]) -> Result<Vec<KeyValue>, CanonicalJsonError> {
-        serde_json::from_slice(bytes).map_err(CanonicalJsonError::Decode)
+        match serde_json::from_slice::<Vec<KeyValue>>(bytes) {
+            Ok(kvs) => Ok(kvs),
+            Err(fast) => {
+                let json = serde_json::from_slice::<serde_json::Value>(bytes)
+                    .map_err(|_| CanonicalJsonError::Decode(fast))?;
+                let arr = json.as_array().ok_or_else(|| {
+                    CanonicalJsonError::Decode(de_err("attributes must be a JSON array"))
+                })?;
+                arr.iter()
+                    .map(json_to_kv)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(CanonicalJsonError::Decode)
+            }
+        }
+    }
+
+    // ---- RFC 0018 §3.4 non-finite-double support ----------------------
+    //
+    // `serde_json` renders a non-finite `f64` as `null` (lossy: the three
+    // non-finite values collapse to one shape, and `opentelemetry-proto`'s
+    // deserializer rejects both `null` and the proto3 string form for an
+    // `f64` field). When — and only when — a non-finite double is present,
+    // we route through these hand-built converters, which use the proto3-JSON
+    // string forms `"NaN"`/`"Infinity"`/`"-Infinity"` and round-trip them.
+    // The finite case stays on `opentelemetry-proto`'s exact serde (above).
+
+    /// A canonical-decode error with `msg` (constructed without a direct
+    /// `serde` dependency — `serde_json::Error::io` is the public escape
+    /// hatch for "the bytes were valid JSON but not a valid `AnyValue`").
+    fn de_err(msg: impl Into<String>) -> serde_json::Error {
+        serde_json::Error::io(std::io::Error::other(msg.into()))
+    }
+
+    /// Whether `av` contains a non-finite double anywhere in its tree.
+    fn has_nonfinite(av: &AnyValue) -> bool {
+        match &av.value {
+            Some(any_value::Value::DoubleValue(d)) => !d.is_finite(),
+            Some(any_value::Value::ArrayValue(a)) => a.values.iter().any(has_nonfinite),
+            Some(any_value::Value::KvlistValue(kv)) => kv
+                .values
+                .iter()
+                .any(|k| k.value.as_ref().is_some_and(has_nonfinite)),
+            _ => false,
+        }
+    }
+
+    /// The proto3-JSON string form for a non-finite double.
+    fn nonfinite_token(d: f64) -> &'static str {
+        if d.is_nan() {
+            "NaN"
+        } else if d > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+    }
+
+    /// `AnyValue` → JSON, emitting the proto3 string form for non-finite
+    /// doubles. Subtrees with no non-finite double delegate to
+    /// `opentelemetry-proto`'s exact serde (correct shapes / escaping /
+    /// int-decimal-string / base64), so only the non-finite spine is
+    /// hand-built.
+    fn av_to_json(av: &AnyValue) -> serde_json::Value {
+        use serde_json::json;
+        match &av.value {
+            Some(any_value::Value::DoubleValue(d)) if !d.is_finite() => {
+                json!({ "doubleValue": nonfinite_token(*d) })
+            }
+            Some(any_value::Value::ArrayValue(a)) if a.values.iter().any(has_nonfinite) => {
+                json!({ "arrayValue": { "values": a.values.iter().map(av_to_json).collect::<Vec<_>>() } })
+            }
+            Some(any_value::Value::KvlistValue(kv))
+                if kv
+                    .values
+                    .iter()
+                    .any(|k| k.value.as_ref().is_some_and(has_nonfinite)) =>
+            {
+                json!({ "kvlistValue": { "values": kv.values.iter().map(kv_to_json).collect::<Vec<_>>() } })
+            }
+            // Finite-only subtree (incl. finite double, string, int, bool,
+            // bytes, empty) — `opentelemetry-proto` serde is exact + infallible.
+            _ => serde_json::to_value(av).expect("opentelemetry-proto serde is infallible here"),
+        }
+    }
+
+    /// `KeyValue` → `{"key": …, "value": …}` (value omitted when absent),
+    /// matching `opentelemetry-proto`'s shape.
+    fn kv_to_json(kv: &KeyValue) -> serde_json::Value {
+        use serde_json::json;
+        match &kv.value {
+            Some(v) => json!({ "key": kv.key, "value": av_to_json(v) }),
+            None => json!({ "key": kv.key }),
+        }
+    }
+
+    /// Inverse of [`av_to_json`]: a generic JSON tree → `AnyValue`, decoding
+    /// the proto3 non-finite string forms; finite leaves delegate to
+    /// `opentelemetry-proto`'s serde.
+    fn json_to_av(j: &serde_json::Value) -> Result<AnyValue, serde_json::Error> {
+        if let Some(obj) = j.as_object() {
+            if let Some(serde_json::Value::String(s)) = obj.get("doubleValue") {
+                let d = match s.as_str() {
+                    "NaN" => f64::NAN,
+                    "Infinity" => f64::INFINITY,
+                    "-Infinity" => f64::NEG_INFINITY,
+                    other => {
+                        return Err(de_err(format!("invalid doubleValue string {other:?}")));
+                    }
+                };
+                return Ok(AnyValue {
+                    value: Some(any_value::Value::DoubleValue(d)),
+                });
+            }
+            if let Some(arr) = obj.get("arrayValue").and_then(|a| a.get("values")) {
+                let values = arr
+                    .as_array()
+                    .ok_or_else(|| de_err("arrayValue.values must be an array"))?
+                    .iter()
+                    .map(json_to_av)
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(AnyValue {
+                    value: Some(any_value::Value::ArrayValue(ArrayValue { values })),
+                });
+            }
+            if let Some(vals) = obj.get("kvlistValue").and_then(|k| k.get("values")) {
+                let values = vals
+                    .as_array()
+                    .ok_or_else(|| de_err("kvlistValue.values must be an array"))?
+                    .iter()
+                    .map(json_to_kv)
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(AnyValue {
+                    value: Some(any_value::Value::KvlistValue(KeyValueList { values })),
+                });
+            }
+        }
+        // No non-finite-double / structured spine here → exact serde.
+        serde_json::from_value(j.clone())
+    }
+
+    /// Inverse of [`kv_to_json`].
+    fn json_to_kv(j: &serde_json::Value) -> Result<KeyValue, serde_json::Error> {
+        let obj = j
+            .as_object()
+            .ok_or_else(|| de_err("KeyValue must be a JSON object"))?;
+        let key = obj
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| de_err("KeyValue.key must be a string"))?
+            .to_string();
+        let value = match obj.get("value") {
+            Some(v) => Some(json_to_av(v)?),
+            None => None,
+        };
+        Ok(KeyValue {
+            key,
+            value,
+            ..Default::default()
+        })
     }
 
     #[cfg(test)]
@@ -579,23 +768,34 @@ pub mod canonical {
             }
         }
 
-        /// Non-finite doubles have no JSON-number form; the
-        /// `with-serde` encoder emits `{"doubleValue":null}` for
-        /// them (captured empirically — **not** the proto3-JSON
-        /// `"NaN"` / `"Infinity"` strings). Pinned so an upstream
-        /// change can't drift stored bytes silently. Decoding
-        /// these bytes fails — a known, pre-existing gap
-        /// independent of #130.
+        /// RFC 0018 §3.4 overturns the prior clamp-to-`null` gap: a
+        /// non-finite double now encodes to the proto3-JSON string form
+        /// (`"NaN"`/`"Infinity"`/`"-Infinity"`) and round-trips. (Was: the
+        /// `with-serde` encoder emitted `{"doubleValue":null}`, which did not
+        /// decode — silently dropping the value.)
         #[test]
-        fn nonfinite_doubles_encode_to_the_null_shape() {
-            for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        // `x == y` on the ±Infinity arms is intentional exact equality — the
+        // round-trip contract is value-identity, and Inf == Inf is well-defined.
+        #[allow(clippy::float_cmp)]
+        fn nonfinite_doubles_round_trip_via_proto3_strings() {
+            for (x, token) in [
+                (f64::NAN, "NaN"),
+                (f64::INFINITY, "Infinity"),
+                (f64::NEG_INFINITY, "-Infinity"),
+            ] {
                 let bytes = encode_any_value(&double_av(x)).expect("encode");
-                assert_eq!(bytes, br#"{"doubleValue":null}"#, "drift for {x:?}");
-                // The other half of the pinned gap: those bytes do not
-                // decode, so non-finite doubles never round-trip.
+                assert_eq!(
+                    bytes,
+                    format!(r#"{{"doubleValue":"{token}"}}"#).into_bytes(),
+                    "non-finite double encodes to the proto3 string form",
+                );
+                let back = decode_any_value(&bytes).expect("decode");
+                let Some(any_value::Value::DoubleValue(y)) = back.value else {
+                    panic!("decoded variant drifted for {x:?}");
+                };
                 assert!(
-                    decode_any_value(&bytes).is_err(),
-                    "the null shape unexpectedly decoded for {x:?}",
+                    (x.is_nan() && y.is_nan()) || x == y,
+                    "non-finite double round-trips: {x:?} -> {y:?}",
                 );
             }
         }

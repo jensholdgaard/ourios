@@ -563,18 +563,11 @@ fn column_of(field: &Field) -> (&'static str, bool) {
 /// Whether a field maps to a text-typed column the regex operators
 /// (`=~`/`!~`) and `DataFusion` string functions can apply to. The attribute
 /// fields (`service`/`resource`/`attr`) are JSON-text-backed but are routed
-/// through [`attr_match`] before this is consulted, so the only text columns
-/// reaching the column path are `body`, `scope`, and `event_name`.
+/// through [`attr_match`] before this is consulted (the only caller is on the
+/// dedicated-column path in [`column_comparison`]), so the only text columns
+/// reaching here are `body`, `scope`, and `event_name`.
 fn is_text_field(field: &Field) -> bool {
-    matches!(
-        field,
-        Field::Body
-            | Field::Scope
-            | Field::EventName
-            | Field::Service
-            | Field::Resource(_)
-            | Field::Attr(_)
-    )
+    matches!(field, Field::Body | Field::Scope | Field::EventName)
 }
 
 fn field_name(field: &Field) -> String {

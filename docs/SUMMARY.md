@@ -33,6 +33,7 @@
 - [RFC 0013 — Object storage (S3-compatible)](./rfcs/0013-object-storage.md)
 - [RFC 0014 — Ingest write path (record sink & flush)](./rfcs/0014-ingest-write-path.md)
 - [RFC 0015 — Fuzzing harness](./rfcs/0015-fuzzing-harness.md)
+- [RFC 0016 — Query-serving endpoint](./rfcs/0016-query-serving-endpoint.md)
 
 # Talks
 

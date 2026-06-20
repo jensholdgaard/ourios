@@ -6,7 +6,10 @@
 //! result to a tonic `Status`:
 //! - tenant-resolution failure → `INVALID_ARGUMENT` (naming the failing
 //!   `ResourceLogs` index + attribute, RFC0003.4/.11);
-//! - WAL failure → `INTERNAL` (the batch was not acked, §3.4);
+//! - WAL append/sync failure → `UNAVAILABLE` — a transient failure (the
+//!   batch was not acked, §3.4), so retryable per the OTLP failures table
+//!   (RFC 0018 §3.2);
+//! - a panicked ingest task → `INTERNAL` (a genuine, non-retryable bug);
 //! - success → an empty `ExportLogsServiceResponse`.
 //!
 //! `ingest` is async (its fsync is batched by the group-commit

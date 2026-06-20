@@ -77,7 +77,8 @@ Parquet its `TemplateCreated` event is durable.
 ### 3.2 `derive_template_registry` — fold the audit stream
 
 A querier function mirroring `alias_store::derive_alias_map`
-(`alias_store.rs:40`): scan the tenant's `audit/tenant_id=…` Parquet
+(`crates/ourios-querier/src/alias_store.rs:40`): scan the tenant's
+`audit/tenant_id=…` Parquet
 files, read the template events (`template_created`, `template_widened`,
 `template_type_expanded`), and fold them — in the pinned deterministic
 order `(timestamp, file path lexicographic, within-file row index)` (RFC

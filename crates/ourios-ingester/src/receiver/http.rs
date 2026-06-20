@@ -117,9 +117,13 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         // A Resource that doesn't resolve to a tenant is a client error
         // (the whole batch is rejected, RFC0003.4).
         Ok(Err(ReceiveError::TenantResolution(_))) => StatusCode::BAD_REQUEST.into_response(),
-        // A WAL failure (or a panicked ingest task) is server-side; the
-        // batch was not acked (§3.4).
-        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        // A WAL append/sync failure is *transient* server-side; the batch was
+        // not acked (§3.4), so the client SHOULD retry. 503 is retryable per
+        // the OTLP failures table — non-retryable 500 would make compliant
+        // clients drop data they should re-send (RFC 0018 §3.2).
+        Ok(Err(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        // The ingest task panicked — a genuine, non-retryable internal bug.
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

@@ -15,7 +15,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_core::config::MinerConfig;
 use ourios_miner::cluster::MinerCluster;
-use ourios_wal::{FrameKind, FrameSink, RecoveryError, Wal, WalConfig, WalOffset};
+use ourios_wal::{FrameKind, FrameSink, RecoveryError, SyncError, Wal, WalConfig, WalOffset};
 
 use ourios_ingester::receiver::{
     CommitCoordinator, IngestPipeline, Journal, ReceiveError, TenantRule,
@@ -103,6 +103,37 @@ pub fn spy_pipeline(log: CallLog) -> IngestPipeline {
     let miner = MinerCluster::new(MinerConfig::default());
     IngestPipeline::new(
         coordinator(Box::new(SpyJournal { log, byte: 0 })),
+        miner,
+        TenantRule::service_name(),
+    )
+}
+
+/// A `Journal` that appends fine but **fails the fsync** — a transient
+/// WAL/storage failure (`ReceiveError::WalSync`). The batch is never acked
+/// (§3.4); the transport must report a retryable status (RFC 0018 §3.2).
+struct FailingSyncJournal;
+
+impl Journal for FailingSyncJournal {
+    fn append_batch(&mut self, _payload: &[u8]) -> Result<(), ReceiveError> {
+        Ok(())
+    }
+    fn sync(&mut self) -> Result<WalOffset, ReceiveError> {
+        Err(ReceiveError::WalSync(SyncError::Io {
+            op: "fdatasync",
+            source: std::io::Error::other("injected fsync failure"),
+        }))
+    }
+    fn unflushed_bytes(&self) -> u64 {
+        0
+    }
+}
+
+/// A pipeline whose fsync always fails — drives the transient-failure
+/// (`WalSync`) path for the RFC 0018 §3.2 retryable-status mapping.
+pub fn failing_sync_pipeline() -> IngestPipeline {
+    let miner = MinerCluster::new(MinerConfig::default());
+    IngestPipeline::new(
+        coordinator(Box::new(FailingSyncJournal)),
         miner,
         TenantRule::service_name(),
     )

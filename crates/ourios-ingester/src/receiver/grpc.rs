@@ -56,10 +56,14 @@ impl LogsService for LogsReceiver {
             Ok(Err(ReceiveError::TenantResolution(e))) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
-            // A WAL append/sync failure — server-side; the batch was not
-            // acked (§3.4). Surface the (Display-able) detail.
-            Ok(Err(e)) => Err(Status::internal(e.to_string())),
-            // The ingest task panicked; contain it as INTERNAL.
+            // A WAL append/sync failure — a *transient* server-side failure;
+            // the batch was not acked (§3.4), so the client SHOULD retry.
+            // `UNAVAILABLE` is retryable per the OTLP failures table; mapping
+            // it to non-retryable `INTERNAL` would make compliant clients
+            // drop data they should re-send (RFC 0018 §3.2).
+            Ok(Err(e)) => Err(Status::unavailable(e.to_string())),
+            // The ingest task panicked — a genuine, non-retryable internal
+            // bug; contain it as INTERNAL.
             Err(join) => Err(Status::internal(format!("ingest task failed: {join}"))),
         }
     }

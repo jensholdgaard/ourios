@@ -34,6 +34,7 @@
 - [RFC 0014 — Ingest write path (record sink & flush)](./rfcs/0014-ingest-write-path.md)
 - [RFC 0015 — Fuzzing harness](./rfcs/0015-fuzzing-harness.md)
 - [RFC 0016 — Query-serving endpoint](./rfcs/0016-query-serving-endpoint.md)
+- [RFC 0017 — Template registry & query rendering](./rfcs/0017-template-registry-query-rendering.md)
 
 # Talks
 

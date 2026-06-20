@@ -44,7 +44,9 @@ but the engine implemented only the count; the typed-row payload was
 never built (RFC 0007 §8 left result materialisation open). RFC 0016's
 query-serving endpoint is hollow without real rows, and the *point* of an
 operator query is to see the **logs**, which means reconstructing each
-line from `(template_id, params, separators)` per the CLAUDE.md §3.3 bit-identical
+line from `(template_id, template_version, params, separators)` —
+`template_version` selects the correct token set for that leaf over time
+(§3.5) — per the CLAUDE.md §3.3 bit-identical
 contract — or returning the retained `body` for lossy/parse-failure rows.
 
 Reconstruction needs the leaf's **tokens** at read time. RFC 0005 §3.7.1
@@ -126,12 +128,22 @@ A row whose `(template_id, version)` isn't in the registry (should not
 happen once §3.1 lands; a corrupt/foreign row) renders `RetainedVerbatim`
 from `body` (or empty) — never a panic, never a wrong line.
 
-### 3.4 `LogRow` + `QueryResult` (non-breaking)
+### 3.4 `LogRow` + `QueryResult` (B1/B2-compatible)
 
 `QueryResult` keeps `rows: u64` (the count — B1/B2 and existing tests are
 untouched) and **adds `records: Vec<LogRow>`** (the returned rows, ≤
 `limit`). `LogRow` is Ourios-owned (H6 — no arrow/DataFusion type crosses
 the boundary). The endpoint (RFC 0016) serialises `records`.
+
+`QueryResult` is **not** `#[non_exhaustive]` today
+(`crates/ourios-querier/src/lib.rs:117` — only `QueryError` is), so adding
+a public field is a Rust semver break for downstream struct literals /
+destructuring. This RFC therefore also marks `QueryResult`
+`#[non_exhaustive]` as part of the change — pre-release is the moment to
+do it, and it future-proofs the further fields the execution slice will
+add. The change is *behaviour*-compatible (B1/B2 and existing tests read
+`rows`/`stats`, which are unchanged); "B1/B2-compatible", not "non-breaking
+at the type level".
 
 **OTLP fidelity is a first-class requirement of this RFC, not a v1
 best-effort.** Ourios is an OTLP-native log backend, so a returned row
@@ -280,13 +292,15 @@ line isn't a usable query API.
 > - **Then** it renders against the version-1 tokens, not the
 >   widened version-2 tokens
 
-> **Scenario RFC0017.6 — typed-row payload is returned, non-breaking**
+> **Scenario RFC0017.6 — typed-row payload is returned, B1/B2-compatible**
 > - **Given** a query with a `limit`
 > - **When** it runs
 > - **Then** `QueryResult.records` holds up to `limit` `LogRow`s
->   (rendered line + marker + columns), **and** `QueryResult.rows`
->   (the count) and `stats` are unchanged so B1/B2 and existing
->   tests still pass
+>   (rendered/structured body + marker + the OTLP fields per §3.4),
+>   **and** `QueryResult.rows` (the count) and `stats` are unchanged
+>   so B1/B2 and existing tests still pass
+> - **And** `QueryResult` is `#[non_exhaustive]`, so the field
+>   addition is not a Rust semver break for downstream consumers
 
 > **Scenario RFC0017.7 — no engine internals leak (H6)**
 > - **Given** the public `LogRow` / `QueryResult` surface

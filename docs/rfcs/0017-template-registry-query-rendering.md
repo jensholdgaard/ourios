@@ -40,7 +40,7 @@ but the engine implemented only the count; the typed-row payload was
 never built (RFC 0007 §8 left result materialisation open). RFC 0016's
 query-serving endpoint is hollow without real rows, and the *point* of an
 operator query is to see the **logs**, which means reconstructing each
-line from `(template_id, params, separators)` per the §3.3 bit-identical
+line from `(template_id, params, separators)` per the CLAUDE.md §3.3 bit-identical
 contract — or returning the retained `body` for lossy/parse-failure rows.
 
 Reconstruction needs the leaf's **tokens** at read time. RFC 0005 §3.7.1
@@ -65,7 +65,11 @@ in-memory tree, never durably in the audit stream — unrecoverable for a
 read-time derivation once the originating rows age out.
 
 Add a `TemplateChange::Created` variant (RFC 0001 §6.4) and a new audit
-`event_kind` ordinal + `event_type` string `template_created` (an
+`event_kind` ordinal **`6`** — the next free value after the existing
+`0`–`5` (`template_widened`=0, `template_type_expanded`=1,
+`template_widening_rejected_degenerate`=2, `compaction`=3,
+`alias_asserted`=4, `alias_retracted`=5 in `ourios-core`'s `audit.rs`) —
+paired with the `event_type` string `template_created` (an
 **append-only** addition per RFC 0005 §3.7 — new ordinal, no renumber, so
 old readers are unaffected and §3.5 migration holds). It reuses the
 existing audit columns: `new_template` = the initial tokens,
@@ -104,7 +108,7 @@ fields `reconstruct::render` needs, looks up
 three-zone model (RFC 0001 §6.3 / §6.6):
 
 - **clean** (`Reconstruction::Faithful`) → the line rebuilt from the
-  versioned tokens + params + separators (bit-identical, §3.3);
+  versioned tokens + params + separators (bit-identical, CLAUDE.md §3.3);
 - **lossy / parse-failure** (`RetainedVerbatim`) → the retained `body`
   verbatim;
 - **structured** → the §6.1 canonical body.
@@ -199,12 +203,12 @@ line isn't a usable query API.
 >   `(template_id, version)` the stream describes, **including
 >   version 1**, with later versions not clobbering earlier ones
 
-> **Scenario RFC0017.3 — a clean row renders bit-identically (§3.3)**
+> **Scenario RFC0017.3 — a clean row renders bit-identically (CLAUDE.md §3.3)**
 > - **Given** a stored clean-path row (`Faithful`-eligible) and the
 >   derived registry
 > - **When** the querier renders it via the registry tokens
 > - **Then** the rendered line equals the originally-ingested line
->   byte-for-byte (the §3.3 invariant), and the row's
+>   byte-for-byte (the CLAUDE.md §3.3 invariant), and the row's
 >   `Reconstruction` marker is `Faithful`
 
 > **Scenario RFC0017.4 — lossy / parse-failure rows return the retained body**
@@ -246,7 +250,7 @@ line isn't a usable query API.
   synthetic audit stream (creation + widening), asserting completeness and
   per-version keying; deterministic-order test mirroring the alias-map
   tests.
-- **RFC0017.3** — a **property test** reusing the §3.3 invariant: for a
+- **RFC0017.3** — a **property test** reusing the CLAUDE.md §3.3 invariant: for a
   corpus of mined rows, registry-rendered line == original (or flagged
   lossy). Cross-references `ourios-miner`'s reconstruction property test.
 - **RFC0017.4** — fixtures for lossy + parse-failure + structured rows →

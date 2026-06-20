@@ -122,6 +122,15 @@ crosses the boundary): the projected schema columns plus the rendered
 `line: Vec<u8>` and the `Reconstruction` marker. The endpoint (RFC 0016)
 serialises `records`.
 
+`LogRow` carries the OTLP log record's top-level fields as first-class
+typed columns — `timestamp` / `observed_timestamp`, `severity_number` +
+`severity_text`, trace context (`trace_id` / `span_id` / `trace_flags`),
+and `attributes` — not just the rendered body line + marker. The rendered
+`line` corresponds to the OTLP **`Body`** field; the other fields are
+returned alongside it so a record is a faithful OTLP-shaped row, not a
+bare string (OTel logs data model — these are the named top-level fields a
+backend should preserve on read).
+
 ### 3.5 Version correctness
 
 A row carrying `template_version = N` renders against the **N-version**
@@ -264,7 +273,14 @@ is greppable (`docs/verification.md` §2).
   slot types are derivable / not needed for `render`.)
 - [ ] **Structured-body rendering** — confirm the §6.1 canonical-encoding
   path needs no registry (it doesn't walk a template) and is rendered
-  directly from `body`.
+  directly from `body`. The OTLP `Body` is an `AnyValue` — a plain string
+  **or** a structured map/array — so the miner's template walk applies only
+  to the string-body case; a structured body has no faithful single-line
+  rendering and falls in the structured zone (canonical encoding into
+  `line`). Open: does `LogRow` flatten a structured body into `line:
+  Vec<u8>` (lossy on shape), or should it preserve the `AnyValue` structure
+  so the consumer can re-render? Leaning canonical-bytes-into-`line` for
+  v1; revisit if operators need the structured shape back.
 - [ ] **Backfill** — existing audit streams predate `template_created`;
   templates created before this lands won't have a creation event.
   Acceptable (best-effort `RetainedVerbatim` fallback for those), or is a

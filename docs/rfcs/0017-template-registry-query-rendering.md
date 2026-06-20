@@ -72,7 +72,8 @@ Add a `TemplateChange::Created` variant (RFC 0001 §6.4) and a new audit
 `event_kind` ordinal **`6`** — the next free value after the existing
 `0`–`5` (`template_widened`=0, `template_type_expanded`=1,
 `template_widening_rejected_degenerate`=2, `compaction`=3,
-`alias_asserted`=4, `alias_retracted`=5 in `ourios-core`'s `audit.rs`) —
+`alias_asserted`=4, `alias_retracted`=5 in
+`crates/ourios-core/src/audit.rs`) —
 paired with the `event_type` string `template_created` (an
 **append-only** addition per RFC 0005 §3.7 — new ordinal, no renumber, so
 old readers are unaffected and §3.5 migration holds). It reuses the
@@ -168,8 +169,17 @@ enum LogBody {
 ```
 
 A string body yields `Rendered` (clean → `Faithful`; lossy/parse-failure
-→ `RetainedVerbatim`, §3.3); a structured body yields `Structured`,
-preserving the map/array shape the OTLP spec mandates `Body` retain.
+→ `RetainedVerbatim`, §3.3). A structured body (`body_kind = Structured`)
+yields `Structured`, preserving the map/array shape the OTLP spec mandates
+`Body` retain — this is the `render`-contract `Faithful` case (the
+canonical JSON in `body` round-trips, no template walk). Its one edge: a
+structured row whose `body` is **absent** (a corrupt row — there is no
+structure to return) falls back to `Rendered { line: empty,
+RetainedVerbatim }`, never `Structured` over nothing, matching
+`ourios_miner::reconstruct::render`'s
+`BodyKind::Structured → (empty, RetainedVerbatim)` arm. So the
+`Reconstruction` marker lives on `Rendered`; a `Structured` value is
+faithful by construction.
 
 The three OTLP fields ingest does **not** persist today —
 `InstrumentationScope.attributes`, and the per-resource / per-scope
@@ -352,7 +362,7 @@ is greppable (`docs/verification.md` §2).
 - [x] **Structured-body rendering** — *resolved* (§3.3 / §3.4): the OTLP
   `Body` is an `AnyValue`, and the storage path already preserves the
   structured case (`body_kind = Structured`, canonical JSON in `body`,
-  RFC 0005 §3.2/§3.3). `LogRow::LogBody::Structured(AnyValue)` returns it
+  RFC 0005 §3.2/§3.3). `LogBody::Structured(AnyValue)` returns it
   as structure; only string bodies walk the template. No flattening.
 - [ ] **Residual ingest-side fidelity gap** — `LogRow` returns every OTLP
   field the schema stores, but three are dropped at the *receiver* today
@@ -383,5 +393,6 @@ is greppable (`docs/verification.md` §2).
   hazard H6 (no DataFusion surface leak), §3.7 (multi-tenancy — the
   registry is per-tenant).
 - `crates/ourios-querier/src/alias_store.rs` (`derive_alias_map`, the
-  pattern); `ourios_miner::reconstruct::render`; `ourios-core` `audit.rs`
-  (`TemplateChange`); `ourios_miner::tree::OwnedToken`.
+  pattern); `ourios_miner::reconstruct::render`;
+  `crates/ourios-core/src/audit.rs` (`TemplateChange`);
+  `ourios_miner::tree::OwnedToken`.

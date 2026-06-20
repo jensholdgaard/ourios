@@ -69,8 +69,9 @@ Add a `TemplateChange::Created` variant (RFC 0001 §6.4) and a new audit
 **append-only** addition per RFC 0005 §3.7 — new ordinal, no renumber, so
 old readers are unaffected and §3.5 migration holds). It reuses the
 existing audit columns: `new_template` = the initial tokens,
-`new_version = 1`, `old_template`/`old_version` empty/zero (no prior
-template). The miner emits it at leaf creation, on the same WAL-before-ack
+`new_version = 1`, and `old_template`/`old_version` left **`NULL`** — the
+OPTIONAL "not applicable to this event kind" sentinel per RFC 0005 §3.7
+(no prior template), not a zero/empty value. The miner emits it at leaf creation, on the same WAL-before-ack
 path as the existing template events, so by the time a v1 row reaches
 Parquet its `TemplateCreated` event is durable.
 

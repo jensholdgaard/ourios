@@ -26,11 +26,15 @@ template's **initial creation is unaudited today** — so this RFC also
 **amends the audit contract to emit a `TemplateCreated` event** on leaf
 creation. The querier then returns Ourios-owned `LogRow`s (a new
 `records: Vec<LogRow>` on `QueryResult`, alongside the existing `rows`
-count), each carrying the rendered line + reconstruction marker. This
-delivers the typed-row payload RFC 0007 §4.1 ("Crate shape") *specifies*
-but the engine never implemented (it returns only a count), plus the
-query-time rendering that needs it, and is the prerequisite for RFC
-0016's HTTP endpoint to return actual logs.
+count). Because Ourios is an **OTLP-native** backend, a `LogRow` is a
+faithful OTLP LogRecord: it carries **every OTLP field ingest persisted**
+(timestamps, severity, trace context, scope, attributes, resource
+attributes, event name, dropped count) plus the body — rendered for
+string bodies, returned as structure for `AnyValue` bodies — not just a
+line + marker. This delivers the typed-row payload RFC 0007 §4.1 ("Crate
+shape") *specifies* but the engine never implemented (it returns only a
+count), plus the query-time rendering that needs it, and is the
+prerequisite for RFC 0016's HTTP endpoint to return actual logs.
 
 ## 2. Motivation
 
@@ -111,7 +115,11 @@ three-zone model (RFC 0001 §6.3 / §6.6):
   versioned tokens + params + separators (bit-identical, CLAUDE.md §3.3);
 - **lossy / parse-failure** (`RetainedVerbatim`) → the retained `body`
   verbatim;
-- **structured** → the §6.1 canonical body.
+- **structured** (`body_kind = Structured`) → the structured `AnyValue`,
+  decoded from the `body` column's canonical JSON (RFC 0005 §3.3) and
+  returned **as structure** — not flattened to a byte line, which would
+  discard the map/array shape the OTLP `Body` is required to preserve
+  (see §3.4).
 
 A row whose `(template_id, version)` isn't in the registry (should not
 happen once §3.1 lands; a corrupt/foreign row) renders `RetainedVerbatim`
@@ -121,19 +129,55 @@ from `body` (or empty) — never a panic, never a wrong line.
 
 `QueryResult` keeps `rows: u64` (the count — B1/B2 and existing tests are
 untouched) and **adds `records: Vec<LogRow>`** (the returned rows, ≤
-`limit`). `LogRow` is Ourios-owned (H6 — no arrow/DataFusion type
-crosses the boundary): the projected schema columns plus the rendered
-`line: Vec<u8>` and the `Reconstruction` marker. The endpoint (RFC 0016)
-serialises `records`.
+`limit`). `LogRow` is Ourios-owned (H6 — no arrow/DataFusion type crosses
+the boundary). The endpoint (RFC 0016) serialises `records`.
 
-`LogRow` carries the OTLP log record's top-level fields as first-class
-typed columns — `timestamp` / `observed_timestamp`, `severity_number` +
-`severity_text`, trace context (`trace_id` / `span_id` / `trace_flags`),
-and `attributes` — not just the rendered body line + marker. The rendered
-`line` corresponds to the OTLP **`Body`** field; the other fields are
-returned alongside it so a record is a faithful OTLP-shaped row, not a
-bare string (OTel logs data model — these are the named top-level fields a
-backend should preserve on read).
+**OTLP fidelity is a first-class requirement of this RFC, not a v1
+best-effort.** Ourios is an OTLP-native log backend, so a returned row
+MUST carry **every OTLP LogRecord field that ingest persisted** — a read
+that drops fields the wire carried and the schema stored is a fidelity
+bug. The storage path (RFC 0005 §3.2 schema; `ourios-core` `record.rs` /
+`otlp.rs`) already persists the full record, so `LogRow` mirrors it
+field-for-field as Ourios-owned typed fields:
+
+- `time_unix_nano` (required) and `observed_time_unix_nano` (optional);
+- `severity_number` + `severity_text`;
+- trace context — `trace_id` (16 B), `span_id` (8 B), `flags`;
+- `event_name`;
+- `attributes` and `resource_attributes`, **decoded** from the stored
+  canonical JSON (RFC 0005 §3.3) into structured key/values — not handed
+  back as an opaque JSON blob;
+- `scope_name` / `scope_version`;
+- `dropped_attributes_count` (carried verbatim, never recomputed);
+- the **body** (below), with its `Reconstruction` marker.
+
+**Body — the OTLP `Body` is an `AnyValue` (string *or* structured).** The
+storage path already distinguishes the two via the `body_kind`
+discriminator (RFC 0005 §3.2) and stores structured bodies as canonical
+JSON (RFC 0005 §3.3). `LogRow` models the body as a sum type so invalid
+states are unrepresentable rather than a flat `line` + side flags:
+
+```
+enum LogBody {
+    /// body_kind = String — the §3.3 three-zone result.
+    Rendered { line: Vec<u8>, reconstruction: Reconstruction },
+    /// body_kind = Structured — the AnyValue decoded from canonical JSON,
+    /// returned as structure (map/array), never flattened to a line.
+    Structured(AnyValue),
+}
+```
+
+A string body yields `Rendered` (clean → `Faithful`; lossy/parse-failure
+→ `RetainedVerbatim`, §3.3); a structured body yields `Structured`,
+preserving the map/array shape the OTLP spec mandates `Body` retain.
+
+The three OTLP fields ingest does **not** persist today —
+`InstrumentationScope.attributes`, and the per-resource / per-scope
+`schema_url` (dropped at the receiver, RFC 0003 §6.8 / §9) — are
+consequently not returnable. Closing those is an **ingest-side** fix
+(RFC 0003), out of scope here; this RFC's contract is that `LogRow`
+returns everything the schema holds. Flagged in §7 as the residual
+fidelity gap.
 
 ### 3.5 Version correctness
 
@@ -240,6 +284,25 @@ line isn't a usable query API.
 > - **Then** no `arrow`/`DataFusion`/SQL type or text appears in it;
 >   all fields are Ourios-owned
 
+> **Scenario RFC0017.8 — every persisted OTLP field round-trips on read**
+> - **Given** a stored row whose ingest carried the full OTLP
+>   LogRecord field set (timestamps, severity number + text, trace
+>   context, scope name/version, attributes, resource attributes,
+>   dropped count, event name)
+> - **When** the querier returns it as a `LogRow`
+> - **Then** each of those fields equals what the schema stored
+>   (RFC 0005 §3.2), `attributes` / `resource_attributes` are decoded
+>   to structured key/values (not an opaque JSON blob), and **no
+>   stored OTLP field is dropped on the read path**
+
+> **Scenario RFC0017.9 — a structured (`AnyValue`) body is returned as structure**
+> - **Given** a stored row with `body_kind = Structured` (the OTLP
+>   `Body` was a map/array, canonical JSON in `body`, RFC 0005 §3.3)
+> - **When** the querier returns it
+> - **Then** the body is `LogBody::Structured(AnyValue)` preserving the
+>   original map/array shape — **not** flattened into a byte line — and
+>   round-trips the ingested `AnyValue`
+
 ## 6. Testing strategy
 
 - **RFC0017.1** — a miner unit/integration test asserting a
@@ -260,6 +323,17 @@ line isn't a usable query API.
   count assertion still holds).
 - **RFC0017.7** — a grep-style guard that the public crate surface has no
   `arrow`/`datafusion` types (mirrors the RFC0007.3 / H6 guard).
+- **RFC0017.8** — a querier test that ingests a record populating **every**
+  OTLP field, stores it, queries it back, and asserts each `LogRow` field
+  equals the ingested value (a field-completeness assertion over the RFC
+  0005 §3.2 column set), with `attributes` / `resource_attributes` decoded
+  to structured key/values. The assertion enumerates the field set so a
+  newly-added stored column that the read path forgets fails the test.
+- **RFC0017.9** — a property/round-trip test: for structured-body inputs
+  (`AnyValue` maps/arrays), `LogRow.body == LogBody::Structured(v)` where
+  `v` equals the ingested `AnyValue` (decoded canonical JSON), never a
+  flattened line. Cross-references the `ourios-core` canonical
+  encode/decode property tests.
 
 Each scenario id (`RFC0017.N`) is referenced from its test so the mapping
 is greppable (`docs/verification.md` §2).
@@ -275,16 +349,19 @@ is greppable (`docs/verification.md` §2).
 - [ ] **`TemplateCreated` payload** — does it also carry `slot_types`
   (like `TypeExpanded`), or just tokens? (Leaning tokens-only for v1;
   slot types are derivable / not needed for `render`.)
-- [ ] **Structured-body rendering** — confirm the §6.1 canonical-encoding
-  path needs no registry (it doesn't walk a template) and is rendered
-  directly from `body`. The OTLP `Body` is an `AnyValue` — a plain string
-  **or** a structured map/array — so the miner's template walk applies only
-  to the string-body case; a structured body has no faithful single-line
-  rendering and falls in the structured zone (canonical encoding into
-  `line`). Open: does `LogRow` flatten a structured body into `line:
-  Vec<u8>` (lossy on shape), or should it preserve the `AnyValue` structure
-  so the consumer can re-render? Leaning canonical-bytes-into-`line` for
-  v1; revisit if operators need the structured shape back.
+- [x] **Structured-body rendering** — *resolved* (§3.3 / §3.4): the OTLP
+  `Body` is an `AnyValue`, and the storage path already preserves the
+  structured case (`body_kind = Structured`, canonical JSON in `body`,
+  RFC 0005 §3.2/§3.3). `LogRow::LogBody::Structured(AnyValue)` returns it
+  as structure; only string bodies walk the template. No flattening.
+- [ ] **Residual ingest-side fidelity gap** — `LogRow` returns every OTLP
+  field the schema stores, but three are dropped at the *receiver* today
+  and so cannot be returned: `InstrumentationScope.attributes`, and the
+  per-resource / per-scope `schema_url` (RFC 0003 §6.8 "out of scope" /
+  §9). For a backend whose thesis is OTLP-native fidelity these are worth
+  closing — but at ingest (an RFC 0003 schema addition + RFC 0005 columns),
+  not in this read-path RFC. Track as an RFC 0003 follow-up; this RFC is
+  faithful to the *stored* record by construction.
 - [ ] **Backfill** — existing audit streams predate `template_created`;
   templates created before this lands won't have a creation event.
   Acceptable (best-effort `RetainedVerbatim` fallback for those), or is a

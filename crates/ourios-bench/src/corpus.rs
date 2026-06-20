@@ -436,7 +436,13 @@ fn map_log_record(
         severity_text: empty_to_none(lr.severity_text),
         scope_name: scope.and_then(|s| empty_to_none(s.name.clone())),
         scope_version: scope.and_then(|s| empty_to_none(s.version.clone())),
-        scope_attributes: Vec::new(),
+        // RFC 0018 §3.1 — mirror the production receiver: carry the scope's
+        // own attributes so the bench corpus exercises the scope-metadata
+        // path. The per-resource / per-scope `schema_url`s live on the
+        // `ResourceLogs`/`ScopeLogs` wrappers, which this per-record loader
+        // doesn't thread through — left `None` (bench input, not a fidelity
+        // gate).
+        scope_attributes: scope.map(|s| s.attributes.clone()).unwrap_or_default(),
         resource_schema_url: None,
         scope_schema_url: None,
         attributes: lr.attributes,

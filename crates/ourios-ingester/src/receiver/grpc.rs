@@ -63,8 +63,15 @@ impl LogsService for LogsReceiver {
             // the batch was not acked (§3.4), so the client SHOULD retry.
             // `UNAVAILABLE` is retryable per the OTLP failures table; mapping
             // it to non-retryable `INTERNAL` would make compliant clients
-            // drop data they should re-send (RFC 0018 §3.2).
-            Ok(Err(e)) => Err(Status::unavailable(e.to_string())),
+            // drop data they should re-send (RFC 0018 §3.2). Matched
+            // explicitly per-variant (not a catch-all): within this crate the
+            // arms are exhaustive over `ReceiveError`, so a future
+            // `#[non_exhaustive]` variant breaks the build here and forces an
+            // explicit retryable-vs-not decision rather than defaulting either
+            // way.
+            Ok(Err(e @ (ReceiveError::WalAppend(_) | ReceiveError::WalSync(_)))) => {
+                Err(Status::unavailable(e.to_string()))
+            }
             // The ingest task panicked — a genuine, non-retryable internal
             // bug; contain it as INTERNAL.
             Err(join) => Err(Status::internal(format!("ingest task failed: {join}"))),

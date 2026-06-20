@@ -120,8 +120,13 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         // A WAL append/sync failure is *transient* server-side; the batch was
         // not acked (§3.4), so the client SHOULD retry. 503 is retryable per
         // the OTLP failures table — non-retryable 500 would make compliant
-        // clients drop data they should re-send (RFC 0018 §3.2).
-        Ok(Err(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        // clients drop data they should re-send (RFC 0018 §3.2). Matched
+        // per-variant (exhaustive over `ReceiveError` in-crate): a future
+        // `#[non_exhaustive]` variant breaks the build here, forcing a
+        // retryable-vs-not decision rather than defaulting either way.
+        Ok(Err(ReceiveError::WalAppend(_) | ReceiveError::WalSync(_))) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
         // The ingest task panicked — a genuine, non-retryable internal bug.
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

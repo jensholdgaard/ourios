@@ -36,7 +36,7 @@ fn rfc0017_7_no_engine_internals_leak() {
 }
 
 /// Scenario RFC0017.8 — a stored row whose ingest carried the full OTLP
-/// LogRecord field set is returned as a `LogRow` where each field equals what
+/// `LogRecord` field set is returned as a `LogRow` where each field equals what
 /// the schema stored (RFC 0005 §3.2), `attributes` / `resource_attributes` are
 /// decoded to structured key/values (not an opaque JSON blob), and no stored
 /// OTLP field is dropped on the read path.

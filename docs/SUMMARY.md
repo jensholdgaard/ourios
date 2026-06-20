@@ -35,6 +35,7 @@
 - [RFC 0015 — Fuzzing harness](./rfcs/0015-fuzzing-harness.md)
 - [RFC 0016 — Query-serving endpoint](./rfcs/0016-query-serving-endpoint.md)
 - [RFC 0017 — Template registry & query rendering](./rfcs/0017-template-registry-query-rendering.md)
+- [RFC 0018 — OTLP log-spec compliance amendments](./rfcs/0018-otlp-log-spec-compliance.md)
 
 # Talks
 

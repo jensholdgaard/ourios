@@ -548,6 +548,7 @@ fn column_of(field: &Field) -> (&'static str, bool) {
         Field::TraceId => (columns::TRACE_ID, true),
         Field::SpanId => (columns::SPAN_ID, true),
         Field::Scope => (columns::SCOPE_NAME, true),
+        Field::EventName => (columns::EVENT_NAME, true),
         Field::Flags => (columns::FLAGS, false),
         Field::TemplateId => (columns::TEMPLATE_ID, false),
         Field::Confidence => (columns::CONFIDENCE, false),
@@ -563,11 +564,16 @@ fn column_of(field: &Field) -> (&'static str, bool) {
 /// (`=~`/`!~`) and `DataFusion` string functions can apply to. The attribute
 /// fields (`service`/`resource`/`attr`) are JSON-text-backed but are routed
 /// through [`attr_match`] before this is consulted, so the only text columns
-/// reaching the column path are `body` and `scope`.
+/// reaching the column path are `body`, `scope`, and `event_name`.
 fn is_text_field(field: &Field) -> bool {
     matches!(
         field,
-        Field::Body | Field::Scope | Field::Service | Field::Resource(_) | Field::Attr(_)
+        Field::Body
+            | Field::Scope
+            | Field::EventName
+            | Field::Service
+            | Field::Resource(_)
+            | Field::Attr(_)
     )
 }
 
@@ -580,6 +586,7 @@ fn field_name(field: &Field) -> String {
         Field::TraceId => "trace_id".into(),
         Field::SpanId => "span_id".into(),
         Field::Scope => "scope".into(),
+        Field::EventName => "event_name".into(),
         Field::Flags => "flags".into(),
         Field::Service => "service".into(),
         Field::TemplateId => "template_id".into(),
@@ -720,6 +727,7 @@ fn string_call_column(field: &Field) -> Result<&'static str, QueryError> {
     match field {
         Field::Body => Ok(columns::BODY),
         Field::Scope => Ok(columns::SCOPE_NAME),
+        Field::EventName => Ok(columns::EVENT_NAME),
         // `trace_id`/`span_id` are binary id columns. The DSL accepts them as
         // string operands at parse time (a hex-string equality is meaningful),
         // but the DataFusion string functions are not defined over binary, so

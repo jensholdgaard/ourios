@@ -139,6 +139,7 @@ fn write_field(out: &mut String, field: &Field) {
         Field::TraceId => out.push_str("trace_id"),
         Field::SpanId => out.push_str("span_id"),
         Field::Scope => out.push_str("scope"),
+        Field::EventName => out.push_str("event_name"),
         Field::Flags => out.push_str("flags"),
         Field::Service => out.push_str("service"),
         Field::TemplateId => out.push_str("template_id"),

@@ -93,12 +93,6 @@ fn rfc0018_3_transient_failure_is_retryable() {
     todo!("RFC0018.3: transient -> retryable code; permanent -> INVALID_ARGUMENT/400")
 }
 
-/// Scenario RFC0018.6 — out-of-range `SeverityNumber` is preserved, not clamped:
-/// `severity_number` 25 / 200 are stored verbatim (never silently clamped to 0),
-/// the `ingest.severity_out_of_range` metric increments, a `severity >= ERROR`
-/// query still matches the preserved 25 / 200 (monotonicity), and a value a
-/// `u8` cannot hold (negative, > 255) maps to 0 + the same anomaly count.
-/// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
 /// Sum of `ourios.ingest.records` datapoints, filtered by `error.type`:
 /// `None` → success points (the attribute absent); `Some(v)` → points whose
 /// `error.type` equals `v`.

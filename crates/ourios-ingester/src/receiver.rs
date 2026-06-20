@@ -41,6 +41,6 @@ pub mod tenant;
 
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
-pub use materialize::{materialize_record, materialize_resource_logs, severity_is_out_of_range};
+pub use materialize::{materialize_record, materialize_resource_logs};
 pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
 pub use tenant::{TenantResolutionError, TenantRule, fan_out};

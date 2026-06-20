@@ -127,7 +127,7 @@ fn severity_to_u8(n: i32) -> u8 {
 /// range too but indistinguishable post-narrowing, so attribution is
 /// best-effort over the `u8`-storable band (see §3.5).
 #[must_use]
-pub fn severity_is_out_of_range(severity_number: u8) -> bool {
+pub(crate) fn severity_is_out_of_range(severity_number: u8) -> bool {
     severity_number > 24
 }
 

@@ -277,7 +277,7 @@ impl IngestPipeline {
                 // aren't separately attributed — accepted limitation).
                 let severity_out_of_range = records
                     .iter()
-                    .filter(|r| super::severity_is_out_of_range(r.severity_number))
+                    .filter(|r| super::materialize::severity_is_out_of_range(r.severity_number))
                     .count();
                 self.metrics
                     .record_batch(records.len(), severity_out_of_range, append_elapsed);

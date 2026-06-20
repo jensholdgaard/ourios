@@ -13,28 +13,18 @@ superseded-by: —
 
 ## 1. Summary
 
-Make the querier return **rendered log lines**, not just a count. The
-engine reconstructs each matching row's body via
-`reconstruct::render(record, tokens)`, which needs the leaf's tokens at
-read time. We build that **read-time template registry**
-(`(template_id, template_version) → tokens`) by **folding the tenant's
-audit stream** — the same deterministic pattern `derive_alias_map`
-already uses — rather than the deferred cached-map artifact. That fold is
-only *complete* if every template version's tokens are in the audit
-stream; widening/type-expansion events already carry them, but a
-template's **initial creation is unaudited today** — so this RFC also
+Make the querier return **rendered log lines**, not just a count: add
+`records: Vec<LogRow>` to `QueryResult` (keeping the `rows` count). A
+`LogRow` is a faithful OTLP LogRecord — every OTLP field ingest persisted,
+plus the body (rendered for string bodies, returned as structure for
+`AnyValue` bodies). Rendering needs each leaf's *versioned* tokens at read
+time, so this RFC builds a **read-time template registry**
+(`(template_id, template_version) → tokens`) by folding the tenant's audit
+stream — and, because a template's initial creation is unaudited today,
 **amends the audit contract to emit a `TemplateCreated` event** on leaf
-creation. The querier then returns Ourios-owned `LogRow`s (a new
-`records: Vec<LogRow>` on `QueryResult`, alongside the existing `rows`
-count). Because Ourios is an **OTLP-native** backend, a `LogRow` is a
-faithful OTLP LogRecord: it carries **every OTLP field ingest persisted**
-(timestamps, severity, trace context, scope, attributes, resource
-attributes, event name, dropped count) plus the body — rendered for
-string bodies, returned as structure for `AnyValue` bodies — not just a
-line + marker. This delivers the typed-row payload RFC 0007 §4.1 ("Crate
-shape") *specifies* but the engine never implemented (it returns only a
-count), plus the query-time rendering that needs it, and is the
-prerequisite for RFC 0016's HTTP endpoint to return actual logs.
+creation. This delivers the typed-row payload RFC 0007 §4.1 specifies but
+the engine never built, and is the prerequisite for RFC 0016's endpoint to
+return actual logs.
 
 ## 2. Motivation
 
@@ -96,7 +86,7 @@ files, read the template events (`template_created`, `template_widened`,
 order `(timestamp, file path lexicographic, within-file row index)` (RFC
 0005 §3.7.1) — into
 
-```
+```text
 TemplateRegistry = HashMap<(template_id: u64, version: u32), Vec<OwnedToken>>
 ```
 
@@ -140,14 +130,15 @@ pre-release and OTLP-native; where faithful OTLP shape requires changing
 or breaking a public type, that is acceptable — we do **not** compromise
 the LogRecord shape to preserve a Rust API. `QueryResult` is not
 `#[non_exhaustive]` today (`crates/ourios-querier/src/lib.rs:117` — only
-`QueryError` is), so adding a public field is a Rust semver break for
-downstream struct literals / destructuring. That break is fine on its own
-terms; we mark `QueryResult` `#[non_exhaustive]` here as plain
-hygiene (it future-proofs the further fields the execution slice will
-add), not because compatibility constrains the design. The change is in
-any case *behaviour*-compatible — B1/B2 and existing tests read
-`rows`/`stats`, which are unchanged — so "B1/B2-compatible" is the precise
-claim, not "non-breaking at the type level".
+`QueryError` is), so **both** adding a public field **and** marking the
+struct `#[non_exhaustive]` are one-time Rust semver breaks for downstream
+struct literals / patterns. Both are accepted — we don't compromise the
+shape to preserve the API — and the `#[non_exhaustive]` mark buys that
+*subsequent* field additions (the execution slice will add more) are
+non-breaking. The change is in any case *behaviour*-compatible — B1/B2 and
+existing tests read `rows`/`stats`, which are unchanged — so
+"B1/B2-compatible" is the precise claim, not "non-breaking at the type
+level".
 
 **OTLP fidelity is a first-class requirement of this RFC, not a v1
 best-effort.** Ourios is an OTLP-native log backend, so a returned row
@@ -174,7 +165,7 @@ discriminator (RFC 0005 §3.2) and stores structured bodies as canonical
 JSON (RFC 0005 §3.3). `LogRow` models the body as a sum type so invalid
 states are unrepresentable rather than a flat `line` + side flags:
 
-```
+```rust
 enum LogBody {
     /// body_kind = String — the §3.3 three-zone result.
     Rendered { line: Vec<u8>, reconstruction: Reconstruction },
@@ -303,8 +294,9 @@ line isn't a usable query API.
 >   (rendered/structured body + marker + the OTLP fields per §3.4),
 >   **and** `QueryResult.rows` (the count) and `stats` are unchanged
 >   so B1/B2 and existing tests still pass
-> - **And** `QueryResult` is `#[non_exhaustive]`, so the field
->   addition is not a Rust semver break for downstream consumers
+> - **And** `QueryResult` is marked `#[non_exhaustive]` (which, with
+>   the field addition, is an accepted one-time semver break per §3.4)
+>   so that *subsequent* field additions are non-breaking
 
 > **Scenario RFC0017.7 — no engine internals leak (H6)**
 > - **Given** the public `LogRow` / `QueryResult` surface
@@ -391,9 +383,16 @@ is greppable (`docs/verification.md` §2).
   not in this read-path RFC. Track as an RFC 0003 follow-up; this RFC is
   faithful to the *stored* record by construction.
 - [ ] **Backfill** — existing audit streams predate `template_created`;
-  templates created before this lands won't have a creation event.
-  Acceptable (best-effort `RetainedVerbatim` fallback for those), or is a
-  one-time backfill warranted? (Leaning acceptable for pre-release.)
+  templates created before this lands won't have a creation event, so their
+  v1 rows aren't in the registry and hit the §3.3 not-in-registry fallback.
+  **Caveat:** that fallback renders `RetainedVerbatim` from `body`, but a
+  clean-path `body_kind = String` row has **no** `body` (absent by design,
+  RFC 0005 §3.2) — so the fallback yields an **empty** line, not the
+  original, unless tokens are recovered. Options: accept empty-line for
+  pre-`template_created` clean rows (pre-release, leaning this), a one-time
+  audit backfill, or recover v1 tokens from a surviving v1 row's shape
+  (the §4 "reconstruct v1 from a surviving row" alternative, rejected there
+  as fragile). Pre-release lean: acceptable + documented.
 
 ## 8. References
 

@@ -249,8 +249,8 @@ back-reference.
 
 > **Scenario RFC0018.1 — scope attributes + schema URLs survive ingest→storage**
 > - **Given** an OTLP batch whose `InstrumentationScope` carries
->   `attributes` and a `schema_url`, and whose `ResourceLogs` carries a
->   `schema_url`
+>   `attributes`, whose `ScopeLogs` carries a `schema_url`, and whose
+>   `ResourceLogs` carries a `schema_url`
 > - **When** the receiver materialises the records and they are written
 >   to Parquet
 > - **Then** `scope_attributes` (canonical JSON), `scope_schema_url`,
@@ -338,7 +338,8 @@ is greppable (`docs/verification.md` §2).
   class* (`severity_number`, `scope_name`); higher-cardinality emitter
   *metadata* (`scope_version`, `scope_attributes`) is retained + queryable
   (`scope.<key>`) but not keyed — keying on it would explode `template_count`
-  (§3.1 hazard) for no fidelity gain (attributes are retained per-row;
+  (the template-cardinality hazard; `CLAUDE.md` §3.1 / `docs/hazards.md` #1)
+  for no fidelity gain (attributes are retained per-row;
   reconstruction §3.3 never depended on scope). Per-attribute partitioning,
   if ever needed, is a future opt-in config (gated on a concrete consumer).
 - [ ] **Pre-amendment backfill** — historical files lack the new columns;
@@ -366,7 +367,8 @@ is greppable (`docs/verification.md` §2).
   (empty/zero MUST be stored), [common/instrumentation-scope](https://opentelemetry.io/docs/specs/otel/common/instrumentation-scope/)
   (the `(name,version,schema_url,attributes)` tuple),
   [otlp/#json-protobuf-encoding](https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding)
-  (proto3 JSON mapping — non-finite doubles as `"NaN"`/`"Infinity"` strings),
+  (proto3 JSON mapping — non-finite doubles as `"NaN"`/`"Infinity"`/`"-Infinity"`
+  strings),
   [otlp/#failures](https://opentelemetry.io/docs/specs/otlp/#failures)
   (retryable vs non-retryable codes), [otlp/#otlpgrpc-throttling](https://opentelemetry.io/docs/specs/otlp/#otlpgrpc-throttling).
 - RFCs amended: **RFC 0002** (DSL — §6.1 bare fields), **RFC 0003**

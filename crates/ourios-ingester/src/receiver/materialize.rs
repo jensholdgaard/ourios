@@ -31,7 +31,9 @@ use ourios_core::tenant::TenantId;
 pub fn materialize_record(
     record: LogRecord,
     resource_attributes: &[KeyValue],
+    resource_schema_url: &str,
     scope: Option<&InstrumentationScope>,
+    scope_schema_url: &str,
     tenant_id: TenantId,
 ) -> OtlpLogRecord {
     OtlpLogRecord {
@@ -50,6 +52,13 @@ pub fn materialize_record(
         severity_text: nonempty(record.severity_text),
         scope_name: scope.and_then(|s| (!s.name.is_empty()).then(|| s.name.clone())),
         scope_version: scope.and_then(|s| (!s.version.is_empty()).then(|| s.version.clone())),
+        // RFC 0018 §3.1 — the scope's own attributes, and the schema URLs from
+        // the ScopeLogs / ResourceLogs wrappers. Empty wire string → `None`
+        // (the RFC0003.9 absence rule; proto3 can't distinguish unset from "").
+        scope_attributes: scope.map(|s| s.attributes.clone()).unwrap_or_default(),
+        resource_schema_url: (!resource_schema_url.is_empty())
+            .then(|| resource_schema_url.to_string()),
+        scope_schema_url: (!scope_schema_url.is_empty()).then(|| scope_schema_url.to_string()),
         attributes: record.attributes,
         // Reflected verbatim from the wire, never recomputed (RFC0003.10).
         dropped_attributes_count: record.dropped_attributes_count,
@@ -81,14 +90,18 @@ pub fn materialize_resource_logs(
         .resource
         .map(|resource| resource.attributes)
         .unwrap_or_default();
+    let resource_schema_url = resource_logs.schema_url;
     let mut records = Vec::new();
     for scope_logs in resource_logs.scope_logs {
         let scope = scope_logs.scope;
+        let scope_schema_url = scope_logs.schema_url;
         for record in scope_logs.log_records {
             records.push(materialize_record(
                 record,
                 &resource_attributes,
+                &resource_schema_url,
                 scope.as_ref(),
+                &scope_schema_url,
                 tenant_id.clone(),
             ));
         }

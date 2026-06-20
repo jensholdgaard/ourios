@@ -39,7 +39,9 @@ fn rfc0003_9_edge_fields_pass_through_without_coalescing() {
     let materialized = materialize_record(
         record,
         &resource_attributes,
+        "",
         Some(&scope),
+        "",
         TenantId::new("tenant-a"),
     );
 
@@ -85,7 +87,7 @@ fn rfc0003_9_out_of_range_severity_narrows_to_unspecified() {
             severity_number: wire,
             ..Default::default()
         };
-        let materialized = materialize_record(record, &[], None, TenantId::new("tenant-a"));
+        let materialized = materialize_record(record, &[], "", None, "", TenantId::new("tenant-a"));
         assert_eq!(
             materialized.severity_number, expected,
             "severity_number {wire} narrows to {expected}",

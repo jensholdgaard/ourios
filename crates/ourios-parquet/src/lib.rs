@@ -89,6 +89,14 @@ pub mod columns {
     pub const SEPARATORS: &str = "separators";
     pub const CONFIDENCE: &str = "confidence";
     pub const LOSSY_FLAG: &str = "lossy_flag";
+    /// RFC 0018 §3.1 — `InstrumentationScope.attributes`, canonical JSON
+    /// (OPTIONAL for the §3.5 migration; `[]` when empty, NULL only in
+    /// pre-amendment files).
+    pub const SCOPE_ATTRIBUTES: &str = "scope_attributes";
+    /// RFC 0018 §3.1 — `ResourceLogs.schema_url` (OPTIONAL).
+    pub const RESOURCE_SCHEMA_URL: &str = "resource_schema_url";
+    /// RFC 0018 §3.1 — `ScopeLogs.schema_url` (OPTIONAL).
+    pub const SCOPE_SCHEMA_URL: &str = "scope_schema_url";
 }
 
 /// Audit-event file column-name constants (RFC 0005 §3.7).
@@ -192,6 +200,11 @@ pub fn data_schema() -> SchemaRef {
         ),
         Field::new(columns::CONFIDENCE, DataType::Float32, false),
         Field::new(columns::LOSSY_FLAG, DataType::Boolean, false),
+        // RFC 0018 §3.1 — additive OPTIONAL columns (§3.5 migration: readers
+        // tolerate their absence in pre-amendment files).
+        Field::new(columns::SCOPE_ATTRIBUTES, DataType::Utf8, true),
+        Field::new(columns::RESOURCE_SCHEMA_URL, DataType::Utf8, true),
+        Field::new(columns::SCOPE_SCHEMA_URL, DataType::Utf8, true),
     ]))
 }
 

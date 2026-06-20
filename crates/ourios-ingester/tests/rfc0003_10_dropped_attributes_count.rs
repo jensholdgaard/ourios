@@ -15,7 +15,7 @@ fn rfc0003_10_dropped_attributes_count_is_reflected_verbatim() {
         dropped_attributes_count: 42,
         ..Default::default()
     };
-    let materialized = materialize_record(record, &[], None, TenantId::new("tenant-a"));
+    let materialized = materialize_record(record, &[], "", None, "", TenantId::new("tenant-a"));
     assert_eq!(
         materialized.dropped_attributes_count, 42,
         "dropped_attributes_count is reflected from the wire, never recomputed",

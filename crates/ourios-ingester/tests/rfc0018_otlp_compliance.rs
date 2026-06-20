@@ -1,37 +1,78 @@
 //! RFC 0018 — OTLP log-spec compliance acceptance scenarios (§5), the
-//! receiver + ingest/schema arms (`.1`, `.2`, `.3`, `.6`).
+//! receiver arms.
 //!
-//! **Status: `red`.** Failing stubs that drive the `green` implementation:
-//! each encodes one RFC 0018 §5 scenario and currently `todo!()`s. They are
-//! `#[ignore]`d so the default `cargo test` (and CI) stays green while the
-//! ingest/receiver changes are built — `green` replaces each body with a real
-//! assertion and removes the `#[ignore]`.
-//!
-//! `.4` (`event_name` DSL filter) lives in `ourios-querier` and `.5`
-//! (non-finite-double canonical round-trip) in `ourios-core`, next to where
-//! their `green` implementations land.
+//! `.1` (receiver half): the receiver materialises `InstrumentationScope`
+//! attributes and the per-resource / per-scope `schema_url` from the wire.
+//! The storage round-trip + back-compat halves of `.1`/`.2` live in
+//! `ourios-parquet/tests/rfc0018_otlp_compliance.rs` (the Writer/Reader
+//! harness). `.3` (retryable error mapping) and `.6` (severity preserve)
+//! remain `#[ignore]`d stubs until those receiver changes land (`green`).
 //!
 //! See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5/§6.
 
-/// Scenario RFC0018.1 — scope attributes + schema URLs survive ingest→storage:
-/// a batch whose `InstrumentationScope` carries `attributes`, whose `ScopeLogs`
-/// carries a `schema_url`, and whose `ResourceLogs` carries a `schema_url`
-/// round-trips those values through Parquet (`scope_attributes` as canonical JSON).
-/// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
-#[test]
-#[ignore = "RFC0018.1 — red until scope_attributes / *_schema_url decode + columns land (green)"]
-fn rfc0018_1_scope_fields_round_trip() {
-    todo!("RFC0018.1: scope attributes + resource/scope schema_url persist and round-trip")
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use ourios_core::tenant::TenantId;
+use ourios_ingester::receiver::materialize_resource_logs;
+
+fn kv(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(Value::StringValue(value.to_owned())),
+        }),
+        ..Default::default()
+    }
 }
 
-/// Scenario RFC0018.2 — the new columns are OPTIONAL / back-compatible: a
-/// historical Parquet file written before this amendment (no `scope_attributes` /
-/// `*_schema_url` columns) reads successfully, those fields read absent/NULL, no error.
+/// Scenario RFC0018.1 — scope attributes + schema URLs survive ingest
+/// (receiver half): a batch whose `InstrumentationScope` carries
+/// `attributes`, whose `ScopeLogs` carries a `schema_url`, and whose
+/// `ResourceLogs` carries a `schema_url` materialises into an
+/// `OtlpLogRecord` carrying all three (the storage round-trip is proven in
+/// `ourios-parquet/tests/rfc0018_otlp_compliance.rs`).
 /// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
 #[test]
-#[ignore = "RFC0018.2 — red until the additive OPTIONAL columns + reader tolerance land (green)"]
-fn rfc0018_2_new_columns_back_compatible() {
-    todo!("RFC0018.2: pre-amendment files read fine; the three new fields read absent/NULL")
+fn rfc0018_1_receiver_materialises_scope_fields() {
+    let resource_logs = ResourceLogs {
+        resource: Some(Resource {
+            attributes: vec![kv("service.name", "checkout")],
+            ..Default::default()
+        }),
+        schema_url: "https://opentelemetry.io/schemas/1.31.0".to_owned(),
+        scope_logs: vec![ScopeLogs {
+            scope: Some(InstrumentationScope {
+                name: "lib.cart".to_owned(),
+                version: "1.0.0".to_owned(),
+                attributes: vec![kv("db.system", "postgres")],
+                ..Default::default()
+            }),
+            schema_url: "https://opentelemetry.io/schemas/1.0.0".to_owned(),
+            log_records: vec![LogRecord::default()],
+        }],
+    };
+
+    let materialized = materialize_resource_logs(resource_logs, &TenantId::new("tenant-a"));
+
+    assert_eq!(materialized.len(), 1, "one record materialised");
+    let r = &materialized[0];
+    assert_eq!(
+        r.scope_attributes,
+        vec![kv("db.system", "postgres")],
+        "scope.attributes carried from the wire"
+    );
+    assert_eq!(
+        r.scope_schema_url.as_deref(),
+        Some("https://opentelemetry.io/schemas/1.0.0"),
+        "ScopeLogs.schema_url carried"
+    );
+    assert_eq!(
+        r.resource_schema_url.as_deref(),
+        Some("https://opentelemetry.io/schemas/1.31.0"),
+        "ResourceLogs.schema_url carried"
+    );
 }
 
 /// Scenario RFC0018.3 — transient ingest failure is reported retryable: a WAL

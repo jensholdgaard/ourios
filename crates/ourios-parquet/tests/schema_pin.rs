@@ -138,6 +138,10 @@ fn rfc0005_10_data_schema_matches_pinned_field_list() {
         separators_field(),
         Field::new("confidence", DataType::Float32, false),
         Field::new("lossy_flag", DataType::Boolean, false),
+        // RFC 0018 §3.1 — additive OPTIONAL columns.
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("resource_schema_url", DataType::Utf8, true),
+        Field::new("scope_schema_url", DataType::Utf8, true),
     ];
     check_schema_against(&expected, &data_schema());
 }

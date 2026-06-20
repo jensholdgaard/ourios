@@ -110,6 +110,17 @@ pub struct MinedRecord {
     /// retained per-record for drift / debugging. Outside the
     /// template key.
     pub scope_version: Option<String>,
+    /// `InstrumentationScope.attributes` — the scope's own attribute set
+    /// (RFC 0018 §3.1). Outside the template key (retained + queryable
+    /// metadata, not template identity). Canonical-JSON in the OPTIONAL
+    /// `scope_attributes` column; empty vec ↔ `[]` on disk.
+    pub scope_attributes: Vec<KeyValue>,
+    /// `ResourceLogs.schema_url` — the resource group's Telemetry Schema
+    /// URL, when set (RFC 0018 §3.1). OPTIONAL `resource_schema_url` column.
+    pub resource_schema_url: Option<String>,
+    /// `ScopeLogs.schema_url` — the scope group's Telemetry Schema URL,
+    /// when set (RFC 0018 §3.1). OPTIONAL `scope_schema_url` column.
+    pub scope_schema_url: Option<String>,
     /// Source event time per `OtlpLogRecord.time_unix_nano`. `0`
     /// = unknown.
     pub time_unix_nano: u64,
@@ -326,6 +337,9 @@ mod tests {
             severity_text: None,
             scope_name: Some("lib.auth".to_string()),
             scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
             time_unix_nano: 1_700_000_000_000_000_000,
             observed_time_unix_nano: None,
             attributes: Vec::new(),
@@ -362,6 +376,9 @@ mod tests {
             severity_text: None,
             scope_name: None,
             scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
             time_unix_nano: 0,
             observed_time_unix_nano: None,
             attributes: Vec::new(),

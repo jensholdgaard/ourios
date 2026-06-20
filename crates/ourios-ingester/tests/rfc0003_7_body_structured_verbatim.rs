@@ -44,7 +44,7 @@ fn rfc0003_7_structured_body_is_carried_verbatim() {
             body: Some(any_value.clone()),
             ..Default::default()
         };
-        let materialized = materialize_record(record, &[], None, TenantId::new("tenant-a"));
+        let materialized = materialize_record(record, &[], "", None, "", TenantId::new("tenant-a"));
         assert_eq!(
             materialized.body,
             Some(Body::Structured(any_value)),

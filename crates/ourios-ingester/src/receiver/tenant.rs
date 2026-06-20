@@ -121,6 +121,16 @@ impl TenantResolutionError {
         self.resource_index = Some(index);
         self
     }
+
+    /// Build an instance for in-crate unit tests (the real constructor is
+    /// driven by the resolution path).
+    #[cfg(test)]
+    pub(crate) fn for_test(attribute: &str) -> Self {
+        Self {
+            attribute: attribute.to_owned(),
+            resource_index: None,
+        }
+    }
 }
 
 impl std::fmt::Display for TenantResolutionError {

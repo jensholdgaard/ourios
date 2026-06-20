@@ -3,10 +3,11 @@
 //!
 //! `.1` (receiver half): the receiver materialises `InstrumentationScope`
 //! attributes and the per-resource / per-scope `schema_url` from the wire.
-//! The storage round-trip + back-compat halves of `.1`/`.2` live in
+//! `.6`: out-of-range severity is preserved + tagged via `error.type`. The
+//! storage round-trip + back-compat halves of `.1`/`.2` live in
 //! `ourios-parquet/tests/rfc0018_otlp_compliance.rs` (the Writer/Reader
-//! harness). `.3` (retryable error mapping) and `.6` (severity preserve)
-//! remain `#[ignore]`d stubs until those receiver changes land (`green`).
+//! harness); `.3` (retryable error mapping) in `tests/rfc0018_retryable.rs`;
+//! `.6`'s monotonicity arm in `ourios-querier/tests/rfc0018_severity.rs`.
 //!
 //! See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5/§6.
 
@@ -80,17 +81,6 @@ fn rfc0018_1_receiver_materialises_scope_fields() {
         Some("https://opentelemetry.io/schemas/1.31.0"),
         "ResourceLogs.schema_url carried"
     );
-}
-
-/// Scenario RFC0018.3 — transient ingest failure is reported retryable: a WAL
-/// append/fsync failure yields a retryable gRPC code (UNAVAILABLE, or
-/// `RESOURCE_EXHAUSTED` + `RetryInfo`) and HTTP 503/429 — never `INTERNAL`/500; a
-/// permanent failure still maps to `INVALID_ARGUMENT`/400.
-/// See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5.
-#[test]
-#[ignore = "RFC0018.3 — red until the transient-vs-permanent error mapping lands (green)"]
-fn rfc0018_3_transient_failure_is_retryable() {
-    todo!("RFC0018.3: transient -> retryable code; permanent -> INVALID_ARGUMENT/400")
 }
 
 /// Sum of `ourios.ingest.records` datapoints, filtered by `error.type`:

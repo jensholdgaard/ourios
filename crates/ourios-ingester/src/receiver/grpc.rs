@@ -6,7 +6,12 @@
 //! result to a tonic `Status`:
 //! - tenant-resolution failure → `INVALID_ARGUMENT` (naming the failing
 //!   `ResourceLogs` index + attribute, RFC0003.4/.11);
-//! - WAL failure → `INTERNAL` (the batch was not acked, §3.4);
+//! - an oversize payload (`AppendError::TooLarge`, > 16 MiB) →
+//!   `INVALID_ARGUMENT` — a permanent client sizing error, non-retryable;
+//! - any other WAL append/sync failure → `UNAVAILABLE` — a transient
+//!   failure (the batch was not acked, §3.4), so retryable per the OTLP
+//!   failures table (RFC 0018 §3.2);
+//! - a panicked ingest task → `INTERNAL` (a genuine, non-retryable bug);
 //! - success → an empty `ExportLogsServiceResponse`.
 //!
 //! `ingest` is async (its fsync is batched by the group-commit
@@ -50,17 +55,84 @@ impl LogsService for LogsReceiver {
         let pipeline = self.pipeline.clone();
         match tokio::spawn(async move { pipeline.ingest(export).await }).await {
             Ok(Ok(_)) => Ok(Response::new(ExportLogsServiceResponse::default())),
-            // A Resource that doesn't resolve to a tenant is a client
-            // error; the whole batch is rejected (RFC0003.4). The error's
-            // Display names the failing ResourceLogs index + attribute.
-            Ok(Err(ReceiveError::TenantResolution(e))) => {
-                Err(Status::invalid_argument(e.to_string()))
-            }
-            // A WAL append/sync failure — server-side; the batch was not
-            // acked (§3.4). Surface the (Display-able) detail.
-            Ok(Err(e)) => Err(Status::internal(e.to_string())),
-            // The ingest task panicked; contain it as INTERNAL.
+            Ok(Err(e)) => Err(ingest_error_status(&e)),
+            // The ingest task panicked — a genuine, non-retryable internal
+            // bug; contain it as INTERNAL.
             Err(join) => Err(Status::internal(format!("ingest task failed: {join}"))),
         }
+    }
+}
+
+/// Map a settled ingest failure to a tonic `Status` (RFC 0018 §3.2).
+///
+/// Permanent client errors are non-retryable: tenant-resolution failure and
+/// an oversize payload (`AppendError::TooLarge`, over the 16 MiB WAL frame
+/// ceiling) both → `INVALID_ARGUMENT` — retrying an oversize batch
+/// byte-identical can never succeed. Any other WAL append/sync failure is
+/// *transient* (the batch was not acked, §3.4) → retryable `UNAVAILABLE`, so
+/// compliant clients re-send rather than drop data (a non-retryable
+/// `INTERNAL` would tell them to drop it).
+///
+/// Matched per-variant (exhaustive over `ReceiveError` in-crate): a future
+/// `#[non_exhaustive]` variant breaks the build here, forcing a
+/// retryable-vs-not decision rather than defaulting either way.
+fn ingest_error_status(error: &ReceiveError) -> Status {
+    match error {
+        // `TenantResolutionError`'s Display names the failing ResourceLogs
+        // index + attribute.
+        ReceiveError::TenantResolution(e) => Status::invalid_argument(e.to_string()),
+        e @ ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => {
+            Status::invalid_argument(e.to_string())
+        }
+        e @ (ReceiveError::WalAppend(_) | ReceiveError::WalSync(_)) => {
+            Status::unavailable(e.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReceiveError, ingest_error_status};
+    use crate::receiver::tenant::TenantResolutionError;
+    use ourios_wal::{AppendError, SyncError};
+    use tonic::Code;
+
+    #[test]
+    fn tenant_resolution_is_invalid_argument() {
+        let e = ReceiveError::TenantResolution(TenantResolutionError::for_test("service.name"));
+        assert_eq!(ingest_error_status(&e).code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn oversize_payload_is_invalid_argument() {
+        let e = ReceiveError::WalAppend(AppendError::TooLarge {
+            len: 32 * 1024 * 1024,
+            limit: 16 * 1024 * 1024,
+        });
+        assert_eq!(ingest_error_status(&e).code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn transient_wal_append_is_unavailable() {
+        let e = ReceiveError::WalAppend(AppendError::Io {
+            op: "write",
+            source: std::io::Error::other("io"),
+        });
+        assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn quiesced_wal_append_is_unavailable() {
+        let e = ReceiveError::WalAppend(AppendError::QuiescedAfterRotationFailure);
+        assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn transient_wal_sync_is_unavailable() {
+        let e = ReceiveError::WalSync(SyncError::Io {
+            op: "fdatasync",
+            source: std::io::Error::other("io"),
+        });
+        assert_eq!(ingest_error_status(&e).code(), Code::Unavailable);
     }
 }

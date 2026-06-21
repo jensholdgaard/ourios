@@ -15,8 +15,8 @@
 //! tree on `Body::String` records:
 //!
 //! - **No candidate** in the `(severity, scope, length, prefix)`
-//!   bucket → fresh leaf, emitting a `TemplateCreated` audit event
-//!   (RFC 0017 §3.1; not a merge).
+//!   bucket → fresh leaf, emitting a `TemplateChange::Created` audit
+//!   event (`event_type` `template_created`, RFC 0017 §3.1; not a merge).
 //! - **Best candidate has `sim_seq == 1.0`** → clean attach to the
 //!   existing leaf, no widening, no audit.
 //! - **Best candidate has `threshold ≤ sim_seq < 1.0`** → compute

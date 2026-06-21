@@ -10,20 +10,24 @@
 //! stub runs `cargo test <name> -- --ignored` and watches the
 //! `todo!()` panic. See `docs/verification.md` §3.
 
-/// Scenario RFC0001.1 — Fresh-leaf creation does not emit an audit event.
-/// See `docs/rfcs/0001-template-miner.md` §5.
+/// Scenario RFC0001.1 — **superseded by RFC 0017 §3.1.** The original
+/// RFC0001.1 contract was "fresh-leaf creation does not emit an audit
+/// event". RFC 0017 §3.1 overturns it: a read-time template registry must
+/// be able to recover a leaf's version-1 tokens after the originating rows
+/// age out, so leaf creation now emits a `template_created` audit event.
+/// This test asserts the amended contract — still *not* a merge.
+/// See `docs/rfcs/0017-template-registry-query-rendering.md` §3.1 / §5
+/// (and `docs/rfcs/0001-template-miner.md` §5 for the original scenario).
 #[test]
-fn rfc0001_1_fresh_leaf_creation_does_not_emit_audit_event() {
-    use ourios_core::audit::SharedAuditSink;
+fn rfc0001_1_fresh_leaf_creation_emits_template_created() {
+    use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
     use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
 
     // Arrange — ingest two structurally distinct lines, both
-    // creating fresh leaves. Per §6.2 step 4, fresh-leaf
-    // creation does not emit an audit event; the audit stream
-    // is reserved for widening events.
+    // creating fresh leaves.
     let sink = SharedAuditSink::new();
     let mut cluster = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(sink.clone()));
     let t = TenantId::new("tenant-x");
@@ -37,13 +41,22 @@ fn rfc0001_1_fresh_leaf_creation_does_not_emit_audit_event() {
     let _ = cluster.ingest(&make("user 42 logged in"));
     let _ = cluster.ingest(&make("GET /home 200"));
 
-    // Assert — both lines created fresh leaves; the sink
-    // remains empty.
+    // Assert — both lines created fresh leaves, each emitting one
+    // `template_created` event; creation is not a merge.
     assert_eq!(cluster.template_count(&t), 2);
-    assert_eq!(cluster.merges_total(), 0);
+    assert_eq!(cluster.merges_total(), 0, "creation is not a merge");
+
+    let events = sink.drain();
+    assert_eq!(events.len(), 2, "one template_created event per fresh leaf");
     assert!(
-        sink.is_empty(),
-        "fresh-leaf creation must not emit audit events",
+        events.iter().all(|e| matches!(
+            &e.payload,
+            AuditPayload::Template {
+                change: TemplateChange::Created { .. },
+                ..
+            }
+        )),
+        "every fresh leaf emits a version-1 template_created event",
     );
 }
 
@@ -117,7 +130,21 @@ fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
         "L3's rejection is a parse failure",
     );
 
-    let events = sink.drain();
+    // Filter out the leading `Created` events (RFC 0017 §3.1 audits leaf
+    // creation); this scenario asserts the widening + rejection pair.
+    let events: Vec<_> = sink
+        .drain()
+        .into_iter()
+        .filter(|e| {
+            !matches!(
+                &e.payload,
+                AuditPayload::Template {
+                    change: TemplateChange::Created { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
     assert_eq!(events.len(), 2);
     assert!(
         matches!(

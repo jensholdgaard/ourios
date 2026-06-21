@@ -15,7 +15,8 @@
 //! tree on `Body::String` records:
 //!
 //! - **No candidate** in the `(severity, scope, length, prefix)`
-//!   bucket → fresh leaf, no audit event (RFC0001.1).
+//!   bucket → fresh leaf, emitting a `TemplateChange::Created` audit
+//!   event (`event_type` `template_created`, RFC 0017 §3.1; not a merge).
 //! - **Best candidate has `sim_seq == 1.0`** → clean attach to the
 //!   existing leaf, no widening, no audit.
 //! - **Best candidate has `threshold ≤ sim_seq < 1.0`** → compute
@@ -1270,6 +1271,7 @@ impl MinerCluster {
             None => {
                 let new_id = self.create_new_leaf(
                     record,
+                    raw,
                     &masked_strs,
                     &masked.wildcard_positions,
                     &masked.typed_params,
@@ -1310,16 +1312,17 @@ impl MinerCluster {
                     ),
                     // Lossy: new leaf rather than force-merge
                     // into a too-weak candidate (RFC §6.2 step
-                    // 5b). Body retained; no audit event
-                    // (no widening happened). The retention
-                    // counter bumps here; `record_parse_failure`
-                    // covers the parse-failure-zone path
-                    // separately.
+                    // 5b). Body retained; no *widening* event, but
+                    // `create_new_leaf` audits the leaf's creation
+                    // (RFC 0017 §3.1). The retention counter bumps
+                    // here; `record_parse_failure` covers the
+                    // parse-failure-zone path separately.
                     ConfidenceZone::Lossy => {
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
                         self.metrics.record_body_retention(&record.tenant_id);
                         let new_id = self.create_new_leaf(
                             record,
+                            raw,
                             &masked_strs,
                             &masked.wildcard_positions,
                             &masked.typed_params,
@@ -1429,13 +1432,16 @@ impl MinerCluster {
     /// .type_tag}` for the k-th masked position, recording the
     /// type observed at that slot's first sight.
     ///
-    /// RFC0001.1: this path **does not** emit an audit event —
-    /// `template_count` already reflects the allocation and
-    /// `merges_total` is reserved for widening / type-expansion
-    /// events on existing leaves.
+    /// RFC 0017 §3.1: this path emits a `TemplateChange::Created` audit
+    /// event so a read-time registry can recover the leaf's v1 tokens. It
+    /// is **not** a merge — `template_count` reflects the allocation and
+    /// `merges_total` stays reserved for widening / type-expansion events
+    /// on existing leaves. (Supersedes the original RFC0001.1
+    /// "creation emits nothing" contract.)
     fn create_new_leaf(
         &mut self,
         record: &OtlpLogRecord,
+        raw: &str,
         masked_strs: &[&str],
         line_wildcard_positions: &[usize],
         line_typed_params: &[crate::mask::TypedParam<'_>],
@@ -1453,48 +1459,73 @@ impl MinerCluster {
         // can't reach back to `self.tenant_overrides` while the
         // map is borrowed mutably.
         let effective_config = self.effective_config(&record.tenant_id);
-        let state = self
-            .tenants
-            .entry(record.tenant_id.clone())
-            .or_insert_with(|| TenantState::new(effective_config));
-        let parent = state
-            .tree
-            .descend_mut(masked_strs, state.config.prefix_depth as usize);
-        // Build the leaf template: Wildcard at every mask-emitted
-        // position, Fixed at every other. `wildcard_positions` is
-        // ascending (single forward pass over the tokens) so we
-        // can walk both arrays in lockstep without allocating a
-        // membership set.
-        let mut new_template = Vec::with_capacity(masked_strs.len());
-        let mut wp_iter = line_wildcard_positions.iter().copied().peekable();
-        for (p, s) in masked_strs.iter().enumerate() {
-            if wp_iter.peek().copied() == Some(p) {
-                new_template.push(OwnedToken::Wildcard);
-                wp_iter.next();
-            } else {
-                new_template.push(OwnedToken::Fixed((*s).to_string()));
+        // Scope the `self.tenants` borrow so it is released before the
+        // audit emit below (which borrows `self.audit_sink`); the leaf's
+        // canonical template string is computed inside and handed out.
+        let created_template = {
+            let state = self
+                .tenants
+                .entry(record.tenant_id.clone())
+                .or_insert_with(|| TenantState::new(effective_config));
+            let parent = state
+                .tree
+                .descend_mut(masked_strs, state.config.prefix_depth as usize);
+            // Build the leaf template: Wildcard at every mask-emitted
+            // position, Fixed at every other. `wildcard_positions` is
+            // ascending (single forward pass over the tokens) so we
+            // can walk both arrays in lockstep without allocating a
+            // membership set.
+            let mut new_template = Vec::with_capacity(masked_strs.len());
+            let mut wp_iter = line_wildcard_positions.iter().copied().peekable();
+            for (p, s) in masked_strs.iter().enumerate() {
+                if wp_iter.peek().copied() == Some(p) {
+                    new_template.push(OwnedToken::Wildcard);
+                    wp_iter.next();
+                } else {
+                    new_template.push(OwnedToken::Fixed((*s).to_string()));
+                }
             }
-        }
-        debug_assert!(
-            wp_iter.peek().is_none(),
-            "every wildcard_position must land within masked_strs.len()",
-        );
-        let slot_types: Vec<SlotTypes> = line_typed_params
-            .iter()
-            .map(|tp| SlotTypes::singleton(tp.type_tag))
-            .collect();
-        parent.leaves.push(Leaf {
-            template: new_template,
-            template_id: new_id,
-            template_version: 1,
-            severity_number: record.severity_number,
-            scope_name: record.scope_name.clone(),
-            slot_types,
+            debug_assert!(
+                wp_iter.peek().is_none(),
+                "every wildcard_position must land within masked_strs.len()",
+            );
+            let slot_types: Vec<SlotTypes> = line_typed_params
+                .iter()
+                .map(|tp| SlotTypes::singleton(tp.type_tag))
+                .collect();
+            // Canonical form for the audit event, taken before `new_template`
+            // is moved into the leaf.
+            let created_template = format_template(&new_template);
+            parent.leaves.push(Leaf {
+                template: new_template,
+                template_id: new_id,
+                template_version: 1,
+                severity_number: record.severity_number,
+                scope_name: record.scope_name.clone(),
+                slot_types,
+            });
+            // Maintain the TenantState::template_count cache invariant —
+            // every fresh allocation under `state` is mirrored here so
+            // `MinerCluster::template_count` can stay O(1).
+            state.template_count += 1;
+            created_template
+        };
+        // RFC 0017 §3.1 — audit the leaf's initial (version 1) creation so a
+        // read-time template registry can recover the v1 tokens once the
+        // originating rows age out. Same WAL-before-ack path as the widening
+        // events; not a merge, so it does not bump `merges_total`.
+        self.audit_sink.emit(AuditEvent {
+            tenant_id: record.tenant_id.clone(),
+            timestamp: self.clock.now(),
+            payload: AuditPayload::Template {
+                template_id: new_id,
+                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
+                triggering_line_sample: Some(sample_first_256_bytes(raw)),
+                change: TemplateChange::Created {
+                    new_template: created_template,
+                },
+            },
         });
-        // Maintain the TenantState::template_count cache invariant —
-        // every fresh allocation under `state` is mirrored here so
-        // `MinerCluster::template_count` can stay O(1).
-        state.template_count += 1;
         new_id
     }
 
@@ -2273,6 +2304,30 @@ mod tests {
         (cluster, sink)
     }
 
+    /// Drain the sink and return only the template *changes* a widening /
+    /// type-expansion / rejection test asserts on, dropping the per-leaf
+    /// `Created` events RFC 0017 §3.1 emits on every allocation. Leaf
+    /// creation is audited now (so a read-time registry can recover v1
+    /// tokens), but its correctness is covered by
+    /// `fresh_leaf_emits_created_event` and the RFC0017.1 acceptance test;
+    /// filtering here keeps each widening test decoupled from how many
+    /// leaves the scenario happens to allocate rather than re-asserting the
+    /// creation count in every one.
+    fn drain_changes(sink: &SharedAuditSink) -> Vec<AuditEvent> {
+        sink.drain()
+            .into_iter()
+            .filter(|e| {
+                !matches!(
+                    &e.payload,
+                    AuditPayload::Template {
+                        change: TemplateChange::Created { .. },
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
     // ---------- existing String-body behaviour preserved ----------
 
     #[test]
@@ -2663,7 +2718,7 @@ mod tests {
         assert_eq!(cluster.template_count(&t), 1);
         assert_eq!(cluster.merges_total(), 1);
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1);
         let AuditPayload::Template {
             template_id,
@@ -2698,21 +2753,38 @@ mod tests {
     }
 
     #[test]
-    fn fresh_leaf_does_not_emit_audit_event() {
-        // RFC0001.1 — leaf allocation is reflected in
-        // `template_count`, but the audit stream is reserved for
-        // widening events. Verifies both:
-        //  - `merges_total` stays 0
-        //  - the sink stays empty
+    fn fresh_leaf_emits_created_event() {
+        // RFC 0017 §3.1 overturns the former "fresh leaf emits nothing"
+        // contract: leaf allocation now emits a `template_created` audit
+        // event (so a read-time registry can recover v1 tokens), while
+        // still NOT counting as a merge. Two distinct fresh leaves →
+        // exactly two `Created` events, `merges_total` still 0.
         let (mut cluster, sink) = cluster_with_observable_sink();
         let t = TenantId::new("tenant-x");
 
-        let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
-        let _ = cluster.ingest(&string_record(&t, "GET /home 200"));
+        let id_a = cluster.ingest(&string_record(&t, "user 42 logged in"));
+        let id_b = cluster.ingest(&string_record(&t, "GET /home 200"));
 
         assert_eq!(cluster.template_count(&t), 2);
-        assert_eq!(cluster.merges_total(), 0);
-        assert!(sink.is_empty());
+        assert_eq!(cluster.merges_total(), 0, "creation is not a merge");
+
+        let events = sink.drain();
+        assert_eq!(events.len(), 2, "one Created event per fresh leaf");
+        for (event, id) in events.iter().zip([id_a, id_b]) {
+            let AuditPayload::Template {
+                template_id,
+                change: TemplateChange::Created { new_template },
+                ..
+            } = &event.payload
+            else {
+                panic!("expected Template/Created, got {:?}", event.payload);
+            };
+            assert_eq!(*template_id, id);
+            assert!(
+                !new_template.is_empty(),
+                "creation carries the initial tokens",
+            );
+        }
     }
 
     #[test]
@@ -2741,7 +2813,7 @@ mod tests {
 
         assert_eq!(id1, id2);
         assert_eq!(cluster.merges_total(), 0);
-        assert!(sink.is_empty());
+        assert!(drain_changes(&sink).is_empty());
 
         let templates = cluster.templates_for(&t);
         assert_eq!(templates.len(), 1);
@@ -2779,7 +2851,7 @@ mod tests {
         let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
         let _ = cluster.ingest(&string_record(&t, "user 42 logged out from 10.0.0.1"));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1);
         let AuditPayload::Template {
             change:
@@ -2818,7 +2890,7 @@ mod tests {
         assert_eq!(cluster.template_count(&t), 1);
         assert_eq!(cluster.merges_total(), 2);
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 2);
         let AuditPayload::Template {
             change:
@@ -2873,9 +2945,10 @@ mod tests {
         // Mask emits at positions 1 (`<NUM>`) and 5 (`<IP>`).
         let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
 
-        // Fresh-leaf creation does NOT emit an audit event
-        // (RFC0001.1) — even with non-empty slot_types.
-        assert!(sink.is_empty());
+        // Fresh-leaf creation emits a `Created` event now (RFC 0017 §3.1),
+        // but no *widening / type-expansion* — even with non-empty
+        // slot_types. `drain_changes` filters the Created event out.
+        assert!(drain_changes(&sink).is_empty());
 
         let templates = cluster.templates_for(&t);
         assert_eq!(templates.len(), 1);
@@ -2933,7 +3006,7 @@ mod tests {
         let _ = cluster.ingest(&string_record(&t, "user 42 logged in"));
         let _ = cluster.ingest(&string_record(&t, "user 42 logged out"));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1, "literal widening: one event only");
         assert!(matches!(
             events[0].payload,
@@ -2989,7 +3062,7 @@ mod tests {
             "user logged 550e8400-e29b-41d4-a716-446655440000 in",
         ));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1, "single TemplateTypeExpanded, no widening");
         let AuditPayload::Template {
             change:
@@ -3043,7 +3116,7 @@ mod tests {
         let _ = cluster.ingest(&string_record(&t, "user logged 99 in"));
 
         assert!(
-            sink.is_empty(),
+            drain_changes(&sink).is_empty(),
             "known type at typed wildcard must not emit",
         );
         let templates = cluster.templates_for(&t);
@@ -3073,7 +3146,7 @@ mod tests {
         // leaf has a Wildcard with slot_types[0] = {Str}.
         let _ = cluster.ingest(&string_record(&t, "user logged at hour 13"));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1, "exactly one TemplateTypeExpanded");
         let AuditPayload::Template {
             change:
@@ -3156,7 +3229,7 @@ mod tests {
         //     Expansion fires at ordinal 1, adding Num.
         let _ = cluster.ingest(&string_record(&t, "user logged at minute 13"));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 2, "combined widening + type expansion");
         let AuditPayload::Template {
             change:
@@ -3277,7 +3350,7 @@ mod tests {
             "GET /home 550e8400-e29b-41d4-a716-446655440000 ok",
         ));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert!(
             !events.is_empty(),
             "§3.1: mask-tag type change at a tree-routed wildcard slot must audit",
@@ -3335,7 +3408,7 @@ mod tests {
         let _ = cluster.ingest(&string_record(&t, "user logged at hour <NUM>"));
 
         assert!(
-            sink.is_empty(),
+            drain_changes(&sink).is_empty(),
             "literal `<NUM>` must be Str (already in slot's set), not a spurious Num expansion",
         );
         let templates = cluster.templates_for(&t);
@@ -3389,9 +3462,11 @@ mod tests {
             "leaf `Fixed(\"<NUM>\")` (literal) must not absorb a real mask-emit `<NUM>`",
         );
         assert_eq!(cluster.template_count(&t), 2);
-        // No widening fired (the Lossy zone created a new leaf
-        // rather than widening). No audit events.
-        assert!(audit_sink.is_empty());
+        // No widening fired (the Lossy zone created a new leaf rather than
+        // widening). The two leaf creations each emit a `Created` event
+        // (RFC 0017 §3.1), which `drain_changes` filters out — so there are
+        // no widening / type-expansion / rejection events.
+        assert!(drain_changes(&audit_sink).is_empty());
         // The §6.3 lossy zone bumped body_retentions for L2 (and
         // retained its body on the emitted record).
         assert_eq!(cluster.body_retentions_total(), 1);
@@ -3491,7 +3566,7 @@ mod tests {
         let l2 = "user 42 logged out from 10.0.0.1";
         let _ = cluster.ingest(&string_record(&t, l2));
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1);
         let AuditPayload::Template {
             triggering_line_hash,
@@ -3521,7 +3596,7 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(cluster.template_count(&t), 2);
         assert_eq!(cluster.merges_total(), 0);
-        assert!(sink.is_empty());
+        assert!(drain_changes(&sink).is_empty());
     }
 
     #[test]
@@ -3579,7 +3654,7 @@ mod tests {
             "§6.4 says degenerate-rejected lines retain body",
         );
 
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 2);
         assert!(
             matches!(
@@ -3714,7 +3789,7 @@ mod tests {
         assert_ne!(id_a, id_b, "leaves are distinct after L2");
         assert_eq!(cluster.template_count(&t), 2);
         assert!(
-            sink.is_empty(),
+            drain_changes(&sink).is_empty(),
             "L2 fell into the lossy zone → fresh leaf, no widening",
         );
         assert_eq!(
@@ -3730,7 +3805,7 @@ mod tests {
             "best-candidate selection must pick the higher-similarity leaf",
         );
         assert_eq!(cluster.merges_total(), 1);
-        let events = sink.drain();
+        let events = drain_changes(&sink);
         assert_eq!(events.len(), 1);
         let AuditPayload::Template {
             template_id,
@@ -4043,7 +4118,10 @@ mod tests {
         assert_eq!(cluster.body_retentions_total(), 1);
         assert_eq!(cluster.merges_total(), 0);
         assert_eq!(cluster.parse_failures_total(), 0);
-        assert!(sink.is_empty(), "lossy attach emits no audit event");
+        assert!(
+            drain_changes(&sink).is_empty(),
+            "lossy attach emits no audit event"
+        );
     }
 
     #[test]
@@ -4087,7 +4165,10 @@ mod tests {
             "RFC §6.3: parse failure retains body too",
         );
         assert_eq!(cluster.merges_total(), 0);
-        assert!(sink.is_empty(), "parse failure emits no audit event");
+        assert!(
+            drain_changes(&sink).is_empty(),
+            "parse failure emits no audit event"
+        );
     }
 
     #[test]

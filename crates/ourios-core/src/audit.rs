@@ -35,6 +35,23 @@ use crate::tenant::TenantId;
 /// compiler enforces those per-variant contracts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateChange {
+    /// A new leaf was allocated — the template's initial (version 1)
+    /// creation (RFC 0017 §3.1). Audited so a read-time template
+    /// registry can recover the v1 tokens once the originating rows
+    /// age out; without it, v1 rows would have no derivable tokens.
+    ///
+    /// Carries **only** the initial tokens. A leaf is *always* born at
+    /// version 1, so the variant deliberately omits a `new_version` field:
+    /// the v1 invariant is made unrepresentable rather than carried-and-
+    /// validated (there is no way to construct a creation at any other
+    /// version). The on-disk row still stores `new_version = 1` (the
+    /// writer supplies it) with `old_version` / `old_template` left `NULL`
+    /// — the RFC 0005 §3.7 "not applicable" sentinel (no prior template).
+    Created {
+        /// Canonical-form template at creation (the initial tokens,
+        /// literals + `<*>`), the same encoding `Widened` carries.
+        new_template: String,
+    },
     /// An existing template gained one or more wildcard slots
     /// because a clean attach would otherwise mismatch positions
     /// (RFC §6.2 step 5).
@@ -221,6 +238,10 @@ pub const EVENT_KIND_COMPACTION: u8 = 3;
 pub const EVENT_KIND_ALIAS_ASSERTED: u8 = 4;
 /// See [`EVENT_KIND_TEMPLATE_WIDENED`]. RFC 0001 §6.7 alias write path.
 pub const EVENT_KIND_ALIAS_RETRACTED: u8 = 5;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`]. RFC 0017 §3.1 leaf-creation audit —
+/// an **append-only** addition (next free ordinal, no renumber): old readers
+/// surface it via the [`AuditPayload::Unknown`] tolerance path (RFC 0005 §3.7).
+pub const EVENT_KIND_TEMPLATE_CREATED: u8 = 6;
 
 /// Canonical `event_type` strings paired with the ordinals above
 /// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
@@ -236,6 +257,14 @@ pub const EVENT_TYPE_COMPACTION: &str = "compaction";
 pub const EVENT_TYPE_ALIAS_ASSERTED: &str = "alias_asserted";
 /// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0001 §6.7 alias write path.
 pub const EVENT_TYPE_ALIAS_RETRACTED: &str = "alias_retracted";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0017 §3.1 leaf-creation audit.
+pub const EVENT_TYPE_TEMPLATE_CREATED: &str = "template_created";
+
+/// The `template_version` a leaf is born at (RFC 0017 §3.1). The
+/// [`TemplateChange::Created`] variant omits a version field — the invariant
+/// is unrepresentable — so the writer supplies this for the on-disk
+/// `new_version` column and the read-time registry keys creation rows by it.
+pub const TEMPLATE_INITIAL_VERSION: u32 = 1;
 
 impl AuditPayload {
     /// The stable `event_kind` ordinal for this payload (RFC 0005
@@ -245,6 +274,7 @@ impl AuditPayload {
     pub fn event_kind(&self) -> u8 {
         match self {
             Self::Template { change, .. } => match change {
+                TemplateChange::Created { .. } => EVENT_KIND_TEMPLATE_CREATED,
                 TemplateChange::Widened { .. } => EVENT_KIND_TEMPLATE_WIDENED,
                 TemplateChange::TypeExpanded { .. } => EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
                 TemplateChange::RejectedDegenerate { .. } => {
@@ -266,6 +296,7 @@ impl AuditPayload {
     pub fn event_type(&self) -> &str {
         match self {
             Self::Template { change, .. } => match change {
+                TemplateChange::Created { .. } => EVENT_TYPE_TEMPLATE_CREATED,
                 TemplateChange::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
                 TemplateChange::TypeExpanded { .. } => EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
                 TemplateChange::RejectedDegenerate { .. } => {
@@ -314,6 +345,7 @@ impl TemplateChange {
     #[must_use]
     pub fn event_type(&self) -> &'static str {
         match self {
+            Self::Created { .. } => EVENT_TYPE_TEMPLATE_CREATED,
             Self::Widened { .. } => EVENT_TYPE_TEMPLATE_WIDENED,
             Self::TypeExpanded { .. } => EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
             Self::RejectedDegenerate { .. } => EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,

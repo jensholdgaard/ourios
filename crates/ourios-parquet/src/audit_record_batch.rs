@@ -57,7 +57,9 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field};
-use ourios_core::audit::{AuditEvent, AuditPayload, ParamType, SlotExpansion, TemplateChange};
+use ourios_core::audit::{
+    AuditEvent, AuditPayload, ParamType, SlotExpansion, TEMPLATE_INITIAL_VERSION, TemplateChange,
+};
 
 use crate::audit_schema;
 
@@ -67,10 +69,11 @@ use crate::audit_schema;
 /// existing call sites resolve them at their established path.
 pub use ourios_core::audit::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_ALIAS_ASSERTED,
-    EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_TYPE_EXPANDED,
-    EVENT_TYPE_TEMPLATE_WIDENED, EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_CREATED,
+    EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
+    EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 
 /// Build an Arrow `RecordBatch` matching [`audit_schema`] from a
@@ -385,6 +388,20 @@ impl Builders {
     /// template, positions/slots, and reason columns.
     fn append_template_change(&mut self, change: &TemplateChange) -> Result<(), AuditBatchError> {
         match change {
+            TemplateChange::Created { new_template } => {
+                // RFC 0017 §3.1 — creation has no prior template: the
+                // `old_*` columns are NULL (the "not applicable" sentinel),
+                // not a copy of the new template. The variant omits a
+                // version (a leaf is always born at v1), so the on-disk
+                // `new_version` is the canonical initial version.
+                self.old_version.append_null();
+                self.new_version.append_value(TEMPLATE_INITIAL_VERSION);
+                self.old_template.append_null();
+                self.new_template.append_value(new_template);
+                append_positions(&mut self.positions_widened, &[]);
+                append_slots(&mut self.slots_expanded, &[]);
+                self.reason.append_null();
+            }
             TemplateChange::Widened {
                 old_version,
                 new_version,

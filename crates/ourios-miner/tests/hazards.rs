@@ -219,8 +219,22 @@ fn h1_3_every_widening_emits_an_audit_event() {
     let _ = cluster.ingest(&make("user 42 logged in from 10.0.0.1"));
     let _ = cluster.ingest(&make("user 42 logged out from 10.0.0.1"));
 
-    // Assert — exactly one audit event, schema fields populated.
-    let events = sink.drain();
+    // Assert — exactly one *widening* event, schema fields populated.
+    // Leaf creation is audited separately now (a leading `Created` event,
+    // RFC 0017 §3.1), so filter to the widening this scenario exercises.
+    let events: Vec<_> = sink
+        .drain()
+        .into_iter()
+        .filter(|e| {
+            !matches!(
+                &e.payload,
+                AuditPayload::Template {
+                    change: TemplateChange::Created { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
     assert_eq!(events.len(), 1, "exactly one widening occurred");
     let e = &events[0];
     assert_eq!(e.tenant_id, t);
@@ -748,8 +762,21 @@ fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
     let _ = cluster.ingest(&make("user 42 logged in from 10.0.0.1"));
     let _ = cluster.ingest(&make("user 42 logged out from 10.0.0.1"));
 
-    // Assert
-    let events = sink.drain();
+    // Assert — filter out the leading `Created` event (RFC 0017 §3.1
+    // audits leaf creation); this scenario asserts the widening.
+    let events: Vec<_> = sink
+        .drain()
+        .into_iter()
+        .filter(|e| {
+            !matches!(
+                &e.payload,
+                AuditPayload::Template {
+                    change: TemplateChange::Created { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
     assert_eq!(events.len(), 1);
     let AuditPayload::Template {
         change:

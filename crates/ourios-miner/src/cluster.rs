@@ -2948,8 +2948,9 @@ mod tests {
         // Mask emits at positions 1 (`<NUM>`) and 5 (`<IP>`).
         let _ = cluster.ingest(&string_record(&t, "user 42 logged in from 10.0.0.1"));
 
-        // Fresh-leaf creation does NOT emit an audit event
-        // (RFC0001.1) — even with non-empty slot_types.
+        // Fresh-leaf creation emits a `Created` event now (RFC 0017 §3.1),
+        // but no *widening / type-expansion* — even with non-empty
+        // slot_types. `drain_changes` filters the Created event out.
         assert!(drain_changes(&sink).is_empty());
 
         let templates = cluster.templates_for(&t);
@@ -3464,8 +3465,10 @@ mod tests {
             "leaf `Fixed(\"<NUM>\")` (literal) must not absorb a real mask-emit `<NUM>`",
         );
         assert_eq!(cluster.template_count(&t), 2);
-        // No widening fired (the Lossy zone created a new leaf
-        // rather than widening). No audit events.
+        // No widening fired (the Lossy zone created a new leaf rather than
+        // widening). The two leaf creations each emit a `Created` event
+        // (RFC 0017 §3.1), which `drain_changes` filters out — so there are
+        // no widening / type-expansion / rejection events.
         assert!(drain_changes(&audit_sink).is_empty());
         // The §6.3 lossy zone bumped body_retentions for L2 (and
         // retained its body on the emitted record).

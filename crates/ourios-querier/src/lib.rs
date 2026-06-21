@@ -42,8 +42,10 @@ mod audit_scan;
 mod compile;
 mod drift;
 pub mod dsl;
+mod template_registry;
 
 pub use drift::{DriftResult, DriftRow};
+pub use template_registry::{TemplateRegistry, derive_template_registry};
 
 use std::path::PathBuf;
 use std::sync::Arc;

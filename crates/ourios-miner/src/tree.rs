@@ -306,9 +306,111 @@ fn descend_recursively<'t>(node: &'t mut PrefixNode, path: &[&str]) -> &'t mut P
     descend_recursively(child, tail)
 }
 
+/// Render a template to its canonical string form: tokens joined by a
+/// single space, with `Wildcard` shown as `<*>` (RFC 0001 §6.6 / RFC 0005
+/// §3.7). This is the form stored in the audit stream's
+/// `old_template` / `new_template` columns.
+#[must_use]
+pub fn format_template(template: &[OwnedToken]) -> String {
+    template
+        .iter()
+        .map(|t| match t {
+            OwnedToken::Fixed(s) => s.as_str(),
+            OwnedToken::Wildcard => "<*>",
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse a canonical template string (the inverse of [`format_template`])
+/// back into tokens: split on single spaces, mapping `<*>` to
+/// [`OwnedToken::Wildcard`] and every other token to
+/// [`OwnedToken::Fixed`]. The empty string yields an empty template (a
+/// zero-token template formats to `""`). Used by the read-time template
+/// registry (RFC 0017 §3.2) to recover a leaf's tokens from the audit
+/// stream's stored template strings.
+///
+/// Tokens are whitespace-split at mine time so a `Fixed` token never
+/// contains a space; splitting on `' '` is therefore an exact inverse for
+/// the templates this codebase writes. (A degenerate literal token equal
+/// to `<*>` would round-trip as a wildcard — the same ambiguity
+/// [`format_template`] already carries; not reachable from the masker.)
+#[must_use]
+pub fn parse_template(canonical: &str) -> Vec<OwnedToken> {
+    if canonical.is_empty() {
+        return Vec::new();
+    }
+    canonical
+        .split(' ')
+        .map(|tok| {
+            if tok == "<*>" {
+                OwnedToken::Wildcard
+            } else {
+                OwnedToken::Fixed(tok.to_owned())
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_template_inverts_format_template() {
+        // The canonical encode/decode pair must round-trip so the read-time
+        // registry (RFC 0017 §3.2) recovers exactly the tokens the miner
+        // wrote to the audit stream.
+        let cases: Vec<Vec<OwnedToken>> = vec![
+            vec![],
+            vec![OwnedToken::Wildcard],
+            vec![OwnedToken::Fixed("user".to_owned())],
+            vec![
+                OwnedToken::Fixed("user".to_owned()),
+                OwnedToken::Wildcard,
+                OwnedToken::Fixed("logged".to_owned()),
+                OwnedToken::Wildcard,
+            ],
+        ];
+        for template in cases {
+            let canonical = format_template(&template);
+            assert_eq!(
+                parse_template(&canonical),
+                template,
+                "round-trip failed for {canonical:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_template_empty_string_is_empty_template() {
+        assert_eq!(parse_template(""), Vec::<OwnedToken>::new());
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `parse_template(format_template(t)) == t` over arbitrary token
+        /// sequences. `Fixed` tokens are drawn from a space-free alphabet that
+        /// excludes the `<*>` wildcard marker — the exact domain the invariant
+        /// holds for: mine-time tokens are whitespace-split (never contain a
+        /// space), and a literal `<*>` is not producible by the masker. (Those
+        /// two excluded shapes are the documented ambiguities the canonical
+        /// space-joined form carries.)
+        #[test]
+        fn parse_template_inverts_format_template_prop(
+            tokens in prop::collection::vec(
+                prop_oneof![
+                    Just(OwnedToken::Wildcard),
+                    "[a-zA-Z0-9_./:=-]{1,12}".prop_map(OwnedToken::Fixed),
+                ],
+                0..12,
+            )
+        ) {
+            let canonical = format_template(&tokens);
+            prop_assert_eq!(parse_template(&canonical), tokens);
+        }
+    }
 
     #[test]
     fn descend_mut_creates_length_node_lazily() {

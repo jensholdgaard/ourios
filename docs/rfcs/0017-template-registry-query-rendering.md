@@ -103,9 +103,12 @@ TemplateRegistry = HashMap<(template_id: u64, version: u32), Vec<OwnedToken>>
 ```
 
 keyed by `(template_id, new_version)`, value = the `new_template` tokens
-parsed from the canonical `["lit", "<*>", …]` encoding (RFC 0005 §3.7,
-the same shape the miner's `Vec<OwnedToken>` produces). It is derived once
-per query (like the alias map), only when the query actually returns rows.
+parsed by `ourios_miner::tree::parse_template` from the canonical
+space-joined `lit … <*>` encoding (the inverse of `tree::format_template`,
+the exact form the miner writes to the audit `new_template` column —
+literals verbatim, `<*>` per wildcard, joined by single spaces). It is
+derived once per query (like the alias map), only when the query actually
+returns rows.
 
 ### 3.3 Query-time rendering
 

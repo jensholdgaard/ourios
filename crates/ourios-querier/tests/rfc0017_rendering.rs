@@ -141,10 +141,11 @@ fn rfc0017_4_lossy_rows_return_retained_body() {
     );
 }
 
-/// Scenario RFC0017.9 — a stored row with `body_kind = Structured` (the OTLP
-/// `Body` was a map/array, canonical JSON in `body`) is returned as
-/// `LogBody::Structured(AnyValue)`, preserving the original map/array shape
-/// (not flattened to a byte line) and round-tripping the ingested `AnyValue`.
+/// Scenario RFC0017.9 — a stored row with `body_kind = Structured` (any
+/// non-`String` OTLP `AnyValue` — here a kvlist — stored as canonical JSON in
+/// `body`) is returned as `LogBody::Structured(AnyValue)`, preserving the typed
+/// value (not flattened to a byte line) and round-tripping the ingested
+/// `AnyValue`.
 /// See `docs/rfcs/0017-template-registry-query-rendering.md` §5.
 #[test]
 fn rfc0017_9_structured_body_returned_as_structure() {
@@ -241,5 +242,23 @@ fn rfc0017_9_structured_row_with_absent_body_falls_back() {
             reconstruction: Reconstruction::RetainedVerbatim,
         },
         "a structured row with no body renders empty/RetainedVerbatim, not Structured",
+    );
+}
+
+/// RFC0017.9 (edge) — a structured row whose `body` is **present but not valid
+/// canonical JSON** (a corrupt/foreign row) must not claim `Faithful` over the
+/// raw bytes: it falls back to empty / `RetainedVerbatim`, like the absent-body
+/// case.
+#[test]
+fn rfc0017_9_structured_row_with_undecodable_body_falls_back() {
+    let mut r = record(BodyKind::Structured);
+    r.body = Some("{ this is not canonical AnyValue JSON".to_owned());
+    assert_eq!(
+        render_log_body(&r, &TemplateRegistry::new()),
+        LogBody::Rendered {
+            line: Vec::new(),
+            reconstruction: Reconstruction::RetainedVerbatim,
+        },
+        "an undecodable structured body falls back to empty/RetainedVerbatim, never Faithful",
     );
 }

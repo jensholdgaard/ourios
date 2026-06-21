@@ -27,7 +27,12 @@ use crate::TemplateRegistry;
 /// states are unrepresentable: a string body always carries its
 /// [`Reconstruction`] marker, and a structured body is faithful by
 /// construction (the canonical JSON round-trips, no template walk).
+///
+/// Marked `#[non_exhaustive]` — like the public, expected-to-evolve
+/// [`crate::QueryError`] — so a future body representation can be added
+/// without breaking downstream exhaustive `match`es.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum LogBody {
     /// `body_kind = String` (or absent) — the §3.3 three-zone result: the
     /// rendered bytes plus whether they were faithfully reconstructed or

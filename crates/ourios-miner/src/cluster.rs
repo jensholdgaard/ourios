@@ -74,7 +74,7 @@ use crate::mask::{mask, tag_str_for};
 use crate::metrics::{MinerMetrics, service_of};
 use crate::sim_seq::sim_seq_owned;
 use crate::tokenize::tokenize;
-use crate::tree::{Leaf, OwnedToken, Tree};
+use crate::tree::{Leaf, OwnedToken, Tree, format_template};
 
 /// Sentinel `template_id` returned by [`MinerCluster::ingest`] when
 /// no template was allocated for the input. Three paths reach this
@@ -2242,21 +2242,6 @@ fn positions_to_u16(positions: &[usize]) -> Vec<u16> {
                 .expect("line length capped at u16::MAX in ingest_string; positions fit")
         })
         .collect()
-}
-
-/// Canonical string form of a template: literal tokens for
-/// `Fixed`, `<*>` for `Wildcard`, space-joined. RFC §6.4 calls
-/// for this form in `old_template` / `new_template` audit
-/// fields.
-fn format_template(template: &[OwnedToken]) -> String {
-    template
-        .iter()
-        .map(|t| match t {
-            OwnedToken::Fixed(s) => s.as_str(),
-            OwnedToken::Wildcard => "<*>",
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(test)]

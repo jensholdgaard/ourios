@@ -3098,6 +3098,7 @@ dependencies = [
  "datafusion",
  "jsonschema",
  "ourios-core",
+ "ourios-miner",
  "ourios-parquet",
  "parquet 55.2.0",
  "proptest",

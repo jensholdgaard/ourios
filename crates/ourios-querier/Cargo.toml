@@ -15,6 +15,12 @@ path = "src/lib.rs"
 [dependencies]
 # `TenantId` for the per-request tenant scope (CLAUDE.md §3.7).
 ourios-core = { path = "../ourios-core" }
+# RFC 0017 §3.2/§3.3 — the read-time template registry stores
+# `tree::OwnedToken`s (parsed from the audit stream's canonical template
+# strings) and the query-row path renders lines via `reconstruct::render`.
+# The read path reuses the miner's token model + reconstruction logic
+# rather than re-deriving them. No arrow/DataFusion type crosses this.
+ourios-miner = { path = "../ourios-miner" }
 # The RFC 0005 store this queries — used here for the canonical
 # `percent_encode_tenant` so the tenant partition-dir path matches
 # the writer's byte-for-byte (single source of truth, no drift).

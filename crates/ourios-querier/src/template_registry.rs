@@ -83,8 +83,20 @@ pub fn derive_template_registry(
             }
         }
     }
-    // The stable sort by event time completes the total order: same-timestamp
-    // events keep their (file path, row index) order.
+    Ok(fold_registry(events))
+}
+
+/// Fold template audit `events` into the registry (RFC 0017 §3.2) — the pure
+/// core of [`derive_template_registry`], split out so the version-keying logic
+/// is unit-testable without the audit-file I/O.
+///
+/// Sorts by timestamp first: the stable sort completes the §3.7.1 total order,
+/// keeping same-timestamp events in their (file path, row index) input order.
+/// Each event keys by its version — `template_created` at
+/// [`TEMPLATE_INITIAL_VERSION`], widening / type-expansion at `new_version`,
+/// rejections contribute nothing — so distinct versions never collide and a
+/// later widening cannot clobber an earlier version's tokens.
+fn fold_registry(mut events: Vec<AuditEvent>) -> TemplateRegistry {
     events.sort_by_key(|e| e.timestamp);
 
     let mut registry = TemplateRegistry::new();
@@ -114,5 +126,129 @@ pub fn derive_template_registry(
         };
         registry.insert((template_id, version), parse_template(&template));
     }
-    Ok(registry)
+    registry
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ourios_core::audit::hash_triggering_line;
+
+    use super::{
+        AuditEvent, AuditPayload, OwnedToken, TEMPLATE_INITIAL_VERSION, TemplateChange, TenantId,
+        fold_registry,
+    };
+
+    fn event(template_id: u64, secs: u64, change: TemplateChange) -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("t"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(secs),
+            payload: AuditPayload::Template {
+                template_id,
+                triggering_line_hash: hash_triggering_line(b"line"),
+                triggering_line_sample: None,
+                change,
+            },
+        }
+    }
+
+    fn created(template_id: u64, secs: u64, new_template: &str) -> AuditEvent {
+        event(
+            template_id,
+            secs,
+            TemplateChange::Created {
+                new_template: new_template.to_owned(),
+            },
+        )
+    }
+
+    fn widened(template_id: u64, secs: u64, new_version: u32, new_template: &str) -> AuditEvent {
+        event(
+            template_id,
+            secs,
+            TemplateChange::Widened {
+                old_version: new_version - 1,
+                new_version,
+                old_template: "user <*>".to_owned(),
+                new_template: new_template.to_owned(),
+                positions_widened: vec![2],
+            },
+        )
+    }
+
+    fn fixed(s: &str) -> OwnedToken {
+        OwnedToken::Fixed(s.to_owned())
+    }
+
+    #[test]
+    fn created_keys_at_initial_version_widened_at_new_version() {
+        let registry = fold_registry(vec![
+            created(1, 10, "user <*>"),
+            widened(1, 20, 2, "user <*> <*>"),
+        ]);
+        assert_eq!(
+            registry.get(&(1, TEMPLATE_INITIAL_VERSION)),
+            Some(&vec![fixed("user"), OwnedToken::Wildcard]),
+        );
+        assert_eq!(
+            registry.get(&(1, 2)),
+            Some(&vec![
+                fixed("user"),
+                OwnedToken::Wildcard,
+                OwnedToken::Wildcard
+            ]),
+            "later version is a distinct key — v1 not clobbered",
+        );
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn type_expanded_keys_at_new_version() {
+        let registry = fold_registry(vec![event(
+            5,
+            10,
+            TemplateChange::TypeExpanded {
+                old_version: 1,
+                new_version: 2,
+                old_template: "GET <*>".to_owned(),
+                new_template: "GET <*>".to_owned(),
+                slots_expanded: Vec::new(),
+            },
+        )]);
+        assert_eq!(
+            registry.get(&(5, 2)),
+            Some(&vec![fixed("GET"), OwnedToken::Wildcard]),
+        );
+    }
+
+    #[test]
+    fn rejection_contributes_nothing() {
+        let registry = fold_registry(vec![event(
+            1,
+            10,
+            TemplateChange::RejectedDegenerate {
+                version: 2,
+                current_template: "user <*> <*>".to_owned(),
+                would_be_template: "<*> <*> <*>".to_owned(),
+                would_be_positions: vec![0],
+            },
+        )]);
+        assert!(registry.is_empty(), "a rejection adds no registry entry");
+    }
+
+    #[test]
+    fn same_key_resolves_in_timestamp_order_last_wins() {
+        // Two events for the same (id, version) — the stable sort by timestamp
+        // makes the later one authoritative regardless of input order.
+        let registry = fold_registry(vec![
+            widened(7, 30, 2, "late <*>"),
+            widened(7, 20, 2, "early <*>"),
+        ]);
+        assert_eq!(
+            registry.get(&(7, 2)),
+            Some(&vec![fixed("late"), OwnedToken::Wildcard]),
+            "the later-timestamp event wins the (id, version) key",
+        );
+    }
 }

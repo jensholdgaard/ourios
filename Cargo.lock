@@ -3062,6 +3062,7 @@ dependencies = [
  "ourios-core",
  "ourios-semconv",
  "ourios-telemetry",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",

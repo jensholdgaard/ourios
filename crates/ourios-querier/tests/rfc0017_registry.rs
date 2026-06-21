@@ -150,6 +150,13 @@ fn rfc0017_2_registry_derives_completely_including_v1() {
     assert_eq!(registry.len(), 4, "no entry for the degenerate rejection");
 }
 
+// Note: the row-vs-path tenant backstop in `derive_template_registry` (RFC
+// 0005 §3.9) is defense-in-depth against a hand-corrupted file. It is *not*
+// reachable through the supported write path — `AuditWriter` rejects a
+// tenant/partition mismatch at write time (`PartitionMismatch`) — so, like the
+// identical backstop in `alias_store::derive_alias_map`, it is not exercised by
+// a forged fixture here. The fold logic is unit-tested in the module.
+
 /// Scenario RFC0017.5 — a row carrying `template_version = N` renders against
 /// the N-version tokens (the event whose `new_version = N`), not the latest:
 /// a line ingested before a widening reconstructs as it was then.

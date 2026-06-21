@@ -387,6 +387,31 @@ mod tests {
         assert_eq!(parse_template(""), Vec::<OwnedToken>::new());
     }
 
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `parse_template(format_template(t)) == t` over arbitrary token
+        /// sequences. `Fixed` tokens are drawn from a space-free alphabet that
+        /// excludes the `<*>` wildcard marker — the exact domain the invariant
+        /// holds for: mine-time tokens are whitespace-split (never contain a
+        /// space), and a literal `<*>` is not producible by the masker. (Those
+        /// two excluded shapes are the documented ambiguities the canonical
+        /// space-joined form carries.)
+        #[test]
+        fn parse_template_inverts_format_template_prop(
+            tokens in prop::collection::vec(
+                prop_oneof![
+                    Just(OwnedToken::Wildcard),
+                    "[a-zA-Z0-9_./:=-]{1,12}".prop_map(OwnedToken::Fixed),
+                ],
+                0..12,
+            )
+        ) {
+            let canonical = format_template(&tokens);
+            prop_assert_eq!(parse_template(&canonical), tokens);
+        }
+    }
+
     #[test]
     fn descend_mut_creates_length_node_lazily() {
         // Arrange — fresh tree, no length nodes yet.

@@ -40,6 +40,10 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+# Property test for the canonical template encode/decode invariant
+# (`tree::format_template` ↔ `tree::parse_template`), per CLAUDE.md §6.2
+# ("reconstruction is always a property test").
+proptest = "1"
 
 [lints]
 workspace = true

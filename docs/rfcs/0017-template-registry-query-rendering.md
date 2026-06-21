@@ -77,9 +77,16 @@ old readers are unaffected and §3.5 migration holds). It reuses the
 existing audit columns: `new_template` = the initial tokens,
 `new_version = 1`, and `old_template`/`old_version` left **`NULL`** — the
 OPTIONAL "not applicable to this event kind" sentinel per RFC 0005 §3.7
-(no prior template), not a zero/empty value. The miner emits it at leaf creation, on the same WAL-before-ack
-path as the existing template events, so by the time a v1 row reaches
-Parquet its `TemplateCreated` event is durable.
+(no prior template), not a zero/empty value. The in-memory
+`TemplateChange::Created` variant carries **only** `new_template`: a leaf is
+always born at version 1, so rather than carry-and-validate a `new_version`
+field the invariant is made *unrepresentable* (there is no way to construct
+a creation at another version). The writer supplies the canonical
+`new_version = 1` for the on-disk column (`TEMPLATE_INITIAL_VERSION`); the
+reader does not read it back into the variant. The miner emits it at leaf
+creation, on the same WAL-before-ack path as the existing template events,
+so by the time a v1 row reaches Parquet its `TemplateCreated` event is
+durable.
 
 ### 3.2 `derive_template_registry` — fold the audit stream
 

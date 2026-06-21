@@ -40,13 +40,14 @@ pub enum TemplateChange {
     /// registry can recover the v1 tokens once the originating rows
     /// age out; without it, v1 rows would have no derivable tokens.
     ///
-    /// Carries no `old_*` pair — there is no prior template — so the
-    /// on-disk `old_version` / `old_template` columns are left `NULL`
-    /// (the RFC 0005 §3.7 "not applicable" sentinel). `new_version` is
-    /// always `1`: a leaf is born at version 1.
+    /// Carries **only** the initial tokens. A leaf is *always* born at
+    /// version 1, so the variant deliberately omits a `new_version` field:
+    /// the v1 invariant is made unrepresentable rather than carried-and-
+    /// validated (there is no way to construct a creation at any other
+    /// version). The on-disk row still stores `new_version = 1` (the
+    /// writer supplies it) with `old_version` / `old_template` left `NULL`
+    /// — the RFC 0005 §3.7 "not applicable" sentinel (no prior template).
     Created {
-        /// Always `1` — the version a leaf is created at.
-        new_version: u32,
         /// Canonical-form template at creation (the initial tokens,
         /// literals + `<*>`), the same encoding `Widened` carries.
         new_template: String,
@@ -258,6 +259,12 @@ pub const EVENT_TYPE_ALIAS_ASSERTED: &str = "alias_asserted";
 pub const EVENT_TYPE_ALIAS_RETRACTED: &str = "alias_retracted";
 /// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0017 §3.1 leaf-creation audit.
 pub const EVENT_TYPE_TEMPLATE_CREATED: &str = "template_created";
+
+/// The `template_version` a leaf is born at (RFC 0017 §3.1). The
+/// [`TemplateChange::Created`] variant omits a version field — the invariant
+/// is unrepresentable — so the writer supplies this for the on-disk
+/// `new_version` column and the read-time registry keys creation rows by it.
+pub const TEMPLATE_INITIAL_VERSION: u32 = 1;
 
 impl AuditPayload {
     /// The stable `event_kind` ordinal for this payload (RFC 0005

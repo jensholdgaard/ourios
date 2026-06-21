@@ -1519,7 +1519,6 @@ impl MinerCluster {
                 triggering_line_hash: hash_triggering_line(raw.as_bytes()),
                 triggering_line_sample: Some(sample_first_256_bytes(raw)),
                 change: TemplateChange::Created {
-                    new_version: 1,
                     new_template: created_template,
                 },
             },
@@ -2771,18 +2770,13 @@ mod tests {
         for (event, id) in events.iter().zip([id_a, id_b]) {
             let AuditPayload::Template {
                 template_id,
-                change:
-                    TemplateChange::Created {
-                        new_version,
-                        new_template,
-                    },
+                change: TemplateChange::Created { new_template },
                 ..
             } = &event.payload
             else {
                 panic!("expected Template/Created, got {:?}", event.payload);
             };
             assert_eq!(*template_id, id);
-            assert_eq!(*new_version, 1, "a leaf is created at version 1");
             assert!(
                 !new_template.is_empty(),
                 "creation carries the initial tokens",

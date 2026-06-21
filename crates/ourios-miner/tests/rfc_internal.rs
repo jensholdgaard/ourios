@@ -52,7 +52,7 @@ fn rfc0001_1_fresh_leaf_creation_emits_template_created() {
         events.iter().all(|e| matches!(
             &e.payload,
             AuditPayload::Template {
-                change: TemplateChange::Created { new_version: 1, .. },
+                change: TemplateChange::Created { .. },
                 ..
             }
         )),

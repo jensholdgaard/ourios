@@ -543,10 +543,11 @@ fn decode_template_change(
     // Creation has no prior template, so its `old_*` columns are NULL
     // (RFC 0017 §3.1) — handle it before `require_at` on `old_version` /
     // `old_template`, which would (correctly) reject those NULLs for the
-    // widening kinds.
+    // widening kinds. The variant omits a version (a leaf is always born at
+    // v1), so the on-disk `new_version` (canonically `1`) is not read back
+    // into it — the v1 contract is structural, not a decoded value.
     if cols.event_kind == EVENT_KIND_TEMPLATE_CREATED {
         return Ok(TemplateChange::Created {
-            new_version: require_at(cols.new_version, i, audit_columns::NEW_VERSION, file_row)?,
             new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
         });
     }

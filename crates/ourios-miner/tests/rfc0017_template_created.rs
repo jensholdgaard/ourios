@@ -38,18 +38,15 @@ fn rfc0017_1_new_leaf_emits_template_created() {
     assert_eq!(events.len(), 1, "fresh leaf emits exactly one audit event");
     let AuditPayload::Template {
         template_id,
-        change:
-            TemplateChange::Created {
-                new_version,
-                new_template,
-            },
+        change: TemplateChange::Created { new_template },
         ..
     } = &events[0].payload
     else {
         panic!("expected Template/Created, got {:?}", events[0].payload);
     };
     assert_eq!(*template_id, id, "event names the allocated template_id");
-    assert_eq!(*new_version, 1, "a leaf is created at version 1");
+    // The variant carries no version (a leaf is always born at v1, made
+    // unrepresentable-if-otherwise); the on-disk row stores new_version = 1.
     assert_eq!(
         new_template, "user <*> logged in",
         "creation carries the initial tokens",

@@ -205,7 +205,6 @@ fn rfc0017_1_template_created_round_trips() {
         Some("user 42 logged in"),
         1_775_127_480,
         TemplateChange::Created {
-            new_version: 1,
             new_template: "user <*> logged in".to_string(),
         },
     );

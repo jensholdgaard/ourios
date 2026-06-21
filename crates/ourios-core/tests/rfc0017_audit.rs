@@ -62,7 +62,6 @@ fn rfc0017_1_template_created_is_append_only_audit_addition() {
             triggering_line_hash: hash_triggering_line(b"user 42 logged in"),
             triggering_line_sample: Some("user 42 logged in".to_owned()),
             change: TemplateChange::Created {
-                new_version: 1,
                 new_template: "user <*> logged in".to_owned(),
             },
         },

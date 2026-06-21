@@ -21,7 +21,7 @@ plus the body (rendered for string bodies, returned as structure for
 time, so this RFC builds a **read-time template registry**
 (`(template_id, template_version) → tokens`) by folding the tenant's audit
 stream — and, because a template's initial creation is unaudited today,
-**amends the audit contract to emit a `TemplateCreated` event** on leaf
+**amends the audit contract to emit a `template_created` event** on leaf
 creation. This delivers the typed-row payload RFC 0007 §4.1 specifies but
 the engine never built, and is the prerequisite for RFC 0016's endpoint to
 return actual logs.
@@ -52,12 +52,12 @@ designed away" — the manifest fork #94/#147). So the registry should be
 blocker: derivation is only correct if the audit stream records **every**
 template version's tokens. It records widening (`new_template`) and
 type-expansion, but **not a template's initial (version 1) creation** —
-so v1 rows have no derivable tokens. Closing that gap (a `TemplateCreated`
+so v1 rows have no derivable tokens. Closing that gap (a `template_created`
 audit event) makes the registry complete and the rendering correct.
 
 ## 3. Proposed design
 
-### 3.1 The audit gap → a `TemplateCreated` event
+### 3.1 The audit gap → a `template_created` event
 
 When the miner allocates a new leaf it assigns a `template_id` /
 `template_version = 1` but emits **no audit event**; the first event for
@@ -85,7 +85,7 @@ a creation at another version). The writer supplies the canonical
 `new_version = 1` for the on-disk column (`TEMPLATE_INITIAL_VERSION`); the
 reader does not read it back into the variant. The miner emits it at leaf
 creation, on the same WAL-before-ack path as the existing template events,
-so by the time a v1 row reaches Parquet its `TemplateCreated` event is
+so by the time a v1 row reaches Parquet its `template_created` event is
 durable.
 
 ### 3.2 `derive_template_registry` — fold the audit stream
@@ -226,7 +226,7 @@ Rendering is bounded to the returned (`limit`-capped) rows.
 ## 4. Alternatives considered
 
 **Derive ≥v2, reconstruct v1 from a surviving row.** Skip the
-`TemplateCreated` event; if a v1 token set is missing, recover it from any
+`template_created` event; if a v1 token set is missing, recover it from any
 still-present v1 row's shape. Rejected — fragile and lossy: once every v1
 row of a template is compacted/retention-expired, its tokens are
 unrecoverable, so a later query over an older file that *does* reference
@@ -378,7 +378,7 @@ is greppable (`docs/verification.md` §2).
 - [ ] **Registry memory bound** — for tenants with very large template
   counts, is the per-query in-memory registry acceptable, or does it need
   a cap / lazy per-`(id,version)` lookup?
-- [ ] **`TemplateCreated` payload** — does it also carry `slot_types`
+- [ ] **`template_created` payload** — does it also carry `slot_types`
   (like `TypeExpanded`), or just tokens? (Leaning tokens-only for v1;
   slot types are derivable / not needed for `render`.)
 - [x] **Structured-body rendering** — *resolved* (§3.3 / §3.4): the OTLP

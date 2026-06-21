@@ -193,9 +193,10 @@ fn rfc0005_7_audit_round_trip_one_of_each_variant() {
 
 /// Scenario RFC0017.1 (storage round-trip) — the `template_created` variant
 /// round-trips through the audit file series. Full `AuditEvent` equality
-/// confirms `new_version` / `new_template` survive and the reader
-/// reconstructs `Created` (whose absence of `old_*` fields reflects the NULL
-/// "not applicable" columns, RFC 0017 §3.1) — pins the writer/reader arms.
+/// confirms `new_template` survives and the reader reconstructs `Created`
+/// (which carries no version — a leaf is always v1 — and no `old_*`,
+/// reflecting the NULL "not applicable" columns; the on-disk `new_version`
+/// is the canonical `1`, RFC 0017 §3.1) — pins the writer/reader arms.
 #[test]
 fn rfc0017_1_template_created_round_trips() {
     let bucket = TempDir::new().unwrap();

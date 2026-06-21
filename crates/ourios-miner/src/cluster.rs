@@ -15,7 +15,8 @@
 //! tree on `Body::String` records:
 //!
 //! - **No candidate** in the `(severity, scope, length, prefix)`
-//!   bucket → fresh leaf, no audit event (RFC0001.1).
+//!   bucket → fresh leaf, emitting a `TemplateCreated` audit event
+//!   (RFC 0017 §3.1; not a merge).
 //! - **Best candidate has `sim_seq == 1.0`** → clean attach to the
 //!   existing leaf, no widening, no audit.
 //! - **Best candidate has `threshold ≤ sim_seq < 1.0`** → compute
@@ -1431,10 +1432,12 @@ impl MinerCluster {
     /// .type_tag}` for the k-th masked position, recording the
     /// type observed at that slot's first sight.
     ///
-    /// RFC0001.1: this path **does not** emit an audit event —
-    /// `template_count` already reflects the allocation and
-    /// `merges_total` is reserved for widening / type-expansion
-    /// events on existing leaves.
+    /// RFC 0017 §3.1: this path emits a `TemplateChange::Created` audit
+    /// event so a read-time registry can recover the leaf's v1 tokens. It
+    /// is **not** a merge — `template_count` reflects the allocation and
+    /// `merges_total` stays reserved for widening / type-expansion events
+    /// on existing leaves. (Supersedes the original RFC0001.1
+    /// "creation emits nothing" contract.)
     fn create_new_leaf(
         &mut self,
         record: &OtlpLogRecord,

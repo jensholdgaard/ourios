@@ -2,9 +2,10 @@
 //! miner-emit arm of scenario `.1`.
 //!
 //! Asserts that allocating a new leaf emits a `template_created` audit event
-//! carrying the leaf's `template_id`, `new_version = 1`, and the initial
-//! tokens — on the same `AuditSink` (WAL-before-ack) path as the existing
-//! template events.
+//! carrying the leaf's `template_id` and the initial tokens — on the same
+//! `AuditSink` (WAL-before-ack) path as the existing template events. The
+//! `Created` variant carries no version field (a leaf is always born at v1,
+//! made unrepresentable); the on-disk row stores `new_version = 1`.
 //!
 //! See `docs/rfcs/0017-template-registry-query-rendering.md` §3.1 / §5 / §6.
 

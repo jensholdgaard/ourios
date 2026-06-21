@@ -26,6 +26,11 @@ creation. This delivers the typed-row payload RFC 0007 §4.1 specifies but
 the engine never built, and is the prerequisite for RFC 0016's endpoint to
 return actual logs.
 
+This **amends RFC 0001**: scenario RFC0001.1 ("fresh-leaf creation does not
+emit an audit event") is superseded — leaf creation now emits a
+`template_created` event (§3.1). It remains a non-merge (`merges_total`
+unchanged), so RFC 0001's merge-counting contract is untouched.
+
 ## 2. Motivation
 
 A query returns `QueryResult { rows: u64, stats }` today — a count, no

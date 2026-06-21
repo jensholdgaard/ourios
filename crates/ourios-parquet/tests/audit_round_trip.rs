@@ -191,6 +191,42 @@ fn rfc0005_7_audit_round_trip_one_of_each_variant() {
     }
 }
 
+/// Scenario RFC0017.1 (storage round-trip) — the `template_created` variant
+/// round-trips through the audit file series. Full `AuditEvent` equality
+/// confirms `new_version` / `new_template` survive and the reader
+/// reconstructs `Created` (whose absence of `old_*` fields reflects the NULL
+/// "not applicable" columns, RFC 0017 §3.1) — pins the writer/reader arms.
+#[test]
+fn rfc0017_1_template_created_round_trips() {
+    let bucket = TempDir::new().unwrap();
+    let event = template_event(
+        "acme",
+        11,
+        Some("user 42 logged in"),
+        1_775_127_480,
+        TemplateChange::Created {
+            new_version: 1,
+            new_template: "user <*> logged in".to_string(),
+        },
+    );
+    let partition = audit_partition_for(&event);
+
+    let mut writer = AuditWriter::open(bucket.path(), partition.clone()).expect("open");
+    writer
+        .append_events(std::slice::from_ref(&event))
+        .expect("append");
+    let written = writer.close().expect("close");
+
+    let reader = AuditReader::open_partition(&written.path, partition).expect("open_partition");
+    let round_tripped = reader.read_all().expect("read_all");
+
+    assert_eq!(round_tripped.len(), 1);
+    assert_eq!(
+        round_tripped[0], event,
+        "template_created round-trips with full AuditEvent equality",
+    );
+}
+
 /// RFC0005.7 sub-test — audit files land under
 /// `audit/tenant_id=…/year/month/day/<flush_uuid>.parquet`. There
 /// is NO `hour=HH` segment (the audit partitioning is one axis

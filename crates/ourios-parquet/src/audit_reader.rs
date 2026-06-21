@@ -43,7 +43,7 @@ use parquet::errors::ParquetError;
 use crate::audit_columns;
 use crate::audit_record_batch::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
     EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
@@ -327,7 +327,8 @@ fn batch_to_audit_events(
         let file_row = row_offset + i;
         let ts = decode_timestamp(timestamp[i], file_row)?;
         let payload = match event_kind[i] {
-            EVENT_KIND_TEMPLATE_WIDENED
+            EVENT_KIND_TEMPLATE_CREATED
+            | EVENT_KIND_TEMPLATE_WIDENED
             | EVENT_KIND_TEMPLATE_TYPE_EXPANDED
             | EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE => {
                 let cols = TemplateColumns {
@@ -539,6 +540,17 @@ fn decode_template_change(
     i: usize,
     file_row: usize,
 ) -> Result<TemplateChange, AuditReaderError> {
+    // Creation has no prior template, so its `old_*` columns are NULL
+    // (RFC 0017 §3.1) — handle it before `require_at` on `old_version` /
+    // `old_template`, which would (correctly) reject those NULLs for the
+    // widening kinds.
+    if cols.event_kind == EVENT_KIND_TEMPLATE_CREATED {
+        return Ok(TemplateChange::Created {
+            new_version: require_at(cols.new_version, i, audit_columns::NEW_VERSION, file_row)?,
+            new_template: require_at(cols.new_template, i, audit_columns::NEW_TEMPLATE, file_row)?,
+        });
+    }
+
     let old_version = require_at(cols.old_version, i, audit_columns::OLD_VERSION, file_row)?;
     let old_template = require_at(cols.old_template, i, audit_columns::OLD_TEMPLATE, file_row)?;
 

@@ -1,11 +1,11 @@
 //! RFC 0017 — read-time template registry & query-row rendering, the
-//! registry-derivation scenarios (`.2`, `.5`).
+//! registry-derivation scenario (`.2`).
 //!
-//! `.2` (`derive_template_registry` completeness) is green. `.5` (rows render
-//! against their own version) needs the query-row rendering path and is
-//! `#[ignore]`d until that slice (`.3`) lands.
+//! `.2` is `derive_template_registry` completeness. The version-correct
+//! *rendering* scenario (`.5`) lives in `rfc0017_rendering.rs` with the other
+//! `render_log_body` scenarios.
 //!
-//! See `docs/rfcs/0017-template-registry-query-rendering.md` §3.2 / §3.5 / §5 / §6.
+//! See `docs/rfcs/0017-template-registry-query-rendering.md` §3.2 / §5 / §6.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -157,14 +157,5 @@ fn rfc0017_2_registry_derives_completely_including_v1() {
 // identical backstop in `alias_store::derive_alias_map`, it is not exercised by
 // a forged fixture here. The fold logic is unit-tested in the module.
 
-/// Scenario RFC0017.5 — a row carrying `template_version = N` renders against
-/// the N-version tokens (the event whose `new_version = N`), not the latest:
-/// a line ingested before a widening reconstructs as it was then.
-/// See `docs/rfcs/0017-template-registry-query-rendering.md` §5.
-#[test]
-#[ignore = "RFC0017.5 — red until rendering keys the registry by (template_id, version) (green)"]
-fn rfc0017_5_rows_render_against_their_own_version() {
-    todo!(
-        "RFC0017.5: a version-1 row renders against version-1 tokens, not the widened version-2 tokens"
-    )
-}
+// Scenario RFC0017.5 (rows render against their own template version) lives in
+// `rfc0017_rendering.rs`, alongside the other `render_log_body` scenarios.

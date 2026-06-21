@@ -42,9 +42,11 @@ mod audit_scan;
 mod compile;
 mod drift;
 pub mod dsl;
+mod log_row;
 mod template_registry;
 
 pub use drift::{DriftResult, DriftRow};
+pub use log_row::{LogBody, render_log_body};
 pub use template_registry::{TemplateRegistry, derive_template_registry};
 
 use std::path::PathBuf;

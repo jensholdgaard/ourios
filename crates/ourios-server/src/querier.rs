@@ -247,9 +247,11 @@ fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
     // The compiler reads the *last* `Limit`. Normalize to exactly one — the
     // clamped last — keeping its position relative to the non-limit stages
     // (stage order is DSL pipeline semantics, RFC 0002) and dropping any
-    // earlier shadowed limits. A query with no limit gets `default` appended.
+    // earlier shadowed limits. A query with no limit gets `default`, itself
+    // clamped to `cap` so the "no larger than cap" contract holds even if a
+    // caller misconfigures `default > cap`.
     let Some(last) = stages.iter().rposition(|s| matches!(s, Stage::Limit(_))) else {
-        stages.push(Stage::Limit(default));
+        stages.push(Stage::Limit(default.min(cap)));
         return;
     };
     let Stage::Limit(value) = stages[last] else {

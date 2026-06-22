@@ -131,8 +131,10 @@ impl QuerierMetrics {
             .u64_counter(semconv::OURIOS_QUERY_ROW_GROUPS)
             .with_unit("{row_group}")
             .build();
-        // Seed both pruning states so the series are visible before the first
-        // query (the ingester's attribute-free seeding, per required value).
+        // Seed each pruning state with a zero so both series are visible before
+        // the first query. The `state` attribute is required (there is no
+        // attribute-free series), so this seeds once per value rather than the
+        // ingester's single attribute-free `add(0, &[])`.
         row_groups.add(0, &Self::state_attrs(ROW_GROUP_SCANNED));
         row_groups.add(0, &Self::state_attrs(ROW_GROUP_PRUNED));
         Self {

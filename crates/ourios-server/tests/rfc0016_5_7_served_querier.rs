@@ -160,7 +160,10 @@ async fn rfc0016_5_role_gating_and_graceful_shutdown() {
     // a deterministic readiness signal (the printed address) before the signal —
     // the disabled case prints nothing, so a blind SIGTERM would race the
     // signal-handler setup.
-    disabled.kill().await.expect("kill the disabled-role process");
+    disabled
+        .kill()
+        .await
+        .expect("kill the disabled-role process");
 
     // Act: now enable the querier role on an ephemeral port.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))

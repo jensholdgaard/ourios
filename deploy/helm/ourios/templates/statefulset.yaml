@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ourios.fullname" . }}
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+spec:
+  # Single replica: until the object-storage backend (RFC 0013) lands, the data
+  # store is a ReadWriteOnce volume the roles share in one pod. The compactor is
+  # the single writer of the store, so this must not be scaled horizontally.
+  replicas: 1
+  serviceName: {{ include "ourios.fullname" . }}-headless
+  selector:
+    matchLabels:
+      {{- include "ourios.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ourios.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ourios.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ourios-server
+          image: {{ include "ourios.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- include "ourios.env" . | nindent 12 }}
+          ports:
+            {{- if .Values.roles.receiver.enabled }}
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.roles.querier.enabled }}
+            - name: query-http
+              containerPort: 4319
+              protocol: TCP
+            {{- end }}
+          {{- /*
+          No HTTP health route exists yet (the endpoints are POST-only), so
+          probe a listening role port over TCP. A compactor-only pod exposes no
+          port, so it gets no probe (the process supervises itself).
+          */}}
+          {{- $probePort := "" }}
+          {{- if .Values.roles.querier.enabled }}{{ $probePort = "query-http" }}
+          {{- else if .Values.roles.receiver.enabled }}{{ $probePort = "otlp-http" }}{{ end }}
+          {{- if $probePort }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ $probePort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ $probePort }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.dataDir }}
+            {{- if .Values.roles.receiver.enabled }}
+            - name: wal
+              mountPath: {{ .Values.walDir }}
+            {{- end }}
+            # readOnlyRootFilesystem is on, so give the process a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "ourios.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
+        {{- with .Values.persistence.data.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.data.size | quote }}
+    {{- if .Values.roles.receiver.enabled }}
+    - metadata:
+        name: wal
+        labels:
+          {{- include "ourios.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.wal.accessModes | nindent 10 }}
+        {{- with .Values.persistence.wal.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.wal.size | quote }}
+    {{- end }}

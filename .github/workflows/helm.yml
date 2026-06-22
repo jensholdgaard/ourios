@@ -1,0 +1,45 @@
+name: Helm
+
+# Lints and render-tests the deploy/helm/ourios chart on every PR and push to
+# main that touches it. The render smoke covers the role-toggle matrix (the
+# chart's "tests": `helm lint` + `helm template` across each enabled-roles
+# combination), mirroring the local verification in deploy/helm/ourios.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/helm.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+      - ".github/workflows/helm.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+      - name: helm lint
+        run: helm lint deploy/helm/ourios
+      - name: helm template (role-toggle matrix)
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/ourios
+          # Each enabled-roles combination must render valid manifests.
+          helm template o "$chart" >/dev/null
+          helm template o "$chart" --set roles.querier.enabled=false >/dev/null
+          helm template o "$chart" --set roles.receiver.enabled=false >/dev/null
+          helm template o "$chart" \
+            --set roles.receiver.enabled=false \
+            --set roles.querier.enabled=false >/dev/null

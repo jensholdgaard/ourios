@@ -1,0 +1,35 @@
+{{- if or .Values.roles.receiver.enabled .Values.roles.querier.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "ourios.fullname" . }}-test-connection"
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    {{- if .Values.roles.querier.enabled }}
+    # Post a trivial DSL query to the querier and require a 200.
+    - name: query
+      image: busybox
+      command:
+        - wget
+      args:
+        - -S
+        - -O-
+        - --header=X-Ourios-Tenant: helm-test
+        - --header=Content-Type: text/plain
+        - --post-data=template_id == 0
+        - "http://{{ include "ourios.fullname" . }}:4319/v1/query"
+    {{- else }}
+    # Receiver-only: confirm the OTLP HTTP port accepts a connection.
+    - name: otlp-http
+      image: busybox
+      command:
+        - sh
+        - -c
+        - "nc -z -w5 {{ include "ourios.fullname" . }} 4318"
+    {{- end }}
+{{- end }}

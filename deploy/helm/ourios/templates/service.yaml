@@ -1,0 +1,46 @@
+{{- /* Headless service: governs the StatefulSet's stable network identity. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ourios.fullname" . }}-headless
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "ourios.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: placeholder
+      port: 1
+      targetPort: 1
+{{- if or .Values.roles.receiver.enabled .Values.roles.querier.enabled }}
+---
+{{- /* Client-facing service: only the enabled roles' ports. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ourios.fullname" . }}
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ourios.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- if .Values.roles.receiver.enabled }}
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.roles.querier.enabled }}
+    - name: query-http
+      port: 4319
+      targetPort: query-http
+      protocol: TCP
+    {{- end }}
+{{- end }}

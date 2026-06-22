@@ -1,0 +1,41 @@
+Ourios is installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Roles running in the single ourios-server process:
+  - compaction: always on (interval {{ .Values.compaction.intervalSecs }}s)
+  - receiver:   {{ if .Values.roles.receiver.enabled }}ENABLED — OTLP logs over gRPC :4317 and HTTP :4318{{ else }}disabled{{ end }}
+  - querier:    {{ if .Values.roles.querier.enabled }}ENABLED — logs-DSL query API over HTTP :4319{{ else }}disabled{{ end }}
+
+Data store (OURIOS_BUCKET_ROOT) → PVC `data` ({{ .Values.persistence.data.size }}) at {{ .Values.dataDir }}.
+{{- if .Values.roles.receiver.enabled }}
+Write-ahead log (OURIOS_WAL_ROOT) → PVC `wal` ({{ .Values.persistence.wal.size }}) at {{ .Values.walDir }}.
+{{- end }}
+
+{{- if or .Values.roles.receiver.enabled .Values.roles.querier.enabled }}
+
+In-cluster service: {{ include "ourios.fullname" . }}.{{ .Release.Namespace }}.svc
+
+Reach it from your workstation with a port-forward:
+{{- if .Values.roles.querier.enabled }}
+
+  # Query API
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }} 4319:4319
+  curl -s -H 'X-Ourios-Tenant: my-tenant' -H 'Content-Type: text/plain' \
+    --data 'template_id == 0' http://127.0.0.1:4319/v1/query
+{{- end }}
+{{- if .Values.roles.receiver.enabled }}
+
+  # OTLP ingest (point your OpenTelemetry exporter here)
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }} 4317:4317 4318:4318
+{{- end }}
+
+Verify the install:
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+{{- else }}
+
+Only the background compactor is running (receiver and querier are disabled).
+Enable a role with `--set roles.receiver.enabled=true` or
+`--set roles.querier.enabled=true`.
+{{- end }}
+
+NOTE: the data store is a ReadWriteOnce volume and the deployment is a single
+replica until the object-storage backend (RFC 0013) lands. Do not scale it.

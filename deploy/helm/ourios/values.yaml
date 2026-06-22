@@ -1,0 +1,113 @@
+# Default values for the Ourios chart.
+#
+# Ourios is one binary (`ourios-server`) with three roles in a single process:
+#   - the always-on background compactor (RFC 0009),
+#   - the optional OTLP receiver (RFC 0003), and
+#   - the optional query endpoint (RFC 0016).
+# This chart runs that one process as a single-replica StatefulSet, with the
+# data store and the write-ahead log on PVCs. Until the object-storage backend
+# (RFC 0013) lands, the data store is a local ReadWriteOnce volume, so the roles
+# share one pod; splitting the querier into its own horizontally-scaled
+# Deployment is a follow-up that arrives with S3 (then the store is shared via
+# object storage, not a volume).
+
+image:
+  repository: ghcr.io/jensholdgaard/ourios
+  pullPolicy: IfNotPresent
+  # Overrides the image tag; defaults to the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Which optional roles the process runs. The compactor is always on.
+roles:
+  receiver:
+    # OTLP log ingest over gRPC (4317) + HTTP (4318). Needs the WAL PVC.
+    enabled: true
+  querier:
+    # The logs-DSL query endpoint over HTTP (4319).
+    enabled: true
+
+# In-container mount paths for the two PVCs (the env the binary reads points
+# here): OURIOS_BUCKET_ROOT and OURIOS_WAL_ROOT respectively.
+dataDir: /var/lib/ourios/data
+walDir: /var/lib/ourios/wal
+
+# Background compaction cadence — OURIOS_COMPACTION_INTERVAL_SECS.
+compaction:
+  intervalSecs: 300
+
+# Querier tuning.
+querier:
+  # Default look-back for a query with no range(...) stage, in seconds
+  # (OURIOS_QUERIER_DEFAULT_WINDOW_SECS; RFC 0016 §7). Must be non-zero.
+  defaultWindowSecs: 3600
+
+# Persistent volumes. `data` backs OURIOS_BUCKET_ROOT (the Parquet data + audit
+# store, the source of truth until S3); `wal` backs OURIOS_WAL_ROOT (the
+# write-ahead log, only provisioned when the receiver is enabled).
+persistence:
+  data:
+    size: 10Gi
+    # "" uses the cluster default StorageClass; set to bind a specific class.
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+  wal:
+    size: 2Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+
+# Ourios's own self-telemetry (RFC 0001 §6.8): the OTLP endpoint its meter
+# exports to. Empty leaves the OpenTelemetry SDK default
+# (OTEL_EXPORTER_OTLP_ENDPOINT unset). Standard OTEL_* env can also be set via
+# `extraEnv`.
+otel:
+  exporterEndpoint: ""
+
+# Extra environment variables appended verbatim to the container (e.g. OTEL_*
+# overrides, or future object-storage credentials).
+extraEnv: []
+  # - name: OTEL_EXPORTER_OTLP_PROTOCOL
+  #   value: http/protobuf
+
+service:
+  type: ClusterIP
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# The image runs as nonroot (uid 65532, distroless). fsGroup lets that user
+# write the PVCs (a fresh volume is otherwise root-owned).
+podSecurityContext:
+  fsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources: {}
+  # limits:
+  #   cpu: "1"
+  #   memory: 1Gi
+  # requests:
+  #   cpu: 250m
+  #   memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

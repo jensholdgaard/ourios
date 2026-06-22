@@ -121,11 +121,11 @@ pub struct QueryStats {
     pub bytes_read: u64,
 }
 
-/// Result of a query. The typed-row payload lands with the
-/// execution slice (its shape follows the RFC 0002 projection +
-/// RFC 0005 schema, and must stay free of arrow `RecordBatch`
-/// leakage per §4.6); the scaffold carries the [`QueryStats`]
-/// the B1/B2 gates assert on.
+/// Result of a query: the matching-row count (`rows`) and the scan's pruning
+/// [`QueryStats`] the B1/B2 gates assert on, plus — when the query carried a
+/// `limit` — the rendered [`LogRow`] payload (`records`, RFC 0017 §3.3/§3.4).
+/// All fields are Ourios-owned; no arrow `RecordBatch` / `DataFusion` type
+/// crosses this boundary (§4.6 / RFC0017.7).
 ///
 /// Marked `#[non_exhaustive]` so further additive fields stay non-breaking
 /// (RFC 0017 §3.4 — the field addition itself is the accepted one-time break).

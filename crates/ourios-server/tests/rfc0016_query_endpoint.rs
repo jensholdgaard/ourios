@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -24,12 +24,20 @@ use ourios_parquet::{ParquetAuditSink, PartitionKey, Writer};
 use ourios_server::querier::router;
 use tower::ServiceExt;
 
-/// 2026-04-02T10:58:00Z — a fixed past instant; with `HUGE_WINDOW` the
-/// default look-back `[now - W, now]` covers it regardless of wall clock.
-const TS0: u64 = 1_775_127_480_000_000_000;
-/// A default window so wide that fixed-past fixtures always fall inside the
-/// no-`range` look-back (≈100 years of nanos, well under `u64::MAX`).
+/// A default window wide enough that the fixture rows (timestamped an hour
+/// before the request's `now`) always fall inside the no-`range` look-back
+/// `[now - W, now]`, with no dependence on the absolute wall clock.
 const HUGE_WINDOW: u64 = 100 * 365 * 24 * 60 * 60 * 1_000_000_000;
+
+/// One hour before the current wall clock, in unix nanos — a fixture timestamp
+/// that is always in the recent past (so the look-back window covers it)
+/// regardless of the machine's clock.
+fn recent_ns() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    u64::try_from(now.saturating_sub(60 * 60 * 1_000_000_000)).unwrap_or(0)
+}
 
 fn mined(tenant: &str, template_id: u64) -> MinedRecord {
     MinedRecord {
@@ -43,7 +51,7 @@ fn mined(tenant: &str, template_id: u64) -> MinedRecord {
         scope_attributes: Vec::new(),
         resource_schema_url: None,
         scope_schema_url: None,
-        time_unix_nano: TS0,
+        time_unix_nano: recent_ns(),
         observed_time_unix_nano: None,
         attributes: Vec::new(),
         dropped_attributes_count: 0,

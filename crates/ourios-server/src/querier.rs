@@ -241,18 +241,29 @@ fn parse_body(headers: &HeaderMap, body: &[u8]) -> Result<Statement, String> {
 
 /// Ensure the query's stages carry a `limit` no larger than `cap` (RFC 0016
 /// §7): a query's own limit is clamped to `cap`; a query with none gets
-/// `default`. Exactly one `Limit` stage remains so the engine returns rows.
+/// `default`. Normalizes to **exactly one** `Limit` stage so the engine returns
+/// rows.
 fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
-    // Clamp the effective (last) limit **in place** rather than removing and
-    // re-appending: stage order is part of the DSL pipeline semantics (RFC
-    // 0002), so reordering would be a footgun once more stages execute. The
-    // compiler reads the last `Limit`; a query with none gets one appended.
-    match stages.iter_mut().rev().find_map(|s| match s {
-        Stage::Limit(n) => Some(n),
-        _ => None,
-    }) {
-        Some(n) => *n = (*n).min(cap),
-        None => stages.push(Stage::Limit(default)),
+    // The compiler reads the *last* `Limit`. Normalize to exactly one — the
+    // clamped last — keeping its position relative to the non-limit stages
+    // (stage order is DSL pipeline semantics, RFC 0002) and dropping any
+    // earlier shadowed limits. A query with no limit gets `default` appended.
+    let Some(last) = stages.iter().rposition(|s| matches!(s, Stage::Limit(_))) else {
+        stages.push(Stage::Limit(default));
+        return;
+    };
+    let Stage::Limit(value) = stages[last] else {
+        unreachable!("rposition matched a Limit stage")
+    };
+    let clamped = value.min(cap);
+    let mut idx = 0;
+    stages.retain(|s| {
+        let keep = !matches!(s, Stage::Limit(_)) || idx == last;
+        idx += 1;
+        keep
+    });
+    if let Some(Stage::Limit(n)) = stages.iter_mut().find(|s| matches!(s, Stage::Limit(_))) {
+        *n = clamped;
     }
 }
 
@@ -601,6 +612,20 @@ mod tests {
         let mut stages = vec![Stage::Limit(MAX_LIMIT + 1)];
         apply_limit(&mut stages, DEFAULT_LIMIT, MAX_LIMIT);
         assert_eq!(stages, vec![Stage::Limit(MAX_LIMIT)]);
+
+        // Multiple limits → normalized to one (the clamped last), at the last
+        // one's position, earlier limits dropped, non-limit stages untouched.
+        let sort = Stage::Sort {
+            key: "count".to_owned(),
+            desc: true,
+        };
+        let mut stages = vec![sort.clone(), Stage::Limit(5), Stage::Limit(MAX_LIMIT + 100)];
+        apply_limit(&mut stages, DEFAULT_LIMIT, MAX_LIMIT);
+        assert_eq!(
+            stages,
+            vec![sort, Stage::Limit(MAX_LIMIT)],
+            "exactly one limit (the clamped last) remains after the non-limit stage",
+        );
     }
 
     #[test]

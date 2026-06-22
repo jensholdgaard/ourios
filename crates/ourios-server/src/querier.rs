@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -54,6 +54,10 @@ pub const DEFAULT_LIMIT: u64 = 1000;
 /// Hard cap on returned rows (RFC 0016 §7): a query's own `limit` is clamped to
 /// this so a client can't request an unbounded materialisation.
 pub const MAX_LIMIT: u64 = 10_000;
+/// Max request-body size (a DSL statement is small; cap it so an oversized body
+/// can't exhaust memory via the `Bytes` extractor — mirrors the receiver's
+/// `DefaultBodyLimit`).
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Querier role configuration (RFC 0016 §3.2).
 #[derive(Debug, Clone)]
@@ -109,6 +113,7 @@ pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
     };
     Router::new()
         .route("/v1/query", post(handle_query))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -238,13 +243,17 @@ fn parse_body(headers: &HeaderMap, body: &[u8]) -> Result<Statement, String> {
 /// §7): a query's own limit is clamped to `cap`; a query with none gets
 /// `default`. Exactly one `Limit` stage remains so the engine returns rows.
 fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
-    let requested = stages.iter().rev().find_map(|s| match s {
-        Stage::Limit(n) => Some(*n),
+    // Clamp the effective (last) limit **in place** rather than removing and
+    // re-appending: stage order is part of the DSL pipeline semantics (RFC
+    // 0002), so reordering would be a footgun once more stages execute. The
+    // compiler reads the last `Limit`; a query with none gets one appended.
+    match stages.iter_mut().rev().find_map(|s| match s {
+        Stage::Limit(n) => Some(n),
         _ => None,
-    });
-    let effective = requested.unwrap_or(default).min(cap);
-    stages.retain(|s| !matches!(s, Stage::Limit(_)));
-    stages.push(Stage::Limit(effective));
+    }) {
+        Some(n) => *n = (*n).min(cap),
+        None => stages.push(Stage::Limit(default)),
+    }
 }
 
 fn now_unix_nano() -> u64 {

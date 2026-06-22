@@ -299,6 +299,20 @@ async fn rfc0016_4_malformed_dsl_is_a_clean_400_no_engine_leak() {
     }
 }
 
+/// RFC0016.4 (resource bound) — an oversized request body is rejected with
+/// `413` by the router's `DefaultBodyLimit`, not read into memory.
+#[tokio::test]
+async fn rfc0016_oversize_body_is_rejected() {
+    let bucket = tempfile::tempdir().unwrap();
+    let huge = "a".repeat(ourios_server::querier::MAX_BODY_BYTES + 1);
+    let (status, _) = post(bucket.path(), Some("acme"), "text/plain", &huge).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an over-limit body is 413, never read whole into memory",
+    );
+}
+
 /// Scenario RFC0016.5 — role gating + graceful shutdown.
 /// See `docs/rfcs/0016-query-serving-endpoint.md` §5.
 #[test]

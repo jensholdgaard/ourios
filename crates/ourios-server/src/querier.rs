@@ -254,10 +254,12 @@ fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
         stages.push(Stage::Limit(default.min(cap)));
         return;
     };
-    let Stage::Limit(value) = stages[last] else {
-        unreachable!("rposition matched a Limit stage")
+    // Borrow the stage and copy out the `u64` (matching by value would be a
+    // partial copy, not a move — `u64` is `Copy` — but the borrow is clearer).
+    let clamped = match &stages[last] {
+        Stage::Limit(value) => (*value).min(cap),
+        _ => unreachable!("rposition matched a Limit stage"),
     };
-    let clamped = value.min(cap);
     let mut idx = 0;
     stages.retain(|s| {
         let keep = !matches!(s, Stage::Limit(_)) || idx == last;

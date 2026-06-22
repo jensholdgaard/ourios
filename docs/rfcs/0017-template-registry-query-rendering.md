@@ -1,7 +1,7 @@
 ---
 rfc: 0017
 title: Read-time template registry & query-row rendering
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-20

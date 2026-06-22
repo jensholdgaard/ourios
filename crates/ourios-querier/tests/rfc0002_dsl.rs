@@ -311,6 +311,7 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
             time_range: Some((NOW - DEFAULT_WINDOW_NS, NOW)),
             template_id: Some(1),
             severity_text: None,
+            limit: None,
         })
         .await
         .expect("run");

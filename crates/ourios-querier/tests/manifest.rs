@@ -58,6 +58,7 @@ fn req(template_id: Option<u64>) -> QueryRequest {
         time_range: None,
         template_id,
         severity_text: None,
+        limit: None,
     }
 }
 

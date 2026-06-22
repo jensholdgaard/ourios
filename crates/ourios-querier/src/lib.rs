@@ -43,10 +43,11 @@ mod compile;
 mod drift;
 pub mod dsl;
 mod log_row;
+mod row_decode;
 mod template_registry;
 
 pub use drift::{DriftResult, DriftRow};
-pub use log_row::{LogBody, render_log_body};
+pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_registry::{TemplateRegistry, derive_template_registry};
 
 use std::path::PathBuf;
@@ -95,6 +96,13 @@ pub struct QueryRequest {
     /// structured counterpart to the B1 reference's `grep ERROR`: rows
     /// whose severity is null or anything else don't match.
     pub severity_text: Option<String>,
+    /// Optional cap on returned rows (RFC 0017 §3.4). `Some(n)` populates
+    /// `QueryResult.records` with up to `n` rendered [`LogRow`]s; `None` is
+    /// count-only (`records` stays empty). The count (`rows`) is unaffected
+    /// (always the full matching total), and `stats` continues to report the
+    /// count/pruning scan only — the extra IO to materialise the (≤ `n`) record
+    /// rows is **not** folded into `bytes_read`.
+    pub limit: Option<usize>,
 }
 
 /// Pruning / IO accounting for one query, surfaced so B1
@@ -113,19 +121,25 @@ pub struct QueryStats {
     pub bytes_read: u64,
 }
 
-/// Result of a query. The typed-row payload lands with the
-/// execution slice (its shape follows the RFC 0002 projection +
-/// RFC 0005 schema, and must stay free of arrow `RecordBatch`
-/// leakage per §4.6); the scaffold carries the [`QueryStats`]
-/// the B1/B2 gates assert on.
+/// Result of a query: the matching-row count (`rows`) and the scan's pruning
+/// [`QueryStats`] the B1/B2 gates assert on, plus — when the query carried a
+/// `limit` — the rendered [`LogRow`] payload (`records`, RFC 0017 §3.3/§3.4).
+/// All fields are Ourios-owned; no arrow `RecordBatch` / `DataFusion` type
+/// crosses this boundary (§4.6 / RFC0017.7).
+///
+/// Marked `#[non_exhaustive]` so further additive fields stay non-breaking
+/// (RFC 0017 §3.4 — the field addition itself is the accepted one-time break).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct QueryResult {
-    /// Number of matching rows. (The typed-row payload — projected
-    /// columns — lands when there's a query thesis worth shaping it
-    /// around; B1/B2 only need the count + stats. Stays free of
-    /// arrow `RecordBatch` leakage per §4.6.)
+    /// Number of matching rows (the count). Unchanged by RFC 0017 — B1/B2 and
+    /// existing tests read this. Free of arrow `RecordBatch` leakage (§4.6).
     pub rows: u64,
     pub stats: QueryStats,
+    /// The returned rows, rendered (RFC 0017 §3.3/§3.4) — at most the query's
+    /// `limit`. Empty when no `limit` was given (count-only). Each [`LogRow`]
+    /// is fully Ourios-owned (no engine type — RFC0017.7).
+    pub records: Vec<LogRow>,
 }
 
 /// Errors from [`Querier::run`]. Ourios-owned — no
@@ -458,8 +472,11 @@ impl Querier {
     pub async fn run(&self, request: QueryRequest) -> Result<QueryResult, QueryError> {
         let tenant = request.tenant.clone();
         let window = request.time_range;
-        self.execute(&tenant, window, |df| apply_request_filters(df, &request))
-            .await
+        let row_limit = request.limit;
+        self.execute(&tenant, window, row_limit, |df| {
+            apply_request_filters(df, &request)
+        })
+        .await
     }
 
     /// Compile a parsed DSL [`Query`](dsl::Query) IR (RFC 0002) to the
@@ -525,7 +542,10 @@ impl Querier {
             }
         };
         let plan = compile::compile(query, tenant, now_unix_nano, default_window_nanos, map)?;
-        self.execute(tenant, Some(plan.window), move |df| {
+        // The DSL `limit` (RFC 0002) doubles as the RFC 0017 row cap; read it
+        // before `plan` moves into the filter closure.
+        let row_limit = plan.limit;
+        self.execute(tenant, Some(plan.window), row_limit, move |df| {
             compile::apply(df, plan)
         })
         .await
@@ -572,6 +592,10 @@ impl Querier {
         &self,
         tenant: &TenantId,
         partition_window: Option<(u64, u64)>,
+        // RFC 0017 §3.4 — when `Some(n)`, collect up to `n` matching rows into
+        // `QueryResult.records` (rendered via the read-time registry); `None`
+        // is count-only. The count + stats are taken the same way regardless.
+        row_limit: Option<usize>,
         build_filter: F,
     ) -> Result<QueryResult, QueryError>
     where
@@ -641,8 +665,16 @@ impl Querier {
                 urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
             }
         }
-        let options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        // Read Parquet string/binary columns as `Utf8` / `Binary`, not the
+        // `Utf8View` / `BinaryView` DataFusion forces by default — the RFC 0017
+        // row decoder (`row_decode`) downcasts to the non-view array types, and
+        // the count/filter path is indifferent to which representation it gets.
+        // Set on the `ParquetFormat` itself (a bare `ParquetFormat::default()`
+        // ignores the session config's parquet options).
+        let mut parquet_options = datafusion::common::config::TableParquetOptions::default();
+        parquet_options.global.schema_force_view_types = false;
+        let parquet_format = ParquetFormat::default().with_options(parquet_options);
+        let options = ListingOptions::new(Arc::new(parquet_format)).with_file_extension(".parquet");
         // `infer_schema` over the multi-path set merges the files'
         // schemas, so additive schema drift across files reads as the
         // union (RFC0007.4 / RFC 0005 §3.9).
@@ -665,8 +697,11 @@ impl Querier {
         // `params` / `body` columns are never materialised
         // (projection pushdown). We build + execute the physical
         // plan ourselves (rather than `df.count()`) so we can read
-        // the scan's pruning metrics off the retained plan.
+        // the scan's pruning metrics off the retained plan. Clone
+        // `df` first so the (RFC 0017) row collection below reads the
+        // same filtered frame.
         let counted = df
+            .clone()
             .aggregate(vec![], vec![count(lit(1_i64)).alias("n")])
             .map_err(storage_err)?;
         let plan = counted.create_physical_plan().await.map_err(storage_err)?;
@@ -675,7 +710,62 @@ impl Querier {
             .map_err(storage_err)?;
         let rows = count_value(&batches)?;
         let stats = scan_stats(plan.as_ref());
-        Ok(QueryResult { rows, stats })
+
+        // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the
+        // matching rows (the same filtered frame, capped at the limit), decode
+        // them to `MinedRecord`s, and render each into a `LogRow` via the
+        // read-time template registry. Heavy columns are only materialised for
+        // these (≤ limit) rows. `None` ⇒ count-only (records stays empty).
+        let records = match row_limit {
+            Some(n) => self.collect_records(df, n, tenant).await?,
+            None => Vec::new(),
+        };
+        Ok(QueryResult {
+            rows,
+            stats,
+            records,
+        })
+    }
+
+    /// Materialise up to `limit` matching rows from the filtered `df`, decode
+    /// them, and render each into a [`LogRow`] (RFC 0017 §3.3). The template
+    /// registry is derived once (from the tenant's audit stream) only when
+    /// there are rows to render.
+    async fn collect_records(
+        &self,
+        df: datafusion::dataframe::DataFrame,
+        limit: usize,
+        tenant: &TenantId,
+    ) -> Result<Vec<LogRow>, QueryError> {
+        let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
+        let batches = limited.collect().await.map_err(storage_err)?;
+        let mined = row_decode::batches_to_mined_records(&batches)?;
+        if mined.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
+        // row-vs-path): the scan is rooted at the tenant's partition and the
+        // file set is canonical-path-checked under it, but a misplaced /
+        // corrupt Parquet file could still carry a row for another tenant.
+        // Returning row *contents*, refuse to render such a row rather than
+        // expose another tenant's data — fail loudly, mirroring the
+        // alias-map / template-registry derivations.
+        for record in &mined {
+            if record.tenant_id != *tenant {
+                return Err(QueryError::Storage {
+                    detail: format!(
+                        "a returned row carries tenant {} under tenant {}'s partition root",
+                        record.tenant_id.as_str(),
+                        tenant.as_str(),
+                    ),
+                });
+            }
+        }
+        let registry = derive_template_registry(&self.bucket_root, tenant)?;
+        Ok(mined
+            .iter()
+            .map(|record| LogRow::from_record(record, &registry))
+            .collect())
     }
 }
 

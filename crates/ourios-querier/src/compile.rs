@@ -80,7 +80,7 @@ pub(crate) struct Plan {
     pub(crate) window: (u64, u64),
     predicate: Predicate,
     alias_classes: BTreeMap<u64, BTreeSet<u64>>,
-    limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
 }
 
 /// Nanoseconds per duration unit (RFC 0002 §7 `duration`: `s`/`m`/`h`/`d`/`w`).
@@ -198,16 +198,23 @@ fn collect_alias_classes(
     }
 }
 
-/// Apply a compiled [`Plan`] to the base `DataFrame`: the time-window filter,
-/// the compiled predicate (using the now-known union schema for the
-/// absent-column guard), and the `limit`. Returns `Ok(None)` when the whole
-/// query is provably empty.
+/// Apply a compiled [`Plan`] to the base `DataFrame`: the time-window filter
+/// and the compiled predicate (using the now-known union schema for the
+/// absent-column guard). The `limit` is deliberately **not** applied here — it
+/// caps the returned `records`, not the count (RFC 0017 §3.4; see the
+/// destructure note below). Returns `Ok(None)` when the whole query is provably
+/// empty.
 pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, QueryError> {
     let Plan {
         window: (start, end),
         predicate,
         alias_classes,
-        limit,
+        // `limit` is **not** applied to this (counted) frame: the count
+        // (`QueryResult.rows`) is the total matching rows, and the limit caps
+        // only the returned `records` — applied downstream in
+        // `Querier::execute` via the `row_limit` it reads from `plan.limit`
+        // (RFC 0017 §3.4). Applying it here would wrongly cap the count too.
+        limit: _,
     } = plan;
     // The window filters the *effective* timestamp (RFC 0002 §6.2 amendment
     // 2026-06-11), with the RFC 0005 §3.9 fallback for pre-amendment files;
@@ -225,9 +232,6 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         }
     }
 
-    if let Some(n) = limit {
-        df = df.limit(0, Some(n)).map_err(crate::storage_err)?;
-    }
     Ok(Some(df))
 }
 

@@ -51,6 +51,7 @@ async fn rfc0007_3_real_engine_error_does_not_leak() {
             time_range: None,
             template_id: Some(1),
             severity_text: None,
+            limit: None,
         })
         .await
         .expect_err("a corrupt parquet must surface as an error");

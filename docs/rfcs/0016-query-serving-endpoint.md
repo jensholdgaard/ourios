@@ -263,9 +263,11 @@ spec-to-test mapping is greppable (`docs/verification.md` §2).
   (tenant header, no auth), or is a token/mTLS story in scope? (Leaning
   trusted-network for v1; auth as a follow-up RFC.)
 - [ ] **gRPC query service** — revisit when a concrete consumer needs it.
-- [ ] **Default time window** — what window applies when a query has no
-  `range(...)` stage (the compiler already has a default-window notion;
-  pin the server-supplied value + make it configurable?).
+- [x] **Default time window** → resolved: a query with no `range(...)`
+  stage looks back over a server-supplied default window, defaulting to
+  **one hour** and configurable via `OURIOS_QUERIER_DEFAULT_WINDOW_SECS`
+  (a non-zero integer of seconds). The server passes it to the compiler
+  as `default_window_nanos`; it is never unbounded (RFC 0002 §4 P5).
 - [ ] **Endpoint surface** — single `POST /v1/query` that dispatches
   Logs/Drift by statement type (proposed), or distinct paths?
 

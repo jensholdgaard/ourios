@@ -321,13 +321,10 @@ async fn rfc0016_oversize_body_is_rejected() {
     );
 }
 
-/// Scenario RFC0016.5 — role gating + graceful shutdown.
-/// See `docs/rfcs/0016-query-serving-endpoint.md` §5.
-#[test]
-#[ignore = "RFC0016.5 — red until the querier role is env-gated + drains on shutdown (green)"]
-fn rfc0016_5_role_gating_and_graceful_shutdown() {
-    todo!("RFC0016.5: unset → no listener; enabled → binds, drains on shutdown")
-}
+// RFC0016.5 (role gating + graceful shutdown) and RFC0016.7 (receiver +
+// querier compose) are process-level: they spawn the `ourios-server` binary
+// and drive SIGTERM, so they live in the unix-gated `rfc0016_5_7_served_querier`
+// integration test (mirroring the receiver's `rfc0003_16_served_binary`).
 
 /// Scenario RFC0016.6 — pruning is observable.
 /// See `docs/rfcs/0016-query-serving-endpoint.md` §5.
@@ -335,12 +332,4 @@ fn rfc0016_5_role_gating_and_graceful_shutdown() {
 #[ignore = "RFC0016.6 — red until pruning stats + OTel query metrics are emitted (green)"]
 fn rfc0016_6_pruning_is_observable() {
     todo!("RFC0016.6: selective query → row_groups_pruned > 0 + latency/pruning-ratio metric")
-}
-
-/// Scenario RFC0016.7 — receiver and querier compose in one binary.
-/// See `docs/rfcs/0016-query-serving-endpoint.md` §5.
-#[test]
-#[ignore = "RFC0016.7 — red until receiver + querier compose in one binary (green)"]
-fn rfc0016_7_receiver_and_querier_compose_in_one_binary() {
-    todo!("RFC0016.7: both roles enabled → both bind over one bucket root; shutdown drains both")
 }

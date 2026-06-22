@@ -1,7 +1,7 @@
 ---
 rfc: 0016
 title: Query-serving endpoint — the HTTP query API over the logs DSL
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-19

@@ -333,3 +333,31 @@ groups:
       the hard ceiling (RFC0014.4).
     instrument: updowncounter
     unit: "By"
+
+  - id: metric.ourios.query.duration
+    type: metric
+    metric_name: ourios.query.duration
+    stability: development
+    brief: >-
+      Duration of a query served by the querier endpoint, by kind
+      (RFC 0016). Follows the OTel `{operation}.duration` convention; a
+      failed query carries the `error.type` attribute.
+    instrument: histogram
+    unit: "s"
+    attributes:
+      - ref: ourios.query.kind
+        requirement_level: required
+
+  - id: metric.ourios.query.row_groups
+    type: metric
+    metric_name: ourios.query.row_groups
+    stability: development
+    brief: >-
+      Candidate row groups a query scanned vs. pruned (pillar #1's
+      footer-skip; the B1 win). The two states partition the candidates,
+      so the pruned fraction is derived as `pruned / (scanned + pruned)`.
+    instrument: counter
+    unit: "{row_group}"
+    attributes:
+      - ref: ourios.query.row_group.state
+        requirement_level: required

@@ -1,7 +1,7 @@
 ---
 rfc: 0016
 title: Query-serving endpoint — the HTTP query API over the logs DSL
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-19
@@ -10,6 +10,19 @@ superseded-by: —
 ---
 
 # RFC 0016 — Query-serving endpoint: the HTTP query API over the logs DSL
+
+> **Status note.** **`green`** (2026-06-22; `red` 2026-06-19). All seven §5
+> scenarios pass. The querier role is wired into `ourios-server` as an
+> env-gated HTTP endpoint (`POST /v1/query`) over the RFC 0007 engine,
+> mirroring the receiver role's `serve`/`Handle` topology: `.1`–`.4` (the
+> request/dispatch/error handler driven in-process) landed in #283; `.5`/`.7`
+> (role gating + graceful shutdown + receiver/querier compose) and the §3.6
+> query metrics (`.6`) followed. Per the OpenTelemetry usage/state convention,
+> the pruning signal is emitted as raw scanned/pruned row-group counts
+> (`ourios.query.row_groups`, `state = scanned | pruned`) plus a
+> `ourios.query.duration` histogram — the B1 pruned fraction is derived in the
+> backend, not pre-computed. gRPC and authn/z beyond tenant-scoping remain
+> deferred (§7).
 
 ## 1. Summary
 

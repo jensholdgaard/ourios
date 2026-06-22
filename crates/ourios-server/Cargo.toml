@@ -27,6 +27,11 @@ ourios-ingester = { path = "../ourios-ingester" }
 ourios-parquet = { path = "../ourios-parquet" }
 # OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8).
 ourios-telemetry = { path = "../ourios-telemetry" }
+# OTel meter API for the querier role's metrics (RFC 0016 §3.6); the SDK
+# lives in ourios-telemetry, library code resolves against the global meter.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# Generated semantic-convention name constants for the query metrics.
+ourios-semconv = { path = "../ourios-semconv" }
 # The receiver role's durable WAL + miner + miner config (one pipeline
 # over a single `Wal`, RFC 0003 §6.5 / RFC 0008 §3.1).
 ourios-wal = { path = "../ourios-wal" }
@@ -67,6 +72,10 @@ tokio = { version = "1", default-features = false, features = ["io-util", "time"
 # Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
 # RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# In-memory metric exporter for the RFC0016.6 query-metrics test: install a
+# global meter provider and read the exported stream (the ingester pattern).
+ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
 [lints]
 workspace = true

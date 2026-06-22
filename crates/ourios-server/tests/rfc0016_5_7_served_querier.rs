@@ -153,7 +153,11 @@ async fn rfc0016_5_role_gating_and_graceful_shutdown() {
         matches!(saw_querier_line, Err(_) | Ok(false)),
         "no querier listener is bound when the role is disabled, saw {saw_querier_line:?}",
     );
-    terminate_and_assert_clean(disabled).await;
+    // Reap the compactor-only process (kill_on_drop). Its graceful-shutdown
+    // path is asserted in the enabled case below, which has a deterministic
+    // readiness signal (the printed address) before the signal — the disabled
+    // case prints nothing, so a blind wait would race the signal-handler setup.
+    drop(disabled);
 
     // Act: now enable the querier role on an ephemeral port.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))

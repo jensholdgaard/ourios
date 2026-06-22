@@ -22,7 +22,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -30,6 +30,8 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::{KeyValue, global};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -41,6 +43,7 @@ use ourios_miner::reconstruct::Reconstruction;
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
 use ourios_querier::{DriftResult, LogBody, LogRow, Querier, QueryResult, QueryStats};
+use ourios_semconv as semconv;
 
 /// The `X-Ourios-Tenant` request header (RFC 0016 §3.3) — kept out of the DSL
 /// body so the grammar stays tenant-agnostic.
@@ -97,11 +100,87 @@ impl QuerierHandle {
     }
 }
 
-/// Shared handler state: the engine + the default window.
+/// `ourios.query.kind` attribute values (RFC 0016 §3.6).
+const QUERY_KIND_LOGS: &str = "logs";
+const QUERY_KIND_DRIFT: &str = "drift";
+/// `ourios.query.row_group.state` attribute values.
+const ROW_GROUP_SCANNED: &str = "scanned";
+const ROW_GROUP_PRUNED: &str = "pruned";
+/// The upstream OpenTelemetry `error.type` attribute key — a failed query is
+/// recorded on the duration metric with this set, not as a bespoke error metric
+/// (the "recording errors on metrics" convention).
+const ERROR_TYPE: &str = "error.type";
+
+/// The querier role's OpenTelemetry instruments (RFC 0016 §3.6): a query-duration
+/// histogram (by kind, and `error.type` on failure) and the scanned-vs-pruned
+/// row-group counter. Built against the global meter, so they resolve to
+/// whatever `MeterProvider` the process installed (RFC 0001 §6.8).
+struct QuerierMetrics {
+    duration: Histogram<f64>,
+    row_groups: Counter<u64>,
+}
+
+impl QuerierMetrics {
+    fn new() -> Self {
+        let meter = global::meter("ourios.query");
+        let duration = meter
+            .f64_histogram(semconv::OURIOS_QUERY_DURATION)
+            .with_unit("s")
+            .build();
+        let row_groups = meter
+            .u64_counter(semconv::OURIOS_QUERY_ROW_GROUPS)
+            .with_unit("{row_group}")
+            .build();
+        // Seed both pruning states so the series are visible before the first
+        // query (the ingester's attribute-free seeding, per required value).
+        row_groups.add(0, &Self::state_attrs(ROW_GROUP_SCANNED));
+        row_groups.add(0, &Self::state_attrs(ROW_GROUP_PRUNED));
+        Self {
+            duration,
+            row_groups,
+        }
+    }
+
+    fn state_attrs(state: &'static str) -> [KeyValue; 1] {
+        [KeyValue::new(semconv::OURIOS_QUERY_ROW_GROUP_STATE, state)]
+    }
+
+    /// Record a successful query: its wall-clock duration (by kind) and the
+    /// scanned/pruned row-group split (the two states partition the candidates,
+    /// so the B1 pruned fraction is derivable in the backend).
+    fn record_ok(&self, kind: &'static str, elapsed: Duration, stats: &QueryStats) {
+        self.duration.record(
+            elapsed.as_secs_f64(),
+            &[KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)],
+        );
+        self.row_groups.add(
+            stats.row_groups_scanned,
+            &Self::state_attrs(ROW_GROUP_SCANNED),
+        );
+        self.row_groups.add(
+            stats.row_groups_pruned,
+            &Self::state_attrs(ROW_GROUP_PRUNED),
+        );
+    }
+
+    /// Record a failed query: its duration, tagged with `error.type`.
+    fn record_err(&self, kind: &'static str, elapsed: Duration, error_type: &'static str) {
+        self.duration.record(
+            elapsed.as_secs_f64(),
+            &[
+                KeyValue::new(semconv::OURIOS_QUERY_KIND, kind),
+                KeyValue::new(ERROR_TYPE, error_type),
+            ],
+        );
+    }
+}
+
+/// Shared handler state: the engine, the default window, and the metrics.
 #[derive(Clone)]
 struct QuerierState {
     querier: Arc<Querier>,
     default_window_nanos: u64,
+    metrics: Arc<QuerierMetrics>,
 }
 
 /// Build the querier role's axum router over `state` (RFC 0016 §3.3). Split out
@@ -110,6 +189,7 @@ pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
     let state = QuerierState {
         querier: Arc::new(Querier::new(bucket_root)),
         default_window_nanos,
+        metrics: Arc::new(QuerierMetrics::new()),
     };
     Router::new()
         .route("/v1/query", post(handle_query))
@@ -178,22 +258,61 @@ async fn handle_query(
     };
 
     let now = now_unix_nano();
+    let started = Instant::now();
     match statement {
         Statement::Logs(mut query) => {
             apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
-            match state
+            let result = state
                 .querier
                 .run_query(&query, &tenant, now, state.default_window_nanos, None)
-                .await
-            {
-                Ok(result) => json_ok(&LogQueryResponse::from(&result)),
-                Err(e) => query_error_response(&e),
+                .await;
+            let elapsed = started.elapsed();
+            match result {
+                Ok(result) => {
+                    state
+                        .metrics
+                        .record_ok(QUERY_KIND_LOGS, elapsed, &result.stats);
+                    json_ok(&LogQueryResponse::from(&result))
+                }
+                Err(e) => {
+                    state
+                        .metrics
+                        .record_err(QUERY_KIND_LOGS, elapsed, query_error_type(&e));
+                    query_error_response(&e)
+                }
             }
         }
-        Statement::Drift(query) => match state.querier.run_drift(&query, &tenant, now).await {
-            Ok(result) => json_ok(&DriftResponse::from(&result)),
-            Err(e) => query_error_response(&e),
-        },
+        Statement::Drift(query) => {
+            let result = state.querier.run_drift(&query, &tenant, now).await;
+            let elapsed = started.elapsed();
+            match result {
+                Ok(result) => {
+                    state
+                        .metrics
+                        .record_ok(QUERY_KIND_DRIFT, elapsed, &result.stats);
+                    json_ok(&DriftResponse::from(&result))
+                }
+                Err(e) => {
+                    state
+                        .metrics
+                        .record_err(QUERY_KIND_DRIFT, elapsed, query_error_type(&e));
+                    query_error_response(&e)
+                }
+            }
+        }
+    }
+}
+
+/// The stable `error.type` token for a [`QueryError`] (RFC 0016 §3.6) — a low
+/// cardinality class, never the engine's detail (H6).
+fn query_error_type(error: &ourios_querier::QueryError) -> &'static str {
+    use ourios_querier::QueryError;
+    match error {
+        QueryError::TenantRequired => "tenant_required",
+        QueryError::InvalidQuery { .. } => "invalid_query",
+        QueryError::Storage { .. } => "storage",
+        // OpenTelemetry's fallback for an unclassified error class.
+        _ => "_OTHER",
     }
 }
 

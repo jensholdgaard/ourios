@@ -3147,12 +3147,15 @@ name = "ourios-server"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "opentelemetry",
  "opentelemetry-proto",
+ "opentelemetry_sdk",
  "ourios-core",
  "ourios-ingester",
  "ourios-miner",
  "ourios-parquet",
  "ourios-querier",
+ "ourios-semconv",
  "ourios-telemetry",
  "ourios-wal",
  "prost",

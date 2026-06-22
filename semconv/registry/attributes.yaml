@@ -92,3 +92,36 @@ groups:
                 hard ceiling (RFC0014.4) — indicates memory backpressure.
         stability: development
         brief: Why the record sink flushed a partition (RFC 0014 §3.2).
+      - id: ourios.query.kind
+        type:
+          members:
+            - id: logs
+              value: "logs"
+              stability: development
+              brief: A logs DSL query (`run_query`).
+            - id: drift
+              value: "drift"
+              stability: development
+              brief: A template-drift query (`run_drift`).
+        stability: development
+        brief: The kind of query served by the querier endpoint (RFC 0016).
+      - id: ourios.query.row_group.state
+        type:
+          members:
+            - id: scanned
+              value: "scanned"
+              stability: development
+              brief: A row group `DataFusion` read to answer the query.
+            - id: pruned
+              value: "pruned"
+              stability: development
+              brief: >-
+                A row group skipped via partition / statistics pruning
+                (pillar #1's footer-skip; the B1 win).
+        stability: development
+        brief: >-
+          Whether a candidate row group was scanned or pruned. The two
+          states partition the query's candidate row groups (their sum is
+          the total), so the B1 pruned fraction is derived in the backend
+          as `pruned / (scanned + pruned)` (RFC 0016; OTel usage/state
+          convention — record raw counts, derive the ratio).

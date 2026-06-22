@@ -18,7 +18,7 @@ ourios-semconv = { path = "../ourios-semconv" }
 # = false build of `sha2` drops the asm backend and keeps the
 # pure-Rust path — sufficient for an 8-byte-prefix hash on a
 # per-param hot path, with no platform-specific build assumptions.
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 # The OTel metrics **API** only (RFC 0001 §6.8 "Export architecture":
 # library crates depend on the lightweight API and resolve instruments
 # through `global::meter`; the heavy SDK + OTLP exporter live in

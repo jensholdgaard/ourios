@@ -114,7 +114,7 @@ jobs:
       # RFC diagrams are Mermaid (docs/rfcs/README.md). The
       # preprocessor is declared in book.toml, so the binary must be
       # on PATH or `mdbook build` fails with "preprocessor not found".
-      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: mdbook-mermaid@0.17.0
       - run: mdbook build
@@ -191,7 +191,7 @@ jobs:
       # schema, advisory handling) can't change under us when a new release
       # lands; bump deliberately (Renovate/manual) alongside any deny.toml
       # changes the new version needs.
-      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-deny@0.19.8
       - run: cargo deny check
@@ -227,7 +227,7 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2
         with:
           tool: cargo-llvm-cov
       # Collect once (runs the test suite under instrumentation), then

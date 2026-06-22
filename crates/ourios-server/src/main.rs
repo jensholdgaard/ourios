@@ -7,13 +7,15 @@
 //!
 //! When `OURIOS_RECEIVER_ENABLED` is set it also runs the **OTLP receiver
 //! role** (RFC 0003 §6.2 / the §9 process-model resolution): gRPC + HTTP
-//! listeners over one shared pipeline (see [`receiver`]). Both roles
-//! share the tokio runtime and shut down gracefully on SIGINT or SIGTERM
-//! (the latter is what k8s / `nerdctl stop` send), then telemetry flushes.
+//! listeners over one shared pipeline (see [`receiver`]). When
+//! `OURIOS_QUERIER_ENABLED` is set it runs the **querier role** (RFC 0016):
+//! the HTTP query API over the logs DSL (`ourios_server::querier`), reading
+//! the same `OURIOS_BUCKET_ROOT` store. Every role shares the tokio runtime
+//! and shuts down gracefully on SIGINT or SIGTERM (the latter is what k8s /
+//! `nerdctl stop` send), then telemetry flushes.
 //!
-//! The querier (RFC 0007) role and a structured-logging framework
-//! (`CLAUDE.md` §6.3 — errors go to stderr as a stopgap here) are
-//! follow-ups.
+//! A structured-logging framework (`CLAUDE.md` §6.3 — errors go to stderr as
+//! a stopgap here) is a follow-up.
 
 #![deny(unsafe_code)]
 
@@ -38,6 +40,14 @@ const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 300;
 const DEFAULT_GRPC_ADDR: &str = "0.0.0.0:4317";
 /// Default OTLP/HTTP bind address (port 4318, the OTLP default).
 const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:4318";
+/// Default querier HTTP bind address (port 4319, adjacent to the OTLP
+/// receiver ports).
+const DEFAULT_QUERIER_HTTP_ADDR: &str = "0.0.0.0:4319";
+/// Default look-back window for a query with no `range(...)` stage — one
+/// hour (RFC 0002 §4 P5; RFC 0016 §7).
+const DEFAULT_QUERIER_WINDOW_SECS: u64 = 3600;
+/// Nanoseconds per second — the unit the DSL compiler's window is in.
+const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 /// Resolved server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +58,15 @@ struct ServerConfig {
     compaction_interval: Duration,
     /// The OTLP receiver role, if enabled (RFC 0003 §9).
     receiver: Option<ReceiverParams>,
+    /// The querier role, if enabled (RFC 0016).
+    querier: Option<QuerierParams>,
+}
+
+/// Resolved querier-role configuration (RFC 0016 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuerierParams {
+    http_addr: SocketAddr,
+    default_window_nanos: u64,
 }
 
 /// Resolved OTLP-receiver-role configuration (RFC 0003 §6.2).
@@ -77,7 +96,54 @@ fn config_from_env() -> Result<ServerConfig, String> {
         std::env::var("OURIOS_RECEIVER_HTTP_ADDR").ok().as_deref(),
         std::env::var_os("OURIOS_WAL_ROOT").map(PathBuf::from),
     )?;
+    config.querier = build_querier_config(
+        std::env::var("OURIOS_QUERIER_ENABLED").ok().as_deref(),
+        std::env::var("OURIOS_QUERIER_HTTP_ADDR").ok().as_deref(),
+        std::env::var("OURIOS_QUERIER_DEFAULT_WINDOW_SECS")
+            .ok()
+            .as_deref(),
+    )?;
     Ok(config)
+}
+
+/// Pure querier-config assembly + validation (env reads live in
+/// [`config_from_env`]). `None` when the querier role is disabled.
+///
+/// - `enabled_raw` — `OURIOS_QUERIER_ENABLED` (`1`/`true`/`yes` enables).
+/// - `http_raw` — `OURIOS_QUERIER_HTTP_ADDR` (default
+///   [`DEFAULT_QUERIER_HTTP_ADDR`]).
+/// - `window_raw` — `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` (default
+///   [`DEFAULT_QUERIER_WINDOW_SECS`]); must be a non-zero integer of seconds.
+fn build_querier_config(
+    enabled_raw: Option<&str>,
+    http_raw: Option<&str>,
+    window_raw: Option<&str>,
+) -> Result<Option<QuerierParams>, String> {
+    if !matches!(enabled_raw, Some("1" | "true" | "yes")) {
+        return Ok(None);
+    }
+    let http_addr = parse_addr(http_raw, DEFAULT_QUERIER_HTTP_ADDR)?;
+    let window_secs = match window_raw {
+        None => DEFAULT_QUERIER_WINDOW_SECS,
+        Some(raw) => {
+            let secs: u64 = raw.parse().map_err(|_| {
+                format!(
+                    "OURIOS_QUERIER_DEFAULT_WINDOW_SECS must be a positive integer, got {raw:?}"
+                )
+            })?;
+            if secs == 0 {
+                return Err("OURIOS_QUERIER_DEFAULT_WINDOW_SECS must be non-zero".to_string());
+            }
+            secs
+        }
+    };
+    let default_window_nanos = window_secs
+        .checked_mul(NANOS_PER_SEC)
+        .ok_or("OURIOS_QUERIER_DEFAULT_WINDOW_SECS overflows when converted to nanoseconds")?;
+    Ok(Some(QuerierParams {
+        http_addr,
+        default_window_nanos,
+    }))
 }
 
 /// Pure receiver-config assembly + validation (env reads live in
@@ -151,6 +217,7 @@ fn build_config(
         bucket_root,
         compaction_interval,
         receiver: None,
+        querier: None,
     })
 }
 
@@ -205,6 +272,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
+    // Start the querier role if enabled (RFC 0016), over the same store the
+    // receiver writes and the compactor sweeps. Report the bound address on
+    // stdout (an operator — or a test binding `:0` — learns the actual port).
+    let querier = match &config.querier {
+        Some(params) => {
+            let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
+                http_addr: params.http_addr,
+                bucket_root: config.bucket_root.clone(),
+                default_window_nanos: params.default_window_nanos,
+            })
+            .await?;
+            println!("querier HTTP listening on {}", handle.http_addr);
+            std::io::stdout().flush().ok();
+            Some(handle)
+        }
+        None => None,
+    };
+
     // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7).
     let sink = Box::new(ParquetAuditSink::new(&config.bucket_root));
     let compactor = Compactor::new(
@@ -230,8 +315,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         () = terminate_signal() => Ok(()),
     };
 
-    // Drain the receiver listeners gracefully (releasing the single `Wal`)
-    // before flushing telemetry and exiting.
+    // Drain the listeners gracefully (the receiver release frees the single
+    // `Wal`) before flushing telemetry and exiting.
+    if let Some(handle) = querier {
+        if let Err(e) = handle.shutdown().await {
+            eprintln!("querier shutdown error: {e}");
+        }
+    }
     if let Some(handle) = receiver {
         if let Err(e) = handle.shutdown().await {
             eprintln!("receiver shutdown error: {e}");
@@ -378,6 +468,68 @@ mod tests {
                 Some(PathBuf::from("/wal"))
             )
             .is_err(),
+            "a malformed bind address is rejected",
+        );
+    }
+
+    #[test]
+    fn build_querier_config_disabled_unless_explicitly_enabled() {
+        // Arrange / Act / Assert — unset or a falsey value disables the role.
+        for raw in [None, Some("0"), Some("false"), Some("nope")] {
+            assert_eq!(
+                build_querier_config(raw, None, None).expect("ok"),
+                None,
+                "querier disabled for enabled_raw = {raw:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_querier_config_enabled_defaults_address_and_window() {
+        // Arrange / Act
+        let params = build_querier_config(Some("1"), None, None)
+            .expect("ok")
+            .expect("enabled");
+
+        // Assert
+        assert_eq!(params.http_addr, DEFAULT_QUERIER_HTTP_ADDR.parse().unwrap());
+        assert_eq!(
+            params.default_window_nanos,
+            DEFAULT_QUERIER_WINDOW_SECS * NANOS_PER_SEC,
+        );
+    }
+
+    #[test]
+    fn build_querier_config_parses_custom_address_and_window() {
+        // Arrange / Act
+        let params = build_querier_config(Some("yes"), Some("127.0.0.1:9"), Some("120"))
+            .expect("ok")
+            .expect("enabled");
+
+        // Assert
+        assert_eq!(params.http_addr, "127.0.0.1:9".parse().unwrap());
+        assert_eq!(params.default_window_nanos, 120 * NANOS_PER_SEC);
+    }
+
+    #[test]
+    fn build_querier_config_rejects_a_zero_or_nonnumeric_window() {
+        // Arrange / Act / Assert — a zero window would make every no-`range`
+        // query empty; a non-numeric value is a config typo.
+        assert!(
+            build_querier_config(Some("1"), None, Some("0")).is_err(),
+            "a zero default window is rejected",
+        );
+        assert!(
+            build_querier_config(Some("1"), None, Some("soon")).is_err(),
+            "a non-numeric default window is rejected",
+        );
+    }
+
+    #[test]
+    fn build_querier_config_rejects_a_malformed_address() {
+        // Arrange / Act / Assert
+        assert!(
+            build_querier_config(Some("1"), Some("not-an-addr"), None).is_err(),
             "a malformed bind address is rejected",
         );
     }

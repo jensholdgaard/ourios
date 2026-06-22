@@ -3152,12 +3152,16 @@ dependencies = [
  "ourios-ingester",
  "ourios-miner",
  "ourios-parquet",
+ "ourios-querier",
  "ourios-telemetry",
  "ourios-wal",
  "prost",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",
+ "tower",
 ]
 
 [[package]]

@@ -375,8 +375,9 @@ impl From<&LogBody> for LogBodyDto {
                 line: String::from_utf8_lossy(line).into_owned(),
                 reconstruction: match reconstruction {
                     Reconstruction::Faithful => "faithful",
-                    // `Reconstruction` is `#[non_exhaustive]`; any non-Faithful
-                    // marker (incl. a future one) is reported as not-faithful.
+                    // `Reconstruction` is `#[non_exhaustive]`; `RetainedVerbatim`
+                    // and any future non-faithful marker serialise as
+                    // `"retained_verbatim"`.
                     _ => "retained_verbatim",
                 },
             },
@@ -533,8 +534,100 @@ fn query_error_response(error: &ourios_querier::QueryError) -> Response {
     }
 }
 
-/// The `{"query": "<dsl text>"}` JSON wrapper (RFC 0016 §3.3).
+/// The `{"query": "<dsl text>"}` JSON wrapper (RFC 0016 §3.3). `deny_unknown_fields`
+/// keeps the wrapper unambiguous against the structured-IR JSON: a structured
+/// statement object (which carries `predicate` / `stages`, not a lone `query`
+/// string) fails to parse as the wrapper and falls through to the structured
+/// parser, rather than being mis-read as the wrapper.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryWrapper {
     query: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::{
+        DEFAULT_LIMIT, MAX_LIMIT, Stage, Statement, apply_limit, parse_body, tenant_from_headers,
+    };
+
+    fn headers(content_type: Option<&str>, tenant: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(ct) = content_type {
+            h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+        }
+        if let Some(t) = tenant {
+            h.insert("x-ourios-tenant", HeaderValue::from_str(t).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn tenant_header_present_absent_empty() {
+        assert_eq!(
+            tenant_from_headers(&headers(None, Some("acme")))
+                .as_ref()
+                .map(ourios_core::tenant::TenantId::as_str),
+            Some("acme"),
+        );
+        assert!(tenant_from_headers(&headers(None, None)).is_none());
+        assert!(tenant_from_headers(&headers(None, Some("   "))).is_none());
+    }
+
+    #[test]
+    fn apply_limit_defaults_clamps_and_keeps_one() {
+        // No limit → DEFAULT injected.
+        let mut stages = vec![];
+        apply_limit(&mut stages, DEFAULT_LIMIT, MAX_LIMIT);
+        assert_eq!(stages, vec![Stage::Limit(DEFAULT_LIMIT)]);
+
+        // Existing within cap → kept; exactly one Limit remains.
+        let mut stages = vec![Stage::Limit(5)];
+        apply_limit(&mut stages, DEFAULT_LIMIT, MAX_LIMIT);
+        assert_eq!(stages, vec![Stage::Limit(5)]);
+
+        // Over cap → clamped.
+        let mut stages = vec![Stage::Limit(MAX_LIMIT + 1)];
+        apply_limit(&mut stages, DEFAULT_LIMIT, MAX_LIMIT);
+        assert_eq!(stages, vec![Stage::Limit(MAX_LIMIT)]);
+    }
+
+    #[test]
+    fn parse_body_text_plain_and_json_modes() {
+        // text/plain → the raw grammar.
+        assert!(matches!(
+            parse_body(&headers(Some("text/plain"), None), b"template_id == 1"),
+            Ok(Statement::Logs(_)),
+        ));
+        // application/json `{"query": …}` wrapper → the text grammar.
+        assert!(matches!(
+            parse_body(
+                &headers(Some("application/json"), None),
+                br#"{"query": "template_id == 1"}"#,
+            ),
+            Ok(Statement::Logs(_)),
+        ));
+        // application/json structured-IR (RFC 0002 §6.4) → the structured
+        // parser. A match-all predicate with no stages is the minimal valid
+        // structured log query.
+        assert!(matches!(
+            parse_body(
+                &headers(Some("application/json"), None),
+                br#"{"predicate":{"const":true},"stages":[]}"#,
+            ),
+            Ok(Statement::Logs(_)),
+        ));
+        // A drift statement still routes through the grammar.
+        assert!(matches!(
+            parse_body(
+                &headers(Some("text/plain"), None),
+                b"drift from 2026-06-01T00:00:00Z to 2026-06-02T00:00:00Z",
+            ),
+            Ok(Statement::Drift(_)),
+        ));
+        // Malformed → Err (mapped to 400 by the caller).
+        assert!(parse_body(&headers(Some("text/plain"), None), b"not a query").is_err());
+    }
 }

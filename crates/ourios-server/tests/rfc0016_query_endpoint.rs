@@ -165,10 +165,13 @@ async fn rfc0016_1_querier_role_serves_a_dsl_query_end_to_end() {
 #[tokio::test]
 async fn rfc0016_2_tenant_scoping_is_enforced_at_the_api() {
     let bucket = tempfile::tempdir().unwrap();
-    // Two tenants, each with one matching row.
-    write_records(bucket.path(), &[mined("acme", 1), mined("other", 1)]);
+    // Two tenants with *distinct* data: acme has template 1, other has
+    // template 2. Querying `template_id == 2` as acme proves isolation — a
+    // cross-tenant read would surface other's row; truncation can't explain a
+    // zero result.
+    write_records(bucket.path(), &[mined("acme", 1), mined("other", 2)]);
 
-    // Scoped to `acme` → only acme's row, never `other`'s.
+    // acme sees its own template-1 row.
     let (status, json) = post(
         bucket.path(),
         Some("acme"),
@@ -177,7 +180,19 @@ async fn rfc0016_2_tenant_scoping_is_enforced_at_the_api() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["rows"], 1, "only the requesting tenant's row is read");
+    assert_eq!(json["rows"], 1, "acme's own row is read");
+    assert_eq!(json["records"][0]["template_id"], 1);
+
+    // acme does NOT see other's template-2 row — never scanned.
+    let (status, json) = post(
+        bucket.path(),
+        Some("acme"),
+        "text/plain",
+        "template_id == 2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["rows"], 0, "another tenant's row is never read");
 
     // No tenant header → 400 from the server's header check.
     let (status, json) = post(bucket.path(), None, "text/plain", "template_id == 1").await;
@@ -187,6 +202,39 @@ async fn rfc0016_2_tenant_scoping_is_enforced_at_the_api() {
         "missing tenant header is 400"
     );
     assert_eq!(json["error"]["kind"], "missing_tenant");
+}
+
+/// Scenario RFC0016.1 (JSON request modes) — the `application/json` forms both
+/// dispatch: the `{"query": …}` text wrapper and the structured-IR JSON
+/// (RFC 0002 §6.4) each parse + execute to the same result as `text/plain`.
+/// See `docs/rfcs/0016-query-serving-endpoint.md` §5.
+#[tokio::test]
+async fn rfc0016_1_json_request_modes_dispatch() {
+    let bucket = tempfile::tempdir().unwrap();
+    write_records(bucket.path(), &[mined("acme", 1)]);
+
+    // `{"query": "<dsl text>"}` wrapper.
+    let (status, json) = post(
+        bucket.path(),
+        Some("acme"),
+        "application/json",
+        r#"{"query": "template_id == 1"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "wrapper JSON served: {json}");
+    assert_eq!(json["rows"], 1);
+
+    // Structured-IR JSON (RFC 0002 §6.4): a match-all predicate, no stages —
+    // matches the one stored row.
+    let (status, json) = post(
+        bucket.path(),
+        Some("acme"),
+        "application/json",
+        r#"{"predicate":{"const":true},"stages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "structured-IR JSON served: {json}");
+    assert_eq!(json["rows"], 1);
 }
 
 /// Scenario RFC0016.3 — a drift query routes to the drift path.

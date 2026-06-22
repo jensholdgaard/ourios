@@ -102,6 +102,7 @@ fn req(tenant: &str, time_range: Option<(u64, u64)>, template_id: Option<u64>) -
         time_range,
         template_id,
         severity_text: None,
+        limit: None,
     }
 }
 
@@ -296,6 +297,7 @@ async fn rfc0007_1_severity_filter_counts_and_prunes() {
             time_range: None,
             template_id: None,
             severity_text: Some("ERROR".to_string()),
+            limit: None,
         })
         .await
         .expect("severity query");

@@ -149,6 +149,7 @@ fn b1_query() -> QueryRequest {
         time_range: Some((TS0, TS0 + 2 * HOUR_NS)),
         template_id: None,
         severity_text: Some("ERROR".to_string()),
+        limit: None,
     }
 }
 
@@ -317,6 +318,7 @@ fn severity_query(built: &ourios_bench::B1Store, dir: &str) -> Option<(String, Q
         time_range: Some((built.min_effective_time_unix_nano, window_end)),
         template_id: None,
         severity_text: Some(severity.clone()),
+        limit: None,
     };
     Some((severity, query))
 }

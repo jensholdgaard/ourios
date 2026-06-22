@@ -86,6 +86,7 @@ fn req(time_range: Option<(u64, u64)>, template_id: Option<u64>) -> QueryRequest
         time_range,
         template_id,
         severity_text: None,
+        limit: None,
     }
 }
 
@@ -226,6 +227,7 @@ async fn rfc0007_4_severity_filter_on_column_absent_everywhere_is_empty() {
             time_range: None,
             template_id: None,
             severity_text: Some("ERROR".to_string()),
+            limit: None,
         })
         .await
         .expect("severity filter on an absent column must not error");

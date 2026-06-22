@@ -113,6 +113,7 @@ fn template_exact(tenant: &str, template_id: u64) -> QueryRequest {
         time_range: None,
         template_id: Some(template_id),
         severity_text: None,
+        limit: None,
     }
 }
 
@@ -296,6 +297,7 @@ fn first_hour_window(
         time_range: Some((hour_start, hour_end)),
         template_id: Some(built.busiest_template_id),
         severity_text: None,
+        limit: None,
     };
     let probe = rt
         .block_on(querier.run(windowed.clone()))

@@ -356,6 +356,7 @@ fn template_exact(tenant: &str, template_id: u64) -> QueryRequest {
         time_range: None,
         template_id: Some(template_id),
         severity_text: None,
+        limit: None,
     }
 }
 

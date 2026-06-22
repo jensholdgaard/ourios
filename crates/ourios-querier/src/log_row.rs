@@ -16,12 +16,96 @@
 //! verbatim; this layer only adds the registry lookup (the versioned tokens
 //! §6.6 left out) and the structured → `AnyValue` decode.
 
-use ourios_core::otlp::AnyValue;
 use ourios_core::otlp::canonical::decode_any_value;
+use ourios_core::otlp::{AnyValue, KeyValue};
 use ourios_core::record::{BodyKind, MinedRecord};
 use ourios_miner::reconstruct::{Reconstruction, render};
 
 use crate::TemplateRegistry;
+
+/// One returned query row — a faithful OTLP `LogRecord` (RFC 0017 §3.4).
+///
+/// Every field is Ourios-owned (no `arrow` / `DataFusion` / SQL type crosses
+/// this boundary — hazard `CLAUDE.md` §4.6 / RFC0017.7); `KeyValue` / `AnyValue`
+/// are the `opentelemetry-proto` types Ourios already re-exports through
+/// `ourios_core::otlp`, not engine types. It mirrors the stored
+/// [`MinedRecord`] field-for-field over the OTLP `LogRecord` set (RFC 0005 §3.2),
+/// so a read drops no field the wire carried and the schema kept (RFC0017.8),
+/// plus the `template_id` / `template_version` the row was mined under.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct LogRow {
+    /// Source event time (`0` = unknown, per OTLP).
+    pub time_unix_nano: u64,
+    /// Collector observation time, when set.
+    pub observed_time_unix_nano: Option<u64>,
+    /// OTLP `SeverityNumber` (preserved verbatim — RFC 0018 §3.5).
+    pub severity_number: u8,
+    /// Source's original severity string.
+    pub severity_text: Option<String>,
+    /// Trace correlation, when set.
+    pub trace_id: Option<[u8; 16]>,
+    /// Span correlation, when set.
+    pub span_id: Option<[u8; 8]>,
+    /// W3C trace flags (lower 8 bits).
+    pub flags: u32,
+    /// Structured-event identifier.
+    pub event_name: Option<String>,
+    /// `InstrumentationScope.name`.
+    pub scope_name: Option<String>,
+    /// `InstrumentationScope.version`.
+    pub scope_version: Option<String>,
+    /// `InstrumentationScope.attributes` (RFC 0018 §3.1), decoded to typed
+    /// key/values — not an opaque JSON blob.
+    pub scope_attributes: Vec<KeyValue>,
+    /// `ResourceLogs.schema_url` (RFC 0018 §3.1), when set.
+    pub resource_schema_url: Option<String>,
+    /// `ScopeLogs.schema_url` (RFC 0018 §3.1), when set.
+    pub scope_schema_url: Option<String>,
+    /// Per-record attributes, decoded to typed key/values.
+    pub attributes: Vec<KeyValue>,
+    /// Resource attributes, decoded to typed key/values.
+    pub resource_attributes: Vec<KeyValue>,
+    /// Truncation indicator carried verbatim from the wire.
+    pub dropped_attributes_count: u32,
+    /// The Ourios template the row was mined under.
+    pub template_id: u64,
+    /// The leaf `template_version` the row was stamped with (selects the
+    /// token set the body was rendered against — RFC 0017 §3.5).
+    pub template_version: u32,
+    /// The rendered / structured body (RFC 0017 §3.3).
+    pub body: LogBody,
+}
+
+impl LogRow {
+    /// Build a `LogRow` from a stored [`MinedRecord`], rendering its body
+    /// against the read-time `registry` (RFC 0017 §3.3/§3.4). Every OTLP field
+    /// the schema stored is carried through unchanged (RFC0017.8).
+    #[must_use]
+    pub fn from_record(record: &MinedRecord, registry: &TemplateRegistry) -> Self {
+        Self {
+            time_unix_nano: record.time_unix_nano,
+            observed_time_unix_nano: record.observed_time_unix_nano,
+            severity_number: record.severity_number,
+            severity_text: record.severity_text.clone(),
+            trace_id: record.trace_id,
+            span_id: record.span_id,
+            flags: record.flags,
+            event_name: record.event_name.clone(),
+            scope_name: record.scope_name.clone(),
+            scope_version: record.scope_version.clone(),
+            scope_attributes: record.scope_attributes.clone(),
+            resource_schema_url: record.resource_schema_url.clone(),
+            scope_schema_url: record.scope_schema_url.clone(),
+            attributes: record.attributes.clone(),
+            resource_attributes: record.resource_attributes.clone(),
+            dropped_attributes_count: record.dropped_attributes_count,
+            template_id: record.template_id,
+            template_version: record.template_version,
+            body: render_log_body(record, registry),
+        }
+    }
+}
 
 /// The body of a returned query row (RFC 0017 §3.4). A sum type so invalid
 /// states are unrepresentable: a string body always carries its

@@ -32,6 +32,17 @@ ourios-telemetry = { path = "../ourios-telemetry" }
 ourios-wal = { path = "../ourios-wal" }
 ourios-miner = { path = "../ourios-miner" }
 ourios-core = { path = "../ourios-core" }
+# The query engine (RFC 0007) the querier role (RFC 0016) serves: the DSL
+# front-ends (`dsl::parse_statement` / `parse_structured_statement`) + the
+# `Querier` (`run_query` / `run_drift`). Its types are kept internal — no
+# DataFusion/SQL crosses the HTTP boundary (H6 / RFC0016.5-error-model).
+ourios-querier = { path = "../ourios-querier" }
+# JSON request/response codec for the querier endpoint (RFC 0016 §3.3/§3.4):
+# parse the `{"query": …}` wrapper and serialise the Ourios-owned response
+# DTOs. The structured-IR JSON body itself is parsed by the querier's own
+# `parse_structured_statement`.
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 # `LogsServiceServer` to host the receiver's `LogsService` impl over gRPC.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs"] }
 # gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16).
@@ -53,6 +64,9 @@ tempfile = "3"
 prost = { version = "0.14", default-features = false, features = ["std"] }
 tonic = { version = "0.14", default-features = false, features = ["channel"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "time", "process"] }
+# Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
+# RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [lints]
 workspace = true

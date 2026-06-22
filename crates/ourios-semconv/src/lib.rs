@@ -89,6 +89,12 @@ pub const OURIOS_MINER_TEMPLATE_COUNT: &str = "ourios.miner.template.count";
 /// `ourios.miner.template.version_changes` (counter, unit `{change}`).
 pub const OURIOS_MINER_TEMPLATE_VERSION_CHANGES: &str = "ourios.miner.template.version_changes";
 
+/// `ourios.query.duration` (histogram, unit `s`).
+pub const OURIOS_QUERY_DURATION: &str = "ourios.query.duration";
+
+/// `ourios.query.row_groups` (counter, unit `{row_group}`).
+pub const OURIOS_QUERY_ROW_GROUPS: &str = "ourios.query.row_groups";
+
 /// `ourios.sink.buffer.usage` (updowncounter, unit `By`).
 pub const OURIOS_SINK_BUFFER_USAGE: &str = "ourios.sink.buffer.usage";
 
@@ -120,6 +126,12 @@ pub const OURIOS_IO_DIRECTION: &str = "ourios.io.direction";
 
 /// `ourios.miner.template_change` attribute key.
 pub const OURIOS_MINER_TEMPLATE_CHANGE: &str = "ourios.miner.template_change";
+
+/// `ourios.query.kind` attribute key.
+pub const OURIOS_QUERY_KIND: &str = "ourios.query.kind";
+
+/// `ourios.query.row_group.state` attribute key.
+pub const OURIOS_QUERY_ROW_GROUP_STATE: &str = "ourios.query.row_group.state";
 
 /// `ourios.service` attribute key.
 pub const OURIOS_SERVICE: &str = "ourios.service";

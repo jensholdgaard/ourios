@@ -325,11 +325,6 @@ async fn rfc0016_oversize_body_is_rejected() {
 // querier compose) are process-level: they spawn the `ourios-server` binary
 // and drive SIGTERM, so they live in the unix-gated `rfc0016_5_7_served_querier`
 // integration test (mirroring the receiver's `rfc0003_16_served_binary`).
-
-/// Scenario RFC0016.6 — pruning is observable.
-/// See `docs/rfcs/0016-query-serving-endpoint.md` §5.
-#[test]
-#[ignore = "RFC0016.6 — red until pruning stats + OTel query metrics are emitted (green)"]
-fn rfc0016_6_pruning_is_observable() {
-    todo!("RFC0016.6: selective query → row_groups_pruned > 0 + latency/pruning-ratio metric")
-}
+//
+// RFC0016.6 (pruning observable + OTel query metrics) installs a process-global
+// in-memory meter, so it lives in its own `rfc0016_6_query_metrics` binary.

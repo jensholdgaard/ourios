@@ -68,8 +68,12 @@ defeating §3.4's batched-fsync latency/durability knob; S3 is the truth for the
 *flushed* Parquet, which is all §3.6 requires. The WAL's durability obligation
 is bounded by the flush horizon (§3.6 — local disk need not be durable *beyond*
 it). Surviving the loss of the volume itself (node/AZ failure) is a separate,
-out-of-scope tier — WAL **replication**, which §3.4 reserves as an addition to
-the WAL, not a replacement, and which a future RFC may add.
+out-of-scope tier — WAL **replication / archiving**, which §3.4 reserves as an
+addition to the WAL, not a replacement, and which a future RFC may add. The
+prior art is the PostgreSQL model (CloudNativePG's Barman Cloud,
+`barman-cloud-wal-archive`): a hot fsync'd WAL on a local persistent volume,
+*plus* asynchronous archiving of completed segments to object storage for
+off-node recovery (§8).
 
 ### 3.2 The `StoreConfig` seam
 
@@ -128,10 +132,15 @@ existing reader/writer remain valid (RFC 0013 §3.2).
 `S3Config` resolves credentials via `AmazonS3Builder::from_env()` — i.e. the
 standard AWS chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (static keys,
 delivered as a k8s Secret), a shared profile, IRSA, or instance metadata. No
-Ourios-specific credential config is introduced. Credentials MUST never appear
-in logs, error messages, or metric attributes; `StoreError` already withholds
-backend internals, and config-resolution errors name only the *keys* that were
-missing, never their values.
+Ourios-specific credential config is introduced. **Credential and secret
+values** MUST never appear in logs, error messages, or metric attributes:
+Ourios never reads `AWS_*` itself (the AWS chain does), `StoreError` withholds
+backend internals, and a missing-S3-config error names only the *key*
+(`OURIOS_S3_BUCKET`), never a credential. Non-secret config values (an
+addressing knob, an interval) MAY be echoed in a resolution error for
+diagnosability — e.g. the existing `OURIOS_COMPACTION_INTERVAL_SECS` parser
+reporting the offending value — since those carry no secret; the prohibition is
+specifically on credential/secret material.
 
 ## 4. Alternatives considered
 
@@ -153,7 +162,7 @@ missing, never their values.
 ## 5. Acceptance criteria
 
 > **Scenario RFC0019.1 — backend selection from config**
-> - **Given** `OURIOS_STORAGE_BACKEND` unset
+> - **Given** `OURIOS_STORAGE_BACKEND` unset and `OURIOS_BUCKET_ROOT` set
 > - **When** the server resolves its config
 > - **Then** it selects the local backend from `OURIOS_BUCKET_ROOT`;
 >   **and** with `OURIOS_STORAGE_BACKEND=s3` + `OURIOS_S3_BUCKET` it
@@ -191,11 +200,13 @@ missing, never their values.
 > - **Given** S3 credentials supplied via the AWS chain
 > - **When** the server starts, logs, errors, or exports metrics
 > - **Then** no credential value appears in any log line, error message,
->   or metric attribute; a missing-config error names only the missing
->   key, never a value (`CLAUDE.md` §6.3, RFC 0004).
+>   or metric attribute; a missing-S3-config error names only the missing
+>   key, never a credential (non-secret knobs may be echoed for
+>   diagnosability) (`CLAUDE.md` §6.3, RFC 0004).
 
 > **Scenario RFC0019.7 — local backend regression**
-> - **Given** no storage-backend env set (the default)
+> - **Given** no `OURIOS_STORAGE_BACKEND` set and `OURIOS_BUCKET_ROOT` set
+>   (the default local path)
 > - **When** the full existing suite runs
 > - **Then** behaviour is byte-for-byte unchanged from the local path
 >   today: receiver, querier, and compactor produce identical results,
@@ -239,5 +250,12 @@ missing, never their values.
   self-telemetry — no secret leakage).
 - `crates/ourios-parquet/src/store.rs` (`Store`, `S3Config`, `StoreError`),
   `crates/ourios-parquet/tests/rfc0013_object_store.rs` (the localstack
-  harness), `crates/ourios-server/src/{main,receiver,querier}.rs`,
+  harness), `crates/ourios-server/src/main.rs`,
+  `crates/ourios-server/src/receiver.rs`,
+  `crates/ourios-server/src/querier.rs`,
   `crates/ourios-ingester/src/compactor.rs`.
+- Prior art for the deferred WAL-replication/archive tier (§3.1): PostgreSQL
+  WAL archiving (`archive_command` / `archive_library`) and CloudNativePG's
+  Barman Cloud (`barman-cloud-wal-archive`) — the same layering, a hot
+  fsync'd WAL on a local persistent volume plus asynchronous shipping of
+  completed segments to object storage for off-node recovery / PITR.

@@ -33,6 +33,10 @@ object_store = { version = "0.13", features = ["aws"] }
 # the RFC 0013 buffer-and-put read path (`Reader::open_bytes`). Already in the
 # arrow/parquet tree; declared directly.
 bytes = { version = "1", default-features = false }
+# `TryStreamExt::try_collect` to drain the `object_store` `list` stream in
+# `Store::list_blocking` (RFC 0019 — the querier/compactor enumerate partitions
+# + files through the seam). Already in the tree via object_store/tokio.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 # Drives the async `object_store` calls from the sync storage API
 # (`Store::*_blocking` bridge — `Writer`/`Reader`/compaction/manifest are sync,
 # `object_store` is async). `rt-multi-thread` because the bridge shares one

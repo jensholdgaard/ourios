@@ -3105,6 +3105,7 @@ dependencies = [
  "arrow-schema 55.2.0",
  "bytes",
  "chrono",
+ "futures",
  "object_store",
  "ourios-core",
  "parquet 55.2.0",

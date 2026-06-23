@@ -401,3 +401,45 @@ fn rfc0013_8_reader_forward_compat_over_store() {
     // integration test would re-create that machinery for no added coverage.
     todo!("RFC0013.8: dedicated variant-schema integration test (deferred)")
 }
+
+/// `Store::list_blocking` enumerates keys under a prefix on the real `AmazonS3`
+/// backend (the seam the querier/compactor walk instead of `std::fs`, RFC 0019
+/// §3.3) — recursive, prefix-scoped, store-relative keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn store_list_enumerates_keys_on_s3() {
+    let (_node, s3) = localstack_s3("ourios-it-list").await;
+    for key in [
+        "data/tenant_id=a/year=2026/h0.parquet",
+        "data/tenant_id=a/year=2026/h1.parquet",
+        "data/tenant_id=b/year=2026/h0.parquet",
+    ] {
+        s3.put(key, b"x".to_vec()).await.expect("s3 put");
+    }
+
+    // `list_blocking` is sync; run it off the async test thread (it drives its
+    // own off-runtime bridge, but `spawn_blocking` keeps the test runtime free).
+    let scoped = {
+        let s3 = s3.clone();
+        tokio::task::spawn_blocking(move || s3.list_blocking(Some("data/tenant_id=a")))
+            .await
+            .expect("join")
+            .expect("list a")
+    };
+    let mut scoped = scoped;
+    scoped.sort();
+    assert_eq!(
+        scoped,
+        vec![
+            "data/tenant_id=a/year=2026/h0.parquet".to_string(),
+            "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+        ],
+        "S3 listing is prefix-scoped, recursive, and store-relative",
+    );
+
+    let all = tokio::task::spawn_blocking(move || s3.list_blocking(None))
+        .await
+        .expect("join")
+        .expect("list all");
+    assert_eq!(all.len(), 3, "no prefix lists the whole bucket");
+}

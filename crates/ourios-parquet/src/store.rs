@@ -441,19 +441,23 @@ impl Store {
         let root = &self.prefix;
         let mut keys: Vec<String> = metas
             .into_iter()
-            // Strip the store prefix so callers get the same key space as
-            // `get`/`put`. `prefix_match` yields the remaining parts when
-            // `location` is under `root`, and `None` otherwise — drop the
-            // latter rather than leaking an absolute key (S3 prefix matching
-            // can surface a string-prefix sibling, e.g. `ourios2/…` under
-            // `ourios`).
             .filter_map(|m| {
-                m.location.prefix_match(root).map(|parts| {
+                // The backend's `list` does **string**-prefix matching, so S3
+                // can return a sibling (`tenant_id=ab/…` when asked for
+                // `tenant_id=a`). `prefix_match` is **segment-wise**, so it
+                // excludes that sibling — gate on it against the *requested*
+                // prefix (`scoped`) to keep listing tenant-isolation-safe
+                // (RFC0019.5), then strip the store `root` to the caller's key
+                // space (the same keys `get`/`put` take).
+                // Bind to `_` to consume the returned iterator (`#[must_use]`).
+                let _ = m.location.prefix_match(&scoped)?;
+                let parts = m.location.prefix_match(root)?;
+                Some(
                     parts
                         .map(|p| p.as_ref().to_owned())
                         .collect::<Vec<_>>()
-                        .join("/")
-                })
+                        .join("/"),
+                )
             })
             .collect();
         keys.sort();
@@ -669,13 +673,18 @@ mod tests {
         for key in [
             "data/tenant_id=a/year=2026/h0.parquet",
             "data/tenant_id=a/year=2026/h1.parquet",
+            // A string-prefix *sibling* of `tenant_id=a` — S3's string-prefix
+            // `list` would surface this when asked for `tenant_id=a`; the
+            // segment-wise filter must exclude it (tenant isolation, RFC0019.5).
+            "data/tenant_id=ab/year=2026/h0.parquet",
             "data/tenant_id=b/year=2026/h0.parquet",
         ] {
             store.put_blocking(key, b"x".to_vec()).expect("put");
         }
         // Scoped to one tenant's prefix → only that tenant's objects, in the
         // guaranteed lexicographic order (asserted directly — no test-side sort,
-        // so an ordering regression would fail here).
+        // so an ordering regression would fail here). The `tenant_id=ab` sibling
+        // is excluded.
         assert_eq!(
             store
                 .list_blocking(Some("data/tenant_id=a"))
@@ -685,12 +694,14 @@ mod tests {
                 "data/tenant_id=a/year=2026/h1.parquet".to_string(),
             ],
         );
-        // No prefix → the whole store, all three objects, lexicographically.
+        // No prefix → the whole store, all four objects, lexicographically
+        // (note `tenant_id=a/` sorts before `tenant_id=ab/` — `/` < `b`).
         assert_eq!(
             store.list_blocking(None).expect("list all"),
             vec![
                 "data/tenant_id=a/year=2026/h0.parquet".to_string(),
                 "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+                "data/tenant_id=ab/year=2026/h0.parquet".to_string(),
                 "data/tenant_id=b/year=2026/h0.parquet".to_string(),
             ],
         );

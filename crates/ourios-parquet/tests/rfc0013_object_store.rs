@@ -412,6 +412,10 @@ async fn store_list_enumerates_keys_on_s3() {
     for key in [
         "data/tenant_id=a/year=2026/h0.parquet",
         "data/tenant_id=a/year=2026/h1.parquet",
+        // A string-prefix sibling of `tenant_id=a`: S3's string-prefix `list`
+        // surfaces this when asked for `tenant_id=a`, so the scoped assertion
+        // below proves the segment-wise filter excludes it (RFC0019.5).
+        "data/tenant_id=ab/year=2026/h0.parquet",
         "data/tenant_id=b/year=2026/h0.parquet",
     ] {
         s3.put(key, b"x".to_vec()).await.expect("s3 put");

@@ -420,14 +420,16 @@ impl Store {
     }
 
     /// List every object key under `prefix` (store-relative), recursively, in
-    /// the backend's lexicographic order. The querier and compactor enumerate
-    /// partitions + files through this rather than reaching past the seam to
+    /// **lexicographic order**. The querier and compactor enumerate their
+    /// partitions and files through this rather than reaching past the seam to
     /// `std::fs` (RFC 0019 §3.3) — so the same walk targets `LocalFileSystem`
     /// or S3. `prefix` is `None` to list the whole store.
     ///
     /// Keys are returned relative to the store's own prefix (the same form the
     /// `get`/`put` methods take); today that prefix is empty (RFC 0013 §3.7),
-    /// so a key is the full object path.
+    /// so a key is the full object path. The order is enforced here by sorting,
+    /// not inherited from the backend (neither `LocalFileSystem` nor S3
+    /// guarantees stream order), so the contract is deterministic.
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
         let scoped = prefix.map_or_else(|| self.prefix.clone(), |p| self.resolve(p));
         let metas: Vec<ObjectMeta> = self
@@ -437,24 +439,24 @@ impl Store {
             .await
             .map_err(StoreError::Backend)?;
         let root = &self.prefix;
-        let keys = metas
+        let mut keys: Vec<String> = metas
             .into_iter()
-            .map(|m| {
-                // Strip the store prefix so callers get the same key space as
-                // `get`/`put`. `prefix_match` yields the remaining parts when
-                // `location` is under `root`; otherwise fall back to the full
-                // location (can't happen for keys the backend listed under it).
-                root.prefix_match(&m.location).map_or_else(
-                    || m.location.to_string(),
-                    |parts| {
-                        parts
-                            .map(|p| p.as_ref().to_owned())
-                            .collect::<Vec<_>>()
-                            .join("/")
-                    },
-                )
+            // Strip the store prefix so callers get the same key space as
+            // `get`/`put`. `prefix_match` yields the remaining parts when
+            // `location` is under `root`, and `None` otherwise — drop the
+            // latter rather than leaking an absolute key (S3 prefix matching
+            // can surface a string-prefix sibling, e.g. `ourios2/…` under
+            // `ourios`).
+            .filter_map(|m| {
+                m.location.prefix_match(root).map(|parts| {
+                    parts
+                        .map(|p| p.as_ref().to_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
             })
             .collect();
+        keys.sort();
         Ok(keys)
     }
 
@@ -671,20 +673,27 @@ mod tests {
         ] {
             store.put_blocking(key, b"x".to_vec()).expect("put");
         }
-        // Scoped to one tenant's prefix → only that tenant's objects.
-        let mut a = store
-            .list_blocking(Some("data/tenant_id=a"))
-            .expect("list a");
-        a.sort();
+        // Scoped to one tenant's prefix → only that tenant's objects, in the
+        // guaranteed lexicographic order (asserted directly — no test-side sort,
+        // so an ordering regression would fail here).
         assert_eq!(
-            a,
+            store
+                .list_blocking(Some("data/tenant_id=a"))
+                .expect("list a"),
             vec![
                 "data/tenant_id=a/year=2026/h0.parquet".to_string(),
                 "data/tenant_id=a/year=2026/h1.parquet".to_string(),
             ],
         );
-        // No prefix → the whole store (all three objects).
-        assert_eq!(store.list_blocking(None).expect("list all").len(), 3);
+        // No prefix → the whole store, all three objects, lexicographically.
+        assert_eq!(
+            store.list_blocking(None).expect("list all"),
+            vec![
+                "data/tenant_id=a/year=2026/h0.parquet".to_string(),
+                "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+                "data/tenant_id=b/year=2026/h0.parquet".to_string(),
+            ],
+        );
         // A prefix matching nothing → empty.
         assert!(
             store

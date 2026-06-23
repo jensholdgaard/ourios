@@ -426,20 +426,28 @@ async fn store_list_enumerates_keys_on_s3() {
             .expect("join")
             .expect("list a")
     };
-    let mut scoped = scoped;
-    scoped.sort();
+    // Asserted directly (no test-side sort) — `list_blocking` guarantees
+    // lexicographic order, so a regression on the real S3 backend fails here.
     assert_eq!(
         scoped,
         vec![
             "data/tenant_id=a/year=2026/h0.parquet".to_string(),
             "data/tenant_id=a/year=2026/h1.parquet".to_string(),
         ],
-        "S3 listing is prefix-scoped, recursive, and store-relative",
+        "S3 listing is prefix-scoped, recursive, store-relative, and ordered",
     );
 
     let all = tokio::task::spawn_blocking(move || s3.list_blocking(None))
         .await
         .expect("join")
         .expect("list all");
-    assert_eq!(all.len(), 3, "no prefix lists the whole bucket");
+    assert_eq!(
+        all,
+        vec![
+            "data/tenant_id=a/year=2026/h0.parquet".to_string(),
+            "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+            "data/tenant_id=b/year=2026/h0.parquet".to_string(),
+        ],
+        "no prefix lists the whole bucket, ordered",
+    );
 }

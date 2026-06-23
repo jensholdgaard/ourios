@@ -32,7 +32,8 @@ cache and WAL. Parquet on S3 is the truth."* RFC 0013 built the storage seam
 deferred the **selection** at the server config layer. The consequence today is
 concrete: a deployment cannot put data on S3, so the first Helm chart had to
 back the data store with a local `ReadWriteOnce` volume and a single replica —
-a stopgap that contradicts §3.6 and blocks horizontal querier scaling. Doing
+a stopgap that contradicts `CLAUDE.md` §3.6 and blocks horizontal querier
+scaling. Doing
 selection at this layer, now, unblocks the architecturally-correct shipping
 shape and exercises the RFC 0013 S3 path end-to-end through the real server.
 
@@ -44,9 +45,13 @@ the receiver write path (RFC 0014) already goes through `Store`.
 
 ### 3.1 Configuration (extends RFC 0004)
 
-A new tunable class — the storage backend and its addressing — is added to the
-RFC 0004 surface. Credentials are **not** Ourios tunables: they are operator
-secrets resolved by the standard AWS credential chain (see §3.4).
+A new **startup configuration surface** — the storage backend and its
+addressing — is added under RFC 0004's governance (its validation +
+secret-hygiene rules). It is *not* an RFC 0004 **tunable** in the strict sense:
+a tunable is global-with-per-tenant-override, whereas backend selection is
+necessarily **process-wide** (one store per process). Credentials are not
+Ourios configuration at all: they are operator secrets resolved by the standard
+AWS credential chain (see §3.4 below).
 
 | Env var | Backend | Meaning | Default |
 | --- | --- | --- | --- |
@@ -58,18 +63,19 @@ secrets resolved by the standard AWS credential chain (see §3.4).
 | `OURIOS_S3_PREFIX` | s3 | key prefix within the bucket | unset (bucket root) |
 
 `OURIOS_WAL_ROOT` is unchanged and remains a **local** path under every
-backend (§3.6 — the WAL is never an object-store key). "Local" here means
-**fsync-durable local-filesystem semantics, not ephemeral storage**: the WAL is
-the recovery mechanism (WAL-before-ack, §3.4), so the path MUST be backed by
-storage that survives a process/pod crash — i.e. a persistent volume, never a
-scratch/`emptyDir`-style mount. S3 is deliberately *not* used for the WAL: it
-offers no atomic append or fsync and would put S3 PUT latency on the ack path,
-defeating §3.4's batched-fsync latency/durability knob; S3 is the truth for the
-*flushed* Parquet, which is all §3.6 requires. The WAL's durability obligation
-is bounded by the flush horizon (§3.6 — local disk need not be durable *beyond*
-it). Surviving the loss of the volume itself (node/AZ failure) is a separate,
-out-of-scope tier — WAL **replication / archiving**, which §3.4 reserves as an
-addition to the WAL, not a replacement, and which a future RFC may add. The
+backend (`CLAUDE.md` §3.6 — the WAL is never an object-store key). "Local" here
+means **fsync-durable local-filesystem semantics, not ephemeral storage**: the
+WAL is the recovery mechanism (WAL-before-ack, `CLAUDE.md` §3.4), so the path
+MUST be backed by storage that survives a process/pod crash — i.e. a persistent
+volume, never a scratch/`emptyDir`-style mount. S3 is deliberately *not* used
+for the WAL: it offers no atomic append or fsync and would put S3 PUT latency on
+the ack path, defeating `CLAUDE.md` §3.4's batched-fsync latency/durability
+knob; S3 is the truth for the *flushed* Parquet, which is all `CLAUDE.md` §3.6
+requires. The WAL's durability obligation is bounded by the flush horizon
+(`CLAUDE.md` §3.6 — local disk need not be durable *beyond* it). Surviving the
+loss of the volume itself (node/AZ failure) is a separate, out-of-scope tier —
+WAL **replication / archiving**, which `CLAUDE.md` §3.4 reserves as an addition
+to the WAL, not a replacement, and which a future RFC may add. The
 prior art is the PostgreSQL model (CloudNativePG's Barman Cloud,
 `barman-cloud-wal-archive`): a hot fsync'd WAL on a local persistent volume,
 *plus* asynchronous archiving of completed segments to object storage for
@@ -98,7 +104,7 @@ querier each take a `StoreConfig` (or a constructed `Store`) instead of a
 flowchart LR
   env[OURIOS_STORAGE_BACKEND + addressing] --> cfg{StoreConfig}
   cfg -->|Local| sl[Store::local]
-  cfg -->|S3| ss[Store::s3 / AmazonS3Builder::from_env]
+  cfg -->|S3| ss["Store::s3 / AmazonS3Builder::from_env()"]
   sl --> store[(Store)]
   ss --> store
   store --> rcv[receiver write path]
@@ -156,8 +162,8 @@ specifically on credential/secret material.
   code run unchanged, but defeats the conditional-PUT atomicity RFC 0009/0013
   rely on for the manifest swap, and adds an opaque failure surface. Rejected.
 - **Defer (keep local-only).** Leaves the shipping chart on a single-replica
-  RWO stopgap that contradicts §3.6 and blocks querier scaling. Rejected — this
-  RFC is the unblock.
+  RWO stopgap that contradicts `CLAUDE.md` §3.6 and blocks querier scaling.
+  Rejected — this RFC is the unblock.
 
 ## 5. Acceptance criteria
 
@@ -169,7 +175,7 @@ specifically on credential/secret material.
 >   selects S3; **and** `s3` without `OURIOS_S3_BUCKET`, or an unknown
 >   backend value, is a clear fail-fast startup error.
 
-> **Scenario RFC0019.2 — the WAL stays local under every backend (§3.6)**
+> **Scenario RFC0019.2 — the WAL stays local under every backend (`CLAUDE.md` §3.6)**
 > - **Given** `OURIOS_STORAGE_BACKEND=s3`
 > - **When** the receiver role runs
 > - **Then** the WAL is written under the local `OURIOS_WAL_ROOT` and
@@ -190,13 +196,13 @@ specifically on credential/secret material.
 >   swapped with a conditional PUT (`publish_cas`); a losing concurrent
 >   sweep does not clobber the winning generation (RFC0013.3/.4).
 
-> **Scenario RFC0019.5 — tenant isolation on S3 (§3.7)**
+> **Scenario RFC0019.5 — tenant isolation on S3 (`CLAUDE.md` §3.7)**
 > - **Given** two tenants' data on the S3 backend
 > - **When** one tenant queries
 > - **Then** only that tenant's prefix is read; another tenant's objects
 >   are never returned.
 
-> **Scenario RFC0019.6 — config is an RFC 0004 tunable; no secret leakage**
+> **Scenario RFC0019.6 — config is governed by RFC 0004; no secret leakage**
 > - **Given** S3 credentials supplied via the AWS chain
 > - **When** the server starts, logs, errors, or exports metrics
 > - **Then** no credential value appears in any log line, error message,

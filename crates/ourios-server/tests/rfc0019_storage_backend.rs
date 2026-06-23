@@ -8,8 +8,8 @@
 //! local-backend regression (`.7`).
 //!
 //! The S3 scenarios (`.3`/`.4`/`.5`) run against a localstack container in CI
-//! (the `rfc0013_object_store.rs` harness pattern) and stay `#[ignore]`d in the
-//! default `cargo test` run even once green.
+//! (the `crates/ourios-parquet/tests/rfc0013_object_store.rs` harness pattern)
+//! and stay `#[ignore]`d in the default `cargo test` run even once green.
 //!
 //! See `docs/rfcs/0019-storage-backend-selection.md` §5 / §6.
 

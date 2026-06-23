@@ -124,7 +124,7 @@ pub struct Store {
 ///
 /// `Default` yields an **empty `bucket`**, which is not valid; [`Store::s3`]
 /// rejects it with [`StoreError::Config`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct S3Config {
     /// Bucket name (required; an empty value is rejected by [`Store::s3`]).
@@ -173,6 +173,32 @@ impl S3Config {
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
         self
+    }
+}
+
+/// Which backend the process addresses, plus its addressing (RFC 0019). The
+/// operator resolves this from config; [`StoreConfig::open`] constructs the
+/// [`Store`]. Exhaustive on purpose: adding a backend should force every
+/// consumer (server, querier, compactor) to handle it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreConfig {
+    /// Local-filesystem backend rooted at the path (dev / test / CI).
+    Local(std::path::PathBuf),
+    /// S3 / S3-compatible backend — the data + audit store on object storage
+    /// (`CLAUDE.md` §3.6, the production source of truth).
+    S3(S3Config),
+}
+
+impl StoreConfig {
+    /// Construct the [`Store`] for this backend.
+    ///
+    /// # Errors
+    /// Propagates [`Store::local`] / [`Store::s3`] construction failures.
+    pub fn open(&self) -> Result<Store, StoreError> {
+        match self {
+            Self::Local(root) => Store::local(root),
+            Self::S3(cfg) => Store::s3(cfg.clone()),
+        }
     }
 }
 

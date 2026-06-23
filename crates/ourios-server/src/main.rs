@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ourios_ingester::Compactor;
-use ourios_parquet::{CompactionPolicy, ParquetAuditSink};
+use ourios_parquet::{CompactionPolicy, ParquetAuditSink, S3Config, StoreConfig};
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
 
@@ -52,8 +52,8 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 /// Resolved server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerConfig {
-    /// Root of the data + audit store (the compactor sweeps under it).
-    bucket_root: PathBuf,
+    /// The data + audit store backend (local or S3, RFC 0019).
+    store: StoreConfig,
     /// How often the compaction daemon sweeps.
     compaction_interval: Duration,
     /// The OTLP receiver role, if enabled (RFC 0003 §9).
@@ -78,18 +78,30 @@ struct ReceiverParams {
 }
 
 /// Resolve [`ServerConfig`] from the environment:
-/// - `OURIOS_BUCKET_ROOT` (required) — the store root.
+/// - `OURIOS_STORAGE_BACKEND` (optional, `local` (default) or `s3`) — the data
+///   + audit store backend (RFC 0019).
+/// - `OURIOS_BUCKET_ROOT` (required for the `local` backend) — the store root.
+/// - `OURIOS_S3_BUCKET` (required for `s3`) + `OURIOS_S3_ENDPOINT` /
+///   `OURIOS_S3_REGION` / `OURIOS_S3_PREFIX` (optional) — S3 addressing.
+///   Credentials come from the AWS chain, never this config (RFC 0019 §3.4).
 /// - `OURIOS_COMPACTION_INTERVAL_SECS` (optional, default
 ///   [`DEFAULT_COMPACTION_INTERVAL_SECS`]).
 /// - `OURIOS_RECEIVER_ENABLED` (optional) — enable the receiver role.
 /// - `OURIOS_RECEIVER_GRPC_ADDR` / `OURIOS_RECEIVER_HTTP_ADDR` (optional,
 ///   default [`DEFAULT_GRPC_ADDR`] / [`DEFAULT_HTTP_ADDR`]).
 /// - `OURIOS_WAL_ROOT` (required when the receiver is enabled) — the
-///   write-ahead-log root.
+///   write-ahead-log root (always local, RFC 0019 §3.1).
 fn config_from_env() -> Result<ServerConfig, String> {
-    let bucket_root = std::env::var_os("OURIOS_BUCKET_ROOT").map(PathBuf::from);
+    let store = build_store_config(
+        std::env::var("OURIOS_STORAGE_BACKEND").ok().as_deref(),
+        std::env::var_os("OURIOS_BUCKET_ROOT").map(PathBuf::from),
+        std::env::var("OURIOS_S3_BUCKET").ok().as_deref(),
+        std::env::var("OURIOS_S3_ENDPOINT").ok().as_deref(),
+        std::env::var("OURIOS_S3_REGION").ok().as_deref(),
+        std::env::var("OURIOS_S3_PREFIX").ok().as_deref(),
+    )?;
     let interval_raw = std::env::var("OURIOS_COMPACTION_INTERVAL_SECS").ok();
-    let mut config = build_config(bucket_root, interval_raw.as_deref())?;
+    let mut config = build_config(store, interval_raw.as_deref())?;
     config.receiver = build_receiver_config(
         std::env::var("OURIOS_RECEIVER_ENABLED").ok().as_deref(),
         std::env::var("OURIOS_RECEIVER_GRPC_ADDR").ok().as_deref(),
@@ -104,6 +116,53 @@ fn config_from_env() -> Result<ServerConfig, String> {
             .as_deref(),
     )?;
     Ok(config)
+}
+
+/// Pure storage-backend resolution (env reads live in [`config_from_env`];
+/// this is the testable core, RFC 0019 §3.1/§3.2).
+///
+/// `backend_raw` is `OURIOS_STORAGE_BACKEND` (`local` (default) or `s3`). The
+/// `local` backend requires a non-empty `bucket_root`; `s3` requires a
+/// non-empty `s3_bucket` and accepts optional endpoint/region/prefix.
+/// Credentials are never read here — they come from the AWS chain inside
+/// [`StoreConfig::open`] (RFC 0019 §3.4), so a resolution error names only the
+/// missing **key**, never a secret.
+fn build_store_config(
+    backend_raw: Option<&str>,
+    bucket_root: Option<PathBuf>,
+    s3_bucket: Option<&str>,
+    s3_endpoint: Option<&str>,
+    s3_region: Option<&str>,
+    s3_prefix: Option<&str>,
+) -> Result<StoreConfig, String> {
+    match backend_raw {
+        None | Some("local") => {
+            let root = bucket_root
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or("OURIOS_BUCKET_ROOT must be set (the local data + audit store root)")?;
+            Ok(StoreConfig::Local(root))
+        }
+        Some("s3") => {
+            let bucket = s3_bucket
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .ok_or("OURIOS_S3_BUCKET must be set when OURIOS_STORAGE_BACKEND=s3")?;
+            let mut cfg = S3Config::new(bucket);
+            if let Some(endpoint) = s3_endpoint.map(str::trim).filter(|v| !v.is_empty()) {
+                cfg = cfg.with_endpoint(endpoint);
+            }
+            if let Some(region) = s3_region.map(str::trim).filter(|v| !v.is_empty()) {
+                cfg = cfg.with_region(region);
+            }
+            if let Some(prefix) = s3_prefix.map(str::trim).filter(|v| !v.is_empty()) {
+                cfg = cfg.with_prefix(prefix);
+            }
+            Ok(StoreConfig::S3(cfg))
+        }
+        Some(other) => Err(format!(
+            "OURIOS_STORAGE_BACKEND must be 'local' or 's3', got {other:?}"
+        )),
+    }
 }
 
 /// Pure querier-config assembly + validation (env reads live in
@@ -192,15 +251,7 @@ fn wal_config(root: &Path) -> WalConfig {
 
 /// Pure config assembly + validation (env reads live in
 /// [`config_from_env`]; this is the testable core).
-fn build_config(
-    bucket_root: Option<PathBuf>,
-    interval_raw: Option<&str>,
-) -> Result<ServerConfig, String> {
-    let bucket_root =
-        bucket_root.ok_or("OURIOS_BUCKET_ROOT must be set (the data + audit store root)")?;
-    if bucket_root.as_os_str().is_empty() {
-        return Err("OURIOS_BUCKET_ROOT must not be empty".to_string());
-    }
+fn build_config(store: StoreConfig, interval_raw: Option<&str>) -> Result<ServerConfig, String> {
     let compaction_interval = match interval_raw {
         None => Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
         Some(raw) => {
@@ -214,7 +265,7 @@ fn build_config(
         }
     };
     Ok(ServerConfig {
-        bucket_root,
+        store,
         compaction_interval,
         receiver: None,
         querier: None,
@@ -244,6 +295,20 @@ async fn terminate_signal() {
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = config_from_env()?;
 
+    // The receiver/compactor/querier still address the store as a local path;
+    // migrating them onto the `Store` abstraction (so the S3 backend works) is
+    // a later RFC 0019 slice. Until then the S3 backend resolves from config but
+    // cannot run — fail fast with a clear message rather than silently ignoring
+    // it (RFC 0019 §3.3, RFC0019.3/.4).
+    let StoreConfig::Local(bucket_root) = &config.store else {
+        return Err(
+            "OURIOS_STORAGE_BACKEND=s3 is selected, but the role wiring onto \
+             object storage lands in a later RFC 0019 slice (RFC0019.3/.4); only the \
+             local backend runs today"
+                .into(),
+        );
+    };
+
     // Boot OpenTelemetry first so the compactor's instruments export
     // (RFC 0001 §6.8). The guard flushes pending metrics on shutdown;
     // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
@@ -259,9 +324,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 http_addr: params.http_addr,
                 wal: wal_config(&params.wal_root),
                 // The data store the receiver's RFC 0014 write path lands
-                // Parquet in — the same root the compactor sweeps (cloned
-                // because `bucket_root` is moved into the compactor below).
-                bucket_root: config.bucket_root.clone(),
+                // Parquet in — the same root the compactor sweeps.
+                bucket_root: bucket_root.clone(),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -279,7 +343,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(params) => {
             let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
                 http_addr: params.http_addr,
-                bucket_root: config.bucket_root.clone(),
+                bucket_root: bucket_root.clone(),
                 default_window_nanos: params.default_window_nanos,
             })
             .await?;
@@ -291,9 +355,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7).
-    let sink = Box::new(ParquetAuditSink::new(&config.bucket_root));
+    let sink = Box::new(ParquetAuditSink::new(bucket_root));
     let compactor = Compactor::new(
-        config.bucket_root,
+        bucket_root.clone(),
         CompactionPolicy::default(),
         config.compaction_interval,
     )
@@ -347,42 +411,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn build_config_requires_bucket_root() {
-        // Arrange / Act
-        let result = build_config(None, None);
-
-        // Assert
-        assert!(result.is_err(), "OURIOS_BUCKET_ROOT is mandatory");
-    }
-
-    #[test]
-    fn build_config_rejects_an_empty_bucket_root() {
-        // Arrange / Act — an empty `OURIOS_BUCKET_ROOT` would resolve to a
-        // relative/empty path and silently misdirect the store.
-        let result = build_config(Some(PathBuf::from("")), None);
-
-        // Assert
-        assert!(result.is_err(), "an empty bucket root must be rejected");
+    /// A `local` [`StoreConfig`] for `path`, the common test fixture.
+    fn local(path: &str) -> StoreConfig {
+        StoreConfig::Local(PathBuf::from(path))
     }
 
     #[test]
     fn build_config_defaults_the_interval() {
         // Arrange / Act
-        let config = build_config(Some(PathBuf::from("/store")), None).expect("valid");
+        let config = build_config(local("/store"), None).expect("valid");
 
         // Assert
         assert_eq!(
             config.compaction_interval,
             Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
         );
-        assert_eq!(config.bucket_root, PathBuf::from("/store"));
+        assert_eq!(config.store, local("/store"));
     }
 
     #[test]
     fn build_config_parses_a_custom_interval() {
         // Arrange / Act
-        let config = build_config(Some(PathBuf::from("/store")), Some("60")).expect("valid");
+        let config = build_config(local("/store"), Some("60")).expect("valid");
 
         // Assert
         assert_eq!(config.compaction_interval, Duration::from_secs(60));
@@ -392,13 +442,131 @@ mod tests {
     fn build_config_rejects_a_zero_or_nonnumeric_interval() {
         // Arrange / Act / Assert
         assert!(
-            build_config(Some(PathBuf::from("/store")), Some("0")).is_err(),
+            build_config(local("/store"), Some("0")).is_err(),
             "a zero interval would busy-loop the daemon",
         );
         assert!(
-            build_config(Some(PathBuf::from("/store")), Some("soon")).is_err(),
+            build_config(local("/store"), Some("soon")).is_err(),
             "non-numeric interval is rejected",
         );
+    }
+
+    /// Scenario RFC0019.1 — backend selection from config.
+    /// See `docs/rfcs/0019-storage-backend-selection.md` §5.
+    #[test]
+    fn rfc0019_1_backend_selection_from_config() {
+        // Unset backend + a bucket root → local.
+        assert_eq!(
+            build_store_config(None, Some(PathBuf::from("/store")), None, None, None, None)
+                .expect("local default"),
+            local("/store"),
+        );
+        // Explicit `local` behaves the same.
+        assert_eq!(
+            build_store_config(
+                Some("local"),
+                Some(PathBuf::from("/store")),
+                None,
+                None,
+                None,
+                None
+            )
+            .expect("explicit local"),
+            local("/store"),
+        );
+        // `s3` + a bucket (and optional addressing) → an S3 backend.
+        let s3 = build_store_config(
+            Some("s3"),
+            None,
+            Some("my-bucket"),
+            Some("http://localhost:4566"),
+            Some("us-east-1"),
+            Some("ourios"),
+        )
+        .expect("s3 selected");
+        assert_eq!(
+            s3,
+            StoreConfig::S3(
+                S3Config::new("my-bucket")
+                    .with_endpoint("http://localhost:4566")
+                    .with_region("us-east-1")
+                    .with_prefix("ourios"),
+            ),
+        );
+        // `s3` without a bucket, and an unknown backend, both fail fast.
+        assert!(
+            build_store_config(Some("s3"), None, None, None, None, None).is_err(),
+            "s3 backend requires OURIOS_S3_BUCKET",
+        );
+        assert!(
+            build_store_config(
+                Some("gcs"),
+                Some(PathBuf::from("/store")),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err(),
+            "an unknown backend is rejected",
+        );
+        // Local backend with no bucket root is rejected.
+        assert!(
+            build_store_config(None, None, None, None, None, None).is_err(),
+            "local backend requires OURIOS_BUCKET_ROOT",
+        );
+        assert!(
+            build_store_config(
+                Some("local"),
+                Some(PathBuf::from("")),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err(),
+            "an empty bucket root is rejected",
+        );
+    }
+
+    /// Scenario RFC0019.6 — config governed by RFC 0004; no secret leakage.
+    /// See `docs/rfcs/0019-storage-backend-selection.md` §5.
+    #[test]
+    fn rfc0019_6_config_governed_no_secret_leakage() {
+        // A missing S3 bucket names only the *key*, never a value, and config
+        // resolution never reads credentials (those come from the AWS chain in
+        // `StoreConfig::open`), so no secret can appear in an error.
+        let err = build_store_config(Some("s3"), None, None, None, None, None)
+            .expect_err("missing bucket");
+        assert!(
+            err.contains("OURIOS_S3_BUCKET"),
+            "the error names the missing key, got {err:?}",
+        );
+        // The well-known AWS credential env vars are never echoed (they aren't
+        // even read here); guard against a future regression that surfaces one.
+        for secret_key in ["AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID"] {
+            assert!(
+                !err.contains(secret_key),
+                "a credential key must not appear in a config error, got {err:?}",
+            );
+        }
+    }
+
+    /// Scenario RFC0019.7 — local backend regression (the default path).
+    /// See `docs/rfcs/0019-storage-backend-selection.md` §5.
+    #[test]
+    fn rfc0019_7_local_backend_regression() {
+        // The default (no `OURIOS_STORAGE_BACKEND`, a bucket root set) resolves
+        // to exactly the local store used before RFC 0019 — the
+        // receiver/querier/compactor behaviour is then guarded by their
+        // existing local suites, unchanged.
+        let config = build_config(
+            build_store_config(None, Some(PathBuf::from("/store")), None, None, None, None)
+                .expect("default local"),
+            None,
+        )
+        .expect("valid");
+        assert_eq!(config.store, local("/store"));
     }
 
     #[test]

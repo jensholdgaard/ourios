@@ -7,9 +7,12 @@
 //! tenant isolation on S3 (`.5`), config/secret hygiene (`.6`), and the
 //! local-backend regression (`.7`).
 //!
-//! The S3 scenarios (`.3`/`.4`/`.5`) run against a localstack container in CI
-//! (the `crates/ourios-parquet/tests/rfc0013_object_store.rs` harness pattern)
-//! and stay `#[ignore]`d in the default `cargo test` run even once green.
+//! The S3 scenarios (`.3`/`.4`/`.5`) will use a localstack container (the
+//! `crates/ourios-parquet/tests/rfc0013_object_store.rs` harness pattern) and
+//! stay `#[ignore]`d in the default `cargo test` run even once green. The CI
+//! job that exercises these `ourios-server` ignored tests against localstack is
+//! added with their green slice (today CI only runs `ourios-parquet`'s ignored
+//! localstack tests).
 //!
 //! See `docs/rfcs/0019-storage-backend-selection.md` §5 / §6.
 

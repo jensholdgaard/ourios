@@ -120,13 +120,21 @@ flowchart LR
   `SessionContext` and address tables by object-store URL rather than a local
   `ListingTableUrl` path. The audit-stream helpers that read with `std::fs`
   (`audit_scan`, `alias_store::derive_alias_map`,
-  `template_registry::derive_template_registry`) move to `Store::list` /
+  `template_registry::derive_template_registry`) move to `Store` listing +
   `get_blocking`. `Querier::new` takes a `Store` (or `StoreConfig`).
 - **Compactor.** The filesystem walks (`tenants`, `plan_candidates`,
-  `compact_partition`, `gc_orphans`) move to `Store::list` + the
+  `compact_partition`, `gc_orphans`) move to `Store` listing + the
   `ourios-parquet` `Store`-based read/write/delete. The manifest swap adopts
   `Manifest::publish_cas` (conditional PUT, RFC0013.3/.4) so concurrent or
   retried sweeps cannot clobber a generation. `Compactor::new` takes a `Store`.
+
+`Store` exposes object/key I/O (`get_blocking`/`put_blocking`/…) but not yet a
+listing method (listing lives on the inner `object_store::ObjectStore`). This
+RFC's implementation adds a thin **`Store` listing wrapper** over
+`ObjectStore::list` (prefix → keys, bridged off-runtime like the existing
+blocking helpers) so the querier and compactor never reach past the `Store`
+seam; the alternative — calling `ObjectStore::list` directly via
+`Store::object_store()` — is equivalent but leaks the abstraction.
 
 Both migrations preserve the on-disk layout and the partition key scheme
 (RFC 0005 §3.4) byte-for-byte — only the *addressing* changes (a local path

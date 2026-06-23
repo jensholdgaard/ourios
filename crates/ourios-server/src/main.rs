@@ -142,8 +142,10 @@ fn build_store_config(
     match backend_raw.map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("local") => {
             let root = bucket_root
-                .filter(|p| !p.as_os_str().is_empty())
                 .ok_or("OURIOS_BUCKET_ROOT must be set (the local data + audit store root)")?;
+            if root.as_os_str().is_empty() {
+                return Err("OURIOS_BUCKET_ROOT must not be empty".to_string());
+            }
             Ok(StoreConfig::Local(root))
         }
         Some("s3") => {
@@ -514,22 +516,26 @@ mod tests {
             .is_err(),
             "an unknown backend is rejected",
         );
-        // Local backend with no bucket root is rejected.
+        // Local backend with no bucket root is rejected — "must be set" for an
+        // unset var, distinct from "must not be empty" for a present-but-empty
+        // one (clearer operator diagnostics).
+        let unset = build_store_config(None, None, None, None, None, None).expect_err("unset");
         assert!(
-            build_store_config(None, None, None, None, None, None).is_err(),
-            "local backend requires OURIOS_BUCKET_ROOT",
+            unset.contains("must be set"),
+            "unset names the missing key, got {unset:?}",
         );
+        let empty = build_store_config(
+            Some("local"),
+            Some(PathBuf::from("")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("empty");
         assert!(
-            build_store_config(
-                Some("local"),
-                Some(PathBuf::from("")),
-                None,
-                None,
-                None,
-                None
-            )
-            .is_err(),
-            "an empty bucket root is rejected",
+            empty.contains("must not be empty"),
+            "an empty bucket root is reported distinctly, got {empty:?}",
         );
         // The backend value is trimmed; a blank value is treated as unset
         // (→ local), not as an unknown backend.

@@ -58,7 +58,18 @@ secrets resolved by the standard AWS credential chain (see §3.4).
 | `OURIOS_S3_PREFIX` | s3 | key prefix within the bucket | unset (bucket root) |
 
 `OURIOS_WAL_ROOT` is unchanged and remains a **local** path under every
-backend (§3.6 — the WAL is never an object-store key).
+backend (§3.6 — the WAL is never an object-store key). "Local" here means
+**fsync-durable local-filesystem semantics, not ephemeral storage**: the WAL is
+the recovery mechanism (WAL-before-ack, §3.4), so the path MUST be backed by
+storage that survives a process/pod crash — i.e. a persistent volume, never a
+scratch/`emptyDir`-style mount. S3 is deliberately *not* used for the WAL: it
+offers no atomic append or fsync and would put S3 PUT latency on the ack path,
+defeating §3.4's batched-fsync latency/durability knob; S3 is the truth for the
+*flushed* Parquet, which is all §3.6 requires. The WAL's durability obligation
+is bounded by the flush horizon (§3.6 — local disk need not be durable *beyond*
+it). Surviving the loss of the volume itself (node/AZ failure) is a separate,
+out-of-scope tier — WAL **replication**, which §3.4 reserves as an addition to
+the WAL, not a replacement, and which a future RFC may add.
 
 ### 3.2 The `StoreConfig` seam
 

@@ -1,7 +1,7 @@
 ---
 rfc: 0019
 title: Storage-backend selection — wiring the server to choose local vs S3
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-22

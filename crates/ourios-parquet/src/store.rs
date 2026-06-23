@@ -178,8 +178,15 @@ impl S3Config {
 
 /// Which backend the process addresses, plus its addressing (RFC 0019). The
 /// operator resolves this from config; [`StoreConfig::open`] constructs the
-/// [`Store`]. Exhaustive on purpose: adding a backend should force every
-/// consumer (server, querier, compactor) to handle it.
+/// [`Store`].
+///
+/// Deliberately **exhaustive** (not `#[non_exhaustive]`, unlike the growable
+/// public enums elsewhere): adding a backend variant should be a *compile
+/// error* at every consumer (server, querier, compactor) so none silently
+/// falls through to a wildcard. The usual `#[non_exhaustive]` semver tradeoff —
+/// adding a variant breaks downstream `match`es — does not bite here: every
+/// Ourios crate is internal (`publish = false`), so there is no external
+/// downstream, and the compile-time forcing is precisely what we want.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreConfig {
     /// Local-filesystem backend rooted at the path (dev / test / CI).

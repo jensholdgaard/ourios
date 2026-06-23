@@ -121,12 +121,14 @@ fn config_from_env() -> Result<ServerConfig, String> {
 /// Pure storage-backend resolution (env reads live in [`config_from_env`];
 /// this is the testable core, RFC 0019 §3.1/§3.2).
 ///
-/// `backend_raw` is `OURIOS_STORAGE_BACKEND` (`local` (default) or `s3`). The
-/// `local` backend requires a non-empty `bucket_root`; `s3` requires a
-/// non-empty `s3_bucket` and accepts optional endpoint/region/prefix.
-/// Credentials are never read here — they come from the AWS chain inside
-/// [`StoreConfig::open`] (RFC 0019 §3.4), so a resolution error names only the
-/// missing **key**, never a secret.
+/// `backend_raw` is `OURIOS_STORAGE_BACKEND` (`local` (default) or `s3`),
+/// trimmed and treated as unset when empty. The `local` backend requires a
+/// non-empty `bucket_root`; `s3` requires a non-empty `s3_bucket` and accepts
+/// optional endpoint/region/prefix. Credentials are never read here — they come
+/// from the AWS chain inside [`StoreConfig::open`] (RFC 0019 §3.4), so an error
+/// for a **missing required** value names only the key, never a secret; other
+/// errors (an unknown backend) may echo the offending non-secret value for
+/// diagnosability.
 fn build_store_config(
     backend_raw: Option<&str>,
     bucket_root: Option<PathBuf>,
@@ -135,7 +137,9 @@ fn build_store_config(
     s3_region: Option<&str>,
     s3_prefix: Option<&str>,
 ) -> Result<StoreConfig, String> {
-    match backend_raw {
+    // Trim and treat empty as unset, so " s3 " selects S3 and a blank value
+    // falls back to the local default rather than reading as an unknown backend.
+    match backend_raw.map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("local") => {
             let root = bucket_root
                 .filter(|p| !p.as_os_str().is_empty())
@@ -526,6 +530,25 @@ mod tests {
             )
             .is_err(),
             "an empty bucket root is rejected",
+        );
+        // The backend value is trimmed; a blank value is treated as unset
+        // (→ local), not as an unknown backend.
+        assert_eq!(
+            build_store_config(Some("  s3  "), None, Some("b"), None, None, None)
+                .expect("trimmed s3"),
+            StoreConfig::S3(S3Config::new("b")),
+        );
+        assert_eq!(
+            build_store_config(
+                Some("   "),
+                Some(PathBuf::from("/store")),
+                None,
+                None,
+                None,
+                None
+            )
+            .expect("blank backend → local"),
+            local("/store"),
         );
     }
 

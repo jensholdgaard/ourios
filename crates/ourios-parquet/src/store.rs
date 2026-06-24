@@ -20,10 +20,13 @@
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
+use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{
+    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+};
 use tokio::runtime::Runtime;
 
 /// The process-wide runtime that drives the async `object_store` calls behind
@@ -416,6 +419,65 @@ impl Store {
         block_on_off_runtime(self.get(key))
     }
 
+    /// List every object key under `prefix` (store-relative), recursively, in
+    /// **lexicographic order**. The querier and compactor enumerate their
+    /// partitions and files through this rather than reaching past the seam to
+    /// `std::fs` (RFC 0019 §3.3) — so the same walk targets `LocalFileSystem`
+    /// or S3. `prefix` is `None` to list the whole store.
+    ///
+    /// Keys are returned relative to the store's own prefix (the same form the
+    /// `get`/`put` methods take); today that prefix is empty (RFC 0013 §3.7),
+    /// so a key is the full object path. The order is enforced here by sorting,
+    /// not inherited from the backend (neither `LocalFileSystem` nor S3
+    /// guarantees stream order), so the contract is deterministic.
+    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        let scoped = prefix.map_or_else(|| self.prefix.clone(), |p| self.resolve(p));
+        let metas: Vec<ObjectMeta> = self
+            .inner
+            .list(Some(&scoped))
+            .try_collect()
+            .await
+            .map_err(StoreError::Backend)?;
+        let root = &self.prefix;
+        let mut keys: Vec<String> = metas
+            .into_iter()
+            .filter_map(|m| {
+                // The backend's `list` does **string**-prefix matching, so S3
+                // can return a sibling (`tenant_id=ab/…` when asked for
+                // `tenant_id=a`). `prefix_match` is **segment-wise**, so it
+                // excludes that sibling — gate on it against the *requested*
+                // prefix (`scoped`) to keep listing tenant-isolation-safe
+                // (RFC0019.5), then strip the store `root` to the caller's key
+                // space (the same keys `get`/`put` take).
+                // `?` rejects an object not under the requested prefix; the
+                // matched iterator isn't needed here (the key is built from the
+                // `root` strip below), so bind it to `_` to mark the
+                // `#[must_use]` value used.
+                let _ = m.location.prefix_match(&scoped)?;
+                let parts = m.location.prefix_match(root)?;
+                Some(
+                    parts
+                        .map(|p| p.as_ref().to_owned())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            })
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Blocking recursive key listing for the **sync** storage call sites — the
+    /// bridge over the internal async `list`. Safe to call from inside a tokio
+    /// runtime (see [`Self::get_blocking`]).
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// [`StoreError::Backend`] on a listing failure.
+    pub fn list_blocking(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        block_on_off_runtime(self.list(prefix))
+    }
+
     /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
     /// compaction). Safe to call from inside a tokio runtime (see
     /// [`Self::get_blocking`]).
@@ -600,6 +662,58 @@ mod tests {
         assert_eq!(
             store.get_blocking(key).expect("get_blocking"),
             b"hello-blocking"
+        );
+    }
+
+    /// `list_blocking` enumerates keys under a prefix recursively, in
+    /// lexicographic order, returning store-relative keys (the same key space
+    /// as `get`/`put`) — the seam the querier/compactor walk instead of
+    /// `std::fs` (RFC 0019 §3.3).
+    #[test]
+    fn list_blocking_enumerates_keys_under_a_prefix() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        for key in [
+            "data/tenant_id=a/year=2026/h0.parquet",
+            "data/tenant_id=a/year=2026/h1.parquet",
+            // A string-prefix *sibling* of `tenant_id=a` — S3's string-prefix
+            // `list` would surface this when asked for `tenant_id=a`; the
+            // segment-wise filter must exclude it (tenant isolation, RFC0019.5).
+            "data/tenant_id=ab/year=2026/h0.parquet",
+            "data/tenant_id=b/year=2026/h0.parquet",
+        ] {
+            store.put_blocking(key, b"x".to_vec()).expect("put");
+        }
+        // Scoped to one tenant's prefix → only that tenant's objects, in the
+        // guaranteed lexicographic order (asserted directly — no test-side sort,
+        // so an ordering regression would fail here). The `tenant_id=ab` sibling
+        // is excluded.
+        assert_eq!(
+            store
+                .list_blocking(Some("data/tenant_id=a"))
+                .expect("list a"),
+            vec![
+                "data/tenant_id=a/year=2026/h0.parquet".to_string(),
+                "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+            ],
+        );
+        // No prefix → the whole store, all four objects, lexicographically
+        // (note `tenant_id=a/` sorts before `tenant_id=ab/` — `/` < `b`).
+        assert_eq!(
+            store.list_blocking(None).expect("list all"),
+            vec![
+                "data/tenant_id=a/year=2026/h0.parquet".to_string(),
+                "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+                "data/tenant_id=ab/year=2026/h0.parquet".to_string(),
+                "data/tenant_id=b/year=2026/h0.parquet".to_string(),
+            ],
+        );
+        // A prefix matching nothing → empty.
+        assert!(
+            store
+                .list_blocking(Some("data/tenant_id=z"))
+                .expect("list z")
+                .is_empty(),
         );
     }
 

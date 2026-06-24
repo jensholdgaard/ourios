@@ -449,7 +449,10 @@ impl Store {
                 // prefix (`scoped`) to keep listing tenant-isolation-safe
                 // (RFC0019.5), then strip the store `root` to the caller's key
                 // space (the same keys `get`/`put` take).
-                // Bind to `_` to consume the returned iterator (`#[must_use]`).
+                // `?` rejects an object not under the requested prefix; the
+                // matched iterator isn't needed here (the key is built from the
+                // `root` strip below), so bind it to `_` to mark the
+                // `#[must_use]` value used.
                 let _ = m.location.prefix_match(&scoped)?;
                 let parts = m.location.prefix_match(root)?;
                 Some(

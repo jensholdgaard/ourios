@@ -450,8 +450,9 @@ async fn store_list_enumerates_keys_on_s3() {
         vec![
             "data/tenant_id=a/year=2026/h0.parquet".to_string(),
             "data/tenant_id=a/year=2026/h1.parquet".to_string(),
+            "data/tenant_id=ab/year=2026/h0.parquet".to_string(),
             "data/tenant_id=b/year=2026/h0.parquet".to_string(),
         ],
-        "no prefix lists the whole bucket, ordered",
+        "no prefix lists the whole bucket (incl. the sibling), ordered",
     );
 }

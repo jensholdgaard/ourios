@@ -191,6 +191,31 @@ fn rfc0005_7_audit_round_trip_one_of_each_variant() {
     }
 }
 
+/// `AuditReader::open_bytes` reads an audit file from in-memory bytes — the
+/// RFC 0019 `Store` read path the querier's audit scan moves onto (so the scan
+/// reads through the object-storage seam, local or S3, rather than `std::fs`).
+/// The events round-trip identically to the on-disk `open_file` path.
+#[test]
+fn audit_reader_open_bytes_round_trips() {
+    let bucket = TempDir::new().unwrap();
+    let events = three_variants("acme");
+    let partition = audit_partition_for(&events[0]);
+
+    let mut writer = AuditWriter::open(bucket.path(), partition).expect("open");
+    writer.append_events(&events).expect("append");
+    let written = writer.close().expect("close");
+
+    // Read the written object's raw bytes and parse them through `open_bytes`
+    // (the bytes a `Store::get_blocking` returns on the migrated scan path).
+    let bytes = std::fs::read(&written.path).expect("read file bytes");
+    let round_tripped = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+        .expect("open_bytes")
+        .read_all()
+        .expect("read_all");
+
+    assert_eq!(round_tripped, events, "open_bytes round-trips every event");
+}
+
 /// Scenario RFC0017.1 (storage round-trip) — the `template_created` variant
 /// round-trips through the audit file series. Full `AuditEvent` equality
 /// confirms `new_template` survives and the reader reconstructs `Created`

@@ -88,9 +88,32 @@ impl AuditReader {
             path: path.to_path_buf(),
             source,
         })?;
+        Self::from_chunk_reader(file, path.to_path_buf())
+    }
 
+    /// Open an audit file from in-memory bytes — the RFC 0019 `Store` read path
+    /// (`Store::get_blocking` → bytes → here), so the audit scan reads through
+    /// the object-storage seam (local or S3) rather than `std::fs`. Skips
+    /// row-vs-path validation like [`Self::open_file`]; there is no filesystem
+    /// access, so no [`AuditReaderError::Io`] is produced.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditReaderError::Parquet`] / [`AuditReaderError::MissingRequiredColumn`]
+    /// as [`Self::open_file`].
+    pub fn open_bytes(bytes: bytes::Bytes) -> Result<Self, AuditReaderError> {
+        Self::from_chunk_reader(bytes, PathBuf::from("<object-store>"))
+    }
+
+    /// Build the reader from any Parquet [`ChunkReader`] (a `File` or in-memory
+    /// `Bytes`), enforcing the §3.7 baseline-REQUIRED-column check. Shared by
+    /// [`Self::open_file`] and [`Self::open_bytes`].
+    fn from_chunk_reader<R: parquet::file::reader::ChunkReader + 'static>(
+        reader: R,
+        file_path: PathBuf,
+    ) -> Result<Self, AuditReaderError> {
         let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(AuditReaderError::Parquet)?;
+            ParquetRecordBatchReaderBuilder::try_new(reader).map_err(AuditReaderError::Parquet)?;
 
         let file_schema = builder.schema();
         for expected_field in crate::audit_schema().fields() {
@@ -110,7 +133,7 @@ impl AuditReader {
         Ok(Self {
             inner,
             partition: None,
-            file_path: path.to_path_buf(),
+            file_path,
         })
     }
 

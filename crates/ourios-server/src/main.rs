@@ -349,7 +349,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(params) => {
             let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
                 http_addr: params.http_addr,
-                bucket_root: bucket_root.clone(),
+                // The querier engine is Store-capable (RFC 0019 slice 2a), but
+                // main() still fails fast on s3 above (the compactor migration
+                // is slice 2b), so this is always the local backend today.
+                store: StoreConfig::Local(bucket_root.clone()),
                 default_window_nanos: params.default_window_nanos,
             })
             .await?;

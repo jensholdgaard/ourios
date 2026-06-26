@@ -17,12 +17,11 @@
 //! later widening never clobbers an earlier version's tokens.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{OwnedToken, parse_template};
-use ourios_parquet::AuditReader;
+use ourios_parquet::{AuditReader, Store};
 
 use crate::{QueryError, audit_scan};
 
@@ -32,9 +31,9 @@ use crate::{QueryError, audit_scan};
 /// [`ourios_miner::tree::parse_template`].
 pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 
-/// Fold `tenant`'s template registry from its audit stream under
-/// `bucket_root` per RFC 0017 §3.2. A tenant with no audit files (or none
-/// carrying template events) derives the empty registry.
+/// Fold `tenant`'s template registry from its audit stream in `store`
+/// per RFC 0017 §3.2. A tenant with no audit files (or none carrying
+/// template events) derives the empty registry.
 ///
 /// Each `template_created` event keys at [`TEMPLATE_INITIAL_VERSION`] (the
 /// variant omits the version — a leaf is always born at v1); each
@@ -44,35 +43,37 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 ///
 /// # Errors
 ///
-/// [`QueryError::Storage`] if the audit subtree cannot be walked, an audit
+/// [`QueryError::Storage`] if the audit subtree cannot be listed, an audit
 /// file cannot be read, or a row claims a tenant other than the one whose
 /// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
 pub fn derive_template_registry(
-    bucket_root: &Path,
+    store: &Store,
     tenant: &TenantId,
 ) -> Result<TemplateRegistry, QueryError> {
-    // Lexicographic file order from the shared walk + in-file row order from
+    // Lexicographic key order from the shared listing + in-file row order from
     // the reader give the §3.7.1 tiebreak components; no window — the
     // registry folds the tenant's whole template history.
-    let files = audit_scan::audit_files(bucket_root, tenant, None)?;
+    let keys = audit_scan::audit_files(store, tenant, None)?;
     let mut events: Vec<AuditEvent> = Vec::new();
-    for path in &files {
-        let read = AuditReader::open_file(path)
+    for key in &keys {
+        let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
+            detail: format!("audit file {key}: {e}"),
+        })?;
+        let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
             .and_then(AuditReader::read_all)
             .map_err(|e| QueryError::Storage {
-                detail: format!("audit file {}: {e}", path.display()),
+                detail: format!("audit file {key}: {e}"),
             })?;
         for event in read {
             // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
-            // row-vs-path): the walk is rooted at the tenant's partition, so
+            // row-vs-path): the listing is scoped to the tenant's partition, so
             // a row claiming another tenant is a corrupt or foreign file —
             // fail loudly rather than fold (or silently drop) it.
             if event.tenant_id != *tenant {
                 return Err(QueryError::Storage {
                     detail: format!(
-                        "audit file {} carries a row for tenant {} under tenant {}'s \
+                        "audit file {key} carries a row for tenant {} under tenant {}'s \
                          partition root",
-                        path.display(),
                         event.tenant_id.as_str(),
                         tenant.as_str(),
                     ),

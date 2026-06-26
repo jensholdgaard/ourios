@@ -40,6 +40,7 @@ use tokio::task::JoinHandle;
 use ourios_core::otlp::canonical;
 use ourios_core::tenant::TenantId;
 use ourios_miner::reconstruct::Reconstruction;
+use ourios_parquet::StoreConfig;
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
 use ourios_querier::{DriftResult, LogBody, LogRow, Querier, QueryResult, QueryStats};
@@ -67,8 +68,10 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub struct QuerierConfig {
     /// The HTTP listen address (`OURIOS_QUERIER_HTTP_ADDR`).
     pub http_addr: SocketAddr,
-    /// Root of the RFC 0005 store to query (`OURIOS_BUCKET_ROOT`).
-    pub bucket_root: PathBuf,
+    /// The data + audit store to query (RFC 0019): a local-filesystem root
+    /// (`OURIOS_BUCKET_ROOT`) or an S3-compatible bucket (`OURIOS_S3_*`),
+    /// resolved by the server (`main.rs`).
+    pub store: StoreConfig,
     /// The look-back applied to a query with no `range(...)` stage — the
     /// server-supplied default window the DSL compiler expects (RFC 0002 §4 P5;
     /// RFC 0016 §7).
@@ -185,11 +188,19 @@ struct QuerierState {
     metrics: Arc<QuerierMetrics>,
 }
 
-/// Build the querier role's axum router over `state` (RFC 0016 §3.3). Split out
-/// from [`serve`] so it can be driven in-process by tests.
+/// Build the querier role's axum router over a **local** store root (RFC 0016
+/// §3.3). Split out from [`serve`] so it can be driven in-process by tests; the
+/// local backend is the test/dev default and the RFC 0019 regression guard.
 pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
+    router_from_querier(Querier::new(bucket_root), default_window_nanos)
+}
+
+/// Build the router from an already-constructed [`Querier`] — the shared core
+/// of [`router`] (local) and [`serve`] (which builds the querier from the
+/// resolved [`StoreConfig`], so the S3 backend is wired the same way).
+fn router_from_querier(querier: Querier, default_window_nanos: u64) -> Router {
     let state = QuerierState {
-        querier: Arc::new(Querier::new(bucket_root)),
+        querier: Arc::new(querier),
         default_window_nanos,
         metrics: Arc::new(QuerierMetrics::new()),
     };
@@ -207,12 +218,16 @@ pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
 ///
 /// A `String` describing a store-root creation, bind, or `local_addr` failure.
 pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
-    // The store root may not exist yet (a fresh dir); the querier only reads,
-    // but binding before the dir exists would make the first query fail with a
-    // confusing not-found rather than an empty result — create it, matching the
-    // receiver role.
-    std::fs::create_dir_all(&config.bucket_root)
-        .map_err(|e| format!("create store root {}: {e}", config.bucket_root.display()))?;
+    // The local store root may not exist yet (a fresh dir); the querier only
+    // reads, but binding before the dir exists would make the first query fail
+    // with a confusing not-found rather than an empty result — create it,
+    // matching the receiver role. An S3 backend needs no such bootstrap.
+    if let StoreConfig::Local(root) = &config.store {
+        std::fs::create_dir_all(root)
+            .map_err(|e| format!("create store root {}: {e}", root.display()))?;
+    }
+    let querier = Querier::from_store_config(&config.store)
+        .map_err(|e| format!("build querier store: {e}"))?;
 
     let listener = TcpListener::bind(config.http_addr)
         .await
@@ -221,7 +236,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         .local_addr()
         .map_err(|e| format!("HTTP local_addr: {e}"))?;
 
-    let app = router(config.bucket_root, config.default_window_nanos);
+    let app = router_from_querier(querier, config.default_window_nanos);
     let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())

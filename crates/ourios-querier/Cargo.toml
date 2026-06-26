@@ -23,8 +23,13 @@ ourios-core = { path = "../ourios-core" }
 ourios-miner = { path = "../ourios-miner" }
 # The RFC 0005 store this queries — used here for the canonical
 # `percent_encode_tenant` so the tenant partition-dir path matches
-# the writer's byte-for-byte (single source of truth, no drift).
+# the writer's byte-for-byte (single source of truth, no drift), and
+# (RFC 0019) the `Store` seam the audit + bulk scans read through.
 ourios-parquet = { path = "../ourios-parquet" }
+# RFC 0019 — the audit read path feeds `Store::get_blocking` bytes into
+# `AuditReader::open_bytes(bytes::Bytes)`; already in the tree via
+# ourios-parquet's object_store.
+bytes = { version = "1", default-features = false }
 # Pillar #3 — the execution engine. A plain dep, but its types are
 # kept strictly internal: no `datafusion`/`arrow` type appears in
 # any public signature or error (hazard §4.6). Pulls arrow/parquet

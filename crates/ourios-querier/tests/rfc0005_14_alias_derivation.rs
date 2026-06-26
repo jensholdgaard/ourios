@@ -223,11 +223,15 @@ async fn second_tenants_alias_events_never_fold_into_the_derived_map() {
     assert_eq!(resolves_to_a_rows(bucket.path(), "T2").await, 2);
 }
 
-/// A symlinked tenant *root* must be rejected outright: if
-/// `audit/tenant_id=EVIL` is a symlink into another tenant's subtree,
-/// canonicalizing it as the trust anchor would make every foreign file
-/// pass the per-file `starts_with` backstop. The scan anchors trust at
-/// the bucket root instead and fails loudly (`CLAUDE.md` §3.7).
+/// A symlinked tenant *root* must not fold another tenant's events into the
+/// querying tenant's map. Under RFC 0019 the audit scan reads through the
+/// `Store` seam and the prior local `canonicalize` trust-anchor backstop is
+/// dropped (object storage has no symlinks; the audit scan no longer touches
+/// `std::fs`). Isolation here is enforced by the surviving **row-level** tenant
+/// backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9 row-vs-path, the §3.7 decision
+/// keeps it): a `audit/tenant_id=EVIL` symlink to T's subtree lists T's file,
+/// but folding it surfaces a row whose `tenant_id` is `T` while the querying
+/// tenant is `EVIL` — which fails loudly rather than leaking T's aliases.
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_tenant_root_is_rejected() {
@@ -254,7 +258,7 @@ async fn symlinked_tenant_root_is_rejected() {
         .expect_err("a symlinked tenant root must not be scanned");
     match err {
         ourios_querier::QueryError::Storage { detail } => assert!(
-            detail.contains("resolves outside its expected partition path"),
+            detail.contains("carries a row for tenant T under tenant EVIL's partition root"),
             "unexpected detail: {detail}",
         ),
         other => panic!("expected Storage, got {other:?}"),

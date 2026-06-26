@@ -20,49 +20,46 @@
 //! (the RFC 0009 §3.4 manifest fork) would accelerate, not change,
 //! this derivation.
 
-use std::path::Path;
-
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::{AuditEvent, AuditPayload};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::AuditReader;
+use ourios_parquet::{AuditReader, Store};
 
 use crate::{QueryError, audit_scan};
 
-/// Fold `tenant`'s alias map from its audit stream under `bucket_root`
-/// per RFC 0005 §3.7.1. A tenant with no audit files (or none carrying
+/// Fold `tenant`'s alias map from its audit stream in `store` per
+/// RFC 0005 §3.7.1. A tenant with no audit files (or none carrying
 /// alias events) derives the empty map — every id then resolves to
 /// itself.
 ///
 /// Alias events are rare operator actions, not ingest-volume data, so
 /// the unwindowed scan is small by construction (§3.7.1); no day prune
 /// applies because the fold covers the tenant's whole alias history.
-pub(crate) fn derive_alias_map(
-    bucket_root: &Path,
-    tenant: &TenantId,
-) -> Result<AliasMap, QueryError> {
-    // Lexicographic file order from the shared walk + in-file row order
+pub(crate) fn derive_alias_map(store: &Store, tenant: &TenantId) -> Result<AliasMap, QueryError> {
+    // Lexicographic key order from the shared listing + in-file row order
     // from the reader give the §3.7.1 tiebreak components…
-    let files = audit_scan::audit_files(bucket_root, tenant, None)?;
+    let keys = audit_scan::audit_files(store, tenant, None)?;
     let mut events: Vec<AuditEvent> = Vec::new();
-    for path in &files {
-        let read = AuditReader::open_file(path)
+    for key in &keys {
+        let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
+            detail: format!("audit file {key}: {e}"),
+        })?;
+        let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
             .and_then(AuditReader::read_all)
             .map_err(|e| QueryError::Storage {
-                detail: format!("audit file {}: {e}", path.display()),
+                detail: format!("audit file {key}: {e}"),
             })?;
         for event in read {
             // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005
-            // §3.9 row-vs-path): the walk is already rooted at the
+            // §3.9 row-vs-path): the listing is already scoped to the
             // tenant's partition, so a row claiming another tenant is
             // a corrupt or foreign file — fail loudly rather than
             // fold (or silently drop) it.
             if event.tenant_id != *tenant {
                 return Err(QueryError::Storage {
                     detail: format!(
-                        "audit file {} carries a row for tenant {} under tenant {}'s \
+                        "audit file {key} carries a row for tenant {} under tenant {}'s \
                          partition root",
-                        path.display(),
                         event.tenant_id.as_str(),
                         tenant.as_str(),
                     ),

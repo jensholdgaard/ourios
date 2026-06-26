@@ -14,7 +14,7 @@ use ourios_core::audit::{
 };
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::OwnedToken;
-use ourios_parquet::ParquetAuditSink;
+use ourios_parquet::{ParquetAuditSink, Store};
 use ourios_querier::derive_template_registry;
 use tempfile::TempDir;
 
@@ -118,7 +118,9 @@ fn rfc0017_2_registry_derives_completely_including_v1() {
     }
     assert_eq!(sink.write_failures(), 0, "fixture events must all persist");
 
-    let registry = derive_template_registry(bucket.path(), &TenantId::new(tenant)).expect("derive");
+    // RFC 0019 — the registry derivation now reads through the `Store` seam.
+    let store = Store::local(bucket.path()).expect("local store");
+    let registry = derive_template_registry(&store, &TenantId::new(tenant)).expect("derive");
 
     // Every (template_id, version) the stream described is present — including
     // version 1 (the `template_created` events), the gap this RFC closes.

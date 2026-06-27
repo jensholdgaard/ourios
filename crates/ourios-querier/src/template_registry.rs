@@ -16,15 +16,12 @@
 //! rather than the latest (RFC 0017 §3.5): each version is its own key, so a
 //! later widening never clobbers an earlier version's tokens.
 
-use std::collections::HashMap;
-use std::path::Path;
-
 use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{OwnedToken, parse_template};
-use ourios_parquet::AuditReader;
+use std::collections::HashMap;
 
-use crate::{QueryError, audit_scan};
+use crate::{QueryError, StoreRef, audit_scan};
 
 /// Read-time map from a leaf's `(template_id, template_version)` to the
 /// canonical tokens of that version (RFC 0017 §3.2). The value is parsed
@@ -32,9 +29,13 @@ use crate::{QueryError, audit_scan};
 /// [`ourios_miner::tree::parse_template`].
 pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 
-/// Fold `tenant`'s template registry from its audit stream under
-/// `bucket_root` per RFC 0017 §3.2. A tenant with no audit files (or none
-/// carrying template events) derives the empty registry.
+/// Fold `tenant`'s template registry from its audit stream per RFC 0017 §3.2.
+/// A tenant with no audit files (or none carrying template events) derives the
+/// empty registry.
+///
+/// `backend` selects the hybrid scan (RFC 0019 §3.3): [`StoreRef::Local`] reads
+/// local audit files, [`StoreRef::Remote`] lists keys + reads bytes through the
+/// S3 store.
 ///
 /// Each `template_created` event keys at [`TEMPLATE_INITIAL_VERSION`] (the
 /// variant omits the version — a leaf is always born at v1); each
@@ -44,45 +45,20 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 ///
 /// # Errors
 ///
-/// [`QueryError::Storage`] if the audit subtree cannot be walked, an audit
+/// [`QueryError::Storage`] if the audit subtree cannot be listed, an audit
 /// file cannot be read, or a row claims a tenant other than the one whose
 /// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
 pub fn derive_template_registry(
-    bucket_root: &Path,
+    backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<TemplateRegistry, QueryError> {
-    // Lexicographic file order from the shared walk + in-file row order from
-    // the reader give the §3.7.1 tiebreak components; no window — the
-    // registry folds the tenant's whole template history.
-    let files = audit_scan::audit_files(bucket_root, tenant, None)?;
-    let mut events: Vec<AuditEvent> = Vec::new();
-    for path in &files {
-        let read = AuditReader::open_file(path)
-            .and_then(AuditReader::read_all)
-            .map_err(|e| QueryError::Storage {
-                detail: format!("audit file {}: {e}", path.display()),
-            })?;
-        for event in read {
-            // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
-            // row-vs-path): the walk is rooted at the tenant's partition, so
-            // a row claiming another tenant is a corrupt or foreign file —
-            // fail loudly rather than fold (or silently drop) it.
-            if event.tenant_id != *tenant {
-                return Err(QueryError::Storage {
-                    detail: format!(
-                        "audit file {} carries a row for tenant {} under tenant {}'s \
-                         partition root",
-                        path.display(),
-                        event.tenant_id.as_str(),
-                        tenant.as_str(),
-                    ),
-                });
-            }
-            if matches!(event.payload, AuditPayload::Template { .. }) {
-                events.push(event);
-            }
-        }
-    }
+    // The shared reader gives the §3.7.1 file/row order and the row-level
+    // tenant backstop; keep only the template events (no window — the registry
+    // folds the tenant's whole template history).
+    let events: Vec<AuditEvent> = audit_scan::read_all_events(backend, tenant)?
+        .into_iter()
+        .filter(|e| matches!(&e.payload, AuditPayload::Template { .. }))
+        .collect();
     Ok(fold_registry(events))
 }
 

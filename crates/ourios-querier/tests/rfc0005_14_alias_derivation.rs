@@ -227,7 +227,9 @@ async fn second_tenants_alias_events_never_fold_into_the_derived_map() {
 /// `audit/tenant_id=EVIL` is a symlink into another tenant's subtree,
 /// canonicalizing it as the trust anchor would make every foreign file
 /// pass the per-file `starts_with` backstop. The scan anchors trust at
-/// the bucket root instead and fails loudly (`CLAUDE.md` §3.7).
+/// the bucket root instead and fails loudly (`CLAUDE.md` §3.7). Under
+/// RFC 0019 the local audit scan keeps this canonicalizing `std::fs` walk
+/// (the hybrid's local branch), so the trust-anchor backstop is preserved.
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_tenant_root_is_rejected() {

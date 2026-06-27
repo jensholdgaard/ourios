@@ -3,40 +3,175 @@
 //! Both audit-stream consumers — the RFC 0010 drift query
 //! ([`crate::drift`]) and the RFC 0005 §3.7.1 alias-map derivation
 //! ([`crate::alias_store`]) — resolve their file set through this one
-//! walk so the tenancy guarantees stay in a single place:
+//! [`audit_files`] so the tenancy guarantees stay in a single place.
 //!
-//! - **Tenant isolation is the partition root** (`CLAUDE.md` §3.7 /
-//!   RFC0010.4): the walk is rooted at `audit/tenant_id=<enc>/`, so no
-//!   other tenant's events are reachable by construction.
-//! - **Canonical-path escape backstop**: every resolved `*.parquet`
-//!   must canonicalize *under* the tenant's canonical root — a
-//!   symlinked file resolving into another tenant's tree fails loudly
-//!   rather than being read.
-//! - **Optional day-granularity window prune** (RFC 0005 §3.4 — the
-//!   audit layout has no `hour` segment): with a window, out-of-range
-//!   `day=…` leaves are skipped before they are listed. The prune is
-//!   conservative (an unparseable dir is never pruned) and the
-//!   row-level `timestamp` predicate stays the correctness authority.
-//!   The alias derivation passes no window — it folds the tenant's
-//!   whole alias history.
+//! Like the bulk log/data scan, this is a **hybrid** keyed on whether the
+//! querier is local or S3 (RFC 0019 §3.3):
+//!
+//! - **Local backend** ([`StoreRef::Local`]): the original `std::fs` walk,
+//!   rooted at `audit/tenant_id=<enc>/`, **unchanged** — including the
+//!   canonical-path tenant-isolation backstops: the tenant root must not be a
+//!   symlink into another tenant's subtree (anchored to the canonical bucket
+//!   root), every resolved `*.parquet` must canonicalize *under* the canonical
+//!   tenant root, and canonical paths are de-duplicated (an in-tenant symlink
+//!   can't double-count a file). Drift now also applies a `tenant_id =
+//!   <tenant>` predicate in its `DataFusion` plan (row-level isolation matching
+//!   the alias/registry byte-folds), but the walk's escape backstop is still
+//!   what stops a symlinked-out file from being read at all, and the dedup
+//!   still prevents a symlinked same-tenant file from being counted twice.
+//! - **S3 backend** ([`StoreRef::Remote`]): [`Store::list_blocking`] over the
+//!   `audit/tenant_id=<enc>` prefix. Tenant isolation is the **segment-wise**
+//!   prefix scope (RFC0019.5) — a string-prefix sibling such as `tenant_id=ab`
+//!   is excluded when listing `tenant_id=a` — and the object key space has no
+//!   symlinks, so the canonicalize backstops are moot there. The keys come back
+//!   lexicographically sorted (the §3.7.1 fold order) and unique.
+//!
+//! **Optional day-granularity window prune** (RFC 0005 §3.4 — the audit layout
+//! has no `hour` segment): with a window, out-of-range `day=…` partitions are
+//! skipped before their files are read. The prune is conservative (an
+//! unparseable path/key is never pruned) and the row-level `timestamp`
+//! predicate stays the correctness authority. The alias derivation passes no
+//! window — it folds the tenant's whole alias history.
 
 use std::path::{Path, PathBuf};
 
+use ourios_core::audit::AuditEvent;
 use ourios_core::tenant::TenantId;
-use ourios_parquet::percent_encode_tenant;
+use ourios_parquet::{AuditReader, Store, percent_encode_tenant};
 
-use crate::QueryError;
+use crate::{Backend, QueryError};
 
-/// Resolve the live audit `*.parquet` files for `tenant`, optionally
-/// pruned to the day partitions that could hold an event in the
-/// half-open `[start, end)` window. Canonical paths are de-duplicated
-/// (an in-tenant symlink can't double-count a file) and returned in
-/// **lexicographic path order** — the file-path component of the
-/// RFC 0005 §3.7.1 total fold order, and stable across re-scans. A
-/// missing tenant directory is an empty set, not an error; any other
-/// I/O failure surfaces as [`QueryError::Storage`] rather than being
-/// masked as "no data".
+/// Borrowed audit-scan backend selector (RFC 0019 §3.3): either a local
+/// filesystem root or an S3-backed [`Store`]. A single value rather than an
+/// `(Option<&Store>, Option<&Path>)` pair, so neither an inconsistent
+/// combination (both set, or neither) nor the resulting "can't happen" branch
+/// is representable — the reader-side derivations take this directly.
+#[derive(Debug, Clone, Copy)]
+pub enum StoreRef<'a> {
+    /// Read audit files directly from this local filesystem root (the `std::fs`
+    /// walk with the canonical-path tenant backstops).
+    Local(&'a Path),
+    /// List + read audit objects through this S3-backed [`Store`].
+    Remote(&'a Store),
+}
+
+impl StoreRef<'_> {
+    /// Clone into an owned [`Backend`] for a `'static + Send` blocking task
+    /// (e.g. drift's `spawn_blocking` listing); borrow it back with
+    /// [`Backend::store_ref`] inside the closure.
+    pub(crate) fn into_owned(self) -> Backend {
+        match self {
+            StoreRef::Local(root) => Backend::Local(root.to_path_buf()),
+            StoreRef::Remote(store) => Backend::Remote(store.clone()),
+        }
+    }
+}
+
+/// The resolved audit file set, addressed per backend (RFC 0019 §3.3). The
+/// consumers branch on this: the alias / registry folds read local files
+/// directly and S3 keys through the [`Store`]; drift builds local-path or
+/// object-store table URLs.
+pub(crate) enum AuditFiles {
+    /// Absolute, canonical local file paths (lexicographically sorted, unique).
+    Local(Vec<PathBuf>),
+    /// Store-relative object keys (lexicographically sorted, unique).
+    Remote(Vec<String>),
+}
+
+impl AuditFiles {
+    /// True when the tenant has no live audit files in the resolved set.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Local(paths) => paths.is_empty(),
+            Self::Remote(keys) => keys.is_empty(),
+        }
+    }
+}
+
+/// Resolve `tenant`'s live audit `*.parquet` file set, optionally pruned to the
+/// day partitions that could hold an event in the half-open `[start, end)`
+/// window. Files come back in **lexicographic order** — the file-path component
+/// of the RFC 0005 §3.7.1 total fold order, stable across re-scans — and unique.
+/// A tenant with no audit files is an empty set, not an error.
+///
+/// `backend` selects the scan: [`StoreRef::Local`] walks `std::fs` (with the
+/// canonical-path backstops), [`StoreRef::Remote`] lists the prefix-scoped
+/// [`Store::list_blocking`].
 pub(crate) fn audit_files(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+    window: Option<(u64, u64)>,
+) -> Result<AuditFiles, QueryError> {
+    match backend {
+        StoreRef::Local(root) => Ok(AuditFiles::Local(local_audit_files(root, tenant, window)?)),
+        StoreRef::Remote(store) => Ok(AuditFiles::Remote(remote_audit_files(
+            store, tenant, window,
+        )?)),
+    }
+}
+
+/// Read every [`AuditEvent`] from `tenant`'s resolved audit file set (the
+/// `None`-window full history), in the §3.7.1 fold order, applying the
+/// **row-level tenant backstop** (`CLAUDE.md` §3.7 / RFC 0005 §3.9 row-vs-path):
+/// the listing/walk is already tenant-scoped, so a row claiming another tenant
+/// is a corrupt or foreign file — fail loudly rather than fold (or silently
+/// drop) it. The shared reader for the alias-map and template-registry folds; a
+/// local file is read with [`AuditReader::open_file`], an S3 key via
+/// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
+pub(crate) fn read_all_events(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+) -> Result<Vec<AuditEvent>, QueryError> {
+    let mut events: Vec<AuditEvent> = Vec::new();
+    let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
+        for event in read {
+            if event.tenant_id != *tenant {
+                return Err(QueryError::Storage {
+                    detail: format!(
+                        "audit file {label} carries a row for tenant {} under tenant {}'s \
+                         partition root",
+                        event.tenant_id.as_str(),
+                        tenant.as_str(),
+                    ),
+                });
+            }
+            events.push(event);
+        }
+        Ok(())
+    };
+    match backend {
+        StoreRef::Local(root) => {
+            for path in &local_audit_files(root, tenant, None)? {
+                let read = AuditReader::open_file(path)
+                    .and_then(AuditReader::read_all)
+                    .map_err(|e| QueryError::Storage {
+                        detail: format!("audit file {}: {e}", path.display()),
+                    })?;
+                push_validated(&path.display().to_string(), read)?;
+            }
+        }
+        StoreRef::Remote(store) => {
+            for key in &remote_audit_files(store, tenant, None)? {
+                let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
+                    detail: format!("audit file {key}: {e}"),
+                })?;
+                let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+                    .and_then(AuditReader::read_all)
+                    .map_err(|e| QueryError::Storage {
+                        detail: format!("audit file {key}: {e}"),
+                    })?;
+                push_validated(key, read)?;
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// The **local** `std::fs` audit walk (RFC 0019 §3.3 local branch) — the
+/// pre-RFC-0019 behaviour, byte-for-byte: rooted at `audit/tenant_id=<enc>/`,
+/// with the day-window prune, the symlinked-tenant-root rejection, the per-file
+/// canonical-path escape backstop, canonical-path dedup, and lexicographic sort.
+fn local_audit_files(
     bucket_root: &Path,
     tenant: &TenantId,
     window: Option<(u64, u64)>,
@@ -142,6 +277,38 @@ pub(crate) fn audit_files(
     Ok(validated)
 }
 
+/// The **S3** audit listing (RFC 0019 §3.3 S3 branch): the live audit
+/// `*.parquet` object keys under `audit/tenant_id=<enc>`. Tenant isolation is
+/// the segment-wise prefix scope of [`Store::list_blocking`] (RFC0019.5); the
+/// object key space has no symlinks, so the local canonicalize backstops are
+/// moot. Keys come back sorted (the §3.7.1 fold order) and unique.
+fn remote_audit_files(
+    store: &Store,
+    tenant: &TenantId,
+    window: Option<(u64, u64)>,
+) -> Result<Vec<String>, QueryError> {
+    let enc = percent_encode_tenant(tenant.as_str());
+    let prefix = format!("audit/tenant_id={enc}");
+    let keys = store
+        .list_blocking(Some(&prefix))
+        .map_err(|e| QueryError::Storage {
+            detail: format!("list audit prefix {prefix}: {e}"),
+        })?;
+    let files = keys
+        .into_iter()
+        // `*.parquet.tmp` does not end in `.parquet`, so an uncommitted /
+        // crashed writer's temp object contributes nothing.
+        .filter(|key| key.ends_with(".parquet"))
+        // Day-granularity partition prune (RFC 0005 §3.4 / RFC 0010
+        // §6.5): a key whose `year/month/day` segments fall out of the
+        // window is dropped before it is read. `day_key_in_window` is
+        // conservative — a key whose segments don't parse is never
+        // pruned — so an unrecognised layout never drops in-window data.
+        .filter(|key| window.is_none_or(|(start, end)| day_key_in_window(key, start, end)))
+        .collect();
+    Ok(files)
+}
+
 /// One day in nanoseconds — the span a `…/day=DD/` audit partition covers.
 const DAY_NANOS: u64 = 86_400_000_000_000;
 
@@ -150,7 +317,35 @@ const DAY_NANOS: u64 = 86_400_000_000_000;
 /// `year/month/day` segments don't parse or aren't a real UTC instant, so a
 /// query never drops in-window data on an unrecognised layout.
 fn day_partition_in_window(dir: &Path, start: u64, end: u64) -> bool {
-    let Some((year, month, day)) = parse_day_partition(dir) else {
+    let segments: Vec<&str> = dir
+        .components()
+        .rev()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    day_segments_in_window(&segments, start, end)
+}
+
+/// The key-based sibling of [`day_partition_in_window`] for the S3 branch:
+/// whether the day partition the object `key` lives under could hold an event
+/// in `[start, end)`.
+fn day_key_in_window(key: &str, start: u64, end: u64) -> bool {
+    // The key's leaf is the file name; the day partition is its parent
+    // directory, so the partition segments are the key's path segments
+    // (deepest first) after dropping that leaf.
+    let segments: Vec<&str> = key.rsplit('/').skip(1).collect();
+    day_segments_in_window(&segments, start, end)
+}
+
+/// Decide the day-window prune from `segments` ordered **deepest-first** (the
+/// reversed path/key components, leaf already dropped for a key). Requires the
+/// deepest three to be exactly `day=`, `month=`, `year=` **adjacent** with
+/// parseable numbers — a non-contiguous or foreign layout (or a non-leaf dir)
+/// fails to parse and is never pruned (the conservative guarantee).
+fn day_segments_in_window(segments: &[&str], start: u64, end: u64) -> bool {
+    let Some((year, month, day)) = parse_day_partition(segments) else {
         return true;
     };
     let Some((lo, hi)) = day_span_ns(year, month, day) else {
@@ -159,17 +354,16 @@ fn day_partition_in_window(dir: &Path, start: u64, end: u64) -> bool {
     lo < end && start < hi
 }
 
-/// Parse `(year, month, day)` from the trailing three Hive segments of an audit
-/// partition directory. `None` if the deepest three components aren't `day=`,
-/// `month=`, `year=` with parseable numbers (a non-leaf dir or a foreign path).
-fn parse_day_partition(dir: &Path) -> Option<(i32, u32, u32)> {
-    let mut segments = dir.components().rev().filter_map(|c| match c {
-        std::path::Component::Normal(s) => s.to_str(),
-        _ => None,
-    });
-    let day = segments.next()?.strip_prefix("day=")?.parse().ok()?;
-    let month = segments.next()?.strip_prefix("month=")?.parse().ok()?;
-    let year = segments.next()?.strip_prefix("year=")?.parse().ok()?;
+/// Parse `(year, month, day)` from the trailing three Hive segments (passed
+/// **deepest-first**). `None` unless the deepest three are exactly `day=`,
+/// `month=`, `year=` **adjacent** with parseable numbers — a non-contiguous run
+/// (e.g. a stray segment between them) or a non-leaf / foreign path mis-parses
+/// to `None`, which the caller treats as non-prunable.
+fn parse_day_partition(segments: &[&str]) -> Option<(i32, u32, u32)> {
+    let mut it = segments.iter();
+    let day = it.next()?.strip_prefix("day=")?.parse().ok()?;
+    let month = it.next()?.strip_prefix("month=")?.parse().ok()?;
+    let year = it.next()?.strip_prefix("year=")?.parse().ok()?;
     Some((year, month, day))
 }
 
@@ -204,6 +398,9 @@ mod tests {
         .collect()
     }
 
+    /// An S3 object key under the same `day=02` partition.
+    const DAY_KEY: &str = "audit/tenant_id=t/year=2026/month=04/day=02/e.parquet";
+
     #[test]
     fn day_partition_prune_overlap_cases() {
         let dir = day_dir();
@@ -231,11 +428,64 @@ mod tests {
     }
 
     #[test]
+    fn day_key_prune_matches_the_path_prune() {
+        // The key-based prune (S3 branch) agrees with the path-based prune.
+        assert!(day_key_in_window(
+            DAY_KEY,
+            DAY_START + 3_600_000_000_000,
+            DAY_START + 7_200_000_000_000,
+        ));
+        assert!(!day_key_in_window(
+            DAY_KEY,
+            DAY_START - 7_200_000_000_000,
+            DAY_START - 3_600_000_000_000,
+        ));
+    }
+
+    #[test]
     fn day_partition_prune_is_conservative_on_unparseable_paths() {
         // A non-leaf / foreign path can't be proven out of range → never pruned.
         let tenant_dir: PathBuf = ["bucket", "audit", "tenant_id=t"].iter().collect();
         assert!(day_partition_in_window(&tenant_dir, 0, 1));
         let foreign: PathBuf = ["some", "other", "dir"].iter().collect();
         assert!(day_partition_in_window(&foreign, 0, 1));
+        // And the key sibling.
+        assert!(day_key_in_window("audit/tenant_id=t/x.parquet", 0, 1));
+        assert!(day_key_in_window("some/other/key", 0, 1));
+    }
+
+    #[test]
+    fn day_prune_requires_a_contiguous_trailing_run() {
+        // A stray segment between `month=` and `day=` breaks the contiguous
+        // `year=/month=/day=` run, so the deepest three aren't the partition
+        // triple — the prune must NOT fire (conservative: never drop an
+        // in-window object on an unrecognised layout). Before the fix the
+        // anywhere-scan grabbed the three regardless and could prune a valid
+        // object whose window is far from the (mis-parsed) day.
+        let non_contiguous = "audit/tenant_id=t/year=2026/month=04/stray=x/day=02/e.parquet";
+        // A window entirely before `day=02` would prune if the triple parsed;
+        // because the run is non-contiguous, it parses to None → keep.
+        assert!(day_key_in_window(
+            non_contiguous,
+            DAY_START - 7_200_000_000_000,
+            DAY_START - 3_600_000_000_000,
+        ));
+        // The path form too.
+        let dir: PathBuf = [
+            "bucket",
+            "audit",
+            "tenant_id=t",
+            "year=2026",
+            "month=04",
+            "stray=x",
+            "day=02",
+        ]
+        .iter()
+        .collect();
+        assert!(day_partition_in_window(
+            &dir,
+            DAY_START - 7_200_000_000_000,
+            DAY_START - 3_600_000_000_000,
+        ));
     }
 }

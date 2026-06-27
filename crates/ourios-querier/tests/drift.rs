@@ -340,7 +340,12 @@ fn rfc0010_8_no_sql_or_datafusion_leakage() {
 /// Tenant-isolation backstop (RFC0010.4 / `CLAUDE.md` §3.7): an audit file that
 /// symlinks outside the tenant's canonical `audit/tenant_id=…` root is refused,
 /// mirroring the log-query path's guard — a drift query must never resolve into
-/// another tenant's (or an out-of-tree) audit events.
+/// another tenant's (or an out-of-tree) audit events. Under RFC 0019 the local
+/// audit scan keeps the canonicalizing `std::fs` walk (the hybrid's local
+/// branch), so this escape backstop — which stops a symlinked-out file from
+/// being read at all — is preserved exactly. (Drift also applies a `tenant_id =
+/// <tenant>` predicate in its plan for row-level isolation, but that filters
+/// rows it has already read; this test guards the read itself.)
 #[cfg(unix)]
 #[tokio::test]
 async fn drift_rejects_audit_file_escaping_tenant_root() {
@@ -372,4 +377,37 @@ async fn drift_rejects_audit_file_escaping_tenant_root() {
         ),
         other => panic!("expected QueryError::Storage, got {other:?}"),
     }
+}
+
+/// Tenant isolation across a **string-prefix sibling** (RFC0010.4 /
+/// `CLAUDE.md` §3.7 / RFC0019.5): querying `acme` must never read `acmex`'s
+/// events, even though `tenant_id=acme` is a string prefix of `tenant_id=acmex`.
+/// On the local walk this holds because the walk is rooted at the exact
+/// `audit/tenant_id=acme/` directory; on S3 the segment-wise prefix scope of
+/// `Store::list_blocking` enforces the same (RFC0019.5). Guards against a
+/// regression to a naive string-prefix match on either backend.
+#[tokio::test]
+async fn drift_excludes_a_string_prefix_sibling_tenant() {
+    const ACME_TEMPLATE: u64 = 11;
+    const ACMEX_TEMPLATE: u64 = 22;
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(
+        bucket.path(),
+        &[
+            widened("acme", ACME_TEMPLATE, 1, MID),
+            // `tenant_id=acmex` is a string-prefix sibling of `tenant_id=acme`.
+            widened("acmex", ACMEX_TEMPLATE, 1, MID),
+        ],
+    );
+
+    // Act — drift in `acme`'s context.
+    let rows = run(bucket.path(), "acme", &drift_one_day()).await;
+
+    // Assert — only acme's template; the `acmex` sibling is unreachable.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].template_id, ACME_TEMPLATE);
+    assert!(
+        rows.iter().all(|r| r.template_id != ACMEX_TEMPLATE),
+        "the string-prefix sibling tenant must never appear in acme's result",
+    );
 }

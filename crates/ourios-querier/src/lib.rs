@@ -46,6 +46,7 @@ mod log_row;
 mod row_decode;
 mod template_registry;
 
+pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_registry::{TemplateRegistry, derive_template_registry};
@@ -66,10 +67,10 @@ use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionContext, col, lit};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::Manifest;
 use ourios_parquet::columns;
 use ourios_parquet::hour_partition_in_window;
 use ourios_parquet::percent_encode_tenant;
+use ourios_parquet::{MANIFEST_FILENAME, Manifest, Store, StoreConfig};
 
 /// A logs query to execute. **Throwaway surface** while the query
 /// thesis (B1/B2) is unproven — per the maintainer decision, DSL
@@ -252,6 +253,86 @@ fn resolve_live_files(
         stack.extend(subdirs);
     }
     Ok(files)
+}
+
+/// The S3 analog of [`resolve_live_files`]: resolve the live data-file **keys**
+/// under the tenant's `prefix` through the [`Store`] seam (RFC 0019 §3.3),
+/// honouring partition-level time pruning + the RFC 0009 §3.4 per-partition
+/// manifest. Returns store-relative keys (the same key space `Store::get`/`put`
+/// take), addressed as object-store URLs by the caller.
+///
+/// [`Store::list_blocking`] returns every key under `prefix` recursively, in
+/// lexicographic order, segment-wise prefix-scoped to this tenant (RFC0019.5).
+/// The keys are grouped by their partition directory (everything up to the last
+/// `/`); for each partition: skip it when an `hour=HH` window prune proves it
+/// out of range, then if it carries a `manifest.json` the manifest is
+/// authoritative (only its named files are live, joined onto the partition key),
+/// otherwise fall back to the partition's committed `*.parquet` keys
+/// (`*.parquet.tmp` is excluded — it does not end in `.parquet`).
+fn resolve_live_keys(
+    store: &Store,
+    prefix: &str,
+    window: Option<(u64, u64)>,
+) -> Result<Vec<String>, QueryError> {
+    let keys = store
+        .list_blocking(Some(prefix))
+        .map_err(|e| QueryError::Storage {
+            detail: format!("list data prefix {prefix}: {e}"),
+        })?;
+    // Group keys by partition directory (the key up to its last `/`).
+    let mut by_partition: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for key in &keys {
+        let (dir, _) = key.rsplit_once('/').unwrap_or(("", key.as_str()));
+        by_partition.entry(dir).or_default().push(key);
+    }
+
+    let mut live = Vec::new();
+    for (dir, partition_keys) in by_partition {
+        // Partition-level time pruning (RFC 0007), conservative — never prunes a
+        // partition it can't prove out of range. `hour_partition_in_window`
+        // parses the trailing Hive segments off a path, so build one from the
+        // partition-dir key.
+        if let Some((start, end)) = window
+            && !hour_partition_in_window(&PathBuf::from(dir), start, end)
+        {
+            continue;
+        }
+        let manifest_key = format!("{dir}/{MANIFEST_FILENAME}");
+        // Only read the manifest when its key is actually in the listing: the
+        // partition is already enumerated, so a `read_with_etag` for an absent
+        // manifest is a wasted (404) GET per un-compacted partition on S3.
+        // Absent ⇒ no manifest ⇒ all committed files live (same as today's
+        // glob fallback). `list_blocking` returns store-relative keys, so this
+        // compares like-for-like.
+        let manifest = if partition_keys.iter().any(|k| *k == manifest_key) {
+            Manifest::read_with_etag(store, &manifest_key).map_err(|e| QueryError::Storage {
+                detail: format!("manifest {manifest_key}: {e}"),
+            })?
+        } else {
+            None
+        };
+        match manifest {
+            // Manifest is authoritative: only its named files are live (joined
+            // onto the partition key as `<dir>/<name>`).
+            Some((manifest, _etag)) => {
+                live.extend(
+                    manifest
+                        .files
+                        .into_iter()
+                        .map(|name| format!("{dir}/{name}")),
+                );
+            }
+            // No manifest → glob fallback for this partition's committed files.
+            None => live.extend(
+                partition_keys
+                    .into_iter()
+                    .filter(|k| k.ends_with(".parquet"))
+                    .map(ToOwned::to_owned),
+            ),
+        }
+    }
+    Ok(live)
 }
 
 /// Pull the single aggregate count out of the result batches. A
@@ -439,22 +520,100 @@ fn apply_request_filters(
     Ok(Some(df))
 }
 
-/// The query engine. One per querier process; reads the RFC 0005
-/// Parquet store rooted at `bucket_root` (the writer's
-/// `<bucket_root>/data/...` layout).
+/// Which backend a [`Querier`] reads (RFC 0019 §3.3). The local variant holds
+/// only the path: building a `Store::local` **canonicalizes** the prefix and so
+/// fails on a not-yet-created bucket, which would break the infallible
+/// [`Querier::new`] contract and the long-standing "query a fresh bucket ⇒
+/// empty result, never an error" behaviour. The local read paths walk `std::fs`
+/// directly and tolerate `NotFound`, so the local branch never needs a
+/// constructed `Store` for I/O — only the S3 branch holds an eager [`Store`].
 #[derive(Debug, Clone)]
-pub struct Querier {
-    bucket_root: PathBuf,
+pub(crate) enum Backend {
+    /// Local-filesystem store rooted at the path (the `data/`-and-`audit/`
+    /// parent). Held as a path so construction is infallible and a missing dir
+    /// is tolerated at query time.
+    Local(PathBuf),
+    /// S3 / S3-compatible store, constructed eagerly (the read paths address it
+    /// via `Store::list_blocking` / `object_store`).
+    Remote(Store),
 }
 
+impl Backend {
+    /// Borrow as the [`StoreRef`] selector the reader-side derivations
+    /// (`audit_scan` / alias / registry / drift) take — the hybrid-scan branch
+    /// is then a single exhaustive `match` with no "can't happen" arm.
+    pub(crate) fn store_ref(&self) -> StoreRef<'_> {
+        match self {
+            Self::Local(root) => StoreRef::Local(root),
+            Self::Remote(store) => StoreRef::Remote(store),
+        }
+    }
+}
+
+/// The query engine. One per querier process; reads the RFC 0005
+/// Parquet + audit store through the `ourios-parquet` [`Store`] seam,
+/// so the same engine targets a local-filesystem store (dev / test /
+/// the regression guard) or an S3-compatible bucket (production,
+/// `CLAUDE.md` §3.6).
+///
+/// The backend (local vs S3) drives the hybrid scan: a local backend addresses
+/// files by absolute local path and walks `std::fs` (unchanged from before
+/// RFC 0019, missing dirs tolerated as empty); an S3 backend registers the
+/// [`Store`]'s `object_store` on the `SessionContext`, addresses tables by
+/// object-store URL, and resolves the live-file set through
+/// [`Store::list_blocking`] (RFC 0019 §3.3).
+#[derive(Debug, Clone)]
+pub struct Querier {
+    backend: Backend,
+}
+
+/// The object-store URL scheme/authority the S3 scan registers its
+/// [`Store`] under and addresses tables by — `ourios://store/<key>`.
+/// The host carries no meaning beyond keying the `SessionContext`'s
+/// object-store registry (the real bucket/prefix is inside the
+/// registered store); using a private scheme keeps these synthetic URLs
+/// from colliding with any real `s3://` / `file://` addressing.
+const STORE_URL: &str = "ourios://store";
+
 impl Querier {
-    /// Create a querier reading the RFC 0005 store under
-    /// `bucket_root` (the same root the `ourios-parquet` writer
-    /// writes `data/tenant_id=…/year=…/…` under).
+    /// Create a querier reading the RFC 0005 store under the **local**
+    /// `bucket_root` (the same root the `ourios-parquet` writer writes
+    /// `data/tenant_id=…/year=…/…` under). The default constructor —
+    /// the local backend is the test/dev default and the RFC 0019
+    /// regression guard.
+    ///
+    /// Infallible and side-effect-free: it only records the path (no I/O, no
+    /// `Store` construction), so it never panics and never requires the bucket
+    /// to exist. A query against a not-yet-created bucket yields an empty result
+    /// (the `std::fs` read paths tolerate `NotFound`), exactly as before
+    /// RFC 0019.
     pub fn new(bucket_root: impl Into<PathBuf>) -> Self {
         Self {
-            bucket_root: bucket_root.into(),
+            backend: Backend::Local(bucket_root.into()),
         }
+    }
+
+    /// Create a querier from a resolved [`StoreConfig`] (RFC 0019 §3.2)
+    /// — the S3-capable constructor the server wires the querier role
+    /// through. A `Local` config is equivalent to [`Self::new`]; an
+    /// `S3` config drives the object-store scan branch.
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::Storage`] if the S3 backend cannot be constructed
+    /// (e.g. an invalid S3 config — see [`StoreConfig::open`]). A local
+    /// config is infallible (it defers to [`Self::new`]).
+    pub fn from_store_config(config: &StoreConfig) -> Result<Self, QueryError> {
+        let backend = match config {
+            StoreConfig::Local(root) => Backend::Local(root.clone()),
+            StoreConfig::S3(_) => {
+                let store = config.open().map_err(|e| QueryError::Storage {
+                    detail: format!("open store: {e}"),
+                })?;
+                Backend::Remote(store)
+            }
+        };
+        Ok(Self { backend })
     }
 
     /// Execute `request` against the RFC 0005 store with predicate
@@ -531,7 +690,17 @@ impl Querier {
         let map = match alias_map {
             Some(map) => map,
             None if compile::uses_resolves_to(&query.predicate) => {
-                derived = alias_store::derive_alias_map(&self.bucket_root, tenant)?;
+                // Offload the blocking audit derivation (S3 `get_blocking` /
+                // the local `std::fs` reads) off the runtime worker, mirroring
+                // `run_drift` — the derivation is deeply sync, so clone the
+                // cheap backend handle into the blocking task.
+                derived = self
+                    .spawn_blocking_audit({
+                        let backend = self.backend.clone();
+                        let tenant = tenant.clone();
+                        move || alias_store::derive_alias_map(backend.store_ref(), &tenant)
+                    })
+                    .await?;
                 &derived
             }
             // No `resolves_to` ⇒ the map is never consulted; an empty
@@ -578,7 +747,7 @@ impl Querier {
         tenant: &TenantId,
         now_unix_nano: u64,
     ) -> Result<DriftResult, QueryError> {
-        drift::run_drift(&self.bucket_root, query, tenant, now_unix_nano).await
+        drift::run_drift(self.backend.store_ref(), query, tenant, now_unix_nano).await
     }
 
     /// Shared scan path for both [`run`](Self::run) and
@@ -607,64 +776,22 @@ impl Querier {
         ) -> Result<Option<datafusion::dataframe::DataFrame>, QueryError>,
     {
         let enc = percent_encode_tenant(tenant.as_str());
-        let tenant_dir = self
-            .bucket_root
-            .join("data")
-            .join(format!("tenant_id={enc}"));
-        // Resolve the live file set under the tenant dir, honouring
-        // the RFC 0009 §3.4 manifest (glob-fallback when absent). An
-        // empty set ⇒ the tenant has nothing queryable ⇒ empty result
-        // (not an error). Covers the missing-dir case and a partition
-        // holding only `*.parquet.tmp` (a poisoned/crashed writer) —
-        // where building a table over zero files would otherwise
-        // error and wrongly fail the query.
-        let live_files = resolve_live_files(&tenant_dir, partition_window)?;
-        if live_files.is_empty() {
+        let data_prefix = format!("data/tenant_id={enc}");
+
+        let ctx = SessionContext::new();
+        // Resolve the live file set under the tenant's `data/` prefix,
+        // honouring the RFC 0009 §3.4 manifest (glob-fallback when absent),
+        // and produce the per-file table URLs (local absolute path, or
+        // object-store URL on S3). An empty set ⇒ the tenant has nothing
+        // queryable ⇒ empty result (not an error). Covers the missing-dir
+        // case and a partition holding only `*.parquet.tmp` (a poisoned /
+        // crashed writer) — where building a table over zero files would
+        // otherwise error and wrongly fail the query.
+        let urls = self.resolve_data_urls(&ctx, &data_prefix, partition_window)?;
+        if urls.is_empty() {
             return Ok(QueryResult::default());
         }
 
-        let ctx = SessionContext::new();
-        // Tenant isolation (RFC0007.5 / §3.7) is enforced here, not
-        // just assumed structural: every resolved file must
-        // canonicalize to a path *under* the tenant's canonical
-        // partition root. The manifest's entries are already validated
-        // as partition-local names (`Manifest::validate`), but a
-        // symlinked `*.parquet` could still resolve outside — this
-        // `starts_with` check is the backstop that fails such a path
-        // loudly rather than reading another tenant's data.
-        let tenant_root = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
-            detail: format!("canonicalize {}: {e}", tenant_dir.display()),
-        })?;
-        // One table path per *live* data file (RFC 0009 §3.4 — the
-        // manifest, not a directory glob, decides the file set, so a
-        // query never sees a compaction's superseded inputs). Each is
-        // the canonical absolute path: DataFusion 53 treats an
-        // absolute filesystem path as local and URI-encodes it
-        // internally, so spaces / reserved characters are handled
-        // without a hand-built `file://…` string. `year/month/day/hour`
-        // stay path-only (not file columns) and the query filters only
-        // data columns, so no table partition columns are declared.
-        let mut seen = std::collections::HashSet::new();
-        let mut urls = Vec::with_capacity(live_files.len());
-        for file in &live_files {
-            let abs = file.canonicalize().map_err(|e| QueryError::Storage {
-                detail: format!("canonicalize {}: {e}", file.display()),
-            })?;
-            if !abs.starts_with(&tenant_root) {
-                return Err(QueryError::Storage {
-                    detail: format!(
-                        "resolved file {} escapes tenant partition root {}",
-                        abs.display(),
-                        tenant_root.display(),
-                    ),
-                });
-            }
-            // De-duplicate so a manifest naming the same file twice
-            // can't double-count its rows.
-            if seen.insert(abs.clone()) {
-                urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
-            }
-        }
         // Read Parquet string/binary columns as `Utf8` / `Binary`, not the
         // `Utf8View` / `BinaryView` DataFusion forces by default — the RFC 0017
         // row decoder (`row_decode`) downcasts to the non-view array types, and
@@ -744,11 +871,11 @@ impl Querier {
             return Ok(Vec::new());
         }
         // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
-        // row-vs-path): the scan is rooted at the tenant's partition and the
-        // file set is canonical-path-checked under it, but a misplaced /
-        // corrupt Parquet file could still carry a row for another tenant.
-        // Returning row *contents*, refuse to render such a row rather than
-        // expose another tenant's data — fail loudly, mirroring the
+        // row-vs-path): the scan is scoped to the tenant's partition prefix
+        // (and, on the local backend, canonical-path-checked under it), but a
+        // misplaced / corrupt Parquet file could still carry a row for another
+        // tenant. Returning row *contents*, refuse to render such a row rather
+        // than expose another tenant's data — fail loudly, mirroring the
         // alias-map / template-registry derivations.
         for record in &mined {
             if record.tenant_id != *tenant {
@@ -761,17 +888,294 @@ impl Querier {
                 });
             }
         }
-        let registry = derive_template_registry(&self.bucket_root, tenant)?;
+        // Offload the blocking registry derivation (S3 `get_blocking` / local
+        // `std::fs` reads) off the runtime worker, like the alias derivation.
+        let registry = self
+            .spawn_blocking_audit({
+                let backend = self.backend.clone();
+                let tenant = tenant.clone();
+                move || derive_template_registry(backend.store_ref(), &tenant)
+            })
+            .await?;
         Ok(mined
             .iter()
             .map(|record| LogRow::from_record(record, &registry))
             .collect())
+    }
+
+    /// Run a blocking audit derivation (`derive_alias_map` /
+    /// `derive_template_registry`) on the tokio blocking pool so the async query
+    /// path doesn't tie up a runtime worker on the S3 `get_blocking` (or local
+    /// `std::fs`) reads — the same offload `run_drift` applies to the listing.
+    /// The closure owns its captured `Backend` / `TenantId` clones so it
+    /// satisfies the `'static + Send` bound.
+    async fn spawn_blocking_audit<T, F>(&self, derive: F) -> Result<T, QueryError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, QueryError> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(derive)
+            .await
+            .map_err(|e| QueryError::Storage {
+                detail: format!("audit derivation task: {e}"),
+            })?
+    }
+
+    /// Resolve the live data files under the tenant's `data/` prefix and turn
+    /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3):
+    ///
+    /// - **Local backend** ([`Backend::Local`]): walk `std::fs` under
+    ///   `<root>/<prefix>` honouring the RFC 0009 §3.4 manifest, then address
+    ///   each file by its absolute local path — byte-for-byte the pre-RFC-0019
+    ///   read path, with the canonical-path tenant-isolation backstop intact.
+    /// - **S3 backend** ([`Backend::Remote`]): list the keys under `prefix`
+    ///   through [`Store::list_blocking`] (segment-wise prefix-scoped, the
+    ///   RFC0019.5 tenant guarantee), resolve the per-partition manifest through
+    ///   the [`Store`], register the store on `ctx`, and address each key by the
+    ///   `ourios://store/<key>` object-store URL.
+    fn resolve_data_urls(
+        &self,
+        ctx: &SessionContext,
+        prefix: &str,
+        window: Option<(u64, u64)>,
+    ) -> Result<Vec<ListingTableUrl>, QueryError> {
+        match &self.backend {
+            Backend::Local(root) => {
+                let tenant_dir = root.join(prefix);
+                let live_files = resolve_live_files(&tenant_dir, window)?;
+                local_file_urls(&tenant_dir, &live_files)
+            }
+            Backend::Remote(store) => {
+                let live_keys = resolve_live_keys(store, prefix, window)?;
+                object_store_urls(ctx, store, &live_keys)
+            }
+        }
+    }
+}
+
+/// Build the `DataFusion` table URLs for the **local** backend: every resolved
+/// file must canonicalize *under* the tenant's canonical partition root before
+/// it is addressed, the tenant-isolation backstop (RFC0007.5 / §3.7). The
+/// manifest's entries are already validated as partition-local names
+/// (`Manifest::validate`), but a symlinked `*.parquet` could still resolve
+/// outside — this `starts_with` check fails such a path loudly rather than
+/// reading another tenant's data. Canonical paths are de-duplicated so a
+/// manifest naming the same file twice can't double-count its rows.
+///
+/// Each URL is the canonical absolute path: `DataFusion` 53 treats an absolute
+/// filesystem path as local and URI-encodes it internally, so spaces / reserved
+/// characters are handled without a hand-built `file://…` string.
+/// `year/month/day/hour` stay path-only (not file columns) and the query
+/// filters only data columns, so no table partition columns are declared.
+fn local_file_urls(
+    tenant_dir: &std::path::Path,
+    live_files: &[PathBuf],
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    if live_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tenant_root = tenant_dir.canonicalize().map_err(|e| QueryError::Storage {
+        detail: format!("canonicalize {}: {e}", tenant_dir.display()),
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    let mut urls = Vec::with_capacity(live_files.len());
+    for file in live_files {
+        let abs = file.canonicalize().map_err(|e| QueryError::Storage {
+            detail: format!("canonicalize {}: {e}", file.display()),
+        })?;
+        if !abs.starts_with(&tenant_root) {
+            return Err(QueryError::Storage {
+                detail: format!(
+                    "resolved file {} escapes tenant partition root {}",
+                    abs.display(),
+                    tenant_root.display(),
+                ),
+            });
+        }
+        if seen.insert(abs.clone()) {
+            urls.push(ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)?);
+        }
+    }
+    Ok(urls)
+}
+
+/// Build the `DataFusion` table URLs for the **S3** backend: register the
+/// [`Store`]'s `object_store` on `ctx` under the [`STORE_URL`] scheme/authority
+/// and address each store-relative key by an `ourios://store/<key>` URL
+/// (RFC 0019 §3.3). Tenant isolation is the segment-wise prefix scope of the
+/// listing that produced `keys` (RFC0019.5) — the object key space has no
+/// symlinks, so there is no canonical-path escape to backstop here (the §3.7
+/// row-level backstop in the consumers stays). De-duplicates keys so a manifest
+/// naming the same file twice can't double-count its rows.
+fn object_store_urls(
+    ctx: &SessionContext,
+    store: &Store,
+    keys: &[String],
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(STORE_URL)
+        .map_err(storage_err)?;
+    ctx.register_object_store(store_url.as_ref(), store.object_store());
+    // `Store::object_store()` is the RAW backend (prefix NOT applied), whereas
+    // `list_blocking`/`get_blocking` operate in the store-relative key space
+    // under `Store::prefix()` (the `OURIOS_S3_PREFIX` root). So the URLs handed
+    // to DataFusion — which reads the raw backend directly — must carry the FULL
+    // key: the store prefix segments followed by the relative key. With no
+    // prefix (the local default) this is just the key.
+    let prefix: Vec<String> = store
+        .prefix()
+        .parts()
+        .map(|p| p.as_ref().to_owned())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut urls = Vec::with_capacity(keys.len());
+    for key in keys {
+        if seen.insert(key.clone()) {
+            urls.push(
+                ListingTableUrl::parse(object_store_url_for_key(&prefix, key))
+                    .map_err(storage_err)?,
+            );
+        }
+    }
+    Ok(urls)
+}
+
+/// Build the `ourios://store/<prefix>/<key>` URL for a store-relative `key`
+/// under the store's `prefix` segments, percent-encoding each path segment.
+///
+/// Two reasons the full path matters:
+/// - **Prefix** — `Store::object_store()` is the un-scoped raw backend, so the
+///   URL must carry the store's `OURIOS_S3_PREFIX` root (`prefix`) ahead of the
+///   relative key, or `DataFusion` would address an un-prefixed (not-found) path.
+/// - **Encoding** — `ListingTableUrl::parse` URL-**decodes** the path, and a
+///   key carries literal `%` (the partition dir is `tenant_id=<percent-encoded>`,
+///   e.g. `tenant_id=tenant%20ABC`), so an un-encoded segment would be
+///   double-decoded into a wrong path. Encoding every non-unreserved byte per
+///   segment (and re-joining with `/`) makes the parse round-trip back to the
+///   exact full key. `NON_ALPHANUMERIC` over-encodes harmlessly (`=`, `-`, `.`
+///   round-trip the same); the only structural byte we keep is the `/`
+///   separator, preserved by the per-segment split.
+fn object_store_url_for_key(prefix: &[String], key: &str) -> String {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    let encode = |segment: &str| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string();
+    let encoded = prefix
+        .iter()
+        .map(|p| encode(p))
+        .chain(key.split('/').map(encode))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{STORE_URL}/{encoded}")
+}
+
+/// Build the `DataFusion` table URLs for an **audit** scan (the drift query's
+/// `ListingTable` over the audit stream) from a resolved [`AuditFiles`],
+/// branching the same way as the bulk log scan (RFC 0019 §3.3):
+///
+/// - **Local** ([`AuditFiles::Local`]): the paths are already the
+///   canonicalizing `std::fs` walk's output — absolute, canonical, deduped, and
+///   tenant-isolation-checked (the symlink-escape / tenant-root backstops live
+///   in [`audit_scan`]). Address each by its absolute local path.
+/// - **S3** ([`AuditFiles::Remote`]): register the store on `ctx` and address
+///   each key by its percent-encoded `ourios://store/<key>` object-store URL;
+///   tenant isolation is the segment-wise prefix scope (RFC0019.5).
+pub(crate) fn audit_table_urls(
+    ctx: &SessionContext,
+    backend: StoreRef<'_>,
+    files: &audit_scan::AuditFiles,
+) -> Result<Vec<ListingTableUrl>, QueryError> {
+    match files {
+        // The walk already produced absolute canonical paths, so address them
+        // directly — no `root.join`, no CWD-relative path. The local branch
+        // needs no `Store`.
+        audit_scan::AuditFiles::Local(paths) => paths
+            .iter()
+            .map(|path| ListingTableUrl::parse(path.display().to_string()).map_err(storage_err))
+            .collect(),
+        // Remote keys imply the S3 backend, so `backend` is `Remote` here (it is
+        // what produced these keys); a `Local` is an internal invariant
+        // violation, surfaced rather than unwrapped (no panics, `CLAUDE.md` §6).
+        audit_scan::AuditFiles::Remote(keys) => {
+            let StoreRef::Remote(store) = backend else {
+                return Err(QueryError::Storage {
+                    detail: "internal: S3 audit URLs reached with a local backend".to_string(),
+                });
+            };
+            object_store_urls(ctx, store, keys)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Querier::new` is infallible and must not panic on a not-yet-created
+    /// bucket: it only records the path (no `Store` construction, which would
+    /// canonicalize and fail on a missing dir). Querying a non-existent local
+    /// bucket returns an empty result — the `std::fs` read paths tolerate
+    /// `NotFound` — exactly as before RFC 0019.
+    #[tokio::test]
+    async fn new_on_missing_dir_does_not_panic_and_queries_empty() {
+        // A path under a temp dir that was never created — `Store::local` would
+        // error on this (it canonicalizes the prefix), but `new` must not.
+        let tmp = tempfile::tempdir().expect("temp");
+        let missing = tmp.path().join("never/created/bucket");
+        assert!(!missing.exists(), "precondition: the bucket dir is absent");
+
+        let querier = Querier::new(&missing);
+        let result = querier
+            .run(QueryRequest {
+                tenant: ourios_core::tenant::TenantId::new("acme"),
+                time_range: None,
+                template_id: None,
+                severity_text: None,
+                limit: None,
+            })
+            .await
+            .expect("a query against a missing bucket is an empty result, not an error");
+        assert_eq!(result.rows, 0, "no rows from a non-existent bucket");
+        assert!(result.records.is_empty());
+        assert_eq!(result.stats, QueryStats::default());
+    }
+
+    /// The S3 object-store URL for a key prepends the store prefix and
+    /// percent-encodes every segment, so `ListingTableUrl::parse`'s URL-decode
+    /// round-trips back to the **full** key the raw backend expects
+    /// (`OURIOS_S3_PREFIX` + the store-relative key). The partition dir carries
+    /// a literal `%` (`tenant_id=tenant%20ABC`) that must survive the parse.
+    #[test]
+    fn object_store_url_prepends_prefix_and_round_trips() {
+        let prefix = vec!["ourios".to_string()];
+        let key = "data/tenant_id=tenant%20ABC/year=2026/h.parquet";
+        let url = object_store_url_for_key(&prefix, key);
+        // The parsed URL's object-store path must decode back to prefix + key,
+        // not double-decode the literal `%20` into a space.
+        let parsed = ListingTableUrl::parse(&url).expect("parse url");
+        let decoded = percent_encoding::percent_decode_str(parsed.as_ref())
+            .decode_utf8()
+            .expect("utf8");
+        assert!(
+            decoded.ends_with("ourios/data/tenant_id=tenant%20ABC/year=2026/h.parquet"),
+            "decoded URL must carry the full prefixed key verbatim: {decoded}",
+        );
+    }
+
+    /// With no store prefix (the local default), the URL is just the key —
+    /// the prefix prepend is a no-op.
+    #[test]
+    fn object_store_url_with_no_prefix_is_just_the_key() {
+        let url = object_store_url_for_key(&[], "data/tenant_id=t/h.parquet");
+        let parsed = ListingTableUrl::parse(&url).expect("parse url");
+        let decoded = percent_encoding::percent_decode_str(parsed.as_ref())
+            .decode_utf8()
+            .expect("utf8");
+        assert!(
+            decoded.ends_with("data/tenant_id=t/h.parquet"),
+            "no-prefix URL is the bare key: {decoded}",
+        );
+    }
 
     /// Engine/SQL substrings that must never appear in an
     /// operator-facing `QueryError` message (RFC0007.3 / §4.6).

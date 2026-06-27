@@ -9,16 +9,16 @@
 //! SQL in RFC 0001 §6.7 / RFC 0010 §6.3 is anchored programmatically, never
 //! exposed.
 //!
-//! Tenancy (RFC0010.4 / `CLAUDE.md` §3.7) is a partition prune: the scan is
-//! rooted at the executing tenant's `audit/tenant_id=<enc>/` directory, so no
-//! other tenant's events are reachable. The window drives a day-granularity
-//! `year/month/day` partition prune (RFC 0005 §3.4 — the audit layout has no
-//! `hour` segment), then an exact `timestamp` predicate trims the boundary
-//! days to the half-open `[from, to)` window (RFC 0010 §6.5). The walk —
-//! tenant root, canonical-path escape backstop, day prune — is the shared
-//! [`crate::audit_scan`], also used by the §3.7.1 alias-map derivation.
+//! Tenancy (RFC0010.4 / `CLAUDE.md` §3.7) is a prefix scope: the scan is scoped
+//! to the executing tenant's `audit/tenant_id=<enc>/` prefix, so no other
+//! tenant's events are reachable (RFC0019.5 — the listing is segment-wise
+//! prefix-scoped). The window drives a day-granularity `year/month/day`
+//! partition prune (RFC 0005 §3.4 — the audit layout has no `hour` segment),
+//! then an exact `timestamp` predicate trims the boundary days to the half-open
+//! `[from, to)` window (RFC 0010 §6.5). The listing — tenant prefix, day prune
+//! — is the shared [`crate::audit_scan`], also used by the §3.7.1 alias-map
+//! derivation.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -27,9 +27,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
+use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion::functions_aggregate::expr_fn::{count, max, min};
 use datafusion::prelude::{SessionContext, col, lit};
 
@@ -38,7 +36,10 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::audit_columns;
 
 use crate::dsl::DriftQuery;
-use crate::{QueryError, QueryStats, audit_scan, scan_stats, storage_err, time_bound_scalar};
+use crate::{
+    QueryError, QueryStats, StoreRef, audit_scan, audit_table_urls, scan_stats, storage_err,
+    time_bound_scalar,
+};
 
 /// One drift row: a template that gained at least one version in the queried
 /// window, with the §6.3 aggregates. The columns map one-to-one onto RFC 0010
@@ -79,14 +80,19 @@ const MAX_NEW_VERSION: &str = "max_new_version";
 const FIRST_SEEN: &str = "first_seen";
 const LAST_SEEN: &str = "last_seen";
 
-/// Execute the drift query against the tenant's audit stream under
-/// `bucket_root`, resolving the window against `now_unix_nano`.
+/// Execute the drift query against the tenant's audit stream, resolving the
+/// window against `now_unix_nano`.
+///
+/// `backend` selects the hybrid scan (RFC 0019 §3.3, mirroring the bulk log
+/// path): [`StoreRef::Local`] addresses the audit files by absolute local path;
+/// [`StoreRef::Remote`] registers the store on the `SessionContext` and
+/// addresses by object-store URL.
 ///
 /// `now_unix_nano` is the wall-clock reference the relative `from`/`to` bounds
 /// (`-7d`, `now`) resolve against; the caller supplies it so execution is
 /// deterministic and testable (mirroring [`crate::Querier::run_query`]).
 pub(crate) async fn run_drift(
-    bucket_root: &Path,
+    backend: StoreRef<'_>,
     query: &DriftQuery,
     tenant: &TenantId,
     now_unix_nano: u64,
@@ -98,7 +104,21 @@ pub(crate) async fn run_drift(
         // (RFC0010.5).
         return Ok(DriftResult::default());
     }
-    let files = audit_scan::audit_files(bucket_root, tenant, Some((start, end)))?;
+    // Resolve the audit file set off the async runtime: the S3 branch's
+    // `Store::list_blocking` (and the local `std::fs` walk) are blocking, so
+    // offload them via `spawn_blocking` rather than tie up a runtime worker.
+    // The owned `Backend` (cheap to clone) gives the task a `'static` selector.
+    let files = {
+        let owned = backend.into_owned();
+        let tenant = tenant.clone();
+        tokio::task::spawn_blocking(move || {
+            audit_scan::audit_files(owned.store_ref(), &tenant, Some((start, end)))
+        })
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit listing task: {e}"),
+        })??
+    };
     if files.is_empty() {
         // No audit files for the window ⇒ empty drift result, not an error
         // (RFC0010.5).
@@ -106,10 +126,7 @@ pub(crate) async fn run_drift(
     }
 
     let ctx = SessionContext::new();
-    let urls = files
-        .iter()
-        .map(|f| ListingTableUrl::parse(f.display().to_string()).map_err(storage_err))
-        .collect::<Result<Vec<_>, _>>()?;
+    let urls = audit_table_urls(&ctx, backend, &files)?;
     let options =
         ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
     let config = ListingTableConfig::new_with_multi_paths(urls)
@@ -133,8 +150,15 @@ pub(crate) async fn run_drift(
         .clone()
         .gt_eq(lit(time_bound_scalar(start)?))
         .and(ts.lt(lit(time_bound_scalar(end)?)));
+    // Row-level tenant guard (`CLAUDE.md` §3.7): the scan is already scoped to
+    // the tenant's `audit/tenant_id=…` prefix (and, on local, the canonical-path
+    // walk), but drift aggregates in DataFusion and has no per-row backstop like
+    // the alias / registry folds. A `tenant_id = <tenant>` predicate gives the
+    // same guarantee, so a corrupt or misplaced row under the prefix can't skew
+    // (or leak into) another tenant's drift counts.
+    let tenant_match = col(audit_columns::TENANT_ID).eq(lit(tenant.as_str()));
     let filtered = base
-        .filter(widened.or(type_expanded).and(in_window))
+        .filter(widened.or(type_expanded).and(in_window).and(tenant_match))
         .map_err(storage_err)?;
 
     // §6.3 steps 2–3 — GROUP BY template_id, the five aggregates.

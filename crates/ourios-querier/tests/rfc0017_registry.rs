@@ -15,7 +15,7 @@ use ourios_core::audit::{
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::OwnedToken;
 use ourios_parquet::ParquetAuditSink;
-use ourios_querier::derive_template_registry;
+use ourios_querier::{StoreRef, derive_template_registry};
 use tempfile::TempDir;
 
 fn at(secs: u64) -> SystemTime {
@@ -118,7 +118,10 @@ fn rfc0017_2_registry_derives_completely_including_v1() {
     }
     assert_eq!(sink.write_failures(), 0, "fixture events must all persist");
 
-    let registry = derive_template_registry(bucket.path(), &TenantId::new(tenant)).expect("derive");
+    // RFC 0019 — the registry derivation is a hybrid; `StoreRef::Local` selects
+    // the local `std::fs` branch (the S3 branch is `StoreRef::Remote(&store)`).
+    let registry = derive_template_registry(StoreRef::Local(bucket.path()), &TenantId::new(tenant))
+        .expect("derive");
 
     // Every (template_id, version) the stream described is present — including
     // version 1 (the `template_created` events), the gap this RFC closes.

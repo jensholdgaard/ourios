@@ -109,6 +109,28 @@ impl Reader {
         Self::from_bytes(bytes, PathBuf::from("<object-store>"))
     }
 
+    /// Open a reader over in-memory Parquet `bytes` under a known
+    /// [`PartitionKey`] — the store-backed counterpart of
+    /// [`Self::open_partition`] (the compactor reads each input via
+    /// [`Store::get_blocking`](crate::Store::get_blocking) → these bytes so it
+    /// can target S3, RFC 0019). Applies the same RFC 0005 §3.9 row-vs-path
+    /// validation on [`Self::read_all`]: every row's `tenant_id` and derived
+    /// time bucket must match `partition`, or the read is a hard error
+    /// (RFC0009.5 — a mis-partitioned input aborts a compaction).
+    ///
+    /// # Errors
+    /// [`ReaderError::Parquet`] if the bytes are not a valid Parquet file;
+    /// [`ReaderError::MissingRequiredColumn`] if a baseline REQUIRED column is
+    /// absent (§3.9).
+    pub fn open_partition_bytes(
+        bytes: bytes::Bytes,
+        partition: PartitionKey,
+    ) -> Result<Self, ReaderError> {
+        let mut reader = Self::from_bytes(bytes, PathBuf::from("<object-store>"))?;
+        reader.partition = Some(partition);
+        Ok(reader)
+    }
+
     /// Build a reader over in-memory Parquet `bytes`, recording `file_path`
     /// for diagnostics (the real path on the [`Self::open_file`] /
     /// [`Self::open_partition`] seam, a sentinel on [`Self::open_bytes`]).

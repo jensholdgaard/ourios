@@ -550,6 +550,68 @@ impl Store {
         block_on_off_runtime(self.list_entries(prefix))
     }
 
+    /// List the **immediate child common-prefixes** under `prefix` (the
+    /// `/`-delimited "directories" one level down), store-relative, sorted, and
+    /// deduplicated — a one-level roll-up via `ObjectStore::list_with_delimiter`,
+    /// **not** a recursive walk. The compactor enumerates tenants with this
+    /// (`data/` → `data/tenant_id=…`) so it reads one listing page rather than
+    /// every object under `data/` (an S3-scale concern). `prefix` is `None` to
+    /// roll up the store root.
+    ///
+    /// Keys are returned relative to the store's own prefix (the same form
+    /// [`Self::list_blocking`] returns), and the order is enforced here by
+    /// sorting, not inherited from the backend. Tenant isolation is the same
+    /// **segment-wise** prefix scope as [`Self::list_blocking`]
+    /// (RFC0019.5): a string-prefix sibling of the requested prefix is excluded.
+    /// `LocalFileSystem` and S3 both surface subdirectories as common-prefixes.
+    async fn list_common_prefixes(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        let scoped = prefix.map_or_else(|| self.prefix.clone(), |p| self.resolve(p));
+        let result = self
+            .inner
+            .list_with_delimiter(Some(&scoped))
+            .await
+            .map_err(StoreError::Backend)?;
+        let root = &self.prefix;
+        let mut prefixes: Vec<String> = result
+            .common_prefixes
+            .into_iter()
+            .filter_map(|p| {
+                // Same segment-wise gating as `list_entries`: exclude a
+                // string-prefix sibling, then strip the store `root` to the
+                // caller's key space. `?` rejects a prefix not under the
+                // requested one; the matched iterator isn't needed (the key is
+                // built from the `root` strip), so bind it to `_`.
+                let _ = p.prefix_match(&scoped)?;
+                let parts = p.prefix_match(root)?;
+                Some(
+                    parts
+                        .map(|s| s.as_ref().to_owned())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            })
+            .collect();
+        prefixes.sort();
+        prefixes.dedup();
+        Ok(prefixes)
+    }
+
+    /// Blocking immediate-child common-prefix listing for the **sync** storage
+    /// call sites — the bridge over the internal async `list_common_prefixes`,
+    /// used by the compactor's one-level tenant enumeration. Safe to call from
+    /// inside a tokio runtime (see [`Self::get_blocking`]). Same order +
+    /// isolation contract as [`Self::list_blocking`].
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// [`StoreError::Backend`] on a listing failure.
+    pub fn list_common_prefixes_blocking(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<String>, StoreError> {
+        block_on_off_runtime(self.list_common_prefixes(prefix))
+    }
+
     /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
     /// compaction). Safe to call from inside a tokio runtime (see
     /// [`Self::get_blocking`]).
@@ -785,6 +847,52 @@ mod tests {
             store
                 .list_blocking(Some("data/tenant_id=z"))
                 .expect("list z")
+                .is_empty(),
+        );
+    }
+
+    /// `list_common_prefixes_blocking` rolls up to the **immediate** child
+    /// "directories" under a prefix (one level, not a recursive walk) —
+    /// store-relative, sorted, deduplicated. The compactor enumerates tenants
+    /// with this (`data/` → `data/tenant_id=…`) rather than scanning every
+    /// object under `data/`.
+    #[test]
+    fn list_common_prefixes_rolls_up_immediate_children() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        for key in [
+            "data/tenant_id=a/year=2026/month=04/day=02/hour=10/h0.parquet",
+            "data/tenant_id=a/year=2026/month=04/day=02/hour=11/h1.parquet",
+            "data/tenant_id=ab/year=2026/h0.parquet",
+            "data/tenant_id=b/year=2026/h0.parquet",
+        ] {
+            store.put_blocking(key, b"x".to_vec()).expect("put");
+        }
+        // Under `data/`: the three tenant dirs, one level down only (no deeper
+        // segments), deduplicated across each tenant's many objects, sorted.
+        assert_eq!(
+            store
+                .list_common_prefixes_blocking(Some("data"))
+                .expect("roll up data"),
+            vec![
+                "data/tenant_id=a".to_string(),
+                "data/tenant_id=ab".to_string(),
+                "data/tenant_id=b".to_string(),
+            ],
+        );
+        // Scoped to one tenant → its immediate `year=…` child only (segment-wise
+        // scope excludes the `tenant_id=ab` sibling).
+        assert_eq!(
+            store
+                .list_common_prefixes_blocking(Some("data/tenant_id=a"))
+                .expect("roll up tenant a"),
+            vec!["data/tenant_id=a/year=2026".to_string()],
+        );
+        // A prefix matching nothing → empty.
+        assert!(
+            store
+                .list_common_prefixes_blocking(Some("data/tenant_id=z"))
+                .expect("roll up z")
                 .is_empty(),
         );
     }

@@ -457,6 +457,52 @@ async fn store_list_enumerates_keys_on_s3() {
     );
 }
 
+/// `Store::list_common_prefixes_blocking` rolls up to the immediate child
+/// "directories" on the real `AmazonS3` backend (the one-level tenant
+/// enumeration the compactor uses instead of a recursive `data/` scan, RFC 0019
+/// §3.3) — store-relative, sorted, deduplicated across each tenant's objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn store_list_common_prefixes_rolls_up_on_s3() {
+    let (_node, s3) = localstack_s3("ourios-it-prefixes").await;
+    for key in [
+        "data/tenant_id=a/year=2026/month=04/day=02/hour=10/h0.parquet",
+        "data/tenant_id=a/year=2026/month=04/day=02/hour=11/h1.parquet",
+        "data/tenant_id=ab/year=2026/h0.parquet",
+        "data/tenant_id=b/year=2026/h0.parquet",
+    ] {
+        s3.put(key, b"x".to_vec()).await.expect("s3 put");
+    }
+
+    // Under `data/`: the three tenant common-prefixes, one level down, dedup'd
+    // across each tenant's many objects and sorted — not a recursive walk.
+    let s3b = s3.clone();
+    let prefixes =
+        tokio::task::spawn_blocking(move || s3b.list_common_prefixes_blocking(Some("data")))
+            .await
+            .expect("join")
+            .expect("roll up data");
+    assert_eq!(
+        prefixes,
+        vec![
+            "data/tenant_id=a".to_string(),
+            "data/tenant_id=ab".to_string(),
+            "data/tenant_id=b".to_string(),
+        ],
+        "S3 roll-up is one-level, store-relative, deduped, ordered",
+    );
+
+    // Scoped to one tenant → its immediate `year=…` child only (segment-wise
+    // scope excludes the `tenant_id=ab` sibling).
+    let scoped = tokio::task::spawn_blocking(move || {
+        s3.list_common_prefixes_blocking(Some("data/tenant_id=a"))
+    })
+    .await
+    .expect("join")
+    .expect("roll up tenant a");
+    assert_eq!(scoped, vec!["data/tenant_id=a/year=2026".to_string()]);
+}
+
 /// Scenario RFC0019.4 — a small-file partition compacts to one file on the real
 /// `AmazonS3` backend, the manifest swapped via the conditional-PUT CAS
 /// (`publish_cas`): `compact_partition` runs entirely through the `Store` seam
@@ -517,7 +563,8 @@ async fn compact_partition_consolidates_on_s3_via_cas() {
         "consolidated to a single live file"
     );
 
-    // The consolidated file reads back all three rows through the store.
+    // The consolidated file reads back *exactly* the original rows through the
+    // store — row identity, not just count, so a duplicate/drop bug can't pass.
     let consolidated_key = format!(
         "data/tenant_id=tenant-c/year=2026/month=04/day=02/hour=10/{}",
         manifest.files[0],
@@ -530,12 +577,21 @@ async fn compact_partition_consolidates_on_s3_via_cas() {
             .expect("join get")
             .expect("get consolidated")
     };
-    let rows =
+    let mut rows =
         Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition, &consolidated_key)
             .expect("open consolidated")
             .read_all()
             .expect("read consolidated");
-    assert_eq!(rows.len(), 3, "consolidated file holds every original row");
+    // Order-insensitive value equality: compaction reads the inputs in listing
+    // order, so sort both by the distinct per-record timestamp before comparing
+    // the full records (`rec_for(i)` makes `time_unix_nano` unique per row).
+    let mut expected = records;
+    rows.sort_by_key(|r| r.time_unix_nano);
+    expected.sort_by_key(|r| r.time_unix_nano);
+    assert_eq!(
+        rows, expected,
+        "consolidated file holds every original row, value-for-value (no drop/dup)",
+    );
 }
 
 /// `Store::list_with_sizes_blocking` reports each object's byte length on the

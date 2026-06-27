@@ -217,23 +217,25 @@ pub fn run_sweep(
     Ok(report)
 }
 
-/// Raw tenant ids present in the store, decoded from the leading
-/// `data/tenant_id=<enc>/` segment of every object key under `data/`
-/// ([`Store::list_blocking`], RFC 0019 §3.3), sorted + deduplicated so a
-/// sweep is deterministic. Segments that don't decode are skipped (not
+/// Raw tenant ids present in the store, decoded from the immediate
+/// `data/tenant_id=<enc>` child common-prefixes
+/// ([`Store::list_common_prefixes_blocking`], RFC 0019 §3.3), sorted +
+/// deduplicated so a sweep is deterministic. This is a **one-level** roll-up
+/// (the object-store equivalent of the original `read_dir(data/)`), not a
+/// recursive scan of every object. Prefixes that don't decode are skipped (not
 /// Ourios output); an empty `data/` prefix yields none.
 fn tenants(store: &Store) -> Result<Vec<String>, IngestError> {
-    let keys = store
-        .list_blocking(Some("data"))
+    let prefixes = store
+        .list_common_prefixes_blocking(Some("data"))
         .map_err(|source| IngestError::Io {
             op: "list",
             path: PathBuf::from("data"),
             source: std::io::Error::other(source),
         })?;
-    let mut tenants: Vec<String> = keys
+    let mut tenants: Vec<String> = prefixes
         .iter()
-        .filter_map(|key| key.strip_prefix("data/"))
-        .filter_map(|rest| rest.split('/').next())
+        // Each prefix is `data/tenant_id=<enc>`; take the trailing segment.
+        .filter_map(|prefix| prefix.rsplit('/').next())
         .filter_map(|segment| segment.strip_prefix("tenant_id="))
         .filter_map(percent_decode_tenant)
         .collect();

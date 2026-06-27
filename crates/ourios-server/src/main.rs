@@ -309,6 +309,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|e| format!("create store root {}: {e}", root.display()))?;
     }
 
+    // Preflight the compactor's store *before* binding any network role, so a
+    // store-open failure (bad creds / endpoint / root) early-returns here rather
+    // than after the receiver/querier handles are live — which would bypass
+    // their graceful shutdown. The opened handle is moved into `Compactor::new`
+    // below.
+    let store = config.store.open()?;
+
     // Boot OpenTelemetry first so the compactor's instruments export
     // (RFC 0001 §6.8). The guard flushes pending metrics on shutdown;
     // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
@@ -368,8 +375,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b).
-    let store = config.store.open()?;
+    // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
+    // opened in the preflight above so a store failure never leaks a live role.
     let compactor = Compactor::new(
         store,
         CompactionPolicy::default(),

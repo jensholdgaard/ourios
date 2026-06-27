@@ -158,12 +158,16 @@ fn compaction_throughput(c: &mut Criterion) {
             |b, &nf| {
                 b.iter_batched(
                     || {
+                        // Build the backlog *and* open the store in the untimed
+                        // setup phase, so only `compact_partition` is timed (not
+                        // store construction / canonicalization). `_dir` is held
+                        // to keep the temp bucket alive for the iteration.
                         let dir = tempfile::TempDir::new().expect("temp bucket");
                         let part = build_backlog(dir.path(), nf);
-                        (dir, part)
-                    },
-                    |(dir, part)| {
                         let store = Store::local(dir.path()).expect("store");
+                        (dir, store, part)
+                    },
+                    |(_dir, store, part)| {
                         let outcome = compact_partition(&store, &part).expect("compact");
                         black_box(outcome.rows);
                     },
@@ -229,12 +233,14 @@ fn small_file_collapse(c: &mut Criterion) {
     group.bench_function(BenchmarkId::from_parameter(D3_FILES), |b| {
         b.iter_batched(
             || {
+                // Open the store in the untimed setup phase so only
+                // `compact_partition` is timed; `_d` keeps the bucket alive.
                 let d = tempfile::TempDir::new().expect("temp bucket");
                 let p = build_backlog(d.path(), D3_FILES);
-                (d, p)
-            },
-            |(d, p)| {
                 let store = Store::local(d.path()).expect("store");
+                (d, store, p)
+            },
+            |(_d, store, p)| {
                 let o = compact_partition(&store, &p).expect("compact");
                 black_box(o.rows);
             },

@@ -115,8 +115,8 @@ impl Reader {
     /// [`Store::get_blocking`](crate::Store::get_blocking) → these bytes so it
     /// can target S3, RFC 0019). Applies the same RFC 0005 §3.9 row-vs-path
     /// validation on [`Self::read_all`]: every row's `tenant_id` and derived
-    /// time bucket must match `partition`, or the read is a hard error
-    /// (RFC0009.5 — a mis-partitioned input aborts a compaction).
+    /// time bucket must match `partition`, or the read is a hard error per
+    /// RFC 0005 §3.9 (a mis-partitioned compaction input then aborts, RFC0009.5).
     ///
     /// `key` is the object key the bytes came from; it is recorded only for
     /// diagnostics, so a [`ReaderError::PartitionMismatch`] names the offending
@@ -155,7 +155,7 @@ impl Reader {
 
     /// Read every row in the file as a `MinedRecord`. Applies
     /// row-vs-path validation when the reader was opened via
-    /// [`Self::open_partition`].
+    /// [`Self::open_partition`] or [`Self::open_partition_bytes`].
     ///
     /// # Errors
     ///

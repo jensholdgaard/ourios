@@ -440,10 +440,11 @@ impl Writer {
         })
     }
 
-    /// Inspector for the absolute path the writer publishes to on
-    /// [`Self::close`] (the store root joined with the object key);
-    /// useful for tests that assert the landing site without reading
-    /// the file. The bytes only exist there after a successful
+    /// Inspector for the path reported through [`WrittenFile::path`]: the
+    /// absolute landing path for [`Self::open`], or the object key rendered as a
+    /// path for [`Self::open_in`] (no local root). Useful for tests that assert
+    /// the local landing site; store-backed callers address the object by
+    /// [`WrittenFile::key`]. The bytes only exist there after a successful
     /// `close` — while the writer is open they live in memory.
     #[must_use]
     pub fn final_path(&self) -> &Path {

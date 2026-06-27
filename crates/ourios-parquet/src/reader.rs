@@ -118,6 +118,10 @@ impl Reader {
     /// time bucket must match `partition`, or the read is a hard error
     /// (RFC0009.5 — a mis-partitioned input aborts a compaction).
     ///
+    /// `key` is the object key the bytes came from; it is recorded only for
+    /// diagnostics, so a [`ReaderError::PartitionMismatch`] names the offending
+    /// object in compaction logs (the bytes path has no real file path).
+    ///
     /// # Errors
     /// [`ReaderError::Parquet`] if the bytes are not a valid Parquet file;
     /// [`ReaderError::MissingRequiredColumn`] if a baseline REQUIRED column is
@@ -125,8 +129,9 @@ impl Reader {
     pub fn open_partition_bytes(
         bytes: bytes::Bytes,
         partition: PartitionKey,
+        key: &str,
     ) -> Result<Self, ReaderError> {
-        let mut reader = Self::from_bytes(bytes, PathBuf::from("<object-store>"))?;
+        let mut reader = Self::from_bytes(bytes, PathBuf::from(key))?;
         reader.partition = Some(partition);
         Ok(reader)
     }

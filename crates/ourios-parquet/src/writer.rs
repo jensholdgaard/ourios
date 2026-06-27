@@ -133,9 +133,10 @@ pub struct Writer {
 impl Writer {
     /// Open a writer for `partition` under `bucket_root` using the
     /// RFC 0005 §3.6 default compression level
-    /// ([`DEFAULT_ZSTD_LEVEL`]). Creates the partition directory
-    /// and the `UUIDv7`-named Parquet file; the file is empty until
-    /// [`Writer::append_records`] starts adding rows.
+    /// ([`DEFAULT_ZSTD_LEVEL`]). Creates the local partition directory; the
+    /// `<UUIDv7>.parquet` object itself is buffer-and-put — rows accumulate in
+    /// memory via [`Writer::append_records`] and nothing is published until
+    /// [`Writer::close`].
     ///
     /// This is the **local-filesystem** constructor — it opens a
     /// [`Store::local`] rooted at `bucket_root`. [`Writer::open_in`]
@@ -856,10 +857,11 @@ mod tests {
             written.bytes_written,
             "WrittenFile.bytes_written equals the put size",
         );
-        let decoded = Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition)
-            .expect("open_partition_bytes")
-            .read_all()
-            .expect("read_all");
+        let decoded =
+            Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition, &written.key)
+                .expect("open_partition_bytes")
+                .read_all()
+                .expect("read_all");
         assert_eq!(
             decoded, records,
             "every row recovered through the store seam"
@@ -886,7 +888,7 @@ mod tests {
         other.tenant_id = TenantId::new("b");
         let wrong = PartitionKey::derive(&other).expect("derive other");
 
-        let err = Reader::open_partition_bytes(bytes::Bytes::from(bytes), wrong)
+        let err = Reader::open_partition_bytes(bytes::Bytes::from(bytes), wrong, &written.key)
             .expect("open_partition_bytes")
             .read_all()
             .expect_err("a mismatched tenant must be a hard read error");

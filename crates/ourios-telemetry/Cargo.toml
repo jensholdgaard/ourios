@@ -31,8 +31,8 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 testing = ["opentelemetry_sdk/testing"]
 
 [dev-dependencies]
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

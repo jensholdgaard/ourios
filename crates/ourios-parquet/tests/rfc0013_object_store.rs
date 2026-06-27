@@ -489,8 +489,9 @@ async fn store_list_with_sizes_reports_byte_lengths_on_s3() {
 }
 
 /// `Store::delete_blocking` removes an object on the real `AmazonS3` backend
-/// (the compactor's orphan/input GC), and a missing key surfaces as a
-/// `is_not_found` error — the GC loops treat that as already-reclaimed.
+/// (the compactor's orphan/input GC). S3 DELETE is idempotent, so a redundant
+/// delete of an absent key is tolerated (success or `is_not_found`) — the GC
+/// loops treat either as already-reclaimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
 async fn store_delete_blocking_removes_on_s3() {

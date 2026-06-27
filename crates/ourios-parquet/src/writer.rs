@@ -170,6 +170,10 @@ impl Writer {
         partition: PartitionKey,
         zstd_level: i32,
     ) -> Result<Self, WriterError> {
+        // Validate the codec level *before* any filesystem side effect, so an
+        // invalid level leaves no partition directory behind (the delegate
+        // re-validates — cheap and keeps it self-contained).
+        ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
         // Ensure the store root (and the partition dir) exist:
         // `Store::local` canonicalises `bucket_root`, which must
         // therefore exist; the object-store `put` on close creates any

@@ -563,7 +563,7 @@ impl Backend {
 /// the regression guard) or an S3-compatible bucket (production,
 /// `CLAUDE.md` §3.6).
 ///
-/// The backend ([`Backend`]) drives the hybrid scan: a local backend addresses
+/// The backend (local vs S3) drives the hybrid scan: a local backend addresses
 /// files by absolute local path and walks `std::fs` (unchanged from before
 /// RFC 0019, missing dirs tolerated as empty); an S3 backend registers the
 /// [`Store`]'s `object_store` on the `SessionContext`, addresses tables by

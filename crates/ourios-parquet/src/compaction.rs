@@ -458,7 +458,7 @@ fn is_candidate(
         .map_err(|e| store_io("list", &prefix, e))?;
     let sizes: Vec<u64> = entries
         .iter()
-        .filter(|(key, _)| is_committed_parquet(key))
+        .filter(|(key, _)| is_committed_parquet(key) && is_immediate_child(key, &prefix))
         .filter(|(key, _)| {
             live_names
                 .as_ref()
@@ -553,7 +553,7 @@ fn live_file_keys(
         .map_err(|e| store_io("list", &prefix, e))?;
     Ok(keys
         .into_iter()
-        .filter(|k| is_committed_parquet(k))
+        .filter(|k| is_committed_parquet(k) && is_immediate_child(k, &prefix))
         .collect())
 }
 
@@ -578,8 +578,13 @@ fn read_manifest_etag(store: &Store, key: &str) -> Result<Option<String>, Compac
         .and_then(|(_manifest, etag)| etag))
 }
 
-/// A no-op / lost-race outcome: nothing was committed, read, or written. Used
-/// for a sub-two-file partition and for a lost manifest CAS.
+/// An outcome that **committed nothing** (`committed: None`, zero rows/bytes).
+/// Used both for a true no-op (a sub-two-file partition — no I/O happens) and
+/// for a lost manifest CAS: in the lost-race case inputs were read and a
+/// consolidated object was written, but it lost the swap and is left as an
+/// orphan (a later `gc_orphans` reclaims it), so from the sweep's accounting
+/// nothing was committed. The read/written bytes of a lost race are not
+/// attributed here (the work is discarded).
 fn no_op_outcome(files_before: usize) -> CompactionOutcome {
     CompactionOutcome {
         files_before,
@@ -595,6 +600,18 @@ fn no_op_outcome(files_before: usize) -> CompactionOutcome {
 /// `manifest.json` are excluded). The writer only ever emits `<uuid>.parquet`.
 fn is_committed_parquet(key: &str) -> bool {
     key.ends_with(".parquet")
+}
+
+/// True when `key` is an **immediate** child object of `prefix`
+/// (`<prefix>/<name>` with no further `/`). `Store::list*` enumerates the whole
+/// subtree, but a partition's files live directly under its prefix, so — like
+/// the pre-RFC-0019 `read_dir` immediate-children scan — a nested object under
+/// the prefix (a foreign file or a future sidecar layout) is **not** a
+/// partition input and must not be folded in.
+fn is_immediate_child(key: &str, prefix: &str) -> bool {
+    key.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
 /// The trailing path segment of a `/`-delimited object key.

@@ -237,10 +237,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
     // The production data write path (RFC 0014): mined records buffer per
-    // partition and flush to Parquet objects on the RFC 0013/0019 store —
-    // local or S3, opened by the server and passed in. Only Parquet/audit/
-    // manifest objects reach the store; the WAL stays under `wal.root` on local
-    // disk (RFC0013.6 / `CLAUDE.md` §3.6 — the WAL is never on object storage).
+    // partition and flush to data Parquet (+ manifest) objects on the RFC
+    // 0013/0019 store — local or S3, opened by the server and passed in. (The
+    // compaction audit stream is written by the compactor's sink, still local-
+    // only today; the receiver itself doesn't emit it.) The WAL stays under
+    // `wal.root` on local disk (RFC0013.6 / `CLAUDE.md` §3.6 — never on object
+    // storage).
     let sink = SharedParquetSink::new(ParquetRecordSink::new(config.store, flush_config()));
 
     // Wire the sink into the miner *before* recovery: replay re-mines the
@@ -480,5 +482,43 @@ mod tests {
             !snapshot_written,
             "the snapshot is skipped, so the horizon cannot advance past un-flushed data",
         );
+    }
+
+    fn test_wal_config(root: &Path) -> WalConfig {
+        WalConfig {
+            root: root.to_path_buf(),
+            batch_window_ms: 100,
+            segment_size_bytes: 128 * 1024 * 1024,
+            segment_age_secs: 600,
+            housekeeping_secs: 60,
+            macos_full_fsync: false,
+        }
+    }
+
+    /// `serve` threads the server-opened [`Store`] (RFC 0019 slice 2c) into the
+    /// data write path and binds the listeners. This drives the local backend in
+    /// process — a `Store::local` is passed in, `:0` resolves to real ports, and
+    /// graceful shutdown drains cleanly. The S3 backend is exercised end to end
+    /// by the RFC0019.3 localstack scenario (slice 3). The binary-spawn
+    /// `rfc0013_6_wal_stays_local` covers the full local request path; this is
+    /// the focused in-process check of the `ReceiverConfig.store` plumbing.
+    // Multi-thread runtime: `serve` uses `block_in_place` for its blocking
+    // recovery/flush I/O, which a current-thread runtime can't host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_threads_the_store_and_binds_then_shuts_down() {
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            wal: test_wal_config(wal_dir.path()),
+            store,
+        })
+        .await
+        .expect("serve");
+        assert_ne!(handle.grpc_addr.port(), 0, "gRPC bound to a real port");
+        assert_ne!(handle.http_addr.port(), 0, "HTTP bound to a real port");
+        handle.shutdown().await.expect("graceful shutdown");
     }
 }

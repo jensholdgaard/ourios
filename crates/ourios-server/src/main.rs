@@ -314,9 +314,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // receiver/querier handles are live — which would bypass their graceful
     // shutdown. `open` only validates local-root existence / backend config; an
     // S3 backend doesn't contact the endpoint here (credentials and connectivity
-    // resolve on first request, surfacing later). The handle is shared by the
-    // receiver (cloned) and moved into `Compactor::new` below; both roles write
-    // and sweep the same store.
+    // resolve on first request, surfacing later). This opened handle is cloned
+    // into the receiver and moved into `Compactor::new` below (both write/sweep
+    // the same store); the querier opens its own handle from the same
+    // `StoreConfig` in `querier::serve`.
     let store = config.store.open()?;
 
     // Boot OpenTelemetry first so the compactor's instruments export

@@ -7,7 +7,7 @@
 # Builder: pinned to the workspace MSRV (Cargo.toml `rust-version = 1.85`)
 # by digest for reproducibility; the tag comment lets Renovate's docker
 # manager bump it.
-FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS builder
+FROM rust:1.96-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS builder
 WORKDIR /build
 COPY . .
 # `--locked` so a stale Cargo.lock fails the build instead of being

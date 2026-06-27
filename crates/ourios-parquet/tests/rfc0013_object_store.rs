@@ -456,3 +456,68 @@ async fn store_list_enumerates_keys_on_s3() {
         "no prefix lists the whole bucket (incl. the sibling), ordered",
     );
 }
+
+/// `Store::list_with_sizes_blocking` reports each object's byte length on the
+/// real `AmazonS3` backend — the compactor's small-file candidate check reads
+/// sizes from the listing rather than a per-object `head` (RFC 0019 §3.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn store_list_with_sizes_reports_byte_lengths_on_s3() {
+    let (_node, s3) = localstack_s3("ourios-it-sizes").await;
+    s3.put("data/tenant_id=a/year=2026/h0.parquet", vec![0u8; 3])
+        .await
+        .expect("s3 put");
+    s3.put("data/tenant_id=a/year=2026/h1.parquet", vec![0u8; 7])
+        .await
+        .expect("s3 put");
+
+    let entries = {
+        let s3 = s3.clone();
+        tokio::task::spawn_blocking(move || s3.list_with_sizes_blocking(Some("data/tenant_id=a")))
+            .await
+            .expect("join")
+            .expect("list a")
+    };
+    assert_eq!(
+        entries,
+        vec![
+            ("data/tenant_id=a/year=2026/h0.parquet".to_string(), 3),
+            ("data/tenant_id=a/year=2026/h1.parquet".to_string(), 7),
+        ],
+        "S3 listing carries byte sizes, key-ordered",
+    );
+}
+
+/// `Store::delete_blocking` removes an object on the real `AmazonS3` backend
+/// (the compactor's orphan/input GC), and a missing key surfaces as a
+/// `is_not_found` error — the GC loops treat that as already-reclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn store_delete_blocking_removes_on_s3() {
+    let (_node, s3) = localstack_s3("ourios-it-delete").await;
+    let key = "data/tenant_id=t/year=2026/x.parquet";
+    s3.put(key, b"x".to_vec()).await.expect("s3 put");
+
+    let s3b = s3.clone();
+    tokio::task::spawn_blocking(move || s3b.delete_blocking(key))
+        .await
+        .expect("join")
+        .expect("delete");
+    assert!(
+        s3.get(key)
+            .await
+            .expect_err("gone after delete")
+            .is_not_found(),
+        "object is removed",
+    );
+
+    let s3c = s3.clone();
+    let err = tokio::task::spawn_blocking(move || s3c.delete_blocking(key))
+        .await
+        .expect("join")
+        .expect_err("absent delete is not-found");
+    assert!(
+        err.is_not_found(),
+        "absent S3 delete maps to not-found: {err:?}"
+    );
+}

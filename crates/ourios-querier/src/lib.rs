@@ -298,9 +298,20 @@ fn resolve_live_keys(
             continue;
         }
         let manifest_key = format!("{dir}/{MANIFEST_FILENAME}");
-        match Manifest::read_with_etag(store, &manifest_key).map_err(|e| QueryError::Storage {
-            detail: format!("manifest {manifest_key}: {e}"),
-        })? {
+        // Only read the manifest when its key is actually in the listing: the
+        // partition is already enumerated, so a `read_with_etag` for an absent
+        // manifest is a wasted (404) GET per un-compacted partition on S3.
+        // Absent ⇒ no manifest ⇒ all committed files live (same as today's
+        // glob fallback). `list_blocking` returns store-relative keys, so this
+        // compares like-for-like.
+        let manifest = if partition_keys.iter().any(|k| *k == manifest_key) {
+            Manifest::read_with_etag(store, &manifest_key).map_err(|e| QueryError::Storage {
+                detail: format!("manifest {manifest_key}: {e}"),
+            })?
+        } else {
+            None
+        };
+        match manifest {
             // Manifest is authoritative: only its named files are live (joined
             // onto the partition key as `<dir>/<name>`).
             Some((manifest, _etag)) => {
@@ -660,8 +671,20 @@ impl Querier {
         let map = match alias_map {
             Some(map) => map,
             None if compile::uses_resolves_to(&query.predicate) => {
-                derived =
-                    alias_store::derive_alias_map(&self.store, self.local_root.as_deref(), tenant)?;
+                // Offload the blocking audit derivation (S3 `get_blocking` /
+                // the local `std::fs` reads) off the runtime worker, mirroring
+                // `run_drift` — the derivation is deeply sync, so clone the
+                // cheap handles into the blocking task.
+                derived = self
+                    .spawn_blocking_audit({
+                        let store = self.store.clone();
+                        let local_root = self.local_root.clone();
+                        let tenant = tenant.clone();
+                        move || {
+                            alias_store::derive_alias_map(&store, local_root.as_deref(), &tenant)
+                        }
+                    })
+                    .await?;
                 &derived
             }
             // No `resolves_to` ⇒ the map is never consulted; an empty
@@ -856,11 +879,38 @@ impl Querier {
                 });
             }
         }
-        let registry = derive_template_registry(&self.store, self.local_root.as_deref(), tenant)?;
+        // Offload the blocking registry derivation (S3 `get_blocking` / local
+        // `std::fs` reads) off the runtime worker, like the alias derivation.
+        let registry = self
+            .spawn_blocking_audit({
+                let store = self.store.clone();
+                let local_root = self.local_root.clone();
+                let tenant = tenant.clone();
+                move || derive_template_registry(&store, local_root.as_deref(), &tenant)
+            })
+            .await?;
         Ok(mined
             .iter()
             .map(|record| LogRow::from_record(record, &registry))
             .collect())
+    }
+
+    /// Run a blocking audit derivation (`derive_alias_map` /
+    /// `derive_template_registry`) on the tokio blocking pool so the async query
+    /// path doesn't tie up a runtime worker on the S3 `get_blocking` (or local
+    /// `std::fs`) reads — the same offload `run_drift` applies to the listing.
+    /// The closure owns its captured `Store` / `local_root` / `TenantId` clones
+    /// so it satisfies the `'static + Send` bound.
+    async fn spawn_blocking_audit<T, F>(&self, derive: F) -> Result<T, QueryError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, QueryError> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(derive)
+            .await
+            .map_err(|e| QueryError::Storage {
+                detail: format!("audit derivation task: {e}"),
+            })?
     }
 
     /// Resolve the live data files under the tenant's `data/` prefix and turn
@@ -957,30 +1007,52 @@ fn object_store_urls(
     let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(STORE_URL)
         .map_err(storage_err)?;
     ctx.register_object_store(store_url.as_ref(), store.object_store());
+    // `Store::object_store()` is the RAW backend (prefix NOT applied), whereas
+    // `list_blocking`/`get_blocking` operate in the store-relative key space
+    // under `Store::prefix()` (the `OURIOS_S3_PREFIX` root). So the URLs handed
+    // to DataFusion — which reads the raw backend directly — must carry the FULL
+    // key: the store prefix segments followed by the relative key. With no
+    // prefix (the local default) this is just the key.
+    let prefix: Vec<String> = store
+        .prefix()
+        .parts()
+        .map(|p| p.as_ref().to_owned())
+        .collect();
     let mut seen = std::collections::HashSet::new();
     let mut urls = Vec::with_capacity(keys.len());
     for key in keys {
         if seen.insert(key.clone()) {
-            urls.push(ListingTableUrl::parse(object_store_url_for_key(key)).map_err(storage_err)?);
+            urls.push(
+                ListingTableUrl::parse(object_store_url_for_key(&prefix, key))
+                    .map_err(storage_err)?,
+            );
         }
     }
     Ok(urls)
 }
 
-/// Build the `ourios://store/<key>` URL for a store-relative `key`,
-/// percent-encoding each path segment. `ListingTableUrl::parse` URL-**decodes**
-/// the path, and a store key carries literal `%` (the partition dir is
-/// `tenant_id=<percent-encoded>`, e.g. `tenant_id=tenant%20ABC`), so an
-/// un-encoded key would be double-decoded into a wrong path. Encoding every
-/// non-unreserved byte per segment (and re-joining with `/`) makes the parse
-/// round-trip back to the exact key. `NON_ALPHANUMERIC` over-encodes harmlessly
-/// (`=`, `-`, `.` round-trip the same); the only structural byte we must keep is
-/// the `/` separator, which the per-segment split preserves.
-fn object_store_url_for_key(key: &str) -> String {
+/// Build the `ourios://store/<prefix>/<key>` URL for a store-relative `key`
+/// under the store's `prefix` segments, percent-encoding each path segment.
+///
+/// Two reasons the full path matters:
+/// - **Prefix** — `Store::object_store()` is the un-scoped raw backend, so the
+///   URL must carry the store's `OURIOS_S3_PREFIX` root (`prefix`) ahead of the
+///   relative key, or `DataFusion` would address an un-prefixed (not-found) path.
+/// - **Encoding** — `ListingTableUrl::parse` URL-**decodes** the path, and a
+///   key carries literal `%` (the partition dir is `tenant_id=<percent-encoded>`,
+///   e.g. `tenant_id=tenant%20ABC`), so an un-encoded segment would be
+///   double-decoded into a wrong path. Encoding every non-unreserved byte per
+///   segment (and re-joining with `/`) makes the parse round-trip back to the
+///   exact full key. `NON_ALPHANUMERIC` over-encodes harmlessly (`=`, `-`, `.`
+///   round-trip the same); the only structural byte we keep is the `/`
+///   separator, preserved by the per-segment split.
+fn object_store_url_for_key(prefix: &[String], key: &str) -> String {
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-    let encoded = key
-        .split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
+    let encode = |segment: &str| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string();
+    let encoded = prefix
+        .iter()
+        .map(|p| encode(p))
+        .chain(key.split('/').map(encode))
         .collect::<Vec<_>>()
         .join("/");
     format!("{STORE_URL}/{encoded}")
@@ -1016,6 +1088,43 @@ pub(crate) fn audit_table_urls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The S3 object-store URL for a key prepends the store prefix and
+    /// percent-encodes every segment, so `ListingTableUrl::parse`'s URL-decode
+    /// round-trips back to the **full** key the raw backend expects
+    /// (`OURIOS_S3_PREFIX` + the store-relative key). The partition dir carries
+    /// a literal `%` (`tenant_id=tenant%20ABC`) that must survive the parse.
+    #[test]
+    fn object_store_url_prepends_prefix_and_round_trips() {
+        let prefix = vec!["ourios".to_string()];
+        let key = "data/tenant_id=tenant%20ABC/year=2026/h.parquet";
+        let url = object_store_url_for_key(&prefix, key);
+        // The parsed URL's object-store path must decode back to prefix + key,
+        // not double-decode the literal `%20` into a space.
+        let parsed = ListingTableUrl::parse(&url).expect("parse url");
+        let decoded = percent_encoding::percent_decode_str(parsed.as_ref())
+            .decode_utf8()
+            .expect("utf8");
+        assert!(
+            decoded.ends_with("ourios/data/tenant_id=tenant%20ABC/year=2026/h.parquet"),
+            "decoded URL must carry the full prefixed key verbatim: {decoded}",
+        );
+    }
+
+    /// With no store prefix (the local default), the URL is just the key —
+    /// the prefix prepend is a no-op.
+    #[test]
+    fn object_store_url_with_no_prefix_is_just_the_key() {
+        let url = object_store_url_for_key(&[], "data/tenant_id=t/h.parquet");
+        let parsed = ListingTableUrl::parse(&url).expect("parse url");
+        let decoded = percent_encoding::percent_decode_str(parsed.as_ref())
+            .decode_utf8()
+            .expect("utf8");
+        assert!(
+            decoded.ends_with("data/tenant_id=t/h.parquet"),
+            "no-prefix URL is the bare key: {decoded}",
+        );
+    }
 
     /// Engine/SQL substrings that must never appear in an
     /// operator-facing `QueryError` message (RFC0007.3 / §4.6).

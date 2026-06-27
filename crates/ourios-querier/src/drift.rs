@@ -153,8 +153,15 @@ pub(crate) async fn run_drift(
         .clone()
         .gt_eq(lit(time_bound_scalar(start)?))
         .and(ts.lt(lit(time_bound_scalar(end)?)));
+    // Row-level tenant guard (`CLAUDE.md` §3.7): the scan is already scoped to
+    // the tenant's `audit/tenant_id=…` prefix (and, on local, the canonical-path
+    // walk), but drift aggregates in DataFusion and has no per-row backstop like
+    // the alias / registry folds. A `tenant_id = <tenant>` predicate gives the
+    // same guarantee, so a corrupt or misplaced row under the prefix can't skew
+    // (or leak into) another tenant's drift counts.
+    let tenant_match = col(audit_columns::TENANT_ID).eq(lit(tenant.as_str()));
     let filtered = base
-        .filter(widened.or(type_expanded).and(in_window))
+        .filter(widened.or(type_expanded).and(in_window).and(tenant_match))
         .map_err(storage_err)?;
 
     // §6.3 steps 2–3 — GROUP BY template_id, the five aggregates.

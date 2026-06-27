@@ -60,7 +60,7 @@ pub fn derive_template_registry(
     // folds the tenant's whole template history).
     let events: Vec<AuditEvent> = audit_scan::read_all_events(store, local_root, tenant)?
         .into_iter()
-        .filter(|e| matches!(e.payload, AuditPayload::Template { .. }))
+        .filter(|e| matches!(&e.payload, AuditPayload::Template { .. }))
         .collect();
     Ok(fold_registry(events))
 }

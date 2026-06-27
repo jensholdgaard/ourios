@@ -51,7 +51,7 @@ pub(crate) fn derive_alias_map(
         .into_iter()
         .filter(|e| {
             matches!(
-                e.payload,
+                &e.payload,
                 AuditPayload::AliasAsserted { .. } | AuditPayload::AliasRetracted { .. }
             )
         })

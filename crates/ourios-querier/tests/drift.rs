@@ -14,7 +14,7 @@ mod common;
 use common::{compaction, rejected_degenerate, type_expanded, widened, write_audit};
 use ourios_core::tenant::TenantId;
 use ourios_querier::dsl::{DriftQuery, Statement, parse_statement};
-use ourios_querier::{DriftRow, Querier};
+use ourios_querier::{DriftRow, Querier, QueryError};
 
 /// 2026-06-01T00:00:00Z in nanos — the window lower bound the tests use.
 const T1: u64 = 1_780_272_000_000_000_000;
@@ -337,16 +337,53 @@ fn rfc0010_8_no_sql_or_datafusion_leakage() {
     }
 }
 
+/// Tenant-isolation backstop (RFC0010.4 / `CLAUDE.md` §3.7): an audit file that
+/// symlinks outside the tenant's canonical `audit/tenant_id=…` root is refused,
+/// mirroring the log-query path's guard — a drift query must never resolve into
+/// another tenant's (or an out-of-tree) audit events. Under RFC 0019 the local
+/// audit scan keeps the canonicalizing `std::fs` walk (the hybrid's local
+/// branch), so this backstop — drift's *only* local tenant guard, as drift has
+/// no row-level check — is preserved exactly.
+#[cfg(unix)]
+#[tokio::test]
+async fn drift_rejects_audit_file_escaping_tenant_root() {
+    // Arrange — a legit in-window audit file (creates the tenant's day dir),
+    // plus a parquet OUTSIDE the tenant partition symlinked into that day dir.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_audit(bucket.path(), &[widened("acme", 1, 1, MID)]);
+    let outside = bucket.path().join("outside.parquet");
+    std::fs::write(&outside, b"not really parquet").expect("write outside");
+    let day_dir = bucket
+        .path()
+        .join("audit/tenant_id=acme/year=2026/month=06/day=01");
+    std::os::unix::fs::symlink(&outside, day_dir.join("leak.parquet")).expect("symlink");
+
+    // Act
+    let result = Querier::new(bucket.path())
+        .run_drift(&drift_one_day(), &TenantId::new("acme"), NOW)
+        .await;
+
+    // Assert — the escaping symlink is rejected by the tenant-root backstop
+    // (before any read), not silently read. `Display` deliberately hides the
+    // detail (H6), so match the variant's `detail` to confirm it is the
+    // escape guard firing and not an unrelated storage error.
+    let err = result.expect_err("escaping symlink must be rejected");
+    match err {
+        QueryError::Storage { detail } => assert!(
+            detail.contains("escapes tenant partition root"),
+            "expected the tenant-root escape guard, got: {detail}"
+        ),
+        other => panic!("expected QueryError::Storage, got {other:?}"),
+    }
+}
+
 /// Tenant isolation across a **string-prefix sibling** (RFC0010.4 /
-/// `CLAUDE.md` §3.7 / RFC0019.5). Under RFC 0019 the audit scan reads through
-/// the `Store` seam and tenant isolation rests on `Store::list_blocking`'s
-/// **segment-wise** prefix scope (the prior local `canonicalize` symlink-escape
-/// backstop is dropped — `audit_scan` no longer touches `std::fs`, and object
-/// storage has no symlinks; the §3.7 row-level backstop in the alias / registry
-/// derivations stays). The sharp edge a segment-wise scope must catch is a
-/// sibling tenant whose id is a *string prefix* of another's: querying `acme`
-/// must never read `acmex`'s events, even though `tenant_id=acme` is a string
-/// prefix of `tenant_id=acmex`.
+/// `CLAUDE.md` §3.7 / RFC0019.5): querying `acme` must never read `acmex`'s
+/// events, even though `tenant_id=acme` is a string prefix of `tenant_id=acmex`.
+/// On the local walk this holds because the walk is rooted at the exact
+/// `audit/tenant_id=acme/` directory; on S3 the segment-wise prefix scope of
+/// `Store::list_blocking` enforces the same (RFC0019.5). Guards against a
+/// regression to a naive string-prefix match on either backend.
 #[tokio::test]
 async fn drift_excludes_a_string_prefix_sibling_tenant() {
     const ACME_TEMPLATE: u64 = 11;
@@ -356,8 +393,7 @@ async fn drift_excludes_a_string_prefix_sibling_tenant() {
         bucket.path(),
         &[
             widened("acme", ACME_TEMPLATE, 1, MID),
-            // `tenant_id=acmex` is a string-prefix sibling of `tenant_id=acme`;
-            // a naive string-prefix list would leak it into acme's scan.
+            // `tenant_id=acmex` is a string-prefix sibling of `tenant_id=acme`.
             widened("acmex", ACMEX_TEMPLATE, 1, MID),
         ],
     );

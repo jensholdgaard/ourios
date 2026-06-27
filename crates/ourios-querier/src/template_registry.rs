@@ -17,11 +17,12 @@
 //! later widening never clobbers an earlier version's tokens.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{OwnedToken, parse_template};
-use ourios_parquet::{AuditReader, Store};
+use ourios_parquet::Store;
 
 use crate::{QueryError, audit_scan};
 
@@ -34,6 +35,9 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 /// Fold `tenant`'s template registry from its audit stream in `store`
 /// per RFC 0017 §3.2. A tenant with no audit files (or none carrying
 /// template events) derives the empty registry.
+///
+/// `local_root` selects the hybrid scan backend (RFC 0019 §3.3): `Some` reads
+/// local audit files, `None` lists keys + reads bytes through the [`Store`].
 ///
 /// Each `template_created` event keys at [`TEMPLATE_INITIAL_VERSION`] (the
 /// variant omits the version — a leaf is always born at v1); each
@@ -48,42 +52,16 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 /// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
 pub fn derive_template_registry(
     store: &Store,
+    local_root: Option<&Path>,
     tenant: &TenantId,
 ) -> Result<TemplateRegistry, QueryError> {
-    // Lexicographic key order from the shared listing + in-file row order from
-    // the reader give the §3.7.1 tiebreak components; no window — the
-    // registry folds the tenant's whole template history.
-    let keys = audit_scan::audit_files(store, tenant, None)?;
-    let mut events: Vec<AuditEvent> = Vec::new();
-    for key in &keys {
-        let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
-            detail: format!("audit file {key}: {e}"),
-        })?;
-        let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
-            .and_then(AuditReader::read_all)
-            .map_err(|e| QueryError::Storage {
-                detail: format!("audit file {key}: {e}"),
-            })?;
-        for event in read {
-            // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
-            // row-vs-path): the listing is scoped to the tenant's partition, so
-            // a row claiming another tenant is a corrupt or foreign file —
-            // fail loudly rather than fold (or silently drop) it.
-            if event.tenant_id != *tenant {
-                return Err(QueryError::Storage {
-                    detail: format!(
-                        "audit file {key} carries a row for tenant {} under tenant {}'s \
-                         partition root",
-                        event.tenant_id.as_str(),
-                        tenant.as_str(),
-                    ),
-                });
-            }
-            if matches!(event.payload, AuditPayload::Template { .. }) {
-                events.push(event);
-            }
-        }
-    }
+    // The shared reader gives the §3.7.1 file/row order and the row-level
+    // tenant backstop; keep only the template events (no window — the registry
+    // folds the tenant's whole template history).
+    let events: Vec<AuditEvent> = audit_scan::read_all_events(store, local_root, tenant)?
+        .into_iter()
+        .filter(|e| matches!(e.payload, AuditPayload::Template { .. }))
+        .collect();
     Ok(fold_registry(events))
 }
 

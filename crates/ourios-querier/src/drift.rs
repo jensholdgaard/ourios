@@ -106,15 +106,30 @@ pub(crate) async fn run_drift(
         // (RFC0010.5).
         return Ok(DriftResult::default());
     }
-    let keys = audit_scan::audit_files(store, tenant, Some((start, end)))?;
-    if keys.is_empty() {
+    // Resolve the audit file set off the async runtime: the S3 branch's
+    // `Store::list_blocking` (and the local `std::fs` walk) are blocking, so
+    // offload them via `spawn_blocking` rather than tie up a runtime worker.
+    // `Store` / `TenantId` / `PathBuf` are cheap to clone into the task.
+    let files = {
+        let store = store.clone();
+        let tenant = tenant.clone();
+        let local_root = local_root.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            audit_scan::audit_files(&store, local_root.as_deref(), &tenant, Some((start, end)))
+        })
+        .await
+        .map_err(|e| QueryError::Storage {
+            detail: format!("audit listing task: {e}"),
+        })??
+    };
+    if files.is_empty() {
         // No audit files for the window ⇒ empty drift result, not an error
         // (RFC0010.5).
         return Ok(DriftResult::default());
     }
 
     let ctx = SessionContext::new();
-    let urls = audit_table_urls(&ctx, store, local_root, &keys)?;
+    let urls = audit_table_urls(&ctx, store, &files)?;
     let options =
         ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
     let config = ListingTableConfig::new_with_multi_paths(urls)

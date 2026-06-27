@@ -30,6 +30,11 @@ ourios-parquet = { path = "../ourios-parquet" }
 # `AuditReader::open_bytes(bytes::Bytes)`; already in the tree via
 # ourios-parquet's object_store.
 bytes = { version = "1", default-features = false }
+# RFC 0019 — object-store table URLs (`ourios://store/<key>`) must
+# percent-encode each key segment so `ListingTableUrl::parse`'s URL-decode
+# round-trips back to the exact store key (keys carry literal `%` from the
+# percent-encoded `tenant_id=`). Already in the tree via url/object_store.
+percent-encoding = { version = "2", default-features = false, features = ["alloc"] }
 # Pillar #3 — the execution engine. A plain dep, but its types are
 # kept strictly internal: no `datafusion`/`arrow` type appears in
 # any public signature or error (hazard §4.6). Pulls arrow/parquet
@@ -55,6 +60,11 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # dep tree (and ourios-parquet uses it for the same nanosecond timeline),
 # so this adds no new transitive cost.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# RFC 0019 — `run_drift` offloads the blocking audit listing (`Store::list_blocking`
+# / the `std::fs` walk) via `spawn_blocking` so it doesn't tie up a runtime worker
+# on the async query path. `rt` is the blocking-pool half only; the runtime itself
+# is the caller's (the server / `#[tokio::test]`).
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 # RFC0002.7 — the parse/serialise round-trip is a property test over

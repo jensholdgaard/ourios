@@ -660,7 +660,8 @@ impl Querier {
         let map = match alias_map {
             Some(map) => map,
             None if compile::uses_resolves_to(&query.predicate) => {
-                derived = alias_store::derive_alias_map(&self.store, tenant)?;
+                derived =
+                    alias_store::derive_alias_map(&self.store, self.local_root.as_deref(), tenant)?;
                 &derived
             }
             // No `resolves_to` ⇒ the map is never consulted; an empty
@@ -855,7 +856,7 @@ impl Querier {
                 });
             }
         }
-        let registry = derive_template_registry(&self.store, tenant)?;
+        let registry = derive_template_registry(&self.store, self.local_root.as_deref(), tenant)?;
         Ok(mined
             .iter()
             .map(|record| LogRow::from_record(record, &registry))
@@ -960,41 +961,55 @@ fn object_store_urls(
     let mut urls = Vec::with_capacity(keys.len());
     for key in keys {
         if seen.insert(key.clone()) {
-            urls.push(ListingTableUrl::parse(format!("{STORE_URL}/{key}")).map_err(storage_err)?);
+            urls.push(ListingTableUrl::parse(object_store_url_for_key(key)).map_err(storage_err)?);
         }
     }
     Ok(urls)
 }
 
+/// Build the `ourios://store/<key>` URL for a store-relative `key`,
+/// percent-encoding each path segment. `ListingTableUrl::parse` URL-**decodes**
+/// the path, and a store key carries literal `%` (the partition dir is
+/// `tenant_id=<percent-encoded>`, e.g. `tenant_id=tenant%20ABC`), so an
+/// un-encoded key would be double-decoded into a wrong path. Encoding every
+/// non-unreserved byte per segment (and re-joining with `/`) makes the parse
+/// round-trip back to the exact key. `NON_ALPHANUMERIC` over-encodes harmlessly
+/// (`=`, `-`, `.` round-trip the same); the only structural byte we must keep is
+/// the `/` separator, which the per-segment split preserves.
+fn object_store_url_for_key(key: &str) -> String {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    let encoded = key
+        .split('/')
+        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{STORE_URL}/{encoded}")
+}
+
 /// Build the `DataFusion` table URLs for an **audit** scan (the drift query's
-/// `ListingTable` over the audit stream) from store-relative `keys`, branching
-/// the same way as the bulk log scan (RFC 0019 §3.3):
+/// `ListingTable` over the audit stream) from a resolved [`AuditFiles`],
+/// branching the same way as the bulk log scan (RFC 0019 §3.3):
 ///
-/// - **Local backend** (`local_root == Some`): join each key onto the local
-///   root and address it by absolute local path.
-/// - **S3 backend** (`local_root == None`): register the store on `ctx` and
-///   address each key by its `ourios://store/<key>` object-store URL.
-///
-/// Unlike the log path there is no per-file canonical-path tenant backstop:
-/// the audit keys come from a segment-wise prefix-scoped listing (RFC0019.5),
-/// and per the RFC 0019 §3.3 §3.7 decision the local symlink backstop is
-/// dropped in favour of the prefix scope (the row-level backstop in the
-/// consumers stays).
+/// - **Local** ([`AuditFiles::Local`]): the paths are already the
+///   canonicalizing `std::fs` walk's output — absolute, canonical, deduped, and
+///   tenant-isolation-checked (the symlink-escape / tenant-root backstops live
+///   in [`audit_scan`]). Address each by its absolute local path.
+/// - **S3** ([`AuditFiles::Remote`]): register the store on `ctx` and address
+///   each key by its percent-encoded `ourios://store/<key>` object-store URL;
+///   tenant isolation is the segment-wise prefix scope (RFC0019.5).
 pub(crate) fn audit_table_urls(
     ctx: &SessionContext,
     store: &Store,
-    local_root: Option<&std::path::Path>,
-    keys: &[String],
+    files: &audit_scan::AuditFiles,
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
-    match local_root {
-        Some(root) => keys
+    match files {
+        // The walk already produced absolute canonical paths, so address them
+        // directly — no `root.join`, no CWD-relative path.
+        audit_scan::AuditFiles::Local(paths) => paths
             .iter()
-            .map(|key| {
-                let abs = root.join(key);
-                ListingTableUrl::parse(abs.display().to_string()).map_err(storage_err)
-            })
+            .map(|path| ListingTableUrl::parse(path.display().to_string()).map_err(storage_err))
             .collect(),
-        None => object_store_urls(ctx, store, keys),
+        audit_scan::AuditFiles::Remote(keys) => object_store_urls(ctx, store, keys),
     }
 }
 

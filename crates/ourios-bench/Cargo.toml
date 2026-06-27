@@ -64,9 +64,9 @@ tempfile = "3"
 # which is what B2's "median latency" target wants; ourios-querier
 # is the unit under test (and pulls DataFusion); a current-thread
 # tokio runtime drives its async `Querier::run`.
-criterion = "0.8"
+criterion = "=0.8.2"
 ourios-querier = { path = "../ourios-querier" }
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 # RFC0008.3 recovery-non-amplification bench: times `Wal::replay`
 # over N ∈ {1, 4, 16} segments. Supportive wall-clock evidence
 # (the O(N) shape) mirroring b1/b2's role; the structural side is

@@ -579,12 +579,12 @@ fn read_manifest_etag(store: &Store, key: &str) -> Result<Option<String>, Compac
 }
 
 /// An outcome that **committed nothing** (`committed: None`, zero rows/bytes).
-/// Used both for a true no-op (a sub-two-file partition — no I/O happens) and
-/// for a lost manifest CAS: in the lost-race case inputs were read and a
-/// consolidated object was written, but it lost the swap and is left as an
-/// orphan (a later `gc_orphans` reclaims it), so from the sweep's accounting
-/// nothing was committed. The read/written bytes of a lost race are not
-/// attributed here (the work is discarded).
+/// Used both for a sub-two-file partition (the listing + manifest read still
+/// happened, but no consolidation is performed) and for a lost manifest CAS: in
+/// the lost-race case inputs were read and a consolidated object was written,
+/// but it lost the swap and is left as an orphan (a later `gc_orphans` reclaims
+/// it), so from the sweep's accounting nothing was committed. The read/written
+/// bytes of a lost race are not attributed here (the work is discarded).
 fn no_op_outcome(files_before: usize) -> CompactionOutcome {
     CompactionOutcome {
         files_before,

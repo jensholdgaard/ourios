@@ -139,10 +139,11 @@ pub struct ReceiverConfig {
     pub grpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub wal: WalConfig,
-    /// Root of the data store (RFC 0013). The data write path (RFC 0014)
-    /// flushes Parquet here; the WAL stays under `wal.root` on local disk
-    /// (RFC0013.6 / `CLAUDE.md` §3.4, §3.6).
-    pub bucket_root: PathBuf,
+    /// The data store (RFC 0013/0019), opened by the server — local or S3. The
+    /// data write path (RFC 0014) flushes Parquet through it; the WAL stays
+    /// under `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md`
+    /// §3.4, §3.6 — the WAL is never on object storage).
+    pub store: Store,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -236,23 +237,11 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
     // The production data write path (RFC 0014): mined records buffer per
-    // partition and flush to Parquet objects on the RFC 0013 store. Local
-    // backend for now — S3 selection (RFC 0004) is the RFC 0014 §7 follow-on.
-    // The store is rooted at `bucket_root`; the WAL stays under `wal.root` on
-    // local disk, so only Parquet/audit/manifest objects reach the store
-    // (RFC0013.6 / `CLAUDE.md` §3.6). The local `object_store` backend requires
-    // its root to exist, so create it first — `OURIOS_BUCKET_ROOT` may point at
-    // a not-yet-created path (e.g. a fresh dev/test dir), as it could before
-    // the receiver opened a store at startup.
-    std::fs::create_dir_all(&config.bucket_root).map_err(|e| {
-        format!(
-            "create data store root {}: {e}",
-            config.bucket_root.display()
-        )
-    })?;
-    let store = Store::local(&config.bucket_root)
-        .map_err(|e| format!("open data store at {}: {e}", config.bucket_root.display()))?;
-    let sink = SharedParquetSink::new(ParquetRecordSink::new(store, flush_config()));
+    // partition and flush to Parquet objects on the RFC 0013/0019 store —
+    // local or S3, opened by the server and passed in. Only Parquet/audit/
+    // manifest objects reach the store; the WAL stays under `wal.root` on local
+    // disk (RFC0013.6 / `CLAUDE.md` §3.6 — the WAL is never on object storage).
+    let sink = SharedParquetSink::new(ParquetRecordSink::new(config.store, flush_config()));
 
     // Wire the sink into the miner *before* recovery: replay re-mines the
     // un-flushed tail through `miner.ingest`, which re-emits it into the sink

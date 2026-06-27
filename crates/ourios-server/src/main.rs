@@ -309,13 +309,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|e| format!("create store root {}: {e}", root.display()))?;
     }
 
-    // Preflight the compactor's store *before* binding any network role, so a
+    // Preflight the data store *before* binding any network role, so a
     // store-open failure early-returns here rather than after the
     // receiver/querier handles are live — which would bypass their graceful
     // shutdown. `open` only validates local-root existence / backend config; an
     // S3 backend doesn't contact the endpoint here (credentials and connectivity
-    // resolve on first request, surfacing later). The opened handle is moved into
-    // `Compactor::new` below.
+    // resolve on first request, surfacing later). The handle is shared by the
+    // receiver (cloned) and moved into `Compactor::new` below; both roles write
+    // and sweep the same store.
     let store = config.store.open()?;
 
     // Boot OpenTelemetry first so the compactor's instruments export
@@ -327,26 +328,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // bound addresses on stdout so an operator — or a test binding `:0` —
     // learns the actual ports.
     let receiver = match &config.receiver {
-        // The receiver's RFC 0014 data write path is still local-only (its
-        // migration onto `Store` is a later RFC 0019 slice); the compactor and
-        // querier below run on either backend. Fail fast on s3 rather than
-        // silently ignoring the role.
+        // The receiver's RFC 0014 data write path runs on the resolved store
+        // (local or S3, RFC 0019 slice 2c) — the same store the querier reads
+        // and the compactor sweeps. The WAL stays local regardless (§3.6).
         Some(params) => {
-            let StoreConfig::Local(bucket_root) = &config.store else {
-                return Err(
-                    "the receiver role's RFC 0014 data write path targets local \
-                     storage only; running it on OURIOS_STORAGE_BACKEND=s3 lands in \
-                     a later RFC 0019 slice"
-                        .into(),
-                );
-            };
             let handle = receiver::serve(receiver::ReceiverConfig {
                 grpc_addr: params.grpc_addr,
                 http_addr: params.http_addr,
                 wal: wal_config(&params.wal_root),
                 // The data store the receiver's RFC 0014 write path lands
-                // Parquet in — the same root the compactor sweeps.
-                bucket_root: bucket_root.clone(),
+                // Parquet in — the same store the compactor sweeps (cloned; the
+                // handle is cheap to share, the compactor keeps the original).
+                store: store.clone(),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);

@@ -342,8 +342,10 @@ fn rfc0010_8_no_sql_or_datafusion_leakage() {
 /// mirroring the log-query path's guard — a drift query must never resolve into
 /// another tenant's (or an out-of-tree) audit events. Under RFC 0019 the local
 /// audit scan keeps the canonicalizing `std::fs` walk (the hybrid's local
-/// branch), so this backstop — drift's *only* local tenant guard, as drift has
-/// no row-level check — is preserved exactly.
+/// branch), so this escape backstop — which stops a symlinked-out file from
+/// being read at all — is preserved exactly. (Drift also applies a `tenant_id =
+/// <tenant>` predicate in its plan for row-level isolation, but that filters
+/// rows it has already read; this test guards the read itself.)
 #[cfg(unix)]
 #[tokio::test]
 async fn drift_rejects_audit_file_escaping_tenant_root() {

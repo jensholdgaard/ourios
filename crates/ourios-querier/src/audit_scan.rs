@@ -14,9 +14,11 @@
 //!   symlink into another tenant's subtree (anchored to the canonical bucket
 //!   root), every resolved `*.parquet` must canonicalize *under* the canonical
 //!   tenant root, and canonical paths are de-duplicated (an in-tenant symlink
-//!   can't double-count a file). This matters because drift has no row-level
-//!   tenant check, so the walk's backstop is its only local tenant guard, and
-//!   the dedup prevents a symlinked same-tenant file from being counted twice.
+//!   can't double-count a file). Drift now also applies a `tenant_id =
+//!   <tenant>` predicate in its `DataFusion` plan (row-level isolation matching
+//!   the alias/registry byte-folds), but the walk's escape backstop is still
+//!   what stops a symlinked-out file from being read at all, and the dedup
+//!   still prevents a symlinked same-tenant file from being counted twice.
 //! - **S3 backend** (`local_root == None`): [`Store::list_blocking`] over the
 //!   `audit/tenant_id=<enc>` prefix. Tenant isolation is the **segment-wise**
 //!   prefix scope (RFC0019.5) — a string-prefix sibling such as `tenant_id=ab`

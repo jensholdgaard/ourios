@@ -412,9 +412,17 @@ impl Store {
     /// compactor's orphan GC and post-commit input reclaim). Safe to call from
     /// inside a tokio runtime (see [`Self::get_blocking`]).
     ///
+    /// **Missing-key behaviour is backend-dependent** (this bridge adds no
+    /// existence check): `LocalFileSystem` maps an absent key to a
+    /// [`is_not_found`](StoreError::is_not_found) error, while S3 DELETE is
+    /// idempotent and returns success. The compactor's GC loops treat *both* as
+    /// "already reclaimed" — they match `is_not_found` and otherwise count a
+    /// failure — so the difference is invisible to them; do not rely on a
+    /// uniform not-found for an absent key.
+    ///
     /// # Errors
     /// [`StoreError::Runtime`] if the bridge runtime can't be built;
-    /// otherwise as [`Self::delete`].
+    /// otherwise as [`Self::delete`] (and see the missing-key note above).
     pub fn delete_blocking(&self, key: &str) -> Result<(), StoreError> {
         block_on_off_runtime(self.delete(key))
     }
@@ -788,12 +796,13 @@ mod tests {
         );
     }
 
-    /// `delete_blocking` removes an object (the compactor's orphan/input GC),
-    /// and a missing key surfaces as a `is_not_found` error rather than `Ok` —
-    /// the compactor's GC loops must (and do) treat that as already-reclaimed,
-    /// the same way they tolerate `ErrorKind::NotFound` on `std::fs::remove_file`.
+    /// `delete_blocking` removes an object (the compactor's orphan/input GC). On
+    /// the **local** backend a missing key surfaces as a `is_not_found` error
+    /// (S3 DELETE is idempotent instead — see the method doc); the compactor's
+    /// GC treats either as already-reclaimed, the same way it tolerates
+    /// `ErrorKind::NotFound` on `std::fs::remove_file`.
     #[test]
-    fn delete_blocking_removes_and_reports_missing_as_not_found() {
+    fn delete_blocking_removes_and_local_missing_is_not_found() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let store = Store::local(dir.path()).expect("local store");
         let key = "data/tenant_id=t/year=2026/x.parquet";
@@ -802,7 +811,7 @@ mod tests {
         assert_eq!(store.get_blocking_opt(key).expect("get_opt"), None);
         let err = store
             .delete_blocking(key)
-            .expect_err("deleting an absent key is a not-found error");
+            .expect_err("local backend: absent key is a not-found error");
         assert!(
             err.is_not_found(),
             "absent delete maps to not-found: {err:?}"

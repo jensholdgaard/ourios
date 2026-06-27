@@ -511,13 +511,16 @@ async fn store_delete_blocking_removes_on_s3() {
         "object is removed",
     );
 
+    // S3 DELETE is idempotent: a redundant delete of an absent key returns
+    // success (unlike the local backend's not-found). Assert only what the
+    // compactor's GC relies on — the redundant delete is *tolerable*: either
+    // success or a not-found, never a hard error the GC can't classify.
     let s3c = s3.clone();
-    let err = tokio::task::spawn_blocking(move || s3c.delete_blocking(key))
+    let redundant = tokio::task::spawn_blocking(move || s3c.delete_blocking(key))
         .await
-        .expect("join")
-        .expect_err("absent delete is not-found");
+        .expect("join");
     assert!(
-        err.is_not_found(),
-        "absent S3 delete maps to not-found: {err:?}"
+        redundant.map_or_else(|e| e.is_not_found(), |()| true),
+        "redundant S3 delete is tolerated (success or not-found)",
     );
 }

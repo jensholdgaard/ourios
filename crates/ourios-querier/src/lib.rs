@@ -46,6 +46,7 @@ mod log_row;
 mod row_decode;
 mod template_registry;
 
+pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_registry::{TemplateRegistry, derive_template_registry};
@@ -527,7 +528,7 @@ fn apply_request_filters(
 /// directly and tolerate `NotFound`, so the local branch never needs a
 /// constructed `Store` for I/O — only the S3 branch holds an eager [`Store`].
 #[derive(Debug, Clone)]
-enum Backend {
+pub(crate) enum Backend {
     /// Local-filesystem store rooted at the path (the `data/`-and-`audit/`
     /// parent). Held as a path so construction is infallible and a missing dir
     /// is tolerated at query time.
@@ -538,21 +539,13 @@ enum Backend {
 }
 
 impl Backend {
-    /// The local store root, `Some` for [`Backend::Local`] — the hybrid-scan
-    /// branch selector.
-    fn local_root(&self) -> Option<&std::path::Path> {
+    /// Borrow as the [`StoreRef`] selector the reader-side derivations
+    /// (`audit_scan` / alias / registry / drift) take — the hybrid-scan branch
+    /// is then a single exhaustive `match` with no "can't happen" arm.
+    pub(crate) fn store_ref(&self) -> StoreRef<'_> {
         match self {
-            Self::Local(root) => Some(root),
-            Self::Remote(_) => None,
-        }
-    }
-
-    /// The constructed S3 [`Store`], `Some` only for [`Backend::Remote`]. The
-    /// local branch never needs a `Store` (its read paths walk `std::fs`).
-    fn remote_store(&self) -> Option<&Store> {
-        match self {
-            Self::Local(_) => None,
-            Self::Remote(store) => Some(store),
+            Self::Local(root) => StoreRef::Local(root),
+            Self::Remote(store) => StoreRef::Remote(store),
         }
     }
 }
@@ -621,20 +614,6 @@ impl Querier {
             }
         };
         Ok(Self { backend })
-    }
-
-    /// The local store root, `Some` for the local backend, `None` for S3 —
-    /// the hybrid-scan branch selector.
-    fn local_root(&self) -> Option<&std::path::Path> {
-        self.backend.local_root()
-    }
-
-    /// The constructed S3 [`Store`], `Some` only for the S3 backend. The local
-    /// branch never needs a `Store` (its read paths walk `std::fs`), so this is
-    /// `None` there — the helpers take it as `Option<&Store>` and only deref it
-    /// on the S3 branch.
-    fn remote_store(&self) -> Option<&Store> {
-        self.backend.remote_store()
     }
 
     /// Execute `request` against the RFC 0005 store with predicate
@@ -719,13 +698,7 @@ impl Querier {
                     .spawn_blocking_audit({
                         let backend = self.backend.clone();
                         let tenant = tenant.clone();
-                        move || {
-                            alias_store::derive_alias_map(
-                                backend.remote_store(),
-                                backend.local_root(),
-                                &tenant,
-                            )
-                        }
+                        move || alias_store::derive_alias_map(backend.store_ref(), &tenant)
                     })
                     .await?;
                 &derived
@@ -774,14 +747,7 @@ impl Querier {
         tenant: &TenantId,
         now_unix_nano: u64,
     ) -> Result<DriftResult, QueryError> {
-        drift::run_drift(
-            self.remote_store(),
-            self.local_root(),
-            query,
-            tenant,
-            now_unix_nano,
-        )
-        .await
+        drift::run_drift(self.backend.store_ref(), query, tenant, now_unix_nano).await
     }
 
     /// Shared scan path for both [`run`](Self::run) and
@@ -928,9 +894,7 @@ impl Querier {
             .spawn_blocking_audit({
                 let backend = self.backend.clone();
                 let tenant = tenant.clone();
-                move || {
-                    derive_template_registry(backend.remote_store(), backend.local_root(), &tenant)
-                }
+                move || derive_template_registry(backend.store_ref(), &tenant)
             })
             .await?;
         Ok(mined
@@ -1118,7 +1082,7 @@ fn object_store_url_for_key(prefix: &[String], key: &str) -> String {
 ///   tenant isolation is the segment-wise prefix scope (RFC0019.5).
 pub(crate) fn audit_table_urls(
     ctx: &SessionContext,
-    store: Option<&Store>,
+    backend: StoreRef<'_>,
     files: &audit_scan::AuditFiles,
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
     match files {
@@ -1129,13 +1093,15 @@ pub(crate) fn audit_table_urls(
             .iter()
             .map(|path| ListingTableUrl::parse(path.display().to_string()).map_err(storage_err))
             .collect(),
-        // Remote keys imply the S3 backend, so `store` is always `Some` here
-        // (the `Querier` built one); a `None` is an internal invariant
+        // Remote keys imply the S3 backend, so `backend` is `Remote` here (it is
+        // what produced these keys); a `Local` is an internal invariant
         // violation, surfaced rather than unwrapped (no panics, `CLAUDE.md` §6).
         audit_scan::AuditFiles::Remote(keys) => {
-            let store = store.ok_or_else(|| QueryError::Storage {
-                detail: "internal: S3 audit URLs reached with no store".to_string(),
-            })?;
+            let StoreRef::Remote(store) = backend else {
+                return Err(QueryError::Storage {
+                    detail: "internal: S3 audit URLs reached with a local backend".to_string(),
+                });
+            };
             object_store_urls(ctx, store, keys)
         }
     }

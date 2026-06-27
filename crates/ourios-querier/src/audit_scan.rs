@@ -8,7 +8,7 @@
 //! Like the bulk log/data scan, this is a **hybrid** keyed on whether the
 //! querier is local or S3 (RFC 0019 §3.3):
 //!
-//! - **Local backend** (`local_root == Some`): the original `std::fs` walk,
+//! - **Local backend** ([`StoreRef::Local`]): the original `std::fs` walk,
 //!   rooted at `audit/tenant_id=<enc>/`, **unchanged** — including the
 //!   canonical-path tenant-isolation backstops: the tenant root must not be a
 //!   symlink into another tenant's subtree (anchored to the canonical bucket
@@ -19,7 +19,7 @@
 //!   the alias/registry byte-folds), but the walk's escape backstop is still
 //!   what stops a symlinked-out file from being read at all, and the dedup
 //!   still prevents a symlinked same-tenant file from being counted twice.
-//! - **S3 backend** (`local_root == None`): [`Store::list_blocking`] over the
+//! - **S3 backend** ([`StoreRef::Remote`]): [`Store::list_blocking`] over the
 //!   `audit/tenant_id=<enc>` prefix. Tenant isolation is the **segment-wise**
 //!   prefix scope (RFC0019.5) — a string-prefix sibling such as `tenant_id=ab`
 //!   is excluded when listing `tenant_id=a` — and the object key space has no
@@ -39,7 +39,33 @@ use ourios_core::audit::AuditEvent;
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{AuditReader, Store, percent_encode_tenant};
 
-use crate::QueryError;
+use crate::{Backend, QueryError};
+
+/// Borrowed audit-scan backend selector (RFC 0019 §3.3): either a local
+/// filesystem root or an S3-backed [`Store`]. A single value rather than an
+/// `(Option<&Store>, Option<&Path>)` pair, so neither an inconsistent
+/// combination (both set, or neither) nor the resulting "can't happen" branch
+/// is representable — the reader-side derivations take this directly.
+#[derive(Debug, Clone, Copy)]
+pub enum StoreRef<'a> {
+    /// Read audit files directly from this local filesystem root (the `std::fs`
+    /// walk with the canonical-path tenant backstops).
+    Local(&'a Path),
+    /// List + read audit objects through this S3-backed [`Store`].
+    Remote(&'a Store),
+}
+
+impl StoreRef<'_> {
+    /// Clone into an owned [`Backend`] for a `'static + Send` blocking task
+    /// (e.g. drift's `spawn_blocking` listing); borrow it back with
+    /// [`Backend::store_ref`] inside the closure.
+    pub(crate) fn into_owned(self) -> Backend {
+        match self {
+            StoreRef::Local(root) => Backend::Local(root.to_path_buf()),
+            StoreRef::Remote(store) => Backend::Remote(store.clone()),
+        }
+    }
+}
 
 /// The resolved audit file set, addressed per backend (RFC 0019 §3.3). The
 /// consumers branch on this: the alias / registry folds read local files
@@ -68,35 +94,20 @@ impl AuditFiles {
 /// of the RFC 0005 §3.7.1 total fold order, stable across re-scans — and unique.
 /// A tenant with no audit files is an empty set, not an error.
 ///
-/// `local_root` is `Some` for the local backend (the `std::fs` walk with the
-/// canonical-path backstops) and `None` for S3 (the prefix-scoped
-/// [`Store::list_blocking`]). `store` is the S3 [`Store`], required (`Some`)
-/// exactly on the S3 branch — the local walk never needs it.
+/// `backend` selects the scan: [`StoreRef::Local`] walks `std::fs` (with the
+/// canonical-path backstops), [`StoreRef::Remote`] lists the prefix-scoped
+/// [`Store::list_blocking`].
 pub(crate) fn audit_files(
-    store: Option<&Store>,
-    local_root: Option<&Path>,
+    backend: StoreRef<'_>,
     tenant: &TenantId,
     window: Option<(u64, u64)>,
 ) -> Result<AuditFiles, QueryError> {
-    match local_root {
-        Some(root) => Ok(AuditFiles::Local(local_audit_files(root, tenant, window)?)),
-        None => Ok(AuditFiles::Remote(remote_audit_files(
-            remote_store(store)?,
-            tenant,
-            window,
+    match backend {
+        StoreRef::Local(root) => Ok(AuditFiles::Local(local_audit_files(root, tenant, window)?)),
+        StoreRef::Remote(store) => Ok(AuditFiles::Remote(remote_audit_files(
+            store, tenant, window,
         )?)),
     }
-}
-
-/// Unwrap the S3 [`Store`] for a remote-branch call: it is always `Some` when
-/// `local_root` is `None` (the [`crate::Querier`] constructs one for the S3
-/// backend), so a `None` here is an internal invariant violation, surfaced as a
-/// `Storage` error rather than an `unwrap`/`panic` (no panics off the
-/// production path, `CLAUDE.md` §6).
-fn remote_store(store: Option<&Store>) -> Result<&Store, QueryError> {
-    store.ok_or_else(|| QueryError::Storage {
-        detail: "internal: S3 audit scan reached with no store".to_string(),
-    })
 }
 
 /// Read every [`AuditEvent`] from `tenant`'s resolved audit file set (the
@@ -108,11 +119,9 @@ fn remote_store(store: Option<&Store>) -> Result<&Store, QueryError> {
 /// local file is read with [`AuditReader::open_file`], an S3 key via
 /// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
 pub(crate) fn read_all_events(
-    store: Option<&Store>,
-    local_root: Option<&Path>,
+    backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<Vec<AuditEvent>, QueryError> {
-    let files = audit_files(store, local_root, tenant, None)?;
     let mut events: Vec<AuditEvent> = Vec::new();
     let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
         for event in read {
@@ -130,9 +139,9 @@ pub(crate) fn read_all_events(
         }
         Ok(())
     };
-    match files {
-        AuditFiles::Local(paths) => {
-            for path in &paths {
+    match backend {
+        StoreRef::Local(root) => {
+            for path in &local_audit_files(root, tenant, None)? {
                 let read = AuditReader::open_file(path)
                     .and_then(AuditReader::read_all)
                     .map_err(|e| QueryError::Storage {
@@ -141,9 +150,8 @@ pub(crate) fn read_all_events(
                 push_validated(&path.display().to_string(), read)?;
             }
         }
-        AuditFiles::Remote(keys) => {
-            let store = remote_store(store)?;
-            for key in &keys {
+        StoreRef::Remote(store) => {
+            for key in &remote_audit_files(store, tenant, None)? {
                 let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
                     detail: format!("audit file {key}: {e}"),
                 })?;

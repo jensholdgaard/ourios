@@ -20,35 +20,30 @@
 //! (the RFC 0009 §3.4 manifest fork) would accelerate, not change,
 //! this derivation.
 
-use std::path::Path;
-
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::AuditPayload;
 use ourios_core::tenant::TenantId;
-use ourios_parquet::Store;
 
-use crate::{QueryError, audit_scan};
+use crate::{QueryError, StoreRef, audit_scan};
 
-/// Fold `tenant`'s alias map from its audit stream in `store` per
-/// RFC 0005 §3.7.1. A tenant with no audit files (or none carrying
-/// alias events) derives the empty map — every id then resolves to
-/// itself.
+/// Fold `tenant`'s alias map from its audit stream per RFC 0005 §3.7.1. A
+/// tenant with no audit files (or none carrying alias events) derives the empty
+/// map — every id then resolves to itself.
 ///
-/// `local_root` selects the hybrid scan backend (RFC 0019 §3.3): `Some` reads
-/// local audit files, `None` lists keys + reads bytes through the S3 [`Store`]
-/// (`store`, required `Some` on the S3 branch only).
+/// `backend` selects the hybrid scan (RFC 0019 §3.3): [`StoreRef::Local`] reads
+/// local audit files, [`StoreRef::Remote`] lists keys + reads bytes through the
+/// S3 store.
 ///
 /// Alias events are rare operator actions, not ingest-volume data, so
 /// the unwindowed scan is small by construction (§3.7.1); no day prune
 /// applies because the fold covers the tenant's whole alias history.
 pub(crate) fn derive_alias_map(
-    store: Option<&Store>,
-    local_root: Option<&Path>,
+    backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<AliasMap, QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
     // tenant backstop; keep only the alias events.
-    let mut events: Vec<_> = audit_scan::read_all_events(store, local_root, tenant)?
+    let mut events: Vec<_> = audit_scan::read_all_events(backend, tenant)?
         .into_iter()
         .filter(|e| {
             matches!(

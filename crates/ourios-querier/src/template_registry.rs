@@ -16,15 +16,12 @@
 //! rather than the latest (RFC 0017 §3.5): each version is its own key, so a
 //! later widening never clobbers an earlier version's tokens.
 
-use std::collections::HashMap;
-use std::path::Path;
-
 use ourios_core::audit::{AuditEvent, AuditPayload, TEMPLATE_INITIAL_VERSION, TemplateChange};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{OwnedToken, parse_template};
-use ourios_parquet::Store;
+use std::collections::HashMap;
 
-use crate::{QueryError, audit_scan};
+use crate::{QueryError, StoreRef, audit_scan};
 
 /// Read-time map from a leaf's `(template_id, template_version)` to the
 /// canonical tokens of that version (RFC 0017 §3.2). The value is parsed
@@ -32,14 +29,13 @@ use crate::{QueryError, audit_scan};
 /// [`ourios_miner::tree::parse_template`].
 pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 
-/// Fold `tenant`'s template registry from its audit stream in `store`
-/// per RFC 0017 §3.2. A tenant with no audit files (or none carrying
-/// template events) derives the empty registry.
+/// Fold `tenant`'s template registry from its audit stream per RFC 0017 §3.2.
+/// A tenant with no audit files (or none carrying template events) derives the
+/// empty registry.
 ///
-/// `local_root` selects the hybrid scan backend (RFC 0019 §3.3): `Some` reads
-/// local audit files, `None` lists keys + reads bytes through the S3 [`Store`]
-/// (`store`, required `Some` on the S3 branch only — the local walk never needs
-/// a constructed `Store`).
+/// `backend` selects the hybrid scan (RFC 0019 §3.3): [`StoreRef::Local`] reads
+/// local audit files, [`StoreRef::Remote`] lists keys + reads bytes through the
+/// S3 store.
 ///
 /// Each `template_created` event keys at [`TEMPLATE_INITIAL_VERSION`] (the
 /// variant omits the version — a leaf is always born at v1); each
@@ -53,14 +49,13 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 /// file cannot be read, or a row claims a tenant other than the one whose
 /// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
 pub fn derive_template_registry(
-    store: Option<&Store>,
-    local_root: Option<&Path>,
+    backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<TemplateRegistry, QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
     // tenant backstop; keep only the template events (no window — the registry
     // folds the tenant's whole template history).
-    let events: Vec<AuditEvent> = audit_scan::read_all_events(store, local_root, tenant)?
+    let events: Vec<AuditEvent> = audit_scan::read_all_events(backend, tenant)?
         .into_iter()
         .filter(|e| matches!(&e.payload, AuditPayload::Template { .. }))
         .collect();

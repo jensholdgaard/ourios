@@ -19,7 +19,6 @@
 //! — is the shared [`crate::audit_scan`], also used by the §3.7.1 alias-map
 //! derivation.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -34,11 +33,11 @@ use datafusion::prelude::{SessionContext, col, lit};
 
 use ourios_core::audit::{EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{Store, audit_columns};
+use ourios_parquet::audit_columns;
 
 use crate::dsl::DriftQuery;
 use crate::{
-    QueryError, QueryStats, audit_scan, audit_table_urls, scan_stats, storage_err,
+    QueryError, QueryStats, StoreRef, audit_scan, audit_table_urls, scan_stats, storage_err,
     time_bound_scalar,
 };
 
@@ -93,8 +92,7 @@ const LAST_SEEN: &str = "last_seen";
 /// (`-7d`, `now`) resolve against; the caller supplies it so execution is
 /// deterministic and testable (mirroring [`crate::Querier::run_query`]).
 pub(crate) async fn run_drift(
-    store: Option<&Store>,
-    local_root: Option<&Path>,
+    backend: StoreRef<'_>,
     query: &DriftQuery,
     tenant: &TenantId,
     now_unix_nano: u64,
@@ -109,18 +107,12 @@ pub(crate) async fn run_drift(
     // Resolve the audit file set off the async runtime: the S3 branch's
     // `Store::list_blocking` (and the local `std::fs` walk) are blocking, so
     // offload them via `spawn_blocking` rather than tie up a runtime worker.
-    // `Store` / `TenantId` / `PathBuf` are cheap to clone into the task.
+    // The owned `Backend` (cheap to clone) gives the task a `'static` selector.
     let files = {
-        let store = store.cloned();
+        let owned = backend.into_owned();
         let tenant = tenant.clone();
-        let local_root = local_root.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            audit_scan::audit_files(
-                store.as_ref(),
-                local_root.as_deref(),
-                &tenant,
-                Some((start, end)),
-            )
+            audit_scan::audit_files(owned.store_ref(), &tenant, Some((start, end)))
         })
         .await
         .map_err(|e| QueryError::Storage {
@@ -134,7 +126,7 @@ pub(crate) async fn run_drift(
     }
 
     let ctx = SessionContext::new();
-    let urls = audit_table_urls(&ctx, store, &files)?;
+    let urls = audit_table_urls(&ctx, backend, &files)?;
     let options =
         ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
     let config = ListingTableConfig::new_with_multi_paths(urls)

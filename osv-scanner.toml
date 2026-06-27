@@ -1,0 +1,27 @@
+# OSV-Scanner ignore list — the OSV/GHSA counterpart of `deny.toml`'s reasoned
+# `advisories.ignore` (which covers only the RustSec DB). OpenSSF Scorecard's
+# Vulnerabilities check runs OSV-Scanner over the full lockfile and flags
+# advisories that have a GHSA/OSV id but no RustSec id (so `cargo deny` misses
+# them) or that aren't in the built graph. Each entry is reviewed and accepted,
+# with a reason; `ignoreUntil` forces re-evaluation.
+
+# reason: thrift v0.17.0 (pulled by parquet 55.2.0 -> every Ourios crate) is
+# affected by GHSA-2f9f-gq7v-9h6m / CVE-2026-43868 (DoS: excessive allocation on
+# untrusted thrift deserialization; fixed 0.23.0). parquet requires `thrift
+# ^0.17`, so thrift can't move without an arrow/parquet/DataFusion upgrade
+# (datafusion 53 pins arrow 55) — tracked in issue #295. Low practical surface:
+# thrift only parses Parquet footers, and Ourios reads objects it itself wrote
+# into an Ourios-controlled bucket. Re-evaluate at ignoreUntil (or when RustSec
+# mints an id, at which point `cargo deny` will require a `deny.toml` ignore too).
+[[IgnoredVulns]]
+id = "GHSA-2f9f-gq7v-9h6m"
+ignoreUntil = 2026-12-31
+reason = "thrift<=0.22 DoS via parquet; un-upgradable w/o arrow/DataFusion bump (issue #295); footer-parse only, Ourios-owned bucket"
+
+# reason: quinn-proto 0.11.14 (RUSTSEC-2026-0185, DoS) is present in Cargo.lock
+# but NOT in the build graph under any target/feature
+# (`cargo tree -i quinn-proto --target all --all-features` => nothing), so it is
+# never compiled into any Ourios binary — a lockfile-only false positive.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0185"
+reason = "quinn-proto not in the build graph (lockfile-only; cargo tree --target all --all-features finds nothing)"

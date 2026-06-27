@@ -119,6 +119,11 @@ pub struct Store {
     /// Reserved key prefix (the store root). Always empty at `red`; honoured
     /// once the consumers migrate onto [`Store`] at `green`.
     prefix: ObjectPath,
+    /// Whether the backend supports a conditional update (`If-Match` CAS), the
+    /// manifest generation-swap ([`crate::Manifest::publish_cas`]) the compactor
+    /// commits with on S3. `false` for `LocalFileSystem`, which rejects
+    /// `PutMode::Update` (see [`Self::supports_conditional_update`]).
+    conditional_update: bool,
 }
 
 /// Non-secret addressing for the S3 / S3-compatible backend (RFC0013.7) —
@@ -289,6 +294,9 @@ impl Store {
         Ok(Self {
             inner: Arc::new(fs),
             prefix: ObjectPath::default(),
+            // `LocalFileSystem` rejects `PutMode::Update`, so it has no `If-Match`
+            // CAS; the compactor commits the manifest with an atomic overwrite here.
+            conditional_update: false,
         })
     }
 
@@ -344,7 +352,22 @@ impl Store {
         Ok(Self {
             inner: Arc::new(s3),
             prefix,
+            // The backend keeps object_store's default `S3ConditionalPut::ETagMatch`,
+            // so the `If-Match` CAS the manifest generation-swap needs is available.
+            conditional_update: true,
         })
+    }
+
+    /// Whether this backend supports a conditional update (`If-Match` CAS) — the
+    /// atomic manifest generation-swap [`crate::Manifest::publish_cas`] needs
+    /// (RFC0013.3/.4). S3-compatible backends do; `LocalFileSystem` rejects
+    /// `PutMode::Update`, so the compactor commits there with an atomic overwrite
+    /// instead (the local backend stages to a temp object and renames it into
+    /// place — last-writer-wins, RFC0019.7 keeping the local commit byte-for-byte
+    /// unchanged). A caller branches on this to pick the backend-appropriate swap.
+    #[must_use]
+    pub fn supports_conditional_update(&self) -> bool {
+        self.conditional_update
     }
 
     /// The underlying [`ObjectStore`], for handing to `DataFusion`'s table

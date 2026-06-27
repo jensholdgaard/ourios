@@ -20,7 +20,7 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
     DEFAULT_ZSTD_LEVEL, Manifest, PartitionKey, Published, Reader, S3Config, Store, Writer,
-    encode_records_to_parquet,
+    compact_partition, encode_records_to_parquet,
 };
 use testcontainers_modules::localstack::LocalStack;
 use testcontainers_modules::testcontainers::core::ExecCommand;
@@ -455,6 +455,87 @@ async fn store_list_enumerates_keys_on_s3() {
         ],
         "no prefix lists the whole bucket (incl. the sibling), ordered",
     );
+}
+
+/// Scenario RFC0019.4 — a small-file partition compacts to one file on the real
+/// `AmazonS3` backend, the manifest swapped via the conditional-PUT CAS
+/// (`publish_cas`): `compact_partition` runs entirely through the `Store` seam
+/// (RFC 0019 §3.3), consolidates the inputs, and commits generation 2 naming the
+/// single output; the consolidated file reads back every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn compact_partition_consolidates_on_s3_via_cas() {
+    let (_node, s3) = localstack_s3("ourios-it-compact").await;
+
+    // Three small files (one record each) in one partition, written through the
+    // Store-backed writer — the sealed-but-uncompacted backlog.
+    let records: Vec<MinedRecord> = (0..3).map(|i| rec_for("tenant-c", i)).collect();
+    let partition = PartitionKey::derive(&records[0]).expect("derive partition");
+    {
+        let s3 = s3.clone();
+        let partition = partition.clone();
+        let records = records.clone();
+        tokio::task::spawn_blocking(move || {
+            for record in &records {
+                let mut writer = Writer::open_in(&s3, partition.clone()).expect("open_in");
+                writer
+                    .append_records(std::slice::from_ref(record))
+                    .expect("append");
+                writer.close().expect("close");
+            }
+        })
+        .await
+        .expect("join writes");
+    }
+
+    // Compact (blocking work) off the async test thread.
+    let outcome = {
+        let s3 = s3.clone();
+        let partition = partition.clone();
+        tokio::task::spawn_blocking(move || compact_partition(&s3, &partition))
+            .await
+            .expect("join")
+            .expect("compact")
+    };
+    assert!(outcome.committed.is_some(), "a 3-file backlog must compact");
+    assert_eq!(outcome.files_before, 3, "all three inputs were live");
+    assert_eq!(
+        outcome.rows, 3,
+        "every row carried across the consolidation"
+    );
+
+    // The manifest is at generation 2 (bootstrap gen 1, CAS commit gen 2),
+    // naming the single consolidated file — swapped via the conditional PUT.
+    let key = "data/tenant_id=tenant-c/year=2026/month=04/day=02/hour=10/manifest.json";
+    let (manifest, _) = Manifest::read_with_etag(&s3, key)
+        .expect("read manifest")
+        .expect("manifest present after commit");
+    assert_eq!(manifest.generation, 2, "bootstrap gen 1 → CAS commit gen 2");
+    assert_eq!(
+        manifest.files.len(),
+        1,
+        "consolidated to a single live file"
+    );
+
+    // The consolidated file reads back all three rows through the store.
+    let consolidated_key = format!(
+        "data/tenant_id=tenant-c/year=2026/month=04/day=02/hour=10/{}",
+        manifest.files[0],
+    );
+    let bytes = {
+        let s3 = s3.clone();
+        let consolidated_key = consolidated_key.clone();
+        tokio::task::spawn_blocking(move || s3.get_blocking(&consolidated_key))
+            .await
+            .expect("join get")
+            .expect("get consolidated")
+    };
+    let rows =
+        Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition, &consolidated_key)
+            .expect("open consolidated")
+            .read_all()
+            .expect("read consolidated");
+    assert_eq!(rows.len(), 3, "consolidated file holds every original row");
 }
 
 /// `Store::list_with_sizes_blocking` reports each object's byte length on the

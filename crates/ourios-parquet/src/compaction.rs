@@ -1,23 +1,36 @@
-//! Sealed-partition compaction (RFC 0009).
+//! Sealed-partition compaction (RFC 0009), through the object-storage
+//! [`Store`] seam (RFC 0019).
 //!
 //! [`compact_partition`] consolidates a partition's many small
-//! `*.parquet` files into one, **preserving every stored row** (it
+//! `*.parquet` objects into one, **preserving every stored row** (it
 //! copies rows via [`Reader`]/[`Writer`], never re-mines them), and
-//! commits the result by atomically swapping the partition manifest
-//! ([`Manifest::write_atomic`]) so a concurrent query never sees a
-//! row twice or misses one (RFC0009.2 / RFC0009.3). It operates on a
-//! single partition and validates that every row belongs to it
-//! (`Reader::open_partition`, RFC0009.5); the *scheduler* that
-//! decides which sealed partitions are candidates and the orphan GC
-//! cadence are separate concerns (epic #94).
+//! commits the result by atomically swapping the partition manifest so a
+//! concurrent query never sees a row twice or misses one (RFC0009.2 /
+//! RFC0009.3). The swap is backend-appropriate: a conditional PUT
+//! ([`Manifest::publish_cas`], RFC0019.4) on an S3 backend, or an atomic
+//! overwrite on the local backend (which has no `If-Match` CAS — RFC0019.7
+//! keeps the local commit byte-for-byte unchanged). It operates on a single
+//! partition and validates that every row belongs to it
+//! ([`Reader::open_partition_bytes`], RFC0009.5); the *scheduler* that
+//! decides which sealed partitions are candidates and the orphan GC cadence
+//! are separate concerns (epic #94).
+//!
+//! Every filesystem walk is a [`Store`] listing (RFC 0019 §3.3), so the same
+//! code path targets `LocalFileSystem` or S3 — there is no local/remote
+//! hybrid here (unlike the querier): the compactor's tenant isolation is
+//! structural (per-partition prefix) plus the row-vs-path validation, neither
+//! of which needs local-path canonicalisation.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use chrono::NaiveDate;
 
-use crate::manifest::{Manifest, ManifestError};
+use crate::manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 use crate::partition::{PartitionKey, percent_encode_tenant};
 use crate::reader::{Reader, ReaderError};
+use crate::store::{Store, StoreError};
 use crate::writer::{Writer, WriterError};
 
 /// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
@@ -32,7 +45,8 @@ pub struct CompactionOutcome {
     /// `0` on a no-op.
     pub rows: u64,
     /// The commit, or `None` when compaction was a no-op (fewer than
-    /// two live files — nothing to consolidate).
+    /// two live files — nothing to consolidate — or a lost CAS race that
+    /// left the work for a later sweep).
     pub committed: Option<Committed>,
     /// Superseded input files that could not be removed after the
     /// commit. These are non-live (the committed manifest excludes
@@ -46,8 +60,9 @@ pub struct CompactionOutcome {
     /// Size in bytes of the consolidated output file (`0` on a no-op) —
     /// the write volume for `ourios.compaction.io` and the sample for
     /// the `ourios.storage.parquet.file.size` H4 detector (RFC 0009
-    /// §3.6). Best-effort: a `stat` failure on a file we just wrote or
-    /// read records `0` rather than failing a committed compaction.
+    /// §3.6). This is the encoded byte length the [`Writer`] reports
+    /// ([`crate::WrittenFile::bytes_written`]), not a `stat` of a path —
+    /// a store-backed (S3) output can't be `stat`-ed.
     pub bytes_written: u64,
 }
 
@@ -101,12 +116,7 @@ pub enum CompactionError {
     Write(WriterError),
     /// Reading or committing the manifest failed.
     Manifest(ManifestError),
-    /// A live data file has a non-UTF-8 name, so it can't be recorded
-    /// in the UTF-8 JSON manifest. Reachable only via the glob
-    /// fallback (a foreign file dropped into a partition); the writer
-    /// only ever emits UUID names.
-    NonUtf8FileName(PathBuf),
-    /// A filesystem operation (directory scan) failed.
+    /// A [`Store`] operation (a key listing, object read, or delete) failed.
     Io {
         op: &'static str,
         path: PathBuf,
@@ -120,13 +130,6 @@ impl std::fmt::Display for CompactionError {
             Self::Read(e) => write!(f, "compaction read: {e}"),
             Self::Write(e) => write!(f, "compaction write: {e}"),
             Self::Manifest(e) => write!(f, "compaction manifest: {e}"),
-            Self::NonUtf8FileName(path) => {
-                write!(
-                    f,
-                    "compaction: non-UTF-8 data file name: {}",
-                    path.display()
-                )
-            }
             Self::Io { op, path, source } => {
                 write!(f, "compaction {op} {}: {source}", path.display())
             }
@@ -140,131 +143,128 @@ impl std::error::Error for CompactionError {
             Self::Read(e) => Some(e),
             Self::Write(e) => Some(e),
             Self::Manifest(e) => Some(e),
-            Self::NonUtf8FileName(_) => None,
             Self::Io { source, .. } => Some(source),
         }
     }
 }
 
-/// Compact the partition `partition` under `bucket_root`: read its
-/// live files' rows and rewrite them as one file, then atomically
-/// commit the manifest to name only that file and remove the
-/// superseded inputs.
+/// Compact the partition `partition` in `store`: read its live files' rows and
+/// rewrite them as one file, then atomically commit the manifest to name only
+/// that file and remove the superseded inputs.
 ///
-/// A no-op (returns `committed: None`) when the partition has fewer
-/// than two live files — there is nothing to consolidate.
+/// A no-op (returns `committed: None`) when the partition has fewer than two
+/// live files (nothing to consolidate), or when a compare-and-swap on the
+/// manifest is lost to a concurrent sweep (S3 only) — in the latter case the
+/// freshly written consolidated file is a non-live orphan a later
+/// [`gc_orphans`] reclaims.
 ///
 /// # Errors
 ///
-/// [`CompactionError`] if an input can't be read (including a
-/// row-vs-path mismatch), the consolidated file can't be written,
-/// the manifest can't be read/committed, or a filesystem operation
-/// fails. On any error before the commit, the inputs are untouched
-/// and the partition reads exactly as before.
-///
-/// # Panics
-///
-/// Panics if the consolidated file's UUID name is not valid UTF-8, or
-/// if a single input file's row count exceeds `u64` — neither is
-/// reachable (the name is a UUID we just wrote; `usize <= u64`). A
-/// *foreign* non-UTF-8 file name surfaces as
-/// [`CompactionError::NonUtf8FileName`], not a panic.
+/// [`CompactionError`] if an input can't be read (including a row-vs-path
+/// mismatch), the consolidated file can't be written, the manifest can't be
+/// read/committed, or a [`Store`] listing fails. On any error before the
+/// commit, the inputs are untouched and the partition reads exactly as before.
 pub fn compact_partition(
-    bucket_root: &Path,
+    store: &Store,
     partition: &PartitionKey,
 ) -> Result<CompactionOutcome, CompactionError> {
-    let partition_dir = partition.data_path(bucket_root);
-    let inputs = live_files(&partition_dir)?;
+    let key = manifest_key(partition);
+    let (existing, etag) =
+        match Manifest::read_with_etag(store, &key).map_err(CompactionError::Manifest)? {
+            Some((manifest, etag)) => (Some(manifest), etag),
+            None => (None, None),
+        };
+    let inputs = live_file_keys(store, partition, existing.as_ref())?;
     if inputs.len() < 2 {
-        return Ok(CompactionOutcome {
-            files_before: inputs.len(),
-            rows: 0,
-            committed: None,
-            gc_failures: 0,
-            bytes_read: 0,
-            bytes_written: 0,
-        });
+        return Ok(no_op_outcome(inputs.len()));
     }
 
-    // Make the reader manifest-authoritative *before* the consolidated
-    // file appears. With no prior manifest, a concurrent glob reader
-    // would otherwise see the inputs *and* the new file in the window
-    // before the commit (a double count). Bootstrapping a manifest
-    // that names the current inputs is the same set the glob already
-    // returns, so it changes nothing visible (RFC0009.3 — no torn
-    // read), and from then on the new file stays invisible until the
-    // commit names it.
-    let mut generation = if let Some(manifest) =
-        Manifest::read(&partition_dir).map_err(CompactionError::Manifest)?
-    {
-        manifest.generation
+    // Make the reader manifest-authoritative *before* the consolidated file
+    // appears. With no prior manifest, a concurrent glob reader would otherwise
+    // see the inputs *and* the new file in the window before the commit (a
+    // double count). Bootstrapping a manifest naming the current inputs is the
+    // same set the glob already returns, so it changes nothing visible
+    // (RFC0009.3 — no torn read), and from then on the new file stays invisible
+    // until the commit names it. The bootstrap is a create-if-absent
+    // conditional PUT (supported on both backends); a lost race means another
+    // compactor owns this partition, so back off as a no-op rather than fight it.
+    let (base_generation, commit_etag) = if let Some(manifest) = &existing {
+        (manifest.generation, etag)
     } else {
         let bootstrap = Manifest {
             generation: 1,
-            files: file_names(&inputs)?,
+            files: basenames(&inputs),
         };
-        bootstrap
-            .write_atomic(&partition_dir)
-            .map_err(CompactionError::Manifest)?;
-        1
+        match bootstrap
+            .publish_cas(store, &key, None)
+            .map_err(CompactionError::Manifest)?
+        {
+            Published::Won => {}
+            Published::Lost => return Ok(no_op_outcome(inputs.len())),
+        }
+        // Re-read to learn the bootstrap generation's ETag for the CAS commit
+        // (the S3 path; the local overwrite commit ignores it).
+        (1, read_manifest_etag(store, &key)?)
     };
 
-    // Stream the inputs into the consolidated file one at a time, so
-    // peak memory is bounded by a single input file's rows rather than
-    // the whole partition (which can be large). `open_partition`
-    // validates each row's tenant + time bucket against this partition
-    // (RFC 0005 §3.9 / RFC0009.5), so a mis-partitioned input aborts
-    // the compaction instead of being silently merged. Row groups
-    // rotate at the RFC 0005 §3.5 threshold within the single output.
-    let mut writer =
-        Writer::open(bucket_root, partition.clone()).map_err(CompactionError::Write)?;
+    // Stream the inputs into the consolidated file one at a time, so peak
+    // memory is bounded by a single input file's rows rather than the whole
+    // partition. `open_partition_bytes` validates each row's tenant + time
+    // bucket against this partition (RFC 0005 §3.9 / RFC0009.5), so a
+    // mis-partitioned input aborts the compaction instead of being silently
+    // merged. Row groups rotate at the RFC 0005 §3.5 threshold within the
+    // single output.
+    let mut writer = Writer::open_in(store, partition.clone()).map_err(CompactionError::Write)?;
     let mut row_count: u64 = 0;
     let mut bytes_read: u64 = 0;
-    for file in &inputs {
-        bytes_read = bytes_read.saturating_add(file_len(file));
-        let reader =
-            Reader::open_partition(file, partition.clone()).map_err(CompactionError::Read)?;
+    for input in &inputs {
+        let bytes = store
+            .get_blocking(input)
+            .map_err(|e| store_io("get", input, e))?;
+        bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+        let reader = Reader::open_partition_bytes(Bytes::from(bytes), partition.clone(), input)
+            .map_err(CompactionError::Read)?;
         let records = reader.read_all().map_err(CompactionError::Read)?;
-        row_count += u64::try_from(records.len()).expect("file row count fits in u64");
+        // `usize <= u64` on every supported target; saturate rather than panic
+        // on a theoretically wider one.
+        row_count = row_count.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
         writer
             .append_records(&records)
             .map_err(CompactionError::Write)?;
     }
     let written = writer.close().map_err(CompactionError::Write)?;
-    let bytes_written = file_len(&written.path);
-    let consolidated = written
-        .path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .expect("UUID file name is valid UTF-8")
-        .to_string();
+    let bytes_written = written.bytes_written;
+    let consolidated = basename(&written.key).to_owned();
 
-    // Commit: swap the manifest to name only the consolidated file.
-    generation += 1;
-    // The input file names (the merged-away set) for the §3.6 audit
-    // event — captured before the GC loop removes the files (names are
-    // stable regardless). Sorted so the audit event is deterministic
-    // regardless of the `live_files` read-dir order (the consolidation
-    // itself reads `inputs` in their original order).
-    let mut input_files = file_names(&inputs)?;
+    // Commit: swap the manifest to name only the consolidated file. The input
+    // names (the merged-away set) for the §3.6 audit event are captured here,
+    // sorted so the event is deterministic regardless of listing order.
+    let generation = base_generation.saturating_add(1);
+    let mut input_files = basenames(&inputs);
     input_files.sort();
-    Manifest {
+    let commit = Manifest {
         generation,
         files: vec![consolidated.clone()],
+    };
+    match commit_manifest(store, &key, &commit, commit_etag.as_deref())? {
+        Published::Won => {}
+        // Lost the CAS race (S3 only — the local overwrite always wins): the
+        // consolidated file is now a non-live orphan a later `gc_orphans`
+        // reclaims. Not an error — the work is left for the next sweep.
+        Published::Lost => return Ok(no_op_outcome(inputs.len())),
     }
-    .write_atomic(&partition_dir)
-    .map_err(CompactionError::Manifest)?;
 
-    // GC the now-superseded inputs. The commit already succeeded, so a
-    // delete failure only leaves a non-live orphan (the manifest
-    // excludes it) for a later sweep — it must NOT turn a committed
-    // compaction into a reported failure. Count such failures so the
-    // caller can surface them, and continue.
+    // GC the now-superseded inputs. The commit already succeeded, so a delete
+    // failure only leaves a non-live orphan (the manifest excludes it) for a
+    // later sweep — it must NOT turn a committed compaction into a reported
+    // failure. Count such failures and continue; a not-found is
+    // already-reclaimed (S3 DELETE is idempotent; the local backend reports
+    // not-found — the GC treats both alike).
     let mut gc_failures = 0;
-    for file in &inputs {
-        match std::fs::remove_file(file) {
+    for input in &inputs {
+        match store.delete_blocking(input) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.is_not_found() => {}
             Err(_) => gc_failures += 1,
         }
     }
@@ -283,6 +283,38 @@ pub fn compact_partition(
     })
 }
 
+/// Commit `manifest` to `key` in `store` with the backend-appropriate atomic
+/// swap (CLAUDE.md §3.5 / RFC0009.3 — no torn read either way):
+///
+/// - **CAS-capable backend (S3, RFC0019.4):** an `If-Match` conditional PUT
+///   ([`Manifest::publish_cas`]) against `expected`; a lost race returns
+///   [`Published::Lost`].
+/// - **Local backend (RFC0019.7 — byte-for-byte unchanged):** `LocalFileSystem`
+///   rejects `PutMode::Update`, so commit with an atomic overwrite (it stages to
+///   a temp object and renames it into place — the same swap
+///   [`Manifest::write_atomic`] performed pre-RFC-0019). Last-writer-wins; there
+///   is no S3-style CAS race to lose on a single local host, so it always wins.
+fn commit_manifest(
+    store: &Store,
+    key: &str,
+    manifest: &Manifest,
+    expected: Option<&str>,
+) -> Result<Published, CompactionError> {
+    if store.supports_conditional_update() {
+        return manifest
+            .publish_cas(store, key, expected)
+            .map_err(CompactionError::Manifest);
+    }
+    manifest.validate().map_err(CompactionError::Manifest)?;
+    let bytes = manifest
+        .to_json()
+        .map_err(|e| CompactionError::Manifest(ManifestError::Parse(e)))?;
+    store
+        .put_blocking(key, bytes)
+        .map_err(|e| CompactionError::Manifest(ManifestError::Io(std::io::Error::other(e))))?;
+    Ok(Published::Won)
+}
+
 /// Outcome of a [`gc_orphans`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -293,16 +325,15 @@ pub struct OrphanGc {
     pub failures: u64,
 }
 
-/// Reclaim a partition's **orphan** files — those a compaction left when
-/// it crashed before its in-process GC finished (RFC0009.4). The commit
-/// point is the atomic manifest swap (§3.4), so a crash always freezes a
-/// partition at a clean generation; what it can leave behind is dead
-/// files the manifest does not name. When a `manifest.json` is present it
-/// is authoritative (RFC0009.3): every `*.parquet` on disk **not** named
-/// by it is provably dead — a pre-commit consolidated file, or a
-/// superseded input the post-commit GC never reached — and any
-/// `*.parquet.tmp` is an interrupted [`Writer`] publish. Both are safe to
-/// unlink. With **no** manifest the glob is the live set, so no
+/// Reclaim a partition's **orphan** files — those a compaction left when it
+/// crashed before its in-process GC finished (RFC0009.4). The commit point is
+/// the atomic manifest swap (§3.4), so a crash always freezes a partition at a
+/// clean generation; what it can leave behind is dead files the manifest does
+/// not name. When a `manifest.json` is present it is authoritative (RFC0009.3):
+/// every `*.parquet` object **not** named by it is provably dead — a pre-commit
+/// consolidated file, or a superseded input the post-commit GC never reached —
+/// and any `*.parquet.tmp` is an interrupted publish (absent on S3). Both are
+/// safe to unlink. With **no** manifest the glob is the live set, so no
 /// `*.parquet` is an orphan and only stray `*.parquet.tmp` are reclaimed.
 ///
 /// Idempotent, never touches a live file, and safe to run on any sealed
@@ -311,52 +342,24 @@ pub struct OrphanGc {
 ///
 /// # Errors
 ///
-/// [`CompactionError::Manifest`] if the partition's `manifest.json` can't
-/// be read, or [`CompactionError::Io`] if the directory scan itself
-/// fails. A failed unlink of an individual orphan is counted in
-/// [`OrphanGc::failures`], not surfaced — an orphan that outlives one
-/// pass is reclaimed by the next.
-pub fn gc_orphans(partition_dir: &Path) -> Result<OrphanGc, CompactionError> {
-    let live: Option<std::collections::HashSet<String>> = Manifest::read(partition_dir)
-        .map_err(CompactionError::Manifest)?
-        .map(|m| m.files.into_iter().collect());
-    let entries = match std::fs::read_dir(partition_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OrphanGc::default()),
-        Err(source) => {
-            return Err(CompactionError::Io {
-                op: "read_dir",
-                path: partition_dir.to_path_buf(),
-                source,
-            });
-        }
-    };
+/// [`CompactionError::Manifest`] if the partition's `manifest.json` can't be
+/// read, or [`CompactionError::Io`] if the [`Store`] listing fails. A failed
+/// unlink of an individual orphan is counted in [`OrphanGc::failures`], not
+/// surfaced — an orphan that outlives one pass is reclaimed by the next.
+pub fn gc_orphans(store: &Store, partition: &PartitionKey) -> Result<OrphanGc, CompactionError> {
+    let prefix = partition_data_prefix(partition);
+    let live: Option<HashSet<String>> =
+        read_manifest(store, partition)?.map(|m| m.files.into_iter().collect());
+    let keys = store
+        .list_blocking(Some(&prefix))
+        .map_err(|e| store_io("list", &prefix, e))?;
     let mut gc = OrphanGc::default();
-    for entry in entries {
-        let entry = entry.map_err(|source| CompactionError::Io {
-            op: "read_dir entry",
-            path: partition_dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let is_file = entry
-            .file_type()
-            .map_err(|source| CompactionError::Io {
-                op: "file_type",
-                path: path.clone(),
-                source,
-            })?
-            .is_file();
-        if !is_file {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        // `.parquet.tmp` is always a dead interrupted publish. A
-        // `.parquet` is an orphan only when a manifest names a set that
-        // excludes it (no manifest ⇒ glob ⇒ every `.parquet` is live).
-        // Anything else (`manifest.json`, a future sidecar) is not ours.
+    for object in keys {
+        let name = basename(&object);
+        // `.parquet.tmp` is always a dead interrupted publish. A `.parquet` is
+        // an orphan only when a manifest names a set that excludes it (no
+        // manifest ⇒ glob ⇒ every `.parquet` is live). Anything else
+        // (`manifest.json`, a future sidecar) is not ours.
         let orphan = if name.ends_with(".parquet.tmp") {
             true
         } else if name.ends_with(".parquet") {
@@ -365,9 +368,9 @@ pub fn gc_orphans(partition_dir: &Path) -> Result<OrphanGc, CompactionError> {
             false
         };
         if orphan {
-            match std::fs::remove_file(&path) {
+            match store.delete_blocking(&object) {
                 Ok(()) => gc.reclaimed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.is_not_found() => {}
                 Err(_) => gc.failures += 1,
             }
         }
@@ -375,57 +378,46 @@ pub fn gc_orphans(partition_dir: &Path) -> Result<OrphanGc, CompactionError> {
     Ok(gc)
 }
 
-/// On-disk size of `path` in bytes, best-effort: a `stat` failure
-/// yields `0`. Used only for `ourios.compaction.io` /
-/// `ourios.storage.parquet.file.size` volume — a metric inaccuracy on
-/// a file we just wrote or read must never fail a committed compaction.
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map_or(0, |m| m.len())
-}
-
 /// Select the `tenant`'s sealed partitions that are worth compacting
-/// (RFC 0009 §3.3), as of wall-clock `now_unix_nanos`. The result is
-/// the work list a background compactor feeds to [`compact_partition`];
-/// this function makes only the *decision* — read-only I/O (directory
-/// scans, file metadata, and each candidate partition's
-/// `manifest.json`), no mutation — so it is deterministic and
-/// testable. The driving loop (timer + bounded concurrency) belongs in
-/// the ingester role, which doesn't exist yet.
+/// (RFC 0009 §3.3), as of wall-clock `now_unix_nanos`. The result is the work
+/// list a background compactor feeds to [`compact_partition`]; this function
+/// makes only the *decision* — read-only [`Store`] listings and each candidate
+/// partition's `manifest.json`, no mutation — so it is deterministic and
+/// testable. The driving loop (timer + bounded concurrency) belongs in the
+/// ingester role.
 ///
-/// A partition is selected when it is **sealed** — its hour ended at
-/// least `policy.grace_nanos` ago, so no writer is still appending —
-/// and a **candidate**: it has at least two live files (fewer can't be
-/// consolidated) and either more than `policy.min_files` of them or one
-/// below `policy.small_file_bytes`. The list is ordered chronologically
-/// (oldest partition first), deterministic across runs.
+/// A partition is selected when it is **sealed** — its hour ended at least
+/// `policy.grace_nanos` ago, so no writer is still appending — and a
+/// **candidate**: it has at least two live files (fewer can't be consolidated)
+/// and either more than `policy.min_files` of them or one below
+/// `policy.small_file_bytes`. The list is ordered chronologically (oldest
+/// partition first), deterministic across runs.
 ///
 /// # Errors
 ///
-/// [`CompactionError::Io`] if a directory scan or file `stat` fails,
-/// or [`CompactionError::Manifest`] if a partition's manifest can't be
-/// read while counting its live files.
+/// [`CompactionError::Io`] if a [`Store`] listing fails, or
+/// [`CompactionError::Manifest`] if a partition's manifest can't be read while
+/// counting its live files.
 pub fn plan_candidates(
-    bucket_root: &Path,
+    store: &Store,
     tenant: &str,
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
 ) -> Result<Vec<PartitionKey>, CompactionError> {
-    let tenant_dir = bucket_root
-        .join("data")
-        .join(format!("tenant_id={}", percent_encode_tenant(tenant)));
     let mut selected = Vec::new();
-    for (partition, dir) in hour_partitions(&tenant_dir, tenant)? {
-        if is_sealed(&partition, now_unix_nanos, policy) && is_candidate(&dir, policy)? {
+    for partition in hour_partitions(store, tenant)? {
+        if is_sealed(&partition, now_unix_nanos, policy) && is_candidate(store, &partition, policy)?
+        {
             selected.push(partition);
         }
     }
     Ok(selected)
 }
 
-/// Whether the partition's hour ended at least `grace_nanos` before
-/// `now` (the comparison is inclusive: sealed at exactly
-/// `hour_end + grace`). A partition whose `(year, month, day, hour)` is not a real
-/// UTC instant (a corrupt directory name) is treated as not sealed.
+/// Whether the partition's hour ended at least `grace_nanos` before `now` (the
+/// comparison is inclusive: sealed at exactly `hour_end + grace`). A partition
+/// whose `(year, month, day, hour)` is not a real UTC instant (a corrupt key)
+/// is treated as not sealed.
 fn is_sealed(partition: &PartitionKey, now_unix_nanos: u64, policy: &CompactionPolicy) -> bool {
     let Some(hour_start) = NaiveDate::from_ymd_opt(partition.year, partition.month, partition.day)
         .and_then(|d| d.and_hms_opt(partition.hour, 0, 0))
@@ -445,234 +437,200 @@ fn is_sealed(partition: &PartitionKey, now_unix_nanos: u64, policy: &CompactionP
             .saturating_add(policy.grace_nanos)
 }
 
-/// Whether a partition is worth compacting per `policy`: at least two
-/// live files (fewer can't be consolidated — [`compact_partition`]
-/// no-ops), and either more than `min_files` of them or one smaller
-/// than `small_file_bytes`.
-fn is_candidate(partition_dir: &Path, policy: &CompactionPolicy) -> Result<bool, CompactionError> {
-    let live = live_files(partition_dir)?;
-    if live.len() < 2 {
+/// Whether a partition is worth compacting per `policy`: at least two live
+/// files, and either more than `min_files` of them or one smaller than
+/// `small_file_bytes`. Resolves the live set + sizes from one
+/// [`Store::list_with_sizes_blocking`] — when a manifest is present it restricts
+/// the live set to the named files; otherwise every committed `*.parquet` under
+/// the prefix is live (the glob fallback).
+fn is_candidate(
+    store: &Store,
+    partition: &PartitionKey,
+    policy: &CompactionPolicy,
+) -> Result<bool, CompactionError> {
+    let prefix = partition_data_prefix(partition);
+    let manifest = read_manifest(store, partition)?;
+    let live_names: Option<HashSet<&str>> = manifest
+        .as_ref()
+        .map(|m| m.files.iter().map(String::as_str).collect());
+    let entries = store
+        .list_with_sizes_blocking(Some(&prefix))
+        .map_err(|e| store_io("list", &prefix, e))?;
+    let sizes: Vec<u64> = entries
+        .iter()
+        .filter(|(key, _)| is_committed_parquet(key))
+        .filter(|(key, _)| {
+            live_names
+                .as_ref()
+                .is_none_or(|n| n.contains(basename(key)))
+        })
+        .map(|(_, size)| *size)
+        .collect();
+    if sizes.len() < 2 {
         return Ok(false);
     }
-    if live.len() > policy.min_files {
+    if sizes.len() > policy.min_files {
         return Ok(true);
     }
-    for file in &live {
-        let len = std::fs::metadata(file)
-            .map_err(|source| CompactionError::Io {
-                op: "stat",
-                path: file.clone(),
-                source,
-            })?
-            .len();
-        if len < policy.small_file_bytes {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(sizes.iter().any(|&len| len < policy.small_file_bytes))
 }
 
-/// Enumerate `tenant_dir`'s `year=/month=/day=/hour=` leaf partitions
-/// as `(PartitionKey, hour_dir)` — the **cartesian product** of the
-/// four Hive levels. Each level is one [`expand_level`] step folded
-/// over the running frontier, so the descent is a single generic
-/// expansion rather than four hand-nested loops. Directory names that
-/// aren't the canonical `key=value` segments drop out (not Ourios
-/// output); a missing `tenant_dir` yields an empty list.
-fn hour_partitions(
-    tenant_dir: &Path,
-    tenant: &str,
-) -> Result<Vec<(PartitionKey, PathBuf)>, CompactionError> {
-    // The Hive levels, outermost first, with the zero-pad width
-    // `PartitionKey::data_path` writes each segment at.
-    const LEVELS: [(&str, usize); 4] = [("year", 4), ("month", 2), ("day", 2), ("hour", 2)];
-
-    // Fold the levels into the product: start at the tenant root with
-    // no numbers, expand by one level each step (short-circuiting on
-    // I/O error), and end with every hour leaf + its [y, m, d, h].
-    let root = vec![(tenant_dir.to_path_buf(), Vec::<u32>::new())];
-    let leaves = LEVELS.iter().try_fold(root, |frontier, &(prefix, width)| {
-        expand_level(frontier, prefix, width)
-    })?;
-
-    Ok(leaves
-        .into_iter()
-        .filter_map(|(hour_dir, nums)| partition_from(tenant, &nums, hour_dir))
-        .collect())
+/// Enumerate the tenant's `year=/month=/day=/hour=` leaf partitions that hold
+/// objects, by listing every key under `data/tenant_id=<enc>/` and parsing the
+/// partition tuple from each key's path segments. Keys whose trailing
+/// `…/year=/month=/day=/hour=/<file>` run isn't the canonical zero-padded form
+/// (the shape [`PartitionKey::data_path`] writes, so the key round-trips) are
+/// skipped — the key-based equivalent of the old directory walk dropping
+/// non-canonical names. Returned sorted chronologically (oldest first) and
+/// deduplicated (many files, plus the manifest, map to one partition).
+fn hour_partitions(store: &Store, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
+    let prefix = format!("data/tenant_id={}", percent_encode_tenant(tenant));
+    let keys = store
+        .list_blocking(Some(&prefix))
+        .map_err(|e| store_io("list", &prefix, e))?;
+    let mut partitions: Vec<PartitionKey> = keys
+        .iter()
+        .filter_map(|key| parse_hour_partition_key(tenant, key))
+        .collect();
+    // Ascending tuple order is chronological (oldest sealed partition first);
+    // dedup after the sort collapses the many keys that share one partition.
+    partitions.sort_by_key(|p| (p.year, p.month, p.day, p.hour));
+    partitions.dedup();
+    Ok(partitions)
 }
 
-/// Expand every `(dir, nums)` in `frontier` by one Hive level: replace
-/// it with one entry per `<prefix>=<n>` child directory, appending the
-/// parsed `n` to `nums`. Folding this over the levels is the cartesian
-/// product `year × month × day × hour`.
-fn expand_level(
-    frontier: Vec<(PathBuf, Vec<u32>)>,
-    prefix: &str,
-    width: usize,
-) -> Result<Vec<(PathBuf, Vec<u32>)>, CompactionError> {
-    frontier
-        .into_iter()
-        .map(|(dir, nums)| {
-            numbered_children(&dir, prefix, width).map(|children| {
-                children.into_iter().map(move |(child, value)| {
-                    let mut nums = nums.clone();
-                    nums.push(value);
-                    (child, nums)
-                })
-            })
-        })
-        .collect::<Result<Vec<_>, CompactionError>>()
-        .map(|nested| nested.into_iter().flatten().collect())
+/// Parse a [`PartitionKey`] from a data-object `key` by matching its trailing
+/// `…/year=YYYY/month=MM/day=DD/hour=HH/<file>` segments (the leaf file name
+/// dropped). Requires a **contiguous** run of the four canonical zero-padded
+/// segments — mirroring the querier's `parse_day_partition` fix (don't pick
+/// `year=` from an arbitrary position) — so a non-contiguous, non-canonical, or
+/// foreign layout yields `None` and is skipped.
+fn parse_hour_partition_key(tenant: &str, key: &str) -> Option<PartitionKey> {
+    // Segments deepest-first, with the leaf (file name) dropped.
+    let mut segments = key.rsplit('/').skip(1);
+    let hour = parse_partition_segment(segments.next()?, "hour", 2)?;
+    let day = parse_partition_segment(segments.next()?, "day", 2)?;
+    let month = parse_partition_segment(segments.next()?, "month", 2)?;
+    let year = parse_partition_segment(segments.next()?, "year", 4)?;
+    Some(PartitionKey {
+        tenant_id: tenant.to_owned(),
+        year: i32::try_from(year).ok()?,
+        month,
+        day,
+        hour,
+    })
 }
 
-/// Build a `(PartitionKey, hour_dir)` from the four parsed
-/// `[year, month, day, hour]` numbers, or `None` if there aren't
-/// exactly four or `year` doesn't fit `i32` (not a partition Ourios
-/// writes).
-fn partition_from(
-    tenant: &str,
-    nums: &[u32],
-    hour_dir: PathBuf,
-) -> Option<(PartitionKey, PathBuf)> {
-    let [year, month, day, hour] = *nums else {
-        return None;
-    };
-    Some((
-        PartitionKey {
-            tenant_id: tenant.to_owned(),
-            year: i32::try_from(year).ok()?,
-            month,
-            day,
-            hour,
-        },
-        hour_dir,
-    ))
+/// Parse one canonical Hive segment `<prefix>=<zero-padded number>` to its
+/// value. Accepts only the exact zero-padded width [`PartitionKey::data_path`]
+/// writes (`month=04`, not `month=4` or `month=004`), so the parsed key
+/// round-trips to the scanned object (RFC 0005 §3.4); any other form is `None`.
+fn parse_partition_segment(segment: &str, prefix: &str, width: usize) -> Option<u32> {
+    let digits = segment.strip_prefix(prefix)?.strip_prefix('=')?;
+    let value: u32 = digits.parse().ok()?;
+    (digits == format!("{value:0width$}")).then_some(value)
 }
 
-/// Subdirectories of `dir` named `<prefix>=<n>` in the canonical
-/// zero-padded form `PartitionKey::data_path` writes (`width` digits,
-/// e.g. `month=04`), returned as `(path, n)`. A non-canonical name
-/// (`month=4`, `month=004`) is skipped: it would parse to a value
-/// whose `data_path` form (`month=04`) names a *different* directory,
-/// so the resulting `PartitionKey` wouldn't round-trip to the scanned
-/// dir (RFC 0005 §3.4). Non-matching entries and non-directories are
-/// skipped; a missing `dir` yields an empty list.
-fn numbered_children(
-    dir: &Path,
-    prefix: &str,
-    width: usize,
-) -> Result<Vec<(PathBuf, u32)>, CompactionError> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(CompactionError::Io {
-                op: "read_dir",
-                path: dir.to_path_buf(),
-                source,
-            });
-        }
-    };
-    let mut out = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| CompactionError::Io {
-            op: "read_dir entry",
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let is_dir = entry
-            .file_type()
-            .map_err(|source| CompactionError::Io {
-                op: "file_type",
-                path: path.clone(),
-                source,
-            })?
-            .is_dir();
-        if !is_dir {
-            continue;
-        }
-        if let Some(value) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_prefix(prefix)?.strip_prefix('='))
-            .and_then(|digits| {
-                let value: u32 = digits.parse().ok()?;
-                // Accept only the exact zero-padded form `data_path`
-                // emits, so the PartitionKey round-trips to this dir.
-                (digits == format!("{value:0width$}")).then_some(value)
-            })
-        {
-            out.push((path, value));
-        }
-    }
-    // `read_dir` order is unspecified; sort by value so the descent —
-    // and thus `plan_candidates`' work list — is deterministic
-    // (ascending = chronological: oldest sealed partitions first).
-    out.sort_by_key(|(_, value)| *value);
-    Ok(out)
-}
-
-/// The partition's live data files: the manifest's named files when a
-/// manifest is present (authoritative), else every committed
-/// `*.parquet` in the directory (`*.parquet.tmp` and `manifest.json`
-/// are excluded by extension). Mirrors the querier's resolution.
-fn live_files(partition_dir: &Path) -> Result<Vec<PathBuf>, CompactionError> {
-    if let Some(manifest) = Manifest::read(partition_dir).map_err(CompactionError::Manifest)? {
+/// The partition's live data-file *keys*: the manifest's named files joined to
+/// the partition prefix when a manifest is present (authoritative), else every
+/// committed `*.parquet` object under the prefix (`*.parquet.tmp` and
+/// `manifest.json` are excluded by suffix). Mirrors the querier's resolution.
+fn live_file_keys(
+    store: &Store,
+    partition: &PartitionKey,
+    manifest: Option<&Manifest>,
+) -> Result<Vec<String>, CompactionError> {
+    let prefix = partition_data_prefix(partition);
+    if let Some(manifest) = manifest {
         return Ok(manifest
             .files
             .iter()
-            .map(|name| partition_dir.join(name))
+            .map(|name| format!("{prefix}/{name}"))
             .collect());
     }
-    let mut files = Vec::new();
-    let entries = match std::fs::read_dir(partition_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(files),
-        Err(source) => {
-            return Err(CompactionError::Io {
-                op: "read_dir",
-                path: partition_dir.to_path_buf(),
-                source,
-            });
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|source| CompactionError::Io {
-            op: "read_dir entry",
-            path: partition_dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let is_file = entry
-            .file_type()
-            .map_err(|source| CompactionError::Io {
-                op: "file_type",
-                path: path.clone(),
-                source,
-            })?
-            .is_file();
-        if is_file && path.extension().is_some_and(|x| x == "parquet") {
-            files.push(path);
-        }
-    }
-    Ok(files)
+    let keys = store
+        .list_blocking(Some(&prefix))
+        .map_err(|e| store_io("list", &prefix, e))?;
+    Ok(keys
+        .into_iter()
+        .filter(|k| is_committed_parquet(k))
+        .collect())
 }
 
-/// Bare file names of `paths` (for a manifest's `files` list). A
-/// non-UTF-8 name can't be written to the JSON manifest, so it is a
-/// [`CompactionError::NonUtf8FileName`] rather than a panic — the
-/// glob fallback may pick up a foreign file.
-fn file_names(paths: &[PathBuf]) -> Result<Vec<String>, CompactionError> {
-    paths
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-                .ok_or_else(|| CompactionError::NonUtf8FileName(p.clone()))
-        })
-        .collect()
+/// Read the partition's `manifest.json` through the [`Store`], discarding the
+/// `ETag`. `Ok(None)` when absent (the pre-compaction / glob-fallback case).
+fn read_manifest(
+    store: &Store,
+    partition: &PartitionKey,
+) -> Result<Option<Manifest>, CompactionError> {
+    Ok(Manifest::read_with_etag(store, &manifest_key(partition))
+        .map_err(CompactionError::Manifest)?
+        .map(|(manifest, _etag)| manifest))
+}
+
+/// Re-read `key`'s manifest `ETag` after a successful bootstrap publish — the
+/// compare-and-swap token the S3 commit needs. `None` if the backend exposes no
+/// `ETag` or the manifest vanished under us (the latter only under concurrency;
+/// the commit then falls back to a create-if-absent that a winning peer loses).
+fn read_manifest_etag(store: &Store, key: &str) -> Result<Option<String>, CompactionError> {
+    Ok(Manifest::read_with_etag(store, key)
+        .map_err(CompactionError::Manifest)?
+        .and_then(|(_manifest, etag)| etag))
+}
+
+/// A no-op / lost-race outcome: nothing was committed, read, or written. Used
+/// for a sub-two-file partition and for a lost manifest CAS.
+fn no_op_outcome(files_before: usize) -> CompactionOutcome {
+    CompactionOutcome {
+        files_before,
+        rows: 0,
+        committed: None,
+        gc_failures: 0,
+        bytes_read: 0,
+        bytes_written: 0,
+    }
+}
+
+/// A committed data object: a `*.parquet` key (so `*.parquet.tmp` and
+/// `manifest.json` are excluded). The writer only ever emits `<uuid>.parquet`.
+fn is_committed_parquet(key: &str) -> bool {
+    key.ends_with(".parquet")
+}
+
+/// The trailing path segment of a `/`-delimited object key.
+fn basename(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or(key)
+}
+
+/// Bare file names of `keys` (for a manifest's `files` list). Keys are valid
+/// UTF-8 strings, so this is infallible.
+fn basenames(keys: &[String]) -> Vec<String> {
+    keys.iter().map(|k| basename(k).to_owned()).collect()
+}
+
+/// The partition's data path relative to the store root, as a `/`-delimited
+/// object-key prefix (`data/tenant_id=…/year=…/month=…/day=…/hour=…`) — the same
+/// address [`Writer::open_in`] publishes files under.
+fn partition_data_prefix(partition: &PartitionKey) -> String {
+    partition
+        .data_path(Path::new(""))
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// The partition's `manifest.json` object key.
+fn manifest_key(partition: &PartitionKey) -> String {
+    format!("{}/{MANIFEST_FILENAME}", partition_data_prefix(partition))
+}
+
+/// Map a [`StoreError`] from a listing / object operation onto
+/// [`CompactionError::Io`], keeping the backend cause in the error chain.
+fn store_io(op: &'static str, key: &str, source: StoreError) -> CompactionError {
+    CompactionError::Io {
+        op,
+        path: PathBuf::from(key),
+        source: std::io::Error::other(source),
+    }
 }
 
 #[cfg(test)]
@@ -682,7 +640,6 @@ mod tests {
     use ourios_core::tenant::TenantId;
 
     use super::*;
-    use crate::manifest::MANIFEST_FILENAME;
 
     /// 2026-04-02T10:58:00 UTC — offsets stay within hour 10, so
     /// every record shares one partition.
@@ -725,11 +682,53 @@ mod tests {
         PartitionKey::derive(&rec(1, TS0)).expect("derive partition")
     }
 
-    /// Write `recs` (sharing one partition) as one committed file.
-    fn write_file(bucket: &Path, recs: &[MinedRecord]) {
-        let mut w = Writer::open(bucket, partition()).expect("open writer");
+    /// A local [`Store`] rooted at `bucket` — the test seam every migrated
+    /// compaction call goes through (RFC 0019 §3.3).
+    fn store_at(bucket: &Path) -> Store {
+        Store::local(bucket).expect("local store")
+    }
+
+    /// Write `recs` (sharing one partition) as one committed file through the
+    /// store-backed [`Writer`].
+    fn write_file(store: &Store, recs: &[MinedRecord]) {
+        let mut w = Writer::open_in(store, partition()).expect("open writer");
         w.append_records(recs).expect("append");
         w.close().expect("close");
+    }
+
+    /// Seed a manifest at the partition's manifest key (the test equivalent of
+    /// the pre-RFC-0019 `write_atomic`, but through the store seam).
+    fn seed_manifest(store: &Store, part: &PartitionKey, manifest: &Manifest) {
+        store
+            .put_blocking(&manifest_key(part), manifest.to_json().expect("json"))
+            .expect("seed manifest");
+    }
+
+    /// Resolve [`partition`]'s live file keys the way a reader does
+    /// (manifest-authoritative, glob fallback).
+    fn live_keys(store: &Store, part: &PartitionKey) -> Vec<String> {
+        let manifest = read_manifest(store, part).expect("manifest");
+        live_file_keys(store, part, manifest.as_ref()).expect("live")
+    }
+
+    /// Count committed `*.parquet` objects physically present under the
+    /// partition prefix (what the H4 small-file detector counts).
+    fn on_disk_parquet_count(store: &Store, part: &PartitionKey) -> usize {
+        store
+            .list_blocking(Some(&partition_data_prefix(part)))
+            .expect("list")
+            .into_iter()
+            .filter(|k| is_committed_parquet(k))
+            .count()
+    }
+
+    /// Read every row in one live file key, through the store seam.
+    fn read_key(store: &Store, part: &PartitionKey, key: &str) -> Vec<MinedRecord> {
+        let bytes = store.get_blocking(key).expect("get");
+        Reader::open_partition_bytes(Bytes::from(bytes), part.clone(), key)
+            .expect("open")
+            .read_all()
+            .expect("read")
     }
 
     /// Hour-10 start (2026-04-02T10:00:00Z): a record at `+off` for any
@@ -772,6 +771,20 @@ mod tests {
         )
     }
 
+    /// Resolve [`partition`]'s live files under `store` and read every row, the
+    /// way a reader does (manifest-authoritative, glob fallback). Both the file
+    /// set and the row-vs-path validation derive from the same [`partition`], so
+    /// they can't disagree.
+    fn read_partition_rows(store: &Store) -> Vec<MinedRecord> {
+        let part = partition();
+        let mut rows = Vec::new();
+        for key in live_keys(store, &part) {
+            rows.extend(read_key(store, &part, &key));
+        }
+        rows.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
+        rows
+    }
+
     proptest::proptest! {
         // Each case builds + compacts + re-reads a multi-file store, so
         // cap the case count to keep the suite fast while still covering
@@ -802,6 +815,7 @@ mod tests {
             )
         ) {
             let bucket = tempfile::tempdir().expect("temp");
+            let store = store_at(bucket.path());
             let part = partition();
             let mut expected: Vec<MinedRecord> = Vec::new();
             for file in &files {
@@ -810,22 +824,18 @@ mod tests {
                     .map(|(tid, off, sev, val)| prop_rec(*tid, HOUR10_START + off, *sev, val))
                     .collect();
                 expected.extend(recs.iter().cloned());
-                let mut w = Writer::open(bucket.path(), part.clone()).expect("open writer");
+                let mut w = Writer::open_in(&store, part.clone()).expect("open writer");
                 w.append_records(&recs).expect("append");
                 w.close().expect("close");
             }
 
-            let outcome = compact_partition(bucket.path(), &part).expect("compact");
+            let outcome = compact_partition(&store, &part).expect("compact");
             proptest::prop_assert!(outcome.committed.is_some(), "≥2 files ⇒ a commit");
             proptest::prop_assert_eq!(outcome.rows, expected.len() as u64, "row count conserved");
 
-            let dir = part.data_path(bucket.path());
-            let live = live_files(&dir).expect("live");
+            let live = live_keys(&store, &part);
             proptest::prop_assert_eq!(live.len(), 1, "one consolidated file");
-            let mut got = Reader::open_partition(&live[0], part.clone())
-                .expect("open")
-                .read_all()
-                .expect("read");
+            let mut got = read_key(&store, &part, &live[0]);
 
             // Multiset equality: only `(template, ts, severity, param)`
             // vary, so that tuple is a total key over distinguishable
@@ -837,88 +847,67 @@ mod tests {
         }
     }
 
-    /// Resolve [`partition`]'s live files under `bucket` the way a reader
-    /// does (manifest-authoritative, glob fallback) and read every row.
-    /// Both the directory and the row-vs-path validation derive from the
-    /// same [`partition`], so they can't disagree.
-    fn read_partition_rows(bucket: &Path) -> Vec<MinedRecord> {
-        let part = partition();
-        let mut rows = Vec::new();
-        for f in live_files(&part.data_path(bucket)).expect("live") {
-            rows.extend(
-                Reader::open_partition(&f, part.clone())
-                    .expect("open")
-                    .read_all()
-                    .expect("read"),
-            );
-        }
-        rows.sort_by(|a, b| row_key(a).cmp(&row_key(b)));
-        rows
-    }
-
     /// RFC0009.3 — atomic publish / no torn read. A compaction first
     /// bootstraps a manifest naming the *inputs*, then writes the
     /// consolidated file, then atomically swaps the manifest to name only
     /// that file. This models the two states a crash could freeze and
     /// asserts a reader is never torn: pre-commit it sees exactly the
-    /// inputs (the on-disk consolidated file is invisible — no double
+    /// inputs (the stored consolidated file is invisible — no double
     /// count), post-commit exactly the consolidated rows (no loss).
     #[test]
     fn atomic_publish_is_never_torn_across_the_swap() {
         // Arrange — two committed input files (3 rows) in one partition.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
-        let dir = partition().data_path(bucket.path());
-        let inputs = live_files(&dir).expect("inputs");
-        let input_names = file_names(&inputs).expect("names");
-        let originals = read_partition_rows(bucket.path());
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        write_file(&store, &[rec(2, TS0 + 2_000_000)]);
+        let inputs = live_keys(&store, &part);
+        let input_names = basenames(&inputs);
+        let originals = read_partition_rows(&store);
         assert_eq!(originals.len(), 3, "three input rows");
 
         // Mid-compaction, in compact_partition's order: bootstrap the
         // manifest naming the inputs *first* (so the reader is
         // manifest-authoritative before any new file appears)...
-        Manifest {
-            generation: 1,
-            files: input_names,
-        }
-        .write_atomic(&dir)
-        .expect("bootstrap manifest");
-        // ...then write the consolidated file. It now exists on disk but
+        seed_manifest(
+            &store,
+            &part,
+            &Manifest {
+                generation: 1,
+                files: input_names,
+            },
+        );
+        // ...then write the consolidated file. It now exists in the store but
         // the manifest still names only the inputs.
-        let mut w = Writer::open(bucket.path(), partition()).expect("writer");
+        let mut w = Writer::open_in(&store, part.clone()).expect("writer");
         w.append_records(&originals).expect("append");
         let consolidated = w.close().expect("close");
-        let consolidated_name = consolidated
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .expect("utf-8 name")
-            .to_string();
+        let consolidated_name = basename(&consolidated.key).to_owned();
 
         // All three files are physically present...
-        let on_disk = std::fs::read_dir(&dir)
-            .expect("read_dir")
-            // Surface (not drop) an entry error so a miscount can't pass.
-            .map(|e| e.expect("read_dir entry"))
-            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
-            .count();
-        assert_eq!(on_disk, 3, "inputs + consolidated all on disk pre-commit");
+        assert_eq!(
+            on_disk_parquet_count(&store, &part),
+            3,
+            "inputs + consolidated all present pre-commit"
+        );
         // ...but the manifest hides the consolidated file: a reader sees
         // exactly the 3 input rows, never 6 (no torn read / double count).
-        let pre = read_partition_rows(bucket.path());
+        let pre = read_partition_rows(&store);
         assert_eq!(pre, originals, "pre-commit reader sees only the inputs");
 
         // Commit: atomic swap to name only the consolidated file.
-        Manifest {
-            generation: 2,
-            files: vec![consolidated_name],
-        }
-        .write_atomic(&dir)
-        .expect("commit manifest");
+        seed_manifest(
+            &store,
+            &part,
+            &Manifest {
+                generation: 2,
+                files: vec![consolidated_name],
+            },
+        );
 
         // Post-commit: exactly the consolidated rows — no loss, no dup.
-        let post = read_partition_rows(bucket.path());
+        let post = read_partition_rows(&store);
         assert_eq!(
             post, originals,
             "post-commit reader sees the consolidated rows"
@@ -932,40 +921,38 @@ mod tests {
     /// crash leaves are *reclaimable* by `gc_orphans`, which never removes
     /// a live file. Each builds the exact on-disk state a `SIGKILL` at
     /// that point would leave — faithful because the commit is a single
-    /// `rename`.
+    /// atomic swap.
     ///
     /// Crash AFTER the commit swap, before input GC: the manifest names
-    /// the consolidated file; the superseded inputs are still on disk (the
+    /// the consolidated file; the superseded inputs are still present (the
     /// post-commit generation with orphans).
     #[test]
     fn rfc0009_4_post_commit_orphan_inputs_are_reclaimable() {
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
-        let dir = partition().data_path(bucket.path());
-        let originals = read_partition_rows(bucket.path());
-        let mut w = Writer::open(bucket.path(), partition()).expect("writer");
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        write_file(&store, &[rec(2, TS0 + 2_000_000)]);
+        let originals = read_partition_rows(&store);
+        let mut w = Writer::open_in(&store, part.clone()).expect("writer");
         w.append_records(&originals).expect("append");
         let consolidated = w.close().expect("close");
-        let consolidated_name = consolidated
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .expect("utf-8 name")
-            .to_string();
-        Manifest {
-            generation: 2,
-            files: vec![consolidated_name],
-        }
-        .write_atomic(&dir)
-        .expect("commit manifest");
+        let consolidated_name = basename(&consolidated.key).to_owned();
+        seed_manifest(
+            &store,
+            &part,
+            &Manifest {
+                generation: 2,
+                files: vec![consolidated_name],
+            },
+        );
         // Reader is already at the clean post generation despite orphans.
         assert_eq!(
-            read_partition_rows(bucket.path()),
+            read_partition_rows(&store),
             originals,
             "post-commit reader sees the consolidated rows, ignoring orphans",
         );
-        let gc = gc_orphans(&dir).expect("gc");
+        let gc = gc_orphans(&store, &part).expect("gc");
         assert_eq!(
             gc,
             OrphanGc {
@@ -974,18 +961,14 @@ mod tests {
             },
             "two orphan inputs reclaimed"
         );
+        assert_eq!(live_keys(&store, &part).len(), 1, "consolidated stays live");
         assert_eq!(
-            live_files(&dir).expect("live").len(),
-            1,
-            "consolidated stays live"
-        );
-        assert_eq!(
-            read_partition_rows(bucket.path()),
+            read_partition_rows(&store),
             originals,
             "GC left the live data exactly intact",
         );
         assert_eq!(
-            gc_orphans(&dir).expect("gc again"),
+            gc_orphans(&store, &part).expect("gc again"),
             OrphanGc::default(),
             "idempotent"
         );
@@ -998,26 +981,29 @@ mod tests {
     #[test]
     fn rfc0009_4_pre_commit_orphan_consolidated_is_reclaimable() {
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(7, TS0), rec(7, TS0 + 1_000_000)]);
-        write_file(bucket.path(), &[rec(8, TS0 + 2_000_000)]);
-        let dir = partition().data_path(bucket.path());
-        let inputs = live_files(&dir).expect("inputs");
-        let originals = read_partition_rows(bucket.path());
-        Manifest {
-            generation: 1,
-            files: file_names(&inputs).expect("names"),
-        }
-        .write_atomic(&dir)
-        .expect("bootstrap manifest");
-        let mut w = Writer::open(bucket.path(), partition()).expect("writer");
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(7, TS0), rec(7, TS0 + 1_000_000)]);
+        write_file(&store, &[rec(8, TS0 + 2_000_000)]);
+        let inputs = live_keys(&store, &part);
+        let originals = read_partition_rows(&store);
+        seed_manifest(
+            &store,
+            &part,
+            &Manifest {
+                generation: 1,
+                files: basenames(&inputs),
+            },
+        );
+        let mut w = Writer::open_in(&store, part.clone()).expect("writer");
         w.append_records(&originals).expect("append");
-        w.close().expect("close"); // consolidated on disk, NOT in manifest
+        w.close().expect("close"); // consolidated present, NOT in manifest
         assert_eq!(
-            read_partition_rows(bucket.path()),
+            read_partition_rows(&store),
             originals,
             "pre-commit reader sees only the inputs (consolidated invisible)",
         );
-        let gc = gc_orphans(&dir).expect("gc");
+        let gc = gc_orphans(&store, &part).expect("gc");
         assert_eq!(
             gc,
             OrphanGc {
@@ -1027,15 +1013,11 @@ mod tests {
             "orphan consolidated reclaimed"
         );
         assert_eq!(
-            live_files(&dir).expect("live").len(),
+            live_keys(&store, &part).len(),
             inputs.len(),
             "inputs stay live"
         );
-        assert_eq!(
-            read_partition_rows(bucket.path()),
-            originals,
-            "inputs intact"
-        );
+        assert_eq!(read_partition_rows(&store), originals, "inputs intact");
     }
 
     /// RFC0009.4 — a stray `*.parquet.tmp` with NO manifest (glob live
@@ -1044,15 +1026,18 @@ mod tests {
     #[test]
     fn rfc0009_4_stray_tmp_reclaimed_under_glob_fallback() {
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(9, TS0)]);
-        let dir = partition().data_path(bucket.path());
-        std::fs::write(
-            dir.join("0190abcd-dead-7eef-8aaa-000000000000.parquet.tmp"),
-            b"torn",
-        )
-        .expect("stray tmp");
-        let before = read_partition_rows(bucket.path());
-        let gc = gc_orphans(&dir).expect("gc");
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(9, TS0)]);
+        let tmp_key = format!(
+            "{}/0190abcd-dead-7eef-8aaa-000000000000.parquet.tmp",
+            partition_data_prefix(&part),
+        );
+        store
+            .put_blocking(&tmp_key, b"torn".to_vec())
+            .expect("stray tmp");
+        let before = read_partition_rows(&store);
+        let gc = gc_orphans(&store, &part).expect("gc");
         assert_eq!(
             gc,
             OrphanGc {
@@ -1062,15 +1047,11 @@ mod tests {
             "only the .tmp reclaimed"
         );
         assert_eq!(
-            live_files(&dir).expect("live").len(),
+            live_keys(&store, &part).len(),
             1,
             "the live .parquet is untouched"
         );
-        assert_eq!(
-            read_partition_rows(bucket.path()),
-            before,
-            "glob data intact"
-        );
+        assert_eq!(read_partition_rows(&store), before, "glob data intact");
     }
 
     /// RFC0009.1 — compaction drives the H4 small-file **count** down. A
@@ -1092,16 +1073,17 @@ mod tests {
         // row-vs-path check for a reason unrelated to this test.
         let n = policy.min_files + 1;
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
+        let part = partition();
         for i in 0..n {
             let template_id = u64::try_from(i + 1).expect("small count");
-            write_file(bucket.path(), &[rec(template_id, TS0)]);
+            write_file(&store, &[rec(template_id, TS0)]);
         }
-        let dir = partition().data_path(bucket.path());
-        let before = live_files(&dir).expect("before");
+        let before = live_keys(&store, &part);
         assert_eq!(before.len(), n, "one small file per write");
         assert!(before.len() > policy.min_files, "starts over-fragmented");
 
-        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        let outcome = compact_partition(&store, &part).expect("compact");
         assert_eq!(outcome.files_before, n);
         assert_eq!(
             outcome.rows,
@@ -1109,7 +1091,7 @@ mod tests {
             "all rows carried",
         );
 
-        let after = live_files(&dir).expect("after");
+        let after = live_keys(&store, &part);
         assert_eq!(after.len(), 1, "collapsed to a single live file");
         assert!(
             after.len() <= policy.min_files,
@@ -1117,19 +1099,15 @@ mod tests {
         );
         // H4 counts *physical* files (footer reads), so the inputs must
         // actually be gone — not merely manifest-excluded orphans that
-        // `live_files` would hide. Assert both: the GC removed them and
-        // exactly one `.parquet` remains on disk.
+        // `live_keys` would hide. Assert both: the GC removed them and
+        // exactly one `.parquet` remains present.
         assert_eq!(outcome.gc_failures, 0, "every superseded input removed");
-        let on_disk = std::fs::read_dir(&dir)
-            .expect("read_dir")
-            .map(|e| e.expect("read_dir entry"))
-            .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
-            .count();
-        assert_eq!(on_disk, 1, "exactly one physical .parquet file remains");
-        let rows = Reader::open_partition(&after[0], partition())
-            .expect("open")
-            .read_all()
-            .expect("read");
+        assert_eq!(
+            on_disk_parquet_count(&store, &part),
+            1,
+            "exactly one physical .parquet file remains"
+        );
+        let rows = read_key(&store, &part, &after[0]);
         assert_eq!(rows.len(), n, "row conservation across the collapse");
     }
 
@@ -1144,17 +1122,22 @@ mod tests {
     #[test]
     fn rfc0009_6_merges_inputs_spanning_a_schema_amendment() {
         use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
+        let part = partition();
         // File A — current full schema.
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        let dir = partition().data_path(bucket.path());
+        write_file(&store, &[rec(1, TS0)]);
+        let dir = part.data_path(bucket.path());
 
         // File B — a pre-amendment file missing the OPTIONAL
         // `effective_time_unix_nano` column (added 2026-06-11). Built by
         // projecting a full batch down by that one column, so no arrays
         // are hand-rolled. Same tenant + hour as A, so the row-vs-path
         // check (RFC0009.5) passes via the surviving `time_unix_nano`.
+        // Written directly to the local store path (File A's write already
+        // created the partition dir); compaction reads it back via the store.
         let full = crate::mined_records_to_batch(&[rec(2, TS0)]).expect("full batch");
         let drop = full
             .schema()
@@ -1178,54 +1161,52 @@ mod tests {
         w.close().expect("close B");
 
         // Two inputs with differing schemas → union merge.
-        let outcome = compact_partition(bucket.path(), &partition()).expect("union merge");
+        let outcome = compact_partition(&store, &part).expect("union merge");
         assert_eq!(outcome.files_before, 2);
         assert_eq!(outcome.rows, 2, "both rows carried across the union merge");
 
         // Output carries the full (union) schema and reads without error.
-        let live = live_files(&dir).expect("live");
+        let live = live_keys(&store, &part);
         assert_eq!(live.len(), 1, "consolidated to one file");
         // Assert the union directly: the consolidated Parquet schema
         // carries the amended column file B lacked (not B's reduced one).
-        let out = std::fs::File::open(&live[0]).expect("open output");
-        let out_schema =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(out)
-                .expect("output reader builder")
-                .schema()
-                .clone();
+        let out_bytes = store.get_blocking(&live[0]).expect("get output");
+        let out_schema = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(out_bytes))
+            .expect("output reader builder")
+            .schema()
+            .clone();
         assert!(
             out_schema
                 .index_of(crate::columns::EFFECTIVE_TIME_UNIX_NANO)
                 .is_ok(),
             "consolidated output carries the union (amended) schema",
         );
-        let rows = Reader::open_partition(&live[0], partition())
-            .expect("open union output")
-            .read_all()
-            .expect("read union output");
+        let rows = read_key(&store, &part, &live[0]);
         assert_eq!(rows.len(), 2, "every row preserved across the amendment");
     }
 
     /// RFC0009.5 — tenant + partition isolation. Compaction reads every
-    /// input through `Reader::open_partition`, which enforces the RFC 0005
-    /// §3.9 row-vs-path contract, so an input file holding a row that
-    /// belongs to a *different* time bucket (or tenant) aborts the
+    /// input through `Reader::open_partition_bytes`, which enforces the
+    /// RFC 0005 §3.9 row-vs-path contract, so an input file holding a row
+    /// that belongs to a *different* time bucket (or tenant) aborts the
     /// compaction instead of being silently merged across the boundary.
     #[test]
     fn rfc0009_5_mis_partitioned_input_aborts_rather_than_merging() {
         use parquet::arrow::ArrowWriter;
 
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
+        let part = partition();
         // A legitimate input for partition P.
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        let dir = partition().data_path(bucket.path());
+        write_file(&store, &[rec(1, TS0)]);
+        let dir = part.data_path(bucket.path());
 
         // A second file dropped into P's directory whose row belongs to a
         // *different* hour (TS0 + 2 h) — a mis-partitioned input.
         let foreign = rec(2, TS0 + 2 * HOUR_NANOS);
         assert_ne!(
             PartitionKey::derive(&foreign).expect("derive foreign"),
-            partition(),
+            part,
             "the foreign row really maps to another partition",
         );
         let batch = crate::mined_records_to_batch(&[foreign]).expect("batch");
@@ -1237,7 +1218,7 @@ mod tests {
 
         // Two inputs, one mis-partitioned → compaction aborts on the
         // row-vs-path check; it never merges rows across partition keys.
-        let err = compact_partition(bucket.path(), &partition()).expect_err("must reject");
+        let err = compact_partition(&store, &part).expect_err("must reject");
         assert!(
             matches!(
                 err,
@@ -1252,19 +1233,20 @@ mod tests {
     fn compacts_two_files_into_one_preserving_rows() {
         // Arrange — two committed files in one partition (5 rows total).
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
         write_file(
-            bucket.path(),
+            &store,
             &[
                 rec(2, TS0 + 2_000_000),
                 rec(2, TS0 + 3_000_000),
                 rec(2, TS0 + 4_000_000),
             ],
         );
-        let dir = partition().data_path(bucket.path());
 
         // Act
-        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        let outcome = compact_partition(&store, &part).expect("compact");
 
         // Assert — consolidated to one file with all 5 rows, manifest
         // names it, inputs GC'd, rows preserved.
@@ -1272,13 +1254,10 @@ mod tests {
         assert_eq!(outcome.rows, 5);
         assert_eq!(outcome.gc_failures, 0, "both inputs removed");
         let committed = outcome.committed.expect("committed");
-        let live = live_files(&dir).expect("live");
+        let live = live_keys(&store, &part);
         assert_eq!(live.len(), 1, "one file remains live");
         assert!(live[0].ends_with(&committed.file));
-        let rows = Reader::open_partition(&live[0], partition())
-            .expect("open")
-            .read_all()
-            .expect("read");
+        let rows = read_key(&store, &part, &live[0]);
         assert_eq!(rows.len(), 5, "every row preserved");
     }
 
@@ -1286,22 +1265,23 @@ mod tests {
     fn reports_byte_volumes_for_io_and_file_size_metrics() {
         // Arrange — two committed files in one partition.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 2_000_000)]);
-        let dir = partition().data_path(bucket.path());
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0), rec(1, TS0 + 1_000_000)]);
+        write_file(&store, &[rec(2, TS0 + 2_000_000)]);
 
         // Act
-        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        let outcome = compact_partition(&store, &part).expect("compact");
 
         // Assert — read volume covers both inputs, write volume is the
-        // (sole, live) consolidated file's actual on-disk size.
+        // (sole, live) consolidated file's actual stored byte size.
         let committed = outcome.committed.expect("committed");
-        let live = live_files(&dir).expect("live");
+        let live = live_keys(&store, &part);
         assert_eq!(live.len(), 1, "one consolidated file remains live");
-        let on_disk = std::fs::metadata(&live[0]).expect("stat").len();
+        let stored = store.get_blocking(&live[0]).expect("get").len() as u64;
         assert!(outcome.bytes_read > 0, "read volume is recorded");
         assert_eq!(
-            outcome.bytes_written, on_disk,
+            outcome.bytes_written, stored,
             "write volume is the consolidated file's byte size"
         );
         assert!(live[0].ends_with(&committed.file));
@@ -1311,10 +1291,12 @@ mod tests {
     fn no_op_reports_zero_byte_volumes() {
         // Arrange — one file: a no-op, nothing read or written.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0)]);
 
         // Act
-        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        let outcome = compact_partition(&store, &part).expect("compact");
 
         // Assert
         assert!(outcome.committed.is_none());
@@ -1326,35 +1308,42 @@ mod tests {
     fn single_file_partition_is_a_no_op() {
         // Arrange — one file, nothing to consolidate.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        let dir = partition().data_path(bucket.path());
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0)]);
 
         // Act
-        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        let outcome = compact_partition(&store, &part).expect("compact");
 
         // Assert — no-op: no commit, no manifest written.
         assert_eq!(outcome.files_before, 1);
         assert!(outcome.committed.is_none());
-        assert!(!dir.join(MANIFEST_FILENAME).exists());
+        assert!(
+            read_manifest(&store, &part).expect("manifest").is_none(),
+            "a no-op writes no manifest",
+        );
     }
 
     #[test]
     fn bumps_generation_from_an_existing_manifest() {
         // Arrange — two files plus a manifest already at generation 5.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 1_000_000)]);
-        let dir = partition().data_path(bucket.path());
-        let names = file_names(&live_files(&dir).expect("live")).expect("names");
-        Manifest {
-            generation: 5,
-            files: names,
-        }
-        .write_atomic(&dir)
-        .expect("seed manifest");
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[rec(1, TS0)]);
+        write_file(&store, &[rec(2, TS0 + 1_000_000)]);
+        let names = basenames(&live_keys(&store, &part));
+        seed_manifest(
+            &store,
+            &part,
+            &Manifest {
+                generation: 5,
+                files: names,
+            },
+        );
 
         // Act
-        let outcome = compact_partition(bucket.path(), &partition()).expect("compact");
+        let outcome = compact_partition(&store, &part).expect("compact");
 
         // Assert — committed at generation 6.
         assert_eq!(outcome.committed.expect("committed").generation, 6);
@@ -1371,17 +1360,13 @@ mod tests {
     fn plan_skips_an_unsealed_partition() {
         // Arrange — two small files, but `now` is still inside the hour.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 1_000_000)]);
+        let store = store_at(bucket.path());
+        write_file(&store, &[rec(1, TS0)]);
+        write_file(&store, &[rec(2, TS0 + 1_000_000)]);
 
         // Act
-        let selected = plan_candidates(
-            bucket.path(),
-            "a",
-            NOW_UNSEALED,
-            &CompactionPolicy::default(),
-        )
-        .expect("plan");
+        let selected =
+            plan_candidates(&store, "a", NOW_UNSEALED, &CompactionPolicy::default()).expect("plan");
 
         // Assert
         assert!(
@@ -1395,13 +1380,13 @@ mod tests {
         // Arrange — two committed files (each well under 128 MiB), and
         // `now` past the hour-end + grace.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 1_000_000)]);
+        let store = store_at(bucket.path());
+        write_file(&store, &[rec(1, TS0)]);
+        write_file(&store, &[rec(2, TS0 + 1_000_000)]);
 
         // Act
         let selected =
-            plan_candidates(bucket.path(), "a", NOW_SEALED, &CompactionPolicy::default())
-                .expect("plan");
+            plan_candidates(&store, "a", NOW_SEALED, &CompactionPolicy::default()).expect("plan");
 
         // Assert
         assert_eq!(
@@ -1415,11 +1400,12 @@ mod tests {
     fn plan_returns_partitions_in_chronological_order() {
         // Arrange — two sealed small-file partitions, hour 10 and 11.
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
         for ts in [TS0, TS0 + HOUR_NANOS] {
             for template_id in [1_u64, 2] {
                 let record = rec(template_id, ts);
-                let mut w = Writer::open(bucket.path(), PartitionKey::derive(&record).unwrap())
-                    .expect("open");
+                let mut w =
+                    Writer::open_in(&store, PartitionKey::derive(&record).unwrap()).expect("open");
                 w.append_records(&[record]).expect("append");
                 w.close().expect("close");
             }
@@ -1428,9 +1414,9 @@ mod tests {
 
         // Act
         let selected =
-            plan_candidates(bucket.path(), "a", now, &CompactionPolicy::default()).expect("plan");
+            plan_candidates(&store, "a", now, &CompactionPolicy::default()).expect("plan");
 
-        // Assert — both selected, oldest first, regardless of read_dir order.
+        // Assert — both selected, oldest first, regardless of listing order.
         let hours: Vec<u32> = selected.iter().map(|p| p.hour).collect();
         assert_eq!(hours, vec![10, 11], "deterministic, chronological");
     }
@@ -1439,12 +1425,12 @@ mod tests {
     fn plan_skips_a_single_file_partition() {
         // Arrange — one file: sealed, but nothing to consolidate.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
+        let store = store_at(bucket.path());
+        write_file(&store, &[rec(1, TS0)]);
 
         // Act
         let selected =
-            plan_candidates(bucket.path(), "a", NOW_SEALED, &CompactionPolicy::default())
-                .expect("plan");
+            plan_candidates(&store, "a", NOW_SEALED, &CompactionPolicy::default()).expect("plan");
 
         // Assert
         assert!(
@@ -1459,8 +1445,9 @@ mod tests {
         // the size arm disabled (1-byte threshold) so *only* the count
         // arm can select.
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
         for i in 0..5 {
-            write_file(bucket.path(), &[rec(1, TS0 + i * 1_000)]);
+            write_file(&store, &[rec(1, TS0 + i * 1_000)]);
         }
         let policy = CompactionPolicy {
             min_files: 4,
@@ -1469,7 +1456,7 @@ mod tests {
         };
 
         // Act
-        let selected = plan_candidates(bucket.path(), "a", NOW_SEALED, &policy).expect("plan");
+        let selected = plan_candidates(&store, "a", NOW_SEALED, &policy).expect("plan");
 
         // Assert
         assert_eq!(
@@ -1485,8 +1472,9 @@ mod tests {
         // count (2 ≤ min_files) nor the size (1-byte threshold) arm
         // fires.
         let bucket = tempfile::tempdir().expect("temp");
-        write_file(bucket.path(), &[rec(1, TS0)]);
-        write_file(bucket.path(), &[rec(2, TS0 + 1_000_000)]);
+        let store = store_at(bucket.path());
+        write_file(&store, &[rec(1, TS0)]);
+        write_file(&store, &[rec(2, TS0 + 1_000_000)]);
         let policy = CompactionPolicy {
             min_files: 4,
             small_file_bytes: 1,
@@ -1494,7 +1482,7 @@ mod tests {
         };
 
         // Act
-        let selected = plan_candidates(bucket.path(), "a", NOW_SEALED, &policy).expect("plan");
+        let selected = plan_candidates(&store, "a", NOW_SEALED, &policy).expect("plan");
 
         // Assert
         assert!(selected.is_empty(), "few large files are not a candidate");
@@ -1504,20 +1492,22 @@ mod tests {
     fn plan_skips_non_canonical_partition_dir_names() {
         // Arrange — a sealed partition whose `month` segment isn't
         // zero-padded (`month=4`, not `month=04`). A PartitionKey from
-        // it would render `month=04` via data_path and miss this dir,
+        // it would render `month=04` via data_path and miss this key,
         // so it must not be selected.
         let bucket = tempfile::tempdir().expect("temp");
-        let bad = bucket
-            .path()
-            .join("data/tenant_id=a/year=2026/month=4/day=02/hour=10");
-        std::fs::create_dir_all(&bad).expect("mkdir");
-        std::fs::write(bad.join("a.parquet"), b"x").expect("a");
-        std::fs::write(bad.join("b.parquet"), b"y").expect("b");
+        let store = store_at(bucket.path());
+        for name in ["a.parquet", "b.parquet"] {
+            store
+                .put_blocking(
+                    &format!("data/tenant_id=a/year=2026/month=4/day=02/hour=10/{name}"),
+                    b"x".to_vec(),
+                )
+                .expect("put");
+        }
 
         // Act
         let selected =
-            plan_candidates(bucket.path(), "a", NOW_SEALED, &CompactionPolicy::default())
-                .expect("plan");
+            plan_candidates(&store, "a", NOW_SEALED, &CompactionPolicy::default()).expect("plan");
 
         // Assert
         assert!(selected.is_empty(), "non-canonical dir names are skipped");
@@ -1527,15 +1517,11 @@ mod tests {
     fn plan_for_a_tenant_with_no_data_is_empty() {
         // Arrange
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
 
         // Act
-        let selected = plan_candidates(
-            bucket.path(),
-            "ghost",
-            NOW_SEALED,
-            &CompactionPolicy::default(),
-        )
-        .expect("plan");
+        let selected = plan_candidates(&store, "ghost", NOW_SEALED, &CompactionPolicy::default())
+            .expect("plan");
 
         // Assert
         assert!(selected.is_empty());

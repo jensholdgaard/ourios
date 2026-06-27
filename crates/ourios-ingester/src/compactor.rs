@@ -9,14 +9,14 @@
 //! ([`crate::metrics::CompactionMetrics`]), and hands each result to a
 //! caller-supplied observer for logging.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionPolicy, PartitionKey, compact_partition, gc_orphans,
-    percent_decode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionPolicy, PartitionKey, Store, compact_partition,
+    gc_orphans, percent_decode_tenant, plan_candidates,
 };
 
 use crate::metrics::CompactionMetrics;
@@ -27,7 +27,7 @@ use crate::metrics::CompactionMetrics;
 pub enum IngestError {
     /// Planning or consolidating a partition failed.
     Compaction(CompactionError),
-    /// Scanning the store's tenant directories failed.
+    /// Listing the store's tenant keys failed.
     Io {
         op: &'static str,
         path: PathBuf,
@@ -137,7 +137,7 @@ pub struct CompactedFile {
     pub bytes: u64,
 }
 
-/// Run one compaction sweep over `bucket_root`, as of wall-clock
+/// Run one compaction sweep over `store`, as of wall-clock
 /// `now_unix_nanos`: for each tenant, select its sealed candidate
 /// partitions ([`plan_candidates`]) and consolidate each
 /// ([`compact_partition`]), accumulating a [`SweepReport`].
@@ -145,22 +145,22 @@ pub struct CompactedFile {
 /// Resilient: a tenant whose planning fails, or a partition whose
 /// consolidation fails, is recorded in [`SweepReport::errors`] and
 /// skipped — the sweep continues with the rest. Only a failure to
-/// scan the store itself (the tenant listing) is fatal.
+/// list the store itself (the tenant enumeration) is fatal.
 ///
 /// # Errors
 ///
-/// [`IngestError`] only if the store's tenant directory can't be
-/// scanned; per-tenant / per-partition failures are collected into
-/// the returned report, not propagated.
+/// [`IngestError`] only if the store's tenant keys can't be listed;
+/// per-tenant / per-partition failures are collected into the returned
+/// report, not propagated.
 pub fn run_sweep(
-    bucket_root: &Path,
+    store: &Store,
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
 ) -> Result<SweepReport, IngestError> {
     let mut report = SweepReport::default();
-    for tenant in tenants(bucket_root)? {
+    for tenant in tenants(store)? {
         report.tenants_scanned += 1;
-        let candidates = match plan_candidates(bucket_root, &tenant, now_unix_nanos, policy) {
+        let candidates = match plan_candidates(store, &tenant, now_unix_nanos, policy) {
             Ok(candidates) => candidates,
             Err(e) => {
                 report.errors.push(format!("plan tenant {tenant:?}: {e}"));
@@ -173,14 +173,14 @@ pub fn run_sweep(
             // Reclaim orphans a prior crashed compaction of this partition
             // left (RFC0009.4). Manifest-authoritative, so it never touches
             // a live file; a scan error is recorded, not fatal.
-            match gc_orphans(&partition.data_path(bucket_root)) {
+            match gc_orphans(store, &partition) {
                 Ok(gc) => report.orphans_reclaimed += gc.reclaimed,
                 Err(e) => report.errors.push(format!(
                     "gc-orphans {tenant:?} {:04}-{:02}-{:02}T{:02}: {e}",
                     partition.year, partition.month, partition.day, partition.hour,
                 )),
             }
-            match compact_partition(bucket_root, &partition) {
+            match compact_partition(store, &partition) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
@@ -217,59 +217,36 @@ pub fn run_sweep(
     Ok(report)
 }
 
-/// Raw tenant ids present in the store, decoded from the
-/// `data/tenant_id=<enc>/` directory names (sorted, so a sweep is
-/// deterministic). Names that don't decode are skipped (not Ourios
-/// output); a missing `data/` directory yields none.
-fn tenants(bucket_root: &Path) -> Result<Vec<String>, IngestError> {
-    let data = bucket_root.join("data");
-    let entries = match std::fs::read_dir(&data) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(IngestError::Io {
-                op: "read_dir",
-                path: data,
-                source,
-            });
-        }
-    };
-    let mut out = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| IngestError::Io {
-            op: "read_dir entry",
-            path: data.clone(),
-            source,
+/// Raw tenant ids present in the store, decoded from the leading
+/// `data/tenant_id=<enc>/` segment of every object key under `data/`
+/// ([`Store::list_blocking`], RFC 0019 §3.3), sorted + deduplicated so a
+/// sweep is deterministic. Segments that don't decode are skipped (not
+/// Ourios output); an empty `data/` prefix yields none.
+fn tenants(store: &Store) -> Result<Vec<String>, IngestError> {
+    let keys = store
+        .list_blocking(Some("data"))
+        .map_err(|source| IngestError::Io {
+            op: "list",
+            path: PathBuf::from("data"),
+            source: std::io::Error::other(source),
         })?;
-        let is_dir = entry
-            .file_type()
-            .map_err(|source| IngestError::Io {
-                op: "file_type",
-                path: entry.path(),
-                source,
-            })?
-            .is_dir();
-        if !is_dir {
-            continue;
-        }
-        if let Some(tenant) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_prefix("tenant_id="))
-            .and_then(percent_decode_tenant)
-        {
-            out.push(tenant);
-        }
-    }
-    out.sort();
-    Ok(out)
+    let mut tenants: Vec<String> = keys
+        .iter()
+        .filter_map(|key| key.strip_prefix("data/"))
+        .filter_map(|rest| rest.split('/').next())
+        .filter_map(|segment| segment.strip_prefix("tenant_id="))
+        .filter_map(percent_decode_tenant)
+        .collect();
+    tenants.sort();
+    tenants.dedup();
+    Ok(tenants)
 }
 
 /// Background compaction daemon (RFC 0009 §3.2): sweeps the store on a
 /// fixed cadence. Hosted in the ingester role so it never lands on the
 /// ack-latency hot path.
 pub struct Compactor {
-    bucket_root: PathBuf,
+    store: Store,
     policy: CompactionPolicy,
     interval: Duration,
     /// Where committed-compaction audit events go (RFC 0009 §3.6).
@@ -282,7 +259,7 @@ impl std::fmt::Debug for Compactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `AuditSink` is not `Debug`; name it without its contents.
         f.debug_struct("Compactor")
-            .field("bucket_root", &self.bucket_root)
+            .field("store", &self.store)
             .field("policy", &self.policy)
             .field("interval", &self.interval)
             .field("audit_sink", &"Box<dyn AuditSink>")
@@ -291,16 +268,15 @@ impl std::fmt::Debug for Compactor {
 }
 
 impl Compactor {
-    /// A compactor sweeping `bucket_root` every `interval` under
-    /// `policy`, dropping audit events ([`NoOpAuditSink`]) until a sink
-    /// is set via [`Self::with_audit_sink`].
-    pub fn new(
-        bucket_root: impl Into<PathBuf>,
-        policy: CompactionPolicy,
-        interval: Duration,
-    ) -> Self {
+    /// A compactor sweeping `store` every `interval` under `policy`,
+    /// dropping audit events ([`NoOpAuditSink`]) until a sink is set via
+    /// [`Self::with_audit_sink`]. The server builds the [`Store`] from the
+    /// resolved [`ourios_parquet::StoreConfig`] (RFC 0019), so the same
+    /// compactor targets the local filesystem or an S3 bucket.
+    #[must_use]
+    pub fn new(store: Store, policy: CompactionPolicy, interval: Duration) -> Self {
         Self {
-            bucket_root: bucket_root.into(),
+            store,
             policy,
             interval,
             audit_sink: Box::new(NoOpAuditSink::new()),
@@ -343,11 +319,13 @@ impl Compactor {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let bucket = self.bucket_root.clone();
+            // `Store` is a cheap `Arc` handle; clone it into the blocking task
+            // (compaction is blocking I/O) rather than borrowing `self`.
+            let store = self.store.clone();
             let policy = self.policy;
             let (result, elapsed) = tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
-                let result = run_sweep(&bucket, now_unix_nanos(), &policy);
+                let result = run_sweep(&store, now_unix_nanos(), &policy);
                 (result, start.elapsed())
             })
             .await
@@ -414,12 +392,20 @@ fn now_unix_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use ourios_core::audit::ParamType;
     use ourios_core::record::{BodyKind, MinedRecord, Param};
     use ourios_core::tenant::TenantId;
-    use ourios_parquet::{PartitionKey, Writer};
+    use ourios_parquet::{PartitionKey, Store, Writer};
 
     use super::*;
+
+    /// A local [`Store`] rooted at `bucket` — the seam every sweep runs
+    /// through (RFC 0019 §3.3).
+    fn store_at(bucket: &Path) -> Store {
+        Store::local(bucket).expect("local store")
+    }
 
     /// 2026-04-02T10:58:00 UTC (hour 10).
     const TS0: u64 = 1_775_127_480_000_000_000;
@@ -460,30 +446,30 @@ mod tests {
         }
     }
 
-    /// Write one committed file for `tenant` at `ts_ns`.
-    fn write_file(bucket: &Path, tenant: &str, template_id: u64, ts_ns: u64) {
+    /// Write one committed file for `tenant` at `ts_ns` through the store seam.
+    fn write_file(store: &Store, tenant: &str, template_id: u64, ts_ns: u64) {
         let record = rec(tenant, template_id, ts_ns);
-        let mut w = Writer::open(bucket, PartitionKey::derive(&record).expect("derive"))
+        let mut w = Writer::open_in(store, PartitionKey::derive(&record).expect("derive"))
             .expect("open writer");
         w.append_records(&[record]).expect("append");
         w.close().expect("close");
     }
 
     /// Two committed files in one sealed partition = a candidate.
-    fn write_sealed_candidate(bucket: &Path, tenant: &str) {
-        write_file(bucket, tenant, 1, TS0);
-        write_file(bucket, tenant, 2, TS0 + 1_000_000);
+    fn write_sealed_candidate(store: &Store, tenant: &str) {
+        write_file(store, tenant, 1, TS0);
+        write_file(store, tenant, 2, TS0 + 1_000_000);
     }
 
     #[test]
     fn sweep_compacts_a_sealed_candidate() {
         // Arrange
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
 
         // Act
-        let report =
-            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
         // Assert
         assert_eq!(report.tenants_scanned, 1);
@@ -500,12 +486,12 @@ mod tests {
         // Arrange — tenant "a" is a sealed candidate (compacts); tenant
         // "b" has a single file (not a candidate → 0 found, 0 compacted).
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
-        write_file(bucket.path(), "b", 1, TS0);
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
+        write_file(&store, "b", 1, TS0);
 
         // Act
-        let report =
-            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
         // Assert — both tenants get a per-tenant entry; the residual
         // (candidates_found − partitions_compacted) is each one's backlog.
@@ -526,11 +512,11 @@ mod tests {
     fn sweep_emits_a_compaction_audit_event() {
         // Arrange
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
 
         // Act
-        let report =
-            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
         // Assert — one RFC 0009 §3.6 compaction audit event, carrying
         // the partition / input set / output / generation / rows.
@@ -562,10 +548,11 @@ mod tests {
     fn sweep_skips_an_unsealed_partition() {
         // Arrange — a candidate, but `now` is still inside its hour.
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
 
         // Act
-        let report = run_sweep(bucket.path(), TS0, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, TS0, &CompactionPolicy::default()).expect("sweep");
 
         // Assert
         assert_eq!(report.tenants_scanned, 1);
@@ -580,12 +567,12 @@ mod tests {
         // Arrange — tenant "a" is a candidate; tenant "b" has one file
         // (nothing to consolidate).
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
-        write_file(bucket.path(), "b", 1, TS0);
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
+        write_file(&store, "b", 1, TS0);
 
         // Act
-        let report =
-            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
         // Assert
         assert_eq!(report.tenants_scanned, 2, "both tenants scanned");
@@ -597,8 +584,11 @@ mod tests {
         // Arrange — tenant "a" is a healthy sealed candidate; tenant
         // "b" has a malformed manifest.json, so planning it errors.
         let bucket = tempfile::tempdir().expect("temp");
-        write_sealed_candidate(bucket.path(), "a");
-        write_file(bucket.path(), "b", 1, TS0);
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
+        write_file(&store, "b", 1, TS0);
+        // Corrupt b's manifest on the local store (its partition dir exists
+        // after the write above); planning b then fails to parse it.
         let b_dir = PartitionKey::derive(&rec("b", 1, TS0))
             .expect("derive")
             .data_path(bucket.path());
@@ -606,8 +596,7 @@ mod tests {
             .expect("corrupt b's manifest");
 
         // Act
-        let report =
-            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
         // Assert — b's failure is recorded, but a is still compacted.
         assert_eq!(report.tenants_scanned, 2);
@@ -626,10 +615,10 @@ mod tests {
     fn sweep_of_an_empty_store_is_zero() {
         // Arrange
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
 
         // Act
-        let report =
-            run_sweep(bucket.path(), NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        let report = run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
 
         // Assert
         assert_eq!(report, SweepReport::default());
@@ -642,14 +631,12 @@ mod tests {
         // so it is sealed under `now_unix_nanos()` regardless of the
         // date the suite runs.
         let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
         let hour_start = (now_unix_nanos().saturating_sub(3 * HOUR) / HOUR) * HOUR;
-        write_file(bucket.path(), "a", 1, hour_start + 1_000_000);
-        write_file(bucket.path(), "a", 2, hour_start + 2_000_000);
-        let compactor = Compactor::new(
-            bucket.path(),
-            CompactionPolicy::default(),
-            Duration::from_millis(5),
-        );
+        write_file(&store, "a", 1, hour_start + 1_000_000);
+        write_file(&store, "a", 2, hour_start + 2_000_000);
+        let compactor =
+            Compactor::new(store, CompactionPolicy::default(), Duration::from_millis(5));
         let (tx, rx) = std::sync::mpsc::channel();
 
         let rt = tokio::runtime::Builder::new_current_thread()

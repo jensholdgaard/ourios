@@ -301,19 +301,13 @@ async fn terminate_signal() {
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = config_from_env()?;
 
-    // The receiver/compactor/querier still address the store as a local path;
-    // migrating them onto the `Store` abstraction (so the S3 backend works) is
-    // a later RFC 0019 slice. Until then the S3 backend resolves from config but
-    // cannot run — fail fast with a clear message rather than silently ignoring
-    // it (RFC 0019 §3.3, RFC0019.3/.4).
-    let StoreConfig::Local(bucket_root) = &config.store else {
-        return Err(
-            "OURIOS_STORAGE_BACKEND=s3 is selected, but the role wiring onto \
-             object storage lands in a later RFC 0019 slice (RFC0019.3/.4); only the \
-             local backend runs today"
-                .into(),
-        );
-    };
+    // Pre-create a local store root (`Store::local` canonicalises it and errors
+    // on a missing dir); an S3 backend needs no such step. Mirrors the querier
+    // role's `serve()`.
+    if let StoreConfig::Local(root) = &config.store {
+        std::fs::create_dir_all(root)
+            .map_err(|e| format!("create store root {}: {e}", root.display()))?;
+    }
 
     // Boot OpenTelemetry first so the compactor's instruments export
     // (RFC 0001 §6.8). The guard flushes pending metrics on shutdown;
@@ -324,7 +318,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // bound addresses on stdout so an operator — or a test binding `:0` —
     // learns the actual ports.
     let receiver = match &config.receiver {
+        // The receiver's RFC 0014 data write path is still local-only (its
+        // migration onto `Store` is a later RFC 0019 slice); the compactor and
+        // querier below run on either backend. Fail fast on s3 rather than
+        // silently ignoring the role.
         Some(params) => {
+            let StoreConfig::Local(bucket_root) = &config.store else {
+                return Err(
+                    "the receiver role's RFC 0014 data write path targets local \
+                     storage only; running it on OURIOS_STORAGE_BACKEND=s3 lands in \
+                     a later RFC 0019 slice"
+                        .into(),
+                );
+            };
             let handle = receiver::serve(receiver::ReceiverConfig {
                 grpc_addr: params.grpc_addr,
                 http_addr: params.http_addr,
@@ -349,10 +355,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(params) => {
             let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
                 http_addr: params.http_addr,
-                // The querier engine is Store-capable (RFC 0019 slice 2a), but
-                // main() still fails fast on s3 above (the compactor migration
-                // is slice 2b), so this is always the local backend today.
-                store: StoreConfig::Local(bucket_root.clone()),
+                // The querier engine is Store-capable (RFC 0019 slice 2a), so it
+                // reads whichever backend config resolved (local or S3).
+                store: config.store.clone(),
                 default_window_nanos: params.default_window_nanos,
             })
             .await?;
@@ -363,14 +368,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7).
-    let sink = Box::new(ParquetAuditSink::new(bucket_root));
+    // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b).
+    let store = config.store.open()?;
     let compactor = Compactor::new(
-        bucket_root.clone(),
+        store,
         CompactionPolicy::default(),
         config.compaction_interval,
-    )
-    .with_audit_sink(sink);
+    );
+    // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7). The
+    // `ParquetAuditSink` still writes the audit stream to a local path (its
+    // migration onto `Store` is a later RFC 0019 slice), so wire it only for the
+    // local backend; on s3 the compactor runs with the default no-op sink rather
+    // than mis-placing audit Parquet on local disk, and reports the gap on
+    // stderr (the structured-logging bootstrap is a follow-up, `CLAUDE.md` §6.3).
+    let compactor = match &config.store {
+        StoreConfig::Local(bucket_root) => {
+            compactor.with_audit_sink(Box::new(ParquetAuditSink::new(bucket_root)))
+        }
+        StoreConfig::S3(_) => {
+            eprintln!(
+                "compaction audit: durable audit events on the s3 backend await the \
+                 ParquetAuditSink Store migration (a later RFC 0019 slice); they are \
+                 dropped this run"
+            );
+            compactor
+        }
+    };
 
     // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM).
     // `compactor.run` never returns on its own, so the select resolves on

@@ -81,13 +81,16 @@ const SUB_BATCH_ROWS: usize = 1024;
 /// finished bytes to the object store under the partition's key.
 /// The store [`put`](Store::put_blocking) is the **commit point**:
 /// the local backend stages to a private temp object and renames it
-/// into place, so an enumerating reader sees either nothing or a
-/// logically complete `<uuid>.parquet` — never a partial file. A
-/// writer dropped without [`Writer::close`] (panic, early-return)
-/// simply discards its buffer; no object is ever published (the
-/// partition directory is created at [`Writer::open`], but holds no
-/// file unless `close` succeeds). This satisfies RFC 0005 §7's
-/// "atomic-publish convention" open-question item.
+/// into place (and S3's put is atomic), so an enumerating reader sees
+/// either nothing or a logically complete `<uuid>.parquet` — never a
+/// partial file. A writer dropped without [`Writer::close`] (panic,
+/// early-return) simply discards its buffer; no object is ever
+/// published. This satisfies RFC 0005 §7's "atomic-publish
+/// convention" open-question item.
+///
+/// [`Writer::open`] opens a local-filesystem [`Store`] rooted at a
+/// `bucket_root` path; [`Writer::open_in`] takes an already-built [`Store`]
+/// so the same writer targets S3 (the compactor's RFC 0019 path).
 ///
 /// **The atomic publish is logical, not crash-durable.** The store
 /// put is not `fsync`-ed; a host crash between the put and the OS's
@@ -103,10 +106,13 @@ pub struct Writer {
     /// `put` to [`Self::key`] on close.
     store: Store,
     /// `/`-delimited object key the file is published to, relative to
-    /// the store root (`data/tenant_id=…/year=…/…/<uuid>.parquet`).
+    /// the store root (`data/tenant_id=…/year=…/…/<uuid>.parquet`). The
+    /// backend-agnostic address (surfaced in [`WrittenFile`]).
     key: String,
-    /// Absolute path the published file lands at (store root joined
-    /// with [`Self::key`]) — surfaced in [`WrittenFile`] for readers.
+    /// Absolute local landing path ([`Writer::open`]); the object key rendered
+    /// as a path for [`Writer::open_in`] (which addresses by key regardless of
+    /// the store's backend). Surfaced in [`WrittenFile::path`]; address a
+    /// store-backed file by [`Self::key`], not this.
     final_path: PathBuf,
     /// Running count of rows written so far (incremented per
     /// sub-batch as each `write` succeeds); reported by
@@ -127,9 +133,15 @@ pub struct Writer {
 impl Writer {
     /// Open a writer for `partition` under `bucket_root` using the
     /// RFC 0005 §3.6 default compression level
-    /// ([`DEFAULT_ZSTD_LEVEL`]). Creates the partition directory
-    /// and the `UUIDv7`-named Parquet file; the file is empty until
-    /// [`Writer::append_records`] starts adding rows.
+    /// ([`DEFAULT_ZSTD_LEVEL`]). Creates the local partition directory; the
+    /// `<UUIDv7>.parquet` object itself is buffer-and-put — rows accumulate in
+    /// memory via [`Writer::append_records`] and nothing is published until
+    /// [`Writer::close`].
+    ///
+    /// This is the **local-filesystem** constructor — it opens a
+    /// [`Store::local`] rooted at `bucket_root`. [`Writer::open_in`]
+    /// takes an already-built [`Store`] instead, so a writer can target
+    /// S3 (the compactor's path under RFC 0019).
     ///
     /// # Errors
     ///
@@ -158,10 +170,10 @@ impl Writer {
         partition: PartitionKey,
         zstd_level: i32,
     ) -> Result<Self, WriterError> {
-        // Validate the codec level up front so invalid input fails
-        // fast. The validated level flows into `writer_properties` so
-        // it isn't re-checked.
-        let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
+        // Validate the codec level *before* any filesystem side effect, so an
+        // invalid level leaves no partition directory behind (the delegate
+        // re-validates — cheap and keeps it self-contained).
+        ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
         // Ensure the store root (and the partition dir) exist:
         // `Store::local` canonicalises `bucket_root`, which must
         // therefore exist; the object-store `put` on close creates any
@@ -177,11 +189,49 @@ impl Writer {
             path: bucket_root.to_path_buf(),
             source: io::Error::other(e),
         })?;
+        let mut writer = Self::open_in_with_zstd_level(&store, partition, zstd_level)?;
+        // Surface the absolute local landing path for the local backend
+        // (readers/tests join the store root to find the file); the store
+        // constructor leaves `final_path` as the object key rendered as a path.
+        writer.final_path = dir.join(format!("{}.parquet", writer.flush_uuid));
+        Ok(writer)
+    }
+
+    /// Open a writer for `partition` on an already-built [`Store`] (local or
+    /// S3-compatible) using the RFC 0005 §3.6 default compression level — the
+    /// S3-capable constructor (RFC 0019). The compactor and any non-local
+    /// writer build a [`Store`] once and open writers through it. Nothing is
+    /// created up front (object stores have no directories, and the local
+    /// backend's `put` creates parents); the file is `put` to its object key on
+    /// [`Writer::close`] (the buffer-and-put commit point).
+    ///
+    /// # Errors
+    ///
+    /// See [`Writer::open_in_with_zstd_level`].
+    pub fn open_in(store: &Store, partition: PartitionKey) -> Result<Self, WriterError> {
+        Self::open_in_with_zstd_level(store, partition, DEFAULT_ZSTD_LEVEL)
+    }
+
+    /// Like [`Writer::open_in`] but with an explicit ZSTD level (see
+    /// [`Writer::open_with_zstd_level`] for the level's semantics — it is a
+    /// physical-encoding knob, not a schema change).
+    ///
+    /// # Errors
+    ///
+    /// [`WriterError::Parquet`] when `zstd_level` is outside the valid ZSTD
+    /// range or `ArrowWriter` setup fails.
+    pub fn open_in_with_zstd_level(
+        store: &Store,
+        partition: PartitionKey,
+        zstd_level: i32,
+    ) -> Result<Self, WriterError> {
+        // Validate the codec level up front so invalid input fails fast. The
+        // validated level flows into `writer_properties` so it isn't re-checked.
+        let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
         let flush_uuid = Uuid::now_v7();
-        let final_path = dir.join(format!("{flush_uuid}.parquet"));
-        // The object key is the partition's Hive path (relative to the
-        // store root) plus the file name, with `/` separators —
-        // object keys are `/`-delimited regardless of the host OS.
+        // The object key is the partition's Hive path (relative to the store
+        // root) plus the file name, with `/` separators — object keys are
+        // `/`-delimited regardless of the host OS.
         let key = format!(
             "{}/{}.parquet",
             partition
@@ -190,6 +240,11 @@ impl Writer {
                 .replace(std::path::MAIN_SEPARATOR, "/"),
             flush_uuid
         );
+        // No local root to join on the store path, so the object key rendered
+        // as a path is the `final_path` here; the local constructor overrides
+        // it with the absolute landing path. For S3 this is not a filesystem
+        // path (readers address the file by `key`, surfaced in `WrittenFile`).
+        let final_path = PathBuf::from(&key);
 
         let props = writer_properties(zstd);
         // Buffer-and-put: encode into memory; nothing hits the store
@@ -201,7 +256,7 @@ impl Writer {
             inner: Some(inner),
             partition,
             flush_uuid,
-            store,
+            store: store.clone(),
             key,
             final_path,
             num_rows: 0,
@@ -367,6 +422,7 @@ impl Writer {
         // `into_inner` writes the footer and returns the finished
         // bytes; the `put` is the atomic commit point.
         let bytes = inner.into_inner().map_err(WriterError::Parquet)?;
+        let bytes_written = bytes.len() as u64;
         self.store
             .put_blocking(&self.key, bytes)
             .map_err(|e| WriterError::Io {
@@ -376,16 +432,19 @@ impl Writer {
             })?;
         Ok(WrittenFile {
             path: self.final_path.clone(),
+            key: self.key.clone(),
             partition: self.partition.clone(),
             flush_uuid: self.flush_uuid,
             num_rows: self.num_rows,
+            bytes_written,
         })
     }
 
-    /// Inspector for the absolute path the writer publishes to on
-    /// [`Self::close`] (the store root joined with the object key);
-    /// useful for tests that assert the landing site without reading
-    /// the file. The bytes only exist there after a successful
+    /// Inspector for the path reported through [`WrittenFile::path`]: the
+    /// absolute landing path for [`Self::open`], or the object key rendered as a
+    /// path for [`Self::open_in`] (no local root). Useful for tests that assert
+    /// the local landing site; store-backed callers address the object by
+    /// [`WrittenFile::key`]. The bytes only exist there after a successful
     /// `close` — while the writer is open they live in memory.
     #[must_use]
     pub fn final_path(&self) -> &Path {
@@ -400,14 +459,24 @@ impl Writer {
 /// Result of a successful [`Writer::close`].
 #[derive(Debug)]
 pub struct WrittenFile {
-    /// Absolute path the file was written to.
+    /// Absolute landing path for the **local** backend; the object key
+    /// rendered as a path for a store-backed writer ([`Writer::open_in`]).
+    /// Address a store-backed file by [`Self::key`], not this.
     pub path: PathBuf,
+    /// `/`-delimited object key the file was `put` to, relative to the store
+    /// root (`data/tenant_id=…/year=…/…/<uuid>.parquet`) — the backend-agnostic
+    /// address (the compactor reads/deletes by this).
+    pub key: String,
     /// Partition key the file was opened under.
     pub partition: PartitionKey,
     /// `UUIDv7` flush identifier embedded in the filename.
     pub flush_uuid: Uuid,
     /// Total number of rows in the file (sum across row groups).
     pub num_rows: i64,
+    /// Encoded Parquet byte length (the size `put` to the store) — the
+    /// backend-agnostic replacement for stat-ing `path`, which a store-backed
+    /// (S3) writer can't do.
+    pub bytes_written: u64,
 }
 
 /// Errors produced by [`Writer`].
@@ -752,6 +821,86 @@ mod tests {
             .read_all()
             .expect("read_all");
         assert_eq!(decoded, records, "every row recovered byte-for-byte");
+    }
+
+    /// `Writer::open_in` writes through an already-built `Store` (the RFC 0019
+    /// S3-capable path) with no pre-created partition dir: the file lands at the
+    /// partition's object key, `WrittenFile` carries that key + the encoded byte
+    /// length (the backend-agnostic replacements for stat-ing a local path), and
+    /// `Reader::open_partition_bytes` over `store.get` recovers every row.
+    #[test]
+    fn open_in_writes_through_a_store_and_reports_key_and_size() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let records: Vec<MinedRecord> = (0..50).map(|i| rec(i % 3, TS0 + i * 1_000)).collect();
+        let partition = PartitionKey::derive(&records[0]).expect("derive");
+
+        let mut writer = Writer::open_in(&store, partition.clone()).expect("open_in");
+        writer.append_records(&records).expect("append");
+        let written = writer.close().expect("close");
+
+        // The key is the partition's Hive path + the uuid file name.
+        let partition_prefix = format!(
+            "{}/",
+            partition
+                .data_path(Path::new(""))
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+        );
+        assert!(
+            written.key.starts_with(&partition_prefix),
+            "key under the partition prefix: {}",
+            written.key,
+        );
+        assert!(written.key.ends_with(".parquet"));
+        assert!(written.bytes_written > 0, "encoded byte length recorded");
+
+        // The object is addressable by `key`; the put size matches.
+        let bytes = store.get_blocking(&written.key).expect("get");
+        assert_eq!(
+            bytes.len() as u64,
+            written.bytes_written,
+            "WrittenFile.bytes_written equals the put size",
+        );
+        let decoded =
+            Reader::open_partition_bytes(bytes::Bytes::from(bytes), partition, &written.key)
+                .expect("open_partition_bytes")
+                .read_all()
+                .expect("read_all");
+        assert_eq!(
+            decoded, records,
+            "every row recovered through the store seam"
+        );
+    }
+
+    /// `Reader::open_partition_bytes` applies the §3.9 row-vs-path validation
+    /// (RFC0009.5): reading store bytes under the wrong partition is a hard
+    /// `PartitionMismatch`, so a mis-partitioned compaction input aborts rather
+    /// than being silently merged.
+    #[test]
+    fn open_partition_bytes_rejects_a_mismatched_partition() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let records = vec![rec(1, TS0)]; // tenant "a"
+        let partition = PartitionKey::derive(&records[0]).expect("derive");
+        let mut writer = Writer::open_in(&store, partition).expect("open_in");
+        writer.append_records(&records).expect("append");
+        let written = writer.close().expect("close");
+        let bytes = store.get_blocking(&written.key).expect("get");
+
+        // A partition for a different tenant (same time bucket, wrong tenant).
+        let mut other = rec(1, TS0);
+        other.tenant_id = TenantId::new("b");
+        let wrong = PartitionKey::derive(&other).expect("derive other");
+
+        let err = Reader::open_partition_bytes(bytes::Bytes::from(bytes), wrong, &written.key)
+            .expect("open_partition_bytes")
+            .read_all()
+            .expect_err("a mismatched tenant must be a hard read error");
+        assert!(
+            matches!(err, crate::ReaderError::PartitionMismatch { .. }),
+            "got {err:?}",
+        );
     }
 
     /// An empty input is still a valid, complete Parquet file (footer +

@@ -109,6 +109,33 @@ impl Reader {
         Self::from_bytes(bytes, PathBuf::from("<object-store>"))
     }
 
+    /// Open a reader over in-memory Parquet `bytes` under a known
+    /// [`PartitionKey`] — the store-backed counterpart of
+    /// [`Self::open_partition`] (the compactor reads each input via
+    /// [`Store::get_blocking`](crate::Store::get_blocking) → these bytes so it
+    /// can target S3, RFC 0019). Applies the same RFC 0005 §3.9 row-vs-path
+    /// validation on [`Self::read_all`]: every row's `tenant_id` and derived
+    /// time bucket must match `partition`, or the read is a hard error per
+    /// RFC 0005 §3.9 (a mis-partitioned compaction input then aborts, RFC0009.5).
+    ///
+    /// `key` is the object key the bytes came from; it is recorded only for
+    /// diagnostics, so a [`ReaderError::PartitionMismatch`] names the offending
+    /// object in compaction logs (the bytes path has no real file path).
+    ///
+    /// # Errors
+    /// [`ReaderError::Parquet`] if the bytes are not a valid Parquet file;
+    /// [`ReaderError::MissingRequiredColumn`] if a baseline REQUIRED column is
+    /// absent (§3.9).
+    pub fn open_partition_bytes(
+        bytes: bytes::Bytes,
+        partition: PartitionKey,
+        key: &str,
+    ) -> Result<Self, ReaderError> {
+        let mut reader = Self::from_bytes(bytes, PathBuf::from(key))?;
+        reader.partition = Some(partition);
+        Ok(reader)
+    }
+
     /// Build a reader over in-memory Parquet `bytes`, recording `file_path`
     /// for diagnostics (the real path on the [`Self::open_file`] /
     /// [`Self::open_partition`] seam, a sentinel on [`Self::open_bytes`]).
@@ -128,7 +155,7 @@ impl Reader {
 
     /// Read every row in the file as a `MinedRecord`. Applies
     /// row-vs-path validation when the reader was opened via
-    /// [`Self::open_partition`].
+    /// [`Self::open_partition`] or [`Self::open_partition_bytes`].
     ///
     /// # Errors
     ///
@@ -142,8 +169,8 @@ impl Reader {
     ///   fail the RFC 0005 §3.3 canonical-JSON decode (corrupt
     ///   file or foreign-producer bytes).
     /// - [`ReaderError::PartitionMismatch`] when a row's
-    ///   derived partition disagrees with the writer-side
-    ///   partition supplied to [`Self::open_partition`].
+    ///   derived partition disagrees with the partition supplied to
+    ///   [`Self::open_partition`] or [`Self::open_partition_bytes`].
     pub fn read_all(self) -> Result<Vec<MinedRecord>, ReaderError> {
         let mut out = Vec::new();
         let partition = self.partition;

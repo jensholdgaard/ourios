@@ -35,13 +35,14 @@ use crate::{QueryError, audit_scan};
 /// itself.
 ///
 /// `local_root` selects the hybrid scan backend (RFC 0019 §3.3): `Some` reads
-/// local audit files, `None` lists keys + reads bytes through the [`Store`].
+/// local audit files, `None` lists keys + reads bytes through the S3 [`Store`]
+/// (`store`, required `Some` on the S3 branch only).
 ///
 /// Alias events are rare operator actions, not ingest-volume data, so
 /// the unwindowed scan is small by construction (§3.7.1); no day prune
 /// applies because the fold covers the tenant's whole alias history.
 pub(crate) fn derive_alias_map(
-    store: &Store,
+    store: Option<&Store>,
     local_root: Option<&Path>,
     tenant: &TenantId,
 ) -> Result<AliasMap, QueryError> {

@@ -70,9 +70,10 @@ impl AuditFiles {
 ///
 /// `local_root` is `Some` for the local backend (the `std::fs` walk with the
 /// canonical-path backstops) and `None` for S3 (the prefix-scoped
-/// [`Store::list_blocking`]).
+/// [`Store::list_blocking`]). `store` is the S3 [`Store`], required (`Some`)
+/// exactly on the S3 branch — the local walk never needs it.
 pub(crate) fn audit_files(
-    store: &Store,
+    store: Option<&Store>,
     local_root: Option<&Path>,
     tenant: &TenantId,
     window: Option<(u64, u64)>,
@@ -80,9 +81,22 @@ pub(crate) fn audit_files(
     match local_root {
         Some(root) => Ok(AuditFiles::Local(local_audit_files(root, tenant, window)?)),
         None => Ok(AuditFiles::Remote(remote_audit_files(
-            store, tenant, window,
+            remote_store(store)?,
+            tenant,
+            window,
         )?)),
     }
+}
+
+/// Unwrap the S3 [`Store`] for a remote-branch call: it is always `Some` when
+/// `local_root` is `None` (the [`crate::Querier`] constructs one for the S3
+/// backend), so a `None` here is an internal invariant violation, surfaced as a
+/// `Storage` error rather than an `unwrap`/`panic` (no panics off the
+/// production path, `CLAUDE.md` §6).
+fn remote_store(store: Option<&Store>) -> Result<&Store, QueryError> {
+    store.ok_or_else(|| QueryError::Storage {
+        detail: "internal: S3 audit scan reached with no store".to_string(),
+    })
 }
 
 /// Read every [`AuditEvent`] from `tenant`'s resolved audit file set (the
@@ -94,7 +108,7 @@ pub(crate) fn audit_files(
 /// local file is read with [`AuditReader::open_file`], an S3 key via
 /// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
 pub(crate) fn read_all_events(
-    store: &Store,
+    store: Option<&Store>,
     local_root: Option<&Path>,
     tenant: &TenantId,
 ) -> Result<Vec<AuditEvent>, QueryError> {
@@ -128,6 +142,7 @@ pub(crate) fn read_all_events(
             }
         }
         AuditFiles::Remote(keys) => {
+            let store = remote_store(store)?;
             for key in &keys {
                 let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
                     detail: format!("audit file {key}: {e}"),

@@ -93,7 +93,7 @@ const LAST_SEEN: &str = "last_seen";
 /// (`-7d`, `now`) resolve against; the caller supplies it so execution is
 /// deterministic and testable (mirroring [`crate::Querier::run_query`]).
 pub(crate) async fn run_drift(
-    store: &Store,
+    store: Option<&Store>,
     local_root: Option<&Path>,
     query: &DriftQuery,
     tenant: &TenantId,
@@ -111,11 +111,16 @@ pub(crate) async fn run_drift(
     // offload them via `spawn_blocking` rather than tie up a runtime worker.
     // `Store` / `TenantId` / `PathBuf` are cheap to clone into the task.
     let files = {
-        let store = store.clone();
+        let store = store.cloned();
         let tenant = tenant.clone();
         let local_root = local_root.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            audit_scan::audit_files(&store, local_root.as_deref(), &tenant, Some((start, end)))
+            audit_scan::audit_files(
+                store.as_ref(),
+                local_root.as_deref(),
+                &tenant,
+                Some((start, end)),
+            )
         })
         .await
         .map_err(|e| QueryError::Storage {

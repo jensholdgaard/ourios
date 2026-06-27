@@ -37,7 +37,9 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 /// template events) derives the empty registry.
 ///
 /// `local_root` selects the hybrid scan backend (RFC 0019 §3.3): `Some` reads
-/// local audit files, `None` lists keys + reads bytes through the [`Store`].
+/// local audit files, `None` lists keys + reads bytes through the S3 [`Store`]
+/// (`store`, required `Some` on the S3 branch only — the local walk never needs
+/// a constructed `Store`).
 ///
 /// Each `template_created` event keys at [`TEMPLATE_INITIAL_VERSION`] (the
 /// variant omits the version — a leaf is always born at v1); each
@@ -51,7 +53,7 @@ pub type TemplateRegistry = HashMap<(u64, u32), Vec<OwnedToken>>;
 /// file cannot be read, or a row claims a tenant other than the one whose
 /// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
 pub fn derive_template_registry(
-    store: &Store,
+    store: Option<&Store>,
     local_root: Option<&Path>,
     tenant: &TenantId,
 ) -> Result<TemplateRegistry, QueryError> {

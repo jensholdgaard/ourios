@@ -519,26 +519,59 @@ fn apply_request_filters(
     Ok(Some(df))
 }
 
+/// Which backend a [`Querier`] reads (RFC 0019 §3.3). The local variant holds
+/// only the path: building a `Store::local` **canonicalizes** the prefix and so
+/// fails on a not-yet-created bucket, which would break the infallible
+/// [`Querier::new`] contract and the long-standing "query a fresh bucket ⇒
+/// empty result, never an error" behaviour. The local read paths walk `std::fs`
+/// directly and tolerate `NotFound`, so the local branch never needs a
+/// constructed `Store` for I/O — only the S3 branch holds an eager [`Store`].
+#[derive(Debug, Clone)]
+enum Backend {
+    /// Local-filesystem store rooted at the path (the `data/`-and-`audit/`
+    /// parent). Held as a path so construction is infallible and a missing dir
+    /// is tolerated at query time.
+    Local(PathBuf),
+    /// S3 / S3-compatible store, constructed eagerly (the read paths address it
+    /// via `Store::list_blocking` / `object_store`).
+    Remote(Store),
+}
+
+impl Backend {
+    /// The local store root, `Some` for [`Backend::Local`] — the hybrid-scan
+    /// branch selector.
+    fn local_root(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Local(root) => Some(root),
+            Self::Remote(_) => None,
+        }
+    }
+
+    /// The constructed S3 [`Store`], `Some` only for [`Backend::Remote`]. The
+    /// local branch never needs a `Store` (its read paths walk `std::fs`).
+    fn remote_store(&self) -> Option<&Store> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(store) => Some(store),
+        }
+    }
+}
+
 /// The query engine. One per querier process; reads the RFC 0005
 /// Parquet + audit store through the `ourios-parquet` [`Store`] seam,
 /// so the same engine targets a local-filesystem store (dev / test /
 /// the regression guard) or an S3-compatible bucket (production,
 /// `CLAUDE.md` §3.6).
 ///
-/// `local_root` is `Some` exactly when the backend is local: the bulk
-/// `DataFusion` scan then addresses files by absolute local path
-/// (unchanged from before RFC 0019), and `Manifest::read` /
-/// `resolve_live_files` walk `std::fs`. When the backend is S3
-/// (`local_root == None`) the scan registers the [`Store`]'s
-/// `object_store` on the `SessionContext` and addresses tables by
-/// object-store URL, and the live-file set is resolved through
+/// The backend ([`Backend`]) drives the hybrid scan: a local backend addresses
+/// files by absolute local path and walks `std::fs` (unchanged from before
+/// RFC 0019, missing dirs tolerated as empty); an S3 backend registers the
+/// [`Store`]'s `object_store` on the `SessionContext`, addresses tables by
+/// object-store URL, and resolves the live-file set through
 /// [`Store::list_blocking`] (RFC 0019 §3.3).
 #[derive(Debug, Clone)]
 pub struct Querier {
-    store: Store,
-    /// `Some(root)` for the local backend (the `data/`-and-`audit/`
-    /// parent directory), `None` for S3. Drives the hybrid scan branch.
-    local_root: Option<PathBuf>,
+    backend: Backend,
 }
 
 /// The object-store URL scheme/authority the S3 scan registers its
@@ -556,24 +589,14 @@ impl Querier {
     /// the local backend is the test/dev default and the RFC 0019
     /// regression guard.
     ///
-    /// # Panics
-    ///
-    /// Panics if a `Store::local` cannot be built for `bucket_root` —
-    /// only on a resource failure constructing the trivial
-    /// `LocalFileSystem` backend, which the prior `PathBuf`-only
-    /// constructor could not hit. Use [`Self::from_store_config`] for
-    /// fallible construction.
+    /// Infallible and side-effect-free: it only records the path (no I/O, no
+    /// `Store` construction), so it never panics and never requires the bucket
+    /// to exist. A query against a not-yet-created bucket yields an empty result
+    /// (the `std::fs` read paths tolerate `NotFound`), exactly as before
+    /// RFC 0019.
     pub fn new(bucket_root: impl Into<PathBuf>) -> Self {
-        let root = bucket_root.into();
-        // `LocalFileSystem::new_with_prefix` only fails on a resource
-        // error (it does not require the path to exist), so this keeps
-        // the infallible `new(path)` contract the 49 call sites rely on.
-        let store = Store::local(&root).unwrap_or_else(|e| {
-            panic!("local store for {}: {e}", root.display());
-        });
         Self {
-            store,
-            local_root: Some(root),
+            backend: Backend::Local(bucket_root.into()),
         }
     }
 
@@ -584,17 +607,34 @@ impl Querier {
     ///
     /// # Errors
     ///
-    /// [`QueryError::Storage`] if the backend cannot be constructed
-    /// (e.g. an invalid S3 config — see [`StoreConfig::open`]).
+    /// [`QueryError::Storage`] if the S3 backend cannot be constructed
+    /// (e.g. an invalid S3 config — see [`StoreConfig::open`]). A local
+    /// config is infallible (it defers to [`Self::new`]).
     pub fn from_store_config(config: &StoreConfig) -> Result<Self, QueryError> {
-        let store = config.open().map_err(|e| QueryError::Storage {
-            detail: format!("open store: {e}"),
-        })?;
-        let local_root = match config {
-            StoreConfig::Local(root) => Some(root.clone()),
-            StoreConfig::S3(_) => None,
+        let backend = match config {
+            StoreConfig::Local(root) => Backend::Local(root.clone()),
+            StoreConfig::S3(_) => {
+                let store = config.open().map_err(|e| QueryError::Storage {
+                    detail: format!("open store: {e}"),
+                })?;
+                Backend::Remote(store)
+            }
         };
-        Ok(Self { store, local_root })
+        Ok(Self { backend })
+    }
+
+    /// The local store root, `Some` for the local backend, `None` for S3 —
+    /// the hybrid-scan branch selector.
+    fn local_root(&self) -> Option<&std::path::Path> {
+        self.backend.local_root()
+    }
+
+    /// The constructed S3 [`Store`], `Some` only for the S3 backend. The local
+    /// branch never needs a `Store` (its read paths walk `std::fs`), so this is
+    /// `None` there — the helpers take it as `Option<&Store>` and only deref it
+    /// on the S3 branch.
+    fn remote_store(&self) -> Option<&Store> {
+        self.backend.remote_store()
     }
 
     /// Execute `request` against the RFC 0005 store with predicate
@@ -674,14 +714,17 @@ impl Querier {
                 // Offload the blocking audit derivation (S3 `get_blocking` /
                 // the local `std::fs` reads) off the runtime worker, mirroring
                 // `run_drift` — the derivation is deeply sync, so clone the
-                // cheap handles into the blocking task.
+                // cheap backend handle into the blocking task.
                 derived = self
                     .spawn_blocking_audit({
-                        let store = self.store.clone();
-                        let local_root = self.local_root.clone();
+                        let backend = self.backend.clone();
                         let tenant = tenant.clone();
                         move || {
-                            alias_store::derive_alias_map(&store, local_root.as_deref(), &tenant)
+                            alias_store::derive_alias_map(
+                                backend.remote_store(),
+                                backend.local_root(),
+                                &tenant,
+                            )
                         }
                     })
                     .await?;
@@ -732,8 +775,8 @@ impl Querier {
         now_unix_nano: u64,
     ) -> Result<DriftResult, QueryError> {
         drift::run_drift(
-            &self.store,
-            self.local_root.as_deref(),
+            self.remote_store(),
+            self.local_root(),
             query,
             tenant,
             now_unix_nano,
@@ -883,10 +926,11 @@ impl Querier {
         // `std::fs` reads) off the runtime worker, like the alias derivation.
         let registry = self
             .spawn_blocking_audit({
-                let store = self.store.clone();
-                let local_root = self.local_root.clone();
+                let backend = self.backend.clone();
                 let tenant = tenant.clone();
-                move || derive_template_registry(&store, local_root.as_deref(), &tenant)
+                move || {
+                    derive_template_registry(backend.remote_store(), backend.local_root(), &tenant)
+                }
             })
             .await?;
         Ok(mined
@@ -899,8 +943,8 @@ impl Querier {
     /// `derive_template_registry`) on the tokio blocking pool so the async query
     /// path doesn't tie up a runtime worker on the S3 `get_blocking` (or local
     /// `std::fs`) reads — the same offload `run_drift` applies to the listing.
-    /// The closure owns its captured `Store` / `local_root` / `TenantId` clones
-    /// so it satisfies the `'static + Send` bound.
+    /// The closure owns its captured `Backend` / `TenantId` clones so it
+    /// satisfies the `'static + Send` bound.
     async fn spawn_blocking_audit<T, F>(&self, derive: F) -> Result<T, QueryError>
     where
         T: Send + 'static,
@@ -931,13 +975,16 @@ impl Querier {
         prefix: &str,
         window: Option<(u64, u64)>,
     ) -> Result<Vec<ListingTableUrl>, QueryError> {
-        if let Some(root) = &self.local_root {
-            let tenant_dir = root.join(prefix);
-            let live_files = resolve_live_files(&tenant_dir, window)?;
-            local_file_urls(&tenant_dir, &live_files)
-        } else {
-            let live_keys = resolve_live_keys(&self.store, prefix, window)?;
-            object_store_urls(ctx, &self.store, &live_keys)
+        match &self.backend {
+            Backend::Local(root) => {
+                let tenant_dir = root.join(prefix);
+                let live_files = resolve_live_files(&tenant_dir, window)?;
+                local_file_urls(&tenant_dir, &live_files)
+            }
+            Backend::Remote(store) => {
+                let live_keys = resolve_live_keys(store, prefix, window)?;
+                object_store_urls(ctx, store, &live_keys)
+            }
         }
     }
 }
@@ -1071,23 +1118,61 @@ fn object_store_url_for_key(prefix: &[String], key: &str) -> String {
 ///   tenant isolation is the segment-wise prefix scope (RFC0019.5).
 pub(crate) fn audit_table_urls(
     ctx: &SessionContext,
-    store: &Store,
+    store: Option<&Store>,
     files: &audit_scan::AuditFiles,
 ) -> Result<Vec<ListingTableUrl>, QueryError> {
     match files {
         // The walk already produced absolute canonical paths, so address them
-        // directly — no `root.join`, no CWD-relative path.
+        // directly — no `root.join`, no CWD-relative path. The local branch
+        // needs no `Store`.
         audit_scan::AuditFiles::Local(paths) => paths
             .iter()
             .map(|path| ListingTableUrl::parse(path.display().to_string()).map_err(storage_err))
             .collect(),
-        audit_scan::AuditFiles::Remote(keys) => object_store_urls(ctx, store, keys),
+        // Remote keys imply the S3 backend, so `store` is always `Some` here
+        // (the `Querier` built one); a `None` is an internal invariant
+        // violation, surfaced rather than unwrapped (no panics, `CLAUDE.md` §6).
+        audit_scan::AuditFiles::Remote(keys) => {
+            let store = store.ok_or_else(|| QueryError::Storage {
+                detail: "internal: S3 audit URLs reached with no store".to_string(),
+            })?;
+            object_store_urls(ctx, store, keys)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Querier::new` is infallible and must not panic on a not-yet-created
+    /// bucket: it only records the path (no `Store` construction, which would
+    /// canonicalize and fail on a missing dir). Querying a non-existent local
+    /// bucket returns an empty result — the `std::fs` read paths tolerate
+    /// `NotFound` — exactly as before RFC 0019.
+    #[tokio::test]
+    async fn new_on_missing_dir_does_not_panic_and_queries_empty() {
+        // A path under a temp dir that was never created — `Store::local` would
+        // error on this (it canonicalizes the prefix), but `new` must not.
+        let tmp = tempfile::tempdir().expect("temp");
+        let missing = tmp.path().join("never/created/bucket");
+        assert!(!missing.exists(), "precondition: the bucket dir is absent");
+
+        let querier = Querier::new(&missing);
+        let result = querier
+            .run(QueryRequest {
+                tenant: ourios_core::tenant::TenantId::new("acme"),
+                time_range: None,
+                template_id: None,
+                severity_text: None,
+                limit: None,
+            })
+            .await
+            .expect("a query against a missing bucket is an empty result, not an error");
+        assert_eq!(result.rows, 0, "no rows from a non-existent bucket");
+        assert!(result.records.is_empty());
+        assert_eq!(result.stats, QueryStats::default());
+    }
 
     /// The S3 object-store URL for a key prepends the store prefix and
     /// percent-encodes every segment, so `ListingTableUrl::parse`'s URL-decode

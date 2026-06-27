@@ -14,7 +14,7 @@ use ourios_core::audit::{
 };
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::OwnedToken;
-use ourios_parquet::{ParquetAuditSink, Store};
+use ourios_parquet::ParquetAuditSink;
 use ourios_querier::derive_template_registry;
 use tempfile::TempDir;
 
@@ -118,10 +118,10 @@ fn rfc0017_2_registry_derives_completely_including_v1() {
     }
     assert_eq!(sink.write_failures(), 0, "fixture events must all persist");
 
-    // RFC 0019 — the registry derivation now reads through the `Store` seam;
-    // `Some(local_root)` selects the local hybrid branch (the std::fs walk).
-    let store = Store::local(bucket.path()).expect("local store");
-    let registry = derive_template_registry(&store, Some(bucket.path()), &TenantId::new(tenant))
+    // RFC 0019 — the registry derivation is a hybrid; `Some(local_root)` selects
+    // the local `std::fs` branch (which needs no constructed `Store`, so the
+    // store arg is `None` here — only the S3 branch passes a `Some(store)`).
+    let registry = derive_template_registry(None, Some(bucket.path()), &TenantId::new(tenant))
         .expect("derive");
 
     // Every (template_id, version) the stream described is present — including

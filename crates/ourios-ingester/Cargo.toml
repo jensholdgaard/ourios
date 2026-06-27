@@ -96,22 +96,22 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.27.0"
 # Drive the axum `Router` in-process (`ServiceExt::oneshot`) for the
 # HTTP-transport acceptance tests — no real socket.
-tower = { version = "0.5", default-features = false, features = ["util"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # Proptest strategy over the OTLP proto value space for the
 # wire-decode equivalence scenarios (RFC0003.5/.6 per §8).
-proptest = "1"
+proptest = "=1.11.0"
 # Stand up an in-memory MeterProvider to assert the compaction metric
 # stream; `testing` exposes `init_in_memory`.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # The SDK data types (`ResourceMetrics` etc.) the metrics test reads.
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 # The metrics test collects via the in-memory reader's periodic-export
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
+tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 
 [lints]
 workspace = true

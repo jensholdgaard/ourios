@@ -65,17 +65,17 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # RFC0003.16 served-binary integration test: temp dirs, a real tonic
 # gRPC client (`channel`) + a hand-rolled HTTP/1.1 POST (tokio io/time),
 # prost to encode the request, the WAL to replay + assert durability.
-tempfile = "3"
-prost = { version = "0.14", default-features = false, features = ["std"] }
-tonic = { version = "0.14", default-features = false, features = ["channel"] }
-tokio = { version = "1", default-features = false, features = ["io-util", "time", "process"] }
+tempfile = "=3.27.0"
+prost = { version = "=0.14.4", default-features = false, features = ["std"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["channel"] }
+tokio = { version = "=1.52.3", default-features = false, features = ["io-util", "time", "process"] }
 # Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
 # RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).
-tower = { version = "0.5", default-features = false, features = ["util"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # In-memory metric exporter for the RFC0016.6 query-metrics test: install a
 # global meter provider and read the exported stream (the ingester pattern).
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 
 [lints]
 workspace = true

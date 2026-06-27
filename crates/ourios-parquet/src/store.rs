@@ -408,6 +408,25 @@ impl Store {
             .map_err(StoreError::Backend)
     }
 
+    /// Blocking [`Self::delete`] for the **sync** storage call sites (the
+    /// compactor's orphan GC and post-commit input reclaim). Safe to call from
+    /// inside a tokio runtime (see [`Self::get_blocking`]).
+    ///
+    /// **Missing-key behaviour is backend-dependent** (this bridge adds no
+    /// existence check): `LocalFileSystem` maps an absent key to a
+    /// [`is_not_found`](StoreError::is_not_found) error, while S3 DELETE is
+    /// idempotent and returns success. The compactor's GC loops treat *both* as
+    /// "already reclaimed" — they match `is_not_found` and otherwise count a
+    /// failure — so the difference is invisible to them; do not rely on a
+    /// uniform not-found for an absent key.
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// otherwise as [`Self::delete`] (and see the missing-key note above).
+    pub fn delete_blocking(&self, key: &str) -> Result<(), StoreError> {
+        block_on_off_runtime(self.delete(key))
+    }
+
     /// Blocking [`Self::get`] for the **sync** storage call sites (`Reader`,
     /// compaction). Safe to call from any thread, including inside a tokio
     /// runtime — the `block_on` runs off the caller's thread.
@@ -431,6 +450,22 @@ impl Store {
     /// not inherited from the backend (neither `LocalFileSystem` nor S3
     /// guarantees stream order), so the contract is deterministic.
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .list_entries(prefix)
+            .await?
+            .into_iter()
+            .map(|(key, _size)| key)
+            .collect())
+    }
+
+    /// List every object under `prefix` (store-relative) as `(key, size)` pairs,
+    /// recursively, in **lexicographic key order** — the size-bearing core of
+    /// [`Self::list`]. The compactor's small-file candidate check needs each
+    /// object's byte length, which the backend already reports in the listing
+    /// (`ObjectMeta::size`), so it comes for free here rather than via a
+    /// per-object `head`. Same tenant-isolation gating and key normalisation as
+    /// [`Self::list`].
+    async fn list_entries(&self, prefix: Option<&str>) -> Result<Vec<(String, u64)>, StoreError> {
         let scoped = prefix.map_or_else(|| self.prefix.clone(), |p| self.resolve(p));
         let metas: Vec<ObjectMeta> = self
             .inner
@@ -439,7 +474,7 @@ impl Store {
             .await
             .map_err(StoreError::Backend)?;
         let root = &self.prefix;
-        let mut keys: Vec<String> = metas
+        let mut entries: Vec<(String, u64)> = metas
             .into_iter()
             .filter_map(|m| {
                 // The backend's `list` does **string**-prefix matching, so S3
@@ -455,16 +490,15 @@ impl Store {
                 // `#[must_use]` value used.
                 let _ = m.location.prefix_match(&scoped)?;
                 let parts = m.location.prefix_match(root)?;
-                Some(
-                    parts
-                        .map(|p| p.as_ref().to_owned())
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                )
+                let key = parts
+                    .map(|p| p.as_ref().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                Some((key, m.size))
             })
             .collect();
-        keys.sort();
-        Ok(keys)
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
     }
 
     /// Blocking recursive key listing for the **sync** storage call sites — the
@@ -476,6 +510,21 @@ impl Store {
     /// [`StoreError::Backend`] on a listing failure.
     pub fn list_blocking(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
         block_on_off_runtime(self.list(prefix))
+    }
+
+    /// Blocking `(key, size)` listing for the **sync** storage call sites — the
+    /// bridge over the internal async `list_entries`, used by the compactor to
+    /// size small-file candidates without a per-object `head`. Same order +
+    /// isolation contract as [`Self::list_blocking`].
+    ///
+    /// # Errors
+    /// [`StoreError::Runtime`] if the bridge runtime can't be built;
+    /// [`StoreError::Backend`] on a listing failure.
+    pub fn list_with_sizes_blocking(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        block_on_off_runtime(self.list_entries(prefix))
     }
 
     /// Blocking [`Self::put`] for the **sync** storage call sites (`Writer`,
@@ -714,6 +763,58 @@ mod tests {
                 .list_blocking(Some("data/tenant_id=z"))
                 .expect("list z")
                 .is_empty(),
+        );
+    }
+
+    /// `list_with_sizes_blocking` reports each object's byte length alongside
+    /// the key, in the same lexicographic-by-key order and with the same
+    /// segment-wise tenant isolation as `list_blocking` — the compactor sizes
+    /// small-file candidates from this rather than a per-object `head`.
+    #[test]
+    fn list_with_sizes_reports_byte_lengths_in_key_order() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        // Distinct lengths so a size mismatch is visible; the `tenant_id=ab`
+        // sibling must be excluded when scoping to `tenant_id=a`.
+        store
+            .put_blocking("data/tenant_id=a/year=2026/h0.parquet", vec![0u8; 3])
+            .expect("put");
+        store
+            .put_blocking("data/tenant_id=a/year=2026/h1.parquet", vec![0u8; 7])
+            .expect("put");
+        store
+            .put_blocking("data/tenant_id=ab/year=2026/h0.parquet", vec![0u8; 11])
+            .expect("put");
+        assert_eq!(
+            store
+                .list_with_sizes_blocking(Some("data/tenant_id=a"))
+                .expect("list a"),
+            vec![
+                ("data/tenant_id=a/year=2026/h0.parquet".to_string(), 3),
+                ("data/tenant_id=a/year=2026/h1.parquet".to_string(), 7),
+            ],
+        );
+    }
+
+    /// `delete_blocking` removes an object (the compactor's orphan/input GC). On
+    /// the **local** backend a missing key surfaces as a `is_not_found` error
+    /// (S3 DELETE is idempotent instead — see the method doc); the compactor's
+    /// GC treats either as already-reclaimed, the same way it tolerates
+    /// `ErrorKind::NotFound` on `std::fs::remove_file`.
+    #[test]
+    fn delete_blocking_removes_and_local_missing_is_not_found() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let key = "data/tenant_id=t/year=2026/x.parquet";
+        store.put_blocking(key, b"x".to_vec()).expect("put");
+        store.delete_blocking(key).expect("delete");
+        assert_eq!(store.get_blocking_opt(key).expect("get_opt"), None);
+        let err = store
+            .delete_blocking(key)
+            .expect_err("local backend: absent key is a not-found error");
+        assert!(
+            err.is_not_found(),
+            "absent delete maps to not-found: {err:?}"
         );
     }
 

@@ -218,10 +218,10 @@ fn router_from_querier(querier: Querier, default_window_nanos: u64) -> Router {
 ///
 /// A `String` describing a store-root creation, bind, or `local_addr` failure.
 pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
-    // The local store root may not exist yet (a fresh dir); the querier only
-    // reads, but binding before the dir exists would make the first query fail
-    // with a confusing not-found rather than an empty result — create it,
-    // matching the receiver role. An S3 backend needs no such bootstrap.
+    // Pre-create the local store root (the read paths already treat a missing
+    // dir as empty, so this is not about query correctness): it surfaces a
+    // permission/creation problem at startup rather than later, and matches the
+    // receiver role's bootstrap. An S3 backend needs no such step.
     if let StoreConfig::Local(root) = &config.store {
         std::fs::create_dir_all(root)
             .map_err(|e| format!("create store root {}: {e}", root.display()))?;

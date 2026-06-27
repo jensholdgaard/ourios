@@ -476,49 +476,69 @@ fn is_candidate(
 }
 
 /// Enumerate the tenant's `year=/month=/day=/hour=` leaf partitions that hold
-/// objects, by listing every key under `data/tenant_id=<enc>/` and parsing the
-/// partition tuple from each key's path segments. Keys whose trailing
-/// `…/year=/month=/day=/hour=/<file>` run isn't the canonical zero-padded form
-/// (the shape [`PartitionKey::data_path`] writes, so the key round-trips) are
-/// skipped — the key-based equivalent of the old directory walk dropping
-/// non-canonical names. Returned sorted chronologically (oldest first) and
-/// deduplicated (many files, plus the manifest, map to one partition).
+/// objects, walking the Hive levels with a **delimiter rollup** at each step:
+/// from `data/tenant_id=<enc>` roll up the `year=` child prefixes, then for each
+/// the `month=`, then `day=`, then `hour=` children — every listing returns only
+/// the immediate common-prefixes (cheap), never the full object set. This is the
+/// object-store equivalent of the pre-RFC-0019 level-by-level `read_dir` walk,
+/// not a recursive `O(N_objects)` scan. Each level's segment is parsed in the
+/// canonical zero-padded form ([`parse_partition_segment`]); a non-canonical
+/// child prefix is dropped exactly as the old walk dropped non-canonical dirs.
+/// Returned sorted chronologically (oldest first) and deduplicated.
 fn hour_partitions(store: &Store, tenant: &str) -> Result<Vec<PartitionKey>, CompactionError> {
-    let prefix = format!("data/tenant_id={}", percent_encode_tenant(tenant));
-    let keys = store
-        .list_blocking(Some(&prefix))
-        .map_err(|e| store_io("list", &prefix, e))?;
-    let mut partitions: Vec<PartitionKey> = keys
-        .iter()
-        .filter_map(|key| parse_hour_partition_key(tenant, key))
-        .collect();
+    let root = format!("data/tenant_id={}", percent_encode_tenant(tenant));
+    let mut partitions = Vec::new();
+    for (year_prefix, year) in numbered_child_prefixes(store, &root, "year", 4)? {
+        // `year` is a calendar year; skip the (unreachable for Ourios output)
+        // value that wouldn't fit the `PartitionKey` `i32`.
+        let Ok(year) = i32::try_from(year) else {
+            continue;
+        };
+        for (month_prefix, month) in numbered_child_prefixes(store, &year_prefix, "month", 2)? {
+            for (day_prefix, day) in numbered_child_prefixes(store, &month_prefix, "day", 2)? {
+                for (_hour_prefix, hour) in numbered_child_prefixes(store, &day_prefix, "hour", 2)?
+                {
+                    partitions.push(PartitionKey {
+                        tenant_id: tenant.to_owned(),
+                        year,
+                        month,
+                        day,
+                        hour,
+                    });
+                }
+            }
+        }
+    }
     // Ascending tuple order is chronological (oldest sealed partition first);
-    // dedup after the sort collapses the many keys that share one partition.
+    // dedup after the sort is a belt-and-braces guard (the rollup yields each
+    // partition once).
     partitions.sort_by_key(|p| (p.year, p.month, p.day, p.hour));
     partitions.dedup();
     Ok(partitions)
 }
 
-/// Parse a [`PartitionKey`] from a data-object `key` by matching its trailing
-/// `…/year=YYYY/month=MM/day=DD/hour=HH/<file>` segments (the leaf file name
-/// dropped). Requires a **contiguous** run of the four canonical zero-padded
-/// segments — mirroring the querier's `parse_day_partition` fix (don't pick
-/// `year=` from an arbitrary position) — so a non-contiguous, non-canonical, or
-/// foreign layout yields `None` and is skipped.
-fn parse_hour_partition_key(tenant: &str, key: &str) -> Option<PartitionKey> {
-    // Segments deepest-first, with the leaf (file name) dropped.
-    let mut segments = key.rsplit('/').skip(1);
-    let hour = parse_partition_segment(segments.next()?, "hour", 2)?;
-    let day = parse_partition_segment(segments.next()?, "day", 2)?;
-    let month = parse_partition_segment(segments.next()?, "month", 2)?;
-    let year = parse_partition_segment(segments.next()?, "year", 4)?;
-    Some(PartitionKey {
-        tenant_id: tenant.to_owned(),
-        year: i32::try_from(year).ok()?,
-        month,
-        day,
-        hour,
-    })
+/// Roll up the immediate child common-prefixes of `parent` (one delimiter level,
+/// via [`Store::list_common_prefixes_blocking`]) and parse each one's trailing
+/// `<name>=NN` segment in the canonical zero-padded form, returning
+/// `(child_prefix, value)` for the matches. A non-canonical child (`month=4`,
+/// `month=004`) parses to `None` and is dropped — the same way the pre-RFC-0019
+/// `read_dir` walk skipped non-canonical directory names (RFC 0005 §3.4).
+fn numbered_child_prefixes(
+    store: &Store,
+    parent: &str,
+    name: &str,
+    width: usize,
+) -> Result<Vec<(String, u32)>, CompactionError> {
+    let children = store
+        .list_common_prefixes_blocking(Some(parent))
+        .map_err(|e| store_io("list", parent, e))?;
+    Ok(children
+        .into_iter()
+        .filter_map(|child| {
+            let value = parse_partition_segment(basename(&child), name, width)?;
+            Some((child, value))
+        })
+        .collect())
 }
 
 /// Parse one canonical Hive segment `<prefix>=<zero-padded number>` to its

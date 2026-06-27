@@ -80,13 +80,13 @@ const MAX_NEW_VERSION: &str = "max_new_version";
 const FIRST_SEEN: &str = "first_seen";
 const LAST_SEEN: &str = "last_seen";
 
-/// Execute the drift query against the tenant's audit stream in `store`,
-/// resolving the window against `now_unix_nano`.
+/// Execute the drift query against the tenant's audit stream, resolving the
+/// window against `now_unix_nano`.
 ///
-/// `local_root` is `Some` for the local backend (drift then addresses the audit
-/// files by absolute local path) and `None` for S3 (it registers the store on
-/// the `SessionContext` and addresses by object-store URL) — the hybrid scan of
-/// RFC 0019 §3.3, mirroring the bulk log path.
+/// `backend` selects the hybrid scan (RFC 0019 §3.3, mirroring the bulk log
+/// path): [`StoreRef::Local`] addresses the audit files by absolute local path;
+/// [`StoreRef::Remote`] registers the store on the `SessionContext` and
+/// addresses by object-store URL.
 ///
 /// `now_unix_nano` is the wall-clock reference the relative `from`/`to` bounds
 /// (`-7d`, `now`) resolve against; the caller supplies it so execution is

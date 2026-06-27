@@ -924,11 +924,11 @@ impl Querier {
     /// Resolve the live data files under the tenant's `data/` prefix and turn
     /// them into the `DataFusion` table URLs for the hybrid scan (RFC 0019 §3.3):
     ///
-    /// - **Local backend** (`local_root == Some`): walk `std::fs` under
+    /// - **Local backend** ([`Backend::Local`]): walk `std::fs` under
     ///   `<root>/<prefix>` honouring the RFC 0009 §3.4 manifest, then address
     ///   each file by its absolute local path — byte-for-byte the pre-RFC-0019
     ///   read path, with the canonical-path tenant-isolation backstop intact.
-    /// - **S3 backend** (`local_root == None`): list the keys under `prefix`
+    /// - **S3 backend** ([`Backend::Remote`]): list the keys under `prefix`
     ///   through [`Store::list_blocking`] (segment-wise prefix-scoped, the
     ///   RFC0019.5 tenant guarantee), resolve the per-partition manifest through
     ///   the [`Store`], register the store on `ctx`, and address each key by the

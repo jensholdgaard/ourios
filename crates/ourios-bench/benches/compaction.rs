@@ -35,7 +35,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{PartitionKey, Writer, compact_partition};
+use ourios_parquet::{PartitionKey, Store, Writer, compact_partition};
 use ourios_querier::{Querier, QueryRequest};
 
 /// Anchored in 2026 so the derived partition path is stable; all records
@@ -158,12 +158,17 @@ fn compaction_throughput(c: &mut Criterion) {
             |b, &nf| {
                 b.iter_batched(
                     || {
+                        // Build the backlog *and* open the store in the untimed
+                        // setup phase, so only `compact_partition` is timed (not
+                        // store construction / canonicalization). `_dir` is held
+                        // to keep the temp bucket alive for the iteration.
                         let dir = tempfile::TempDir::new().expect("temp bucket");
                         let part = build_backlog(dir.path(), nf);
-                        (dir, part)
+                        let store = Store::local(dir.path()).expect("store");
+                        (dir, store, part)
                     },
-                    |(dir, part)| {
-                        let outcome = compact_partition(dir.path(), &part).expect("compact");
+                    |(_dir, store, part)| {
+                        let outcome = compact_partition(&store, &part).expect("compact");
                         black_box(outcome.rows);
                     },
                     BatchSize::PerIteration,
@@ -179,7 +184,8 @@ fn compaction_throughput(c: &mut Criterion) {
     for num_files in D2_BACKLOGS {
         let dir = tempfile::TempDir::new().expect("temp bucket");
         let part = build_backlog(dir.path(), num_files);
-        let outcome = compact_partition(dir.path(), &part).expect("compact");
+        let store = Store::local(dir.path()).expect("store");
+        let outcome = compact_partition(&store, &part).expect("compact");
         eprintln!(
             "d2/compaction-throughput: {num_files} files → {} rows; read {} B, wrote {} B \
              (divide the criterion time for {num_files} into bytes_read for MiB/s)",
@@ -197,7 +203,8 @@ fn small_file_collapse(c: &mut Criterion) {
     // emitted once with a clean (untimed) outcome.
     let dir = tempfile::TempDir::new().expect("temp bucket");
     let part = build_backlog(dir.path(), D3_FILES);
-    let outcome = compact_partition(dir.path(), &part).expect("compact");
+    let store = Store::local(dir.path()).expect("store");
+    let outcome = compact_partition(&store, &part).expect("compact");
     assert!(
         outcome.committed.is_some(),
         "a {D3_FILES}-file backlog must compact (not a no-op)",
@@ -226,12 +233,15 @@ fn small_file_collapse(c: &mut Criterion) {
     group.bench_function(BenchmarkId::from_parameter(D3_FILES), |b| {
         b.iter_batched(
             || {
+                // Open the store in the untimed setup phase so only
+                // `compact_partition` is timed; `_d` keeps the bucket alive.
                 let d = tempfile::TempDir::new().expect("temp bucket");
                 let p = build_backlog(d.path(), D3_FILES);
-                (d, p)
+                let store = Store::local(d.path()).expect("store");
+                (d, store, p)
             },
-            |(d, p)| {
-                let o = compact_partition(d.path(), &p).expect("compact");
+            |(_d, store, p)| {
+                let o = compact_partition(&store, &p).expect("compact");
                 black_box(o.rows);
             },
             BatchSize::PerIteration,
@@ -302,7 +312,8 @@ fn baseline(_c: &mut Criterion) {
     let part = build_backlog_sized(dir.path(), files, rows, body);
 
     let t0 = Instant::now();
-    let outcome = compact_partition(dir.path(), &part).expect("compact");
+    let store = Store::local(dir.path()).expect("store");
+    let outcome = compact_partition(&store, &part).expect("compact");
     // Clamp so a sub-microsecond run can't print an infinite/NaN MiB/s.
     let secs = t0.elapsed().as_secs_f64().max(1e-9);
 
@@ -383,7 +394,8 @@ fn b2_post_compaction(c: &mut Criterion) {
     // resolves the single live file; the superseded inputs are ignored).
     let compacted = tempfile::TempDir::new().expect("temp bucket");
     let part = build_backlog(compacted.path(), B2_POST_FILES);
-    let outcome = compact_partition(compacted.path(), &part).expect("compact");
+    let store = Store::local(compacted.path()).expect("store");
+    let outcome = compact_partition(&store, &part).expect("compact");
     assert!(
         outcome.committed.is_some(),
         "b2-post setup must actually compact (not a no-op)"

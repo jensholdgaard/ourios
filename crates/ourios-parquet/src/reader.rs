@@ -169,8 +169,8 @@ impl Reader {
     ///   fail the RFC 0005 §3.3 canonical-JSON decode (corrupt
     ///   file or foreign-producer bytes).
     /// - [`ReaderError::PartitionMismatch`] when a row's
-    ///   derived partition disagrees with the writer-side
-    ///   partition supplied to [`Self::open_partition`].
+    ///   derived partition disagrees with the partition supplied to
+    ///   [`Self::open_partition`] or [`Self::open_partition_bytes`].
     pub fn read_all(self) -> Result<Vec<MinedRecord>, ReaderError> {
         let mut out = Vec::new();
         let partition = self.partition;

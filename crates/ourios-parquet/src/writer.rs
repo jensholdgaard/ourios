@@ -109,10 +109,10 @@ pub struct Writer {
     /// the store root (`data/tenant_id=…/year=…/…/<uuid>.parquet`). The
     /// backend-agnostic address (surfaced in [`WrittenFile`]).
     key: String,
-    /// Absolute local landing path ([`Writer::open`]) or the object key
-    /// rendered as a path ([`Writer::open_in`], where there is no local root) —
-    /// surfaced in [`WrittenFile::path`]. Address a store-backed file by
-    /// [`Self::key`], not this.
+    /// Absolute local landing path ([`Writer::open`]); the object key rendered
+    /// as a path for [`Writer::open_in`] (which addresses by key regardless of
+    /// the store's backend). Surfaced in [`WrittenFile::path`]; address a
+    /// store-backed file by [`Self::key`], not this.
     final_path: PathBuf,
     /// Running count of rows written so far (incremented per
     /// sub-batch as each `write` succeeds); reported by

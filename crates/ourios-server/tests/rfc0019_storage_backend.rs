@@ -208,7 +208,7 @@ fn s3_server(endpoint: &str, bucket: &str) -> Command {
 
 /// A `Command` like [`s3_server`] but supplying credentials via the **explicit
 /// S3-named** keys (`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
-/// `OURIOS_S3_SESSION_TOKEN`, RFC 0019 §9) — and **removing** the `AWS_*` static
+/// `OURIOS_S3_SESSION_TOKEN`, RFC 0019 §3.4) — and **removing** the `AWS_*` static
 /// keys from the child's environment, so only the explicit path can
 /// authenticate (RFC0019.8). Values come from the `AWS_*` the CI job sets
 /// (`LocalStack` accepts any), defaulting to `LocalStack`'s conventional `test`.
@@ -641,8 +641,8 @@ async fn rfc0019_5_tenant_isolation_on_s3() {
     terminate_and_assert_clean(querier).await;
 }
 
-/// Scenario RFC0019.8 — explicit S3 credentials, S3-named (RFC 0019 §9).
-/// See `docs/rfcs/0019-storage-backend-selection.md` §9.5/§9.6.
+/// Scenario RFC0019.8 — explicit S3 credentials, S3-named (RFC 0019 §3.4).
+/// See `docs/rfcs/0019-storage-backend-selection.md` §5 (RFC0019.8) / §6.
 ///
 /// Mirrors RFC0019.3's ingest→query round-trip, but the server authenticates via
 /// the explicit `OURIOS_S3_*` credential keys with the `AWS_*` static keys

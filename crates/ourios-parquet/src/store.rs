@@ -129,7 +129,7 @@ pub struct Store {
 
 /// Addressing for the S3 / S3-compatible backend (RFC0013.7) — bucket,
 /// endpoint, region, and key prefix — plus optional explicit S3 credentials
-/// (RFC 0019 §9). When the credential fields are set, [`Store::s3`] applies them
+/// (RFC 0019 §3.4). When the credential fields are set, [`Store::s3`] applies them
 /// to the builder; when they are unset, credentials fall back to the standard
 /// chain ([`AmazonS3Builder::from_env`] — static `AWS_*` keys, a shared profile,
 /// IRSA, or instance metadata).
@@ -139,7 +139,7 @@ pub struct Store {
 ///
 /// The credential fields are **secret**: the manual [`fmt::Debug`] impl redacts
 /// their values (showing only presence), so a `Debug` rendering of an
-/// `S3Config` never leaks a key (RFC 0019 §9.4 / RFC0019.6).
+/// `S3Config` never leaks a key (RFC 0019 §3.4 / RFC0019.6).
 #[derive(Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct S3Config {
@@ -165,7 +165,7 @@ pub struct S3Config {
 
 impl fmt::Debug for S3Config {
     /// Redacts the credential fields — a `Debug` rendering shows only whether a
-    /// credential is present, never its value (RFC 0019 §9.4 / RFC0019.6).
+    /// credential is present, never its value (RFC 0019 §3.4 / RFC0019.6).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
         f.debug_struct("S3Config")
@@ -365,14 +365,14 @@ impl Store {
     /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
     /// S3-compatible endpoint (Hetzner, R2, …) via [`S3Config::endpoint`].
     ///
-    /// Credentials resolve **explicit-over-chain** (RFC 0019 §9.3): when
+    /// Credentials resolve **explicit-over-chain** (RFC 0019 §3.4): when
     /// `cfg.access_key_id` / `cfg.secret_access_key` (and optionally
     /// `cfg.session_token`) are set they are applied to the builder; otherwise
     /// they fall back to the standard chain ([`AmazonS3Builder::from_env`] —
     /// static `AWS_*` env, shared profile, IRSA, or instance metadata). The
     /// static access key and secret are a pair: setting one without the other,
     /// or a session token without that pair, is rejected (the error names only
-    /// the missing/offending field, never a value — RFC 0019 §9.4). The backend
+    /// the missing/offending field, never a value — RFC 0019 §3.4). The backend
     /// keeps `object_store`'s default `S3ConditionalPut::ETagMatch`, the
     /// `If-Match` CAS the manifest generation-swap needs (RFC0013.3/.4).
     ///
@@ -404,22 +404,22 @@ impl Store {
         }
         // The static access key and its secret are a pair; a session token is
         // meaningless without them. Reject a partial set rather than silently
-        // falling back to the chain on an operator typo (RFC 0019 §9.3). The
-        // message names only the field, never a value (RFC 0019 §9.4).
+        // falling back to the chain on an operator typo. The message names only
+        // the offending key, never a value (RFC 0019 §3.4).
         match (&access_key_id, &secret_access_key) {
             (Some(_), None) => {
                 return Err(StoreError::Config(
-                    "OURIOS_S3_ACCESS_KEY_ID is set but OURIOS_S3_SECRET_ACCESS_KEY is not (both are required together)".to_string(),
+                    "OURIOS_S3_SECRET_ACCESS_KEY must be set (the static access key and secret access key are required together)".to_string(),
                 ));
             }
             (None, Some(_)) => {
                 return Err(StoreError::Config(
-                    "OURIOS_S3_SECRET_ACCESS_KEY is set but OURIOS_S3_ACCESS_KEY_ID is not (both are required together)".to_string(),
+                    "OURIOS_S3_ACCESS_KEY_ID must be set (the static access key and secret access key are required together)".to_string(),
                 ));
             }
             (None, None) if session_token.is_some() => {
                 return Err(StoreError::Config(
-                    "OURIOS_S3_SESSION_TOKEN is set without OURIOS_S3_ACCESS_KEY_ID / OURIOS_S3_SECRET_ACCESS_KEY (a session token requires the static key pair)".to_string(),
+                    "OURIOS_S3_SESSION_TOKEN requires the static access key and secret access key (a session token is valid only with the static key pair)".to_string(),
                 ));
             }
             _ => {}
@@ -880,7 +880,7 @@ mod tests {
     }
 
     /// RFC0019.8 — a partial credential set fails fast with [`StoreError::Config`]
-    /// naming only the offending key, never a value (RFC 0019 §9.3/§9.4): an
+    /// naming only the offending key, never a value (RFC 0019 §3.4): an
     /// access key without its secret, a secret without its key, or a session
     /// token without the pair.
     #[test]
@@ -902,7 +902,7 @@ mod tests {
         }
     }
 
-    /// RFC0019.8 / §9.4 — `S3Config`'s `Debug` redacts credential values, so a
+    /// RFC0019.8 / §3.4 — `S3Config`'s `Debug` redacts credential values, so a
     /// config logged or surfaced in an error never leaks a secret. Presence is
     /// still visible (so misconfig is diagnosable) but the value is not.
     #[test]

@@ -284,17 +284,26 @@ fn build_config(
         compaction_enabled_raw.map(str::trim),
         Some("0" | "false" | "no" | "off")
     );
-    let compaction_interval = match interval_raw {
-        None => Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
-        Some(raw) => {
-            let secs: u64 = raw.parse().map_err(|_| {
-                format!("OURIOS_COMPACTION_INTERVAL_SECS must be a positive integer, got {raw:?}")
-            })?;
-            if secs == 0 {
-                return Err("OURIOS_COMPACTION_INTERVAL_SECS must be non-zero".to_string());
+    // Only parse/validate the interval when compaction is on — a pod with
+    // compaction disabled must not fail to start over an interval it never uses
+    // (the default is a placeholder there, never read).
+    let compaction_interval = if compaction_enabled {
+        match interval_raw {
+            None => Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
+            Some(raw) => {
+                let secs: u64 = raw.parse().map_err(|_| {
+                    format!(
+                        "OURIOS_COMPACTION_INTERVAL_SECS must be a positive integer, got {raw:?}"
+                    )
+                })?;
+                if secs == 0 {
+                    return Err("OURIOS_COMPACTION_INTERVAL_SECS must be non-zero".to_string());
+                }
+                Duration::from_secs(secs)
             }
-            Duration::from_secs(secs)
         }
+    } else {
+        Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS)
     };
     Ok(ServerConfig {
         store,
@@ -402,20 +411,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `ParquetAuditSink` now writes the audit stream through the resolved
     // `Store` (local or S3, RFC 0019 slice 2d), so it's wired unconditionally on
     // both backends. Clone the preflight-opened store for the sink before the
-    // original is moved into `Compactor::new` below.
-    let audit_store = store.clone();
     // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
     // opened in the preflight above so a store failure never leaks a live role.
     // Built only when compaction is enabled (RFC 0009 §3.2) — a deployment can
     // disable it on receiver/querier pods so a single dedicated compactor sweeps.
-    let compactor = config.compaction_enabled.then(|| {
-        Compactor::new(
-            store,
-            CompactionPolicy::default(),
-            config.compaction_interval,
+    // When disabled, neither the store clone nor the audit sink is constructed,
+    // and the disabled state is logged so it's visible in a multi-pod rollout.
+    let compactor = if config.compaction_enabled {
+        let audit_store = store.clone();
+        Some(
+            Compactor::new(
+                store,
+                CompactionPolicy::default(),
+                config.compaction_interval,
+            )
+            .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store))),
         )
-        .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store)))
-    });
+    } else {
+        println!("compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
+        std::io::stdout().flush().ok();
+        None
+    };
 
     // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM). The
     // compaction loop never returns on its own (it sweeps forever, or just
@@ -540,6 +556,18 @@ mod tests {
                     .expect("valid")
                     .compaction_enabled,
                 "compaction is disabled for {raw:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_config_disabled_compaction_ignores_a_bad_interval() {
+        // With compaction off, the interval is never used, so an otherwise-
+        // rejected value must not block startup.
+        for bad in [Some("0"), Some("soon")] {
+            assert!(
+                build_config(local("/store"), Some("off"), bad).is_ok(),
+                "a disabled pod starts despite interval {bad:?}",
             );
         }
     }

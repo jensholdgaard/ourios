@@ -37,9 +37,11 @@ spec:
         - "template_id == 0"
         - "http://{{ include "ourios.fullname" . }}-querier:4319/v1/query"
     {{- else }}
-    # Receiver-only: confirm the OTLP HTTP port accepts a connection.
+    # Receiver-only: confirm the OTLP HTTP port accepts a connection. Pinned to a
+    # specific BusyBox version (a floating tag could change `nc` behaviour and
+    # break `helm test` unexpectedly).
     - name: otlp-http
-      image: busybox
+      image: busybox:1.37.0
       command:
         - sh
         - -c

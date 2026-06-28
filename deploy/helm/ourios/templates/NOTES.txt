@@ -6,8 +6,8 @@ Storage backend: {{ .Values.storage.backend }}
 {{- if and (not .Values.storage.s3.existingSecret) (not (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn")) }}
 
   NOTE: no object-store credentials configured. Set EITHER
-  storage.s3.existingSecret (a Secret with AWS_ACCESS_KEY_ID /
-  AWS_SECRET_ACCESS_KEY — the standard S3 credential env, used by every
+  storage.s3.existingSecret (a Secret with OURIOS_S3_ACCESS_KEY_ID /
+  OURIOS_S3_SECRET_ACCESS_KEY — the S3-named credential keys, working with every
   S3-compatible provider) OR, on AWS EKS, an IRSA role-arn via
   serviceAccount.annotations. Credentials are never chart config as plaintext.
 {{- end }}

@@ -98,24 +98,24 @@ helm test ourios
 
 ## Credentials
 
-Credentials are **never** chart config as plaintext. The `AWS_*` key names below
-are the **S3 SDK convention** that every S3-compatible provider uses (MinIO, R2,
-Hetzner, Ceph, …) — they are not AWS-the-cloud-specific. Supply exactly one of:
+Credentials are **never** chart config as plaintext. Static credentials use the
+**S3-named** keys Ourios reads (`OURIOS_S3_*`, RFC 0019 §3.4) — not AWS-specific;
+they work against AWS S3 and every S3-compatible provider (MinIO, R2, Hetzner,
+Ceph, …). Supply exactly one of:
 
 1. **`storage.s3.existingSecret`** — the name of a `Secret` holding
-   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally
-   `AWS_SESSION_TOKEN`). Injected via `envFrom` so the SDK credential chain
-   picks it up. Works for AWS S3 **and any S3-compatible provider**. Create it
-   yourself:
+   `OURIOS_S3_ACCESS_KEY_ID` and `OURIOS_S3_SECRET_ACCESS_KEY` (and optionally
+   `OURIOS_S3_SESSION_TOKEN`). Injected via `envFrom`. Works for AWS S3 **and any
+   S3-compatible provider**. Create it yourself:
 
    ```sh
    kubectl create secret generic ourios-s3 \
-     --from-literal=AWS_ACCESS_KEY_ID=... \
-     --from-literal=AWS_SECRET_ACCESS_KEY=...
+     --from-literal=OURIOS_S3_ACCESS_KEY_ID=... \
+     --from-literal=OURIOS_S3_SECRET_ACCESS_KEY=...
    ```
 
 2. **IRSA** (AWS EKS only) — leave `storage.s3.existingSecret` empty and set the
-   role ARN on the service account:
+   role ARN on the service account (this path uses the AWS credential chain):
 
    ```sh
    --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/<role>
@@ -158,7 +158,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `storage.s3.endpoint` | `""` | S3-compatible endpoint URL — set for any non-AWS provider (MinIO/R2/Hetzner/Ceph/LocalStack); empty targets AWS. |
 | `storage.s3.region` | `""` | Bucket region; drives both `OURIOS_S3_REGION` and `AWS_DEFAULT_REGION`. |
 | `storage.s3.prefix` | `""` | Key prefix within the bucket. |
-| `storage.s3.existingSecret` | `""` | Secret with the S3 credential env (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), injected via `envFrom`. Used by any S3-compatible provider. |
+| `storage.s3.existingSecret` | `""` | Secret with the S3-named credential keys (`OURIOS_S3_ACCESS_KEY_ID`/`OURIOS_S3_SECRET_ACCESS_KEY`), injected via `envFrom`. Used by any S3-compatible provider. |
 | `storage.local.bucketRoot` | `/var/lib/ourios/data` | Data dir for the local backend. |
 | `storage.local.size` | `10Gi` | Local data PVC size. |
 | `receiver.enabled` | `true` | OTLP ingest StatefulSet (gRPC `:4317` + HTTP `:4318`). |

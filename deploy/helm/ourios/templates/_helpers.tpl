@@ -170,12 +170,12 @@ interval. The receiver/querier disable it via OURIOS_COMPACTION_ENABLED=0.
 
 {{/*
 Object-store credential envFrom: the Secret named by storage.s3.existingSecret,
-if set. The Secret holds the standard S3 credential env (AWS_ACCESS_KEY_ID /
-AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN]) — the SDK naming every
-S3-compatible backend uses, not AWS-the-cloud-specific. Empty otherwise (IRSA /
-instance metadata supply credentials with no static keys). The two modes are
-mutually exclusive — static keys would shadow the IRSA web-identity credentials
-— so configuring both is rejected.
+if set. The Secret holds the S3-named credential keys Ourios reads
+(OURIOS_S3_ACCESS_KEY_ID / OURIOS_S3_SECRET_ACCESS_KEY [/ OURIOS_S3_SESSION_TOKEN],
+RFC 0019 §3.4) — working against AWS S3 and every S3-compatible backend. Empty
+otherwise (IRSA / instance metadata supply credentials via the AWS chain, no
+static keys). The two modes are mutually exclusive — static keys would shadow the
+IRSA web-identity credentials — so configuring both is rejected.
 */}}
 {{- define "ourios.s3CredentialsEnvFrom" -}}
 {{- if and .Values.storage.s3.existingSecret (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn") }}

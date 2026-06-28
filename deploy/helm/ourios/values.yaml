@@ -56,16 +56,16 @@ storage:
     # encode a tenant here.
     prefix: ""
     # Object-store credentials. NEVER set keys here as plaintext — give the name
-    # of a Secret holding the standard S3 credential env: AWS_ACCESS_KEY_ID and
-    # AWS_SECRET_ACCESS_KEY (and optionally AWS_SESSION_TOKEN). That naming is
-    # the S3 SDK convention every S3-compatible provider uses — it is NOT
-    # AWS-the-cloud-specific. Injected via envFrom so the credential chain picks
-    # it up. Create it yourself:
+    # of a Secret holding the S3-named credential keys Ourios reads (RFC 0019
+    # §3.4): OURIOS_S3_ACCESS_KEY_ID and OURIOS_S3_SECRET_ACCESS_KEY (and
+    # optionally OURIOS_S3_SESSION_TOKEN). Injected via envFrom; works against AWS
+    # S3 and every S3-compatible provider. Create it yourself:
     #   kubectl create secret generic ourios-s3 \
-    #     --from-literal=AWS_ACCESS_KEY_ID=... \
-    #     --from-literal=AWS_SECRET_ACCESS_KEY=...
+    #     --from-literal=OURIOS_S3_ACCESS_KEY_ID=... \
+    #     --from-literal=OURIOS_S3_SECRET_ACCESS_KEY=...
     # On AWS EKS you may instead leave this empty and use IRSA — set the role-arn
-    # under serviceAccount.annotations. The two modes are mutually exclusive
+    # under serviceAccount.annotations; that path uses the AWS credential chain
+    # (its own AWS_* web-identity vars). The two modes are mutually exclusive
     # (configuring both fails render).
     existingSecret: ""
   # Only used when backend=local. A single shared ReadWriteOnce PVC mounted by

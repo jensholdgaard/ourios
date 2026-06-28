@@ -39,27 +39,42 @@ source of truth).
 
 ## Install
 
-S3 backend (production):
+**S3 backend (production):**
 
 ```sh
 helm install ourios deploy/helm/ourios \
   --set image.tag=<release> \
+  --set storage.backend=s3 \
   --set storage.s3.bucket=my-ourios-bucket \
   --set storage.s3.region=us-east-1 \
   --set aws.existingSecret=ourios-aws        # OR use IRSA (see below)
 ```
 
-Local backend (single-node / dev only):
+The chart **fails to render** an `s3` backend with no `storage.s3.bucket`, so a
+broken store can never install.
+
+**Local backend (the default — single-node / dev only):**
 
 ```sh
-helm install ourios deploy/helm/ourios --set storage.backend=local
+helm install ourios deploy/helm/ourios        # storage.backend=local
 ```
+
+`local` provisions one shared `ReadWriteOnce` PVC mounted by all three
+workloads. That is coherent **only on a single node** (the pods must
+co-schedule) **or with a `ReadWriteMany` StorageClass** — on a typical
+multi-node RWO cluster some workloads will stay `Pending`. It is intended for
+kick-the-tires / dev; **use `s3` in production**, where the workloads share the
+store over object storage and scale independently.
 
 Verify:
 
 ```sh
 helm test ourios
 ```
+
+> The image tag defaults to `latest` (no image is published for the
+> pre-release `0.0.0` app version); pin a released tag via `image.tag` in
+> production.
 
 ## AWS credentials
 
@@ -85,6 +100,10 @@ Credentials are **never** chart config as plaintext. Supply exactly one of:
 
    The pod assumes the role; no static keys exist anywhere.
 
+Setting **both** `aws.existingSecret` and the IRSA `role-arn` annotation **fails
+render** — the static keys would shadow the web-identity credentials, so exactly
+one mode must be chosen.
+
 ## Compactor topology
 
 The `ourios-server` binary runs the compaction role by default. To avoid every
@@ -104,9 +123,9 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | Key | Default | Description |
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/jensholdgaard/ourios` | Image repository. |
-| `image.tag` | `""` (chart `appVersion`) | Image tag. |
-| `storage.backend` | `s3` | `s3` or `local`. |
-| `storage.s3.bucket` | `""` | **Required for s3** (`OURIOS_S3_BUCKET`). |
+| `image.tag` | `""` (→ `latest`) | Image tag; pin a released tag in production. |
+| `storage.backend` | `local` | `local` (single-node/dev) or `s3` (production). |
+| `storage.s3.bucket` | `""` | **Required for s3** (`OURIOS_S3_BUCKET`); render fails if empty. |
 | `storage.s3.endpoint` | `""` | S3-compatible endpoint (MinIO/LocalStack). |
 | `storage.s3.region` | `""` | Bucket region (`OURIOS_S3_REGION`). |
 | `storage.s3.prefix` | `""` | Key prefix within the bucket. |
@@ -121,7 +140,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `querier.enabled` | `true` | Querier Deployment (HTTP `:4319`). |
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |
-| `compactor.enabled` | `true` | Dedicated singleton compactor Deployment. |
+| `compactor.enabled` | `true` | Dedicated singleton compactor Deployment. Setting `false` **fails render** (the only sweeper — hazard #4). |
 | `compactor.intervalSecs` | `300` | Compaction sweep cadence (used only by the dedicated compactor). |
 | `serviceAccount.annotations` | `{}` | IRSA `eks.amazonaws.com/role-arn` goes here. |
 | `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |

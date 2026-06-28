@@ -13,7 +13,9 @@
 image:
   repository: ghcr.io/jensholdgaard/ourios
   pullPolicy: IfNotPresent
-  # Overrides the image tag; defaults to the chart appVersion.
+  # Image tag. Defaults to `latest` when empty — appVersion tracks the
+  # unreleased crate version (0.0.0), which is never published as an image.
+  # Pin a released tag (e.g. a `vX.Y.Z` build) in production.
   tag: ""
 
 imagePullSecrets: []
@@ -21,13 +23,16 @@ nameOverride: ""
 fullnameOverride: ""
 
 # Where the Parquet data + audit + manifest live (OURIOS_STORAGE_BACKEND).
-# This chart is S3-native; `local` is a single-node/dev fallback (see below).
+# Default is `local` so a bare `helm install`/`helm template` works zero-config
+# for a single-node try-it. S3 is the production path: set backend=s3 and
+# storage.s3.bucket (the chart fails to render an s3 backend with no bucket).
 storage:
-  # "s3" or "local".
-  backend: s3
+  # "local" (default, single-node/dev) or "s3" (production).
+  backend: local
   s3:
-    # REQUIRED for the s3 backend (OURIOS_S3_BUCKET). Left empty in the
-    # defaults so `helm template` renders out-of-box; an install MUST set it.
+    # REQUIRED when backend=s3 (OURIOS_S3_BUCKET). The chart aborts at render
+    # time if backend=s3 and this is empty — no install can boot with an
+    # invalid store. Credentials are never set here (see aws.* below).
     bucket: ""
     # Optional S3-compatible endpoint (OURIOS_S3_ENDPOINT) — e.g. MinIO or
     # LocalStack. Empty uses the real AWS endpoint for the region.

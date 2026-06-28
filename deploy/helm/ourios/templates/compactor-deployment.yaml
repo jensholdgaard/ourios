@@ -1,9 +1,9 @@
 {{- if .Values.compactor.enabled }}
 {{- /*
 The background compactor (RFC 0009) as a singleton Deployment: neither receiver
-nor querier role enabled, so this process only sweeps the shared store. Pinned
-to one replica — see the README design note on why this is the designated
-sweeper even though every ourios-server pod compacts.
+nor querier role enabled, so this process only sweeps the shared store. It is
+the chart's sole sweeper — the receiver/querier set OURIOS_COMPACTION_ENABLED=0.
+Pinned to one replica (see the README "Compactor topology" section).
 */}}
 apiVersion: apps/v1
 kind: Deployment
@@ -29,9 +29,9 @@ spec:
         {{- with .Values.compactor.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.compactor.podAnnotations | default .Values.podAnnotations }}
+      {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.compactor.podAnnotations)) }}
       annotations:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}

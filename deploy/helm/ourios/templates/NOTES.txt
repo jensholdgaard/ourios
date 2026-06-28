@@ -10,7 +10,7 @@ Storage backend: {{ .Values.storage.backend }}
 {{- else }}
   bucket: {{ .Values.storage.s3.bucket }}{{ with .Values.storage.s3.prefix }} (prefix {{ . }}){{ end }}
 {{- end }}
-{{- if and (not .Values.aws.existingSecret) (not .Values.serviceAccount.annotations) }}
+{{- if and (not .Values.aws.existingSecret) (not (index .Values.serviceAccount.annotations "eks.amazonaws.com/role-arn")) }}
 
   NOTE: no AWS credentials configured. Set EITHER aws.existingSecret (a Secret
   with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) OR an IRSA role-arn via

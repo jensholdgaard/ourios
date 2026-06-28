@@ -29,9 +29,9 @@ spec:
         {{- with .Values.querier.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.querier.podAnnotations | default .Values.podAnnotations }}
+      {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.querier.podAnnotations)) }}
       annotations:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}

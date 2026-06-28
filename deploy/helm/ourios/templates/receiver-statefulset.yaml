@@ -31,9 +31,9 @@ spec:
         {{- with .Values.receiver.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.receiver.podAnnotations | default .Values.podAnnotations }}
+      {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.receiver.podAnnotations)) }}
       annotations:
-        {{- toYaml . | nindent 8 }}
+        {{- . | nindent 8 }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}

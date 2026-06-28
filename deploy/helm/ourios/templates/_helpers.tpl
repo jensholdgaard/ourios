@@ -62,10 +62,13 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
-The image reference (repository:tag), defaulting the tag to the chart appVersion.
+The image reference (repository:tag). The tag defaults to `latest` (a
+publishable floating tag) rather than the chart appVersion — appVersion tracks
+the unreleased crate version (0.0.0), for which no image is ever pushed. Pin a
+released tag via image.tag in production.
 */}}
 {{- define "ourios.image" -}}
-{{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+{{- printf "%s:%s" .Values.image.repository (default "latest" .Values.image.tag) }}
 {{- end }}
 
 {{/*
@@ -78,7 +81,7 @@ envFrom/IRSA). For local: the in-container data root.
   value: {{ .Values.storage.backend | quote }}
 {{- if eq .Values.storage.backend "s3" }}
 - name: OURIOS_S3_BUCKET
-  value: {{ .Values.storage.s3.bucket | quote }}
+  value: {{ required "storage.s3.bucket is required when storage.backend=s3" .Values.storage.s3.bucket | quote }}
 {{- with .Values.storage.s3.endpoint }}
 - name: OURIOS_S3_ENDPOINT
   value: {{ . | quote }}
@@ -104,6 +107,9 @@ dedicated compactor sweeps; the receiver/querier set OURIOS_COMPACTION_ENABLED=0
 (RFC 0009 §3.2) so a single sweeper avoids redundant per-interval listing.
 */}}
 {{- define "ourios.commonEnv" -}}
+{{- if not .Values.compactor.enabled }}
+{{- fail "compactor.enabled=false leaves the deployment with no sweeper: the receiver and querier set OURIOS_COMPACTION_ENABLED=0, so the dedicated compactor is the chart's only compactor. Set compactor.enabled=true (small files accumulate otherwise — hazard #4)." }}
+{{- end }}
 {{ include "ourios.storageEnv" . }}
 {{- with .Values.aws.region }}
 - name: AWS_DEFAULT_REGION
@@ -164,8 +170,13 @@ interval. The receiver/querier disable it via OURIOS_COMPACTION_ENABLED=0.
 {{/*
 AWS-credential envFrom: the Secret named by aws.existingSecret, if set. Empty
 otherwise (IRSA / instance metadata supply credentials with no static keys).
+The two modes are mutually exclusive — static keys in the Secret would shadow
+the IRSA web-identity credentials — so configuring both is rejected.
 */}}
 {{- define "ourios.awsEnvFrom" -}}
+{{- if and .Values.aws.existingSecret (index .Values.serviceAccount.annotations "eks.amazonaws.com/role-arn") }}
+{{- fail "aws.existingSecret and IRSA (serviceAccount.annotations \"eks.amazonaws.com/role-arn\") are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one AWS auth mode." }}
+{{- end }}
 {{- with .Values.aws.existingSecret }}
 envFrom:
   - secretRef:
@@ -193,5 +204,18 @@ by every workload (dev/single-node; see values.yaml).
 - name: data
   persistentVolumeClaim:
     claimName: {{ include "ourios.fullname" . }}-data
+{{- end }}
+{{- end }}
+
+{{/*
+Merged pod annotations for a workload: the chart-level .Values.podAnnotations
+plus the per-role map, with role-specific entries winning on conflict (so shared
+annotations and role-specific ones both apply). Pass a dict with "global" and
+"role" keys. Renders nothing when both are empty.
+*/}}
+{{- define "ourios.podAnnotations" -}}
+{{- $merged := merge (deepCopy (.role | default dict)) (.global | default dict) -}}
+{{- with $merged }}
+{{- toYaml . }}
 {{- end }}
 {{- end }}

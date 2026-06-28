@@ -310,27 +310,35 @@ impl Compactor {
     where
         F: FnMut(Result<SweepReport, IngestError>),
     {
+        // Destructure up front into owned locals: `audit_sink` moves into each
+        // sweep's blocking task and back out, and `store`/`policy` are used
+        // inside the loop without holding `self`.
+        let Self {
+            store,
+            policy,
+            interval,
+            // Own the audit sink locally so it can move into each sweep's
+            // blocking task and back out. Its `emit` performs Parquet `put`s
+            // through the store — now S3 network I/O (RFC 0019 slice 2d) — so it
+            // must run on the blocking pool alongside the sweep, never on the
+            // async task where slow S3 would stall the runtime.
+            mut audit_sink,
+        } = self;
         // Built (and zero-seeded) once, before the loop, so the metric
         // set is visible to the exporter even before the first sweep.
         let metrics = CompactionMetrics::new();
-        let mut ticker = tokio::time::interval(self.interval);
+        let mut ticker = tokio::time::interval(interval);
         // A maintenance sweep that overruns `interval` must not make
         // the next ticks fire back-to-back (the default `Burst`) —
         // that would pile sustained compaction load after any slow
         // pass. `Delay` keeps a full `interval` gap between sweeps.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Own the audit sink locally so it can move into each sweep's blocking
-        // task and back out. Its `emit` performs Parquet `put`s through the
-        // store — now S3 network I/O (RFC 0019 slice 2d) — so it must run on the
-        // blocking pool alongside the sweep, never on the async task where slow
-        // S3 would stall the runtime.
-        let mut audit_sink = self.audit_sink;
         loop {
             ticker.tick().await;
             // `Store` is a cheap `Arc` handle; clone it into the blocking task
-            // (compaction is blocking I/O) rather than borrowing `self`.
-            let store = self.store.clone();
-            let policy = self.policy;
+            // (compaction is blocking I/O). `policy` is `Copy`, so the `move`
+            // closure copies it and the outer binding stays valid each loop.
+            let store = store.clone();
             let (result, elapsed, sink) = tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
                 let result = run_sweep(&store, now_unix_nanos(), &policy);

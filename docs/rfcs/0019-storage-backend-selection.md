@@ -49,9 +49,10 @@ A new **startup configuration surface** — the storage backend and its
 addressing — is added under RFC 0004's governance (its validation +
 secret-hygiene rules). It is *not* an RFC 0004 **tunable** in the strict sense:
 a tunable is global-with-per-tenant-override, whereas backend selection is
-necessarily **process-wide** (one store per process). Credentials are not
-Ourios configuration at all: they are operator secrets resolved by the standard
-AWS credential chain (see §3.4 below).
+necessarily **process-wide** (one store per process). Credentials MAY be
+supplied as Ourios config (the `OURIOS_S3_*` secret keys, §3.4) or left to the
+standard credential chain; either way they are operator secrets, never logged or
+echoed (§3.4).
 
 | Env var | Backend | Meaning | Default |
 | --- | --- | --- | --- |
@@ -61,6 +62,9 @@ AWS credential chain (see §3.4 below).
 | `OURIOS_S3_ENDPOINT` | s3 | S3-compatible endpoint (MinIO, R2) | unset (AWS) |
 | `OURIOS_S3_REGION` | s3 | region | unset |
 | `OURIOS_S3_PREFIX` | s3 | key prefix within the bucket | unset (bucket root) |
+| `OURIOS_S3_ACCESS_KEY_ID` | s3 | static access key (**secret**) | unset (→ credential chain) |
+| `OURIOS_S3_SECRET_ACCESS_KEY` | s3 | static secret key (**secret**) | unset (→ credential chain) |
+| `OURIOS_S3_SESSION_TOKEN` | s3 | session token for temporary credentials (**secret**) | unset |
 
 `OURIOS_WAL_ROOT` is unchanged and remains a **local** path under every
 backend (`CLAUDE.md` §3.6 — the WAL is never an object-store key). "Local" here
@@ -143,18 +147,43 @@ existing reader/writer remain valid (RFC 0013 §3.2).
 
 ### 3.4 Credentials and secret hygiene
 
-`S3Config` resolves credentials via `AmazonS3Builder::from_env()` — i.e. the
-standard AWS chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (static keys,
-delivered as a k8s Secret), a shared profile, IRSA, or instance metadata. No
-Ourios-specific credential config is introduced. **Credential and secret
-values** MUST never appear in logs, error messages, or metric attributes:
-Ourios never reads `AWS_*` itself (the AWS chain does), `StoreError` withholds
-backend internals, and a missing-S3-config error names only the *key*
-(`OURIOS_S3_BUCKET`), never a credential. Non-secret config values (an
-addressing knob, an interval) MAY be echoed in a resolution error for
+S3 credentials resolve in two layers, **explicit-over-chain**:
+
+1. **Explicit Ourios config (preferred for static keys).**
+   `OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` (and
+   `OURIOS_S3_SESSION_TOKEN` for temporary credentials), when set, are read by
+   Ourios and applied to the `AmazonS3Builder` (`with_access_key_id` /
+   `with_secret_access_key` / `with_token`). These are **S3-API** names, not
+   AWS-the-cloud names: they authenticate against AWS S3 **and** every
+   S3-compatible store (MinIO, R2, Hetzner, Ceph, …) identically. This is the
+   RFC 0004-governed credential config that earlier revisions of this RFC
+   deferred.
+2. **The standard credential chain (fallback).** When the explicit keys are
+   unset, `AmazonS3Builder::from_env()` resolves credentials the usual way:
+   static `AWS_*` keys, a shared profile, **IRSA**, or instance metadata. This
+   path is retained deliberately — AWS IRSA injects its own `AWS_ROLE_ARN` /
+   `AWS_WEB_IDENTITY_TOKEN_FILE` (set by the EKS pod-identity webhook, outside
+   Ourios's control), for which there is no Ourios-named equivalent, so on EKS
+   the chain is the credential source.
+
+**Secret hygiene (unchanged obligation, widened scope).** Credential and secret
+values MUST never appear in logs, error messages, or metric attributes. Ourios
+now *reads* the `OURIOS_S3_*` secret keys (it read no credential before), so it
+owns their redaction: a value read from `OURIOS_S3_ACCESS_KEY_ID` /
+`OURIOS_S3_SECRET_ACCESS_KEY` / `OURIOS_S3_SESSION_TOKEN` is never echoed — not
+in a config-resolution error, a `StoreError` (which withholds backend
+internals), a log line, or a metric attribute. A missing-required-config error
+names only the *key* (`OURIOS_S3_BUCKET`), never a credential. Non-secret config
+values (an addressing knob, an interval) MAY be echoed in a resolution error for
 diagnosability — e.g. the existing `OURIOS_COMPACTION_INTERVAL_SECS` parser
 reporting the offending value — since those carry no secret; the prohibition is
 specifically on credential/secret material.
+
+*Amended 2026-06-28: introduce the explicit `OURIOS_S3_*` credential keys
+(superseding the earlier "no Ourios-specific credential config is introduced"),
+with the credential chain retained as the fallback IRSA depends on. Scenario
+RFC0019.8 gates the explicit-credential path and the widened redaction; it is
+greened by the implementation PR.*
 
 ## 4. Alternatives considered
 
@@ -226,9 +255,22 @@ specifically on credential/secret material.
 >   today: receiver, querier, and compactor produce identical results,
 >   and every pre-existing local test passes.
 
+> **Scenario RFC0019.8 — explicit S3 credentials, S3-named and never leaked**
+> - **Given** `OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` set
+>   and no `AWS_*` static keys in the environment
+> - **When** the server resolves its config and runs an ingest→query against
+>   an S3-compatible backend (localstack)
+> - **Then** the explicit keys authenticate the store (the round-trip
+>   succeeds), confirming Ourios applies them to the builder; **and** when the
+>   explicit keys are unset the standard credential chain (`from_env`,
+>   including IRSA) is used unchanged; **and** no credential value ever appears
+>   in a config error, log line, `StoreError`, or metric attribute — extending
+>   RFC0019.6's redaction to the `OURIOS_S3_*` secret keys.
+
 ## 6. Testing strategy
 
-All seven scenarios have passing tests; the RFC is `green`.
+Scenarios RFC0019.1–.7 have passing tests (the RFC's accepted body); RFC0019.8
+(this amendment) is greened by the implementation PR.
 
 - **RFC0019.1 / .6 / .7** — unit tests on `build_store_config` / `build_config`
   (the `main.rs` pattern), including the missing-key / secret-scrub assertion
@@ -249,6 +291,14 @@ All seven scenarios have passing tests; the RFC is `green`.
 - **RFC0019.7 (regression)** — in addition to the unit test above, the existing
   local receiver/querier/compactor suites run unchanged over the default config
   path; they are the byte-for-byte regression guard.
+- **RFC0019.8** — two halves. The **redaction** half extends the `rfc0019_6_*`
+  unit test to the `OURIOS_S3_*` secret keys, plus a `build_store_config` test
+  that the explicit keys are read into `S3Config` but never surface in a
+  resolution error. The **authentication** half is a localstack integration
+  test that configures the server with `OURIOS_S3_*` credentials only (no
+  `AWS_*` static keys) and asserts the ingest→query round-trip succeeds, in
+  `crates/ourios-server/tests/rfc0019_storage_backend.rs` (gated to the
+  `s3 integration (localstack)` CI job).
 
 ## 7. Open questions
 

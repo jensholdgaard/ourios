@@ -553,8 +553,8 @@ impl fmt::Display for WriterError {
                 f,
                 "Writer is poisoned — a prior append_records failed with a Parquet error, \
                  leaving the buffer in an undefined state; close() refuses to publish to \
-                 avoid landing a partial / corrupted file (the .parquet.tmp is preserved \
-                 on disk for diagnosis)",
+                 avoid landing a partial / corrupted file (the in-memory buffer is \
+                 discarded; nothing is put to the store)",
             ),
         }
     }

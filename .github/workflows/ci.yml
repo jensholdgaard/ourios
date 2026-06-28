@@ -95,6 +95,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # `--exact` with an explicit list (not bare `--ignored`) so the deferred
+      # `rfc0013_8_reader_forward_compat_over_store` `todo!()` stub stays
+      # un-run. The RFC 0019 Store-migration localstack tests join the list as
+      # they land (querier/compactor/audit + the Store listing/delete helpers).
       - run: >
           cargo test -p ourios-parquet --test rfc0013_object_store --
           --ignored --exact
@@ -102,6 +106,12 @@ jobs:
           rfc0013_3_atomic_publish_under_contention
           rfc0013_4_manifest_swap_via_conditional_put
           rfc0013_7_s3_compatible_endpoint_via_override
+          store_list_enumerates_keys_on_s3
+          store_list_common_prefixes_rolls_up_on_s3
+          store_list_with_sizes_reports_byte_lengths_on_s3
+          store_delete_blocking_removes_on_s3
+          compact_partition_consolidates_on_s3_via_cas
+          parquet_audit_sink_persists_to_s3
 
   book:
     name: mdbook build

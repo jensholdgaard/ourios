@@ -190,7 +190,11 @@ web-identity credentials — so configuring both is rejected.
 */}}
 {{- define "ourios.s3CredentialsEnvFrom" -}}
 {{- if eq .Values.storage.backend "s3" }}
-{{- if and .Values.storage.s3.existingSecret (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn") }}
+{{- $roleArn := index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn" }}
+{{- if and $roleArn (not .Values.serviceAccount.create) }}
+{{- fail "serviceAccount.annotations \"eks.amazonaws.com/role-arn\" (IRSA) requires serviceAccount.create=true so the chart applies it; with create=false the chart renders no ServiceAccount and the annotation has no effect. Either set serviceAccount.create=true, or annotate your existing ServiceAccount out-of-band and remove it here." }}
+{{- end }}
+{{- if and .Values.storage.s3.existingSecret $roleArn }}
 {{- fail "storage.s3.existingSecret and IRSA (serviceAccount.annotations \"eks.amazonaws.com/role-arn\") are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one credential mode." }}
 {{- end }}
 {{- with .Values.storage.s3.existingSecret }}

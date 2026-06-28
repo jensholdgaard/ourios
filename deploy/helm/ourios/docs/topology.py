@@ -93,7 +93,10 @@ with Diagram(
     qry[0] >> Edge(label="read", color="blue") >> s3
     cmp >> Edge(label="sweep / compact", color="firebrick") >> s3
 
-    # Credentials reach the store one of two mutually-exclusive ways: a mounted
-    # Secret of S3-named keys (envFrom) OR, on AWS EKS, IRSA on the ServiceAccount.
-    secret >> Edge(style="dotted", label="envFrom") >> s3
-    sa >> Edge(style="dotted", label="IRSA (AWS EKS)") >> s3
+    # Credentials are consumed by the workloads (the pods authenticate to the
+    # store), one of two mutually-exclusive ways: a mounted Secret of S3-named
+    # keys (envFrom) OR, on AWS EKS, IRSA on the ServiceAccount. The pods then use
+    # them on the existing workload→store paths above.
+    for workload in (rcv, qry[0], cmp):
+        secret >> Edge(style="dotted", label="envFrom") >> workload
+        sa >> Edge(style="dotted", label="IRSA (AWS EKS)") >> workload

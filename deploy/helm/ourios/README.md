@@ -25,9 +25,10 @@ them as three workloads sharing a data + audit store on object storage:
 ![Ourios Helm chart topology](docs/topology.png)
 
 Diagram source: [`docs/topology.py`](docs/topology.py) (mingrammer
-[`diagrams`](https://diagrams.mingrammer.com/), k8s node set). Regenerate with
-`python deploy/helm/ourios/docs/topology.py` (needs Graphviz + `pip install
-diagrams`). A text fallback follows for terminal / `helm show readme`:
+[`diagrams`](https://diagrams.mingrammer.com/), k8s node set). Regenerate from
+this chart directory with `python docs/topology.py` (or
+`python deploy/helm/ourios/docs/topology.py` from the repo root; needs Graphviz +
+`pip install diagrams`). A text fallback follows for terminal / `helm show readme`:
 
 ```
             OTLP                         query
@@ -129,7 +130,11 @@ Ceph, …). Supply exactly one of:
    ```
 
    The pod assumes the role; no static keys exist anywhere. This mode is
-   AWS-specific; on other providers use `storage.s3.existingSecret`.
+   AWS-specific; on other providers use `storage.s3.existingSecret`. It requires
+   `serviceAccount.create=true` (the default) so the chart renders the
+   ServiceAccount and applies the annotation — the chart fails render if a
+   role-arn is set with `serviceAccount.create=false`. To use an existing SA,
+   annotate it out-of-band instead.
 
 Setting **both** `storage.s3.existingSecret` and the IRSA `role-arn` annotation
 **fails render** — the static keys would shadow the web-identity credentials, so

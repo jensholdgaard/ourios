@@ -1,9 +1,11 @@
 //! `ourios-server` — the Ourios binary (`CLAUDE.md` §1, §7).
 //!
-//! It always runs the **background compaction role** (RFC 0009 §3.2):
-//! it boots OpenTelemetry (the OTLP push `MeterProvider`, RFC 0001 §6.8),
-//! opens a durable audit sink for the §3.6 compaction events (RFC 0005
-//! §3.7), and runs the compactor until shutdown.
+//! It boots OpenTelemetry (the OTLP push `MeterProvider`, RFC 0001 §6.8) and,
+//! unless `OURIOS_COMPACTION_ENABLED` is set falsey, runs the **background
+//! compaction role** (RFC 0009 §3.2) — opening a durable audit sink for the
+//! §3.6 compaction events (RFC 0005 §3.7) and sweeping until shutdown. A
+//! multi-pod deployment disables it on the receiver/querier pods so a single
+//! dedicated compactor sweeps.
 //!
 //! When `OURIOS_RECEIVER_ENABLED` is set it also runs the **OTLP receiver
 //! role** (RFC 0003 §6.2 / the §9 process-model resolution): gRPC + HTTP
@@ -54,7 +56,13 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 struct ServerConfig {
     /// The data + audit store backend (local or S3, RFC 0019).
     store: StoreConfig,
-    /// How often the compaction daemon sweeps.
+    /// Whether this process runs the background compaction sweep. Default on;
+    /// `OURIOS_COMPACTION_ENABLED=0` disables it so a multi-pod deployment can
+    /// run a single dedicated compactor rather than every pod sweeping (RFC 0009
+    /// §3.2 — `publish_cas` keeps concurrent sweeps correct, but one sweeper
+    /// avoids the redundant per-interval object listing).
+    compaction_enabled: bool,
+    /// How often the compaction daemon sweeps (when enabled).
     compaction_interval: Duration,
     /// The OTLP receiver role, if enabled (RFC 0003 §9).
     receiver: Option<ReceiverParams>,
@@ -84,6 +92,9 @@ struct ReceiverParams {
 /// - `OURIOS_S3_BUCKET` (required for `s3`) + `OURIOS_S3_ENDPOINT` /
 ///   `OURIOS_S3_REGION` / `OURIOS_S3_PREFIX` (optional) — S3 addressing.
 ///   Credentials come from the AWS chain, never this config (RFC 0019 §3.4).
+/// - `OURIOS_COMPACTION_ENABLED` (optional, default on) — set to a falsey value
+///   (`0`/`false`/`no`/`off`) to disable this process's compaction sweep, so a
+///   deployment can run a single dedicated compactor (RFC 0009 §3.2).
 /// - `OURIOS_COMPACTION_INTERVAL_SECS` (optional, default
 ///   [`DEFAULT_COMPACTION_INTERVAL_SECS`]).
 /// - `OURIOS_RECEIVER_ENABLED` (optional) — enable the receiver role.
@@ -101,7 +112,11 @@ fn config_from_env() -> Result<ServerConfig, String> {
         std::env::var("OURIOS_S3_PREFIX").ok().as_deref(),
     )?;
     let interval_raw = std::env::var("OURIOS_COMPACTION_INTERVAL_SECS").ok();
-    let mut config = build_config(store, interval_raw.as_deref())?;
+    let mut config = build_config(
+        store,
+        std::env::var("OURIOS_COMPACTION_ENABLED").ok().as_deref(),
+        interval_raw.as_deref(),
+    )?;
     config.receiver = build_receiver_config(
         std::env::var("OURIOS_RECEIVER_ENABLED").ok().as_deref(),
         std::env::var("OURIOS_RECEIVER_GRPC_ADDR").ok().as_deref(),
@@ -257,21 +272,42 @@ fn wal_config(root: &Path) -> WalConfig {
 
 /// Pure config assembly + validation (env reads live in
 /// [`config_from_env`]; this is the testable core).
-fn build_config(store: StoreConfig, interval_raw: Option<&str>) -> Result<ServerConfig, String> {
-    let compaction_interval = match interval_raw {
-        None => Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
-        Some(raw) => {
-            let secs: u64 = raw.parse().map_err(|_| {
-                format!("OURIOS_COMPACTION_INTERVAL_SECS must be a positive integer, got {raw:?}")
-            })?;
-            if secs == 0 {
-                return Err("OURIOS_COMPACTION_INTERVAL_SECS must be non-zero".to_string());
+fn build_config(
+    store: StoreConfig,
+    compaction_enabled_raw: Option<&str>,
+    interval_raw: Option<&str>,
+) -> Result<ServerConfig, String> {
+    // Compaction is opt-*out* (default on), unlike the opt-in receiver/querier
+    // roles: an explicit falsey value disables the sweep, anything else (incl.
+    // unset) keeps it on.
+    let compaction_enabled = !matches!(
+        compaction_enabled_raw.map(str::trim),
+        Some("0" | "false" | "no" | "off")
+    );
+    // Only parse/validate the interval when compaction is on — a pod with
+    // compaction disabled must not fail to start over an interval it never uses
+    // (the default is a placeholder there, never read).
+    let compaction_interval = if compaction_enabled {
+        match interval_raw {
+            None => Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
+            Some(raw) => {
+                let secs: u64 = raw.parse().map_err(|_| {
+                    format!(
+                        "OURIOS_COMPACTION_INTERVAL_SECS must be a positive integer, got {raw:?}"
+                    )
+                })?;
+                if secs == 0 {
+                    return Err("OURIOS_COMPACTION_INTERVAL_SECS must be non-zero".to_string());
+                }
+                Duration::from_secs(secs)
             }
-            Duration::from_secs(secs)
         }
+    } else {
+        Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS)
     };
     Ok(ServerConfig {
         store,
+        compaction_enabled,
         compaction_interval,
         receiver: None,
         querier: None,
@@ -371,33 +407,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7). The
-    // `ParquetAuditSink` now writes the audit stream through the resolved
-    // `Store` (local or S3, RFC 0019 slice 2d), so it's wired unconditionally on
-    // both backends. Clone the preflight-opened store for the sink before the
-    // original is moved into `Compactor::new` below.
-    let audit_store = store.clone();
     // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
-    // opened in the preflight above so a store failure never leaks a live role.
-    let compactor = Compactor::new(
-        store,
-        CompactionPolicy::default(),
-        config.compaction_interval,
-    )
-    .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store)));
+    // opened in the preflight above so a store failure never leaks a live role,
+    // and writes durable compaction audit events through the same `Store` via
+    // the `ParquetAuditSink` (RFC 0009 §3.6 → RFC 0005 §3.7, slice 2d). Built
+    // only when compaction is enabled (RFC 0009 §3.2) — a deployment disables it
+    // on receiver/querier pods so a single dedicated compactor sweeps. When
+    // disabled, neither the store clone nor the audit sink is constructed, and
+    // the disabled state is logged so it's visible in a multi-pod rollout.
+    let compactor = if config.compaction_enabled {
+        let audit_store = store.clone();
+        Some(
+            Compactor::new(
+                store,
+                CompactionPolicy::default(),
+                config.compaction_interval,
+            )
+            .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store))),
+        )
+    } else {
+        println!("compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
+        std::io::stdout().flush().ok();
+        None
+    };
 
-    // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM).
-    // `compactor.run` never returns on its own, so the select resolves on
-    // a signal (or a SIGINT-setup failure).
-    let shutdown = tokio::select! {
-        () = compactor.run(|result| match result {
-            Ok(report) => {
-                for err in &report.errors {
-                    eprintln!("compaction sweep error: {err}");
-                }
+    // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM). The
+    // compaction loop never returns on its own (it sweeps forever, or just
+    // pends when disabled), so the select resolves on a signal (or a SIGINT
+    // setup failure).
+    let compaction = async {
+        match compactor {
+            Some(c) => {
+                c.run(|result| match result {
+                    Ok(report) => {
+                        for err in &report.errors {
+                            eprintln!("compaction sweep error: {err}");
+                        }
+                    }
+                    Err(e) => eprintln!("compaction sweep failed: {e}"),
+                })
+                .await;
             }
-            Err(e) => eprintln!("compaction sweep failed: {e}"),
-        }) => Ok(()),
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let shutdown = tokio::select! {
+        () = compaction => Ok(()),
         signal = tokio::signal::ctrl_c() => signal,
         () = terminate_signal() => Ok(()),
     };
@@ -442,7 +497,7 @@ mod tests {
     #[test]
     fn build_config_defaults_the_interval() {
         // Arrange / Act
-        let config = build_config(local("/store"), None).expect("valid");
+        let config = build_config(local("/store"), None, None).expect("valid");
 
         // Assert
         assert_eq!(
@@ -455,7 +510,7 @@ mod tests {
     #[test]
     fn build_config_parses_a_custom_interval() {
         // Arrange / Act
-        let config = build_config(local("/store"), Some("60")).expect("valid");
+        let config = build_config(local("/store"), None, Some("60")).expect("valid");
 
         // Assert
         assert_eq!(config.compaction_interval, Duration::from_secs(60));
@@ -465,13 +520,54 @@ mod tests {
     fn build_config_rejects_a_zero_or_nonnumeric_interval() {
         // Arrange / Act / Assert
         assert!(
-            build_config(local("/store"), Some("0")).is_err(),
+            build_config(local("/store"), None, Some("0")).is_err(),
             "a zero interval would busy-loop the daemon",
         );
         assert!(
-            build_config(local("/store"), Some("soon")).is_err(),
+            build_config(local("/store"), None, Some("soon")).is_err(),
             "non-numeric interval is rejected",
         );
+    }
+
+    #[test]
+    fn build_config_compaction_is_opt_out() {
+        // Default (unset) and any non-falsey value keep compaction on; only an
+        // explicit falsey token (trimmed) turns it off — the inverse of the
+        // opt-in receiver/querier roles.
+        for raw in [None, Some("1"), Some("true"), Some("yes"), Some("anything")] {
+            assert!(
+                build_config(local("/store"), raw, None)
+                    .expect("valid")
+                    .compaction_enabled,
+                "compaction stays on for {raw:?}",
+            );
+        }
+        for raw in [
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("  off  "),
+        ] {
+            assert!(
+                !build_config(local("/store"), raw, None)
+                    .expect("valid")
+                    .compaction_enabled,
+                "compaction is disabled for {raw:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_config_disabled_compaction_ignores_a_bad_interval() {
+        // With compaction off, the interval is never used, so an otherwise-
+        // rejected value must not block startup.
+        for bad in [Some("0"), Some("soon")] {
+            assert!(
+                build_config(local("/store"), Some("off"), bad).is_ok(),
+                "a disabled pod starts despite interval {bad:?}",
+            );
+        }
     }
 
     /// Scenario RFC0019.1 — backend selection from config.
@@ -610,9 +706,11 @@ mod tests {
             build_store_config(None, Some(PathBuf::from("/store")), None, None, None, None)
                 .expect("default local"),
             None,
+            None,
         )
         .expect("valid");
         assert_eq!(config.store, local("/store"));
+        assert!(config.compaction_enabled, "compaction is on by default");
     }
 
     #[test]

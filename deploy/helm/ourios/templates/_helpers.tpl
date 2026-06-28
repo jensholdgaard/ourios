@@ -75,9 +75,9 @@ released tag via image.tag in production.
 Storage-backend env (RFC 0019). For s3 (the S3 API — AWS or any S3-compatible
 provider): the bucket + optional addressing. Credentials never appear here —
 they come from the S3 credential chain (storage.s3.existingSecret → envFrom, or
-IRSA on EKS). The region drives both the store (OURIOS_S3_REGION) and the SDK
-credential chain (AWS_DEFAULT_REGION), which the S3 client needs for every
-S3-compatible backend. For local: the in-container data root.
+IRSA on EKS). When set, the region drives both the store (OURIOS_S3_REGION) and
+the SDK credential chain (AWS_DEFAULT_REGION); it is optional here and may also
+come from the standard AWS env/config. For local: the in-container data root.
 */}}
 {{- define "ourios.storageEnv" -}}
 {{- if not (or (eq .Values.storage.backend "local") (eq .Values.storage.backend "s3")) }}

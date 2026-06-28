@@ -98,7 +98,8 @@ receiver:
   podAnnotations: {}
   podLabels: {}
 
-# Querier role (RFC 0016): a stateless Deployment that reads S3, scales freely.
+# Querier role (RFC 0016): a stateless Deployment that reads the configured store
+# (local or s3) and scales freely.
 querier:
   enabled: true
   replicas: 2

@@ -407,16 +407,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7). The
-    // `ParquetAuditSink` now writes the audit stream through the resolved
-    // `Store` (local or S3, RFC 0019 slice 2d), so it's wired unconditionally on
-    // both backends. Clone the preflight-opened store for the sink before the
     // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
-    // opened in the preflight above so a store failure never leaks a live role.
-    // Built only when compaction is enabled (RFC 0009 §3.2) — a deployment can
-    // disable it on receiver/querier pods so a single dedicated compactor sweeps.
-    // When disabled, neither the store clone nor the audit sink is constructed,
-    // and the disabled state is logged so it's visible in a multi-pod rollout.
+    // opened in the preflight above so a store failure never leaks a live role,
+    // and writes durable compaction audit events through the same `Store` via
+    // the `ParquetAuditSink` (RFC 0009 §3.6 → RFC 0005 §3.7, slice 2d). Built
+    // only when compaction is enabled (RFC 0009 §3.2) — a deployment disables it
+    // on receiver/querier pods so a single dedicated compactor sweeps. When
+    // disabled, neither the store clone nor the audit sink is constructed, and
+    // the disabled state is logged so it's visible in a multi-pod rollout.
     let compactor = if config.compaction_enabled {
         let audit_store = store.clone();
         Some(

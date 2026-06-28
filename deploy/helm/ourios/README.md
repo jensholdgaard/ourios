@@ -22,6 +22,13 @@ them as three workloads sharing a data + audit store on object storage:
 
 ## Topology
 
+![Ourios Helm chart topology](docs/topology.png)
+
+Diagram source: [`docs/topology.py`](docs/topology.py) (mingrammer
+[`diagrams`](https://diagrams.mingrammer.com/), k8s node set). Regenerate with
+`python deploy/helm/ourios/docs/topology.py` (needs Graphviz + `pip install
+diagrams`). A text fallback follows for terminal / `helm show readme`:
+
 ```
             OTLP                         query
               │                            │

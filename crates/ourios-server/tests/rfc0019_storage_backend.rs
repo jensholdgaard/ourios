@@ -208,12 +208,13 @@ fn s3_server(endpoint: &str, bucket: &str) -> Command {
 
 /// A `Command` like [`s3_server`] but supplying credentials via the **explicit
 /// S3-named** keys (`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
-/// `OURIOS_S3_SESSION_TOKEN`, RFC 0019 §3.4) — and **removing** the `AWS_*` static
-/// keys from the child's environment, so the credential chain has no static keys
-/// of its own and the explicit `OURIOS_S3_*` keys are the credentials in play
-/// (RFC0019.8). (A shared profile or IRSA web-identity env could still feed the
-/// chain in principle, but the CI job sets neither.) Values come from the `AWS_*`
-/// the CI job sets (`LocalStack` accepts any), defaulting to `LocalStack`'s
+/// `OURIOS_S3_SESSION_TOKEN`, RFC 0019 §3.4) — and **removing the full AWS
+/// credential-chain environment** from the child (static keys, shared profile,
+/// IRSA/web-identity, container, and EC2 metadata), so the explicit
+/// `OURIOS_S3_*` keys are the only credentials available to it (RFC0019.8).
+/// `AWS_EC2_METADATA_DISABLED` is set so a missing chain can't stall on a slow
+/// metadata-endpoint fallback. Credential values come from the `AWS_*` the CI
+/// job sets (`LocalStack` accepts any), defaulting to `LocalStack`'s
 /// conventional `test` when unset.
 fn s3_server_explicit_creds(endpoint: &str, bucket: &str) -> Command {
     let access = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "test".to_string());
@@ -224,7 +225,17 @@ fn s3_server_explicit_creds(endpoint: &str, bucket: &str) -> Command {
         .env("OURIOS_S3_SECRET_ACCESS_KEY", secret)
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY")
-        .env_remove("AWS_SESSION_TOKEN");
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_SHARED_CREDENTIALS_FILE")
+        .env_remove("AWS_CONFIG_FILE")
+        .env_remove("AWS_WEB_IDENTITY_TOKEN_FILE")
+        .env_remove("AWS_ROLE_ARN")
+        .env_remove("AWS_ROLE_SESSION_NAME")
+        .env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        .env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        .env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN")
+        .env("AWS_EC2_METADATA_DISABLED", "true");
     if let Some(token) = session {
         cmd.env("OURIOS_S3_SESSION_TOKEN", token);
     }

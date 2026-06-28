@@ -114,7 +114,9 @@ fn seed_record(tenant: &str, i: u64) -> MinedRecord {
         tenant_id: TenantId::new(tenant),
         template_id: 1,
         template_version: 1,
-        severity_number: 9,
+        // `SEVERITY_INFO` is the OTLP/proto severity (`i32`); `MinedRecord`'s is
+        // `u8`, so convert rather than re-spelling the magic number.
+        severity_number: SEVERITY_INFO.try_into().expect("INFO severity fits u8"),
         severity_text: Some("INFO".to_string()),
         scope_name: Some("lib.cart".to_string()),
         scope_version: Some("1.0.0".to_string()),
@@ -255,7 +257,7 @@ async fn http_post_query(addr: SocketAddr, tenant: &str, dsl: &str) -> String {
     );
     stream.write_all(head.as_bytes()).await.expect("write head");
     stream.write_all(dsl.as_bytes()).await.expect("write body");
-    stream.flush().await.ok();
+    stream.flush().await.expect("flush querier request");
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)

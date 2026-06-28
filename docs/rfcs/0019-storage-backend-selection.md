@@ -1,7 +1,7 @@
 ---
 rfc: 0019
 title: Storage-backend selection — wiring the server to choose local vs S3
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-22
@@ -228,17 +228,27 @@ specifically on credential/secret material.
 
 ## 6. Testing strategy
 
-- **RFC0019.1 / .6** — unit tests on `config_from_env` / `StoreConfig`
-  resolution (the `main.rs` pattern), plus a log/error-scrub assertion for
-  secret hygiene. Mirrors the existing `build_*_config` tests.
-- **RFC0019.3 / .4 / .5** — testcontainers + localstack integration tests,
-  reusing the `rfc0013_object_store.rs` harness (`Store::s3` against a
-  localstack endpoint), gated to the CI `s3 integration (localstack)` job and
-  `#[ignore]`d for the default `cargo test` run.
-- **RFC0019.2** — a server-level test (the `rfc0013_6_wal_stays_local` pattern)
-  asserting the WAL path is local while the data backend is S3.
-- **RFC0019.7** — the existing local receiver/querier/compactor suites, run
-  unchanged; the default config path is the regression guard.
+All seven scenarios have passing tests; the RFC is `green`.
+
+- **RFC0019.1 / .6 / .7** — unit tests on `build_store_config` / `build_config`
+  (the `main.rs` pattern), including the missing-key / secret-scrub assertion
+  for hygiene and the local-default regression. They live in
+  `crates/ourios-server/src/main.rs` (`rfc0019_1_*` / `rfc0019_6_*` /
+  `rfc0019_7_*`) and run in the default `cargo test` job.
+- **RFC0019.2 / .3 / .4 / .5** — server-level testcontainers + localstack
+  integration tests in `crates/ourios-server/tests/rfc0019_storage_backend.rs`,
+  reusing the `rfc0013_object_store.rs` harness (`Store::s3` against a localstack
+  endpoint) and spawning the `ourios-server` binary configured for the S3
+  backend, driven over HTTP. `.2` asserts the WAL stays local while the data
+  backend is S3 (the `rfc0013_6_wal_stays_local` pattern); `.3` ingests then
+  queries end to end on S3; `.4` runs the background compactor against S3 and
+  asserts the conditional-PUT manifest swap; `.5` proves cross-tenant isolation.
+  They are `#[ignore]`d for the default `cargo test` run and gated to the CI
+  `s3 integration (localstack)` job (Docker-API runtime + the `AWS_*` env),
+  invoked by name via `--ignored --exact`.
+- **RFC0019.7 (regression)** — in addition to the unit test above, the existing
+  local receiver/querier/compactor suites run unchanged over the default config
+  path; they are the byte-for-byte regression guard.
 
 ## 7. Open questions
 

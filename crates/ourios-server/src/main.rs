@@ -91,7 +91,11 @@ struct ReceiverParams {
 /// - `OURIOS_BUCKET_ROOT` (required for the `local` backend) — the store root.
 /// - `OURIOS_S3_BUCKET` (required for `s3`) + `OURIOS_S3_ENDPOINT` /
 ///   `OURIOS_S3_REGION` / `OURIOS_S3_PREFIX` (optional) — S3 addressing.
-///   Credentials come from the AWS chain, never this config (RFC 0019 §3.4).
+/// - `OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
+///   `OURIOS_S3_SESSION_TOKEN` (optional, **secret**) — explicit S3 credentials
+///   applied over the standard chain (RFC 0019 §3.4); when unset, credentials
+///   come from the chain (`AmazonS3Builder::from_env`, incl. IRSA). Never
+///   logged (RFC 0019 §3.4).
 /// - `OURIOS_COMPACTION_ENABLED` (optional, default on) — set to a falsey value
 ///   (`0`/`false`/`no`/`off`) to disable this process's compaction sweep, so a
 ///   deployment can run a single dedicated compactor (RFC 0009 §3.2).
@@ -111,6 +115,17 @@ fn config_from_env() -> Result<ServerConfig, String> {
         std::env::var("OURIOS_S3_REGION").ok().as_deref(),
         std::env::var("OURIOS_S3_PREFIX").ok().as_deref(),
     )?;
+    // Explicit S3 credentials (RFC 0019 §3.4), layered over the standard chain.
+    // Bound to locals so the `as_deref` borrows outlive the call.
+    let s3_access_key_id = std::env::var("OURIOS_S3_ACCESS_KEY_ID").ok();
+    let s3_secret_access_key = std::env::var("OURIOS_S3_SECRET_ACCESS_KEY").ok();
+    let s3_session_token = std::env::var("OURIOS_S3_SESSION_TOKEN").ok();
+    let store = with_s3_credentials(
+        store,
+        s3_access_key_id.as_deref(),
+        s3_secret_access_key.as_deref(),
+        s3_session_token.as_deref(),
+    );
     let interval_raw = std::env::var("OURIOS_COMPACTION_INTERVAL_SECS").ok();
     let mut config = build_config(
         store,
@@ -139,10 +154,11 @@ fn config_from_env() -> Result<ServerConfig, String> {
 /// `backend_raw` is `OURIOS_STORAGE_BACKEND` (`local` (default) or `s3`),
 /// trimmed and treated as unset when empty. The `local` backend requires a
 /// non-empty `bucket_root`; `s3` requires a non-empty `s3_bucket` and accepts
-/// optional endpoint/region/prefix. Credentials are never read here — they come
-/// from the AWS chain inside [`StoreConfig::open`] (RFC 0019 §3.4), so an error
-/// for a **missing required** value names only the key, never a secret; other
-/// errors (an unknown backend) may echo the offending non-secret value for
+/// optional endpoint/region/prefix. Credentials are never read here — the
+/// explicit `OURIOS_S3_*` keys are applied separately by [`with_s3_credentials`]
+/// and the chain is the fallback in [`StoreConfig::open`] (RFC 0019 §3.4), so
+/// an error for a **missing required** value names only the key, never a secret;
+/// other errors (an unknown backend) may echo the offending non-secret value for
 /// diagnosability.
 fn build_store_config(
     backend_raw: Option<&str>,
@@ -183,6 +199,38 @@ fn build_store_config(
         Some(other) => Err(format!(
             "OURIOS_STORAGE_BACKEND must be 'local' or 's3', got {other:?}"
         )),
+    }
+}
+
+/// Apply explicit S3 credentials (RFC 0019 §3.4) onto a resolved [`StoreConfig`].
+///
+/// Each value is trimmed and an empty string is treated as unset (matching the
+/// addressing knobs), so a present-but-blank env var does not count as "set"
+/// and trip the partial-pair check at store-build time. A `local` backend
+/// carries no credentials, so it passes through unchanged. The pairing rule
+/// (access key + secret together; a session token only with the pair) and the
+/// secret-scrubbing of any resulting error are enforced in
+/// `ourios_parquet::Store::s3`, which names only the offending field, never a
+/// value (RFC 0019 §3.4).
+fn with_s3_credentials(
+    store: StoreConfig,
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+    session_token: Option<&str>,
+) -> StoreConfig {
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    match store {
+        StoreConfig::S3(mut cfg) => {
+            cfg.access_key_id = clean(access_key_id);
+            cfg.secret_access_key = clean(secret_access_key);
+            cfg.session_token = clean(session_token);
+            StoreConfig::S3(cfg)
+        }
+        local @ StoreConfig::Local(_) => local,
     }
 }
 
@@ -684,14 +732,52 @@ mod tests {
             err.contains("OURIOS_S3_BUCKET"),
             "the error names the missing key, got {err:?}",
         );
-        // The well-known AWS credential env vars are never echoed (they aren't
-        // even read here); guard against a future regression that surfaces one.
-        for secret_key in ["AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID"] {
+        // The credential env vars are never echoed in a config error — neither
+        // the AWS-chain names nor the explicit OURIOS_S3_* keys (RFC 0019 §3.4).
+        for secret_key in [
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "OURIOS_S3_SECRET_ACCESS_KEY",
+            "OURIOS_S3_ACCESS_KEY_ID",
+            "OURIOS_S3_SESSION_TOKEN",
+        ] {
             assert!(
                 !err.contains(secret_key),
                 "a credential key must not appear in a config error, got {err:?}",
             );
         }
+    }
+
+    /// RFC0019.8 (config layer) — explicit S3 credentials are applied to an
+    /// `s3` `StoreConfig`, a present-but-blank value reads as unset, and a
+    /// `local` config carries none. The pairing/validation and the redaction of
+    /// any build error live in `ourios_parquet::Store::s3` (covered there).
+    /// See `docs/rfcs/0019-storage-backend-selection.md` §3.4 / §5 (RFC0019.8).
+    #[test]
+    fn rfc0019_8_explicit_s3_credentials_applied() {
+        let s3 = with_s3_credentials(
+            StoreConfig::S3(S3Config::new("b")),
+            Some("AKIAEXAMPLE"),
+            Some("s3cr3t"),
+            Some("tok"),
+        );
+        assert_eq!(
+            s3,
+            StoreConfig::S3(
+                S3Config::new("b")
+                    .with_access_key_id("AKIAEXAMPLE")
+                    .with_secret_access_key("s3cr3t")
+                    .with_session_token("tok"),
+            ),
+        );
+        // A present-but-blank credential reads as unset (so it can't trip the
+        // partial-pair check at store-build time).
+        let blank =
+            with_s3_credentials(StoreConfig::S3(S3Config::new("b")), Some("  "), None, None);
+        assert_eq!(blank, StoreConfig::S3(S3Config::new("b")));
+        // A local backend carries no credentials — passes through untouched.
+        let local_cfg = with_s3_credentials(local("/store"), Some("x"), Some("y"), None);
+        assert_eq!(local_cfg, local("/store"));
     }
 
     /// Scenario RFC0019.7 — local backend regression (the default path).

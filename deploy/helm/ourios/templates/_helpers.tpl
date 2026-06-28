@@ -150,6 +150,9 @@ never S3 (CLAUDE.md §3.4/§3.6).
 Querier-role env (RFC 0016).
 */}}
 {{- define "ourios.querierEnv" -}}
+{{- if le (int .Values.querier.defaultWindowSecs) 0 }}
+{{- fail (printf "querier.defaultWindowSecs must be a positive integer (seconds), got %v" .Values.querier.defaultWindowSecs) }}
+{{- end }}
 - name: OURIOS_QUERIER_ENABLED
   value: "true"
 # Compaction runs only on the dedicated compactor (RFC 0009 §3.2).
@@ -167,6 +170,9 @@ in the binary, so the dedicated compactor needs no enable flag — only the
 interval. The receiver/querier disable it via OURIOS_COMPACTION_ENABLED=0.
 */}}
 {{- define "ourios.compactorEnv" -}}
+{{- if le (int .Values.compactor.intervalSecs) 0 }}
+{{- fail (printf "compactor.intervalSecs must be a positive integer (seconds), got %v" .Values.compactor.intervalSecs) }}
+{{- end }}
 - name: OURIOS_COMPACTION_INTERVAL_SECS
   value: {{ .Values.compactor.intervalSecs | quote }}
 {{- end }}

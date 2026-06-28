@@ -206,6 +206,28 @@ fn s3_server(endpoint: &str, bucket: &str) -> Command {
     cmd
 }
 
+/// A `Command` like [`s3_server`] but supplying credentials via the **explicit
+/// S3-named** keys (`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
+/// `OURIOS_S3_SESSION_TOKEN`, RFC 0019 §9) — and **removing** the `AWS_*` static
+/// keys from the child's environment, so only the explicit path can
+/// authenticate (RFC0019.8). Values come from the `AWS_*` the CI job sets
+/// (`LocalStack` accepts any), defaulting to `LocalStack`'s conventional `test`.
+fn s3_server_explicit_creds(endpoint: &str, bucket: &str) -> Command {
+    let access = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "test".to_string());
+    let secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "test".to_string());
+    let session = std::env::var("AWS_SESSION_TOKEN").ok();
+    let mut cmd = s3_server(endpoint, bucket);
+    cmd.env("OURIOS_S3_ACCESS_KEY_ID", access)
+        .env("OURIOS_S3_SECRET_ACCESS_KEY", secret)
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN");
+    if let Some(token) = session {
+        cmd.env("OURIOS_S3_SESSION_TOKEN", token);
+    }
+    cmd
+}
+
 /// Read the `{prefix}{addr}` line the server prints on startup, with a timeout.
 async fn read_listen_addr(child: &mut Child, prefix: &str) -> SocketAddr {
     let stdout = child.stdout.take().expect("server stdout piped");
@@ -614,6 +636,70 @@ async fn rfc0019_5_tenant_isolation_on_s3() {
     assert!(
         !response.contains("bravo"),
         "no bravo data leaks into an alpha query: {response}",
+    );
+
+    terminate_and_assert_clean(querier).await;
+}
+
+/// Scenario RFC0019.8 — explicit S3 credentials, S3-named (RFC 0019 §9).
+/// See `docs/rfcs/0019-storage-backend-selection.md` §9.5/§9.6.
+///
+/// Mirrors RFC0019.3's ingest→query round-trip, but the server authenticates via
+/// the explicit `OURIOS_S3_*` credential keys with the `AWS_*` static keys
+/// removed from its environment ([`s3_server_explicit_creds`]). A successful
+/// round-trip confirms Ourios applies the explicit keys to the S3 builder.
+/// (`LocalStack` does not enforce auth, so "the values reach the builder" and the
+/// partial-set fail-fast / `Debug`-redaction assertions live in the
+/// `ourios-parquet` + `ourios-server` unit tests; this proves the end-to-end
+/// path is functional with only the S3-named keys set.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0019.8 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn rfc0019_8_explicit_s3_credentials_authenticate() {
+    const BUCKET: &str = "ourios-it-srv-explicit-creds";
+    let (_node, endpoint, s3) = localstack_s3(BUCKET).await;
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let bodies = ["user 1 logged in", "user 2 logged in"];
+    let batch = export_request(&[("storefront", &bodies)]);
+
+    // Phase 1 — ingest with explicit OURIOS_S3_* creds (no AWS_*), drain on SIGTERM.
+    let mut receiver = s3_server_explicit_creds(&endpoint, BUCKET)
+        .env("OURIOS_RECEIVER_ENABLED", "1")
+        .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")
+        .env("OURIOS_RECEIVER_HTTP_ADDR", "127.0.0.1:0")
+        .env("OURIOS_WAL_ROOT", tmp.path().join("wal"))
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn receiver");
+    let http_addr = read_listen_addr(&mut receiver, "receiver HTTP listening on ").await;
+    let response = http_post_logs(http_addr, &batch.encode_to_vec()).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "export returns 200 under explicit creds, got status line {:?}",
+        response.lines().next(),
+    );
+    terminate_and_assert_clean(receiver).await;
+
+    // The data is durable on S3 — proving the explicit-credential write path
+    // authenticated against the bucket.
+    let data = list_keys(&s3, Some("data/tenant_id=storefront")).await;
+    assert!(
+        data.iter().any(|k| k.ends_with(".parquet")),
+        "the receiver flushed Parquet to S3 authenticating via OURIOS_S3_* creds; saw {data:?}",
+    );
+
+    // Phase 2 — query the same bucket through a fresh querier, also explicit-creds.
+    let mut querier = s3_server_explicit_creds(&endpoint, BUCKET)
+        .env("OURIOS_QUERIER_ENABLED", "1")
+        .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn querier");
+    let querier_addr = read_listen_addr(&mut querier, "querier HTTP listening on ").await;
+    let response = http_post_query(querier_addr, "storefront", "severity >= info").await;
+    let json = query_json(&response);
+    assert_eq!(
+        json["rows"], 2,
+        "the rows round-trip out of S3 under explicit OURIOS_S3_* credentials: {json}",
     );
 
     terminate_and_assert_clean(querier).await;

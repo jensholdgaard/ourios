@@ -20,7 +20,7 @@ use ourios_core::audit::{
 };
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{ParquetAuditSink, PartitionKey, Writer};
+use ourios_parquet::{ParquetAuditSink, PartitionKey, Store, Writer};
 use ourios_server::querier::router;
 use tower::ServiceExt;
 
@@ -252,7 +252,7 @@ async fn rfc0016_3_a_drift_query_routes_to_the_drift_path() {
     let bucket = tempfile::tempdir().unwrap();
     // A widening at 2026-06-01T12:00:00Z (1_780_315_200 s), inside the query
     // window below.
-    let mut sink = ParquetAuditSink::new(bucket.path());
+    let mut sink = ParquetAuditSink::new(Store::local(bucket.path()).expect("store"));
     sink.emit(widened("acme", 5, 1_780_315_200_000_000_000));
     assert_eq!(sink.write_failures(), 0, "audit fixture persisted");
 

@@ -1,14 +1,13 @@
 //! A durable [`AuditSink`] backed by the RFC 0005 §3.7 audit Parquet
 //! stream.
 
-use std::path::PathBuf;
-
 use ourios_core::audit::{AuditEvent, AuditSink};
 
 use crate::audit_writer::{AuditWriter, AuditWriterError, derive_audit_partition};
+use crate::store::Store;
 
 /// An [`AuditSink`] that persists each event to the RFC 0005 §3.7
-/// audit Parquet stream under `bucket_root`.
+/// audit Parquet stream through the [`Store`] (local or S3, RFC 0019).
 ///
 /// Each [`emit`](AuditSink::emit) derives the event's audit partition
 /// (tenant + UTC day, RFC 0005 §3.4) and writes a single-event file at
@@ -26,16 +25,16 @@ use crate::audit_writer::{AuditWriter, AuditWriterError, derive_audit_partition}
 /// bootstrap can report it (`CLAUDE.md` §6.3).
 #[derive(Debug)]
 pub struct ParquetAuditSink {
-    bucket_root: PathBuf,
+    store: Store,
     write_failures: u64,
 }
 
 impl ParquetAuditSink {
-    /// A sink writing the audit stream under `bucket_root`.
+    /// A sink writing the audit stream through `store` (local or S3).
     #[must_use]
-    pub fn new(bucket_root: impl Into<PathBuf>) -> Self {
+    pub fn new(store: Store) -> Self {
         Self {
-            bucket_root: bucket_root.into(),
+            store,
             write_failures: 0,
         }
     }
@@ -49,7 +48,7 @@ impl ParquetAuditSink {
 
     fn try_write(&self, event: &AuditEvent) -> Result<(), AuditWriterError> {
         let partition = derive_audit_partition(event)?;
-        let mut writer = AuditWriter::open(&self.bucket_root, partition)?;
+        let mut writer = AuditWriter::open_in(&self.store, partition)?;
         writer.append_events(std::slice::from_ref(event))?;
         writer.close()?;
         Ok(())
@@ -91,7 +90,7 @@ mod tests {
     fn persists_an_event_to_the_audit_stream() {
         // Arrange
         let bucket = tempfile::tempdir().expect("temp");
-        let mut sink = ParquetAuditSink::new(bucket.path());
+        let mut sink = ParquetAuditSink::new(Store::local(bucket.path()).expect("store"));
         let event = compaction_event();
 
         // Act

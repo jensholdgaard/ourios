@@ -371,32 +371,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
+    // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7). The
+    // `ParquetAuditSink` now writes the audit stream through the resolved
+    // `Store` (local or S3, RFC 0019 slice 2d), so it's wired unconditionally on
+    // both backends. Clone the preflight-opened store for the sink before the
+    // original is moved into `Compactor::new` below.
+    let audit_store = store.clone();
     // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
     // opened in the preflight above so a store failure never leaks a live role.
     let compactor = Compactor::new(
         store,
         CompactionPolicy::default(),
         config.compaction_interval,
-    );
-    // Durable compaction audit events (RFC 0009 §3.6 → RFC 0005 §3.7). The
-    // `ParquetAuditSink` still writes the audit stream to a local path (its
-    // migration onto `Store` is a later RFC 0019 slice), so wire it only for the
-    // local backend; on s3 the compactor runs with the default no-op sink rather
-    // than mis-placing audit Parquet on local disk, and reports the gap on
-    // stderr (the structured-logging bootstrap is a follow-up, `CLAUDE.md` §6.3).
-    let compactor = match &config.store {
-        StoreConfig::Local(bucket_root) => {
-            compactor.with_audit_sink(Box::new(ParquetAuditSink::new(bucket_root)))
-        }
-        StoreConfig::S3(_) => {
-            eprintln!(
-                "compaction audit: durable audit events on the s3 backend await the \
-                 ParquetAuditSink Store migration (a later RFC 0019 slice); they are \
-                 dropped this run"
-            );
-            compactor
-        }
-    };
+    )
+    .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store)));
 
     // Run until SIGINT or SIGTERM (k8s / `nerdctl stop` send SIGTERM).
     // `compactor.run` never returns on its own, so the select resolves on

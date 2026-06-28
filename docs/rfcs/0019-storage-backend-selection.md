@@ -321,6 +321,9 @@ AWS chain as the fallback that AWS IRSA requires.
 | `OURIOS_S3_SECRET_ACCESS_KEY` | s3 | static secret key (**secret**) | unset (→ credential chain) |
 | `OURIOS_S3_SESSION_TOKEN` | s3 | session token for temporary credentials (**secret**) | unset (valid only with the static key pair, §9.3) |
 
+Collectively these three are referred to below as the **S3 credential keys** —
+distinct from the non-secret `OURIOS_S3_*` addressing keys in §3.1.
+
 ### 9.3 Resolution model (two-layer, explicit-over-chain)
 
 1. **Explicit Ourios config.** When set, `OURIOS_S3_ACCESS_KEY_ID` /
@@ -347,7 +350,7 @@ when an operator set keys but typo'd one.
 
 ### 9.4 Secret hygiene (widens §3.4, does not relax it)
 
-Ourios now *reads* the `OURIOS_S3_*` secret keys (it read no credential before),
+Ourios now *reads* the S3 credential keys (it read no credential before),
 so it owns their redaction across **every** sink: a value read from
 `OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
 `OURIOS_S3_SESSION_TOKEN` MUST never appear in a config-resolution error, a
@@ -370,16 +373,16 @@ presence). The §3.4 obligation is otherwise unchanged.
 >   pair, or a token alone) fails fast naming only the offending key; **and** no
 >   credential value ever appears in a config error, log line, `StoreError`,
 >   `Debug` output, or metric attribute — extending RFC0019.6's redaction to the
->   `OURIOS_S3_*` secret keys.
+>   S3 credential keys.
 
 ### 9.6 Testing plan (lands with the implementation PR)
 
 - **Redaction + validation (unit).** Extend the `rfc0019_6_*` unit test to the
-  `OURIOS_S3_*` secret keys; add tests that the explicit keys are read into
+  S3 credential keys; add tests that the explicit keys are read into
   `S3Config`, that a partial set fails fast naming only the key, and that
   `format!("{:?}", S3Config)` carrying a secret never contains the secret value.
 - **Authentication (localstack integration).** A test in
   `crates/ourios-server/tests/rfc0019_storage_backend.rs` that configures the
-  server with `OURIOS_S3_*` credentials only (no `AWS_*` static keys) and
+  server with the S3 credential keys only (no `AWS_*` static keys) and
   asserts the ingest→query round-trip succeeds, gated to the
   `s3 integration (localstack)` CI job.

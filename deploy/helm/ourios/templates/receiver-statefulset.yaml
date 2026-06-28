@@ -3,8 +3,9 @@
 The OTLP receiver role (RFC 0003) as a StatefulSet: each replica gets its own
 durable WAL PVC via a volumeClaimTemplate (CLAUDE.md §3.4 WAL-before-ack needs a
 durable local WAL; §3.6 the WAL is never on S3). The receiver writes Parquet to
-the shared store (S3 by default); compaction is disabled here
-(OURIOS_COMPACTION_ENABLED=0) so only the dedicated compactor sweeps.
+the shared store (the configured backend — local by default, S3 in production);
+compaction is disabled here (OURIOS_COMPACTION_ENABLED=0) so only the dedicated
+compactor sweeps.
 */}}
 apiVersion: apps/v1
 kind: StatefulSet

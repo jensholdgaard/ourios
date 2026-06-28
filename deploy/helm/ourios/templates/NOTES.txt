@@ -5,11 +5,13 @@ Storage backend: {{ .Values.storage.backend }}
   bucket: {{ .Values.storage.s3.bucket }}{{ with .Values.storage.s3.prefix }} (prefix {{ . }}){{ end }}
 {{- if and (not .Values.storage.s3.existingSecret) (not (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn")) }}
 
-  NOTE: no object-store credentials configured. Set EITHER
+  NOTE: no object-store credentials set via this chart. For static keys use
   storage.s3.existingSecret (a Secret with OURIOS_S3_ACCESS_KEY_ID /
   OURIOS_S3_SECRET_ACCESS_KEY — the S3-named credential keys, working with every
-  S3-compatible provider) OR, on AWS EKS, an IRSA role-arn via
-  serviceAccount.annotations. Credentials are never chart config as plaintext.
+  S3-compatible provider); on AWS EKS use an IRSA role-arn via
+  serviceAccount.annotations. Otherwise the server falls back to the AWS
+  credential chain (shared profile, node/instance IAM role, container creds) if
+  the environment provides it. Credentials are never chart config as plaintext.
 {{- end }}
 {{- else }}
   data PVC: {{ include "ourios.fullname" . }}-data ({{ .Values.storage.local.size }}) at {{ .Values.storage.local.bucketRoot }}
@@ -30,7 +32,7 @@ Workloads:
 {{- if .Values.compactor.enabled }}
   - compactor (Deployment, 1 replica) — the sole background sweeper (interval {{ .Values.compactor.intervalSecs }}s); receiver/querier have compaction disabled.
 {{- else }}
-  - compactor DISABLED, and no receiver/querier enabled — nothing runs. (Enabling a role with compactor.enabled=false fails the render: the chart refuses a deployment with no sweeper, hazard #4.)
+  - compactor DISABLED. With a receiver or querier enabled the chart refuses to render (a deployment with no sweeper — hazard #4); with all roles disabled, nothing runs.
 {{- end }}
 
 {{- if .Values.querier.enabled }}

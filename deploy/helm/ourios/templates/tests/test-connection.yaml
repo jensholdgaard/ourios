@@ -15,6 +15,9 @@ spec:
   # Cap the whole test so a stuck DNS lookup / TCP connect fails `helm test`
   # deterministically instead of hanging and accumulating pods.
   activeDeadlineSeconds: 60
+  # One container per enabled role, so a split-topology install (both roles
+  # enabled — the default) verifies BOTH the querier and the receiver: the test
+  # Pod succeeds only when every container exits 0.
   containers:
     {{- if .Values.querier.enabled }}
     # Post a trivial DSL query to the querier service. `curl -f` exits non-zero
@@ -44,8 +47,9 @@ spec:
         - --data
         - "template_id == 0"
         - "http://{{ include "ourios.fullname" . }}-querier:4319/v1/query"
-    {{- else }}
-    # Receiver-only: confirm the OTLP HTTP port accepts a connection. Pinned to a
+    {{- end }}
+    {{- if .Values.receiver.enabled }}
+    # Confirm the receiver's OTLP HTTP port accepts a connection. Pinned to a
     # specific BusyBox version (a floating tag could change `nc` behaviour and
     # break `helm test` unexpectedly).
     - name: otlp-http

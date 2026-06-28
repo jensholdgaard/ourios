@@ -35,7 +35,7 @@ Workloads:
 {{- if .Values.compactor.enabled }}
   - compactor (Deployment, 1 replica) — the sole background sweeper (interval {{ .Values.compactor.intervalSecs }}s); receiver/querier have compaction disabled.
 {{- else }}
-  - compactor DISABLED — and the receiver/querier set OURIOS_COMPACTION_ENABLED=0, so NO pod compacts. Small files won't be consolidated (hazard #4). Enable compactor.enabled, or unset OURIOS_COMPACTION_ENABLED on a workload via extraEnv.
+  - compactor DISABLED — and the receiver/querier set OURIOS_COMPACTION_ENABLED=0, so NO pod compacts. Small files won't be consolidated (hazard #4). Set compactor.enabled=true so the dedicated compactor sweeps.
 {{- end }}
 
 {{- if .Values.querier.enabled }}

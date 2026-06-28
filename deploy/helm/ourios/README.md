@@ -122,7 +122,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `querier.replicas` | `2` | Querier replicas (scales independently, no PVC). |
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |
 | `compactor.enabled` | `true` | Dedicated singleton compactor Deployment. |
-| `compactor.intervalSecs` | `300` | Compaction cadence (applied to every workload). |
+| `compactor.intervalSecs` | `300` | Compaction sweep cadence (used only by the dedicated compactor). |
 | `serviceAccount.annotations` | `{}` | IRSA `eks.amazonaws.com/role-arn` goes here. |
 | `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |
 | `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |

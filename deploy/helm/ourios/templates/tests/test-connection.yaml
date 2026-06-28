@@ -11,18 +11,19 @@ spec:
   restartPolicy: Never
   containers:
     {{- if .Values.querier.enabled }}
-    # Post a trivial DSL query to the querier service and require a 200.
+    # Post a trivial DSL query to the querier service and require a 200. Run via
+    # `sh -c` with the header/body single-quoted so their spaces survive intact.
     - name: query
       image: busybox
       command:
-        - wget
-      args:
-        - -S
-        - -O-
-        - --header=X-Ourios-Tenant: helm-test
-        - --header=Content-Type: text/plain
-        - --post-data=template_id == 0
-        - "http://{{ include "ourios.fullname" . }}-querier:4319/v1/query"
+        - sh
+        - -c
+        - >
+          wget -S -O- -q
+          --header='X-Ourios-Tenant: helm-test'
+          --header='Content-Type: text/plain'
+          --post-data='template_id == 0'
+          'http://{{ include "ourios.fullname" . }}-querier:4319/v1/query'
     {{- else }}
     # Receiver-only: confirm the OTLP HTTP port accepts a connection.
     - name: otlp-http

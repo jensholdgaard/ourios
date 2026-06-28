@@ -367,12 +367,14 @@ impl Store {
     ///
     /// Credentials resolve **explicit-over-chain** (RFC 0019 §3.4): when
     /// `cfg.access_key_id` / `cfg.secret_access_key` (and optionally
-    /// `cfg.session_token`) are set they are applied to the builder; otherwise
-    /// they fall back to the standard chain ([`AmazonS3Builder::from_env`] —
-    /// static `AWS_*` env, shared profile, IRSA, or instance metadata). The
-    /// static access key and secret are a pair: setting one without the other,
-    /// or a session token without that pair, is rejected (the error names only
-    /// the missing/offending field, never a value — RFC 0019 §3.4). The backend
+    /// `cfg.session_token`) are set they build a **clean** `AmazonS3Builder` (so
+    /// no ambient chain credential bleeds in); otherwise credentials fall back to
+    /// the standard chain ([`AmazonS3Builder::from_env`] — static `AWS_*` env,
+    /// shared profile, IRSA, or instance metadata). Blank credential values are
+    /// trimmed and treated as unset. The static access key and secret are a pair:
+    /// setting one without the other, or a session token without that pair, is
+    /// rejected (the error names only the missing/offending field, never a value
+    /// — RFC 0019 §3.4). The backend
     /// keeps `object_store`'s default `S3ConditionalPut::ETagMatch`, the
     /// `If-Match` CAS the manifest generation-swap needs (RFC0013.3/.4).
     ///
@@ -402,6 +404,15 @@ impl Store {
                 "S3 bucket name must not be empty".to_string(),
             ));
         }
+        // Normalize the explicit credential fields: trim and treat an empty or
+        // whitespace-only value as unset, so a blank reads consistently across
+        // every caller of `S3Config` (matching the server's env parsing) and
+        // can't spuriously trip the partial-set check below (RFC 0019 §3.4).
+        let normalize =
+            |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        let access_key_id = normalize(access_key_id);
+        let secret_access_key = normalize(secret_access_key);
+        let session_token = normalize(session_token);
         // The static access key and its secret are a pair; a session token is
         // meaningless without them. Reject a partial set rather than silently
         // falling back to the chain on an operator typo. The message names only
@@ -424,17 +435,27 @@ impl Store {
             }
             _ => {}
         }
-        // Base off the standard credential chain; the explicit pair (validated
-        // above) overrides it when present.
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
-            builder = builder
-                .with_access_key_id(access_key_id)
-                .with_secret_access_key(secret_access_key);
-            if let Some(session_token) = session_token {
-                builder = builder.with_token(session_token);
+        // Explicit credentials build from a **clean** builder so no ambient
+        // chain credential (e.g. an `AWS_SESSION_TOKEN` `from_env` would pick up)
+        // bleeds into the explicit static-key pair — the `with_*` setters do not
+        // clear an inherited token. `from_env()` (the standard chain: static
+        // `AWS_*`, shared profile, IRSA, instance metadata) is used only as the
+        // fallback when no explicit pair is given (RFC 0019 §3.4).
+        let mut builder = match (access_key_id, secret_access_key) {
+            (Some(access_key_id), Some(secret_access_key)) => {
+                let mut explicit = AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .with_access_key_id(access_key_id)
+                    .with_secret_access_key(secret_access_key);
+                if let Some(session_token) = session_token {
+                    explicit = explicit.with_token(session_token);
+                }
+                explicit
             }
-        }
+            // The validation above guarantees the remaining case is "no explicit
+            // credentials" (a lone key, lone secret, or lone token is rejected).
+            _ => AmazonS3Builder::from_env().with_bucket_name(bucket),
+        };
         if let Some(endpoint) = endpoint {
             // S3-compatible dev endpoints are often plain HTTP; object_store
             // refuses HTTP unless explicitly allowed.
@@ -900,6 +921,19 @@ mod tests {
                 "the error must not echo a credential value, got {msg:?}",
             );
         }
+    }
+
+    /// RFC0019.8 — blank/whitespace-only credential values are trimmed and read
+    /// as unset (consistent with the server's env parsing), so they don't
+    /// spuriously trip the partial-set fail-fast; the config falls back to the
+    /// chain and constructs offline.
+    #[test]
+    fn s3_treats_blank_credentials_as_unset() {
+        let cfg = S3Config::new("b")
+            .with_access_key_id("   ")
+            .with_secret_access_key("")
+            .with_session_token("  ");
+        Store::s3(cfg).expect("blank credentials read as unset, not a partial set");
     }
 
     /// RFC0019.8 / §3.4 — `S3Config`'s `Debug` redacts credential values, so a

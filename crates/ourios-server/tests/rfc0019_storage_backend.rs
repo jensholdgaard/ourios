@@ -209,9 +209,12 @@ fn s3_server(endpoint: &str, bucket: &str) -> Command {
 /// A `Command` like [`s3_server`] but supplying credentials via the **explicit
 /// S3-named** keys (`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
 /// `OURIOS_S3_SESSION_TOKEN`, RFC 0019 §3.4) — and **removing** the `AWS_*` static
-/// keys from the child's environment, so only the explicit path can
-/// authenticate (RFC0019.8). Values come from the `AWS_*` the CI job sets
-/// (`LocalStack` accepts any), defaulting to `LocalStack`'s conventional `test`.
+/// keys from the child's environment, so the credential chain has no static keys
+/// of its own and the explicit `OURIOS_S3_*` keys are the credentials in play
+/// (RFC0019.8). (A shared profile or IRSA web-identity env could still feed the
+/// chain in principle, but the CI job sets neither.) Values come from the `AWS_*`
+/// the CI job sets (`LocalStack` accepts any), defaulting to `LocalStack`'s
+/// conventional `test` when unset.
 fn s3_server_explicit_creds(endpoint: &str, bucket: &str) -> Command {
     let access = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "test".to_string());
     let secret = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "test".to_string());
@@ -653,7 +656,7 @@ async fn rfc0019_5_tenant_isolation_on_s3() {
 /// `ourios-parquet` + `ourios-server` unit tests; this proves the end-to-end
 /// path is functional with only the S3-named keys set.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "RFC0019.8 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+#[ignore = "RFC0019.8 — S3 integration; run via the `s3-integration` CI job (needs a Docker-API runtime; credentials default to `test`)"]
 async fn rfc0019_8_explicit_s3_credentials_authenticate() {
     const BUCKET: &str = "ourios-it-srv-explicit-creds";
     let (_node, endpoint, s3) = localstack_s3(BUCKET).await;

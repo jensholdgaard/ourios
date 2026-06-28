@@ -12,6 +12,9 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   restartPolicy: Never
+  # Cap the whole test so a stuck DNS lookup / TCP connect fails `helm test`
+  # deterministically instead of hanging and accumulating pods.
+  activeDeadlineSeconds: 60
   containers:
     {{- if .Values.querier.enabled }}
     # Post a trivial DSL query to the querier service. `curl -f` exits non-zero
@@ -23,6 +26,11 @@ spec:
         - curl
       args:
         - -fsS
+        # Fail fast rather than hang if the Service exists but never responds.
+        - --connect-timeout
+        - "5"
+        - --max-time
+        - "15"
         - -o
         - /dev/null
         - -w

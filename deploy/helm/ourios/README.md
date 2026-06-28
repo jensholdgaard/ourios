@@ -25,8 +25,10 @@ them as three workloads sharing a data + audit store on object storage:
 ![Ourios Helm chart topology](docs/topology.png)
 
 Diagram source: [`docs/topology.py`](docs/topology.py) (mingrammer
-[`diagrams`](https://diagrams.mingrammer.com/), k8s node set). Regenerate from
-this chart directory with `python docs/topology.py` (or
+[`diagrams`](https://diagrams.mingrammer.com/), k8s node set) — shipped in the
+**repo checkout** only; it is excluded from the packaged chart (`.helmignore`),
+so the link above resolves on GitHub, not from a chart artifact. Regenerate from
+a repo checkout with `python docs/topology.py` in this chart directory (or
 `python deploy/helm/ourios/docs/topology.py` from the repo root; needs Graphviz +
 `pip install diagrams`). A text fallback follows for terminal / `helm show readme`:
 

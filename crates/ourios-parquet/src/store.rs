@@ -17,6 +17,7 @@
 //! (not a new crate): `ourios-querier`, `-ingester`, and `-server` already
 //! depend on this crate, so the type is visible to every storage consumer.
 
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
@@ -126,13 +127,20 @@ pub struct Store {
     conditional_update: bool,
 }
 
-/// Non-secret addressing for the S3 / S3-compatible backend (RFC0013.7) —
-/// bucket, endpoint, region, and key prefix. Credentials are resolved by
-/// [`Store::s3`] from the AWS credential chain, not carried here.
+/// Addressing for the S3 / S3-compatible backend (RFC0013.7) — bucket,
+/// endpoint, region, and key prefix — plus optional explicit S3 credentials
+/// (RFC 0019 §9). When the credential fields are set, [`Store::s3`] applies them
+/// to the builder; when they are unset, credentials fall back to the standard
+/// chain ([`AmazonS3Builder::from_env`] — static `AWS_*` keys, a shared profile,
+/// IRSA, or instance metadata).
 ///
 /// `Default` yields an **empty `bucket`**, which is not valid; [`Store::s3`]
 /// rejects it with [`StoreError::Config`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The credential fields are **secret**: the manual [`fmt::Debug`] impl redacts
+/// their values (showing only presence), so a `Debug` rendering of an
+/// `S3Config` never leaks a key (RFC 0019 §9.4 / RFC0019.6).
+#[derive(Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct S3Config {
     /// Bucket name (required; an empty value is rejected by [`Store::s3`]).
@@ -143,6 +151,33 @@ pub struct S3Config {
     pub region: Option<String>,
     /// Key prefix within the bucket (the store root).
     pub prefix: Option<String>,
+    /// Explicit static access key id (**secret**, `OURIOS_S3_ACCESS_KEY_ID`).
+    /// Paired with [`Self::secret_access_key`]; setting one without the other is
+    /// rejected by [`Store::s3`].
+    pub access_key_id: Option<String>,
+    /// Explicit static secret access key (**secret**,
+    /// `OURIOS_S3_SECRET_ACCESS_KEY`).
+    pub secret_access_key: Option<String>,
+    /// Explicit session token for temporary credentials (**secret**,
+    /// `OURIOS_S3_SESSION_TOKEN`); valid only alongside the static key pair.
+    pub session_token: Option<String>,
+}
+
+impl fmt::Debug for S3Config {
+    /// Redacts the credential fields — a `Debug` rendering shows only whether a
+    /// credential is present, never its value (RFC 0019 §9.4 / RFC0019.6).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &redact(&self.access_key_id))
+            .field("secret_access_key", &redact(&self.secret_access_key))
+            .field("session_token", &redact(&self.session_token))
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -158,6 +193,9 @@ impl S3Config {
             endpoint: None,
             region: None,
             prefix: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
         }
     }
 
@@ -180,6 +218,30 @@ impl S3Config {
     #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Set the explicit static access key id (**secret**). Pair with
+    /// [`Self::with_secret_access_key`]; [`Store::s3`] rejects one without the
+    /// other.
+    #[must_use]
+    pub fn with_access_key_id(mut self, access_key_id: impl Into<String>) -> Self {
+        self.access_key_id = Some(access_key_id.into());
+        self
+    }
+
+    /// Set the explicit static secret access key (**secret**).
+    #[must_use]
+    pub fn with_secret_access_key(mut self, secret_access_key: impl Into<String>) -> Self {
+        self.secret_access_key = Some(secret_access_key.into());
+        self
+    }
+
+    /// Set the explicit session token for temporary credentials (**secret**);
+    /// valid only alongside the static key pair.
+    #[must_use]
+    pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.session_token = Some(session_token.into());
         self
     }
 }
@@ -303,26 +365,33 @@ impl Store {
     /// S3 / S3-compatible backend (RFC0013.1/.4/.7) — AWS S3, or any
     /// S3-compatible endpoint (Hetzner, R2, …) via [`S3Config::endpoint`].
     ///
-    /// Credentials come from the standard AWS credential chain
-    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env, shared profile, or
-    /// instance metadata) — `cfg` only carries the non-secret addressing
-    /// (bucket, endpoint, region, prefix). Threading explicit RFC 0004
-    /// credentials is a later refinement. The backend keeps `object_store`'s
-    /// default `S3ConditionalPut::ETagMatch`, the `If-Match` CAS the manifest
-    /// generation-swap needs (RFC0013.3/.4).
+    /// Credentials resolve **explicit-over-chain** (RFC 0019 §9.3): when
+    /// `cfg.access_key_id` / `cfg.secret_access_key` (and optionally
+    /// `cfg.session_token`) are set they are applied to the builder; otherwise
+    /// they fall back to the standard chain ([`AmazonS3Builder::from_env`] —
+    /// static `AWS_*` env, shared profile, IRSA, or instance metadata). The
+    /// static access key and secret are a pair: setting one without the other,
+    /// or a session token without that pair, is rejected (the error names only
+    /// the missing/offending field, never a value — RFC 0019 §9.4). The backend
+    /// keeps `object_store`'s default `S3ConditionalPut::ETagMatch`, the
+    /// `If-Match` CAS the manifest generation-swap needs (RFC0013.3/.4).
     ///
     /// Construction does not contact the endpoint — credentials and
     /// connectivity are resolved on the first request.
     ///
     /// # Errors
-    /// [`StoreError::Config`] if `cfg.bucket` is empty; [`StoreError::Backend`]
-    /// if the `AmazonS3` backend cannot be built from `cfg`.
+    /// [`StoreError::Config`] if `cfg.bucket` is empty or the explicit
+    /// credential fields are a partial set; [`StoreError::Backend`] if the
+    /// `AmazonS3` backend cannot be built from `cfg`.
     pub fn s3(cfg: S3Config) -> Result<Self, StoreError> {
         let S3Config {
             bucket,
             endpoint,
             region,
             prefix,
+            access_key_id,
+            secret_access_key,
+            session_token,
         } = cfg;
         // Trim once and use the trimmed value for both the check and the
         // builder, so a whitespace-padded bucket can't pass validation and then
@@ -333,8 +402,39 @@ impl Store {
                 "S3 bucket name must not be empty".to_string(),
             ));
         }
-        // Base off the AWS credential chain; explicit `cfg` fields override.
+        // The static access key and its secret are a pair; a session token is
+        // meaningless without them. Reject a partial set rather than silently
+        // falling back to the chain on an operator typo (RFC 0019 §9.3). The
+        // message names only the field, never a value (RFC 0019 §9.4).
+        match (&access_key_id, &secret_access_key) {
+            (Some(_), None) => {
+                return Err(StoreError::Config(
+                    "OURIOS_S3_ACCESS_KEY_ID is set but OURIOS_S3_SECRET_ACCESS_KEY is not (both are required together)".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(StoreError::Config(
+                    "OURIOS_S3_SECRET_ACCESS_KEY is set but OURIOS_S3_ACCESS_KEY_ID is not (both are required together)".to_string(),
+                ));
+            }
+            (None, None) if session_token.is_some() => {
+                return Err(StoreError::Config(
+                    "OURIOS_S3_SESSION_TOKEN is set without OURIOS_S3_ACCESS_KEY_ID / OURIOS_S3_SECRET_ACCESS_KEY (a session token requires the static key pair)".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        // Base off the standard credential chain; the explicit pair (validated
+        // above) overrides it when present.
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
+            builder = builder
+                .with_access_key_id(access_key_id)
+                .with_secret_access_key(secret_access_key);
+            if let Some(session_token) = session_token {
+                builder = builder.with_token(session_token);
+            }
+        }
         if let Some(endpoint) = endpoint {
             // S3-compatible dev endpoints are often plain HTTP; object_store
             // refuses HTTP unless explicitly allowed.
@@ -766,6 +866,71 @@ mod tests {
     fn s3_rejects_an_empty_bucket() {
         let err = Store::s3(S3Config::default()).expect_err("empty bucket must fail");
         assert!(matches!(err, StoreError::Config(_)), "got {err:?}");
+    }
+
+    /// RFC0019.8 — a full explicit credential pair (and an optional session
+    /// token) is accepted and applied to the builder; construction stays offline.
+    #[test]
+    fn s3_accepts_a_valid_credential_pair() {
+        let cfg = S3Config::new("ourios-test")
+            .with_access_key_id("AKIAEXAMPLE")
+            .with_secret_access_key("s3cr3t")
+            .with_session_token("token");
+        Store::s3(cfg).expect("explicit credential pair");
+    }
+
+    /// RFC0019.8 — a partial credential set fails fast with [`StoreError::Config`]
+    /// naming only the offending key, never a value (RFC 0019 §9.3/§9.4): an
+    /// access key without its secret, a secret without its key, or a session
+    /// token without the pair.
+    #[test]
+    fn s3_rejects_a_partial_credential_set() {
+        let secret_val = "s3cr3t-value-must-not-leak";
+        let cases = [
+            S3Config::new("b").with_access_key_id("AKIAEXAMPLE"),
+            S3Config::new("b").with_secret_access_key(secret_val),
+            S3Config::new("b").with_session_token("token"),
+        ];
+        for cfg in cases {
+            let err = Store::s3(cfg).expect_err("partial credential set must fail");
+            assert!(matches!(err, StoreError::Config(_)), "got {err:?}");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains(secret_val),
+                "the error must not echo a credential value, got {msg:?}",
+            );
+        }
+    }
+
+    /// RFC0019.8 / §9.4 — `S3Config`'s `Debug` redacts credential values, so a
+    /// config logged or surfaced in an error never leaks a secret. Presence is
+    /// still visible (so misconfig is diagnosable) but the value is not.
+    #[test]
+    fn s3config_debug_redacts_credentials() {
+        let access = "AKIA-do-not-leak";
+        let secret = "secret-do-not-leak";
+        let token = "token-do-not-leak";
+        let cfg = S3Config::new("b")
+            .with_access_key_id(access)
+            .with_secret_access_key(secret)
+            .with_session_token(token);
+        let rendered = format!("{cfg:?}");
+        for v in [access, secret, token] {
+            assert!(
+                !rendered.contains(v),
+                "Debug leaked a credential value: {rendered}",
+            );
+        }
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug should mark credential presence, got {rendered}",
+        );
+        // A config with no credentials shows them absent (None), not redacted.
+        let bare = format!("{:?}", S3Config::new("b"));
+        assert!(
+            !bare.contains("<redacted>"),
+            "absent credentials are not redacted, got {bare}",
+        );
     }
 
     /// A byte object round-trips through the local backend, and a delete

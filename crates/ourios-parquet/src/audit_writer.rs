@@ -30,7 +30,6 @@
 //! hours land in the same audit file legitimately.
 
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -46,6 +45,7 @@ use uuid::Uuid;
 
 use crate::audit_record_batch::{AuditBatchError, audit_events_to_batch};
 use crate::partition::PartitionKey;
+use crate::store::Store;
 use crate::writer::ROW_GROUP_FLUSH_BYTES;
 use crate::{audit_columns, audit_schema};
 
@@ -58,46 +58,73 @@ use crate::{audit_columns, audit_schema};
 /// a row group past the §3.5 1 GiB ceiling.
 const SUB_BATCH_ROWS: usize = 256;
 
-/// Streaming audit Parquet writer.
+/// Buffer-and-put audit Parquet writer (RFC 0013 object-storage
+/// seam; RFC 0019 §3 the audit sink's S3 migration).
 ///
 /// One [`AuditWriter`] writes one audit Parquet file. Atomic
-/// publish mirrors [`crate::Writer`]: bytes are written to
-/// `<uuid>.parquet.tmp` while the writer is open; [`Self::close`]
-/// renames the temp file to the final `<uuid>.parquet` only after
-/// the footer is written. Dropping without `close` removes the
-/// temp file (the [`Drop`] impl is identical to the data side's).
+/// publish mirrors [`crate::Writer`]: events are encoded into an
+/// in-memory buffer as they arrive; [`Self::close`] writes the
+/// finished bytes to the object store under the partition's key.
+/// Nothing is published until that `put` — a writer dropped without
+/// [`Self::close`] (panic, early-return) simply discards its buffer.
+///
+/// [`AuditWriter::open`] opens a local-filesystem [`Store`] rooted at a
+/// `bucket_root` path; [`AuditWriter::open_in`] takes an already-built
+/// [`Store`] so the same writer targets S3 (the compaction audit sink's
+/// RFC 0019 path).
 ///
 /// The atomic publish is logical, not crash-durable — the same
 /// caveat the data writer documents applies here.
 pub struct AuditWriter {
-    inner: Option<ArrowWriter<File>>,
+    inner: Option<ArrowWriter<Vec<u8>>>,
     partition: PartitionKey,
     flush_uuid: Uuid,
+    /// Object store rooted at `bucket_root`; the finished file is
+    /// `put` to [`Self::key`] on close.
+    store: Store,
+    /// `/`-delimited object key the file is published to, relative to
+    /// the store root (`audit/tenant_id=…/year=…/…/<uuid>.parquet`).
+    key: String,
+    /// Absolute local landing path ([`AuditWriter::open`]); the object key
+    /// rendered as a path for [`AuditWriter::open_in`] (which addresses by key
+    /// regardless of the store's backend). Surfaced in [`AuditWrittenFile::path`].
     final_path: PathBuf,
-    temp_path: Option<PathBuf>,
+    /// Running count of rows written so far (incremented per
+    /// sub-batch as each `write` succeeds); reported by
+    /// [`Self::close`]. Tracked directly because `into_inner` returns
+    /// the buffer, not file metadata.
+    num_rows: i64,
     /// Set to `true` once any `ArrowWriter::write` /
     /// `ArrowWriter::flush` call returns `Err`. The underlying
     /// `ArrowWriter`'s buffer state is undefined after such a
     /// failure (the row group may be partially written), so
-    /// [`Self::close`] refuses to publish — renaming the temp file
-    /// into place would silently land a potentially-corrupted
-    /// audit file. The temp file is left on disk for diagnosis
-    /// (the [`Drop`] impl skips its usual cleanup when poisoned).
+    /// [`Self::close`] refuses to publish — putting a potentially
+    /// corrupted buffer would land a bad audit file. The buffer is
+    /// discarded (there is no on-disk artifact to inspect).
     poisoned: bool,
 }
 
 impl AuditWriter {
-    /// Open an audit writer for `partition` under `bucket_root`.
-    /// Creates the audit partition directory (`audit/tenant_id=…/
-    /// year=YYYY/month=MM/day=DD/`) and the UUIDv7-named file.
+    /// Open an audit writer for `partition` under `bucket_root` — the
+    /// **local-filesystem** constructor. Creates the audit partition
+    /// directory (`audit/tenant_id=…/year=YYYY/month=MM/day=DD/`); the
+    /// `<UUIDv7>.parquet` object itself is buffer-and-put — events accumulate in
+    /// memory via [`AuditWriter::append_events`] and nothing is published until
+    /// [`AuditWriter::close`].
+    ///
+    /// [`AuditWriter::open_in`] takes an already-built [`Store`] instead, so a
+    /// writer can target S3 (the compaction audit sink's path under RFC 0019).
     ///
     /// # Errors
     ///
-    /// - [`AuditWriterError::Io`] when the partition directory or
-    ///   target file cannot be created.
+    /// - [`AuditWriterError::Io`] when the partition directory can't be
+    ///   created or the object store can't be opened at `bucket_root`.
     /// - [`AuditWriterError::Parquet`] when the ZSTD level is
     ///   rejected or `ArrowWriter` setup fails.
     pub fn open(bucket_root: &Path, partition: PartitionKey) -> Result<Self, AuditWriterError> {
+        // Ensure the store root (and the partition dir) exist:
+        // `Store::local` canonicalises `bucket_root`, which must therefore
+        // exist; the object-store `put` on close creates any remaining parents.
         let dir = partition.audit_path(bucket_root);
         std::fs::create_dir_all(&dir).map_err(|source| AuditWriterError::Io {
             op: "create_dir_all",
@@ -105,38 +132,61 @@ impl AuditWriter {
             source_path: None,
             source,
         })?;
-        let flush_uuid = Uuid::now_v7();
-        let final_path = dir.join(format!("{flush_uuid}.parquet"));
-        let temp_path = dir.join(format!("{flush_uuid}.parquet.tmp"));
-        let file = File::create(&temp_path).map_err(|source| AuditWriterError::Io {
-            op: "create",
-            path: temp_path.clone(),
+        let store = Store::local(bucket_root).map_err(|e| AuditWriterError::Io {
+            op: "open store",
+            path: bucket_root.to_path_buf(),
             source_path: None,
-            source,
+            source: io::Error::other(e),
         })?;
+        let mut writer = Self::open_in(&store, partition)?;
+        // Surface the absolute local landing path for the local backend
+        // (readers/tests join the store root to find the file); the store
+        // constructor leaves `final_path` as the object key rendered as a path.
+        writer.final_path = dir.join(format!("{}.parquet", writer.flush_uuid));
+        Ok(writer)
+    }
 
-        let props = match audit_writer_properties() {
-            Ok(p) => p,
-            Err(e) => {
-                drop(file);
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(e);
-            }
-        };
-        let inner = match ArrowWriter::try_new(file, audit_schema(), Some(props)) {
-            Ok(w) => w,
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(AuditWriterError::Parquet(e));
-            }
-        };
+    /// Open an audit writer for `partition` on an already-built [`Store`] (local
+    /// or S3-compatible) — the S3-capable constructor (RFC 0019). Nothing is
+    /// created up front (object stores have no directories, and the local
+    /// backend's `put` creates parents); the file is `put` to its object key on
+    /// [`AuditWriter::close`] (the buffer-and-put commit point).
+    ///
+    /// # Errors
+    ///
+    /// [`AuditWriterError::Parquet`] when the ZSTD level is rejected or
+    /// `ArrowWriter` setup fails.
+    pub fn open_in(store: &Store, partition: PartitionKey) -> Result<Self, AuditWriterError> {
+        let flush_uuid = Uuid::now_v7();
+        // The object key is the partition's audit Hive path (relative to the
+        // store root) plus the file name, with `/` separators — object keys are
+        // `/`-delimited regardless of the host OS.
+        let key = format!(
+            "{}/{}.parquet",
+            partition
+                .audit_path(Path::new(""))
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+            flush_uuid
+        );
+        // No local root to join, so the object key rendered as a path is the
+        // `final_path` here; the local constructor overrides it with the
+        // absolute landing path.
+        let final_path = PathBuf::from(&key);
+        let props = audit_writer_properties()?;
+        // Buffer-and-put: encode into memory; nothing hits the store until
+        // `close`. A construction failure leaves no artifact.
+        let inner = ArrowWriter::try_new(Vec::new(), audit_schema(), Some(props))
+            .map_err(AuditWriterError::Parquet)?;
 
         Ok(Self {
             inner: Some(inner),
             partition,
             flush_uuid,
+            store: store.clone(),
+            key,
             final_path,
-            temp_path: Some(temp_path),
+            num_rows: 0,
             poisoned: false,
         })
     }
@@ -161,10 +211,10 @@ impl AuditWriter {
     /// undefined state — the partial row group can't be safely
     /// recovered. When that happens, the writer marks itself
     /// poisoned and [`Self::close`] subsequently returns
-    /// [`AuditWriterError::Poisoned`] instead of renaming the
-    /// temp file into place. The `.parquet.tmp` stays on disk
-    /// for diagnosis. `PartitionMismatch` and `Batch` errors do
-    /// **not** poison: the writer remains usable for a follow-up
+    /// [`AuditWriterError::Poisoned`] instead of publishing the
+    /// buffer. The buffer is discarded (there is no on-disk
+    /// artifact to inspect). `PartitionMismatch` and `Batch` errors
+    /// do **not** poison: the writer remains usable for a follow-up
     /// `append_events` call.
     ///
     /// `append_events` is **not all-or-nothing** across the
@@ -231,124 +281,92 @@ impl AuditWriter {
             .as_mut()
             .expect("inner ArrowWriter is Some until AuditWriter::close is called");
         // Run the Parquet-touching loop in a helper that takes a
-        // `&mut ArrowWriter<File>` so the outer `self.poisoned =
+        // `&mut ArrowWriter<Vec<u8>>` so the outer `self.poisoned =
         // true` assignment can run after the borrow on `self.inner`
-        // ends. Poison only on Parquet errors — `Batch` errors
-        // come from `audit_events_to_batch`, which runs on a
+        // ends. `num_rows` is a disjoint field, so it can be borrowed
+        // alongside `inner`; the helper bumps it per successfully
+        // written sub-batch. Poison only on Parquet errors — `Batch`
+        // errors come from `audit_events_to_batch`, which runs on a
         // single chunk and doesn't touch `inner` itself; the
         // buffer's state at the moment a `Batch` error fires is
         // whatever earlier chunks left it (clean, or holding
         // already-written events from this same call). Either
         // way a follow-up `append_events` is safe — the contract
         // is "writer remains usable", not "no events persisted".
-        let result = append_chunks(inner, events);
+        let result = append_chunks(inner, events, &mut self.num_rows);
         if matches!(result, Err(AuditWriterError::Parquet(_))) {
             self.poisoned = true;
         }
         result
     }
 
-    /// Close the writer, finalising the Parquet footer on the
-    /// temp file and atomically renaming it to the final path.
-    ///
-    /// **Both fallible steps preserve the temp file on disk for
-    /// diagnosis.** `inner` and `temp_path` are taken out of
-    /// `self` *before* any fallible work; if either `inner.close()`
-    /// (footer write) or `fs::rename` (atomic publish) then errors,
-    /// `self.temp_path` is already `None` so the [`Drop`] impl
-    /// won't delete the partially-written `.parquet.tmp`. This
-    /// ordering is load-bearing — a failed `close` that destroyed
-    /// its own artifact would be the worst-case failure mode,
-    /// matching the data writer's [`crate::writer::Writer::close`]
-    /// contract.
+    /// Close the writer, finalising the Parquet footer in the
+    /// in-memory buffer and publishing the bytes to the object store
+    /// under the partition's key. Must be called for the file to be
+    /// published; dropping without `close` discards the buffer and
+    /// publishes nothing.
     ///
     /// **Poisoning check.** If a prior `append_events` returned a
-    /// [`AuditWriterError::Parquet`] error, the writer is
-    /// poisoned and this method refuses to publish — returns
-    /// [`AuditWriterError::Poisoned`] without touching `inner` /
-    /// `temp_path`, so the [`Drop`] impl's poisoned branch leaves
-    /// the temp file on disk for diagnosis.
+    /// [`AuditWriterError::Parquet`] error, the writer is poisoned and
+    /// this method refuses to publish — returns
+    /// [`AuditWriterError::Poisoned`] and discards the buffer (there is
+    /// no on-disk artifact to leave behind, unlike the former
+    /// temp-file scheme).
     ///
     /// # Errors
     ///
-    /// - [`AuditWriterError::Poisoned`] when a prior
-    ///   `append_events` failed with a Parquet error (temp file
-    ///   left on disk).
-    /// - [`AuditWriterError::Parquet`] when the footer write
-    ///   fails (temp file left on disk).
-    /// - [`AuditWriterError::Io`] when the atomic rename fails
-    ///   (temp file left on disk).
+    /// - [`AuditWriterError::Poisoned`] when a prior `append_events`
+    ///   failed with a Parquet error.
+    /// - [`AuditWriterError::Parquet`] when the footer write fails.
+    /// - [`AuditWriterError::Io`] when the store `put` fails. Nothing
+    ///   is published in that case (object-store puts are atomic).
     ///
     /// # Panics
     ///
-    /// Structurally impossible. `inner` / `temp_path` are
-    /// populated by [`Self::open`] and only consumed here;
-    /// `close` takes `self` by value so it can't run twice.
+    /// Structurally impossible. `inner` is populated by [`Self::open`]
+    /// and only consumed here; `close` takes `self` by value so it
+    /// can't run twice.
     pub fn close(mut self) -> Result<AuditWrittenFile, AuditWriterError> {
         if self.poisoned {
-            // Refuse to publish a possibly-partial file. Don't
-            // take `inner` / `temp_path` — `Drop` sees `poisoned
-            // = true` and leaves the .parquet.tmp on disk for
-            // diagnosis. The Parquet handle is released as part
-            // of the destructor cascade.
+            // Refuse to publish a possibly-partial buffer.
             return Err(AuditWriterError::Poisoned);
         }
-        // Take both `inner` and `temp_path` BEFORE any fallible
-        // work so that a failed `inner.close()` / `fs::rename`
-        // leaves the `.parquet.tmp` on disk for diagnosis (the
-        // [`Drop`] impl only removes the file when `temp_path`
-        // is still `Some`). Matches the data writer's contract;
-        // see the doc comment above.
         let inner = self
             .inner
             .take()
             .expect("AuditWriter::close consumes self; inner is Some on entry");
-        let temp_path = self
-            .temp_path
-            .take()
-            .expect("temp_path is Some until close consumes it");
-        let metadata = inner.close().map_err(AuditWriterError::Parquet)?;
-        std::fs::rename(&temp_path, &self.final_path).map_err(|source| AuditWriterError::Io {
-            op: "rename",
-            path: self.final_path.clone(),
-            source_path: Some(temp_path.clone()),
-            source,
-        })?;
+        // `into_inner` writes the footer and returns the finished
+        // bytes; the `put` is the atomic commit point.
+        let bytes = inner.into_inner().map_err(AuditWriterError::Parquet)?;
+        self.store
+            .put_blocking(&self.key, bytes)
+            .map_err(|e| AuditWriterError::Io {
+                op: "put",
+                path: self.final_path.clone(),
+                source_path: None,
+                source: io::Error::other(e),
+            })?;
         Ok(AuditWrittenFile {
             path: self.final_path.clone(),
             partition: self.partition.clone(),
             flush_uuid: self.flush_uuid,
-            num_rows: metadata.num_rows,
+            num_rows: self.num_rows,
         })
     }
 
-    /// Inspector for the absolute path the writer will publish
-    /// to on close. While the writer is open the actual bytes
-    /// live at `<this path>.tmp`.
+    /// Inspector for the path reported through [`AuditWrittenFile::path`]: the
+    /// absolute landing path for [`Self::open`], or the object key rendered as a
+    /// path for [`Self::open_in`] (no local root). The bytes only exist there
+    /// after a successful `close` — while the writer is open they live in memory.
     #[must_use]
     pub fn final_path(&self) -> &Path {
         &self.final_path
     }
 }
 
-impl Drop for AuditWriter {
-    fn drop(&mut self) {
-        if self.poisoned {
-            // A poisoned writer preserves its `.parquet.tmp` for
-            // diagnosis. Release the file handle (drop inner) but
-            // leave the temp file on disk — `close()` already
-            // returned `Poisoned` without consuming `temp_path`,
-            // so it's still `Some(...)` here. We deliberately do
-            // not `remove_file` it.
-            drop(self.inner.take());
-            return;
-        }
-        if let Some(temp) = self.temp_path.take() {
-            drop(self.inner.take());
-            let _ = std::fs::remove_file(&temp);
-        }
-    }
-}
+// No `Drop`: a writer abandoned without `close` just drops its
+// in-memory buffer — nothing was ever written to the store, so there
+// is no temp artifact to clean up (unlike the former temp-file scheme).
 
 /// Result of a successful [`AuditWriter::close`].
 #[derive(Debug)]
@@ -379,8 +397,7 @@ pub enum AuditWriterError {
     /// `Parquet` error, leaving the underlying writer's buffer in
     /// an undefined state. [`AuditWriter::close`] refuses to
     /// publish to protect against landing a partial / corrupted
-    /// audit file; the `.parquet.tmp` is preserved on disk for
-    /// diagnosis.
+    /// audit file; the buffer is discarded.
     Poisoned,
 }
 
@@ -395,15 +412,11 @@ impl fmt::Display for AuditWriterError {
             } => match source_path {
                 Some(src) => write!(
                     f,
-                    "filesystem I/O on `{op}` from {} to {}: {source}",
+                    "storage I/O on `{op}` from {} to {}: {source}",
                     src.display(),
                     path.display(),
                 ),
-                None => write!(
-                    f,
-                    "filesystem I/O on `{op}` at {}: {source}",
-                    path.display(),
-                ),
+                None => write!(f, "storage I/O on `{op}` at {}: {source}", path.display()),
             },
             Self::Parquet(e) => write!(f, "parquet writer: {e}"),
             Self::Batch(e) => write!(f, "audit batch: {e}"),
@@ -430,8 +443,8 @@ impl fmt::Display for AuditWriterError {
                 f,
                 "AuditWriter is poisoned — a prior append_events failed with a Parquet \
                  error, leaving the buffer in an undefined state; close() refuses to \
-                 publish to avoid landing a partial / corrupted file (the .parquet.tmp is \
-                 preserved on disk for diagnosis)",
+                 publish to avoid landing a partial / corrupted file (the buffer is \
+                 discarded)",
             ),
         }
     }
@@ -455,8 +468,9 @@ impl std::error::Error for AuditWriterError {
 /// sizing rule, runs a `flush()` when the in-progress buffer
 /// crosses [`ROW_GROUP_FLUSH_BYTES`] (128 MiB).
 fn append_chunks(
-    inner: &mut ArrowWriter<File>,
+    inner: &mut ArrowWriter<Vec<u8>>,
     events: &[AuditEvent],
+    num_rows: &mut i64,
 ) -> Result<(), AuditWriterError> {
     for chunk in events.chunks(SUB_BATCH_ROWS) {
         if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
@@ -464,6 +478,13 @@ fn append_chunks(
         }
         let batch = audit_events_to_batch(chunk).map_err(AuditWriterError::Batch)?;
         inner.write(&batch).map_err(AuditWriterError::Parquet)?;
+        // Count rows only once the sub-batch has been accepted, so a
+        // mid-slice failure leaves `num_rows` reflecting exactly what
+        // landed in the buffer. `chunk.len()` is bounded by
+        // `SUB_BATCH_ROWS` (256), so the cast to `i64` is lossless.
+        #[allow(clippy::cast_possible_wrap)]
+        let written = chunk.len() as i64;
+        *num_rows += written;
     }
     if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
         inner.flush().map_err(AuditWriterError::Parquet)?;
@@ -591,4 +612,86 @@ fn audit_writer_properties() -> Result<WriterProperties, AuditWriterError> {
     );
 
     Ok(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ourios_core::audit::{AuditEvent, AuditPayload};
+    use ourios_core::tenant::TenantId;
+
+    use super::{AuditWriter, derive_audit_partition};
+    use crate::{AuditReader, Store};
+
+    fn compaction_event(secs: u64) -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(secs),
+            payload: AuditPayload::Compaction {
+                partition: "year=2026/month=04/day=02/hour=10".to_string(),
+                input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+                output_file: "c.parquet".to_string(),
+                generation: 7,
+                rows: 100,
+            },
+        }
+    }
+
+    /// `open_in` writes through an already-built `Store` and publishes on
+    /// `close`: the events `put` to the partition's object key recover
+    /// byte-for-byte, and `AuditWrittenFile` carries the row count plus the key
+    /// (as `path`, rendered as a path for the store ctor).
+    #[test]
+    fn open_in_publishes_on_close_and_round_trips() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let events = vec![
+            compaction_event(1_775_127_480),
+            compaction_event(1_775_127_481),
+        ];
+        let partition = derive_audit_partition(&events[0]).expect("derive");
+
+        let mut writer = AuditWriter::open_in(&store, partition).expect("open_in");
+        writer.append_events(&events).expect("append");
+        let written = writer.close().expect("close");
+
+        // For `open_in`, `path` is the object key rendered as a path (no local
+        // root); on this platform it round-trips to the store key.
+        let key = written.path.to_string_lossy().into_owned();
+        assert!(key.ends_with(".parquet"), "key: {key}");
+        assert_eq!(written.num_rows, 2);
+        let bytes = store.get_blocking(&key).expect("get");
+        let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+            .expect("open_bytes")
+            .read_all()
+            .expect("read_all");
+        assert_eq!(
+            read, events,
+            "events recover byte-for-byte through the store"
+        );
+    }
+
+    /// A writer dropped without `close` publishes nothing — buffer-and-put means
+    /// the object only exists after the `close` `put`, so an abandoned writer
+    /// leaves no object behind (no temp file, unlike the old fs scheme).
+    #[test]
+    fn drop_without_close_publishes_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let event = compaction_event(1_775_127_480);
+        let partition = derive_audit_partition(&event).expect("derive");
+
+        {
+            let mut writer = AuditWriter::open_in(&store, partition).expect("open_in");
+            writer
+                .append_events(std::slice::from_ref(&event))
+                .expect("append");
+            // drop without close
+        }
+        assert!(
+            store.list_blocking(None).expect("list").is_empty(),
+            "no object is published until close",
+        );
+    }
 }

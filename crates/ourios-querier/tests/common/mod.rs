@@ -134,7 +134,7 @@ pub fn no_aliases() -> ourios_core::alias::AliasMap {
 use ourios_core::audit::{
     AuditEvent, AuditPayload, AuditSink, TemplateChange, hash_triggering_line,
 };
-use ourios_parquet::ParquetAuditSink;
+use ourios_parquet::{ParquetAuditSink, Store};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A `SystemTime` `ns` nanoseconds after the epoch — the audit `timestamp`
@@ -228,7 +228,7 @@ pub fn compaction(tenant: &str, ts_ns: u64) -> AuditEvent {
 /// reads). Asserts no write failures so a test never silently runs against an
 /// empty stream.
 pub fn write_audit(bucket: &Path, events: &[AuditEvent]) {
-    let mut sink = ParquetAuditSink::new(bucket);
+    let mut sink = ParquetAuditSink::new(Store::local(bucket).expect("store"));
     for e in events {
         sink.emit(e.clone());
     }

@@ -662,3 +662,55 @@ async fn store_delete_blocking_removes_on_s3() {
         "redundant S3 delete is tolerated (success or not-found)",
     );
 }
+
+/// `ParquetAuditSink` on an S3 `Store` durably persists a compaction audit
+/// event (RFC 0019 §3 audit-sink Store migration): emitting through the
+/// production sink lands one audit object on S3, and `AuditReader` over the S3
+/// store recovers it byte-for-byte — the durable-audit-on-S3 guarantee the
+/// local-disk temp-file scheme could not provide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC 0019 — S3 integration; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn parquet_audit_sink_persists_to_s3() {
+    use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink};
+    use ourios_core::tenant::TenantId;
+    use ourios_parquet::{AuditReader, ParquetAuditSink};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let (_node, s3) = localstack_s3("ourios-it-audit").await;
+
+    let event = AuditEvent {
+        tenant_id: TenantId::new("acme"),
+        // 2026-04-02T10:58:00Z.
+        timestamp: UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+        payload: AuditPayload::Compaction {
+            partition: "year=2026/month=04/day=02/hour=10".to_string(),
+            input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            output_file: "c.parquet".to_string(),
+            generation: 7,
+            rows: 100,
+        },
+    };
+
+    // Emit through the production sink on the S3 store. `emit` is infallible and
+    // drives `put_blocking` internally, so run it on a blocking thread.
+    let s3b = s3.clone();
+    let ev = event.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut sink = ParquetAuditSink::new(s3b);
+        sink.emit(ev);
+        assert_eq!(sink.write_failures(), 0, "the event persisted to S3");
+    })
+    .await
+    .expect("join");
+
+    // The sink wrote exactly one audit object under `audit/`; read it back
+    // through the S3 store and decode it.
+    let keys = s3.list_blocking(Some("audit")).expect("list audit");
+    assert_eq!(keys.len(), 1, "one audit file written, got {keys:?}");
+    let bytes = s3.get(&keys[0]).await.expect("s3 get audit");
+    let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+        .expect("open_bytes")
+        .read_all()
+        .expect("read_all");
+    assert_eq!(read, vec![event], "audit event recovered from S3");
+}

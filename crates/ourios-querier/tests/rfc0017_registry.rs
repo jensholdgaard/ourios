@@ -14,7 +14,7 @@ use ourios_core::audit::{
 };
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::OwnedToken;
-use ourios_parquet::ParquetAuditSink;
+use ourios_parquet::{ParquetAuditSink, Store};
 use ourios_querier::{StoreRef, derive_template_registry};
 use tempfile::TempDir;
 
@@ -112,7 +112,7 @@ fn rfc0017_2_registry_derives_completely_including_v1() {
         ),
     ];
 
-    let mut sink = ParquetAuditSink::new(bucket.path());
+    let mut sink = ParquetAuditSink::new(Store::local(bucket.path()).expect("store"));
     for e in &events {
         sink.emit(e.clone());
     }

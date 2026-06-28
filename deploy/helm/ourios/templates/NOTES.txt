@@ -1,0 +1,57 @@
+Ourios is installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Storage backend: {{ .Values.storage.backend }}
+{{- if eq .Values.storage.backend "s3" }}
+{{- if not .Values.storage.s3.bucket }}
+
+  !! storage.s3.bucket is EMPTY. The s3 backend requires a bucket — the pods
+  !! will fail to start. Reinstall/upgrade with:
+  !!   --set storage.s3.bucket=<your-bucket>
+{{- else }}
+  bucket: {{ .Values.storage.s3.bucket }}{{ with .Values.storage.s3.prefix }} (prefix {{ . }}){{ end }}
+{{- end }}
+{{- if and (not .Values.aws.existingSecret) (not .Values.serviceAccount.annotations) }}
+
+  NOTE: no AWS credentials configured. Set EITHER aws.existingSecret (a Secret
+  with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) OR an IRSA role-arn via
+  serviceAccount.annotations. Credentials are never chart config as plaintext.
+{{- end }}
+{{- else }}
+  data PVC: {{ include "ourios.fullname" . }}-data ({{ .Values.storage.local.size }}) at {{ .Values.storage.local.bucketRoot }}
+  (local backend is single-node/dev — use s3 in production.)
+{{- end }}
+
+Workloads:
+{{- if .Values.receiver.enabled }}
+  - receiver  (StatefulSet, {{ .Values.receiver.replicas }} replica(s)) — OTLP gRPC :4317 + HTTP :4318; per-replica WAL PVC ({{ .Values.receiver.wal.size }}, local, never S3).
+{{- else }}
+  - receiver  disabled
+{{- end }}
+{{- if .Values.querier.enabled }}
+  - querier   (Deployment, {{ .Values.querier.replicas }} replica(s)) — logs-DSL query API over HTTP :4319; stateless, reads the store.
+{{- else }}
+  - querier   disabled
+{{- end }}
+{{- if .Values.compactor.enabled }}
+  - compactor (Deployment, 1 replica) — always-on background compaction (interval {{ .Values.compactor.intervalSecs }}s).
+{{- else }}
+  - compactor (dedicated singleton) disabled — receiver/querier pods still sweep (the binary always compacts).
+{{- end }}
+
+{{- if .Values.querier.enabled }}
+
+Query the logs DSL (port-forward from your workstation):
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }}-querier 4319:4319
+  curl -s -H 'X-Ourios-Tenant: my-tenant' -H 'Content-Type: text/plain' \
+    --data 'template_id == 0' http://127.0.0.1:4319/v1/query
+{{- end }}
+{{- if .Values.receiver.enabled }}
+
+Send OTLP logs (point your OpenTelemetry exporter here):
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }}-receiver 4317:4317 4318:4318
+{{- end }}
+{{- if or .Values.receiver.enabled .Values.querier.enabled }}
+
+Verify the install:
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+{{- end }}

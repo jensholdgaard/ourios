@@ -1,0 +1,124 @@
+{{- if .Values.receiver.enabled }}
+{{- /*
+The OTLP receiver role (RFC 0003) as a StatefulSet: each replica gets its own
+durable WAL PVC via a volumeClaimTemplate (CLAUDE.md §3.4 WAL-before-ack needs a
+durable local WAL; §3.6 the WAL is never on S3). The receiver writes Parquet to
+the shared store (S3 by default) and, like every ourios-server pod, also runs
+the always-on compactor (safe via the publish-CAS commit).
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ourios.fullname" . }}-receiver
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receiver
+spec:
+  replicas: {{ .Values.receiver.replicas }}
+  serviceName: {{ include "ourios.fullname" . }}-receiver-headless
+  selector:
+    matchLabels:
+      {{- include "ourios.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: receiver
+  template:
+    metadata:
+      labels:
+        {{- include "ourios.labels" . | nindent 8 }}
+        app.kubernetes.io/component: receiver
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.receiver.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.receiver.podAnnotations | default .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ourios.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ourios-server
+          image: {{ include "ourios.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- include "ourios.commonEnv" . | nindent 12 }}
+            {{- include "ourios.receiverEnv" . | nindent 12 }}
+          {{- include "ourios.awsEnvFrom" . | nindent 10 }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+          {{- /*
+          No HTTP health route exists yet (the endpoints are POST-only), so
+          probe the listening OTLP/HTTP port over TCP.
+          */}}
+          readinessProbe:
+            tcpSocket:
+              port: otlp-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: otlp-http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with .Values.receiver.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: wal
+              mountPath: {{ .Values.receiver.wal.mountPath }}
+            {{- include "ourios.dataVolumeMount" . | nindent 12 }}
+            # readOnlyRootFilesystem is on, so give the process a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- include "ourios.dataVolume" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: wal
+        labels:
+          {{- include "ourios.labels" . | nindent 10 }}
+          app.kubernetes.io/component: receiver
+      spec:
+        accessModes:
+          {{- toYaml .Values.receiver.wal.accessModes | nindent 10 }}
+        {{- with .Values.receiver.wal.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.receiver.wal.size | quote }}
+{{- end }}

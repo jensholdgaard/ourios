@@ -1,0 +1,26 @@
+apiVersion: v2
+name: ourios
+description: |
+  Ourios — a log storage and query backend on Apache Parquet, a Drain-derived
+  template miner, and Apache DataFusion. This chart deploys the single
+  `ourios-server` binary S3-native (RFC 0019): the OTLP receiver as a
+  StatefulSet with a per-replica WAL PVC, the querier as an independently
+  scalable stateless Deployment, and a singleton background compactor, all
+  sharing the data + audit store on S3.
+type: application
+# Chart version — bumped on chart changes, independent of the app version.
+version: 0.2.0
+# The ourios-server image tag this chart defaults to (the published
+# ghcr.io/jensholdgaard/ourios release). Overridable via image.tag.
+appVersion: "0.0.0"
+keywords:
+  - logs
+  - observability
+  - opentelemetry
+  - parquet
+  - datafusion
+home: https://github.com/jensholdgaard/ourios
+sources:
+  - https://github.com/jensholdgaard/ourios
+maintainers:
+  - name: Jens Holdgaard Pedersen

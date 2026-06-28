@@ -1,0 +1,23 @@
+{{- if eq .Values.storage.backend "local" }}
+{{- /*
+The shared local data store (OURIOS_BUCKET_ROOT), only for the local backend.
+A single PVC mounted by every workload — coherent only on one node or with a
+ReadWriteMany class. The s3 backend uses no data PVC. The WAL is always a
+separate per-receiver-replica claim (see the receiver StatefulSet).
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ourios.fullname" . }}-data
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.storage.local.accessModes | nindent 4 }}
+  {{- with .Values.storage.local.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.local.size | quote }}
+{{- end }}

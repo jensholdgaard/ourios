@@ -1,0 +1,154 @@
+# Default values for the Ourios chart (S3-native, RFC 0019).
+#
+# Ourios is one binary (`ourios-server`) with three roles. This chart deploys
+# them as three workloads sharing a data + audit store on S3:
+#   - receiver  — OTLP log ingest, a StatefulSet with a per-replica WAL PVC
+#                 (the WAL is ALWAYS a local durable volume, never S3;
+#                 CLAUDE.md §3.4 WAL-before-ack / §3.6 object storage is truth);
+#   - querier   — the logs-DSL query API, a stateless Deployment that scales
+#                 independently and reads S3 (no PVC);
+#   - compactor — the always-on background compactor, a singleton Deployment.
+# Only the data/audit/manifest live on S3; the WAL never does.
+
+image:
+  repository: ghcr.io/jensholdgaard/ourios
+  pullPolicy: IfNotPresent
+  # Overrides the image tag; defaults to the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Where the Parquet data + audit + manifest live (OURIOS_STORAGE_BACKEND).
+# This chart is S3-native; `local` is a single-node/dev fallback (see below).
+storage:
+  # "s3" or "local".
+  backend: s3
+  s3:
+    # REQUIRED for the s3 backend (OURIOS_S3_BUCKET). Left empty in the
+    # defaults so `helm template` renders out-of-box; an install MUST set it.
+    bucket: ""
+    # Optional S3-compatible endpoint (OURIOS_S3_ENDPOINT) — e.g. MinIO or
+    # LocalStack. Empty uses the real AWS endpoint for the region.
+    endpoint: ""
+    # Optional bucket region (OURIOS_S3_REGION).
+    region: ""
+    # Optional key prefix within the bucket (OURIOS_S3_PREFIX). Per-tenant
+    # prefixes live below this at the data layer (CLAUDE.md §3.7) — do not
+    # encode a tenant here.
+    prefix: ""
+  # Only used when backend=local. A single shared ReadWriteOnce PVC mounted by
+  # every workload — coherent only on a single node (the pods must co-schedule)
+  # or with a ReadWriteMany class. Intended for kick-the-tires / dev; use s3 in
+  # production. The WAL is always its own per-receiver-replica PVC regardless.
+  local:
+    bucketRoot: /var/lib/ourios/data
+    size: 10Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+
+# AWS credentials for the s3 backend. Credentials are NEVER chart config as
+# plaintext — supply exactly ONE of:
+#   1. existingSecret — the name of a Secret holding AWS_ACCESS_KEY_ID and
+#      AWS_SECRET_ACCESS_KEY (and optionally AWS_SESSION_TOKEN); injected via
+#      envFrom so the SDK credential chain picks it up. Create it yourself:
+#        kubectl create secret generic ourios-aws \
+#          --from-literal=AWS_ACCESS_KEY_ID=... \
+#          --from-literal=AWS_SECRET_ACCESS_KEY=...
+#   2. IRSA — leave existingSecret empty and set
+#      serviceAccount.annotations."eks.amazonaws.com/role-arn"; the pod assumes
+#      the role and no static keys exist anywhere. Preferred on EKS.
+aws:
+  existingSecret: ""
+  # AWS_DEFAULT_REGION for the SDK credential chain (distinct from the bucket's
+  # storage.s3.region). Optional; IRSA / instance metadata usually supply it.
+  region: ""
+
+# OTLP receiver role (RFC 0003): a StatefulSet, one durable WAL PVC per replica.
+receiver:
+  enabled: true
+  replicas: 1
+  service:
+    type: ClusterIP
+  # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never
+  # S3, never emptyDir (CLAUDE.md §3.4/§3.6). Each replica gets its own.
+  wal:
+    mountPath: /var/lib/ourios/wal
+    size: 2Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Querier role (RFC 0016): a stateless Deployment that reads S3, scales freely.
+querier:
+  enabled: true
+  replicas: 2
+  service:
+    type: ClusterIP
+  # Default look-back for a query with no range(...) stage, in seconds
+  # (OURIOS_QUERIER_DEFAULT_WINDOW_SECS; RFC 0016 §7). Must be non-zero.
+  defaultWindowSecs: 3600
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Background compactor (RFC 0009). The binary ALWAYS runs the compaction role,
+# so receiver and querier pods also sweep; concurrent sweeps are safe (the
+# publish-CAS commit makes losers no-op). This singleton Deployment is the
+# designated sweeper and the one that keeps running when both roles are off.
+# It is pinned to one replica on purpose — see the README design note.
+compactor:
+  enabled: true
+  # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS). Applied to every workload,
+  # since every workload compacts.
+  intervalSecs: 300
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Ourios's own self-telemetry (RFC 0001 §6.8): the OTLP endpoint its meter
+# exports to. Empty leaves the OpenTelemetry SDK default
+# (OTEL_EXPORTER_OTLP_ENDPOINT unset). Standard OTEL_* env can also be set via
+# extraEnv.
+otel:
+  exporterEndpoint: ""
+
+# Extra environment variables appended verbatim to every container (e.g. OTEL_*
+# overrides). Do NOT put AWS credentials here as plaintext — use aws.* above.
+extraEnv: []
+  # - name: OTEL_EXPORTER_OTLP_PROTOCOL
+  #   value: http/protobuf
+
+serviceAccount:
+  create: true
+  automount: true
+  # IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# The image runs as nonroot (uid 65532, distroless). fsGroup lets that user
+# write the PVCs (a fresh volume is otherwise root-owned).
+podSecurityContext:
+  fsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Scheduling, applied to all three workloads.
+nodeSelector: {}
+tolerations: []
+affinity: {}

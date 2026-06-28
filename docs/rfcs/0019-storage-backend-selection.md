@@ -51,7 +51,11 @@ secret-hygiene rules). It is *not* an RFC 0004 **tunable** in the strict sense:
 a tunable is global-with-per-tenant-override, whereas backend selection is
 necessarily **process-wide** (one store per process). Credentials are not
 Ourios configuration at all: they are operator secrets resolved by the standard
-AWS credential chain (see §3.4 below).
+AWS credential chain (see §3.4 below). *(The §9 amendment introduces optional
+S3-named credential config — the `OURIOS_S3_ACCESS_KEY_ID` /
+`OURIOS_S3_SECRET_ACCESS_KEY` / `OURIOS_S3_SESSION_TOKEN` secret keys (§9.2),
+distinct from the non-secret addressing keys above — pending its implementation
+PR.)*
 
 | Env var | Backend | Meaning | Default |
 | --- | --- | --- | --- |
@@ -155,6 +159,13 @@ addressing knob, an interval) MAY be echoed in a resolution error for
 diagnosability — e.g. the existing `OURIOS_COMPACTION_INTERVAL_SECS` parser
 reporting the offending value — since those carry no secret; the prohibition is
 specifically on credential/secret material.
+
+*The §9 amendment (2026-06-28) adds optional S3-named credential config — the
+`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` / `OURIOS_S3_SESSION_TOKEN`
+secret keys (§9.2), distinct from the non-secret `OURIOS_S3_*` addressing keys —
+layered explicit-over-chain, and widens this redaction obligation to those
+credential keys Ourios then reads. It is pending its implementation PR; until
+that lands, this section stands as the green behaviour.*
 
 ## 4. Alternatives considered
 
@@ -283,3 +294,95 @@ All seven scenarios have passing tests; the RFC is `green`.
   Barman Cloud (`barman-cloud-wal-archive`) — the same layering, a hot
   fsync'd WAL on a local persistent volume plus asynchronous shipping of
   completed segments to object storage for off-node recovery / PITR.
+
+## 9. Amendment (2026-06-28): explicit S3-named credentials
+
+> **Status:** specified, **pending implementation**. This amendment proposes a
+> new acceptance criterion (RFC0019.8) and is kept separate from the green body
+> so the RFC stays `green` (all §5 criteria still pass). Only the implementation
+> PR folds these changes into §§3/5 — promoting RFC0019.8 into §5 once it passes
+> — keeping the RFC `green` throughout.
+
+### 9.1 Motivation
+
+§3.4 as accepted introduces "no Ourios-specific credential config" and resolves
+S3 credentials solely through `AmazonS3Builder::from_env()` — the AWS-SDK-named
+chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / …). Ourios is
+**S3-compatible**, not AWS-specific (it runs on MinIO, Cloudflare R2, Hetzner,
+Ceph/RADOS, GCS S3-interop, …), so its own credential surface should read as S3,
+not AWS. This amendment adds **S3-named** credential env vars while keeping the
+AWS chain as the fallback that AWS IRSA requires.
+
+### 9.2 New env vars (extend §3.1's table)
+
+| Env var | Backend | Meaning | Default |
+| --- | --- | --- | --- |
+| `OURIOS_S3_ACCESS_KEY_ID` | s3 | static access key (**secret**) | unset (→ credential chain) |
+| `OURIOS_S3_SECRET_ACCESS_KEY` | s3 | static secret key (**secret**) | unset (→ credential chain) |
+| `OURIOS_S3_SESSION_TOKEN` | s3 | session token for temporary credentials (**secret**) | unset (valid only with the static key pair, §9.3) |
+
+Collectively these three are referred to below as the **S3 credential keys** —
+distinct from the non-secret `OURIOS_S3_*` addressing keys in §3.1.
+
+### 9.3 Resolution model (two-layer, explicit-over-chain)
+
+1. **Explicit Ourios config.** When set, `OURIOS_S3_ACCESS_KEY_ID` /
+   `OURIOS_S3_SECRET_ACCESS_KEY` (and optionally `OURIOS_S3_SESSION_TOKEN`) are
+   read by Ourios and applied to the `AmazonS3Builder`
+   (`with_access_key_id` / `with_secret_access_key` / `with_token`). They
+   authenticate AWS S3 and every S3-compatible store identically.
+2. **The standard credential chain (fallback).** When the explicit keys are
+   **all** unset, `AmazonS3Builder::from_env()` resolves the usual way: static
+   `AWS_*` keys, a shared profile, **IRSA**, or instance metadata. Retained
+   deliberately — AWS IRSA injects its own `AWS_ROLE_ARN` /
+   `AWS_WEB_IDENTITY_TOKEN_FILE` (set by the EKS pod-identity webhook, outside
+   Ourios's control), for which there is no Ourios-named equivalent, so on EKS
+   the chain is the credential source.
+
+**Validation (fail-fast on a partial set).** An access key and its secret are a
+pair: if **either** `OURIOS_S3_ACCESS_KEY_ID` **or** `OURIOS_S3_SECRET_ACCESS_KEY`
+is set, **both** MUST be set, or config resolution fails fast. A
+`OURIOS_S3_SESSION_TOKEN` set without that pair is likewise a fast failure (a
+session token is meaningless without the static keys it accompanies). The
+fail-fast error names only the missing/offending **key**, never a value (§3.4,
+RFC0019.6). This prevents a silent, surprising fallback to the credential chain
+when an operator set keys but typo'd one.
+
+### 9.4 Secret hygiene (widens §3.4, does not relax it)
+
+Ourios now *reads* the S3 credential keys (it read no credential before),
+so it owns their redaction across **every** sink: a value read from
+`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` /
+`OURIOS_S3_SESSION_TOKEN` MUST never appear in a config-resolution error, a
+`StoreError`, a log line, a metric attribute, or a `Debug` rendering of the
+config (`S3Config`'s `Debug` redacts the credential fields, showing only their
+presence). The §3.4 obligation is otherwise unchanged.
+
+### 9.5 Acceptance criterion (promoted into §5 by the implementation PR)
+
+> **Scenario RFC0019.8 — explicit S3 credentials, S3-named and never leaked**
+> - **Given** `OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` set
+>   and no `AWS_*` static keys in the environment
+> - **When** the server resolves its config and runs an ingest→query against
+>   an S3-compatible backend (localstack)
+> - **Then** the explicit keys authenticate the store (the round-trip
+>   succeeds), confirming Ourios applies them to the builder; **and** when the
+>   explicit keys are all unset the standard credential chain
+>   (`AmazonS3Builder::from_env()`, including IRSA) is used unchanged; **and** a
+>   partial set (one of the static
+>   pair, or a token alone) fails fast naming only the offending key; **and** no
+>   credential value ever appears in a config error, log line, `StoreError`,
+>   `Debug` output, or metric attribute — extending RFC0019.6's redaction to the
+>   S3 credential keys.
+
+### 9.6 Testing plan (lands with the implementation PR)
+
+- **Redaction + validation (unit).** Extend the `rfc0019_6_*` unit test to the
+  S3 credential keys; add tests that the explicit keys are read into
+  `S3Config`, that a partial set fails fast naming only the key, and that
+  `format!("{:?}", S3Config)` carrying a secret never contains the secret value.
+- **Authentication (localstack integration).** A test in
+  `crates/ourios-server/tests/rfc0019_storage_backend.rs` that configures the
+  server with the S3 credential keys only (no `AWS_*` static keys) and
+  asserts the ingest→query round-trip succeeds, gated to the
+  `s3 integration (localstack)` CI job.

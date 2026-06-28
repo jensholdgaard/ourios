@@ -52,8 +52,10 @@ a tunable is global-with-per-tenant-override, whereas backend selection is
 necessarily **process-wide** (one store per process). Credentials are not
 Ourios configuration at all: they are operator secrets resolved by the standard
 AWS credential chain (see §3.4 below). *(The §9 amendment introduces optional
-S3-named credential config — `OURIOS_S3_*` secret keys — pending its
-implementation PR.)*
+S3-named credential config — the `OURIOS_S3_ACCESS_KEY_ID` /
+`OURIOS_S3_SECRET_ACCESS_KEY` / `OURIOS_S3_SESSION_TOKEN` secret keys (§9.2),
+distinct from the non-secret addressing keys above — pending its implementation
+PR.)*
 
 | Env var | Backend | Meaning | Default |
 | --- | --- | --- | --- |
@@ -296,9 +298,10 @@ All seven scenarios have passing tests; the RFC is `green`.
 ## 9. Amendment (2026-06-28): explicit S3-named credentials
 
 > **Status:** specified, **pending implementation**. This amendment proposes a
-> new acceptance criterion (RFC0019.8). The implementation PR promotes RFC0019.8
-> into §5, folds the env vars into §3.1's table and the design into §3.4, and
-> only then does the RFC remain `green` with all criteria passing.
+> new acceptance criterion (RFC0019.8) and is kept separate from the green body
+> so the RFC stays `green` (all §5 criteria still pass). Only the implementation
+> PR folds these changes into §§3/5 — promoting RFC0019.8 into §5 once it passes
+> — keeping the RFC `green` throughout.
 
 ### 9.1 Motivation
 

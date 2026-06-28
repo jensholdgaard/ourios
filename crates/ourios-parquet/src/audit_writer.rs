@@ -640,7 +640,8 @@ mod tests {
 
     /// `open_in` writes through an already-built `Store` and publishes on
     /// `close`: the events `put` to the partition's object key recover
-    /// byte-for-byte, and `WrittenFile` carries that key + row count.
+    /// byte-for-byte, and `AuditWrittenFile` carries the row count plus the key
+    /// (as `path`, rendered as a path for the store ctor).
     #[test]
     fn open_in_publishes_on_close_and_round_trips() {
         let dir = tempfile::TempDir::new().expect("temp");

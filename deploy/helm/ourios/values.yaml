@@ -1,14 +1,19 @@
-# Default values for the Ourios chart (S3-native, RFC 0019).
+# Default values for the Ourios chart (object-storage-native, RFC 0019).
+#
+# "S3" here means the S3 API, NOT AWS specifically: the store works with AWS S3
+# and any S3-compatible object store — MinIO, Cloudflare R2, Hetzner Object
+# Storage, Ceph/RADOS Gateway, Google Cloud Storage via its S3 interop endpoint,
+# and so on. Point storage.s3.endpoint at a non-AWS provider (see below).
 #
 # Ourios is one binary (`ourios-server`) with three roles. This chart deploys
-# them as three workloads sharing a data + audit store on S3:
+# them as three workloads sharing a data + audit store on object storage:
 #   - receiver  — OTLP log ingest, a StatefulSet with a per-replica WAL PVC
-#                 (the WAL is ALWAYS a local durable volume, never S3;
+#                 (the WAL is ALWAYS a local durable volume, never object storage;
 #                 CLAUDE.md §3.4 WAL-before-ack / §3.6 object storage is truth);
 #   - querier   — the logs-DSL query API, a stateless Deployment that scales
-#                 independently and reads S3 (no PVC);
+#                 independently and reads the store (no PVC);
 #   - compactor — the always-on background compactor, a singleton Deployment.
-# Only the data/audit/manifest live on S3; the WAL never does.
+# Only the data/audit/manifest live on object storage; the WAL never does.
 
 image:
   repository: ghcr.io/jensholdgaard/ourios
@@ -24,25 +29,45 @@ fullnameOverride: ""
 
 # Where the Parquet data + audit + manifest live (OURIOS_STORAGE_BACKEND).
 # Default is `local` so a bare `helm install`/`helm template` works zero-config
-# for a single-node try-it. S3 is the production path: set backend=s3 and
-# storage.s3.bucket (the chart fails to render an s3 backend with no bucket).
+# for a single-node try-it. `s3` is the production path (the S3 API — AWS or any
+# S3-compatible provider): set backend=s3 and storage.s3.bucket (the chart fails
+# to render an s3 backend with no bucket).
 storage:
-  # "local" (default, single-node/dev) or "s3" (production).
+  # "local" (default, single-node/dev) or "s3" (production, any S3-compatible
+  # object store).
   backend: local
   s3:
     # REQUIRED when backend=s3 (OURIOS_S3_BUCKET). The chart aborts at render
     # time if backend=s3 and this is empty — no install can boot with an
-    # invalid store. Credentials are never set here (see aws.* below).
+    # invalid store.
     bucket: ""
-    # Optional S3-compatible endpoint (OURIOS_S3_ENDPOINT) — e.g. MinIO or
-    # LocalStack. Empty uses the real AWS endpoint for the region.
+    # S3-compatible endpoint URL (OURIOS_S3_ENDPOINT). Set this for ANY non-AWS
+    # provider — e.g. MinIO (http://minio:9000), Cloudflare R2, Hetzner Object
+    # Storage, Ceph/RADOS Gateway, GCS S3-interop, LocalStack. Empty targets AWS
+    # S3 at the regional endpoint.
     endpoint: ""
-    # Optional bucket region (OURIOS_S3_REGION).
+    # Bucket region. Drives both the store (OURIOS_S3_REGION) and the SDK
+    # credential chain (AWS_DEFAULT_REGION). The SDK requires a region even for
+    # non-AWS stores — use the provider's region, or a placeholder like
+    # "us-east-1" for providers that have none.
     region: ""
     # Optional key prefix within the bucket (OURIOS_S3_PREFIX). Per-tenant
     # prefixes live below this at the data layer (CLAUDE.md §3.7) — do not
     # encode a tenant here.
     prefix: ""
+    # Object-store credentials. NEVER set keys here as plaintext — give the name
+    # of a Secret holding the standard S3 credential env: AWS_ACCESS_KEY_ID and
+    # AWS_SECRET_ACCESS_KEY (and optionally AWS_SESSION_TOKEN). That naming is
+    # the S3 SDK convention every S3-compatible provider uses — it is NOT
+    # AWS-the-cloud-specific. Injected via envFrom so the credential chain picks
+    # it up. Create it yourself:
+    #   kubectl create secret generic ourios-s3 \
+    #     --from-literal=AWS_ACCESS_KEY_ID=... \
+    #     --from-literal=AWS_SECRET_ACCESS_KEY=...
+    # On AWS EKS you may instead leave this empty and use IRSA — set the role-arn
+    # under serviceAccount.annotations. The two modes are mutually exclusive
+    # (configuring both fails render).
+    existingSecret: ""
   # Only used when backend=local. A single shared ReadWriteOnce PVC mounted by
   # every workload — coherent only on a single node (the pods must co-schedule)
   # or with a ReadWriteMany class. Intended for kick-the-tires / dev; use s3 in
@@ -53,23 +78,6 @@ storage:
     storageClassName: ""
     accessModes:
       - ReadWriteOnce
-
-# AWS credentials for the s3 backend. Credentials are NEVER chart config as
-# plaintext — supply exactly ONE of:
-#   1. existingSecret — the name of a Secret holding AWS_ACCESS_KEY_ID and
-#      AWS_SECRET_ACCESS_KEY (and optionally AWS_SESSION_TOKEN); injected via
-#      envFrom so the SDK credential chain picks it up. Create it yourself:
-#        kubectl create secret generic ourios-aws \
-#          --from-literal=AWS_ACCESS_KEY_ID=... \
-#          --from-literal=AWS_SECRET_ACCESS_KEY=...
-#   2. IRSA — leave existingSecret empty and set
-#      serviceAccount.annotations."eks.amazonaws.com/role-arn"; the pod assumes
-#      the role and no static keys exist anywhere. Preferred on EKS.
-aws:
-  existingSecret: ""
-  # AWS_DEFAULT_REGION for the SDK credential chain (distinct from the bucket's
-  # storage.s3.region). Optional; IRSA / instance metadata usually supply it.
-  region: ""
 
 # OTLP receiver role (RFC 0003): a StatefulSet, one durable WAL PVC per replica.
 receiver:
@@ -122,7 +130,8 @@ otel:
   exporterEndpoint: ""
 
 # Extra environment variables appended verbatim to every container (e.g. OTEL_*
-# overrides). Do NOT put AWS credentials here as plaintext — use aws.* above.
+# overrides). Do NOT put object-store credentials here as plaintext — use
+# storage.s3.existingSecret above.
 extraEnv: []
   # - name: OTEL_EXPORTER_OTLP_PROTOCOL
   #   value: http/protobuf
@@ -130,7 +139,9 @@ extraEnv: []
 serviceAccount:
   create: true
   automount: true
-  # IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+  # IRSA (AWS EKS-specific credential mode): set
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+  # as an alternative to storage.s3.existingSecret (mutually exclusive).
   annotations: {}
   name: ""
 

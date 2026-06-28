@@ -72,9 +72,12 @@ released tag via image.tag in production.
 {{- end }}
 
 {{/*
-Storage-backend env (RFC 0019). For s3: the bucket + optional addressing;
-credentials never appear here — they come from the AWS chain (aws.* →
-envFrom/IRSA). For local: the in-container data root.
+Storage-backend env (RFC 0019). For s3 (the S3 API — AWS or any S3-compatible
+provider): the bucket + optional addressing. Credentials never appear here —
+they come from the S3 credential chain (storage.s3.existingSecret → envFrom, or
+IRSA on EKS). The region drives both the store (OURIOS_S3_REGION) and the SDK
+credential chain (AWS_DEFAULT_REGION), which the S3 client needs for every
+S3-compatible backend. For local: the in-container data root.
 */}}
 {{- define "ourios.storageEnv" -}}
 - name: OURIOS_STORAGE_BACKEND
@@ -89,6 +92,8 @@ envFrom/IRSA). For local: the in-container data root.
 {{- with .Values.storage.s3.region }}
 - name: OURIOS_S3_REGION
   value: {{ . | quote }}
+- name: AWS_DEFAULT_REGION
+  value: {{ . | quote }}
 {{- end }}
 {{- with .Values.storage.s3.prefix }}
 - name: OURIOS_S3_PREFIX
@@ -101,20 +106,16 @@ envFrom/IRSA). For local: the in-container data root.
 {{- end }}
 
 {{/*
-Env common to every workload: the storage backend, the AWS chain region,
-self-telemetry, and any extraEnv. Compaction is wired per-workload — only the
-dedicated compactor sweeps; the receiver/querier set OURIOS_COMPACTION_ENABLED=0
-(RFC 0009 §3.2) so a single sweeper avoids redundant per-interval listing.
+Env common to every workload: the storage backend, self-telemetry, and any
+extraEnv. Compaction is wired per-workload — only the dedicated compactor
+sweeps; the receiver/querier set OURIOS_COMPACTION_ENABLED=0 (RFC 0009 §3.2) so
+a single sweeper avoids redundant per-interval listing.
 */}}
 {{- define "ourios.commonEnv" -}}
 {{- if not .Values.compactor.enabled }}
 {{- fail "compactor.enabled=false leaves the deployment with no sweeper: the receiver and querier set OURIOS_COMPACTION_ENABLED=0, so the dedicated compactor is the chart's only compactor. Set compactor.enabled=true (small files accumulate otherwise — hazard #4)." }}
 {{- end }}
 {{ include "ourios.storageEnv" . }}
-{{- with .Values.aws.region }}
-- name: AWS_DEFAULT_REGION
-  value: {{ . | quote }}
-{{- end }}
 {{- with .Values.otel.exporterEndpoint }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ . | quote }}
@@ -168,16 +169,19 @@ interval. The receiver/querier disable it via OURIOS_COMPACTION_ENABLED=0.
 {{- end }}
 
 {{/*
-AWS-credential envFrom: the Secret named by aws.existingSecret, if set. Empty
-otherwise (IRSA / instance metadata supply credentials with no static keys).
-The two modes are mutually exclusive — static keys in the Secret would shadow
-the IRSA web-identity credentials — so configuring both is rejected.
+Object-store credential envFrom: the Secret named by storage.s3.existingSecret,
+if set. The Secret holds the standard S3 credential env (AWS_ACCESS_KEY_ID /
+AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN]) — the SDK naming every
+S3-compatible backend uses, not AWS-the-cloud-specific. Empty otherwise (IRSA /
+instance metadata supply credentials with no static keys). The two modes are
+mutually exclusive — static keys would shadow the IRSA web-identity credentials
+— so configuring both is rejected.
 */}}
-{{- define "ourios.awsEnvFrom" -}}
-{{- if and .Values.aws.existingSecret (index .Values.serviceAccount.annotations "eks.amazonaws.com/role-arn") }}
-{{- fail "aws.existingSecret and IRSA (serviceAccount.annotations \"eks.amazonaws.com/role-arn\") are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one AWS auth mode." }}
+{{- define "ourios.s3CredentialsEnvFrom" -}}
+{{- if and .Values.storage.s3.existingSecret (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn") }}
+{{- fail "storage.s3.existingSecret and IRSA (serviceAccount.annotations \"eks.amazonaws.com/role-arn\") are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one credential mode." }}
 {{- end }}
-{{- with .Values.aws.existingSecret }}
+{{- with .Values.storage.s3.existingSecret }}
 envFrom:
   - secretRef:
       name: {{ . | quote }}

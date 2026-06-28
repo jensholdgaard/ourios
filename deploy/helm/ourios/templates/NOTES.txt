@@ -2,18 +2,13 @@ Ourios is installed as release {{ .Release.Name }} in namespace {{ .Release.Name
 
 Storage backend: {{ .Values.storage.backend }}
 {{- if eq .Values.storage.backend "s3" }}
-{{- if not .Values.storage.s3.bucket }}
-
-  !! storage.s3.bucket is EMPTY. The s3 backend requires a bucket — the pods
-  !! will fail to start. Reinstall/upgrade with:
-  !!   --set storage.s3.bucket=<your-bucket>
-{{- else }}
   bucket: {{ .Values.storage.s3.bucket }}{{ with .Values.storage.s3.prefix }} (prefix {{ . }}){{ end }}
-{{- end }}
-{{- if and (not .Values.aws.existingSecret) (not (index .Values.serviceAccount.annotations "eks.amazonaws.com/role-arn")) }}
+{{- if and (not .Values.storage.s3.existingSecret) (not (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn")) }}
 
-  NOTE: no AWS credentials configured. Set EITHER aws.existingSecret (a Secret
-  with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) OR an IRSA role-arn via
+  NOTE: no object-store credentials configured. Set EITHER
+  storage.s3.existingSecret (a Secret with AWS_ACCESS_KEY_ID /
+  AWS_SECRET_ACCESS_KEY — the standard S3 credential env, used by every
+  S3-compatible provider) OR, on AWS EKS, an IRSA role-arn via
   serviceAccount.annotations. Credentials are never chart config as plaintext.
 {{- end }}
 {{- else }}
@@ -35,7 +30,7 @@ Workloads:
 {{- if .Values.compactor.enabled }}
   - compactor (Deployment, 1 replica) — the sole background sweeper (interval {{ .Values.compactor.intervalSecs }}s); receiver/querier have compaction disabled.
 {{- else }}
-  - compactor DISABLED — and the receiver/querier set OURIOS_COMPACTION_ENABLED=0, so NO pod compacts. Small files won't be consolidated (hazard #4). Set compactor.enabled=true so the dedicated compactor sweeps.
+  - compactor DISABLED, and no receiver/querier enabled — nothing runs. (Enabling a role with compactor.enabled=false fails the render: the chart refuses a deployment with no sweeper, hazard #4.)
 {{- end }}
 
 {{- if .Values.querier.enabled }}

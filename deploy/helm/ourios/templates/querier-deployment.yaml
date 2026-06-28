@@ -55,7 +55,7 @@ spec:
           env:
             {{- include "ourios.commonEnv" . | nindent 12 }}
             {{- include "ourios.querierEnv" . | nindent 12 }}
-          {{- include "ourios.awsEnvFrom" . | nindent 10 }}
+          {{- include "ourios.s3CredentialsEnvFrom" . | nindent 10 }}
           ports:
             - name: query-http
               containerPort: 4319

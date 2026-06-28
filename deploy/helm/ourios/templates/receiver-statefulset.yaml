@@ -57,7 +57,7 @@ spec:
           env:
             {{- include "ourios.commonEnv" . | nindent 12 }}
             {{- include "ourios.receiverEnv" . | nindent 12 }}
-          {{- include "ourios.awsEnvFrom" . | nindent 10 }}
+          {{- include "ourios.s3CredentialsEnvFrom" . | nindent 10 }}
           ports:
             - name: otlp-grpc
               containerPort: 4317

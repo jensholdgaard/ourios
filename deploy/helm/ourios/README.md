@@ -2,15 +2,21 @@
 
 Deploys [Ourios](https://github.com/jensholdgaard/ourios) — a log storage and
 query backend on Apache Parquet, a Drain-derived template miner, and Apache
-DataFusion — **S3-native** (RFC 0019).
+DataFusion — backed by **S3-compatible object storage** (RFC 0019).
+
+"S3" here means the S3 API, **not AWS specifically**: the store works with AWS
+S3 and any S3-compatible provider — MinIO, Cloudflare R2, Hetzner Object
+Storage, Ceph/RADOS Gateway, Google Cloud Storage via its S3 interop endpoint,
+and so on. Point `storage.s3.endpoint` at a non-AWS provider (see
+[Credentials](#credentials)).
 
 Ourios is one binary (`ourios-server`) running three roles. This chart deploys
-them as three workloads sharing a data + audit store on S3:
+them as three workloads sharing a data + audit store on object storage:
 
 - **receiver** — OTLP log ingest, a **StatefulSet** with a per-replica
   write-ahead-log PVC;
 - **querier** — the logs-DSL query API, a stateless **Deployment** that scales
-  independently and reads S3 (no PVC);
+  independently and reads the store (no PVC);
 - **compactor** — the always-on background compactor, a singleton
   **Deployment**.
 
@@ -28,18 +34,19 @@ them as three workloads sharing a data + audit store on S3:
               └──────────────┬──────────────┘
                              ▼
                    ┌───────────────────┐        ┌──────────────────────┐
-                   │   S3 data store   │◀───────│ compactor Deployment  │
-                   │ (data/audit/man.) │ sweep  │     (1 replica)       │
+                   │  object store     │◀───────│ compactor Deployment  │
+                   │  (S3 API)         │ sweep  │     (1 replica)       │
+                   │ (data/audit/man.) │        │                      │
                    └───────────────────┘        └──────────────────────┘
 ```
 
-Only the data/audit/manifest live on S3. The **WAL is always a local durable
-PVC, never S3** (CLAUDE.md §3.4 WAL-before-ack / §3.6 object storage is the
-source of truth).
+Only the data/audit/manifest live on object storage. The **WAL is always a
+local durable PVC, never object storage** (CLAUDE.md §3.4 WAL-before-ack / §3.6
+object storage is the source of truth).
 
 ## Install
 
-**S3 backend (production):**
+**S3 backend on AWS (production):**
 
 ```sh
 helm install ourios deploy/helm/ourios \
@@ -47,7 +54,20 @@ helm install ourios deploy/helm/ourios \
   --set storage.backend=s3 \
   --set storage.s3.bucket=my-ourios-bucket \
   --set storage.s3.region=us-east-1 \
-  --set aws.existingSecret=ourios-aws        # OR use IRSA (see below)
+  --set storage.s3.existingSecret=ourios-s3   # OR use IRSA (see below)
+```
+
+**S3-compatible backend (MinIO / R2 / Hetzner / Ceph / … — production):** the
+same, plus `storage.s3.endpoint`:
+
+```sh
+helm install ourios deploy/helm/ourios \
+  --set image.tag=<release> \
+  --set storage.backend=s3 \
+  --set storage.s3.bucket=my-ourios-bucket \
+  --set storage.s3.endpoint=https://<provider-s3-endpoint> \
+  --set storage.s3.region=auto \
+  --set storage.s3.existingSecret=ourios-s3
 ```
 
 The chart **fails to render** an `s3` backend with no `storage.s3.bucket`, so a
@@ -76,33 +96,42 @@ helm test ourios
 > pre-release `0.0.0` app version); pin a released tag via `image.tag` in
 > production.
 
-## AWS credentials
+## Credentials
 
-Credentials are **never** chart config as plaintext. Supply exactly one of:
+Credentials are **never** chart config as plaintext. The `AWS_*` key names below
+are the **S3 SDK convention** that every S3-compatible provider uses (MinIO, R2,
+Hetzner, Ceph, …) — they are not AWS-the-cloud-specific. Supply exactly one of:
 
-1. **`aws.existingSecret`** — the name of a `Secret` holding
+1. **`storage.s3.existingSecret`** — the name of a `Secret` holding
    `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally
    `AWS_SESSION_TOKEN`). Injected via `envFrom` so the SDK credential chain
-   picks it up. Create it yourself:
+   picks it up. Works for AWS S3 **and any S3-compatible provider**. Create it
+   yourself:
 
    ```sh
-   kubectl create secret generic ourios-aws \
+   kubectl create secret generic ourios-s3 \
      --from-literal=AWS_ACCESS_KEY_ID=... \
      --from-literal=AWS_SECRET_ACCESS_KEY=...
    ```
 
-2. **IRSA** (preferred on EKS) — leave `aws.existingSecret` empty and set the
+2. **IRSA** (AWS EKS only) — leave `storage.s3.existingSecret` empty and set the
    role ARN on the service account:
 
    ```sh
    --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/<role>
    ```
 
-   The pod assumes the role; no static keys exist anywhere.
+   The pod assumes the role; no static keys exist anywhere. This mode is
+   AWS-specific; on other providers use `storage.s3.existingSecret`.
 
-Setting **both** `aws.existingSecret` and the IRSA `role-arn` annotation **fails
-render** — the static keys would shadow the web-identity credentials, so exactly
-one mode must be chosen.
+Setting **both** `storage.s3.existingSecret` and the IRSA `role-arn` annotation
+**fails render** — the static keys would shadow the web-identity credentials, so
+exactly one mode must be chosen.
+
+For a **non-AWS provider**, also set `storage.s3.endpoint` to its S3 endpoint URL
+(e.g. `http://minio:9000`, a Cloudflare R2 / Hetzner endpoint, …) and
+`storage.s3.region` to the provider's region (or a placeholder like `us-east-1`
+if it has none).
 
 ## Compactor topology
 
@@ -124,15 +153,14 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/jensholdgaard/ourios` | Image repository. |
 | `image.tag` | `""` (→ `latest`) | Image tag; pin a released tag in production. |
-| `storage.backend` | `local` | `local` (single-node/dev) or `s3` (production). |
+| `storage.backend` | `local` | `local` (single-node/dev) or `s3` (production — the S3 API, AWS or any S3-compatible provider). |
 | `storage.s3.bucket` | `""` | **Required for s3** (`OURIOS_S3_BUCKET`); render fails if empty. |
-| `storage.s3.endpoint` | `""` | S3-compatible endpoint (MinIO/LocalStack). |
-| `storage.s3.region` | `""` | Bucket region (`OURIOS_S3_REGION`). |
+| `storage.s3.endpoint` | `""` | S3-compatible endpoint URL — set for any non-AWS provider (MinIO/R2/Hetzner/Ceph/LocalStack); empty targets AWS. |
+| `storage.s3.region` | `""` | Bucket region; drives both `OURIOS_S3_REGION` and `AWS_DEFAULT_REGION`. |
 | `storage.s3.prefix` | `""` | Key prefix within the bucket. |
+| `storage.s3.existingSecret` | `""` | Secret with the S3 credential env (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), injected via `envFrom`. Used by any S3-compatible provider. |
 | `storage.local.bucketRoot` | `/var/lib/ourios/data` | Data dir for the local backend. |
 | `storage.local.size` | `10Gi` | Local data PVC size. |
-| `aws.existingSecret` | `""` | Secret with AWS keys, injected via `envFrom`. |
-| `aws.region` | `""` | `AWS_DEFAULT_REGION` for the credential chain. |
 | `receiver.enabled` | `true` | OTLP ingest StatefulSet (gRPC `:4317` + HTTP `:4318`). |
 | `receiver.replicas` | `1` | Receiver replicas (each gets its own WAL PVC). |
 | `receiver.wal.size` | `2Gi` | WAL PVC size (`OURIOS_WAL_ROOT`, always local). |
@@ -142,7 +170,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |
 | `compactor.enabled` | `true` | Dedicated singleton compactor Deployment. Setting `false` **fails render** (the only sweeper — hazard #4). |
 | `compactor.intervalSecs` | `300` | Compaction sweep cadence (used only by the dedicated compactor). |
-| `serviceAccount.annotations` | `{}` | IRSA `eks.amazonaws.com/role-arn` goes here. |
+| `serviceAccount.annotations` | `{}` | AWS EKS IRSA `eks.amazonaws.com/role-arn` goes here (alternative to `storage.s3.existingSecret`). |
 | `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |
 | `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |
 

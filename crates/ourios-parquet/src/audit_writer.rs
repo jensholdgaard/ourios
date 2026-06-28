@@ -412,15 +412,11 @@ impl fmt::Display for AuditWriterError {
             } => match source_path {
                 Some(src) => write!(
                     f,
-                    "filesystem I/O on `{op}` from {} to {}: {source}",
+                    "storage I/O on `{op}` from {} to {}: {source}",
                     src.display(),
                     path.display(),
                 ),
-                None => write!(
-                    f,
-                    "filesystem I/O on `{op}` at {}: {source}",
-                    path.display(),
-                ),
+                None => write!(f, "storage I/O on `{op}` at {}: {source}", path.display()),
             },
             Self::Parquet(e) => write!(f, "parquet writer: {e}"),
             Self::Batch(e) => write!(f, "audit batch: {e}"),
@@ -616,4 +612,85 @@ fn audit_writer_properties() -> Result<WriterProperties, AuditWriterError> {
     );
 
     Ok(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ourios_core::audit::{AuditEvent, AuditPayload};
+    use ourios_core::tenant::TenantId;
+
+    use super::{AuditWriter, derive_audit_partition};
+    use crate::{AuditReader, Store};
+
+    fn compaction_event(secs: u64) -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new("acme"),
+            timestamp: UNIX_EPOCH + Duration::from_secs(secs),
+            payload: AuditPayload::Compaction {
+                partition: "year=2026/month=04/day=02/hour=10".to_string(),
+                input_files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+                output_file: "c.parquet".to_string(),
+                generation: 7,
+                rows: 100,
+            },
+        }
+    }
+
+    /// `open_in` writes through an already-built `Store` and publishes on
+    /// `close`: the events `put` to the partition's object key recover
+    /// byte-for-byte, and `WrittenFile` carries that key + row count.
+    #[test]
+    fn open_in_publishes_on_close_and_round_trips() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let events = vec![
+            compaction_event(1_775_127_480),
+            compaction_event(1_775_127_481),
+        ];
+        let partition = derive_audit_partition(&events[0]).expect("derive");
+
+        let mut writer = AuditWriter::open_in(&store, partition).expect("open_in");
+        writer.append_events(&events).expect("append");
+        let written = writer.close().expect("close");
+
+        // For `open_in`, `path` is the object key rendered as a path (no local
+        // root); on this platform it round-trips to the store key.
+        let key = written.path.to_string_lossy().into_owned();
+        assert!(key.ends_with(".parquet"), "key: {key}");
+        assert_eq!(written.num_rows, 2);
+        let bytes = store.get_blocking(&key).expect("get");
+        let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+            .expect("open_bytes")
+            .read_all()
+            .expect("read_all");
+        assert_eq!(
+            read, events,
+            "events recover byte-for-byte through the store"
+        );
+    }
+
+    /// A writer dropped without `close` publishes nothing — buffer-and-put means
+    /// the object only exists after the `close` `put`, so an abandoned writer
+    /// leaves no object behind (no temp file, unlike the old fs scheme).
+    #[test]
+    fn drop_without_close_publishes_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        let event = compaction_event(1_775_127_480);
+        let partition = derive_audit_partition(&event).expect("derive");
+
+        {
+            let mut writer = AuditWriter::open_in(&store, partition).expect("open_in");
+            writer
+                .append_events(std::slice::from_ref(&event))
+                .expect("append");
+            // drop without close
+        }
+        assert!(
+            store.list_blocking(None).expect("list").is_empty(),
+            "no object is published until close",
+        );
+    }
 }

@@ -112,6 +112,17 @@ jobs:
           store_delete_blocking_removes_on_s3
           compact_partition_consolidates_on_s3_via_cas
           parquet_audit_sink_persists_to_s3
+      # RFC 0019 server-level §5 scenarios (.2/.3/.4/.5): spawn the
+      # `ourios-server` binary configured for the S3 backend against the same
+      # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored
+      # unit tests that run in the normal `test` job).
+      - run: >
+          cargo test -p ourios-server --test rfc0019_storage_backend --
+          --ignored --exact
+          rfc0019_2_wal_stays_local_under_s3
+          rfc0019_3_ingest_query_end_to_end_on_s3
+          rfc0019_4_compaction_operates_on_s3
+          rfc0019_5_tenant_isolation_on_s3
 
   book:
     name: mdbook build

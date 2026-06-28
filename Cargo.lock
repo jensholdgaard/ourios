@@ -3165,6 +3165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers-modules",
  "tokio",
  "tonic",
  "tower",

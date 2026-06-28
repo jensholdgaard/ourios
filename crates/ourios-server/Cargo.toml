@@ -76,6 +76,12 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # global meter provider and read the exported stream (the ingester pattern).
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+# RFC 0019 server-level S3 integration tests (rfc0019_storage_backend): spin
+# LocalStack (S3-compatible, Apache-2.0) via testcontainers, spawn the server
+# pointed at it through the endpoint override, and assert bucket contents via a
+# `Store::s3`. `#[ignore]`d — run only by the `s3-integration` CI job (Docker +
+# AWS_* env); the default `cargo test` compiles but skips them.
+testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 
 [lints]
 workspace = true

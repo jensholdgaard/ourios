@@ -158,10 +158,12 @@ diagnosability — e.g. the existing `OURIOS_COMPACTION_INTERVAL_SECS` parser
 reporting the offending value — since those carry no secret; the prohibition is
 specifically on credential/secret material.
 
-*The §9 amendment (2026-06-28) adds optional S3-named credential config
-(`OURIOS_S3_*`) layered explicit-over-chain, and widens this redaction
-obligation to the keys Ourios then reads. It is pending its implementation PR;
-until that lands, this section stands as the green behaviour.*
+*The §9 amendment (2026-06-28) adds optional S3-named credential config — the
+`OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` / `OURIOS_S3_SESSION_TOKEN`
+secret keys (§9.2), distinct from the non-secret `OURIOS_S3_*` addressing keys —
+layered explicit-over-chain, and widens this redaction obligation to those
+credential keys Ourios then reads. It is pending its implementation PR; until
+that lands, this section stands as the green behaviour.*
 
 ## 4. Alternatives considered
 
@@ -314,7 +316,7 @@ AWS chain as the fallback that AWS IRSA requires.
 | --- | --- | --- | --- |
 | `OURIOS_S3_ACCESS_KEY_ID` | s3 | static access key (**secret**) | unset (→ credential chain) |
 | `OURIOS_S3_SECRET_ACCESS_KEY` | s3 | static secret key (**secret**) | unset (→ credential chain) |
-| `OURIOS_S3_SESSION_TOKEN` | s3 | session token for temporary credentials (**secret**) | unset |
+| `OURIOS_S3_SESSION_TOKEN` | s3 | session token for temporary credentials (**secret**) | unset (valid only with the static key pair, §9.3) |
 
 ### 9.3 Resolution model (two-layer, explicit-over-chain)
 
@@ -359,8 +361,9 @@ presence). The §3.4 obligation is otherwise unchanged.
 >   an S3-compatible backend (localstack)
 > - **Then** the explicit keys authenticate the store (the round-trip
 >   succeeds), confirming Ourios applies them to the builder; **and** when the
->   explicit keys are all unset the standard credential chain (`from_env`,
->   including IRSA) is used unchanged; **and** a partial set (one of the static
+>   explicit keys are all unset the standard credential chain
+>   (`AmazonS3Builder::from_env()`, including IRSA) is used unchanged; **and** a
+>   partial set (one of the static
 >   pair, or a token alone) fails fast naming only the offending key; **and** no
 >   credential value ever appears in a config error, log line, `StoreError`,
 >   `Debug` output, or metric attribute — extending RFC0019.6's redaction to the

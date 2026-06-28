@@ -85,22 +85,19 @@ Credentials are **never** chart config as plaintext. Supply exactly one of:
 
    The pod assumes the role; no static keys exist anywhere.
 
-## Compactor design note (for review)
+## Compactor topology
 
-The `ourios-server` binary **always** runs the compaction role — there is no
-env flag to disable it. So receiver and querier pods also sweep. Concurrent
-sweeps are safe: the publish-CAS commit makes all but one sweeper a no-op. This
-chart adds a dedicated **`compactor` Deployment pinned to 1 replica** as the
-*designated* sweeper and the workload that keeps compaction running when both
-roles are disabled.
+The `ourios-server` binary runs the compaction role by default. To avoid every
+pod sweeping, the receiver and querier workloads set `OURIOS_COMPACTION_ENABLED=0`,
+so a **single dedicated `compactor` Deployment (1 replica)** is the only sweeper.
 
-The tradeoff: with the defaults you get N+1 sweepers (receiver replicas +
-querier replicas + the singleton), all on the same `compactor.intervalSecs`
-cadence — wasteful but correct. The clean fix is a binary-level
-"compaction-disabled" mode (so only the dedicated pod sweeps) or leader
-election; both are out of scope for this chart and flagged for a follow-up. If
-you prefer fewer sweepers today, set `compactor.enabled=false` and let the
-receiver pods be the sweepers, or raise `compactor.intervalSecs`.
+Scaling that compactor `Deployment` past 1 replica is **safe but unnecessary**:
+the manifest publish-CAS commit (RFC 0009 §3.2 / RFC0013.3–.4) makes concurrent
+sweeps correct — a losing sweeper's consolidated file is just an orphan a later
+sweep reclaims — but it duplicates the per-interval object listing for no gain.
+A `replicas: 1` Deployment self-heals (k8s reschedules a dead pod; a brief gap
+in this background maintenance is harmless), so leader election isn't needed and
+is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 
 ## Key values
 

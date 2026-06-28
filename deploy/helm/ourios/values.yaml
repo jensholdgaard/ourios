@@ -97,15 +97,13 @@ querier:
   podAnnotations: {}
   podLabels: {}
 
-# Background compactor (RFC 0009). The binary ALWAYS runs the compaction role,
-# so receiver and querier pods also sweep; concurrent sweeps are safe (the
-# publish-CAS commit makes losers no-op). This singleton Deployment is the
-# designated sweeper and the one that keeps running when both roles are off.
-# It is pinned to one replica on purpose — see the README design note.
+# Background compactor (RFC 0009). The single sweeper: the receiver and querier
+# workloads set OURIOS_COMPACTION_ENABLED=0, so only this Deployment compacts.
+# Pinned to one replica on purpose (>1 is safe via the publish-CAS commit but
+# redundant; no leader election) — see the README "Compactor topology" section.
 compactor:
   enabled: true
-  # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS). Applied to every workload,
-  # since every workload compacts.
+  # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS), used only by this compactor.
   intervalSecs: 300
   resources: {}
   podAnnotations: {}

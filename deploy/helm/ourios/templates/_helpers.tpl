@@ -98,14 +98,13 @@ envFrom/IRSA). For local: the in-container data root.
 {{- end }}
 
 {{/*
-Env common to every workload: the storage backend, the always-on compaction
-cadence (every workload compacts; see the README design note), the AWS chain
-region, self-telemetry, and any extraEnv.
+Env common to every workload: the storage backend, the AWS chain region,
+self-telemetry, and any extraEnv. Compaction is wired per-workload — only the
+dedicated compactor sweeps; the receiver/querier set OURIOS_COMPACTION_ENABLED=0
+(RFC 0009 §3.2) so a single sweeper avoids redundant per-interval listing.
 */}}
 {{- define "ourios.commonEnv" -}}
 {{ include "ourios.storageEnv" . }}
-- name: OURIOS_COMPACTION_INTERVAL_SECS
-  value: {{ .Values.compactor.intervalSecs | quote }}
 {{- with .Values.aws.region }}
 - name: AWS_DEFAULT_REGION
   value: {{ . | quote }}
@@ -126,6 +125,9 @@ never S3 (CLAUDE.md §3.4/§3.6).
 {{- define "ourios.receiverEnv" -}}
 - name: OURIOS_RECEIVER_ENABLED
   value: "true"
+# Compaction runs only on the dedicated compactor (RFC 0009 §3.2).
+- name: OURIOS_COMPACTION_ENABLED
+  value: "0"
 - name: OURIOS_RECEIVER_GRPC_ADDR
   value: "0.0.0.0:4317"
 - name: OURIOS_RECEIVER_HTTP_ADDR
@@ -140,10 +142,23 @@ Querier-role env (RFC 0016).
 {{- define "ourios.querierEnv" -}}
 - name: OURIOS_QUERIER_ENABLED
   value: "true"
+# Compaction runs only on the dedicated compactor (RFC 0009 §3.2).
+- name: OURIOS_COMPACTION_ENABLED
+  value: "0"
 - name: OURIOS_QUERIER_HTTP_ADDR
   value: "0.0.0.0:4319"
 - name: OURIOS_QUERIER_DEFAULT_WINDOW_SECS
   value: {{ .Values.querier.defaultWindowSecs | quote }}
+{{- end }}
+
+{{/*
+Compactor-role env (RFC 0009): the sweep cadence. Compaction is on by default
+in the binary, so the dedicated compactor needs no enable flag — only the
+interval. The receiver/querier disable it via OURIOS_COMPACTION_ENABLED=0.
+*/}}
+{{- define "ourios.compactorEnv" -}}
+- name: OURIOS_COMPACTION_INTERVAL_SECS
+  value: {{ .Values.compactor.intervalSecs | quote }}
 {{- end }}
 
 {{/*

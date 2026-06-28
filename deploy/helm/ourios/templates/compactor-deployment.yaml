@@ -54,6 +54,7 @@ spec:
           {{- end }}
           env:
             {{- include "ourios.commonEnv" . | nindent 12 }}
+            {{- include "ourios.compactorEnv" . | nindent 12 }}
           {{- include "ourios.awsEnvFrom" . | nindent 10 }}
           {{- with .Values.compactor.resources }}
           resources:

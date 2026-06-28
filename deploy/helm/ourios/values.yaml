@@ -46,10 +46,11 @@ storage:
     # Storage, Ceph/RADOS Gateway, GCS S3-interop, LocalStack. Empty targets AWS
     # S3 at the regional endpoint.
     endpoint: ""
-    # Bucket region. Drives both the store (OURIOS_S3_REGION) and the SDK
-    # credential chain (AWS_DEFAULT_REGION). The SDK requires a region even for
-    # non-AWS stores — use the provider's region, or a placeholder like
-    # "us-east-1" for providers that have none.
+    # Bucket region. Optional here, but recommended: when set it drives both the
+    # store (OURIOS_S3_REGION) and the SDK credential chain (AWS_DEFAULT_REGION).
+    # Some providers / AWS SDK configurations require a region; if unset it can
+    # also come from the standard AWS env/config. For non-AWS stores use the
+    # provider's region, or a placeholder like "us-east-1" if it has none.
     region: ""
     # Optional key prefix within the bucket (OURIOS_S3_PREFIX). Per-tenant
     # prefixes live below this at the data layer (CLAUDE.md §3.7) — do not

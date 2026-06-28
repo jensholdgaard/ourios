@@ -80,6 +80,9 @@ credential chain (AWS_DEFAULT_REGION), which the S3 client needs for every
 S3-compatible backend. For local: the in-container data root.
 */}}
 {{- define "ourios.storageEnv" -}}
+{{- if not (or (eq .Values.storage.backend "local") (eq .Values.storage.backend "s3")) }}
+{{- fail (printf "storage.backend must be \"local\" or \"s3\", got %q" .Values.storage.backend) }}
+{{- end }}
 - name: OURIOS_STORAGE_BACKEND
   value: {{ .Values.storage.backend | quote }}
 {{- if eq .Values.storage.backend "s3" }}
@@ -174,10 +177,13 @@ if set. The Secret holds the S3-named credential keys Ourios reads
 (OURIOS_S3_ACCESS_KEY_ID / OURIOS_S3_SECRET_ACCESS_KEY [/ OURIOS_S3_SESSION_TOKEN],
 RFC 0019 §3.4) — working against AWS S3 and every S3-compatible backend. Empty
 otherwise (IRSA / instance metadata supply credentials via the AWS chain, no
-static keys). The two modes are mutually exclusive — static keys would shadow the
-IRSA web-identity credentials — so configuring both is rejected.
+static keys). Only emitted for the s3 backend — the local backend has no
+credentials, so a stray existingSecret is neither mounted nor cross-checked. The
+two credential modes are mutually exclusive — static keys would shadow the IRSA
+web-identity credentials — so configuring both is rejected.
 */}}
 {{- define "ourios.s3CredentialsEnvFrom" -}}
+{{- if eq .Values.storage.backend "s3" }}
 {{- if and .Values.storage.s3.existingSecret (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn") }}
 {{- fail "storage.s3.existingSecret and IRSA (serviceAccount.annotations \"eks.amazonaws.com/role-arn\") are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one credential mode." }}
 {{- end }}
@@ -185,6 +191,7 @@ IRSA web-identity credentials — so configuring both is rejected.
 envFrom:
   - secretRef:
       name: {{ . | quote }}
+{{- end }}
 {{- end }}
 {{- end }}
 

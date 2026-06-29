@@ -18,6 +18,11 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
+# Single source of truth for every workspace member crate's version (each sets
+# `version.workspace = true`). The excluded `fuzz/` harness is a separate
+# workspace and versions independently. The release recipe (`just release X.Y.Z`)
+# bumps this one line; the matching `vX.Y.Z` tag then drives cargo-dist + image.
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

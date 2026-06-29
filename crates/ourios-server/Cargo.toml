@@ -1,6 +1,6 @@
 [package]
 name = "ourios-server"
-version = "0.0.0"
+version.workspace = true
 description = "Ourios server binary (CLAUDE.md §1, §7). Currently runs the background compaction role (RFC 0009 §3.2) with OTLP metrics + durable audit."
 edition.workspace = true
 rust-version.workspace = true

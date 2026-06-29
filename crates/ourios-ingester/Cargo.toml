@@ -1,6 +1,6 @@
 [package]
 name = "ourios-ingester"
-version = "0.0.0"
+version.workspace = true
 description = "Ourios ingester role — OTLP receiver (RFC 0003), WAL-before-ack (RFC 0008), and the background compaction runner (RFC 0009)."
 edition.workspace = true
 rust-version.workspace = true

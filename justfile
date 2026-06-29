@@ -7,6 +7,13 @@
 # Install on macOS: `brew install just`
 # Install elsewhere: https://github.com/casey/just#packages
 
+# Pass recipe arguments as positional args ($1, $2, ...) to shebang recipes.
+# just's `{{...}}` substitution is textual, so an argument interpolated into a
+# shell line — even inside double quotes — would let embedded `$(...)`/backticks
+# execute. Capturing `$1` into a shell variable instead keeps untrusted input
+# (e.g. a release version) as data the shell never re-parses.
+set positional-arguments
+
 # Default: list available recipes.
 default:
     @just --list
@@ -53,6 +60,110 @@ thesis-bench *ARGS:
 # Lint commit message (requires `committed`: cargo install committed).
 lint-commits:
     committed --commit-file .git/COMMIT_EDITMSG
+
+# Preview a release WITHOUT changing anything (no bump, no tag): the CHANGELOG.md
+# git-cliff would generate for vX.Y.Z, then the artifacts cargo-dist would build.
+# `dist plan --tag` parses the version and rejects anything that isn't a valid
+# release tag — we don't re-validate SemVer ourselves. Requires git-cliff
+# (`brew install git-cliff`) + dist (cargo-dist). e.g. `just release-dry 0.1.0`.
+release-dry version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$1"
+    # `dist plan` accepts SemVer build metadata, but image.yml tags the release
+    # via docker/metadata-action `type=semver` and a Docker tag cannot contain
+    # `+` — reject it so the preview matches the real release constraints. This
+    # is the one constraint the canonical parsers are blind to; everything else
+    # (leading `v`, leading zeroes, non-numeric) `dist plan --tag` rejects below.
+    case "$version" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '$version'"; exit 1;; esac
+    command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
+    command -v dist >/dev/null || { echo "error: dist (cargo-dist) not installed"; exit 1; }
+    # `dist plan` first: it parses the tag and rejects an invalid one (e.g. a
+    # stray leading `v`), so we fail fast before git-cliff prints a changelog for
+    # a tag that can't actually be released. `--tag` previews the intended version
+    # (not the current workspace version); `--force-tag` lets it do so unbumped.
+    echo "=== dist plan (release artifacts) ==="
+    dist plan --tag "v$version" --force-tag
+    echo ""
+    echo "=== CHANGELOG.md for v$version (git-cliff preview) ==="
+    git-cliff --tag "v$version"
+
+# Cut a release: bump the single workspace version (every workspace member crate
+# inherits it; the excluded `fuzz/` harness is a separate workspace and is not
+# released), regenerate CHANGELOG.md from the conventional-commit history
+# (git-cliff), commit, and tag vX.Y.Z. Does NOT push — review, then fire the
+# pipeline with `git push --follow-tags origin main` (the tag drives cargo-dist's
+# signed release + image.yml's container image). Run `just release-dry X.Y.Z`
+# first. Requires git-cliff; must run on a clean `main`. e.g. `just release 0.1.0`.
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$1"
+    # cargo (below) accepts SemVer build metadata as a valid package version, but
+    # image.yml tags the release via docker/metadata-action `type=semver` and a
+    # Docker tag cannot contain `+` — reject it before mutating anything. cargo's
+    # parser still rejects the rest (leading `v`, leading zeroes, non-numeric).
+    case "$version" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '$version'"; exit 1;; esac
+    [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
+    [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
+    command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
+    # Refresh remote refs so the checks below see the real state of origin.
+    git fetch --quiet --tags origin
+    # Release only from a `main` that exactly matches `origin/main` — never a
+    # stale or diverged tree (else the release commit would build on the wrong
+    # base and the eventual push could be rejected or rebased).
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "error: local main is not in sync with origin/main — pull/push first"; exit 1; }
+    # Fail fast if the tag already exists locally OR on origin — BEFORE mutating
+    # the manifest / changelog — so a re-run can't advance `main` with a release
+    # commit that `git tag` (or the later push) then refuses, leaving the tag the
+    # workflow expects missing.
+    if git rev-parse -q --verify "refs/tags/v$version" >/dev/null 2>&1 \
+        || git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+        echo "error: tag v$version already exists (local or origin)"; exit 1
+    fi
+    # The workspace version is the single source of truth — after every workspace
+    # member crate switched to `version.workspace = true`, this is the only
+    # literal `version = "..."` in the root manifest. Read it, and fail fast if
+    # the requested version already matches (else the bump is a no-op and the
+    # release "commit" would carry only a regenerated changelog/lock, or nothing).
+    current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
+    [ -n "$current" ] || { echo "error: could not read the current workspace version from Cargo.toml (expected a literal 'version = \"...\"')"; exit 1; }
+    [ "$version" != "$current" ] || { echo "error: version $version is already the current workspace version"; exit 1; }
+    # Capture the pristine starting commit (the clean-tree + HEAD==origin/main
+    # checks above guarantee it is one) so any failure below rolls the whole
+    # attempt back: a hard reset to this SHA reverts every mutation — Cargo.toml,
+    # the synced Cargo.lock, the regenerated CHANGELOG.md, and the release commit
+    # — then we drop the tag. Disarmed on success. Safer than restoring
+    # individual files: a `git tag` failure after the commit would otherwise
+    # leave the working tree inconsistent with an advanced HEAD.
+    start_sha="$(git rev-parse HEAD)"
+    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v$version" >/dev/null 2>&1 || true; rm -f Cargo.toml.bak' ERR
+    # The anchored edit is precise (only the workspace version matches). sed needs
+    # a backup suffix to edit in place portably. Keep the edit and the cleanup as
+    # separate statements: in `sed ... && rm`, a sed failure is the non-final
+    # command of an && list and so is exempt from `set -e`, which would let the
+    # script continue with an unbumped Cargo.toml. git reset is the rollback (the
+    # trap also drops a stray .bak); this rm just clears it on the success path.
+    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml
+    rm -f Cargo.toml.bak
+    # Sync Cargo.lock to the new workspace-crate versions AND validate the
+    # version: cargo parses `version = "..."` with its own SemVer parser, so a
+    # malformed arg (leading `v`, leading zeroes, non-numeric) fails here — we
+    # don't reimplement that check. A check (not `cargo update`) so third-party
+    # deps can't churn into the release commit; it rewrites the lock for the
+    # manifest version change + compile-verifies.
+    cargo check --workspace
+    # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
+    # commit — cargo-dist reads it for the GitHub Release body (release.yml).
+    git-cliff --tag "v$version" --output CHANGELOG.md
+    git add Cargo.toml Cargo.lock CHANGELOG.md
+    git commit -m "chore(release): v$version"
+    git tag -a "v$version" -m "v$version"
+    # Success: disarm the rollback trap.
+    trap - ERR
+    echo ""
+    echo "Tagged v$version locally (NOT pushed). Review the commit, then fire the"
+    echo "release: git push --follow-tags origin main"
 
 # Clean build artefacts (cargo target + mdBook output).
 clean:

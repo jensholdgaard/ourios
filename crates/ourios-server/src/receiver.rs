@@ -54,20 +54,15 @@ const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
 /// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.
 const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
 
-/// Soft ceiling on the audit sink's in-memory event buffer (issue #302). The
-/// miner has no template-count cap, so an adversarial burst of template churn
-/// could otherwise grow the buffer unbounded between `SINK_FLUSH_TICK`s;
-/// reaching this signals an eager off-runtime flush (it never blocks `emit` or
-/// drops events). Generous by default — a buffered audit event is small and the
-/// normal driver is the cadence, not this cap.
+/// Soft ceiling on the audit sink's in-memory event buffer (issue #302):
+/// reaching it signals an eager off-runtime flush, which keeps the buffer
+/// bounded whenever the store is healthy (the realistic case). It is **not** a
+/// hard cap — `emit` never drops; under sustained store-unavailability the
+/// buffer is retained and may transiently exceed this, exactly like the record
+/// sink (dropping would lose template events the WAL can't re-mine past the
+/// snapshot gate — `CLAUDE.md` §3.3). Generous by default — a buffered audit
+/// event is small and the normal driver is the cadence, not this signal.
 const AUDIT_SINK_CEILING_EVENTS: usize = 100_000;
-/// Hard cap on the audit sink's in-memory buffer (issue #302 fix #3) — the OOM
-/// backstop. Well above the soft ceiling: under sustained store-unavailability
-/// (flush can't drain) `emit` drops past this rather than grow without bound.
-/// Dropped template events degrade those templates to retained/empty bodies
-/// until the WAL re-mines them on restart — bounded memory is the deliberate
-/// trade.
-const AUDIT_SINK_MAX_EVENTS: usize = 1_000_000;
 
 fn flush_config() -> FlushConfig {
     FlushConfig {
@@ -311,7 +306,6 @@ fn build_write_sinks(store: Store) -> (SharedParquetSink, SharedParquetAuditSink
     let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
         store.clone(),
         AUDIT_SINK_CEILING_EVENTS,
-        AUDIT_SINK_MAX_EVENTS,
     ));
     let barrier_audit = audit_sink.clone();
     let sink = SharedParquetSink::new(
@@ -553,13 +547,12 @@ mod tests {
     }
 
     /// An audit sink rooted at `store_root`. A generous ceiling keeps the
-    /// bounding signal out of these tests.
+    /// eager-flush signal out of these tests.
     fn audit_sink(store_root: &Path) -> SharedParquetAuditSink {
         std::fs::create_dir_all(store_root).expect("create audit store root");
         SharedParquetAuditSink::new(BufferingAuditSink::new(
             Store::local(store_root).expect("audit store"),
             10_000,
-            100_000,
         ))
     }
 

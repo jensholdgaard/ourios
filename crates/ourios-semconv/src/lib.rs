@@ -25,9 +25,6 @@ pub const OURIOS_AUDIT_SINK_BUFFER_USAGE: &str = "ourios.audit_sink.buffer.usage
 /// `ourios.audit_sink.derive.errors` (counter, unit `{error}`).
 pub const OURIOS_AUDIT_SINK_DERIVE_ERRORS: &str = "ourios.audit_sink.derive.errors";
 
-/// `ourios.audit_sink.dropped` (counter, unit `{event}`).
-pub const OURIOS_AUDIT_SINK_DROPPED: &str = "ourios.audit_sink.dropped";
-
 /// `ourios.audit_sink.flush.errors` (counter, unit `{error}`).
 pub const OURIOS_AUDIT_SINK_FLUSH_ERRORS: &str = "ourios.audit_sink.flush.errors";
 

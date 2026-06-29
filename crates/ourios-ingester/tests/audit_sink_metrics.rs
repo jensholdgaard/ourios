@@ -65,7 +65,7 @@ async fn audit_sink_exports_its_instruments() {
     let store_root = dir.path().join("store");
     std::fs::create_dir_all(&store_root).expect("create store root");
     let store = Store::local(&store_root).expect("store");
-    let mut sink = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024, 4096));
+    let mut sink = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024));
 
     // Phase 1 — three events across two tenants flush to two files.
     sink.emit(created_event("alpha", 1));

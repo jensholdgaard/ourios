@@ -757,7 +757,6 @@ mod tests {
         let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
             Store::local(&audit_root).expect("audit store"),
             1024,
-            4096,
         ));
 
         let data_root = tmp.path().join("data");
@@ -801,7 +800,6 @@ mod tests {
         let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
             Store::local(&audit_root).expect("audit store"),
             1024,
-            4096,
         ));
         let data_root = tmp.path().join("data");
         std::fs::create_dir_all(&data_root).expect("data root");

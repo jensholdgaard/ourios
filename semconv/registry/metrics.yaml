@@ -415,14 +415,3 @@ groups:
       (a pre-epoch / overflowing timestamp).
     instrument: counter
     unit: "{error}"
-
-  - id: metric.ourios.audit_sink.dropped
-    type: metric
-    metric_name: ourios.audit_sink.dropped
-    stability: development
-    brief: >-
-      Audit events dropped at the hard in-memory buffer cap — the OOM backstop
-      under sustained store-unavailability. Affected templates render
-      retained/empty until the WAL re-mines them on restart.
-    instrument: counter
-    unit: "{event}"

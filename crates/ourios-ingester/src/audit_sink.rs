@@ -1,6 +1,6 @@
 //! Buffering audit sink for the ingest path (issue #302).
 //!
-//! The Drain miner emits a template audit event (`template_created` /
+//! The template miner emits a template audit event (`template_created` /
 //! `template_widened` / `template_type_expanded`, RFC 0001 §6.4 / RFC 0017
 //! §3.1) synchronously from `MinerCluster::ingest`, which runs on the
 //! receiver's async request path. The querier's read-time template registry
@@ -24,12 +24,21 @@
 //! transient failure's events *ahead* of anything `emit` buffered meanwhile.
 //! So a slow store flush never holds the mutex `emit` contends on.
 //!
-//! **Bounded buffer (issue #302 fix #3).** `emit` signals an eager flush at a
-//! soft `ceiling_events`, and *drops* (counted via `ourios.audit_sink.dropped`,
-//! logged once) at a hard `max_events` cap — the OOM backstop when the store is
-//! down and the buffer can't drain. Dropped template events degrade those
-//! templates to retained/empty bodies until the WAL re-mines them on restart;
-//! bounded memory is the deliberate trade.
+//! **Buffer bound (issue #302 fix #3).** `emit` **always buffers** — it never
+//! drops. Under a healthy store the soft `ceiling_events` fires the `Notify` for
+//! an eager off-runtime flush, which is the bound for the realistic case (a
+//! working store keeps up with template churn). Under sustained
+//! store-unavailability the buffer is *retained* and may transiently exceed the
+//! ceiling — exactly the [`crate::record_sink::ParquetRecordSink`] posture (its
+//! `FlushConfig::ceiling_bytes` doc: retain + transiently exceed rather than
+//! stall or drop). Dropping here would be **data loss**, not graceful
+//! degradation: a dropped event isn't counted by `buffered_events`, so the
+//! no-loss snapshot gate (`flush_then_snapshot`, §3.4) would advance the miner
+//! snapshot past that line's WAL position and recovery would never re-mine the
+//! template event — the row becomes permanently unreconstructable (§3.3). So we
+//! retain; the snapshot gate (which won't advance while the buffer is non-empty)
+//! holds. OOM under a *total* sustained store outage is the same accepted
+//! failure mode the record sink already carries.
 //!
 //! **Publication is audit-ordered (issue #302 fix #1/#2).** A mined record must
 //! never be query-visible before its template event is durable. The miner emits
@@ -141,12 +150,12 @@ fn write_one_partition(
 pub struct BufferingAuditSink {
     store: Store,
     buffer: Vec<AuditEvent>,
-    /// Soft cap: reaching it signals an eager off-runtime flush (never blocks
-    /// `emit` or drops).
+    /// Soft cap: reaching it signals an eager off-runtime flush (it never blocks
+    /// or drops — `emit` always buffers). Under sustained store-unavailability
+    /// the buffer is retained and may transiently exceed this, like the record
+    /// sink, rather than dropping (which would be data loss — see the module
+    /// docs).
     ceiling_events: usize,
-    /// Hard cap (OOM backstop): at it, `emit` drops the event (counted +
-    /// logged once) rather than grow without bound.
-    max_events: usize,
     /// Signalled by `emit` at `ceiling_events`; the receiver's age-sweep selects
     /// on it to flush eagerly — signal-to-flush, never drop.
     overflow_notify: Arc<Notify>,
@@ -155,33 +164,27 @@ pub struct BufferingAuditSink {
     flush_errors_transient: u64,
     flush_errors_permanent: u64,
     derive_errors: u64,
-    dropped_at_cap: u64,
-    /// One stderr warning per sink while at the hard cap, reset when it drains.
-    cap_warned: bool,
     /// RFC 0001 §6.8 / `CLAUDE.md` §6.3 instruments; no-op without a provider.
     metrics: AuditSinkMetrics,
 }
 
 impl BufferingAuditSink {
     /// A sink buffering events and flushing the audit stream through `store`
-    /// (local or S3). `ceiling_events` signals an eager off-runtime flush;
-    /// `max_events` (≥ `ceiling_events`) is the hard OOM-backstop cap at which
-    /// `emit` drops rather than grow.
+    /// (local or S3). `ceiling_events` signals an eager off-runtime flush; the
+    /// sink never drops — under store-unavailability the buffer is retained and
+    /// may transiently exceed the ceiling (see the module docs).
     #[must_use]
-    pub fn new(store: Store, ceiling_events: usize, max_events: usize) -> Self {
+    pub fn new(store: Store, ceiling_events: usize) -> Self {
         Self {
             store,
             buffer: Vec::new(),
             ceiling_events,
-            max_events,
             overflow_notify: Arc::new(Notify::new()),
             flushes: 0,
             events_flushed: 0,
             flush_errors_transient: 0,
             flush_errors_permanent: 0,
             derive_errors: 0,
-            dropped_at_cap: 0,
-            cap_warned: false,
             metrics: AuditSinkMetrics::new(),
         }
     }
@@ -222,35 +225,19 @@ impl BufferingAuditSink {
         self.derive_errors
     }
 
-    /// Events dropped at the hard buffer cap (the OOM backstop).
-    #[must_use]
-    pub fn dropped_at_cap(&self) -> u64 {
-        self.dropped_at_cap
-    }
-
-    /// Buffer `event` unless at the hard cap. Updates the occupancy gauge and
-    /// signals an eager flush at the soft ceiling. Never blocks or flushes
-    /// inline — this runs on the request path.
+    /// Buffer `event` — always; never drops (issue #302: dropping is data loss,
+    /// not graceful degradation — see the module docs). Updates the occupancy
+    /// gauge and signals an eager off-runtime flush once the buffer reaches the
+    /// soft ceiling. Never blocks or flushes inline — this runs on the request
+    /// path.
     fn buffer_event(&mut self, event: AuditEvent) {
-        if self.buffer.len() >= self.max_events {
-            self.dropped_at_cap = self.dropped_at_cap.saturating_add(1);
-            self.metrics.record_dropped_at_cap();
-            if !self.cap_warned {
-                eprintln!(
-                    "audit sink: in-memory buffer at the hard cap of {} events (store \
-                     unavailable / flush not keeping up); dropping template events — affected \
-                     templates render retained/empty until the WAL re-mines them on restart",
-                    self.max_events,
-                );
-                self.cap_warned = true;
-            }
-            return;
-        }
         self.buffer.push(event);
         self.metrics.set_buffered(self.buffer.len());
         if self.buffer.len() >= self.ceiling_events {
             // `notify_one` coalesces, so a burst past the ceiling wakes the
-            // sweep once; it flushes off the runtime (signal-to-flush).
+            // sweep once; it flushes off the runtime (signal-to-flush). The
+            // buffer is retained (may transiently exceed) until the store
+            // accepts the flush — never dropped.
             self.overflow_notify.notify_one();
         }
     }
@@ -280,22 +267,13 @@ impl BufferingAuditSink {
     }
 
     /// Requeue a transient failure's `retained` events *ahead* of whatever
-    /// `emit` buffered during the unlocked I/O, honouring the hard cap (the
-    /// retained set alone never exceeds it). Then refresh the gauge + cap state.
-    fn requeue_ahead(&mut self, retained: Vec<AuditEvent>) {
+    /// `emit` buffered during the unlocked I/O, then refresh the gauge. Never
+    /// drops — the buffer is retained for retry (the WAL is the durability of
+    /// record).
+    fn requeue_ahead(&mut self, mut retained: Vec<AuditEvent>) {
         if !retained.is_empty() {
-            let buffered = std::mem::replace(&mut self.buffer, retained);
-            for event in buffered {
-                if self.buffer.len() >= self.max_events {
-                    self.dropped_at_cap = self.dropped_at_cap.saturating_add(1);
-                    self.metrics.record_dropped_at_cap();
-                } else {
-                    self.buffer.push(event);
-                }
-            }
-        }
-        if self.buffer.len() < self.max_events {
-            self.cap_warned = false;
+            retained.append(&mut self.buffer);
+            self.buffer = retained;
         }
         self.metrics.set_buffered(self.buffer.len());
     }
@@ -368,7 +346,6 @@ impl SharedParquetAuditSink {
     pub fn take_buffer(&self) -> Vec<AuditEvent> {
         let mut guard = self.lock();
         let events = std::mem::take(&mut guard.buffer);
-        guard.cap_warned = false;
         guard.metrics.set_buffered(0);
         events
     }
@@ -425,10 +402,9 @@ mod tests {
         route_partition_result,
     };
 
-    /// Generous caps so the bounding/eager-flush behaviour stays out of the
-    /// tests not exercising it.
+    /// A generous ceiling so the eager-flush signal stays out of the tests not
+    /// exercising it.
     const TEST_CEILING: usize = 1024;
-    const TEST_MAX: usize = 4096;
 
     fn created_event(tenant: &str, template_id: u64, template: &str) -> AuditEvent {
         AuditEvent {
@@ -483,8 +459,7 @@ mod tests {
     fn flush_batches_per_partition_and_round_trips() {
         let dir = tempfile::TempDir::new().expect("temp");
         let store = Store::local(dir.path()).expect("store");
-        let handle =
-            SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING, TEST_MAX));
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING));
 
         // Three events across two tenants → two audit partitions.
         let events = [
@@ -529,11 +504,8 @@ mod tests {
     fn empty_buffer_flush_is_a_no_op() {
         let dir = tempfile::TempDir::new().expect("temp");
         let store = Store::local(dir.path()).expect("store");
-        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(
-            store.clone(),
-            TEST_CEILING,
-            TEST_MAX,
-        ));
+        let handle =
+            SharedParquetAuditSink::new(BufferingAuditSink::new(store.clone(), TEST_CEILING));
 
         assert!(handle.flush(), "an empty flush is vacuously fully drained");
         assert_eq!(handle.flushes(), 0, "no flush happened");
@@ -613,8 +585,7 @@ mod tests {
         let store_root = dir.path().join("store");
         std::fs::create_dir_all(&store_root).expect("create store root");
         let store = Store::local(&store_root).expect("store");
-        let handle =
-            SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING, TEST_MAX));
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING));
         let mut producer = handle.clone();
         producer.emit(created_event("alpha", 1, "user <*> logged in"));
 
@@ -633,26 +604,35 @@ mod tests {
     }
 
     #[test]
-    fn hard_cap_drops_and_bounds_the_buffer() {
-        // issue #302 fix #3: at the hard cap, `emit` drops rather than grow.
+    fn persistent_store_failure_retains_every_event_never_drops() {
+        // issue #302 (round 5): under a *persistently* failing store the sink
+        // RETAINS — it never drops. Dropping would lose template events the WAL
+        // can no longer re-mine past the snapshot gate (§3.3). The buffer may
+        // transiently exceed the ceiling, exactly like the record sink.
         let dir = tempfile::TempDir::new().expect("temp");
-        let store = Store::local(dir.path()).expect("store");
-        // ceiling 2, hard cap 3.
-        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2, 3));
+        let store_root = dir.path().join("store");
+        std::fs::create_dir_all(&store_root).expect("create store root");
+        let store = Store::local(&store_root).expect("store");
+        // A tiny ceiling so repeated emit would have tripped the old hard cap.
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2));
         let mut producer = handle.clone();
-        for i in 0..10 {
+
+        // The store is down for the whole run.
+        std::fs::remove_dir_all(&store_root).expect("remove store dir");
+        std::fs::write(&store_root, b"not a directory").expect("sabotage");
+
+        // Interleave emit + flush repeatedly; every flush fails transiently and
+        // retains, and emit keeps buffering past the ceiling — nothing is lost.
+        for i in 0..20 {
             producer.emit(created_event("alpha", i, "user <*> logged in"));
+            assert!(!handle.flush(), "the down store never fully drains");
         }
         assert_eq!(
             handle.buffered_events(),
-            3,
-            "the buffer is bounded by the cap"
+            20,
+            "every emitted event is retained for retry — none dropped",
         );
-        assert_eq!(
-            handle.lock().dropped_at_cap(),
-            7,
-            "the 7 events past the cap are dropped + counted",
-        );
+        assert_eq!(handle.flushes(), 0, "nothing reached durability");
     }
 
     #[tokio::test]
@@ -661,7 +641,7 @@ mod tests {
         // signals the receiver's age-sweep to flush off the runtime.
         let dir = tempfile::TempDir::new().expect("temp");
         let store = Store::local(dir.path()).expect("store");
-        let mut handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2, TEST_MAX));
+        let mut handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2));
         let notify = handle.overflow_notify();
 
         handle.emit(created_event("alpha", 1, "user <*> logged in"));
@@ -682,7 +662,7 @@ mod tests {
         assert_eq!(
             handle.buffered_events(),
             2,
-            "emit buffers, never flushes or drops inline (below the hard cap)",
+            "emit buffers, never flushes or drops inline",
         );
     }
 }

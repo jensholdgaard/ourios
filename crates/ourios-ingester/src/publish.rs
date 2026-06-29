@@ -232,7 +232,6 @@ mod tests {
         let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
             Store::local(&audit_root).expect("audit store"),
             1024,
-            4096,
         ));
         let coord = PublishCoordinator::new(records.clone(), audit.clone());
 
@@ -282,7 +281,6 @@ mod tests {
         let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
             Store::local(&audit_root).expect("audit store"),
             1024,
-            4096,
         ));
         let coord = PublishCoordinator::new(records.clone(), audit.clone());
 

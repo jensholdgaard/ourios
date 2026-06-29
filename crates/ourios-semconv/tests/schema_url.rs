@@ -10,22 +10,25 @@ fn schema_url_points_at_the_ourios_conventions_schema() {
     let version = url
         .strip_prefix(PREFIX)
         .unwrap_or_else(|| panic!("SCHEMA_URL is the Ourios conventions schema URL, got {url:?}"));
-    // A real version follows the prefix — at least `MAJOR.MINOR` of digits —
-    // rather than just any non-empty tail (so e.g. `ourios-.yaml` fails),
-    // without pinning the exact version (a schema bump must not break this).
-    let (major, rest) = version
-        .split_once('.')
-        .unwrap_or_else(|| panic!("SCHEMA_URL carries a dotted version, got {url:?}"));
+    // `version` looks like `0.1.0.yaml` (MAJOR.MINOR.PATCH + the `.yaml` doc
+    // suffix). Assert a numeric MAJOR.MINOR (so a versionless `ourios-.yaml`
+    // fails) and that the document's final dot-segment is `yaml` (so
+    // `…yaml.bak` / `…yaml?x` fail) — version-agnostic, no exact pin. Uses
+    // dot-segment checks rather than `starts_with`/`ends_with` patterns to stay
+    // clear of `clippy::case_sensitive_file_extension_comparisons`.
+    let mut segments = version.split('.');
+    let major = segments.next().unwrap_or("");
+    let minor = segments.next().unwrap_or("");
     assert!(
         !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()),
-        "SCHEMA_URL's version starts with a numeric MAJOR, got {url:?}",
+        "SCHEMA_URL has a numeric MAJOR version, got {url:?}",
     );
     assert!(
-        rest.starts_with(|c: char| c.is_ascii_digit()),
-        "SCHEMA_URL's version has a numeric MINOR after MAJOR, got {url:?}",
+        !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()),
+        "SCHEMA_URL has a numeric MINOR version, got {url:?}",
     );
     assert!(
-        version.contains(".yaml"),
+        version.rsplit('.').next() == Some("yaml"),
         "SCHEMA_URL is a .yaml schema document, got {url:?}",
     );
 }

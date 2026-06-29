@@ -78,13 +78,15 @@ release-dry version:
     case "$version" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '$version'"; exit 1;; esac
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
     command -v dist >/dev/null || { echo "error: dist (cargo-dist) not installed"; exit 1; }
+    # `dist plan` first: it parses the tag and rejects an invalid one (e.g. a
+    # stray leading `v`), so we fail fast before git-cliff prints a changelog for
+    # a tag that can't actually be released. `--tag` previews the intended version
+    # (not the current workspace version); `--force-tag` lets it do so unbumped.
+    echo "=== dist plan (release artifacts) ==="
+    dist plan --tag "v$version" --force-tag
+    echo ""
     echo "=== CHANGELOG.md for v$version (git-cliff preview) ==="
     git-cliff --tag "v$version"
-    echo ""
-    echo "=== dist plan (release artifacts) ==="
-    # `--tag` so the plan previews the intended version (not the current
-    # workspace version); `--force-tag` lets it do so without bumping first.
-    dist plan --tag "v$version" --force-tag
 
 # Cut a release: bump the single workspace version (every workspace member crate
 # inherits it; the excluded `fuzz/` harness is a separate workspace and is not
@@ -125,6 +127,7 @@ release version:
     # the requested version already matches (else the bump is a no-op and the
     # release "commit" would carry only a regenerated changelog/lock, or nothing).
     current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
+    [ -n "$current" ] || { echo "error: could not read the current workspace version from Cargo.toml (expected a literal 'version = \"...\"')"; exit 1; }
     [ "$version" != "$current" ] || { echo "error: version $version is already the current workspace version"; exit 1; }
     # Capture the pristine starting commit (the clean-tree + HEAD==origin/main
     # checks above guarantee it is one) so any failure below rolls the whole

@@ -80,6 +80,11 @@ release version:
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
+    # The arg is a BARE SemVer (e.g. 0.1.0) — the recipe adds the `v` for the tag.
+    # Reject a leading `v` (would make `vv0.1.0`) or any non-SemVer-ish value
+    # before touching anything.
+    echo "{{version}}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
+        || { echo "error: version must be a bare SemVer like 0.1.0 (no leading 'v'), got '{{version}}'"; exit 1; }
     # Refresh remote refs so the checks below see the real state of origin.
     git fetch --quiet --tags origin
     # Release only from a `main` that exactly matches `origin/main` — never a
@@ -96,8 +101,12 @@ release version:
     fi
     # The workspace version is the single source of truth — after every workspace
     # member crate switched to `version.workspace = true`, this is the only
-    # literal `version = "..."` in the root manifest, so this anchored edit is
-    # precise.
+    # literal `version = "..."` in the root manifest. Read it, and fail fast if
+    # the requested version already matches (else the bump is a no-op and the
+    # release "commit" would carry only a regenerated changelog/lock, or nothing).
+    current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
+    [ "{{version}}" != "$current" ] || { echo "error: version {{version}} is already the current workspace version"; exit 1; }
+    # The anchored edit is precise (only the workspace version matches).
     sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml && rm -f Cargo.toml.bak
     # Sync Cargo.lock to the new workspace-crate versions. A check (not
     # `cargo update`) so third-party deps can't churn into the release commit:

@@ -495,7 +495,7 @@ fn append_chunks(
 /// Derive the [`PartitionKey`] for an audit event. Reuses the
 /// data-side `PartitionKey` shape (which carries an `hour`
 /// field); the audit path stops at `day`, so the `hour` field is
-/// populated (always `0`) but ignored by [`audit_partition_matches`].
+/// populated (always `0`) but ignored by `audit_partition_matches`.
 ///
 /// Because `hour` is fixed at `0`, the returned key is canonical for the
 /// audit partitioning axis (tenant + year/month/day): two events on the same

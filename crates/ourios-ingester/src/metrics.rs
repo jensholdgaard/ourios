@@ -22,6 +22,7 @@
 //! candidate/compacted breakdown. This completes the §3.6 metric set.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -414,6 +415,122 @@ impl SinkMetrics {
 }
 
 impl Default for SinkMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `ourios.audit_sink.flush.outcome` value for a transient (store-I/O) flush
+/// failure: the batch is retained and retried (the WAL is the durability of
+/// record).
+pub const FLUSH_OUTCOME_TRANSIENT: &str = "transient";
+/// `ourios.audit_sink.flush.outcome` value for a permanent (content / encode)
+/// flush failure: the batch is dropped so one malformed event can't wedge the
+/// partition behind it (issue #302).
+pub const FLUSH_OUTCOME_PERMANENT: &str = "permanent";
+
+/// Audit-sink instruments (issue #302 / `CLAUDE.md` §6.3): the miner's
+/// template-audit write path, mirroring [`SinkMetrics`]. Built once per sink on
+/// the global `ourios.audit_sink` meter; recording is a no-op when no provider
+/// is installed (RFC 0001 §6.8 API/SDK split).
+#[derive(Debug)]
+pub struct AuditSinkMetrics {
+    flushes: Counter<u64>,
+    flush_events: Counter<u64>,
+    flush_errors: Counter<u64>,
+    derive_errors: Counter<u64>,
+    /// Absolute current buffered-event count, kept up to date by the sink and
+    /// read by the `buffer.usage` observable's callback at collect time — the
+    /// `ourios.compaction.backlog` pattern (an observable gauge of the absolute
+    /// value avoids the drift a per-event delta `UpDownCounter` would accrue).
+    buffered_state: Arc<AtomicI64>,
+    #[expect(dead_code, reason = "retains the observable-callback registration")]
+    buffer_usage: ObservableUpDownCounter<i64>,
+}
+
+impl AuditSinkMetrics {
+    /// Build the audit-sink instruments with their registry units.
+    #[must_use]
+    pub fn new() -> Self {
+        let meter = global::meter("ourios.audit_sink");
+        let flushes = meter
+            .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSHES)
+            .with_unit("{flush}")
+            .build();
+        let flush_events = meter
+            .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSH_EVENTS)
+            .with_unit("{event}")
+            .build();
+        let flush_errors = meter
+            .u64_counter(semconv::OURIOS_AUDIT_SINK_FLUSH_ERRORS)
+            .with_unit("{error}")
+            .build();
+        let derive_errors = meter
+            .u64_counter(semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS)
+            .with_unit("{error}")
+            .build();
+
+        // `buffer.usage` is an **observable** UpDownCounter reporting the
+        // absolute buffered-event count at collect time (the backlog pattern).
+        let buffered_state = Arc::new(AtomicI64::new(0));
+        let callback_state = Arc::clone(&buffered_state);
+        let buffer_usage = meter
+            .i64_observable_up_down_counter(semconv::OURIOS_AUDIT_SINK_BUFFER_USAGE)
+            .with_unit("{event}")
+            .with_callback(move |observer| {
+                observer.observe(callback_state.load(Ordering::Relaxed), &[]);
+            })
+            .build();
+
+        // Seed the attribute-free counters so they're visible before the first
+        // flush (collect-on-read); `flush_errors` carries the required
+        // `flush.outcome` attribute and surfaces on the first real error.
+        flushes.add(0, &[]);
+        flush_events.add(0, &[]);
+        derive_errors.add(0, &[]);
+        Self {
+            flushes,
+            flush_events,
+            flush_errors,
+            derive_errors,
+            buffered_state,
+            buffer_usage,
+        }
+    }
+
+    /// One successful partition flush of `event_count` events.
+    pub fn record_flush(&self, event_count: usize) {
+        self.flushes.add(1, &[]);
+        self.flush_events.add(to_u64(event_count), &[]);
+    }
+
+    /// A failed partition flush, classified by `outcome`
+    /// ([`FLUSH_OUTCOME_TRANSIENT`] → retained + retried, or
+    /// [`FLUSH_OUTCOME_PERMANENT`] → dropped).
+    pub fn record_flush_error(&self, outcome: &'static str) {
+        self.flush_errors.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_AUDIT_SINK_FLUSH_OUTCOME,
+                outcome,
+            )],
+        );
+    }
+
+    /// An event dropped because its partition key could not be derived (a
+    /// pre-epoch / overflowing timestamp).
+    pub fn record_derive_error(&self) {
+        self.derive_errors.add(1, &[]);
+    }
+
+    /// Update the observable buffer gauge to the absolute `events` now buffered.
+    pub fn set_buffered(&self, events: usize) {
+        self.buffered_state
+            .store(i64::try_from(events).unwrap_or(i64::MAX), Ordering::Relaxed);
+    }
+}
+
+impl Default for AuditSinkMetrics {
     fn default() -> Self {
         Self::new()
     }

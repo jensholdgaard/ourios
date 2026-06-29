@@ -19,6 +19,21 @@
 
 // Metric names (RFC 0009 §3.6).
 
+/// `ourios.audit_sink.buffer.usage` (updowncounter, unit `{event}`).
+pub const OURIOS_AUDIT_SINK_BUFFER_USAGE: &str = "ourios.audit_sink.buffer.usage";
+
+/// `ourios.audit_sink.derive.errors` (counter, unit `{error}`).
+pub const OURIOS_AUDIT_SINK_DERIVE_ERRORS: &str = "ourios.audit_sink.derive.errors";
+
+/// `ourios.audit_sink.flush.errors` (counter, unit `{error}`).
+pub const OURIOS_AUDIT_SINK_FLUSH_ERRORS: &str = "ourios.audit_sink.flush.errors";
+
+/// `ourios.audit_sink.flush.events` (counter, unit `{event}`).
+pub const OURIOS_AUDIT_SINK_FLUSH_EVENTS: &str = "ourios.audit_sink.flush.events";
+
+/// `ourios.audit_sink.flushes` (counter, unit `{flush}`).
+pub const OURIOS_AUDIT_SINK_FLUSHES: &str = "ourios.audit_sink.flushes";
+
 /// `ourios.compaction.backlog` (updowncounter, unit `{partition}`).
 pub const OURIOS_COMPACTION_BACKLOG: &str = "ourios.compaction.backlog";
 
@@ -117,6 +132,9 @@ pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.
 pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
 
 // Attribute keys.
+
+/// `ourios.audit_sink.flush.outcome` attribute key.
+pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
 
 /// `ourios.compaction.result` attribute key.
 pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";

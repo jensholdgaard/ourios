@@ -125,3 +125,24 @@ groups:
           the total), so the B1 pruned fraction is derived in the backend
           as `pruned / (scanned + pruned)` (RFC 0016; OTel usage/state
           convention — record raw counts, derive the ratio).
+      - id: ourios.audit_sink.flush.outcome
+        type:
+          members:
+            - id: transient
+              value: "transient"
+              stability: development
+              brief: >-
+                A store I/O error (the object store was unreachable); the
+                batch is retained and retried — the WAL is the durability
+                of record.
+            - id: permanent
+              value: "permanent"
+              stability: development
+              brief: >-
+                A content / encode error (bad batch, partition mismatch, or
+                a poisoned writer); the batch is dropped so one malformed
+                event cannot permanently wedge the partition behind it.
+        stability: development
+        brief: >-
+          The disposition of a failed audit partition flush (issue #302):
+          whether the batch was retained for retry or dropped.

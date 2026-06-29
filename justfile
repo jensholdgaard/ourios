@@ -63,27 +63,39 @@ release-dry version:
     git-cliff --tag v{{version}}
     @echo ""
     @echo "=== dist plan (release artifacts) ==="
-    dist plan
+    # `--tag` so the plan previews the intended version (not the current 0.0.0);
+    # `--force-tag` lets it do so without bumping the manifest first.
+    dist plan --tag v{{version}} --force-tag
 
-# Cut a release: bump the single workspace version (every crate inherits it),
-# regenerate CHANGELOG.md from the conventional-commit history (git-cliff),
-# commit, and tag vX.Y.Z. Does NOT push — review, then fire the pipeline with
-# `git push --follow-tags origin main` (the tag drives cargo-dist's signed
-# release + image.yml's container image). Run `just release-dry X.Y.Z` first.
-# Requires git-cliff; must run on a clean `main`. e.g. `just release 0.1.0`.
+# Cut a release: bump the single workspace version (every workspace member crate
+# inherits it; the excluded `fuzz/` harness is a separate workspace and is not
+# released), regenerate CHANGELOG.md from the conventional-commit history
+# (git-cliff), commit, and tag vX.Y.Z. Does NOT push — review, then fire the
+# pipeline with `git push --follow-tags origin main` (the tag drives cargo-dist's
+# signed release + image.yml's container image). Run `just release-dry X.Y.Z`
+# first. Requires git-cliff; must run on a clean `main`. e.g. `just release 0.1.0`.
 release version:
     #!/usr/bin/env bash
     set -euo pipefail
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
-    # The workspace version is the single source of truth — after every crate
-    # switched to `version.workspace = true`, this is the only literal
-    # `version = "..."` in the root manifest, so this anchored edit is precise.
+    # Fail fast if the tag already exists — BEFORE mutating the manifest /
+    # changelog — so a re-run can't advance `main` with a release commit that
+    # `git tag` then refuses to create (leaving the tag the workflow expects
+    # missing).
+    if git rev-parse -q --verify "refs/tags/v{{version}}" >/dev/null 2>&1; then
+        echo "error: tag v{{version}} already exists"; exit 1
+    fi
+    # The workspace version is the single source of truth — after every workspace
+    # member crate switched to `version.workspace = true`, this is the only
+    # literal `version = "..."` in the root manifest, so this anchored edit is
+    # precise.
     sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml && rm -f Cargo.toml.bak
-    # Sync Cargo.lock to the new workspace-crate versions (workspace members
-    # only — no dependency churn).
-    cargo update --workspace
+    # Sync Cargo.lock to the new workspace-crate versions. A check (not
+    # `cargo update`) so third-party deps can't churn into the release commit:
+    # it rewrites the lock for the manifest version change + compile-verifies.
+    cargo check --workspace
     # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
     # commit — cargo-dist reads it for the GitHub Release body (release.yml).
     git-cliff --tag v{{version}} --output CHANGELOG.md

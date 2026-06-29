@@ -17,6 +17,14 @@
 
 #![deny(unsafe_code)]
 
+/// The semantic-conventions schema URL these constants were generated from — the
+/// registry manifest's `schema_url`, which carries the conventions version
+/// (decoupled from this crate's package version). Mirrors upstream
+/// `opentelemetry_semantic_conventions::SCHEMA_URL`; attach it to a telemetry
+/// resource so consumers can resolve the schema. Sourced from the registry's
+/// resolved provenance (uniform across the registry).
+pub const SCHEMA_URL: &str = "https://ourios.dev/schemas/ourios-0.1.0.yaml";
+
 // Metric names (RFC 0009 §3.6).
 
 /// `ourios.audit_sink.buffer.usage` (updowncounter, unit `{event}`).

@@ -68,7 +68,7 @@ jobs:
     name: B1/B2 query gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         # We read the corpus via `gh release download` (GH_TOKEN env),
         # not git, so don't leave the checkout token persisted in
         # `.git/config` on the runner.

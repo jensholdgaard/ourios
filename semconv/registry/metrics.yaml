@@ -361,3 +361,57 @@ groups:
     attributes:
       - ref: ourios.query.row_group.state
         requirement_level: required
+
+  # Audit sink (issue #302): the miner's template-audit write path. A
+  # buffering sink mirroring the RFC 0014 record sink — events buffer on the
+  # request path and flush off the runtime. `flush.outcome` splits a failed
+  # flush into transient (retained + retried) vs permanent (dropped).
+  - id: metric.ourios.audit_sink.buffer.usage
+    type: metric
+    metric_name: ourios.audit_sink.buffer.usage
+    stability: development
+    brief: >-
+      Audit events currently buffered in memory awaiting flush, against the
+      ceiling that triggers an eager flush.
+    instrument: updowncounter
+    unit: "{event}"
+
+  - id: metric.ourios.audit_sink.flushes
+    type: metric
+    metric_name: ourios.audit_sink.flushes
+    stability: development
+    brief: Audit partition flushes (one published Parquet file each).
+    instrument: counter
+    unit: "{flush}"
+
+  - id: metric.ourios.audit_sink.flush.events
+    type: metric
+    metric_name: ourios.audit_sink.flush.events
+    stability: development
+    brief: Audit events written out across sink flushes.
+    instrument: counter
+    unit: "{event}"
+
+  - id: metric.ourios.audit_sink.flush.errors
+    type: metric
+    metric_name: ourios.audit_sink.flush.errors
+    stability: development
+    brief: >-
+      Failed audit partition flushes, split by disposition: transient (store
+      unreachable → retained + retried) vs permanent (bad content/encode →
+      dropped so it cannot wedge the partition).
+    instrument: counter
+    unit: "{error}"
+    attributes:
+      - ref: ourios.audit_sink.flush.outcome
+        requirement_level: required
+
+  - id: metric.ourios.audit_sink.derive.errors
+    type: metric
+    metric_name: ourios.audit_sink.derive.errors
+    stability: development
+    brief: >-
+      Audit events dropped because their partition key could not be derived
+      (a pre-epoch / overflowing timestamp).
+    instrument: counter
+    unit: "{error}"

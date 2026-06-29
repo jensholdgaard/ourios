@@ -18,8 +18,11 @@ use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_core::config::MinerConfig;
+use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
+use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
@@ -27,7 +30,7 @@ use ourios_miner::cluster::MinerCluster;
 use ourios_parquet::Store;
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -51,6 +54,16 @@ const SINK_CEILING_BYTES: usize = 1024 * 1024 * 1024;
 /// flushes within `SINK_MAX_BUFFER_AGE + SINK_FLUSH_TICK`.
 const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
 
+/// Soft ceiling on the audit sink's in-memory event buffer (issue #302):
+/// reaching it signals an eager off-runtime flush, which keeps the buffer
+/// bounded whenever the store is healthy (the realistic case). It is **not** a
+/// hard cap — `emit` never drops; under sustained store-unavailability the
+/// buffer is retained and may transiently exceed this, exactly like the record
+/// sink (dropping would lose template events the WAL can't re-mine past the
+/// snapshot gate — `CLAUDE.md` §3.3). Generous by default — a buffered audit
+/// event is small and the normal driver is the cadence, not this signal.
+const AUDIT_SINK_CEILING_EVENTS: usize = 100_000;
+
 fn flush_config() -> FlushConfig {
     FlushConfig {
         target_bytes: SINK_TARGET_BYTES,
@@ -59,11 +72,25 @@ fn flush_config() -> FlushConfig {
     }
 }
 
-/// The age-sweep task (RFC0014.2): every [`SINK_FLUSH_TICK`], flush partitions
-/// whose oldest record has reached `max_buffer_age`, so a low-volume partition
-/// becomes queryable without waiting for a WAL rotation. Stops when `shutdown`
-/// fires; the shutdown path then drains the sink fully (`flush_all`).
-fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -> JoinHandle<()> {
+/// The age-sweep task (RFC0014.2): every [`SINK_FLUSH_TICK`] — or sooner, when
+/// the audit buffer reaches its ceiling and raises `audit_overflow` (issue #302
+/// fix #3) — publish the aged record partitions, audit-ordered and race-free
+/// (issue #302 fix #1).
+///
+/// Each sweep takes an **atomic snapshot** of both buffers under the pipeline's
+/// miner lock (`with_miner` → [`PublishCoordinator::drain_aged`]; a microsecond
+/// memory move, no I/O), then writes off the lock
+/// ([`PublishCoordinator::write_ordered`]): the audit batch to durability first,
+/// and the record partitions only after — so a record never reaches the store
+/// before its template event is durable, and no concurrent `ingest` can split a
+/// record from its audit event across the drain. Stops when `shutdown` fires;
+/// the shutdown path then drains both sinks fully.
+fn spawn_age_sweep(
+    pipeline: SharedPipeline,
+    coordinator: PublishCoordinator,
+    audit_overflow: Arc<Notify>,
+    mut shutdown: watch::Receiver<()>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SINK_FLUSH_TICK);
         // A slow sweep (e.g. against S3) must not make the interval "catch up"
@@ -72,57 +99,89 @@ fn spawn_age_sweep(sink: SharedParquetSink, mut shutdown: watch::Receiver<()>) -
         tick.tick().await; // the first tick is immediate; skip it
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    // `flush_aged` encodes Parquet and does blocking store I/O
-                    // (more so against S3), so run it on the blocking pool
-                    // rather than stalling a runtime worker. A `JoinError`
-                    // means the runtime is shutting down — stop sweeping.
-                    let sink = sink.clone();
-                    if tokio::task::spawn_blocking(move || sink.flush_aged())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+                _ = tick.tick() => {}
+                () = audit_overflow.notified() => {}
                 _ = shutdown.changed() => break,
+            }
+            // The drain takes the miner lock (atomic w.r.t. ingest) for only a
+            // memory move; the ordered write does the blocking store I/O off the
+            // lock. Run the whole step on the blocking pool rather than stalling
+            // a runtime worker. A `JoinError` means the runtime is shutting down
+            // — stop sweeping.
+            let pipeline = pipeline.clone();
+            let coordinator = coordinator.clone();
+            if tokio::task::spawn_blocking(move || {
+                let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+                // The cadence is best-effort: a partial write (transient store
+                // error) retains the un-published data + audit (the WAL is the
+                // durability of record) and the next tick retries — so the
+                // published-everything signal is not needed here (no snapshot is
+                // taken at the cadence; that's the rotation/shutdown path).
+                let _published = coordinator.write_ordered(drained, "age");
+            })
+            .await
+            .is_err()
+            {
+                break;
             }
         }
     })
 }
 
-/// Flush the sink, then write the per-tenant miner snapshot **only if the sink
-/// fully drained**.
+/// Flush the audit sink, then the record sink, then write the per-tenant miner
+/// snapshot **only if both sinks fully drained**.
 ///
-/// This is the no-loss invariant (`CLAUDE.md` §3.4). `flush_all` retains any
-/// partition whose store write failed (the WAL is the durability of record, so
-/// a flush failure is non-fatal). Writing the snapshot anyway would advance the
-/// miner's snapshot horizon past records that never reached the store — and
-/// recovery suppresses frames at or below that horizon, so on the next start
-/// they would never be re-emitted into a fresh sink. That is data loss when the
-/// store is unavailable. Skipping the snapshot instead degrades the next start
-/// to a fuller replay (which re-mines + re-emits the un-flushed records and
-/// retries the flush), never loss. Best-effort, like every RFC 0001 §6.9
-/// cadence point; `cadence` names the call site for the log line.
+/// This is the no-loss invariant (`CLAUDE.md` §3.4) extended to the audit
+/// stream (issue #302). A flush retains any partition whose store write failed
+/// (the WAL is the durability of record, so a flush failure is non-fatal).
+/// Writing the snapshot anyway would advance the miner's snapshot horizon past
+/// data that never reached the store — and recovery suppresses frames at or
+/// below that horizon, so on the next start they would never be re-emitted into
+/// a fresh sink. For records that is data loss; for the audit stream it is a
+/// permanently-empty body on a clean row (`derive_template_registry` would lack
+/// the row's `template_created` event, so reconstruction falls back to the
+/// empty retained `body` — `CLAUDE.md` §3.3). Skipping the snapshot instead
+/// degrades the next start to a fuller replay (which re-mines + re-emits both
+/// the un-flushed records *and* their template events, and retries the flush),
+/// never loss. Best-effort, like every RFC 0001 §6.9 cadence point; `cadence`
+/// names the call site for the log line.
 ///
-/// Returns whether the sink fully drained: `true` means the buffer cleared and
-/// the snapshot was *attempted* (a write failure there is a separate, logged,
-/// rebuildable-cache miss — it does not endanger no-loss, since the data is in
-/// the store); `false` means records were retained and the snapshot was
+/// The audit sink flushes **before** the record sink so a row's template event
+/// is durable no later than the row it describes (the registry can render it).
+/// If the audit sink does not fully drain, the **record flush is skipped** this
+/// cycle (issue #302 §3.3): a non-empty audit buffer means a transient store
+/// error (permanent errors drop, leaving it empty), so the record flush to the
+/// same store would fail anyway, and flushing it would expose a clean row
+/// before its template event is durable.
+///
+/// Returns whether both sinks fully drained: `true` means both buffers cleared
+/// and the snapshot was *attempted* (a write failure there is a separate,
+/// logged, rebuildable-cache miss — it does not endanger no-loss, since the
+/// data is in the store); `false` means data was retained and the snapshot was
 /// skipped. Callers log via `cadence`; the value is for tests today and
 /// sink-flush metrics later (RFC 0014 §6.3).
 fn flush_then_snapshot(
     sink: &SharedParquetSink,
+    audit_sink: &SharedParquetAuditSink,
     snapshots_root: &Path,
     miner: &MinerCluster,
     high_water: Option<WalOffset>,
     cadence: &str,
 ) -> bool {
-    sink.flush_all();
-    let buffered = sink.buffered_records();
-    if buffered != 0 {
+    if !audit_sink.flush() {
+        let audit_events = audit_sink.buffered_events();
         eprintln!(
-            "{cadence}: sink retained {buffered} record(s) (store unavailable?); skipping the \
+            "{cadence}: audit sink retained {audit_events} event(s) (store unavailable?); skipping \
+             the record flush + snapshot this cycle so a clean row isn't exposed before its \
+             template event is durable — no acknowledged data is lost (the WAL is durable)"
+        );
+        return false;
+    }
+    sink.flush_all();
+    let records = sink.buffered_records();
+    if records != 0 {
+        eprintln!(
+            "{cadence}: record sink retained {records} record(s) (store unavailable?); skipping the \
              snapshot so recovery re-mines them — no acknowledged data is lost (the WAL is durable)"
         );
         return false;
@@ -160,6 +219,10 @@ pub struct ReceiverHandle {
     /// shutdown snapshot, to keep the miner's snapshot horizon at or below the
     /// sink's flushed horizon (the no-loss invariant; see [`serve`]).
     sink: SharedParquetSink,
+    /// The audit sink (issue #302). Drained on graceful shutdown alongside the
+    /// data sink (before it, so a row's template event is durable no later than
+    /// the row), and likewise gates the shutdown snapshot.
+    audit_sink: SharedParquetAuditSink,
     /// The age-sweep task (`flush_aged` every [`SINK_FLUSH_TICK`]); awaited to a
     /// clean exit on shutdown via the `shutdown` watch signal.
     flush_tick: JoinHandle<()>,
@@ -211,6 +274,7 @@ impl ReceiverHandle {
             self.pipeline.with_miner(|miner| {
                 flush_then_snapshot(
                     &self.sink,
+                    &self.audit_sink,
                     &self.snapshots_root,
                     miner,
                     last_durable,
@@ -220,6 +284,61 @@ impl ReceiverHandle {
         });
         Ok(())
     }
+}
+
+/// Build the two shared write sinks over the data `store` (RFC 0013/0019,
+/// local or S3): the RFC 0014 record sink and the issue #302 audit sink.
+///
+/// Both buffer cheaply on the request path and flush off the runtime at the
+/// same cadence points. The audit sink carries the miner's `template_created` /
+/// `template_widened` / `template_type_expanded` events to the RFC 0005 §3.7
+/// audit Parquet stream; without it the querier's read-time registry is empty
+/// and a clean row's body renders empty (`CLAUDE.md` §3.3). The WAL stays under
+/// `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md` §3.6).
+///
+/// The audit sink is built first so the record sink can take an **audit
+/// barrier** (issue #302 fix #2): before any inline size/ceiling publish the
+/// record sink flushes the audit sink to durability, so a partition is never
+/// put to the store before its template events are durable. That inline publish
+/// runs under the miner lock, so the barrier flush + the publish are atomic
+/// w.r.t. ingest.
+fn build_write_sinks(store: Store) -> (SharedParquetSink, SharedParquetAuditSink) {
+    let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
+        store.clone(),
+        AUDIT_SINK_CEILING_EVENTS,
+    ));
+    let barrier_audit = audit_sink.clone();
+    let sink = SharedParquetSink::new(
+        ParquetRecordSink::new(store, flush_config())
+            .with_audit_barrier(Box::new(move || barrier_audit.flush())),
+    );
+    (sink, audit_sink)
+}
+
+/// The WAL-segment-rotation hook (RFC 0001 §6.9 primary cadence point):
+/// force-flush every partition through `flush_then_snapshot`, then snapshot at
+/// the rotation `mark` only if both sinks drained (the no-loss invariant). The
+/// hook fires before the new segment's first record reaches the miner, so the
+/// buffers hold exactly the sealed segment's data (RFC0014.3/.5, `CLAUDE.md`
+/// §3.4). It runs on the request path (inside `ingest`) and does blocking
+/// Parquet/store I/O, so `block_in_place` lets the runtime relocate other tasks.
+fn rotation_snapshot_hook(
+    sink: SharedParquetSink,
+    audit_sink: SharedParquetAuditSink,
+    snapshots_root: PathBuf,
+) -> RotationHook {
+    Box::new(move |miner, mark| {
+        tokio::task::block_in_place(|| {
+            flush_then_snapshot(
+                &sink,
+                &audit_sink,
+                &snapshots_root,
+                miner,
+                Some(mark),
+                "rotation",
+            );
+        });
+    })
 }
 
 /// Bind both transports and start serving over one shared
@@ -236,21 +355,16 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let segment_size_bytes = config.wal.segment_size_bytes;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
-    // The production data write path (RFC 0014): mined records buffer per
-    // partition and flush to data Parquet (+ manifest) objects on the RFC
-    // 0013/0019 store — local or S3, opened by the server and passed in. (The
-    // compaction audit stream is written by the compactor's sink, still local-
-    // only today; the receiver itself doesn't emit it.) The WAL stays under
-    // `wal.root` on local disk (RFC0013.6 / `CLAUDE.md` §3.6 — never on object
-    // storage).
-    let sink = SharedParquetSink::new(ParquetRecordSink::new(config.store, flush_config()));
+    let (sink, audit_sink) = build_write_sinks(config.store);
 
-    // Wire the sink into the miner *before* recovery: replay re-mines the
-    // un-flushed tail through `miner.ingest`, which re-emits it into the sink
-    // (RFC0014.5 — recovery rebuilds the in-memory buffer the crash dropped;
-    // the records are durable in the WAL, never in the buffer).
+    // Wire both sinks into the miner *before* recovery: replay re-mines the
+    // un-flushed tail through `miner.ingest`, which re-emits its records into
+    // the record sink and its template events into the audit sink (RFC0014.5 —
+    // recovery rebuilds the in-memory buffers the crash dropped; the durability
+    // of record is the WAL, never the buffers).
     let mut miner =
-        MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+        MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
+            .with_record_sink(Box::new(sink.clone()));
     let rule = TenantRule::service_name();
 
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &rule)
@@ -273,6 +387,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     tokio::task::block_in_place(|| {
         flush_then_snapshot(
             &sink,
+            &audit_sink,
             &snapshots_root,
             &miner,
             report.max_delivered,
@@ -280,38 +395,23 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         );
     });
 
-    // Seed the durable mark from replay so a process serving zero
-    // requests still stamps its shutdown snapshots with a concrete
-    // horizon — an unstamped snapshot is discarded at the next start
-    // (RFC 0001 §6.9), which would overwrite the post-recovery
-    // artefacts with full-replay-only ones.
-    //
-    // The rotation hook is the §6.9 *primary* cadence point: every WAL
-    // segment rotation persists per-tenant snapshots at the
-    // rotation-point high-water mark. Best-effort, like the other
-    // cadence points — a snapshot is a rebuildable cache.
-    let hook_root = snapshots_root.clone();
-    let hook_sink = sink.clone();
     // The group-commit coordinator owns the single-writer WAL and folds
     // concurrent appends into one fsync per `wal_batch_window_ms`
-    // (RFC0008.8); the pipeline owns the miner + the rotation hook.
+    // (RFC0008.8); the pipeline owns the miner + the rotation hook (the §6.9
+    // *primary* cadence point). `with_last_durable` seeds the durable mark from
+    // replay so a process serving zero requests still stamps its shutdown
+    // snapshots with a concrete horizon — an unstamped snapshot is discarded at
+    // the next start (RFC 0001 §6.9), which would overwrite the post-recovery
+    // artefacts with full-replay-only ones.
     let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(coordinator, miner, rule)
             .with_last_durable(report.max_delivered)
-            .with_rotation_hook(Box::new(move |miner, mark| {
-                // Force-flush every partition, then snapshot at the rotation
-                // mark only if the sink drained (`flush_then_snapshot` — the
-                // no-loss invariant). The hook fires before the new segment's
-                // first record reaches the miner, so the buffer holds exactly
-                // the sealed segment's records (RFC0014.3/.5, `CLAUDE.md` §3.4).
-                // This runs on the request path (inside `ingest`) and does
-                // blocking Parquet/store I/O, so `block_in_place` lets the
-                // runtime relocate other tasks off this worker.
-                tokio::task::block_in_place(|| {
-                    flush_then_snapshot(&hook_sink, &hook_root, miner, Some(mark), "rotation");
-                });
-            })),
+            .with_rotation_hook(rotation_snapshot_hook(
+                sink.clone(),
+                audit_sink.clone(),
+                snapshots_root.clone(),
+            )),
     );
 
     // gRPC: bind first so `:0` resolves to a real port before serving.
@@ -331,7 +431,15 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     let (shutdown, shutdown_rx) = watch::channel(());
 
-    let flush_tick = spawn_age_sweep(sink.clone(), shutdown_rx.clone());
+    // The cadence age-sweep publishes through the coordinator: atomic drain
+    // under the miner lock + audit-ordered off-lock write (issue #302 #1/#2).
+    let coordinator = PublishCoordinator::new(sink.clone(), audit_sink.clone());
+    let flush_tick = spawn_age_sweep(
+        pipeline.clone(),
+        coordinator,
+        audit_sink.overflow_notify(),
+        shutdown_rx.clone(),
+    );
 
     let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()));
     let grpc = tokio::spawn({
@@ -367,13 +475,14 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         pipeline,
         snapshots_root,
         sink,
+        audit_sink,
         flush_tick,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use ourios_core::audit::ParamType;
+    use ourios_core::audit::{AuditSink, ParamType};
     use ourios_core::record::{BodyKind, MinedRecord, Param, RecordSink};
     use ourios_core::tenant::TenantId;
 
@@ -437,14 +546,48 @@ mod tests {
         sink
     }
 
+    /// An audit sink rooted at `store_root`. A generous ceiling keeps the
+    /// eager-flush signal out of these tests.
+    fn audit_sink(store_root: &Path) -> SharedParquetAuditSink {
+        std::fs::create_dir_all(store_root).expect("create audit store root");
+        SharedParquetAuditSink::new(BufferingAuditSink::new(
+            Store::local(store_root).expect("audit store"),
+            10_000,
+        ))
+    }
+
+    /// An audit event for `tenant` (used to seed the audit sink in the
+    /// flush-gating test).
+    fn audit_event(tenant: &str) -> ourios_core::audit::AuditEvent {
+        ourios_core::audit::AuditEvent {
+            tenant_id: TenantId::new(tenant),
+            timestamp: std::time::UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: ourios_core::audit::AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: ourios_core::audit::hash_triggering_line(b"line"),
+                triggering_line_sample: Some("line".to_owned()),
+                change: ourios_core::audit::TemplateChange::Created {
+                    new_template: "user <*> logged in".to_owned(),
+                },
+            },
+        }
+    }
+
     #[test]
     fn flush_then_snapshot_drains_and_snapshots_when_the_store_accepts_writes() {
         let tmp = tempfile::TempDir::new().expect("temp");
         let sink = buffered_sink(&tmp.path().join("store"));
+        let audit = audit_sink(&tmp.path().join("audit"));
         let miner = MinerCluster::new(MinerConfig::default());
 
-        let drained =
-            flush_then_snapshot(&sink, &tmp.path().join("snapshots"), &miner, None, "test");
+        let drained = flush_then_snapshot(
+            &sink,
+            &audit,
+            &tmp.path().join("snapshots"),
+            &miner,
+            None,
+            "test",
+        );
 
         assert!(drained, "a working store drains the sink");
         assert_eq!(sink.buffered_records(), 0, "the buffer cleared on flush");
@@ -459,6 +602,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp");
         let store_root = tmp.path().join("store");
         let sink = buffered_sink(&store_root);
+        let audit = audit_sink(&tmp.path().join("audit"));
 
         // Make `put_blocking` fail deterministically: replace the store root
         // directory with a regular file, so writing under it errors.
@@ -467,7 +611,7 @@ mod tests {
 
         let snapshots_root = tmp.path().join("snapshots");
         let miner = MinerCluster::new(MinerConfig::default());
-        let drained = flush_then_snapshot(&sink, &snapshots_root, &miner, None, "test");
+        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, None, "test");
 
         assert!(!drained, "an unavailable store does not drain the sink");
         assert_eq!(
@@ -482,6 +626,50 @@ mod tests {
             !snapshot_written,
             "the snapshot is skipped, so the horizon cannot advance past un-flushed data",
         );
+    }
+
+    #[test]
+    fn flush_then_snapshot_skips_the_record_flush_when_audit_retains() {
+        // issue #302 fix #3: a clean row must not be exposed before its template
+        // event is durable. When the audit sink retains events (a transient
+        // store error), the record flush is skipped this cycle even though the
+        // record store is healthy — flushing it would publish a row whose
+        // template the read-time registry can't yet see.
+        let tmp = tempfile::TempDir::new().expect("temp");
+
+        // A healthy record store with buffered records.
+        let sink = buffered_sink(&tmp.path().join("store"));
+
+        // An audit sink with a buffered event, then a sabotaged store so its
+        // flush fails transiently (Io) and the event is retained.
+        let audit_root = tmp.path().join("audit");
+        let audit = audit_sink(&audit_root);
+        {
+            let mut producer = audit.clone();
+            producer.emit(audit_event("checkout"));
+        }
+        std::fs::remove_dir_all(&audit_root).expect("remove audit dir");
+        std::fs::write(&audit_root, b"not a directory").expect("sabotage audit store");
+
+        let snapshots_root = tmp.path().join("snapshots");
+        let miner = MinerCluster::new(MinerConfig::default());
+        let drained = flush_then_snapshot(&sink, &audit, &snapshots_root, &miner, None, "test");
+
+        assert!(!drained, "a retained audit buffer blocks the drain");
+        assert_eq!(
+            audit.buffered_events(),
+            1,
+            "the audit event is retained (transient store error)",
+        );
+        assert_eq!(
+            sink.buffered_records(),
+            2,
+            "the record flush is skipped while the audit event isn't durable (issue #302 §3.3)",
+        );
+        let snapshot_written = std::fs::read_dir(&snapshots_root)
+            .ok()
+            .is_some_and(|mut d| d.next().is_some());
+        assert!(!snapshot_written, "the snapshot is skipped too");
     }
 
     fn test_wal_config(root: &Path) -> WalConfig {
@@ -520,5 +708,181 @@ mod tests {
         assert_ne!(handle.grpc_addr.port(), 0, "gRPC bound to a real port");
         assert_ne!(handle.http_addr.port(), 0, "HTTP bound to a real port");
         handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// One OTLP/HTTP export of `bodies` for `service` (its `service.name` routes
+    /// to the matching tenant, RFC 0003 §6.3), each record at INFO with a fixed
+    /// in-partition timestamp.
+    fn export_request(
+        service: &str,
+        bodies: &[&str],
+    ) -> opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let string_value = |s: &str| AnyValue {
+            value: Some(Value::StringValue(s.to_owned())),
+        };
+        let log_records = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| LogRecord {
+                body: Some(string_value(b)),
+                severity_number: 9, // INFO (RFC 0018)
+                time_unix_nano: 1_775_127_480_000_000_000 + u64::try_from(i).unwrap_or(0),
+                ..Default::default()
+            })
+            .collect();
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_owned(),
+                        value: Some(string_value(service)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Hand-rolled OTLP/HTTP `POST /v1/logs` (no HTTP-client dependency); asserts
+    /// a `200`.
+    async fn post_otlp_http(addr: SocketAddr, body: &[u8]) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect HTTP");
+        let head = format!(
+            "POST /v1/logs HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        stream.write_all(head.as_bytes()).await.expect("write head");
+        stream.write_all(body).await.expect("write body");
+        stream.flush().await.expect("flush request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "export returns 200, got status line {:?}",
+            response.lines().next(),
+        );
+    }
+
+    /// Every `*.parquet` data file under `root`, recursively.
+    fn data_parquet_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "parquet") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// issue #302: the receiver wires the miner's audit sink, so its
+    /// `template_created` / `template_widened` events reach the audit stream and
+    /// the read-time registry (RFC 0017 `derive_template_registry`) can render a
+    /// clean, high-confidence row's body bit-for-bit — rather than the empty
+    /// retained `body` a clean row carries (`CLAUDE.md` §3.3). Before the fix the
+    /// registry was empty, so every clean row rendered empty + `RetainedVerbatim`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_persists_template_audit_so_clean_rows_reconstruct() {
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            wal: test_wal_config(wal_dir.path()),
+            store,
+        })
+        .await
+        .expect("serve");
+
+        // Clean, near-identical lines mine to a stable `user <*> logged in`
+        // template; their body column is dropped (high confidence, §3.1).
+        let bodies = ["user 1 logged in", "user 2 logged in", "user 3 logged in"];
+        let request = export_request("checkout", &bodies);
+        let encoded = {
+            use prost::Message;
+            request.encode_to_vec()
+        };
+        post_otlp_http(handle.http_addr, &encoded).await;
+
+        // Graceful shutdown drains the audit sink (before the record sink) and
+        // the record sink to the local store.
+        handle.shutdown().await.expect("graceful shutdown");
+
+        // The registry folds the template events the receiver persisted.
+        let tenant = ourios_core::tenant::TenantId::new("checkout");
+        let registry = ourios_querier::derive_template_registry(
+            ourios_querier::StoreRef::Local(data_dir.path()),
+            &tenant,
+        )
+        .expect("derive registry");
+        assert!(
+            !registry.is_empty(),
+            "the receiver persisted the miner's template audit events",
+        );
+
+        // Every stored data record reconstructs its original line bit-for-bit.
+        // Scope the walk to the `data/` subtree so the audit Parquet (a
+        // different schema, under `audit/`) isn't read as a data file.
+        let mut rendered = Vec::new();
+        for file in data_parquet_files(&data_dir.path().join("data")) {
+            let records = ourios_parquet::Reader::open_file(&file)
+                .expect("open data file")
+                .read_all()
+                .expect("read records");
+            for record in records {
+                let ourios_querier::LogBody::Rendered {
+                    line,
+                    reconstruction,
+                } = ourios_querier::render_log_body(&record, &registry)
+                else {
+                    panic!("a string body renders to a line");
+                };
+                assert!(
+                    matches!(
+                        reconstruction,
+                        ourios_miner::reconstruct::Reconstruction::Faithful
+                    ),
+                    "a clean row reconstructs faithfully from its template, not the empty \
+                     retained body (issue #302)",
+                );
+                rendered.push(String::from_utf8(line).expect("utf8 line"));
+            }
+        }
+        rendered.sort();
+        let mut want: Vec<String> = bodies.iter().map(|s| (*s).to_owned()).collect();
+        want.sort();
+        assert_eq!(
+            rendered, want,
+            "every ingested clean line round-trips out of the store rendered from its template",
+        );
     }
 }

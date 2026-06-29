@@ -50,8 +50,9 @@ ourios-miner = { path = "../ourios-miner" }
 ourios-parquet = { path = "../ourios-parquet" }
 # Async runtime for the background compaction loop: `time` for the
 # interval timer, `rt` for `spawn_blocking` (compaction is blocking
-# filesystem/Parquet work), `macros` for `#[tokio::main]`/tests.
-tokio = { version = "1", default-features = false, features = ["rt", "time", "macros"] }
+# filesystem/Parquet work), `macros` for `#[tokio::main]`/tests, `sync`
+# for the audit sink's `Notify` eager-flush signal (issue #302).
+tokio = { version = "1", default-features = false, features = ["rt", "time", "macros", "sync"] }
 # Telemetry: the lightweight OTel metrics API only (RFC 0001 §6.8 — the
 # heavy SDK/OTLP live in ourios-telemetry; library crates resolve
 # instruments through the global meter).

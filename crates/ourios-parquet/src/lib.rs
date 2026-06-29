@@ -40,7 +40,7 @@ pub mod writer;
 pub use audit_reader::{AuditReader, AuditReaderError};
 pub use audit_record_batch::{AuditBatchError, audit_events_to_batch};
 pub use audit_sink::ParquetAuditSink;
-pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile};
+pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_audit_partition};
 pub use compaction::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, compact_partition,
     gc_orphans, plan_candidates,

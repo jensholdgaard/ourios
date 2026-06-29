@@ -80,12 +80,19 @@ release version:
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
-    # Fail fast if the tag already exists — BEFORE mutating the manifest /
-    # changelog — so a re-run can't advance `main` with a release commit that
-    # `git tag` then refuses to create (leaving the tag the workflow expects
-    # missing).
-    if git rev-parse -q --verify "refs/tags/v{{version}}" >/dev/null 2>&1; then
-        echo "error: tag v{{version}} already exists"; exit 1
+    # Refresh remote refs so the checks below see the real state of origin.
+    git fetch --quiet --tags origin
+    # Release only from a `main` that exactly matches `origin/main` — never a
+    # stale or diverged tree (else the release commit would build on the wrong
+    # base and the eventual push could be rejected or rebased).
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "error: local main is not in sync with origin/main — pull/push first"; exit 1; }
+    # Fail fast if the tag already exists locally OR on origin — BEFORE mutating
+    # the manifest / changelog — so a re-run can't advance `main` with a release
+    # commit that `git tag` (or the later push) then refuses, leaving the tag the
+    # workflow expects missing.
+    if git rev-parse -q --verify "refs/tags/v{{version}}" >/dev/null 2>&1 \
+        || git ls-remote --exit-code --tags origin "refs/tags/v{{version}}" >/dev/null 2>&1; then
+        echo "error: tag v{{version}} already exists (local or origin)"; exit 1
     fi
     # The workspace version is the single source of truth — after every workspace
     # member crate switched to `version.workspace = true`, this is the only

@@ -495,8 +495,19 @@ fn append_chunks(
 /// Derive the [`PartitionKey`] for an audit event. Reuses the
 /// data-side `PartitionKey` shape (which carries an `hour`
 /// field); the audit path stops at `day`, so the `hour` field is
-/// populated but ignored by [`audit_partition_matches`].
-pub(crate) fn derive_audit_partition(event: &AuditEvent) -> Result<PartitionKey, AuditWriterError> {
+/// populated (always `0`) but ignored by [`audit_partition_matches`].
+///
+/// Because `hour` is fixed at `0`, the returned key is canonical for the
+/// audit partitioning axis (tenant + year/month/day): two events on the same
+/// UTC day derive equal keys regardless of wall-clock hour. That makes it a
+/// sound grouping key for a buffering sink batching one `AuditWriter` per
+/// partition (issue #302).
+///
+/// # Errors
+///
+/// [`AuditWriterError::Batch`] when the event's timestamp is before the Unix
+/// epoch or overflows `i64` nanoseconds.
+pub fn derive_audit_partition(event: &AuditEvent) -> Result<PartitionKey, AuditWriterError> {
     let nanos = event
         .timestamp
         .duration_since(SystemTime::UNIX_EPOCH)

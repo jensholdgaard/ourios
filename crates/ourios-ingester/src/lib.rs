@@ -32,6 +32,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod audit_sink;
 pub mod compactor;
 pub mod metrics;
 pub mod receiver;

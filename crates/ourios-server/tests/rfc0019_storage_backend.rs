@@ -316,6 +316,42 @@ fn query_json(response: &str) -> serde_json::Value {
     serde_json::from_str(body).expect("body is JSON")
 }
 
+/// The reconstructed `body.line` text of every returned record, sorted, after
+/// asserting each row reconstructed *faithfully* from its template. A clean,
+/// high-confidence row's `body` column is empty by design (`CLAUDE.md` §3.1);
+/// it renders bit-for-bit only because the receiver now persists the miner's
+/// `template_created` / `template_widened` audit events for the read-time
+/// registry (issue #302). Before that fix every clean row rendered an empty
+/// line marked `retained_verbatim`.
+fn body_lines(json: &serde_json::Value) -> Vec<String> {
+    let records = json["records"]
+        .as_array()
+        .expect("the query response carries a records array");
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|r| {
+            assert_eq!(
+                r["body"]["reconstruction"], "faithful",
+                "a clean row reconstructs faithfully from its template, not the empty \
+                 retained body (issue #302): {r}",
+            );
+            r["body"]["line"]
+                .as_str()
+                .expect("a string body renders a line")
+                .to_owned()
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `lines`, sorted — the expected `body_lines` for a set of ingested bodies.
+fn sorted_bodies(bodies: &[&str]) -> Vec<String> {
+    let mut want: Vec<String> = bodies.iter().map(|b| (*b).to_owned()).collect();
+    want.sort();
+    want
+}
+
 /// SIGTERM `child` (what k8s / `nerdctl stop` send) and assert a clean exit —
 /// the graceful-shutdown drain flushes the RFC 0014 sink to the store.
 async fn terminate_and_assert_clean(mut child: Child) {
@@ -491,15 +527,17 @@ async fn rfc0019_3_ingest_query_end_to_end_on_s3() {
     let response = http_post_query(querier_addr, "storefront", "severity >= info").await;
     let json = query_json(&response);
     // RFC0019.3 acceptance: the query returns the rows with pruning stats — "the
-    // same result the local backend produces." We assert the row count + stats,
-    // not the body *text*: reconstructing a clean row's body needs the read-time
-    // template registry, derived from the miner's `template_created` audit events
-    // — which the receiver does not yet persist (issue #302), so a clean row's
-    // body renders empty on *both* backends. That gap is orthogonal to RFC 0019's
-    // local-vs-S3 scope; when #302 lands these tests can also assert body text.
+    // same result the local backend produces." With the receiver persisting the
+    // miner's template audit events (issue #302), each clean row also
+    // reconstructs its original line bit-for-bit out of S3 (`CLAUDE.md` §3.3).
     assert_eq!(
         json["rows"], 3,
         "the three ingested rows round-trip out of S3: {json}",
+    );
+    assert_eq!(
+        body_lines(&json),
+        sorted_bodies(&bodies),
+        "each clean row renders its original line from the template, out of S3: {json}",
     );
     let scanned = json["stats"]["row_groups_scanned"]
         .as_u64()
@@ -639,13 +677,18 @@ async fn rfc0019_5_tenant_isolation_on_s3() {
     let response = http_post_query(querier_addr, "alpha", "severity >= info").await;
     let json = query_json(&response);
     // RFC0019.5 acceptance: alpha reads only its own prefix; bravo's objects are
-    // never returned. Assert the row count + that bravo's `service.name` (carried
-    // in each row's resource attributes) never appears — the cross-tenant leak
-    // check. (Body *text* isn't asserted: it renders empty for clean rows until
-    // issue #302; isolation is about which rows are returned, not their text.)
+    // never returned. Assert the row count, that alpha's own rows reconstruct
+    // their body text (issue #302 — the audit registry is per-tenant), and that
+    // bravo's `service.name` / body text never appears — the cross-tenant leak
+    // check.
     assert_eq!(
         json["rows"], 2,
         "alpha sees exactly its own two rows, bravo's excluded: {json}",
+    );
+    assert_eq!(
+        body_lines(&json),
+        sorted_bodies(&["alpha one apple", "alpha two apple"]),
+        "alpha's own rows reconstruct their body text from alpha's template registry: {json}",
     );
     assert!(
         !response.contains("bravo"),

@@ -176,13 +176,18 @@ async fn rfc0013_6_wal_stays_local() {
     // Assert: the store holds the Parquet data and nothing WAL-ish; the WAL
     // segments stayed under the local WAL root.
     let store_files = files_under(&bucket_root);
-    let parquet: Vec<&PathBuf> = store_files
+    // The mined data lands under `data/`; the miner's template audit stream
+    // (issue #302) lands under `audit/` in the same store. Scope the data
+    // round-trip to `data/` so an audit Parquet (a different schema) isn't read
+    // back with the data reader.
+    let data_root = bucket_root.join("data");
+    let data_parquet: Vec<&PathBuf> = store_files
         .iter()
-        .filter(|p| has_extension(p, "parquet"))
+        .filter(|p| has_extension(p, "parquet") && p.starts_with(&data_root))
         .collect();
     assert!(
-        !parquet.is_empty(),
-        "the shutdown drain landed at least one Parquet object in the store; saw {store_files:?}",
+        !data_parquet.is_empty(),
+        "the shutdown drain landed at least one data Parquet object in the store; saw {store_files:?}",
     );
     for path in &store_files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -208,7 +213,7 @@ async fn rfc0013_6_wal_stays_local() {
 
     // The store's Parquet is the real mined data (the separation isn't
     // vacuous): the checkout records round-trip back out.
-    let rows: usize = parquet
+    let rows: usize = data_parquet
         .iter()
         .map(|p| {
             Reader::open_file(p)

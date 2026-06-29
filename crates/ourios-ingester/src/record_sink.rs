@@ -348,6 +348,13 @@ impl ParquetRecordSink {
     /// of anything `emit` buffered for the same partition meanwhile, and the
     /// byte accounting + gauge are restored.
     pub fn requeue(&mut self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>) {
+        // These records were drained because they had aged; keep the partition
+        // aged so the retry isn't deferred behind newer records that arrived
+        // during the off-lock publish (which carry a newer `oldest`). Pin
+        // `oldest` to the age threshold (or older), so the next sweep re-drains.
+        let aged = Instant::now()
+            .checked_sub(self.config.max_buffer_age)
+            .unwrap_or_else(Instant::now);
         for (key, records) in batches {
             let est: usize = records.iter().map(estimate_bytes).sum();
             let buf = self.buffers.entry(key).or_insert_with(|| PartitionBuffer {
@@ -359,6 +366,7 @@ impl ParquetRecordSink {
             combined.append(&mut buf.records);
             buf.records = combined;
             buf.est_bytes = buf.est_bytes.saturating_add(est);
+            buf.oldest = buf.oldest.min(aged);
             self.total_bytes = self.total_bytes.saturating_add(est);
             self.metrics
                 .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
@@ -663,6 +671,47 @@ mod tests {
         handle.flush_all(); // the rotation trigger, via the pipeline's handle
         assert_eq!(handle.flushes(), 1);
         assert_eq!(handle.buffered_records(), 0, "flush drained the buffer");
+    }
+
+    #[test]
+    fn requeue_keeps_the_partition_aged_for_prompt_retry() {
+        // A transient-failed publish requeues already-aged records. If a newer
+        // record arrived for the same partition during the off-lock publish, the
+        // partition's `oldest` reflects that fresh record and the requeued (aged)
+        // records would miss the next age-sweep. `requeue` pins `oldest` to the
+        // age threshold so the retry re-drains promptly (issue #302).
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        // `never_flush` has a 1-day max age, so a freshly-emitted record is not
+        // aged on its own — the partition only ages via the requeue pin.
+        let mut sink = ParquetRecordSink::new(store, never_flush());
+
+        // Drain a batch to stand in for an aged drain whose publish then fails.
+        sink.emit(rec("checkout"));
+        let batch = sink.drain_all();
+        assert_eq!(batch.len(), 1, "one partition drained");
+
+        // A newer record arrives for the same partition during the off-lock
+        // publish; on its own it is not aged.
+        sink.emit(rec("checkout"));
+        assert!(
+            sink.drain_aged().is_empty(),
+            "the fresh record alone is not aged",
+        );
+
+        sink.requeue(batch);
+
+        let retry = sink.drain_aged();
+        assert_eq!(
+            retry.len(),
+            1,
+            "the requeued partition is aged again and re-drains on the next sweep",
+        );
+        assert_eq!(
+            retry[0].1.len(),
+            2,
+            "both the requeued record and the newer one drain together",
+        );
     }
 
     // --- issue #302 fix #2: the inline size trigger is audit-ordered. ---

@@ -1,37 +1,120 @@
 name: Container image
 
 # Build, push, and sign the production `ourios-server` OCI image (first
-# shipping milestone, workstream A). Multi-arch (linux/amd64 + arm64 via
-# QEMU), pushed to GHCR, signed keyless with cosign (Sigstore OIDC, no
-# key secret). Triggered by version tags; `workflow_dispatch` lets the
-# image be verified post-merge without cutting a tag (the local
-# environment has no Docker, mirroring the ClusterFuzzLite setup).
+# shipping milestone, workstream A). Multi-arch (linux/amd64 + linux/arm64):
+# each architecture is built on its own NATIVE runner — no QEMU emulation, so
+# the arm64 leg no longer recompiles the workspace under emulation — then the
+# per-arch images are merged into one manifest list and signed keyless with
+# cosign (Sigstore OIDC, no key secret). Triggered by version tags;
+# `workflow_dispatch` lets the image be verified post-merge without cutting a
+# tag (the local environment has no Docker, mirroring the ClusterFuzzLite
+# setup; a dispatch run gets a :sha tag).
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
-# Least privilege at the top; the build job widens to what it needs.
+# Least privilege at the top; each job widens to exactly what it needs.
 permissions:
   contents: read
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  image:
-    name: build, push, sign
-    runs-on: ubuntu-latest
+  build:
+    name: build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      # Push the image + attestations to GHCR.
+      # Push the per-arch image (by digest) + its attestations to GHCR.
       packages: write
-      # Keyless cosign signing via the Sigstore OIDC flow.
-      id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels only here; the tags are applied once, to the manifest list, in
+      # the merge job. A `/` is invalid in an artifact name, so derive a dashed
+      # platform pair for the per-arch digest artifact.
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # BuildKit-generated supply-chain attestations, per arch.
+          provenance: mode=max
+          sbom: true
+          # Per-arch GHA layer cache — native build, but caching still keeps
+          # incremental release builds fast. Scoped per platform so the two
+          # legs don't clobber each other's cache.
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+          # Push by digest only; the manifest list (with the real tags) is
+          # assembled in the merge job. `name-canonical` records the canonical
+          # image name so imagetools can reference the pushed digest.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge manifest + sign
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Push the manifest list to GHCR.
+      packages: write
+      # Keyless cosign signing via the Sigstore OIDC flow.
+      id-token: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -43,35 +126,39 @@ jobs:
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           # Explicit tags only — suppresses the default branch tag (e.g.
-          # ":main") on workflow_dispatch. On a v* tag push this yields
-          # the semver tags; dispatch runs get a :sha tag.
+          # ":main") on workflow_dispatch. On a v* tag push this yields the
+          # semver tags; dispatch runs get a :sha tag.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
-      - id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # BuildKit-generated supply-chain attestations.
-          provenance: mode=max
-          sbom: true
-          # GHA layer cache — the arm64 leg cross-builds under QEMU, so
-          # caching across runs keeps the build off the CI timeout.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        # Intentional word-splitting (SC2046): the `jq` substitution expands to
+        # multiple `-t <tag>` flags and the `printf` to one `IMAGE@sha256:<hex>`
+        # ref per downloaded digest file — quoting would collapse them.
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Resolve manifest-list digest
+        id: digest
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: cosign sign (keyless)
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE: ${{ env.IMAGE }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"

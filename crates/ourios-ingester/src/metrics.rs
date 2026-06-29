@@ -439,6 +439,7 @@ pub struct AuditSinkMetrics {
     flush_events: Counter<u64>,
     flush_errors: Counter<u64>,
     derive_errors: Counter<u64>,
+    dropped: Counter<u64>,
     /// Absolute current buffered-event count, kept up to date by the sink and
     /// read by the `buffer.usage` observable's callback at collect time — the
     /// `ourios.compaction.backlog` pattern (an observable gauge of the absolute
@@ -469,6 +470,10 @@ impl AuditSinkMetrics {
             .u64_counter(semconv::OURIOS_AUDIT_SINK_DERIVE_ERRORS)
             .with_unit("{error}")
             .build();
+        let dropped = meter
+            .u64_counter(semconv::OURIOS_AUDIT_SINK_DROPPED)
+            .with_unit("{event}")
+            .build();
 
         // `buffer.usage` is an **observable** UpDownCounter reporting the
         // absolute buffered-event count at collect time (the backlog pattern).
@@ -488,20 +493,23 @@ impl AuditSinkMetrics {
         flushes.add(0, &[]);
         flush_events.add(0, &[]);
         derive_errors.add(0, &[]);
+        dropped.add(0, &[]);
         Self {
             flushes,
             flush_events,
             flush_errors,
             derive_errors,
+            dropped,
             buffered_state,
             buffer_usage,
         }
     }
 
-    /// One successful partition flush of `event_count` events.
-    pub fn record_flush(&self, event_count: usize) {
-        self.flushes.add(1, &[]);
-        self.flush_events.add(to_u64(event_count), &[]);
+    /// `partitions` successful partition flushes carrying `events` events in
+    /// total (one call settles a whole flush pass).
+    pub fn record_flush(&self, partitions: u64, events: u64) {
+        self.flushes.add(partitions, &[]);
+        self.flush_events.add(events, &[]);
     }
 
     /// A failed partition flush, classified by `outcome`
@@ -521,6 +529,11 @@ impl AuditSinkMetrics {
     /// pre-epoch / overflowing timestamp).
     pub fn record_derive_error(&self) {
         self.derive_errors.add(1, &[]);
+    }
+
+    /// An event dropped at the hard buffer cap (the OOM backstop).
+    pub fn record_dropped_at_cap(&self) {
+        self.dropped.add(1, &[]);
     }
 
     /// Update the observable buffer gauge to the absolute `events` now buffered.

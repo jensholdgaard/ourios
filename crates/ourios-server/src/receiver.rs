@@ -19,6 +19,7 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use ourios_core::config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
@@ -60,6 +61,13 @@ const SINK_FLUSH_TICK: Duration = Duration::from_secs(30);
 /// drops events). Generous by default — a buffered audit event is small and the
 /// normal driver is the cadence, not this cap.
 const AUDIT_SINK_CEILING_EVENTS: usize = 100_000;
+/// Hard cap on the audit sink's in-memory buffer (issue #302 fix #3) — the OOM
+/// backstop. Well above the soft ceiling: under sustained store-unavailability
+/// (flush can't drain) `emit` drops past this rather than grow without bound.
+/// Dropped template events degrade those templates to retained/empty bodies
+/// until the WAL re-mines them on restart — bounded memory is the deliberate
+/// trade.
+const AUDIT_SINK_MAX_EVENTS: usize = 1_000_000;
 
 fn flush_config() -> FlushConfig {
     FlushConfig {
@@ -71,18 +79,20 @@ fn flush_config() -> FlushConfig {
 
 /// The age-sweep task (RFC0014.2): every [`SINK_FLUSH_TICK`] — or sooner, when
 /// the audit buffer reaches its ceiling and raises `audit_overflow` (issue #302
-/// fix #4) — flush partitions whose oldest record has reached `max_buffer_age`,
-/// so a low-volume partition becomes queryable without waiting for a WAL
-/// rotation. The audit sink flushes first, and the record flush is **skipped**
-/// when the audit sink did not fully drain: a non-empty buffer means a transient
-/// store error (permanent errors drop), so the record flush to the same store
-/// would fail anyway, and flushing it would expose a clean row before its
-/// template event is durable (issue #302 §3.3). Audit volume is low, so the
-/// whole buffer flushes each sweep rather than tracking per-event age. Stops
-/// when `shutdown` fires; the shutdown path then drains both sinks fully.
+/// fix #3) — publish the aged record partitions, audit-ordered and race-free
+/// (issue #302 fix #1).
+///
+/// Each sweep takes an **atomic snapshot** of both buffers under the pipeline's
+/// miner lock (`with_miner` → [`PublishCoordinator::drain_aged`]; a microsecond
+/// memory move, no I/O), then writes off the lock
+/// ([`PublishCoordinator::write_ordered`]): the audit batch to durability first,
+/// and the record partitions only after — so a record never reaches the store
+/// before its template event is durable, and no concurrent `ingest` can split a
+/// record from its audit event across the drain. Stops when `shutdown` fires;
+/// the shutdown path then drains both sinks fully.
 fn spawn_age_sweep(
-    sink: SharedParquetSink,
-    audit_sink: SharedParquetAuditSink,
+    pipeline: SharedPipeline,
+    coordinator: PublishCoordinator,
     audit_overflow: Arc<Notify>,
     mut shutdown: watch::Receiver<()>,
 ) -> JoinHandle<()> {
@@ -98,19 +108,21 @@ fn spawn_age_sweep(
                 () = audit_overflow.notified() => {}
                 _ = shutdown.changed() => break,
             }
-            // Both flushes encode Parquet and do blocking store I/O (more so
-            // against S3), so run them on the blocking pool rather than stalling
+            // The drain takes the miner lock (atomic w.r.t. ingest) for only a
+            // memory move; the ordered write does the blocking store I/O off the
+            // lock. Run the whole step on the blocking pool rather than stalling
             // a runtime worker. A `JoinError` means the runtime is shutting down
             // — stop sweeping.
-            let sink = sink.clone();
-            let audit_sink = audit_sink.clone();
+            let pipeline = pipeline.clone();
+            let coordinator = coordinator.clone();
             if tokio::task::spawn_blocking(move || {
-                audit_sink.flush();
-                // Only flush records once the audit sink fully drained (issue
-                // #302 §3.3 — see this function's doc).
-                if audit_sink.buffered_events() == 0 {
-                    sink.flush_aged();
-                }
+                let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+                // The cadence is best-effort: a partial write (transient store
+                // error) retains the un-published data + audit (the WAL is the
+                // durability of record) and the next tick retries — so the
+                // published-everything signal is not needed here (no snapshot is
+                // taken at the cadence; that's the rotation/shutdown path).
+                let _published = coordinator.write_ordered(drained, "age");
             })
             .await
             .is_err()
@@ -161,9 +173,8 @@ fn flush_then_snapshot(
     high_water: Option<WalOffset>,
     cadence: &str,
 ) -> bool {
-    audit_sink.flush();
-    let audit_events = audit_sink.buffered_events();
-    if audit_events != 0 {
+    if !audit_sink.flush() {
+        let audit_events = audit_sink.buffered_events();
         eprintln!(
             "{cadence}: audit sink retained {audit_events} event(s) (store unavailable?); skipping \
              the record flush + snapshot this cycle so a clean row isn't exposed before its \
@@ -289,10 +300,24 @@ impl ReceiverHandle {
 /// audit Parquet stream; without it the querier's read-time registry is empty
 /// and a clean row's body renders empty (`CLAUDE.md` §3.3). The WAL stays under
 /// `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md` §3.6).
+///
+/// The audit sink is built first so the record sink can take an **audit
+/// barrier** (issue #302 fix #2): before any inline size/ceiling publish the
+/// record sink flushes the audit sink to durability, so a partition is never
+/// put to the store before its template events are durable. That inline publish
+/// runs under the miner lock, so the barrier flush + the publish are atomic
+/// w.r.t. ingest.
 fn build_write_sinks(store: Store) -> (SharedParquetSink, SharedParquetAuditSink) {
-    let sink = SharedParquetSink::new(ParquetRecordSink::new(store.clone(), flush_config()));
-    let audit_sink =
-        SharedParquetAuditSink::new(BufferingAuditSink::new(store, AUDIT_SINK_CEILING_EVENTS));
+    let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
+        store.clone(),
+        AUDIT_SINK_CEILING_EVENTS,
+        AUDIT_SINK_MAX_EVENTS,
+    ));
+    let barrier_audit = audit_sink.clone();
+    let sink = SharedParquetSink::new(
+        ParquetRecordSink::new(store, flush_config())
+            .with_audit_barrier(Box::new(move || barrier_audit.flush())),
+    );
     (sink, audit_sink)
 }
 
@@ -412,9 +437,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
 
     let (shutdown, shutdown_rx) = watch::channel(());
 
+    // The cadence age-sweep publishes through the coordinator: atomic drain
+    // under the miner lock + audit-ordered off-lock write (issue #302 #1/#2).
+    let coordinator = PublishCoordinator::new(sink.clone(), audit_sink.clone());
     let flush_tick = spawn_age_sweep(
-        sink.clone(),
-        audit_sink.clone(),
+        pipeline.clone(),
+        coordinator,
         audit_sink.overflow_notify(),
         shutdown_rx.clone(),
     );
@@ -531,6 +559,7 @@ mod tests {
         SharedParquetAuditSink::new(BufferingAuditSink::new(
             Store::local(store_root).expect("audit store"),
             10_000,
+            100_000,
         ))
     }
 

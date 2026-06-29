@@ -12,7 +12,7 @@ use ourios_core::audit::{
     AuditEvent, AuditPayload, AuditSink, TemplateChange, hash_triggering_line,
 };
 use ourios_core::tenant::TenantId;
-use ourios_ingester::audit_sink::BufferingAuditSink;
+use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::metrics::FLUSH_OUTCOME_TRANSIENT;
 use ourios_parquet::Store;
 use ourios_semconv as semconv;
@@ -62,27 +62,31 @@ async fn audit_sink_exports_its_instruments() {
     // Build the sink after the provider is installed so its instruments resolve
     // against it.
     let dir = tempfile::TempDir::new().expect("temp");
-    let store = Store::local(dir.path()).expect("store");
-    let mut sink = BufferingAuditSink::new(store, 1024);
+    let store_root = dir.path().join("store");
+    std::fs::create_dir_all(&store_root).expect("create store root");
+    let store = Store::local(&store_root).expect("store");
+    let mut sink = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024, 4096));
 
     // Phase 1 — three events across two tenants flush to two files.
     sink.emit(created_event("alpha", 1));
     sink.emit(created_event("alpha", 2));
     sink.emit(created_event("bravo", 1));
-    sink.flush();
+    assert!(sink.flush(), "a healthy store fully drains");
 
     // Phase 2 — one more event, then a sabotaged store forces a transient
     // (Io) flush error: the event is retained, the error counted.
     sink.emit(created_event("alpha", 3));
-    std::fs::remove_dir_all(dir.path()).expect("remove store dir");
-    std::fs::write(dir.path(), b"not a directory").expect("sabotage");
-    sink.flush();
+    std::fs::remove_dir_all(&store_root).expect("remove store dir");
+    std::fs::write(&store_root, b"not a directory").expect("sabotage");
+    assert!(
+        !sink.flush(),
+        "a transient store error is not fully drained"
+    );
     assert_eq!(
         sink.buffered_events(),
         1,
         "the transient error retained the event"
     );
-    assert_eq!(sink.flush_errors_transient(), 1);
 
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");

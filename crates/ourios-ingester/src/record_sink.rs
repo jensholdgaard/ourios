@@ -98,6 +98,14 @@ pub struct ParquetRecordSink {
     records_flushed: u64,
     flush_errors: u64,
     derive_errors: u64,
+    /// Audit-durability barrier (issue #302 fix #2): run before any *inline*
+    /// publish (size trigger / ceiling) to flush the audit sink to durability
+    /// first, returning whether it fully drained. A record must not be published
+    /// before its template event is durable (`CLAUDE.md` §3.3); the inline
+    /// publish runs under the miner lock, so the barrier flush + the publish are
+    /// atomic w.r.t. ingest. `None` (the RFC 0014 default + the record-sink unit
+    /// tests) leaves the inline publish unconstrained.
+    audit_barrier: Option<Box<dyn FnMut() -> bool + Send>>,
     /// RFC 0014 §6.3 instruments (flush throughput/latency by trigger,
     /// errors, buffer occupancy). No-op when no meter provider is installed.
     metrics: SinkMetrics,
@@ -146,7 +154,30 @@ impl ParquetRecordSink {
             records_flushed: 0,
             flush_errors: 0,
             derive_errors: 0,
+            audit_barrier: None,
             metrics: SinkMetrics::new(),
+        }
+    }
+
+    /// Install the audit-durability barrier (issue #302 fix #2): a closure run
+    /// before any inline size/ceiling publish that flushes the audit sink and
+    /// returns whether it fully drained. When it returns `false` the inline
+    /// publish is skipped (the partition is retained — the WAL is the durability
+    /// of record — and the coordinated cadence flush retries it once the store
+    /// recovers), so a record is never published before its template event is
+    /// durable.
+    #[must_use]
+    pub fn with_audit_barrier(mut self, barrier: Box<dyn FnMut() -> bool + Send>) -> Self {
+        self.audit_barrier = Some(barrier);
+        self
+    }
+
+    /// Whether an inline publish may proceed: with a barrier installed, flush
+    /// the audit sink first and require it to fully drain; without one, always.
+    fn inline_publish_allowed(&mut self) -> bool {
+        match &mut self.audit_barrier {
+            Some(barrier) => barrier(),
+            None => true,
         }
     }
 
@@ -268,6 +299,110 @@ impl ParquetRecordSink {
             false
         }
     }
+
+    /// Take every partition whose oldest record has reached `max_buffer_age`
+    /// (the cadence drain) as owned batches — a cheap memory move, **no I/O**.
+    /// The [`crate::publish::PublishCoordinator`] calls this under the pipeline's
+    /// miner lock so the drain is atomic w.r.t. `miner.ingest` (issue #302 #1),
+    /// then publishes the batches off-lock via `publish_partition`.
+    pub fn drain_aged(&mut self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        let max = self.config.max_buffer_age;
+        let keys: Vec<PartitionKey> = self
+            .buffers
+            .iter()
+            .filter(|(_, b)| b.oldest.elapsed() >= max)
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.take_partitions(keys)
+    }
+
+    /// Take **every** buffered partition as owned batches (the rotation /
+    /// shutdown drain) — a cheap memory move, no I/O.
+    pub fn drain_all(&mut self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        let keys: Vec<PartitionKey> = self.buffers.keys().cloned().collect();
+        self.take_partitions(keys)
+    }
+
+    /// Remove `keys` from the buffer map, returning their non-empty record
+    /// batches and decrementing the byte accounting + occupancy gauge.
+    fn take_partitions(
+        &mut self,
+        keys: Vec<PartitionKey>,
+    ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(buf) = self.buffers.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(buf.est_bytes);
+                self.metrics
+                    .add_buffered(-i64::try_from(buf.est_bytes).unwrap_or(i64::MAX));
+                if !buf.records.is_empty() {
+                    out.push((key, buf.records));
+                }
+            }
+        }
+        out
+    }
+
+    /// Re-buffer `batches` whose off-lock publish failed (transient): the WAL is
+    /// the durability of record, so retain + retry. Retained records go *ahead*
+    /// of anything `emit` buffered for the same partition meanwhile, and the
+    /// byte accounting + gauge are restored.
+    pub fn requeue(&mut self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>) {
+        for (key, records) in batches {
+            let est: usize = records.iter().map(estimate_bytes).sum();
+            let buf = self.buffers.entry(key).or_insert_with(|| PartitionBuffer {
+                records: Vec::new(),
+                est_bytes: 0,
+                oldest: Instant::now(),
+            });
+            let mut combined = records;
+            combined.append(&mut buf.records);
+            buf.records = combined;
+            buf.est_bytes = buf.est_bytes.saturating_add(est);
+            self.total_bytes = self.total_bytes.saturating_add(est);
+            self.metrics
+                .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
+        }
+    }
+
+    /// Settle counters + metrics for a successful off-lock publish of one
+    /// partition's `records`, caused by `trigger`, taking `elapsed`.
+    pub fn note_published(&mut self, records: usize, elapsed: Duration, trigger: &'static str) {
+        self.flushes += 1;
+        self.records_flushed += records as u64;
+        self.metrics.record_flush(trigger, records, elapsed);
+    }
+
+    /// Settle counters + metrics for a failed off-lock publish (the partition is
+    /// requeued by the caller).
+    pub fn note_flush_error(&mut self) {
+        self.flush_errors += 1;
+        self.metrics.record_flush_error();
+    }
+
+    /// A clone of the data store, for the coordinator's off-lock publish.
+    #[must_use]
+    pub fn store(&self) -> Store {
+        self.store.clone()
+    }
+}
+
+/// Encode + put one partition's records to the data store, holding **no sink
+/// lock** — the coordinator's off-lock publish step (issue #302). Mirrors
+/// [`ParquetRecordSink::flush_partition`]'s encode+put without the buffer
+/// bookkeeping (the caller settles via [`ParquetRecordSink::note_published`] /
+/// [`ParquetRecordSink::requeue`]).
+fn publish_partition(
+    store: &Store,
+    key: &PartitionKey,
+    records: &[MinedRecord],
+) -> Result<(), FlushError> {
+    let bytes =
+        encode_records_to_parquet(records, DEFAULT_ZSTD_LEVEL).map_err(FlushError::Encode)?;
+    store
+        .put_blocking(&object_key(key), bytes)
+        .map_err(FlushError::Store)?;
+    Ok(())
 }
 
 /// A cloneable handle to one shared [`ParquetRecordSink`].
@@ -340,6 +475,62 @@ impl SharedParquetSink {
     pub fn buffered_records(&self) -> usize {
         self.lock().buffered_records()
     }
+
+    /// Atomically take the aged partitions as owned batches (issue #302). The
+    /// [`crate::publish::PublishCoordinator`] calls this under the pipeline's
+    /// miner lock so the drain is atomic w.r.t. `miner.ingest`, then publishes
+    /// off-lock via [`Self::publish_owned`].
+    #[must_use]
+    pub fn drain_aged(&self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        self.lock().drain_aged()
+    }
+
+    /// Atomically take **every** buffered partition as owned batches.
+    #[must_use]
+    pub fn drain_all(&self) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        self.lock().drain_all()
+    }
+
+    /// Re-buffer owned `batches` (a transient publish failure, or the
+    /// coordinator holding records because the audit write failed). The WAL is
+    /// the durability of record, so retain + retry on the next cadence.
+    pub fn requeue(&self, batches: Vec<(PartitionKey, Vec<MinedRecord>)>) {
+        self.lock().requeue(batches);
+    }
+
+    /// Publish owned `batches` to the data store **off the lock** (the encode +
+    /// put runs unlocked; the sink is locked only to read the store handle and
+    /// to settle / requeue). A partition whose put fails is requeued (the WAL is
+    /// the durability of record). Returns whether every partition was published.
+    /// `trigger` labels the flush metric.
+    #[must_use]
+    pub fn publish_owned(
+        &self,
+        batches: Vec<(PartitionKey, Vec<MinedRecord>)>,
+        trigger: &'static str,
+    ) -> bool {
+        if batches.is_empty() {
+            return true;
+        }
+        let store = self.lock().store();
+        let mut requeue = Vec::new();
+        let mut all_published = true;
+        for (key, records) in batches {
+            let start = Instant::now();
+            if publish_partition(&store, &key, &records).is_ok() {
+                self.lock()
+                    .note_published(records.len(), start.elapsed(), trigger);
+            } else {
+                self.lock().note_flush_error();
+                requeue.push((key, records));
+                all_published = false;
+            }
+        }
+        if !requeue.is_empty() {
+            self.lock().requeue(requeue);
+        }
+        all_published
+    }
 }
 
 impl RecordSink for SharedParquetSink {
@@ -367,7 +558,13 @@ impl RecordSink for ParquetRecordSink {
         // retained below (the WAL is the durability of record), and the
         // ceiling may be transiently exceeded (counted via `flush_errors`)
         // instead of deadlocking the ingest path.
+        // The audit barrier (issue #302 fix #2) runs before each inline publish
+        // so a partition is never put to the store before the audit sink is
+        // durable; if it can't drain (transient store error), stop rather than
+        // publish, leaving the record buffered (the WAL is the durability of
+        // record) and the ceiling transiently exceeded.
         while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes
+            && self.inline_publish_allowed()
             && self.flush_largest()
         {}
 
@@ -389,8 +586,12 @@ impl RecordSink for ParquetRecordSink {
         self.metrics
             .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
 
-        // Size trigger (RFC0014.1): the emit that crosses the target flushes.
-        if over_target {
+        // Size trigger (RFC0014.1): the emit that crosses the target flushes —
+        // but only after the audit barrier confirms the audit sink is durable
+        // (issue #302 fix #2). If it can't drain, retain the partition (the WAL
+        // is the durability of record); the coordinated cadence flush publishes
+        // it once the store recovers, never before its template event is durable.
+        if over_target && self.inline_publish_allowed() {
             self.flush_partition_swallow(&key, "size");
         }
     }
@@ -462,5 +663,124 @@ mod tests {
         handle.flush_all(); // the rotation trigger, via the pipeline's handle
         assert_eq!(handle.flushes(), 1);
         assert_eq!(handle.buffered_records(), 0, "flush drained the buffer");
+    }
+
+    // --- issue #302 fix #2: the inline size trigger is audit-ordered. ---
+
+    use crate::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+    use ourios_core::audit::{
+        AuditEvent, AuditPayload, AuditSink, TemplateChange, hash_triggering_line,
+    };
+
+    /// A record sink whose per-emit estimate crosses `target_bytes` on the first
+    /// record, so a single `emit` fires the inline size trigger.
+    fn size_trigger_config() -> FlushConfig {
+        FlushConfig {
+            target_bytes: 16,
+            max_buffer_age: Duration::from_secs(86_400),
+            ceiling_bytes: usize::MAX,
+        }
+    }
+
+    fn created_event(tenant: &str) -> AuditEvent {
+        AuditEvent {
+            tenant_id: TenantId::new(tenant),
+            timestamp: std::time::UNIX_EPOCH + Duration::from_secs(1_775_127_480),
+            payload: AuditPayload::Template {
+                template_id: 1,
+                triggering_line_hash: hash_triggering_line(b"user 1 logged in"),
+                triggering_line_sample: Some("user 1 logged in".to_owned()),
+                change: TemplateChange::Created {
+                    new_template: "user <*> logged in".to_owned(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn size_trigger_flushes_audit_before_publishing() {
+        // The inline size trigger publishes the partition only after the audit
+        // barrier drives the audit sink to durability — so a clean row is never
+        // query-visible before its template event is durable (issue #302 §3.3).
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let audit_root = tmp.path().join("audit");
+        std::fs::create_dir_all(&audit_root).expect("audit root");
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            Store::local(&audit_root).expect("audit store"),
+            1024,
+            4096,
+        ));
+
+        let data_root = tmp.path().join("data");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let barrier_audit = audit.clone();
+        let records = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                Store::local(&data_root).expect("data store"),
+                size_trigger_config(),
+            )
+            .with_audit_barrier(Box::new(move || barrier_audit.flush())),
+        );
+
+        // A template event is buffered (as the miner would, before the record).
+        audit.clone().emit(created_event("tenant-a"));
+        // The record whose emit crosses the size target.
+        records.clone().emit(rec("tenant-a"));
+
+        assert_eq!(
+            records.flushes(),
+            1,
+            "the size trigger published the partition"
+        );
+        assert_eq!(records.buffered_records(), 0, "the partition was drained");
+        assert_eq!(
+            audit.buffered_events(),
+            0,
+            "the audit barrier flushed the template event to durability first",
+        );
+        assert!(audit.flushes() >= 1, "an audit partition was written");
+    }
+
+    #[test]
+    fn size_trigger_is_skipped_when_audit_cannot_drain() {
+        // If the audit barrier can't reach durability (transient store error),
+        // the size trigger must NOT publish — the record is retained (the WAL is
+        // the durability of record), never exposed before its template event.
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let audit_root = tmp.path().join("audit");
+        std::fs::create_dir_all(&audit_root).expect("audit root");
+        let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            Store::local(&audit_root).expect("audit store"),
+            1024,
+            4096,
+        ));
+        let data_root = tmp.path().join("data");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let barrier_audit = audit.clone();
+        let records = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                Store::local(&data_root).expect("data store"),
+                size_trigger_config(),
+            )
+            .with_audit_barrier(Box::new(move || barrier_audit.flush())),
+        );
+
+        audit.clone().emit(created_event("tenant-a"));
+        // Sabotage the audit store so the barrier flush fails transiently.
+        std::fs::remove_dir_all(&audit_root).expect("remove audit dir");
+        std::fs::write(&audit_root, b"not a directory").expect("sabotage audit");
+
+        records.clone().emit(rec("tenant-a"));
+
+        assert_eq!(
+            records.flushes(),
+            0,
+            "the size trigger is skipped while the template event isn't durable",
+        );
+        assert_eq!(
+            records.buffered_records(),
+            1,
+            "the record is retained (the WAL is the durability of record)",
+        );
     }
 }

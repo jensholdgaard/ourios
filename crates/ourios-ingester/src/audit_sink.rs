@@ -16,31 +16,29 @@
 //! problem). This sink instead mirrors the RFC 0014 record sink
 //! ([`crate::record_sink::ParquetRecordSink`]): [`AuditSink::emit`] only
 //! buffers (a cheap, request-path-safe push), and the blocking store I/O
-//! happens on [`SharedParquetAuditSink::flush`], which the receiver drives off
-//! the async runtime at the same cadence + rotation + shutdown points it
-//! flushes the record sink.
+//! happens on [`SharedParquetAuditSink::flush`] / [`SharedParquetAuditSink::write_owned`].
 //!
-//! **Flush ordering (no later than the records).** A row stamped
-//! `template_version = N` needs its template event durable for the registry to
-//! render it, so the receiver flushes this sink *before* the record sink at
-//! each cadence point and, if this sink does not fully drain, skips the record
-//! flush that cycle (and the miner snapshot): a non-empty buffer after a flush
-//! means a *transient* store error (permanent errors drop, below), so the
-//! record flush to the same store would fail anyway, and skipping it avoids
-//! exposing a clean row before its template event is durable. A transient flush
-//! failure retains the events (the WAL is the durability of record, so recovery
-//! re-mines and re-emits them). The inline size trigger on the record sink
-//! (RFC 0014 §3.1, fired from `emit`) is *not* paired with an audit flush — a
-//! clean row flushed by that trigger may render empty in the narrow window
-//! before the next audit flush; it reconstructs once the audit cadence catches
-//! up, and a crash in that window re-mines from the WAL, so durability is
-//! unaffected.
+//! **`emit` never blocks on flush I/O (issue #302 fix #4).** A flush drains the
+//! buffer under the lock, releases it, does the `AuditWriter` store I/O
+//! **unlocked**, then re-locks only to settle counters and to requeue a
+//! transient failure's events *ahead* of anything `emit` buffered meanwhile.
+//! So a slow store flush never holds the mutex `emit` contends on.
 //!
-//! **Bounded buffer.** `emit` enforces a soft event ceiling without blocking or
-//! flushing inline: on reaching it, it signals a [`tokio::sync::Notify`] the
-//! receiver's age-sweep selects on, so an adversarial burst of template churn
-//! flushes promptly off the runtime rather than growing the buffer until OOM
-//! (the miner has no template-count cap). This is signal-to-flush, never drop.
+//! **Bounded buffer (issue #302 fix #3).** `emit` signals an eager flush at a
+//! soft `ceiling_events`, and *drops* (counted via `ourios.audit_sink.dropped`,
+//! logged once) at a hard `max_events` cap — the OOM backstop when the store is
+//! down and the buffer can't drain. Dropped template events degrade those
+//! templates to retained/empty bodies until the WAL re-mines them on restart;
+//! bounded memory is the deliberate trade.
+//!
+//! **Publication is audit-ordered (issue #302 fix #1/#2).** A mined record must
+//! never be query-visible before its template event is durable. The miner emits
+//! both within one `ingest` call, audit event before record, so: the
+//! [`crate::publish::PublishCoordinator`] drains both buffers atomically under
+//! the pipeline's miner lock and writes audit-before-record; and the record
+//! sink's inline size/ceiling publish first calls an audit barrier
+//! ([`crate::record_sink::ParquetRecordSink::with_audit_barrier`]) that flushes
+//! this sink to durability (race-free — that publish runs under the miner lock).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -51,57 +49,139 @@ use tokio::sync::Notify;
 
 use crate::metrics::{AuditSinkMetrics, FLUSH_OUTCOME_PERMANENT, FLUSH_OUTCOME_TRANSIENT};
 
+/// Counts accumulated by one off-lock write pass, settled back into the sink
+/// under the lock afterwards.
+#[derive(Debug, Default)]
+struct FlushSummary {
+    flushed_partitions: u64,
+    flushed_events: u64,
+    transient_errors: u64,
+    permanent_errors: u64,
+    derive_errors: u64,
+}
+
+/// Classify a failed audit partition flush (issue #302 fix #2): a store-I/O
+/// error is **transient** (the object store was unreachable — retain + retry),
+/// every other error is **permanent** (a bad batch, partition mismatch, encode
+/// failure, or poisoned writer — content that will never succeed, so drop it
+/// rather than wedge the partition behind it forever).
+fn is_transient_flush_error(err: &AuditWriterError) -> bool {
+    matches!(err, AuditWriterError::Io { .. })
+}
+
+/// Apply one partition write's outcome to the pass accumulators: success
+/// counts, a transient error retains `batch` for retry, a permanent error drops
+/// it (counted + logged once here).
+fn route_partition_result(
+    summary: &mut FlushSummary,
+    retained: &mut Vec<AuditEvent>,
+    partition: &PartitionKey,
+    batch: Vec<AuditEvent>,
+    result: Result<(), AuditWriterError>,
+) {
+    match result {
+        Ok(()) => {
+            summary.flushed_partitions = summary.flushed_partitions.saturating_add(1);
+            summary.flushed_events = summary.flushed_events.saturating_add(batch.len() as u64);
+        }
+        Err(err) if is_transient_flush_error(&err) => {
+            summary.transient_errors = summary.transient_errors.saturating_add(1);
+            retained.extend(batch);
+        }
+        Err(err) => {
+            summary.permanent_errors = summary.permanent_errors.saturating_add(1);
+            eprintln!(
+                "audit sink: dropping {} event(s) for tenant {:?} {:04}-{:02}-{:02} — \
+                 permanent write error (not persisted): {err}",
+                batch.len(),
+                partition.tenant_id,
+                partition.year,
+                partition.month,
+                partition.day,
+            );
+        }
+    }
+}
+
+/// Write `events` to `store` grouped by audit partition, with **no sink lock
+/// held** (issue #302 fix #4). Returns the events to retain (transient
+/// failures) and the pass counts. Pure w.r.t. the sink — the caller settles.
+fn write_events(store: &Store, events: Vec<AuditEvent>) -> (Vec<AuditEvent>, FlushSummary) {
+    let mut summary = FlushSummary::default();
+    let mut groups: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
+    for event in events {
+        let Ok(partition) = derive_audit_partition(&event) else {
+            summary.derive_errors = summary.derive_errors.saturating_add(1);
+            continue;
+        };
+        groups.entry(partition).or_default().push(event);
+    }
+    let mut retained = Vec::new();
+    for (partition, batch) in groups {
+        let result = write_one_partition(store, &partition, &batch);
+        route_partition_result(&mut summary, &mut retained, &partition, batch, result);
+    }
+    (retained, summary)
+}
+
+/// Encode + put one partition's batch through a single [`AuditWriter`].
+fn write_one_partition(
+    store: &Store,
+    partition: &PartitionKey,
+    batch: &[AuditEvent],
+) -> Result<(), AuditWriterError> {
+    let mut writer = AuditWriter::open_in(store, partition.clone())?;
+    writer.append_events(batch)?;
+    writer.close()?;
+    Ok(())
+}
+
 /// A buffering [`AuditSink`] persisting the RFC 0005 §3.7 audit Parquet stream
-/// through the [`Store`] (local or S3, RFC 0019).
-///
-/// [`AuditSink::emit`] buffers in memory; [`Self::flush`] drains the buffer,
-/// groups the events by audit partition (tenant + UTC day, RFC 0005 §3.4), and
-/// writes each partition's batch with a single [`AuditWriter`] — so one flush
-/// produces at most one file per partition, not one per event.
-///
-/// A failed partition flush is classified: a transient store-I/O error retains
-/// the batch for the next flush (the WAL is the durability of record), but a
-/// permanent content/encode error drops it — retrying a malformed batch loops
-/// forever and would block every newer good event for that partition behind it
-/// (issue #302).
+/// through the [`Store`] (local or S3, RFC 0019). See the module docs.
 pub struct BufferingAuditSink {
     store: Store,
     buffer: Vec<AuditEvent>,
-    /// Soft cap on buffered events. `emit` never blocks or flushes inline; on
-    /// reaching the cap it signals [`Self::overflow_notify`] so the receiver's
-    /// age-sweep flushes promptly off the runtime (issue #302 — the miner has
-    /// no template-count cap, so adversarial template churn could otherwise
-    /// grow this `Vec` unbounded between the cadence flushes).
+    /// Soft cap: reaching it signals an eager off-runtime flush (never blocks
+    /// `emit` or drops).
     ceiling_events: usize,
-    /// Signalled by `emit` when the buffer reaches `ceiling_events`; the
-    /// receiver's age-sweep selects on it to flush eagerly — signal-to-flush,
-    /// never drop, so no data is lost.
+    /// Hard cap (OOM backstop): at it, `emit` drops the event (counted +
+    /// logged once) rather than grow without bound.
+    max_events: usize,
+    /// Signalled by `emit` at `ceiling_events`; the receiver's age-sweep selects
+    /// on it to flush eagerly — signal-to-flush, never drop.
     overflow_notify: Arc<Notify>,
     flushes: u64,
     events_flushed: u64,
     flush_errors_transient: u64,
     flush_errors_permanent: u64,
     derive_errors: u64,
+    dropped_at_cap: u64,
+    /// One stderr warning per sink while at the hard cap, reset when it drains.
+    cap_warned: bool,
     /// RFC 0001 §6.8 / `CLAUDE.md` §6.3 instruments; no-op without a provider.
     metrics: AuditSinkMetrics,
 }
 
 impl BufferingAuditSink {
     /// A sink buffering events and flushing the audit stream through `store`
-    /// (local or S3). `ceiling_events` bounds the in-memory buffer: reaching it
-    /// signals an eager off-runtime flush (it never drops or blocks `emit`).
+    /// (local or S3). `ceiling_events` signals an eager off-runtime flush;
+    /// `max_events` (≥ `ceiling_events`) is the hard OOM-backstop cap at which
+    /// `emit` drops rather than grow.
     #[must_use]
-    pub fn new(store: Store, ceiling_events: usize) -> Self {
+    pub fn new(store: Store, ceiling_events: usize, max_events: usize) -> Self {
         Self {
             store,
             buffer: Vec::new(),
             ceiling_events,
+            max_events,
             overflow_notify: Arc::new(Notify::new()),
             flushes: 0,
             events_flushed: 0,
             flush_errors_transient: 0,
             flush_errors_permanent: 0,
             derive_errors: 0,
+            dropped_at_cap: 0,
+            cap_warned: false,
             metrics: AuditSinkMetrics::new(),
         }
     }
@@ -112,7 +192,7 @@ impl BufferingAuditSink {
         self.buffer.len()
     }
 
-    /// Count of successful partition flushes (one per partition per [`Self::flush`]).
+    /// Count of successful partition flushes.
     #[must_use]
     pub fn flushes(&self) -> u64 {
         self.flushes
@@ -142,10 +222,30 @@ impl BufferingAuditSink {
         self.derive_errors
     }
 
-    /// Buffer the `event`, updating the occupancy gauge and signalling an eager
-    /// flush once the buffer reaches the ceiling. Never blocks or flushes inline
-    /// — this runs on the request path.
+    /// Events dropped at the hard buffer cap (the OOM backstop).
+    #[must_use]
+    pub fn dropped_at_cap(&self) -> u64 {
+        self.dropped_at_cap
+    }
+
+    /// Buffer `event` unless at the hard cap. Updates the occupancy gauge and
+    /// signals an eager flush at the soft ceiling. Never blocks or flushes
+    /// inline — this runs on the request path.
     fn buffer_event(&mut self, event: AuditEvent) {
+        if self.buffer.len() >= self.max_events {
+            self.dropped_at_cap = self.dropped_at_cap.saturating_add(1);
+            self.metrics.record_dropped_at_cap();
+            if !self.cap_warned {
+                eprintln!(
+                    "audit sink: in-memory buffer at the hard cap of {} events (store \
+                     unavailable / flush not keeping up); dropping template events — affected \
+                     templates render retained/empty until the WAL re-mines them on restart",
+                    self.max_events,
+                );
+                self.cap_warned = true;
+            }
+            return;
+        }
         self.buffer.push(event);
         self.metrics.set_buffered(self.buffer.len());
         if self.buffer.len() >= self.ceiling_events {
@@ -155,106 +255,69 @@ impl BufferingAuditSink {
         }
     }
 
-    /// Drain the buffer and persist it, one [`AuditWriter`] per audit partition.
-    ///
-    /// A partition whose write fails with a transient store-I/O error has its
-    /// events retained for the next flush (the WAL is the durability of record);
-    /// a permanent content/encode error drops the batch (retrying loops forever
-    /// and blocks newer good events behind it). An event whose timestamp can't
-    /// derive a partition (pre-epoch / overflow) is counted and dropped, since
-    /// retrying it would loop forever. An empty buffer is a no-op — no writer is
-    /// opened and no file is published.
-    pub fn flush(&mut self) {
-        if self.buffer.is_empty() {
-            return;
+    /// Settle one off-lock write pass back into the sink's counters + metrics.
+    fn settle(&mut self, summary: &FlushSummary) {
+        self.flushes = self.flushes.saturating_add(summary.flushed_partitions);
+        self.events_flushed = self.events_flushed.saturating_add(summary.flushed_events);
+        self.flush_errors_transient = self
+            .flush_errors_transient
+            .saturating_add(summary.transient_errors);
+        self.flush_errors_permanent = self
+            .flush_errors_permanent
+            .saturating_add(summary.permanent_errors);
+        self.derive_errors = self.derive_errors.saturating_add(summary.derive_errors);
+        self.metrics
+            .record_flush(summary.flushed_partitions, summary.flushed_events);
+        for _ in 0..summary.transient_errors {
+            self.metrics.record_flush_error(FLUSH_OUTCOME_TRANSIENT);
         }
-        let mut groups: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
-        for event in std::mem::take(&mut self.buffer) {
-            let Ok(partition) = derive_audit_partition(&event) else {
-                self.derive_errors = self.derive_errors.saturating_add(1);
-                self.metrics.record_derive_error();
-                continue;
-            };
-            groups.entry(partition).or_default().push(event);
+        for _ in 0..summary.permanent_errors {
+            self.metrics.record_flush_error(FLUSH_OUTCOME_PERMANENT);
         }
-        for (partition, batch) in groups {
-            let result = self.write_partition(&partition, &batch);
-            self.handle_flush_result(&partition, batch, result);
+        for _ in 0..summary.derive_errors {
+            self.metrics.record_derive_error();
+        }
+    }
+
+    /// Requeue a transient failure's `retained` events *ahead* of whatever
+    /// `emit` buffered during the unlocked I/O, honouring the hard cap (the
+    /// retained set alone never exceeds it). Then refresh the gauge + cap state.
+    fn requeue_ahead(&mut self, retained: Vec<AuditEvent>) {
+        if !retained.is_empty() {
+            let buffered = std::mem::replace(&mut self.buffer, retained);
+            for event in buffered {
+                if self.buffer.len() >= self.max_events {
+                    self.dropped_at_cap = self.dropped_at_cap.saturating_add(1);
+                    self.metrics.record_dropped_at_cap();
+                } else {
+                    self.buffer.push(event);
+                }
+            }
+        }
+        if self.buffer.len() < self.max_events {
+            self.cap_warned = false;
         }
         self.metrics.set_buffered(self.buffer.len());
     }
-
-    /// Write one partition's batch through a single [`AuditWriter`]. On success
-    /// the counters advance; on error the caller classifies + handles it.
-    fn write_partition(
-        &mut self,
-        partition: &PartitionKey,
-        batch: &[AuditEvent],
-    ) -> Result<(), AuditWriterError> {
-        let mut writer = AuditWriter::open_in(&self.store, partition.clone())?;
-        writer.append_events(batch)?;
-        writer.close()?;
-        self.flushes = self.flushes.saturating_add(1);
-        self.events_flushed = self.events_flushed.saturating_add(batch.len() as u64);
-        self.metrics.record_flush(batch.len());
-        Ok(())
-    }
-
-    /// Apply a partition write's outcome (issue #302 fix #2). A transient
-    /// store-I/O error retains `batch` for the next flush (the WAL is the
-    /// durability of record); a permanent content/encode error drops it —
-    /// retrying a malformed batch loops forever and wedges every newer good
-    /// event for that partition behind it.
-    fn handle_flush_result(
-        &mut self,
-        partition: &PartitionKey,
-        batch: Vec<AuditEvent>,
-        result: Result<(), AuditWriterError>,
-    ) {
-        let Err(err) = result else {
-            return;
-        };
-        if is_transient_flush_error(&err) {
-            self.flush_errors_transient = self.flush_errors_transient.saturating_add(1);
-            self.metrics.record_flush_error(FLUSH_OUTCOME_TRANSIENT);
-            self.buffer.extend(batch);
-        } else {
-            self.flush_errors_permanent = self.flush_errors_permanent.saturating_add(1);
-            self.metrics.record_flush_error(FLUSH_OUTCOME_PERMANENT);
-            eprintln!(
-                "audit sink: dropping {} event(s) for tenant {:?} {:04}-{:02}-{:02} — \
-                 permanent write error (not persisted): {err}",
-                batch.len(),
-                partition.tenant_id,
-                partition.year,
-                partition.month,
-                partition.day,
-            );
-        }
-    }
 }
 
-/// Classify a failed audit partition flush (issue #302 fix #2): a store-I/O
-/// error is **transient** (the object store was unreachable — retain + retry),
-/// every other error is **permanent** (a bad batch, partition mismatch, encode
-/// failure, or poisoned writer — content that will never succeed, so drop it
-/// rather than wedge the partition).
-fn is_transient_flush_error(err: &AuditWriterError) -> bool {
-    matches!(err, AuditWriterError::Io { .. })
+impl AuditSink for BufferingAuditSink {
+    fn emit(&mut self, event: AuditEvent) {
+        self.buffer_event(event);
+    }
 }
 
 /// A cloneable handle to one shared [`BufferingAuditSink`].
 ///
-/// Mirrors [`crate::record_sink::SharedParquetSink`]: the ingest path has two
-/// holders of the same sink — the miner `emit`s template events through its
-/// `Box<dyn AuditSink>`, while the receiver drives [`Self::flush`] off the async
-/// runtime at the cadence / rotation / shutdown points. `Clone` yields another
-/// handle to the *same* sink.
+/// Mirrors [`crate::record_sink::SharedParquetSink`]: the miner `emit`s template
+/// events through its `Box<dyn AuditSink>`, while the receiver drives the
+/// flushes off the async runtime. `Clone` yields another handle to the *same*
+/// sink.
 ///
-/// All access serializes on one mutex. `emit` is a short critical section;
-/// `flush` is **not** — it holds the lock across `AuditWriter` encode +
-/// `Store` put (an S3 PUT on the s3 backend), so the receiver runs it via
-/// `block_in_place` / `spawn_blocking`, the same posture the record sink takes.
+/// `emit` is a short critical section. The flushes ([`Self::flush`] /
+/// [`Self::write_owned`]) take the lock only to drain the buffer and to settle
+/// afterwards — the `AuditWriter` store I/O runs **unlocked** in between (issue
+/// #302 fix #4), so a slow store flush never blocks a concurrent `emit`.
 #[derive(Clone)]
 pub struct SharedParquetAuditSink {
     inner: Arc<Mutex<BufferingAuditSink>>,
@@ -278,16 +341,9 @@ impl SharedParquetAuditSink {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Drain the buffer to the audit stream — the cadence / rotation / shutdown
-    /// trigger, run off the async runtime by the receiver.
-    pub fn flush(&self) {
-        self.lock().flush();
-    }
-
     /// The eager-flush signal `emit` raises when the buffer reaches its ceiling
-    /// (issue #302). The receiver's age-sweep selects on this alongside its tick
-    /// so a burst flushes promptly off the runtime, bounding the buffer without
-    /// blocking `emit` or dropping events.
+    /// (issue #302 fix #3). The receiver's age-sweep selects on this alongside
+    /// its tick so a burst flushes promptly off the runtime.
     #[must_use]
     pub fn overflow_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.lock().overflow_notify)
@@ -304,17 +360,52 @@ impl SharedParquetAuditSink {
     pub fn flushes(&self) -> u64 {
         self.lock().flushes()
     }
+
+    /// Atomically take the whole buffer (a cheap memory move, no I/O). The
+    /// [`crate::publish::PublishCoordinator`] calls this under the pipeline's
+    /// miner lock so the drain is atomic w.r.t. `miner.ingest`.
+    #[must_use]
+    pub fn take_buffer(&self) -> Vec<AuditEvent> {
+        let mut guard = self.lock();
+        let events = std::mem::take(&mut guard.buffer);
+        guard.cap_warned = false;
+        guard.metrics.set_buffered(0);
+        events
+    }
+
+    /// Write an owned `events` batch to durability, holding the lock only to
+    /// read the store handle and to settle afterwards (the store I/O runs
+    /// unlocked). Transient failures are requeued ahead of newly-buffered
+    /// events; permanent failures drop. Returns whether every event reached
+    /// durability or was permanently dropped — i.e. **nothing is retained for
+    /// retry** (the audit-before-record gate the publisher needs).
+    #[must_use]
+    pub fn write_owned(&self, events: Vec<AuditEvent>) -> bool {
+        if events.is_empty() {
+            return true;
+        }
+        let store = self.lock().store.clone();
+        let (retained, summary) = write_events(&store, events);
+        let fully_durable = retained.is_empty();
+        let mut guard = self.lock();
+        guard.settle(&summary);
+        guard.requeue_ahead(retained);
+        fully_durable
+    }
+
+    /// Drain the internal buffer to durability — the size-trigger audit barrier
+    /// and standalone cadence/shutdown flush. Returns whether the buffer was
+    /// fully drained (nothing retained for retry).
+    #[must_use]
+    pub fn flush(&self) -> bool {
+        let events = self.take_buffer();
+        self.write_owned(events)
+    }
 }
 
 impl AuditSink for SharedParquetAuditSink {
     fn emit(&mut self, event: AuditEvent) {
         self.lock().buffer_event(event);
-    }
-}
-
-impl AuditSink for BufferingAuditSink {
-    fn emit(&mut self, event: AuditEvent) {
-        self.buffer_event(event);
     }
 }
 
@@ -327,15 +418,17 @@ mod tests {
         AuditEvent, AuditPayload, AuditSink, TemplateChange, hash_triggering_line,
     };
     use ourios_core::tenant::TenantId;
-    use ourios_parquet::{
-        AuditBatchError, AuditReader, AuditWriterError, Store, derive_audit_partition,
+    use ourios_parquet::{AuditBatchError, AuditReader, AuditWriterError, Store};
+
+    use super::{
+        BufferingAuditSink, FlushSummary, SharedParquetAuditSink, is_transient_flush_error,
+        route_partition_result,
     };
 
-    use super::{BufferingAuditSink, SharedParquetAuditSink, is_transient_flush_error};
-
-    /// A generous ceiling so the bounding signal doesn't fire in the tests that
-    /// aren't exercising it.
+    /// Generous caps so the bounding/eager-flush behaviour stays out of the
+    /// tests not exercising it.
     const TEST_CEILING: usize = 1024;
+    const TEST_MAX: usize = 4096;
 
     fn created_event(tenant: &str, template_id: u64, template: &str) -> AuditEvent {
         AuditEvent {
@@ -353,7 +446,6 @@ mod tests {
         }
     }
 
-    /// Every `*.parquet` audit file under `root`, recursively.
     fn parquet_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -373,8 +465,6 @@ mod tests {
         out
     }
 
-    /// Every audit event published under `root`, read back through the reader,
-    /// paired with the file it came from.
     fn read_back(root: &Path) -> Vec<(PathBuf, AuditEvent)> {
         let mut out = Vec::new();
         for file in parquet_files(root) {
@@ -393,7 +483,8 @@ mod tests {
     fn flush_batches_per_partition_and_round_trips() {
         let dir = tempfile::TempDir::new().expect("temp");
         let store = Store::local(dir.path()).expect("store");
-        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING));
+        let handle =
+            SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING, TEST_MAX));
 
         // Three events across two tenants → two audit partitions.
         let events = [
@@ -408,9 +499,8 @@ mod tests {
         assert_eq!(handle.buffered_events(), 3, "clones share one buffer");
         assert_eq!(handle.flushes(), 0, "no trigger fired yet");
 
-        handle.flush();
+        assert!(handle.flush(), "a healthy store fully drains");
         assert_eq!(handle.buffered_events(), 0, "flush drained the buffer");
-        // One file per partition, not one per event (the small-file guard).
         assert_eq!(handle.flushes(), 2, "two partitions → two files");
 
         let read = read_back(dir.path());
@@ -439,11 +529,13 @@ mod tests {
     fn empty_buffer_flush_is_a_no_op() {
         let dir = tempfile::TempDir::new().expect("temp");
         let store = Store::local(dir.path()).expect("store");
-        let handle =
-            SharedParquetAuditSink::new(BufferingAuditSink::new(store.clone(), TEST_CEILING));
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(
+            store.clone(),
+            TEST_CEILING,
+            TEST_MAX,
+        ));
 
-        handle.flush();
-
+        assert!(handle.flush(), "an empty flush is vacuously fully drained");
         assert_eq!(handle.flushes(), 0, "no flush happened");
         assert!(
             store.list_blocking(None).expect("list").is_empty(),
@@ -462,8 +554,6 @@ mod tests {
 
     #[test]
     fn flush_error_classification() {
-        // Only a store-I/O error is transient (retry); every content/encode
-        // variant is permanent (drop).
         assert!(is_transient_flush_error(&io_error()), "Io is transient");
         assert!(
             !is_transient_flush_error(&AuditWriterError::Batch(AuditBatchError::PreEpochTimestamp)),
@@ -480,52 +570,100 @@ mod tests {
         // issue #302 fix #2: a permanent (Batch) error must DROP the batch (not
         // requeue it — that loops forever and wedges newer good events); a
         // transient (Io) error must RETAIN it for retry.
-        let dir = tempfile::TempDir::new().expect("temp");
-        let store = Store::local(dir.path()).expect("store");
-        let mut sink = BufferingAuditSink::new(store, TEST_CEILING);
-
         let good = created_event("alpha", 1, "user <*> logged in");
-        let partition = derive_audit_partition(&good).expect("derive");
+        let bad = created_event("alpha", 2, "GET <*>");
+        let partition = ourios_parquet::derive_audit_partition(&good).expect("derive");
 
-        // Permanent: dropped, counted, NOT requeued.
-        sink.handle_flush_result(
+        let mut summary = FlushSummary::default();
+        let mut retained = Vec::new();
+
+        // Permanent: dropped, counted, NOT retained.
+        route_partition_result(
+            &mut summary,
+            &mut retained,
             &partition,
-            vec![created_event("alpha", 2, "GET <*>")],
+            vec![bad],
             Err(AuditWriterError::Batch(AuditBatchError::PreEpochTimestamp)),
         );
-        assert_eq!(
-            sink.buffered_events(),
-            0,
-            "a permanent error drops the batch"
-        );
-        assert_eq!(sink.flush_errors_permanent(), 1);
-        assert_eq!(sink.flush_errors_transient(), 0);
+        assert_eq!(summary.permanent_errors, 1);
+        assert!(retained.is_empty(), "a permanent error drops the batch");
 
         // Transient: retained for retry, counted.
-        sink.handle_flush_result(&partition, vec![good], Err(io_error()));
-        assert_eq!(
-            sink.buffered_events(),
-            1,
-            "a transient error retains the batch"
+        route_partition_result(
+            &mut summary,
+            &mut retained,
+            &partition,
+            vec![good.clone()],
+            Err(io_error()),
         );
-        assert_eq!(sink.flush_errors_transient(), 1);
+        assert_eq!(summary.transient_errors, 1);
+        assert_eq!(retained, vec![good], "a transient error retains the batch");
         assert_eq!(
-            sink.flush_errors_permanent(),
-            1,
+            summary.permanent_errors, 1,
             "unchanged by the transient path"
+        );
+    }
+
+    #[test]
+    fn transient_store_failure_retains_for_retry() {
+        // End-to-end: a sabotaged store makes `write_owned` fail transiently;
+        // the events are retained (not durable, not dropped) and the flush
+        // reports "not fully drained" so the publisher holds the records.
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store_root = dir.path().join("store");
+        std::fs::create_dir_all(&store_root).expect("create store root");
+        let store = Store::local(&store_root).expect("store");
+        let handle =
+            SharedParquetAuditSink::new(BufferingAuditSink::new(store, TEST_CEILING, TEST_MAX));
+        let mut producer = handle.clone();
+        producer.emit(created_event("alpha", 1, "user <*> logged in"));
+
+        std::fs::remove_dir_all(&store_root).expect("remove store dir");
+        std::fs::write(&store_root, b"not a directory").expect("sabotage");
+
+        assert!(
+            !handle.flush(),
+            "a transient store error is not fully drained"
+        );
+        assert_eq!(
+            handle.buffered_events(),
+            1,
+            "the event is retained for retry"
+        );
+    }
+
+    #[test]
+    fn hard_cap_drops_and_bounds_the_buffer() {
+        // issue #302 fix #3: at the hard cap, `emit` drops rather than grow.
+        let dir = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(dir.path()).expect("store");
+        // ceiling 2, hard cap 3.
+        let handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2, 3));
+        let mut producer = handle.clone();
+        for i in 0..10 {
+            producer.emit(created_event("alpha", i, "user <*> logged in"));
+        }
+        assert_eq!(
+            handle.buffered_events(),
+            3,
+            "the buffer is bounded by the cap"
+        );
+        assert_eq!(
+            handle.lock().dropped_at_cap(),
+            7,
+            "the 7 events past the cap are dropped + counted",
         );
     }
 
     #[tokio::test]
     async fn emit_past_ceiling_signals_an_eager_flush() {
-        // issue #302 fix #4: `emit` never flushes inline; reaching the ceiling
+        // issue #302 fix #3: `emit` never flushes inline; reaching the ceiling
         // signals the receiver's age-sweep to flush off the runtime.
         let dir = tempfile::TempDir::new().expect("temp");
         let store = Store::local(dir.path()).expect("store");
-        let mut handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2));
+        let mut handle = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 2, TEST_MAX));
         let notify = handle.overflow_notify();
 
-        // One event (below the ceiling of 2): no signal — the future stays pending.
         handle.emit(created_event("alpha", 1, "user <*> logged in"));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), notify.notified())
@@ -534,7 +672,6 @@ mod tests {
             "below the ceiling, no eager-flush signal is raised",
         );
 
-        // Reaching the ceiling raises the signal.
         handle.emit(created_event("alpha", 2, "GET <*>"));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), notify.notified())
@@ -545,7 +682,7 @@ mod tests {
         assert_eq!(
             handle.buffered_events(),
             2,
-            "emit buffers, never flushes or drops inline",
+            "emit buffers, never flushes or drops inline (below the hard cap)",
         );
     }
 }

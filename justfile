@@ -71,12 +71,12 @@ release-dry version:
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
     command -v dist >/dev/null || { echo "error: dist (cargo-dist) not installed"; exit 1; }
     echo "=== CHANGELOG.md for v{{version}} (git-cliff preview) ==="
-    git-cliff --tag v{{version}}
+    git-cliff --tag "v{{version}}"
     echo ""
     echo "=== dist plan (release artifacts) ==="
     # `--tag` so the plan previews the intended version (not the current
     # workspace version); `--force-tag` lets it do so without bumping first.
-    dist plan --tag v{{version}} --force-tag
+    dist plan --tag "v{{version}}" --force-tag
 
 # Cut a release: bump the single workspace version (every workspace member crate
 # inherits it; the excluded `fuzz/` harness is a separate workspace and is not
@@ -137,7 +137,7 @@ release version:
     cargo check --workspace
     # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
     # commit — cargo-dist reads it for the GitHub Release body (release.yml).
-    git-cliff --tag v{{version}} --output CHANGELOG.md
+    git-cliff --tag "v{{version}}" --output CHANGELOG.md
     git add Cargo.toml Cargo.lock CHANGELOG.md
     git commit -m "chore(release): v{{version}}"
     git tag -a "v{{version}}" -m "v{{version}}"

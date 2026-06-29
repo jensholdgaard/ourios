@@ -62,6 +62,12 @@ lint-commits:
 release-dry version:
     #!/usr/bin/env bash
     set -euo pipefail
+    # `dist plan` accepts SemVer build metadata, but image.yml tags the release
+    # via docker/metadata-action `type=semver` and a Docker tag cannot contain
+    # `+` — reject it so the preview matches the real release constraints. This
+    # is the one constraint the canonical parsers are blind to; everything else
+    # (leading `v`, leading zeroes, non-numeric) `dist plan --tag` rejects below.
+    case "{{version}}" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '{{version}}'"; exit 1;; esac
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
     command -v dist >/dev/null || { echo "error: dist (cargo-dist) not installed"; exit 1; }
     echo "=== CHANGELOG.md for v{{version}} (git-cliff preview) ==="
@@ -82,6 +88,11 @@ release-dry version:
 release version:
     #!/usr/bin/env bash
     set -euo pipefail
+    # cargo (below) accepts SemVer build metadata as a valid package version, but
+    # image.yml tags the release via docker/metadata-action `type=semver` and a
+    # Docker tag cannot contain `+` — reject it before mutating anything. cargo's
+    # parser still rejects the rest (leading `v`, leading zeroes, non-numeric).
+    case "{{version}}" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '{{version}}'"; exit 1;; esac
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
@@ -107,7 +118,11 @@ release version:
     current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
     [ "{{version}}" != "$current" ] || { echo "error: version {{version}} is already the current workspace version"; exit 1; }
     # The anchored edit is precise (only the workspace version matches).
-    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml && rm -f Cargo.toml.bak
+    # `sed -i.bak` leaves Cargo.toml.bak as the pre-bump original; an ERR trap
+    # restores it if any later step fails (cargo check, git-cliff, commit, tag),
+    # so a failed release never leaves a mutated tree. Removed only on success.
+    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml
+    trap 'mv -f Cargo.toml.bak Cargo.toml 2>/dev/null || true' ERR
     # Sync Cargo.lock to the new workspace-crate versions AND validate the
     # version: cargo parses `version = "..."` with its own SemVer parser, so a
     # malformed arg (leading `v`, leading zeroes, non-numeric) fails here — we
@@ -121,6 +136,9 @@ release version:
     git add Cargo.toml Cargo.lock CHANGELOG.md
     git commit -m "chore(release): v{{version}}"
     git tag -a "v{{version}}" -m "v{{version}}"
+    # Success: drop the rollback copy and disarm the trap.
+    rm -f Cargo.toml.bak
+    trap - ERR
     echo ""
     echo "Tagged v{{version}} locally (NOT pushed). Review the commit, then fire the"
     echo "release: git push --follow-tags origin main"

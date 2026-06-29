@@ -1,0 +1,62 @@
+{{- if or .Values.querier.enabled .Values.receiver.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "ourios.fullname" . }}-test-connection"
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    # Clean the test pod up on success and before re-running, so repeated
+    # `helm test` runs don't collide on the pod name or leave clutter.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  # Cap the whole test so a stuck DNS lookup / TCP connect fails `helm test`
+  # deterministically instead of hanging and accumulating pods.
+  activeDeadlineSeconds: 60
+  # One container per enabled role, so a split-topology install (both roles
+  # enabled — the default) verifies BOTH the querier and the receiver: the test
+  # Pod succeeds only when every container exits 0.
+  containers:
+    {{- if .Values.querier.enabled }}
+    # Post a trivial DSL query to the querier service. `curl -f` exits non-zero
+    # on any HTTP >= 400, so the test fails on a non-2xx. (BusyBox wget lacks
+    # --post-data, hence a real curl image; args are exec-form, not shell-split.)
+    - name: query
+      image: curlimages/curl:8.11.1
+      command:
+        - curl
+      args:
+        - -fsS
+        # Fail fast rather than hang if the Service exists but never responds.
+        - --connect-timeout
+        - "5"
+        - --max-time
+        - "15"
+        - -o
+        - /dev/null
+        - -w
+        - "%{http_code}\n"
+        - -X
+        - POST
+        - -H
+        - "X-Ourios-Tenant: helm-test"
+        - -H
+        - "Content-Type: text/plain"
+        - --data
+        - "template_id == 0"
+        - "http://{{ include "ourios.fullname" . }}-querier:4319/v1/query"
+    {{- end }}
+    {{- if .Values.receiver.enabled }}
+    # Confirm the receiver's OTLP HTTP port accepts a connection. Pinned to a
+    # specific BusyBox version (a floating tag could change `nc` behaviour and
+    # break `helm test` unexpectedly).
+    - name: otlp-http
+      image: busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - "nc -z -w5 {{ include "ourios.fullname" . }}-receiver 4318"
+    {{- end }}
+{{- end }}

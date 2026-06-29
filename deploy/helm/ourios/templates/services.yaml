@@ -1,0 +1,68 @@
+{{- if .Values.receiver.enabled }}
+{{- /* Headless service: stable network identity for the receiver StatefulSet. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ourios.fullname" . }}-receiver-headless
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receiver
+spec:
+  clusterIP: None
+  selector:
+    {{- include "ourios.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: receiver
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+---
+{{- /* Client-facing receiver service: OTLP gRPC + HTTP. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ourios.fullname" . }}-receiver
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+    app.kubernetes.io/component: receiver
+spec:
+  type: {{ .Values.receiver.service.type }}
+  selector:
+    {{- include "ourios.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: receiver
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+{{- end }}
+{{- if .Values.querier.enabled }}
+---
+{{- /* Querier service: the logs-DSL query API over HTTP. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ourios.fullname" . }}-querier
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+    app.kubernetes.io/component: querier
+spec:
+  type: {{ .Values.querier.service.type }}
+  selector:
+    {{- include "ourios.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: querier
+  ports:
+    - name: query-http
+      port: 4319
+      targetPort: query-http
+      protocol: TCP
+{{- end }}

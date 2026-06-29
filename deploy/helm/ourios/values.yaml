@@ -1,0 +1,170 @@
+# Default values for the Ourios chart (object-storage-native, RFC 0019).
+#
+# "S3" here means the S3 API, NOT AWS specifically: the store works with AWS S3
+# and any S3-compatible object store — MinIO, Cloudflare R2, Hetzner Object
+# Storage, Ceph/RADOS Gateway, Google Cloud Storage via its S3 interop endpoint,
+# and so on. Point storage.s3.endpoint at a non-AWS provider (see below).
+#
+# Ourios is one binary (`ourios-server`) with three roles. This chart deploys
+# them as three workloads sharing a data + audit store on object storage:
+#   - receiver  — OTLP log ingest, a StatefulSet with a per-replica WAL PVC
+#                 (the WAL is ALWAYS a local durable volume, never object storage;
+#                 CLAUDE.md §3.4 WAL-before-ack / §3.6 object storage is truth);
+#   - querier   — the logs-DSL query API, a stateless Deployment that scales
+#                 independently and reads the store (no PVC);
+#   - compactor — the always-on background compactor, a singleton Deployment.
+# Only the data/audit/manifest live on object storage; the WAL never does.
+
+image:
+  repository: ghcr.io/jensholdgaard/ourios
+  pullPolicy: IfNotPresent
+  # Image tag. Defaults to `latest` when empty — appVersion tracks the
+  # unreleased crate version (0.0.0), which is never published as an image.
+  # Pin a released tag (e.g. a `vX.Y.Z` build) in production.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Where the Parquet data + audit + manifest live (OURIOS_STORAGE_BACKEND).
+# Default is `local` so a bare `helm install`/`helm template` works zero-config
+# for a single-node try-it. `s3` is the production path (the S3 API — AWS or any
+# S3-compatible provider): set backend=s3 and storage.s3.bucket (the chart fails
+# to render an s3 backend with no bucket).
+storage:
+  # "local" (default, single-node/dev) or "s3" (production, any S3-compatible
+  # object store).
+  backend: local
+  s3:
+    # REQUIRED when backend=s3 (OURIOS_S3_BUCKET). The chart aborts at render
+    # time if backend=s3 and this is empty — no install can boot with an
+    # invalid store.
+    bucket: ""
+    # S3-compatible endpoint URL (OURIOS_S3_ENDPOINT). Set this for ANY non-AWS
+    # provider — e.g. MinIO (http://minio:9000), Cloudflare R2, Hetzner Object
+    # Storage, Ceph/RADOS Gateway, GCS S3-interop, LocalStack. Empty targets AWS
+    # S3 at the regional endpoint.
+    endpoint: ""
+    # Bucket region. Optional here, but recommended: when set it drives both the
+    # store (OURIOS_S3_REGION) and the SDK credential chain (AWS_DEFAULT_REGION).
+    # Some providers / AWS SDK configurations require a region; if unset it can
+    # also come from the standard AWS env/config. For non-AWS stores use the
+    # provider's region, or a placeholder like "us-east-1" if it has none.
+    region: ""
+    # Optional key prefix within the bucket (OURIOS_S3_PREFIX). Per-tenant
+    # prefixes live below this at the data layer (CLAUDE.md §3.7) — do not
+    # encode a tenant here.
+    prefix: ""
+    # Object-store credentials. NEVER set keys here as plaintext — give the name
+    # of a Secret holding the S3-named credential keys Ourios reads (RFC 0019
+    # §3.4): OURIOS_S3_ACCESS_KEY_ID and OURIOS_S3_SECRET_ACCESS_KEY (and
+    # optionally OURIOS_S3_SESSION_TOKEN). Injected via envFrom; works against AWS
+    # S3 and every S3-compatible provider. Create it yourself:
+    #   kubectl create secret generic ourios-s3 \
+    #     --from-literal=OURIOS_S3_ACCESS_KEY_ID=... \
+    #     --from-literal=OURIOS_S3_SECRET_ACCESS_KEY=...
+    # On AWS EKS you may instead leave this empty and use IRSA — set the role-arn
+    # under serviceAccount.annotations; that path uses the AWS credential chain
+    # (its own AWS_* web-identity vars). The two modes are mutually exclusive
+    # (configuring both fails render).
+    existingSecret: ""
+  # Only used when backend=local. A single shared ReadWriteOnce PVC mounted by
+  # every workload — coherent only on a single node (the pods must co-schedule)
+  # or with a ReadWriteMany class. Intended for kick-the-tires / dev; use s3 in
+  # production. The WAL is always its own per-receiver-replica PVC regardless.
+  local:
+    bucketRoot: /var/lib/ourios/data
+    size: 10Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+
+# OTLP receiver role (RFC 0003): a StatefulSet, one durable WAL PVC per replica.
+receiver:
+  enabled: true
+  replicas: 1
+  service:
+    type: ClusterIP
+  # The write-ahead log (OURIOS_WAL_ROOT). ALWAYS a local durable PVC — never
+  # S3, never emptyDir (CLAUDE.md §3.4/§3.6). Each replica gets its own.
+  wal:
+    mountPath: /var/lib/ourios/wal
+    size: 2Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Querier role (RFC 0016): a stateless Deployment that reads the configured store
+# (local or s3) and scales freely.
+querier:
+  enabled: true
+  replicas: 2
+  service:
+    type: ClusterIP
+  # Default look-back for a query with no range(...) stage, in seconds
+  # (OURIOS_QUERIER_DEFAULT_WINDOW_SECS; RFC 0016 §7). Must be non-zero.
+  defaultWindowSecs: 3600
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Background compactor (RFC 0009). The single sweeper: the receiver and querier
+# workloads set OURIOS_COMPACTION_ENABLED=0, so only this Deployment compacts.
+# Pinned to one replica on purpose (>1 is safe via the publish-CAS commit but
+# redundant; no leader election) — see the README "Compactor topology" section.
+compactor:
+  enabled: true
+  # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS), used only by this compactor.
+  intervalSecs: 300
+  resources: {}
+  podAnnotations: {}
+  podLabels: {}
+
+# Ourios's own self-telemetry (RFC 0001 §6.8): the OTLP endpoint its meter
+# exports to. Empty leaves the OpenTelemetry SDK default
+# (OTEL_EXPORTER_OTLP_ENDPOINT unset). Standard OTEL_* env can also be set via
+# extraEnv.
+otel:
+  exporterEndpoint: ""
+
+# Extra environment variables appended verbatim to every container (e.g. OTEL_*
+# overrides). Do NOT put object-store credentials here as plaintext — use
+# storage.s3.existingSecret above.
+extraEnv: []
+  # - name: OTEL_EXPORTER_OTLP_PROTOCOL
+  #   value: http/protobuf
+
+serviceAccount:
+  create: true
+  automount: true
+  # IRSA (AWS EKS-specific credential mode): set
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+  # as an alternative to storage.s3.existingSecret (mutually exclusive).
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# The image runs as nonroot (uid 65532, distroless). fsGroup lets that user
+# write the PVCs (a fresh volume is otherwise root-owned).
+podSecurityContext:
+  fsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Scheduling, applied to all three workloads.
+nodeSelector: {}
+tolerations: []
+affinity: {}

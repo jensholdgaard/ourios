@@ -1,0 +1,102 @@
+{{- if .Values.querier.enabled }}
+{{- /*
+The querier role (RFC 0016) as a stateless Deployment: it reads the shared store
+(the configured backend — local by default, S3 in production) and scales
+independently of ingest. No WAL, no per-replica state. Compaction is disabled
+here (OURIOS_COMPACTION_ENABLED=0) — only the dedicated compactor sweeps.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ourios.fullname" . }}-querier
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+    app.kubernetes.io/component: querier
+spec:
+  replicas: {{ .Values.querier.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ourios.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: querier
+  template:
+    metadata:
+      labels:
+        {{- include "ourios.labels" . | nindent 8 }}
+        app.kubernetes.io/component: querier
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.querier.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.querier.podAnnotations)) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ourios.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ourios-server
+          image: {{ include "ourios.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- include "ourios.commonEnv" . | nindent 12 }}
+            {{- include "ourios.querierEnv" . | nindent 12 }}
+          {{- include "ourios.s3CredentialsEnvFrom" . | nindent 10 }}
+          ports:
+            - name: query-http
+              containerPort: 4319
+              protocol: TCP
+          {{- /*
+          No HTTP health route exists yet (the query endpoint is POST-only), so
+          probe the listening port over TCP.
+          */}}
+          readinessProbe:
+            tcpSocket:
+              port: query-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: query-http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with .Values.querier.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "ourios.dataVolumeMount" . | nindent 12 }}
+            # readOnlyRootFilesystem is on, so give the process a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- include "ourios.dataVolume" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

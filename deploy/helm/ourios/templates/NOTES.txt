@@ -1,0 +1,54 @@
+Ourios is installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Storage backend: {{ .Values.storage.backend }}
+{{- if eq .Values.storage.backend "s3" }}
+  bucket: {{ .Values.storage.s3.bucket }}{{ with .Values.storage.s3.prefix }} (prefix {{ . }}){{ end }}
+{{- if and (not .Values.storage.s3.existingSecret) (not (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn")) }}
+
+  NOTE: no object-store credentials set via this chart. For static keys use
+  storage.s3.existingSecret (a Secret with OURIOS_S3_ACCESS_KEY_ID /
+  OURIOS_S3_SECRET_ACCESS_KEY — the S3-named credential keys, working with every
+  S3-compatible provider); on AWS EKS use an IRSA role-arn via
+  serviceAccount.annotations. Otherwise the server falls back to the AWS
+  credential chain (shared profile, node/instance IAM role, container creds) if
+  the environment provides it. Credentials are never chart config as plaintext.
+{{- end }}
+{{- else }}
+  data PVC: {{ include "ourios.fullname" . }}-data ({{ .Values.storage.local.size }}) at {{ .Values.storage.local.bucketRoot }}
+  (local backend is single-node/dev — use s3 in production.)
+{{- end }}
+
+Workloads:
+{{- if .Values.receiver.enabled }}
+  - receiver  (StatefulSet, {{ .Values.receiver.replicas }} replica(s)) — OTLP gRPC :4317 + HTTP :4318; per-replica WAL PVC ({{ .Values.receiver.wal.size }}, local, never S3).
+{{- else }}
+  - receiver  disabled
+{{- end }}
+{{- if .Values.querier.enabled }}
+  - querier   (Deployment, {{ .Values.querier.replicas }} replica(s)) — logs-DSL query API over HTTP :4319; stateless, reads the store.
+{{- else }}
+  - querier   disabled
+{{- end }}
+{{- if .Values.compactor.enabled }}
+  - compactor (Deployment, 1 replica) — the sole background sweeper (interval {{ .Values.compactor.intervalSecs }}s); receiver/querier have compaction disabled.
+{{- else }}
+  - compactor DISABLED. With a receiver or querier enabled the chart refuses to render (a deployment with no sweeper — hazard #4); with all roles disabled, nothing runs.
+{{- end }}
+
+{{- if .Values.querier.enabled }}
+
+Query the logs DSL (port-forward from your workstation):
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }}-querier 4319:4319
+  curl -s -H 'X-Ourios-Tenant: my-tenant' -H 'Content-Type: text/plain' \
+    --data 'template_id == 0' http://127.0.0.1:4319/v1/query
+{{- end }}
+{{- if .Values.receiver.enabled }}
+
+Send OTLP logs (point your OpenTelemetry exporter here):
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ourios.fullname" . }}-receiver 4317:4317 4318:4318
+{{- end }}
+{{- if or .Values.receiver.enabled .Values.querier.enabled }}
+
+Verify the install:
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+{{- end }}

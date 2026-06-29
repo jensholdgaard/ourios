@@ -7,6 +7,13 @@
 # Install on macOS: `brew install just`
 # Install elsewhere: https://github.com/casey/just#packages
 
+# Pass recipe arguments as positional args ($1, $2, ...) to shebang recipes.
+# just's `{{...}}` substitution is textual, so an argument interpolated into a
+# shell line — even inside double quotes — would let embedded `$(...)`/backticks
+# execute. Capturing `$1` into a shell variable instead keeps untrusted input
+# (e.g. a release version) as data the shell never re-parses.
+set positional-arguments
+
 # Default: list available recipes.
 default:
     @just --list
@@ -62,21 +69,22 @@ lint-commits:
 release-dry version:
     #!/usr/bin/env bash
     set -euo pipefail
+    version="$1"
     # `dist plan` accepts SemVer build metadata, but image.yml tags the release
     # via docker/metadata-action `type=semver` and a Docker tag cannot contain
     # `+` — reject it so the preview matches the real release constraints. This
     # is the one constraint the canonical parsers are blind to; everything else
     # (leading `v`, leading zeroes, non-numeric) `dist plan --tag` rejects below.
-    case "{{version}}" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '{{version}}'"; exit 1;; esac
+    case "$version" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '$version'"; exit 1;; esac
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
     command -v dist >/dev/null || { echo "error: dist (cargo-dist) not installed"; exit 1; }
-    echo "=== CHANGELOG.md for v{{version}} (git-cliff preview) ==="
-    git-cliff --tag "v{{version}}"
+    echo "=== CHANGELOG.md for v$version (git-cliff preview) ==="
+    git-cliff --tag "v$version"
     echo ""
     echo "=== dist plan (release artifacts) ==="
     # `--tag` so the plan previews the intended version (not the current
     # workspace version); `--force-tag` lets it do so without bumping first.
-    dist plan --tag "v{{version}}" --force-tag
+    dist plan --tag "v$version" --force-tag
 
 # Cut a release: bump the single workspace version (every workspace member crate
 # inherits it; the excluded `fuzz/` harness is a separate workspace and is not
@@ -88,11 +96,12 @@ release-dry version:
 release version:
     #!/usr/bin/env bash
     set -euo pipefail
+    version="$1"
     # cargo (below) accepts SemVer build metadata as a valid package version, but
     # image.yml tags the release via docker/metadata-action `type=semver` and a
     # Docker tag cannot contain `+` — reject it before mutating anything. cargo's
     # parser still rejects the rest (leading `v`, leading zeroes, non-numeric).
-    case "{{version}}" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '{{version}}'"; exit 1;; esac
+    case "$version" in *+*) echo "error: version must not contain '+build' metadata (not a legal container tag); got '$version'"; exit 1;; esac
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
@@ -106,9 +115,9 @@ release version:
     # the manifest / changelog — so a re-run can't advance `main` with a release
     # commit that `git tag` (or the later push) then refuses, leaving the tag the
     # workflow expects missing.
-    if git rev-parse -q --verify "refs/tags/v{{version}}" >/dev/null 2>&1 \
-        || git ls-remote --exit-code --tags origin "refs/tags/v{{version}}" >/dev/null 2>&1; then
-        echo "error: tag v{{version}} already exists (local or origin)"; exit 1
+    if git rev-parse -q --verify "refs/tags/v$version" >/dev/null 2>&1 \
+        || git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+        echo "error: tag v$version already exists (local or origin)"; exit 1
     fi
     # The workspace version is the single source of truth — after every workspace
     # member crate switched to `version.workspace = true`, this is the only
@@ -116,7 +125,7 @@ release version:
     # the requested version already matches (else the bump is a no-op and the
     # release "commit" would carry only a regenerated changelog/lock, or nothing).
     current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
-    [ "{{version}}" != "$current" ] || { echo "error: version {{version}} is already the current workspace version"; exit 1; }
+    [ "$version" != "$current" ] || { echo "error: version $version is already the current workspace version"; exit 1; }
     # Capture the pristine starting commit (the clean-tree + HEAD==origin/main
     # checks above guarantee it is one) so any failure below rolls the whole
     # attempt back: a hard reset to this SHA reverts every mutation — Cargo.toml,
@@ -125,11 +134,11 @@ release version:
     # individual files: a `git tag` failure after the commit would otherwise
     # leave the working tree inconsistent with an advanced HEAD.
     start_sha="$(git rev-parse HEAD)"
-    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v{{version}}" >/dev/null 2>&1 || true' ERR
+    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v$version" >/dev/null 2>&1 || true' ERR
     # The anchored edit is precise (only the workspace version matches). sed needs
     # a backup suffix to edit in place portably; remove it at once — git reset
     # (above) is the rollback, not the .bak.
-    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml && rm -f Cargo.toml.bak
+    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm -f Cargo.toml.bak
     # Sync Cargo.lock to the new workspace-crate versions AND validate the
     # version: cargo parses `version = "..."` with its own SemVer parser, so a
     # malformed arg (leading `v`, leading zeroes, non-numeric) fails here — we
@@ -139,14 +148,14 @@ release version:
     cargo check --workspace
     # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
     # commit — cargo-dist reads it for the GitHub Release body (release.yml).
-    git-cliff --tag "v{{version}}" --output CHANGELOG.md
+    git-cliff --tag "v$version" --output CHANGELOG.md
     git add Cargo.toml Cargo.lock CHANGELOG.md
-    git commit -m "chore(release): v{{version}}"
-    git tag -a "v{{version}}" -m "v{{version}}"
+    git commit -m "chore(release): v$version"
+    git tag -a "v$version" -m "v$version"
     # Success: disarm the rollback trap.
     trap - ERR
     echo ""
-    echo "Tagged v{{version}} locally (NOT pushed). Review the commit, then fire the"
+    echo "Tagged v$version locally (NOT pushed). Review the commit, then fire the"
     echo "release: git push --follow-tags origin main"
 
 # Clean build artefacts (cargo target + mdBook output).

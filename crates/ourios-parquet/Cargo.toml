@@ -28,7 +28,7 @@ parquet = { version = "55", default-features = false, features = ["arrow", "zstd
 # `AmazonS3` backend (RFC0013.1/.7) — it defaults conditional PUT to
 # `S3ConditionalPut::ETagMatch`, the `If-Match` CAS the manifest swap needs
 # (RFC0013.3/.4).
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 # `bytes::Bytes` is the `parquet` reader's in-memory `ChunkReader` source for
 # the RFC 0013 buffer-and-put read path (`Reader::open_bytes`). Already in the
 # arrow/parquet tree; declared directly.

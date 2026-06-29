@@ -117,12 +117,17 @@ release version:
     # release "commit" would carry only a regenerated changelog/lock, or nothing).
     current="$(sed -nE 's/^version = "([^"]*)"/\1/p' Cargo.toml | head -1)"
     [ "{{version}}" != "$current" ] || { echo "error: version {{version}} is already the current workspace version"; exit 1; }
+    # Capture the pristine starting commit (the clean-tree + HEAD==origin/main
+    # checks above guarantee it is one) so any failure below rolls the whole
+    # attempt back: a hard reset to this SHA reverts every mutation — Cargo.toml,
+    # the synced Cargo.lock, the regenerated CHANGELOG.md, and the release commit
+    # — then we drop the tag and the sed backup. Disarmed on success. Safer than
+    # restoring individual files: a `git tag` failure after the commit would
+    # otherwise leave the working tree inconsistent with an advanced HEAD.
+    start_sha="$(git rev-parse HEAD)"
+    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v{{version}}" >/dev/null 2>&1 || true; rm -f Cargo.toml.bak' ERR
     # The anchored edit is precise (only the workspace version matches).
-    # `sed -i.bak` leaves Cargo.toml.bak as the pre-bump original; an ERR trap
-    # restores it if any later step fails (cargo check, git-cliff, commit, tag),
-    # so a failed release never leaves a mutated tree. Removed only on success.
-    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml
-    trap 'mv -f Cargo.toml.bak Cargo.toml 2>/dev/null || true' ERR
+    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml && rm -f Cargo.toml.bak
     # Sync Cargo.lock to the new workspace-crate versions AND validate the
     # version: cargo parses `version = "..."` with its own SemVer parser, so a
     # malformed arg (leading `v`, leading zeroes, non-numeric) fails here — we
@@ -136,8 +141,7 @@ release version:
     git add Cargo.toml Cargo.lock CHANGELOG.md
     git commit -m "chore(release): v{{version}}"
     git tag -a "v{{version}}" -m "v{{version}}"
-    # Success: drop the rollback copy and disarm the trap.
-    rm -f Cargo.toml.bak
+    # Success: disarm the rollback trap (the sed backup is already gone).
     trap - ERR
     echo ""
     echo "Tagged v{{version}} locally (NOT pushed). Review the commit, then fire the"

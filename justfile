@@ -137,11 +137,15 @@ release version:
     # individual files: a `git tag` failure after the commit would otherwise
     # leave the working tree inconsistent with an advanced HEAD.
     start_sha="$(git rev-parse HEAD)"
-    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v$version" >/dev/null 2>&1 || true' ERR
+    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v$version" >/dev/null 2>&1 || true; rm -f Cargo.toml.bak' ERR
     # The anchored edit is precise (only the workspace version matches). sed needs
-    # a backup suffix to edit in place portably; remove it at once — git reset
-    # (above) is the rollback, not the .bak.
-    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm -f Cargo.toml.bak
+    # a backup suffix to edit in place portably. Keep the edit and the cleanup as
+    # separate statements: in `sed ... && rm`, a sed failure is the non-final
+    # command of an && list and so is exempt from `set -e`, which would let the
+    # script continue with an unbumped Cargo.toml. git reset is the rollback (the
+    # trap also drops a stray .bak); this rm just clears it on the success path.
+    sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml
+    rm -f Cargo.toml.bak
     # Sync Cargo.lock to the new workspace-crate versions AND validate the
     # version: cargo parses `version = "..."` with its own SemVer parser, so a
     # malformed arg (leading `v`, leading zeroes, non-numeric) fails here — we

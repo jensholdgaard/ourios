@@ -54,17 +54,32 @@ thesis-bench *ARGS:
 lint-commits:
     committed --commit-file .git/COMMIT_EDITMSG
 
+# Validate a release version arg: bare SemVer MAJOR.MINOR.PATCH with an optional
+# -prerelease. No leading `v`, no leading zeroes, and NO `+build` metadata — the
+# version becomes a container tag via image.yml's docker/metadata-action
+# `type=semver`, and `+` is not a legal tag character. Private (`_` prefix); both
+# release recipes depend on it so the check can't drift between them.
+_check-release-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "{{version}}" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$' \
+        || { echo "error: version must be bare SemVer like 0.1.0 — no leading 'v', no leading zeroes, no +build metadata; got '{{version}}'"; exit 1; }
+
 # Preview a release WITHOUT changing anything (no bump, no tag): the CHANGELOG.md
 # git-cliff would generate for vX.Y.Z, then the artifacts cargo-dist would build.
 # Requires git-cliff (`brew install git-cliff`) + dist (cargo-dist). e.g.
 # `just release-dry 0.1.0`.
-release-dry version:
-    @echo "=== CHANGELOG.md for v{{version}} (git-cliff preview) ==="
+release-dry version: (_check-release-version version)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
+    command -v dist >/dev/null || { echo "error: dist (cargo-dist) not installed"; exit 1; }
+    echo "=== CHANGELOG.md for v{{version}} (git-cliff preview) ==="
     git-cliff --tag v{{version}}
-    @echo ""
-    @echo "=== dist plan (release artifacts) ==="
-    # `--tag` so the plan previews the intended version (not the current 0.0.0);
-    # `--force-tag` lets it do so without bumping the manifest first.
+    echo ""
+    echo "=== dist plan (release artifacts) ==="
+    # `--tag` so the plan previews the intended version (not the current
+    # workspace version); `--force-tag` lets it do so without bumping first.
     dist plan --tag v{{version}} --force-tag
 
 # Cut a release: bump the single workspace version (every workspace member crate
@@ -74,17 +89,12 @@ release-dry version:
 # pipeline with `git push --follow-tags origin main` (the tag drives cargo-dist's
 # signed release + image.yml's container image). Run `just release-dry X.Y.Z`
 # first. Requires git-cliff; must run on a clean `main`. e.g. `just release 0.1.0`.
-release version:
+release version: (_check-release-version version)
     #!/usr/bin/env bash
     set -euo pipefail
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
-    # The arg is a BARE SemVer (e.g. 0.1.0) — the recipe adds the `v` for the tag.
-    # Reject a leading `v` (would make `vv0.1.0`) or any non-SemVer-ish value
-    # before touching anything.
-    echo "{{version}}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
-        || { echo "error: version must be a bare SemVer like 0.1.0 (no leading 'v'), got '{{version}}'"; exit 1; }
     # Refresh remote refs so the checks below see the real state of origin.
     git fetch --quiet --tags origin
     # Release only from a `main` that exactly matches `origin/main` — never a

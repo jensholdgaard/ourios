@@ -121,12 +121,14 @@ release version:
     # checks above guarantee it is one) so any failure below rolls the whole
     # attempt back: a hard reset to this SHA reverts every mutation — Cargo.toml,
     # the synced Cargo.lock, the regenerated CHANGELOG.md, and the release commit
-    # — then we drop the tag and the sed backup. Disarmed on success. Safer than
-    # restoring individual files: a `git tag` failure after the commit would
-    # otherwise leave the working tree inconsistent with an advanced HEAD.
+    # — then we drop the tag. Disarmed on success. Safer than restoring
+    # individual files: a `git tag` failure after the commit would otherwise
+    # leave the working tree inconsistent with an advanced HEAD.
     start_sha="$(git rev-parse HEAD)"
-    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v{{version}}" >/dev/null 2>&1 || true; rm -f Cargo.toml.bak' ERR
-    # The anchored edit is precise (only the workspace version matches).
+    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v{{version}}" >/dev/null 2>&1 || true' ERR
+    # The anchored edit is precise (only the workspace version matches). sed needs
+    # a backup suffix to edit in place portably; remove it at once — git reset
+    # (above) is the rollback, not the .bak.
     sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"{{version}}\"/" Cargo.toml && rm -f Cargo.toml.bak
     # Sync Cargo.lock to the new workspace-crate versions AND validate the
     # version: cargo parses `version = "..."` with its own SemVer parser, so a
@@ -141,7 +143,7 @@ release version:
     git add Cargo.toml Cargo.lock CHANGELOG.md
     git commit -m "chore(release): v{{version}}"
     git tag -a "v{{version}}" -m "v{{version}}"
-    # Success: disarm the rollback trap (the sed backup is already gone).
+    # Success: disarm the rollback trap.
     trap - ERR
     echo ""
     echo "Tagged v{{version}} locally (NOT pushed). Review the commit, then fire the"

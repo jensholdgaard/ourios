@@ -1,6 +1,6 @@
 [package]
 name = "ourios-miner"
-version = "0.0.0"
+version.workspace = true
 description = "Drain-derived online template miner for Ourios."
 edition.workspace = true
 rust-version.workspace = true

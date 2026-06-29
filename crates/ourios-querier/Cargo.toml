@@ -1,6 +1,6 @@
 [package]
 name = "ourios-querier"
-version = "0.0.0"
+version.workspace = true
 description = "RFC 0007 querier — DataFusion execution frontend that runs the logs DSL against the RFC 0005 Parquet store."
 edition.workspace = true
 rust-version.workspace = true

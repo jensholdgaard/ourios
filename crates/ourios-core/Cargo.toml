@@ -1,6 +1,6 @@
 [package]
 name = "ourios-core"
-version = "0.0.0"
+version.workspace = true
 description = "Foundational types for Ourios."
 edition.workspace = true
 rust-version.workspace = true

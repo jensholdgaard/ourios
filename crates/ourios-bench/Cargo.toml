@@ -1,6 +1,6 @@
 [package]
 name = "ourios-bench"
-version = "0.0.0"
+version.workspace = true
 description = "RFC 0006 thesis-gate bench harness (A1 / C1 / C2). Drives ourios-miner + ourios-parquet against a corpus and computes the writer-side thesis-gate numbers."
 edition.workspace = true
 rust-version.workspace = true

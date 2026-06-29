@@ -1,6 +1,6 @@
 [package]
 name = "ourios-parquet"
-version = "0.0.0"
+version.workspace = true
 description = "Parquet schema, writer, reader, and audit-event file series for Ourios. RFC 0005 is the on-disk contract."
 edition.workspace = true
 rust-version.workspace = true

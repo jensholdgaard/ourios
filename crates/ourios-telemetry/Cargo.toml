@@ -1,6 +1,6 @@
 [package]
 name = "ourios-telemetry"
-version = "0.0.0"
+version.workspace = true
 description = "Ourios telemetry bootstrap — OpenTelemetry SDK MeterProvider + OTLP push metric exporter (RFC 0001 §6.8)."
 edition.workspace = true
 rust-version.workspace = true

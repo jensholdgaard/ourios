@@ -62,6 +62,9 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
 
 [dev-dependencies]
+# RFC 0020 env-substitution resolver property tests (config::env_subst): the
+# OTel Config WG vector table + invariants (escape round-trip, non-recursion).
+proptest = "=1.11.0"
 # RFC0003.16 served-binary integration test: temp dirs, a real tonic
 # gRPC client (`channel`) + a hand-rolled HTTP/1.1 POST (tokio io/time),
 # prost to encode the request, the WAL to replay + assert durability.

@@ -3161,6 +3161,7 @@ dependencies = [
  "ourios-semconv",
  "ourios-telemetry",
  "ourios-wal",
+ "proptest",
  "prost",
  "serde",
  "serde_json",

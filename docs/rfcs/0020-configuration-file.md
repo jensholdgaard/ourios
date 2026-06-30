@@ -1,7 +1,7 @@
 ---
 rfc: 0020
 title: Server configuration file — YAML with environment-variable substitution
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-30

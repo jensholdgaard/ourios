@@ -35,7 +35,9 @@ pub struct MalformedReference {
 
 impl fmt::Display for MalformedReference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "malformed substitution reference {}", self.reference)
+        // `{:?}` delimits + escapes so a reference with whitespace/newlines
+        // stays legible in logs (and never bleeds into surrounding text).
+        write!(f, "malformed substitution reference {:?}", self.reference)
     }
 }
 
@@ -93,10 +95,10 @@ fn substitute_segment(
         };
         out.push_str(&rest[..open]);
         let after = &rest[open + 2..];
-        // The first `}` closes the reference: `GENERIC` is brace-free, so a
-        // nested `${…}` in a default is captured as literal default text and is
-        // not resolved (non-recursive — see §3.3). No `}` anywhere ⇒ not a
-        // reference, so emit `${` verbatim and carry on.
+        // The first `}` closes the reference: its body has no `}` (it may still
+        // contain `{`), so a nested `${…}` in a default is captured as literal
+        // default text and is not resolved (non-recursive — see §3.3). No `}`
+        // anywhere ⇒ not a reference, so emit `${` verbatim and carry on.
         let Some(close) = after.find('}') else {
             out.push_str("${");
             rest = after;

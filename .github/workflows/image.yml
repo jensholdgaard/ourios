@@ -30,8 +30,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
+            pair: linux-amd64
             runner: ubuntu-latest
           - platform: linux/arm64
+            pair: linux-arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -52,17 +54,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Labels only here; the tags are applied once, to the manifest list, in
-      # the merge job. A `/` is invalid in an artifact name, so derive a dashed
-      # platform pair for the per-arch digest artifact.
+      # the merge job. `matrix.pair` is the dashed platform (a `/` is invalid in
+      # an artifact name and noisy in a cache scope).
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE }}
-
-      - name: Prepare platform pair
-        run: |
-          platform="${{ matrix.platform }}"
-          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -76,8 +73,8 @@ jobs:
           # Per-arch GHA layer cache — native build, but caching still keeps
           # incremental release builds fast. Scoped per platform so the two
           # legs don't clobber each other's cache.
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+          cache-from: type=gha,scope=${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.pair }}
           # Push by digest only; the manifest list (with the real tags) is
           # assembled in the merge job. `name-canonical` records the canonical
           # image name so imagetools can reference the pushed digest.
@@ -92,7 +89,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
+          name: digests-${{ matrix.pair }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1

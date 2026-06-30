@@ -3,8 +3,9 @@ name: Deploy smoke test (kind)
 # End-to-end deploy validation (first shipping milestone): spin up an ephemeral
 # kind cluster, deploy the Ourios Helm chart against an in-cluster LocalStack
 # (the S3-compatible store the chart's production path uses), then exercise the
-# real path — push an OTLP/JSON log batch at the receiver and read it back
-# through the querier. There is no persistent cluster, so this IS the
+# real path — push an OTLP log at the receiver with telemetrygen (over gRPC) and
+# read it back through the querier, asserting the body reconstructs
+# bit-identically. There is no persistent cluster, so this IS the
 # deploy target; managed K8s (AKS/GKE) + bare metal come later as separate infra.
 #
 # On-demand + nightly (not per-PR): a kind boot + image build + deploy is too
@@ -29,6 +30,9 @@ env:
   # so the ingested service.name and the query's X-Ourios-Tenant must match.
   TENANT: ourios-smoke
   S3_BUCKET: ourios-smoke
+  # The log line we ingest and expect the querier to reconstruct bit-identically
+  # from its template + params (CLAUDE.md §3.3; the #302 audit-event fix).
+  LOG_BODY: user 1 logged in
 
 jobs:
   deploy-smoke:
@@ -129,24 +133,37 @@ jobs:
           kubectl rollout status deploy/ourios-querier --timeout=180s
           kubectl rollout status deploy/ourios-compactor --timeout=180s
 
-      # Ingest an OTLP/JSON log batch. service.name is the tenant.
-      - name: Ingest OTLP logs
+      # Ingest one OTLP log over gRPC (:4317) with telemetrygen — the
+      # OpenTelemetry synthetic-telemetry generator — run as an in-cluster Job
+      # against the receiver's gRPC service. A real OTLP client on the wire, not
+      # a hand-built payload. service.name is the tenant; --body is the line the
+      # querier must reconstruct. Image pinned by digest.
+      - name: Ingest OTLP logs (telemetrygen, gRPC)
         run: |
-          # Explicit ClusterIP service (the release is named "ourios"); the
-          # component label also matches the headless service (clusterIP None),
-          # which port-forwards unreliably.
-          recv=ourios-receiver
-          kubectl port-forward "svc/${recv}" 4318:4318 >/tmp/pf-recv.log 2>&1 &
-          pf=$!; trap 'kill $pf 2>/dev/null || true' EXIT
-          for _ in $(seq 1 30); do if (echo > /dev/tcp/127.0.0.1/4318) >/dev/null 2>&1; then break; fi; sleep 1; done
-          ts="$(date +%s)000000000"
-          body="{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"${TENANT}\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"${ts}\",\"severityNumber\":9,\"severityText\":\"INFO\",\"body\":{\"stringValue\":\"user 1 logged in\"}}]}]}]}"
-          code="$(curl -s -o /tmp/ingest.out -w '%{http_code}' \
-            -X POST 'http://127.0.0.1:4318/v1/logs' \
-            -H 'Content-Type: application/json' \
-            --data "$body" || true)"
-          echo "ingest HTTP $code"; cat /tmp/ingest.out; echo
-          [ "$code" = "200" ] || { echo "ingest failed"; exit 1; }
+          kubectl apply -f - <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: otlp-ingest
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: telemetrygen
+                    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.155.0@sha256:32d1762abb401e36dd8cfdf60a71075b41bd996a0cfb7c8d2e6eac4d609625b9
+                    args:
+                      - logs
+                      - --otlp-endpoint=ourios-receiver:4317
+                      - --otlp-insecure
+                      - --logs=1
+                      - --otlp-attributes=service.name="${TENANT}"
+                      - --body=${LOG_BODY}
+          YAML
+          kubectl wait --for=condition=complete job/otlp-ingest --timeout=120s \
+            || { echo "telemetrygen job did not complete"; kubectl logs job/otlp-ingest --tail=100 || true; kubectl describe job/otlp-ingest || true; exit 1; }
+          echo "telemetrygen output:"; kubectl logs job/otlp-ingest --tail=20 || true
 
       # Records buffer in the sink until a size/age (300s) flush. Graceful
       # shutdown drains the sink to S3, so restart the receiver to force a prompt
@@ -162,19 +179,28 @@ jobs:
           kubectl port-forward "svc/${q}" 4319:4319 >/tmp/pf-q.log 2>&1 &
           pf=$!; trap 'kill $pf 2>/dev/null || true' EXIT
           for _ in $(seq 1 30); do if (echo > /dev/tcp/127.0.0.1/4319) >/dev/null 2>&1; then break; fi; sleep 1; done
-          rows=""
+          # Succeed only once the row is back AND its body reconstructs to the
+          # ingested line — exercises the full path (audit template events →
+          # read-time registry → bit-identical render; CLAUDE.md §3.3 / #302),
+          # not just that a row exists. Audit events flush before the data (the
+          # sink's audit barrier), so a visible row implies a derivable registry.
+          rows=0; line=""; recon=""
           for i in $(seq 1 30); do
             out="$(curl -s -X POST 'http://127.0.0.1:4319/v1/query' \
               -H "X-Ourios-Tenant: ${TENANT}" \
               -H 'Content-Type: text/plain' \
               --data "service == \"${TENANT}\" | range(-1h, now) | limit 100" || true)"
             rows="$(printf '%s' "$out" | jq -r '.rows // 0' 2>/dev/null || echo 0)"
-            echo "attempt $i: rows=$rows"
-            [ "${rows:-0}" -ge 1 ] && { echo "$out" | jq .; break; }
+            line="$(printf '%s' "$out" | jq -r '.records[0].body.line // ""' 2>/dev/null || echo "")"
+            recon="$(printf '%s' "$out" | jq -r '.records[0].body.reconstruction // ""' 2>/dev/null || echo "")"
+            echo "attempt $i: rows=$rows line=\"$line\" reconstruction=$recon"
+            if [ "${rows:-0}" -ge 1 ] && [ "$line" = "${LOG_BODY}" ] && [ "$recon" = "faithful" ]; then echo "$out" | jq .; break; fi
             sleep 5
           done
           [ "${rows:-0}" -ge 1 ] || { echo "query returned no rows"; exit 1; }
-          echo "SMOKE OK — ingested log queried back ($rows row(s))"
+          [ "$line" = "${LOG_BODY}" ] || { echo "body did not reconstruct: got \"$line\" (reconstruction=$recon), want \"${LOG_BODY}\""; exit 1; }
+          [ "$recon" = "faithful" ] || { echo "unexpected reconstruction kind: $recon (want faithful)"; exit 1; }
+          echo "SMOKE OK — ingested log queried back with faithful body ($rows row(s): \"$line\")"
 
       - name: Diagnostics on failure
         if: failure()

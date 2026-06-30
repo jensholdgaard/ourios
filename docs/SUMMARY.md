@@ -37,6 +37,7 @@
 - [RFC 0017 — Template registry & query rendering](./rfcs/0017-template-registry-query-rendering.md)
 - [RFC 0018 — OTLP log-spec compliance amendments](./rfcs/0018-otlp-log-spec-compliance.md)
 - [RFC 0019 — Storage-backend selection](./rfcs/0019-storage-backend-selection.md)
+- [RFC 0020 — Configuration file](./rfcs/0020-configuration-file.md)
 
 # Talks
 

@@ -15,13 +15,6 @@ on:
   schedule:
     # Nightly, offset from the other scheduled jobs.
     - cron: '37 4 * * *'
-  # temporary — dropped before merge. workflow_dispatch can't target a
-  # non-default branch, so a path-scoped pull_request trigger is the only way to
-  # exercise this workflow on its own PR (precedent: fuzz.yml #256). final state
-  # is on-demand + nightly only.
-  pull_request:
-    paths:
-      - '.github/workflows/deploy-test.yml'
 
 permissions:
   contents: read

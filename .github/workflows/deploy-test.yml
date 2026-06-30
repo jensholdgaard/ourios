@@ -194,7 +194,7 @@ jobs:
             line="$(printf '%s' "$out" | jq -r '.records[0].body.line // ""' 2>/dev/null || echo "")"
             recon="$(printf '%s' "$out" | jq -r '.records[0].body.reconstruction // ""' 2>/dev/null || echo "")"
             echo "attempt $i: rows=$rows line=\"$line\" reconstruction=$recon"
-            if [ "${rows:-0}" -ge 1 ] && [ "$line" = "${LOG_BODY}" ]; then echo "$out" | jq .; break; fi
+            if [ "${rows:-0}" -ge 1 ] && [ "$line" = "${LOG_BODY}" ] && [ "$recon" = "faithful" ]; then echo "$out" | jq .; break; fi
             sleep 5
           done
           [ "${rows:-0}" -ge 1 ] || { echo "query returned no rows"; exit 1; }

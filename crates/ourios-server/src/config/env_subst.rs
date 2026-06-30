@@ -56,9 +56,13 @@ pub fn resolve(
     input: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, MalformedReference> {
-    // Split on the `$$` escape left to right: the text before each `$$` is
-    // substituted, then a literal `$` is emitted. A `${…}` never spans a `$$`,
-    // so each segment can be substituted independently (the WG algorithm).
+    // The WG algorithm is escape-first: "consume the input left to right,
+    // identify the next escape sequence, and match the content *since the prior
+    // escape* against SUBSTITUTION-REF". So we split on `$$`, substitute each
+    // segment, and emit a literal `$` between them. A `$$` inside a would-be
+    // `${…}` therefore BREAKS the reference — it is not part of it and the ref
+    // does not resolve (normative table row `${X:-$${Y}}` → `${X:-${Y}}`). This
+    // is intentional; do not "fix" it by scanning refs across `$$`.
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     loop {
@@ -73,6 +77,9 @@ pub fn resolve(
 }
 
 /// Substitute every `${…}` reference in an escape-free segment into `out`.
+///
+/// The segment contains no `$$` — [`resolve`] has already split those out — so
+/// a lone `$` here is only ever literal text or the start of a `${…}`.
 fn substitute_segment(
     segment: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -207,6 +214,32 @@ mod tests {
             ("${VALUE_WITH_ESCAPE}", "value$$"),
             ("a $$ b", "a $ b"),
             ("a $ b", "a $ b"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                resolve(input, &lookup).as_deref(),
+                Ok(*want),
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// The WG algorithm processes the `$$` escape **before** matching a
+    /// `${…}` reference, so a `$$` inside a would-be reference (or its default)
+    /// breaks the reference rather than being part of it — the ref does not
+    /// resolve. Mirrors the normative table row `${X:-$${Y}}` → `${X:-${Y}}`.
+    #[test]
+    fn escape_is_processed_before_reference_matching() {
+        let lookup = env(&[("NAME", "v")]); // `A`/`B` are unset
+        let cases: &[(&str, &str)] = &[
+            // `$$` splits the ref: `${NAME:-foo` has no `}` ⇒ literal, then
+            // `$` (escape), then `bar}` ⇒ the default is NOT applied.
+            ("${NAME:-foo$$bar}", "${NAME:-foo$bar}"),
+            // `${A` (no `}` before `$$`) is not a reference ⇒ no malformed-ref
+            // error; the `$$` collapses to one `$`.
+            ("${A$$B}", "${A$B}"),
+            // A single `$` in a default IS part of the default and resolves.
+            ("${A:-foo$bar}", "foo$bar"),
         ];
         for (input, want) in cases {
             assert_eq!(

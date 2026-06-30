@@ -292,9 +292,10 @@ mod tests {
     }
 
     proptest! {
-        /// Never panics on arbitrary input.
+        /// Never panics on arbitrary input. `(?s)` so `.` also covers newlines
+        /// (a config scalar / env value can be multi-line).
         #[test]
-        fn never_panics(input in ".*") {
+        fn never_panics(input in "(?s).*") {
             let lookup = |_: &str| None;
             let _ = resolve(&input, &lookup);
         }
@@ -309,7 +310,7 @@ mod tests {
         /// A resolved value is inserted verbatim — non-recursive: even a value
         /// that itself looks like a reference or an escape is not re-scanned.
         #[test]
-        fn value_inserted_verbatim(value in ".{0,32}") {
+        fn value_inserted_verbatim(value in "(?s).{0,32}") {
             let v = value.clone();
             let lookup = move |n: &str| (n == "X").then(|| v.clone());
             // Non-empty values round-trip exactly; empty falls back to "" too.

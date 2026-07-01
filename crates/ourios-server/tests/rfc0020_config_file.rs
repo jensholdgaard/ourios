@@ -44,7 +44,7 @@ storage:
   backend: ${env:BACKEND:-s3}
   s3:
     bucket: ${BUCKET}
-    endpoint: ${env:MISSING:-}
+    endpoint: ${env:MISSING}
     prefix: a$$b
 querier:
   enabled: ${QUERIER_ON:-true}

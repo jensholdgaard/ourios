@@ -1,25 +1,29 @@
-//! The RFC 0020 YAML configuration schema and its environment-substitution walk.
+//! The RFC 0020 YAML configuration schema and its environment substitution.
 //!
-//! [`parse`] turns config-file text into a [`FileConfig`]: it parses the YAML
-//! into a node tree, substitutes `${env:…}` references in the scalar **values**
-//! ([`env_subst`]), then deserialises the substituted tree
-//! into the schema. Mapping onto the resolved server config (via the existing
-//! `build_*` validators — the single validation path, RFC 0020 §3.1) is the
-//! `--config` wiring layer in the binary; this module stops at a validated,
+//! [`parse`] turns config-file text into a [`FileConfig`]: it deserialises the
+//! YAML into the schema, then substitutes `${env:…}` references in the scalar
+//! **values** ([`env_subst`]). Mapping onto the resolved server config (via the
+//! existing `build_*` validators — the single validation path, RFC 0020 §3.1) is
+//! the `--config` wiring layer in the binary; this module stops at a validated,
 //! substituted view of the file.
 //!
-//! **Substitution operates on parsed scalar values, never raw text** (RFC 0020
-//! §3.3): the walk descends the node tree and rewrites only scalar *values*, so
-//! mapping keys are left verbatim (rule 4) and a substituted value is inserted
-//! as-is and never re-parsed into YAML structure (rule 5 — the security
-//! boundary). It is not recursive: [`env_subst::resolve`] emits the resolved
-//! value without re-scanning it.
+//! **Order: validate the schema, then substitute.** Deserialisation runs on the
+//! *raw* (pre-substitution) tree, so a shape or unknown-key error references the
+//! file's own text — a bare `${env:SECRET}` written where a section is expected
+//! is reported as `invalid type: string "${env:SECRET}", …`, naming the
+//! reference, never a resolved secret (RFC 0020 §3.5 / RFC 0019 §3.4). `serde`
+//! never sees a substituted value. Substitution then rewrites the typed scalar
+//! leaves in place — the parsed *values* only, so mapping keys (which became
+//! field names) are never candidates (rule 4), and a substituted value stays in
+//! its `Option<String>` field, never re-parsed into YAML structure (rule 5, the
+//! security boundary). It is not recursive: [`env_subst::resolve`] emits the
+//! resolved value without re-scanning it.
 //!
 //! **Type after substitution** (rule 7) is resolved at the typed boundary rather
-//! than by re-tagging the node tree. `serde_yaml`'s `Value` does not preserve a
+//! than by re-tagging a node tree. `serde_yaml`'s `Value` does not preserve a
 //! scalar's quoting style, so a literal "re-interpret the substituted scalar by
 //! YAML's type rules" pass cannot tell a quoted string from a bare one and would
-//! wrongly coerce `"01"` to an integer. Instead every leaf is carried as its
+//! wrongly coerce `"01"` to an integer. Instead every leaf is captured as its
 //! string form (a bare `3600` and a substituted `${env:W}`→`3600` both become
 //! the string `"3600"`) and the final type is resolved when that string flows
 //! through the existing `build_*` validators — the same path the environment
@@ -35,13 +39,30 @@ use serde_yaml::Value;
 
 use super::env_subst::{self, MalformedReference};
 
+/// Substitute `${env:…}` in one optional scalar leaf in place (RFC 0020 §3.3).
+fn substitute(
+    field: &mut Option<String>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), MalformedReference> {
+    if let Some(value) = field {
+        *value = env_subst::resolve(value, lookup)?;
+    }
+    Ok(())
+}
+
 /// A failure loading a configuration file.
 ///
 /// Both variants name only structural locators — a YAML key path or a
 /// non-conforming `${…}` reference — never a resolved value, so the error is
 /// safe to surface even when a sibling scalar holds a secret (RFC 0020 §3.5 /
 /// RFC 0019 §3.4).
+///
+/// `#[non_exhaustive]` — the `--config` wiring slice adds file-I/O and
+/// value-validation variants; forcing a wildcard arm keeps that non-breaking
+/// for downstream matches (the codebase's public-error-enum convention, e.g.
+/// `ourios_miner::tokenize::TokenizeError`).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FileConfigError {
     /// A `${…}` reference that does not conform to the substitution grammar.
     Substitution(MalformedReference),
@@ -101,7 +122,11 @@ pub struct StorageSection {
 }
 
 /// `storage.s3.*` — S3 addressing and (env-only) credentials (RFC 0019 §3.4).
-#[derive(Debug, Default, Deserialize)]
+///
+/// The credential fields are **secret**: the manual [`fmt::Debug`] impl redacts
+/// their values (showing only presence), mirroring `ourios_parquet::S3Config` so
+/// a `Debug` rendering never leaks a key (RFC 0020 §3.5 / RFC 0019 §3.4).
+#[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct S3Section {
     #[serde(deserialize_with = "scalar_opt")]
@@ -118,6 +143,23 @@ pub struct S3Section {
     pub secret_access_key: Option<String>,
     #[serde(deserialize_with = "scalar_opt")]
     pub session_token: Option<String>,
+}
+
+impl fmt::Debug for S3Section {
+    /// Redacts the credential fields — a `Debug` rendering shows only whether a
+    /// credential is present, never its value (RFC 0020 §3.5 / RFC 0019 §3.4).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("S3Section")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &redact(&self.access_key_id))
+            .field("secret_access_key", &redact(&self.secret_access_key))
+            .field("session_token", &redact(&self.session_token))
+            .finish()
+    }
 }
 
 /// `storage.local.*` — the local store root (RFC 0019 §3.1).
@@ -168,58 +210,115 @@ pub struct CompactionSection {
 ///
 /// `lookup` resolves an environment-variable name for `${env:…}` substitution
 /// (`None` when unset); the binary passes `|n| std::env::var(n).ok()`. The file
-/// is parsed into a node tree, scalar values are substituted, and the result is
-/// deserialised into the schema — a strict pass (unknown keys are rejected,
-/// RFC 0020 §3.4).
+/// is deserialised into the schema — a strict pass (unknown keys are rejected,
+/// RFC 0020 §3.4) — on the **raw** tree, so a schema error references the file's
+/// own text rather than a resolved value; substitution then runs on the typed
+/// scalar leaves (see the module docs).
 ///
 /// # Errors
 ///
-/// Returns [`FileConfigError::Substitution`] for a malformed `${…}` reference in
-/// a scalar value (RFC0020.5), or [`FileConfigError::Schema`] for a YAML syntax
-/// error, an unknown key, or a value that does not fit the schema. Resolution is
+/// Returns [`FileConfigError::Schema`] for a YAML syntax error, an unknown key,
+/// or a value that does not fit the schema, or [`FileConfigError::Substitution`]
+/// for a malformed `${…}` reference in a scalar value (RFC0020.5). Resolution is
 /// all-or-nothing: on error no partial configuration is produced.
 pub fn parse(
     yaml: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<FileConfig, FileConfigError> {
-    let mut tree: Value = serde_yaml::from_str(yaml).map_err(FileConfigError::Schema)?;
+    let tree: Value = serde_yaml::from_str(yaml).map_err(FileConfigError::Schema)?;
     // An empty document parses to `Null`; treat it as an all-default config
     // rather than a type error (deserialising `Null` into a struct fails).
     if tree.is_null() {
         return Ok(FileConfig::default());
     }
-    substitute_tree(&mut tree, lookup).map_err(FileConfigError::Substitution)?;
-    serde_yaml::from_value(tree).map_err(FileConfigError::Schema)
+    // Validate on the raw (pre-substitution) tree: any shape / unknown-key error
+    // then names the file's own text, never a resolved secret (RFC 0020 §3.5).
+    let mut config: FileConfig = serde_yaml::from_value(tree).map_err(FileConfigError::Schema)?;
+    config
+        .substitute(lookup)
+        .map_err(FileConfigError::Substitution)?;
+    Ok(config)
 }
 
-/// Substitute `${env:…}` references in every scalar **value** of the tree.
-///
-/// Mapping keys are never visited (rule 4 — a `${…}` in a key position is left
-/// verbatim), and a substituted value is a `String` that is never re-parsed into
-/// YAML structure (rule 5). Non-string scalars (`Number`/`Bool`/`Null`) hold no
-/// `$` and are left untouched.
-fn substitute_tree(
-    value: &mut Value,
-    lookup: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), MalformedReference> {
-    match value {
-        Value::String(s) => {
-            *s = env_subst::resolve(s, lookup)?;
-        }
-        Value::Mapping(map) => {
-            for (_key, val) in map.iter_mut() {
-                substitute_tree(val, lookup)?;
-            }
-        }
-        Value::Sequence(seq) => {
-            for val in seq {
-                substitute_tree(val, lookup)?;
-            }
-        }
-        Value::Tagged(tagged) => substitute_tree(&mut tagged.value, lookup)?,
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+impl FileConfig {
+    /// Substitute `${env:…}` in every scalar leaf (RFC 0020 §3.3), in place.
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        self.storage.substitute(lookup)?;
+        self.receiver.substitute(lookup)?;
+        self.querier.substitute(lookup)?;
+        self.compaction.substitute(lookup)
     }
-    Ok(())
+}
+
+impl StorageSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.backend, lookup)?;
+        self.s3.substitute(lookup)?;
+        self.local.substitute(lookup)
+    }
+}
+
+impl S3Section {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.bucket, lookup)?;
+        substitute(&mut self.endpoint, lookup)?;
+        substitute(&mut self.region, lookup)?;
+        substitute(&mut self.prefix, lookup)?;
+        substitute(&mut self.access_key_id, lookup)?;
+        substitute(&mut self.secret_access_key, lookup)?;
+        substitute(&mut self.session_token, lookup)
+    }
+}
+
+impl LocalSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.bucket_root, lookup)
+    }
+}
+
+impl ReceiverSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.enabled, lookup)?;
+        substitute(&mut self.grpc_addr, lookup)?;
+        substitute(&mut self.http_addr, lookup)?;
+        substitute(&mut self.wal_root, lookup)
+    }
+}
+
+impl QuerierSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.enabled, lookup)?;
+        substitute(&mut self.http_addr, lookup)?;
+        substitute(&mut self.default_window_secs, lookup)
+    }
+}
+
+impl CompactionSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.enabled, lookup)?;
+        substitute(&mut self.interval_secs, lookup)
+    }
 }
 
 /// Deserialise an optional YAML scalar into its string form.
@@ -286,8 +385,7 @@ impl<'de> Deserialize<'de> for Scalar {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{FileConfigError, parse, substitute_tree};
-    use serde_yaml::Value;
+    use super::{FileConfigError, parse};
 
     /// A lookup over a fixed environment map.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -315,7 +413,7 @@ storage:
   s3:
     bucket: ${BUCKET}
     region: ${env:REGION}
-    endpoint: ${env:MISSING:-}
+    endpoint: ${env:MISSING}
     prefix: a$$b
 querier:
   enabled: ${env:QUERIER_ON:-true}
@@ -350,18 +448,66 @@ compaction:
         assert_eq!(cfg.compaction.interval_secs.as_deref(), Some("300"));
     }
 
-    /// RFC0020.2 rule 4 — substitution never touches a mapping **key**; a
-    /// `${…}` in key position is left verbatim (asserted at the tree level, as
-    /// the typed schema has no free-form-key field to carry one).
+    /// RFC0020.2 rule 4 — a `${…}` in a mapping **key** position is never a
+    /// substitution candidate. `X` resolves to a *valid* section name, so if keys
+    /// were substituted the file would parse; it must not — keys deserialise as
+    /// field names and are left verbatim, so the reference-shaped key is rejected
+    /// as unknown.
     #[test]
-    fn mapping_keys_are_left_verbatim() {
-        let lookup = env(&[("K", "resolved"), ("V", "resolved")]);
-        let mut tree: Value = serde_yaml::from_str("${env:K}: ${env:V}").expect("yaml");
-        substitute_tree(&mut tree, &lookup).expect("ok");
-        let map = tree.as_mapping().expect("a mapping");
-        let (key, value) = map.iter().next().expect("one entry");
-        assert_eq!(key.as_str(), Some("${env:K}"), "the key is verbatim");
-        assert_eq!(value.as_str(), Some("resolved"), "the value is substituted");
+    fn a_reference_in_key_position_is_left_verbatim() {
+        let lookup = env(&[("X", "storage")]);
+        let err = parse("${env:X}:\n  backend: s3\n", &lookup).expect_err("verbatim key");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+    }
+
+    /// RFC0020.6 (schema-error hygiene) — a reference placed where a whole
+    /// section is expected fails on the **raw** tree, so the error names the
+    /// reference text, never the resolved secret value (RFC 0020 §3.5): `serde`
+    /// never sees a substituted value.
+    #[test]
+    fn schema_error_never_echoes_a_resolved_value() {
+        const SECRET: &str = "SUPER-SECRET-TOKEN";
+        let lookup = env(&[("SECRET", SECRET)]);
+        let err = parse("storage: ${env:SECRET}\n", &lookup).expect_err("shape mismatch");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(SECRET),
+            "the resolved secret must not leak: {msg}"
+        );
+        assert!(
+            msg.contains("${env:SECRET}"),
+            "names the reference instead: {msg}",
+        );
+    }
+
+    /// The S3 credential fields are redacted in `Debug` — presence only, never
+    /// the value (RFC 0020 §3.5 / RFC 0019 §3.4), mirroring `S3Config`.
+    #[test]
+    fn s3_credentials_are_redacted_in_debug() {
+        let lookup = env(&[("KEY", "AKIAEXAMPLE"), ("SECRET", "s3cr3t-value")]);
+        let cfg = parse(
+            "storage:\n  s3:\n    bucket: b\n    access_key_id: ${env:KEY}\n    secret_access_key: ${env:SECRET}\n",
+            &lookup,
+        )
+        .expect("valid");
+        let rendered = format!("{:?}", cfg.storage.s3);
+        assert!(
+            rendered.contains("bucket"),
+            "non-secret fields stay visible"
+        );
+        assert!(
+            !rendered.contains("AKIAEXAMPLE"),
+            "access key id redacted: {rendered}",
+        );
+        assert!(
+            !rendered.contains("s3cr3t-value"),
+            "secret access key redacted: {rendered}",
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "shows presence: {rendered}"
+        );
     }
 
     /// RFC0020.2 rule 5 — a substituted value is inserted as-is and never

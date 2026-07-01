@@ -51,17 +51,18 @@ fn substitute(
 
 /// A failure loading a configuration file.
 ///
-/// Both variants name only structural locators — a YAML key path or a
+/// Every variant names only structural locators — a YAML key path or a
 /// non-conforming `${…}` reference — never a resolved value, so the error is
 /// safe to surface even when a sibling scalar holds a secret (RFC 0020 §3.5 /
 /// RFC 0019 §3.4).
 ///
-/// `Display` forwards to the underlying error; the caller supplies the file
-/// context (e.g. `config file <path>: <this>`), so the two do not stack.
+/// `Display` forwards to the underlying error where there is one; the caller
+/// supplies the file context (e.g. `config file <path>: <this>`), so the two do
+/// not stack.
 ///
-/// `#[non_exhaustive]` — the `--config` wiring slice adds file-I/O and
-/// value-validation variants; forcing a wildcard arm keeps that non-breaking
-/// for downstream matches (the codebase's public-error-enum convention, e.g.
+/// `#[non_exhaustive]` — this enum has grown variants across the RFC 0020 green
+/// slices; forcing a wildcard arm keeps further additions non-breaking for
+/// downstream matches (the codebase's public-error-enum convention, e.g.
 /// `ourios_miner::tokenize::TokenizeError`).
 #[derive(Debug)]
 #[non_exhaustive]
@@ -71,6 +72,13 @@ pub enum FileConfigError {
     /// A YAML syntax error, an unknown key (`deny_unknown_fields`), or a value
     /// whose shape does not match the schema.
     Schema(serde_yaml::Error),
+    /// A `storage.s3.*` credential holds an inline literal instead of an
+    /// `${env:…}` reference (RFC 0020 §3.5). Names the offending key only, never
+    /// the value.
+    InlineCredential {
+        /// The offending `storage.s3.*` credential field name.
+        key: &'static str,
+    },
 }
 
 impl fmt::Display for FileConfigError {
@@ -78,6 +86,11 @@ impl fmt::Display for FileConfigError {
         match self {
             Self::Substitution(e) => e.fmt(f),
             Self::Schema(e) => e.fmt(f),
+            Self::InlineCredential { key } => write!(
+                f,
+                "storage.s3.{key} must be an ${{env:…}} reference, not an inline \
+                 literal (RFC 0020 §3.5)"
+            ),
         }
     }
 }
@@ -87,6 +100,7 @@ impl std::error::Error for FileConfigError {
         match self {
             Self::Substitution(e) => Some(e),
             Self::Schema(e) => Some(e),
+            Self::InlineCredential { .. } => None,
         }
     }
 }
@@ -220,8 +234,10 @@ pub struct CompactionSection {
 /// # Errors
 ///
 /// Returns [`FileConfigError::Schema`] for a YAML syntax error, an unknown key,
-/// or a value that does not fit the schema, or [`FileConfigError::Substitution`]
-/// for a malformed `${…}` reference in a scalar value (RFC0020.5). Resolution is
+/// or a value that does not fit the schema; [`FileConfigError::InlineCredential`]
+/// for an object-store credential given as an inline literal rather than an
+/// `${env:…}` reference (RFC 0020 §3.5); or [`FileConfigError::Substitution`] for
+/// a malformed `${…}` reference in a scalar value (RFC0020.5). Resolution is
 /// all-or-nothing: on error no partial configuration is produced.
 pub fn parse(
     yaml: &str,
@@ -236,10 +252,51 @@ pub fn parse(
     let mut config: FileConfig = serde_yaml::from_str::<Option<FileConfig>>(yaml)
         .map_err(FileConfigError::Schema)?
         .unwrap_or_default();
+    // Enforce §3.5 on the *raw* credential values — after substitution a
+    // reference is indistinguishable from a literal.
+    check_credentials_are_references(&config.storage.s3)?;
     config
         .substitute(lookup)
         .map_err(FileConfigError::Substitution)?;
     Ok(config)
+}
+
+/// Enforce RFC 0020 §3.5: object-store credentials must be `${env:…}` references,
+/// never inline literals. Runs on the **raw** (pre-substitution) values. An
+/// absent or empty field is not a literal and is allowed (it reads as "unset",
+/// falling back to the AWS credential chain).
+fn check_credentials_are_references(s3: &S3Section) -> Result<(), FileConfigError> {
+    for (key, value) in [
+        ("access_key_id", &s3.access_key_id),
+        ("secret_access_key", &s3.secret_access_key),
+        ("session_token", &s3.session_token),
+    ] {
+        if let Some(raw) = value {
+            if !raw.is_empty() && !is_env_reference(raw) {
+                return Err(FileConfigError::InlineCredential { key });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `raw` is a single `${env:NAME}` / `${NAME}` substitution reference
+/// spanning the whole value, with no default or an **empty** default
+/// (`${env:NAME:-}`). A literal, a partial (`foo-${…}`), two references, or a
+/// **non-empty** default (which would itself embed a literal secret) are all
+/// rejected. The reference's name is validated later by substitution.
+fn is_env_reference(raw: &str) -> bool {
+    let Some(body) = raw.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return false;
+    };
+    if body.contains('}') {
+        return false; // a second `}` ⇒ more than one reference / trailing text
+    }
+    let body = body.strip_prefix("env:").unwrap_or(body);
+    match body.split_once(":-") {
+        Some((_name, default)) => default.is_empty(),
+        None => true,
+    }
 }
 
 impl FileConfig {
@@ -510,6 +567,64 @@ compaction:
             rendered.contains("<redacted>"),
             "shows presence: {rendered}"
         );
+    }
+
+    /// RFC0020.6 (§3.5 enforcement) — an object-store credential given as an
+    /// inline literal is rejected, and the error names the offending key, never
+    /// the value. Bare `${env:…}` references (with an optional empty default) are
+    /// allowed; a non-empty default (an embedded literal) is not.
+    #[test]
+    fn inline_credential_literal_is_rejected_naming_the_key() {
+        let lookup = env(&[]);
+
+        // A literal secret is rejected — the error names the key, not the value.
+        let err = parse(
+            "storage:\n  s3:\n    secret_access_key: AKIAHARDCODEDSECRET\n",
+            &lookup,
+        )
+        .expect_err("inline literal");
+        assert!(
+            matches!(err, FileConfigError::InlineCredential { key } if key == "secret_access_key"),
+            "got {err:?}",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("secret_access_key"), "names the key: {msg}");
+        assert!(
+            !msg.contains("AKIAHARDCODEDSECRET"),
+            "never the value: {msg}",
+        );
+
+        // A reference with a non-empty default embeds a literal — also rejected.
+        assert!(
+            parse(
+                "storage:\n  s3:\n    access_key_id: ${env:K:-AKIAFALLBACK}\n",
+                &lookup,
+            )
+            .is_err(),
+            "a non-empty default is an embedded literal",
+        );
+        // A partial reference (surrounding literal text) is rejected.
+        assert!(
+            parse(
+                "storage:\n  s3:\n    session_token: tok-${env:T}\n",
+                &lookup,
+            )
+            .is_err(),
+        );
+
+        // Bare references, and a reference with an empty default, are allowed.
+        for ok in [
+            "${env:OURIOS_S3_SECRET_ACCESS_KEY}",
+            "${OURIOS_S3_SECRET_ACCESS_KEY}",
+            "${env:OURIOS_S3_SECRET_ACCESS_KEY:-}",
+        ] {
+            let yaml = format!("storage:\n  s3:\n    secret_access_key: {ok}\n");
+            parse(&yaml, &lookup).unwrap_or_else(|e| panic!("{ok} should be allowed: {e}"));
+        }
+
+        // An absent or empty credential is not a literal (reads as unset).
+        parse("storage:\n  s3:\n    secret_access_key: \"\"\n", &lookup)
+            .expect("an empty credential is allowed (unset)");
     }
 
     /// RFC0020.2 rule 5 — a substituted value is inserted as-is and never

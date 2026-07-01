@@ -1,7 +1,7 @@
 ---
 rfc: 0020
 title: Server configuration file — YAML with environment-variable substitution
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-30
@@ -197,11 +197,25 @@ resolution (§3.1).
 
 Object-store credentials MUST NOT appear as inline literals in the file.
 They are expressed only as env references (`${env:OURIOS_S3_SECRET_ACCESS_KEY}`),
-which a deployment injects from a `Secret`. The existing invariant —
-resolved credentials are never logged, and a config error names the
-offending **key/path**, never a value (RFC 0019 §3.4, RFC0019.6) —
-extends to the file path: substitution errors and schema errors report
-the YAML key or env-var **name**, never the resolved secret text.
+which a deployment injects from a `Secret`. This is **enforced**: each
+credential field (`storage.s3.access_key_id` / `secret_access_key` /
+`session_token`) must be a single `${env:NAME}` / `${NAME}` reference
+spanning the whole value, optionally with an **empty** default
+(`${env:NAME:-}`, meaning "unset → fall back to the AWS credential
+chain"). A literal, a partial reference (`prefix-${env:NAME}`), or a
+**non-empty** default (`${env:NAME:-literal}`, which would itself embed a
+secret) is a startup error naming the offending **key**, never the value.
+The check runs on the **raw** value, before substitution — afterwards a
+reference is indistinguishable from a literal. An absent or empty field is
+not a literal and is allowed (it reads as unset).
+
+The existing invariant — resolved credentials are never logged, and a
+config error names the offending **key/path**, never a value (RFC 0019
+§3.4, RFC0019.6) — extends to the file path: substitution errors, schema
+errors, and the credential-literal error report the YAML key or env-var
+**name**, never the resolved secret text. The credential fields are also
+redacted in the config's `Debug` rendering (mirroring
+`ourios_parquet::S3Config`).
 
 ### 3.6 Crate placement
 

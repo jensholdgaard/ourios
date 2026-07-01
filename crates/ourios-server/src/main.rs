@@ -781,6 +781,46 @@ querier:
         );
     }
 
+    /// Scenario RFC0020.6 — secret hygiene across the file path. A resolved
+    /// credential is present in the `FileConfig`, yet a sibling value that the
+    /// mapping rejects produces an error naming the offending key only — never
+    /// the resolved secret (extends RFC 0019 §3.4 / RFC0019.6 to the file path;
+    /// the `${env:…}`-only credential rule and `Debug` redaction are covered in
+    /// `config::file`). See `docs/rfcs/0020-configuration-file.md` §5.
+    #[test]
+    fn rfc0020_6_secret_hygiene_across_the_file_path() {
+        let secret = "topsecret-access-key";
+        // The credentials are `${env:…}` references (§3.5); they resolve to real
+        // values, but the backend is `s3` with no bucket — a sibling error.
+        let file = parse(
+            "\
+storage:
+  backend: s3
+  s3:
+    access_key_id: ${env:KEY}
+    secret_access_key: ${env:SECRET}
+",
+            &|name| match name {
+                "KEY" => Some("AKIAEXAMPLE".to_owned()),
+                "SECRET" => Some(secret.to_owned()),
+                _ => None,
+            },
+        )
+        .expect("parses (credentials are references)");
+
+        // The secret is resolved and present in the config...
+        assert_eq!(file.storage.s3.secret_access_key.as_deref(), Some(secret));
+
+        // ...but the mapping fails on the missing bucket, and the error names the
+        // offending key, never the resolved secret.
+        let err = server_config_from_file(&file).expect_err("s3 needs a bucket");
+        assert!(err.contains("S3_BUCKET"), "names the missing key: {err}");
+        assert!(
+            !err.contains(secret),
+            "the resolved secret must not leak: {err}"
+        );
+    }
+
     /// `config_from_file` end-to-end through the real filesystem: a valid file
     /// reads and resolves, and both failure paths name the offending file — a
     /// missing file via the read-error prefix, a parse failure via the

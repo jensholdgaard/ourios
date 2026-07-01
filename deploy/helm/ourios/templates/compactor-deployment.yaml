@@ -30,10 +30,12 @@ spec:
         {{- with .Values.compactor.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.compactor.podAnnotations)) }}
       annotations:
+        # Roll the pods when the mounted RFC 0020 config changes.
+        checksum/config: {{ include "ourios.config" (dict "root" . "role" "compactor") | sha256sum }}
+        {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.compactor.podAnnotations)) }}
         {{- . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -53,20 +55,27 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          args:
+            - --config
+            - /etc/ourios/config.yaml
+          {{- $env := include "ourios.commonEnv" . | trim }}
+          {{- if $env }}
           env:
-            {{- include "ourios.commonEnv" . | nindent 12 }}
-            {{- include "ourios.compactorEnv" . | nindent 12 }}
+            {{- $env | nindent 12 }}
+          {{- end }}
           {{- include "ourios.s3CredentialsEnvFrom" . | nindent 10 }}
           {{- with .Values.compactor.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            {{- include "ourios.configVolumeMount" . | nindent 12 }}
             {{- include "ourios.dataVolumeMount" . | nindent 12 }}
             # readOnlyRootFilesystem is on, so give the process a writable /tmp.
             - name: tmp
               mountPath: /tmp
       volumes:
+        {{- include "ourios.configVolume" (dict "root" . "role" "compactor") | nindent 8 }}
         - name: tmp
           emptyDir: {}
         {{- include "ourios.dataVolume" . | nindent 8 }}

@@ -14,6 +14,15 @@
 #                 independently and reads the store (no PVC);
 #   - compactor — the always-on background compactor, a singleton Deployment.
 # Only the data/audit/manifest live on object storage; the WAL never does.
+#
+# Configuration is delivered as an RFC 0020 YAML config file: the chart renders a
+# per-role ConfigMap, mounts it at /etc/ourios/config.yaml, and runs the binary
+# with --config (the file is authoritative). The settings below map onto that
+# file — the `OURIOS_*` names in parentheses are the equivalent config keys.
+# Object-store credentials are the exception: they are `${env:…}` references
+# resolved from a Secret via envFrom, never written into the file (see
+# storage.s3.existingSecret). OTEL_* and AWS_* stay plain env, read by their own
+# SDKs (RFC 0020 §3.8).
 
 image:
   repository: ghcr.io/jensholdgaard/ourios

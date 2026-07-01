@@ -106,9 +106,24 @@ helm test ourios
 > pre-release `0.0.0` app version); pin a released tag via `image.tag` in
 > production.
 
+## Configuration
+
+The chart renders an RFC 0020 **configuration file** — a per-role key in a
+`ConfigMap` — and mounts it into each workload at `/etc/ourios/config.yaml`,
+passing `--config` to the binary. The file is the authoritative source of
+Ourios's data-plane configuration (storage, roles, compaction); the `values.yaml`
+settings map onto it. Object-store credentials are **not** written into the file
+— they appear as `${env:OURIOS_S3_*}` references resolved from the `Secret` via
+`envFrom` (see [Credentials](#credentials)). The self-telemetry `OTEL_*` endpoint
+and the AWS SDK region stay plain environment variables — those are read by their
+own SDKs, never modelled in the config (RFC 0020 §3.8). A `checksum/config` pod
+annotation rolls the workloads when the rendered config changes.
+
 ## Credentials
 
-Credentials are **never** chart config as plaintext. Static credentials use the
+Credentials are **never** chart config as plaintext, and never written into the
+mounted config file — the file references them as `${env:…}` (RFC 0020 §3.5) and
+they are injected as environment variables at startup. Static credentials use the
 **S3-named** keys Ourios reads (`OURIOS_S3_*`, RFC 0019 §3.4) — not AWS-specific;
 they work against AWS S3 and every S3-compatible provider (MinIO, R2, Hetzner,
 Ceph, …). Supply exactly one of:
@@ -150,8 +165,9 @@ if it has none).
 ## Compactor topology
 
 The `ourios-server` binary runs the compaction role by default. To avoid every
-pod sweeping, the receiver and querier workloads set `OURIOS_COMPACTION_ENABLED=0`,
-so a **single dedicated `compactor` Deployment (1 replica)** is the only sweeper.
+pod sweeping, the receiver and querier disable compaction in their config file
+(`compaction.enabled: false`), so a **single dedicated `compactor` Deployment
+(1 replica)** is the only sweeper.
 
 Scaling that compactor `Deployment` past 1 replica is **safe but unnecessary**:
 the manifest publish-CAS commit (RFC 0009 §3.2 / RFC0013.3–.4) makes concurrent

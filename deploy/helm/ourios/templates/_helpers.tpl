@@ -72,53 +72,98 @@ released tag via image.tag in production.
 {{- end }}
 
 {{/*
-Storage-backend env (RFC 0019). For s3 (the S3 API — AWS or any S3-compatible
-provider): the bucket + optional addressing. Credentials never appear here —
-they come from the S3 credential chain (storage.s3.existingSecret → envFrom, or
-IRSA on EKS). When set, the region drives both the store (OURIOS_S3_REGION) and
-the SDK credential chain (AWS_DEFAULT_REGION); it is optional here and may also
-come from the standard AWS env/config. For local: the in-container data root.
+Storage config block (RFC 0020 §3.4), shared by every role's config file. For s3
+(the S3 API — AWS or any S3-compatible provider): the bucket + optional
+addressing. Credentials are ${env:…} references (RFC 0020 §3.5), resolved from
+the Secret named by storage.s3.existingSecret (envFrom) or left empty to fall
+through to the AWS credential chain (IRSA / instance metadata). For local: the
+in-container data root. Emitted under a top-level `storage:` key.
 */}}
-{{- define "ourios.storageEnv" -}}
+{{- define "ourios.storageConfig" -}}
 {{- if not (or (eq .Values.storage.backend "local") (eq .Values.storage.backend "s3")) }}
 {{- fail (printf "storage.backend must be \"local\" or \"s3\", got %q" .Values.storage.backend) }}
 {{- end }}
-- name: OURIOS_STORAGE_BACKEND
-  value: {{ .Values.storage.backend | quote }}
+storage:
+  backend: {{ .Values.storage.backend | quote }}
 {{- if eq .Values.storage.backend "s3" }}
-- name: OURIOS_S3_BUCKET
-  value: {{ required "storage.s3.bucket is required when storage.backend=s3" .Values.storage.s3.bucket | quote }}
+  s3:
+    bucket: {{ required "storage.s3.bucket is required when storage.backend=s3" .Values.storage.s3.bucket | quote }}
 {{- with .Values.storage.s3.endpoint }}
-- name: OURIOS_S3_ENDPOINT
-  value: {{ . | quote }}
+    endpoint: {{ . | quote }}
 {{- end }}
 {{- with .Values.storage.s3.region }}
-- name: OURIOS_S3_REGION
-  value: {{ . | quote }}
-- name: AWS_DEFAULT_REGION
-  value: {{ . | quote }}
+    region: {{ . | quote }}
 {{- end }}
 {{- with .Values.storage.s3.prefix }}
-- name: OURIOS_S3_PREFIX
-  value: {{ . | quote }}
+    prefix: {{ . | quote }}
 {{- end }}
+    access_key_id: "${env:OURIOS_S3_ACCESS_KEY_ID:-}"
+    secret_access_key: "${env:OURIOS_S3_SECRET_ACCESS_KEY:-}"
+    session_token: "${env:OURIOS_S3_SESSION_TOKEN:-}"
 {{- else }}
-- name: OURIOS_BUCKET_ROOT
-  value: {{ .Values.storage.local.bucketRoot | quote }}
+  local:
+    bucket_root: {{ .Values.storage.local.bucketRoot | quote }}
 {{- end }}
 {{- end }}
 
 {{/*
-Env common to every workload: the storage backend, self-telemetry, and any
-extraEnv. Compaction is wired per-workload — only the dedicated compactor
-sweeps; the receiver/querier set OURIOS_COMPACTION_ENABLED=0 (RFC 0009 §3.2) so
-a single sweeper avoids redundant per-interval listing.
+The full RFC 0020 config file for one role. Pass
+(dict "root" $ "role" "receiver"|"querier"|"compactor"): the shared storage block
+plus that role's flags; the roles it does not run are absent (disabled). The
+receiver/querier disable compaction so only the dedicated compactor sweeps
+(RFC 0009 §3.2). Data-plane only — OTEL_* / AWS_* stay env (RFC 0020 §3.8).
+*/}}
+{{- define "ourios.config" -}}
+{{- $ := .root -}}
+{{- $role := .role -}}
+{{- include "ourios.storageConfig" $ }}
+{{- if eq $role "receiver" }}
+receiver:
+  enabled: true
+  grpc_addr: "0.0.0.0:4317"
+  http_addr: "0.0.0.0:4318"
+  wal_root: {{ $.Values.receiver.wal.mountPath | quote }}
+compaction:
+  enabled: false
+{{- else if eq $role "querier" }}
+{{- if le (int $.Values.querier.defaultWindowSecs) 0 }}
+{{- fail (printf "querier.defaultWindowSecs must be a positive integer (seconds), got %v" $.Values.querier.defaultWindowSecs) }}
+{{- end }}
+querier:
+  enabled: true
+  http_addr: "0.0.0.0:4319"
+  default_window_secs: {{ $.Values.querier.defaultWindowSecs }}
+compaction:
+  enabled: false
+{{- else if eq $role "compactor" }}
+{{- if le (int $.Values.compactor.intervalSecs) 0 }}
+{{- fail (printf "compactor.intervalSecs must be a positive integer (seconds), got %v" $.Values.compactor.intervalSecs) }}
+{{- end }}
+compaction:
+  enabled: true
+  interval_secs: {{ $.Values.compactor.intervalSecs }}
+{{- else }}
+{{- fail (printf "ourios.config: unknown role %q" $role) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Env common to every workload. The data-plane config is the mounted --config file
+(RFC 0020); the only env vars are the self-telemetry OTLP endpoint, the AWS SDK
+region (which drives the credential chain for s3), and any extraEnv — OTEL_* /
+AWS_* are read directly by their SDKs, never modeled in the config (RFC 0020
+§3.8). May render empty (the workloads guard the `env:` block). The dedicated
+compactor is the only sweeper (the per-role config disables compaction on the
+receiver/querier), so it must be enabled.
 */}}
 {{- define "ourios.commonEnv" -}}
 {{- if not .Values.compactor.enabled }}
-{{- fail "compactor.enabled=false leaves the deployment with no sweeper: the receiver and querier set OURIOS_COMPACTION_ENABLED=0, so the dedicated compactor is the chart's only compactor. Set compactor.enabled=true (small files accumulate otherwise — hazard #4)." }}
+{{- fail "compactor.enabled=false leaves the deployment with no sweeper: the receiver and querier disable compaction in their config, so the dedicated compactor is the chart's only compactor. Set compactor.enabled=true (small files accumulate otherwise — hazard #4)." }}
 {{- end }}
-{{ include "ourios.storageEnv" . }}
+{{- if and (eq .Values.storage.backend "s3") .Values.storage.s3.region }}
+- name: AWS_DEFAULT_REGION
+  value: {{ .Values.storage.s3.region | quote }}
+{{- end }}
 {{- with .Values.otel.exporterEndpoint }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ . | quote }}
@@ -129,52 +174,23 @@ a single sweeper avoids redundant per-interval listing.
 {{- end }}
 
 {{/*
-Receiver-role env (RFC 0003). The WAL root is the per-replica local PVC mount —
-never S3 (CLAUDE.md §3.4/§3.6).
+The mounted RFC 0020 config file, passed to the binary via --config. The
+ConfigMap holds one key per role; each workload mounts its own to
+/etc/ourios/config.yaml. Pass (dict "root" $ "role" "<role>") for the volume.
 */}}
-{{- define "ourios.receiverEnv" -}}
-- name: OURIOS_RECEIVER_ENABLED
-  value: "true"
-# Compaction runs only on the dedicated compactor (RFC 0009 §3.2).
-- name: OURIOS_COMPACTION_ENABLED
-  value: "0"
-- name: OURIOS_RECEIVER_GRPC_ADDR
-  value: "0.0.0.0:4317"
-- name: OURIOS_RECEIVER_HTTP_ADDR
-  value: "0.0.0.0:4318"
-- name: OURIOS_WAL_ROOT
-  value: {{ .Values.receiver.wal.mountPath | quote }}
+{{- define "ourios.configVolume" -}}
+- name: config
+  configMap:
+    name: {{ include "ourios.fullname" .root }}-config
+    items:
+      - key: {{ .role }}.yaml
+        path: config.yaml
 {{- end }}
 
-{{/*
-Querier-role env (RFC 0016).
-*/}}
-{{- define "ourios.querierEnv" -}}
-{{- if le (int .Values.querier.defaultWindowSecs) 0 }}
-{{- fail (printf "querier.defaultWindowSecs must be a positive integer (seconds), got %v" .Values.querier.defaultWindowSecs) }}
-{{- end }}
-- name: OURIOS_QUERIER_ENABLED
-  value: "true"
-# Compaction runs only on the dedicated compactor (RFC 0009 §3.2).
-- name: OURIOS_COMPACTION_ENABLED
-  value: "0"
-- name: OURIOS_QUERIER_HTTP_ADDR
-  value: "0.0.0.0:4319"
-- name: OURIOS_QUERIER_DEFAULT_WINDOW_SECS
-  value: {{ .Values.querier.defaultWindowSecs | quote }}
-{{- end }}
-
-{{/*
-Compactor-role env (RFC 0009): the sweep cadence. Compaction is on by default
-in the binary, so the dedicated compactor needs no enable flag — only the
-interval. The receiver/querier disable it via OURIOS_COMPACTION_ENABLED=0.
-*/}}
-{{- define "ourios.compactorEnv" -}}
-{{- if le (int .Values.compactor.intervalSecs) 0 }}
-{{- fail (printf "compactor.intervalSecs must be a positive integer (seconds), got %v" .Values.compactor.intervalSecs) }}
-{{- end }}
-- name: OURIOS_COMPACTION_INTERVAL_SECS
-  value: {{ .Values.compactor.intervalSecs | quote }}
+{{- define "ourios.configVolumeMount" -}}
+- name: config
+  mountPath: /etc/ourios
+  readOnly: true
 {{- end }}
 
 {{/*

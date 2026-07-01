@@ -13,7 +13,15 @@ metadata:
   labels:
     {{- include "ourios.labels" . | nindent 4 }}
 data:
+{{- /*
+Only enabled workloads get a config key — an absent role is never deployed, and
+`ourios.config` validates role-specific values (window / interval > 0), so
+rendering a disabled role would validate values it never uses. Each key mirrors
+the `| trim` the checksum/config pod annotation hashes.
+*/}}
 {{- range $role := list "receiver" "querier" "compactor" }}
+{{- if (index $.Values $role).enabled }}
   {{ $role }}.yaml: |
     {{- include "ourios.config" (dict "root" $ "role" $role) | trim | nindent 4 }}
+{{- end }}
 {{- end }}

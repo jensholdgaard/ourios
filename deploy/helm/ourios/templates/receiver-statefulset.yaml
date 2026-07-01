@@ -34,7 +34,7 @@ spec:
         {{- end }}
       annotations:
         # Roll the pods when the mounted RFC 0020 config changes.
-        checksum/config: {{ include "ourios.config" (dict "root" . "role" "receiver") | sha256sum }}
+        checksum/config: {{ include "ourios.config" (dict "root" . "role" "receiver") | trim | sha256sum }}
         {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.receiver.podAnnotations)) }}
         {{- . | nindent 8 }}
         {{- end }}

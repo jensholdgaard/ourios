@@ -3165,6 +3165,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "testcontainers-modules",
  "tokio",

@@ -781,6 +781,44 @@ querier:
         );
     }
 
+    /// `config_from_file` end-to-end through the real filesystem: a valid file
+    /// reads and resolves, and both failure paths name the offending file — a
+    /// missing file via the read-error prefix, a parse failure via the
+    /// config-file prefix (RFC0020.1 read path / RFC0020.5 error reporting).
+    #[test]
+    fn config_from_file_reads_maps_and_names_the_path() {
+        use std::io::Write as _;
+
+        // Happy path: a self-contained file (no `${env:…}` refs) reads and maps.
+        let mut good = tempfile::NamedTempFile::new().expect("temp file");
+        write!(
+            good,
+            "storage:\n  local:\n    bucket_root: /store\nquerier:\n  enabled: true\n"
+        )
+        .expect("write");
+        let config = config_from_file(good.path()).expect("valid file resolves");
+        assert_eq!(config.store, local("/store"));
+        assert!(config.querier.is_some(), "the querier role is enabled");
+
+        // A missing file is reported with the read-error prefix and the path.
+        let missing = Path::new("/no/such/ourios-config.yaml");
+        let err = config_from_file(missing).expect_err("missing file");
+        assert!(err.contains("read config file"), "read-error prefix: {err}");
+        assert!(err.contains("ourios-config.yaml"), "names the path: {err}");
+
+        // A parse failure is reported with the config-file prefix, the path, and
+        // the offending reference — never a resolved value.
+        let mut bad = tempfile::NamedTempFile::new().expect("temp file");
+        write!(bad, "storage:\n  backend: ${{1BAD}}\n").expect("write");
+        let err = config_from_file(bad.path()).expect_err("malformed reference");
+        assert!(err.contains("config file"), "config-file prefix: {err}");
+        assert!(err.contains("${1BAD}"), "names the reference: {err}");
+        assert!(
+            err.contains(&bad.path().display().to_string()),
+            "names the path: {err}",
+        );
+    }
+
     #[test]
     fn build_config_defaults_the_interval() {
         // Arrange / Act

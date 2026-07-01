@@ -35,6 +35,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clap::Parser;
 use ourios_ingester::Compactor;
 use ourios_parquet::{CompactionPolicy, ParquetAuditSink, S3Config, StoreConfig};
 use ourios_server::config::file::FileConfig;
@@ -155,22 +156,32 @@ fn config_from_env() -> Result<ServerConfig, String> {
     Ok(config)
 }
 
-/// The `--config <path>` CLI flag, if present (RFC 0020 §3.2). `None` selects the
-/// env-only path, which runs unchanged (§3.2, non-breaking). Accepts both
-/// `--config <path>` and `--config=<path>`; a dangling `--config` or an
-/// unrecognised argument is an error (the binary otherwise takes no arguments).
-fn config_path_from_args(args: impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
-    let mut args = args.skip(1); // argv[0] is the program name
-    let Some(arg) = args.next() else {
-        return Ok(None);
-    };
-    if let Some(path) = arg.strip_prefix("--config=") {
-        Ok(Some(PathBuf::from(path)))
-    } else if arg == "--config" {
-        let path = args.next().ok_or("--config requires a path argument")?;
-        Ok(Some(PathBuf::from(path)))
+/// Ourios log-storage server (`CLAUDE.md` §1).
+///
+/// Configuration is read from the `--config` file (RFC 0020) when given,
+/// otherwise from `OURIOS_*` environment variables.
+// A derived `clap` parser (rather than hand-rolled) for `--help`/`--version`,
+// usage, and argument-error handling (missing value, unknown flag, trailing
+// arguments) — the RFC 0020 §3.2 CLI contract, for free.
+#[derive(Debug, clap::Parser)]
+#[command(name = "ourios-server", version, about = "Ourios log-storage server")]
+struct Cli {
+    /// Path to a YAML configuration file (RFC 0020). When given, the file is the
+    /// sole source of configuration and the environment participates only through
+    /// `${env:…}` substitution inside it; without it, configuration comes from
+    /// `OURIOS_*` environment variables.
+    #[arg(long, value_name = "PATH", value_parser = non_empty_path)]
+    config: Option<PathBuf>,
+}
+
+/// A `--config` value parser that rejects an empty path (a required argument
+/// must name a file), yielding a clear `clap` error rather than a later
+/// file-not-found on `""`.
+fn non_empty_path(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() {
+        Err("the config path must not be empty".to_owned())
     } else {
-        Err(format!("unrecognised argument {arg:?}"))
+        Ok(PathBuf::from(value))
     }
 }
 
@@ -182,7 +193,7 @@ fn config_from_file(path: &Path) -> Result<ServerConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read config file {}: {e}", path.display()))?;
     let file = ourios_server::config::file::parse(&text, &|name| std::env::var(name).ok())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("config file {}: {e}", path.display()))?;
     server_config_from_file(&file)
 }
 
@@ -467,8 +478,9 @@ async fn terminate_signal() {
 async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
     // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
-    let config = match config_path_from_args(std::env::args())? {
-        Some(path) => config_from_file(&path)?,
+    let cli = Cli::parse();
+    let config = match cli.config.as_deref() {
+        Some(path) => config_from_file(path)?,
         None => config_from_env()?,
     };
 
@@ -709,32 +721,32 @@ querier:
         );
     }
 
-    /// Scenario RFC0020.4 — no `--config` selects the env-only path unchanged.
+    /// Scenario RFC0020.4 — no `--config` selects the env-only path unchanged;
+    /// the `--config` CLI contract is enforced by `clap`.
     /// See `docs/rfcs/0020-configuration-file.md` §5.
     #[test]
     fn rfc0020_4_no_config_flag_selects_the_env_path() {
-        let argv = |args: &[&str]| args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.config);
 
         // No flag → None → `config_from_env` runs (its behaviour is unchanged,
         // guarded by the `build_*`/`config_from_env` suites).
-        assert_eq!(
-            config_path_from_args(argv(&["ourios-server"]).into_iter()).expect("ok"),
-            None,
-        );
+        assert_eq!(parse(&["ourios-server"]).expect("ok"), None);
         // `--config <path>` and `--config=<path>` both select the file.
         assert_eq!(
-            config_path_from_args(argv(&["ourios-server", "--config", "/c.yaml"]).into_iter())
-                .expect("ok"),
+            parse(&["ourios-server", "--config", "/c.yaml"]).expect("ok"),
             Some(PathBuf::from("/c.yaml")),
         );
         assert_eq!(
-            config_path_from_args(argv(&["ourios-server", "--config=/c.yaml"]).into_iter())
-                .expect("ok"),
+            parse(&["ourios-server", "--config=/c.yaml"]).expect("ok"),
             Some(PathBuf::from("/c.yaml")),
         );
-        // A dangling `--config` and an unknown argument are rejected.
-        assert!(config_path_from_args(argv(&["ourios-server", "--config"]).into_iter()).is_err());
-        assert!(config_path_from_args(argv(&["ourios-server", "--nope"]).into_iter()).is_err());
+        // A dangling `--config`, an empty path, a trailing extra argument, and an
+        // unknown argument are all rejected (clap enforces the CLI contract).
+        assert!(parse(&["ourios-server", "--config"]).is_err());
+        assert!(parse(&["ourios-server", "--config="]).is_err());
+        assert!(parse(&["ourios-server", "--config", "/c.yaml", "--extra"]).is_err());
+        assert!(parse(&["ourios-server", "--config=/c.yaml", "x"]).is_err());
+        assert!(parse(&["ourios-server", "--nope"]).is_err());
     }
 
     /// Scenario RFC0020.5 (value arm) — a well-formed file whose *value* the

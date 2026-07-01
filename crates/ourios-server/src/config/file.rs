@@ -56,6 +56,9 @@ fn substitute(
 /// safe to surface even when a sibling scalar holds a secret (RFC 0020 §3.5 /
 /// RFC 0019 §3.4).
 ///
+/// `Display` forwards to the underlying error; the caller supplies the file
+/// context (e.g. `config file <path>: <this>`), so the two do not stack.
+///
 /// `#[non_exhaustive]` — the `--config` wiring slice adds file-I/O and
 /// value-validation variants; forcing a wildcard arm keeps that non-breaking
 /// for downstream matches (the codebase's public-error-enum convention, e.g.
@@ -73,8 +76,8 @@ pub enum FileConfigError {
 impl fmt::Display for FileConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Substitution(e) => write!(f, "configuration file: {e}"),
-            Self::Schema(e) => write!(f, "configuration file: {e}"),
+            Self::Substitution(e) => e.fmt(f),
+            Self::Schema(e) => e.fmt(f),
         }
     }
 }

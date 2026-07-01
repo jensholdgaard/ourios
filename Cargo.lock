@@ -3150,6 +3150,7 @@ name = "ourios-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "clap",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",

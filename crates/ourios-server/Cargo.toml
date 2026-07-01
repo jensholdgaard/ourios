@@ -48,6 +48,10 @@ ourios-querier = { path = "../ourios-querier" }
 # `parse_structured_statement`.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# CLI argument parsing (`--config <path>`, RFC 0020 §3.2). The ecosystem-standard
+# parser; the derive API gives usage/help + edge-case handling (missing value,
+# unknown flag, trailing args) for free. Lean feature set — no color/suggestions.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 # RFC 0020 configuration-file schema (config::file): deserialise the YAML into
 # the schema, then substitute `${env:…}` in the typed scalar leaves (schema
 # validation runs on the raw text first, so an error never echoes a resolved

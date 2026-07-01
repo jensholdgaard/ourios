@@ -8,7 +8,7 @@
 //!   public `ourios_server::config::file::parse` entry point.
 //! - **`.1`/`.3`/`.4`/`.5`** exercise the resolved (private) `ServerConfig` — the
 //!   file→`ServerConfig` mapping (`server_config_from_file`), the `--config`
-//!   selection (`config_path_from_args`), and the shared `build_*` validators —
+//!   selection (the `clap` `Cli`), and the shared `build_*` validators —
 //!   so they are unit tests in `src/main.rs` (`rfc0020_1_*` … `rfc0020_5_*`),
 //!   which can reach those items. The malformed-reference / unknown-key arms of
 //!   `.5` are additionally covered in `config::file`.

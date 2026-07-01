@@ -1,0 +1,29 @@
+{{- /*
+RFC 0020 configuration files, one key per role. Each workload mounts its own key
+to /etc/ourios/config.yaml and runs the binary with --config, so the file is the
+authoritative source of Ourios's configuration — bare OURIOS_* env vars do not
+override it (§3.2). Object-store credentials are ${env:…} references resolved
+from the Secret via envFrom (§3.5); OTEL_* / AWS_* stay env (§3.8). A
+checksum/config pod annotation rolls the workloads when this changes.
+
+Only enabled workloads get a config key — an absent role is never deployed, and
+`ourios.config` validates role-specific values (window / interval > 0), so
+rendering a disabled role would validate values it never uses. Each key mirrors
+the `| trim` the checksum/config pod annotation hashes. The whole object is
+skipped when every role is disabled, so `data` is never an empty (`null`) map.
+*/}}
+{{- if or .Values.receiver.enabled .Values.querier.enabled .Values.compactor.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ourios.fullname" . }}-config
+  labels:
+    {{- include "ourios.labels" . | nindent 4 }}
+data:
+{{- range $role := list "receiver" "querier" "compactor" }}
+{{- if (index $.Values $role).enabled }}
+  {{ $role }}.yaml: |
+    {{- include "ourios.config" (dict "root" $ "role" $role) | trim | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -32,10 +32,12 @@ spec:
         {{- with .Values.receiver.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.receiver.podAnnotations)) }}
       annotations:
+        # Roll the pods when the mounted RFC 0020 config changes.
+        checksum/config: {{ include "ourios.config" (dict "root" . "role" "receiver") | trim | sha256sum }}
+        {{- with (include "ourios.podAnnotations" (dict "global" .Values.podAnnotations "role" .Values.receiver.podAnnotations)) }}
         {{- . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -55,9 +57,14 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          args:
+            - --config
+            - /etc/ourios/config.yaml
+          {{- $env := include "ourios.commonEnv" . | trim }}
+          {{- if $env }}
           env:
-            {{- include "ourios.commonEnv" . | nindent 12 }}
-            {{- include "ourios.receiverEnv" . | nindent 12 }}
+            {{- $env | nindent 12 }}
+          {{- end }}
           {{- include "ourios.s3CredentialsEnvFrom" . | nindent 10 }}
           ports:
             - name: otlp-grpc
@@ -85,6 +92,7 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            {{- include "ourios.configVolumeMount" . | nindent 12 }}
             - name: wal
               mountPath: {{ .Values.receiver.wal.mountPath }}
             {{- include "ourios.dataVolumeMount" . | nindent 12 }}
@@ -92,6 +100,7 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
+        {{- include "ourios.configVolume" (dict "root" . "role" "receiver") | nindent 8 }}
         - name: tmp
           emptyDir: {}
         {{- include "ourios.dataVolume" . | nindent 8 }}

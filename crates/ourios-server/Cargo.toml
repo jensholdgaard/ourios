@@ -48,6 +48,13 @@ ourios-querier = { path = "../ourios-querier" }
 # `parse_structured_statement`.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# RFC 0020 configuration-file schema (config::file): deserialise the YAML into
+# the schema, then substitute `${env:…}` in the typed scalar leaves (schema
+# validation runs on the raw text first, so an error never echoes a resolved
+# secret — the order is security-relevant, see the module docs). Already vetted
+# in the dep tree (ourios-querier pins the same version), so this adds no new
+# cargo-deny surface.
+serde_yaml = { version = "=0.9.34", default-features = false }
 # `LogsServiceServer` to host the receiver's `LogsService` impl over gRPC.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs"] }
 # gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16).

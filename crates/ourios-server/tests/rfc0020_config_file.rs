@@ -24,12 +24,46 @@ fn rfc0020_1_complete_file_resolves_to_expected_server_config() {
 
 /// Scenario RFC0020.2 — environment substitution follows the `OTel` Config WG model.
 /// See `docs/rfcs/0020-configuration-file.md` §5.
+///
+/// Green: the resolver conformance vectors live in
+/// `ourios_server::config::env_subst` (the WG input→output table + escape /
+/// non-recursion invariants + proptest), and the scalar-value walk that applies
+/// them to a parsed file — scalar-only (mapping keys verbatim), non-recursive
+/// (no injected YAML structure), `$$` escaping, type-after-substitution — lives
+/// in `ourios_server::config::file`. This end-to-end check pins the two together
+/// through the public `parse` entry point.
 #[test]
-#[ignore = "RFC0020.2 stub — implemented in the green slice"]
 fn rfc0020_2_env_substitution_follows_the_otel_config_wg_model() {
-    todo!(
-        "RFC0020.2 — ${{env:NAME}}/${{NAME}}, :-default, $$ escape; scalar-only, non-recursive; the WG vector table"
-    );
+    let lookup = |name: &str| match name {
+        "BUCKET" => Some("logs".to_owned()),
+        "WINDOW" => Some("1800".to_owned()),
+        _ => None,
+    };
+    let yaml = "\
+storage:
+  backend: ${env:BACKEND:-s3}
+  s3:
+    bucket: ${BUCKET}
+    endpoint: ${env:MISSING}
+    prefix: a$$b
+querier:
+  enabled: ${QUERIER_ON:-true}
+  default_window_secs: ${env:WINDOW}
+";
+    let cfg = ourios_server::config::file::parse(yaml, &lookup).expect("valid file");
+
+    assert_eq!(cfg.storage.backend.as_deref(), Some("s3")); // :-default on unset
+    assert_eq!(cfg.storage.s3.bucket.as_deref(), Some("logs")); // ${env:} / ${}
+    assert_eq!(cfg.storage.s3.endpoint.as_deref(), Some("")); // undefined, no default
+    assert_eq!(cfg.storage.s3.prefix.as_deref(), Some("a$b")); // $$ → literal $
+    assert_eq!(cfg.querier.enabled.as_deref(), Some("true"));
+    assert_eq!(cfg.querier.default_window_secs.as_deref(), Some("1800"));
+
+    // A malformed reference in a scalar value fails the whole file (no partial
+    // resolution), naming the reference and not any resolved value.
+    let err = ourios_server::config::file::parse("storage:\n  backend: ${1BAD}\n", &lookup)
+        .expect_err("malformed reference");
+    assert!(err.to_string().contains("${1BAD}"));
 }
 
 /// Scenario RFC0020.3 — file is authoritative; a bare env var does not override.

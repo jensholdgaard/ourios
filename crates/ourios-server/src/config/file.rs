@@ -8,9 +8,9 @@
 //! substituted view of the file.
 //!
 //! **Order: validate the schema, then substitute.** Deserialisation runs on the
-//! *raw* (pre-substitution) tree, so a shape or unknown-key error references the
-//! file's own text — a bare `${env:SECRET}` written where a section is expected
-//! is reported as `invalid type: string "${env:SECRET}", …`, naming the
+//! *raw* (pre-substitution) YAML text, so a shape or unknown-key error references
+//! the file's own text — a bare `${env:SECRET}` written where a section is
+//! expected is reported as `invalid type: string "${env:SECRET}", …`, naming the
 //! reference, never a resolved secret (RFC 0020 §3.5 / RFC 0019 §3.4). `serde`
 //! never sees a substituted value. Substitution then rewrites the typed scalar
 //! leaves in place — the parsed *values* only, so mapping keys (which became
@@ -35,7 +35,6 @@
 use std::fmt;
 
 use serde::Deserialize;
-use serde_yaml::Value;
 
 use super::env_subst::{self, MalformedReference};
 
@@ -225,15 +224,15 @@ pub fn parse(
     yaml: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<FileConfig, FileConfigError> {
-    let tree: Value = serde_yaml::from_str(yaml).map_err(FileConfigError::Schema)?;
-    // An empty document parses to `Null`; treat it as an all-default config
-    // rather than a type error (deserialising `Null` into a struct fails).
-    if tree.is_null() {
-        return Ok(FileConfig::default());
-    }
-    // Validate on the raw (pre-substitution) tree: any shape / unknown-key error
-    // then names the file's own text, never a resolved secret (RFC 0020 §3.5).
-    let mut config: FileConfig = serde_yaml::from_value(tree).map_err(FileConfigError::Schema)?;
+    // Deserialise straight from the text (not via an intermediate `serde_yaml::
+    // Value`) so a schema error keeps its source location. Validation runs on the
+    // raw (pre-substitution) text, so any shape / unknown-key error names the
+    // file's own text, never a resolved secret (RFC 0020 §3.5). `Option` lets an
+    // empty / null document resolve to an all-default config (`None`) rather than
+    // fail the `null`-into-struct type check.
+    let mut config: FileConfig = serde_yaml::from_str::<Option<FileConfig>>(yaml)
+        .map_err(FileConfigError::Schema)?
+        .unwrap_or_default();
     config
         .substitute(lookup)
         .map_err(FileConfigError::Substitution)?;

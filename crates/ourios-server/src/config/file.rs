@@ -2,7 +2,7 @@
 //!
 //! [`parse`] turns config-file text into a [`FileConfig`]: it parses the YAML
 //! into a node tree, substitutes `${env:…}` references in the scalar **values**
-//! ([`env_subst`](super::env_subst)), then deserialises the substituted tree
+//! ([`env_subst`]), then deserialises the substituted tree
 //! into the schema. Mapping onto the resolved server config (via the existing
 //! `build_*` validators — the single validation path, RFC 0020 §3.1) is the
 //! `--config` wiring layer in the binary; this module stops at a validated,
@@ -12,8 +12,8 @@
 //! §3.3): the walk descends the node tree and rewrites only scalar *values*, so
 //! mapping keys are left verbatim (rule 4) and a substituted value is inserted
 //! as-is and never re-parsed into YAML structure (rule 5 — the security
-//! boundary). It is not recursive: [`env_subst::resolve`](super::env_subst::resolve)
-//! emits the resolved value without re-scanning it.
+//! boundary). It is not recursive: [`env_subst::resolve`] emits the resolved
+//! value without re-scanning it.
 //!
 //! **Type after substitution** (rule 7) is resolved at the typed boundary rather
 //! than by re-tagging the node tree. `serde_yaml`'s `Value` does not preserve a

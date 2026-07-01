@@ -3,7 +3,7 @@
 //! The config file (`--config <path>`) maps onto the resolved server config the
 //! binary builds; this module holds the file-loading pieces: the
 //! environment-variable substitution resolver ([`env_subst`]) and the YAML
-//! schema plus its substitution walk ([`file`]). The `--config` CLI wiring and
+//! schema plus its substitution walk ([`file`](mod@file)). The `--config` CLI wiring and
 //! the mapping onto the resolved `ServerConfig` (through the existing `build_*`
 //! validators — the single validation path) land in a subsequent RFC 0020 green
 //! slice.

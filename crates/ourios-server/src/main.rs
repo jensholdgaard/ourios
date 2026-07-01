@@ -16,6 +16,12 @@
 //! and shuts down gracefully on SIGINT or SIGTERM (the latter is what k8s /
 //! `nerdctl stop` send), then telemetry flushes.
 //!
+//! Configuration comes from `OURIOS_*` environment variables, or — when
+//! `--config <path>` is given — from a YAML file with `${env:…}` substitution
+//! (RFC 0020). With `--config` the file is the sole source of Ourios's
+//! configuration and bare `OURIOS_*` env vars do not override it; both paths
+//! resolve the same [`ServerConfig`] through the same `build_*` validators.
+//!
 //! A structured-logging framework (`CLAUDE.md` §6.3 — errors go to stderr as
 //! a stopgap here) is a follow-up.
 
@@ -31,6 +37,7 @@ use std::time::Duration;
 
 use ourios_ingester::Compactor;
 use ourios_parquet::{CompactionPolicy, ParquetAuditSink, S3Config, StoreConfig};
+use ourios_server::config::file::FileConfig;
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
 
@@ -144,6 +151,81 @@ fn config_from_env() -> Result<ServerConfig, String> {
         std::env::var("OURIOS_QUERIER_DEFAULT_WINDOW_SECS")
             .ok()
             .as_deref(),
+    )?;
+    Ok(config)
+}
+
+/// The `--config <path>` CLI flag, if present (RFC 0020 §3.2). `None` selects the
+/// env-only path, which runs unchanged (§3.2, non-breaking). Accepts both
+/// `--config <path>` and `--config=<path>`; a dangling `--config` or an
+/// unrecognised argument is an error (the binary otherwise takes no arguments).
+fn config_path_from_args(args: impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
+    let mut args = args.skip(1); // argv[0] is the program name
+    let Some(arg) = args.next() else {
+        return Ok(None);
+    };
+    if let Some(path) = arg.strip_prefix("--config=") {
+        Ok(Some(PathBuf::from(path)))
+    } else if arg == "--config" {
+        let path = args.next().ok_or("--config requires a path argument")?;
+        Ok(Some(PathBuf::from(path)))
+    } else {
+        Err(format!("unrecognised argument {arg:?}"))
+    }
+}
+
+/// Resolve [`ServerConfig`] from a YAML configuration file (RFC 0020). The file
+/// is the **sole** source of Ourios's configuration; the environment
+/// participates only through `${env:…}` substitution inside it (§3.2), so a bare
+/// `OURIOS_*` env var never overrides a file value.
+fn config_from_file(path: &Path) -> Result<ServerConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read config file {}: {e}", path.display()))?;
+    let file = ourios_server::config::file::parse(&text, &|name| std::env::var(name).ok())
+        .map_err(|e| e.to_string())?;
+    server_config_from_file(&file)
+}
+
+/// Map a parsed [`FileConfig`] onto the resolved [`ServerConfig`] through the
+/// **same** `build_*` validators the environment path uses — the single
+/// validation path (RFC 0020 §3.1). `FileConfig`'s leaves are already the
+/// string-valued inputs those functions expect, so this is a pass-through: the
+/// file front-end adds no second set of validation rules.
+///
+/// The validators name `OURIOS_*` env vars in their error text; a file-sourced
+/// value that fails reuses that message rather than duplicating the rule — the
+/// §3.1 trade-off of one validation path (localising the error text to YAML keys
+/// is a possible follow-up).
+fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
+    let store = build_store_config(
+        file.storage.backend.as_deref(),
+        file.storage.local.bucket_root.as_deref().map(PathBuf::from),
+        file.storage.s3.bucket.as_deref(),
+        file.storage.s3.endpoint.as_deref(),
+        file.storage.s3.region.as_deref(),
+        file.storage.s3.prefix.as_deref(),
+    )?;
+    let store = with_s3_credentials(
+        store,
+        file.storage.s3.access_key_id.as_deref(),
+        file.storage.s3.secret_access_key.as_deref(),
+        file.storage.s3.session_token.as_deref(),
+    );
+    let mut config = build_config(
+        store,
+        file.compaction.enabled.as_deref(),
+        file.compaction.interval_secs.as_deref(),
+    )?;
+    config.receiver = build_receiver_config(
+        file.receiver.enabled.as_deref(),
+        file.receiver.grpc_addr.as_deref(),
+        file.receiver.http_addr.as_deref(),
+        file.receiver.wal_root.as_deref().map(PathBuf::from),
+    )?;
+    config.querier = build_querier_config(
+        file.querier.enabled.as_deref(),
+        file.querier.http_addr.as_deref(),
+        file.querier.default_window_secs.as_deref(),
     )?;
     Ok(config)
 }
@@ -383,7 +465,12 @@ async fn terminate_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = config_from_env()?;
+    // `--config <path>` selects the RFC 0020 file front-end; without it the
+    // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
+    let config = match config_path_from_args(std::env::args())? {
+        Some(path) => config_from_file(&path)?,
+        None => config_from_env()?,
+    };
 
     // Pre-create a local store root (`Store::local` canonicalises it and errors
     // on a missing dir); an S3 backend needs no such step. Mirrors the querier
@@ -537,9 +624,149 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    use ourios_server::config::file::parse;
+
     /// A `local` [`StoreConfig`] for `path`, the common test fixture.
     fn local(path: &str) -> StoreConfig {
         StoreConfig::Local(PathBuf::from(path))
+    }
+
+    /// Parse `yaml` with an empty environment, then map it onto a `ServerConfig`
+    /// through the shared `build_*` validators (RFC 0020 §3.1).
+    fn server_config(yaml: &str) -> Result<ServerConfig, String> {
+        let file = parse(yaml, &|_| None).expect("well-formed file");
+        server_config_from_file(&file)
+    }
+
+    /// Scenario RFC0020.1 — a complete file resolves to the same `ServerConfig`
+    /// the equivalent `OURIOS_*` environment would produce, field for field.
+    /// See `docs/rfcs/0020-configuration-file.md` §5.
+    #[test]
+    fn rfc0020_1_file_resolves_to_the_same_config_as_the_env() {
+        let from_file = server_config(
+            "\
+storage:
+  backend: s3
+  s3:
+    bucket: my-logs
+receiver:
+  enabled: true
+  wal_root: /var/lib/ourios/wal
+querier:
+  enabled: true
+compaction:
+  interval_secs: 120
+",
+        )
+        .expect("valid");
+
+        // The same values expressed through the env-path helpers (the shared
+        // validators), as `config_from_env` would assemble them.
+        let store = with_s3_credentials(
+            build_store_config(Some("s3"), None, Some("my-logs"), None, None, None).expect("s3"),
+            None,
+            None,
+            None,
+        );
+        let mut expected = build_config(store, None, Some("120")).expect("valid");
+        expected.receiver = build_receiver_config(
+            Some("true"),
+            None,
+            None,
+            Some(PathBuf::from("/var/lib/ourios/wal")),
+        )
+        .expect("receiver");
+        expected.querier = build_querier_config(Some("true"), None, None).expect("querier");
+
+        assert_eq!(from_file, expected);
+    }
+
+    /// Scenario RFC0020.3 — the file is authoritative; a bare `OURIOS_*` env var
+    /// does not override a file value (only `${env:…}` refs inside the file
+    /// consult the environment). See `docs/rfcs/0020-configuration-file.md` §5.
+    #[test]
+    fn rfc0020_3_file_value_is_authoritative_over_bare_env() {
+        let yaml = "\
+storage:
+  local:
+    bucket_root: /store
+querier:
+  enabled: true
+  default_window_secs: 1800
+";
+        // The lookup "sets" the bare env knob to 3600, but the file has no
+        // `${env:…}` reference to it, so it is never consulted.
+        let file = parse(yaml, &|name| {
+            (name == "OURIOS_QUERIER_DEFAULT_WINDOW_SECS").then(|| "3600".to_owned())
+        })
+        .expect("valid");
+        let config = server_config_from_file(&file).expect("valid");
+
+        assert_eq!(
+            config.querier.expect("enabled").default_window_nanos,
+            1800 * NANOS_PER_SEC,
+            "the file value wins; the bare env var is ignored",
+        );
+    }
+
+    /// Scenario RFC0020.4 — no `--config` selects the env-only path unchanged.
+    /// See `docs/rfcs/0020-configuration-file.md` §5.
+    #[test]
+    fn rfc0020_4_no_config_flag_selects_the_env_path() {
+        let argv = |args: &[&str]| args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+        // No flag → None → `config_from_env` runs (its behaviour is unchanged,
+        // guarded by the `build_*`/`config_from_env` suites).
+        assert_eq!(
+            config_path_from_args(argv(&["ourios-server"]).into_iter()).expect("ok"),
+            None,
+        );
+        // `--config <path>` and `--config=<path>` both select the file.
+        assert_eq!(
+            config_path_from_args(argv(&["ourios-server", "--config", "/c.yaml"]).into_iter())
+                .expect("ok"),
+            Some(PathBuf::from("/c.yaml")),
+        );
+        assert_eq!(
+            config_path_from_args(argv(&["ourios-server", "--config=/c.yaml"]).into_iter())
+                .expect("ok"),
+            Some(PathBuf::from("/c.yaml")),
+        );
+        // A dangling `--config` and an unknown argument are rejected.
+        assert!(config_path_from_args(argv(&["ourios-server", "--config"]).into_iter()).is_err());
+        assert!(config_path_from_args(argv(&["ourios-server", "--nope"]).into_iter()).is_err());
+    }
+
+    /// Scenario RFC0020.5 (value arm) — a well-formed file whose *value* the
+    /// shared validators reject fails fast, through the same rule the env path
+    /// enforces; no partial config is produced. (The malformed-reference and
+    /// unknown-key arms are covered in `config::file`.)
+    /// See `docs/rfcs/0020-configuration-file.md` §5.
+    #[test]
+    fn rfc0020_5_invalid_file_value_fails_fast() {
+        // `s3` backend with no bucket — the same validation as the env path.
+        let err = server_config("storage:\n  backend: s3\n").expect_err("s3 needs a bucket");
+        assert!(
+            err.contains("S3_BUCKET"),
+            "names the missing bucket: {err:?}"
+        );
+
+        // A non-numeric querier window is rejected.
+        let err = server_config(
+            "\
+storage:
+  local:
+    bucket_root: /store
+querier:
+  enabled: true
+  default_window_secs: soon
+",
+        )
+        .expect_err("bad window");
+        assert!(
+            err.contains("DEFAULT_WINDOW_SECS"),
+            "names the offending field: {err:?}",
+        );
     }
 
     #[test]

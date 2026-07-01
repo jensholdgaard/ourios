@@ -12,8 +12,10 @@
 //!   so they are unit tests in `src/main.rs` (`rfc0020_1_*` … `rfc0020_5_*`),
 //!   which can reach those items. The malformed-reference / unknown-key arms of
 //!   `.5` are additionally covered in `config::file`.
-//! - **`.6`** (secret hygiene across the file path) is the remaining stub, filled
-//!   by the secret-hygiene green slice.
+//! - **`.6`** (secret hygiene across the file path) is here for its public
+//!   surface — inline-literal-credential rejection (error names the key, not the
+//!   value) and `Debug` redaction; the resolved-secret-plus-sibling-error case is
+//!   a `src/main.rs` unit test.
 //!
 //! See `docs/rfcs/0020-configuration-file.md` §5 / §6.
 
@@ -65,12 +67,43 @@ querier:
 // resolved (private) `ServerConfig`, the `--config` selection, and the shared
 // `build_*` validators (see the module docs above).
 
-/// Scenario RFC0020.6 — secret hygiene across the file path.
+/// Scenario RFC0020.6 — secret hygiene across the file path (public surface).
+///
+/// Object-store credentials must be `${env:…}` references, not inline literals
+/// (§3.5): an inline literal is rejected with an error that names the key, never
+/// the value; and a resolved credential is redacted in the config's `Debug`. The
+/// resolved-secret-plus-sibling-error case is a unit test in `src/main.rs`
+/// (`rfc0020_6_*`, which reaches the private mapping).
 /// See `docs/rfcs/0020-configuration-file.md` §5.
 #[test]
-#[ignore = "RFC0020.6 stub — implemented in the green slice"]
 fn rfc0020_6_secret_hygiene_across_the_file_path() {
-    todo!(
-        "RFC0020.6 — resolved secret never logged; config error names the key/env-var, never the value"
+    use ourios_server::config::file::parse;
+
+    // An inline-literal credential is rejected; the error names the key only.
+    let err = parse(
+        "storage:\n  s3:\n    secret_access_key: AKIAINLINELITERAL\n",
+        &|_| None,
+    )
+    .expect_err("inline literal");
+    let msg = err.to_string();
+    assert!(msg.contains("secret_access_key"), "names the key: {msg}");
+    assert!(!msg.contains("AKIAINLINELITERAL"), "never the value: {msg}");
+
+    // A resolved credential (a real value) is redacted in the config's `Debug`.
+    let secret = "s3cr3t-resolved-value";
+    let cfg = parse(
+        "storage:\n  s3:\n    bucket: b\n    secret_access_key: ${env:SECRET}\n",
+        &|name| (name == "SECRET").then(|| secret.to_owned()),
+    )
+    .expect("valid file");
+    assert_eq!(cfg.storage.s3.secret_access_key.as_deref(), Some(secret));
+    let rendered = format!("{:?}", cfg.storage.s3);
+    assert!(
+        !rendered.contains(secret),
+        "the secret must not render: {rendered}"
+    );
+    assert!(
+        rendered.contains("<redacted>"),
+        "shows presence only: {rendered}"
     );
 }

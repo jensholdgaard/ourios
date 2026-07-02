@@ -209,12 +209,13 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .with_resource(resource.clone())
         .build();
 
-    global::set_meter_provider(provider.clone());
-
     // Logs (CLAUDE.md §6.3 dogfooding): `tracing` events → OTel log
     // records → the OTLP batch exporter. The batch (not simple)
     // processor is load-bearing — a simple/synchronous export deadlocks
-    // inside tonic request contexts.
+    // inside tonic request contexts. Built *before* the meter provider is
+    // installed globally: every fallible step happens first, so a failed
+    // `init` cannot leave a live pipeline behind that the caller has no
+    // guard to shut down.
     let mut builder = LogExporter::builder().with_tonic();
     if let Some(endpoint) = &config.otlp_endpoint {
         builder = builder.with_endpoint(endpoint.clone());
@@ -224,6 +225,8 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .with_batch_exporter(log_exporter)
         .with_resource(resource)
         .build();
+
+    global::set_meter_provider(provider.clone());
 
     // The bridge honours `RUST_LOG` (default `info`) like the stderr copy,
     // so exported volume can be turned down (`warn`) or up (`debug`) the

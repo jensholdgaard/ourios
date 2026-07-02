@@ -338,18 +338,42 @@ jobs:
     needs: capture
     # Only when a tag is given. Split from `capture` so the
     # write-capable token is held only by this job, which runs no
-    # third-party code — just downloads the captured artifact and
-    # cuts the release.
+    # third-party code — just downloads the captured artifact,
+    # attests it (GitHub's first-party attest action), and cuts
+    # the release.
     if: inputs.release_tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Sigstore-sign the corpus attestation (keyless OIDC) and store it.
+      attestations: write
+      id-token: write
     steps:
       - name: Download captured corpus
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: otel-demo-corpus
           path: captured
+      - name: Compress corpus
+        working-directory: captured
+        run: gzip -kf logs.jsonl   # logs.jsonl.gz, keep the original
+      # Attest the exact assets the release will carry, and stage the bundle
+      # (`otel-demo-corpus.intoto.jsonl` — Sigstore-bundle JSON Lines with the
+      # SLSA build-provenance statements) as a release asset alongside them,
+      # so corpus releases are signed the same way software releases are
+      # (offline verification via `--bundle`; the form release scanners such
+      # as OpenSSF Scorecard Signed-Releases look for).
+      - id: attest
+        name: Attest corpus
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: |
+            captured/logs.jsonl.gz
+            captured/manifest.md
+      - name: Stage attestation bundle as a release asset
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" captured/otel-demo-corpus.intoto.jsonl
       - name: Publish corpus release
         # Freezes the corpus as a versioned, reproducible artifact
         # `bench.yml` fetches (so every bench run sees identical
@@ -366,7 +390,6 @@ jobs:
           FAILURE_FLAGS: ${{ inputs.failure_flags }}
         run: |
           set -euxo pipefail
-          gzip -kf logs.jsonl   # logs.jsonl.gz, keep the original
           records="$(wc -l < logs.jsonl)"
           bytes="$(stat -c%s logs.jsonl)"
           notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- failure_flags: %s\n- source commit: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
@@ -378,9 +401,9 @@ jobs:
           # always describes the assets currently attached rather
           # than the original capture's parameters.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" logs.jsonl.gz manifest.md --clobber
+            gh release upload "$RELEASE_TAG" logs.jsonl.gz manifest.md otel-demo-corpus.intoto.jsonl --clobber
             gh release edit "$RELEASE_TAG" --notes "$notes"
           else
-            gh release create "$RELEASE_TAG" logs.jsonl.gz manifest.md \
+            gh release create "$RELEASE_TAG" logs.jsonl.gz manifest.md otel-demo-corpus.intoto.jsonl \
               --title "$RELEASE_TAG" --notes "$notes"
           fi

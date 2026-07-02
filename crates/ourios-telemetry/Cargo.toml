@@ -17,12 +17,24 @@ path = "src/lib.rs"
 # `global::meter`); this crate is the one place the heavy SDK +
 # exporter live (RFC 0001 §6.8 "Export architecture").
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
-# The SDK: MeterProvider + periodic reader. `rt-tokio` drives the
-# periodic export on the tokio runtime the server already runs.
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "rt-tokio"] }
-# The OTLP push exporter over gRPC (tonic). This is the export path
-# pinned by the §6.8 amendment — push over OTLP, not a scrape endpoint.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic"] }
+# The SDK: MeterProvider + periodic reader (metrics) and LoggerProvider +
+# batch processor (logs — the CLAUDE.md §6.3 dogfooding path: Ourios's
+# own logs ship as the OTel Logs signal). `rt-tokio` drives the periodic
+# export on the tokio runtime the server already runs.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "logs", "rt-tokio"] }
+# The OTLP push exporter over gRPC (tonic), both signals. This is the
+# export path pinned by the §6.8 amendment — push over OTLP, not a
+# scrape endpoint (and for logs, not plain stderr).
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "logs", "grpc-tonic"] }
+# The OTel-recommended Rust logging bridge: `tracing` events become OTel
+# log records through this appender (Rust has no end-user OTel logging
+# API; `tracing` is the front-end).
+opentelemetry-appender-tracing = { version = "0.32", default-features = false }
+# The subscriber stack the bridge plugs into: `registry` composes layers,
+# `env-filter` gives RUST_LOG-style filtering (and the loop guard muting
+# the exporter's own tonic/hyper internals), `fmt` is the human-readable
+# stderr copy.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter", "fmt"] }
 
 [features]
 # Exposes `init_in_memory` so other crates' tests (e.g. the miner's
@@ -33,6 +45,8 @@ testing = ["opentelemetry_sdk/testing"]
 [dev-dependencies]
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+# Emit `tracing` events in the bridge test.
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

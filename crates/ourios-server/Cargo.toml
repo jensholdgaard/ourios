@@ -52,6 +52,10 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # parser; the derive API gives usage/help + edge-case handling (missing value,
 # unknown flag, trailing args) for free. Lean feature set — no color/suggestions.
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# Structured logging front-end (CLAUDE.md §6.3). `ourios-telemetry` bridges
+# these events to OTel log records pushed over OTLP (the dogfooding path) and
+# mirrors them to stderr; this crate only emits.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # RFC 0020 configuration-file schema (config::file): deserialise the YAML into
 # the schema, then substitute `${env:…}` in the typed scalar leaves (schema
 # validation runs on the raw text first, so an error never echoes a resolved

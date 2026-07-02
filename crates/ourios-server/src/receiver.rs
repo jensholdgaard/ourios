@@ -170,7 +170,7 @@ fn flush_then_snapshot(
 ) -> bool {
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
-        eprintln!(
+        tracing::warn!(
             "{cadence}: audit sink retained {audit_events} event(s) (store unavailable?); skipping \
              the record flush + snapshot this cycle so a clean row isn't exposed before its \
              template event is durable — no acknowledged data is lost (the WAL is durable)"
@@ -180,14 +180,16 @@ fn flush_then_snapshot(
     sink.flush_all();
     let records = sink.buffered_records();
     if records != 0 {
-        eprintln!(
+        tracing::warn!(
             "{cadence}: record sink retained {records} record(s) (store unavailable?); skipping the \
              snapshot so recovery re-mines them — no acknowledged data is lost (the WAL is durable)"
         );
         return false;
     }
     if let Err(e) = recovery::write_snapshots(snapshots_root, miner, high_water) {
-        eprintln!("{cadence} snapshot write failed (next start may replay more from the WAL): {e}");
+        tracing::warn!(
+            "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
+        );
     }
     true
 }
@@ -370,9 +372,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let report = recovery::recover(&mut wal, &snapshots_root, &mut miner, &rule)
         .map_err(|e| format!("startup recovery: {e}"))?;
     for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
-        // Structured-logging framework is still a follow-up (see
-        // main.rs); stderr is the established stopgap warning channel.
-        eprintln!(
+        tracing::warn!(
             "WAL truncated past tenant {:?}'s snapshot high-water mark (external mutation); \
              templates first seen in the gap may re-mint — drift is observable via the \
              RFC 0010 drift query",

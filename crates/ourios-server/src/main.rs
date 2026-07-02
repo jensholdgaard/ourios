@@ -22,8 +22,12 @@
 //! configuration and bare `OURIOS_*` env vars do not override it; both paths
 //! resolve the same [`ServerConfig`] through the same `build_*` validators.
 //!
-//! A structured-logging framework (`CLAUDE.md` §6.3 — errors go to stderr as
-//! a stopgap here) is a follow-up.
+//! Logs are dogfooded (`CLAUDE.md` §6.3): everything after the telemetry
+//! bootstrap logs through `tracing`, which `ourios-telemetry` bridges to an
+//! `OTel` log record pushed over OTLP — Ourios's own logs travel the same
+//! protocol its users' logs arrive on — with a human-readable copy on stderr.
+//! stdout stays reserved for the machine-parsed start-up lines (the
+//! bound-port announcements integration tests read).
 
 #![deny(unsafe_code)]
 
@@ -466,7 +470,7 @@ async fn terminate_signal() {
             sigterm.recv().await;
         }
         Err(e) => {
-            eprintln!("install SIGTERM handler: {e}");
+            tracing::error!("install SIGTERM handler (SIGINT remains the shutdown path): {e}");
             std::future::pending::<()>().await;
         }
     }
@@ -573,8 +577,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store))),
         )
     } else {
-        println!("compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
-        std::io::stdout().flush().ok();
+        tracing::info!("compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
         None
     };
 
@@ -588,10 +591,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 c.run(|result| match result {
                     Ok(report) => {
                         for err in &report.errors {
-                            eprintln!("compaction sweep error: {err}");
+                            tracing::error!("compaction sweep error: {err}");
                         }
                     }
-                    Err(e) => eprintln!("compaction sweep failed: {e}"),
+                    Err(e) => tracing::error!("compaction sweep failed: {e}"),
                 })
                 .await;
             }
@@ -608,18 +611,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `Wal`) before flushing telemetry and exiting.
     if let Some(handle) = querier {
         if let Err(e) = handle.shutdown().await {
-            eprintln!("querier shutdown error: {e}");
+            tracing::error!("querier shutdown error: {e}");
         }
     }
     if let Some(handle) = receiver {
         if let Err(e) = handle.shutdown().await {
-            eprintln!("receiver shutdown error: {e}");
+            tracing::error!("receiver shutdown error: {e}");
         }
     }
 
     // Flush pending telemetry on the way out (best-effort: a failed final
     // export — e.g. the metrics collector is unreachable at shutdown —
     // must not turn an otherwise-clean shutdown into a non-zero exit).
+    // eprintln!, not tracing: the log pipeline this tears down is the one
+    // a tracing event would need, so stderr is the only channel left.
     if let Err(e) = telemetry.shutdown() {
         eprintln!("telemetry shutdown error: {e}");
     }

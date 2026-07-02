@@ -167,3 +167,34 @@ pub const OURIOS_SINK_FLUSH_TRIGGER: &str = "ourios.sink.flush.trigger";
 
 /// `ourios.tenant` attribute key.
 pub const OURIOS_TENANT: &str = "ourios.tenant";
+
+// Log event names (the server's own dogfooded logs; every `tracing` call
+// site names its event with one of these — `weaver registry live-check`
+// enforces it at emission time).
+
+/// `ourios.compaction.sweep.error` log event name.
+pub const EVENT_OURIOS_COMPACTION_SWEEP_ERROR: &str = "ourios.compaction.sweep.error";
+
+/// `ourios.querier.shutdown.error` log event name.
+pub const EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR: &str = "ourios.querier.shutdown.error";
+
+/// `ourios.receiver.audit_sink.retained` log event name.
+pub const EVENT_OURIOS_RECEIVER_AUDIT_SINK_RETAINED: &str = "ourios.receiver.audit_sink.retained";
+
+/// `ourios.receiver.shutdown.error` log event name.
+pub const EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR: &str = "ourios.receiver.shutdown.error";
+
+/// `ourios.receiver.sink.retained` log event name.
+pub const EVENT_OURIOS_RECEIVER_SINK_RETAINED: &str = "ourios.receiver.sink.retained";
+
+/// `ourios.receiver.snapshot.error` log event name.
+pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR: &str = "ourios.receiver.snapshot.error";
+
+/// `ourios.receiver.wal.truncated` log event name.
+pub const EVENT_OURIOS_RECEIVER_WAL_TRUNCATED: &str = "ourios.receiver.wal.truncated";
+
+/// `ourios.server.compaction.disabled` log event name.
+pub const EVENT_OURIOS_SERVER_COMPACTION_DISABLED: &str = "ourios.server.compaction.disabled";
+
+/// `ourios.server.signal_handler.error` log event name.
+pub const EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR: &str = "ourios.server.signal_handler.error";

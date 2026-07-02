@@ -470,7 +470,7 @@ async fn terminate_signal() {
             sigterm.recv().await;
         }
         Err(e) => {
-            tracing::error!("install SIGTERM handler (SIGINT remains the shutdown path): {e}");
+            tracing::error!(name: ourios_semconv::EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR, "install SIGTERM handler (SIGINT remains the shutdown path): {e}");
             std::future::pending::<()>().await;
         }
     }
@@ -577,7 +577,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store))),
         )
     } else {
-        tracing::info!("compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
+        tracing::info!(name: ourios_semconv::EVENT_OURIOS_SERVER_COMPACTION_DISABLED, "compaction disabled for this process (OURIOS_COMPACTION_ENABLED)");
         None
     };
 
@@ -591,10 +591,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 c.run(|result| match result {
                     Ok(report) => {
                         for err in &report.errors {
-                            tracing::error!("compaction sweep error: {err}");
+                            tracing::error!(name: ourios_semconv::EVENT_OURIOS_COMPACTION_SWEEP_ERROR, "compaction sweep error: {err}");
                         }
                     }
-                    Err(e) => tracing::error!("compaction sweep failed: {e}"),
+                    Err(e) => tracing::error!(name: ourios_semconv::EVENT_OURIOS_COMPACTION_SWEEP_ERROR, "compaction sweep failed: {e}"),
                 })
                 .await;
             }
@@ -611,12 +611,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // `Wal`) before flushing telemetry and exiting.
     if let Some(handle) = querier {
         if let Err(e) = handle.shutdown().await {
-            tracing::error!("querier shutdown error: {e}");
+            tracing::error!(name: ourios_semconv::EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR, "querier shutdown error: {e}");
         }
     }
     if let Some(handle) = receiver {
         if let Err(e) = handle.shutdown().await {
-            tracing::error!("receiver shutdown error: {e}");
+            tracing::error!(name: ourios_semconv::EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR, "receiver shutdown error: {e}");
         }
     }
 

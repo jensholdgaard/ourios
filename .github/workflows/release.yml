@@ -194,6 +194,14 @@ jobs:
       - plan
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
+    # The global artifacts (SBOMs, installer, source tarball, checksums) are
+    # attested here the same way build-local-artifacts attests the binaries, so
+    # every release asset carries SLSA build provenance (RFC 0019 §3.4-style
+    # supply-chain posture). Matches build-local-artifacts' permissions.
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -245,6 +253,17 @@ jobs:
             echo "paths<<EOF" >> "$GITHUB_OUTPUT"
             find . -name '*.cdx.xml' | tee -a "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
+      # Attest the global artifacts — the CycloneDX SBOMs plus the installer,
+      # source tarball, and checksums that dist produces here. build-local
+      # attests the per-target binaries; without this the non-binary assets ship
+      # unsigned (a `gh attestation verify <sbom>` would fail). Same SLSA
+      # build-provenance predicate as the local step.
+      - name: Attest global artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ steps.cargo-cyclonedx.outputs.paths }}
       - name: "Upload artifacts"
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

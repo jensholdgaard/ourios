@@ -57,8 +57,9 @@ on:
         description: >-
           Recovery path: if set, skip the multi-hour capture and publish from
           the `otel-demo-corpus` artifact of this earlier workflow run id.
-          Pass the ORIGINAL capture's demo_ref/locust_users/duration/
-          failure_flags inputs too, so the release notes stay truthful.
+          Pass the ORIGINAL capture's demo_ref / locust_users /
+          duration_seconds / failure_flags inputs too, so the release notes
+          stay truthful.
         default: ''
         required: false
 
@@ -415,10 +416,16 @@ jobs:
           FAILURE_FLAGS: ${{ inputs.failure_flags }}
         run: |
           set -euxo pipefail
+          # On the recovery path the notes must name the commit the CAPTURE
+          # ran at, not this publish dispatch's commit.
+          capture_sha="$GITHUB_SHA"
+          if [ "$CAPTURE_RUN_ID" != "$GITHUB_RUN_ID" ]; then
+            capture_sha="$(gh api "repos/${GH_REPO}/actions/runs/${CAPTURE_RUN_ID}" --jq .head_sha)"
+          fi
           records="$(wc -l < logs.jsonl)"
           bytes="$(stat -c%s logs.jsonl)"
           notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- failure_flags: %s\n- source commit: %s\n- capture run id: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
-            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "${FAILURE_FLAGS:-none}" "$GITHUB_SHA" "$CAPTURE_RUN_ID" "$records" "$bytes")"
+            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "${FAILURE_FLAGS:-none}" "$capture_sha" "$CAPTURE_RUN_ID" "$records" "$bytes")"
           # Create the release if it's new, else clobber its
           # assets — re-minting the same tag replaces the corpus
           # in place rather than erroring. On re-mint the notes

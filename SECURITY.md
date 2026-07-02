@@ -36,8 +36,21 @@ gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \
 The same `gh attestation verify` works on the other release assets. Binary
 archives are attested from `v0.1.0` on; the non-binary assets (SBOMs,
 installer, source tarball, checksums) are attested from the release after
-`v0.1.0` on. Offline, `cosign verify-blob-attestation` against a downloaded
-bundle works too.
+`v0.1.0` on.
+
+From the release after `v0.1.0` on, each release also attaches its attestation
+bundles as `*.intoto.jsonl` assets (Sigstore-bundle JSON Lines carrying the
+SLSA-provenance statements), so verification works fully offline — pass the
+downloaded bundle to `gh attestation verify` with `--bundle`:
+
+```sh
+gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \
+  --repo jensholdgaard/ourios \
+  --bundle ourios-server-x86_64-unknown-linux-gnu.intoto.jsonl
+```
+
+Benchmark-corpus releases (`corpus/*`) attach `otel-demo-corpus.intoto.jsonl`
+the same way, from their next re-mint on.
 
 [cosign]: https://docs.sigstore.dev/cosign/verifying/verify/
 [SLSA build provenance]: https://slsa.dev/spec/v1.0/provenance

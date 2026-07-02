@@ -163,10 +163,24 @@ jobs:
             jq --raw-output '.[] | "target/distrib/*\(.)*"' <<< "$TARGETS_JSON"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - name: Attest
+      - id: attest
+        name: Attest
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
         with:
           subject-path: "${{ steps.attest-paths.outputs.paths }}"
+      # Also ship the attestation bundle as a release *asset*
+      # (`<name>.intoto.jsonl` — JSON Lines of Sigstore bundles, one DSSE-wrapped
+      # SLSA-provenance statement per subject, verification material included).
+      # The attestation-store copy above serves online `gh attestation verify`;
+      # the asset copy enables offline verification (`--bundle`) and is the form
+      # release scanners (OpenSSF Scorecard Signed-Releases) look for.
+      - name: Stage attestation bundle as a release asset
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          TARGETS: ${{ join(matrix.targets, '-') }}
+        run: |
+          cp "$BUNDLE_PATH" "target/distrib/ourios-server-${TARGETS}.intoto.jsonl"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -186,6 +200,7 @@ jobs:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
+            target/distrib/ourios-server-${{ join(matrix.targets, '-') }}.intoto.jsonl
             ${{ env.BUILD_MANIFEST_NAME }}
 
   # Build and package all the platform-agnostic(ish) things
@@ -258,12 +273,21 @@ jobs:
       # attests the per-target binaries; without this the non-binary assets ship
       # unsigned (a `gh attestation verify <sbom>` would fail). Same SLSA
       # build-provenance predicate as the local step.
-      - name: Attest global artifacts
+      - id: attest-global
+        name: Attest global artifacts
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
         with:
           subject-path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ steps.cargo-cyclonedx.outputs.paths }}
+      # Ship the bundle as a release asset too — offline verification + the form
+      # release scanners look for (see the build-local twin step).
+      - name: Stage attestation bundle as a release asset
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest-global.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" "target/distrib/ourios-global-artifacts.intoto.jsonl"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -271,6 +295,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ steps.cargo-cyclonedx.outputs.paths }}
+            target/distrib/ourios-global-artifacts.intoto.jsonl
             ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:

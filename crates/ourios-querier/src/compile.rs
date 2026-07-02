@@ -33,7 +33,7 @@
 //!
 //! `service`, `resource.<k>`, and `attr.<k>` have **no dedicated column** in
 //! the RFC 0005 schema: resource/log attributes are stored as a single
-//! OTLP-canonical-JSON `Utf8` column (`resource_attributes` / `attributes`).
+//! Ourios-canonical-JSON `Utf8` column (`resource_attributes` / `attributes`).
 //! They compile to a substring/`LIKE` match against that JSON column using a
 //! needle built from the canonical `{"key":…,"value":{"stringValue":…}}`
 //! shape — honest about the storage, not a column that doesn't exist. This is
@@ -595,7 +595,7 @@ fn field_name(field: &Field) -> String {
 }
 
 /// Compile an attribute equality (`service`/`resource.k`/`attr.k`) to a
-/// substring `LIKE` over the OTLP-canonical-JSON column. Only `==`/`!=` on a
+/// substring `LIKE` over the Ourios-canonical-JSON column. Only `==`/`!=` on a
 /// string value is supported in this slice; the canonical encoding stores
 /// string values as `{"key":"<k>","value":{"stringValue":"<v>"}}`, so an
 /// exact key+string-value pair is matched by that JSON fragment as a `LIKE`

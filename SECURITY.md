@@ -10,20 +10,21 @@ Verify before you run anything.
 
 **Container image** — signed keyless with [cosign] (Sigstore; the signature is
 recorded in the Rekor transparency log, there is no long-lived key). The image
-tag drops the leading `v` (a `v0.1.0` tag publishes `:0.1.0`):
+tag drops the leading `v` (a `v0.1.0` tag publishes `:0.1.0`). The identity is
+pinned to the exact release tag being verified — substitute both occurrences of
+the version to verify a different release:
 
 ```sh
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/jensholdgaard/ourios/[.]github/workflows/image[.]yml@refs/tags/v' \
+  --certificate-identity 'https://github.com/jensholdgaard/ourios/.github/workflows/image.yml@refs/tags/v0.1.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   ghcr.io/jensholdgaard/ourios:0.1.0
 ```
 
-**Release artifacts** — the binary archives, the CycloneDX SBOMs (`*.cdx.xml`),
-the installer, the source tarball, and the checksums all carry [SLSA build
-provenance] attestations. Download an asset from the release and verify it with
-the GitHub CLI (the `--repo` bounds the accepted signer identity to this repo's
-release workflow):
+**Release artifacts** — release assets carry [SLSA build provenance]
+attestations (see the version scope below). Download an asset from the release
+and verify it with the GitHub CLI (the `--repo` bounds the accepted signer
+identity to this repo's release workflow):
 
 ```sh
 gh release download v0.1.0 --pattern 'ourios-server-x86_64-unknown-linux-gnu.tar.xz'

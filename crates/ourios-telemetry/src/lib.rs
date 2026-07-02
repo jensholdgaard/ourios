@@ -76,8 +76,8 @@ impl TelemetryConfig {
     }
 }
 
-/// Errors raised while standing up or tearing down the metrics
-/// pipeline.
+/// Errors raised while standing up or tearing down the telemetry
+/// pipelines (metrics and logs).
 #[derive(Debug)]
 pub enum TelemetryError {
     /// An OTLP exporter (metrics or logs) could not be built (bad
@@ -85,7 +85,7 @@ pub enum TelemetryError {
     Exporter(opentelemetry_otlp::ExporterBuildError),
     /// `MeterProvider::force_flush` failed to export pending metrics.
     Flush(opentelemetry_sdk::error::OTelSdkError),
-    /// `MeterProvider::shutdown` failed to flush on teardown.
+    /// A provider (meter or logger) failed to flush on teardown.
     Shutdown(opentelemetry_sdk::error::OTelSdkError),
 }
 
@@ -94,7 +94,7 @@ impl std::fmt::Display for TelemetryError {
         match self {
             Self::Exporter(e) => write!(f, "building an OTLP exporter failed: {e}"),
             Self::Flush(e) => write!(f, "flushing the meter provider failed: {e}"),
-            Self::Shutdown(e) => write!(f, "shutting down the meter provider failed: {e}"),
+            Self::Shutdown(e) => write!(f, "shutting down a telemetry provider failed: {e}"),
         }
     }
 }

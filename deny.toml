@@ -13,6 +13,17 @@ ignore = [
     # vulnerability — a deep transitive proc-macro of arrow/datafusion that we
     # cannot replace until upstream drops it. Re-evaluate when that happens.
     "RUSTSEC-2024-0436",
+    # reason: quick-xml < 0.41 DoS advisories (quadratic duplicate-attribute
+    # check; unbounded namespace-declaration allocation). Transitive via
+    # object_store — no upgrade path exists yet: datafusion 53.1 pins
+    # object_store ^0.13, and even object_store 0.14 pins quick-xml ^0.40,
+    # both below the patched >=0.41. Exposure is low: quick-xml only parses
+    # XML responses from the operator-configured S3 endpoint (trusted
+    # infrastructure), and the impact is DoS, not corruption or RCE. Remove
+    # when an object_store release takes quick-xml >=0.41 (likely via the
+    # DataFusion/Arrow upgrade, epic #314).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]

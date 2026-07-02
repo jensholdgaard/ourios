@@ -16,12 +16,12 @@
 //! own logs ship as the `OTel` Logs signal, the same way its users' logs
 //! arrive. A `fmt` layer keeps a human-readable copy on **stderr**
 //! (stdout stays reserved for the binary's machine-parsed start-up
-//! lines), filtered by `RUST_LOG` (default `info`). The bridge layer
-//! carries a loop guard muting the export stack's own crates
-//! (`tonic`/`hyper`/`h2`/`tower`/`opentelemetry*`) so exporter-internal
-//! events cannot feed back into the exporter
+//! lines). Both layers honour `RUST_LOG` (default `info`); the bridge
+//! additionally carries a loop guard muting the export stack's own
+//! crates (`tonic`/`hyper`/`h2`/`tower`/`opentelemetry*`) so
+//! exporter-internal events cannot feed back into the exporter
 //! (telemetry-induced-telemetry, per the `OTel` self-observability
-//! guidelines).
+//! guidelines) — the guard wins over `RUST_LOG`.
 //!
 //! The binary (`ourios-server`) calls [`init`] once at start-up with
 //! the role it is running as; benches and integration tests use the
@@ -225,16 +225,32 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .with_resource(resource)
         .build();
 
-    // The bridge layer's filter is the telemetry-induced-telemetry loop
+    // The bridge honours `RUST_LOG` (default `info`) like the stderr copy,
+    // so exported volume can be turned down (`warn`) or up (`debug`) the
+    // same way. On top of that sits the telemetry-induced-telemetry loop
     // guard (OTel self-observability guidelines): the OTLP exporter is
     // itself a tonic/hyper client, so its internal `tracing` events must
     // not re-enter the bridge or every failed export would emit records
-    // that trigger more exports. `EnvFilter::new` ignores invalid
-    // directives rather than panicking.
-    let bridge = OpenTelemetryTracingBridge::new(&logger).with_filter(EnvFilter::new(
-        "info,hyper=off,tonic=off,h2=off,tower=off,reqwest=off,opentelemetry=off,\
-         opentelemetry_sdk=off,opentelemetry_otlp=off",
-    ));
+    // that trigger more exports — the guard's `off` directives always win,
+    // whatever `RUST_LOG` says. The directives are compile-time constants;
+    // an unparsable one is skipped rather than panicking.
+    let mut bridge_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    for directive in [
+        "hyper=off",
+        "tonic=off",
+        "h2=off",
+        "tower=off",
+        "reqwest=off",
+        "opentelemetry=off",
+        "opentelemetry_sdk=off",
+        "opentelemetry_otlp=off",
+    ] {
+        if let Ok(directive) = directive.parse() {
+            bridge_filter = bridge_filter.add_directive(directive);
+        }
+    }
+    let bridge = OpenTelemetryTracingBridge::new(&logger).with_filter(bridge_filter);
     // Human-readable copy on stderr — stdout is reserved for the
     // binary's machine-parsed start-up lines (bound-port announcements).
     // `RUST_LOG` overrides the default `info`.
@@ -244,16 +260,22 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // `try_init` (not `init`): a process can only ever have one global
     // subscriber. If one is already installed (a test harness), keep it —
     // metrics still work and the caller's logs still go wherever that
-    // subscriber sends them.
-    let _ = tracing_subscriber::registry()
+    // subscriber sends them. In that case the bridge was not wired, so
+    // tear the logger pipeline down rather than keep an idle batch
+    // processor alive for the process lifetime.
+    let logger = if tracing_subscriber::registry()
         .with(bridge)
         .with(fmt)
-        .try_init();
+        .try_init()
+        .is_ok()
+    {
+        Some(logger)
+    } else {
+        let _ = logger.shutdown();
+        None
+    };
 
-    Ok(TelemetryGuard {
-        provider,
-        logger: Some(logger),
-    })
+    Ok(TelemetryGuard { provider, logger })
 }
 
 /// Build an in-memory metrics pipeline for tests: a `MeterProvider`

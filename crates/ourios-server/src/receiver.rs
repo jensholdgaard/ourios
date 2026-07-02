@@ -171,6 +171,7 @@ fn flush_then_snapshot(
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
         tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_AUDIT_SINK_RETAINED,
             "{cadence}: audit sink retained {audit_events} event(s) (store unavailable?); skipping \
              the record flush + snapshot this cycle so a clean row isn't exposed before its \
              template event is durable — no acknowledged data is lost (the WAL is durable)"
@@ -181,6 +182,7 @@ fn flush_then_snapshot(
     let records = sink.buffered_records();
     if records != 0 {
         tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SINK_RETAINED,
             "{cadence}: record sink retained {records} record(s) (store unavailable?); skipping the \
              snapshot so recovery re-mines them — no acknowledged data is lost (the WAL is durable)"
         );
@@ -188,6 +190,7 @@ fn flush_then_snapshot(
     }
     if let Err(e) = recovery::write_snapshots(snapshots_root, miner, high_water) {
         tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR,
             "{cadence} snapshot write failed (next start may replay more from the WAL): {e}"
         );
     }
@@ -373,6 +376,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         .map_err(|e| format!("startup recovery: {e}"))?;
     for tenant in report.tenants.iter().filter(|t| t.stale_gap) {
         tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_RECEIVER_WAL_TRUNCATED,
             "WAL truncated past tenant {:?}'s snapshot high-water mark (external mutation); \
              templates first seen in the gap may re-mint — drift is observable via the \
              RFC 0010 drift query",

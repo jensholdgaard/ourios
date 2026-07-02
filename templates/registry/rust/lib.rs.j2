@@ -38,3 +38,11 @@ pub const {{ group.metric_name | screaming_snake_case }}: &str = "{{ group.metri
 pub const {{ attr.name | screaming_snake_case }}: &str = "{{ attr.name }}";
 {% endfor %}
 {% endfor %}
+
+// Log event names (the server's own dogfooded logs; every `tracing` call
+// site names its event with one of these — `weaver registry live-check`
+// enforces it at emission time).
+{% for group in ctx.groups | selectattr("type", "equalto", "event") %}
+/// `{{ group.name }}` log event name.
+pub const EVENT_{{ group.name | screaming_snake_case }}: &str = "{{ group.name }}";
+{% endfor %}

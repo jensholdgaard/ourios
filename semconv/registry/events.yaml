@@ -1,0 +1,72 @@
+groups:
+  # Log event names for ourios-server's own (dogfooded) logs — every
+  # `tracing` call site carries one of these as its explicit event name
+  # (never tracing's default `event <file>:<line>`), so the emitted Logs
+  # signal stays registry-backed end to end. `weaver registry live-check`
+  # enforces this at emission time.
+  - id: event.ourios.server.compaction.disabled
+    type: event
+    name: ourios.server.compaction.disabled
+    stability: development
+    brief: >
+      Compaction is disabled for this process
+      (`OURIOS_COMPACTION_ENABLED` / `compaction.enabled: false`), so a
+      dedicated compactor elsewhere is expected to sweep.
+  - id: event.ourios.server.signal_handler.error
+    type: event
+    name: ourios.server.signal_handler.error
+    stability: development
+    brief: >
+      Installing the SIGTERM handler failed; SIGINT remains the shutdown
+      path.
+  - id: event.ourios.compaction.sweep.error
+    type: event
+    name: ourios.compaction.sweep.error
+    stability: development
+    brief: >
+      A compaction sweep failed or reported per-item errors; the daemon
+      continues with the next sweep.
+  - id: event.ourios.querier.shutdown.error
+    type: event
+    name: ourios.querier.shutdown.error
+    stability: development
+    brief: >
+      The querier role failed to drain cleanly during graceful shutdown.
+  - id: event.ourios.receiver.shutdown.error
+    type: event
+    name: ourios.receiver.shutdown.error
+    stability: development
+    brief: >
+      The receiver role failed to drain cleanly during graceful shutdown.
+  - id: event.ourios.receiver.audit_sink.retained
+    type: event
+    name: ourios.receiver.audit_sink.retained
+    stability: development
+    brief: >
+      The audit sink retained buffered events (store unavailable?); the
+      record flush and snapshot are skipped this cycle so a clean row is
+      not exposed before its template event is durable. No acknowledged
+      data is lost — the WAL is durable.
+  - id: event.ourios.receiver.sink.retained
+    type: event
+    name: ourios.receiver.sink.retained
+    stability: development
+    brief: >
+      The record sink retained buffered records (store unavailable?); the
+      snapshot is skipped so recovery re-mines them. No acknowledged data
+      is lost — the WAL is durable.
+  - id: event.ourios.receiver.snapshot.error
+    type: event
+    name: ourios.receiver.snapshot.error
+    stability: development
+    brief: >
+      Writing a miner snapshot failed; the next start may replay more
+      from the WAL.
+  - id: event.ourios.receiver.wal.truncated
+    type: event
+    name: ourios.receiver.wal.truncated
+    stability: development
+    brief: >
+      The WAL was truncated past a tenant's snapshot high-water mark
+      (external mutation); templates first seen in the gap may re-mint —
+      drift is observable via the RFC 0010 drift query.

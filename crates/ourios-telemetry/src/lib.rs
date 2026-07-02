@@ -80,7 +80,8 @@ impl TelemetryConfig {
 /// pipeline.
 #[derive(Debug)]
 pub enum TelemetryError {
-    /// The OTLP exporter could not be built (bad endpoint, TLS, …).
+    /// An OTLP exporter (metrics or logs) could not be built (bad
+    /// endpoint, TLS, …).
     Exporter(opentelemetry_otlp::ExporterBuildError),
     /// `MeterProvider::force_flush` failed to export pending metrics.
     Flush(opentelemetry_sdk::error::OTelSdkError),
@@ -91,7 +92,7 @@ pub enum TelemetryError {
 impl std::fmt::Display for TelemetryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Exporter(e) => write!(f, "building the OTLP metric exporter failed: {e}"),
+            Self::Exporter(e) => write!(f, "building an OTLP exporter failed: {e}"),
             Self::Flush(e) => write!(f, "flushing the meter provider failed: {e}"),
             Self::Shutdown(e) => write!(f, "shutting down the meter provider failed: {e}"),
         }
@@ -180,8 +181,8 @@ fn resource(service_name: &str) -> Resource {
 /// point, not a reconfiguration API. OpenTelemetry's `set_meter_provider` is
 /// last-wins, so a second call replaces the global provider and leaks
 /// the prior pipeline's periodic-reader thread; the `tracing` subscriber
-/// can only be installed once at all (a second call keeps the first
-/// subscriber and logs a no-op). `ourios-server` owns the single call;
+/// can only be installed once at all (a second call silently keeps the
+/// first subscriber). `ourios-server` owns the single call;
 /// tests use [`init_in_memory`] or build a provider directly.
 ///
 /// Must run inside a tokio runtime: the gRPC (tonic) OTLP exporters
@@ -232,7 +233,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // directives rather than panicking.
     let bridge = OpenTelemetryTracingBridge::new(&logger).with_filter(EnvFilter::new(
         "info,hyper=off,tonic=off,h2=off,tower=off,reqwest=off,opentelemetry=off,\
-         opentelemetry_sdk=off,opentelemetry-otlp=off",
+         opentelemetry_sdk=off,opentelemetry_otlp=off",
     ));
     // Human-readable copy on stderr — stdout is reserved for the
     // binary's machine-parsed start-up lines (bound-port announcements).

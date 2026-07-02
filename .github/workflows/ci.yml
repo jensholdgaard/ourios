@@ -282,7 +282,9 @@ jobs:
             exit 1
           fi
           sleep 1
-          kill -TERM "$server_pid"
+          # Best-effort: the server may already have exited; the wait +
+          # status check below is what enforces the clean exit.
+          kill -TERM "$server_pid" || true
           # A graceful SIGTERM shutdown exits 0; anything else (panic,
           # failed drain) must fail this gate — but collect weaver's
           # verdict first so the report still prints on violations.

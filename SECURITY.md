@@ -27,7 +27,8 @@ and verify it with the GitHub CLI (the `--repo` bounds the accepted signer
 identity to this repo's release workflow):
 
 ```sh
-gh release download v0.1.0 --pattern 'ourios-server-x86_64-unknown-linux-gnu.tar.xz'
+gh release download v0.1.0 --repo jensholdgaard/ourios \
+  --pattern 'ourios-server-x86_64-unknown-linux-gnu.tar.xz'
 gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \
   --repo jensholdgaard/ourios
 ```

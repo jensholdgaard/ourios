@@ -38,6 +38,7 @@
 - [RFC 0018 — OTLP log-spec compliance amendments](./rfcs/0018-otlp-log-spec-compliance.md)
 - [RFC 0019 — Storage-backend selection](./rfcs/0019-storage-backend-selection.md)
 - [RFC 0020 — Configuration file](./rfcs/0020-configuration-file.md)
+- [RFC 0021 — DataFusion / Arrow upgrade](./rfcs/0021-datafusion-arrow-upgrade.md)
 
 # Talks
 

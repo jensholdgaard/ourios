@@ -53,6 +53,14 @@ on:
         description: If set, publish the corpus as assets on a GitHub release at this tag (e.g. corpus/otel-demo-v1)
         default: ''
         required: false
+      artifact_run_id:
+        description: >-
+          Recovery path: if set, skip the multi-hour capture and publish from
+          the `otel-demo-corpus` artifact of this earlier workflow run id.
+          Pass the ORIGINAL capture's demo_ref/locust_users/duration/
+          failure_flags inputs too, so the release notes stay truthful.
+        default: ''
+        required: false
 
 permissions:
   contents: read
@@ -64,6 +72,8 @@ concurrency:
 jobs:
   capture:
     name: capture demo corpus
+    # Skipped on the publish-only recovery path (artifact_run_id set).
+    if: inputs.artifact_run_id == ''
     runs-on: ubuntu-latest
     permissions:
       # Read-only: this job runs ~20 third-party demo container
@@ -341,7 +351,13 @@ jobs:
     # third-party code — just downloads the captured artifact,
     # attests it (GitHub's first-party attest action), and cuts
     # the release.
-    if: inputs.release_tag != ''
+    # `always()` so the job still runs when `capture` is skipped by the
+    # recovery path; it then requires either a fresh successful capture or
+    # an explicit artifact_run_id to pull the corpus from.
+    if: >-
+      always() && inputs.release_tag != '' &&
+      (needs.capture.result == 'success' ||
+       (needs.capture.result == 'skipped' && inputs.artifact_run_id != ''))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -354,6 +370,10 @@ jobs:
         with:
           name: otel-demo-corpus
           path: captured
+          # Same-run download unless the recovery path names an earlier run
+          # (cross-run downloads need the token).
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Compress corpus
         working-directory: captured
         run: gzip -kf logs.jsonl   # logs.jsonl.gz, keep the original
@@ -383,7 +403,12 @@ jobs:
         working-directory: captured
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so `gh` cannot resolve the repository
+          # from a git remote — name it explicitly (the corpus/otel-demo-v7
+          # failure: `gh release create` → "not a git repository").
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          CAPTURE_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
           DEMO_REF: ${{ inputs.demo_ref }}
           LOCUST_USERS: ${{ inputs.locust_users }}
           DURATION: ${{ inputs.duration_seconds }}
@@ -392,8 +417,8 @@ jobs:
           set -euxo pipefail
           records="$(wc -l < logs.jsonl)"
           bytes="$(stat -c%s logs.jsonl)"
-          notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- failure_flags: %s\n- source commit: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
-            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "${FAILURE_FLAGS:-none}" "$GITHUB_SHA" "$records" "$bytes")"
+          notes="$(printf 'OTel Demo corpus capture\n\n- demo_ref: %s\n- locust_users: %s\n- duration_seconds: %s\n- failure_flags: %s\n- source commit: %s\n- capture run id: %s\n- records (LogsData batches): %s\n- uncompressed bytes: %s\n' \
+            "$DEMO_REF" "$LOCUST_USERS" "$DURATION" "${FAILURE_FLAGS:-none}" "$GITHUB_SHA" "$CAPTURE_RUN_ID" "$records" "$bytes")"
           # Create the release if it's new, else clobber its
           # assets — re-minting the same tag replaces the corpus
           # in place rather than erroring. On re-mint the notes

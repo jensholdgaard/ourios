@@ -241,10 +241,15 @@ jobs:
           # from the upstream registry the manifest depends on; the
           # inactivity timeout ends the session after the server's
           # shutdown flush goes quiet.
+          # The session is ended deterministically via the admin /stop
+          # endpoint below; the inactivity timeout is only a generous
+          # backstop (a short one could expire during a slow startup's
+          # quiet period and end the session before the shutdown flush —
+          # a false pass).
           weaver registry live-check -r semconv/registry --future \
             --include-unreferenced \
             --otlp-grpc-port 24317 --admin-port 24320 \
-            --inactivity-timeout 15 \
+            --inactivity-timeout 120 \
             --format json --output "$workdir/report" &
           weaver_pid=$!
           sleep 3
@@ -290,6 +295,11 @@ jobs:
           # verdict first so the report still prints on violations.
           server_status=0
           wait "$server_pid" || server_status=$?
+          # The server's shutdown flush has been delivered once it exits;
+          # end the weaver session deterministically rather than waiting
+          # out the inactivity backstop.
+          sleep 2
+          curl -sf -X POST 'http://127.0.0.1:24320/stop' > /dev/null || true
           weaver_status=0
           wait "$weaver_pid" || weaver_status=$?
           if [ "$weaver_status" -ne 0 ]; then

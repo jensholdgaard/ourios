@@ -7,7 +7,7 @@
 //! the declared schema.
 //!
 //! **`AnyValue` → canonical JSON.** RFC 0005 §3.3 mandates
-//! OTLP-canonical JSON for the `attributes`,
+//! Ourios-canonical JSON for the `attributes`,
 //! `resource_attributes`, and (when `body_kind = Structured`)
 //! `body` columns. Encoding goes through
 //! [`ourios_core::otlp::canonical`], which wraps
@@ -345,7 +345,7 @@ impl Builders {
 
         self.body_kind.append_value(body_kind_ordinal(r.body_kind)?);
         // RFC 0005 §3.3: when `body_kind = Structured`, the
-        // body column carries OTLP-canonical JSON — the bytes
+        // body column carries Ourios-canonical JSON — the bytes
         // the miner has already encoded via
         // `ourios_core::otlp::canonical::encode_any_value` (the
         // miner's `ingest_structured` writes them into

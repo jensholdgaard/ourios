@@ -1738,7 +1738,7 @@ impl MinerCluster {
         // per RFC §6.1 ("Always false when body_kind =
         // Structured").
         //
-        // `body` carries the RFC 0005 §3.3 OTLP-canonical-JSON
+        // `body` carries the RFC 0005 §3.3 Ourios-canonical-JSON
         // encoding of the `AnyValue` — the bytes the writer
         // stores in the §3.2 `body` column for structured rows.
         // Two interlocking invariants prevent any fallback path
@@ -4391,13 +4391,10 @@ mod tests {
         assert_eq!(rec.template_version, 1);
         // RFC §6.1: Structured records always carry
         // `lossy_flag = false`. The producer populates `body`
-        // with a stored representation of the structured value
-        // so `reconstruct()` returns what we stored, satisfying
-        // §3.3. Today that representation is the AnyValue's
-        // `Debug` form — an interim placeholder. The follow-up
-        // PR replaces it with OTLP-canonical JSON without
-        // changing the schema field or `lossy_flag`. See
-        // `ingest_structured` for the rationale.
+        // with the Ourios-canonical JSON encoding of the
+        // structured value (`ingest_structured` →
+        // `canonical::encode_any_value`), so `reconstruct()`
+        // returns what we stored, satisfying §3.3.
         assert!(rec.separators.is_empty());
         assert!(rec.params.is_empty());
         assert!(

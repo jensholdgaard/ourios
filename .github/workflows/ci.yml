@@ -263,20 +263,41 @@ jobs:
           OTEL_BLRP_SCHEDULE_DELAY=500 \
             ./target/debug/ourios-server &
           server_pid=$!
-          sleep 3
-          # Drive the query path so its metrics exist in the stream.
-          curl -sf -X POST 'http://127.0.0.1:24419/v1/query' \
-            -H 'X-Ourios-Tenant: t' -H 'Content-Type: text/plain' \
-            --data 'service == "t" | range(-1h, now) | limit 10' > /dev/null
-          sleep 1
-          kill -TERM "$server_pid"
-          wait "$server_pid" || true
-          # weaver exits 0 only if no violation-level advice arrived.
-          if ! wait "$weaver_pid"; then
-            echo "::error::weaver live-check found violations — emitted telemetry drifts from semconv/registry/"
-            cat "$workdir/report/live_check.json" || true
+          # Drive the query path so its metrics exist in the stream —
+          # polled rather than a fixed sleep, so a slow runner's startup
+          # can't race the request.
+          query_ok=0
+          for _ in $(seq 1 30); do
+            if curl -sf -X POST 'http://127.0.0.1:24419/v1/query' \
+              -H 'X-Ourios-Tenant: t' -H 'Content-Type: text/plain' \
+              --data 'service == "t" | range(-1h, now) | limit 10' > /dev/null; then
+              query_ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$query_ok" -ne 1 ]; then
+            echo "::error::the querier never accepted the probe query"
+            kill -TERM "$server_pid" || true
             exit 1
           fi
+          sleep 1
+          kill -TERM "$server_pid"
+          # A graceful SIGTERM shutdown exits 0; anything else (panic,
+          # failed drain) must fail this gate — but collect weaver's
+          # verdict first so the report still prints on violations.
+          server_status=0
+          wait "$server_pid" || server_status=$?
+          weaver_status=0
+          wait "$weaver_pid" || weaver_status=$?
+          if [ "$weaver_status" -ne 0 ]; then
+            echo "::error::weaver live-check found violations — emitted telemetry drifts from semconv/registry/"
+            cat "$workdir/report/live_check.json" || true
+          fi
+          if [ "$server_status" -ne 0 ]; then
+            echo "::error::ourios-server exited with status $server_status"
+          fi
+          [ "$weaver_status" -eq 0 ] && [ "$server_status" -eq 0 ]
       - name: Upload live-check report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

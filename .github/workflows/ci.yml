@@ -195,6 +195,96 @@ jobs:
             exit 1
           fi
 
+  # Emission-time semconv conformance: boot the real `ourios-server`,
+  # point its OTLP export (metrics + the dogfooded logs signal) at
+  # `weaver registry live-check`, drive a little traffic, and gate on the
+  # exit code — weaver exits non-zero on a `violation` (an unregistered
+  # metric/attribute/event name, wrong instrument, …), while
+  # improvement-level advice (e.g. `stability: development`, expected
+  # pre-1.0) passes. Complements the `semconv` job: that one validates
+  # the registry *definitions*; this one validates what the binary
+  # actually *emits* against them. A required check (in `ci-success`'s
+  # `needs`).
+  live-check:
+    name: live-check (weaver)
+    runs-on: ubuntu-latest
+    env:
+      WEAVER_VERSION: v0.23.0
+      # sha256 of weaver-x86_64-unknown-linux-gnu.tar.xz for WEAVER_VERSION
+      # (open-telemetry/weaver release asset). Bump both together.
+      WEAVER_SHA256: a9822c712d6871bd89d6530f18c5df5cea3821f642e7b8e5e49e985917f7d12d
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install weaver
+        run: |
+          set -euo pipefail
+          tarball="weaver-x86_64-unknown-linux-gnu.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/open-telemetry/weaver/releases/download/${WEAVER_VERSION}/${tarball}"
+          echo "${WEAVER_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/weaver-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
+      - run: cargo build -p ourios-server
+      - name: Live-check the emitted telemetry
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/live-check"
+          mkdir -p "$workdir/data" "$workdir/wal" "$workdir/report"
+          # weaver's OTLP gRPC listener; --include-unreferenced resolves
+          # the SDK resource attributes (service.name, telemetry.sdk.*)
+          # from the upstream registry the manifest depends on; the
+          # inactivity timeout ends the session after the server's
+          # shutdown flush goes quiet.
+          weaver registry live-check -r semconv/registry --future \
+            --include-unreferenced \
+            --otlp-grpc-port 24317 --admin-port 24320 \
+            --inactivity-timeout 15 \
+            --format json --output "$workdir/report" &
+          weaver_pid=$!
+          sleep 3
+          # The real binary, all roles' telemetry: its OTLP export
+          # (metrics + logs) goes to weaver. The compaction-disabled path
+          # exercises a named log event; shutdown flushes both signals.
+          OURIOS_BUCKET_ROOT="$workdir/data" \
+          OURIOS_WAL_ROOT="$workdir/wal" \
+          OURIOS_RECEIVER_ENABLED=1 \
+          OURIOS_RECEIVER_GRPC_ADDR=127.0.0.1:24417 \
+          OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:24418 \
+          OURIOS_QUERIER_ENABLED=1 \
+          OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:24419 \
+          OURIOS_COMPACTION_ENABLED=0 \
+          OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24317 \
+          OTEL_BLRP_SCHEDULE_DELAY=500 \
+            ./target/debug/ourios-server &
+          server_pid=$!
+          sleep 3
+          # Drive the query path so its metrics exist in the stream.
+          curl -sf -X POST 'http://127.0.0.1:24419/v1/query' \
+            -H 'X-Ourios-Tenant: t' -H 'Content-Type: text/plain' \
+            --data 'service == "t" | range(-1h, now) | limit 10' > /dev/null
+          sleep 1
+          kill -TERM "$server_pid"
+          wait "$server_pid" || true
+          # weaver exits 0 only if no violation-level advice arrived.
+          if ! wait "$weaver_pid"; then
+            echo "::error::weaver live-check found violations — emitted telemetry drifts from semconv/registry/"
+            cat "$workdir/report/live_check.json" || true
+            exit 1
+          fi
+      - name: Upload live-check report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: live-check-report
+          path: ${{ runner.temp }}/live-check/report/
+          if-no-files-found: ignore
+
   # Supply-chain gate via cargo-deny: RustSec advisories, the license
   # allow-list, banned/duplicate crates, and crate sources. Config is
   # deny.toml at the repo root. A required check (in `ci-success`'s `needs`).
@@ -299,7 +389,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, docs, test, book, semconv, deny, s3-integration]
+    needs: [fmt, clippy, docs, test, book, semconv, live-check, deny, s3-integration]
     if: always()
     steps:
       - name: Verify required checks

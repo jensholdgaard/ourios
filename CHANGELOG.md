@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.1.1] - 2026-07-02
+
+### Added
+
+- Configure via a mounted RFC 0020 config file (--config) (#328) (6bd76d6)
+- Rfc0020 green pt4 — credential-literal enforcement + §3.5 hygiene (#327) (f822b5e)
+- Rfc0020 green pt3 — --config CLI wiring + file→ServerConfig map (#326) (034b47f)
+- Rfc0020 green pt2 — YAML schema + scalar-value substitution walk (#325) (c527361)
+- Rfc0020 green pt1 — env-substitution resolver (#322) (d0d6b22)
+
+### CI
+
+- Attach .intoto.jsonl provenance bundles as release assets (Scorecard Signed-Releases) (#332) (ec134e7)
+- Attest global artifacts (SBOMs, installer, source) + doc release verification (#329) (cedef37)
+- Ingest via telemetrygen (gRPC) + assert body reconstruction in the deploy smoke test (#319) (697b771)
+- End-to-end deploy smoke test on an ephemeral kind cluster (#318) (05d42b0)
+- Build arm64 on a native runner instead of QEMU (#317) (3b815e4)
+
+### Chore
+
+- Accept quick-xml DoS advisories RUSTSEC-2026-0194/0195 (no upstream path) (#330) (44cc4f7)
+
+### Documentation
+
+- Configuration file — YAML + env substitution (RFC 0020, specified) (#320) (0bf67ff)
+
+### Tests
+
+- Rfc0020 red — config-file §5 stubs + status (#321) (88fbe1f)
+
 ## [0.1.0] - 2026-06-29
 
 ### Added

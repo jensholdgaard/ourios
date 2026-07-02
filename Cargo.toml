@@ -22,7 +22,7 @@ exclude = ["fuzz"]
 # `version.workspace = true`). The excluded `fuzz/` harness is a separate
 # workspace and versions independently. The release recipe (`just release X.Y.Z`)
 # bumps this one line; the matching `vX.Y.Z` tag then drives cargo-dist + image.
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

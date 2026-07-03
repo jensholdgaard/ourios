@@ -26,7 +26,7 @@ schema:
 
 - Each promoted key is projected at write time into its own `OPTIONAL`
   Utf8 column (dictionary + page index + bloom filter), named literally
-  after the DSL path (`resource.service.name`, `attr.http.method`).
+  after the DSL path (`resource.service.name`, `attr.http.request.method`).
 - The promoted set always contains the resource key `service.name`
   (the `Required`, `Stable` identity attribute of the OTel `service`
   resource entity per the semconv registry, the DSL's bare `service`
@@ -74,7 +74,7 @@ For each promoted key, the writer appends one column to the RFC 0005
 
 | Property | Value |
 |---|---|
-| Name | The DSL path, literally: `resource.<key>` or `attr.<key>` (so `resource.service.name`, `attr.http.method`) |
+| Name | The DSL path, literally: `resource.<key>` or `attr.<key>` (so `resource.service.name`, `attr.http.request.method`) |
 | Arrow / Parquet type | Arrow `Utf8` / Parquet `STRING` logical type over `BYTE_ARRAY` (matching the RFC 0005 §3.2 string columns), `OPTIONAL` |
 | Value | The attribute's **string value**, exactly as stored in the JSON column — no truncation, no normalisation |
 | `NULL` when | The key is absent on the record, **or** its value is not a string `AnyValue` |
@@ -124,7 +124,7 @@ knobs):
 storage:
   promoted_attributes:
     resource: [k8s.namespace.name]   # service.name is implicit, always on
-    log: [http.method, http.status_code]
+    log: [http.request.method, http.route]  # string-valued keys
 ```
 
 - Keys are plain attribute-key strings, taken literally (no globbing).
@@ -374,12 +374,16 @@ generators with the RFC 0001 §6.1 codec suite).
 
 ## 7. Open questions
 
-1. **Typed numeric promotion.** `attr.http.status_code >= 500` compares
-   lexicographically on the string projection ("500" ≥ "500" works;
-   cross-magnitude comparisons don't). A future `Int64`-typed promotion
-   class (per-key type declaration in config) would fix ordering for
-   numeric attributes; deferred until a consumer demands it — the
-   string projection already answers equality and regex.
+1. **Typed numeric promotion.** Numeric attributes split into two
+   cases today. A **string-encoded** number ("500" as a string
+   `AnyValue`) projects and compares lexicographically — `>= "500"`
+   works within one magnitude, cross-magnitude comparisons don't. A
+   **true numeric** `AnyValue` (`http.status_code` as an int, the
+   common OTLP emission) projects `NULL` (§3.1), so ordering/regex
+   predicates on it silently never match and even `==` only answers
+   through the JSON arm. A future `Int64`-typed promotion class
+   (per-key type declaration in config) is what makes numeric
+   attributes first-class; deferred until a consumer demands it.
 2. **Per-tenant promoted sets.** Global-only in this RFC. Multi-tenant
    operators with divergent schemas may want scoping; the column
    mechanism doesn't change, only config addressing.

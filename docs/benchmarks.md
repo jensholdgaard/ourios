@@ -921,3 +921,59 @@ runs. The b1/b2 criterion timings use the reduced
 `--warm-up-time 1 --measurement-time 3` (matching `query-bench.yml`);
 the structural pruning/template numbers are exact and
 criterion-setting-independent.
+
+### 9.9 Results — 2026-07-03 (indicative, `ci-runner`) — B1 / B2 post-RFC 0022 (promoted attribute columns)
+
+**Purpose.** The RFC 0022 §5 RFC0022.5 note: the promoted-attribute
+write path (per-key `resource.<k>` / `attr.<k>` columns + the two-arm
+predicate compile) must leave B1/B2 unchanged. This is the indicative
+re-run after RFC 0022 went `green` (#345–#348); the pruning *counters*
+are pinned structurally in `crates/ourios-querier/tests/rfc0022_attr_columns.rs`,
+this entry is the wall-clock stamp.
+**Corpus.** `corpus/otel-demo-v4` (107,332 records → 735,377 mined
+rows / 5 files) and `corpus/otel-demo-v5` (163,929 records,
+~1.04 GB raw → 1,367,532 mined rows / 6 files). The LogHub HDFS_v1
+arm did not run (`fetch_hdfs` off — memory-bound on the hosted
+runner).
+**Hardware.** `ci-runner` — indicative, not the §1 baseline.
+**Run.** `query-bench.yml` 28686650566 at git `6e3301b` (the RFC 0022
+`green` merge).
+
+**B1 — predicate pushdown vs `zstdcat | grep` (target: ≥ 10× at
+1 GiB).** Query: severity `ERROR`, full corpus span.
+
+| corpus | rows | RGs scanned | ourios bytes | reference bytes (zstd) | ourios | reference | speedup |
+|---|---|---|---|---|---|---|---|
+| v5 | 11 | 3/6 | 324,773 | 1,403,025 | 8.10 ms | 282.06 ms | 34.8× |
+
+Row count agrees exactly with the reference pipeline. v4 is skipped as
+in §9.3 (its capture has no error-band rows).
+
+**B1 verdict: PASS (indicative), no regression** — 34.8× against
+§9.3's 40.0× on the same corpus, comfortably inside hosted-runner
+noise and 3.5× above the bar. Same caveats as §9.3: ultra-thin error
+band, corpus just under the §8 minimum, not the §1 baseline.
+
+**B2 — template-exact latency ∝ result, not corpus.**
+
+| bench | result | timing | pruning |
+|---|---|---|---|
+| `b2/real-corpus/corpus/v4` (template 45) | 89,382 rows | 8.71 ms | 5/5 row groups (full span) |
+| `b2/real-corpus/corpus/v5` (template 8) | 168,487 rows | 12.37 ms | 6/6 row groups (full span) |
+| **`b2/real-corpus/corpus-window-1h/v4`** | 12,854 rows | **5.46 ms** | **1/5 — 4 row groups pruned by the time window** |
+| **`b2/real-corpus/corpus-window-1h/v5`** | 17,632 rows | **6.71 ms** | **1/6 — 5 row groups pruned by the time window** |
+| `b2/synthetic/{2k,20k,100k}` | result held constant | 2.17 / 4.77 / 13.61 ms | sub-linear in corpus size |
+
+**B2 verdict: PASS (supportive, indicative), no regression** — the
+windowed latencies sit in the same flat few-ms band as §9.3/§9.8
+while the full-span variants grow with corpus size, and everything is
+orders of magnitude under the 200 ms bar. The formal target speaks
+above ~10 GiB, which remains unmeasured on this runner class.
+
+**Assessment.** The promoted-column machinery (extra column chunks
+per row group on the write side; the two-arm `OR` compile on the
+read side) shows no measurable drag on either gate. The RFC 0022
+`green → validated` step still requires the authoritative
+`baseline-8vcpu-32gib` rerun per the standing bench policy
+(maintainer opt-in); this entry is its indicative precursor,
+curated by hand as in §9.3 — the workflow never writes §9.

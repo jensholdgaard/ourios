@@ -146,7 +146,8 @@ storage:
 
 Promoted-key predicates compile by operator class (`P` = promoted
 column, `J` = the JSON arm — the existing #146 `LIKE` fragment
-machinery, which can only express key+string-value equality):
+machinery, which expresses exactly `==` and, with its presence guard,
+`!=` on a key + string value, and nothing else):
 
 **`==` / `!=` — the two-arm form:**
 

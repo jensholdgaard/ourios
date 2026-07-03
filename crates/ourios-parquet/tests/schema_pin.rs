@@ -193,3 +193,37 @@ fn rfc0005_10_audit_schema_matches_pinned_field_list() {
     ];
     check_schema_against(&expected, &audit_schema());
 }
+
+/// RFC 0022 §3.1 — the promoted-column extension is additive and
+/// ordered: `data_schema_with_promoted` is exactly the base schema
+/// plus `resource.<key>` fields (implicit `resource.service.name`
+/// leading), then `attr.<key>` fields, all `OPTIONAL` Utf8. Pins both
+/// the default writer shape (base + `resource.service.name`) and a
+/// configured example, so growing the promoted surface stays an
+/// explicit, review-visible schema decision like the base pin above.
+#[test]
+fn promoted_schema_is_base_plus_ordered_optional_utf8() {
+    use ourios_parquet::{PromotedAttributes, data_schema_with_promoted};
+
+    let base = data_schema();
+
+    let default_schema = data_schema_with_promoted(&PromotedAttributes::default());
+    let mut expected: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+    expected.push(Field::new("resource.service.name", DataType::Utf8, true));
+    check_schema_against(&expected, &default_schema);
+
+    let configured = PromotedAttributes::new(
+        ["k8s.namespace.name".to_string()],
+        ["http.route".to_string()],
+    );
+    let configured_schema = data_schema_with_promoted(&configured);
+    let mut expected: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+    expected.push(Field::new("resource.service.name", DataType::Utf8, true));
+    expected.push(Field::new(
+        "resource.k8s.namespace.name",
+        DataType::Utf8,
+        true,
+    ));
+    expected.push(Field::new("attr.http.route", DataType::Utf8, true));
+    check_schema_against(&expected, &configured_schema);
+}

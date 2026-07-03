@@ -2,7 +2,7 @@
 //!
 //! Opens a file at the Hive-style partition path computed by
 //! [`PartitionKey::data_path`], names it `<UUIDv7>.parquet` per
-//! §3.4, writes batches via [`mined_records_to_batch`], and
+//! §3.4, writes batches via [`mined_records_to_batch_with_promoted`], and
 //! rotates row groups when the in-progress buffer crosses the
 //! §3.5 threshold (128 MiB uncompressed).
 //!
@@ -46,9 +46,10 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use uuid::Uuid;
 
-use crate::data_schema;
+use crate::data_schema_with_promoted;
 use crate::partition::PartitionKey;
-use crate::record_batch::{BatchError, mined_records_to_batch};
+use crate::promoted::PromotedAttributes;
+use crate::record_batch::{BatchError, mined_records_to_batch_with_promoted};
 use crate::store::Store;
 
 /// RFC 0005 §3.5 — uncompressed bytes per row group, lower
@@ -119,6 +120,9 @@ pub struct Writer {
     /// [`Self::close`]. Tracked directly because `into_inner` returns
     /// the buffer, not file metadata.
     num_rows: i64,
+    /// RFC 0022 promoted attribute set this writer projects; fixed at
+    /// open time (the declared schema embeds its columns).
+    promoted: PromotedAttributes,
     /// Set to `true` once any `ArrowWriter::write` /
     /// `ArrowWriter::flush` call returns `Err`. The underlying
     /// `ArrowWriter`'s buffer state is undefined after such a
@@ -225,6 +229,24 @@ impl Writer {
         partition: PartitionKey,
         zstd_level: i32,
     ) -> Result<Self, WriterError> {
+        Self::open_in_with_promoted(store, partition, zstd_level, PromotedAttributes::default())
+    }
+
+    /// Like [`Writer::open_in_with_zstd_level`] but with an explicit RFC 0022
+    /// promoted attribute set. The declared schema embeds the promoted
+    /// columns, so the set is fixed for the writer's lifetime; every other
+    /// constructor uses [`PromotedAttributes::default`] (the implicit
+    /// `service.name` only).
+    ///
+    /// # Errors
+    ///
+    /// See [`Writer::open_in_with_zstd_level`].
+    pub fn open_in_with_promoted(
+        store: &Store,
+        partition: PartitionKey,
+        zstd_level: i32,
+        promoted: PromotedAttributes,
+    ) -> Result<Self, WriterError> {
         // Validate the codec level up front so invalid input fails fast. The
         // validated level flows into `writer_properties` so it isn't re-checked.
         let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
@@ -246,11 +268,15 @@ impl Writer {
         // path (readers address the file by `key`, surfaced in `WrittenFile`).
         let final_path = PathBuf::from(&key);
 
-        let props = writer_properties(zstd);
+        let props = writer_properties(zstd, &promoted);
         // Buffer-and-put: encode into memory; nothing hits the store
         // until `close`. A construction failure leaves no artifact.
-        let inner = ArrowWriter::try_new(Vec::new(), data_schema(), Some(props))
-            .map_err(WriterError::Parquet)?;
+        let inner = ArrowWriter::try_new(
+            Vec::new(),
+            data_schema_with_promoted(&promoted),
+            Some(props),
+        )
+        .map_err(WriterError::Parquet)?;
 
         Ok(Self {
             inner: Some(inner),
@@ -260,6 +286,7 @@ impl Writer {
             key,
             final_path,
             num_rows: 0,
+            promoted,
             poisoned: false,
         })
     }
@@ -368,7 +395,7 @@ impl Writer {
         // this same call). Either way a follow-up `append_records` is
         // safe — the contract is "writer remains usable", not "no rows
         // persisted".
-        let result = append_chunks(inner, records, &mut self.num_rows);
+        let result = append_chunks(inner, records, &self.promoted, &mut self.num_rows);
         if matches!(result, Err(WriterError::Parquet(_))) {
             self.poisoned = true;
         }
@@ -581,6 +608,7 @@ impl std::error::Error for WriterError {
 fn append_chunks(
     inner: &mut ArrowWriter<Vec<u8>>,
     records: &[MinedRecord],
+    promoted: &PromotedAttributes,
     num_rows: &mut i64,
 ) -> Result<(), WriterError> {
     // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
@@ -597,7 +625,8 @@ fn append_chunks(
         if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
             inner.flush().map_err(WriterError::Parquet)?;
         }
-        let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
+        let batch =
+            mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)?;
         inner.write(&batch).map_err(WriterError::Parquet)?;
         // Count rows only once the sub-batch has been accepted, so a
         // mid-slice `Batch`/`Parquet` failure leaves `num_rows`
@@ -629,10 +658,24 @@ pub fn encode_records_to_parquet(
     records: &[MinedRecord],
     zstd_level: i32,
 ) -> Result<Vec<u8>, WriterError> {
+    encode_records_to_parquet_with_promoted(records, zstd_level, &PromotedAttributes::default())
+}
+
+/// Like [`encode_records_to_parquet`] but with an explicit RFC 0022 promoted
+/// attribute set (the one-shot counterpart to [`Writer::open_in_with_promoted`]).
+///
+/// # Errors
+/// See [`encode_records_to_parquet`].
+pub fn encode_records_to_parquet_with_promoted(
+    records: &[MinedRecord],
+    zstd_level: i32,
+    promoted: &PromotedAttributes,
+) -> Result<Vec<u8>, WriterError> {
     let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
-    let props = writer_properties(zstd);
-    let mut writer = ArrowWriter::try_new(Vec::new(), data_schema(), Some(props))
-        .map_err(WriterError::Parquet)?;
+    let props = writer_properties(zstd, promoted);
+    let mut writer =
+        ArrowWriter::try_new(Vec::new(), data_schema_with_promoted(promoted), Some(props))
+            .map_err(WriterError::Parquet)?;
     for chunk in records.chunks(SUB_BATCH_ROWS) {
         // §3.5 row-group sizing: seal a row group once the in-progress
         // buffer crosses the threshold (same guard as `Writer::append_chunks`)
@@ -640,7 +683,8 @@ pub fn encode_records_to_parquet(
         if writer.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
             writer.flush().map_err(WriterError::Parquet)?;
         }
-        let batch = mined_records_to_batch(chunk).map_err(WriterError::Batch)?;
+        let batch =
+            mined_records_to_batch_with_promoted(chunk, promoted).map_err(WriterError::Batch)?;
         writer.write(&batch).map_err(WriterError::Parquet)?;
     }
     // `into_inner` flushes the final row group, writes the footer, and
@@ -654,7 +698,7 @@ pub fn encode_records_to_parquet(
 /// validates up front so invalid input fails before any
 /// filesystem work); production uses [`DEFAULT_ZSTD_LEVEL`], the
 /// bench may sweep it.
-fn writer_properties(zstd: ZstdLevel) -> WriterProperties {
+fn writer_properties(zstd: ZstdLevel, promoted: &PromotedAttributes) -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd))
         // Dictionary on globally by default (most columns benefit
@@ -761,6 +805,16 @@ fn writer_properties(zstd: ZstdLevel) -> WriterProperties {
     // §3.6: bloom filter on `template_id` (B2 predicate-pushdown).
     let template_id = ColumnPath::new(vec![crate::columns::TEMPLATE_ID.to_string()]);
     builder = builder.set_column_bloom_filter_enabled(template_id, true);
+
+    // RFC 0022 §3.1: promoted attribute columns are the attribute
+    // predicate-pushdown surface — bloom filter each (dictionary and
+    // page-level statistics are already the global defaults). A
+    // promoted column name is a single schema leaf whose name contains
+    // literal dots, so the ColumnPath is one part, not a nested path.
+    for name in promoted.column_names() {
+        let path = ColumnPath::new(vec![name]);
+        builder = builder.set_column_bloom_filter_enabled(path, true);
+    }
 
     builder.build()
 }

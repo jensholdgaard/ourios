@@ -32,6 +32,7 @@ pub mod audit_writer;
 pub mod compaction;
 pub mod manifest;
 pub mod partition;
+pub mod promoted;
 pub mod reader;
 pub mod record_batch;
 pub mod store;
@@ -50,12 +51,13 @@ pub use partition::{
     PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
     percent_decode_tenant, percent_encode_tenant,
 };
+pub use promoted::{PromotedAttributes, SERVICE_NAME_KEY};
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
-pub use record_batch::{BatchError, mined_records_to_batch};
+pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
 pub use store::{S3Config, Store, StoreConfig, StoreError};
 pub use writer::{
     DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, Writer, WriterError, WrittenFile,
-    encode_records_to_parquet,
+    encode_records_to_parquet, encode_records_to_parquet_with_promoted,
 };
 
 use std::sync::Arc;
@@ -206,6 +208,21 @@ pub fn data_schema() -> SchemaRef {
         Field::new(columns::RESOURCE_SCHEMA_URL, DataType::Utf8, true),
         Field::new(columns::SCOPE_SCHEMA_URL, DataType::Utf8, true),
     ]))
+}
+
+/// [`data_schema`] plus the RFC 0022 promoted attribute columns for
+/// `promoted` — additive `OPTIONAL` Utf8 fields appended after the
+/// §3.2 base columns (`resource.<key>` columns first,
+/// `resource.service.name` always leading, then `attr.<key>`). This
+/// is the writer's declared schema; [`data_schema`] stays the base
+/// shape readers address by name (§3.9 tolerates both absent and
+/// unknown columns, so files written under any promoted set coexist).
+#[must_use]
+pub fn data_schema_with_promoted(promoted: &PromotedAttributes) -> SchemaRef {
+    let base = data_schema();
+    let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.extend(promoted.fields());
+    Arc::new(ArrowSchema::new(fields))
 }
 
 /// Build the audit-event file Arrow schema per RFC 0005 §3.7.

@@ -31,8 +31,16 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{DEFAULT_ZSTD_LEVEL, Reader, encode_records_to_parquet};
 
-/// The committed pre-upgrade fixture, relative to this crate's manifest.
-const FIXTURE_PATH: &str = "../../testdata/rfc0021/pre-upgrade.parquet";
+/// The committed pre-upgrade fixture, resolved from the workspace root (the
+/// repo pattern for `testdata/` paths — parent-walk from `CARGO_MANIFEST_DIR`,
+/// no `..` components in the resulting path).
+fn fixture_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root is two levels above CARGO_MANIFEST_DIR")
+        .join("testdata/rfc0021/pre-upgrade.parquet")
+}
 
 /// Deterministic, representative rows covering the column shapes the §3.5
 /// invariant protects: a templated body (params + separators + trace ids +
@@ -136,7 +144,7 @@ fn fixture_records() -> Vec<MinedRecord> {
 #[ignore = "fixture generator — run manually pre-upgrade only"]
 fn rfc0021_fixture_writes_the_pre_upgrade_file() {
     let bytes = encode_records_to_parquet(&fixture_records(), DEFAULT_ZSTD_LEVEL).expect("encode");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
+    let path = fixture_path();
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(&path, bytes).expect("write fixture");
 }
@@ -150,8 +158,7 @@ fn rfc0021_fixture_writes_the_pre_upgrade_file() {
 /// 55 → 58 bump — a permanent regression guard, not a one-off check.
 #[test]
 fn rfc0021_2_pre_upgrade_fixture_reads_identically() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
-    let records = Reader::open_file(&path)
+    let records = Reader::open_file(&fixture_path())
         .expect("open fixture")
         .read_all()
         .expect("read fixture");

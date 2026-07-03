@@ -330,14 +330,14 @@ fn parse_region(md: &str) -> Result<BTreeMap<(String, String), Block>, BenchErro
                     ..Block::default()
                 },
             ));
-        } else if let Some((_, block)) = current.as_mut() {
-            if let Some((gate, row)) = parse_row(line) {
-                match gate {
-                    "A1" => block.a1 = Some(row),
-                    "C1" => block.c1 = Some(row),
-                    "C2" => block.c2 = Some(row),
-                    _ => {}
-                }
+        } else if let Some((_, block)) = current.as_mut()
+            && let Some((gate, row)) = parse_row(line)
+        {
+            match gate {
+                "A1" => block.a1 = Some(row),
+                "C1" => block.c1 = Some(row),
+                "C2" => block.c2 = Some(row),
+                _ => {}
             }
         }
     }

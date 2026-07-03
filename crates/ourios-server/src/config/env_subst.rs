@@ -128,10 +128,10 @@ fn resolve_reference(body: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Opt
 /// `NAME[:-DEFAULT]` (matching the WG grammar's backtracking, so `${env:-x}`
 /// reads as name `env`, default `x`).
 fn parse_body(body: &str) -> Option<(&str, Option<&str>)> {
-    if let Some(rest) = body.strip_prefix("env:") {
-        if let Some(parsed) = parse_env_substitution(rest) {
-            return Some(parsed);
-        }
+    if let Some(rest) = body.strip_prefix("env:")
+        && let Some(parsed) = parse_env_substitution(rest)
+    {
+        return Some(parsed);
     }
     parse_env_substitution(body)
 }

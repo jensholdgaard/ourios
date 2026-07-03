@@ -45,7 +45,7 @@ percent-encoding = { version = "2", default-features = false, features = ["alloc
 # `starts_with` / `ends_with`) and the `=~` / `!~` regex operators
 # (RFC 0002 §6.1); with default features off they would not be in the
 # session registry and planning those predicates would fail.
-datafusion = { version = "53", default-features = false, features = [
+datafusion = { version = "54", default-features = false, features = [
     "parquet",
     "string_expressions",
     "regex_expressions",
@@ -81,12 +81,11 @@ tempfile = "=3.27.0"
 # ourios-parquet `Writer` only emits the current schema, so the
 # heterogeneous fixtures are written via the raw `ArrowWriter`
 # over a batch built from the public `data_schema()`. Pinned to
-# the same arrow/parquet 55 ourios-parquet writes with; the files
-# are then read by DataFusion's parquet 58 — the same disk-only
-# cross-version handoff the crate already relies on.
-parquet = { version = "=55.2.0", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=55.2.0", default-features = false }
-arrow-schema = { version = "=55.2.0", default-features = false }
+# the same arrow/parquet 58 the whole workspace now shares
+# (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
+parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
+arrow-array = { version = "=58.3.0", default-features = false }
+arrow-schema = { version = "=58.3.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.
 serde_yaml = { version = "=0.9.34", default-features = false }

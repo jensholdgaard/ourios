@@ -609,15 +609,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Drain the listeners gracefully (the receiver release frees the single
     // `Wal`) before flushing telemetry and exiting.
-    if let Some(handle) = querier {
-        if let Err(e) = handle.shutdown().await {
-            tracing::error!(name: ourios_semconv::EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR, "querier shutdown error: {e}");
-        }
+    if let Some(handle) = querier
+        && let Err(e) = handle.shutdown().await
+    {
+        tracing::error!(name: ourios_semconv::EVENT_OURIOS_QUERIER_SHUTDOWN_ERROR, "querier shutdown error: {e}");
     }
-    if let Some(handle) = receiver {
-        if let Err(e) = handle.shutdown().await {
-            tracing::error!(name: ourios_semconv::EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR, "receiver shutdown error: {e}");
-        }
+    if let Some(handle) = receiver
+        && let Err(e) = handle.shutdown().await
+    {
+        tracing::error!(name: ourios_semconv::EVENT_OURIOS_RECEIVER_SHUTDOWN_ERROR, "receiver shutdown error: {e}");
     }
 
     // Flush pending telemetry on the way out (best-effort: a failed final

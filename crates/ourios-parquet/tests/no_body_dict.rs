@@ -120,7 +120,7 @@ fn rfc0005_8_body_column_has_no_dictionary_encoding() {
 
             // Clause 2: encodings does not include any dictionary
             // variant.
-            let encs = col.encodings();
+            let encs: Vec<_> = col.encodings().collect();
             assert!(
                 !encs.contains(&Encoding::PLAIN_DICTIONARY),
                 "row group {rg_idx}: body encodings must not include PLAIN_DICTIONARY, got {encs:?}",
@@ -224,7 +224,7 @@ fn rfc0005_8_params_list_leaves_have_no_dictionary_encoding() {
                 "{path}: compression must be ZSTD, got {:?}",
                 col.compression(),
             );
-            let encs = col.encodings();
+            let encs: Vec<_> = col.encodings().collect();
             assert!(
                 !encs.contains(&Encoding::PLAIN_DICTIONARY),
                 "{path}: encodings must not include PLAIN_DICTIONARY, got {encs:?}",

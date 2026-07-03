@@ -176,21 +176,67 @@ fn rfc0021_2_pre_upgrade_fixture_reads_identically() {
 
 /// Scenario RFC0021.1 — one arrow.
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+///
+/// Inspects the committed lockfile: every `arrow*` package is on the
+/// single post-upgrade major, `datafusion` is on 54.x, and the workspace
+/// MSRV is 1.88. A second arrow major sneaking back in via a transitive
+/// bump fails here, not in a human review of a renovate diff.
 #[test]
-#[ignore = "RFC0021.1 stub — implemented in the phase-1 green slice"]
 fn rfc0021_1_one_arrow_major_and_datafusion_54() {
-    todo!(
-        "RFC0021.1 — lockfile carries exactly one arrow major (58.x) + datafusion 54.x; MSRV 1.88"
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root is two levels above CARGO_MANIFEST_DIR");
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+
+    let mut arrow_majors = std::collections::BTreeSet::new();
+    let mut datafusion_versions = Vec::new();
+    for block in lock.split("[[package]]") {
+        let field = |key: &str| {
+            block.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix(&format!("{key} = \""))
+                    .and_then(|rest| rest.strip_suffix('"'))
+            })
+        };
+        let Some(name) = field("name") else { continue };
+        let version = field("version").expect("every package has a version");
+        if name == "arrow" || name.starts_with("arrow-") {
+            let major = version.split('.').next().expect("semver major");
+            arrow_majors.insert(major.to_string());
+        }
+        if name == "datafusion" {
+            datafusion_versions.push(version.to_string());
+        }
+    }
+    assert_eq!(
+        arrow_majors.into_iter().collect::<Vec<_>>(),
+        ["58"],
+        "exactly one arrow major (58.x) in the lockfile"
+    );
+    assert_eq!(
+        datafusion_versions.len(),
+        1,
+        "exactly one datafusion in the lockfile, got {datafusion_versions:?}"
+    );
+    assert!(
+        datafusion_versions[0].starts_with("54."),
+        "datafusion 54.x, got {}",
+        datafusion_versions[0]
+    );
+
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        manifest.contains("rust-version = \"1.88\""),
+        "workspace MSRV is 1.88"
     );
 }
 
 /// Scenario RFC0021.3 — reconstruction stays bit-identical (§3.3).
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
 #[test]
-#[ignore = "RFC0021.3 stub — the existing reconstruction property + corpus suites are the oracle"]
-fn rfc0021_3_reconstruction_property_and_corpus_green() {
-    todo!("RFC0021.3 — reconstruction suites pass unchanged on the upgraded stack");
-}
+#[ignore = "RFC0021.3 discharged — the reconstruction property + corpus suites (ourios-miner) ran unchanged and green on the upgraded stack (#339/#340); this marker points at that oracle"]
+fn rfc0021_3_reconstruction_property_and_corpus_green() {}
 
 /// Recursively swap `Utf8`→`Utf8View` / `Binary`→`BinaryView` through
 /// `List`/`Struct` nesting — the view mix `DataFusion`'s scan can hand the
@@ -292,15 +338,11 @@ fn rfc0021_4_shared_decoder_reads_view_and_plain_representations() {
 /// Scenario RFC0021.5 — the B1/B2 pruning thesis holds.
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
 #[test]
-#[ignore = "RFC0021.5 stub — benchmarks.md B1/B2 (indicative ci-runner; authoritative on opt-in)"]
-fn rfc0021_5_pruning_gates_hold() {
-    todo!("RFC0021.5 — B1/B2 show no regression beyond run-to-run noise");
-}
+#[ignore = "RFC0021.5 discharged — structural: the rfc0007_1_* pruning tests (ourios-querier) are green on the upgraded stack; wall-clock: indicative ci-runner query-bench on PR #340 showed no regression (authoritative baseline rerun stays maintainer opt-in)"]
+fn rfc0021_5_pruning_gates_hold() {}
 
 /// Scenario RFC0021.6 — the full gate is green.
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
 #[test]
-#[ignore = "RFC0021.6 stub — CI is the oracle (incl. s3-integration + live-check)"]
-fn rfc0021_6_full_gate_green() {
-    todo!("RFC0021.6 — complete suite green on the upgraded stack");
-}
+#[ignore = "RFC0021.6 discharged — CI is the oracle: the complete suite (incl. s3-integration + live-check) is green on main with phase 1 merged (#339/#340)"]
+fn rfc0021_6_full_gate_green() {}

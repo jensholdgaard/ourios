@@ -1,7 +1,7 @@
 ---
 rfc: 0021
 title: Coordinated DataFusion / Arrow upgrade — phased behind upstream
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-03
@@ -168,6 +168,12 @@ DataFusion 54 carries arrow 58 — reintroducing the dual-arrow split
 
 Scenario ids `RFC0021.<m>`. Phase 1 = `.1`–`.6`; phase 2 = `.7`–`.9`
 (**upstream-gated**: their stubs land red only when phase 2 opens).
+
+> **Status note (2026-07-03):** phase 1 is complete — `.1`–`.6` are
+> discharged (#339 dependency bump, #340 decoder unification; indicative
+> B1/B2 ci-runner run on #340). `green` here covers phase 1; opening
+> phase 2 lands `.7`–`.9` as red stubs and moves the status back to
+> `red` until they pass.
 
 > **Scenario RFC0021.1 — one arrow.**
 > Given the phase-1 bump,

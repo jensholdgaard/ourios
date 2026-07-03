@@ -797,14 +797,32 @@ impl Querier {
         // `schema_force_view_types` override is needed.
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-        // `infer_schema` over the multi-path set merges the files'
-        // schemas, so additive schema drift across files reads as the
-        // union (RFC0007.4 / RFC 0005 §3.9).
+        // The table schema must be the **union** across every scanned file
+        // (RFC0007.4 / RFC 0005 §3.9), and since RFC 0022 the union is
+        // load-bearing for predicate compilation: `attr_match` gates the
+        // promoted-column arms on the post-union schema (§3.4). A bare
+        // `ListingTableConfig::infer_schema` infers from the *first* table
+        // path only — with the per-file URLs `resolve_data_urls` produces,
+        // that is one arbitrary file, not the union — so infer per file and
+        // merge. The extra footer reads are already paid: the Parquet format
+        // fetches every listed file's footer for statistics at plan time.
+        let mut schemas = Vec::with_capacity(urls.len());
+        for url in &urls {
+            let schema = options
+                .infer_schema(&ctx.state(), url)
+                .await
+                .map_err(storage_err)?;
+            schemas.push(schema.as_ref().clone());
+        }
+        let file_schema =
+            datafusion::arrow::datatypes::Schema::try_merge(schemas).map_err(|e| {
+                QueryError::Storage {
+                    detail: format!("merging scanned file schemas: {e}"),
+                }
+            })?;
         let config = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(options)
-            .infer_schema(&ctx.state())
-            .await
-            .map_err(storage_err)?;
+            .with_schema(Arc::new(file_schema));
         let table = ListingTable::try_new(config).map_err(storage_err)?;
         ctx.register_table("logs", Arc::new(table))
             .map_err(storage_err)?;

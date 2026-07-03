@@ -17,7 +17,7 @@ use ourios_core::otlp::any_value::Value as AvValue;
 use ourios_core::otlp::{AnyValue, KeyValue};
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{PartitionKey, Writer};
+use ourios_parquet::{DEFAULT_ZSTD_LEVEL, PartitionKey, PromotedAttributes, Writer};
 
 /// 2026-04-02T10:58:00 UTC — the same base instant the execution tests
 /// use, so all fixture rows land in one `hour=` partition unless bumped.
@@ -112,6 +112,42 @@ pub fn write_all(bucket: &Path, recs: &[MinedRecord]) {
         let mut w = Writer::open(bucket, part).expect("open writer");
         w.append_records(&rs).expect("append");
         w.close().expect("close");
+    }
+}
+
+/// [`write_all`] with an explicit RFC 0022 promoted attribute set, so a test
+/// can seed post-amendment files whose promoted columns go beyond the
+/// implicit `service.name`.
+pub fn write_all_with_promoted(bucket: &Path, recs: &[MinedRecord], promoted: &PromotedAttributes) {
+    let store = Store::local(bucket).expect("local store");
+    let mut by_part: HashMap<PartitionKey, Vec<MinedRecord>> = HashMap::new();
+    for r in recs {
+        by_part
+            .entry(PartitionKey::derive(r).expect("derive partition"))
+            .or_default()
+            .push(r.clone());
+    }
+    for (part, rs) in by_part {
+        let mut w =
+            Writer::open_in_with_promoted(&store, part, DEFAULT_ZSTD_LEVEL, promoted.clone())
+                .expect("open writer");
+        w.append_records(&rs).expect("append");
+        w.close().expect("close");
+    }
+}
+
+/// A record with explicit log `attributes` on top of [`rec_with_resource`]'s
+/// explicit resource attributes, so promoted-column tests can drive both
+/// families.
+pub fn rec_with_attrs(
+    tenant: &str,
+    ts_ns: u64,
+    resource_attributes: Vec<KeyValue>,
+    attributes: Vec<KeyValue>,
+) -> MinedRecord {
+    MinedRecord {
+        attributes,
+        ..rec_with_resource(tenant, ts_ns, resource_attributes)
     }
 }
 

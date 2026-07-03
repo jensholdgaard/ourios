@@ -31,15 +31,20 @@
 //! RFC 0005 §3.9 `effective := time_unix_nano` fallback for files that
 //! predate the column.
 //!
-//! `service`, `resource.<k>`, and `attr.<k>` have **no dedicated column** in
-//! the RFC 0005 schema: resource/log attributes are stored as a single
-//! Ourios-canonical-JSON `Utf8` column (`resource_attributes` / `attributes`).
-//! They compile to a substring/`LIKE` match against that JSON column using a
-//! needle built from the canonical `{"key":…,"value":{"stringValue":…}}`
-//! shape — honest about the storage, not a column that doesn't exist. This is
-//! a `Filter` with no row-group-pruning claim (RFC 0002 §5 RFC0002.6), and is
-//! limited to string equality / string calls; ordering comparisons on a
-//! JSON-encoded attribute are out of scope for this slice and rejected.
+//! `service`, `resource.<k>`, and `attr.<k>` are attribute-backed:
+//! resource/log attributes are stored as a single Ourios-canonical-JSON
+//! `Utf8` column (`resource_attributes` / `attributes`), plus — for keys in
+//! the RFC 0022 promoted set — a dedicated `OPTIONAL Utf8` column named
+//! after the DSL path (`resource.<k>` / `attr.<k>`). When the scanned union
+//! schema carries a key's promoted column, [`attr_match`] compiles the full
+//! `cmp_op` set against it (§3.3's two-arm form for `==`/`!=`, typed-arm
+//! only for ordering/regex) and the typed arm prunes row groups. Otherwise
+//! the key compiles to a substring/`LIKE` match against the JSON column
+//! using a needle built from the canonical
+//! `{"key":…,"value":{"stringValue":…}}` shape — honest about the storage,
+//! a `Filter` with no row-group-pruning claim (RFC 0002 §5 RFC0002.6),
+//! limited to string equality; ordering/regex on a non-promoted
+//! (JSON-encoded) attribute stay rejected.
 //!
 //! ## Absent OPTIONAL columns (RFC 0005 §3.9 / RFC0007.4)
 //!
@@ -52,6 +57,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use datafusion::common::Column;
 use datafusion::dataframe::DataFrame;
 use datafusion::functions::expr_fn::{regexp_like, starts_with};
 use datafusion::logical_expr::{Expr, not};
@@ -64,7 +70,7 @@ use crate::dsl::ir::{
     Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
 };
 use crate::{QueryError, has_column, time_bound_scalar};
-use ourios_parquet::columns;
+use ourios_parquet::{columns, promoted};
 
 /// A compiled query: the resolved time window (drives both the
 /// directory-level partition pruning and the row-level time filter) and the
@@ -594,13 +600,27 @@ fn field_name(field: &Field) -> String {
     }
 }
 
-/// Compile an attribute equality (`service`/`resource.k`/`attr.k`) to a
-/// substring `LIKE` over the Ourios-canonical-JSON column. Only `==`/`!=` on a
-/// string value is supported in this slice; the canonical encoding stores
-/// string values as `{"key":"<k>","value":{"stringValue":"<v>"}}`, so an
-/// exact key+string-value pair is matched by that JSON fragment as a `LIKE`
-/// substring. Ordering / regex / non-string comparisons over a JSON-encoded
-/// attribute are rejected (out of scope until attributes are columned).
+/// Compile an attribute comparison (`service`/`resource.k`/`attr.k`).
+///
+/// When the scanned union schema carries the key's RFC 0022 promoted column
+/// (`resource.<k>` / `attr.<k>` — §3.4's compile rule), the operator set is
+/// the full `cmp_op` (§3.3):
+///
+/// - `==`/`!=` compile to the two-arm form — the typed column arm (prunable)
+///   `OR` a `P IS NULL AND <JSON arm>` fallback covering pre-amendment files
+///   and non-string values.
+/// - Ordering and regex compile against the typed arm only; the JSON arm
+///   cannot express them, so rows whose promoted cell is `NULL`
+///   (pre-amendment files, non-string values) never match — §3.3's
+///   documented silent non-match, consistent with the DSL's missing-field
+///   rule.
+///
+/// Without the promoted column, `==`/`!=` on a string value keep the #146
+/// substring `LIKE` over the Ourios-canonical-JSON column (the canonical
+/// encoding stores string values as
+/// `{"key":"<k>","value":{"stringValue":"<v>"}}`, so an exact
+/// key+string-value pair is matched by that JSON fragment), and every other
+/// operator is rejected — unchanged pre-RFC 0022 behaviour.
 fn attr_match(
     column: &str,
     key: &str,
@@ -618,13 +638,28 @@ fn attr_match(
             detail: "attribute comparisons take a string value in this query surface".to_string(),
         });
     };
-    let ord = match op {
+    let promoted_name = promoted_column_name(column, key);
+    // `col()` parses dotted names as qualified references, so the promoted
+    // column (literally named `resource.<k>` / `attr.<k>`) must be addressed
+    // as an unqualified `Column` built directly.
+    let promoted = has_column(df, &promoted_name)
+        .then(|| Expr::Column(Column::new_unqualified(promoted_name)));
+    let eq = match op {
         CmpOp::Ord(OrdOp::Eq) => true,
         CmpOp::Ord(OrdOp::Ne) => false,
-        _ => {
-            return Err(QueryError::InvalidQuery {
-                detail: "attributes support only == / != in this query surface".to_string(),
-            });
+        op => {
+            let Some(p) = promoted else {
+                return Err(QueryError::InvalidQuery {
+                    detail: "non-promoted attributes support only == / != in this query surface"
+                        .to_string(),
+                });
+            };
+            let expr = match op {
+                CmpOp::Ord(ord) => ord_expr(p, ord, lit(v.clone())),
+                CmpOp::Match => regexp_like(p, lit(v.clone()), None),
+                CmpOp::NotMatch => not(regexp_like(p, lit(v.clone()), None)),
+            };
+            return Ok(PredExpr::Filter(expr));
         }
     };
     // The canonical JSON fragment for this key/value pair. `serde_json`'s
@@ -638,18 +673,45 @@ fn attr_match(
     })?;
     let fragment = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":{needle_value}}}}}");
     let value_match = col(column).like(lit(format!("%{}%", like_escape(&fragment))));
-    if ord {
+    let json = if eq {
         // `==` matches when the key is present with this exact string value.
-        return Ok(PredExpr::Filter(value_match));
+        value_match
+    } else {
+        // `!=` must require the key PRESENT with a *different* value: a row
+        // missing the key does not match. The presence guard matches the key
+        // with any string value, then we exclude the exact value above.
+        // Without the guard, `NOT LIKE` is also true for absent keys, which
+        // diverges from the missing-field "no match" semantics used
+        // everywhere else.
+        let key_present = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":");
+        let presence = col(column).like(lit(format!("%{}%", like_escape(&key_present))));
+        presence.and(not(value_match))
+    };
+    let Some(p) = promoted else {
+        return Ok(PredExpr::Filter(json));
+    };
+    // §3.3's two-arm form. The `!=` typed arm keeps the presence check
+    // explicit (`P IS NOT NULL AND P != v`) rather than leaning on 3-valued
+    // logic, mirroring the JSON arm's presence guard.
+    let expr = if eq {
+        p.clone().eq(lit(v.clone())).or(p.is_null().and(json))
+    } else {
+        p.clone()
+            .is_not_null()
+            .and(p.clone().not_eq(lit(v.clone())))
+            .or(p.is_null().and(json))
+    };
+    Ok(PredExpr::Filter(expr))
+}
+
+/// The RFC 0022 promoted column name for an attribute key: the literal DSL
+/// path (`resource.<k>` / `attr.<k>`, §3.1), derived from the same prefixes
+/// the writer's [`ourios_parquet::promoted`] module declares.
+fn promoted_column_name(column: &str, key: &str) -> String {
+    match column {
+        columns::RESOURCE_ATTRIBUTES => format!("{}{key}", promoted::RESOURCE_PREFIX),
+        _ => format!("{}{key}", promoted::ATTR_PREFIX),
     }
-    // `!=` must require the key PRESENT with a *different* value: a row
-    // missing the key does not match. The presence guard matches the key with
-    // any string value, then we exclude the exact value above. Without the
-    // guard, `NOT LIKE` is also true for absent keys, which diverges from the
-    // missing-field "no match" semantics used everywhere else.
-    let key_present = format!("{{\"key\":{needle_key},\"value\":{{\"stringValue\":");
-    let presence = col(column).like(lit(format!("%{}%", like_escape(&key_present))));
-    Ok(PredExpr::Filter(presence.and(not(value_match))))
 }
 
 /// Escape the `%` / `_` / `\` wildcards in a `LIKE` pattern literal so the

@@ -129,7 +129,7 @@ For a DSL comparison on a **promoted** key, the compiler emits a
 two-arm expression (`P` = promoted column, `J` = the JSON arm — the
 existing #146 `LIKE` fragment machinery):
 
-```
+```text
 match_expr(op, v) :=
       (P op v)                       -- typed arm: full cmp_op set, prunable
    OR (P IS NULL AND J(op, v))       -- fallback arm: pre-amendment files,

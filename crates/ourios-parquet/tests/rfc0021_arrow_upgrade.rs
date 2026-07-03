@@ -12,11 +12,13 @@
 //!   run manually) generated `testdata/rfc0021/pre-upgrade.parquet` with the
 //!   **pre-upgrade (arrow 55) writer** — committed before any dependency
 //!   moves, per RFC 0021 §6.
-//! - [`pre_upgrade_fixture_reads_identically`] is the permanent RFC0021.2
-//!   regression guard: it decodes that committed file and asserts full
-//!   `MinedRecord` equality against the in-code expectation. It passes on the
-//!   current stack and MUST keep passing across the arrow 55 → 58 bump (§3.5:
-//!   files written before the upgrade read identically after it).
+//! - [`rfc0021_2_pre_upgrade_fixture_reads_identically`] is the RFC0021.2
+//!   scenario itself, live as a permanent regression guard: it decodes that
+//!   committed file and asserts full `MinedRecord` equality against the
+//!   in-code expectation. It passes on the current stack and MUST keep
+//!   passing across the arrow 55 → 58 bump (§3.5: files written before the
+//!   upgrade read identically after it) — there is no separate ignored stub
+//!   for `.2`.
 //!
 //! At green, `.1`/`.4`/`.6` resolve where the code lives (lockfile /
 //! querier row path / CI); `.3` maps onto the existing reconstruction
@@ -139,11 +141,15 @@ fn rfc0021_fixture_writes_the_pre_upgrade_file() {
     std::fs::write(&path, bytes).expect("write fixture");
 }
 
-/// The permanent RFC0021.2 regression guard (live from red): the committed
-/// pre-upgrade file decodes to exactly the expected rows. Green today on
-/// arrow 55; must stay green across the bump (§3.5).
+/// Scenario RFC0021.2 — old files read identically (§3.5).
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+///
+/// Live (not a stub) from red on purpose: the committed pre-upgrade file
+/// decodes to exactly the expected rows. Green today on arrow 55; the
+/// scenario is *discharged* by this same test staying green across the
+/// 55 → 58 bump — a permanent regression guard, not a one-off check.
 #[test]
-fn pre_upgrade_fixture_reads_identically() {
+fn rfc0021_2_pre_upgrade_fixture_reads_identically() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
     let records = Reader::open_file(&path)
         .expect("open fixture")
@@ -159,16 +165,6 @@ fn pre_upgrade_fixture_reads_identically() {
 fn rfc0021_1_one_arrow_major_and_datafusion_54() {
     todo!(
         "RFC0021.1 — lockfile carries exactly one arrow major (58.x) + datafusion 54.x; MSRV 1.88"
-    );
-}
-
-/// Scenario RFC0021.2 — old files read identically (§3.5).
-/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
-#[test]
-#[ignore = "RFC0021.2 stub — discharged by pre_upgrade_fixture_reads_identically staying green across the bump"]
-fn rfc0021_2_pre_upgrade_files_read_identically() {
-    todo!(
-        "RFC0021.2 — the committed pre-upgrade fixture decodes identically on the upgraded stack"
     );
 }
 

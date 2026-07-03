@@ -392,7 +392,8 @@ consumer," not "it might be useful."
 > statistics and bloom filters are not key-scoped, so it cannot
 > prune — see RFC 0022 §4) and extends the §3.6 encodings table when
 > it lands. This section's JSON columns remain the source of truth;
-> no schema bytes change until RFC 0022 reaches `red`/`green`.
+> no schema bytes change before RFC 0022's `green` slices land (at
+> `red` only failing stubs exist).
 
 ### 3.4 Partition layout on disk
 

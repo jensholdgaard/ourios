@@ -217,9 +217,11 @@ flowchart LR
 
 ### 3.6 Telemetry
 
-Per the weaver-registry discipline: a `ourios.parquet.promoted_bytes`
-counter (attribute: promoted column name) recording projected bytes per
-flush, alongside the existing writer metrics. Query-side pruning is
+Per the weaver-registry discipline: a
+`ourios.storage.parquet.promoted.bytes` counter (attribute: promoted
+column name), following the existing `ourios.storage.parquet.*`
+namespace (`metric.ourios.storage.parquet.file.size`), recording
+projected bytes per flush alongside the existing writer metrics. Query-side pruning is
 already observable through the RFC 0016 scanned/pruned row-group
 counters — RFC0022.5 uses them as its oracle.
 

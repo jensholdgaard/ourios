@@ -252,7 +252,7 @@ flowchart LR
 Per the weaver-registry discipline: an
 `ourios.storage.parquet.promoted.size` instrument (attribute: promoted
 column name) recording per-flush projected bytes, mirroring
-`metric.ourios.storage.parquet.file.size` (histogram, UCUM unit `By`)
+`ourios.storage.parquet.file.size` (histogram, UCUM unit `By`)
 in both namespace and shape. The unit lives in instrument metadata,
 not the name, per the OTel metric semantic conventions ("metrics that
 have their units included in OpenTelemetry metadata SHOULD NOT include

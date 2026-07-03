@@ -436,7 +436,8 @@ async fn rfc0022_5_promoted_predicates_prune() {
     );
     assert!(
         r.stats.bytes_read > 0,
-        "bytes_scanned extraction stays wired; stats={:?}",
+        "bytes_read extraction (from the engine's bytes_scanned metric) \
+         stays wired; stats={:?}",
         r.stats,
     );
 }

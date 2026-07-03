@@ -16,10 +16,13 @@ use ourios_core::otlp::{KeyValue, any_value};
 /// resource entity, surfaced in the DSL as the bare `service` field.
 pub const SERVICE_NAME_KEY: &str = "service.name";
 
-/// Column-name prefix for promoted resource-attribute keys.
-const RESOURCE_PREFIX: &str = "resource.";
-/// Column-name prefix for promoted log-attribute keys.
-const ATTR_PREFIX: &str = "attr.";
+/// Column-name prefix for promoted resource-attribute keys. Public because
+/// the query-side compile (RFC 0022 §3.3) derives promoted column names from
+/// the same prefixes the writer declares.
+pub const RESOURCE_PREFIX: &str = "resource.";
+/// Column-name prefix for promoted log-attribute keys (see
+/// [`RESOURCE_PREFIX`]).
+pub const ATTR_PREFIX: &str = "attr.";
 
 /// The effective promoted attribute key set (RFC 0022 §3.1/§3.2).
 ///

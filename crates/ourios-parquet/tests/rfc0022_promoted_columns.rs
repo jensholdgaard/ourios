@@ -230,3 +230,32 @@ fn rfc0022_2_configured_keys_project() {
         );
     }
 }
+
+/// §3.1 first-occurrence semantics hold through the batch path: the
+/// first attribute carrying a promoted key decides the cell, even when
+/// a later duplicate would project differently.
+#[test]
+fn promoted_projection_is_first_occurrence_per_record() {
+    let promoted = PromotedAttributes::new(Vec::new(), ["http.route".to_string()]);
+    let records = [
+        rec(
+            Vec::new(),
+            vec![
+                kv_str("http.route", "/first"),
+                kv_str("http.route", "/shadowed"),
+            ],
+        ),
+        rec(
+            Vec::new(),
+            // First occurrence is non-string → NULL, despite the later string.
+            vec![kv_int("http.route", 1), kv_str("http.route", "/late")],
+        ),
+    ];
+    let bytes = encode_records_to_parquet_with_promoted(&records, DEFAULT_ZSTD_LEVEL, &promoted)
+        .expect("encode");
+    let (batch, _) = read_all(&bytes);
+    assert_eq!(
+        promoted_values(&batch, "attr.http.route"),
+        [Some("/first".to_string()), None],
+    );
+}

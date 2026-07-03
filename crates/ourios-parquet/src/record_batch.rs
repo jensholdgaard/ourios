@@ -22,6 +22,7 @@
 //! the body into the canonical bytes (`MinedRecord.body` carries
 //! the bytes verbatim), so the writer just appends them.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -81,31 +82,60 @@ pub fn mined_records_to_batch_with_promoted(
         b.append(r)?;
     }
     let mut arrays = b.finish();
-    for key in promoted.resource_keys() {
-        arrays.push(project_promoted_column(records, key, |r| {
-            r.resource_attributes.as_slice()
-        }));
-    }
-    for key in promoted.log_keys() {
-        arrays.push(project_promoted_column(records, key, |r| {
-            r.attributes.as_slice()
-        }));
-    }
+    arrays.extend(project_promoted_columns(
+        records,
+        promoted.resource_keys(),
+        |r| r.resource_attributes.as_slice(),
+    ));
+    arrays.extend(project_promoted_columns(
+        records,
+        promoted.log_keys(),
+        |r| r.attributes.as_slice(),
+    ));
     RecordBatch::try_new(data_schema_with_promoted(promoted), arrays).map_err(BatchError::Arrow)
 }
 
-/// Materialise one promoted column: the §3.1 string projection of
-/// `key` from `attrs_of(record)` for every record, in row order.
-fn project_promoted_column(
+/// Materialise the promoted columns of one attribute-list family
+/// (resource or log) in key order, visiting each record's attribute
+/// list once rather than once per key. The first occurrence of a
+/// promoted key decides its cell — [`promoted::string_value`] or a
+/// `NULL` for a non-string — matching
+/// [`promoted::project_string_value`] per column.
+fn project_promoted_columns(
     records: &[MinedRecord],
-    key: &str,
+    keys: &[String],
     attrs_of: impl Fn(&MinedRecord) -> &[KeyValue],
-) -> ArrayRef {
-    let mut b = StringBuilder::with_capacity(records.len(), 0);
-    for r in records {
-        append_option_str(&mut b, promoted::project_string_value(attrs_of(r), key));
+) -> Vec<ArrayRef> {
+    if keys.is_empty() {
+        return Vec::new();
     }
-    Arc::new(b.finish())
+    let index: HashMap<&str, usize> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
+    let mut builders: Vec<StringBuilder> = keys
+        .iter()
+        .map(|_| StringBuilder::with_capacity(records.len(), 0))
+        .collect();
+    let mut cells: Vec<Option<Option<&str>>> = vec![None; keys.len()];
+    for r in records {
+        cells.fill(None);
+        for kv in attrs_of(r) {
+            if let Some(&i) = index.get(kv.key.as_str())
+                && cells[i].is_none()
+            {
+                cells[i] = Some(promoted::string_value(kv));
+            }
+        }
+        for (b, cell) in builders.iter_mut().zip(&cells) {
+            append_option_str(b, cell.flatten());
+        }
+    }
+    builders
+        .into_iter()
+        .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+        .collect()
 }
 
 /// Errors produced by [`mined_records_to_batch`].

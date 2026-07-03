@@ -107,12 +107,17 @@ impl PromotedAttributes {
 /// first-match semantics of the query-side JSON `LIKE` arm.
 #[must_use]
 pub fn project_string_value<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a str> {
-    attrs.iter().find(|kv| kv.key == key).and_then(|kv| {
-        match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
-            Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
-            _ => None,
-        }
-    })
+    attrs.iter().find(|kv| kv.key == key).and_then(string_value)
+}
+
+/// The §3.1 value projection of a single attribute: the payload **iff**
+/// the `AnyValue` is a string, `None` for any other variant (or none).
+#[must_use]
+pub fn string_value(kv: &KeyValue) -> Option<&str> {
+    match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
+        Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

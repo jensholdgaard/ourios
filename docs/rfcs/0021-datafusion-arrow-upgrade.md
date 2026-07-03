@@ -76,7 +76,7 @@ The version locks, as of this writing:
 | parquet 58.3 → thrift | pins `^0.17` (vulnerable); dropped in parquet 59 |
 | object_store 0.14.0 → quick-xml | pins `^0.40.1` (< patched 0.41) |
 | ourios-querier ↔ ourios-parquet | must share one `object_store` (the querier registers `Store::object_store()` with DataFusion's `SessionContext`, RFC 0013 §2.2) |
-| DataFusion 54.0.0 → rustc | MSRV 1.88.0 (workspace documents 1.85) |
+| DataFusion 54.0.0 → rustc | MSRV 1.88.0 (workspace documented 1.85 pre-phase-1; now 1.88) |
 
 A "single coordinated bump" resolving the whole epic is therefore not
 constructible from released crates today. What *is* constructible now —

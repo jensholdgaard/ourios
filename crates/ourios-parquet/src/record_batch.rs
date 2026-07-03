@@ -37,7 +37,8 @@ use ourios_core::otlp::KeyValue;
 use ourios_core::record::{BodyKind, MinedRecord};
 
 use crate::partition::{TimestampOverflowError, effective_time_unix_nano};
-use crate::{columns, data_schema};
+use crate::promoted::{self, PromotedAttributes};
+use crate::{columns, data_schema, data_schema_with_promoted};
 
 /// Build an Arrow `RecordBatch` matching `data_schema()` from a
 /// slice of [`MinedRecord`]s.
@@ -58,6 +59,53 @@ pub fn mined_records_to_batch(records: &[MinedRecord]) -> Result<RecordBatch, Ba
     }
     let arrays = b.finish();
     RecordBatch::try_new(data_schema(), arrays).map_err(BatchError::Arrow)
+}
+
+/// [`mined_records_to_batch`] plus the RFC 0022 promoted attribute
+/// columns for `promoted`, appended in [`PromotedAttributes`] column
+/// order to match [`crate::data_schema_with_promoted`]. Each promoted
+/// cell is the §3.1 string projection out of the record's
+/// resource/log attribute list (`NULL` for absent or non-string
+/// values); the canonical-JSON columns are built exactly as in the
+/// base path and remain the source of truth.
+///
+/// # Errors
+///
+/// See [`mined_records_to_batch`].
+pub fn mined_records_to_batch_with_promoted(
+    records: &[MinedRecord],
+    promoted: &PromotedAttributes,
+) -> Result<RecordBatch, BatchError> {
+    let mut b = Builders::with_capacity(records.len());
+    for r in records {
+        b.append(r)?;
+    }
+    let mut arrays = b.finish();
+    for key in promoted.resource_keys() {
+        arrays.push(project_promoted_column(records, key, |r| {
+            r.resource_attributes.as_slice()
+        }));
+    }
+    for key in promoted.log_keys() {
+        arrays.push(project_promoted_column(records, key, |r| {
+            r.attributes.as_slice()
+        }));
+    }
+    RecordBatch::try_new(data_schema_with_promoted(promoted), arrays).map_err(BatchError::Arrow)
+}
+
+/// Materialise one promoted column: the §3.1 string projection of
+/// `key` from `attrs_of(record)` for every record, in row order.
+fn project_promoted_column(
+    records: &[MinedRecord],
+    key: &str,
+    attrs_of: impl Fn(&MinedRecord) -> &[KeyValue],
+) -> ArrayRef {
+    let mut b = StringBuilder::with_capacity(records.len(), 0);
+    for r in records {
+        append_option_str(&mut b, promoted::project_string_value(attrs_of(r), key));
+    }
+    Arc::new(b.finish())
 }
 
 /// Errors produced by [`mined_records_to_batch`].

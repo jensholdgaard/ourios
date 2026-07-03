@@ -220,25 +220,59 @@ fn rfc0021_4_shared_decoder_reads_view_and_plain_representations() {
     assert_eq!(batches.len(), 1, "fixture fits one batch");
     let plain = &batches[0];
 
-    // The same batch with every flat Utf8/Binary column cast to its view
-    // representation — what DataFusion's default scan hands the querier.
+    // The same batch with every Utf8/Binary — flat *and* nested inside the
+    // `params` list-of-struct and `separators` list — cast to its view
+    // representation, covering whatever mix DataFusion's scan hands the
+    // querier.
+    fn to_view_type(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
+        use arrow_schema::DataType;
+        match dt {
+            DataType::Utf8 => DataType::Utf8View,
+            DataType::Binary => DataType::BinaryView,
+            DataType::List(f) => DataType::List(Arc::new(
+                f.as_ref()
+                    .clone()
+                    .with_data_type(to_view_type(f.data_type())),
+            )),
+            DataType::Struct(fs) => DataType::Struct(
+                fs.iter()
+                    .map(|f| {
+                        Arc::new(
+                            f.as_ref()
+                                .clone()
+                                .with_data_type(to_view_type(f.data_type())),
+                        )
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    let plain_schema = plain.schema();
     let mut fields = Vec::new();
     let mut columns = Vec::new();
-    for (field, column) in plain.schema().fields().iter().zip(plain.columns()) {
-        use arrow_schema::DataType;
-        let target = match field.data_type() {
-            DataType::Utf8 => Some(DataType::Utf8View),
-            DataType::Binary => Some(DataType::BinaryView),
-            _ => None,
-        };
-        if let Some(dt) = target {
-            let cast = arrow_cast::cast(column, &dt).expect("cast to view");
-            fields.push(field.as_ref().clone().with_data_type(dt));
-            columns.push(cast);
-        } else {
+    let mut recast = Vec::new();
+    for (field, column) in plain_schema.fields().iter().zip(plain.columns()) {
+        let target = to_view_type(field.data_type());
+        if target == *field.data_type() {
             fields.push(field.as_ref().clone());
             columns.push(Arc::clone(column));
+        } else {
+            let cast = arrow_cast::cast(column, &target).expect("cast to view");
+            fields.push(field.as_ref().clone().with_data_type(target));
+            columns.push(cast);
+            recast.push(field.name().as_str());
         }
+    }
+    // Guard the test itself: the nested columns must actually change
+    // representation, or the view-decode assertion below proves nothing
+    // about the params/separators element paths.
+    for name in ["tenant_id", "body", "params", "separators"] {
+        assert!(
+            recast.contains(&name),
+            "{name} was not recast to a view type"
+        );
     }
     let schema = Arc::new(arrow_schema::Schema::new(fields));
     let view = arrow_array::RecordBatch::try_new(schema, columns).expect("view batch");

@@ -191,7 +191,7 @@ impl Reader {
                     validate_row_vs_partition(r, p, row_offset + idx_in_batch, &file_path)?;
                 }
             }
-            row_offset += records.len();
+            row_offset += batch.num_rows();
             out.extend(records);
         }
         Ok(out)
@@ -473,8 +473,9 @@ fn require_baseline_columns(file_schema: &arrow_schema::Schema) -> Result<(), Re
 /// calls this over the parquet crate's plain `Utf8`/`Binary` batches, and
 /// the querier calls it over `DataFusion`'s default `Utf8View`/`BinaryView`
 /// batches — the string/binary accessors handle both representations.
-/// `row_offset` is the file-global row index of `batch`'s first row, so
-/// per-row diagnostics report stable indices across multi-batch files.
+/// `row_offset` is the stream-global index of `batch`'s first row (file
+/// row order for the [`Reader`], result order for the querier), so per-row
+/// diagnostics report stable indices across multi-batch decodes.
 ///
 /// # Errors
 ///
@@ -494,18 +495,19 @@ pub fn batch_to_mined_records(
     let mut records: Vec<MinedRecord> = Vec::with_capacity(n);
 
     // Required columns — verified present at open time.
-    let tenant_id = required_string(batch, columns::TENANT_ID)?;
-    let template_id = required_u64(batch, columns::TEMPLATE_ID)?;
-    let template_version = required_u32(batch, columns::TEMPLATE_VERSION)?;
-    let time_unix_nano = required_timestamp(batch, columns::TIME_UNIX_NANO)?;
-    let severity_number = required_u8(batch, columns::SEVERITY_NUMBER)?;
-    let attributes = required_string(batch, columns::ATTRIBUTES)?;
-    let dropped_attributes_count = required_u32(batch, columns::DROPPED_ATTRIBUTES_COUNT)?;
-    let resource_attributes = required_string(batch, columns::RESOURCE_ATTRIBUTES)?;
-    let flags = required_u32(batch, columns::FLAGS)?;
-    let body_kind = required_u8(batch, columns::BODY_KIND)?;
-    let confidence = required_f32(batch, columns::CONFIDENCE)?;
-    let lossy_flag = required_bool(batch, columns::LOSSY_FLAG)?;
+    let tenant_id = required_string(batch, columns::TENANT_ID, row_offset)?;
+    let template_id = required_u64(batch, columns::TEMPLATE_ID, row_offset)?;
+    let template_version = required_u32(batch, columns::TEMPLATE_VERSION, row_offset)?;
+    let time_unix_nano = required_timestamp(batch, columns::TIME_UNIX_NANO, row_offset)?;
+    let severity_number = required_u8(batch, columns::SEVERITY_NUMBER, row_offset)?;
+    let attributes = required_string(batch, columns::ATTRIBUTES, row_offset)?;
+    let dropped_attributes_count =
+        required_u32(batch, columns::DROPPED_ATTRIBUTES_COUNT, row_offset)?;
+    let resource_attributes = required_string(batch, columns::RESOURCE_ATTRIBUTES, row_offset)?;
+    let flags = required_u32(batch, columns::FLAGS, row_offset)?;
+    let body_kind = required_u8(batch, columns::BODY_KIND, row_offset)?;
+    let confidence = required_f32(batch, columns::CONFIDENCE, row_offset)?;
+    let lossy_flag = required_bool(batch, columns::LOSSY_FLAG, row_offset)?;
 
     // OPTIONAL columns — missing-column carve-out (§3.9): if
     // the file's schema doesn't carry the column, every row's
@@ -527,8 +529,8 @@ pub fn batch_to_mined_records(
     // List columns — `params` and `separators` are REQUIRED in
     // the schema but the list itself may be empty per RFC 0005
     // §3.2 (`Vec::new()` is a valid value).
-    let params_lists = decode_params_column(batch)?;
-    let separators_lists = decode_separators_column(batch)?;
+    let params_lists = decode_params_column(batch, row_offset)?;
+    let separators_lists = decode_separators_column(batch, row_offset)?;
 
     for i in 0..n {
         // Empty-list short-circuit mirrors the writer's
@@ -704,7 +706,10 @@ fn decode_param_type(ord: i32) -> ParamType {
     }
 }
 
-fn decode_params_column(batch: &RecordBatch) -> Result<Vec<Vec<Param>>, ReaderError> {
+fn decode_params_column(
+    batch: &RecordBatch,
+    row_offset: usize,
+) -> Result<Vec<Vec<Param>>, ReaderError> {
     let idx = batch.schema().index_of(columns::PARAMS).map_err(|_| {
         ReaderError::MissingRequiredColumn {
             name: columns::PARAMS.to_string(),
@@ -719,8 +724,9 @@ fn decode_params_column(batch: &RecordBatch) -> Result<Vec<Vec<Param>>, ReaderEr
         })?;
 
     let mut out = Vec::with_capacity(list.len());
-    for row_idx in 0..list.len() {
-        if list.is_null(row_idx) {
+    for batch_row in 0..list.len() {
+        let row_idx = row_offset + batch_row;
+        if list.is_null(batch_row) {
             return Err(ReaderError::Conversion {
                 column: columns::PARAMS,
                 detail: format!(
@@ -728,7 +734,7 @@ fn decode_params_column(batch: &RecordBatch) -> Result<Vec<Vec<Param>>, ReaderEr
                 ),
             });
         }
-        let elements = list.value(row_idx);
+        let elements = list.value(batch_row);
         let struct_arr = elements
             .as_any()
             .downcast_ref::<StructArray>()
@@ -819,7 +825,10 @@ fn decode_params_column(batch: &RecordBatch) -> Result<Vec<Vec<Param>>, ReaderEr
     Ok(out)
 }
 
-fn decode_separators_column(batch: &RecordBatch) -> Result<Vec<Vec<String>>, ReaderError> {
+fn decode_separators_column(
+    batch: &RecordBatch,
+    row_offset: usize,
+) -> Result<Vec<Vec<String>>, ReaderError> {
     let idx = batch.schema().index_of(columns::SEPARATORS).map_err(|_| {
         ReaderError::MissingRequiredColumn {
             name: columns::SEPARATORS.to_string(),
@@ -834,8 +843,9 @@ fn decode_separators_column(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Rea
         })?;
 
     let mut out = Vec::with_capacity(list.len());
-    for row_idx in 0..list.len() {
-        if list.is_null(row_idx) {
+    for batch_row in 0..list.len() {
+        let row_idx = row_offset + batch_row;
+        if list.is_null(batch_row) {
             return Err(ReaderError::Conversion {
                 column: columns::SEPARATORS,
                 detail: format!(
@@ -843,7 +853,7 @@ fn decode_separators_column(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Rea
                 ),
             });
         }
-        let elements = list.value(row_idx);
+        let elements = list.value(batch_row);
         let bin = BinCol::try_new(elements.as_ref()).ok_or_else(|| ReaderError::Conversion {
             column: columns::SEPARATORS,
             detail: "list element is not a Binary/BinaryView array".to_string(),
@@ -877,7 +887,11 @@ fn decode_separators_column(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Rea
 // (OPTIONAL columns — `None` when the file's schema doesn't
 // carry the column, per §3.9's missing-column carve-out).
 
-fn required_string(batch: &RecordBatch, name: &'static str) -> Result<Vec<String>, ReaderError> {
+fn required_string(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<String>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = StrCol::try_new(col).ok_or_else(|| ReaderError::Conversion {
         column: name,
@@ -891,7 +905,7 @@ fn required_string(batch: &RecordBatch, name: &'static str) -> Result<Vec<String
         let Some(v) = arr.get(i) else {
             return Err(ReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         };
         out.push(v.to_string());
@@ -899,7 +913,11 @@ fn required_string(batch: &RecordBatch, name: &'static str) -> Result<Vec<String
     Ok(out)
 }
 
-fn required_u64(batch: &RecordBatch, name: &'static str) -> Result<Vec<u64>, ReaderError> {
+fn required_u64(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<u64>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<UInt64Type>()
@@ -907,10 +925,14 @@ fn required_u64(batch: &RecordBatch, name: &'static str) -> Result<Vec<u64>, Rea
             column: name,
             detail: format!("expected UInt64Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
-fn required_u32(batch: &RecordBatch, name: &'static str) -> Result<Vec<u32>, ReaderError> {
+fn required_u32(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<u32>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<UInt32Type>()
@@ -918,10 +940,14 @@ fn required_u32(batch: &RecordBatch, name: &'static str) -> Result<Vec<u32>, Rea
             column: name,
             detail: format!("expected UInt32Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
-fn required_u8(batch: &RecordBatch, name: &'static str) -> Result<Vec<u8>, ReaderError> {
+fn required_u8(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<u8>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<UInt8Type>()
@@ -929,10 +955,14 @@ fn required_u8(batch: &RecordBatch, name: &'static str) -> Result<Vec<u8>, Reade
             column: name,
             detail: format!("expected UInt8Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
-fn required_f32(batch: &RecordBatch, name: &'static str) -> Result<Vec<f32>, ReaderError> {
+fn required_f32(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<f32>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<Float32Type>()
@@ -940,7 +970,7 @@ fn required_f32(batch: &RecordBatch, name: &'static str) -> Result<Vec<f32>, Rea
             column: name,
             detail: format!("expected Float32Array, got {:?}", col.data_type()),
         })?;
-    materialize_required_primitive(arr, name)
+    materialize_required_primitive(arr, name, row_offset)
 }
 
 /// Materialise a primitive Arrow array into `Vec<T::Native>`,
@@ -952,6 +982,7 @@ fn required_f32(batch: &RecordBatch, name: &'static str) -> Result<Vec<f32>, Rea
 fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
     arr: &arrow_array::PrimitiveArray<T>,
     name: &'static str,
+    row_offset: usize,
 ) -> Result<Vec<T::Native>, ReaderError> {
     if arr.null_count() == 0 {
         return Ok(arr.values().to_vec());
@@ -960,7 +991,7 @@ fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
         if arr.is_null(i) {
             return Err(ReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
     }
@@ -969,7 +1000,11 @@ fn materialize_required_primitive<T: arrow_array::types::ArrowPrimitiveType>(
     Ok(arr.values().to_vec())
 }
 
-fn required_bool(batch: &RecordBatch, name: &'static str) -> Result<Vec<bool>, ReaderError> {
+fn required_bool(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<bool>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_boolean_opt()
@@ -982,7 +1017,7 @@ fn required_bool(batch: &RecordBatch, name: &'static str) -> Result<Vec<bool>, R
         if arr.is_null(i) {
             return Err(ReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
         out.push(arr.value(i));
@@ -990,7 +1025,11 @@ fn required_bool(batch: &RecordBatch, name: &'static str) -> Result<Vec<bool>, R
     Ok(out)
 }
 
-fn required_timestamp(batch: &RecordBatch, name: &'static str) -> Result<Vec<i64>, ReaderError> {
+fn required_timestamp(
+    batch: &RecordBatch,
+    name: &'static str,
+    row_offset: usize,
+) -> Result<Vec<i64>, ReaderError> {
     let col = required_column(batch, name)?;
     let arr = col
         .as_primitive_opt::<TimestampNanosecondType>()
@@ -1006,7 +1045,7 @@ fn required_timestamp(batch: &RecordBatch, name: &'static str) -> Result<Vec<i64
         if arr.is_null(i) {
             return Err(ReaderError::Conversion {
                 column: name,
-                detail: format!("row {i}: null on a REQUIRED column"),
+                detail: format!("row {}: null on a REQUIRED column", row_offset + i),
             });
         }
         out.push(arr.value(i));

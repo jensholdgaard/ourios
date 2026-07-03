@@ -194,10 +194,61 @@ fn rfc0021_3_reconstruction_property_and_corpus_green() {
 
 /// Scenario RFC0021.4 — the RFC 0017 dual decoder is gone (#276).
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+///
+/// The structural half (the querier's `row_decode` duplicate deleted, the
+/// `schema_force_view_types` override removed, `DataFusion` feeding its
+/// default view representations through the shared decoder end-to-end) is
+/// proven by the RFC 0017 suites. This test pins the property that makes
+/// that possible: the **single** [`batch_to_mined_records`] path decodes a
+/// batch whose string/binary columns are `Utf8View`/`BinaryView` to exactly
+/// the rows the plain `Utf8`/`Binary` representation yields.
 #[test]
-#[ignore = "RFC0021.4 stub — implemented in the phase-1 green slice"]
-fn rfc0021_4_dual_decoder_removed() {
-    todo!("RFC0021.4 — single unified arrow decode path; schema_force_view_types override removed");
+fn rfc0021_4_shared_decoder_reads_view_and_plain_representations() {
+    use std::sync::Arc;
+
+    use ourios_parquet::ShapeValidation;
+
+    // A real plain-representation batch, straight from the parquet bytes.
+    let bytes = encode_records_to_parquet(&fixture_records(), DEFAULT_ZSTD_LEVEL).expect("encode");
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(bytes),
+    )
+    .expect("builder")
+    .build()
+    .expect("reader");
+    let batches: Vec<_> = reader.collect::<Result<_, _>>().expect("batches");
+    assert_eq!(batches.len(), 1, "fixture fits one batch");
+    let plain = &batches[0];
+
+    // The same batch with every flat Utf8/Binary column cast to its view
+    // representation — what DataFusion's default scan hands the querier.
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for (field, column) in plain.schema().fields().iter().zip(plain.columns()) {
+        use arrow_schema::DataType;
+        let target = match field.data_type() {
+            DataType::Utf8 => Some(DataType::Utf8View),
+            DataType::Binary => Some(DataType::BinaryView),
+            _ => None,
+        };
+        if let Some(dt) = target {
+            let cast = arrow_cast::cast(column, &dt).expect("cast to view");
+            fields.push(field.as_ref().clone().with_data_type(dt));
+            columns.push(cast);
+        } else {
+            fields.push(field.as_ref().clone());
+            columns.push(Arc::clone(column));
+        }
+    }
+    let schema = Arc::new(arrow_schema::Schema::new(fields));
+    let view = arrow_array::RecordBatch::try_new(schema, columns).expect("view batch");
+
+    let from_plain = ourios_parquet::batch_to_mined_records(plain, 0, ShapeValidation::Enforce)
+        .expect("plain decodes");
+    let from_view = ourios_parquet::batch_to_mined_records(&view, 0, ShapeValidation::Enforce)
+        .expect("view decodes");
+    assert_eq!(from_view, from_plain);
+    assert_eq!(from_plain, fixture_records());
 }
 
 /// Scenario RFC0021.5 — the B1/B2 pruning thesis holds.

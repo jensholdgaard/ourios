@@ -143,8 +143,17 @@ fn fixture_records() -> Vec<MinedRecord> {
 #[test]
 #[ignore = "fixture generator — run manually pre-upgrade only"]
 fn rfc0021_fixture_writes_the_pre_upgrade_file() {
-    let bytes = encode_records_to_parquet(&fixture_records(), DEFAULT_ZSTD_LEVEL).expect("encode");
     let path = fixture_path();
+    // Refuse to overwrite: regenerating after the dependency bump would
+    // silently replace the pre-upgrade artefact with a post-upgrade one and
+    // defeat the RFC0021.2 guard. Delete the file by hand first if a
+    // regeneration is ever genuinely intended (pre-upgrade only).
+    assert!(
+        !path.exists(),
+        "{} already exists — refusing to overwrite the pre-upgrade fixture",
+        path.display(),
+    );
+    let bytes = encode_records_to_parquet(&fixture_records(), DEFAULT_ZSTD_LEVEL).expect("encode");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(&path, bytes).expect("write fixture");
 }

@@ -190,7 +190,7 @@ fn rfc0021_1_one_arrow_major_and_datafusion_54() {
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
 
     let mut arrow_majors = std::collections::BTreeSet::new();
-    let mut datafusion_version = None;
+    let mut datafusion_versions = Vec::new();
     for block in lock.split("[[package]]") {
         let field = |key: &str| {
             block.lines().find_map(|l| {
@@ -206,7 +206,7 @@ fn rfc0021_1_one_arrow_major_and_datafusion_54() {
             arrow_majors.insert(major.to_string());
         }
         if name == "datafusion" {
-            datafusion_version = Some(version.to_string());
+            datafusion_versions.push(version.to_string());
         }
     }
     assert_eq!(
@@ -214,8 +214,16 @@ fn rfc0021_1_one_arrow_major_and_datafusion_54() {
         ["58"],
         "exactly one arrow major (58.x) in the lockfile"
     );
-    let df = datafusion_version.expect("datafusion in the lockfile");
-    assert!(df.starts_with("54."), "datafusion 54.x, got {df}");
+    assert_eq!(
+        datafusion_versions.len(),
+        1,
+        "exactly one datafusion in the lockfile, got {datafusion_versions:?}"
+    );
+    assert!(
+        datafusion_versions[0].starts_with("54."),
+        "datafusion 54.x, got {}",
+        datafusion_versions[0]
+    );
 
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
     assert!(

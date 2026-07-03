@@ -471,17 +471,24 @@ fn build_config(
 }
 
 /// Resolve `storage.promoted_attributes` (RFC 0022 §3.2) into the effective
-/// promoted set. Keys are taken literally (no globbing); an empty key — e.g.
-/// an `${env:…}` reference that resolved to nothing — is a config error
-/// rather than a silently unqueryable column. Deduplication and the implicit
-/// `service.name` are [`PromotedAttributes::new`]'s contract.
+/// promoted set. Keys are taken literally (no globbing), so a key that is
+/// empty or carries surrounding whitespace — e.g. an `${env:…}` reference
+/// that resolved to nothing, or a quoted `" key"` — is a config error rather
+/// than a silently never-matching promoted column. Deduplication and the
+/// implicit `service.name` are [`PromotedAttributes::new`]'s contract.
 fn build_promoted_attributes(
     resource: &[String],
     log: &[String],
 ) -> Result<PromotedAttributes, String> {
-    if resource.iter().chain(log).any(|k| k.trim().is_empty()) {
+    if resource
+        .iter()
+        .chain(log)
+        .any(|k| k.is_empty() || k.trim() != k)
+    {
         return Err(
-            "storage.promoted_attributes keys must be non-empty attribute names".to_string(),
+            "storage.promoted_attributes keys must be non-empty attribute names \
+                    without surrounding whitespace"
+                .to_string(),
         );
     }
     Ok(PromotedAttributes::new(
@@ -936,6 +943,12 @@ storage:
         let err = build_promoted_attributes(&["k8s.namespace.name".to_string()], &[String::new()])
             .expect_err("empty key");
         assert!(err.contains("non-empty"), "the error names the rule: {err}");
+        // Surrounding whitespace would mint a promoted column whose name can
+        // never match the intended attribute key — rejected, not normalised.
+        build_promoted_attributes(&[" k8s.namespace.name".to_string()], &[])
+            .expect_err("whitespace-padded key");
+        build_promoted_attributes(&[], &["http.route ".to_string()])
+            .expect_err("trailing-whitespace key");
     }
 
     #[test]

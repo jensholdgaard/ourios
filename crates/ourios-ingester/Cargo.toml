@@ -99,8 +99,9 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 [dev-dependencies]
 tempfile = "=3.27.0"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
-# threading test (version in lockstep with ourios-parquet's arrow stack).
-parquet = { version = "58", default-features = false, features = ["arrow"] }
+# threading test (pinned in lockstep with ourios-parquet's arrow stack,
+# matching ourios-querier's dev pin).
+parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
 # Drive the axum `Router` in-process (`ServiceExt::oneshot`) for the
 # HTTP-transport acceptance tests — no real socket.
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }

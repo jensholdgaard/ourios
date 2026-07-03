@@ -27,7 +27,7 @@ use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipelin
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::Store;
+use ourios_parquet::{PromotedAttributes, Store};
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
@@ -208,6 +208,9 @@ pub struct ReceiverConfig {
     /// under `wal.root` on local disk regardless (RFC0013.6 / `CLAUDE.md`
     /// §3.4, §3.6 — the WAL is never on object storage).
     pub store: Store,
+    /// The RFC 0022 promoted attribute set every flushed data file projects
+    /// (`storage.promoted_attributes`, §3.2).
+    pub promoted: PromotedAttributes,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -307,7 +310,10 @@ impl ReceiverHandle {
 /// put to the store before its template events are durable. That inline publish
 /// runs under the miner lock, so the barrier flush + the publish are atomic
 /// w.r.t. ingest.
-fn build_write_sinks(store: Store) -> (SharedParquetSink, SharedParquetAuditSink) {
+fn build_write_sinks(
+    store: Store,
+    promoted: PromotedAttributes,
+) -> (SharedParquetSink, SharedParquetAuditSink) {
     let audit_sink = SharedParquetAuditSink::new(BufferingAuditSink::new(
         store.clone(),
         AUDIT_SINK_CEILING_EVENTS,
@@ -315,6 +321,7 @@ fn build_write_sinks(store: Store) -> (SharedParquetSink, SharedParquetAuditSink
     let barrier_audit = audit_sink.clone();
     let sink = SharedParquetSink::new(
         ParquetRecordSink::new(store, flush_config())
+            .with_promoted_attributes(promoted)
             .with_audit_barrier(Box::new(move || barrier_audit.flush())),
     );
     (sink, audit_sink)
@@ -360,7 +367,7 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let segment_size_bytes = config.wal.segment_size_bytes;
     let mut wal = Wal::open(config.wal).map_err(|e| format!("open WAL: {e:?}"))?;
 
-    let (sink, audit_sink) = build_write_sinks(config.store);
+    let (sink, audit_sink) = build_write_sinks(config.store, config.promoted);
 
     // Wire both sinks into the miner *before* recovery: replay re-mines the
     // un-flushed tail through `miner.ingest`, which re-emits its records into
@@ -706,6 +713,7 @@ mod tests {
             http_addr: "127.0.0.1:0".parse().expect("addr"),
             wal: test_wal_config(wal_dir.path()),
             store,
+            promoted: PromotedAttributes::default(),
         })
         .await
         .expect("serve");
@@ -823,6 +831,7 @@ mod tests {
             http_addr: "127.0.0.1:0".parse().expect("addr"),
             wal: test_wal_config(wal_dir.path()),
             store,
+            promoted: PromotedAttributes::default(),
         })
         .await
         .expect("serve");

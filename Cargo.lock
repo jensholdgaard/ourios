@@ -2988,6 +2988,7 @@ dependencies = [
  "ourios-semconv",
  "ourios-telemetry",
  "ourios-wal",
+ "parquet",
  "proptest",
  "prost",
  "serde_json",

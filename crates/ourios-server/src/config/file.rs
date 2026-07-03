@@ -135,6 +135,24 @@ pub struct StorageSection {
     pub s3: S3Section,
     /// Local-backend store root (`storage.local.*`).
     pub local: LocalSection,
+    /// Promoted attribute key sets (`storage.promoted_attributes.*`,
+    /// RFC 0022 §3.2 — an RFC 0020 schema extension).
+    pub promoted_attributes: PromotedAttributesSection,
+}
+
+/// `storage.promoted_attributes.*` — the RFC 0022 §3.2 promoted attribute
+/// key sets. Keys are plain attribute-key strings, taken literally (no
+/// globbing); the implicit `service.name` promotion never needs listing.
+/// Defaults: empty — promotion beyond `service.name` is opt-in.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromotedAttributesSection {
+    /// Resource-attribute keys to promote (`resource.<key>` columns).
+    #[serde(deserialize_with = "scalar_vec")]
+    pub resource: Vec<String>,
+    /// Log-attribute keys to promote (`attr.<key>` columns).
+    #[serde(deserialize_with = "scalar_vec")]
+    pub log: Vec<String>,
 }
 
 /// `storage.s3.*` — S3 addressing and (env-only) credentials (RFC 0019 §3.4).
@@ -320,7 +338,20 @@ impl StorageSection {
     ) -> Result<(), MalformedReference> {
         substitute(&mut self.backend, lookup)?;
         self.s3.substitute(lookup)?;
-        self.local.substitute(lookup)
+        self.local.substitute(lookup)?;
+        self.promoted_attributes.substitute(lookup)
+    }
+}
+
+impl PromotedAttributesSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        for key in self.resource.iter_mut().chain(self.log.iter_mut()) {
+            *key = env_subst::resolve(key, lookup)?;
+        }
+        Ok(())
     }
 }
 
@@ -393,6 +424,20 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Scalar>::deserialize(deserializer)?.map(|s| s.0))
+}
+
+/// A YAML sequence of scalars, each captured as its string form — the
+/// [`scalar_opt`] model applied per element (RFC 0020 §3.3 rule 7). A
+/// mapping or sequence where an element scalar is expected is a schema
+/// error, as is a bare scalar where the sequence is expected.
+fn scalar_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Vec::<Scalar>::deserialize(deserializer)?
+        .into_iter()
+        .map(|s| s.0)
+        .collect())
 }
 
 /// A YAML scalar captured as its string form (see [`scalar_opt`]).
@@ -487,6 +532,63 @@ querier:
         assert_eq!(cfg.storage.s3.prefix.as_deref(), Some("a$b")); // $$ → literal $
         assert_eq!(cfg.querier.enabled.as_deref(), Some("true"));
         assert_eq!(cfg.querier.default_window_secs.as_deref(), Some("1800"));
+    }
+
+    /// RFC 0022 §3.2 — `storage.promoted_attributes.{resource,log}` parse as
+    /// key lists, each element getting the scalar treatment: `${env:…}`
+    /// substitution applies per element, and the sub-section stays strict
+    /// (unknown keys inside it are rejected elsewhere in this suite).
+    #[test]
+    fn promoted_attribute_keys_parse_and_substitute_per_element() {
+        let lookup = env(&[("NS_KEY", "k8s.namespace.name")]);
+        // Block style: a `${env:…}` reference is not a valid *flow*-sequence
+        // plain scalar (the `:` inside the braces ends the flow entry).
+        let yaml = "
+storage:
+  promoted_attributes:
+    resource:
+      - ${env:NS_KEY}
+      - cloud.region
+    log: [http.route]
+";
+        let cfg = parse(yaml, &lookup).expect("valid");
+        assert_eq!(
+            cfg.storage.promoted_attributes.resource,
+            ["k8s.namespace.name", "cloud.region"]
+        );
+        assert_eq!(cfg.storage.promoted_attributes.log, ["http.route"]);
+    }
+
+    /// RFC 0022 §3.2 — the section defaults to empty key sets when omitted
+    /// (promotion beyond the implicit `service.name` is opt-in), and an
+    /// unknown key inside it is rejected by the strict schema.
+    #[test]
+    fn promoted_attributes_default_empty_and_stay_strict() {
+        let lookup = env(&[]);
+        let cfg = parse("storage:\n  backend: local\n", &lookup).expect("valid");
+        assert!(cfg.storage.promoted_attributes.resource.is_empty());
+        assert!(cfg.storage.promoted_attributes.log.is_empty());
+
+        let err = parse(
+            "storage:\n  promoted_attributes:\n    resources: [a]\n",
+            &lookup,
+        )
+        .expect_err("unknown key inside promoted_attributes");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
+    }
+
+    /// RFC 0022 §3.2 — a bare scalar where a key *list* is expected is a
+    /// schema error (the `scalar_vec` shape rule), mirroring the
+    /// scalar-where-structure rule the other leaves enforce.
+    #[test]
+    fn promoted_attributes_reject_a_scalar_where_a_list_is_expected() {
+        let lookup = env(&[]);
+        let err = parse(
+            "storage:\n  promoted_attributes:\n    resource: k8s.namespace.name\n",
+            &lookup,
+        )
+        .expect_err("scalar where a sequence is expected");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
     }
 
     /// RFC0020.2 — native YAML scalars (a bare integer / boolean, no reference)

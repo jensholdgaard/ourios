@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime};
 use ourios_core::audit::{AuditEvent, AuditPayload, AuditSink, NoOpAuditSink};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    Committed, CompactionError, CompactionPolicy, PartitionKey, Store, compact_partition,
-    gc_orphans, percent_decode_tenant, plan_candidates,
+    Committed, CompactionError, CompactionPolicy, PartitionKey, PromotedAttributes, Store,
+    compact_partition_with_promoted, gc_orphans, percent_decode_tenant, plan_candidates,
 };
 
 use crate::metrics::CompactionMetrics;
@@ -140,7 +140,7 @@ pub struct CompactedFile {
 /// Run one compaction sweep over `store`, as of wall-clock
 /// `now_unix_nanos`: for each tenant, select its sealed candidate
 /// partitions ([`plan_candidates`]) and consolidate each
-/// ([`compact_partition`]), accumulating a [`SweepReport`].
+/// ([`compact_partition_with_promoted`]), accumulating a [`SweepReport`].
 ///
 /// Resilient: a tenant whose planning fails, or a partition whose
 /// consolidation fails, is recorded in [`SweepReport::errors`] and
@@ -156,6 +156,27 @@ pub fn run_sweep(
     store: &Store,
     now_unix_nanos: u64,
     policy: &CompactionPolicy,
+) -> Result<SweepReport, IngestError> {
+    run_sweep_with_promoted(
+        store,
+        now_unix_nanos,
+        policy,
+        &PromotedAttributes::default(),
+    )
+}
+
+/// Like [`run_sweep`] but consolidating under an explicit RFC 0022 promoted
+/// attribute set (§3.4: rewrites re-project with the *current* set). The bare
+/// [`run_sweep`] delegates with the default (`service.name`-only) set.
+///
+/// # Errors
+///
+/// See [`run_sweep`].
+pub fn run_sweep_with_promoted(
+    store: &Store,
+    now_unix_nanos: u64,
+    policy: &CompactionPolicy,
+    promoted: &PromotedAttributes,
 ) -> Result<SweepReport, IngestError> {
     let mut report = SweepReport::default();
     for tenant in tenants(store)? {
@@ -180,7 +201,7 @@ pub fn run_sweep(
                     partition.year, partition.month, partition.day, partition.hour,
                 )),
             }
-            match compact_partition(store, &partition) {
+            match compact_partition_with_promoted(store, &partition, promoted) {
                 Ok(outcome) => {
                     if let Some(committed) = &outcome.committed {
                         report.partitions_compacted += 1;
@@ -251,6 +272,11 @@ pub struct Compactor {
     store: Store,
     policy: CompactionPolicy,
     interval: Duration,
+    /// The RFC 0022 promoted attribute set consolidated files re-project
+    /// under (`storage.promoted_attributes`, §3.2/§3.4). Defaults to the
+    /// implicit `service.name`-only set; set via
+    /// [`Self::with_promoted_attributes`].
+    promoted: PromotedAttributes,
     /// Where committed-compaction audit events go (RFC 0009 §3.6).
     /// Defaults to [`NoOpAuditSink`]; set via [`Self::with_audit_sink`]
     /// (the WAL-backed sink replaces it once `ourios-wal` lands).
@@ -264,6 +290,7 @@ impl std::fmt::Debug for Compactor {
             .field("store", &self.store)
             .field("policy", &self.policy)
             .field("interval", &self.interval)
+            .field("promoted", &self.promoted)
             .field("audit_sink", &"Box<dyn AuditSink>")
             .finish()
     }
@@ -281,8 +308,17 @@ impl Compactor {
             store,
             policy,
             interval,
+            promoted: PromotedAttributes::default(),
             audit_sink: Box::new(NoOpAuditSink::new()),
         }
+    }
+
+    /// Set the RFC 0022 promoted attribute set consolidated files re-project
+    /// under (`storage.promoted_attributes`, §3.2/§3.4).
+    #[must_use]
+    pub fn with_promoted_attributes(mut self, promoted: PromotedAttributes) -> Self {
+        self.promoted = promoted;
+        self
     }
 
     /// Route committed-compaction audit events to `sink`.
@@ -317,6 +353,7 @@ impl Compactor {
             store,
             policy,
             interval,
+            promoted,
             // Own the audit sink locally so it can move into each sweep's
             // blocking task and back out. Its `emit` performs Parquet `put`s
             // through the store — now S3 network I/O (RFC 0019 slice 2d) — so it
@@ -339,9 +376,10 @@ impl Compactor {
             // (compaction is blocking I/O). `policy` is `Copy`, so the `move`
             // closure copies it and the outer binding stays valid each loop.
             let store = store.clone();
+            let promoted = promoted.clone();
             let (result, elapsed, sink) = tokio::task::spawn_blocking(move || {
                 let start = Instant::now();
-                let result = run_sweep(&store, now_unix_nanos(), &policy);
+                let result = run_sweep_with_promoted(&store, now_unix_nanos(), &policy, &promoted);
                 // Emit the committed-compaction audit events here, on the
                 // blocking pool, since the sink's `put`s are blocking store I/O.
                 if let Ok(report) = &result {

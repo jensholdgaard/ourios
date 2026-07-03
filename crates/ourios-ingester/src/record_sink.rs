@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use ourios_core::record::{MinedRecord, RecordSink};
 use ourios_parquet::{
-    DEFAULT_ZSTD_LEVEL, PartitionKey, Store, StoreError, WriterError, encode_records_to_parquet,
+    DEFAULT_ZSTD_LEVEL, PartitionKey, PromotedAttributes, Store, StoreError, WriterError,
+    encode_records_to_parquet_with_promoted,
 };
 use uuid::Uuid;
 
@@ -109,6 +110,10 @@ pub struct ParquetRecordSink {
     /// RFC 0014 §6.3 instruments (flush throughput/latency by trigger,
     /// errors, buffer occupancy). No-op when no meter provider is installed.
     metrics: SinkMetrics,
+    /// The RFC 0022 promoted attribute set every flushed file projects
+    /// (`storage.promoted_attributes`, §3.2). Defaults to the implicit
+    /// `service.name`-only set; set via [`Self::with_promoted_attributes`].
+    promoted: PromotedAttributes,
 }
 
 /// Cheap per-record footprint estimate driving the size trigger + ceiling — a
@@ -156,7 +161,16 @@ impl ParquetRecordSink {
             derive_errors: 0,
             audit_barrier: None,
             metrics: SinkMetrics::new(),
+            promoted: PromotedAttributes::default(),
         }
+    }
+
+    /// Set the RFC 0022 promoted attribute set flushed files project
+    /// (`storage.promoted_attributes`, §3.2).
+    #[must_use]
+    pub fn with_promoted_attributes(mut self, promoted: PromotedAttributes) -> Self {
+        self.promoted = promoted;
+        self
     }
 
     /// Install the audit-durability barrier (issue #302 fix #2): a closure run
@@ -245,10 +259,12 @@ impl ParquetRecordSink {
     ) -> Result<(), FlushError> {
         let flush_start = Instant::now();
         let bytes = match self.buffers.get(key) {
-            Some(buf) if !buf.records.is_empty() => {
-                encode_records_to_parquet(&buf.records, DEFAULT_ZSTD_LEVEL)
-                    .map_err(FlushError::Encode)?
-            }
+            Some(buf) if !buf.records.is_empty() => encode_records_to_parquet_with_promoted(
+                &buf.records,
+                DEFAULT_ZSTD_LEVEL,
+                &self.promoted,
+            )
+            .map_err(FlushError::Encode)?,
             _ => return Ok(()),
         };
         self.store
@@ -404,9 +420,10 @@ fn publish_partition(
     store: &Store,
     key: &PartitionKey,
     records: &[MinedRecord],
+    promoted: &PromotedAttributes,
 ) -> Result<(), FlushError> {
-    let bytes =
-        encode_records_to_parquet(records, DEFAULT_ZSTD_LEVEL).map_err(FlushError::Encode)?;
+    let bytes = encode_records_to_parquet_with_promoted(records, DEFAULT_ZSTD_LEVEL, promoted)
+        .map_err(FlushError::Encode)?;
     store
         .put_blocking(&object_key(key), bytes)
         .map_err(FlushError::Store)?;
@@ -425,7 +442,7 @@ fn publish_partition(
 ///
 /// All access serializes on one mutex. `emit` is a short critical section, but
 /// the flush triggers are **not**: `flush_all` / `flush_aged` hold the lock
-/// across `encode_records_to_parquet` + `Store::put_blocking` (see
+/// across `encode_records_to_parquet_with_promoted` + `Store::put_blocking` (see
 /// [`ParquetRecordSink::flush_all`]), so a flush against a slow store blocks
 /// every concurrent `emit` and trigger for the duration of the I/O. Callers
 /// must treat them as blocking sections (the server runs them via
@@ -520,12 +537,15 @@ impl SharedParquetSink {
         if batches.is_empty() {
             return true;
         }
-        let store = self.lock().store();
+        let (store, promoted) = {
+            let sink = self.lock();
+            (sink.store(), sink.promoted.clone())
+        };
         let mut requeue = Vec::new();
         let mut all_published = true;
         for (key, records) in batches {
             let start = Instant::now();
-            if publish_partition(&store, &key, &records).is_ok() {
+            if publish_partition(&store, &key, &records, &promoted).is_ok() {
                 self.lock()
                     .note_published(records.len(), start.elapsed(), trigger);
             } else {

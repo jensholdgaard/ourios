@@ -29,9 +29,10 @@ use chrono::NaiveDate;
 
 use crate::manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 use crate::partition::{PartitionKey, percent_encode_tenant};
+use crate::promoted::PromotedAttributes;
 use crate::reader::{Reader, ReaderError};
 use crate::store::{Store, StoreError};
-use crate::writer::{Writer, WriterError};
+use crate::writer::{DEFAULT_ZSTD_LEVEL, Writer, WriterError};
 
 /// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
 const HOUR_NANOS: u64 = 3_600_000_000_000;
@@ -168,6 +169,23 @@ pub fn compact_partition(
     store: &Store,
     partition: &PartitionKey,
 ) -> Result<CompactionOutcome, CompactionError> {
+    compact_partition_with_promoted(store, partition, &PromotedAttributes::default())
+}
+
+/// Like [`compact_partition`] but re-projecting the rewritten rows under an
+/// explicit RFC 0022 promoted attribute set (§3.4: compaction rewrites with
+/// the *current* set, so history converges toward pruneability as a side
+/// effect). The bare [`compact_partition`] delegates with the default
+/// (`service.name`-only) set.
+///
+/// # Errors
+///
+/// See [`compact_partition`].
+pub fn compact_partition_with_promoted(
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+) -> Result<CompactionOutcome, CompactionError> {
     let key = manifest_key(partition);
     let (existing, etag) =
         match Manifest::read_with_etag(store, &key).map_err(CompactionError::Manifest)? {
@@ -214,7 +232,13 @@ pub fn compact_partition(
     // mis-partitioned input aborts the compaction instead of being silently
     // merged. Row groups rotate at the RFC 0005 §3.5 threshold within the
     // single output.
-    let mut writer = Writer::open_in(store, partition.clone()).map_err(CompactionError::Write)?;
+    let mut writer = Writer::open_in_with_promoted(
+        store,
+        partition.clone(),
+        DEFAULT_ZSTD_LEVEL,
+        promoted.clone(),
+    )
+    .map_err(CompactionError::Write)?;
     let mut row_count: u64 = 0;
     let mut bytes_read: u64 = 0;
     for input in &inputs {
@@ -731,6 +755,64 @@ mod tests {
         let mut w = Writer::open_in(store, partition()).expect("open writer");
         w.append_records(recs).expect("append");
         w.close().expect("close");
+    }
+
+    /// RFC 0022 §3.4 — compaction re-projects the rows it rewrites under the
+    /// promoted set it is *given*: inputs written under the default
+    /// (`service.name`-only) set consolidate into a file that carries the
+    /// configured key's column (history converges toward pruneability as a
+    /// side effect of ordinary compaction). The bare [`compact_partition`]
+    /// stays on the default set.
+    #[test]
+    fn compaction_reprojects_under_the_given_promoted_set() {
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = store_at(bucket.path());
+        let with_ns = |template_id: u64, ts_ns: u64| {
+            let kv = |key: &str, value: &str| ourios_core::otlp::KeyValue {
+                key: key.to_string(),
+                value: Some(ourios_core::otlp::AnyValue {
+                    value: Some(ourios_core::otlp::any_value::Value::StringValue(
+                        value.to_string(),
+                    )),
+                }),
+                ..Default::default()
+            };
+            MinedRecord {
+                resource_attributes: vec![
+                    kv("service.name", "api"),
+                    kv("k8s.namespace.name", "prod"),
+                ],
+                ..rec(template_id, ts_ns)
+            }
+        };
+        write_file(&store, &[with_ns(1, TS0)]);
+        write_file(&store, &[with_ns(2, TS0 + 1_000)]);
+
+        let promoted = PromotedAttributes::new(["k8s.namespace.name".to_string()], []);
+        let outcome =
+            compact_partition_with_promoted(&store, &partition(), &promoted).expect("compact");
+        let committed = outcome.committed.expect("committed");
+
+        let key = format!("{}/{}", partition_data_prefix(&partition()), committed.file);
+        let bytes = store.get_blocking(&key).expect("get consolidated file");
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            Bytes::from(bytes),
+        )
+        .expect("open consolidated file");
+        let names: Vec<&str> = reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            names.contains(&"resource.k8s.namespace.name"),
+            "the consolidated file re-projects the configured key: {names:?}"
+        );
+        assert!(
+            names.contains(&"resource.service.name"),
+            "the implicit promotion rides along: {names:?}"
+        );
     }
 
     /// Seed a manifest at the partition's manifest key (the test equivalent of

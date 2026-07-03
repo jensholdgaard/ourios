@@ -222,8 +222,9 @@ flowchart LR
   rows it rewrites using the *current* promoted set, so history
   converges toward pruneability as a side effect, but nothing depends
   on that.
-- **Changing the promoted set** between deploys is safe by the same
-  rules: a key removed from the set stops being projected in new files
+- **Changing the *configured* promoted set** between deploys is safe by
+  the same rules (the implicit `service.name` cannot be removed — §3.1):
+  a key removed from the set stops being projected in new files
   (old files keep the column; the compiler still emits the two-arm
   expression whenever the scanned union schema carries the column), a
   key added starts `NULL`-backed in history. Scan-time schema union
@@ -341,8 +342,9 @@ Scenario ids `RFC0022.<m>`.
 > full-fidelity suites pass unchanged.
 
 > **Scenario RFC0022.7 — promoted-set drift across deploys (§3.4).**
-> Given three files written under promoted sets `{}`, `{a}`, `{a,b}`
-> for keys `a`,`b`,
+> Given three files written under *configured* promoted sets `{}`,
+> `{a}`, `{a,b}` for keys `a`,`b` (each on top of the implicit,
+> non-removable `service.name`),
 > When one scan spans all three and predicates on `a` and `b` run,
 > Then the scan unions schemas without error and each predicate
 > returns the correct rows from every file (typed arm where the column

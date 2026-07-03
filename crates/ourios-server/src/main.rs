@@ -41,7 +41,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use ourios_ingester::Compactor;
-use ourios_parquet::{CompactionPolicy, ParquetAuditSink, S3Config, StoreConfig};
+use ourios_parquet::{
+    CompactionPolicy, ParquetAuditSink, PromotedAttributes, S3Config, StoreConfig,
+};
 use ourios_server::config::file::FileConfig;
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
@@ -80,6 +82,10 @@ struct ServerConfig {
     receiver: Option<ReceiverParams>,
     /// The querier role, if enabled (RFC 0016).
     querier: Option<QuerierParams>,
+    /// The effective RFC 0022 promoted attribute set
+    /// (`storage.promoted_attributes`, §3.2) — applied by every write path
+    /// (receiver flushes and compaction rewrites; §3.4).
+    promoted: PromotedAttributes,
 }
 
 /// Resolved querier-role configuration (RFC 0016 §3.2).
@@ -241,6 +247,10 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
         file.querier.enabled.as_deref(),
         file.querier.http_addr.as_deref(),
         file.querier.default_window_secs.as_deref(),
+    )?;
+    config.promoted = build_promoted_attributes(
+        &file.storage.promoted_attributes.resource,
+        &file.storage.promoted_attributes.log,
     )?;
     Ok(config)
 }
@@ -456,7 +466,28 @@ fn build_config(
         compaction_interval,
         receiver: None,
         querier: None,
+        promoted: PromotedAttributes::default(),
     })
+}
+
+/// Resolve `storage.promoted_attributes` (RFC 0022 §3.2) into the effective
+/// promoted set. Keys are taken literally (no globbing); an empty key — e.g.
+/// an `${env:…}` reference that resolved to nothing — is a config error
+/// rather than a silently unqueryable column. Deduplication and the implicit
+/// `service.name` are [`PromotedAttributes::new`]'s contract.
+fn build_promoted_attributes(
+    resource: &[String],
+    log: &[String],
+) -> Result<PromotedAttributes, String> {
+    if resource.iter().chain(log).any(|k| k.trim().is_empty()) {
+        return Err(
+            "storage.promoted_attributes keys must be non-empty attribute names".to_string(),
+        );
+    }
+    Ok(PromotedAttributes::new(
+        resource.iter().cloned(),
+        log.iter().cloned(),
+    ))
 }
 
 /// Resolve when the process receives `SIGTERM` (what k8s / `nerdctl stop`
@@ -528,6 +559,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Parquet in — the same store the compactor sweeps (cloned; the
                 // handle is cheap to share, the compactor keeps the original).
                 store: store.clone(),
+                promoted: config.promoted.clone(),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -574,6 +606,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 CompactionPolicy::default(),
                 config.compaction_interval,
             )
+            .with_promoted_attributes(config.promoted.clone())
             .with_audit_sink(Box::new(ParquetAuditSink::new(audit_store))),
         )
     } else {
@@ -875,6 +908,34 @@ storage:
             Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
         );
         assert_eq!(config.store, local("/store"));
+    }
+
+    /// RFC 0022 §3.2 — `storage.promoted_attributes` resolves onto the
+    /// `ServerConfig` through the shared validator: configured keys land in
+    /// the effective set (the implicit `service.name` and dedup are the
+    /// `PromotedAttributes` contract), an omitted section is the default
+    /// (`service.name`-only) set, and an empty key is a config error.
+    #[test]
+    fn promoted_attributes_resolve_onto_the_server_config() {
+        let config = server_config(
+            "storage:\n  local:\n    bucket_root: /store\n  promoted_attributes:\n    resource: [k8s.namespace.name]\n    log: [http.route]\n",
+        )
+        .expect("valid");
+        assert_eq!(
+            config.promoted,
+            PromotedAttributes::new(
+                ["k8s.namespace.name".to_string()],
+                ["http.route".to_string()],
+            ),
+        );
+
+        let defaulted =
+            server_config("storage:\n  local:\n    bucket_root: /store\n").expect("valid");
+        assert_eq!(defaulted.promoted, PromotedAttributes::default());
+
+        let err = build_promoted_attributes(&["k8s.namespace.name".to_string()], &[String::new()])
+            .expect_err("empty key");
+        assert!(err.contains("non-empty"), "the error names the rule: {err}");
     }
 
     #[test]

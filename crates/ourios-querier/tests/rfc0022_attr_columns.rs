@@ -126,8 +126,15 @@ fn promoted_set() -> PromotedAttributes {
     )
 }
 
+/// The committed fixture's location (the established repo pattern for
+/// `testdata/` paths — parent-walk from `CARGO_MANIFEST_DIR`, no `..`
+/// components in the resulting path).
 fn fixture_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/rfc0022/pre-amendment.parquet")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root is two levels above CARGO_MANIFEST_DIR")
+        .join("testdata/rfc0022/pre-amendment.parquet")
 }
 
 /// Copy the committed pre-amendment fixture into `bucket` at the partition

@@ -627,7 +627,7 @@ pub fn batch_to_mined_records(
         // so a file containing them indicates either corruption
         // or a foreign writer that doesn't honour the contract.
         if validation == ShapeValidation::Enforce {
-            validate_record_shape(&record, i)?;
+            validate_record_shape(&record, row_offset + i)?;
         }
         records.push(record);
     }
@@ -1545,6 +1545,45 @@ mod tests {
 
         match Reader::open_file(f.path()).and_then(Reader::read_all) {
             Err(ReaderError::Conversion { column, .. }) => assert_eq!(column, "body"),
+            Err(other) => panic!("expected Conversion on body, got {other:?}"),
+            Ok(_) => panic!("expected Conversion error"),
+        }
+    }
+
+    /// Shape-invariant diagnostics report the stream-global row index:
+    /// decoding with a nonzero `row_offset` (a later batch of a
+    /// multi-batch decode) must surface `row_offset + i`, not the
+    /// batch-local `i`.
+    #[test]
+    fn shape_violation_reports_stream_global_row_index() {
+        let schema = data_schema();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let arr: ArrayRef = match field.name().as_str() {
+                "lossy_flag" => {
+                    let mut b = BooleanBuilder::new();
+                    b.append_value(true);
+                    Arc::new(b.finish())
+                }
+                "body" => {
+                    let mut b = BinaryBuilder::new();
+                    b.append_null();
+                    Arc::new(b.finish())
+                }
+                other => single_field_array(other),
+            };
+            arrays.push(arr);
+        }
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
+
+        match super::batch_to_mined_records(&batch, 41, super::ShapeValidation::Enforce) {
+            Err(ReaderError::Conversion { column, detail }) => {
+                assert_eq!(column, "body");
+                assert!(
+                    detail.contains("row 41"),
+                    "batch-local index leaked: {detail}"
+                );
+            }
             Err(other) => panic!("expected Conversion on body, got {other:?}"),
             Ok(_) => panic!("expected Conversion error"),
         }

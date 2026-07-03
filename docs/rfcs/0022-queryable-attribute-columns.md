@@ -85,10 +85,11 @@ Rules:
 - **`service.name` is always promoted.** The effective promoted set is
   `{resource: ["service.name"] ∪ configured, log: configured}`.
 - **String values only.** A promoted key whose value is an int, bool,
-  double, bytes, array, or kvlist projects `NULL`; predicates fall
-  through to the JSON arm (§3.3), which is precisely the stopgap's
-  semantics for values it cannot match. Typed numeric promotion is a
-  future extension (§7).
+  double, bytes, array, or kvlist projects `NULL`. `==`/`!=` predicates
+  on such cells fall through to the JSON arm (§3.3) — precisely the
+  stopgap's semantics for values it cannot match; ordering/regex
+  predicates are typed-arm-only (§3.3) and never match them. Typed
+  numeric promotion is a future extension (§7).
 - **No truncation.** Truncating a projected value would make `==`
   silently miss; the projection is byte-faithful or `NULL`. The
   cardinality/size exposure this creates is handled by telemetry, not
@@ -339,7 +340,7 @@ Scenario ids `RFC0022.<m>`.
 > total), and B1/B2 gates are unchanged (indicative ci-runner;
 > authoritative on maintainer opt-in, per the standing bench policy).
 
-> **Scenario RFC0022.6 — the read path is projection-blind (§3.3).**
+> **Scenario RFC0022.6 — the read path is projection-blind (§3.1).**
 > Given files with promoted columns, including a hand-forged file
 > where a promoted cell disagrees with the JSON,
 > When rows are returned through the RFC 0017 read path,

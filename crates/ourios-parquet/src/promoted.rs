@@ -50,21 +50,20 @@ impl PromotedAttributes {
         resource: impl IntoIterator<Item = String>,
         log: impl IntoIterator<Item = String>,
     ) -> Self {
-        let mut resource_keys = vec![SERVICE_NAME_KEY.to_string()];
-        for key in resource {
-            if !resource_keys.contains(&key) {
-                resource_keys.push(key);
-            }
-        }
-        let mut log_keys: Vec<String> = Vec::new();
-        for key in log {
-            if !log_keys.contains(&key) {
-                log_keys.push(key);
-            }
+        fn dedup_preserving_order(
+            implicit: impl IntoIterator<Item = String>,
+            keys: impl IntoIterator<Item = String>,
+        ) -> Vec<String> {
+            let mut seen = std::collections::HashSet::new();
+            implicit
+                .into_iter()
+                .chain(keys)
+                .filter(|k| seen.insert(k.clone()))
+                .collect()
         }
         Self {
-            resource: resource_keys,
-            log: log_keys,
+            resource: dedup_preserving_order([SERVICE_NAME_KEY.to_string()], resource),
+            log: dedup_preserving_order([], log),
         }
     }
 

@@ -12,7 +12,8 @@ use ourios_core::otlp::{AnyValue, KeyValue, any_value, canonical};
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::{
-    PromotedAttributes, columns, encode_records_to_parquet, encode_records_to_parquet_with_promoted,
+    DEFAULT_ZSTD_LEVEL, PromotedAttributes, columns, encode_records_to_parquet,
+    encode_records_to_parquet_with_promoted,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Encoding, LogicalType};
@@ -20,7 +21,6 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 const TS0: u64 = 1_775_127_480_000_000_000;
-const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 fn kv_str(key: &str, value: &str) -> KeyValue {
     KeyValue {

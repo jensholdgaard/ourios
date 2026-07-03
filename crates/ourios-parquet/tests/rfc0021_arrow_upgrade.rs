@@ -1,0 +1,205 @@
+//! RFC 0021 — `DataFusion` / Arrow upgrade, the §5 acceptance scenarios (red).
+//!
+//! Scenario ids (RFC0021.1–.6, phase 1) are pinned here so the RFC → test
+//! mapping is greppable from `red` on (per `docs/verification.md` §2.3).
+//! Phase-2 scenarios (`.7`–`.9`) are upstream-gated (RFC 0021 §5) and get
+//! their stubs only when a released `DataFusion` carries `object_store` ≥ 0.14 /
+//! `parquet` 59.
+//!
+//! Two things here are **live from red**, not stubs:
+//!
+//! - [`rfc0021_fixture_writes_the_pre_upgrade_file`] (`#[ignore]`d,
+//!   run manually) generated `testdata/rfc0021/pre-upgrade.parquet` with the
+//!   **pre-upgrade (arrow 55) writer** — committed before any dependency
+//!   moves, per RFC 0021 §6.
+//! - [`pre_upgrade_fixture_reads_identically`] is the permanent RFC0021.2
+//!   regression guard: it decodes that committed file and asserts full
+//!   `MinedRecord` equality against the in-code expectation. It passes on the
+//!   current stack and MUST keep passing across the arrow 55 → 58 bump (§3.5:
+//!   files written before the upgrade read identically after it).
+//!
+//! At green, `.1`/`.4`/`.6` resolve where the code lives (lockfile /
+//! querier row path / CI); `.3` maps onto the existing reconstruction
+//! property + corpus suites; `.5` onto the benchmarks.md B1/B2 runs.
+//!
+//! See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5 / §6.
+
+use ourios_core::audit::ParamType;
+use ourios_core::record::{BodyKind, MinedRecord, Param};
+use ourios_core::tenant::TenantId;
+use ourios_parquet::{DEFAULT_ZSTD_LEVEL, Reader, encode_records_to_parquet};
+
+/// The committed pre-upgrade fixture, relative to this crate's manifest.
+const FIXTURE_PATH: &str = "../../testdata/rfc0021/pre-upgrade.parquet";
+
+/// Deterministic, representative rows covering the column shapes the §3.5
+/// invariant protects: a templated body (params + separators + trace ids +
+/// attributes), a structured body carrying Ourios-canonical JSON with a
+/// proto3 non-finite double string form (RFC 0018 §3.4), a parse-failure
+/// row (retained body, no template), and a minimal row (absent optionals).
+fn fixture_records() -> Vec<MinedRecord> {
+    let kv = |k: &str, v: &str| ourios_core::otlp::KeyValue {
+        key: k.to_owned(),
+        value: Some(ourios_core::otlp::AnyValue {
+            value: Some(ourios_core::otlp::any_value::Value::StringValue(
+                v.to_owned(),
+            )),
+        }),
+        ..Default::default()
+    };
+    let base = MinedRecord {
+        tenant_id: TenantId::new("rfc0021"),
+        template_id: 7,
+        template_version: 1,
+        severity_number: 9,
+        severity_text: Some("INFO".to_owned()),
+        scope_name: Some("lib.checkout".to_owned()),
+        scope_version: Some("2.1.0".to_owned()),
+        scope_attributes: Vec::new(),
+        resource_schema_url: Some("https://opentelemetry.io/schemas/1.42.0".to_owned()),
+        scope_schema_url: None,
+        time_unix_nano: 1_782_950_400_000_000_000,
+        observed_time_unix_nano: Some(1_782_950_400_000_000_001),
+        attributes: vec![kv("http.request.method", "GET")],
+        dropped_attributes_count: 0,
+        resource_attributes: vec![kv("service.name", "checkout")],
+        trace_id: Some([0xA1; 16]),
+        span_id: Some([0xB2; 8]),
+        flags: 0x01,
+        event_name: None,
+        body_kind: BodyKind::String,
+        params: vec![Param {
+            type_tag: ParamType::Num,
+            value: "42".to_owned(),
+        }],
+        separators: vec![String::new(), " ".to_owned(), String::new()],
+        body: None,
+        confidence: 1.0,
+        lossy_flag: false,
+    };
+
+    let structured = MinedRecord {
+        template_id: 8,
+        event_name: Some("ourios.fixture.event".to_owned()),
+        body_kind: BodyKind::Structured,
+        params: Vec::new(),
+        separators: Vec::new(),
+        // Ourios-canonical JSON incl. the proto3 non-finite string form
+        // (RFC 0018 §3.4) — the shape most sensitive to codec drift.
+        body: Some(
+            r#"{"kvlistValue":{"values":[{"key":"ratio","value":{"doubleValue":"NaN"}},{"key":"msg","value":{"stringValue":"checkout failed"}}]}}"#
+                .to_owned(),
+        ),
+        ..base.clone()
+    };
+
+    let parse_failure = MinedRecord {
+        template_id: 0,
+        template_version: 0,
+        severity_number: 17,
+        severity_text: Some("ERROR".to_owned()),
+        attributes: Vec::new(),
+        trace_id: None,
+        span_id: None,
+        params: Vec::new(),
+        separators: Vec::new(),
+        body: Some("\u{7f}binary\u{0} garbage line".to_owned()),
+        confidence: 0.0,
+        lossy_flag: true,
+        ..base.clone()
+    };
+
+    let minimal = MinedRecord {
+        severity_text: None,
+        scope_name: None,
+        scope_version: None,
+        resource_schema_url: None,
+        observed_time_unix_nano: None,
+        attributes: Vec::new(),
+        resource_attributes: Vec::new(),
+        flags: 0,
+        params: Vec::new(),
+        separators: vec![String::new(), String::new()],
+        ..base.clone()
+    };
+
+    vec![base, structured, parse_failure, minimal]
+}
+
+/// One-shot generator for the committed fixture — run manually **before** the
+/// dependency bump (`cargo test -p ourios-parquet --test rfc0021_arrow_upgrade
+/// -- --ignored rfc0021_fixture`), never in CI. Re-running it after the bump
+/// would defeat the fixture's purpose (it must stay a pre-upgrade artefact).
+#[test]
+#[ignore = "fixture generator — run manually pre-upgrade only"]
+fn rfc0021_fixture_writes_the_pre_upgrade_file() {
+    let bytes = encode_records_to_parquet(&fixture_records(), DEFAULT_ZSTD_LEVEL).expect("encode");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, bytes).expect("write fixture");
+}
+
+/// The permanent RFC0021.2 regression guard (live from red): the committed
+/// pre-upgrade file decodes to exactly the expected rows. Green today on
+/// arrow 55; must stay green across the bump (§3.5).
+#[test]
+fn pre_upgrade_fixture_reads_identically() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
+    let records = Reader::open_file(&path)
+        .expect("open fixture")
+        .read_all()
+        .expect("read fixture");
+    assert_eq!(records, fixture_records());
+}
+
+/// Scenario RFC0021.1 — one arrow.
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+#[test]
+#[ignore = "RFC0021.1 stub — implemented in the phase-1 green slice"]
+fn rfc0021_1_one_arrow_major_and_datafusion_54() {
+    todo!(
+        "RFC0021.1 — lockfile carries exactly one arrow major (58.x) + datafusion 54.x; MSRV 1.88"
+    );
+}
+
+/// Scenario RFC0021.2 — old files read identically (§3.5).
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+#[test]
+#[ignore = "RFC0021.2 stub — discharged by pre_upgrade_fixture_reads_identically staying green across the bump"]
+fn rfc0021_2_pre_upgrade_files_read_identically() {
+    todo!(
+        "RFC0021.2 — the committed pre-upgrade fixture decodes identically on the upgraded stack"
+    );
+}
+
+/// Scenario RFC0021.3 — reconstruction stays bit-identical (§3.3).
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+#[test]
+#[ignore = "RFC0021.3 stub — the existing reconstruction property + corpus suites are the oracle"]
+fn rfc0021_3_reconstruction_property_and_corpus_green() {
+    todo!("RFC0021.3 — reconstruction suites pass unchanged on the upgraded stack");
+}
+
+/// Scenario RFC0021.4 — the RFC 0017 dual decoder is gone (#276).
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+#[test]
+#[ignore = "RFC0021.4 stub — implemented in the phase-1 green slice"]
+fn rfc0021_4_dual_decoder_removed() {
+    todo!("RFC0021.4 — single unified arrow decode path; schema_force_view_types override removed");
+}
+
+/// Scenario RFC0021.5 — the B1/B2 pruning thesis holds.
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+#[test]
+#[ignore = "RFC0021.5 stub — benchmarks.md B1/B2 (indicative ci-runner; authoritative on opt-in)"]
+fn rfc0021_5_pruning_gates_hold() {
+    todo!("RFC0021.5 — B1/B2 show no regression beyond run-to-run noise");
+}
+
+/// Scenario RFC0021.6 — the full gate is green.
+/// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
+#[test]
+#[ignore = "RFC0021.6 stub — CI is the oracle (incl. s3-integration + live-check)"]
+fn rfc0021_6_full_gate_green() {
+    todo!("RFC0021.6 — complete suite green on the upgraded stack");
+}

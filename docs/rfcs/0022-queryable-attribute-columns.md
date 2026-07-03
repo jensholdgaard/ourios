@@ -75,7 +75,7 @@ For each promoted key, the writer appends one column to the RFC 0005
 | Property | Value |
 |---|---|
 | Name | The DSL path, literally: `resource.<key>` or `attr.<key>` (so `resource.service.name`, `attr.http.method`) |
-| Arrow / Parquet type | `Utf8` / `BYTE_ARRAY` (UTF-8), `OPTIONAL` |
+| Arrow / Parquet type | Arrow `Utf8` / Parquet `STRING` logical type over `BYTE_ARRAY` (matching the RFC 0005 §3.2 string columns), `OPTIONAL` |
 | Value | The attribute's **string value**, exactly as stored in the JSON column — no truncation, no normalisation |
 | `NULL` when | The key is absent on the record, **or** its value is not a string `AnyValue` |
 | Encodings | Dictionary **yes**, page index **yes**, bloom filter **yes** (extends the §3.6 table) |
@@ -152,10 +152,15 @@ machinery, which expresses exactly `==` and, with its presence guard,
 **`==` / `!=` — the two-arm form:**
 
 ```text
-match_expr(eq_op, v) :=
-      (P eq_op v)                    -- typed arm: prunable
-   OR (P IS NULL AND J(eq_op, v))    -- fallback arm: pre-amendment files,
-                                     --   non-string values
+match_expr(==, v) :=
+      (P = v)                          -- typed arm: prunable
+   OR (P IS NULL AND J(==, v))         -- fallback arm: pre-amendment
+                                       --   files, non-string values
+
+match_expr(!=, v) :=
+      (P IS NOT NULL AND P != v)       -- presence check explicit: don't
+                                       --   lean on 3-valued logic
+   OR (P IS NULL AND J(!=, v))
 ```
 
 **Ordering (`< <= > >=`) and regex (`=~` / `!~`) — the typed arm

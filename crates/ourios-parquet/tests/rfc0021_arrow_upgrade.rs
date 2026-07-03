@@ -192,6 +192,36 @@ fn rfc0021_3_reconstruction_property_and_corpus_green() {
     todo!("RFC0021.3 — reconstruction suites pass unchanged on the upgraded stack");
 }
 
+/// Recursively swap `Utf8`→`Utf8View` / `Binary`→`BinaryView` through
+/// `List`/`Struct` nesting — the view mix `DataFusion`'s scan can hand the
+/// querier, including the `params` and `separators` element types.
+fn to_view_type(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use std::sync::Arc;
+
+    use arrow_schema::DataType;
+    match dt {
+        DataType::Utf8 => DataType::Utf8View,
+        DataType::Binary => DataType::BinaryView,
+        DataType::List(f) => DataType::List(Arc::new(
+            f.as_ref()
+                .clone()
+                .with_data_type(to_view_type(f.data_type())),
+        )),
+        DataType::Struct(fs) => DataType::Struct(
+            fs.iter()
+                .map(|f| {
+                    Arc::new(
+                        f.as_ref()
+                            .clone()
+                            .with_data_type(to_view_type(f.data_type())),
+                    )
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Scenario RFC0021.4 — the RFC 0017 dual decoder is gone (#276).
 /// See `docs/rfcs/0021-datafusion-arrow-upgrade.md` §5.
 ///
@@ -222,33 +252,7 @@ fn rfc0021_4_shared_decoder_reads_view_and_plain_representations() {
 
     // The same batch with every Utf8/Binary — flat *and* nested inside the
     // `params` list-of-struct and `separators` list — cast to its view
-    // representation, covering whatever mix DataFusion's scan hands the
-    // querier.
-    fn to_view_type(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
-        use arrow_schema::DataType;
-        match dt {
-            DataType::Utf8 => DataType::Utf8View,
-            DataType::Binary => DataType::BinaryView,
-            DataType::List(f) => DataType::List(Arc::new(
-                f.as_ref()
-                    .clone()
-                    .with_data_type(to_view_type(f.data_type())),
-            )),
-            DataType::Struct(fs) => DataType::Struct(
-                fs.iter()
-                    .map(|f| {
-                        Arc::new(
-                            f.as_ref()
-                                .clone()
-                                .with_data_type(to_view_type(f.data_type())),
-                        )
-                    })
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-
+    // representation via `to_view_type`.
     let plain_schema = plain.schema();
     let mut fields = Vec::new();
     let mut columns = Vec::new();

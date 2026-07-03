@@ -380,24 +380,134 @@ async fn rfc0022_6_read_path_is_projection_blind() {
 
 /// Scenario RFC0022.5 — promoted predicates prune (pillar 2).
 /// See `docs/rfcs/0022-queryable-attribute-columns.md` §5.
-#[test]
-#[ignore = "RFC0022.5 stub — implemented in the pruning green slice"]
-fn rfc0022_5_promoted_predicates_prune() {
-    todo!(
-        "RFC0022.5 — a selective equality query on a promoted key shows \
-         pruned > 0 via the RFC 0016 scanned/pruned counters on a \
-         multi-row-group corpus; B1/B2 unchanged"
+///
+/// The `rfc0007_1` shape (counters, not wall-clock): three files in distinct
+/// hours (⇒ distinct row groups), the needle value concentrated in one of
+/// them. Every row carries the promoted key, so in the non-matching row
+/// groups the typed arm is excluded by min/max statistics *and* the
+/// fallback arm by a zero null-count (`P IS NULL` can never hold) — §3.3's
+/// steady-state fast path. B1/B2 are the bench gates, unchanged by
+/// construction (this suite asserts the counters only).
+#[tokio::test]
+async fn rfc0022_5_promoted_predicates_prune() {
+    let bucket = TempDir::new().expect("temp");
+    for (i, ns) in ["alpha", "beta", "needle"].iter().enumerate() {
+        let hour = u64::try_from(i).expect("small index") * common::HOUR_NS;
+        let recs: Vec<MinedRecord> = (0..3u64)
+            .map(|j| MinedRecord {
+                template_id: 500 + j,
+                ..rec_with_attrs(
+                    "a",
+                    TS0 + hour + j * 1_000,
+                    vec![kv("service.name", "api"), kv("k8s.namespace.name", ns)],
+                    Vec::new(),
+                )
+            })
+            .collect();
+        write_all_with_promoted(bucket.path(), &recs, &promoted_set());
+    }
+    let q = Querier::new(bucket.path());
+
+    let query =
+        ourios_querier::dsl::parse(r#"resource.k8s.namespace.name == "needle""#).expect("parse");
+    let r = q
+        .run_query(
+            &query,
+            &TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&no_aliases()),
+        )
+        .await
+        .expect("run_query");
+
+    assert_eq!(r.rows, 3, "exactly the needle file's rows match");
+    assert!(
+        r.stats.row_groups_pruned >= 2,
+        "the alpha/beta row groups are pruned by the promoted column's \
+         statistics; stats={:?}",
+        r.stats,
+    );
+    let total = r.stats.row_groups_scanned + r.stats.row_groups_pruned;
+    assert!(
+        total > r.stats.row_groups_pruned,
+        "at least one row group was also scanned (matched); stats={:?}",
+        r.stats,
+    );
+    assert!(
+        r.stats.bytes_read > 0,
+        "bytes_read extraction (from the engine's bytes_scanned metric) \
+         stays wired; stats={:?}",
+        r.stats,
     );
 }
 
 /// Scenario RFC0022.7 — promoted-set drift across deploys (§3.4).
 /// See `docs/rfcs/0022-queryable-attribute-columns.md` §5.
-#[test]
-#[ignore = "RFC0022.7 stub — implemented in the pruning green slice"]
-fn rfc0022_7_promoted_set_drift_unions_cleanly() {
-    todo!(
-        "RFC0022.7 — one scan over files written under configured sets {{}}, \
-         {{a}}, {{a,b}} unions schemas without error; predicates on a and b \
-         answer correctly from every file"
+///
+/// Three files written under configured sets `{}`, `{a}`, `{a,b}` (each on
+/// top of the implicit `service.name`), for `a = k8s.namespace.name`
+/// (resource) and `b = http.route` (log). One scan spans all three; the
+/// schema union is the ordinary §3.9 case and each predicate answers from
+/// the typed arm where the column exists and is non-`NULL`, the JSON arm
+/// otherwise.
+#[tokio::test]
+async fn rfc0022_7_promoted_set_drift_unions_cleanly() {
+    let bucket = TempDir::new().expect("temp");
+    let row = |tid: u64, ts: u64, ns: &str, route: &str| MinedRecord {
+        template_id: tid,
+        ..rec_with_attrs(
+            "a",
+            ts,
+            vec![kv("service.name", "api"), kv("k8s.namespace.name", ns)],
+            vec![kv("http.route", route)],
+        )
+    };
+    // {}: the default set (implicit service.name only) — the plain writer.
+    common::write_all(bucket.path(), &[row(601, TS0, "prod", "/cart")]);
+    // {a}: k8s.namespace.name promoted, http.route not.
+    write_all_with_promoted(
+        bucket.path(),
+        &[row(602, TS0 + common::HOUR_NS, "dev", "/cart")],
+        &PromotedAttributes::new(["k8s.namespace.name".to_string()], []),
     );
+    // {a,b}: both promoted.
+    write_all_with_promoted(
+        bucket.path(),
+        &[row(603, TS0 + 2 * common::HOUR_NS, "prod", "/login")],
+        &promoted_set(),
+    );
+    let q = Querier::new(bucket.path());
+
+    // The union scan itself must not error.
+    assert_eq!(count(&q, "true").await, 3, "all three files are scanned");
+
+    // `a` answers from every file: typed arm in {a}/{a,b} files, JSON arm in
+    // the {} file (its `resource.k8s.namespace.name` cell reads NULL).
+    assert_eq!(
+        count(&q, r#"resource.k8s.namespace.name == "prod""#).await,
+        2
+    );
+    assert_eq!(
+        count(&q, r#"resource.k8s.namespace.name != "prod""#).await,
+        1
+    );
+    // `b` answers from every file: typed arm only in the {a,b} file.
+    assert_eq!(count(&q, r#"attr.http.route == "/cart""#).await, 2);
+    assert_eq!(count(&q, r#"attr.http.route != "/cart""#).await, 1);
+    // Row identity across the drift: each == match is the expected file.
+    for (query, tid) in [
+        (r#"resource.k8s.namespace.name == "dev""#, 602),
+        (r#"attr.http.route == "/login""#, 603),
+    ] {
+        assert_eq!(
+            count(&q, &format!("{query} and template_id == {tid}")).await,
+            1,
+            "{query} matches exactly template {tid}"
+        );
+    }
+    // Ordering stays typed-arm-only under drift: only the {a,b} file has a
+    // non-NULL `attr.http.route` cell, so its /login row is the sole match —
+    // the /cart rows in the {}/{a} files read NULL and silently non-match.
+    assert_eq!(count(&q, r#"attr.http.route >= "/cart""#).await, 1);
 }

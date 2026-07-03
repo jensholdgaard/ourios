@@ -384,6 +384,16 @@ STRING>` for the common `string`-valued case, leaving complex
 values in the JSON column). The gate is "we have a concrete
 consumer," not "it might be useful."
 
+> **Amendment 2026-07-03 (the consumer arrived).** The reservation
+> above is discharged by **RFC 0022** (queryable attribute columns):
+> the RFC 0002 DSL's `service` / `resource.<key>` / `attr.<key>`
+> predicates are the concrete consumer (#147). RFC 0022 chooses
+> per-key promoted `OPTIONAL` columns over the `MAP` sketch (a map's
+> statistics and bloom filters are not key-scoped, so it cannot
+> prune — see RFC 0022 §4) and extends the §3.6 encodings table when
+> it lands. This section's JSON columns remain the source of truth;
+> no schema bytes change until RFC 0022 reaches `red`/`green`.
+
 ### 3.4 Partition layout on disk
 
 Data files live at:

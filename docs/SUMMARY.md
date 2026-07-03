@@ -39,6 +39,7 @@
 - [RFC 0019 — Storage-backend selection](./rfcs/0019-storage-backend-selection.md)
 - [RFC 0020 — Configuration file](./rfcs/0020-configuration-file.md)
 - [RFC 0021 — DataFusion / Arrow upgrade](./rfcs/0021-datafusion-arrow-upgrade.md)
+- [RFC 0022 — Queryable attribute columns](./rfcs/0022-queryable-attribute-columns.md)
 
 # Talks
 

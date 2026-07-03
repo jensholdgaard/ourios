@@ -29,7 +29,8 @@ schema:
   after the DSL path (`resource.service.name`, `attr.http.method`).
 - The promoted set always contains the resource key `service.name`
   (OTel's primary correlation dimension, the DSL's bare `service`
-  field); operators extend it via the RFC 0020 config file.
+  field); operators extend it via a new `storage.promoted_attributes`
+  key that this RFC adds to the RFC 0020 config schema (§3.2).
 - DSL predicates on promoted keys compile to the typed column with the
   **full `cmp_op` set** (ordering + regex) and row-group pruning; a
   hybrid fallback arm keeps results correct on pre-amendment files and
@@ -105,7 +106,11 @@ SQL identifier parser, so no mangling scheme (and therefore no
 collision handling) is needed. The `resource.` / `attr.` prefixes are
 reserved column-name namespaces in the data schema from this RFC on.
 
-### 3.2 Configuration (RFC 0020)
+### 3.2 Configuration (an RFC 0020 schema extension)
+
+`storage.promoted_attributes` does **not** exist in RFC 0020's schema
+today — this RFC adds it (RFC 0020's own evolution path for new
+knobs):
 
 ```yaml
 storage:
@@ -119,7 +124,14 @@ storage:
   retroactive. Files written under different sets coexist (§3.4).
 - Defaults: empty beyond the implicit `service.name` — promotion
   beyond that is an explicit operator decision because each promoted
-  key costs file bytes on every row (§3.5).
+  key costs file bytes on every row (§3.5). The key itself is
+  optional: configs that omit it are unchanged.
+- **Rollout ordering:** RFC 0020 parses strictly — an unknown key is a
+  startup error — so a config carrying `storage.promoted_attributes`
+  requires a binary at or above this RFC's `green`. Upgrade first,
+  extend the config second; rolling back the binary requires removing
+  the key. (Data written meanwhile stays readable either way — §3.4's
+  unknown-column rule covers files a rolled-back binary encounters.)
 - Per-tenant sets are deferred (§7); the knob is global, consistent
   with every other RFC 0020 setting.
 
@@ -351,7 +363,9 @@ generators with the RFC 0001 §6.1 codec suite).
   RFC extends), §3.9 (evolution rules the migration plan leans on).
 - RFC 0016 (scanned/pruned counters — the RFC0022.5 oracle).
 - RFC 0017 (the projection-blind read path in RFC0022.6).
-- RFC 0020 (the `storage.promoted_attributes` config surface).
+- RFC 0020 (the config schema this RFC extends with
+  `storage.promoted_attributes`; strict parsing → §3.2 rollout
+  ordering).
 - RFC 0007 §8 (the sibling param-pushdown reservation, untouched).
 - CLAUDE.md §2 pillar 2, §3.5 schema-migration invariant, §4 hazards
   #2/#4/#6.

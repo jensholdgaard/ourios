@@ -318,7 +318,7 @@ impl std::error::Error for ReaderError {
 }
 
 /// Whether a batch decode enforces the RFC 0005 §3.2 writer-shape
-/// invariants ([`validate_record_shape`]).
+/// invariants (`validate_record_shape`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeValidation {
     /// Reject rows that violate §3.2 — the [`Reader`]'s own path: a file

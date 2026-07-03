@@ -265,7 +265,10 @@ fn baseline_params() -> Option<(u64, u64, usize)> {
         Ok(v) if v == "1" => {}
         Ok(_) | Err(std::env::VarError::NotPresent) => return None,
         Err(std::env::VarError::NotUnicode(v)) => {
-            panic!("OURIOS_COMPACTION_BASELINE={v:?} is not valid UTF-8")
+            panic!(
+                "OURIOS_COMPACTION_BASELINE={} is not valid UTF-8",
+                v.display()
+            )
         }
     }
     // Fail fast on a present-but-unparsable value (an authoritative run must
@@ -278,7 +281,9 @@ fn baseline_params() -> Option<(u64, u64, usize)> {
         // Default only when the var is genuinely absent; a present-but-non-UTF-8
         // value is a misconfig, not "use the default".
         Err(std::env::VarError::NotPresent) => d,
-        Err(std::env::VarError::NotUnicode(v)) => panic!("{k}={v:?} is not valid UTF-8"),
+        Err(std::env::VarError::NotUnicode(v)) => {
+            panic!("{k}={} is not valid UTF-8", v.display())
+        }
     };
     let files = var("OURIOS_COMPACTION_FILES", 16);
     let rows = var("OURIOS_COMPACTION_ROWS", 16_000);

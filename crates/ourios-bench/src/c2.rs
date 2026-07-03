@@ -110,7 +110,7 @@ impl C2Accumulator {
         // divisible by the cadence) and always on the final
         // line. The guard avoids a duplicate final sample when
         // the last line happens to fall on a cadence boundary.
-        let on_cadence = self.processed % self.cadence == 0;
+        let on_cadence = self.processed.is_multiple_of(self.cadence);
         let is_last = self.processed == self.total_lines;
         if (on_cadence || is_last) && self.curve.last().map(|s| s.lines) != Some(self.processed) {
             self.curve.push(ConvergenceSample {

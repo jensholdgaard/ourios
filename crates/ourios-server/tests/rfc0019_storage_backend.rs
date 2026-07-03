@@ -606,10 +606,10 @@ async fn rfc0019_4_compaction_operates_on_s3() {
                     .await
                     .expect("join manifest read")
                     .expect("manifest read");
-            if let Some((manifest, _)) = manifest {
-                if manifest.files.len() == 1 {
-                    return manifest;
-                }
+            if let Some((manifest, _)) = manifest
+                && manifest.files.len() == 1
+            {
+                return manifest;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

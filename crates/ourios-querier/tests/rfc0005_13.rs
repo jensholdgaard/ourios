@@ -200,7 +200,7 @@ async fn rfc0005_13_effective_window_prunes_row_groups() {
     std::fs::create_dir_all(&dir).expect("mkdir partition");
     let file = File::create(dir.join("two_row_groups.parquet")).expect("create parquet");
     let props = parquet::file::properties::WriterProperties::builder()
-        .set_max_row_group_size(1)
+        .set_max_row_group_row_count(Some(1))
         .build();
     let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
     w.write(&batch).expect("write batch");

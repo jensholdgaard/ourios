@@ -271,10 +271,11 @@ fn check_credentials_are_references(s3: &S3Section) -> Result<(), FileConfigErro
         ("secret_access_key", &s3.secret_access_key),
         ("session_token", &s3.session_token),
     ] {
-        if let Some(raw) = value {
-            if !raw.is_empty() && !is_env_reference(raw) {
-                return Err(FileConfigError::InlineCredential { key });
-            }
+        if let Some(raw) = value
+            && !raw.is_empty()
+            && !is_env_reference(raw)
+        {
+            return Err(FileConfigError::InlineCredential { key });
         }
     }
     Ok(())

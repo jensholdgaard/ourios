@@ -176,29 +176,29 @@ fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
     // don't fail the process; whether a missed compression
     // target pauses the project is the §7 escalation rule's
     // human judgment, not a build red.
-    if let Some(c1) = &results.c1 {
-        if !c1.pass {
-            let failed = c1.non_lossy_total - c1.non_lossy_reconstruct_ok;
-            eprintln!(
-                "ourios-bench: C1 FAILED — {failed} of {} non-lossy row(s) did not reconstruct \
+    if let Some(c1) = &results.c1
+        && !c1.pass
+    {
+        let failed = c1.non_lossy_total - c1.non_lossy_reconstruct_ok;
+        eprintln!(
+            "ourios-bench: C1 FAILED — {failed} of {} non-lossy row(s) did not reconstruct \
                  byte-for-byte (RFC 0006 §3.4.2 / CLAUDE.md §3.3)",
-                c1.non_lossy_total,
+            c1.non_lossy_total,
+        );
+        // RFC0006.2: emit each failing row's template id /
+        // version + expected vs actual bytes. The sample is
+        // bounded (`c1.mismatches`), so note any overflow.
+        for m in &c1.mismatches {
+            eprintln!(
+                "  template_id={} template_version={}\n    expected: {:?}\n    actual:   {:?}",
+                m.template_id, m.template_version, m.expected, m.actual,
             );
-            // RFC0006.2: emit each failing row's template id /
-            // version + expected vs actual bytes. The sample is
-            // bounded (`c1.mismatches`), so note any overflow.
-            for m in &c1.mismatches {
-                eprintln!(
-                    "  template_id={} template_version={}\n    expected: {:?}\n    actual:   {:?}",
-                    m.template_id, m.template_version, m.expected, m.actual,
-                );
-            }
-            let shown = u64::try_from(c1.mismatches.len()).unwrap_or(u64::MAX);
-            if failed > shown {
-                eprintln!("  … and {} more failing row(s) not shown", failed - shown);
-            }
-            return Ok(ExitCode::from(1));
         }
+        let shown = u64::try_from(c1.mismatches.len()).unwrap_or(u64::MAX);
+        if failed > shown {
+            eprintln!("  … and {} more failing row(s) not shown", failed - shown);
+        }
+        return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
 }

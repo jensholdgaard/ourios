@@ -4,7 +4,7 @@
 # only glibc + the binary. Distroless `cc-debian12` is multi-arch, so the
 # CI build cross-builds linux/amd64 + linux/arm64 from one Dockerfile.
 
-# Builder: pinned to the workspace MSRV (Cargo.toml `rust-version = 1.85`)
+# Builder: at or above the workspace MSRV (Cargo.toml `rust-version = 1.88`)
 # by digest for reproducibility; the tag comment lets Renovate's docker
 # manager bump it.
 FROM rust:1.96-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS builder

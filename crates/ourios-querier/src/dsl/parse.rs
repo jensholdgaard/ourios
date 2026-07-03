@@ -577,11 +577,11 @@ impl<'a> Parser<'a> {
 
     /// Consume the next token iff it is the identifier keyword `kw`.
     fn eat_keyword(&mut self, kw: &str) -> bool {
-        if let Some(Tok::Ident(s)) = self.peek() {
-            if s == kw {
-                self.pos += 1;
-                return true;
-            }
+        if let Some(Tok::Ident(s)) = self.peek()
+            && s == kw
+        {
+            self.pos += 1;
+            return true;
         }
         false
     }

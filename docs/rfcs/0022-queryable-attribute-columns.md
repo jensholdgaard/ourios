@@ -28,7 +28,8 @@ schema:
   Utf8 column (dictionary + page index + bloom filter), named literally
   after the DSL path (`resource.service.name`, `attr.http.method`).
 - The promoted set always contains the resource key `service.name`
-  (OTel's primary correlation dimension, the DSL's bare `service`
+  (the `Required`, `Stable` identity attribute of the OTel `service`
+  resource entity per the semconv registry, the DSL's bare `service`
   field); operators extend it via a new `storage.promoted_attributes`
   key that this RFC adds to the RFC 0020 config schema (§3.2).
 - DSL predicates on promoted keys compile to the typed column with the
@@ -100,8 +101,14 @@ Rules:
   round-trip suites stay the oracle for fidelity.
 
 Column-name note: literal dots in column names are valid in Parquet and
-Arrow; on the DataFusion side every reference goes through
-unqualified-column construction (the DataFrame API), never through the
+Arrow. On the DataFusion side the compiler must **not** reference these
+columns through `datafusion::prelude::col("…")` — that parses its
+argument, so `col("resource.service.name")` reads as a qualified
+reference (relation `resource`, column …). The required mechanism is
+explicit unqualified construction:
+`Expr::Column(Column::new_unqualified("resource.service.name"))`
+(`datafusion::common::Column`), which treats the whole string as the
+literal column name. The querier never routes these names through the
 SQL identifier parser, so no mangling scheme (and therefore no
 collision handling) is needed. The `resource.` / `attr.` prefixes are
 reserved column-name namespaces in the data schema from this RFC on.
@@ -162,10 +169,10 @@ with these operators get promoted-era data only; the stopgap's answer
 to the same query was a hard `InvalidQuery`, so no existing query
 degrades.
 
-with the same missing-field semantics the DSL uses everywhere: `NULL`
-never matches, and `!=` requires the key present with a different
-value (`P IS NOT NULL AND P != v`, mirrored in the JSON arm's presence
-guard).
+Both operator classes keep the missing-field semantics the DSL uses
+everywhere: `NULL` never matches, and `!=` requires the key present
+with a different value (`P IS NOT NULL AND P != v`, mirrored in the
+JSON arm's presence guard).
 
 Why the fallback arm is cheap where it matters:
 
@@ -241,13 +248,17 @@ flowchart LR
 
 ### 3.6 Telemetry
 
-Per the weaver-registry discipline: a
-`ourios.storage.parquet.promoted.bytes` counter (attribute: promoted
-column name), following the existing `ourios.storage.parquet.*`
-namespace (`metric.ourios.storage.parquet.file.size`), recording
-projected bytes per flush alongside the existing writer metrics. Query-side pruning is
-already observable through the RFC 0016 scanned/pruned row-group
-counters — RFC0022.5 uses them as its oracle.
+Per the weaver-registry discipline: an
+`ourios.storage.parquet.promoted.size` instrument (attribute: promoted
+column name) recording per-flush projected bytes, mirroring
+`metric.ourios.storage.parquet.file.size` (histogram, UCUM unit `By`)
+in both namespace and shape. The unit lives in instrument metadata,
+not the name, per the OTel metric semantic conventions ("metrics that
+have their units included in OpenTelemetry metadata SHOULD NOT include
+the units in the metric name"). Exact instrument fields are settled in
+the semconv registry entry at implementation time, as always.
+Query-side pruning is already observable through the RFC 0016
+scanned/pruned row-group counters — RFC0022.5 uses them as its oracle.
 
 ## 4. Alternatives considered
 

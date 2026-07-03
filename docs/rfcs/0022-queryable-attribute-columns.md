@@ -137,16 +137,30 @@ storage:
 
 ### 3.3 Predicate compilation
 
-For a DSL comparison on a **promoted** key, the compiler emits a
-two-arm expression (`P` = promoted column, `J` = the JSON arm — the
-existing #146 `LIKE` fragment machinery):
+Promoted-key predicates compile by operator class (`P` = promoted
+column, `J` = the JSON arm — the existing #146 `LIKE` fragment
+machinery, which can only express key+string-value equality):
+
+**`==` / `!=` — the two-arm form:**
 
 ```text
-match_expr(op, v) :=
-      (P op v)                       -- typed arm: full cmp_op set, prunable
-   OR (P IS NULL AND J(op, v))       -- fallback arm: pre-amendment files,
+match_expr(eq_op, v) :=
+      (P eq_op v)                    -- typed arm: prunable
+   OR (P IS NULL AND J(eq_op, v))    -- fallback arm: pre-amendment files,
                                      --   non-string values
 ```
+
+**Ordering (`< <= > >=`) and regex (`=~` / `!~`) — the typed arm
+only.** `J` cannot express these (that inexpressibility is why the
+stopgap rejects them), so there is no fallback arm: `match_expr(op, v)
+:= (P op v)`. The explicit consequence: on **pre-amendment files** the
+column reads as all-`NULL` (§3.9) and **rows in those files never
+match an ordering/regex predicate** — a silent non-match, consistent
+with the DSL's missing-field rule (`NULL` never matches), not an
+error. Operators querying history older than their promotion cutover
+with these operators get promoted-era data only; the stopgap's answer
+to the same query was a hard `InvalidQuery`, so no existing query
+degrades.
 
 with the same missing-field semantics the DSL uses everywhere: `NULL`
 never matches, and `!=` requires the key present with a different
@@ -172,11 +186,9 @@ Why the fallback arm is cheap where it matters:
 
 Operator set on promoted keys: the full RFC 0002 `cmp_op` —
 `== != < <= > >=` (lexicographic, as for every other string field) plus
-`=~` / `!~`. The ordering and regex arms apply **only** to the typed
-column; on the JSON arm they remain rejected, so a query using them is
-answered from promoted data plus `NULL`-fallback semantics — the RFC
-0002 rejection text moves from "attributes don't support this" to
-"non-promoted attributes don't support this".
+`=~` / `!~`, with the per-class compile above. The RFC 0002 rejection
+text moves from "attributes don't support this" to "non-promoted
+attributes don't support this".
 
 Non-promoted keys: compile exactly as today (#146). No behaviour
 change.
@@ -187,7 +199,7 @@ flowchart LR
     C -- no --> J["JSON LIKE arm only<br/>(== / != , unpruned)"]
     C -- yes --> T["typed column arm<br/>full cmp_op, bloom + stats prune"]
     T --> O["OR"]
-    J2["P IS NULL AND JSON arm<br/>(old files, non-string values)"] --> O
+    J2["== / != only:<br/>P IS NULL AND JSON arm<br/>(old files, non-string values)"] --> O
     C -- yes --> J2
 ```
 
@@ -292,11 +304,13 @@ Scenario ids `RFC0022.<m>`.
 > the same data, row for row.
 
 > **Scenario RFC0022.4 — full operator set on promoted keys only.**
-> Given a promoted key and a non-promoted key,
+> Given a promoted key and a non-promoted key, over a scan spanning a
+> pre-amendment file and a post-amendment file,
 > When ordering (`<`, `>=`, …) and regex (`=~`, `!~`) predicates are
 > issued against each,
-> Then the promoted key answers them (with `NULL`-never-matches
-> semantics), and the non-promoted key still rejects them with
+> Then the promoted key answers them from the typed arm only — rows in
+> the pre-amendment file never match (§3.3's documented silent
+> non-match) — and the non-promoted key still rejects them with
 > `InvalidQuery`, `==`/`!=` continuing to work as today.
 
 > **Scenario RFC0022.5 — promoted predicates prune (pillar 2).**

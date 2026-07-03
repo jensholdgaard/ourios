@@ -44,7 +44,7 @@ pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_audit_partition};
 pub use compaction::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, compact_partition,
-    gc_orphans, plan_candidates,
+    compact_partition_with_promoted, gc_orphans, plan_candidates,
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 pub use partition::{

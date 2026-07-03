@@ -41,7 +41,7 @@ pub mod record_sink;
 pub mod recovery;
 pub mod snapshot_store;
 
-pub use compactor::{Compactor, IngestError, SweepReport, run_sweep};
+pub use compactor::{Compactor, IngestError, SweepReport, run_sweep, run_sweep_with_promoted};
 pub use metrics::CompactionMetrics;
 pub use recovery::{RecoveryDriverError, RecoveryReport, TenantRecovery};
 pub use snapshot_store::SnapshotStoreError;

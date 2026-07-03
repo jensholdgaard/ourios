@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field};
 use ourios_core::otlp::{KeyValue, any_value};
 
 /// The resource key that is always promoted (RFC 0022 §3.1): the
-/// `Required`, `Stable` identity attribute of the OTel `service`
+/// `Required`, `Stable` identity attribute of the `OTel` `service`
 /// resource entity, surfaced in the DSL as the bare `service` field.
 pub const SERVICE_NAME_KEY: &str = "service.name";
 

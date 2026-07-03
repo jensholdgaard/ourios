@@ -494,7 +494,8 @@ pub fn batch_to_mined_records(
     let n = batch.num_rows();
     let mut records: Vec<MinedRecord> = Vec::with_capacity(n);
 
-    // Required columns — verified present at open time.
+    // Required columns — the `Reader` verifies these at open time; other
+    // callers (the querier) surface `MissingRequiredColumn` here instead.
     let tenant_id = required_string(batch, columns::TENANT_ID, row_offset)?;
     let template_id = required_u64(batch, columns::TEMPLATE_ID, row_offset)?;
     let template_version = required_u32(batch, columns::TEMPLATE_VERSION, row_offset)?;

@@ -43,7 +43,6 @@ mod compile;
 mod drift;
 pub mod dsl;
 mod log_row;
-mod row_decode;
 mod template_registry;
 
 pub use audit_scan::StoreRef;
@@ -792,16 +791,12 @@ impl Querier {
             return Ok(QueryResult::default());
         }
 
-        // Read Parquet string/binary columns as `Utf8` / `Binary`, not the
-        // `Utf8View` / `BinaryView` DataFusion forces by default — the RFC 0017
-        // row decoder (`row_decode`) downcasts to the non-view array types, and
-        // the count/filter path is indifferent to which representation it gets.
-        // Set on the `ParquetFormat` itself (a bare `ParquetFormat::default()`
-        // ignores the session config's parquet options).
-        let mut parquet_options = datafusion::common::config::TableParquetOptions::default();
-        parquet_options.global.schema_force_view_types = false;
-        let parquet_format = ParquetFormat::default().with_options(parquet_options);
-        let options = ListingOptions::new(Arc::new(parquet_format)).with_file_extension(".parquet");
+        // DataFusion's default `Utf8View` / `BinaryView` representations are
+        // fine here: the shared RFC 0005 decoder handles both view and plain
+        // string/binary arrays (RFC 0021 / RFC0021.4), so no
+        // `schema_force_view_types` override is needed.
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
         // `infer_schema` over the multi-path set merges the files'
         // schemas, so additive schema drift across files reads as the
         // union (RFC0007.4 / RFC 0005 §3.9).
@@ -866,7 +861,24 @@ impl Querier {
     ) -> Result<Vec<LogRow>, QueryError> {
         let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
         let batches = limited.collect().await.map_err(storage_err)?;
-        let mined = row_decode::batches_to_mined_records(&batches)?;
+        // The single RFC 0005 decode path (RFC 0021 §3.1 / RFC0021.4):
+        // `ShapeValidation::Skip` because `render_log_body` handles every
+        // record shape safely — this path renders rather than rejects
+        // (foreign/degraded files still serve queries; RFC 0017).
+        let mut mined = Vec::new();
+        let mut row_offset = 0usize;
+        for batch in &batches {
+            let records = ourios_parquet::batch_to_mined_records(
+                batch,
+                row_offset,
+                ourios_parquet::ShapeValidation::Skip,
+            )
+            .map_err(|e| QueryError::Storage {
+                detail: format!("decode rows: {e}"),
+            })?;
+            row_offset += batch.num_rows();
+            mined.extend(records);
+        }
         if mined.is_empty() {
             return Ok(Vec::new());
         }

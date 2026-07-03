@@ -1,7 +1,7 @@
 ---
 rfc: 0022
 title: Queryable attribute columns (RFC 0005 amendment)
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-03

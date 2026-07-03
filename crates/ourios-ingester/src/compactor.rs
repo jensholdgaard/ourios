@@ -140,7 +140,7 @@ pub struct CompactedFile {
 /// Run one compaction sweep over `store`, as of wall-clock
 /// `now_unix_nanos`: for each tenant, select its sealed candidate
 /// partitions ([`plan_candidates`]) and consolidate each
-/// ([`compact_partition`]), accumulating a [`SweepReport`].
+/// ([`compact_partition_with_promoted`]), accumulating a [`SweepReport`].
 ///
 /// Resilient: a tenant whose planning fails, or a partition whose
 /// consolidation fails, is recorded in [`SweepReport::errors`] and

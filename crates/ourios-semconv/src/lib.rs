@@ -150,6 +150,9 @@ pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
 /// `ourios.io.direction` attribute key.
 pub const OURIOS_IO_DIRECTION: &str = "ourios.io.direction";
 
+/// `ourios.miner.parse_failure.reason` attribute key.
+pub const OURIOS_MINER_PARSE_FAILURE_REASON: &str = "ourios.miner.parse_failure.reason";
+
 /// `ourios.miner.template_change` attribute key.
 pub const OURIOS_MINER_TEMPLATE_CHANGE: &str = "ourios.miner.template_change";
 

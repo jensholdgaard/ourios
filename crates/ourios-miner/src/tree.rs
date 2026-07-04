@@ -415,6 +415,95 @@ pub fn parse_template(canonical: &str) -> Vec<OwnedToken> {
 mod tests {
     use super::*;
 
+    /// RFC 0023 §3.1 bound 1, tree level: keyed children never exceed
+    /// the cap, overflow tokens route through [`WILDCARD_CHILD`], and
+    /// the read-side `descend` finds what the write side routed there.
+    #[test]
+    fn full_node_routes_overflow_tokens_through_the_wildcard_child() {
+        let mut tree = Tree::new();
+        // Cap 2 at prefix depth 1: three distinct first tokens on
+        // same-length lines — the third must not mint a third branch.
+        let _ = tree.descend_mut(&["alpha", "x"], 1, 2);
+        let _ = tree.descend_mut(&["beta", "x"], 1, 2);
+        {
+            let overflow = tree.descend_mut(&["gamma", "x"], 1, 2);
+            overflow.leaves.push(Leaf {
+                template: vec![
+                    OwnedToken::Fixed("gamma".to_owned()),
+                    OwnedToken::Fixed("x".to_owned()),
+                ],
+                template_id: 7,
+                template_version: 1,
+                severity_number: 9,
+                scope_name: None,
+                slot_types: Vec::new(),
+            });
+        }
+
+        // The length-2 bucket's root has exactly the cap's keyed
+        // children plus the wildcard child.
+        let root = &tree.by_length[&2].root;
+        assert_eq!(keyed_children(root), 2, "keyed children capped");
+        assert!(
+            root.children.contains_key(WILDCARD_CHILD),
+            "overflow minted the wildcard child",
+        );
+        assert!(
+            !root.children.contains_key("gamma"),
+            "the overflow token did not mint a keyed branch",
+        );
+
+        // Read side finds the wildcard-routed leaf...
+        let found = tree
+            .descend(&["gamma", "x"], 1, 2)
+            .expect("read-side routing reaches the wildcard child");
+        assert_eq!(found.leaves.len(), 1);
+        assert_eq!(found.leaves[0].template_id, 7);
+        // ...and a fourth unseen token shares the same route.
+        let shared = tree
+            .descend(&["delta", "x"], 1, 2)
+            .expect("every overflow token shares the wildcard route");
+        assert_eq!(shared.leaves.len(), 1, "same bucket as gamma's leaf");
+    }
+
+    /// Property: for any token stream and any cap ≥ 1, no node's
+    /// keyed child count ever exceeds the cap (the RFC 0023 §3.1
+    /// bounded-fanout invariant), and every descend lands somewhere.
+    #[test]
+    fn prop_keyed_children_never_exceed_the_cap() {
+        fn assert_capped(node: &PrefixNode, cap: usize) {
+            assert!(
+                keyed_children(node) <= cap,
+                "keyed children {} exceed cap {cap}",
+                keyed_children(node),
+            );
+            for child in node.children.values() {
+                assert_capped(child, cap);
+            }
+        }
+
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(
+                &(
+                    proptest::collection::vec(proptest::collection::vec("[a-e]{1,3}", 1..5), 1..40),
+                    1usize..5,
+                ),
+                |(lines, cap)| {
+                    let mut tree = Tree::new();
+                    for line in &lines {
+                        let masked: Vec<&str> = line.iter().map(String::as_str).collect();
+                        let _ = tree.descend_mut(&masked, 2, cap);
+                    }
+                    for length_node in tree.by_length.values() {
+                        assert_capped(&length_node.root, cap);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("bounded-fanout property holds");
+    }
+
     #[test]
     fn parse_template_inverts_format_template() {
         // The canonical encode/decode pair must round-trip so the read-time

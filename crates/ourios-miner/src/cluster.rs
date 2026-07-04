@@ -1368,9 +1368,10 @@ impl MinerCluster {
     }
 
     /// Emit the §6.3 parse-failure record for a string line — the
-    /// shared exit for the below-floor zone, the RFC 0023 §3.1
-    /// long-line guard, and the RFC 0023 template-ceiling diverts:
-    /// no template, body retained verbatim, lossy-flagged, counted.
+    /// shared exit for the below-floor zone, the §6.4
+    /// degenerate-widening rejection, the RFC 0023 §3.1 long-line
+    /// guard, and the RFC 0023 template-ceiling diverts: no
+    /// template, body retained verbatim, lossy-flagged, counted.
     fn emit_string_parse_failure(
         &mut self,
         record: &OtlpLogRecord,

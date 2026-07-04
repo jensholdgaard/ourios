@@ -25,21 +25,44 @@ fn record(tenant: &TenantId, text: &str) -> OtlpLogRecord {
     }
 }
 
-/// The tenant's template set as canonical `(tokens, id)` pairs,
-/// sorted — the identity oracle RFC0023.1/.5 compare on.
-fn template_set(cluster: &MinerCluster, tenant: &TenantId) -> Vec<(Vec<String>, u64)> {
-    let mut set: Vec<(Vec<String>, u64)> = cluster
+/// The tenant's template set as canonical `(rendered_template, id)`
+/// pairs, sorted — the identity oracle RFC0023.1/.5 compare on.
+/// Rendering goes through the miner's own [`format_template`]
+/// (`ourios_miner::tree`), the stable canonical form, not `Debug`.
+fn template_set(cluster: &MinerCluster, tenant: &TenantId) -> Vec<(String, u64)> {
+    let mut set: Vec<(String, u64)> = cluster
         .templates_for(tenant)
         .into_iter()
         .map(|leaf| {
             (
-                leaf.template.iter().map(|t| format!("{t:?}")).collect(),
+                ourios_miner::tree::format_template(&leaf.template),
                 leaf.template_id,
             )
         })
         .collect();
     set.sort();
     set
+}
+
+/// RFC 0023 §3.1 — a zero bound is a startup configuration error
+/// (`BoundZero` names the field), never a runtime divert-everything
+/// state. Companion to the RFC 0004 validation suite in
+/// `tests/invariants.rs`.
+#[test]
+fn zero_bounds_are_rejected_at_startup() {
+    use ourios_core::config::MinerConfigError;
+    assert_eq!(
+        MinerConfig::default().with_max_node_children(0),
+        Err(MinerConfigError::BoundZero("max_node_children")),
+    );
+    assert_eq!(
+        MinerConfig::default().with_max_templates(0),
+        Err(MinerConfigError::BoundZero("max_templates")),
+    );
+    assert_eq!(
+        MinerConfig::default().with_max_line_tokens(0),
+        Err(MinerConfigError::BoundZero("max_line_tokens")),
+    );
 }
 
 /// Scenario RFC0023.1 — the ceiling holds and never merges.
@@ -151,7 +174,9 @@ fn rfc0023_4_long_lines_fail_parse_with_body_retained() {
         id, NO_TEMPLATE,
         "over-cap line takes the parse-failure path"
     );
-    let rec = sink.drain().pop().expect("one record emitted");
+    let mut emitted = sink.drain();
+    assert_eq!(emitted.len(), 1, "exactly one record per ingested line");
+    let rec = emitted.pop().expect("asserted non-empty above");
     assert!(rec.lossy_flag);
     assert_eq!(
         rec.body.as_deref(),

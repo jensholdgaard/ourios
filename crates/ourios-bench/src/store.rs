@@ -90,8 +90,23 @@ pub fn build_query_store(
         },
     )?;
 
-    let (busiest_template_id, busiest_template_rows) =
-        counts.into_iter().max_by_key(|&(_, n)| n).unwrap_or((0, 0));
+    // The busiest *mined* template: NO_TEMPLATE (id 0, the §6.3
+    // parse-failure class) is not a template, and on fragmentation-heavy
+    // corpora it dominates row counts — picking it would make the B2
+    // "template-exact" arm measure a body-class count instead (the
+    // §9.11 finding). Fall back to it only when nothing mined at all.
+    let (busiest_template_id, busiest_template_rows) = counts
+        .iter()
+        .filter(|&(&id, _)| id != 0)
+        .max_by_key(|&(_, &n)| n)
+        .map(|(&id, &n)| (id, n))
+        .or_else(|| {
+            counts
+                .iter()
+                .max_by_key(|&(_, &n)| n)
+                .map(|(&id, &n)| (id, n))
+        })
+        .unwrap_or((0, 0));
 
     Ok(BuiltStore {
         tenant: crate::corpus::BENCH_TENANT,
@@ -803,6 +818,41 @@ mod tests {
             Some(("ERROR".to_string(), 1)),
             "the error band yields the B1 predicate with its row count",
         );
+    }
+
+    /// The busiest-template picker skips `NO_TEMPLATE` (id 0): on a
+    /// parse-failure-heavy corpus the B2 arm must measure a real
+    /// template-exact query, not a body-class count (the §9.11
+    /// finding). Three over-long lines (past the RFC 0023 default
+    /// `max_line_tokens`) land in the id-0 class and outnumber the
+    /// two mined rows — the picker must still return the mined
+    /// template.
+    #[test]
+    fn busiest_template_picker_skips_no_template() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        let long = |seed: usize| {
+            (0..600)
+                .map(|i| format!("t{}", i * seed))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let text = format!(
+            "{}\n{}\n{}\nuser 42 in\nuser 43 in\n",
+            long(1),
+            long(2),
+            long(3)
+        );
+        std::fs::write(corpus.path().join("c.txt"), text).expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_query_store(corpus.path(), bucket.path(), corpus::TxtSeverity::Fixed)
+            .expect("build");
+        assert_eq!(built.rows, 5, "all five lines stored (id-0 rows included)");
+        assert_ne!(
+            built.busiest_template_id, 0,
+            "the picker must return a mined template even when NO_TEMPLATE rows dominate",
+        );
+        assert_eq!(built.busiest_template_rows, 2, "the user-in template");
     }
 
     /// When no record carries a non-zero `time_unix_nano` (an OTLP/JSON

@@ -1,7 +1,7 @@
 ---
 rfc: 0023
 title: Bounded template memory (RFC 0001 amendment)
-status: drafted
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-04

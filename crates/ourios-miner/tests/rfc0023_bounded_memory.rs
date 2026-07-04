@@ -151,10 +151,21 @@ fn rfc0023_3_node_fanout_caps_via_wildcard_routing() {
     assert_eq!(repeat, third, "wildcard-routed repeat attaches cleanly");
 
     // Attach below the wildcard child stays threshold-gated: a
-    // below-floor line sharing the wildcard route fails parse
-    // rather than merging into the nearest leaf.
-    let unrelated = cluster.ingest(&record(&tenant, "omega different words entirely"));
-    assert_ne!(unrelated, third, "no forced merge under the wildcard child");
+    // below-floor line landing in gamma's exact bucket (unseen first
+    // token ⇒ wildcard route; second token "worker" ⇒ gamma's
+    // prefix path; same length) matches gamma's leaf at 1/4 < the
+    // 0.4 floor and must fail parse — not merge, not mint.
+    let templates_before = cluster.templates_for(&tenant).len();
+    let unrelated = cluster.ingest(&record(&tenant, "omega worker jumped nowhere"));
+    assert_eq!(
+        unrelated, NO_TEMPLATE,
+        "below-floor under the wildcard child fails parse rather than merging",
+    );
+    assert_eq!(
+        cluster.templates_for(&tenant).len(),
+        templates_before,
+        "the parse failure minted nothing",
+    );
 }
 
 /// Scenario RFC0023.4 — the long-line guard.

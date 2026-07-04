@@ -36,6 +36,9 @@ use std::fmt;
 /// | [`similarity_floor`](Self::similarity_floor) | `0.4` | `(0, threshold]` | §3.1 — bounds the §6.3 lossy zone; body retention in that zone is invariant |
 /// | [`prefix_depth`](Self::prefix_depth) | `2` | `0..=8` | §3.1 — affects tree quality, not safety |
 /// | [`param_byte_limit`](Self::param_byte_limit) | `256` | `1..=1024` | §3.2 — bounds cardinality; overflow spilling is invariant |
+/// | [`max_node_children`](Self::max_node_children) | `100` | `1..` | §3.2 — bounds tree width (RFC 0023 §3.1) |
+/// | [`max_templates`](Self::max_templates) | `20_000` | `1..` | §3.2 — bounds tree size; overflow goes parse-failure, never merge (RFC 0023 §3.1) |
+/// | [`max_line_tokens`](Self::max_line_tokens) | `512` | `1..` | §3.2 — bounds stored-template width (RFC 0023 §3.1) |
 ///
 /// The struct is `Clone + Copy + 'static`, so the cluster can
 /// hold a default and a per-tenant override map without
@@ -102,6 +105,29 @@ pub struct MinerConfig {
     /// the type rejects nonsensical "tens of thousands" values at
     /// the API surface.
     pub prefix_depth: u8,
+
+    /// RFC 0023 §3.1 bound 1 — cap on an internal prefix node's
+    /// distinct-token children. When a node is full, unseen tokens
+    /// route through its `<*>` wildcard child instead of minting a
+    /// new branch (attach below it stays similarity-gated — routing
+    /// is not merging). Default `100`, Drain3's default.
+    pub max_node_children: u16,
+
+    /// RFC 0023 §3.1 bound 2 — per-tenant ceiling on Drain-tree
+    /// leaves. At the ceiling, would-mint lines take the §6.3
+    /// parse-failure path (body retained, counted) instead of
+    /// minting; existing leaves keep widening. Default `20_000` —
+    /// an order of magnitude above what healthy corpora mine to,
+    /// far below the unbounded growth that OOMs a 32 GiB host on
+    /// shape-diverse input (the RFC 0023 §1 finding).
+    pub max_templates: u32,
+
+    /// RFC 0023 §3.1 bound 3 — lines tokenizing past this take the
+    /// §6.3 parse-failure path with the body retained, bounding
+    /// stored-template token width. Default `512`. The type keeps
+    /// every accepted line inside the RFC 0001 §6.4 `u16` audit
+    /// position width.
+    pub max_line_tokens: u16,
 }
 
 /// Per-`CLAUDE.md` §3.2: the project ceiling on configurable
@@ -140,6 +166,11 @@ pub enum MinerConfigError {
     /// The supplied prefix depth exceeds the RFC 0001 §6.1
     /// ceiling of [`PREFIX_DEPTH_CEILING`].
     PrefixDepthTooLarge(u8),
+    /// A supplied RFC 0023 §3.1 bound (`max_node_children`,
+    /// `max_templates`, or `max_line_tokens`) is zero — a zero
+    /// bound would divert every line to parse-failure at startup.
+    /// Carries the field name.
+    BoundZero(&'static str),
 }
 
 impl fmt::Display for MinerConfigError {
@@ -173,6 +204,12 @@ impl fmt::Display for MinerConfigError {
                     "prefix_depth exceeds the RFC 0001 §6.1 ceiling of {PREFIX_DEPTH_CEILING} (got {v})",
                 )
             }
+            Self::BoundZero(field) => {
+                write!(
+                    f,
+                    "{field} must be non-zero (RFC 0023 §3.1: a zero bound would divert every line to parse-failure)",
+                )
+            }
         }
     }
 }
@@ -189,6 +226,9 @@ impl Default for MinerConfig {
             similarity_floor: 0.4,
             param_byte_limit: 256,
             prefix_depth: 2,
+            max_node_children: 100,
+            max_templates: 20_000,
+            max_line_tokens: 512,
         }
     }
 }
@@ -264,9 +304,12 @@ impl MinerConfig {
             similarity_floor: floor,
             param_byte_limit: byte_limit,
             // Picks up `MinerConfig::default()`'s prefix_depth (2,
-            // per the Drain paper). Override with
-            // [`Self::with_prefix_depth`].
+            // per the Drain paper) and the RFC 0023 bounds.
+            // Override with the `with_*` builders.
             prefix_depth: Self::default().prefix_depth,
+            max_node_children: Self::default().max_node_children,
+            max_templates: Self::default().max_templates,
+            max_line_tokens: Self::default().max_line_tokens,
         })
     }
 
@@ -283,6 +326,51 @@ impl MinerConfig {
             return Err(MinerConfigError::PrefixDepthTooLarge(depth));
         }
         self.prefix_depth = depth;
+        Ok(self)
+    }
+
+    /// Return a copy of `self` with
+    /// [`max_node_children`][Self::max_node_children] replaced
+    /// (RFC 0023 §3.1 bound 1).
+    ///
+    /// # Errors
+    ///
+    /// [`MinerConfigError::BoundZero`] when `cap` is zero.
+    pub fn with_max_node_children(mut self, cap: u16) -> Result<Self, MinerConfigError> {
+        if cap == 0 {
+            return Err(MinerConfigError::BoundZero("max_node_children"));
+        }
+        self.max_node_children = cap;
+        Ok(self)
+    }
+
+    /// Return a copy of `self` with
+    /// [`max_templates`][Self::max_templates] replaced (RFC 0023
+    /// §3.1 bound 2).
+    ///
+    /// # Errors
+    ///
+    /// [`MinerConfigError::BoundZero`] when `ceiling` is zero.
+    pub fn with_max_templates(mut self, ceiling: u32) -> Result<Self, MinerConfigError> {
+        if ceiling == 0 {
+            return Err(MinerConfigError::BoundZero("max_templates"));
+        }
+        self.max_templates = ceiling;
+        Ok(self)
+    }
+
+    /// Return a copy of `self` with
+    /// [`max_line_tokens`][Self::max_line_tokens] replaced
+    /// (RFC 0023 §3.1 bound 3).
+    ///
+    /// # Errors
+    ///
+    /// [`MinerConfigError::BoundZero`] when `cap` is zero.
+    pub fn with_max_line_tokens(mut self, cap: u16) -> Result<Self, MinerConfigError> {
+        if cap == 0 {
+            return Err(MinerConfigError::BoundZero("max_line_tokens"));
+        }
+        self.max_line_tokens = cap;
         Ok(self)
     }
 }

@@ -182,7 +182,12 @@ impl Tree {
     /// If `masked` is empty. The miner's tokenize → mask path
     /// guarantees at least one token before any tree call; an
     /// empty input here means a caller bypassed that path.
-    pub fn descend_mut(&mut self, masked: &[&str], prefix_depth: usize) -> &mut PrefixNode {
+    pub fn descend_mut(
+        &mut self,
+        masked: &[&str],
+        prefix_depth: usize,
+        max_node_children: usize,
+    ) -> &mut PrefixNode {
         assert!(
             !masked.is_empty(),
             "descend_mut precondition: masked must be non-empty",
@@ -196,7 +201,7 @@ impl Tree {
         let walk_depth = prefix_depth.min(length);
         let path = &masked[..walk_depth];
 
-        descend_recursively(&mut length_node.root, path)
+        descend_recursively(&mut length_node.root, path, max_node_children)
     }
 
     /// Read-only counterpart to [`Tree::descend_mut`]. Returns the
@@ -213,7 +218,12 @@ impl Tree {
     ///
     /// If `masked` is empty (same precondition as [`Tree::descend_mut`]).
     #[must_use]
-    pub fn descend(&self, masked: &[&str], prefix_depth: usize) -> Option<&PrefixNode> {
+    pub fn descend(
+        &self,
+        masked: &[&str],
+        prefix_depth: usize,
+        max_node_children: usize,
+    ) -> Option<&PrefixNode> {
         assert!(
             !masked.is_empty(),
             "descend precondition: masked must be non-empty",
@@ -225,7 +235,7 @@ impl Tree {
         let walk_depth = prefix_depth.min(length);
         let path = &masked[..walk_depth];
 
-        descend_immutable(&length_node.root, path)
+        descend_immutable(&length_node.root, path, max_node_children)
     }
 
     /// Total leaf count across the tree. Suitable for the
@@ -252,13 +262,45 @@ impl Tree {
     }
 }
 
-fn descend_immutable<'t>(node: &'t PrefixNode, path: &[&str]) -> Option<&'t PrefixNode> {
+/// Reserved child key for RFC 0023 §3.1 overflow routing: when a
+/// node's keyed children reach `max_node_children`, unseen tokens
+/// descend through this child instead of minting a new branch. The
+/// string matches the leaf-template wildcard rendering
+/// ([`format_template`]); a literal log token reading `"<*>"` merely
+/// shares the routing bucket — the same accepted collision class the
+/// mask tags (`"<NUM>"` etc.) already document — and attach below the
+/// child stays similarity-gated, so routing is never merging.
+pub(crate) const WILDCARD_CHILD: &str = "<*>";
+
+/// A node's keyed (non-wildcard) child count — the quantity
+/// `max_node_children` bounds. The wildcard child is routing
+/// infrastructure, not a keyed branch, so it doesn't count.
+fn keyed_children(node: &PrefixNode) -> usize {
+    node.children.len() - usize::from(node.children.contains_key(WILDCARD_CHILD))
+}
+
+fn descend_immutable<'t>(
+    node: &'t PrefixNode,
+    path: &[&str],
+    max_node_children: usize,
+) -> Option<&'t PrefixNode> {
     if path.is_empty() {
         return Some(node);
     }
     let (head, tail) = path.split_first().expect("non-empty by guard above");
-    let child = node.children.get(*head)?;
-    descend_immutable(child, tail)
+    match node.children.get(*head) {
+        Some(child) => descend_immutable(child, tail, max_node_children),
+        // RFC 0023 §3.1 bound 1, read side: an unseen token at a full
+        // node was (or would be) wildcard-routed on the write side, so
+        // candidate selection must look there too. Children only grow,
+        // so a token found keyed was inserted keyed — the two sides
+        // can never disagree on a token's route.
+        None if keyed_children(node) >= max_node_children => {
+            let child = node.children.get(WILDCARD_CHILD)?;
+            descend_immutable(child, tail, max_node_children)
+        }
+        None => None,
+    }
 }
 
 fn count_leaves(node: &PrefixNode) -> usize {
@@ -289,13 +331,30 @@ fn collect_leaves_recursive<'t>(node: &'t PrefixNode, out: &mut Vec<&'t Leaf>) {
 /// owned key, so the lookup-then-insert is the standard workaround
 /// on stable; the second `get_mut` is one extra hash, never an
 /// extra allocation.
-fn descend_recursively<'t>(node: &'t mut PrefixNode, path: &[&str]) -> &'t mut PrefixNode {
+fn descend_recursively<'t>(
+    node: &'t mut PrefixNode,
+    path: &[&str],
+    max_node_children: usize,
+) -> &'t mut PrefixNode {
     if path.is_empty() {
         return node;
     }
     let (head, tail) = path.split_first().expect("non-empty by guard above");
 
     if !node.children.contains_key(*head) {
+        // RFC 0023 §3.1 bound 1: a full node routes unseen tokens
+        // through the wildcard child rather than minting a branch.
+        if keyed_children(node) >= max_node_children {
+            if !node.children.contains_key(WILDCARD_CHILD) {
+                node.children
+                    .insert(WILDCARD_CHILD.to_string(), PrefixNode::default());
+            }
+            let child = node
+                .children
+                .get_mut(WILDCARD_CHILD)
+                .expect("just inserted above if missing");
+            return descend_recursively(child, tail, max_node_children);
+        }
         node.children
             .insert((*head).to_string(), PrefixNode::default());
     }
@@ -303,7 +362,7 @@ fn descend_recursively<'t>(node: &'t mut PrefixNode, path: &[&str]) -> &'t mut P
         .children
         .get_mut(*head)
         .expect("just inserted above if missing");
-    descend_recursively(child, tail)
+    descend_recursively(child, tail, max_node_children)
 }
 
 /// Render a template to its canonical string form: tokens joined by a
@@ -419,7 +478,7 @@ mod tests {
         assert!(tree.by_length.is_empty());
 
         // Act
-        let _ = tree.descend_mut(&["user", "logged", "in"], DEFAULT_PREFIX_DEPTH);
+        let _ = tree.descend_mut(&["user", "logged", "in"], DEFAULT_PREFIX_DEPTH, 100);
 
         // Assert — exactly one length bucket allocated, for N=3.
         assert_eq!(tree.by_length.len(), 1);
@@ -432,8 +491,8 @@ mod tests {
         let mut tree = Tree::new();
 
         // Act
-        let _ = tree.descend_mut(&["user", "logged", "in"], DEFAULT_PREFIX_DEPTH);
-        let _ = tree.descend_mut(&["GET", "/api", "200"], DEFAULT_PREFIX_DEPTH);
+        let _ = tree.descend_mut(&["user", "logged", "in"], DEFAULT_PREFIX_DEPTH, 100);
+        let _ = tree.descend_mut(&["GET", "/api", "200"], DEFAULT_PREFIX_DEPTH, 100);
 
         // Assert — same length bucket, distinct first-prefix
         // children under it.
@@ -450,8 +509,8 @@ mod tests {
         let mut tree = Tree::new();
 
         // Act
-        let _ = tree.descend_mut(&["GET", "/home"], DEFAULT_PREFIX_DEPTH);
-        let _ = tree.descend_mut(&["user", "42", "logged", "in"], DEFAULT_PREFIX_DEPTH);
+        let _ = tree.descend_mut(&["GET", "/home"], DEFAULT_PREFIX_DEPTH, 100);
+        let _ = tree.descend_mut(&["user", "42", "logged", "in"], DEFAULT_PREFIX_DEPTH, 100);
 
         // Assert — distinct length buckets, no cross-pollination.
         assert_eq!(tree.by_length.len(), 2);
@@ -472,7 +531,7 @@ mod tests {
         // leaf-list is the same allocation (so a leaf pushed by
         // call 1 is visible to call 2).
         let leaves_addr_a = {
-            let parent = tree.descend_mut(&line_a, DEFAULT_PREFIX_DEPTH);
+            let parent = tree.descend_mut(&line_a, DEFAULT_PREFIX_DEPTH, 100);
             parent.leaves.push(Leaf {
                 template: [OwnedToken::Fixed("marker".to_string())].into(),
                 template_id: 99,
@@ -483,7 +542,7 @@ mod tests {
             });
             std::ptr::from_ref(&parent.leaves)
         };
-        let parent_b = tree.descend_mut(&line_b, DEFAULT_PREFIX_DEPTH);
+        let parent_b = tree.descend_mut(&line_b, DEFAULT_PREFIX_DEPTH, 100);
         let leaves_addr_b = std::ptr::from_ref(&parent_b.leaves);
 
         // Assert — same parent (pointer identity on the leaves
@@ -501,7 +560,7 @@ mod tests {
         let mut tree = Tree::new();
 
         // Act
-        let _ = tree.descend_mut(&["hello"], 2);
+        let _ = tree.descend_mut(&["hello"], 2, 100);
 
         // Assert — single length bucket for N=1, single child
         // ("hello") under its root, no further descent.
@@ -528,8 +587,8 @@ mod tests {
         let mut tree = Tree::new();
 
         // Act
-        let _ = tree.descend_mut(&["a", "b"], 0);
-        let _ = tree.descend_mut(&["x", "y"], 0);
+        let _ = tree.descend_mut(&["a", "b"], 0, 100);
+        let _ = tree.descend_mut(&["x", "y"], 0, 100);
 
         // Assert — same length bucket, no children under its
         // root (no prefix-token branching), both lines land at
@@ -546,7 +605,7 @@ mod tests {
         let masked: [&str; 0] = [];
 
         // Act + Assert
-        let _ = tree.descend_mut(&masked, DEFAULT_PREFIX_DEPTH);
+        let _ = tree.descend_mut(&masked, DEFAULT_PREFIX_DEPTH, 100);
     }
 
     // OwnedToken / Token round-trip
@@ -608,7 +667,7 @@ mod tests {
         let tree = Tree::new();
 
         // Act
-        let r = tree.descend(&["a", "b"], DEFAULT_PREFIX_DEPTH);
+        let r = tree.descend(&["a", "b"], DEFAULT_PREFIX_DEPTH, 100);
 
         // Assert
         assert!(r.is_none());
@@ -620,10 +679,10 @@ mod tests {
         // first-prefix token. The length bucket exists; the
         // prefix child does not.
         let mut tree = Tree::new();
-        let _ = tree.descend_mut(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH);
+        let _ = tree.descend_mut(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH, 100);
 
         // Act — same length 3, different first-prefix token.
-        let r = tree.descend(&["GET", "/home", "200"], DEFAULT_PREFIX_DEPTH);
+        let r = tree.descend(&["GET", "/home", "200"], DEFAULT_PREFIX_DEPTH, 100);
 
         // Assert
         assert!(r.is_none());
@@ -634,7 +693,7 @@ mod tests {
         // Arrange — materialise a path, then look it up.
         let mut tree = Tree::new();
         {
-            let parent = tree.descend_mut(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH);
+            let parent = tree.descend_mut(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH, 100);
             parent.leaves.push(Leaf {
                 template: [
                     OwnedToken::Fixed("user".to_string()),
@@ -652,7 +711,7 @@ mod tests {
 
         // Act
         let parent = tree
-            .descend(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH)
+            .descend(&["user", "42", "logged"], DEFAULT_PREFIX_DEPTH, 100)
             .expect("path was built");
 
         // Assert — same leaf observable via immutable descend.
@@ -668,7 +727,7 @@ mod tests {
         let masked: [&str; 0] = [];
 
         // Act + Assert
-        let _ = tree.descend(&masked, DEFAULT_PREFIX_DEPTH);
+        let _ = tree.descend(&masked, DEFAULT_PREFIX_DEPTH, 100);
     }
 
     // leaf_count + collect_leaves
@@ -692,7 +751,7 @@ mod tests {
         //   - length 3, prefix "user 42" — 2 leaves (same parent)
         let mut tree = Tree::new();
         {
-            let p = tree.descend_mut(&["GET", "/home"], DEFAULT_PREFIX_DEPTH);
+            let p = tree.descend_mut(&["GET", "/home"], DEFAULT_PREFIX_DEPTH, 100);
             p.leaves.push(Leaf {
                 template: [
                     OwnedToken::Fixed("GET".to_string()),
@@ -707,7 +766,7 @@ mod tests {
             });
         }
         {
-            let p = tree.descend_mut(&["user", "42", "in"], DEFAULT_PREFIX_DEPTH);
+            let p = tree.descend_mut(&["user", "42", "in"], DEFAULT_PREFIX_DEPTH, 100);
             p.leaves.push(Leaf {
                 template: [
                     OwnedToken::Fixed("user".to_string()),
@@ -748,7 +807,7 @@ mod tests {
         // Arrange — two leaves in different length buckets.
         let mut tree = Tree::new();
         {
-            let p = tree.descend_mut(&["a", "b"], DEFAULT_PREFIX_DEPTH);
+            let p = tree.descend_mut(&["a", "b"], DEFAULT_PREFIX_DEPTH, 100);
             p.leaves.push(Leaf {
                 template: [
                     OwnedToken::Fixed("a".to_string()),
@@ -763,7 +822,7 @@ mod tests {
             });
         }
         {
-            let p = tree.descend_mut(&["x", "y", "z"], DEFAULT_PREFIX_DEPTH);
+            let p = tree.descend_mut(&["x", "y", "z"], DEFAULT_PREFIX_DEPTH, 100);
             p.leaves.push(Leaf {
                 template: [
                     OwnedToken::Fixed("x".to_string()),

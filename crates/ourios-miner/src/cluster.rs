@@ -210,6 +210,11 @@ struct TenantState {
     tree: Tree,
     structured_templates: HashMap<(u8, Option<String>), u64>,
     template_count: usize,
+    /// Drain-tree leaves only (excludes structured-template
+    /// entries) — the quantity RFC 0023 §3.1's `max_templates`
+    /// ceiling bounds. Incremented exactly where a leaf is pushed;
+    /// rebuilt from `leaves.len()` on snapshot restore.
+    leaf_count: usize,
     /// Effective [`MinerConfig`] for this tenant, captured at
     /// lazy allocation time. Resolves to the per-tenant override
     /// (set via [`MinerCluster::with_tenant_config`]) if one
@@ -227,6 +232,7 @@ impl TenantState {
             tree: Tree::new(),
             structured_templates: HashMap::new(),
             template_count: 0,
+            leaf_count: 0,
             config,
         }
     }
@@ -1228,16 +1234,14 @@ impl MinerCluster {
             return NO_TEMPLATE;
         }
 
-        // Cap the line's token count at the audit-event's
-        // position width (RFC §6.4 pins `positions_widened:
-        // Vec<u16>`). Lines exceeding this can't be widened
-        // safely — emitting an audit with a truncated set would
-        // be the silent-merge bug `[CLAUDE.md §3.1]` exists to
-        // prevent. ≥65 536 tokens in a single log line is
-        // pathological; the §6.2 step 1 "line longer than
-        // max-line-bytes" parse-failure path. Retain body per
-        // §6.3.
-        if masked_strs.len() > u16::MAX as usize {
+        // RFC 0023 §3.1 bound 3: lines tokenizing past
+        // `max_line_tokens` take the parse-failure path with the
+        // body retained, bounding stored-template token width. The
+        // config type (`u16`) also keeps every accepted line inside
+        // the RFC §6.4 audit position width (`positions_widened:
+        // Vec<u16>`), whose violation would otherwise be the
+        // silent-merge bug `[CLAUDE.md §3.1]` exists to prevent.
+        if masked_strs.len() > usize::from(effective_config.max_line_tokens) {
             let mut rec = Self::record_envelope(record, BodyKind::String);
             rec.separators = separators;
             rec.params = params;
@@ -1269,6 +1273,21 @@ impl MinerCluster {
             // into the lossy zone against, and no template to
             // declare a parse failure against.
             None => {
+                // RFC 0023 §3.1 bound 2: at the per-tenant leaf
+                // ceiling the mint diverts to the §6.3
+                // parse-failure path — body retained, counted,
+                // never force-merged.
+                if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
+                    let mut rec = Self::record_envelope(record, BodyKind::String);
+                    rec.separators = separators;
+                    rec.params = params;
+                    rec.body = Some(raw.to_string());
+                    rec.lossy_flag = true;
+                    self.apply_overflow_retention(record, service, &mut rec, raw);
+                    self.emit_record(rec, service);
+                    self.record_parse_failure(record, service);
+                    return NO_TEMPLATE;
+                }
                 let new_id = self.create_new_leaf(
                     record,
                     raw,
@@ -1318,6 +1337,24 @@ impl MinerCluster {
                     // here; `record_parse_failure` covers the
                     // parse-failure-zone path separately.
                     ConfidenceZone::Lossy => {
+                        // RFC 0023 §3.1 bound 2 — same divert as
+                        // the no-candidate arm: the §6.3 lossy zone
+                        // mints rather than force-merges into the
+                        // too-weak candidate, so at the ceiling it
+                        // must fail parse, not merge.
+                        if self
+                            .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
+                        {
+                            let mut rec = Self::record_envelope(record, BodyKind::String);
+                            rec.separators = separators;
+                            rec.params = params;
+                            rec.body = Some(raw.to_string());
+                            rec.lossy_flag = true;
+                            self.apply_overflow_retention(record, service, &mut rec, raw);
+                            self.emit_record(rec, service);
+                            self.record_parse_failure(record, service);
+                            return NO_TEMPLATE;
+                        }
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
                         self.metrics.record_body_retention(&record.tenant_id);
                         let new_id = self.create_new_leaf(
@@ -1365,6 +1402,15 @@ impl MinerCluster {
         }
     }
 
+    /// RFC 0023 §3.1 bound 2 — whether the tenant's Drain-tree
+    /// leaf count has reached the configured ceiling. An unseen
+    /// tenant is trivially below it.
+    fn at_template_ceiling(&self, tenant: &TenantId, max_templates: u32) -> bool {
+        self.tenants
+            .get(tenant)
+            .is_some_and(|s| s.leaf_count >= max_templates as usize)
+    }
+
     /// RFC §6.2 step 4 — find the best-matching leaf in the
     /// `(severity, scope, length, prefix)` bucket, or `None` if
     /// the tenant is unseen, the prefix path doesn't exist, or
@@ -1379,9 +1425,11 @@ impl MinerCluster {
         // Per-tenant `prefix_depth` (RFC 0004 §3.4) — read from
         // the captured `state.config` rather than the cluster
         // default.
-        let parent = state
-            .tree
-            .descend(masked_strs, state.config.prefix_depth as usize)?;
+        let parent = state.tree.descend(
+            masked_strs,
+            state.config.prefix_depth as usize,
+            usize::from(state.config.max_node_children),
+        )?;
 
         let mut best: Option<Candidate> = None;
         for (leaf_idx, leaf) in parent.leaves.iter().enumerate() {
@@ -1467,9 +1515,11 @@ impl MinerCluster {
                 .tenants
                 .entry(record.tenant_id.clone())
                 .or_insert_with(|| TenantState::new(effective_config));
-            let parent = state
-                .tree
-                .descend_mut(masked_strs, state.config.prefix_depth as usize);
+            let parent = state.tree.descend_mut(
+                masked_strs,
+                state.config.prefix_depth as usize,
+                usize::from(state.config.max_node_children),
+            );
             // Build the leaf template: Wildcard at every mask-emitted
             // position, Fixed at every other. `wildcard_positions` is
             // ascending (single forward pass over the tokens) so we
@@ -1506,8 +1556,10 @@ impl MinerCluster {
             });
             // Maintain the TenantState::template_count cache invariant —
             // every fresh allocation under `state` is mirrored here so
-            // `MinerCluster::template_count` can stay O(1).
+            // `MinerCluster::template_count` can stay O(1). `leaf_count`
+            // mirrors tree leaves only (the RFC 0023 ceiling's basis).
             state.template_count += 1;
+            state.leaf_count += 1;
             created_template
         };
         // RFC 0017 §3.1 — audit the leaf's initial (version 1) creation so a
@@ -1581,9 +1633,11 @@ impl MinerCluster {
                 .tenants
                 .get_mut(&record.tenant_id)
                 .expect("tenant present: find_best_candidate returned Some(...)");
-            let parent = state
-                .tree
-                .descend_mut(masked_strs, state.config.prefix_depth as usize);
+            let parent = state.tree.descend_mut(
+                masked_strs,
+                state.config.prefix_depth as usize,
+                usize::from(state.config.max_node_children),
+            );
             let leaf = &mut parent.leaves[candidate.leaf_idx];
             plan_attach(
                 leaf,
@@ -1925,6 +1979,7 @@ impl MinerCluster {
         }
         let config = self.effective_config(tenant_id);
         let prefix_depth = usize::from(config.prefix_depth);
+        let max_node_children = config.max_node_children;
         let mut tenant = TenantState::new(config);
 
         // Ids are unique cluster-wide and the structured map keys on
@@ -1982,7 +2037,10 @@ impl MinerCluster {
                 }
             }
 
-            let parent = tenant.tree.descend_mut(&masked, prefix_depth);
+            let parent =
+                tenant
+                    .tree
+                    .descend_mut(&masked, prefix_depth, usize::from(max_node_children));
             parent.leaves.push(Leaf {
                 template,
                 template_id: record.template_id,
@@ -2015,7 +2073,10 @@ impl MinerCluster {
         }
         // Mirror live ingest's cache invariant: every fresh
         // allocation — tree leaf or structured-map entry — counts.
+        // `leaf_count` (the RFC 0023 ceiling's basis) rebuilds from
+        // the tree leaves alone.
         tenant.template_count = state.leaves.len() + state.structured_templates.len();
+        tenant.leaf_count = state.leaves.len();
 
         // The id allocator is cluster-wide; without this bump a
         // post-restore allocation would collide with a restored id.

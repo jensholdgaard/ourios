@@ -270,6 +270,14 @@ async fn rfc0023_6_ceiling_saturation_is_observable() {
         AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
     };
 
+    fn has_attr<'a>(
+        mut attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        attrs.any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+    }
+
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
     let ceiling = 1u32;
     let config = MinerConfig::default()
@@ -304,10 +312,11 @@ async fn rfc0023_6_ceiling_saturation_is_observable() {
     let ceiling_failures: u64 = sum
         .data_points()
         .filter(|dp| {
-            dp.attributes().any(|kv| {
-                kv.key.as_str() == ourios_semconv::OURIOS_MINER_PARSE_FAILURE_REASON
-                    && kv.value.as_str() == "template_ceiling"
-            })
+            has_attr(
+                dp.attributes(),
+                ourios_semconv::OURIOS_MINER_PARSE_FAILURE_REASON,
+                "template_ceiling",
+            ) && has_attr(dp.attributes(), ourios_semconv::OURIOS_TENANT, "saturated")
         })
         .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
         .sum();
@@ -324,8 +333,8 @@ async fn rfc0023_6_ceiling_saturation_is_observable() {
     };
     let count: u64 = gauge
         .data_points()
+        .find(|dp| has_attr(dp.attributes(), ourios_semconv::OURIOS_TENANT, "saturated"))
         .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value)
-        .max()
-        .expect("one tenant data point");
+        .expect("the saturated tenant's data point");
     assert_eq!(u64::from(ceiling), count, "the gauge reads the ceiling");
 }

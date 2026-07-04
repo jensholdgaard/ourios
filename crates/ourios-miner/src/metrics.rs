@@ -570,8 +570,17 @@ impl MinerMetrics {
         // RFC 0023 §3.4 — the cause dimension rides the one counter
         // as an attribute (the OTel error.type convention), never
         // per-cause counters. Values are the
-        // `ourios.miner.parse_failure.reason` enum members.
-        let mut attrs = service_attrs(tenant, service);
+        // `ourios.miner.parse_failure.reason` enum members. Built
+        // with exact capacity — this is a per-line hot path on
+        // saturated tenants.
+        let mut attrs = Vec::with_capacity(2 + usize::from(service.is_some()));
+        attrs.push(KeyValue::new(
+            semconv::OURIOS_TENANT,
+            tenant.as_str().to_owned(),
+        ));
+        if let Some(name) = service {
+            attrs.push(KeyValue::new(semconv::OURIOS_SERVICE, name.to_owned()));
+        }
         attrs.push(KeyValue::new(
             semconv::OURIOS_MINER_PARSE_FAILURE_REASON,
             reason,

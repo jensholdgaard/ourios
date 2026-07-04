@@ -524,17 +524,29 @@ fn jsonl_line_records(
 pub(crate) fn stream(
     dir: &Path,
     txt_severity: TxtSeverity,
-) -> Result<(CorpusStream, CorpusFiles), BenchError> {
+) -> Result<(CorpusStream, CorpusMeta), BenchError> {
     let files = collect_files(dir)?;
+    let meta = CorpusMeta {
+        total_files: files.total_files,
+    };
     let stream = CorpusStream {
-        files: files.files.clone().into_iter(),
+        files: files.files.into_iter(),
         current: None,
         pending: std::collections::VecDeque::new(),
         tenant: TenantId::new(BENCH_TENANT),
         next_ns: TIME_BASELINE_NS,
         txt_severity,
     };
-    Ok((stream, files))
+    Ok((stream, meta))
+}
+
+/// The streamed corpus's file count (for the empty-corpus
+/// diagnostic) — the file list itself moves into the
+/// [`CorpusStream`] (no clone; the list can be large on many-file
+/// corpora), and byte accounting stays [`collect_files`]'s.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CorpusMeta {
+    pub total_files: u32,
 }
 
 /// One open corpus file mid-stream.
@@ -714,12 +726,13 @@ mod tests {
     fn stream_replays_load_record_for_record() {
         let dir = seed_corpus_dir();
         let eager = load(&dir).expect("eager load");
-        let (stream, files) = stream(&dir, TxtSeverity::Fixed).expect("stream");
+        let accounting = collect_files(&dir).expect("collect files");
+        let (stream, meta) = stream(&dir, TxtSeverity::Fixed).expect("stream");
         let streamed: Vec<OtlpLogRecord> = stream
             .collect::<Result<_, _>>()
             .expect("stream yields every record");
-        assert_eq!(files.total_files, eager.total_files);
-        assert_eq!(files.raw_bytes, eager.raw_bytes);
+        assert_eq!(meta.total_files, eager.total_files);
+        assert_eq!(accounting.raw_bytes, eager.raw_bytes);
         assert_eq!(streamed.len(), eager.lines.len());
         for (i, (a, b)) in streamed.iter().zip(&eager.lines).enumerate() {
             assert_eq!(a, b, "record {i} diverges between stream and load");

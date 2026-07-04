@@ -18,6 +18,8 @@ use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
 use ourios_core::record::MinedRecord;
 use ourios_parquet::{PartitionKey, Writer};
 
+use ourios_miner::cluster::NO_TEMPLATE;
+
 use crate::reference::ReferenceCorpus;
 use crate::{BenchError, corpus, harness};
 
@@ -90,14 +92,14 @@ pub fn build_query_store(
         },
     )?;
 
-    // The busiest *mined* template: NO_TEMPLATE (id 0, the §6.3
+    // The busiest *mined* template: NO_TEMPLATE (the §6.3
     // parse-failure class) is not a template, and on fragmentation-heavy
     // corpora it dominates row counts — picking it would make the B2
     // "template-exact" arm measure a body-class count instead (the
     // §9.11 finding). Fall back to it only when nothing mined at all.
     let (busiest_template_id, busiest_template_rows) = counts
         .iter()
-        .filter(|&(&id, _)| id != 0)
+        .filter(|&(&id, _)| id != NO_TEMPLATE)
         .max_by_key(|&(_, &n)| n)
         .map(|(&id, &n)| (id, n))
         .or_else(|| {
@@ -106,7 +108,7 @@ pub fn build_query_store(
                 .max_by_key(|&(_, &n)| n)
                 .map(|(&id, &n)| (id, n))
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((NO_TEMPLATE, 0));
 
     Ok(BuiltStore {
         tenant: crate::corpus::BENCH_TENANT,
@@ -830,8 +832,10 @@ mod tests {
     #[test]
     fn busiest_template_picker_skips_no_template() {
         let corpus = tempfile::TempDir::new().expect("corpus dir");
+        // One token past the configured cap, whatever it is.
+        let over_cap = usize::from(ourios_core::config::MinerConfig::default().max_line_tokens) + 1;
         let long = |seed: usize| {
-            (0..600)
+            (0..over_cap)
                 .map(|i| format!("t{}", i * seed))
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -849,7 +853,7 @@ mod tests {
             .expect("build");
         assert_eq!(built.rows, 5, "all five lines stored (id-0 rows included)");
         assert_ne!(
-            built.busiest_template_id, 0,
+            built.busiest_template_id, NO_TEMPLATE,
             "the picker must return a mined template even when NO_TEMPLATE rows dominate",
         );
         assert_eq!(built.busiest_template_rows, 2, "the user-in template");

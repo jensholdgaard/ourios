@@ -104,7 +104,7 @@ pub(crate) struct HarnessResult {
 pub(crate) fn run<F>(
     corpus: &CorpusLoad,
     capture_audit: bool,
-    on_record: F,
+    mut on_record: F,
 ) -> Result<HarnessResult, BenchError>
 where
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
@@ -116,14 +116,20 @@ where
     run_streaming(
         corpus.lines.iter().map(|r| Ok(r.clone())),
         capture_audit,
-        on_record,
+        |input, record, snapshot| {
+            on_record(input, record, snapshot);
+            Ok(())
+        },
     )
 }
 
 /// [`run`] over a lazy record stream — the memory-flat path the
 /// query-store builds use (`corpus::stream` → mine → flush, no
-/// `Vec<OtlpLogRecord>` of the whole corpus). An `Err` item aborts
-/// at the failing line with its diagnostic.
+/// `Vec<OtlpLogRecord>` of the whole corpus). An `Err` item — or an
+/// `Err` from the callback (a Parquet write failure, say) — aborts
+/// at the failing record rather than mining the remaining corpus:
+/// at the 10–100 GiB scale this path exists for, finishing the mine
+/// after a fatal error would burn many minutes of CPU for nothing.
 pub(crate) fn run_streaming<I, F>(
     corpus: I,
     capture_audit: bool,
@@ -131,7 +137,7 @@ pub(crate) fn run_streaming<I, F>(
 ) -> Result<HarnessResult, BenchError>
 where
     I: IntoIterator<Item = Result<OtlpLogRecord, BenchError>>,
-    F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
+    F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>) -> Result<(), BenchError>,
 {
     let sink = SharedRecordSink::new();
     let audit_sink = capture_audit.then(SharedAuditSink::new);
@@ -202,7 +208,7 @@ where
             None
         };
 
-        on_record(&input, &record, template_snapshot);
+        on_record(&input, &record, template_snapshot)?;
     }
 
     Ok(HarnessResult {

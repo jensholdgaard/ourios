@@ -371,7 +371,8 @@ fn build_store(
     // Stream rather than `corpus::load`: the eager `Vec<OtlpLogRecord>`
     // costs ~2-4x the raw corpus bytes, which caps the loadable corpus
     // well below the B1/B2 scale targets; mine + flush below are
-    // per-record, so streaming keeps peak memory flat at any size.
+    // per-record, so streaming keeps peak memory flat in the record /
+    // raw-byte dimension (the pre-collected file list is O(files)).
     let (stream, files_meta) = corpus::stream(corpus_dir, txt_severity)?;
 
     let mut writers: HashMap<PartitionKey, Writer> = HashMap::new();
@@ -383,35 +384,18 @@ fn build_store(
     // meaningful window bound).
     let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
-    // The harness callback returns `()`, so a write/observe error is
-    // stashed (first wins) and surfaced after the run — the same
-    // pattern `a1::A1Accumulator` uses.
-    let mut first_err: Option<BenchError> = None;
 
     harness::run_streaming(stream, false, |input, emitted, _snap| {
-        if first_err.is_some() {
-            return;
+        let effective = effective_nanos(emitted)?;
+        append_record(&mut writers, bucket_root, emitted)?;
+        observe(input, emitted, effective)?;
+        rows += 1;
+        if effective != 0 {
+            min_ts = min_ts.min(effective);
+            max_ts = max_ts.max(effective);
         }
-        let appended = effective_nanos(emitted).and_then(|effective| {
-            append_record(&mut writers, bucket_root, emitted)?;
-            observe(input, emitted, effective)?;
-            Ok(effective)
-        });
-        match appended {
-            Ok(effective) => {
-                rows += 1;
-                if effective != 0 {
-                    min_ts = min_ts.min(effective);
-                    max_ts = max_ts.max(effective);
-                }
-            }
-            Err(e) => first_err = Some(e),
-        }
+        Ok(())
     })?;
-
-    if let Some(e) = first_err {
-        return Err(e);
-    }
     if rows == 0 {
         // Parity with `corpus::load`'s empty-corpus rejection: a store
         // with zero rows would make every query trivially instant.

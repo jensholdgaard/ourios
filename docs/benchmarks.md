@@ -1016,3 +1016,71 @@ this corpus shape, which is the same finding from the pruning side.
 B1 did not reach its arms (stopped before the reference build once
 the OOM trajectory was clear). No gate verdict is claimed from this
 entry; the §8-band verdict waits on RFC 0023 + the rerun.
+
+### 9.11 Results — 2026-07-04 (authoritative, `baseline-8vcpu-32gib`) — B1 / B2 at 16 GiB + RFC0023.7
+
+**Purpose.** The §8 10–100 GiB band's first completed measurement (the
+§9.10 attempt OOM'd), doubling as **RFC0023.7** (bounded mining must
+complete this exact corpus under 8 GiB peak RSS) and the first B1/B2
+readings at ≥ 10 GiB — where B2's formal target speaks.
+**Corpus.** LogHub HDFS_v2 (bench-time fetch): 31 files,
+17,240,888,465 bytes ≈ 16.1 GiB, 71,116,785 mined rows → 21 files /
+80 row groups. B2 ran under the §3.3 Fixed severity baseline; B1
+under the opt-in `OURIOS_CORPUS_SEVERITY=log4j` extraction (#350),
+stated per the methodology rule.
+**Hardware.** `baseline-8vcpu-32gib`, provisioned for the run, torn
+down after. Git `19e0886` (RFC 0023 bounds + telemetry merged).
+
+**RFC0023.7 — bounded mining at scale: PASS.** Peak RSS
+**1.73 GiB** across both benches' store builds (5 s sampler), vs the
+§9.10 OOM at 31.5 GiB on identical input — an 18× reduction, under
+the 8 GiB bar with 4.6× headroom. Both benches completed (B2 phase
+35 min; B1 including its zstd-19 reference build ~2.8 h).
+
+**B1 — predicate pushdown vs `zstdcat | grep` (target: ≥ 10× at
+1 GiB, widening to ≥ 100× at 100 GiB).** Query: severity `ERROR`,
+full 16 GiB span.
+
+| corpus | rows | RGs scanned | ourios bytes | reference bytes (zstd) | ourios | reference | speedup |
+|---|---|---|---|---|---|---|---|
+| HDFS_v2 | 24,030 | 54/80 | 19,284,044 | 548,344,798 | 116.76 ms | 13.545 s | **116×** |
+
+Row count agrees **exactly** with the reference pipeline.
+
+**B1 verdict: PASS (authoritative)** — the ≥ 100× mark projected for
+100 GiB is crossed at 16 GiB. With §9.8's ~35–40× at ~1 GiB, the
+measured trajectory confirms the widening the target predicted: the
+reference's cost grows with corpus bytes while Ourios's grows with
+the matching row groups.
+
+**B2 — template-exact latency ∝ result, not corpus (formal target:
+≥ 10 GiB, ≤ 200 ms for 10 k rows).**
+
+| bench | result | timing | pruning |
+|---|---|---|---|
+| **`b2/real-corpus` windowed 1 h** | 78 rows | **5.60 ms** | **79/80 row groups pruned by the time window** (21 partitions) |
+| `b2/real-corpus` full span | 56,234,257 rows | 124.70 ms | 80/80 scanned (count over the dominant class) |
+| `b2/synthetic/{2k,20k,100k}` | result held constant | 1.92 / 3.70 / 10.3 ms | sub-linear in corpus size |
+
+**B2 verdict: PASS (authoritative, first ≥ 10 GiB reading)** — the
+windowed query answers in the same few-ms band as the ~1 GiB corpora
+(§9.3/§9.8/§9.9): latency tracks the result, not the 71 M-row corpus.
+
+**The fragmentation datum (§9.10's open question, quantified).** The
+"busiest template" is id 0 — `NO_TEMPLATE`: under the default 20 k
+ceiling, ~79 % of HDFS_v2's rows took the §6.3 parse-failure path
+(bodies retained bit-faithfully; observable via
+`ourios.miner.parse_failure.reason`, RFC0023.6). Template mining
+contributes little *on this corpus shape* — and the B1/B2 numbers
+above show the floor it degrades to (first-class-column + time
+pruning over Parquet statistics) still clears every gate. Follow-up
+noted: the B2 bench's busiest-template picker should exclude
+`NO_TEMPLATE` so the full-span arm measures a true template-exact
+query on such corpora.
+
+**Assessment.** RFC 0023's §5 is fully discharged (this entry is the
+`.7` record); the RFC flips `red → green` alongside this entry. The
+§8-band thesis verdict on real, hostile-shaped production logs:
+pruning compounds with scale (B1), result-bound latency holds (B2),
+and the mining-fragmentation failure mode is now bounded, observable,
+and priced.

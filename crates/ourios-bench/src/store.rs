@@ -386,7 +386,7 @@ fn build_store(
     let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
 
-    harness::run_streaming(stream, false, |input, emitted, _snap| {
+    harness::run_streaming(stream, false, false, |input, emitted, _snap| {
         let effective = effective_nanos(emitted)?;
         append_record(&mut writers, bucket_root, emitted)?;
         observe(input, emitted, effective)?;

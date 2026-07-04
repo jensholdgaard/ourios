@@ -112,6 +112,7 @@ where
     run_streaming(
         corpus.lines.iter().map(Ok),
         capture_audit,
+        true,
         |input, record, snapshot| {
             on_record(input, record, snapshot);
             Ok(())
@@ -129,6 +130,7 @@ where
 pub(crate) fn run_streaming<T, I, F>(
     corpus: I,
     capture_audit: bool,
+    capture_snapshots: bool,
     mut on_record: F,
 ) -> Result<HarnessResult, BenchError>
 where
@@ -185,7 +187,16 @@ where
         // (decode the stored `AnyValue` bytes) rather than
         // template + params, so the bench's C1 (which measures
         // template-based reconstruction) doesn't apply.
-        let want_snapshot = !record.lossy_flag
+        // `capture_snapshots = false` skips the whole capture: every new
+        // `(template_id, template_version)` pair otherwise walks + clones
+        // the full template set via `templates_for`. On corpora with heavy
+        // widening churn (one version bump per few lines) that is
+        // quadratic — measured at ~3 KB/s on LogHub HDFS_v2, a ~57-day
+        // store build — and the query-store builds never read the
+        // snapshots at all (their callbacks ignore the argument). Only C1
+        // (reconstruction) needs them.
+        let want_snapshot = capture_snapshots
+            && !record.lossy_flag
             && record.template_id != NO_TEMPLATE
             && matches!(record.body_kind, BodyKind::String);
         if want_snapshot {

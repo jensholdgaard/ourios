@@ -225,7 +225,8 @@ impl TxtSeverity {
 
 /// The first standalone log4j-style level token in `line`, as
 /// `(severity_number, severity_text)` — `OTel` band floors (TRACE 1,
-/// DEBUG 5, INFO 9, WARN 13, ERROR 17, FATAL 21), text verbatim.
+/// DEBUG 5, INFO 9, WARN/WARNING 13, ERROR 17, FATAL 21), text
+/// verbatim.
 fn log4j_severity(line: &str) -> Option<(u8, &'static str)> {
     line.split_ascii_whitespace().find_map(|token| match token {
         "TRACE" => Some((1, "TRACE")),

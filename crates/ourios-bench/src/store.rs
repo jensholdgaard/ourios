@@ -386,17 +386,22 @@ fn build_store(
     let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
 
-    harness::run_streaming(stream, false, false, |input, emitted, _snap| {
-        let effective = effective_nanos(emitted)?;
-        append_record(&mut writers, bucket_root, emitted)?;
-        observe(input, emitted, effective)?;
-        rows += 1;
-        if effective != 0 {
-            min_ts = min_ts.min(effective);
-            max_ts = max_ts.max(effective);
-        }
-        Ok(())
-    })?;
+    harness::run_streaming(
+        stream,
+        /* capture_audit */ false,
+        /* capture_snapshots */ false,
+        |input, emitted, _snap| {
+            let effective = effective_nanos(emitted)?;
+            append_record(&mut writers, bucket_root, emitted)?;
+            observe(input, emitted, effective)?;
+            rows += 1;
+            if effective != 0 {
+                min_ts = min_ts.min(effective);
+                max_ts = max_ts.max(effective);
+            }
+            Ok(())
+        },
+    )?;
     if rows == 0 {
         // Parity with `corpus::load`'s empty-corpus rejection: a store
         // with zero rows would make every query trivially instant.

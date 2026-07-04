@@ -112,7 +112,7 @@ where
     run_streaming(
         corpus.lines.iter().map(Ok),
         capture_audit,
-        true,
+        /* capture_snapshots */ true,
         |input, record, snapshot| {
             on_record(input, record, snapshot);
             Ok(())
@@ -311,12 +311,16 @@ mod tests {
         let mut calls = 0usize;
         run_streaming(
             load.lines.iter().map(Ok),
-            false,
-            false,
+            /* capture_audit */ false,
+            /* capture_snapshots */ false,
             |_input, record, snap| {
                 calls += 1;
                 assert!(!record.lossy_flag, "fixture lines mine cleanly");
                 assert_ne!(record.template_id, NO_TEMPLATE);
+                assert!(
+                    matches!(record.body_kind, BodyKind::String),
+                    "fixture lines carry string bodies",
+                );
                 assert!(
                     snap.is_none(),
                     "capture_snapshots = false must skip the templates_for walk",

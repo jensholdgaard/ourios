@@ -127,6 +127,15 @@ where
 /// at the failing record rather than mining the remaining corpus:
 /// at the 10–100 GiB scale this path exists for, finishing the mine
 /// after a fatal error would burn many minutes of CPU for nothing.
+///
+/// `capture_snapshots` gates the per-`(template_id, version)`
+/// template capture: `true` preserves [`run`]'s contract (non-lossy
+/// string-body records get `Some(template)` in the callback's third
+/// argument — what C1 consumes); `false` skips the
+/// `templates_for` walk entirely and every callback gets `None`.
+/// Store builds pass `false` — the walk clones the full template set
+/// per new pair, which goes quadratic on widening-churny corpora
+/// (measured ~3 KB/s on LogHub HDFS_v2).
 pub(crate) fn run_streaming<T, I, F>(
     corpus: I,
     capture_audit: bool,

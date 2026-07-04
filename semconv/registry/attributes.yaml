@@ -46,7 +46,7 @@ groups:
             - id: tokenizer_failure
               value: "tokenizer_failure"
               stability: development
-              brief: The tokenizer rejected the line (non-text bytes).
+              brief: The tokenizer rejected the line (today, an embedded NUL byte).
             - id: degenerate_widening
               value: "degenerate_widening"
               stability: development

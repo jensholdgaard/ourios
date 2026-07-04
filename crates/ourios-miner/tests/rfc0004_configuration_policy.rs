@@ -172,5 +172,12 @@ fn rfc0004_3_no_invariant_breaking_field_exists_on_miner_config() {
         similarity_floor: _,
         param_byte_limit: _,
         prefix_depth: _,
+        // RFC 0023 §3.1 bounds — classified as tunables *inside*
+        // the invariants: overflow at any of the three diverts to
+        // the §6.3 parse-failure path (body retained, counted),
+        // never force-merges (§3.1) and never drops data.
+        max_node_children: _,
+        max_templates: _,
+        max_line_tokens: _,
     } = cfg;
 }

@@ -517,10 +517,11 @@ fn jsonl_line_records(
 
 /// Streaming counterpart of [`load`] for the query-store builds: the
 /// same files, in the same order, producing the same records — but
-/// one at a time, so peak memory stays flat regardless of corpus
-/// size (RFC 0006's eager `Vec` costs ~2–4× the raw corpus bytes,
-/// which caps the eager path well below the 10–100 GiB corpora the
-/// B1/B2 scale targets speak to). Mining + Parquet flush downstream
+/// one at a time, so peak memory stays flat in the record /
+/// raw-byte dimension — the pre-collected file list is O(files) —
+/// where RFC 0006's eager `Vec` costs ~2–4× the raw corpus bytes,
+/// capping the eager path well below the 10–100 GiB corpora the
+/// B1/B2 scale targets speak to. Mining + Parquet flush downstream
 /// are already incremental (`harness::run_streaming`, `build_store`).
 pub(crate) fn stream(
     dir: &Path,

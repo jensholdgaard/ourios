@@ -345,8 +345,9 @@ struct StoreCore {
 /// per successfully-appended record — its third argument is the
 /// record's effective timestamp (the shared writer/partition
 /// derivation, so the bookkeeping can never disagree with the
-/// store) — and its first error aborts the build (surfaced after the
-/// harness loop, same stash pattern as `a1::A1Accumulator`).
+/// store) — and its first error aborts the build immediately (the
+/// fallible `run_streaming` callback stops the mine at the failing
+/// record).
 fn build_store(
     corpus_dir: &Path,
     bucket_root: &Path,

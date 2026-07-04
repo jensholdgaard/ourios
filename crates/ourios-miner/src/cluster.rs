@@ -507,11 +507,16 @@ impl MinerCluster {
     /// `body_retentions_total` metric doc explicitly excludes,
     /// not the §6.3 lossy-zone retention the gauge is meant to
     /// surface. That path uses [`Self::record_tokenizer_failure`].
-    fn record_parse_failure(&self, record: &OtlpLogRecord, service: Option<&str>) {
+    fn record_parse_failure(
+        &self,
+        record: &OtlpLogRecord,
+        service: Option<&str>,
+        reason: &'static str,
+    ) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .record_parse_failure(&record.tenant_id, service);
+            .record_parse_failure(&record.tenant_id, service, reason);
         self.metrics.record_body_retention(&record.tenant_id);
     }
 
@@ -528,7 +533,7 @@ impl MinerCluster {
     fn record_tokenizer_failure(&self, record: &OtlpLogRecord, service: Option<&str>) {
         self.parse_failures_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .record_parse_failure(&record.tenant_id, service);
+            .record_parse_failure(&record.tenant_id, service, "tokenizer_failure");
     }
 
     /// Build the OTLP-envelope half of a `MinedRecord` from the
@@ -1230,7 +1235,7 @@ impl MinerCluster {
             rec.body = Some(raw.to_string());
             rec.lossy_flag = true;
             self.emit_record(rec, service);
-            self.record_parse_failure(record, service);
+            self.record_parse_failure(record, service, "empty_line");
             return NO_TEMPLATE;
         }
 
@@ -1242,7 +1247,14 @@ impl MinerCluster {
         // Vec<u16>`), whose violation would otherwise be the
         // silent-merge bug `[CLAUDE.md §3.1]` exists to prevent.
         if masked_strs.len() > usize::from(effective_config.max_line_tokens) {
-            return self.emit_string_parse_failure(record, service, raw, separators, params);
+            return self.emit_string_parse_failure(
+                record,
+                service,
+                raw,
+                separators,
+                params,
+                "line_too_long",
+            );
         }
 
         // Phase 1 — read-only candidate selection. RFC §6.2 step
@@ -1267,8 +1279,14 @@ impl MinerCluster {
                 // parse-failure path — body retained, counted,
                 // never force-merged.
                 if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
-                    return self
-                        .emit_string_parse_failure(record, service, raw, separators, params);
+                    return self.emit_string_parse_failure(
+                        record,
+                        service,
+                        raw,
+                        separators,
+                        params,
+                        "template_ceiling",
+                    );
                 }
                 let new_id = self.create_new_leaf(
                     record,
@@ -1328,7 +1346,12 @@ impl MinerCluster {
                             .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
                         {
                             return self.emit_string_parse_failure(
-                                record, service, raw, separators, params,
+                                record,
+                                service,
+                                raw,
+                                separators,
+                                params,
+                                "template_ceiling",
                             );
                         }
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
@@ -1359,9 +1382,14 @@ impl MinerCluster {
                     }
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
-                    ConfidenceZone::ParseFailure => {
-                        self.emit_string_parse_failure(record, service, raw, separators, params)
-                    }
+                    ConfidenceZone::ParseFailure => self.emit_string_parse_failure(
+                        record,
+                        service,
+                        raw,
+                        separators,
+                        params,
+                        "below_floor",
+                    ),
                 }
             }
         }
@@ -1379,6 +1407,7 @@ impl MinerCluster {
         raw: &str,
         separators: Vec<String>,
         params: Vec<Param>,
+        reason: &'static str,
     ) -> u64 {
         let mut rec = Self::record_envelope(record, BodyKind::String);
         rec.separators = separators;
@@ -1389,8 +1418,39 @@ impl MinerCluster {
         // (body is already retained for the parse-failure reason).
         self.apply_overflow_retention(record, service, &mut rec, raw);
         self.emit_record(rec, service);
-        self.record_parse_failure(record, service);
+        self.record_parse_failure(record, service, reason);
         NO_TEMPLATE
+    }
+
+    /// Emit the §6.4 degenerate-widening rejection audit event —
+    /// the record of *why* the attach refused to widen (RFC 0017
+    /// §3.1 keeps the audit stream the template history of record).
+    #[allow(clippy::too_many_arguments)] // mirrors the audit payload's fields 1:1
+    fn emit_rejected_degenerate_audit(
+        &mut self,
+        record: &OtlpLogRecord,
+        raw: &str,
+        template_id: u64,
+        version: u32,
+        current_template: String,
+        would_be_template: String,
+        would_be_positions: Vec<u16>,
+    ) {
+        self.audit_sink.emit(AuditEvent {
+            tenant_id: record.tenant_id.clone(),
+            timestamp: self.clock.now(),
+            payload: AuditPayload::Template {
+                template_id,
+                triggering_line_hash: hash_triggering_line(raw.as_bytes()),
+                triggering_line_sample: Some(sample_first_256_bytes(raw)),
+                change: TemplateChange::RejectedDegenerate {
+                    version,
+                    current_template,
+                    would_be_template,
+                    would_be_positions,
+                },
+            },
+        });
     }
 
     /// RFC 0023 §3.1 bound 2 — whether the tenant's Drain-tree
@@ -1671,26 +1731,27 @@ impl MinerCluster {
                 would_be_template,
                 would_be_positions,
             } => {
-                self.audit_sink.emit(AuditEvent {
-                    tenant_id: record.tenant_id.clone(),
-                    timestamp: self.clock.now(),
-                    payload: AuditPayload::Template {
-                        template_id,
-                        triggering_line_hash: hash_triggering_line(raw.as_bytes()),
-                        triggering_line_sample: Some(sample_first_256_bytes(raw)),
-                        change: TemplateChange::RejectedDegenerate {
-                            version,
-                            current_template,
-                            would_be_template,
-                            would_be_positions,
-                        },
-                    },
-                });
+                self.emit_rejected_degenerate_audit(
+                    record,
+                    raw,
+                    template_id,
+                    version,
+                    current_template,
+                    would_be_template,
+                    would_be_positions,
+                );
                 // §6.4 treats degenerate widening as a parse
                 // failure that retains body (the line-ordered
                 // params fallback is fine — reconstruct ignores
                 // `params` on the lossy path).
-                self.emit_string_parse_failure(record, service, raw, separators, params)
+                self.emit_string_parse_failure(
+                    record,
+                    service,
+                    raw,
+                    separators,
+                    params,
+                    "degenerate_widening",
+                )
             }
             AttachPlan::Mutated {
                 template_id,

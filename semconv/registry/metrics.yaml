@@ -124,6 +124,8 @@ groups:
         requirement_level: required
       - ref: ourios.service
         requirement_level: recommended
+      - ref: ourios.miner.parse_failure.reason
+        requirement_level: required
 
   - id: metric.ourios.miner.params.overflow
     type: metric

@@ -259,13 +259,82 @@ fn rfc0023_5_default_bounds_are_invisible_on_healthy_corpora() {
 
 /// Scenario RFC0023.6 — saturation is observable.
 /// See `docs/rfcs/0023-bounded-template-memory.md` §5.
-#[test]
-#[ignore = "RFC0023.6 stub — implemented in the telemetry green slice"]
-fn rfc0023_6_ceiling_saturation_is_observable() {
-    todo!(
-        "RFC0023.6 — a ceiling-saturated tenant shows \
-         ourios.miner.parse_failures increments with \
-         reason = template_ceiling and ourios.miner.template.count at the \
-         ceiling value"
+///
+/// A ceiling-saturated tenant is diagnosable from telemetry alone:
+/// `ourios.miner.parse_failures` carries
+/// `ourios.miner.parse_failure.reason = template_ceiling` increments
+/// and `ourios.miner.template.count` reads the ceiling value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rfc0023_6_ceiling_saturation_is_observable() {
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
+    };
+
+    fn has_attr<'a>(
+        mut attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        attrs.any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+    }
+
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");
+    let ceiling = 1u32;
+    let config = MinerConfig::default()
+        .with_max_templates(ceiling)
+        .expect("non-zero ceiling");
+    let mut cluster = MinerCluster::new(config);
+    let tenant = TenantId::new("saturated");
+
+    // One mint fills the ceiling; two structurally distinct lines
+    // divert with reason = template_ceiling.
+    cluster.ingest(&record(&tenant, "alpha started"));
+    cluster.ingest(&record(&tenant, "beta accepted request now"));
+    cluster.ingest(&record(&tenant, "gamma rejected request from peer five"));
+    guard.force_flush().expect("force_flush succeeds");
+
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let metric = |name: &str| {
+        rms.iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .find(|m| m.name() == name)
+            .unwrap_or_else(|| panic!("{name} missing from exported stream"))
+            .data()
+    };
+
+    // The reason-attributed failure counter.
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) =
+        metric(ourios_semconv::OURIOS_MINER_PARSE_FAILURES)
+    else {
+        panic!("parse_failures should be a u64 sum");
+    };
+    let ceiling_failures: u64 = sum
+        .data_points()
+        .filter(|dp| {
+            has_attr(
+                dp.attributes(),
+                ourios_semconv::OURIOS_MINER_PARSE_FAILURE_REASON,
+                "template_ceiling",
+            ) && has_attr(dp.attributes(), ourios_semconv::OURIOS_TENANT, "saturated")
+        })
+        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+        .sum();
+    assert_eq!(
+        ceiling_failures, 2,
+        "both diverted lines counted under reason = template_ceiling",
     );
+
+    // The gauge reads the ceiling.
+    let AggregatedMetrics::U64(MetricData::Gauge(gauge)) =
+        metric(ourios_semconv::OURIOS_MINER_TEMPLATE_COUNT)
+    else {
+        panic!("template.count should be a u64 gauge");
+    };
+    let count: u64 = gauge
+        .data_points()
+        .find(|dp| has_attr(dp.attributes(), ourios_semconv::OURIOS_TENANT, "saturated"))
+        .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value)
+        .expect("the saturated tenant's data point");
+    assert_eq!(u64::from(ceiling), count, "the gauge reads the ceiling");
 }

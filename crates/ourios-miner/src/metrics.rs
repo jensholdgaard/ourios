@@ -561,9 +561,31 @@ impl MinerMetrics {
     }
 
     /// Record one parse-failure line (§6.8 `ourios.miner.parse_failures`).
-    pub(crate) fn record_parse_failure(&self, tenant: &TenantId, service: Option<&str>) {
-        self.parse_failures_total
-            .add(1, &service_attrs(tenant, service));
+    pub(crate) fn record_parse_failure(
+        &self,
+        tenant: &TenantId,
+        service: Option<&str>,
+        reason: &'static str,
+    ) {
+        // RFC 0023 §3.4 — the cause dimension rides the one counter
+        // as an attribute (the OTel error.type convention), never
+        // per-cause counters. Values are the
+        // `ourios.miner.parse_failure.reason` enum members. Built
+        // with exact capacity — this is a per-line hot path on
+        // saturated tenants.
+        let mut attrs = Vec::with_capacity(2 + usize::from(service.is_some()));
+        attrs.push(KeyValue::new(
+            semconv::OURIOS_TENANT,
+            tenant.as_str().to_owned(),
+        ));
+        if let Some(name) = service {
+            attrs.push(KeyValue::new(semconv::OURIOS_SERVICE, name.to_owned()));
+        }
+        attrs.push(KeyValue::new(
+            semconv::OURIOS_MINER_PARSE_FAILURE_REASON,
+            reason,
+        ));
+        self.parse_failures_total.add(1, &attrs);
     }
 
     /// Record one body-retention event for the

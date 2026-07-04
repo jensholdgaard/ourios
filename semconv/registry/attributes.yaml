@@ -32,6 +32,39 @@ groups:
         brief: >-
           The kind of template change an `ourios.miner.merges` event
           records.
+      - id: ourios.miner.parse_failure.reason
+        type:
+          members:
+            - id: below_floor
+              value: "below_floor"
+              stability: development
+              brief: Best candidate similarity fell below the RFC 0001 §6.3 floor.
+            - id: empty_line
+              value: "empty_line"
+              stability: development
+              brief: The line was empty or whitespace-only after tokenization.
+            - id: tokenizer_failure
+              value: "tokenizer_failure"
+              stability: development
+              brief: The tokenizer rejected the line (today, an embedded NUL byte).
+            - id: degenerate_widening
+              value: "degenerate_widening"
+              stability: development
+              brief: Attaching would have widened the template to a degenerate form (RFC 0001 §6.4).
+            - id: line_too_long
+              value: "line_too_long"
+              stability: development
+              brief: The line tokenized past `max_line_tokens` (RFC 0023 §3.1).
+            - id: template_ceiling
+              value: "template_ceiling"
+              stability: development
+              brief: The tenant is at `max_templates`; the would-mint line was diverted (RFC 0023 §3.1).
+        stability: development
+        brief: >-
+          Why a line took the parse-failure path (the
+          `ourios.miner.parse_failures` counter's cause dimension,
+          following the OTel error.type convention of an attribute on
+          one instrument rather than per-cause counters).
       - id: ourios.io.direction
         type:
           members:

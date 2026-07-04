@@ -977,3 +977,42 @@ read side) shows no measurable drag on either gate. The RFC 0022
 `baseline-8vcpu-32gib` rerun per the standing bench policy
 (maintainer opt-in); this entry is its indicative precursor,
 curated by hand as in §9.3 — the workflow never writes §9.
+
+### 9.10 Results — 2026-07-04 (authoritative attempt, `baseline-8vcpu-32gib`) — B1/B2 at 16 GiB: run blocked, miner finding
+
+**Purpose.** The first run in the §8 10–100 GiB band: B2's formal
+target speaks above ~10 GiB and had never been measured there.
+**Corpus.** LogHub HDFS_v2 (bench-time fetch, never redistributed):
+31 files, 17,240,888,465 bytes ≈ 16.1 GiB raw, ~71 M lines of Hadoop
+daemon logs — the first corpus in our set whose *shape* (stack
+traces, multi-format node logs) differs qualitatively from HDFS_v1's
+block events.
+**Hardware.** `baseline-8vcpu-32gib`, provisioned for the run and
+torn down after.
+**Outcome: the run did not complete — it produced a product finding
+instead.** The B2 store build was OOM-killed at **31.5 GiB RSS**: the
+miner mints templates without bound on this corpus shape (template
+ids ≥ 56,199 by the 1.8 GiB subset mark, busiest template covering
+0.67 % of 8.37 M rows; memory ~linear at ≈2× corpus bytes). Two
+bench-side pathologies were found and fixed en route — the eager
+corpus load (#350, now streaming: 1.3 GiB flat over hours) and a
+quadratic harness snapshot capture (#351, ~400× store-build speedup;
+gdb stacks exonerate the miner's CPU path). **RFC 0023 (bounded
+template memory) is the response; its RFC0023.7 criterion is this
+exact run completing.**
+
+What did land before the kill (recorded as diagnostic):
+
+| bench | result | timing | pruning |
+|---|---|---|---|
+| `b2/synthetic/{2k,20k,100k}` | result held constant | 2.72 / 6.33 / 19.7 ms | sub-linear in corpus size |
+| `b2/real-corpus` (1.1 GiB subset) | windowed 1 h → 1 row | 6.31 ms | 5/6 row groups pruned |
+| `b2/real-corpus` (1.8 GiB subset) | template 56199 → 55,751 rows full-span; windowed 1 h | windowed 6.31 ms | 10/11 row groups pruned by the window |
+
+B2's *shape* — flat windowed latency, window-driven pruning — holds
+wherever memory allows; the fragmentation itself (56 k templates,
+busiest at 0.67 %) also means pillar #2's logical reduction fails on
+this corpus shape, which is the same finding from the pruning side.
+B1 did not reach its arms (stopped before the reference build once
+the OOM trajectory was clear). No gate verdict is claimed from this
+entry; the §8-band verdict waits on RFC 0023 + the rerun.

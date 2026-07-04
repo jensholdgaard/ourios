@@ -109,12 +109,8 @@ pub(crate) fn run<F>(
 where
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
 {
-    // The gate paths hold the whole corpus anyway (A1/C1 need every
-    // original line); the per-record clone here is transient and off
-    // every measured quantity (the gates measure bytes and counts,
-    // not loader wall-clock).
     run_streaming(
-        corpus.lines.iter().map(|r| Ok(r.clone())),
+        corpus.lines.iter().map(Ok),
         capture_audit,
         |input, record, snapshot| {
             on_record(input, record, snapshot);
@@ -130,13 +126,16 @@ where
 /// at the failing record rather than mining the remaining corpus:
 /// at the 10–100 GiB scale this path exists for, finishing the mine
 /// after a fatal error would burn many minutes of CPU for nothing.
-pub(crate) fn run_streaming<I, F>(
+pub(crate) fn run_streaming<T, I, F>(
     corpus: I,
     capture_audit: bool,
     mut on_record: F,
 ) -> Result<HarnessResult, BenchError>
 where
-    I: IntoIterator<Item = Result<OtlpLogRecord, BenchError>>,
+    // `Borrow` lets the eager gate path feed `&OtlpLogRecord` (no
+    // per-record clone) and the streaming path feed owned records.
+    T: std::borrow::Borrow<OtlpLogRecord>,
+    I: IntoIterator<Item = Result<T, BenchError>>,
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>) -> Result<(), BenchError>,
 {
     let sink = SharedRecordSink::new();
@@ -168,7 +167,8 @@ where
 
     for input in corpus {
         let input = input?;
-        cluster.ingest(&input);
+        let input = input.borrow();
+        cluster.ingest(input);
         let record = require_single(sink.drain())?;
 
         // Skip the snapshot capture for lossy / parse-failure /
@@ -208,7 +208,7 @@ where
             None
         };
 
-        on_record(&input, &record, template_snapshot)?;
+        on_record(input, &record, template_snapshot)?;
     }
 
     Ok(HarnessResult {

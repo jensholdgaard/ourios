@@ -25,7 +25,7 @@ capture was fixed (#351) — leaving the miner's tree itself as the
 proven cause.
 
 This is not bench-only: the production ingester runs the same
-[`MinerCluster`], so **a single tenant shipping shape-diverse logs
+`MinerCluster`, so **a single tenant shipping shape-diverse logs
 (stack traces, multi-format daemon output) can OOM an ingester pod.**
 That is a direct hit on hazards #1 and #2. Upstream Drain3 carries
 `max_children` and a cluster cap for exactly this input class;

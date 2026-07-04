@@ -104,9 +104,33 @@ pub(crate) struct HarnessResult {
 pub(crate) fn run<F>(
     corpus: &CorpusLoad,
     capture_audit: bool,
+    on_record: F,
+) -> Result<HarnessResult, BenchError>
+where
+    F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
+{
+    // The gate paths hold the whole corpus anyway (A1/C1 need every
+    // original line); the per-record clone here is transient and off
+    // every measured quantity (the gates measure bytes and counts,
+    // not loader wall-clock).
+    run_streaming(
+        corpus.lines.iter().map(|r| Ok(r.clone())),
+        capture_audit,
+        on_record,
+    )
+}
+
+/// [`run`] over a lazy record stream — the memory-flat path the
+/// query-store builds use (`corpus::stream` → mine → flush, no
+/// `Vec<OtlpLogRecord>` of the whole corpus). An `Err` item aborts
+/// at the failing line with its diagnostic.
+pub(crate) fn run_streaming<I, F>(
+    corpus: I,
+    capture_audit: bool,
     mut on_record: F,
 ) -> Result<HarnessResult, BenchError>
 where
+    I: IntoIterator<Item = Result<OtlpLogRecord, BenchError>>,
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
 {
     let sink = SharedRecordSink::new();
@@ -136,8 +160,9 @@ where
     let tenant = TenantId::new(BENCH_TENANT);
     let mut snapshots: HashMap<(u64, u32), Vec<OwnedToken>> = HashMap::new();
 
-    for input in &corpus.lines {
-        cluster.ingest(input);
+    for input in corpus {
+        let input = input?;
+        cluster.ingest(&input);
         let record = require_single(sink.drain())?;
 
         // Skip the snapshot capture for lossy / parse-failure /
@@ -177,7 +202,7 @@ where
             None
         };
 
-        on_record(input, &record, template_snapshot);
+        on_record(&input, &record, template_snapshot);
     }
 
     Ok(HarnessResult {

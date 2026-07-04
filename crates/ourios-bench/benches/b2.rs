@@ -26,7 +26,7 @@ use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use ourios_bench::build_query_store;
+use ourios_bench::{TxtSeverity, build_query_store};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
@@ -192,7 +192,8 @@ fn real_corpus(c: &mut Criterion) {
             continue;
         }
         let bucket = tempfile::TempDir::new().expect("temp bucket");
-        let built = build_query_store(path, bucket.path()).expect("build query store");
+        let severity = TxtSeverity::from_env().expect("OURIOS_CORPUS_SEVERITY");
+        let built = build_query_store(path, bucket.path(), severity).expect("build query store");
         if built.busiest_template_rows == 0 {
             eprintln!("b2/real-corpus: {dir} produced no rows — skipping");
             continue;

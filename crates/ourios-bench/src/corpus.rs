@@ -140,40 +140,129 @@ pub(crate) struct CorpusLoad {
 /// unreadable, contains no recognised corpus files, or every
 /// contributing file is empty.
 pub(crate) fn load(dir: &Path) -> Result<CorpusLoad, BenchError> {
-    let mut total_files = 0u32;
-    let mut raw_bytes = 0u64;
+    let files = collect_files(dir)?;
     let mut lines = Vec::new();
     let tenant = TenantId::new(BENCH_TENANT);
     let mut next_ns = TIME_BASELINE_NS;
-    let mut visited = HashSet::new();
 
-    walk(
-        dir,
-        &mut total_files,
-        &mut raw_bytes,
-        &mut lines,
-        &tenant,
-        &mut next_ns,
-        &mut visited,
-    )?;
+    for (path, format) in &files.files {
+        match format {
+            CorpusFormat::Txt => ingest_txt(path, &mut lines, &tenant, &mut next_ns)?,
+            CorpusFormat::OtlpJsonl => ingest_otlp_jsonl(path, &mut lines, &tenant)?,
+        }
+    }
 
     if lines.is_empty() {
-        return Err(BenchError::Corpus {
-            detail: format!(
-                "no non-empty corpus lines under {} (read {} file(s); supported extensions: \
-                 `*.txt`, `*.jsonl`, `*.json`)",
-                dir.display(),
-                total_files,
-            ),
-        });
+        return Err(no_lines_error(dir, files.total_files));
     }
 
     Ok(CorpusLoad {
         lines,
-        total_files,
-        raw_bytes,
+        total_files: files.total_files,
+        raw_bytes: files.raw_bytes,
         directory: dir.display().to_string(),
     })
+}
+
+/// The shared empty-corpus error ([`load`] and the streaming store
+/// build surface the same message for the same condition).
+pub(crate) fn no_lines_error(dir: &Path, total_files: u32) -> BenchError {
+    BenchError::Corpus {
+        detail: format!(
+            "no non-empty corpus lines under {} (read {} file(s); supported extensions: \
+             `*.txt`, `*.jsonl`, `*.json`)",
+            dir.display(),
+            total_files,
+        ),
+    }
+}
+
+/// How the plain-text loader assigns severities (RFC 0006 §3.3).
+///
+/// The §3.3 default pins every plain-text line to `INFO` so all
+/// records share one severity bucket — the documented baseline the
+/// recorded §9 gate numbers (A1/C1/C2 template counts include
+/// severity in the template key) are comparable against. `Log4j` is
+/// the opt-in divergence §3.3 anticipated: extract the first
+/// standalone log4j-style level token from the line (what a
+/// file-tailing agent would emit as `severity_text`), giving
+/// severity-selective corpora like `LogHub` HDFS real error bands for
+/// the B1 predicate arm. Selected via `OURIOS_CORPUS_SEVERITY`
+/// (unset ⇒ `Fixed`, `log4j` ⇒ `Log4j`) — never the default, so
+/// every `--gates` path and prior recorded number is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TxtSeverity {
+    /// Every line is `INFO`/9 (the §3.3 pinned baseline).
+    #[default]
+    Fixed,
+    /// First standalone `TRACE`/`DEBUG`/`INFO`/`WARN`/`WARNING`/
+    /// `ERROR`/`FATAL` token decides; lines with none stay `INFO`/9.
+    Log4j,
+}
+
+impl TxtSeverity {
+    /// Resolve the mode from `OURIOS_CORPUS_SEVERITY`.
+    ///
+    /// # Errors
+    ///
+    /// [`BenchError::Corpus`] on an unrecognised value — a typo must
+    /// not silently fall back to a mode that changes template keys.
+    pub fn from_env() -> Result<Self, BenchError> {
+        match std::env::var("OURIOS_CORPUS_SEVERITY") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Fixed),
+            Ok(v) if v.is_empty() => Ok(Self::Fixed),
+            Ok(v) if v.eq_ignore_ascii_case("log4j") => Ok(Self::Log4j),
+            Ok(v) => Err(BenchError::Corpus {
+                detail: format!("OURIOS_CORPUS_SEVERITY must be unset or `log4j`, got {v:?}"),
+            }),
+            Err(e) => Err(BenchError::Corpus {
+                detail: format!("OURIOS_CORPUS_SEVERITY: {e}"),
+            }),
+        }
+    }
+}
+
+/// The first standalone log4j-style level token in `line`, as
+/// `(severity_number, severity_text)` — `OTel` band floors (TRACE 1,
+/// DEBUG 5, INFO 9, WARN 13, ERROR 17, FATAL 21), text verbatim.
+fn log4j_severity(line: &str) -> Option<(u8, &'static str)> {
+    line.split_ascii_whitespace().find_map(|token| match token {
+        "TRACE" => Some((1, "TRACE")),
+        "DEBUG" => Some((5, "DEBUG")),
+        "INFO" => Some((9, "INFO")),
+        "WARN" => Some((13, "WARN")),
+        "WARNING" => Some((13, "WARNING")),
+        "ERROR" => Some((17, "ERROR")),
+        "FATAL" => Some((21, "FATAL")),
+        _ => None,
+    })
+}
+
+/// Build one plain-text corpus record (RFC 0006 §3.3): the single
+/// per-line construction [`ingest_txt`] and [`CorpusStream`] share,
+/// so the eager and streaming loaders cannot drift.
+fn txt_record(
+    raw: String,
+    tenant: &TenantId,
+    next_ns: &mut u64,
+    severity: TxtSeverity,
+) -> OtlpLogRecord {
+    let (severity_number, severity_text) = match severity {
+        TxtSeverity::Fixed => (BENCH_SEVERITY_NUMBER, BENCH_SEVERITY_TEXT),
+        TxtSeverity::Log4j => {
+            log4j_severity(&raw).unwrap_or((BENCH_SEVERITY_NUMBER, BENCH_SEVERITY_TEXT))
+        }
+    };
+    let record = OtlpLogRecord {
+        tenant_id: tenant.clone(),
+        body: Some(Body::String(raw)),
+        time_unix_nano: *next_ns,
+        severity_number,
+        severity_text: Some(severity_text.to_string()),
+        ..Default::default()
+    };
+    *next_ns = next_ns.saturating_add(TIME_INCREMENT_NS);
+    record
 }
 
 /// Borrow the original line bytes from an OTLP record's body.
@@ -188,13 +277,33 @@ pub(crate) fn line_bytes(record: &OtlpLogRecord) -> Option<&[u8]> {
     }
 }
 
+/// The recognised corpus files under a directory, in the walker's
+/// deterministic order, plus the §3.4.1 metadata sums.
+pub(crate) struct CorpusFiles {
+    pub files: Vec<(PathBuf, CorpusFormat)>,
+    pub total_files: u32,
+    pub raw_bytes: u64,
+}
+
+/// Walk `dir` recursively and collect every recognised corpus file
+/// (`*.txt`, `*.jsonl`, `*.json`) — the single traversal both the
+/// eager [`load`] and the streaming [`stream`] paths consume, so
+/// ordering, the cycle guard, and the byte accounting cannot drift
+/// between them.
+pub(crate) fn collect_files(dir: &Path) -> Result<CorpusFiles, BenchError> {
+    let mut files = CorpusFiles {
+        files: Vec::new(),
+        total_files: 0,
+        raw_bytes: 0,
+    };
+    let mut visited = HashSet::new();
+    walk(dir, &mut files, &mut visited)?;
+    Ok(files)
+}
+
 fn walk(
     dir: &Path,
-    total_files: &mut u32,
-    raw_bytes: &mut u64,
-    lines: &mut Vec<OtlpLogRecord>,
-    tenant: &TenantId,
-    next_ns: &mut u64,
+    files: &mut CorpusFiles,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<(), BenchError> {
     // Cycle / alias guard. `fs::metadata` follows symlinks,
@@ -253,15 +362,7 @@ fn walk(
             detail: format!("metadata({}): {e}", path.display()),
         })?;
         if meta.is_dir() {
-            walk(
-                &path,
-                total_files,
-                raw_bytes,
-                lines,
-                tenant,
-                next_ns,
-                visited,
-            )?;
+            walk(&path, files, visited)?;
             continue;
         }
         // Dispatch on extension. `.txt` → plain-text loader
@@ -284,18 +385,16 @@ fn walk(
             }
             _ => continue,
         };
-        *total_files += 1;
-        *raw_bytes += meta.len();
-        match format {
-            CorpusFormat::Txt => ingest_txt(&path, lines, tenant, next_ns)?,
-            CorpusFormat::OtlpJsonl => ingest_otlp_jsonl(&path, lines, tenant)?,
-        }
+        files.total_files += 1;
+        files.raw_bytes += meta.len();
+        files.files.push((path, format));
     }
     Ok(())
 }
 
 /// Which on-disk encoding a corpus file uses.
-enum CorpusFormat {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CorpusFormat {
     /// RFC 0006 §3.3 plain text, one line per record.
     Txt,
     /// RFC 0006 §3.1 OTLP JSON Lines, one `LogsData` per line
@@ -334,15 +433,7 @@ fn ingest_txt(
         if raw.is_empty() {
             continue;
         }
-        lines.push(OtlpLogRecord {
-            tenant_id: tenant.clone(),
-            body: Some(Body::String(raw)),
-            time_unix_nano: *next_ns,
-            severity_number: BENCH_SEVERITY_NUMBER,
-            severity_text: Some(BENCH_SEVERITY_TEXT.to_string()),
-            ..Default::default()
-        });
-        *next_ns = next_ns.saturating_add(TIME_INCREMENT_NS);
+        lines.push(txt_record(raw, tenant, next_ns, TxtSeverity::Fixed));
     }
     Ok(())
 }
@@ -381,33 +472,162 @@ fn ingest_otlp_jsonl(
         if raw.trim().is_empty() {
             continue;
         }
-        let logs_data: LogsData = serde_json::from_str(&raw).map_err(|e| BenchError::Corpus {
-            detail: format!("parse OTLP/JSON at {}:{}: {e}", path.display(), idx + 1),
-        })?;
-        for rl in logs_data.resource_logs {
-            // Resource attributes are copied onto every record
-            // in the `ResourceLogs` group per the
-            // `OtlpLogRecord` doc-comment ("inherited from
-            // `Resource.attributes` and copied onto every
-            // record under that `ResourceLogs` group"). Hoist
-            // the borrow once so the per-record map doesn't
-            // re-extract.
-            let resource_attrs: Vec<KeyValue> =
-                rl.resource.map(|r| r.attributes).unwrap_or_default();
-            for sl in rl.scope_logs {
-                let scope = sl.scope;
-                for lr in sl.log_records {
-                    lines.push(map_log_record(
-                        tenant.clone(),
-                        &resource_attrs,
-                        scope.as_ref(),
-                        lr,
-                    ));
+        lines.extend(jsonl_line_records(&raw, path, idx + 1, tenant)?);
+    }
+    Ok(())
+}
+
+/// Parse one OTLP/JSON Lines corpus line (a whole `LogsData`) into
+/// its per-wire-record [`OtlpLogRecord`]s — the single per-line
+/// parse [`ingest_otlp_jsonl`] and [`CorpusStream`] share.
+fn jsonl_line_records(
+    raw: &str,
+    path: &Path,
+    line_no: usize,
+    tenant: &TenantId,
+) -> Result<Vec<OtlpLogRecord>, BenchError> {
+    let logs_data: LogsData = serde_json::from_str(raw).map_err(|e| BenchError::Corpus {
+        detail: format!("parse OTLP/JSON at {}:{}: {e}", path.display(), line_no),
+    })?;
+    let mut records = Vec::new();
+    for rl in logs_data.resource_logs {
+        // Resource attributes are copied onto every record
+        // in the `ResourceLogs` group per the
+        // `OtlpLogRecord` doc-comment ("inherited from
+        // `Resource.attributes` and copied onto every
+        // record under that `ResourceLogs` group"). Hoist
+        // the borrow once so the per-record map doesn't
+        // re-extract.
+        let resource_attrs: Vec<KeyValue> = rl.resource.map(|r| r.attributes).unwrap_or_default();
+        for sl in rl.scope_logs {
+            let scope = sl.scope;
+            for lr in sl.log_records {
+                records.push(map_log_record(
+                    tenant.clone(),
+                    &resource_attrs,
+                    scope.as_ref(),
+                    lr,
+                ));
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Streaming counterpart of [`load`] for the query-store builds: the
+/// same files, in the same order, producing the same records — but
+/// one at a time, so peak memory stays flat regardless of corpus
+/// size (RFC 0006's eager `Vec` costs ~2–4× the raw corpus bytes,
+/// which caps the eager path well below the 10–100 GiB corpora the
+/// B1/B2 scale targets speak to). Mining + Parquet flush downstream
+/// are already incremental (`harness::run_streaming`, `build_store`).
+pub(crate) fn stream(
+    dir: &Path,
+    txt_severity: TxtSeverity,
+) -> Result<(CorpusStream, CorpusFiles), BenchError> {
+    let files = collect_files(dir)?;
+    let stream = CorpusStream {
+        files: files.files.clone().into_iter(),
+        current: None,
+        pending: std::collections::VecDeque::new(),
+        tenant: TenantId::new(BENCH_TENANT),
+        next_ns: TIME_BASELINE_NS,
+        txt_severity,
+    };
+    Ok((stream, files))
+}
+
+/// One open corpus file mid-stream.
+struct OpenFile {
+    path: PathBuf,
+    format: CorpusFormat,
+    lines: std::io::Lines<BufReader<File>>,
+    /// 1-based line counter for OTLP/JSON parse diagnostics.
+    line_no: usize,
+}
+
+/// Lazy corpus iterator (see [`stream`]). Yields
+/// `Result<OtlpLogRecord, BenchError>` so a mid-corpus read/parse
+/// error surfaces at the failing line instead of poisoning the whole
+/// load up front.
+pub(crate) struct CorpusStream {
+    files: std::vec::IntoIter<(PathBuf, CorpusFormat)>,
+    current: Option<OpenFile>,
+    /// Records from the current OTLP/JSON line not yet yielded (one
+    /// `LogsData` line can carry many wire records) — the only
+    /// buffering in the stream, bounded by a single corpus line.
+    pending: std::collections::VecDeque<OtlpLogRecord>,
+    tenant: TenantId,
+    next_ns: u64,
+    txt_severity: TxtSeverity,
+}
+
+impl Iterator for CorpusStream {
+    type Item = Result<OtlpLogRecord, BenchError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(record) = self.pending.pop_front() {
+                return Some(Ok(record));
+            }
+            let Some(open) = self.current.as_mut() else {
+                let (path, format) = self.files.next()?;
+                let file = match File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return Some(Err(BenchError::Corpus {
+                            detail: format!("open({}): {e}", path.display()),
+                        }));
+                    }
+                };
+                self.current = Some(OpenFile {
+                    path,
+                    format,
+                    lines: BufReader::new(file).lines(),
+                    line_no: 0,
+                });
+                continue;
+            };
+            let Some(line) = open.lines.next() else {
+                self.current = None;
+                continue;
+            };
+            open.line_no += 1;
+            let mut raw = match line {
+                Ok(raw) => raw,
+                Err(e) => {
+                    return Some(Err(BenchError::Corpus {
+                        detail: format!("read line in {}: {e}", open.path.display()),
+                    }));
+                }
+            };
+            match open.format {
+                CorpusFormat::Txt => {
+                    while raw.ends_with('\r') {
+                        raw.pop();
+                    }
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    return Some(Ok(txt_record(
+                        raw,
+                        &self.tenant,
+                        &mut self.next_ns,
+                        self.txt_severity,
+                    )));
+                }
+                CorpusFormat::OtlpJsonl => {
+                    if raw.trim().is_empty() {
+                        continue;
+                    }
+                    match jsonl_line_records(&raw, &open.path, open.line_no, &self.tenant) {
+                        Ok(records) => self.pending.extend(records),
+                        Err(e) => return Some(Err(e)),
+                    }
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// Map one wire `LogRecord` (plus its inherited resource
@@ -483,6 +703,58 @@ mod tests {
             .and_then(Path::parent)
             .expect("workspace root")
             .join("testdata/corpus")
+    }
+
+    /// The streaming loader is an exact record-for-record replay of
+    /// the eager one on the same directory: same records, same order,
+    /// same timestamps, same file/byte accounting — so a store built
+    /// from either path is identical and the recorded gate numbers
+    /// stay comparable.
+    #[test]
+    fn stream_replays_load_record_for_record() {
+        let dir = seed_corpus_dir();
+        let eager = load(&dir).expect("eager load");
+        let (stream, files) = stream(&dir, TxtSeverity::Fixed).expect("stream");
+        let streamed: Vec<OtlpLogRecord> = stream
+            .collect::<Result<_, _>>()
+            .expect("stream yields every record");
+        assert_eq!(files.total_files, eager.total_files);
+        assert_eq!(files.raw_bytes, eager.raw_bytes);
+        assert_eq!(streamed.len(), eager.lines.len());
+        for (i, (a, b)) in streamed.iter().zip(&eager.lines).enumerate() {
+            assert_eq!(a, b, "record {i} diverges between stream and load");
+        }
+    }
+
+    /// `Log4j` severity extraction: the first standalone level token
+    /// decides `(severity_number, severity_text)`; a line with none
+    /// keeps the §3.3 INFO baseline; `Fixed` ignores tokens entirely.
+    #[test]
+    fn log4j_severity_extraction() {
+        let tenant = TenantId::new(BENCH_TENANT);
+        let mut ns = TIME_BASELINE_NS;
+        let mut rec = |line: &str, mode| txt_record(line.to_string(), &tenant, &mut ns, mode);
+
+        let error = rec(
+            "081109 203615 148 ERROR dfs.DataNode: write failed",
+            TxtSeverity::Log4j,
+        );
+        assert_eq!(error.severity_number, 17);
+        assert_eq!(error.severity_text.as_deref(), Some("ERROR"));
+
+        let warn = rec("081109 WARN something", TxtSeverity::Log4j);
+        assert_eq!(warn.severity_number, 13);
+        assert_eq!(warn.severity_text.as_deref(), Some("WARN"));
+
+        // No standalone token (substring inside a word doesn't count).
+        let plain = rec("state=ERRORED but no level token", TxtSeverity::Log4j);
+        assert_eq!(plain.severity_number, BENCH_SEVERITY_NUMBER);
+        assert_eq!(plain.severity_text.as_deref(), Some(BENCH_SEVERITY_TEXT));
+
+        // Fixed mode never extracts, even with a token present.
+        let fixed = rec("081109 ERROR ignored", TxtSeverity::Fixed);
+        assert_eq!(fixed.severity_number, BENCH_SEVERITY_NUMBER);
+        assert_eq!(fixed.severity_text.as_deref(), Some(BENCH_SEVERITY_TEXT));
     }
 
     #[test]

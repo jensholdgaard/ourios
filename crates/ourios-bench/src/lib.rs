@@ -39,6 +39,7 @@ mod reference;
 mod report;
 mod store;
 
+pub use corpus::TxtSeverity;
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
 pub use store::{B1Store, BuiltStore, build_b1_store, build_query_store};

@@ -73,13 +73,22 @@ pub struct BuiltStore {
 /// Panics if the partition count exceeds `u64` (`usize > u64`),
 /// which can't happen on any supported target — same documented
 /// assumption as [`crate::run`].
-pub fn build_query_store(corpus_dir: &Path, bucket_root: &Path) -> Result<BuiltStore, BenchError> {
+pub fn build_query_store(
+    corpus_dir: &Path,
+    bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
+) -> Result<BuiltStore, BenchError> {
     let mut counts: HashMap<u64, u64> = HashMap::new();
 
-    let core = build_store(corpus_dir, bucket_root, |_input, emitted, _effective| {
-        *counts.entry(emitted.template_id).or_insert(0) += 1;
-        Ok(())
-    })?;
+    let core = build_store(
+        corpus_dir,
+        bucket_root,
+        txt_severity,
+        |_input, emitted, _effective| {
+            *counts.entry(emitted.template_id).or_insert(0) += 1;
+            Ok(())
+        },
+    )?;
 
     let (busiest_template_id, busiest_template_rows) =
         counts.into_iter().max_by_key(|&(_, n)| n).unwrap_or((0, 0));
@@ -161,6 +170,7 @@ pub fn build_b1_store(
     corpus_dir: &Path,
     bucket_root: &Path,
     reference_zstd_level: i32,
+    txt_severity: corpus::TxtSeverity,
 ) -> Result<B1Store, BenchError> {
     let mut severity_rows: BTreeMap<String, u64> = BTreeMap::new();
     let mut error_band_rows: BTreeMap<String, u64> = BTreeMap::new();
@@ -169,30 +179,35 @@ pub fn build_b1_store(
     })?;
     let mut zero_effective_ts_rows = 0u64;
 
-    let core = build_store(corpus_dir, bucket_root, |input, emitted, effective| {
-        if let Some(text) = &emitted.severity_text {
-            *severity_rows.entry(text.clone()).or_insert(0) += 1;
-            if ERROR_BAND.contains(&emitted.severity_number) {
-                *error_band_rows.entry(text.clone()).or_insert(0) += 1;
+    let core = build_store(
+        corpus_dir,
+        bucket_root,
+        txt_severity,
+        |input, emitted, effective| {
+            if let Some(text) = &emitted.severity_text {
+                *severity_rows.entry(text.clone()).or_insert(0) += 1;
+                if ERROR_BAND.contains(&emitted.severity_number) {
+                    *error_band_rows.entry(text.clone()).or_insert(0) += 1;
+                }
             }
-        }
-        if effective == 0 {
-            // Genuinely timeless (neither wire timestamp set) —
-            // out-of-window by definition (the B1 arm skips any corpus
-            // carrying zero-effective-ts rows); keep the reference
-            // strictly in-window rather than spooling lines no query
-            // scans.
-            zero_effective_ts_rows += 1;
-            return Ok(());
-        }
-        let line = reference_line(input)?;
-        spool
-            .append(effective / HOUR_NS, &line)
-            .map_err(|e| BenchError::Pipeline {
-                detail: format!("spool B1 reference line: {e}"),
-            })?;
-        Ok(())
-    })?;
+            if effective == 0 {
+                // Genuinely timeless (neither wire timestamp set) —
+                // out-of-window by definition (the B1 arm skips any corpus
+                // carrying zero-effective-ts rows); keep the reference
+                // strictly in-window rather than spooling lines no query
+                // scans.
+                zero_effective_ts_rows += 1;
+                return Ok(());
+            }
+            let line = reference_line(input)?;
+            spool
+                .append(effective / HOUR_NS, &line)
+                .map_err(|e| BenchError::Pipeline {
+                    detail: format!("spool B1 reference line: {e}"),
+                })?;
+            Ok(())
+        },
+    )?;
 
     let reference =
         spool
@@ -335,6 +350,7 @@ struct StoreCore {
 fn build_store(
     corpus_dir: &Path,
     bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
     mut observe: impl FnMut(&OtlpLogRecord, &MinedRecord, u64) -> Result<(), BenchError>,
 ) -> Result<StoreCore, BenchError> {
     // A reused bucket would let the querier enumerate a prior run's
@@ -352,7 +368,11 @@ fn build_store(
         });
     }
 
-    let load = corpus::load(corpus_dir)?;
+    // Stream rather than `corpus::load`: the eager `Vec<OtlpLogRecord>`
+    // costs ~2-4x the raw corpus bytes, which caps the loadable corpus
+    // well below the B1/B2 scale targets; mine + flush below are
+    // per-record, so streaming keeps peak memory flat at any size.
+    let (stream, files_meta) = corpus::stream(corpus_dir, txt_severity)?;
 
     let mut writers: HashMap<PartitionKey, Writer> = HashMap::new();
     let mut rows: u64 = 0;
@@ -368,7 +388,7 @@ fn build_store(
     // pattern `a1::A1Accumulator` uses.
     let mut first_err: Option<BenchError> = None;
 
-    harness::run(&load, false, |input, emitted, _snap| {
+    harness::run_streaming(stream, false, |input, emitted, _snap| {
         if first_err.is_some() {
             return;
         }
@@ -391,6 +411,11 @@ fn build_store(
 
     if let Some(e) = first_err {
         return Err(e);
+    }
+    if rows == 0 {
+        // Parity with `corpus::load`'s empty-corpus rejection: a store
+        // with zero rows would make every query trivially instant.
+        return Err(corpus::no_lines_error(corpus_dir, files_meta.total_files));
     }
 
     let files = u64::try_from(writers.len()).expect("usize fits in u64 on every supported target");
@@ -476,10 +501,11 @@ mod tests {
         std::fs::write(corpus.path().join("c.txt"), b"user 42 logged in\n").expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let first = build_query_store(corpus.path(), bucket.path()).expect("first build");
+        let first = build_query_store(corpus.path(), bucket.path(), corpus::TxtSeverity::Fixed)
+            .expect("first build");
         assert!(first.rows >= 1, "the one corpus line is written");
 
-        let second = build_query_store(corpus.path(), bucket.path());
+        let second = build_query_store(corpus.path(), bucket.path(), corpus::TxtSeverity::Fixed);
         assert!(
             matches!(second, Err(BenchError::Pipeline { .. })),
             "a reused, non-empty bucket must be rejected, got {second:?}",
@@ -501,7 +527,8 @@ mod tests {
         .expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_query_store(corpus.path(), bucket.path()).expect("build");
+        let built = build_query_store(corpus.path(), bucket.path(), corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(built.rows, 3, "one record per line");
         assert_eq!(
@@ -574,7 +601,8 @@ mod tests {
         std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         // The b1 eligibility guard: a usable span and no
         // zero-effective-ts rows.
@@ -626,7 +654,8 @@ mod tests {
         std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(built.rows, 8);
         assert_eq!(built.zero_effective_ts_rows, 0);
@@ -663,7 +692,8 @@ mod tests {
         std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(
             built.query_severity,
@@ -688,7 +718,8 @@ mod tests {
         std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(
             built.query_severity,
@@ -712,7 +743,8 @@ mod tests {
         std::fs::write(corpus.path().join("c.jsonl"), jsonl).expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(built.zero_effective_ts_rows, 1);
         assert_eq!(
@@ -748,12 +780,38 @@ mod tests {
         .expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_b1_store(corpus.path(), bucket.path(), 3).expect("build");
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(built.distinct_severities, 1, "loader forces INFO on text");
         assert_eq!(
             built.query_severity, None,
             "INFO (9) is not in the error band — nothing to query",
+        );
+    }
+
+    /// The opt-in `Log4j` severity mode gives a plain-text corpus real
+    /// selectivity: level tokens map to distinct severities and the
+    /// error band yields a B1 query predicate. The `Fixed` default
+    /// above stays the §3.3 baseline.
+    #[test]
+    fn b1_store_over_log4j_text_gets_error_band_selectivity() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("c.txt"),
+            b"081109 INFO dfs.DataNode: ok id=1\n081109 ERROR dfs.DataNode: failed id=2\n081109 WARN dfs.DataNode: slow id=3\n",
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_b1_store(corpus.path(), bucket.path(), 3, corpus::TxtSeverity::Log4j)
+            .expect("build");
+
+        assert_eq!(built.distinct_severities, 3, "INFO/WARN/ERROR extracted");
+        assert_eq!(
+            built.query_severity,
+            Some(("ERROR".to_string(), 1)),
+            "the error band yields the B1 predicate with its row count",
         );
     }
 
@@ -771,7 +829,8 @@ mod tests {
         .expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
-        let built = build_query_store(corpus.path(), bucket.path()).expect("build");
+        let built = build_query_store(corpus.path(), bucket.path(), corpus::TxtSeverity::Fixed)
+            .expect("build");
 
         assert_eq!(built.rows, 1, "the one record is written");
         assert_eq!(

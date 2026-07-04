@@ -301,6 +301,33 @@ mod tests {
         (tmp, load)
     }
 
+    /// `capture_snapshots = false` (the query-store builds) skips the
+    /// per-`(id, version)` `templates_for` walk entirely: even a
+    /// non-lossy, real-template, string-body record — exactly the shape
+    /// that gets `Some(template)` under `run()` — receives `None`.
+    #[test]
+    fn store_build_mode_never_captures_snapshots() {
+        let (_tmp, load) = load_lines(&["user 42 logged in", "user 43 logged in"]);
+        let mut calls = 0usize;
+        run_streaming(
+            load.lines.iter().map(Ok),
+            false,
+            false,
+            |_input, record, snap| {
+                calls += 1;
+                assert!(!record.lossy_flag, "fixture lines mine cleanly");
+                assert_ne!(record.template_id, NO_TEMPLATE);
+                assert!(
+                    snap.is_none(),
+                    "capture_snapshots = false must skip the templates_for walk",
+                );
+                Ok(())
+            },
+        )
+        .expect("harness runs");
+        assert_eq!(calls, load.lines.len());
+    }
+
     /// One callback invocation per ingested line — the
     /// RFC 0001 §6.1 emit contract the harness asserts.
     #[test]

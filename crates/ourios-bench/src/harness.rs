@@ -109,6 +109,35 @@ pub(crate) fn run<F>(
 where
     F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>),
 {
+    run_streaming(
+        corpus.lines.iter().map(Ok),
+        capture_audit,
+        |input, record, snapshot| {
+            on_record(input, record, snapshot);
+            Ok(())
+        },
+    )
+}
+
+/// [`run`] over a lazy record stream — the memory-flat path the
+/// query-store builds use (`corpus::stream` → mine → flush, no
+/// `Vec<OtlpLogRecord>` of the whole corpus). An `Err` item — or an
+/// `Err` from the callback (a Parquet write failure, say) — aborts
+/// at the failing record rather than mining the remaining corpus:
+/// at the 10–100 GiB scale this path exists for, finishing the mine
+/// after a fatal error would burn many minutes of CPU for nothing.
+pub(crate) fn run_streaming<T, I, F>(
+    corpus: I,
+    capture_audit: bool,
+    mut on_record: F,
+) -> Result<HarnessResult, BenchError>
+where
+    // `Borrow` lets the eager gate path feed `&OtlpLogRecord` (no
+    // per-record clone) and the streaming path feed owned records.
+    T: std::borrow::Borrow<OtlpLogRecord>,
+    I: IntoIterator<Item = Result<T, BenchError>>,
+    F: FnMut(&OtlpLogRecord, &MinedRecord, Option<&[OwnedToken]>) -> Result<(), BenchError>,
+{
     let sink = SharedRecordSink::new();
     let audit_sink = capture_audit.then(SharedAuditSink::new);
     // `with_audit_sink` is the constructor that takes the
@@ -136,7 +165,9 @@ where
     let tenant = TenantId::new(BENCH_TENANT);
     let mut snapshots: HashMap<(u64, u32), Vec<OwnedToken>> = HashMap::new();
 
-    for input in &corpus.lines {
+    for input in corpus {
+        let input = input?;
+        let input = input.borrow();
         cluster.ingest(input);
         let record = require_single(sink.drain())?;
 
@@ -177,7 +208,7 @@ where
             None
         };
 
-        on_record(input, &record, template_snapshot);
+        on_record(input, &record, template_snapshot)?;
     }
 
     Ok(HarnessResult {

@@ -41,7 +41,7 @@ use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use ourios_bench::{ReferenceCorpus, build_b1_store};
+use ourios_bench::{ReferenceCorpus, TxtSeverity, build_b1_store};
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
@@ -238,6 +238,8 @@ fn real_corpus(c: &mut Criterion) {
     // default 100 samples would run for hours. 10 (criterion's
     // minimum) keeps the indicative timing affordable.
     group.sample_size(10);
+    // Process-global: every corpus in the run shares one severity mode.
+    let severity = TxtSeverity::from_env().expect("OURIOS_CORPUS_SEVERITY");
     for dir in dirs {
         let path = Path::new(dir);
         if !path.is_dir() {
@@ -245,7 +247,8 @@ fn real_corpus(c: &mut Criterion) {
             continue;
         }
         let bucket = tempfile::TempDir::new().expect("temp bucket");
-        let built = build_b1_store(path, bucket.path(), ZSTD_LEVEL).expect("build b1 store");
+        let built =
+            build_b1_store(path, bucket.path(), ZSTD_LEVEL, severity).expect("build b1 store");
         let Some((severity, query)) = severity_query(&built, dir) else {
             continue;
         };

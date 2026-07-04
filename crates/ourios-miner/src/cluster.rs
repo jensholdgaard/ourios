@@ -1242,18 +1242,7 @@ impl MinerCluster {
         // Vec<u16>`), whose violation would otherwise be the
         // silent-merge bug `[CLAUDE.md §3.1]` exists to prevent.
         if masked_strs.len() > usize::from(effective_config.max_line_tokens) {
-            let mut rec = Self::record_envelope(record, BodyKind::String);
-            rec.separators = separators;
-            rec.params = params;
-            rec.body = Some(raw.to_string());
-            rec.lossy_flag = true;
-            // §6.5: bump `params_overflow_total` if any param
-            // exceeded the byte limit. Body retention is already
-            // set above for this parse-failure path.
-            self.apply_overflow_retention(record, service, &mut rec, raw);
-            self.emit_record(rec, service);
-            self.record_parse_failure(record, service);
-            return NO_TEMPLATE;
+            return self.emit_string_parse_failure(record, service, raw, separators, params);
         }
 
         // Phase 1 — read-only candidate selection. RFC §6.2 step
@@ -1278,15 +1267,8 @@ impl MinerCluster {
                 // parse-failure path — body retained, counted,
                 // never force-merged.
                 if self.at_template_ceiling(&record.tenant_id, effective_config.max_templates) {
-                    let mut rec = Self::record_envelope(record, BodyKind::String);
-                    rec.separators = separators;
-                    rec.params = params;
-                    rec.body = Some(raw.to_string());
-                    rec.lossy_flag = true;
-                    self.apply_overflow_retention(record, service, &mut rec, raw);
-                    self.emit_record(rec, service);
-                    self.record_parse_failure(record, service);
-                    return NO_TEMPLATE;
+                    return self
+                        .emit_string_parse_failure(record, service, raw, separators, params);
                 }
                 let new_id = self.create_new_leaf(
                     record,
@@ -1345,15 +1327,9 @@ impl MinerCluster {
                         if self
                             .at_template_ceiling(&record.tenant_id, effective_config.max_templates)
                         {
-                            let mut rec = Self::record_envelope(record, BodyKind::String);
-                            rec.separators = separators;
-                            rec.params = params;
-                            rec.body = Some(raw.to_string());
-                            rec.lossy_flag = true;
-                            self.apply_overflow_retention(record, service, &mut rec, raw);
-                            self.emit_record(rec, service);
-                            self.record_parse_failure(record, service);
-                            return NO_TEMPLATE;
+                            return self.emit_string_parse_failure(
+                                record, service, raw, separators, params,
+                            );
                         }
                         self.body_retentions_total.fetch_add(1, Ordering::Relaxed);
                         self.metrics.record_body_retention(&record.tenant_id);
@@ -1384,22 +1360,36 @@ impl MinerCluster {
                     // Parse failure: no template allocated.
                     // Both counters bump via the shared helper.
                     ConfidenceZone::ParseFailure => {
-                        let mut rec = Self::record_envelope(record, BodyKind::String);
-                        rec.separators = separators;
-                        rec.params = params;
-                        rec.body = Some(raw.to_string());
-                        rec.lossy_flag = true;
-                        // §6.5: bump `params_overflow_total` for
-                        // any overflow params (body is already
-                        // retained for the parse-failure reason).
-                        self.apply_overflow_retention(record, service, &mut rec, raw);
-                        self.emit_record(rec, service);
-                        self.record_parse_failure(record, service);
-                        NO_TEMPLATE
+                        self.emit_string_parse_failure(record, service, raw, separators, params)
                     }
                 }
             }
         }
+    }
+
+    /// Emit the §6.3 parse-failure record for a string line — the
+    /// shared exit for the below-floor zone, the RFC 0023 §3.1
+    /// long-line guard, and the RFC 0023 template-ceiling diverts:
+    /// no template, body retained verbatim, lossy-flagged, counted.
+    fn emit_string_parse_failure(
+        &mut self,
+        record: &OtlpLogRecord,
+        service: Option<&str>,
+        raw: &str,
+        separators: Vec<String>,
+        params: Vec<Param>,
+    ) -> u64 {
+        let mut rec = Self::record_envelope(record, BodyKind::String);
+        rec.separators = separators;
+        rec.params = params;
+        rec.body = Some(raw.to_string());
+        rec.lossy_flag = true;
+        // §6.5: bump `params_overflow_total` for any overflow params
+        // (body is already retained for the parse-failure reason).
+        self.apply_overflow_retention(record, service, &mut rec, raw);
+        self.emit_record(rec, service);
+        self.record_parse_failure(record, service);
+        NO_TEMPLATE
     }
 
     /// RFC 0023 §3.1 bound 2 — whether the tenant's Drain-tree
@@ -1633,11 +1623,11 @@ impl MinerCluster {
                 .tenants
                 .get_mut(&record.tenant_id)
                 .expect("tenant present: find_best_candidate returned Some(...)");
-            let parent = state.tree.descend_mut(
-                masked_strs,
+            let (depth, fanout) = (
                 state.config.prefix_depth as usize,
                 usize::from(state.config.max_node_children),
             );
+            let parent = state.tree.descend_mut(masked_strs, depth, fanout);
             let leaf = &mut parent.leaves[candidate.leaf_idx];
             plan_attach(
                 leaf,
@@ -1696,22 +1686,10 @@ impl MinerCluster {
                     },
                 });
                 // §6.4 treats degenerate widening as a parse
-                // failure that retains body. `lossy_flag = true`
-                // so reconstruct surfaces the retained body and
-                // ignores `params`; the line-ordered fallback is
-                // fine here.
-                let mut rec = Self::record_envelope(record, BodyKind::String);
-                rec.separators = separators;
-                rec.params = params;
-                rec.body = Some(raw.to_string());
-                rec.lossy_flag = true;
-                // §6.5: bump `params_overflow_total` if the
-                // line-ordered params contained any oversized
-                // values (body already retained for §6.4).
-                self.apply_overflow_retention(record, service, &mut rec, raw);
-                self.emit_record(rec, service);
-                self.record_parse_failure(record, service);
-                NO_TEMPLATE
+                // failure that retains body (the line-ordered
+                // params fallback is fine — reconstruct ignores
+                // `params` on the lossy path).
+                self.emit_string_parse_failure(record, service, raw, separators, params)
             }
             AttachPlan::Mutated {
                 template_id,

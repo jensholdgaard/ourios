@@ -191,6 +191,7 @@ pub(crate) fn no_lines_error(dir: &Path, total_files: u32) -> BenchError {
 /// (unset ⇒ `Fixed`, `log4j` ⇒ `Log4j`) — never the default, so
 /// every `--gates` path and prior recorded number is untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TxtSeverity {
     /// Every line is `INFO`/9 (the §3.3 pinned baseline).
     #[default]

@@ -135,7 +135,7 @@ where
 /// `templates_for` walk entirely and every callback gets `None`.
 /// Store builds pass `false` — the walk clones the full template set
 /// per new pair, which goes quadratic on widening-churny corpora
-/// (measured ~3 KB/s on LogHub HDFS_v2).
+/// (measured ~3 KB/s on `LogHub` `HDFS_v2`).
 pub(crate) fn run_streaming<T, I, F>(
     corpus: I,
     capture_audit: bool,

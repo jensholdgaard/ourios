@@ -112,6 +112,7 @@ where
     run_streaming(
         corpus.lines.iter().map(Ok),
         capture_audit,
+        /* capture_snapshots */ true,
         |input, record, snapshot| {
             on_record(input, record, snapshot);
             Ok(())
@@ -126,9 +127,19 @@ where
 /// at the failing record rather than mining the remaining corpus:
 /// at the 10–100 GiB scale this path exists for, finishing the mine
 /// after a fatal error would burn many minutes of CPU for nothing.
+///
+/// `capture_snapshots` gates the per-`(template_id, version)`
+/// template capture: `true` preserves [`run`]'s contract (non-lossy
+/// string-body records get `Some(template)` in the callback's third
+/// argument — what C1 consumes); `false` skips the
+/// `templates_for` walk entirely and every callback gets `None`.
+/// Store builds pass `false` — the walk clones the full template set
+/// per new pair, which goes quadratic on widening-churny corpora
+/// (measured ~3 KB/s on `LogHub` `HDFS_v2`).
 pub(crate) fn run_streaming<T, I, F>(
     corpus: I,
     capture_audit: bool,
+    capture_snapshots: bool,
     mut on_record: F,
 ) -> Result<HarnessResult, BenchError>
 where
@@ -185,7 +196,16 @@ where
         // (decode the stored `AnyValue` bytes) rather than
         // template + params, so the bench's C1 (which measures
         // template-based reconstruction) doesn't apply.
-        let want_snapshot = !record.lossy_flag
+        // `capture_snapshots = false` skips the whole capture: every new
+        // `(template_id, template_version)` pair otherwise walks + clones
+        // the full template set via `templates_for`. On corpora with heavy
+        // widening churn (one version bump per few lines) that is
+        // quadratic — measured at ~3 KB/s on LogHub HDFS_v2, a ~57-day
+        // store build — and the query-store builds never read the
+        // snapshots at all (their callbacks ignore the argument). Only C1
+        // (reconstruction) needs them.
+        let want_snapshot = capture_snapshots
+            && !record.lossy_flag
             && record.template_id != NO_TEMPLATE
             && matches!(record.body_kind, BodyKind::String);
         if want_snapshot {
@@ -288,6 +308,37 @@ mod tests {
         drop(file);
         let load = corpus::load(tmp.path()).expect("fixture loads");
         (tmp, load)
+    }
+
+    /// `capture_snapshots = false` (the query-store builds) skips the
+    /// per-`(id, version)` `templates_for` walk entirely: even a
+    /// non-lossy, real-template, string-body record — exactly the shape
+    /// that gets `Some(template)` under `run()` — receives `None`.
+    #[test]
+    fn store_build_mode_never_captures_snapshots() {
+        let (_tmp, load) = load_lines(&["user 42 logged in", "user 43 logged in"]);
+        let mut calls = 0usize;
+        run_streaming(
+            load.lines.iter().map(Ok),
+            /* capture_audit */ false,
+            /* capture_snapshots */ false,
+            |_input, record, snap| {
+                calls += 1;
+                assert!(!record.lossy_flag, "fixture lines mine cleanly");
+                assert_ne!(record.template_id, NO_TEMPLATE);
+                assert!(
+                    matches!(record.body_kind, BodyKind::String),
+                    "fixture lines carry string bodies",
+                );
+                assert!(
+                    snap.is_none(),
+                    "capture_snapshots = false must skip the templates_for walk",
+                );
+                Ok(())
+            },
+        )
+        .expect("harness runs");
+        assert_eq!(calls, load.lines.len());
     }
 
     /// One callback invocation per ingested line — the

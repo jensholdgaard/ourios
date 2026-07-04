@@ -41,6 +41,7 @@
 - [RFC 0021 — DataFusion / Arrow upgrade](./rfcs/0021-datafusion-arrow-upgrade.md)
 - [RFC 0022 — Queryable attribute columns](./rfcs/0022-queryable-attribute-columns.md)
 - [RFC 0023 — Bounded template memory](./rfcs/0023-bounded-template-memory.md)
+- [RFC 0024 — OTLP-envelope property testing](./rfcs/0024-otlp-envelope-property-testing.md)
 
 # Talks
 

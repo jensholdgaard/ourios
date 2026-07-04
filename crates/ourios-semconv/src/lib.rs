@@ -100,7 +100,8 @@ pub const OURIOS_MINER_MERGES: &str = "ourios.miner.merges";
 pub const OURIOS_MINER_PARAMS_OVERFLOW: &str = "ourios.miner.params.overflow";
 
 /// `ourios.miner.params.overflow.utilization` (gauge, unit `1`).
-pub const OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION: &str = "ourios.miner.params.overflow.utilization";
+pub const OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION: &str =
+    "ourios.miner.params.overflow.utilization";
 
 /// `ourios.miner.parse_failures` (counter, unit `{failure}`).
 pub const OURIOS_MINER_PARSE_FAILURES: &str = "ourios.miner.parse_failures";
@@ -138,9 +139,7 @@ pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.
 /// `ourios.wal.append.duration` (histogram, unit `s`).
 pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
 
-
 // Attribute keys.
-
 
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
@@ -171,8 +170,6 @@ pub const OURIOS_SINK_FLUSH_TRIGGER: &str = "ourios.sink.flush.trigger";
 
 /// `ourios.tenant` attribute key.
 pub const OURIOS_TENANT: &str = "ourios.tenant";
-
-
 
 // Log event names (the server's own dogfooded logs; every `tracing` call
 // site names its event with one of these — `weaver registry live-check`

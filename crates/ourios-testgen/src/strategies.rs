@@ -42,11 +42,14 @@ pub const ADVERSARIAL_MAX_ATTRIBUTES: usize = 2048;
 pub const CALIBRATED_BODY_LEN_CAP: usize = 1 << 16;
 
 /// 2026-01-01T00:00:00Z — fixed epoch for plausible timestamps, so
-/// generation is reproducible (no wall clock).
-const TIME_BASE_UNIX_NANO: u64 = 1_767_225_600_000_000_000;
+/// generation is reproducible (no wall clock). Public so property
+/// suites can anchor their query `now` / windows to where generated
+/// timestamps actually live.
+pub const TIME_BASE_UNIX_NANO: u64 = 1_767_225_600_000_000_000;
 
-/// Span of the plausible-timestamp window (one week).
-const TIME_WINDOW_NANO: u64 = 7 * 24 * 3_600_000_000_000;
+/// Span of the plausible-timestamp window (one week past
+/// [`TIME_BASE_UNIX_NANO`]).
+pub const TIME_WINDOW_NANO: u64 = 7 * 24 * 3_600_000_000_000;
 
 /// Recursion budget handed to `prop_recursive` when growing
 /// containers: two below [`MAX_ANY_VALUE_DEPTH`] so the leaf level

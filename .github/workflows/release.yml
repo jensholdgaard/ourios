@@ -235,12 +235,15 @@ jobs:
         # Download, verify against the pinned sha256, then run
         # (Scorecard PinnedDependencies, #366) — a compromised
         # upstream release asset must not execute in the release
-        # pipeline. bash for pipefail on the curl.
+        # pipeline. bash for `set -o pipefail` on the checksum pipe.
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf -o /tmp/cargo-cyclonedx-installer.sh \
+          set -o pipefail
+          installer="$(mktemp "$RUNNER_TEMP/cargo-cyclonedx-installer-XXXXXX.sh")"
+          curl --proto '=https' --tlsv1.2 -LsSf -o "$installer" \
             https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.5/cargo-cyclonedx-installer.sh
-          echo "20e61d50e5a3f305061809856e51a8853a880556c1d7b2a8ca723c3f3d81b11c  /tmp/cargo-cyclonedx-installer.sh" | sha256sum -c -
-          sh /tmp/cargo-cyclonedx-installer.sh
+          echo "20e61d50e5a3f305061809856e51a8853a880556c1d7b2a8ca723c3f3d81b11c  $installer" | sha256sum -c -
+          sh "$installer"
+          rm -f "$installer"
         shell: bash
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts

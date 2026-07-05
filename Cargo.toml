@@ -59,3 +59,8 @@ lto = "thin"
 # stepping through with a debugger.
 [profile.dev]
 debug = "line-tables-only"
+
+# `test` inherits `dev`, but state it explicitly so the lever can't
+# silently detach from the binaries it exists for.
+[profile.test]
+debug = "line-tables-only"

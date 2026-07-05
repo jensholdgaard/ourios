@@ -91,7 +91,10 @@ fn pre_records() -> Vec<MinedRecord> {
             separators: Vec::new(),
             body: Some(r#"{"intValue":"42"}"#.to_string()),
             confidence: 1.0,
-            lossy_flag: true,
+            // Always false for structured rows (RFC 0001 §6.1) —
+            // the body carries canonical JSON, reconstruction is
+            // defined.
+            lossy_flag: false,
         },
     ]
 }

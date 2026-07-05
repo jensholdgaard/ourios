@@ -166,6 +166,12 @@ pub enum BatchError {
         count: usize,
         source: ourios_core::otlp::canonical::CanonicalJsonError,
     },
+    /// A `body_kind = Absent` record carried body bytes. RFC 0025
+    /// §3.1 pins the on-disk contract as ordinal 2 **with a `NULL`
+    /// `body` cell**; silently writing the bytes would smuggle an
+    /// undefined state into the schema, so the writer rejects the
+    /// producer bug loudly.
+    NonNullBodyForAbsent,
     /// A clean-attach `body_kind = String` record had too few
     /// `separators` entries to satisfy the RFC 0005 §3.2
     /// invariant ("`tokens.len() + 1` elements when
@@ -233,6 +239,12 @@ impl fmt::Display for BatchError {
                  reconstruction path returns the retained body verbatim — without one, the \
                  record is unreconstructable on read",
             ),
+            Self::NonNullBodyForAbsent => write!(
+                f,
+                "body_kind = Absent record carries body bytes, but RFC 0025 §3.1 pins the \
+                 Absent on-disk contract as a NULL body cell — a producer bug, rejected \
+                 rather than written",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -243,7 +255,8 @@ impl std::error::Error for BatchError {
         match self {
             Self::TimestampOverflow { .. }
             | Self::InvalidSeparatorsForString { .. }
-            | Self::MissingBodyForLossyString => None,
+            | Self::MissingBodyForLossyString
+            | Self::NonNullBodyForAbsent => None,
             Self::AttributeEncode { source, .. } => Some(source),
             Self::Arrow(e) => Some(e),
         }
@@ -414,6 +427,9 @@ impl Builders {
         // is the retained line bytes on the §6.6 lossy path
         // (or `None` on the clean-attach path, reconstructed
         // from `template + params + separators` by the reader).
+        if r.body_kind == BodyKind::Absent && r.body.is_some() {
+            return Err(BatchError::NonNullBodyForAbsent);
+        }
         match r.body.as_deref() {
             Some(s) => self.body.append_value(s.as_bytes()),
             None => self.body.append_null(),
@@ -841,6 +857,21 @@ mod tests {
         assert!(
             batch.column(body_idx).is_null(0),
             "the body cell is NULL for Absent rows",
+        );
+    }
+
+    /// The §3.1 contract's other direction: an Absent record
+    /// carrying body bytes is a producer bug and must be rejected
+    /// loudly, never written.
+    #[test]
+    fn absent_body_kind_with_bytes_is_rejected() {
+        let mut rec = empty_record();
+        rec.body_kind = BodyKind::Absent;
+        rec.body = Some("stray bytes".to_string());
+        let err = mined_records_to_batch(&[rec]).expect_err("must reject");
+        assert!(
+            matches!(err, BatchError::NonNullBodyForAbsent),
+            "expected NonNullBodyForAbsent, got {err:?}",
         );
     }
 

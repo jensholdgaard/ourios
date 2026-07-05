@@ -43,6 +43,8 @@
 - [RFC 0023 — Bounded template memory](./rfcs/0023-bounded-template-memory.md)
 - [RFC 0024 — OTLP-envelope property testing](./rfcs/0024-otlp-envelope-property-testing.md)
 - [RFC 0025 — Absent-body representation](./rfcs/0025-absent-body-representation.md)
+- [RFC 0026 — Authentication & tenant binding](./rfcs/0026-authentication-tenant-binding.md)
+- [RFC 0027 — MCP query surface](./rfcs/0027-mcp-query-surface.md)
 
 # Talks
 

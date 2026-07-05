@@ -464,8 +464,21 @@ pub mod canonical {
     /// Inverse of [`av_to_json`]: a generic JSON tree → `AnyValue`, decoding
     /// the proto3 non-finite string forms; finite leaves delegate to
     /// `opentelemetry-proto`'s serde.
+    ///
+    /// Also accepts the two legal "no value" spellings —
+    /// `{}` (proto3 JSON for an unset `oneof`) and `null` — which
+    /// `opentelemetry-proto`'s deserializer rejects ("no known keys
+    /// found"). The wire can legally deliver an empty `AnyValue`
+    /// nested in arrays / kvlists, so the stored canonical bytes can
+    /// legally contain it; found by the RFC 0024 adversarial suite.
     fn json_to_av(j: &serde_json::Value) -> Result<AnyValue, serde_json::Error> {
+        if j.is_null() {
+            return Ok(AnyValue { value: None });
+        }
         if let Some(obj) = j.as_object() {
+            if obj.is_empty() {
+                return Ok(AnyValue { value: None });
+            }
             if let Some(serde_json::Value::String(s)) = obj.get("doubleValue") {
                 let d = match s.as_str() {
                     "NaN" => f64::NAN,
@@ -517,8 +530,11 @@ pub mod canonical {
             .ok_or_else(|| de_err("KeyValue.key must be a string"))?
             .to_string();
         let value = match obj.get("value") {
+            // `"value": null` is `opentelemetry-proto`'s spelling of
+            // an absent value (its serializer doesn't skip `None`) —
+            // absent and null are the same `KeyValue.value = None`.
+            None | Some(serde_json::Value::Null) => None,
             Some(v) => Some(json_to_av(v)?),
-            None => None,
         };
         Ok(KeyValue {
             key,
@@ -804,6 +820,69 @@ pub mod canonical {
                     "non-finite double round-trips: {x:?} -> {y:?}",
                 );
             }
+        }
+
+        /// The wire can legally deliver an empty `AnyValue` (proto3
+        /// `oneof` unset) nested anywhere, and `opentelemetry-proto`'s
+        /// serializer spells it `{}` (and an absent `KeyValue.value`
+        /// `null`) — both of which its own *de*serializer rejects.
+        /// The canonical decoder must accept its encoder's output for
+        /// every legal tree. Found by the RFC 0024 adversarial suite.
+        #[test]
+        fn empty_any_value_round_trips_at_every_nesting() {
+            let empty = AnyValue { value: None };
+            let in_array = AnyValue {
+                value: Some(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![empty.clone(), int_av(1)],
+                })),
+            };
+            let in_kvlist = AnyValue {
+                value: Some(any_value::Value::KvlistValue(KeyValueList {
+                    values: vec![
+                        KeyValue {
+                            key: "absent".to_string(),
+                            value: None,
+                            ..Default::default()
+                        },
+                        KeyValue {
+                            key: "empty".to_string(),
+                            value: Some(empty),
+                            ..Default::default()
+                        },
+                    ],
+                })),
+            };
+            for av in [in_array, in_kvlist] {
+                let bytes = encode_any_value(&av).expect("encode");
+                let back = decode_any_value(&bytes).expect("decode");
+                assert_eq!(
+                    av,
+                    back,
+                    "empty-value round-trip failed via {}",
+                    String::from_utf8_lossy(&bytes),
+                );
+            }
+        }
+
+        /// Attribute lists with absent and empty values round-trip at
+        /// the `attributes` / `resource_attributes` column boundary.
+        #[test]
+        fn attributes_with_absent_and_empty_values_round_trip() {
+            let attrs = vec![
+                KeyValue {
+                    key: "no.value".to_string(),
+                    value: None,
+                    ..Default::default()
+                },
+                KeyValue {
+                    key: "empty.value".to_string(),
+                    value: Some(AnyValue { value: None }),
+                    ..Default::default()
+                },
+            ];
+            let bytes = encode_attributes(&attrs).expect("encode");
+            let back = decode_attributes(&bytes).expect("decode");
+            assert_eq!(attrs, back);
         }
 
         /// Walks to the single double planted by the round-trip

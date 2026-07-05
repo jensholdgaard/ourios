@@ -71,6 +71,11 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# RFC 0024 §5 P1 round-trip (`tests/rfc0024_properties.rs`): generated
+# OTLP batches come from the dev-only generator crate and enter
+# through the real miner so the writer sees production-shaped rows.
+ourios-testgen = { path = "../ourios-testgen" }
+ourios-miner = { path = "../ourios-miner" }
 # RFC0021.4 view-representation test: cast a plain batch's string/binary
 # columns to Utf8View/BinaryView and prove the shared decoder reads both.
 arrow-cast = { version = "=58.3.0", default-features = false }

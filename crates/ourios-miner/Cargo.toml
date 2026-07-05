@@ -33,6 +33,9 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# RFC 0024 §5 pipeline properties (`tests/rfc0024_properties.rs`)
+# generate their OTLP batches from the dev-only generator crate.
+ourios-testgen = { path = "../ourios-testgen" }
 # `init_in_memory` collects the §6.8 instrument stream through an
 # in-memory reader (no OTLP endpoint) in the §3.1.2 / RFC0001.8 /
 # H2.2 telemetry tests — same pattern as the alias + compaction

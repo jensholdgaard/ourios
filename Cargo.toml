@@ -50,3 +50,12 @@ pedantic = { level = "warn", priority = -1 }
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Dev/test builds default to full DWARF debuginfo, which dominates link
+# time and target/ size across this workspace's many DataFusion-heavy
+# test binaries (the RFC 0023 scale-run follow-up measured the pain).
+# Line tables keep panic backtraces file:line-accurate — enough for the
+# test-driven flow here; flip back to `debug = true` locally when
+# stepping through with a debugger.
+[profile.dev]
+debug = "line-tables-only"

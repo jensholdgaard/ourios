@@ -166,16 +166,12 @@ pub enum BatchError {
         count: usize,
         source: ourios_core::otlp::canonical::CanonicalJsonError,
     },
-    /// A record carried [`BodyKind::Absent`] (the in-memory
-    /// "wire delivered no body" variant). RFC 0005 §3.2's
-    /// `body_kind` column pins exactly two ordinals (`0 = String,
-    /// 1 = Structured`); silently mapping `Absent` to one of
-    /// them would misclassify wire-absent rows. Until a future
-    /// RFC 0005 amendment either adds a third ordinal or adds a
-    /// separate `body_present` boolean column, the writer
-    /// rejects these records rather than corrupting the
-    /// `body_kind` semantics.
-    UnsupportedAbsentBody,
+    /// A `body_kind = Absent` record carried body bytes. RFC 0025
+    /// §3.1 pins the on-disk contract as ordinal 2 **with a `NULL`
+    /// `body` cell**; silently writing the bytes would smuggle an
+    /// undefined state into the schema, so the writer rejects the
+    /// producer bug loudly.
+    NonNullBodyForAbsent,
     /// A clean-attach `body_kind = String` record had too few
     /// `separators` entries to satisfy the RFC 0005 §3.2
     /// invariant ("`tokens.len() + 1` elements when
@@ -226,13 +222,6 @@ impl fmt::Display for BatchError {
                  `with-serde` derives are infallible on every spec-compliant `AnyValue`; \
                  this means an `opentelemetry-proto` upgrade broke that contract)",
             ),
-            Self::UnsupportedAbsentBody => write!(
-                f,
-                "record carries BodyKind::Absent (wire-absent body), which RFC 0005 §3.2's \
-                 body_kind column does not yet encode (the column pins ordinals 0=String, \
-                 1=Structured); a future RFC 0005 amendment is required to represent this \
-                 in the schema",
-            ),
             Self::InvalidSeparatorsForString {
                 expected_at_least,
                 actual,
@@ -250,6 +239,12 @@ impl fmt::Display for BatchError {
                  reconstruction path returns the retained body verbatim — without one, the \
                  record is unreconstructable on read",
             ),
+            Self::NonNullBodyForAbsent => write!(
+                f,
+                "body_kind = Absent record carries body bytes, but RFC 0025 §3.1 pins the \
+                 Absent on-disk contract as a NULL body cell — a producer bug, rejected \
+                 rather than written",
+            ),
             Self::Arrow(e) => write!(f, "arrow rejected RecordBatch: {e}"),
         }
     }
@@ -259,9 +254,9 @@ impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TimestampOverflow { .. }
-            | Self::UnsupportedAbsentBody
             | Self::InvalidSeparatorsForString { .. }
-            | Self::MissingBodyForLossyString => None,
+            | Self::MissingBodyForLossyString
+            | Self::NonNullBodyForAbsent => None,
             Self::AttributeEncode { source, .. } => Some(source),
             Self::Arrow(e) => Some(e),
         }
@@ -421,7 +416,7 @@ impl Builders {
         self.flags.append_value(r.flags);
         append_option_str(&mut self.event_name, r.event_name.as_deref());
 
-        self.body_kind.append_value(body_kind_ordinal(r.body_kind)?);
+        self.body_kind.append_value(body_kind_ordinal(r.body_kind));
         // RFC 0005 §3.3: when `body_kind = Structured`, the
         // body column carries Ourios-canonical JSON — the bytes
         // the miner has already encoded via
@@ -432,6 +427,9 @@ impl Builders {
         // is the retained line bytes on the §6.6 lossy path
         // (or `None` on the clean-attach path, reconstructed
         // from `template + params + separators` by the reader).
+        if r.body_kind == BodyKind::Absent && r.body.is_some() {
+            return Err(BatchError::NonNullBodyForAbsent);
+        }
         match r.body.as_deref() {
             Some(s) => self.body.append_value(s.as_bytes()),
             None => self.body.append_null(),
@@ -534,16 +532,14 @@ fn append_option_str(b: &mut StringBuilder, v: Option<&str>) {
 }
 
 /// Map an in-memory [`BodyKind`] to the §3.2 on-disk `body_kind`
-/// ordinal. The schema pins exactly two ordinals (`0 = String,
-/// 1 = Structured`); `BodyKind::Absent` has no on-disk
-/// representation today and the writer rejects records carrying
-/// it via [`BatchError::UnsupportedAbsentBody`] rather than
-/// silently misclassifying them.
-fn body_kind_ordinal(k: BodyKind) -> Result<u8, BatchError> {
+/// ordinal (`0 = String, 1 = Structured, 2 = Absent` — the third
+/// ordinal is the RFC 0025 §3.1 amendment; wire-absent rows carry a
+/// `NULL` body cell).
+fn body_kind_ordinal(k: BodyKind) -> u8 {
     match k {
-        BodyKind::String => Ok(0),
-        BodyKind::Structured => Ok(1),
-        BodyKind::Absent => Err(BatchError::UnsupportedAbsentBody),
+        BodyKind::String => 0,
+        BodyKind::Structured => 1,
+        BodyKind::Absent => 2,
     }
 }
 
@@ -840,18 +836,42 @@ mod tests {
         assert_eq!(stored.value(0), canonical.as_bytes());
     }
 
-    /// `BodyKind::Absent` is not representable in the §3.2
-    /// `body_kind` column today (the ordinals pin to
-    /// `0 = String, 1 = Structured`). The writer rejects such
-    /// records rather than silently lumping them with String.
+    /// RFC 0025 §3.1: `BodyKind::Absent` writes ordinal 2 with a
+    /// `NULL` body cell — the contract change that retired the old
+    /// `UnsupportedAbsentBody` rejection (approved via RFC 0025;
+    /// wire-absent bodies are spec-legal and must persist).
     #[test]
-    fn absent_body_kind_returns_unsupported_error() {
+    fn absent_body_kind_writes_ordinal_two_with_null_body() {
         let mut rec = empty_record();
         rec.body_kind = BodyKind::Absent;
-        let err = mined_records_to_batch(&[rec]).expect_err("Absent body must error");
+        rec.body = None;
+        let batch = mined_records_to_batch(&[rec]).expect("Absent body must write");
+        let kind_idx = batch.schema().index_of(crate::columns::BODY_KIND).unwrap();
+        let kinds = batch
+            .column(kind_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt8Array>()
+            .expect("body_kind is UInt8");
+        assert_eq!(kinds.value(0), 2, "Absent is ordinal 2 (RFC 0025 §3.1)");
+        let body_idx = batch.schema().index_of(crate::columns::BODY).unwrap();
         assert!(
-            matches!(err, BatchError::UnsupportedAbsentBody),
-            "expected UnsupportedAbsentBody, got {err:?}",
+            batch.column(body_idx).is_null(0),
+            "the body cell is NULL for Absent rows",
+        );
+    }
+
+    /// The §3.1 contract's other direction: an Absent record
+    /// carrying body bytes is a producer bug and must be rejected
+    /// loudly, never written.
+    #[test]
+    fn absent_body_kind_with_bytes_is_rejected() {
+        let mut rec = empty_record();
+        rec.body_kind = BodyKind::Absent;
+        rec.body = Some("stray bytes".to_string());
+        let err = mined_records_to_batch(&[rec]).expect_err("must reject");
+        assert!(
+            matches!(err, BatchError::NonNullBodyForAbsent),
+            "expected NonNullBodyForAbsent, got {err:?}",
         );
     }
 

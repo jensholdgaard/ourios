@@ -1153,10 +1153,10 @@ impl MinerCluster {
                 // record with `BodyKind::Absent` and the
                 // template-id sentinel; tokenize/mask didn't
                 // run, so there's no separator / param info to
-                // carry. `lossy_flag = true` because there is no
-                // template, so reconstruction is not possible.
-                let mut rec = Self::record_envelope(record, BodyKind::Absent);
-                rec.lossy_flag = true;
+                // carry. `lossy_flag = false` per RFC 0025 §3.1:
+                // absence is not loss — reconstruction is defined
+                // and total (it renders nothing).
+                let rec = Self::record_envelope(record, BodyKind::Absent);
                 self.emit_record(rec, service);
                 NO_TEMPLATE
             }
@@ -4331,7 +4331,10 @@ mod tests {
         assert_eq!(rec.tenant_id, t);
         assert_eq!(rec.template_id, NO_TEMPLATE);
         assert_eq!(rec.body_kind, BodyKind::Absent);
-        assert!(rec.lossy_flag, "Body::None records are lossy (no template)");
+        assert!(
+            !rec.lossy_flag,
+            "absence is not loss (RFC 0025 §3.1) — reconstruction renders nothing, exactly"
+        );
         assert!(rec.separators.is_empty());
         assert!(rec.params.is_empty());
         assert!(rec.body.is_none());

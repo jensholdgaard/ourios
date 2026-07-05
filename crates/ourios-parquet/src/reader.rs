@@ -682,9 +682,13 @@ fn decode_body_kind(ord: u8) -> Result<BodyKind, ReaderError> {
     match ord {
         0 => Ok(BodyKind::String),
         1 => Ok(BodyKind::Structured),
+        2 => Ok(BodyKind::Absent),
         other => Err(ReaderError::Conversion {
             column: columns::BODY_KIND,
-            detail: format!("unknown ordinal {other} (RFC 0005 §3.2 pins 0=String, 1=Structured)"),
+            detail: format!(
+                "unknown ordinal {other} (RFC 0005 §3.2 pins 0=String, 1=Structured, \
+                 2=Absent per RFC 0025)"
+            ),
         }),
     }
 }

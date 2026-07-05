@@ -78,7 +78,8 @@ fn fail(what: &str, e: impl std::fmt::Display) -> TestCaseError {
 /// Mine `batch`, store every writable row, read it back, and assert
 /// fidelity. Adversarial timestamps can exceed `i64::MAX`, which the
 /// writer *rejects by contract* (RFC 0005 §3.2 timestamp overflow) —
-/// those rows are asserted rejected, everything else must round-trip.
+/// those rows are asserted rejected, everything else (absent bodies
+/// included, per RFC 0025) must round-trip.
 fn assert_round_trip(batch: &[OtlpLogRecord]) -> Result<(), TestCaseError> {
     let sink = SharedRecordSink::new();
     let mut cluster =
@@ -97,24 +98,17 @@ fn assert_round_trip(batch: &[OtlpLogRecord]) -> Result<(), TestCaseError> {
     let mut groups: Vec<(PartitionKey, Vec<(usize, MinedRecord)>)> = Vec::new();
     let mut writable = vec![false; batch.len()];
     for (i, mined) in emitted.into_iter().enumerate() {
-        let absent_body = mined.body_kind == ourios_core::record::BodyKind::Absent;
         let ts_overflow = !fits_i64(mined.time_unix_nano)
             || mined.observed_time_unix_nano.is_some_and(|t| !fits_i64(t));
-        if absent_body || ts_overflow {
-            // - Absent body: KNOWN GAP (#362, found by this suite) —
-            //   no §3.2 on-disk representation until the RFC 0005
-            //   amendment lands; this arm then turns into a
-            //   round-trip.
-            // - Timestamp overflow: the §3.2 u64→i64 contract, on
-            //   *either* timestamp column.
-            // Both must be loud rejections, never silent drops.
+        if ts_overflow {
+            // Timestamp overflow: the §3.2 u64→i64 contract, on
+            // *either* timestamp column — the writer's one remaining
+            // documented loud rejection. (Absent bodies round-trip
+            // since RFC 0025 §3.1 gave them ordinal 2.)
             let err = mined_records_to_batch(std::slice::from_ref(&mined))
                 .expect_err("the writer must reject this record, not silently map it");
             prop_assert!(
-                matches!(
-                    err,
-                    BatchError::UnsupportedAbsentBody | BatchError::TimestampOverflow { .. }
-                ),
+                matches!(err, BatchError::TimestampOverflow { .. }),
                 "record {}: rejected for an undocumented reason: {}",
                 i,
                 err

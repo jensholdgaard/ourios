@@ -42,9 +42,10 @@ pub struct BuiltStore {
     /// Number of partition files written (one per `*.parquet`).
     pub files: u64,
     /// The **mined** `template_id` with the most rows (ties break to
-    /// the lowest id; `NO_TEMPLATE` is skipped unless nothing mined) —
-    /// a query for it is a true template-exact probe with a non-empty
-    /// result.
+    /// the lowest id) — a query for it is a true template-exact probe
+    /// with a non-empty result. When nothing was mined this falls back
+    /// to `NO_TEMPLATE` (`0` rows on an empty corpus), and neither
+    /// guarantee applies.
     pub busiest_template_id: u64,
     /// How many rows that busiest template has (the result size a
     /// `template_id = busiest_template_id` query returns).

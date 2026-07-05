@@ -7,7 +7,7 @@
 //! `.7` stays an `#[ignore]`d stub until the oracle green slice (the
 //! umbrella runs last).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ourios_bench::{TxtSeverity, extract_manifest};
 use ourios_testgen::manifest::{CalibrationAccumulator, ExactHistogram, Log2Histogram};
@@ -17,24 +17,28 @@ use proptest::test_runner::TestRunner;
 
 /// The OTLP/JSON fixture the extraction scenarios measure (4 records:
 /// 2× INFO, 1× WARN, 1× ERROR; 3 string bodies + 1 kvlist body).
-const OTLP_FIXTURE: &str = "tests/data/otlp";
+fn otlp_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/otlp")
+}
+
+/// The repo root, resolved from the crate dir (same pattern as
+/// `tests/a1.rs`) so the test is independent of the invocation cwd.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
 
 /// Scenario RFC0024.1 — calibration extraction.
 /// See `docs/rfcs/0024-otlp-envelope-property-testing.md` §5.
 #[test]
 fn rfc0024_1_calibration_extraction_is_deterministic() {
-    let first = extract_manifest(
-        Path::new(OTLP_FIXTURE),
-        "rfc0024-fixture",
-        TxtSeverity::Fixed,
-    )
-    .expect("extract");
-    let second = extract_manifest(
-        Path::new(OTLP_FIXTURE),
-        "rfc0024-fixture",
-        TxtSeverity::Fixed,
-    )
-    .expect("re-extract");
+    let first =
+        extract_manifest(&otlp_fixture(), "rfc0024-fixture", TxtSeverity::Fixed).expect("extract");
+    let second = extract_manifest(&otlp_fixture(), "rfc0024-fixture", TxtSeverity::Fixed)
+        .expect("re-extract");
     assert_eq!(
         first.to_json_bytes().expect("serialize"),
         second.to_json_bytes().expect("serialize"),
@@ -44,10 +48,10 @@ fn rfc0024_1_calibration_extraction_is_deterministic() {
 
     // The committed-alongside arm: the manifest checked in for the
     // in-repo seed corpus must match regeneration exactly.
-    let committed =
-        std::fs::read("../../testdata/calibration/seed.json").expect("committed seed manifest");
+    let committed = std::fs::read(repo_root().join("testdata/calibration/seed.json"))
+        .expect("committed seed manifest");
     let regenerated = extract_manifest(
-        Path::new("../../testdata/corpus"),
+        &repo_root().join("testdata/corpus"),
         "seed",
         TxtSeverity::Fixed,
     )
@@ -82,6 +86,8 @@ fn weighted_mean(pairs: impl Iterator<Item = (f64, u64)>) -> f64 {
     if n == 0.0 { 0.0 } else { sum / n }
 }
 
+// Same rationale as `weighted_mean`: counts are fixture / generation
+// sizes (≪ 2^52), so the u64 → f64 conversion is exact.
 #[allow(clippy::cast_precision_loss)]
 fn share(count: u64, total: u64) -> f64 {
     if total == 0 {
@@ -126,12 +132,8 @@ fn assert_share_close(
 fn rfc0024_2_calibrated_generators_match_manifest_moments() {
     const DRAWS: u64 = 2000;
 
-    let manifest = extract_manifest(
-        Path::new(OTLP_FIXTURE),
-        "rfc0024-fixture",
-        TxtSeverity::Fixed,
-    )
-    .expect("extract");
+    let manifest =
+        extract_manifest(&otlp_fixture(), "rfc0024-fixture", TxtSeverity::Fixed).expect("extract");
 
     let strategy = strategies::calibrated(&manifest);
     // A fixed-seed runner: the scenario pins generator *shape*, not

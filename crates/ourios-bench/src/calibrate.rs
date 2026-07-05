@@ -27,27 +27,27 @@ pub const CALIBRATION_DIR: &str = "testdata/calibration";
 ///
 /// # Errors
 ///
-/// - [`BenchError::Corpus`] if the directory is missing, empty, or a
-///   record fails to read/parse mid-stream.
+/// - [`BenchError::Corpus`] if the directory is missing, empty
+///   (no files, or files with no records — same semantics as the
+///   gate loaders), or a record fails to read/parse mid-stream.
 pub fn extract_manifest(
     corpus_dir: &Path,
     corpus_tag: &str,
     txt_severity: TxtSeverity,
 ) -> Result<CalibrationManifest, BenchError> {
     let (stream, meta) = corpus::stream(corpus_dir, txt_severity)?;
-    if meta.total_files == 0 {
-        return Err(BenchError::Corpus {
-            detail: format!(
-                "no corpus files under {} — nothing to calibrate",
-                corpus_dir.display(),
-            ),
-        });
-    }
     let mut accumulator = CalibrationAccumulator::new();
     for record in stream {
         accumulator.observe(&record?);
     }
-    Ok(accumulator.finish(corpus_tag))
+    let manifest = accumulator.finish(corpus_tag);
+    if manifest.records == 0 {
+        // Files full of blank lines stream zero records; a 0-record
+        // manifest can't shape a generator, so fail exactly like the
+        // eager loader's empty-corpus diagnostic.
+        return Err(corpus::no_lines_error(corpus_dir, meta.total_files));
+    }
+    Ok(manifest)
 }
 
 /// Write `manifest` in its committed-file form (deterministic pretty
@@ -72,4 +72,21 @@ pub fn write_manifest(manifest: &CalibrationManifest, out: &Path) -> Result<Path
         detail: format!("write {}: {e}", out.display()),
     })?;
     Ok(out.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A corpus that streams zero records (files exist, but only
+    /// blank lines) is rejected with the loaders' empty-corpus
+    /// diagnostic instead of producing a 0-record manifest.
+    #[test]
+    fn extract_manifest_rejects_a_recordless_corpus() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("blank.txt"), "\n\n\n").expect("write fixture");
+        let err = extract_manifest(dir.path(), "empty", TxtSeverity::Fixed)
+            .expect_err("blank-line corpus must not calibrate");
+        assert!(matches!(err, BenchError::Corpus { .. }), "got {err}");
+    }
 }

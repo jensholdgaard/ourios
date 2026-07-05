@@ -1,7 +1,7 @@
 ---
 rfc: 0024
 title: OTLP-envelope property testing and corpus-calibrated generation (RFC 0006 amendment)
-status: drafted
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -101,9 +101,13 @@ RFC 0003 equivalence suites already cover):
   timestamps, non-ASCII and confusable keys, text-heavy bodies past
   `max_line_tokens` (the Collector-fronted-legacy shape).
 
-Both modes share one strategy module (`ourios-bench` or a
-`testsupport` dev-only crate — settled at implementation time; no
-production crate grows a proptest dependency).
+Both modes live in **`crates/ourios-testgen`**, a dev-only crate (no
+production crate grows a proptest dependency; `ourios-bench` cannot
+host them because it already depends on `ourios-querier`, and the
+querier's P4 suite consuming generators from it would create a
+dev-dependency cycle). The crate is test infrastructure named by
+this RFC per `CLAUDE.md` §7's new-crate rule; it is never published
+and nothing in the workspace's production graph depends on it.
 
 ### 3.3 The four properties
 
@@ -203,10 +207,7 @@ querier: P4) so a failure lands at the responsible boundary.
 1. **Deep-run cadence.** A scheduled high-case-count run (nightly?
    weekly?) vs CI-only defaults — decide once the suite's wall-clock
    is known.
-2. **Generator home.** `ourios-bench` vs a dedicated dev-only
-   `testsupport` crate (a new crate needs the §7 layout rule
-   honoured — likely an RFC note, not a new top-level commitment).
-3. **Trace/metric envelopes.** Out of scope (logs backend), noted
+2. **Trace/metric envelopes.** Out of scope (logs backend), noted
    only because the demo capture contains correlated trace ids that
    generators should populate realistically.
 

@@ -126,7 +126,7 @@ Scenario ids `RFC0025.<m>`.
 
 > **Scenario RFC0025.1 — absent bodies round-trip.** Given a mined
 > `BodyKind::Absent` record, When it is written and read back, Then
-> every §3.2 column round-trips, `body` is `NULL`, and the RFC 0024
+> every RFC 0005 §3.2 column round-trips, `body` is `NULL`, and the RFC 0024
 > P1 suite's pinned-rejection arm for absent bodies is **replaced**
 > by round-trip assertion.
 

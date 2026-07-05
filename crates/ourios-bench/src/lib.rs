@@ -33,12 +33,14 @@ use std::path::PathBuf;
 mod a1;
 mod c1;
 mod c2;
+mod calibrate;
 mod corpus;
 mod harness;
 mod reference;
 mod report;
 mod store;
 
+pub use calibrate::{CALIBRATION_DIR, extract_manifest, write_manifest};
 pub use corpus::TxtSeverity;
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};

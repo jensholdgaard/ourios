@@ -31,6 +31,13 @@ ourios-parquet = { path = "../ourios-parquet" }
 # types directly (Rust's resolver requires explicit
 # declaration to import from an otherwise-transitive crate).
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
+# The RFC 0024 §3.1 calibration accumulator + manifest types the
+# `--calibrate` pass folds a corpus into. A regular dependency (the
+# binary path uses it), which pulls `proptest` into this crate's
+# build — acceptable here and only here: the bench harness is a
+# workspace leaf no production crate depends on, so the RFC 0024
+# "no production crate grows a proptest dependency" line holds.
+ourios-testgen = { path = "../ourios-testgen" }
 # CLI argument parsing for the §3.7 flag surface. `clap` is the
 # CNCF-Rust-observability standard (Vector, Quickwit,
 # OpenObserve, GreptimeDB all use it) — the Rust analogue to
@@ -58,6 +65,10 @@ zstd = "0.13"
 tempfile = "3"
 
 [dev-dependencies]
+# RFC0024.2 draws calibrated records through a fixed-seed
+# `TestRunner` (the strategies come from `ourios-testgen`, already a
+# regular dependency above).
+proptest = "=1.11.0"
 # B2 latency bench (RFC 0007 §6 — supportive, non-gating evidence
 # for the RFC0007.2 thesis gate that ourios-querier proves
 # structurally). criterion gives warmup + a statistical median,

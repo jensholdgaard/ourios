@@ -1,7 +1,7 @@
 ---
 rfc: 0025
 title: Absent-body representation and permanent-encode-error quarantine (RFC 0005 amendment)
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05

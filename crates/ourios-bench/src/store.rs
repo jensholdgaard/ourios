@@ -18,6 +18,8 @@ use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
 use ourios_core::record::MinedRecord;
 use ourios_parquet::{PartitionKey, Writer};
 
+use ourios_miner::cluster::NO_TEMPLATE;
+
 use crate::reference::ReferenceCorpus;
 use crate::{BenchError, corpus, harness};
 
@@ -39,8 +41,11 @@ pub struct BuiltStore {
     pub rows: u64,
     /// Number of partition files written (one per `*.parquet`).
     pub files: u64,
-    /// The `template_id` with the most rows — a query for it is
-    /// guaranteed to return a non-empty, representative result.
+    /// The **mined** `template_id` with the most rows (ties break to
+    /// the lowest id) — a query for it is a true template-exact probe
+    /// with a non-empty result. When nothing was mined this falls back
+    /// to `NO_TEMPLATE` (`0` rows on an empty corpus), and neither
+    /// guarantee applies.
     pub busiest_template_id: u64,
     /// How many rows that busiest template has (the result size a
     /// `template_id = busiest_template_id` query returns).
@@ -90,8 +95,24 @@ pub fn build_query_store(
         },
     )?;
 
-    let (busiest_template_id, busiest_template_rows) =
-        counts.into_iter().max_by_key(|&(_, n)| n).unwrap_or((0, 0));
+    // The busiest *mined* template: NO_TEMPLATE (the §6.3
+    // parse-failure class) is not a template, and on fragmentation-heavy
+    // corpora it dominates row counts — picking it would make the B2
+    // "template-exact" arm measure a body-class count instead (the
+    // §9.11 finding). Fall back to it only when nothing mined at all.
+    // Ties break toward the lowest id: HashMap iteration order is
+    // randomized, and the picked id forms the B2 query — RFC0006.7's
+    // bit-identical reruns need a deterministic choice.
+    let busiest = |skip_sentinel: bool| {
+        counts
+            .iter()
+            .filter(|&(&id, _)| !skip_sentinel || id != NO_TEMPLATE)
+            .map(|(&id, &n)| (id, n))
+            .max_by_key(|&(id, n)| (n, std::cmp::Reverse(id)))
+    };
+    let (busiest_template_id, busiest_template_rows) = busiest(true)
+        .or_else(|| busiest(false))
+        .unwrap_or((NO_TEMPLATE, 0));
 
     Ok(BuiltStore {
         tenant: crate::corpus::BENCH_TENANT,
@@ -803,6 +824,43 @@ mod tests {
             Some(("ERROR".to_string(), 1)),
             "the error band yields the B1 predicate with its row count",
         );
+    }
+
+    /// The busiest-template picker skips `NO_TEMPLATE` (id 0): on a
+    /// parse-failure-heavy corpus the B2 arm must measure a real
+    /// template-exact query, not a body-class count (the §9.11
+    /// finding). Three over-long lines (past the RFC 0023 default
+    /// `max_line_tokens`) land in the id-0 class and outnumber the
+    /// two mined rows — the picker must still return the mined
+    /// template.
+    #[test]
+    fn busiest_template_picker_skips_no_template() {
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        // One token past the configured cap, whatever it is.
+        let over_cap = usize::from(ourios_core::config::MinerConfig::default().max_line_tokens) + 1;
+        let long = |seed: usize| {
+            (0..over_cap)
+                .map(|i| format!("t{}", i * seed))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let text = format!(
+            "{}\n{}\n{}\nuser 42 in\nuser 43 in\n",
+            long(1),
+            long(2),
+            long(3)
+        );
+        std::fs::write(corpus.path().join("c.txt"), text).expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built = build_query_store(corpus.path(), bucket.path(), corpus::TxtSeverity::Fixed)
+            .expect("build");
+        assert_eq!(built.rows, 5, "all five lines stored (id-0 rows included)");
+        assert_ne!(
+            built.busiest_template_id, NO_TEMPLATE,
+            "the picker must return a mined template even when NO_TEMPLATE rows dominate",
+        );
+        assert_eq!(built.busiest_template_rows, 2, "the user-in template");
     }
 
     /// When no record carries a non-zero `time_unix_nano` (an OTLP/JSON

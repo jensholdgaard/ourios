@@ -179,6 +179,12 @@ proptest! {
 
         for (i, record) in batch.iter().enumerate() {
             let id = cluster.ingest(record);
+            // Deliberately `templates_for` (leaves), not
+            // `template_count` (leaves + structured entries):
+            // RFC 0023 §3.1 bound 2 is a ceiling on Drain-tree
+            // *leaves* — `at_template_ceiling` gates on `leaf_count`,
+            // which only `create_new_leaf` increments; structured
+            // templates are outside the bound by design.
             prop_assert!(
                 cluster.templates_for(&tenant).len() <= CEILING as usize,
                 "record {}: leaf count exceeded the ceiling mid-stream",

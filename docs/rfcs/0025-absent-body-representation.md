@@ -1,7 +1,7 @@
 ---
 rfc: 0025
 title: Absent-body representation and permanent-encode-error quarantine (RFC 0005 amendment)
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -122,12 +122,45 @@ the alternative is the wedge.
 
 ## 5. Acceptance criteria
 
-Written at the `specified` gate (docs/rfcs/README.md lifecycle).
-Proposed scenarios await maintainer sign-off in the drafting PR.
+Scenario ids `RFC0025.<m>`.
+
+> **Scenario RFC0025.1 — absent bodies round-trip.** Given a mined
+> `BodyKind::Absent` record, When it is written and read back, Then
+> every RFC 0005 §3.2 column round-trips, `body` is `NULL`, and the RFC 0024
+> P1 suite's pinned-rejection arm for absent bodies is **replaced**
+> by round-trip assertion.
+
+> **Scenario RFC0025.2 — old files unaffected.** Given a
+> pre-amendment file, When read by the amended reader, Then results
+> are identical to the prior reader (committed-fixture parity, the
+> RFC 0021 §6 discipline).
+
+> **Scenario RFC0025.3 — rendering distinguishes absent from
+> empty.** Given one row with `body = ""` and one with
+> `body_kind = Absent`, When both are rendered through the query
+> path, Then the empty-string row carries `""` and the absent row
+> carries no body field.
+
+> **Scenario RFC0025.4 — the sink no longer wedges.** Given a
+> buffer containing an absent-body record (pre-amendment encoder
+> simulated) or a timestamp-overflow record, When flush runs, Then
+> the healthy records persist, the poisoned record is quarantined to
+> the audit stream with a `record_quarantined` event, and subsequent
+> flushes of the partition succeed.
+
+> **Scenario RFC0025.5 — quarantine telemetry.** Given a quarantine,
+> Then the existing flush-error counter increments with
+> `error.type` set to the `BatchError` variant, and no new metric
+> name is introduced.
 
 ## 6. Testing strategy
 
-Follows §5 at the `specified` gate.
+RFC0025.1/.3 as integration tests in `ourios-parquet` /
+`ourios-querier`; RFC0025.2 via the committed pre-amendment fixture;
+RFC0025.4/.5 in `ourios-ingester` (the quarantine path is
+deterministic — no property machinery needed, though the RFC 0024
+adversarial umbrella inherits coverage automatically once the P1 arm
+flips).
 
 ## 7. Open questions
 

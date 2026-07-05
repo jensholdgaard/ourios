@@ -1,7 +1,7 @@
 ---
 rfc: 0024
 title: OTLP-envelope property testing and corpus-calibrated generation (RFC 0006 amendment)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05

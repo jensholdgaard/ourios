@@ -3055,6 +3055,7 @@ dependencies = [
  "ourios-core",
  "ourios-miner",
  "ourios-parquet",
+ "ourios-testgen",
  "parquet",
  "percent-encoding",
  "proptest",

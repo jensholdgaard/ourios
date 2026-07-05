@@ -216,13 +216,211 @@ fn rfc0024_2_calibrated_generators_match_manifest_moments() {
     }
 }
 
-/// Scenario RFC0024.7 — adversarial mode finds nothing today.
-/// See `docs/rfcs/0024-otlp-envelope-property-testing.md` §5.
-#[test]
-#[ignore = "RFC0024.7 stub — implemented in the oracle green slice (the umbrella runs last)"]
-fn rfc0024_7_adversarial_mode_passes_the_full_property_set() {
-    todo!(
-        "RFC0024.7 — P1-P4 pass at an elevated case count on the adversarial \
-         generators; any failure is a minimal reproducer by construction"
-    );
+// ---- RFC0024.7 — the adversarial umbrella ---------------------------
+//
+// One end-to-end harness per case: mine (P2 fidelity) → write / read
+// (P1 equality) → query vs the naive oracle (P4) → a second stream
+// under tiny RFC 0023 bounds (P3). The per-property suites in the
+// owning crates carry the fine-grained assertions; the umbrella's job
+// is the *composition* at an elevated case count, adversarial mode
+// only — any failure here shrinks to a minimal reproducer by
+// construction.
+
+mod umbrella {
+    use std::collections::HashMap;
+
+    use ourios_core::config::MinerConfig;
+    use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
+    use ourios_core::record::{BodyKind, MinedRecord, SharedRecordSink};
+    use ourios_core::tenant::TenantId;
+    use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
+    use ourios_miner::reconstruct::reconstruct;
+    use ourios_miner::tree::OwnedToken;
+    use ourios_parquet::{PartitionKey, Reader, Writer};
+    use ourios_testgen::strategies;
+    use proptest::prelude::*;
+    use tempfile::TempDir;
+
+    const NOW: u64 = strategies::TIME_BASE_UNIX_NANO + 24 * 3_600_000_000_000;
+    const WINDOW_NS: u64 = 30 * 24 * 3_600_000_000_000;
+
+    fn fail(what: &str, e: impl std::fmt::Display) -> TestCaseError {
+        TestCaseError::fail(format!("{what}: {e}"))
+    }
+
+    fn effective(r: &MinedRecord) -> u64 {
+        if r.time_unix_nano != 0 {
+            r.time_unix_nano
+        } else {
+            r.observed_time_unix_nano.unwrap_or(0)
+        }
+    }
+
+    fn writable(r: &MinedRecord) -> bool {
+        r.body_kind != BodyKind::Absent
+            && i64::try_from(r.time_unix_nano).is_ok()
+            && r.observed_time_unix_nano
+                .is_none_or(|t| i64::try_from(t).is_ok())
+    }
+
+    /// P2: every emitted row renders back to its own record's body.
+    fn assert_fidelity(
+        batch: &[OtlpLogRecord],
+        emitted: &[MinedRecord],
+        templates: &HashMap<u64, Vec<OwnedToken>>,
+    ) -> Result<(), TestCaseError> {
+        let no_template: Vec<OwnedToken> = Vec::new();
+        for (i, (original, mined)) in batch.iter().zip(emitted).enumerate() {
+            let template = templates.get(&mined.template_id).unwrap_or(&no_template);
+            let rebuilt = reconstruct(mined, template);
+            match &original.body {
+                Some(Body::String(s)) => {
+                    prop_assert_eq!(rebuilt.as_slice(), s.as_bytes(), "record {} body", i);
+                }
+                Some(Body::Structured(av)) => {
+                    let back = canonical::decode_any_value(&rebuilt)
+                        .map_err(|e| fail(&format!("record {i} structured decode"), e))?;
+                    prop_assert_eq!(&back, av, "record {} structured body", i);
+                }
+                None => prop_assert!(rebuilt.is_empty(), "record {} absent body", i),
+            }
+        }
+        Ok(())
+    }
+
+    /// P1: writable rows round-trip storage struct-equal. Returns the
+    /// bucket (kept alive) and the stored rows.
+    fn assert_storage_round_trip(rows: &[MinedRecord]) -> Result<TempDir, TestCaseError> {
+        let bucket = TempDir::new().map_err(|e| fail("temp dir", e))?;
+        let mut groups: Vec<(PartitionKey, Vec<MinedRecord>)> = Vec::new();
+        for r in rows {
+            let key = PartitionKey::derive(r).map_err(|e| fail("derive", e))?;
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => v.push(r.clone()),
+                None => groups.push((key, vec![r.clone()])),
+            }
+        }
+        for (key, originals) in groups {
+            let mut w =
+                Writer::open(bucket.path(), key.clone()).map_err(|e| fail("open writer", e))?;
+            w.append_records(&originals)
+                .map_err(|e| fail("append", e))?;
+            let written = w.close().map_err(|e| fail("close", e))?;
+            let back = Reader::open_partition(&written.path, key)
+                .map_err(|e| fail("open_partition", e))?
+                .read_all()
+                .map_err(|e| fail("read_all", e))?;
+            prop_assert_eq!(&back, &originals, "storage round-trip");
+        }
+        Ok(bucket)
+    }
+
+    /// P4-composition: three fixed-shape queries vs the naive oracle.
+    fn assert_query_oracle(bucket: &TempDir, rows: &[MinedRecord]) -> Result<(), TestCaseError> {
+        let querier = ourios_querier::Querier::new(bucket.path());
+        let tenant = TenantId::new(strategies::TESTGEN_TENANT);
+        let aliases = ourios_core::alias::AliasMap::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| fail("runtime", e))?;
+
+        let mut probes = vec![
+            (
+                "severity >= 17".to_string(),
+                Box::new(|r: &MinedRecord| r.severity_number >= 17)
+                    as Box<dyn Fn(&MinedRecord) -> bool>,
+            ),
+            (
+                "severity >= 0".to_string(),
+                Box::new(|_: &MinedRecord| true),
+            ),
+        ];
+        if let Some(r) = rows.iter().find(|r| r.template_id != NO_TEMPLATE) {
+            let id = r.template_id;
+            probes.push((
+                format!("template_id == {id}"),
+                Box::new(move |r: &MinedRecord| r.template_id == id),
+            ));
+        }
+        for (dsl, pred) in probes {
+            let expected = rows
+                .iter()
+                .filter(|r| {
+                    let t = effective(r);
+                    (NOW - WINDOW_NS..NOW).contains(&t) && pred(r)
+                })
+                .count() as u64;
+            let query =
+                ourios_querier::dsl::parse(&dsl).map_err(|e| fail(&format!("parse `{dsl}`"), e))?;
+            let got = runtime
+                .block_on(querier.run_query(&query, &tenant, NOW, WINDOW_NS, Some(&aliases)))
+                .map_err(|e| fail(&format!("run `{dsl}`"), e))?
+                .rows;
+            prop_assert_eq!(got, expected, "oracle disagreement on `{}`", dsl);
+        }
+        Ok(())
+    }
+
+    /// P3: a second stream under tiny bounds — ceiling holds
+    /// mid-stream, over-long lines divert.
+    fn assert_bounds(batch: &[OtlpLogRecord]) -> Result<(), TestCaseError> {
+        let config = MinerConfig::default()
+            .with_max_templates(3)
+            .expect("non-zero")
+            .with_max_node_children(2)
+            .expect("non-zero")
+            .with_max_line_tokens(8)
+            .expect("non-zero");
+        let mut cluster = MinerCluster::new(config);
+        let tenant = TenantId::new(strategies::TESTGEN_TENANT);
+        for (i, record) in batch.iter().enumerate() {
+            let id = cluster.ingest(record);
+            prop_assert!(
+                cluster.templates_for(&tenant).len() <= 3,
+                "record {}: ceiling breached",
+                i
+            );
+            if let Some(Body::String(s)) = &record.body
+                && s.split_whitespace().count() > 8
+            {
+                prop_assert_eq!(id, NO_TEMPLATE, "record {}: over-long line attached", i);
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// Scenario RFC0024.7 — adversarial mode finds nothing today.
+        /// See `docs/rfcs/0024-otlp-envelope-property-testing.md` §5.
+        #[test]
+        fn rfc0024_7_adversarial_mode_passes_the_full_property_set(
+            batch in proptest::collection::vec(strategies::adversarial(), 1..16),
+        ) {
+            let sink = SharedRecordSink::new();
+            let mut cluster = MinerCluster::new(MinerConfig::default())
+                .with_record_sink(Box::new(sink.clone()));
+            for record in &batch {
+                cluster.ingest(record);
+            }
+            let emitted = sink.drain();
+            prop_assert_eq!(emitted.len(), batch.len());
+
+            let tenant = TenantId::new(strategies::TESTGEN_TENANT);
+            let templates: HashMap<u64, Vec<OwnedToken>> = cluster
+                .templates_for(&tenant)
+                .into_iter()
+                .map(|leaf| (leaf.template_id, leaf.template))
+                .collect();
+
+            assert_fidelity(&batch, &emitted, &templates)?;
+            let stored: Vec<MinedRecord> =
+                emitted.into_iter().filter(writable).collect();
+            let bucket = assert_storage_round_trip(&stored)?;
+            assert_query_oracle(&bucket, &stored)?;
+            assert_bounds(&batch)?;
+        }
+    }
 }

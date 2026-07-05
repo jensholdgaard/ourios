@@ -1,0 +1,44 @@
+name: RFC 0024 deep run
+
+# Elevated-case-count run of the RFC 0024 property suites (the §7
+# "deep-run cadence" open question, resolved as: weekly + on-demand).
+# CI runs proptest defaults on every PR; this cranks PROPTEST_CASES an
+# order of magnitude so the adversarial generators keep probing the
+# envelope between corpus releases. Any failure shrinks to a minimal
+# reproducer and its persistence file becomes a committed regression.
+#
+# Deliberately NOT on `pull_request` (same policy as fuzz.yml): the
+# elevated run is tens of minutes, too heavy for per-change CI.
+on:
+  schedule:
+    - cron: "43 3 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  deep-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run the RFC 0024 suites at 10× cases
+        env:
+          PROPTEST_CASES: "512"
+        run: |
+          cargo test -p ourios-testgen --release
+          cargo test -p ourios-miner   --release --test rfc0024_properties
+          cargo test -p ourios-parquet --release --test rfc0024_properties
+          cargo test -p ourios-querier --release --test rfc0024_properties
+          cargo test -p ourios-bench   --release --test rfc0024_calibration

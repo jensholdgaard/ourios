@@ -604,7 +604,7 @@ mod tests {
         check: impl Fn(S::Value) -> Result<(), proptest::test_runner::TestCaseError>,
     ) {
         let mut runner = TestRunner::new(Config {
-            cases,
+            cases: crate::proptest_cases(cases),
             ..Config::default()
         });
         runner.run(strategy, check).unwrap();

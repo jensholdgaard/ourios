@@ -248,7 +248,7 @@ fn harvested_preds(rows: &[MinedRecord]) -> Vec<Pred> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: ourios_testgen::proptest_cases(12), ..ProptestConfig::default() })]
 
     /// Scenario RFC0024.6 — P4: the query oracle.
     /// See `docs/rfcs/0024-otlp-envelope-property-testing.md` §5.

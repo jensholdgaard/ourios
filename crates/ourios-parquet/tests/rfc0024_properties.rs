@@ -197,7 +197,7 @@ fn assert_round_trip(batch: &[OtlpLogRecord]) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: ourios_testgen::proptest_cases(16), ..ProptestConfig::default() })]
 
     /// Scenario RFC0024.3 — P1: round-trip fidelity over generated
     /// batches, both modes.

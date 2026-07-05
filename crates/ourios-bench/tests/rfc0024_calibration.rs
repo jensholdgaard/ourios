@@ -390,7 +390,7 @@ mod umbrella {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { cases: ourios_testgen::proptest_cases(48), ..ProptestConfig::default() })]
 
         /// Scenario RFC0024.7 — adversarial mode finds nothing today.
         /// See `docs/rfcs/0024-otlp-envelope-property-testing.md` §5.

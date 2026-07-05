@@ -138,7 +138,7 @@ fn assert_no_silent_merge(batch: &[OtlpLogRecord]) -> Result<(), TestCaseError> 
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: ourios_testgen::proptest_cases(24), ..ProptestConfig::default() })]
 
     /// Scenario RFC0024.4 — P2: no silent merge over generated
     /// batches, both modes.

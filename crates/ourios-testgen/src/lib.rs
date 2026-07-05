@@ -20,3 +20,17 @@
 
 pub mod manifest;
 pub mod strategies;
+
+/// Per-suite proptest case count: `base` (the suite's tuned CI
+/// default) unless `PROPTEST_CASES` is set, which wins. proptest's
+/// own env handling feeds `ProptestConfig::default()`, but an
+/// explicit `cases:` field overrides it — so suites that tune their
+/// base count would silently ignore the deep run's elevated setting
+/// without this hook (`.github/workflows/rfc0024-deep-run.yml`).
+#[must_use]
+pub fn proptest_cases(base: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(base)
+}

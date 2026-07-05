@@ -321,7 +321,6 @@ mod umbrella {
         let tenant = TenantId::new(strategies::TESTGEN_TENANT);
         let aliases = ourios_core::alias::AliasMap::new();
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
             .build()
             .map_err(|e| fail("runtime", e))?;
 

@@ -129,7 +129,9 @@ impl Pred {
     }
 
     /// The window this predicate's query runs under (`resolve_window`
-    /// semantics: the `range` stage wins, otherwise `[now - W, now]`).
+    /// picks the bounds — the `range` stage wins, otherwise the
+    /// default lookback — and the compiled filter applies them
+    /// half-open: `[start, end)`).
     fn window(&self) -> (u64, u64) {
         match self {
             Self::Window { hours_back } => (NOW - u64::from(*hours_back) * 3_600_000_000_000, NOW),
@@ -276,7 +278,6 @@ proptest! {
         let querier = Querier::new(bucket.path());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
             .build()
             .expect("runtime");
         for pred in preds.iter().chain(harvested_preds(&rows).iter()) {

@@ -92,12 +92,33 @@ struct Cli {
     #[arg(long)]
     calibrate: bool,
     /// The corpus release the manifest summarises (its committed
-    /// file name and embedded `corpus_tag`).
-    #[arg(long, requires = "calibrate", required_if_eq("calibrate", "true"))]
+    /// file name and embedded `corpus_tag`). A single path
+    /// component — the tag names a file under the calibration dir,
+    /// so separators and `..` are rejected.
+    #[arg(long, requires = "calibrate", required_if_eq("calibrate", "true"),
+          value_parser = parse_corpus_tag)]
     corpus_tag: Option<String>,
     /// Manifest output path override.
     #[arg(long, requires = "calibrate")]
     calibration_out: Option<PathBuf>,
+}
+
+/// clap value parser for `--corpus-tag`: one normal path component
+/// (letters, digits, `-`, `_`, `.`; not `.`/`..`), because the tag
+/// becomes the manifest's file name under the calibration dir.
+fn parse_corpus_tag(s: &str) -> Result<String, String> {
+    let valid = !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if valid {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "{s:?} is not a valid corpus tag (letters, digits, '-', '_', '.' only)"
+        ))
+    }
 }
 
 /// One thesis gate, as named on the `--gates` flag.
@@ -414,6 +435,21 @@ mod tests {
             orphan_out.is_err(),
             "--calibration-out without --calibrate is a usage error"
         );
+
+        // The tag becomes a file name under the calibration dir —
+        // separators / traversal must be a usage error, not an escape.
+        for bad in ["../evil", "a/b", "..", ".", ""] {
+            let err = Cli::try_parse_from(["ourios-bench", "--calibrate", "--corpus-tag", bad]);
+            assert!(err.is_err(), "corpus tag {bad:?} must be rejected");
+        }
+        let dotted = Cli::try_parse_from([
+            "ourios-bench",
+            "--calibrate",
+            "--corpus-tag",
+            "otel-demo-v7.1",
+        ])
+        .expect("dotted release tags parse");
+        assert_eq!(dotted.corpus_tag.as_deref(), Some("otel-demo-v7.1"));
     }
 
     /// `--keep-parquet` requires `--bucket-dir` at the clap

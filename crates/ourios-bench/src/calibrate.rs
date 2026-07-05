@@ -17,9 +17,10 @@ use ourios_testgen::manifest::{CalibrationAccumulator, CalibrationManifest};
 use crate::BenchError;
 use crate::corpus::{self, TxtSeverity};
 
-/// Where committed manifests live, relative to the repo root —
-/// `--calibrate` defaults its output to
-/// `<CALIBRATION_DIR>/<corpus-tag>.json`.
+/// Where committed manifests live. Resolved against the invocation
+/// directory — run from the repo root (the `just` recipes do), it is
+/// the committed `testdata/calibration/`; `--calibrate` defaults its
+/// output to `<CALIBRATION_DIR>/<corpus-tag>.json`.
 pub const CALIBRATION_DIR: &str = "testdata/calibration";
 
 /// Stream the corpus at `corpus_dir` and measure it into a

@@ -1,6 +1,7 @@
 //! RFC 0024 §5 — the miner-owned pipeline properties: P2 (no silent
 //! merge, `.4`) and P3 (RFC 0023 bounds, `.5`) over generated OTLP
-//! batches from `ourios-testgen`. See
+//! batches from `ourios-testgen` (the dev-only
+//! generator crate the calibration green slice introduces). See
 //! `crates/ourios-bench/tests/rfc0024_calibration.rs` for the scenario
 //! placement map.
 

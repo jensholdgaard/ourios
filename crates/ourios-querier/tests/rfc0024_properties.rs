@@ -1,6 +1,7 @@
 //! RFC 0024 §5 — the querier-owned pipeline property: P4 (the query
 //! oracle, `.6`) over generated OTLP batches and generated predicates
-//! from `ourios-testgen`. See
+//! from `ourios-testgen` (the dev-only
+//! generator crate the calibration green slice introduces). See
 //! `crates/ourios-bench/tests/rfc0024_calibration.rs` for the scenario
 //! placement map.
 

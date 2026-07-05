@@ -1,5 +1,6 @@
 //! RFC 0024 §5 — the storage-owned pipeline property: P1 (round-trip
-//! fidelity, `.3`) over generated OTLP batches from `ourios-testgen`.
+//! fidelity, `.3`) over generated OTLP batches from `ourios-testgen` (the dev-only
+//! generator crate the calibration green slice introduces).
 //! See `crates/ourios-bench/tests/rfc0024_calibration.rs` for the
 //! scenario placement map.
 

@@ -101,7 +101,8 @@ RFC 0003 equivalence suites already cover):
   timestamps, non-ASCII and confusable keys, text-heavy bodies past
   `max_line_tokens` (the Collector-fronted-legacy shape).
 
-Both modes live in **`crates/ourios-testgen`**, a dev-only crate (no
+Both modes live in **`crates/ourios-testgen`**, a dev-only crate
+introduced by the calibration green slice (no
 production crate grows a proptest dependency; `ourios-bench` cannot
 host them because it already depends on `ourios-querier`, and the
 querier's P4 suite consuming generators from it would create a

@@ -1,0 +1,61 @@
+{
+  "corpus_tag": "otel-demo-v7",
+  "records": 609113,
+  "log_attribute_count": {
+    "0": 121291,
+    "1": 189659,
+    "2": 96154,
+    "3": 101677,
+    "4": 50168,
+    "7": 50164
+  },
+  "resource_attribute_count": {
+    "6": 146353,
+    "7": 50168,
+    "10": 287811,
+    "13": 9402,
+    "21": 115379
+  },
+  "body_kind": {
+    "string": 609113,
+    "structured": 0,
+    "absent": 0
+  },
+  "string_body_len": {
+    "4": 33843,
+    "5": 115319,
+    "6": 236800,
+    "7": 217294,
+    "8": 5304,
+    "9": 553
+  },
+  "severity": [
+    {
+      "number": 9,
+      "text": "INFO",
+      "count": 316598
+    },
+    {
+      "number": 9,
+      "text": "Information",
+      "count": 287811
+    },
+    {
+      "number": 13,
+      "text": "WARN",
+      "count": 4704
+    }
+  ],
+  "any_value_shapes": {
+    "empty": 0,
+    "string": 7514453,
+    "int": 276622,
+    "double": 0,
+    "boolean": 100332,
+    "bytes": 0,
+    "array": 9402,
+    "kvlist": 0
+  },
+  "any_value_max_depth": 2,
+  "distinct_attribute_keys": 39
+}

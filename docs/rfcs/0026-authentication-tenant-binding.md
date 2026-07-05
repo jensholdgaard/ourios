@@ -105,14 +105,20 @@ auth:
 
 ### 3.3 Query enforcement (RFC 0016 amendment)
 
-- The HTTP query API requires the same bearer scheme;
-  `x-ourios-tenant` (unchanged as the tenant selector) must fall in
-  the token's set, else 403.
+- The HTTP query API requires the same bearer scheme. Status
+  contract: missing/unknown bearer ⇒ 401; missing or empty
+  `x-ourios-tenant` ⇒ 400 (today's contract, unchanged — the header
+  stays the tenant selector); a well-formed tenant outside the
+  token's set ⇒ 403.
 - Enforcement composes with — never replaces — the structural
   scoping: the querier still roots every scan under the tenant's
-  partition directory (RFC0007.5). Authz is a gate in front of an
-  already-scoped read path, so an authz bug degrades to today's
-  behavior, not to cross-tenant reads.
+  partition directory (RFC0007.5). The failure bound is worth
+  stating precisely: a fail-open authz bug would re-open the
+  pre-RFC exposure (any tenant selectable by header for an
+  authenticated caller) — a real regression — but the structural
+  scoping still confines each request to the single tenant it
+  names; no bug in this layer yields cross-tenant reads within one
+  query or unscoped scans.
 
 ### 3.4 Telemetry and audit
 

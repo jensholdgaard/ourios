@@ -70,7 +70,7 @@ it must not ship ahead of query-side authentication.
 | --- | --- | --- |
 | `query_logs` | RFC 0002 DSL via the RFC 0016 path | args: `tenant`, `query` (DSL string), optional `limit`; returns count + up to `limit` rendered rows + pruning stats |
 | `list_templates` | RFC 0017 registry | args: `tenant`; returns `(template_id, rendered_template, version)` rows — the corpus's shape at a glance |
-| `template_drift` | RFC 0010 drift surface | args: `tenant`, `from`, `to`; the audit-stream drift analysis |
+| `template_drift` | RFC 0010 drift surface | args: `tenant`, `from`, `to`; the audit-stream drift analysis over the half-open window `[from, to)` (RFC0010.2's boundary rule, inherited verbatim) |
 
 Plus one **resource**: the DSL grammar/reference doc, served
 verbatim so agents learn the query language from the protocol

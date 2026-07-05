@@ -305,16 +305,27 @@ fn calibrated_leaf(shapes: &AnyValueShapes) -> BoxedStrategy<AnyValue> {
 fn calibrated_structured_body(shapes: &AnyValueShapes) -> BoxedStrategy<Body> {
     let leaf = calibrated_leaf(shapes);
     let mut arms: Vec<(u32, BoxedStrategy<AnyValue>)> = Vec::new();
-    let scalar_weight = shapes.int + shapes.double + shapes.boolean + shapes.bytes;
-    if scalar_weight > 0 {
+    if shapes.int > 0 {
+        arms.push((weight(shapes.int), any::<i64>().prop_map(int_value).boxed()));
+    }
+    if shapes.double > 0 {
         arms.push((
-            weight(scalar_weight),
-            prop_oneof![
-                any::<i64>().prop_map(int_value),
-                (-1.0e12..1.0e12).prop_map(double_value),
-                any::<bool>().prop_map(bool_value),
-            ]
-            .boxed(),
+            weight(shapes.double),
+            (-1.0e12..1.0e12).prop_map(double_value).boxed(),
+        ));
+    }
+    if shapes.boolean > 0 {
+        arms.push((
+            weight(shapes.boolean),
+            any::<bool>().prop_map(bool_value).boxed(),
+        ));
+    }
+    if shapes.bytes > 0 {
+        arms.push((
+            weight(shapes.bytes),
+            proptest::collection::vec(any::<u8>(), 0..32)
+                .prop_map(bytes_value)
+                .boxed(),
         ));
     }
     if shapes.array > 0 {
@@ -354,10 +365,13 @@ fn calibrated_attributes(
         count_histogram
             .iter()
             .map(|(&count, &records)| {
-                (
-                    weight(records),
-                    Just(usize::try_from(count).unwrap_or(usize::MAX)).boxed(),
-                )
+                // Clamp to the adversarial bound: a malformed or
+                // saturated manifest must not turn into pathological
+                // allocations in calibrated runs.
+                let count = usize::try_from(count)
+                    .unwrap_or(ADVERSARIAL_MAX_ATTRIBUTES)
+                    .min(ADVERSARIAL_MAX_ATTRIBUTES);
+                (weight(records), Just(count).boxed())
             })
             .collect()
     };
@@ -689,6 +703,58 @@ mod tests {
                 Some(Body::Structured(_)) => {}
                 None => prop_assert!(false, "manifest has no absent bodies"),
             }
+            Ok(())
+        });
+    }
+
+    /// Structured-body scalars follow the manifest's shape weights:
+    /// a bytes-only manifest must produce bytes-valued bodies, never
+    /// the other scalars.
+    #[test]
+    fn calibrated_structured_scalars_respect_the_shape_support() {
+        let manifest = CalibrationManifest {
+            corpus_tag: "bytes-only".to_string(),
+            records: 5,
+            body_kind: BodyKindMix {
+                string: 0,
+                structured: 5,
+                absent: 0,
+            },
+            any_value_shapes: AnyValueShapes {
+                bytes: 5,
+                ..Default::default()
+            },
+            any_value_max_depth: 1,
+            ..Default::default()
+        };
+        run(64, &calibrated(&manifest), |record| {
+            let Some(Body::Structured(av)) = &record.body else {
+                return Err(proptest::test_runner::TestCaseError::fail(
+                    "manifest admits only structured bodies",
+                ));
+            };
+            prop_assert!(
+                matches!(av.value, Some(any_value::Value::BytesValue(_))),
+                "bytes-only manifest generated {:?}",
+                av.value
+            );
+            Ok(())
+        });
+    }
+
+    /// A saturated (or malformed) attribute-count histogram is
+    /// clamped to the adversarial bound rather than driving
+    /// pathological allocations.
+    #[test]
+    fn calibrated_attribute_counts_are_clamped() {
+        let manifest = CalibrationManifest {
+            corpus_tag: "saturated".to_string(),
+            records: 1,
+            log_attribute_count: BTreeMap::from([(u32::MAX, 1)]),
+            ..Default::default()
+        };
+        run(4, &calibrated(&manifest), |record| {
+            prop_assert_eq!(record.attributes.len(), ADVERSARIAL_MAX_ATTRIBUTES);
             Ok(())
         });
     }

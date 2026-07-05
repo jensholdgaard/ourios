@@ -226,6 +226,17 @@ mod tests {
         }
     }
 
+    /// RFC 0025 §3.2 — the Absent short-circuit: no template walk,
+    /// no empty `Rendered` line, the dedicated variant.
+    #[test]
+    fn absent_body_returns_the_absent_variant() {
+        let r = record(BodyKind::Absent);
+        assert_eq!(
+            render_log_body(&r, &TemplateRegistry::default()),
+            LogBody::Absent,
+        );
+    }
+
     #[test]
     fn structured_decode_success_returns_typed_value() {
         // A scalar structured body (not a map/array) still round-trips.

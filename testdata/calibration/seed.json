@@ -1,0 +1,44 @@
+{
+  "corpus_tag": "seed",
+  "records": 77,
+  "log_attribute_count": {
+    "0": 77
+  },
+  "resource_attribute_count": {
+    "0": 77
+  },
+  "body_kind": {
+    "string": 77,
+    "structured": 0,
+    "absent": 0
+  },
+  "string_body_len": {
+    "4": 9,
+    "5": 30,
+    "6": 12,
+    "7": 1,
+    "8": 3,
+    "9": 17,
+    "11": 1,
+    "12": 4
+  },
+  "severity": [
+    {
+      "number": 9,
+      "text": "INFO",
+      "count": 77
+    }
+  ],
+  "any_value_shapes": {
+    "empty": 0,
+    "string": 0,
+    "int": 0,
+    "double": 0,
+    "boolean": 0,
+    "bytes": 0,
+    "array": 0,
+    "kvlist": 0
+  },
+  "any_value_max_depth": 0,
+  "distinct_attribute_keys": 0
+}

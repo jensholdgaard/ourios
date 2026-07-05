@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use ourios_bench::{
-    BenchConfig, BenchError, GateSet, run, update_status_section, write_results_json,
+    BenchConfig, BenchError, GateSet, TxtSeverity, run, update_status_section, write_results_json,
 };
 
 /// The §9 Results doc the `--update-benchmarks-md` path
@@ -36,6 +36,9 @@ const BASELINE_HARDWARE_TAG: &str = "baseline-8vcpu-32gib (8 vCPU / 32 GiB / gp3
     name = "ourios-bench",
     about = "RFC 0006 thesis-gate bench harness (A1 compression / C1 reconstruction / C2 convergence)"
 )]
+// Each bool is an independent operator flag; a state enum would fight
+// clap's derive, not clarify it.
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Directory of corpus files to load (recursive). Walker
     /// dispatches on extension: `*.txt` (plain-text per RFC
@@ -58,8 +61,9 @@ struct Cli {
     #[arg(long, requires = "bucket_dir")]
     keep_parquet: bool,
     /// §3.5 hardware-kind annotation. Required unless
-    /// `--allow-unknown-hardware`.
-    #[arg(long, required_unless_present = "allow_unknown_hardware")]
+    /// `--allow-unknown-hardware` or `--calibrate` (a calibration
+    /// manifest is a corpus measurement — hardware-independent).
+    #[arg(long, required_unless_present_any = ["allow_unknown_hardware", "calibrate"])]
     hardware_kind: Option<String>,
     /// Tag the results `hardware_kind = "unknown"` instead of
     /// requiring `--hardware-kind`.
@@ -81,6 +85,19 @@ struct Cli {
     /// writer default.
     #[arg(long, default_value_t = ourios_parquet::DEFAULT_ZSTD_LEVEL)]
     parquet_zstd_level: i32,
+    /// RFC 0024 §3.1: extract a calibration manifest from `--corpus`
+    /// instead of running gates. Requires `--corpus-tag`; writes to
+    /// `--calibration-out` (default
+    /// `testdata/calibration/<corpus-tag>.json`).
+    #[arg(long)]
+    calibrate: bool,
+    /// The corpus release the manifest summarises (its committed
+    /// file name and embedded `corpus_tag`).
+    #[arg(long, requires = "calibrate", required_if_eq("calibrate", "true"))]
+    corpus_tag: Option<String>,
+    /// Manifest output path override.
+    #[arg(long, requires = "calibrate")]
+    calibration_out: Option<PathBuf>,
 }
 
 /// One thesis gate, as named on the `--gates` flag.
@@ -139,6 +156,9 @@ fn main() -> ExitCode {
 }
 
 fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
+    if cli.calibrate {
+        return run_calibrate(&cli);
+    }
     if cli.hardware_kind.is_none() {
         // Reachable only via --allow-unknown-hardware (clap
         // requires one of the two). Name the §1 baseline so an
@@ -200,6 +220,28 @@ fn run_bench(cli: Cli) -> Result<ExitCode, BenchError> {
         }
         return Ok(ExitCode::from(1));
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `--calibrate` path: measure the corpus into an RFC 0024 §3.1
+/// manifest and write its committed-file form. No gates run.
+fn run_calibrate(cli: &Cli) -> Result<ExitCode, BenchError> {
+    let tag = cli.corpus_tag.as_deref().ok_or_else(|| BenchError::Cli {
+        // clap's required_if_eq enforces this; backstop for
+        // programmatic construction.
+        detail: "--calibrate requires --corpus-tag".to_string(),
+    })?;
+    let manifest = ourios_bench::extract_manifest(&cli.corpus, tag, TxtSeverity::from_env()?)?;
+    let out = cli.calibration_out.clone().unwrap_or_else(|| {
+        PathBuf::from(ourios_bench::CALIBRATION_DIR).join(format!("{tag}.json"))
+    });
+    let path = ourios_bench::write_manifest(&manifest, &out)?;
+    eprintln!(
+        "ourios-bench: calibration manifest for {} ({} record(s)) written to {}",
+        tag,
+        manifest.records,
+        path.display(),
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -341,6 +383,36 @@ mod tests {
                 c2: true,
             },
             "--gates a1,c2 selects A1 and C2 (comma-separated)",
+        );
+    }
+
+    /// RFC 0024 §3.1 — `--calibrate` needs `--corpus-tag`, lifts the
+    /// `--hardware-kind` requirement (a manifest is a corpus
+    /// measurement, not a hardware one), and `--calibration-out`
+    /// rides only with `--calibrate`.
+    #[test]
+    fn calibrate_flag_surface() {
+        let bare = Cli::try_parse_from(["ourios-bench", "--calibrate"]);
+        assert!(
+            bare.is_err(),
+            "--calibrate without --corpus-tag is a usage error"
+        );
+
+        let ok = Cli::try_parse_from(["ourios-bench", "--calibrate", "--corpus-tag", "seed"])
+            .expect("--calibrate --corpus-tag parses without --hardware-kind");
+        assert!(ok.calibrate);
+        assert_eq!(ok.corpus_tag.as_deref(), Some("seed"));
+        assert!(ok.calibration_out.is_none());
+
+        let orphan_out = Cli::try_parse_from([
+            "ourios-bench",
+            "--allow-unknown-hardware",
+            "--calibration-out",
+            "x.json",
+        ]);
+        assert!(
+            orphan_out.is_err(),
+            "--calibration-out without --calibrate is a usage error"
         );
     }
 

@@ -1,7 +1,7 @@
 ---
 rfc: 0026
 title: Authentication and tenant binding (ingest + query)
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -154,12 +154,66 @@ auth:
 
 ## 5. Acceptance criteria
 
-Written at the `specified` gate (docs/rfcs/README.md lifecycle).
-Proposed scenarios await maintainer sign-off in the drafting PR.
+Scenario ids `RFC0026.<m>`.
+
+> **Scenario RFC0026.1 — token store configuration.** Given a config
+> with an `auth.tokens` list using `${env:VAR}` values, When the
+> server starts, Then tokens resolve through the RFC 0020
+> substitution engine; an empty `auth.tokens` list is a startup
+> configuration error; a missing `auth` section starts in open mode
+> and emits a structured startup warning naming the exposure.
+
+> **Scenario RFC0026.2 — ingest authentication.** Given auth
+> enabled, When an OTLP export arrives with a missing or unknown
+> bearer token (gRPC metadata and HTTP `Authorization`, both
+> listeners), Then it is rejected (`UNAUTHENTICATED` / 401) before
+> wire decode, nothing reaches the WAL, and no ack is returned.
+
+> **Scenario RFC0026.3 — ingest tenant binding.** Given a token
+> bound to tenants `{a, b}`, When a batch whose derived tenants are
+> all within `{a, b}` arrives, Then it is accepted and acked
+> normally; When a batch containing any `ResourceLogs` group deriving
+> to a tenant outside the set arrives, Then the **whole batch** is
+> rejected (`PERMISSION_DENIED` / 403) with **no WAL append and no
+> partial success** — nothing of the batch becomes durable.
+
+> **Scenario RFC0026.4 — query enforcement and status contract.**
+> Given auth enabled, Then the query API returns 401 for a
+> missing/unknown bearer, 400 for a missing or empty
+> `x-ourios-tenant` (today's contract, unchanged), 403 for a
+> well-formed tenant outside the token's set, and correct results
+> for an in-set tenant — with the drift endpoint under the same
+> gate.
+
+> **Scenario RFC0026.5 — wildcard binding.** Given a token with
+> `tenants: ["*"]`, When it ingests to and queries arbitrary
+> tenants, Then both paths behave as if every tenant were listed.
+
+> **Scenario RFC0026.6 — open-mode parity.** Given no `auth`
+> section, When the full existing ingest + query acceptance suites
+> run, Then behavior is byte-for-byte today's (the amendment is
+> invisible until configured), warning aside.
+
+> **Scenario RFC0026.7 — rejection telemetry and audit.** Given
+> authn/authz rejections on either path, Then the existing request
+> counters increment with `error.type`
+> (`unauthenticated` / `permission_denied`) and an ingest authz
+> rejection emits an audit event carrying the token *name* and the
+> offending tenant — and never any token value, on any surface
+> (metrics, audit, logs, errors).
 
 ## 6. Testing strategy
 
-Follows §5 at the `specified` gate.
+RFC0026.1 in `ourios-server` config tests (the RFC 0020 suite's
+home); .2/.3 as receiver integration tests against both listeners
+(the RFC 0003 suite pattern), asserting WAL emptiness on rejection;
+.4/.5 in the querier-role HTTP tests (RFC 0016 suite pattern); .6
+runs the existing suites under a no-`auth` config — parity is the
+assertion; .7 through the in-memory OTel reader (the established
+telemetry-test pattern) plus the audit-sink test fixtures. Token
+comparison is constant-time by construction (a dedicated comparison
+helper with a unit test on the API shape, not a timing measurement —
+timing assertions in CI are noise).
 
 ## 7. Open questions
 

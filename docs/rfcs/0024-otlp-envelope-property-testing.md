@@ -101,14 +101,15 @@ RFC 0003 equivalence suites already cover):
   timestamps, non-ASCII and confusable keys, text-heavy bodies past
   `max_line_tokens` (the Collector-fronted-legacy shape).
 
-Both modes live in **`crates/ourios-testgen`**, a dev-only crate
-introduced by the calibration green slice (no
-production crate grows a proptest dependency; `ourios-bench` cannot
-host them because it already depends on `ourios-querier`, and the
-querier's P4 suite consuming generators from it would create a
-dev-dependency cycle). The crate is test infrastructure named by
-this RFC per `CLAUDE.md` §7's new-crate rule; it is never published
-and nothing in the workspace's production graph depends on it.
+Both modes will live in **`crates/ourios-testgen`**, a dev-only
+crate the calibration green slice introduces (no production crate
+grows a proptest dependency; `ourios-bench` cannot host them because
+it already depends on `ourios-querier`, and the querier's P4 suite
+consuming generators from it would create a dev-dependency cycle).
+The crate is test infrastructure; naming it in this RFC satisfies
+`CLAUDE.md` §7, which treats any new crate as an architectural
+commitment requiring an RFC. It will never be published, and nothing
+in the workspace's production graph will depend on it.
 
 ### 3.3 The four properties
 

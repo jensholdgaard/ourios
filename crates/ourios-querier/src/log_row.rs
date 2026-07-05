@@ -118,7 +118,7 @@ impl LogRow {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum LogBody {
-    /// `body_kind = String` (or absent) — the §3.3 three-zone result: the
+    /// `body_kind = String` — the §3.3 three-zone result: the
     /// rendered bytes plus whether they were faithfully reconstructed or
     /// returned from the retained `body` verbatim.
     Rendered {
@@ -129,6 +129,12 @@ pub enum LogBody {
     /// JSON `body`, returned as the typed value (any non-`String` variant:
     /// kvlist / array or a scalar int / bool / bytes), never flattened.
     Structured(AnyValue),
+    /// `body_kind = Absent` — the wire delivered no body (RFC 0025
+    /// §3.2). Deliberately distinct from
+    /// [`LogBody::Rendered`] with an empty line: an empty-string
+    /// body and no body are different legal records, and the query
+    /// surface must not collapse them.
+    Absent,
 }
 
 /// Render `record`'s body for a query row against the read-time `registry`
@@ -138,12 +144,18 @@ pub enum LogBody {
 /// `AnyValue`; a structured row whose `body` is absent or undecodable (a
 /// corrupt row — there is no structure to return) falls back to the
 /// render-contract empty / [`Reconstruction::RetainedVerbatim`], never
-/// `Structured` over nothing. A string / absent row renders via its versioned
+/// `Structured` over nothing. An absent row returns [`LogBody::Absent`]
+/// (RFC 0025 §3.2). A string row renders via its versioned
 /// tokens; when its `(template_id, template_version)` is not in the registry
 /// the empty token slice makes `render` fall back to the retained `body`
 /// verbatim (§3.3), never a wrong reconstruction.
 #[must_use]
 pub fn render_log_body(record: &MinedRecord, registry: &TemplateRegistry) -> LogBody {
+    if record.body_kind == BodyKind::Absent {
+        // RFC 0025 §3.2: absence renders as no body at all — never
+        // an empty string, which is a different legal record.
+        return LogBody::Absent;
+    }
     if record.body_kind == BodyKind::Structured {
         if let Some(body) = record.body.as_deref()
             && let Ok(value) = decode_any_value(body.as_bytes())

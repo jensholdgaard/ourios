@@ -42,6 +42,7 @@
 - [RFC 0022 — Queryable attribute columns](./rfcs/0022-queryable-attribute-columns.md)
 - [RFC 0023 — Bounded template memory](./rfcs/0023-bounded-template-memory.md)
 - [RFC 0024 — OTLP-envelope property testing](./rfcs/0024-otlp-envelope-property-testing.md)
+- [RFC 0025 — Absent-body representation](./rfcs/0025-absent-body-representation.md)
 
 # Talks
 

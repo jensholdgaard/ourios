@@ -237,13 +237,13 @@ jobs:
         # upstream release asset must not execute in the release
         # pipeline. bash for `set -o pipefail` on the checksum pipe.
         run: |
-          set -o pipefail
+          set -euo pipefail
           installer="$(mktemp "$RUNNER_TEMP/cargo-cyclonedx-installer-XXXXXX.sh")"
+          trap 'rm -f "$installer"' EXIT
           curl --proto '=https' --tlsv1.2 -LsSf -o "$installer" \
             https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.5/cargo-cyclonedx-installer.sh
           echo "20e61d50e5a3f305061809856e51a8853a880556c1d7b2a8ca723c3f3d81b11c  $installer" | sha256sum -c -
           sh "$installer"
-          rm -f "$installer"
         shell: bash
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts

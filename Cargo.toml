@@ -10,6 +10,7 @@ members = [
     "crates/ourios-semconv",
     "crates/ourios-server",
     "crates/ourios-telemetry",
+    "crates/ourios-testgen",
     "crates/ourios-wal",
 ]
 # The cargo-fuzz harness (RFC 0015) is its own standalone workspace: it

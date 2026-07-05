@@ -3108,6 +3108,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-testgen"
+version = "0.1.1"
+dependencies = [
+ "ourios-core",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ourios-wal"
 version = "0.1.1"
 dependencies = [

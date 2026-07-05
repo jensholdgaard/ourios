@@ -41,8 +41,10 @@ pub struct BuiltStore {
     pub rows: u64,
     /// Number of partition files written (one per `*.parquet`).
     pub files: u64,
-    /// The `template_id` with the most rows — a query for it is
-    /// guaranteed to return a non-empty, representative result.
+    /// The **mined** `template_id` with the most rows (ties break to
+    /// the lowest id; `NO_TEMPLATE` is skipped unless nothing mined) —
+    /// a query for it is a true template-exact probe with a non-empty
+    /// result.
     pub busiest_template_id: u64,
     /// How many rows that busiest template has (the result size a
     /// `template_id = busiest_template_id` query returns).
@@ -97,17 +99,18 @@ pub fn build_query_store(
     // corpora it dominates row counts — picking it would make the B2
     // "template-exact" arm measure a body-class count instead (the
     // §9.11 finding). Fall back to it only when nothing mined at all.
-    let (busiest_template_id, busiest_template_rows) = counts
-        .iter()
-        .filter(|&(&id, _)| id != NO_TEMPLATE)
-        .max_by_key(|&(_, &n)| n)
-        .map(|(&id, &n)| (id, n))
-        .or_else(|| {
-            counts
-                .iter()
-                .max_by_key(|&(_, &n)| n)
-                .map(|(&id, &n)| (id, n))
-        })
+    // Ties break toward the lowest id: HashMap iteration order is
+    // randomized, and the picked id forms the B2 query — RFC0006.7's
+    // bit-identical reruns need a deterministic choice.
+    let busiest = |skip_sentinel: bool| {
+        counts
+            .iter()
+            .filter(|&(&id, _)| !skip_sentinel || id != NO_TEMPLATE)
+            .map(|(&id, &n)| (id, n))
+            .max_by_key(|&(id, n)| (n, std::cmp::Reverse(id)))
+    };
+    let (busiest_template_id, busiest_template_rows) = busiest(true)
+        .or_else(|| busiest(false))
         .unwrap_or((NO_TEMPLATE, 0));
 
     Ok(BuiltStore {

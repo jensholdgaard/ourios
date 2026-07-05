@@ -1,7 +1,7 @@
 ---
 rfc: 0026
 title: Authentication and tenant binding (ingest + query)
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05

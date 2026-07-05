@@ -232,9 +232,15 @@ jobs:
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       - name: Install cargo-cyclonedx
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` return non-0
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.5/cargo-cyclonedx-installer.sh | sh"
+        # Download, verify against the pinned sha256, then run
+        # (Scorecard PinnedDependencies, #366) — a compromised
+        # upstream release asset must not execute in the release
+        # pipeline. bash for pipefail on the curl.
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf -o /tmp/cargo-cyclonedx-installer.sh \
+            https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.5/cargo-cyclonedx-installer.sh
+          echo "20e61d50e5a3f305061809856e51a8853a880556c1d7b2a8ca723c3f3d81b11c  /tmp/cargo-cyclonedx-installer.sh" | sha256sum -c -
+          sh /tmp/cargo-cyclonedx-installer.sh
         shell: bash
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts

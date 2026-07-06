@@ -143,8 +143,10 @@ proposed scenarios accompanied the drafting PR, #383).
 
 > **Scenario RFC0028.2 — isolation-sensitive tests stay isolated.**
 > Given the slice-1 inventory of tests requiring process isolation
-> (crash-recovery SIGKILL, env-mutating, hardware-gated), Then each
-> remains its own binary, annotated with the reason it cannot join a
+> (process-global installers, env-mutating, hardware-gated), Then
+> those tests are not merged into a shared harness — they stay in
+> dedicated integration-test binaries (grouped where they can safely
+> share one), each annotated with the reason it cannot join the
 > harness.
 
 > **Scenario RFC0028.3 — the probe set improves.** Given the epic

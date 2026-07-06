@@ -6,29 +6,54 @@
     ":semanticCommitTypeAll(chore)",
     ":dependencyDashboard"
   ],
-  "labels": ["dependencies"],
+  "labels": [
+    "dependencies"
+  ],
   "prConcurrentLimit": 5,
-  "schedule": ["before 06:00 on monday"],
+  "schedule": [
+    "before 06:00 on monday"
+  ],
   "automergeStrategy": "squash",
   "packageRules": [
     {
-      "matchManagers": ["github-actions"],
+      "matchManagers": [
+        "github-actions"
+      ],
       "groupName": "github-actions",
       "pinDigests": true,
-      "matchUpdateTypes": ["digest", "pinDigest"],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
       "automerge": true
     },
     {
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "groupName": "cargo (minor/patch)",
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
       "automerge": true
     },
     {
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["object_store"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "object_store"
+      ],
       "allowedVersions": "<0.14.0",
-      "description": "Hold object_store at 0.13.x. DataFusion 53 pins object_store ^0.13, and ourios-querier hands ourios-parquet's Store::object_store() to DataFusion's register_object_store (RFC 0013 §2.2), so the two crates must share one object_store version. Bumping to 0.14 splits the Arc<dyn ObjectStore> type at that boundary and breaks the build. Lift this together with a DataFusion upgrade (which also gates the thrift advisory, #295)."
+      "description": "Hold object_store at 0.13.x. DataFusion 53 pins object_store ^0.13, and ourios-querier hands ourios-parquet's Store::object_store() to DataFusion's register_object_store (RFC 0013 \u00a72.2), so the two crates must share one object_store version. Bumping to 0.14 splits the Arc<dyn ObjectStore> type at that boundary and breaks the build. Lift this together with a DataFusion upgrade (which also gates the thrift advisory, #295)."
+    },
+    {
+      "matchManagers": [
+        "helm-values"
+      ],
+      "pinDigests": false,
+      "description": "Don't digest-pin the chart's default image. image.tag is deliberately empty (floating latest; the values.yaml comment tells operators to pin a released tag in production), so a point-in-time digest in the published chart's defaults contradicts that contract - and renovate writes it as a bare @sha256:... tag, which the ourios.image helper renders as an invalid repo:@sha256:... reference."
     }
   ]
 }

@@ -5,7 +5,7 @@
 //! a measured corpus; [`adversarial`] roams the envelope's legal
 //! extremes, bounded only by the documented limits below.
 
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{
     AnyValue, ArrayValue, Body, KeyValue, KeyValueList, OtlpLogRecord, any_value,
 };

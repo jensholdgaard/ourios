@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
 use ourios_core::record::SharedRecordSink;
 use ourios_core::tenant::TenantId;

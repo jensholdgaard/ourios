@@ -36,6 +36,8 @@ bench = false
 doctest = false
 
 [dependencies]
+# Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
+ourios-config = { path = "../ourios-config" }
 # Shared types (TenantId, config) for the ingest path.
 ourios-core = { path = "../ourios-core" }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /

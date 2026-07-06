@@ -11,7 +11,7 @@
 //! through the miner, to prove no record lands in the wrong tenant's tree.
 
 use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::receiver::{IngestPipeline, TenantRule};

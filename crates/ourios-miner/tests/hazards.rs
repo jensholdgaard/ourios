@@ -13,7 +13,7 @@
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h1_1_login_and_logout_remain_distinct_at_default_threshold() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -52,7 +52,7 @@ fn h1_1_login_and_logout_remain_distinct_at_default_threshold() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h1_2_lossy_zone_match_retains_body() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -188,7 +188,7 @@ fn h1_2_lossy_zone_match_retains_body() {
 fn h1_3_every_widening_emits_an_audit_event() {
     use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
     use ourios_core::clock::TestClock;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -269,7 +269,7 @@ fn h1_3_every_widening_emits_an_audit_event() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h1_4_severity_number_is_part_of_template_key() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -315,7 +315,7 @@ fn h1_4_severity_number_is_part_of_template_key() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h1_5_scope_name_is_part_of_template_key() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -370,7 +370,7 @@ fn h1_5_scope_name_is_part_of_template_key() {
 #[test]
 fn h2_1_oversized_parameter_triggers_overflow_marker() {
     use ourios_core::audit::ParamType;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -460,7 +460,7 @@ fn h2_1_oversized_parameter_triggers_overflow_marker() {
 #[test]
 fn h2_1_overflow_via_aligned_params_at_existing_wildcard() {
     use ourios_core::audit::ParamType;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -550,7 +550,7 @@ fn h2_1_overflow_via_aligned_params_at_existing_wildcard() {
 #[test]
 fn h2_1_per_tenant_byte_limit_override_honoured() {
     use ourios_core::audit::ParamType;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -633,7 +633,7 @@ async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
         AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
     };
 
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{AnyValue, Body, KeyValue, OtlpLogRecord, any_value};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -739,7 +739,7 @@ async fn h2_2_per_service_overflow_rate_above_one_percent_alerts() {
 #[test]
 fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
     use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -814,7 +814,7 @@ fn h5_1_wildcard_widening_increments_version_and_emits_template_widened() {
 #[test]
 fn h5_2_type_expansion_increments_version_and_emits_template_type_expanded() {
     use ourios_core::audit::{AuditPayload, ParamType, SharedAuditSink, SlotTypes, TemplateChange};
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -954,7 +954,7 @@ fn h7_1_reconstruction_property_holds_across_corpus() {
     use std::fs;
     use std::path::Path;
 
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -1082,7 +1082,7 @@ fn h7_1_reconstruction_property_holds_across_corpus() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn h7_2_tokenizer_failure_sets_lossy_flag_and_retains_body() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::{BodyKind, SharedRecordSink};
     use ourios_core::tenant::TenantId;
@@ -1140,7 +1140,7 @@ fn h7_2_tokenizer_failure_sets_lossy_flag_and_retains_body() {
 /// *Reader render contract*.
 #[test]
 fn h7_3_reader_emits_body_verbatim_when_lossy_flag_is_true() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -1189,7 +1189,7 @@ fn h7_3_reader_emits_body_verbatim_when_lossy_flag_is_true() {
 #[test]
 fn h7_4_widened_literal_slot_reconstructs_via_str_fallback() {
     use ourios_core::audit::ParamType;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;

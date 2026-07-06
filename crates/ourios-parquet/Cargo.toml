@@ -71,6 +71,8 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
+ourios-config = { path = "../ourios-config" }
 # RFC 0024 §5 P1 round-trip (`tests/rfc0024_properties.rs`): generated
 # OTLP batches come from the dev-only generator crate and enter
 # through the real miner so the writer sees production-shaped rows.

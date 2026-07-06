@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ourios-bench",
+    "crates/ourios-config",
     "crates/ourios-core",
     "crates/ourios-ingester",
     "crates/ourios-miner",

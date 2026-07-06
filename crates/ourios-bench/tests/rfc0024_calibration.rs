@@ -229,7 +229,7 @@ fn rfc0024_2_calibrated_generators_match_manifest_moments() {
 mod umbrella {
     use std::collections::HashMap;
 
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
     use ourios_core::record::{BodyKind, MinedRecord, SharedRecordSink};
     use ourios_core::tenant::TenantId;

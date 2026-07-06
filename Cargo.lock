@@ -2954,6 +2954,7 @@ dependencies = [
  "clap",
  "criterion",
  "opentelemetry-proto",
+ "ourios-config",
  "ourios-core",
  "ourios-ingester",
  "ourios-miner",
@@ -2968,6 +2969,10 @@ dependencies = [
  "tokio",
  "zstd",
 ]
+
+[[package]]
+name = "ourios-config"
+version = "0.1.1"
 
 [[package]]
 name = "ourios-core"
@@ -2994,6 +2999,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "ourios-config",
  "ourios-core",
  "ourios-miner",
  "ourios-parquet",
@@ -3017,6 +3023,7 @@ version = "0.1.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
+ "ourios-config",
  "ourios-core",
  "ourios-semconv",
  "ourios-telemetry",
@@ -3039,6 +3046,7 @@ dependencies = [
  "chrono",
  "futures",
  "object_store",
+ "ourios-config",
  "ourios-core",
  "ourios-miner",
  "ourios-testgen",
@@ -3062,6 +3070,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "jsonschema",
+ "ourios-config",
  "ourios-core",
  "ourios-miner",
  "ourios-parquet",
@@ -3089,6 +3098,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "ourios-config",
  "ourios-core",
  "ourios-ingester",
  "ourios-miner",
@@ -3127,6 +3137,7 @@ dependencies = [
 name = "ourios-testgen"
 version = "0.1.1"
 dependencies = [
+ "ourios-config",
  "ourios-core",
  "proptest",
  "serde",

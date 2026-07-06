@@ -4,7 +4,7 @@
 //! crosses the ingest path (miner overflow → Parquet → body
 //! read-back), which needs both crates.
 
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::record::SharedRecordSink;
 use ourios_core::tenant::TenantId;

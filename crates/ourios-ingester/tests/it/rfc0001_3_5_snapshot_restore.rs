@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ingest_support::{open_pipeline, request, resource_logs, wal_config};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_ingester::receiver::{TenantRule, fan_out};
 use ourios_ingester::recovery;
 use ourios_miner::cluster::MinerCluster;

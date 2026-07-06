@@ -35,7 +35,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use ourios_core::audit::{AuditEvent, NoOpAuditSink, SharedAuditSink};
 use ourios_core::clock::TestClock;
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::OtlpLogRecord;
 use ourios_core::record::{BodyKind, MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;

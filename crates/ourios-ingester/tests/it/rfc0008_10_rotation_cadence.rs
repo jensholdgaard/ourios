@@ -30,7 +30,7 @@ fn rotating_pipeline(root: &Path, snapshots_root: &Path) -> IngestPipeline {
     let hook_root = snapshots_root.to_path_buf();
     IngestPipeline::new(
         coordinator(Box::new(wal)),
-        MinerCluster::new(ourios_core::config::MinerConfig::default()),
+        MinerCluster::new(ourios_config::MinerConfig::default()),
         TenantRule::service_name(),
     )
     .with_rotation_hook(Box::new(move |miner, mark| {
@@ -110,7 +110,7 @@ async fn no_rotation_means_no_cadence_write() {
     let wal = Wal::open(wal_config(tmp.path())).expect("open WAL");
     let pipeline = IngestPipeline::new(
         coordinator(Box::new(wal)),
-        MinerCluster::new(ourios_core::config::MinerConfig::default()),
+        MinerCluster::new(ourios_config::MinerConfig::default()),
         TenantRule::service_name(),
     )
     .with_rotation_hook(Box::new(move |miner, mark| {

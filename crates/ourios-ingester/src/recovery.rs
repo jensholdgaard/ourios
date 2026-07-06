@@ -313,7 +313,7 @@ fn reject(offset: WalOffset, error: &dyn std::fmt::Display) -> RecoveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
 
     const SEGMENT: &str = "0190b3c8-1a2b-7c3d-9e4f-50607080a0b0";
 

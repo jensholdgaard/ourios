@@ -10,7 +10,7 @@
 //! See `docs/rfcs/0017-template-registry-query-rendering.md` §3.1 / §5 / §6.
 
 use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::tenant::TenantId;
 use ourios_miner::cluster::MinerCluster;

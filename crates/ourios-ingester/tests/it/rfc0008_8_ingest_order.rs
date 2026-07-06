@@ -19,7 +19,7 @@
 
 use crate::ingest_support::{replay_frames, request, resource_logs, shared_wal_pipeline};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_ingester::receiver::{TenantRule, fan_out};
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::FrameKind;

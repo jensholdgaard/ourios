@@ -20,7 +20,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::record::MinedRecord;
 use ourios_ingester::receiver::TenantRule;
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};

@@ -837,7 +837,7 @@ mod tests {
     fn busiest_template_picker_skips_no_template() {
         let corpus = tempfile::TempDir::new().expect("corpus dir");
         // One token past the configured cap, whatever it is.
-        let over_cap = usize::from(ourios_core::config::MinerConfig::default().max_line_tokens) + 1;
+        let over_cap = usize::from(ourios_config::MinerConfig::default().max_line_tokens) + 1;
         let long = |seed: usize| {
             (0..over_cap)
                 .map(|i| format!("t{}", i * seed))

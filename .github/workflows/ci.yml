@@ -73,7 +73,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --all-features
+      # RFC 0028 slice 5: nextest schedules per-test processes in parallel
+      # (12x the warm suite wall time locally — epic #382). Doctests are not
+      # in nextest's model, so `cargo test --doc` keeps them covered — the
+      # pair preserves the exact suite inventory (RFC0028.5).
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --all-features --no-fail-fast
+      - run: cargo test --workspace --all-features --doc
 
   # RFC 0013 S3 integration tests (RFC0013.1/.3/.4/.7): spin LocalStack
   # (S3-compatible, Apache-2.0) via testcontainers and drive `Store::s3` at it

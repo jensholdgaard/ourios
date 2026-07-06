@@ -171,7 +171,12 @@ proposed scenarios accompanied the drafting PR, #383).
 
 ## 6. Testing strategy
 
-Inventory diffs are the mechanism for RFC0028.1/RFC0028.5: a
+Inventory diffs are the mechanism for RFC0028.1/RFC0028.5's name
+half, and the PR diff is the mechanism for its no-body-change half:
+a consolidation PR is restricted to file moves plus the mechanical
+harness scaffolding (`tests/it/main.rs` `mod` lines, import-path
+adjustments); the reviewer rejects any hunk inside a test function
+body. For RFC0028.1's inventory, a
 `cargo test -p <crate> -- --list` snapshot (scoped to the crate
 being consolidated, matching RFC0028.1) is captured in each
 consolidation

@@ -294,24 +294,21 @@ async fn handle_query(
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let binding: Option<AuthBinding> =
-        match authenticate_bearer(state.auth.as_deref(), authorization) {
-            Ok(binding) => binding,
-            Err(_) => {
-                // RFC 0026 §3.4: the rejection counts on the existing
-                // query counter, kind `rejected` (pre-dispatch).
-                state.metrics.record_err(
-                    QUERY_KIND_REJECTED,
-                    gate_started.elapsed(),
-                    "unauthenticated",
-                );
-                return error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthenticated",
-                    "a valid bearer token is required",
-                );
-            }
-        };
+    let Ok(binding) = authenticate_bearer(state.auth.as_deref(), authorization) else {
+        // RFC 0026 §3.4: the rejection counts on the existing query
+        // counter, kind `rejected` (pre-dispatch).
+        state.metrics.record_err(
+            QUERY_KIND_REJECTED,
+            gate_started.elapsed(),
+            "unauthenticated",
+        );
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "a valid bearer token is required",
+        );
+    };
+    let binding: Option<AuthBinding> = binding;
 
     // Tenant is required and checked here, before the engine is invoked
     // (RFC 0016 §3.3): a missing/empty header is a `400` that never scans data.

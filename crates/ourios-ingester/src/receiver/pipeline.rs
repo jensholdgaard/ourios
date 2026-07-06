@@ -130,6 +130,16 @@ pub struct IngestPipeline {
     metrics: IngestMetrics,
     /// RFC 0026 §3.4: the sink for `ingest_denied` audit events. Behind a
     /// mutex — denials are the cold path.
+    ///
+    /// **Best-effort durability, deliberately.** The server wires the
+    /// buffering audit sink, so a crash before its next cadence flush can
+    /// drop denial events — and unlike template events they have no WAL
+    /// replay to recover from (the denied batch never reached the WAL,
+    /// which is the §3.2 point). The durable alerting signal is the
+    /// `error.type = permission_denied` counter; the event is forensic
+    /// detail. Making denials synchronously durable would put an fsync on
+    /// the rejection path — a write-amplification lever for any
+    /// authenticated-but-misconfigured (or hostile) sender.
     denial_audit: Mutex<Option<Box<dyn ourios_core::audit::AuditSink + Send>>>,
 }
 

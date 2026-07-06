@@ -99,6 +99,9 @@ struct ServerConfig {
 struct QuerierParams {
     http_addr: SocketAddr,
     default_window_nanos: u64,
+    /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled` /
+    /// `OURIOS_QUERIER_MCP_ENABLED`; default off).
+    mcp_enabled: bool,
 }
 
 /// Resolved OTLP-receiver-role configuration (RFC 0003 §6.2).
@@ -168,6 +171,7 @@ fn config_from_env() -> Result<ServerConfig, String> {
         std::env::var("OURIOS_QUERIER_DEFAULT_WINDOW_SECS")
             .ok()
             .as_deref(),
+        std::env::var("OURIOS_QUERIER_MCP_ENABLED").ok().as_deref(),
     )?;
     Ok(config)
 }
@@ -253,6 +257,7 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
         file.querier.enabled.as_deref(),
         file.querier.http_addr.as_deref(),
         file.querier.default_window_secs.as_deref(),
+        file.querier.mcp.enabled.as_deref(),
     )?;
     config.promoted = build_promoted_attributes(
         &file.storage.promoted_attributes.resource,
@@ -360,10 +365,13 @@ fn build_querier_config(
     enabled_raw: Option<&str>,
     http_raw: Option<&str>,
     window_raw: Option<&str>,
+    mcp_enabled_raw: Option<&str>,
 ) -> Result<Option<QuerierParams>, String> {
     if !matches!(enabled_raw, Some("1" | "true" | "yes")) {
         return Ok(None);
     }
+    // Opt-in like the roles themselves (RFC 0027 §3.1; default off).
+    let mcp_enabled = matches!(mcp_enabled_raw, Some("1" | "true" | "yes"));
     let http_addr = parse_addr(http_raw, DEFAULT_QUERIER_HTTP_ADDR)?;
     let window_secs = match window_raw {
         None => DEFAULT_QUERIER_WINDOW_SECS,
@@ -385,6 +393,7 @@ fn build_querier_config(
     Ok(Some(QuerierParams {
         http_addr,
         default_window_nanos,
+        mcp_enabled,
     }))
 }
 
@@ -614,6 +623,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 store: config.store.clone(),
                 auth: config.auth.clone().map(std::sync::Arc::new),
                 default_window_nanos: params.default_window_nanos,
+                mcp_enabled: params.mcp_enabled,
             })
             .await?;
             println!("querier HTTP listening on {}", handle.http_addr);
@@ -759,7 +769,7 @@ compaction:
             Some(PathBuf::from("/var/lib/ourios/wal")),
         )
         .expect("receiver");
-        expected.querier = build_querier_config(Some("true"), None, None).expect("querier");
+        expected.querier = build_querier_config(Some("true"), None, None, None).expect("querier");
 
         assert_eq!(from_file, expected);
     }
@@ -930,6 +940,25 @@ auth:
         let err = server_config("storage:\n  local:\n    bucket_root: /x\nauth:\n  tokens: []\n")
             .expect_err("empty token list");
         assert!(err.contains("auth.tokens"), "names the key: {err}");
+    }
+
+    /// RFC 0027 §3.1 — the MCP flag is opt-in: absent/falsey values leave
+    /// it off, the role-standard truthy values enable it, on both the env
+    /// and file paths (the same `build_querier_config`).
+    #[test]
+    fn querier_mcp_flag_defaults_off_and_accepts_truthy() {
+        for off in [None, Some("0"), Some("false"), Some("off"), Some("")] {
+            let params = build_querier_config(Some("1"), None, None, off)
+                .expect("valid")
+                .expect("enabled");
+            assert!(!params.mcp_enabled, "{off:?} leaves MCP off");
+        }
+        for on in ["1", "true", "yes"] {
+            let params = build_querier_config(Some("1"), None, None, Some(on))
+                .expect("valid")
+                .expect("enabled");
+            assert!(params.mcp_enabled, "{on:?} enables MCP");
+        }
     }
 
     /// `config_from_file` end-to-end through the real filesystem: a valid file
@@ -1337,7 +1366,7 @@ auth:
         // Arrange / Act / Assert — unset or a falsey value disables the role.
         for raw in [None, Some("0"), Some("false"), Some("nope")] {
             assert_eq!(
-                build_querier_config(raw, None, None).expect("ok"),
+                build_querier_config(raw, None, None, None).expect("ok"),
                 None,
                 "querier disabled for enabled_raw = {raw:?}",
             );
@@ -1347,7 +1376,7 @@ auth:
     #[test]
     fn build_querier_config_enabled_defaults_address_and_window() {
         // Arrange / Act
-        let params = build_querier_config(Some("1"), None, None)
+        let params = build_querier_config(Some("1"), None, None, None)
             .expect("ok")
             .expect("enabled");
 
@@ -1362,7 +1391,7 @@ auth:
     #[test]
     fn build_querier_config_parses_custom_address_and_window() {
         // Arrange / Act
-        let params = build_querier_config(Some("yes"), Some("127.0.0.1:9"), Some("120"))
+        let params = build_querier_config(Some("yes"), Some("127.0.0.1:9"), Some("120"), None)
             .expect("ok")
             .expect("enabled");
 
@@ -1376,11 +1405,11 @@ auth:
         // Arrange / Act / Assert — a zero window would make every no-`range`
         // query empty; a non-numeric value is a config typo.
         assert!(
-            build_querier_config(Some("1"), None, Some("0")).is_err(),
+            build_querier_config(Some("1"), None, Some("0"), None).is_err(),
             "a zero default window is rejected",
         );
         assert!(
-            build_querier_config(Some("1"), None, Some("soon")).is_err(),
+            build_querier_config(Some("1"), None, Some("soon"), None).is_err(),
             "a non-numeric default window is rejected",
         );
     }
@@ -1389,7 +1418,7 @@ auth:
     fn build_querier_config_rejects_a_malformed_address() {
         // Arrange / Act / Assert
         assert!(
-            build_querier_config(Some("1"), Some("not-an-addr"), None).is_err(),
+            build_querier_config(Some("1"), Some("not-an-addr"), None, None).is_err(),
             "a malformed bind address is rejected",
         );
     }

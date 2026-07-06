@@ -245,6 +245,16 @@ pub struct QuerierSection {
     pub http_addr: Option<String>,
     #[serde(deserialize_with = "scalar_opt")]
     pub default_window_secs: Option<String>,
+    /// The RFC 0027 MCP surface (`querier.mcp.*`).
+    pub mcp: McpSection,
+}
+
+/// `querier.mcp.*` — the RFC 0027 MCP surface (§3.1; default off).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpSection {
+    #[serde(deserialize_with = "scalar_opt")]
+    pub enabled: Option<String>,
 }
 
 /// `auth.*` — bearer-token authentication and tenant binding (RFC 0026 §3.1).
@@ -498,7 +508,8 @@ impl QuerierSection {
     ) -> Result<(), MalformedReference> {
         substitute(&mut self.enabled, lookup)?;
         substitute(&mut self.http_addr, lookup)?;
-        substitute(&mut self.default_window_secs, lookup)
+        substitute(&mut self.default_window_secs, lookup)?;
+        substitute(&mut self.mcp.enabled, lookup)
     }
 }
 

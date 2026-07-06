@@ -13,4 +13,5 @@
 
 pub mod auth;
 pub mod config;
+mod mcp;
 pub mod querier;

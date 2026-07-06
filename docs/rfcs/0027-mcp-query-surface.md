@@ -1,7 +1,7 @@
 ---
 rfc: 0027
 title: MCP query surface (agent-facing read tools over the querier)
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -118,12 +118,63 @@ tenants out of band.
 
 ## 5. Acceptance criteria
 
-Written at the `specified` gate (docs/rfcs/README.md lifecycle).
-Proposed scenarios await maintainer sign-off in the drafting PR.
+Scenario ids `RFC0027.<m>`. Maintainer sign-off: 2026-07-05 ("go on
+0027 and 0019"), implementation ungated by RFC 0026's green
+(2026-07-06).
+
+> **Scenario RFC0027.1 — gating and placement.** Given
+> `querier.mcp.enabled` unset or false, When the querier role serves,
+> Then `/mcp` returns 404 and the JSON API is byte-for-byte unchanged;
+> Given the flag true, Then `/mcp` speaks MCP streamable HTTP on the
+> same listener, And no new crate exists (the adapter is an
+> `ourios-server` module).
+
+> **Scenario RFC0027.2 — the RFC 0026 gate applies verbatim.** Given
+> auth enabled, When an MCP request arrives with a missing/unknown
+> bearer, Then it is rejected as unauthenticated before any tool
+> dispatch; When a tool call names a tenant outside the token's set,
+> Then it fails with the tenant-denied error and touches no data; And
+> open mode (no `auth` section) serves MCP exactly as it serves the
+> JSON API.
+
+> **Scenario RFC0027.3 — `query_logs`.** Given a seeded tenant, When
+> `query_logs` runs a DSL statement, Then the result carries the total
+> count, at most `limit` rendered rows (the conservative default when
+> unset), and the scanned/pruned stats, matching the JSON API's answer
+> for the same statement; And a malformed statement returns the DSL
+> error as a tool error, never a transport failure.
+
+> **Scenario RFC0027.4 — `list_templates`.** Given a tenant with mined
+> templates, When `list_templates` runs, Then every row is
+> `(template_id, rendered_template, version)` and matches the RFC 0017
+> registry surface for that tenant.
+
+> **Scenario RFC0027.5 — `template_drift`.** Given audit history, When
+> `template_drift` runs over `[from, to)`, Then the analysis equals the
+> RFC 0010 drift surface's for the same half-open window (RFC0010.2's
+> boundary rule inherited verbatim).
+
+> **Scenario RFC0027.6 — the grammar resource.** Given the server
+> enabled, When the client lists/reads resources, Then the DSL
+> grammar/reference doc is served verbatim from the repo's canonical
+> copy — no drift between the resource and the documentation.
+
+> **Scenario RFC0027.7 — output discipline.** Given any tool result,
+> Then it is the RFC 0016 JSON shape re-encoded as MCP content (one
+> serialization boundary), And every tool description carries the
+> treat-log-bodies-as-data warning, And no tool or resource enumerates
+> tenants or accepts SQL.
 
 ## 6. Testing strategy
 
-Follows §5 at the `specified` gate.
+`.1`/`.2` at the served-querier level (the RFC 0016 §5 pattern: spawn
+or in-process router, flag off/on, the RFC 0026 status matrix over
+`/mcp`). `.3`–`.5` as equivalence tests: drive the tool through an MCP
+client against a seeded store and assert equality with the
+corresponding JSON-API/engine answer — the adapter must add nothing
+but the protocol. `.6`/`.7` by inspection of the served
+resource/descriptors against the repo's canonical grammar doc and a
+deny-list assertion on the advertised tool/resource set.
 
 ## 7. Open questions
 

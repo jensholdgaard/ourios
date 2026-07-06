@@ -194,6 +194,9 @@ fn rfc0005_10_audit_schema_matches_pinned_field_list() {
         // 2026-07-06): OPTIONAL, appended after the alias group.
         Field::new("quarantine_partition", DataType::Utf8, true),
         Field::new("quarantine_error", DataType::Utf8, true),
+        // The ingest_denied column (RFC 0026 §3.4 amendment,
+        // 2026-07-06): OPTIONAL, appended after the quarantine group.
+        Field::new("denied_token_name", DataType::Utf8, true),
     ];
     check_schema_against(&expected, &audit_schema());
 }

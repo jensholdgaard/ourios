@@ -133,6 +133,9 @@ pub mod audit_columns {
     // kinds. Appended after the alias group — additive per §3.7.
     pub const QUARANTINE_PARTITION: &str = "quarantine_partition";
     pub const QUARANTINE_ERROR: &str = "quarantine_error";
+    /// The rejecting token's audit label on an `ingest_denied` event
+    /// (RFC 0026 §3.4) — never the token value.
+    pub const DENIED_TOKEN_NAME: &str = "denied_token_name";
 }
 
 /// Build the data-file Arrow schema per RFC 0005 §3.2.
@@ -317,10 +320,13 @@ pub fn audit_schema() -> SchemaRef {
             true,
         ),
         Field::new(audit_columns::ALIAS_ACTOR, DataType::Utf8, true),
-        // Quarantine-event columns (RFC 0025 §3.3): OPTIONAL, NULL
-        // for all other kinds; required-by-convention non-null for
-        // kind 7. Appended after the alias group (§3.7 additive).
+        // Rejection-event columns, appended after the alias group
+        // (§3.7 additive): the quarantine pair (RFC 0025 §3.3,
+        // required-by-convention non-null for kind 7) and the denial
+        // token label (RFC 0026 §3.4, non-null for kind 8). OPTIONAL,
+        // NULL for all other kinds.
         Field::new(audit_columns::QUARANTINE_PARTITION, DataType::Utf8, true),
         Field::new(audit_columns::QUARANTINE_ERROR, DataType::Utf8, true),
+        Field::new(audit_columns::DENIED_TOKEN_NAME, DataType::Utf8, true),
     ]))
 }

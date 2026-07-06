@@ -19,6 +19,8 @@ installers in one process race each other (see the note in
   global in-memory provider.
 - `rfc0025_quarantine.rs` — its RFC0025.5 telemetry arm installs the
   global in-memory provider.
+- `rfc0026_telemetry.rs` — the RFC0026.7 rejection-telemetry arm installs
+  the global in-memory provider.
 
 `fixtures/` holds the crash-fixture **`[[bin]]` targets** (SIGKILL'd by
 harness tests via `CARGO_BIN_EXE_*`), not test binaries.

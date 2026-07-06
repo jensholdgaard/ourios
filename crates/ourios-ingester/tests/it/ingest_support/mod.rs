@@ -316,6 +316,24 @@ pub fn shared_wal_pipeline(root: &Path) -> SharedPipeline {
     Arc::new(open_pipeline(root))
 }
 
+/// [`capturing_pipeline`] with an RFC 0026 denial audit sink attached.
+pub fn capturing_pipeline_with_denial_audit(
+    sink: Box<dyn ourios_core::audit::AuditSink + Send>,
+) -> (SharedPipeline, Captured) {
+    let captured = Captured::default();
+    let miner = MinerCluster::new(MinerConfig::default());
+    let pipeline = IngestPipeline::new(
+        coordinator(Box::new(CapturingJournal {
+            captured: captured.clone(),
+            byte: 0,
+        })),
+        miner,
+        TenantRule::service_name(),
+    )
+    .with_denial_audit_sink(sink);
+    (Arc::new(pipeline), captured)
+}
+
 /// A shared pipeline whose `Journal` captures appended payloads, plus the
 /// capture handle.
 pub fn capturing_pipeline() -> (SharedPipeline, Captured) {

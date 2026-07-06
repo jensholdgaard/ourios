@@ -40,13 +40,20 @@ use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 #[derive(Clone)]
 pub struct AuthInterceptor {
     store: Option<Arc<TokenStore>>,
+    /// Rejection telemetry (RFC 0026 §3.4). The instruments resolve by
+    /// name through the global meter, so this instance aggregates with
+    /// the pipeline's.
+    metrics: Arc<crate::metrics::IngestMetrics>,
 }
 
 impl AuthInterceptor {
     /// An interceptor over `store` (`None` = open mode pass-through).
     #[must_use]
     pub fn new(store: Option<Arc<TokenStore>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            metrics: Arc::new(crate::metrics::IngestMetrics::new()),
+        }
     }
 }
 
@@ -63,8 +70,14 @@ impl tonic::service::Interceptor for AuthInterceptor {
                 Ok(request)
             }
             // One undifferentiated message: missing vs malformed vs unknown
-            // would be a probing oracle (RFC 0026 §3.2).
-            Err(_) => Err(Status::unauthenticated("a valid bearer token is required")),
+            // would be a probing oracle (RFC 0026 §3.2). §3.4: the
+            // rejection counts on `ourios.ingest.batches`
+            // (`error.type = unauthenticated`).
+            Err(_) => {
+                self.metrics
+                    .record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
+                Err(Status::unauthenticated("a valid bearer token is required"))
+            }
         }
     }
 }

@@ -401,6 +401,7 @@ impl AliasMap {
             AuditPayload::Template { .. }
             | AuditPayload::Compaction { .. }
             | AuditPayload::RecordQuarantined { .. }
+            | AuditPayload::IngestDenied { .. }
             | AuditPayload::Unknown { .. } => {}
         }
     }

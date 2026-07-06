@@ -446,6 +446,9 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let coordinator = CommitCoordinator::new(Box::new(wal), batch_window, segment_size_bytes);
     let pipeline: SharedPipeline = Arc::new(
         IngestPipeline::new(coordinator, miner, rule)
+            // RFC 0026 §3.4: tenant-binding denials emit `ingest_denied`
+            // through the same durable audit sink as every other event.
+            .with_denial_audit_sink(Box::new(audit_sink.clone()))
             .with_last_durable(report.max_delivered)
             .with_rotation_hook(rotation_snapshot_hook(
                 sink.clone(),

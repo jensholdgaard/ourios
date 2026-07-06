@@ -69,10 +69,11 @@ use crate::audit_schema;
 /// existing call sites resolve them at their established path.
 pub use ourios_core::audit::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
-    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
-    EVENT_TYPE_ALIAS_ASSERTED, EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION,
-    EVENT_TYPE_TEMPLATE_CREATED, EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
+    EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED,
+    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_ALIAS_ASSERTED,
+    EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_CREATED,
+    EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
     EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 
@@ -212,6 +213,7 @@ struct Builders {
     compaction_partition: StringBuilder,
     quarantine_partition: StringBuilder,
     quarantine_error: StringBuilder,
+    denied_token_name: StringBuilder,
     compaction_input_files: GenericListBuilder<i32, StringBuilder>,
     compaction_output_file: StringBuilder,
     compaction_generation: UInt64Builder,
@@ -269,6 +271,7 @@ impl Builders {
             compaction_partition: StringBuilder::with_capacity(cap, 0),
             quarantine_partition: StringBuilder::with_capacity(cap, 0),
             quarantine_error: StringBuilder::with_capacity(cap, 0),
+            denied_token_name: StringBuilder::with_capacity(cap, 0),
             compaction_input_files: GenericListBuilder::new(StringBuilder::new())
                 .with_field(Field::new("element", DataType::Utf8, false)),
             compaction_output_file: StringBuilder::with_capacity(cap, 0),
@@ -305,6 +308,7 @@ impl Builders {
                 // 2026-06-12).
                 self.append_compaction_nulls();
                 self.append_quarantine_nulls();
+                self.append_denied_nulls();
                 self.append_alias_nulls();
                 self.template_id.append_value(*template_id);
                 self.triggering_line_hash
@@ -338,6 +342,7 @@ impl Builders {
                 self.append_template_nulls();
                 self.append_compaction_nulls();
                 self.append_quarantine_nulls();
+                self.append_denied_nulls();
                 if reason.is_empty() {
                     self.reason.append_null();
                 } else {
@@ -360,6 +365,7 @@ impl Builders {
                 self.append_template_nulls();
                 self.append_compaction_nulls();
                 self.append_quarantine_nulls();
+                self.append_denied_nulls();
                 self.append_alias_nulls();
                 self.reason.append_null();
             }
@@ -384,6 +390,7 @@ impl Builders {
                 self.compaction_generation.append_value(*generation);
                 self.compaction_rows.append_value(*rows);
                 self.append_quarantine_nulls();
+                self.append_denied_nulls();
             }
             AuditPayload::RecordQuarantined { partition, error } => {
                 // Quarantine events (RFC 0025 §3.3) populate only the
@@ -391,9 +398,21 @@ impl Builders {
                 self.append_template_nulls();
                 self.append_compaction_nulls();
                 self.append_alias_nulls();
+                self.append_denied_nulls();
                 self.reason.append_null();
                 self.quarantine_partition.append_value(partition);
                 self.quarantine_error.append_value(error);
+            }
+            AuditPayload::IngestDenied { token_name } => {
+                // Denial events (RFC 0026 §3.4) populate only the
+                // envelope (whose `tenant_id` is the offending tenant)
+                // and the token's audit label.
+                self.append_template_nulls();
+                self.append_compaction_nulls();
+                self.append_alias_nulls();
+                self.append_quarantine_nulls();
+                self.reason.append_null();
+                self.denied_token_name.append_value(token_name);
             }
         }
 
@@ -525,6 +544,11 @@ impl Builders {
         self.quarantine_error.append_null();
     }
 
+    /// NULL the `ingest_denied`-only column (every non-denial kind).
+    fn append_denied_nulls(&mut self) {
+        self.denied_token_name.append_null();
+    }
+
     fn finish(mut self) -> Vec<ArrayRef> {
         vec![
             Arc::new(self.tenant_id.finish()),
@@ -551,6 +575,7 @@ impl Builders {
             Arc::new(self.alias_actor.finish()),
             Arc::new(self.quarantine_partition.finish()),
             Arc::new(self.quarantine_error.finish()),
+            Arc::new(self.denied_token_name.finish()),
         ]
     }
 }

@@ -318,7 +318,23 @@ impl IngestMetrics {
         }
         self.append_duration.record(elapsed.as_secs_f64(), &[]);
     }
+
+    /// Record one rejected request on the existing `ourios.ingest.batches`
+    /// counter with `error.type` (`unauthenticated` | `permission_denied`)
+    /// — the RFC 0026 §3.4 recording-errors convention: no new metric
+    /// name, the reason on a low-cardinality attribute.
+    pub fn record_rejected_batch(&self, error_type: &'static str) {
+        self.batches
+            .add(1, &[KeyValue::new(ERROR_TYPE, error_type)]);
+    }
 }
+
+/// The `error.type` value for a missing/malformed/unknown bearer
+/// (RFC 0026 §3.4).
+pub const ERROR_TYPE_UNAUTHENTICATED: &str = "unauthenticated";
+/// The `error.type` value for an authenticated cross-tenant rejection
+/// (RFC 0026 §3.4).
+pub const ERROR_TYPE_PERMISSION_DENIED: &str = "permission_denied";
 
 /// The OpenTelemetry-standard `error.type` attribute key (semconv, stable).
 /// Deliberately **not** in the Ourios weaver registry — it is an upstream

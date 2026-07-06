@@ -146,10 +146,12 @@ proposed scenarios accompanied the drafting PR, #383).
 > harness.
 
 > **Scenario RFC0028.3 — the probe set improves.** Given the epic
-> #382 probe set re-run after slices 1–2, Then
-> `touch core → cargo test -p ourios-querier --no-run` drops below
-> 30 s, And full-workspace `cargo test` wall time drops by at least
-> 30% against the epic's baseline.
+> #382 probe set re-run after slices 1–2, Then the incremental-edit
+> probe — `touch crates/ourios-core/src/lib.rs` (an mtime-only
+> update, exactly as the epic's baseline measured it) followed by
+> `cargo test -p ourios-querier --no-run` — drops below 30 s, And
+> full-workspace `cargo test` wall time drops by at least 30%
+> against the epic's baseline.
 
 > **Scenario RFC0028.4 — the core split is behavior-free.** Given
 > the `ourios-config` extraction, When the full workspace suite
@@ -170,8 +172,10 @@ committed list (the harness-exempt binaries and their reasons, in
 the consolidating crate's `tests/` README or module docs). `.3`'s
 probe numbers are recorded in epic #382 alongside the baseline so
 the before/after is one table. `.4` is the full suite run plus a
-`cargo build -p <type-only consumer>` recheck-set spot check after
-touching `MinerConfig`.
+recheck-set spot check: a whitespace-only edit inside the
+`MinerConfig` definition (`crates/ourios-core/src/config.rs` today;
+its new home after the split), then `cargo build` on a type-only
+core consumer, asserting it does not recompile.
 
 ## 7. Open questions
 

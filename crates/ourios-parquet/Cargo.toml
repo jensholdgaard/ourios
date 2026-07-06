@@ -18,7 +18,7 @@ ourios-core = { path = "../ourios-core" }
 # `parquet::arrow::ArrowWriter` / `ParquetRecordBatchReader`).
 # `parquet` carries the actual writer (`arrow` feature pulls in
 # `arrow::array::RecordBatch` integration).
-arrow-array = { version = "58", default-features = false }
+arrow-array = { version = "59", default-features = false }
 arrow-schema = { version = "58", default-features = false }
 parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
 # Object-storage backend (RFC 0013) — one trait over LocalFileSystem (dev/

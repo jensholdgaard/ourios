@@ -88,7 +88,7 @@ tempfile = "=3.27.0"
 # the same arrow/parquet 58 the whole workspace now shares
 # (RFC 0021 phase 1 — the pre-upgrade cross-version handoff is gone).
 parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
-arrow-array = { version = "=58.3.0", default-features = false }
+arrow-array = { version = "=59.0.0", default-features = false }
 arrow-schema = { version = "=58.3.0", default-features = false }
 # RFC0002.10 — proves the canonical β serialisation survives a YAML
 # scalar round-trip (the Perses-embedding guarantee). Test-only.

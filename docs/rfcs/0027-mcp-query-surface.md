@@ -119,12 +119,15 @@ tenants out of band.
 ## 5. Acceptance criteria
 
 Scenario ids `RFC0027.<m>`. Maintainer sign-off: 2026-07-05 ("go on
-0027 and 0019"), implementation ungated by RFC 0026's green
-(2026-07-06).
+0027 and 0019"). The §1 gate is satisfied: RFC 0026 went green
+2026-07-06, so serving `/mcp` no longer waits on anything — the gate
+was about never exposing a remote query surface before authn existed.
 
 > **Scenario RFC0027.1 — gating and placement.** Given
 > `querier.mcp.enabled` unset or false, When the querier role serves,
-> Then `/mcp` returns 404 and the JSON API is byte-for-byte unchanged;
+> Then `/mcp` returns 404 and the existing JSON API endpoints are
+> behaviorally unchanged (same routes, status contracts, and response
+> schemas — the RFC 0016 and RFC 0026 §5 suites still pass verbatim);
 > Given the flag true, Then `/mcp` speaks MCP streamable HTTP on the
 > same listener, And no new crate exists (the adapter is an
 > `ourios-server` module).
@@ -156,10 +159,11 @@ Scenario ids `RFC0027.<m>`. Maintainer sign-off: 2026-07-05 ("go on
 
 > **Scenario RFC0027.6 — the grammar resource.** Given the server
 > enabled, When the client lists/reads resources, Then the DSL
-> grammar/reference doc is served verbatim from the canonical copy —
-> the RFC 0002 §7 grammar (`docs/rfcs/0002-query-dsl.md`, embedded at
-> compile time via `include_str!`) — no drift between the resource
-> and the documentation.
+> grammar/reference doc is served from the canonical source,
+> `docs/rfcs/0002-query-dsl.md`, embedded at compile time
+> (`include_str!`) and trimmed to its §7 grammar section at startup —
+> the served text is byte-identical to that section, so the resource
+> cannot drift from the documentation.
 
 > **Scenario RFC0027.7 — output discipline.** Given any tool result,
 > Then it is the RFC 0016 JSON shape re-encoded as MCP content (one

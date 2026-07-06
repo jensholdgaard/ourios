@@ -175,8 +175,9 @@ probe numbers are recorded in epic #382 alongside the baseline so
 the before/after is one table. `.4` is the full suite run plus a
 recheck-set spot check: a whitespace-only edit inside the
 `MinerConfig` definition (`crates/ourios-core/src/config.rs` today;
-its new home after the split), then `cargo build` on a type-only
-core consumer, asserting it does not recompile.
+its new home after the split), then `cargo build -vv` on a
+type-only core consumer, asserting the build reports the consumer
+`Fresh` (no `Compiling`/`Dirty` line for it).
 
 ## 7. Open questions
 

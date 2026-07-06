@@ -77,6 +77,10 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # shutdown, `net`/`sync` for the listeners + shutdown fan-out, `macros`
 # for `#[tokio::main]`.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "net", "sync"] }
+# The MCP query surface (RFC 0027): the official Rust SDK, server side +
+# streamable HTTP only (no client, no stdio). Lives in this crate alone —
+# no new crate (§3.1).
+rmcp = { version = "2.1.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
 # RFC 0020 env-substitution resolver property tests (config::env_subst): the

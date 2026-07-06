@@ -74,6 +74,9 @@ pub struct QuerierConfig {
     /// (`OURIOS_BUCKET_ROOT`) or an S3-compatible bucket (`OURIOS_S3_*`),
     /// resolved by the server (`main.rs`).
     pub store: StoreConfig,
+    /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled`;
+    /// default off). The RFC 0026 gate applies to it identically.
+    pub mcp_enabled: bool,
     /// The RFC 0026 token store; `None` is open mode (§3.1). With a store,
     /// every request must carry a known `Authorization: Bearer` credential
     /// (→ 401) and its `x-ourios-tenant` must fall inside the token's set
@@ -207,6 +210,22 @@ pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
     router_with_auth(bucket_root, default_window_nanos, None)
 }
 
+/// [`router_with_auth`] plus the RFC 0027 `/mcp` surface — the fully
+/// optioned constructor tests drive (RFC0027.1/.2).
+pub fn router_with_mcp(
+    bucket_root: PathBuf,
+    default_window_nanos: u64,
+    auth: Option<Arc<TokenStore>>,
+    mcp_enabled: bool,
+) -> Router {
+    router_from_querier(
+        Querier::new(bucket_root),
+        default_window_nanos,
+        auth,
+        mcp_enabled,
+    )
+}
+
 /// [`router`] with an RFC 0026 token store — the authenticated variant
 /// (`None` = open mode, identical to [`router`]).
 pub fn router_with_auth(
@@ -214,7 +233,7 @@ pub fn router_with_auth(
     default_window_nanos: u64,
     auth: Option<Arc<TokenStore>>,
 ) -> Router {
-    router_from_querier(Querier::new(bucket_root), default_window_nanos, auth)
+    router_from_querier(Querier::new(bucket_root), default_window_nanos, auth, false)
 }
 
 /// Build the router from an already-constructed [`Querier`] — the shared core
@@ -224,17 +243,25 @@ fn router_from_querier(
     querier: Querier,
     default_window_nanos: u64,
     auth: Option<Arc<TokenStore>>,
+    mcp_enabled: bool,
 ) -> Router {
     let state = QuerierState {
         querier: Arc::new(querier),
         default_window_nanos,
         metrics: Arc::new(QuerierMetrics::new()),
-        auth,
+        auth: auth.clone(),
     };
-    Router::new()
+    let router = Router::new()
         .route("/v1/query", post(handle_query))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+        .with_state(state);
+    if mcp_enabled {
+        // RFC 0027 §3.1: the MCP surface rides the same listener at
+        // `/mcp`, behind the same RFC 0026 gate.
+        router.nest("/mcp", crate::mcp::mcp_router(auth))
+    } else {
+        router
+    }
 }
 
 /// Serve the querier role per `config` (RFC 0016 §3.2). Binds the listener
@@ -263,7 +290,12 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         .local_addr()
         .map_err(|e| format!("HTTP local_addr: {e}"))?;
 
-    let app = router_from_querier(querier, config.default_window_nanos, config.auth);
+    let app = router_from_querier(
+        querier,
+        config.default_window_nanos,
+        config.auth,
+        config.mcp_enabled,
+    );
     let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())

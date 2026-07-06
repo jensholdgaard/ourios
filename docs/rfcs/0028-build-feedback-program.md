@@ -1,7 +1,7 @@
 ---
 rfc: 0028
 title: Build-feedback program — test-harness consolidation and workspace decomposition
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-06
@@ -129,12 +129,49 @@ runner-agnostic). CI keeps the exact same suite inventory.
 
 ## 5. Acceptance criteria
 
-Written at the `specified` gate (docs/rfcs/README.md lifecycle).
-Proposed scenarios accompany the drafting PR for sign-off.
+Scenario ids `RFC0028.<m>`. Maintainer sign-off: 2026-07-06 (the
+proposed scenarios accompanied the drafting PR, #383).
+
+> **Scenario RFC0028.1 — consolidation preserves the test
+> inventory.** Given the pre-consolidation
+> `cargo test -p <crate> -- --list` inventory, When the crate's
+> harness consolidation lands, Then the post-consolidation inventory
+> contains the identical test names (modulo the harness path
+> prefix), And no test body changed in the move.
+
+> **Scenario RFC0028.2 — isolation-sensitive tests stay isolated.**
+> Given the slice-1 inventory of tests requiring process isolation
+> (crash-recovery SIGKILL, env-mutating, hardware-gated), Then each
+> remains its own binary, annotated with the reason it cannot join a
+> harness.
+
+> **Scenario RFC0028.3 — the probe set improves.** Given the epic
+> #382 probe set re-run after slices 1–2, Then
+> `touch core → cargo test -p ourios-querier --no-run` drops below
+> 30 s, And full-workspace `cargo test` wall time drops by at least
+> 30% against the epic's baseline.
+
+> **Scenario RFC0028.4 — the core split is behavior-free.** Given
+> the `ourios-config` extraction, When the full workspace suite
+> runs, Then results are identical pre/post split, And a
+> `MinerConfig` edit no longer rechecks type-only core consumers.
+
+> **Scenario RFC0028.5 — CI parity.** Given the consolidated
+> harnesses (and nextest, if slice 5 adopts it), Then CI runs the
+> identical suite inventory and stays green.
 
 ## 6. Testing strategy
 
-Follows §5 at the `specified` gate.
+Inventory diffs are the mechanism for `.1`/`.5`: a
+`cargo test -- --list` snapshot is captured in each consolidation
+PR's description and diffed against the post-move run — the
+reviewer checks the diff is a pure path-prefix rename. `.2` is a
+committed list (the harness-exempt binaries and their reasons, in
+the consolidating crate's `tests/` README or module docs). `.3`'s
+probe numbers are recorded in epic #382 alongside the baseline so
+the before/after is one table. `.4` is the full suite run plus a
+`cargo build -p <type-only consumer>` recheck-set spot check after
+touching `MinerConfig`.
 
 ## 7. Open questions
 

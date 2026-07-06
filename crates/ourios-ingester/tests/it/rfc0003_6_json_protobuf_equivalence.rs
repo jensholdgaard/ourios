@@ -15,13 +15,11 @@
 //!    asserts *are* the verification of `with-serde`'s actual behaviour
 //!    — a failure is an empirical finding, not an assumption.
 
-mod otlp_strategy;
-
+use crate::otlp_strategy::export_request_json_safe;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use otlp_strategy::export_request_json_safe;
 use ourios_ingester::receiver::{decode_json, decode_protobuf};
 use proptest::prelude::*;
 use prost::Message;

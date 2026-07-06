@@ -4,10 +4,8 @@
 //! 404; and an operator-configured override path replaces `/v1/logs`
 //! (the default then 404s) without changing any other behaviour.
 
-mod ingest_support;
-
+use crate::ingest_support::{capturing_pipeline, post_request, send};
 use axum::http::StatusCode;
-use ingest_support::{capturing_pipeline, post_request, send};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use prost::Message;

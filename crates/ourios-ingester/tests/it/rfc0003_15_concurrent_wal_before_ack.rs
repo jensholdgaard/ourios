@@ -6,11 +6,9 @@
 //! it acks, so all N succeed and the WAL ends with exactly N durable
 //! `OtlpBatch` frames — none lost or interleaved away.
 
-mod ingest_support;
-
 use std::sync::Arc;
 
-use ingest_support::{replay_frames, request, resource_logs, shared_wal_pipeline};
+use crate::ingest_support::{replay_frames, request, resource_logs, shared_wal_pipeline};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_wal::FrameKind;

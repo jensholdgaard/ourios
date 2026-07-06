@@ -10,13 +10,11 @@
 //! durable offset, and reflecting only the records ingested
 //! before the rotating batch.
 
-mod ingest_support;
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ingest_support::{coordinator, request, resource_logs, wal_config};
+use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
 use ourios_ingester::receiver::{IngestPipeline, TenantRule};
 use ourios_ingester::{recovery, snapshot_store};
 use ourios_miner::cluster::MinerCluster;

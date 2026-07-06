@@ -13,11 +13,9 @@
 //! never saw the ack will retry, producing a duplicate, which the OTLP
 //! spec's *duplicate-data* section accepts as the right tradeoff.
 
-mod ingest_support;
-
 use std::process::{Command, Stdio};
 
-use ingest_support::replay_frames;
+use crate::ingest_support::replay_frames;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use ourios_ingester::receiver::decode_protobuf;
 use ourios_wal::FrameKind;

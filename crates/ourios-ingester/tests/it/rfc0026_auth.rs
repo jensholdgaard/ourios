@@ -15,11 +15,9 @@
 //! The remaining `.7` stub is `#[ignore]`d, discharged by the
 //! telemetry green slice.
 
-mod ingest_support;
-
 use std::sync::Arc;
 
-use ingest_support::{capturing_pipeline, post_request, request, resource_logs, send};
+use crate::ingest_support::{capturing_pipeline, post_request, request, resource_logs, send};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_core::auth::{TokenSpec, TokenStore, build_token_store};
 use ourios_ingester::receiver::grpc::{AuthInterceptor, LogsReceiver};

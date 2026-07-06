@@ -5,9 +5,9 @@
 //! `log_records` — are accepted as success with no `OtlpBatch` frame
 //! appended and no record reaching the miner.
 
-mod ingest_support;
-
-use ingest_support::{CallLog, request, resource_logs, resource_logs_without_scopes, spy_pipeline};
+use crate::ingest_support::{
+    CallLog, request, resource_logs, resource_logs_without_scopes, spy_pipeline,
+};
 use ourios_core::tenant::TenantId;
 
 /// Scenario RFC0003.12 — Empty `ExportLogsServiceRequest` returns success without WAL write.

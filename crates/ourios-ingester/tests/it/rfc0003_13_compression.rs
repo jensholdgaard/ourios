@@ -4,10 +4,8 @@
 //! decodes to the same request (proving gzip is decompressed, not just
 //! accepted); an unsupported encoding is rejected with 415.
 
-mod ingest_support;
-
+use crate::ingest_support::{capturing_pipeline, gzip, post_request, request, resource_logs, send};
 use axum::http::StatusCode;
-use ingest_support::{capturing_pipeline, gzip, post_request, request, resource_logs, send};
 use ourios_ingester::receiver::decode_protobuf;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use prost::Message;
@@ -15,7 +13,7 @@ use prost::Message;
 const PROTOBUF: &str = "application/x-protobuf";
 
 /// Recover the single `OtlpBatch` payload the pipeline captured.
-fn only_captured(captured: &ingest_support::Captured) -> Vec<u8> {
+fn only_captured(captured: &crate::ingest_support::Captured) -> Vec<u8> {
     let frames = captured.lock().expect("captured");
     assert_eq!(frames.len(), 1, "exactly one frame captured");
     frames[0].clone()

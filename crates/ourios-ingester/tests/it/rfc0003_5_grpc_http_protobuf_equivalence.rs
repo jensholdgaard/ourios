@@ -9,9 +9,7 @@
 //! over the proto value space (shared with RFC0003.6, in
 //! `tests/otlp_strategy`).
 
-mod otlp_strategy;
-
-use otlp_strategy::export_request;
+use crate::otlp_strategy::export_request;
 use ourios_ingester::receiver::decode_protobuf;
 use proptest::prelude::*;
 use prost::Message;

@@ -71,7 +71,8 @@ impl tonic::service::Interceptor for AuthInterceptor {
             }
             // One undifferentiated message: missing vs malformed vs unknown
             // would be a probing oracle (RFC 0026 §3.2). §3.4: the
-            // rejection counts on the request counter.
+            // rejection counts on `ourios.ingest.batches`
+            // (`error.type = unauthenticated`).
             Err(_) => {
                 self.metrics
                     .record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);

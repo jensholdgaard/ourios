@@ -102,7 +102,7 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     let Ok(binding) = authenticate_bearer(state.auth.as_deref(), authorization) else {
-        // RFC 0026 §3.4: the rejection counts on the request counter.
+        // RFC 0026 §3.4: the rejection counts on `ourios.ingest.batches` (`error.type = unauthenticated`).
         state.pipeline.record_unauthenticated();
         return StatusCode::UNAUTHORIZED.into_response();
     };

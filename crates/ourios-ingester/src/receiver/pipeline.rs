@@ -176,7 +176,7 @@ impl IngestPipeline {
         self
     }
 
-    /// Record an authentication rejection on the request counter
+    /// Record an authentication rejection on `ourios.ingest.batches`
     /// (`error.type = unauthenticated`, RFC 0026 §3.4) — called by the
     /// transports, which own the 401 surface.
     pub fn record_unauthenticated(&self) {
@@ -252,8 +252,9 @@ impl IngestPipeline {
         binding: Option<&super::auth::AuthBinding>,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
-        // batch does no encode, fan-out, or WAL work. §3.4: the denial
-        // counts on the request counter and emits the audit event.
+        // batch does no encode, fan-out, or WAL work. §3.4: the denial counts on
+        // `ourios.ingest.batches` (`error.type = permission_denied`)
+        // and emits the audit event.
         if let Some(binding) = binding
             && let Err(e) = super::auth::check_binding(&request, &self.rule, binding)
         {

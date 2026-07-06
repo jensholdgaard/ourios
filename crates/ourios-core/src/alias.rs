@@ -94,7 +94,7 @@ impl AsRef<str> for ActorId {
 /// Errors from the operator-driven alias API.
 ///
 /// One variant per validated precondition; hand-rolled to match the
-/// crate's existing error style (see [`MinerConfigError`](crate::config)).
+/// crate's existing error style (mirroring `ourios_config::MinerConfigError`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasError {
     /// An assertion's `actor` was empty — aliasing is never anonymous

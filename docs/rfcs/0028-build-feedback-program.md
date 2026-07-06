@@ -136,8 +136,10 @@ proposed scenarios accompanied the drafting PR, #383).
 > inventory.** Given the pre-consolidation
 > `cargo test -p <crate> -- --list` inventory, When the crate's
 > harness consolidation lands, Then the post-consolidation inventory
-> contains the identical test names (modulo the harness path
-> prefix), And no test body changed in the move.
+> contains the identical test names, each changed only by the
+> harness's module-path prefix (`--list` prints test names as module
+> paths; a file moving under `tests/it/` gains its module segment),
+> And no test body changed in the move.
 
 > **Scenario RFC0028.2 — isolation-sensitive tests stay isolated.**
 > Given the slice-1 inventory of tests requiring process isolation
@@ -169,7 +171,8 @@ proposed scenarios accompanied the drafting PR, #383).
 
 Inventory diffs are the mechanism for RFC0028.1/RFC0028.5: a
 `cargo test -p <crate> -- --list` snapshot (scoped to the crate
-being consolidated, matching `.1`) is captured in each consolidation
+being consolidated, matching RFC0028.1) is captured in each
+consolidation
 PR's description and diffed against the post-move run — the
 reviewer checks the diff is a pure path-prefix rename. RFC0028.2 is
 a committed list (the harness-exempt binaries and their reasons, in

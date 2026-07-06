@@ -19,3 +19,4 @@ mod rfc0016_query_endpoint;
 mod rfc0019_storage_backend;
 mod rfc0020_config_file;
 mod rfc0026_auth;
+mod rfc0027_mcp;

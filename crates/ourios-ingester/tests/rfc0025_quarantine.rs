@@ -199,8 +199,8 @@ fn all_poison_buffer_releases_its_accounting() {
 
 /// Scenario RFC0025.5 — quarantine telemetry.
 /// See `docs/rfcs/0025-absent-body-representation.md` §5.
-#[test]
-fn rfc0025_5_quarantine_telemetry() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rfc0025_5_quarantine_telemetry() {
     // The in-memory provider must exist before the sink builds its
     // instruments.
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test");

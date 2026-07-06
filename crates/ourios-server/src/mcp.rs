@@ -4,8 +4,9 @@
 //! builds the `/mcp` streamable-HTTP service (the official `rmcp` SDK)
 //! that `querier::router` nests when `querier.mcp.enabled` is set. The
 //! RFC 0026 bearer gate wraps the service as an axum middleware layer, so
-//! authentication answers before any MCP dispatch — the same
-//! one-undifferentiated-401 contract as the JSON API (§3.1).
+//! authentication answers before any MCP dispatch, with the JSON API's
+//! ordering and one-undifferentiated-message discipline (the body shape
+//! is transport-plain here, not the JSON error envelope).
 //!
 //! This slice serves the protocol handshake only; the §3.2 tool set, the
 //! grammar resource, and the per-tool telemetry (the meaningful request
@@ -75,13 +76,16 @@ async fn require_bearer(
 pub(crate) fn mcp_router(auth: Option<Arc<TokenStore>>) -> Router {
     // (`StreamableHttpServerConfig` is `#[non_exhaustive]`; mutate a
     // default.) rmcp's default allows loopback Hosts only — a
-    // DNS-rebinding guard for browser clients that would 403 every real
-    // deployment (the querier binds 0.0.0.0) before auth. Empty = allow
-    // all: MCP clients are not browsers, the JSON API on this same
-    // listener applies no Host filter either, and the RFC 0026 bearer
-    // layer below is the actual gate.
+    // DNS-rebinding guard that would 403 every real deployment (the
+    // querier binds 0.0.0.0) before auth. With a token store the bearer
+    // layer is the gate (a rebinding page cannot present a token), so the
+    // Host filter opens; in open mode there is no compensating control,
+    // so the upstream loopback-only default stays — open mode is the
+    // local/dev posture, where loopback is exactly right.
     let mut config = StreamableHttpServerConfig::default();
-    config.allowed_hosts = Vec::new();
+    if auth.is_some() {
+        config.allowed_hosts = Vec::new();
+    }
     let service = StreamableHttpService::new(
         || Ok(OuriosMcp),
         Arc::new(LocalSessionManager::default()),

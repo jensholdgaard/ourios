@@ -612,6 +612,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // The querier engine is Store-capable (RFC 0019 slice 2a), so it
                 // reads whichever backend config resolved (local or S3).
                 store: config.store.clone(),
+                auth: config.auth.clone().map(std::sync::Arc::new),
                 default_window_nanos: params.default_window_nanos,
             })
             .await?;

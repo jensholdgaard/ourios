@@ -43,8 +43,9 @@ use parquet::errors::ParquetError;
 use crate::audit_columns;
 use crate::audit_record_batch::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
-    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_KIND_INGEST_DENIED, EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED,
+    EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
+    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
 use crate::partition::PartitionKey;
@@ -347,10 +348,7 @@ fn batch_to_audit_events(
     let alias_actor = optional_string(batch, audit_columns::ALIAS_ACTOR)?.unwrap_or_default();
     // Quarantine-group columns (RFC 0025 §3.3) — absent in
     // pre-amendment files (§3.7 absent-column tolerance).
-    let quarantine_partition =
-        optional_string(batch, audit_columns::QUARANTINE_PARTITION)?.unwrap_or_default();
-    let quarantine_error =
-        optional_string(batch, audit_columns::QUARANTINE_ERROR)?.unwrap_or_default();
+    let (quarantine_partition, quarantine_error, denied_token_name) = rejection_columns(batch)?;
 
     for i in 0..n {
         let file_row = row_offset + i;
@@ -399,6 +397,7 @@ fn batch_to_audit_events(
                 };
                 decode_quarantine_payload(&cols, i, file_row)?
             }
+            EVENT_KIND_INGEST_DENIED => decode_denied_payload(&denied_token_name, i, file_row)?,
             kind @ (EVENT_KIND_ALIAS_ASSERTED | EVENT_KIND_ALIAS_RETRACTED) => {
                 let cols = AliasColumns {
                     representative_id: &alias_representative_id,
@@ -472,6 +471,35 @@ fn decode_quarantine_payload(
             file_row,
         )?,
         error: require_at(cols.error, i, audit_columns::QUARANTINE_ERROR, file_row)?,
+    })
+}
+
+/// The rejection-group columns: `quarantine_*` (RFC 0025 §3.3) and
+/// `denied_token_name` (RFC 0026 §3.4) — all absent in pre-amendment
+/// files (§3.7 absent-column tolerance).
+type RejectionColumns = (
+    Vec<Option<String>>,
+    Vec<Option<String>>,
+    Vec<Option<String>>,
+);
+
+fn rejection_columns(batch: &RecordBatch) -> Result<RejectionColumns, AuditReaderError> {
+    Ok((
+        optional_string(batch, audit_columns::QUARANTINE_PARTITION)?.unwrap_or_default(),
+        optional_string(batch, audit_columns::QUARANTINE_ERROR)?.unwrap_or_default(),
+        optional_string(batch, audit_columns::DENIED_TOKEN_NAME)?.unwrap_or_default(),
+    ))
+}
+
+/// Rebuild the `ingest_denied` payload for row `i` from its column
+/// (RFC 0026 §3.4).
+fn decode_denied_payload(
+    token_names: &[Option<String>],
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    Ok(AuditPayload::IngestDenied {
+        token_name: require_at(token_names, i, audit_columns::DENIED_TOKEN_NAME, file_row)?,
     })
 }
 

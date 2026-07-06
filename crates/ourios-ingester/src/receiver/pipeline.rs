@@ -128,6 +128,9 @@ pub struct IngestPipeline {
     /// Ingest throughput + WAL-before-ack latency instruments (RFC 0014
     /// §6.3). Recorded only on a durably-acked batch.
     metrics: IngestMetrics,
+    /// RFC 0026 §3.4: the sink for `ingest_denied` audit events. Behind a
+    /// mutex — denials are the cold path.
+    denial_audit: Mutex<Option<Box<dyn ourios_core::audit::AuditSink + Send>>>,
 }
 
 impl IngestPipeline {
@@ -142,7 +145,31 @@ impl IngestPipeline {
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
             metrics: IngestMetrics::new(),
+            denial_audit: Mutex::new(None),
         }
+    }
+
+    /// Install the RFC 0026 §3.4 denial audit sink: every tenant-binding
+    /// rejection emits an `ingest_denied` event through it (the token's
+    /// audit label + the offending tenant — never a token value).
+    #[must_use]
+    pub fn with_denial_audit_sink(
+        self,
+        sink: Box<dyn ourios_core::audit::AuditSink + Send>,
+    ) -> Self {
+        *self
+            .denial_audit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+        self
+    }
+
+    /// Record an authentication rejection on the request counter
+    /// (`error.type = unauthenticated`, RFC 0026 §3.4) — called by the
+    /// transports, which own the 401 surface.
+    pub fn record_unauthenticated(&self) {
+        self.metrics
+            .record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
     }
 
     /// Install the §6.9 rotation-cadence hook: called once per
@@ -213,9 +240,29 @@ impl IngestPipeline {
         binding: Option<&super::auth::AuthBinding>,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
-        // batch does no encode, fan-out, or WAL work.
-        if let Some(binding) = binding {
-            super::auth::check_binding(&request, &self.rule, binding)?;
+        // batch does no encode, fan-out, or WAL work. §3.4: the denial
+        // counts on the request counter and emits the audit event.
+        if let Some(binding) = binding
+            && let Err(e) = super::auth::check_binding(&request, &self.rule, binding)
+        {
+            if let ReceiveError::TenantDenied { token_name, tenant } = &e {
+                self.metrics
+                    .record_rejected_batch(crate::metrics::ERROR_TYPE_PERMISSION_DENIED);
+                let mut sink = self
+                    .denial_audit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(sink) = sink.as_mut() {
+                    sink.emit(ourios_core::audit::AuditEvent {
+                        tenant_id: tenant.clone(),
+                        timestamp: std::time::SystemTime::now(),
+                        payload: ourios_core::audit::AuditPayload::IngestDenied {
+                            token_name: token_name.clone(),
+                        },
+                    });
+                }
+            }
+            return Err(e);
         }
         // Encode before fan-out consumes the request: the WAL frame is a
         // protobuf `ExportLogsServiceRequest` (§6.5 step 3). Byte-equality

@@ -312,15 +312,6 @@ async fn rfc0026_5_wildcard_binding_ingest() {
     assert_eq!(captured.lock().expect("captured").len(), 3);
 }
 
-/// Scenario RFC0026.7 — rejection telemetry and audit.
-/// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
-#[test]
-#[ignore = "RFC0026.7 stub — implemented in the telemetry green slice"]
-fn rfc0026_7_rejection_telemetry_and_audit() {
-    todo!(
-        "RFC0026.7 — rejections increment existing counters with \
-         error.type (unauthenticated | permission_denied); ingest authz \
-         rejection emits an audit event with the token name and offending \
-         tenant; token values never appear on any surface"
-    );
-}
+// Scenario RFC0026.7 (rejection telemetry + audit) lives in the dedicated
+// `tests/rfc0026_telemetry.rs` binary — it installs the process-global
+// OTel meter provider (the RFC0028.2 harness-exemption class).

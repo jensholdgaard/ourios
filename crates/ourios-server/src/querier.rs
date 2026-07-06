@@ -113,6 +113,10 @@ impl QuerierHandle {
 /// `ourios.query.kind` attribute values (RFC 0016 §3.6).
 const QUERY_KIND_LOGS: &str = "logs";
 const QUERY_KIND_DRIFT: &str = "drift";
+/// The `ourios.query.kind` value for a request rejected before kind
+/// dispatch (RFC 0026 §3.4) — authn/authz answer before the body parse,
+/// so neither `logs` nor `drift` applies.
+const QUERY_KIND_REJECTED: &str = "rejected";
 /// `ourios.query.row_group.state` attribute values.
 const ROW_GROUP_SCANNED: &str = "scanned";
 const ROW_GROUP_PRUNED: &str = "pruned";
@@ -286,6 +290,7 @@ async fn handle_query(
     // tenant check — 401 before 400 before 403, so an unauthenticated
     // probe learns nothing about the tenant contract. One undifferentiated
     // message (missing vs malformed vs unknown would be an oracle).
+    let gate_started = Instant::now();
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
@@ -293,6 +298,13 @@ async fn handle_query(
         match authenticate_bearer(state.auth.as_deref(), authorization) {
             Ok(binding) => binding,
             Err(_) => {
+                // RFC 0026 §3.4: the rejection counts on the existing
+                // query counter, kind `rejected` (pre-dispatch).
+                state.metrics.record_err(
+                    QUERY_KIND_REJECTED,
+                    gate_started.elapsed(),
+                    "unauthenticated",
+                );
                 return error_response(
                     StatusCode::UNAUTHORIZED,
                     "unauthenticated",
@@ -317,6 +329,11 @@ async fn handle_query(
     if let Some(binding) = &binding
         && !binding.tenants().allows(tenant.as_str())
     {
+        state.metrics.record_err(
+            QUERY_KIND_REJECTED,
+            gate_started.elapsed(),
+            "permission_denied",
+        );
         return error_response(
             StatusCode::FORBIDDEN,
             "tenant_denied",

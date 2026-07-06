@@ -137,6 +137,19 @@ fn quarantine_event(tenant: &str) -> AuditEvent {
     }
 }
 
+/// An `ingest_denied` event (RFC 0026 §3.4): the envelope's tenant is
+/// the offending derived tenant; the payload carries the token's audit
+/// label only — never a token value.
+fn denied_event(tenant: &str) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(1_775_127_530),
+        payload: AuditPayload::IngestDenied {
+            token_name: "edge-collector".to_string(),
+        },
+    }
+}
+
 fn audit_partition_for(event: &AuditEvent) -> PartitionKey {
     // Audit partitioning shares the data-side `PartitionKey`
     // shape; the writer/reader compare only tenant + year/month/
@@ -203,6 +216,30 @@ fn rfc0005_7_audit_round_trip_one_of_each_variant() {
             "row {i} mismatch — full AuditEvent equality covers every row-level §3.7 column",
         );
     }
+}
+
+/// RFC 0026 §3.4 — the `ingest_denied` audit event round-trips: kind 8,
+/// the offending tenant on the envelope, the token's audit label in its
+/// column, every other payload column NULL.
+#[test]
+fn rfc0026_ingest_denied_audit_event_round_trips() {
+    let bucket = TempDir::new().unwrap();
+    let events = vec![
+        denied_event("intruded-tenant"),
+        quarantine_event("intruded-tenant"),
+    ];
+    let partition = audit_partition_for(&events[0]);
+
+    let mut writer = AuditWriter::open(bucket.path(), partition.clone()).expect("open");
+    writer.append_events(&events).expect("append");
+    let written = writer.close().expect("close");
+
+    let reader = AuditReader::open_partition(&written.path, partition).expect("open_partition");
+    let round_tripped = reader.read_all().expect("read_all");
+    assert_eq!(
+        round_tripped, events,
+        "denial + quarantine rows round-trip exactly"
+    );
 }
 
 /// `AuditReader::open_bytes` reads an audit file from in-memory bytes — the

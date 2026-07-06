@@ -136,6 +136,13 @@ groups:
               value: "drift"
               stability: development
               brief: A template-drift query (`run_drift`).
+            - id: rejected
+              value: "rejected"
+              stability: development
+              brief: >
+                A request rejected before kind dispatch (RFC 0026 §3.4 —
+                authentication and tenant binding answer before the body
+                parse); carries `error.type`.
         stability: development
         brief: The kind of query served by the querier endpoint (RFC 0016).
       - id: ourios.query.row_group.state

@@ -236,6 +236,15 @@ pub enum AuditPayload {
         /// can never be written.
         error: String,
     },
+    /// An authenticated sender attempted to write outside its token's
+    /// allowed tenant set; the whole batch was rejected before the WAL
+    /// (RFC 0026 §3.2/§3.4). The event's `tenant_id` is the **offending**
+    /// derived tenant; the payload carries the rejecting token's audit
+    /// label — never the token value.
+    IngestDenied {
+        /// The rejecting token's audit/metric label (RFC 0026 §3.4).
+        token_name: String,
+    },
 }
 
 /// Stable on-disk `event_kind` ordinals (RFC 0005 §3.7 mapping).
@@ -260,6 +269,9 @@ pub const EVENT_KIND_TEMPLATE_CREATED: u8 = 6;
 /// append-only addition; old readers surface it via the
 /// [`AuditPayload::Unknown`] tolerance path.
 pub const EVENT_KIND_RECORD_QUARANTINED: u8 = 7;
+/// `ingest_denied` — an authenticated cross-tenant write attempt was
+/// rejected pre-WAL (RFC 0026 §3.2).
+pub const EVENT_KIND_INGEST_DENIED: u8 = 8;
 
 /// Canonical `event_type` strings paired with the ordinals above
 /// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
@@ -279,6 +291,8 @@ pub const EVENT_TYPE_ALIAS_RETRACTED: &str = "alias_retracted";
 pub const EVENT_TYPE_TEMPLATE_CREATED: &str = "template_created";
 /// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0025 §3.3 sink quarantine.
 pub const EVENT_TYPE_RECORD_QUARANTINED: &str = "record_quarantined";
+/// The string form of [`EVENT_KIND_INGEST_DENIED`].
+pub const EVENT_TYPE_INGEST_DENIED: &str = "ingest_denied";
 
 /// The `template_version` a leaf is born at (RFC 0017 §3.1). The
 /// [`TemplateChange::Created`] variant omits a version field — the invariant
@@ -305,6 +319,7 @@ impl AuditPayload {
             Self::AliasRetracted { .. } => EVENT_KIND_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_KIND_COMPACTION,
             Self::RecordQuarantined { .. } => EVENT_KIND_RECORD_QUARANTINED,
+            Self::IngestDenied { .. } => EVENT_KIND_INGEST_DENIED,
             Self::Unknown { event_kind, .. } => *event_kind,
         }
     }
@@ -328,6 +343,7 @@ impl AuditPayload {
             Self::AliasRetracted { .. } => EVENT_TYPE_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_TYPE_COMPACTION,
             Self::RecordQuarantined { .. } => EVENT_TYPE_RECORD_QUARANTINED,
+            Self::IngestDenied { .. } => EVENT_TYPE_INGEST_DENIED,
             Self::Unknown { event_type, .. } => event_type,
         }
     }
@@ -348,6 +364,7 @@ impl AuditPayload {
             | Self::AliasRetracted { .. }
             | Self::Compaction { .. }
             | Self::RecordQuarantined { .. }
+            | Self::IngestDenied { .. }
             | Self::Unknown { .. } => false,
         }
     }

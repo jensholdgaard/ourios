@@ -942,6 +942,25 @@ auth:
         assert!(err.contains("auth.tokens"), "names the key: {err}");
     }
 
+    /// RFC 0027 §3.1 — the MCP flag is opt-in: absent/falsey values leave
+    /// it off, the role-standard truthy values enable it, on both the env
+    /// and file paths (the same `build_querier_config`).
+    #[test]
+    fn querier_mcp_flag_defaults_off_and_accepts_truthy() {
+        for off in [None, Some("0"), Some("false"), Some("off"), Some("")] {
+            let params = build_querier_config(Some("1"), None, None, off)
+                .expect("valid")
+                .expect("enabled");
+            assert!(!params.mcp_enabled, "{off:?} leaves MCP off");
+        }
+        for on in ["1", "true", "yes"] {
+            let params = build_querier_config(Some("1"), None, None, Some(on))
+                .expect("valid")
+                .expect("enabled");
+            assert!(params.mcp_enabled, "{on:?} enables MCP");
+        }
+    }
+
     /// `config_from_file` end-to-end through the real filesystem: a valid file
     /// reads and resolves, and both failure paths name the offending file — a
     /// missing file via the read-error prefix, a parse failure via the

@@ -190,6 +190,10 @@ fn rfc0005_10_audit_schema_matches_pinned_field_list() {
             true,
         ),
         Field::new("alias_actor", DataType::Utf8, true),
+        // Quarantine-event columns (RFC 0025 §3.3 amendment,
+        // 2026-07-06): OPTIONAL, appended after the alias group.
+        Field::new("quarantine_partition", DataType::Utf8, true),
+        Field::new("quarantine_error", DataType::Utf8, true),
     ];
     check_schema_against(&expected, &audit_schema());
 }

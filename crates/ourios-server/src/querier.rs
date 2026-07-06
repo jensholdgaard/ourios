@@ -481,7 +481,10 @@ struct LogRowDto {
     dropped_attributes_count: u32,
     template_id: u64,
     template_version: u32,
-    body: LogBodyDto,
+    /// Omitted entirely for `body_kind = Absent` rows (RFC 0025
+    /// §3.2) — a missing body key, never `""`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<LogBodyDto>,
 }
 
 impl From<&LogRow> for LogRowDto {
@@ -505,7 +508,10 @@ impl From<&LogRow> for LogRowDto {
             dropped_attributes_count: row.dropped_attributes_count,
             template_id: row.template_id,
             template_version: row.template_version,
-            body: LogBodyDto::from(&row.body),
+            body: match &row.body {
+                LogBody::Absent => None,
+                other => Some(LogBodyDto::from(other)),
+            },
         }
     }
 }
@@ -546,6 +552,8 @@ impl From<&LogBody> for LogBodyDto {
             },
             // `LogBody` is `#[non_exhaustive]`; a future body shape degrades to
             // an empty retained line rather than failing the whole response.
+            // (`Absent` never reaches here — the row DTO maps it to a missing
+            // `body` field before this conversion runs, RFC 0025 §3.2.)
             _ => Self::Rendered {
                 line: String::new(),
                 reconstruction: "retained_verbatim",
@@ -710,7 +718,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
     use super::{
-        DEFAULT_LIMIT, MAX_LIMIT, Stage, Statement, apply_limit, parse_body, tenant_from_headers,
+        DEFAULT_LIMIT, LogRowDto, MAX_LIMIT, Stage, Statement, apply_limit, parse_body,
+        tenant_from_headers,
     };
 
     fn headers(content_type: Option<&str>, tenant: Option<&str>) -> HeaderMap {
@@ -722,6 +731,72 @@ mod tests {
             h.insert("x-ourios-tenant", HeaderValue::from_str(t).unwrap());
         }
         h
+    }
+
+    /// RFC 0025 §3.2: an absent-body row's JSON omits the `body`
+    /// key entirely — a missing field, never `""` (an empty-string
+    /// body is a different legal record and keeps its field).
+    #[test]
+    fn absent_body_row_omits_the_body_key() {
+        use ourios_core::record::{BodyKind, MinedRecord};
+        use ourios_querier::{LogRow, TemplateRegistry};
+
+        let registry = TemplateRegistry::default();
+        let absent = MinedRecord {
+            body_kind: BodyKind::Absent,
+            body: None,
+            ..test_record()
+        };
+        let row = LogRow::from_record(&absent, &registry);
+        let json = serde_json::to_value(LogRowDto::from(&row)).expect("serialize");
+        assert!(
+            json.as_object().is_some_and(|o| !o.contains_key("body")),
+            "Absent body must omit the key: {json}",
+        );
+
+        let empty_string = MinedRecord {
+            body_kind: BodyKind::String,
+            body: Some(String::new()),
+            lossy_flag: true,
+            ..test_record()
+        };
+        let row = LogRow::from_record(&empty_string, &registry);
+        let json = serde_json::to_value(LogRowDto::from(&row)).expect("serialize");
+        assert!(
+            json.as_object().is_some_and(|o| o.contains_key("body")),
+            "an empty-string body keeps its field: {json}",
+        );
+    }
+
+    /// A minimal record for the DTO tests above.
+    fn test_record() -> ourios_core::record::MinedRecord {
+        ourios_core::record::MinedRecord {
+            tenant_id: ourios_core::tenant::TenantId::new("t"),
+            template_id: 0,
+            template_version: 0,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
+            time_unix_nano: 1,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: None,
+            body_kind: ourios_core::record::BodyKind::String,
+            params: Vec::new(),
+            separators: Vec::new(),
+            body: Some(String::new()),
+            confidence: 0.0,
+            lossy_flag: true,
+        }
     }
 
     #[test]

@@ -156,8 +156,10 @@ Scenario ids `RFC0027.<m>`. Maintainer sign-off: 2026-07-05 ("go on
 
 > **Scenario RFC0027.6 — the grammar resource.** Given the server
 > enabled, When the client lists/reads resources, Then the DSL
-> grammar/reference doc is served verbatim from the repo's canonical
-> copy — no drift between the resource and the documentation.
+> grammar/reference doc is served verbatim from the canonical copy —
+> the RFC 0002 §7 grammar (`docs/rfcs/0002-query-dsl.md`, embedded at
+> compile time via `include_str!`) — no drift between the resource
+> and the documentation.
 
 > **Scenario RFC0027.7 — output discipline.** Given any tool result,
 > Then it is the RFC 0016 JSON shape re-encoded as MCP content (one
@@ -173,8 +175,8 @@ or in-process router, flag off/on, the RFC 0026 status matrix over
 client against a seeded store and assert equality with the
 corresponding JSON-API/engine answer — the adapter must add nothing
 but the protocol. `.6`/`.7` by inspection of the served
-resource/descriptors against the repo's canonical grammar doc and a
-deny-list assertion on the advertised tool/resource set.
+resource/descriptors against the RFC 0002 §7 grammar source named in
+`.6` and a deny-list assertion on the advertised tool/resource set.
 
 ## 7. Open questions
 

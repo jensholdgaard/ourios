@@ -1,7 +1,7 @@
 ---
 rfc: 0028
 title: Build-feedback program — test-harness consolidation and workspace decomposition
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-06
@@ -150,15 +150,19 @@ proposed scenarios accompanied the drafting PR, #383).
 > harness.
 
 > **Scenario RFC0028.3 — the probe set improves.** Given the epic
-> #382 probe set re-run after slices 1–2 — on the same machine and
+> #382 probe set re-run as the slices land — the edit-loop probe after
+> slices 1–2, the runner-dependent full-suite gate after the runner
+> slice it names — on the same machine and
 > under the same conditions the baseline was captured (warm
 > workspace, same toolchain; environment recorded next to the
 > numbers in the epic) — Then the incremental-edit probe —
 > `touch crates/ourios-core/src/lib.rs` (an mtime-only update,
 > exactly as the epic's baseline measured it) followed by
 > `cargo test -p ourios-querier --no-run` — drops below 30 s, And
-> full-workspace `cargo test` wall time drops by at least 30%
-> against the epic's baseline.
+> full-workspace suite wall time — under the test runner CI adopts
+> (plain `cargo test`, or `cargo nextest run` once slice 5 lands;
+> clarified at the green flip so the criterion matches the slice-5
+> design) — drops by at least 30% against the epic's baseline.
 
 > **Scenario RFC0028.4 — the core split is behavior-free.** Given
 > the `ourios-config` extraction, When the full workspace suite
@@ -168,6 +172,35 @@ proposed scenarios accompanied the drafting PR, #383).
 > **Scenario RFC0028.5 — CI parity.** Given the consolidated
 > harnesses (and nextest, if slice 5 adopts it), Then CI runs the
 > identical suite inventory and stays green.
+
+### 5.1 Discharge record (green, 2026-07-06)
+
+- **RFC0028.1** — per-PR inventory proofs: #399 (ingester, 129/129),
+  #400 (querier, 162/162), #401 (parquet, 162/162), #402 (wal, 64/64),
+  #403 (server, 90/90), #404 (miner, 206/206); every diff a pure
+  module-path-prefix rename.
+- **RFC0028.2** — committed exemption lists:
+  `crates/ourios-ingester/tests/README.md` and
+  `crates/ourios-miner/tests/README.md` (+ the server harness header);
+  all exemptions are process-global `OTel` meter-provider installers.
+- **RFC0028.3** — both gates pass (measurement tables on epic #382,
+  2026-07-06): `touch core → querier --no-run` 57 s → 28.6 s (< 30 s);
+  warm workspace suite ~10 min → 48.2 s under nextest (≥ 30% gate).
+  Steady-state protocol notes (macOS first-exec assessment) recorded
+  with the numbers.
+- **RFC0028.4** — proven in #405: a `MinerConfig` whitespace edit
+  leaves `ourios-core` and `ourios-parquet` `Fresh`; the rebuild set is
+  the semantic one (`config → miner → querier`).
+- **RFC0028.5** — #406: CI runs
+  `cargo nextest run --workspace --all-features` +
+  `cargo test --doc`, preserving the exact suite
+  inventory; the workflow invocations that named old binaries were
+  retargeted in the same PRs that moved them (#401, #403, #404).
+- **Slice 4 (parquet split)** — closed *not-triggered* per the §3.3
+  tripwire: RFC0028.3's < 30 s edit-loop probe passed without it.
+- **`red` note** — this RFC's scenarios are review/measurement
+  mechanisms (§6), not stub-able tests; there was no `red` rung, as
+  recorded in the slice-1 PR.
 
 ## 6. Testing strategy
 

@@ -150,7 +150,9 @@ proposed scenarios accompanied the drafting PR, #383).
 > harness.
 
 > **Scenario RFC0028.3 — the probe set improves.** Given the epic
-> #382 probe set re-run after slices 1–2 — on the same machine and
+> #382 probe set re-run as the slices land — the edit-loop probe after
+> slices 1–2, the runner-dependent full-suite gate after the runner
+> slice it names — on the same machine and
 > under the same conditions the baseline was captured (warm
 > workspace, same toolchain; environment recorded next to the
 > numbers in the epic) — Then the incremental-edit probe —
@@ -195,7 +197,7 @@ proposed scenarios accompanied the drafting PR, #383).
   inventory; the workflow invocations that named old binaries were
   retargeted in the same PRs that moved them (#401, #403, #404).
 - **Slice 4 (parquet split)** — closed *not-triggered* per the §3.3
-  tripwire: the probe-A gate passed without it.
+  tripwire: RFC0028.3's < 30 s edit-loop probe passed without it.
 - **`red` note** — this RFC's scenarios are review/measurement
   mechanisms (§6), not stub-able tests; there was no `red` rung, as
   recorded in the slice-1 PR.

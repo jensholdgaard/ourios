@@ -26,9 +26,11 @@ use subtle::ConstantTimeEq;
 /// §3.1 schema; [`build_token_store`] is the single validation path.
 ///
 /// The `token` field is **secret**: the manual [`fmt::Debug`] impl redacts
-/// its value (showing only presence). The config layer additionally rejects
-/// inline literals at parse time — a spec's token only ever arrives through
-/// `${env:…}` indirection.
+/// its value (showing only presence). On the `ourios-server` config path an
+/// inline literal is additionally rejected at parse time, so there a token
+/// only ever arrives through `${env:…}` indirection; any other constructor
+/// owns the same discipline — never write a token value into a committable
+/// or rendered surface.
 #[derive(Default, Clone)]
 pub struct TokenSpec {
     /// Audit/metric label for this token — never secret (RFC 0026 §3.4).
@@ -136,8 +138,7 @@ impl TokenStore {
 ///
 /// A present spec list must hold at least one token; every entry must carry
 /// a non-empty `name` (unique across entries, it is the audit label), a
-/// `token` that resolved non-empty (an empty one means the `${env:…}`
-/// variable was unset), a unique token value (two entries with one value
+/// non-empty `token`, a unique token value (two entries with one value
 /// would make the tenant binding ambiguous), and a non-empty `tenants` list
 /// — exact ids without surrounding whitespace, or the wildcard `"*"` alone.
 /// Error text names entries by `name`/index only, never a token value.
@@ -171,19 +172,19 @@ pub fn build_token_store(specs: Option<&[TokenSpec]>) -> Result<Option<TokenStor
         }
         let token = match spec.token.as_deref() {
             Some(t) if !t.is_empty() => t.to_string(),
-            // A literal empty string never reaches here (the config layer's
-            // parse-time reference rule rejects it), so empty means the
-            // reference resolved against an unset variable.
+            // The error names the likely cause on the config path (where a
+            // literal "" is already rejected at parse time, an empty token
+            // is almost always an `${env:…}` reference against an unset
+            // variable) without asserting it — the spec is config-agnostic.
             Some(_) => {
                 return Err(format!(
-                    "auth.tokens[{index}] ({name}): token resolved to empty — is the \
-                     ${{env:…}} variable set?"
+                    "auth.tokens[{index}] ({name}): token is empty — an ${{env:…}} \
+                     reference against an unset variable is the usual cause"
                 ));
             }
             None => {
                 return Err(format!(
-                    "auth.tokens[{index}] ({name}): token is required — an \
-                     ${{env:…}} reference (RFC 0026 §3.1)"
+                    "auth.tokens[{index}] ({name}): token is required (RFC 0026 §3.1)"
                 ));
             }
         };
@@ -317,7 +318,7 @@ mod tests {
                 vec![spec("a", "tok-a", &["x"]), spec("a", "tok-b", &["y"])],
                 "duplicates",
             ),
-            (vec![spec("a", "", &["x"])], "resolved to empty"),
+            (vec![spec("a", "", &["x"])], "unset variable"),
             (
                 vec![TokenSpec {
                     name: Some("a".to_string()),

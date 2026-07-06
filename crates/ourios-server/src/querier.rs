@@ -32,6 +32,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
+use ourios_core::auth::TokenStore;
+use ourios_ingester::receiver::auth::{AuthBinding, authenticate_bearer};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -72,6 +74,11 @@ pub struct QuerierConfig {
     /// (`OURIOS_BUCKET_ROOT`) or an S3-compatible bucket (`OURIOS_S3_*`),
     /// resolved by the server (`main.rs`).
     pub store: StoreConfig,
+    /// The RFC 0026 token store; `None` is open mode (§3.1). With a store,
+    /// every request must carry a known `Authorization: Bearer` credential
+    /// (→ 401) and its `x-ourios-tenant` must fall inside the token's set
+    /// (→ 403); the missing-tenant 400 is unchanged (§3.3).
+    pub auth: Option<Arc<TokenStore>>,
     /// The look-back applied to a query with no `range(...)` stage — the
     /// server-supplied default window the DSL compiler expects (RFC 0002 §4 P5;
     /// RFC 0016 §7).
@@ -186,23 +193,39 @@ struct QuerierState {
     querier: Arc<Querier>,
     default_window_nanos: u64,
     metrics: Arc<QuerierMetrics>,
+    auth: Option<Arc<TokenStore>>,
 }
 
 /// Build the querier role's axum router over a **local** store root (RFC 0016
 /// §3.3). Split out from [`serve`] so it can be driven in-process by tests; the
 /// local backend is the test/dev default and the RFC 0019 regression guard.
 pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
-    router_from_querier(Querier::new(bucket_root), default_window_nanos)
+    router_with_auth(bucket_root, default_window_nanos, None)
+}
+
+/// [`router`] with an RFC 0026 token store — the authenticated variant
+/// (`None` = open mode, identical to [`router`]).
+pub fn router_with_auth(
+    bucket_root: PathBuf,
+    default_window_nanos: u64,
+    auth: Option<Arc<TokenStore>>,
+) -> Router {
+    router_from_querier(Querier::new(bucket_root), default_window_nanos, auth)
 }
 
 /// Build the router from an already-constructed [`Querier`] — the shared core
 /// of [`router`] (local) and [`serve`] (which builds the querier from the
 /// resolved [`StoreConfig`], so the S3 backend is wired the same way).
-fn router_from_querier(querier: Querier, default_window_nanos: u64) -> Router {
+fn router_from_querier(
+    querier: Querier,
+    default_window_nanos: u64,
+    auth: Option<Arc<TokenStore>>,
+) -> Router {
     let state = QuerierState {
         querier: Arc::new(querier),
         default_window_nanos,
         metrics: Arc::new(QuerierMetrics::new()),
+        auth,
     };
     Router::new()
         .route("/v1/query", post(handle_query))
@@ -236,7 +259,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         .local_addr()
         .map_err(|e| format!("HTTP local_addr: {e}"))?;
 
-    let app = router_from_querier(querier, config.default_window_nanos);
+    let app = router_from_querier(querier, config.default_window_nanos, config.auth);
     let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
@@ -259,6 +282,25 @@ async fn handle_query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // RFC 0026 §3.3: authentication precedes everything, including the
+    // tenant check — 401 before 400 before 403, so an unauthenticated
+    // probe learns nothing about the tenant contract. One undifferentiated
+    // message (missing vs malformed vs unknown would be an oracle).
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let binding: Option<AuthBinding> =
+        match authenticate_bearer(state.auth.as_deref(), authorization) {
+            Ok(binding) => binding,
+            Err(_) => {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthenticated",
+                    "a valid bearer token is required",
+                );
+            }
+        };
+
     // Tenant is required and checked here, before the engine is invoked
     // (RFC 0016 §3.3): a missing/empty header is a `400` that never scans data.
     let Some(tenant) = tenant_from_headers(&headers) else {
@@ -268,6 +310,19 @@ async fn handle_query(
             "the X-Ourios-Tenant header is required and must be non-empty",
         );
     };
+
+    // RFC 0026 §3.3: a well-formed tenant outside the authenticated token's
+    // set is 403 — enforcement composes with (never replaces) the
+    // structural per-tenant scan scoping below it.
+    if let Some(binding) = &binding
+        && !binding.tenants().allows(tenant.as_str())
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "tenant_denied",
+            "the tenant is outside the authenticated token's allowed set",
+        );
+    }
 
     let statement = match parse_body(&headers, &body) {
         Ok(statement) => statement,

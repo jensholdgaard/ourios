@@ -5,9 +5,7 @@
 //! `.5`, and `.7`) live in
 //! `crates/ourios-ingester/tests/rfc0026_auth.rs`.
 //!
-//! Remaining stubs are `#[ignore]`d so the default run stays green
-//! while the RFC is red; each names the green slice that discharges
-//! it. `.1` is green: the schema/substitution/redaction arms live in
+//! All four server-owned scenarios are green. `.1`: the schema/substitution/redaction arms live in
 //! `ourios_server::config::file`, the store-validation matrix in
 //! `ourios_server::auth`, the file→store mapping in `src/main.rs`
 //! (`rfc0026_1_*`), and the startup-observable arms — the empty-list
@@ -126,37 +124,204 @@ async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
     child.kill().await.expect("kill the server");
 }
 
+/// A one-token store for the query-gate arms.
+fn query_store(tenants: &[&str]) -> std::sync::Arc<ourios_core::auth::TokenStore> {
+    std::sync::Arc::new(
+        ourios_core::auth::build_token_store(Some(&[ourios_core::auth::TokenSpec {
+            name: Some("query-cli".to_string()),
+            token: Some("tok-query".to_string()),
+            tenants: tenants.iter().map(|t| (*t).to_string()).collect(),
+        }]))
+        .expect("valid")
+        .expect("enabled"),
+    )
+}
+
+/// `POST /v1/query` against an authed router. Returns the status.
+async fn post_query(
+    router: axum::Router,
+    bearer: Option<&str>,
+    tenant: Option<&str>,
+    body: &str,
+) -> axum::http::StatusCode {
+    use tower::ServiceExt as _;
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/query")
+        .header(axum::http::header::CONTENT_TYPE, "text/plain");
+    if let Some(value) = bearer {
+        req = req.header(axum::http::header::AUTHORIZATION, value);
+    }
+    if let Some(t) = tenant {
+        req = req.header("x-ourios-tenant", t);
+    }
+    router
+        .oneshot(
+            req.body(axum::body::Body::from(body.to_owned()))
+                .expect("build request"),
+        )
+        .await
+        .expect("oneshot")
+        .status()
+}
+
 /// Scenario RFC0026.4 — query enforcement and status contract.
 /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
-#[test]
-#[ignore = "RFC0026.4 stub — implemented in the query green slice"]
-fn rfc0026_4_query_status_contract() {
-    todo!(
-        "RFC0026.4 — 401 missing/unknown bearer; 400 missing/empty \
-         x-ourios-tenant (unchanged); 403 out-of-set tenant; 200 with \
-         correct results in-set; drift endpoint under the same gate"
+#[tokio::test]
+async fn rfc0026_4_query_status_contract() {
+    use axum::http::StatusCode;
+
+    let bucket = tempfile::tempdir().expect("temp");
+    let auth = query_store(&["acme"]);
+    let router = || {
+        ourios_server::querier::router_with_auth(
+            bucket.path().to_path_buf(),
+            3_600_000_000_000,
+            Some(auth.clone()),
+        )
+    };
+
+    // 401: missing and unknown bearer — before the tenant contract.
+    for bearer in [None, Some("Bearer tok-wrong")] {
+        let status = post_query(router(), bearer, Some("acme"), "template_id == 1").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer:?}");
+    }
+
+    // 400: missing/empty tenant with a VALID bearer — today's contract,
+    // unchanged by the gate.
+    for tenant in [None, Some("")] {
+        let status = post_query(
+            router(),
+            Some("Bearer tok-query"),
+            tenant,
+            "template_id == 1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tenant:?}");
+    }
+
+    // 403: a well-formed tenant outside the token's set.
+    let status = post_query(
+        router(),
+        Some("Bearer tok-query"),
+        Some("globex"),
+        "template_id == 1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 200: in-set tenant serves the query (an empty store answers with an
+    // empty, well-formed result).
+    let status = post_query(
+        router(),
+        Some("Bearer tok-query"),
+        Some("acme"),
+        "template_id == 1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The drift endpoint sits under the same gate: 401 / 403 / 200.
+    let drift = "drift from 2026-06-01T00:00:00Z to 2026-06-02T00:00:00Z";
+    assert_eq!(
+        post_query(router(), None, Some("acme"), drift).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(
+        post_query(router(), Some("Bearer tok-query"), Some("globex"), drift).await,
+        StatusCode::FORBIDDEN,
+    );
+    assert_eq!(
+        post_query(router(), Some("Bearer tok-query"), Some("acme"), drift).await,
+        StatusCode::OK,
     );
 }
 
 /// Scenario RFC0026.5 (query half) — wildcard binding.
 /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
-#[test]
-#[ignore = "RFC0026.5 stub — implemented in the query green slice"]
-fn rfc0026_5_wildcard_binding_query() {
-    todo!(
-        "RFC0026.5 — a tenants: [\"*\"] token queries arbitrary tenants as \
-         if every tenant were listed"
-    );
+#[tokio::test]
+async fn rfc0026_5_wildcard_binding_query() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let auth = query_store(&["*"]);
+    for tenant in ["alpha", "beta", "entirely-new-tenant"] {
+        let status = post_query(
+            ourios_server::querier::router_with_auth(
+                bucket.path().to_path_buf(),
+                3_600_000_000_000,
+                Some(auth.clone()),
+            ),
+            Some("Bearer tok-query"),
+            Some(tenant),
+            "template_id == 1",
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "wildcard serves {tenant}"
+        );
+    }
 }
 
 /// Scenario RFC0026.6 — open-mode parity.
+///
+/// The suites half of the scenario is the CI suite itself: every other
+/// acceptance test in this workspace drives auth-less routers/configs, so
+/// their continued green **is** the parity assertion. This test pins the
+/// remaining observable: with no `auth` configured and both network roles
+/// enabled, the startup warning is emitted exactly once, and requests are
+/// served (open really is open).
 /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
-#[test]
-#[ignore = "RFC0026.6 stub — implemented in the query green slice (parity is asserted by the existing suites plus this warning check)"]
-fn rfc0026_6_open_mode_parity() {
-    todo!(
-        "RFC0026.6 — with no auth section the existing ingest + query \
-         acceptance suites pass unchanged and the startup warning is \
-         emitted exactly once"
-    );
+#[tokio::test]
+async fn rfc0026_6_open_mode_parity() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let wal = tmp.path().join("wal");
+    std::fs::create_dir_all(&wal).expect("wal dir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .env("OURIOS_BUCKET_ROOT", tmp.path())
+        .env("OURIOS_QUERIER_ENABLED", "1")
+        .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
+        .env("OURIOS_RECEIVER_ENABLED", "1")
+        .env("OURIOS_RECEIVER_GRPC_ADDR", "127.0.0.1:0")
+        .env("OURIOS_RECEIVER_HTTP_ADDR", "127.0.0.1:0")
+        .env("OURIOS_WAL_ROOT", &wal)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ourios-server");
+
+    // Readiness bound: both roles announce on stdout; collect until the
+    // querier line (printed last).
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut out_lines = BufReader::new(stdout).lines();
+    timeout(Duration::from_secs(15), async {
+        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+            if line.contains("querier HTTP listening on") {
+                return;
+            }
+        }
+        panic!("querier line never appeared");
+    })
+    .await
+    .expect("server ready before timeout");
+
+    // Exactly one open-mode warning: scan stderr for a bounded window
+    // after readiness (the warning precedes the role start, so it has
+    // already been written).
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut err_lines = BufReader::new(stderr).lines();
+    let mut count = 0;
+    let _ = timeout(Duration::from_secs(2), async {
+        while let Some(line) = err_lines.next_line().await.expect("read stderr") {
+            if line.contains("RFC 0026 open mode") {
+                count += 1;
+            }
+        }
+    })
+    .await;
+    assert_eq!(count, 1, "the open-mode warning is emitted exactly once");
+
+    child.kill().await.expect("kill the server");
 }

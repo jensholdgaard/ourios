@@ -117,12 +117,12 @@ jobs:
       # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored
       # unit tests that run in the normal `test` job).
       - run: >
-          cargo test -p ourios-server --test rfc0019_storage_backend --
+          cargo test -p ourios-server --test it --
           --ignored --exact
-          rfc0019_2_wal_stays_local_under_s3
-          rfc0019_3_ingest_query_end_to_end_on_s3
-          rfc0019_4_compaction_operates_on_s3
-          rfc0019_5_tenant_isolation_on_s3
+          rfc0019_storage_backend::rfc0019_2_wal_stays_local_under_s3
+          rfc0019_storage_backend::rfc0019_3_ingest_query_end_to_end_on_s3
+          rfc0019_storage_backend::rfc0019_4_compaction_operates_on_s3
+          rfc0019_storage_backend::rfc0019_5_tenant_isolation_on_s3
 
   book:
     name: mdbook build

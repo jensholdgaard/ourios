@@ -165,7 +165,9 @@ async fn post_query(
         .await
         .expect("oneshot");
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+    // 1 MiB bound: the error/empty-result bodies here are tiny, and a
+    // runaway body should fail the read, not OOM the test process.
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .expect("read body");
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);

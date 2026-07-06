@@ -319,10 +319,15 @@ fn build_write_sinks(
         AUDIT_SINK_CEILING_EVENTS,
     ));
     let barrier_audit = audit_sink.clone();
+    let quarantine_audit = audit_sink.clone();
     let sink = SharedParquetSink::new(
         ParquetRecordSink::new(store, flush_config())
             .with_promoted_attributes(promoted)
-            .with_audit_barrier(Box::new(move || barrier_audit.flush())),
+            .with_audit_barrier(Box::new(move || barrier_audit.flush()))
+            // RFC 0025 §3.3: permanently-rejected records quarantine
+            // to the shared audit stream instead of wedging the
+            // partition buffer (#362).
+            .with_audit_sink(Box::new(quarantine_audit)),
     );
     (sink, audit_sink)
 }

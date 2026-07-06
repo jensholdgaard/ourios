@@ -222,6 +222,20 @@ pub enum AuditPayload {
         /// rows, the conserved count (RFC0009.2).
         rows: u64,
     },
+    /// A permanently-rejected record was diverted out of the ingest
+    /// sink's partition buffer instead of wedging it (RFC 0025
+    /// §3.3). System-scoped like [`Self::Compaction`]; carries no
+    /// template identity. The WAL still holds the record — this
+    /// event is the operator's pointer to it.
+    RecordQuarantined {
+        /// The data partition whose buffer held the record, as the
+        /// canonical `year=…/month=…/day=…/hour=…` key under the
+        /// event's `tenant_id` (RFC 0005 §3.4).
+        partition: String,
+        /// The permanent encode error's rendering — why this record
+        /// can never be written.
+        error: String,
+    },
 }
 
 /// Stable on-disk `event_kind` ordinals (RFC 0005 §3.7 mapping).
@@ -242,6 +256,10 @@ pub const EVENT_KIND_ALIAS_RETRACTED: u8 = 5;
 /// an **append-only** addition (next free ordinal, no renumber): old readers
 /// surface it via the [`AuditPayload::Unknown`] tolerance path (RFC 0005 §3.7).
 pub const EVENT_KIND_TEMPLATE_CREATED: u8 = 6;
+/// See [`EVENT_KIND_TEMPLATE_WIDENED`]. RFC 0025 §3.3 sink quarantine —
+/// append-only addition; old readers surface it via the
+/// [`AuditPayload::Unknown`] tolerance path.
+pub const EVENT_KIND_RECORD_QUARANTINED: u8 = 7;
 
 /// Canonical `event_type` strings paired with the ordinals above
 /// (RFC 0005 §3.7 / RFC 0001 §6.4 / RFC 0009 §3.6).
@@ -259,6 +277,8 @@ pub const EVENT_TYPE_ALIAS_ASSERTED: &str = "alias_asserted";
 pub const EVENT_TYPE_ALIAS_RETRACTED: &str = "alias_retracted";
 /// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0017 §3.1 leaf-creation audit.
 pub const EVENT_TYPE_TEMPLATE_CREATED: &str = "template_created";
+/// See [`EVENT_TYPE_TEMPLATE_WIDENED`]. RFC 0025 §3.3 sink quarantine.
+pub const EVENT_TYPE_RECORD_QUARANTINED: &str = "record_quarantined";
 
 /// The `template_version` a leaf is born at (RFC 0017 §3.1). The
 /// [`TemplateChange::Created`] variant omits a version field — the invariant
@@ -284,6 +304,7 @@ impl AuditPayload {
             Self::AliasAsserted { .. } => EVENT_KIND_ALIAS_ASSERTED,
             Self::AliasRetracted { .. } => EVENT_KIND_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_KIND_COMPACTION,
+            Self::RecordQuarantined { .. } => EVENT_KIND_RECORD_QUARANTINED,
             Self::Unknown { event_kind, .. } => *event_kind,
         }
     }
@@ -306,6 +327,7 @@ impl AuditPayload {
             Self::AliasAsserted { .. } => EVENT_TYPE_ALIAS_ASSERTED,
             Self::AliasRetracted { .. } => EVENT_TYPE_ALIAS_RETRACTED,
             Self::Compaction { .. } => EVENT_TYPE_COMPACTION,
+            Self::RecordQuarantined { .. } => EVENT_TYPE_RECORD_QUARANTINED,
             Self::Unknown { event_type, .. } => event_type,
         }
     }
@@ -325,6 +347,7 @@ impl AuditPayload {
             Self::AliasAsserted { .. }
             | Self::AliasRetracted { .. }
             | Self::Compaction { .. }
+            | Self::RecordQuarantined { .. }
             | Self::Unknown { .. } => false,
         }
     }

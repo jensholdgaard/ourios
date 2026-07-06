@@ -1,7 +1,7 @@
 ---
 rfc: 0025
 title: Absent-body representation and permanent-encode-error quarantine (RFC 0005 amendment)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -94,8 +94,9 @@ On flush, when the encode fails with a **permanent** `BatchError`
    singleton encodes — O(k·log n) for k poison records, and k is
    almost always 1).
 2. Emit the poisoned record(s) to the audit stream (event kind:
-   `record_quarantined`, carrying tenant, partition, the error text,
-   and the record's WAL position) and drop them from the buffer.
+   `record_quarantined`, carrying the tenant, the partition key, and
+   the error text; the WAL retains the record itself) and drop them
+   from the buffer.
 3. Flush the remainder normally.
 4. Count via the existing flush-error counter with `error.type` =
    the `BatchError` variant name (per the OTel recording-errors
@@ -103,7 +104,8 @@ On flush, when the encode fails with a **permanent** `BatchError`
 
 The WAL retains the record (durability unchanged); the quarantine
 audit event is the operator's pointer for manual recovery or replay
-after a fix. No new config: quarantine is not optional behavior —
+after a fix. The cadence-drain publish path applies the same rule —
+both routes to the encoder quarantine rather than requeue. No new config: quarantine is not optional behavior —
 the alternative is the wedge.
 
 ## 4. Alternatives considered

@@ -69,10 +69,10 @@ use crate::audit_schema;
 /// existing call sites resolve them at their established path.
 pub use ourios_core::audit::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
-    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE, EVENT_TYPE_ALIAS_ASSERTED,
-    EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION, EVENT_TYPE_TEMPLATE_CREATED,
-    EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
+    EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
+    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_TYPE_ALIAS_ASSERTED, EVENT_TYPE_ALIAS_RETRACTED, EVENT_TYPE_COMPACTION,
+    EVENT_TYPE_TEMPLATE_CREATED, EVENT_TYPE_TEMPLATE_TYPE_EXPANDED, EVENT_TYPE_TEMPLATE_WIDENED,
     EVENT_TYPE_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 
@@ -210,6 +210,8 @@ struct Builders {
     triggering_line_sample: StringBuilder,
     reason: StringBuilder,
     compaction_partition: StringBuilder,
+    quarantine_partition: StringBuilder,
+    quarantine_error: StringBuilder,
     compaction_input_files: GenericListBuilder<i32, StringBuilder>,
     compaction_output_file: StringBuilder,
     compaction_generation: UInt64Builder,
@@ -265,6 +267,8 @@ impl Builders {
             triggering_line_sample: StringBuilder::with_capacity(cap, 0),
             reason: StringBuilder::with_capacity(cap, 0),
             compaction_partition: StringBuilder::with_capacity(cap, 0),
+            quarantine_partition: StringBuilder::with_capacity(cap, 0),
+            quarantine_error: StringBuilder::with_capacity(cap, 0),
             compaction_input_files: GenericListBuilder::new(StringBuilder::new())
                 .with_field(Field::new("element", DataType::Utf8, false)),
             compaction_output_file: StringBuilder::with_capacity(cap, 0),
@@ -300,6 +304,7 @@ impl Builders {
                 // columns NULL (§3.7 amendments 2026-06-03 /
                 // 2026-06-12).
                 self.append_compaction_nulls();
+                self.append_quarantine_nulls();
                 self.append_alias_nulls();
                 self.template_id.append_value(*template_id);
                 self.triggering_line_hash
@@ -332,6 +337,7 @@ impl Builders {
                 // empty-string `reason` maps to NULL (`"" ↔ NULL`).
                 self.append_template_nulls();
                 self.append_compaction_nulls();
+                self.append_quarantine_nulls();
                 if reason.is_empty() {
                     self.reason.append_null();
                 } else {
@@ -353,6 +359,7 @@ impl Builders {
                 // with every payload column NULL.
                 self.append_template_nulls();
                 self.append_compaction_nulls();
+                self.append_quarantine_nulls();
                 self.append_alias_nulls();
                 self.reason.append_null();
             }
@@ -376,6 +383,17 @@ impl Builders {
                 self.compaction_output_file.append_value(output_file);
                 self.compaction_generation.append_value(*generation);
                 self.compaction_rows.append_value(*rows);
+                self.append_quarantine_nulls();
+            }
+            AuditPayload::RecordQuarantined { partition, error } => {
+                // Quarantine events (RFC 0025 §3.3) populate only the
+                // envelope and the `quarantine_*` columns.
+                self.append_template_nulls();
+                self.append_compaction_nulls();
+                self.append_alias_nulls();
+                self.reason.append_null();
+                self.quarantine_partition.append_value(partition);
+                self.quarantine_error.append_value(error);
             }
         }
 
@@ -501,6 +519,12 @@ impl Builders {
         self.alias_actor.append_null();
     }
 
+    /// NULL every quarantine-specific column — for a non-quarantine row.
+    fn append_quarantine_nulls(&mut self) {
+        self.quarantine_partition.append_null();
+        self.quarantine_error.append_null();
+    }
+
     fn finish(mut self) -> Vec<ArrayRef> {
         vec![
             Arc::new(self.tenant_id.finish()),
@@ -525,6 +549,8 @@ impl Builders {
             Arc::new(self.alias_representative_id.finish()),
             Arc::new(self.alias_member_ids.finish()),
             Arc::new(self.alias_actor.finish()),
+            Arc::new(self.quarantine_partition.finish()),
+            Arc::new(self.quarantine_error.finish()),
         ]
     }
 }

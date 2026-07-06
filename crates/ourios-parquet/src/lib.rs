@@ -129,6 +129,10 @@ pub mod audit_columns {
     pub const ALIAS_REPRESENTATIVE_ID: &str = "alias_representative_id";
     pub const ALIAS_MEMBER_IDS: &str = "alias_member_ids";
     pub const ALIAS_ACTOR: &str = "alias_actor";
+    // Quarantine-event columns (RFC 0025 §3.3); NULL for all other
+    // kinds. Appended after the alias group — additive per §3.7.
+    pub const QUARANTINE_PARTITION: &str = "quarantine_partition";
+    pub const QUARANTINE_ERROR: &str = "quarantine_error";
 }
 
 /// Build the data-file Arrow schema per RFC 0005 §3.2.
@@ -313,5 +317,10 @@ pub fn audit_schema() -> SchemaRef {
             true,
         ),
         Field::new(audit_columns::ALIAS_ACTOR, DataType::Utf8, true),
+        // Quarantine-event columns (RFC 0025 §3.3): OPTIONAL, NULL
+        // for all other kinds; required-by-convention non-null for
+        // kind 7. Appended after the alias group (§3.7 additive).
+        Field::new(audit_columns::QUARANTINE_PARTITION, DataType::Utf8, true),
+        Field::new(audit_columns::QUARANTINE_ERROR, DataType::Utf8, true),
     ]))
 }

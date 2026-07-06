@@ -123,6 +123,20 @@ fn compaction_event(tenant: &str) -> AuditEvent {
     }
 }
 
+/// A quarantine audit event in the same partition (RFC 0025 §3.3).
+fn quarantine_event(tenant: &str) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: ts(1_775_127_520),
+        payload: AuditPayload::RecordQuarantined {
+            partition: "year=2026/month=04/day=02/hour=10".to_string(),
+            error: "observed_time_unix_nano = 18446744073709551615 exceeds i64::MAX \
+                    (RFC 0005 §3.2 u64→i64 overflow contract)"
+                .to_string(),
+        },
+    }
+}
+
 fn audit_partition_for(event: &AuditEvent) -> PartitionKey {
     // Audit partitioning shares the data-side `PartitionKey`
     // shape; the writer/reader compare only tenant + year/month/
@@ -498,5 +512,36 @@ fn rfc0005_12_compaction_audit_event_round_trips() {
     assert!(
         round_tripped.contains(&template),
         "the template event in the same file is unaffected",
+    );
+}
+
+/// RFC 0025 §3.3 — a `record_quarantined` audit event round-trips
+/// with its `quarantine_*` columns populated and every other payload
+/// group NULL, alongside template and compaction events in the same
+/// file (the §3.8-rule-6 required-by-convention contract, extended
+/// to the third system-scoped kind).
+#[test]
+fn rfc0025_record_quarantined_audit_event_round_trips() {
+    let bucket = TempDir::new().unwrap();
+    let template = three_variants("acme").remove(0);
+    let compaction = compaction_event("acme");
+    let quarantine = quarantine_event("acme");
+    let events = vec![template.clone(), compaction.clone(), quarantine.clone()];
+    let partition = audit_partition_for(&events[0]);
+    let mut writer = AuditWriter::open(bucket.path(), partition.clone()).expect("open");
+    writer.append_events(&events).expect("append");
+    let written = writer.close().expect("close");
+
+    let reader = AuditReader::open_partition(&written.path, partition).expect("open_partition");
+    let round_tripped = reader.read_all().expect("read_all");
+
+    assert_eq!(round_tripped.len(), 3);
+    assert!(
+        round_tripped.contains(&quarantine),
+        "quarantine event round-trips with quarantine_* columns and NULLs elsewhere",
+    );
+    assert!(
+        round_tripped.contains(&compaction) && round_tripped.contains(&template),
+        "the other kinds in the same file are unaffected",
     );
 }

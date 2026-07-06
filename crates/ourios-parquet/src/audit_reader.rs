@@ -43,8 +43,8 @@ use parquet::errors::ParquetError;
 use crate::audit_columns;
 use crate::audit_record_batch::{
     EVENT_KIND_ALIAS_ASSERTED, EVENT_KIND_ALIAS_RETRACTED, EVENT_KIND_COMPACTION,
-    EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED, EVENT_KIND_TEMPLATE_WIDENED,
-    EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
+    EVENT_KIND_RECORD_QUARANTINED, EVENT_KIND_TEMPLATE_CREATED, EVENT_KIND_TEMPLATE_TYPE_EXPANDED,
+    EVENT_KIND_TEMPLATE_WIDENED, EVENT_KIND_TEMPLATE_WIDENING_REJECTED_DEGENERATE,
 };
 use crate::audit_writer::{audit_partition_matches, derive_audit_partition};
 use crate::partition::PartitionKey;
@@ -345,6 +345,12 @@ fn batch_to_audit_events(
     let alias_representative_id = optional_u64(batch, audit_columns::ALIAS_REPRESENTATIVE_ID)?;
     let alias_member_ids = optional_u64_list(batch, audit_columns::ALIAS_MEMBER_IDS)?;
     let alias_actor = optional_string(batch, audit_columns::ALIAS_ACTOR)?.unwrap_or_default();
+    // Quarantine-group columns (RFC 0025 §3.3) — absent in
+    // pre-amendment files (§3.7 absent-column tolerance).
+    let quarantine_partition =
+        optional_string(batch, audit_columns::QUARANTINE_PARTITION)?.unwrap_or_default();
+    let quarantine_error =
+        optional_string(batch, audit_columns::QUARANTINE_ERROR)?.unwrap_or_default();
 
     for i in 0..n {
         let file_row = row_offset + i;
@@ -385,6 +391,13 @@ fn batch_to_audit_events(
                     rows: &compaction_rows,
                 };
                 decode_compaction_payload(&cols, i, file_row)?
+            }
+            EVENT_KIND_RECORD_QUARANTINED => {
+                let cols = QuarantineColumns {
+                    partition: &quarantine_partition,
+                    error: &quarantine_error,
+                };
+                decode_quarantine_payload(&cols, i, file_row)?
             }
             kind @ (EVENT_KIND_ALIAS_ASSERTED | EVENT_KIND_ALIAS_RETRACTED) => {
                 let cols = AliasColumns {
@@ -435,6 +448,31 @@ struct CompactionColumns<'a> {
     output_file: &'a [Option<String>],
     generation: &'a [Option<u64>],
     rows: &'a [Option<u64>],
+}
+
+/// The two quarantine columns (RFC 0025 §3.3), required-by-convention
+/// non-null for kind 7.
+struct QuarantineColumns<'a> {
+    partition: &'a [Option<String>],
+    error: &'a [Option<String>],
+}
+
+/// Rebuild the quarantine payload for row `i` from the
+/// `quarantine_*` columns.
+fn decode_quarantine_payload(
+    cols: &QuarantineColumns,
+    i: usize,
+    file_row: usize,
+) -> Result<AuditPayload, AuditReaderError> {
+    Ok(AuditPayload::RecordQuarantined {
+        partition: require_at(
+            cols.partition,
+            i,
+            audit_columns::QUARANTINE_PARTITION,
+            file_row,
+        )?,
+        error: require_at(cols.error, i, audit_columns::QUARANTINE_ERROR, file_row)?,
+    })
 }
 
 /// Rebuild the compaction payload for row `i` from the

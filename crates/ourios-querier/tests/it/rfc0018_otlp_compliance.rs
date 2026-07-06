@@ -7,9 +7,7 @@
 //!
 //! See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5/§6.
 
-mod common;
-
-use common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
+use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_querier::Querier;

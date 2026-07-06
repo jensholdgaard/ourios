@@ -9,9 +9,7 @@
 //! [`Querier::run_drift`] surface — no `DataFusion`/SQL appears in the test or
 //! the result (RFC0010.8).
 
-mod common;
-
-use common::{compaction, rejected_degenerate, type_expanded, widened, write_audit};
+use crate::common::{compaction, rejected_degenerate, type_expanded, widened, write_audit};
 use ourios_core::tenant::TenantId;
 use ourios_querier::dsl::{DriftQuery, Statement, parse_statement};
 use ourios_querier::{DriftRow, Querier, QueryError};
@@ -298,8 +296,12 @@ async fn rfc0010_7_aggregate_version_and_time_bounds() {
     let r = &rows[0];
     assert_eq!(r.min_old_version, 1, "min(old_version)");
     assert_eq!(r.max_new_version, 5, "max(new_version)");
-    assert_eq!(r.first_seen, common::at(MID), "min(timestamp)");
-    assert_eq!(r.last_seen, common::at(MID + 2_000), "max(timestamp)");
+    assert_eq!(r.first_seen, crate::common::at(MID), "min(timestamp)");
+    assert_eq!(
+        r.last_seen,
+        crate::common::at(MID + 2_000),
+        "max(timestamp)"
+    );
 }
 
 /// Scenario RFC0010.8 — No DataFusion/SQL leakage (hazard H6).

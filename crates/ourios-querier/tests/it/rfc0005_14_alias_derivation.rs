@@ -11,11 +11,9 @@
 //! by writing one event per file and renaming the files into a crafted
 //! lexicographic order (the scan orders by path, not by write time).
 
-mod common;
-
 use std::path::{Path, PathBuf};
 
-use common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, at, simple, write_all};
+use crate::common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, at, simple, write_all};
 use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload};
 use ourios_core::tenant::TenantId;

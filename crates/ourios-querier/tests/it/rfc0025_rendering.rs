@@ -3,9 +3,7 @@
 //! `crates/ourios-parquet/tests/rfc0025_absent_body.rs` for the
 //! scenario placement map.
 
-mod common;
-
-use common::{HOUR_NS, TS0, no_aliases, simple, write_all};
+use crate::common::{HOUR_NS, TS0, no_aliases, simple, write_all};
 use ourios_core::record::{BodyKind, MinedRecord};
 use ourios_core::tenant::TenantId;
 use ourios_querier::{LogBody, Querier};

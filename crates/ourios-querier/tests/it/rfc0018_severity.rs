@@ -8,9 +8,7 @@
 //! See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5; the receiver-preserve
 //! + `error.type` arms live in `ourios-ingester/tests/rfc0018_otlp_compliance.rs`.
 
-mod common;
-
-use common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
+use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, no_aliases, simple, write_all};
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use ourios_querier::Querier;

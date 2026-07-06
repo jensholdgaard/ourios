@@ -7,9 +7,7 @@
 //!
 //! See `docs/rfcs/0017-template-registry-query-rendering.md` §3.4 / §5 / §6.
 
-mod common;
-
-use common::{NOW, kv, rec, simple, write_all};
+use crate::common::{NOW, kv, rec, simple, write_all};
 
 use ourios_core::otlp::any_value::Value;
 use ourios_core::otlp::canonical::encode_any_value;

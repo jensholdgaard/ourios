@@ -1,0 +1,30 @@
+//! The consolidated querier integration-test harness (RFC 0028 slice 2).
+//!
+//! One binary instead of 19: every test binary links the full `DataFusion`
+//! stack, and the link count — not compilation — dominated `cargo test`
+//! wall time (RFC 0028 §1 / epic #382). Files here moved verbatim from
+//! `tests/*.rs`; test names gain only this harness's module-path prefix
+//! (RFC0028.1). No querier binary needs process isolation, so nothing is
+//! exempt (RFC0028.2).
+
+mod common;
+
+mod acceptance;
+mod boundary;
+mod drift;
+mod execution;
+mod forward_compat;
+mod manifest;
+mod rfc0001_query_semantics;
+mod rfc0001_time_preserved;
+mod rfc0002_dsl;
+mod rfc0005_13;
+mod rfc0005_14_alias_derivation;
+mod rfc0017_query_rows;
+mod rfc0017_registry;
+mod rfc0017_rendering;
+mod rfc0018_otlp_compliance;
+mod rfc0018_severity;
+mod rfc0022_attr_columns;
+mod rfc0024_properties;
+mod rfc0025_rendering;

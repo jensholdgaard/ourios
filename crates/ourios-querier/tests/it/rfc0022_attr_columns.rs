@@ -11,8 +11,6 @@
 //! **no** promoted columns, which the current writer can no longer produce
 //! (`service.name` is implicitly promoted on every path since RFC 0022).
 
-mod common;
-
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +19,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
-use common::{
+use crate::common::{
     DEFAULT_WINDOW_NS, NOW, TS0, kv, no_aliases, rec_with_attrs, write_all_with_promoted,
 };
 use ourios_core::otlp::any_value::Value as AvValue;
@@ -392,7 +390,7 @@ async fn rfc0022_6_read_path_is_projection_blind() {
 async fn rfc0022_5_promoted_predicates_prune() {
     let bucket = TempDir::new().expect("temp");
     for (i, ns) in ["alpha", "beta", "needle"].iter().enumerate() {
-        let hour = u64::try_from(i).expect("small index") * common::HOUR_NS;
+        let hour = u64::try_from(i).expect("small index") * crate::common::HOUR_NS;
         let recs: Vec<MinedRecord> = (0..3u64)
             .map(|j| MinedRecord {
                 template_id: 500 + j,
@@ -464,17 +462,17 @@ async fn rfc0022_7_promoted_set_drift_unions_cleanly() {
         )
     };
     // {}: the default set (implicit service.name only) — the plain writer.
-    common::write_all(bucket.path(), &[row(601, TS0, "prod", "/cart")]);
+    crate::common::write_all(bucket.path(), &[row(601, TS0, "prod", "/cart")]);
     // {a}: k8s.namespace.name promoted, http.route not.
     write_all_with_promoted(
         bucket.path(),
-        &[row(602, TS0 + common::HOUR_NS, "dev", "/cart")],
+        &[row(602, TS0 + crate::common::HOUR_NS, "dev", "/cart")],
         &PromotedAttributes::new(["k8s.namespace.name".to_string()], []),
     );
     // {a,b}: both promoted.
     write_all_with_promoted(
         bucket.path(),
-        &[row(603, TS0 + 2 * common::HOUR_NS, "prod", "/login")],
+        &[row(603, TS0 + 2 * crate::common::HOUR_NS, "prod", "/login")],
         &promoted_set(),
     );
     let q = Querier::new(bucket.path());

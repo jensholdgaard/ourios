@@ -80,8 +80,8 @@ async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
         .spawn()
         .expect("spawn ourios-server");
 
-    // The warning precedes the role start, so scanning stderr up to it (with
-    // the querier's bound-address line as the outer bound) cannot hang.
+    // The warning precedes the role start, so it appears promptly; the
+    // timeout bounds the scan if it never does.
     let stderr = child.stderr.take().expect("server stderr piped");
     let mut lines = BufReader::new(stderr).lines();
     let saw_warning = timeout(Duration::from_secs(15), async {

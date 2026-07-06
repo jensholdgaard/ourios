@@ -30,7 +30,7 @@ image:
   # Image tag. Defaults to `latest` when empty — appVersion tracks the
   # unreleased crate version (0.0.0), which is never published as an image.
   # Pin a released tag (e.g. a `vX.Y.Z` build) in production.
-  tag: ""
+  tag: "@sha256:085ecdafe923f64bcaf8224ae986cf0229d2049e273c6336c22b372b15b11e46"
 
 imagePullSecrets: []
 nameOverride: ""

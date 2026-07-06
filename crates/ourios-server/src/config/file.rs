@@ -364,12 +364,13 @@ fn check_credentials_are_references(s3: &S3Section) -> Result<(), FileConfigErro
 /// Enforce RFC 0026 §3.1: bearer-token values must be `${env:…}` references,
 /// never inline literals, so config files stay committable. Runs on the **raw**
 /// (pre-substitution) values; the [`check_credentials_are_references`] rule,
-/// applied to `auth.tokens`. An absent or empty token is not a literal — it is
-/// rejected later, by the token-store validation, which can name the entry.
+/// applied to `auth.tokens`. Unlike an S3 credential, an **empty** token is a
+/// literal like any other — there is no unset-with-fallback reading for a
+/// bearer token. Only an *absent* token (no `token` key) is deferred to the
+/// token-store validation, which can name the entry.
 fn check_tokens_are_references(auth: &AuthSection) -> Result<(), FileConfigError> {
     for (index, entry) in auth.tokens.iter().enumerate() {
         if let Some(raw) = &entry.token
-            && !raw.is_empty()
             && !is_env_reference(raw)
         {
             return Err(FileConfigError::InlineToken { index });
@@ -961,6 +962,18 @@ auth:
             "names the entry: {msg}"
         );
         assert!(!msg.contains("hardcoded-secret"), "never the value: {msg}");
+
+        // An empty string is a literal like any other — a bearer token has no
+        // unset-with-fallback reading (unlike an S3 credential).
+        let err = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: \"\"\n      tenants: [x]\n",
+            &lookup,
+        )
+        .expect_err("empty literal");
+        assert!(
+            matches!(err, FileConfigError::InlineToken { index: 0 }),
+            "got {err:?}",
+        );
 
         let cfg = parse(
             "auth:\n  tokens:\n    - name: a\n      token: ${env:TOK}\n      tenants: [x]\n",

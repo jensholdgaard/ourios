@@ -96,6 +96,10 @@ async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
     .expect("warning appears before timeout");
     assert!(saw_warning, "the open-mode warning names the exposure");
 
+    // Keep draining stderr: the server logs there for its lifetime, and an
+    // undrained pipe can fill and block it before the stdout line below.
+    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
+
     // Open mode is *open*: the role still starts (the listener binds).
     let stdout = child.stdout.take().expect("server stdout piped");
     let mut out_lines = BufReader::new(stdout).lines();

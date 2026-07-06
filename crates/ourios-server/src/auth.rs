@@ -141,10 +141,19 @@ pub fn build_token_store(section: Option<&AuthSection>) -> Result<Option<TokenSt
         }
         let token = match entry.token.as_deref() {
             Some(t) if !t.is_empty() => t.to_string(),
-            _ => {
+            // A literal empty string never reaches here (the parse-time
+            // reference rule rejects it), so empty means the reference
+            // resolved against an unset variable.
+            Some(_) => {
                 return Err(format!(
                     "auth.tokens[{index}] ({name}): token resolved to empty — is the \
                      ${{env:…}} variable set?"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "auth.tokens[{index}] ({name}): token is required — an \
+                     ${{env:…}} reference (RFC 0026 §3.1)"
                 ));
             }
         };
@@ -288,6 +297,14 @@ mod tests {
                 "duplicates",
             ),
             (section(vec![entry("a", "", &["x"])]), "resolved to empty"),
+            (
+                section(vec![TokenEntry {
+                    name: Some("a".to_string()),
+                    token: None,
+                    tenants: vec!["x".to_string()],
+                }]),
+                "required",
+            ),
             (
                 section(vec![
                     entry("a", "tok-same", &["x"]),

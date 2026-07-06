@@ -97,7 +97,7 @@ serde_yaml = { version = "=0.9.34", default-features = false }
 # Schema in the acceptance test. `default-features = false` drops the
 # reqwest/TLS remote-`$ref` resolver: the schema is self-contained
 # (local `$ref`s only), so no network resolver is needed.
-jsonschema = { version = "=0.46.5", default-features = false }
+jsonschema = { version = "=0.46.10", default-features = false }
 
 [lints]
 workspace = true

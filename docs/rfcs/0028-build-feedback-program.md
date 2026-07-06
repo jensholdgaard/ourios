@@ -187,8 +187,9 @@ proposed scenarios accompanied the drafting PR, #383).
 - **RFC0028.4** — proven in #405: a `MinerConfig` whitespace edit
   leaves `ourios-core` and `ourios-parquet` `Fresh`; the rebuild set is
   the semantic one (`config → miner → querier`).
-- **RFC0028.5** — #406: CI runs `cargo nextest run --workspace
-  --all-features` + `cargo test --doc`, preserving the exact suite
+- **RFC0028.5** — #406: CI runs
+  `cargo nextest run --workspace --all-features` +
+  `cargo test --doc`, preserving the exact suite
   inventory; the workflow invocations that named old binaries were
   retargeted in the same PRs that moved them (#401, #403, #404).
 - **Slice 4 (parquet split)** — closed *not-triggered* per the §3.3

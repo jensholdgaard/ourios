@@ -157,8 +157,10 @@ proposed scenarios accompanied the drafting PR, #383).
 > `touch crates/ourios-core/src/lib.rs` (an mtime-only update,
 > exactly as the epic's baseline measured it) followed by
 > `cargo test -p ourios-querier --no-run` — drops below 30 s, And
-> full-workspace `cargo test` wall time drops by at least 30%
-> against the epic's baseline.
+> full-workspace suite wall time — under the test runner CI adopts
+> (plain `cargo test`, or `cargo nextest run` once slice 5 lands;
+> clarified at the green flip so the criterion matches the slice-5
+> design) — drops by at least 30% against the epic's baseline.
 
 > **Scenario RFC0028.4 — the core split is behavior-free.** Given
 > the `ourios-config` extraction, When the full workspace suite

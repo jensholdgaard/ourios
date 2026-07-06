@@ -43,6 +43,9 @@ async fn rfc0026_1_empty_token_list_is_a_startup_error() {
         Command::new(env!("CARGO_BIN_EXE_ourios-server"))
             .arg("--config")
             .arg(&config_path)
+            // If the startup error ever regressed into a running server, the
+            // timeout would drop this future — don't leave that child behind.
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -63,9 +66,11 @@ async fn rfc0026_1_empty_token_list_is_a_startup_error() {
 
 /// Scenario RFC0026.1 (open mode) — a missing `auth` section starts in open
 /// mode: the role comes up, and a structured startup warning names the
-/// exposure (RFC 0026 §3.1). The warning reaches stderr through the tracing
-/// mirror; its `OTel` event name (`ourios.server.auth.open_mode`) is
-/// registry-backed like every dogfooded log event.
+/// exposure (RFC 0026 §3.1). The human-readable copy asserted here reaches
+/// stderr through the tracing `fmt` mirror (which renders the target and
+/// message, not the event name); the registry-backed event name
+/// (`ourios.server.auth.open_mode`) travels the `OTel` Logs signal, where
+/// `weaver registry live-check` enforces it in CI.
 /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
 #[tokio::test]
 async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
@@ -74,6 +79,9 @@ async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
         .env("OURIOS_BUCKET_ROOT", tmp.path())
         .env("OURIOS_QUERIER_ENABLED", "1")
         .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
+        // Deterministic regardless of the harness environment: an inherited
+        // RUST_LOG=error would filter the warning off stderr.
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

@@ -250,6 +250,24 @@ impl fmt::Display for BatchError {
     }
 }
 
+impl BatchError {
+    /// Stable snake-case identifier for the `error.type` metric
+    /// attribute (RFC 0025 §3.3 quarantine telemetry — the `OTel`
+    /// recording-errors convention on the existing flush-error
+    /// counter, never a new metric name).
+    #[must_use]
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::TimestampOverflow { .. } => "timestamp_overflow",
+            Self::AttributeEncode { .. } => "attribute_encode",
+            Self::NonNullBodyForAbsent => "non_null_body_for_absent",
+            Self::InvalidSeparatorsForString { .. } => "invalid_separators_for_string",
+            Self::MissingBodyForLossyString => "missing_body_for_lossy_string",
+            Self::Arrow(_) => "arrow",
+        }
+    }
+}
+
 impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

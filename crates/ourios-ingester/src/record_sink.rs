@@ -107,6 +107,12 @@ pub struct ParquetRecordSink {
     /// atomic w.r.t. ingest. `None` (the RFC 0014 default + the record-sink unit
     /// tests) leaves the inline publish unconstrained.
     audit_barrier: Option<Box<dyn FnMut() -> bool + Send>>,
+    /// RFC 0025 §3.3 quarantine destination: permanently-rejected
+    /// records emit a `record_quarantined` audit event here before
+    /// being dropped from the buffer (the WAL still holds them).
+    /// `None` (tests / minimal wiring) quarantines silently to the
+    /// counter only.
+    audit: Option<Box<dyn ourios_core::audit::AuditSink + Send>>,
     /// RFC 0014 §6.3 instruments (flush throughput/latency by trigger,
     /// errors, buffer occupancy). No-op when no meter provider is installed.
     metrics: SinkMetrics,
@@ -136,6 +142,36 @@ fn estimate_bytes(r: &MinedRecord) -> usize {
 /// `/`-delimited object key for a partition's flushed file: the RFC 0005 §3.4
 /// Hive path (relative to the store root) plus a `UUIDv7` name. Mirrors
 /// `ourios_parquet::Writer`'s key; object keys are `/`-delimited on every host.
+/// Bisect `records` into `(encodable, permanently rejected)` using
+/// the batch conversion as the probe — `BatchError` is deterministic,
+/// so a failing subset always shrinks to its poison records.
+/// O(k·log n) probes for k poison records.
+fn split_poisoned(
+    records: Vec<ourios_core::record::MinedRecord>,
+    promoted: &ourios_parquet::PromotedAttributes,
+) -> (
+    Vec<ourios_core::record::MinedRecord>,
+    Vec<(ourios_core::record::MinedRecord, ourios_parquet::BatchError)>,
+) {
+    match ourios_parquet::mined_records_to_batch_with_promoted(&records, promoted) {
+        Ok(_) => (records, Vec::new()),
+        Err(error) => {
+            if records.len() == 1 {
+                let record = records.into_iter().next().expect("len checked");
+                return (Vec::new(), vec![(record, error)]);
+            }
+            let mid = records.len() / 2;
+            let mut left = records;
+            let right = left.split_off(mid);
+            let (mut kept, mut poisoned) = split_poisoned(left, promoted);
+            let (kept_r, poisoned_r) = split_poisoned(right, promoted);
+            kept.extend(kept_r);
+            poisoned.extend(poisoned_r);
+            (kept, poisoned)
+        }
+    }
+}
+
 fn object_key(partition: &PartitionKey) -> String {
     let rel = partition.data_path(Path::new(""));
     format!(
@@ -160,6 +196,7 @@ impl ParquetRecordSink {
             flush_errors: 0,
             derive_errors: 0,
             audit_barrier: None,
+            audit: None,
             metrics: SinkMetrics::new(),
             promoted: PromotedAttributes::default(),
         }
@@ -170,6 +207,15 @@ impl ParquetRecordSink {
     #[must_use]
     pub fn with_promoted_attributes(mut self, promoted: PromotedAttributes) -> Self {
         self.promoted = promoted;
+        self
+    }
+
+    /// Install the RFC 0025 §3.3 quarantine audit destination:
+    /// permanently-rejected records emit a `record_quarantined`
+    /// event here before being dropped from the buffer.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Box<dyn ourios_core::audit::AuditSink + Send>) -> Self {
+        self.audit = Some(sink);
         self
     }
 
@@ -259,12 +305,35 @@ impl ParquetRecordSink {
     ) -> Result<(), FlushError> {
         let flush_start = Instant::now();
         let bytes = match self.buffers.get(key) {
-            Some(buf) if !buf.records.is_empty() => encode_records_to_parquet_with_promoted(
-                &buf.records,
-                DEFAULT_ZSTD_LEVEL,
-                &self.promoted,
-            )
-            .map_err(FlushError::Encode)?,
+            Some(buf) if !buf.records.is_empty() => {
+                match encode_records_to_parquet_with_promoted(
+                    &buf.records,
+                    DEFAULT_ZSTD_LEVEL,
+                    &self.promoted,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(WriterError::Batch(_)) => {
+                        // A permanent per-record rejection (RFC 0025
+                        // §3.3): retrying the whole buffer would wedge
+                        // the partition forever (#362). Quarantine the
+                        // poisoned record(s) and encode the remainder;
+                        // the WAL keeps the originals.
+                        self.quarantine_poisoned(key);
+                        match self.buffers.get(key) {
+                            Some(buf) if !buf.records.is_empty() => {
+                                encode_records_to_parquet_with_promoted(
+                                    &buf.records,
+                                    DEFAULT_ZSTD_LEVEL,
+                                    &self.promoted,
+                                )
+                                .map_err(FlushError::Encode)?
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                    Err(e) => return Err(FlushError::Encode(e)),
+                }
+            }
             _ => return Ok(()),
         };
         self.store
@@ -283,6 +352,51 @@ impl ParquetRecordSink {
         Ok(())
     }
 
+    /// Split `key`'s buffer into encodable records and permanently
+    /// rejected ones; emit a `record_quarantined` audit event and the
+    /// `error.type`-attributed flush-error count for each rejection,
+    /// then drop the poison from the buffer (RFC 0025 §3.3 — the WAL
+    /// remains the durability of record; the audit event is the
+    /// operator's pointer for replay after a fix).
+    fn quarantine_poisoned(&mut self, key: &PartitionKey) {
+        let records = match self.buffers.get_mut(key) {
+            Some(buf) => std::mem::take(&mut buf.records),
+            None => return,
+        };
+        let kept = self.quarantine_owned(key, records);
+        if let Some(buf) = self.buffers.get_mut(key) {
+            buf.records = kept;
+        }
+    }
+
+    /// [`Self::quarantine_poisoned`] over an owned batch (the
+    /// cadence-drain path) — returns the encodable remainder.
+    fn quarantine_owned(
+        &mut self,
+        key: &PartitionKey,
+        records: Vec<MinedRecord>,
+    ) -> Vec<MinedRecord> {
+        let (kept, poisoned) = split_poisoned(records, &self.promoted);
+        let partition = format!(
+            "year={:04}/month={:02}/day={:02}/hour={:02}",
+            key.year, key.month, key.day, key.hour
+        );
+        for (record, error) in poisoned {
+            self.metrics.record_flush_error(Some(error.error_type()));
+            if let Some(audit) = &mut self.audit {
+                audit.emit(ourios_core::audit::AuditEvent {
+                    tenant_id: record.tenant_id.clone(),
+                    timestamp: std::time::SystemTime::now(),
+                    payload: ourios_core::audit::AuditPayload::RecordQuarantined {
+                        partition: partition.clone(),
+                        error: error.to_string(),
+                    },
+                });
+            }
+        }
+        kept
+    }
+
     /// [`Self::flush_partition`] for the infallible `emit` / tick / rotation
     /// paths: a failed flush retains the buffer (the WAL is the durability of
     /// record) and is counted for observability. `trigger` records *why* the
@@ -290,7 +404,7 @@ impl ParquetRecordSink {
     fn flush_partition_swallow(&mut self, key: &PartitionKey, trigger: &'static str) {
         if self.flush_partition(key, trigger).is_err() {
             self.flush_errors += 1;
-            self.metrics.record_flush_error();
+            self.metrics.record_flush_error(None);
         }
     }
 
@@ -311,7 +425,7 @@ impl ParquetRecordSink {
             true
         } else {
             self.flush_errors += 1;
-            self.metrics.record_flush_error();
+            self.metrics.record_flush_error(None);
             false
         }
     }
@@ -401,7 +515,7 @@ impl ParquetRecordSink {
     /// requeued by the caller).
     pub fn note_flush_error(&mut self) {
         self.flush_errors += 1;
-        self.metrics.record_flush_error();
+        self.metrics.record_flush_error(None);
     }
 
     /// A clone of the data store, for the coordinator's off-lock publish.
@@ -545,13 +659,33 @@ impl SharedParquetSink {
         let mut all_published = true;
         for (key, records) in batches {
             let start = Instant::now();
-            if publish_partition(&store, &key, &records, &promoted).is_ok() {
-                self.lock()
-                    .note_published(records.len(), start.elapsed(), trigger);
-            } else {
-                self.lock().note_flush_error();
-                requeue.push((key, records));
-                all_published = false;
+            match publish_partition(&store, &key, &records, &promoted) {
+                Ok(()) => {
+                    self.lock()
+                        .note_published(records.len(), start.elapsed(), trigger);
+                }
+                Err(FlushError::Encode(WriterError::Batch(_))) => {
+                    // Permanent per-record rejection: requeueing would
+                    // re-fail forever (#362 via the cadence path).
+                    // Quarantine and publish the remainder once.
+                    let kept = self.lock().quarantine_owned(&key, records);
+                    if kept.is_empty() {
+                        continue;
+                    }
+                    if publish_partition(&store, &key, &kept, &promoted).is_ok() {
+                        self.lock()
+                            .note_published(kept.len(), start.elapsed(), trigger);
+                    } else {
+                        self.lock().note_flush_error();
+                        requeue.push((key, kept));
+                        all_published = false;
+                    }
+                }
+                Err(_) => {
+                    self.lock().note_flush_error();
+                    requeue.push((key, records));
+                    all_published = false;
+                }
             }
         }
         if !requeue.is_empty() {

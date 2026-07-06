@@ -400,6 +400,7 @@ impl AliasMap {
             // unknown kinds by construction.
             AuditPayload::Template { .. }
             | AuditPayload::Compaction { .. }
+            | AuditPayload::RecordQuarantined { .. }
             | AuditPayload::Unknown { .. } => {}
         }
     }

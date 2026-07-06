@@ -397,8 +397,14 @@ impl SinkMetrics {
 
     /// A failed partition flush (encode or store error); the buffer is
     /// retained and retried (the WAL is the durability of record).
-    pub fn record_flush_error(&self) {
-        self.flush_errors.add(1, &[]);
+    /// `error_type` carries the permanent-rejection class for
+    /// quarantines (RFC 0025 §3.3, the `error.type` convention);
+    /// transient store failures pass `None`.
+    pub fn record_flush_error(&self, error_type: Option<&'static str>) {
+        match error_type {
+            Some(t) => self.flush_errors.add(1, &[KeyValue::new(ERROR_TYPE, t)]),
+            None => self.flush_errors.add(1, &[]),
+        }
     }
 
     /// A record dropped from the sink because its partition key could not

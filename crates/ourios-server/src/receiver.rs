@@ -20,7 +20,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use ourios_core::config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::publish::PublishCoordinator;
-use ourios_ingester::receiver::grpc::LogsReceiver;
+use ourios_ingester::receiver::grpc::{AuthInterceptor, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
@@ -211,6 +211,11 @@ pub struct ReceiverConfig {
     /// The RFC 0022 promoted attribute set every flushed data file projects
     /// (`storage.promoted_attributes`, §3.2).
     pub promoted: PromotedAttributes,
+    /// The RFC 0026 token store; `None` is open mode (§3.1). Applied to
+    /// both listeners: the gRPC interceptor and the HTTP handler
+    /// authenticate before decode, and the pipeline binds each batch to
+    /// the token's tenant set before the WAL append (§3.2).
+    pub auth: Option<Arc<ourios_core::auth::TokenStore>>,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -364,6 +369,25 @@ fn rotation_snapshot_hook(
 /// sockets bind (RFC0008.10). Returns once both sockets are bound — so
 /// the caller can observe the addresses (e.g. when binding `:0`) — with
 /// serving running on spawned tasks until [`ReceiverHandle::shutdown`].
+/// Bind both listeners before serving, so a `:0` request resolves to the
+/// real port in the returned handle. gRPC first, then HTTP.
+async fn bind_listeners(
+    grpc: SocketAddr,
+    http: SocketAddr,
+) -> Result<(TcpIncoming, SocketAddr, TcpListener, SocketAddr), String> {
+    let grpc_incoming = TcpIncoming::bind(grpc).map_err(|e| format!("bind gRPC {grpc}: {e}"))?;
+    let grpc_addr = grpc_incoming
+        .local_addr()
+        .map_err(|e| format!("gRPC local_addr: {e}"))?;
+    let http_listener = TcpListener::bind(http)
+        .await
+        .map_err(|e| format!("bind HTTP {http}: {e}"))?;
+    let http_addr = http_listener
+        .local_addr()
+        .map_err(|e| format!("HTTP local_addr: {e}"))?;
+    Ok((grpc_incoming, grpc_addr, http_listener, http_addr))
+}
+
 pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
     // The §3.4 group-commit knobs, captured before `config.wal` is moved
@@ -430,20 +454,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             )),
     );
 
-    // gRPC: bind first so `:0` resolves to a real port before serving.
-    let grpc_incoming = TcpIncoming::bind(config.grpc_addr)
-        .map_err(|e| format!("bind gRPC {}: {e}", config.grpc_addr))?;
-    let grpc_addr = grpc_incoming
-        .local_addr()
-        .map_err(|e| format!("gRPC local_addr: {e}"))?;
-
-    // HTTP: same — bind the listener, then hand it to `axum::serve`.
-    let http_listener = TcpListener::bind(config.http_addr)
-        .await
-        .map_err(|e| format!("bind HTTP {}: {e}", config.http_addr))?;
-    let http_addr = http_listener
-        .local_addr()
-        .map_err(|e| format!("HTTP local_addr: {e}"))?;
+    let (grpc_incoming, grpc_addr, http_listener, http_addr) =
+        bind_listeners(config.grpc_addr, config.http_addr).await?;
 
     let (shutdown, shutdown_rx) = watch::channel(());
 
@@ -457,7 +469,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         shutdown_rx.clone(),
     );
 
-    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()));
+    // RFC 0026 §3.2: the interceptor authenticates before the message
+    // decode (open mode passes through unbound); the handler's pipeline
+    // enforces the tenant binding it attaches.
+    let grpc_service = LogsServiceServer::with_interceptor(
+        LogsReceiver::new(pipeline.clone()),
+        AuthInterceptor::new(config.auth.clone()),
+    );
     let grpc = tokio::spawn({
         let mut rx = shutdown_rx.clone();
         async move {
@@ -470,7 +488,13 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         }
     });
 
-    let http_router = router(pipeline.clone(), &HttpConfig::default());
+    let http_router = router(
+        pipeline.clone(),
+        &HttpConfig {
+            auth: config.auth.clone(),
+            ..HttpConfig::default()
+        },
+    );
     let http = tokio::spawn({
         let mut rx = shutdown_rx;
         async move {
@@ -719,6 +743,7 @@ mod tests {
             wal: test_wal_config(wal_dir.path()),
             store,
             promoted: PromotedAttributes::default(),
+            auth: None,
         })
         .await
         .expect("serve");
@@ -837,6 +862,7 @@ mod tests {
             wal: test_wal_config(wal_dir.path()),
             store,
             promoted: PromotedAttributes::default(),
+            auth: None,
         })
         .await
         .expect("serve");

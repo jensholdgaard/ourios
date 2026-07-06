@@ -31,6 +31,7 @@
 //!   wrapping the same pipeline: controlled `Status` mapping + concurrent
 //!   WAL-before-ack (RFC0003.11 gRPC arms / .15).
 
+pub mod auth;
 pub mod commit;
 pub mod decode;
 pub mod grpc;
@@ -39,6 +40,7 @@ pub mod materialize;
 pub mod pipeline;
 pub mod tenant;
 
+pub use auth::{AuthBinding, Unauthenticated, authenticate_bearer};
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};

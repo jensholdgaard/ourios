@@ -15,6 +15,8 @@
 //! §3.1) while letting concurrent requests batch their fsyncs
 //! (RFC0008.8). `ingest` is async, so the handler simply `.await`s it.
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -22,8 +24,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
+use ourios_core::auth::TokenStore;
 use prost::Message;
 
+use crate::receiver::auth::authenticate_bearer;
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 
@@ -36,6 +40,11 @@ pub struct HttpConfig {
     /// Maximum request body size in bytes; a larger body is rejected with
     /// 413 (RFC0003.11).
     pub max_body_bytes: usize,
+    /// The RFC 0026 token store; `None` (the default) is open mode
+    /// (§3.1). With a store, every request must carry a known
+    /// `Authorization: Bearer` credential (→ 401) and its batch is bound
+    /// to the token's tenant set (→ 403).
+    pub auth: Option<Arc<TokenStore>>,
 }
 
 impl Default for HttpConfig {
@@ -43,17 +52,20 @@ impl Default for HttpConfig {
         Self {
             path: "/v1/logs".to_owned(),
             max_body_bytes: 4 * 1024 * 1024,
+            auth: None,
         }
     }
 }
 
 /// Handler state: the shared pipeline plus the decompressed-size cap
 /// (`DefaultBodyLimit` only bounds the *compressed* body, so gzip is
-/// bounded separately to defuse a decompression bomb).
+/// bounded separately to defuse a decompression bomb) and the RFC 0026
+/// token store.
 #[derive(Clone)]
 struct AppState {
     pipeline: SharedPipeline,
     max_decompressed_bytes: usize,
+    auth: Option<Arc<TokenStore>>,
 }
 
 /// Build the OTLP/HTTP router over `pipeline`.
@@ -61,6 +73,7 @@ pub fn router(pipeline: SharedPipeline, config: &HttpConfig) -> Router {
     let state = AppState {
         pipeline,
         max_decompressed_bytes: config.max_body_bytes,
+        auth: config.auth.clone(),
     };
     Router::new()
         .route(&config.path, post(handle_logs))
@@ -82,6 +95,16 @@ enum Encoding {
 }
 
 async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    // RFC 0026 §3.2: authentication precedes everything — media-type
+    // dispatch, decompression, and wire decode all happen only for an
+    // authenticated (or open-mode) request.
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let Ok(binding) = authenticate_bearer(state.auth.as_deref(), authorization) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
     let Some(format) = content_type(&headers) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     };
@@ -112,7 +135,8 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     // pipeline/miner is contained as a 500 (the handler promises not to
     // panic) rather than aborting the connection.
     let pipeline = state.pipeline.clone();
-    match tokio::spawn(async move { pipeline.ingest(request).await }).await {
+    match tokio::spawn(async move { pipeline.ingest_bound(request, binding.as_ref()).await }).await
+    {
         Ok(Ok(_)) => success_response(format),
         Ok(Err(e)) => ingest_error_status(&e).into_response(),
         // The ingest task panicked — a genuine, non-retryable internal bug.
@@ -135,6 +159,9 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
 fn ingest_error_status(error: &ReceiveError) -> StatusCode {
     match error {
         ReceiveError::TenantResolution(_) => StatusCode::BAD_REQUEST,
+        // An authenticated caller writing outside its tenant set — a
+        // permanent authz rejection, whole batch, pre-WAL (RFC 0026 §3.2).
+        ReceiveError::TenantDenied { .. } => StatusCode::FORBIDDEN,
         ReceiveError::WalAppend(ourios_wal::AppendError::TooLarge { .. }) => {
             StatusCode::PAYLOAD_TOO_LARGE
         }
@@ -238,6 +265,15 @@ mod tests {
     fn tenant_resolution_is_400() {
         let e = ReceiveError::TenantResolution(TenantResolutionError::for_test("service.name"));
         assert_eq!(ingest_error_status(&e), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn tenant_denied_is_403() {
+        let e = ReceiveError::TenantDenied {
+            token_name: "edge".to_string(),
+            tenant: ourios_core::tenant::TenantId::new("intruder"),
+        };
+        assert_eq!(ingest_error_status(&e), StatusCode::FORBIDDEN);
     }
 
     #[test]

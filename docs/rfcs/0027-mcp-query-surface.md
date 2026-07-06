@@ -119,9 +119,10 @@ tenants out of band.
 ## 5. Acceptance criteria
 
 Scenario ids `RFC0027.<m>`. Maintainer sign-off: 2026-07-05 ("go on
-0027 and 0019"). The §1 gate is satisfied: RFC 0026 went green
-2026-07-06, so serving `/mcp` no longer waits on anything — the gate
-was about never exposing a remote query surface before authn existed.
+0027 and 0019"). This RFC treats serving `/mcp` as
+gated on RFC 0026 (§1 — a remote query surface must never precede
+authn); that gate is **satisfied** as of RFC 0026's green,
+2026-07-06.
 
 > **Scenario RFC0027.1 — gating and placement.** Given
 > `querier.mcp.enabled` unset or false, When the querier role serves,
@@ -158,7 +159,7 @@ was about never exposing a remote query surface before authn existed.
 > boundary rule inherited verbatim).
 
 > **Scenario RFC0027.6 — the grammar resource.** Given the server
-> enabled, When the client lists/reads resources, Then the DSL
+> is enabled, When the client lists/reads resources, Then the DSL
 > grammar/reference doc is served from the canonical source,
 > `docs/rfcs/0002-query-dsl.md`, embedded at compile time
 > (`include_str!`) and trimmed to its §7 grammar section at startup —

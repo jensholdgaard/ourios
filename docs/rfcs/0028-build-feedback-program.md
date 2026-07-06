@@ -165,7 +165,8 @@ proposed scenarios accompanied the drafting PR, #383).
 ## 6. Testing strategy
 
 Inventory diffs are the mechanism for `.1`/`.5`: a
-`cargo test -- --list` snapshot is captured in each consolidation
+`cargo test -p <crate> -- --list` snapshot (scoped to the crate
+being consolidated, matching `.1`) is captured in each consolidation
 PR's description and diffed against the post-move run — the
 reviewer checks the diff is a pure path-prefix rename. `.2` is a
 committed list (the harness-exempt binaries and their reasons, in

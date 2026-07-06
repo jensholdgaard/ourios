@@ -115,10 +115,10 @@ impl TenantResolutionError {
         self.resource_index
     }
 
-    /// Attach the failing group's index (called by [`fan_out`] and the
-    /// RFC 0026 binding check, which walks the same groups).
+    /// Attach the failing group's index (called by [`derive_for_group`],
+    /// which both [`fan_out`] and the RFC 0026 binding check go through).
     #[must_use]
-    pub(crate) fn at_resource(mut self, index: usize) -> Self {
+    fn at_resource(mut self, index: usize) -> Self {
         self.resource_index = Some(index);
         self
     }

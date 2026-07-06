@@ -154,6 +154,62 @@ async fn rfc0026_2_ingest_authentication() {
     );
 }
 
+/// Scenario RFC0026.2 (served gRPC stack) — the metadata → interceptor →
+/// extension → handler handoff over a real socket: the interceptor is
+/// installed exactly as the server role installs it
+/// (`LogsServiceServer::with_interceptor`), a missing/unknown bearer is
+/// rejected before the handler, and a known bearer's batch lands.
+/// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0026_2_served_grpc_stack_authenticates() {
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
+
+    let (pipeline, captured) = capturing_pipeline();
+    let service = LogsServiceServer::with_interceptor(
+        LogsReceiver::new(pipeline),
+        AuthInterceptor::new(Some(store(&["checkout"]))),
+    );
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("bind");
+    let addr = incoming.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+    });
+
+    let mut client = LogsServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+
+    // No bearer → the interceptor rejects before the handler.
+    let status = client
+        .export(tonic::Request::new(request(vec![resource_logs(
+            "checkout",
+            &["one line"],
+        )])))
+        .await
+        .expect_err("unauthenticated");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert!(
+        captured.lock().expect("captured").is_empty(),
+        "nothing reached the WAL",
+    );
+
+    // A known bearer authenticates through the metadata and the batch lands.
+    let mut authed = tonic::Request::new(request(vec![resource_logs("checkout", &["one line"])]));
+    authed
+        .metadata_mut()
+        .insert("authorization", "Bearer tok-edge".parse().expect("md"));
+    client.export(authed).await.expect("authenticated export");
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+
+    server.abort();
+}
+
 /// Scenario RFC0026.3 — ingest tenant binding.
 /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

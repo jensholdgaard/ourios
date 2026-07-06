@@ -97,6 +97,10 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]
+# The RFC0026.2 served-stack arm: serve `LogsServiceServer::with_interceptor`
+# over a local socket and drive it with a real tonic client, so the
+# metadata → interceptor → extension → handler handoff is covered end to end.
+tonic = { version = "=0.14.6", default-features = false, features = ["transport", "router", "channel"] }
 tempfile = "=3.27.0"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
 # threading test (pinned in lockstep with ourios-parquet's arrow stack,

@@ -171,22 +171,30 @@ pub fn fan_out(
 ) -> Result<Vec<OtlpLogRecord>, TenantResolutionError> {
     let mut records = Vec::new();
     for (index, resource_logs) in request.resource_logs.into_iter().enumerate() {
-        // Scope the borrow of `resource_logs` so it can be moved into
-        // `materialize_resource_logs` afterwards. On failure, attach the
-        // group's index so the error names the failing Resource
-        // (RFC0003.4).
-        let tenant_id = {
-            let resource_attributes = resource_logs
-                .resource
-                .as_ref()
-                .map(|resource| resource.attributes.as_slice())
-                .unwrap_or_default();
-            rule.derive(resource_attributes)
-                .map_err(|error| error.at_resource(index))?
-        };
+        // Derived before `resource_logs` is moved into
+        // `materialize_resource_logs`.
+        let tenant_id = derive_for_group(&resource_logs, index, rule)?;
         records.extend(materialize_resource_logs(resource_logs, &tenant_id));
     }
     Ok(records)
+}
+
+/// Derive one `ResourceLogs` group's tenant (RFC 0003 §6.3), attaching the
+/// group's index to a failure so the error names the failing Resource
+/// (RFC0003.4). The single derivation used by [`fan_out`] and the RFC 0026
+/// binding check — one source of truth, so the two walks cannot drift.
+pub(crate) fn derive_for_group(
+    resource_logs: &opentelemetry_proto::tonic::logs::v1::ResourceLogs,
+    index: usize,
+    rule: &TenantRule,
+) -> Result<ourios_core::tenant::TenantId, TenantResolutionError> {
+    let resource_attributes = resource_logs
+        .resource
+        .as_ref()
+        .map(|resource| resource.attributes.as_slice())
+        .unwrap_or_default();
+    rule.derive(resource_attributes)
+        .map_err(|error| error.at_resource(index))
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::auth::{TenantSet, TokenStore};
 
 use crate::receiver::pipeline::ReceiveError;
-use crate::receiver::tenant::TenantRule;
+use crate::receiver::tenant::{TenantRule, derive_for_group};
 
 /// The authenticated identity a listener attaches to a request: the
 /// token's audit/metric label and its tenant binding — never the token
@@ -115,14 +115,7 @@ pub(crate) fn check_binding(
     binding: &AuthBinding,
 ) -> Result<(), ReceiveError> {
     for (index, resource_logs) in request.resource_logs.iter().enumerate() {
-        let resource_attributes = resource_logs
-            .resource
-            .as_ref()
-            .map(|resource| resource.attributes.as_slice())
-            .unwrap_or_default();
-        let tenant_id = rule
-            .derive(resource_attributes)
-            .map_err(|error| error.at_resource(index))?;
+        let tenant_id = derive_for_group(resource_logs, index, rule)?;
         if !binding.tenants.allows(tenant_id.as_str()) {
             return Err(ReceiveError::TenantDenied {
                 token_name: binding.token_name.clone(),

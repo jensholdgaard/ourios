@@ -295,8 +295,9 @@ async fn handle_query(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     let Ok(binding) = authenticate_bearer(state.auth.as_deref(), authorization) else {
-        // RFC 0026 §3.4: the rejection counts on the existing query
-        // counter, kind `rejected` (pre-dispatch).
+        // RFC 0026 §3.4: the rejection records on the existing
+        // `ourios.query.duration` histogram, kind `rejected`
+        // (pre-dispatch), tagged with `error.type`.
         state.metrics.record_err(
             QUERY_KIND_REJECTED,
             gate_started.elapsed(),

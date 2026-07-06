@@ -126,7 +126,9 @@ pub struct IngestPipeline {
     last_durable: Mutex<Option<WalOffset>>,
     rotation_hook: Mutex<Option<RotationHook>>,
     /// Ingest throughput + WAL-before-ack latency instruments (RFC 0014
-    /// §6.3). Recorded only on a durably-acked batch.
+    /// §6.3), recorded on durably-acked batches — plus the RFC 0026 §3.4
+    /// rejection counts (`error.type` on the batches counter), recorded
+    /// on the pre-WAL denial paths.
     metrics: IngestMetrics,
     /// RFC 0026 §3.4: the sink for `ingest_denied` audit events. Behind a
     /// mutex — denials are the cold path.

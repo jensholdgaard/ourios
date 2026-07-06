@@ -146,9 +146,12 @@ proposed scenarios accompanied the drafting PR, #383).
 > harness.
 
 > **Scenario RFC0028.3 — the probe set improves.** Given the epic
-> #382 probe set re-run after slices 1–2, Then the incremental-edit
-> probe — `touch crates/ourios-core/src/lib.rs` (an mtime-only
-> update, exactly as the epic's baseline measured it) followed by
+> #382 probe set re-run after slices 1–2 — on the same machine and
+> under the same conditions the baseline was captured (warm
+> workspace, same toolchain; environment recorded next to the
+> numbers in the epic) — Then the incremental-edit probe —
+> `touch crates/ourios-core/src/lib.rs` (an mtime-only update,
+> exactly as the epic's baseline measured it) followed by
 > `cargo test -p ourios-querier --no-run` — drops below 30 s, And
 > full-workspace `cargo test` wall time drops by at least 30%
 > against the epic's baseline.
@@ -164,15 +167,16 @@ proposed scenarios accompanied the drafting PR, #383).
 
 ## 6. Testing strategy
 
-Inventory diffs are the mechanism for `.1`/`.5`: a
+Inventory diffs are the mechanism for RFC0028.1/RFC0028.5: a
 `cargo test -p <crate> -- --list` snapshot (scoped to the crate
 being consolidated, matching `.1`) is captured in each consolidation
 PR's description and diffed against the post-move run — the
-reviewer checks the diff is a pure path-prefix rename. `.2` is a
-committed list (the harness-exempt binaries and their reasons, in
-the consolidating crate's `tests/` README or module docs). `.3`'s
-probe numbers are recorded in epic #382 alongside the baseline so
-the before/after is one table. `.4` is the full suite run plus a
+reviewer checks the diff is a pure path-prefix rename. RFC0028.2 is
+a committed list (the harness-exempt binaries and their reasons, in
+the consolidating crate's `tests/` README or module docs).
+RFC0028.3's probe numbers are recorded in epic #382 alongside the
+baseline so the before/after is one table. RFC0028.4 is the full
+suite run plus a
 recheck-set spot check: a whitespace-only edit inside the
 `MinerConfig` definition (`crates/ourios-core/src/config.rs` today;
 its new home after the split), then `cargo build -vv` on a

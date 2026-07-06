@@ -38,7 +38,7 @@ jobs:
           PROPTEST_CASES: "512"
         run: |
           cargo test -p ourios-testgen --release
-          cargo test -p ourios-miner   --release --test rfc0024_properties
+          cargo test -p ourios-miner   --release --test it rfc0024_properties
           cargo test -p ourios-parquet --release --test it rfc0024_properties
           cargo test -p ourios-querier --release --test it rfc0024_properties
           cargo test -p ourios-bench   --release --test rfc0024_calibration

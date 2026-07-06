@@ -17,6 +17,8 @@ name = "ourios_bench"
 path = "src/lib.rs"
 
 [dependencies]
+# Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
+ourios-config = { path = "../ourios-config" }
 # Workspace crates the harness drives end-to-end. The bench is
 # the only consumer that pulls all three on the same dep line
 # (miner + parquet writer + the core OtlpLogRecord shape they

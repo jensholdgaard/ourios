@@ -1,0 +1,14 @@
+[package]
+name = "ourios-config"
+version.workspace = true
+description = "Ourios miner tunables (RFC 0004) — extracted from ourios-core so config edits don't recompile type-only consumers (RFC 0028 §3.2)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -9,6 +9,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
+ourios-config = { path = "../ourios-config" }
 ourios-core = { path = "../ourios-core" }
 # The crate's raison d'être — `proptest` strategies over
 # `OtlpLogRecord` (RFC 0024 §3.2). A *regular* dependency here is the

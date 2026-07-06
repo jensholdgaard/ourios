@@ -67,6 +67,8 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
+# Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
+ourios-config = { path = "../ourios-config" }
 # RFC0002.7 — the parse/serialise round-trip is a property test over
 # generated well-formed queries.
 proptest = "=1.11.0"

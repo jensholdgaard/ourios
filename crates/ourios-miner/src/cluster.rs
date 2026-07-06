@@ -59,13 +59,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ourios_config::MinerConfig;
 use ourios_core::audit::{
     AuditEvent, AuditPayload, AuditSink, NoOpAuditSink, ParamType, SlotExpansion, SlotTypes,
     TemplateChange, hash_triggering_line, sample_first_256_bytes,
 };
 use ourios_core::clock::{Clock, SystemClock};
 use ourios_core::confidence::ConfidenceZone;
-use ourios_core::config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::record::{BodyKind, MinedRecord, NoOpRecordSink, Param, RecordSink};
 use ourios_core::tenant::TenantId;

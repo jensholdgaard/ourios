@@ -14,7 +14,7 @@
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_1_1_default_threshold_is_0_7() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
 
     // Arrange — no override; tenant config is left at defaults.
 
@@ -49,7 +49,7 @@ fn invariant_3_1_1_default_threshold_is_0_7() {
 async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
     use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
 
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -145,7 +145,7 @@ async fn invariant_3_1_2_mandatory_metric_set_is_exposed() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_2_1_default_param_byte_limit_is_256() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
 
     // Arrange — no override; tenant config is left at defaults.
 
@@ -168,7 +168,7 @@ fn invariant_3_2_1_default_param_byte_limit_is_256() {
 /// config refactor cannot silently slide the boundary.)
 #[test]
 fn invariant_default_similarity_floor_is_0_4() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
 
     let from_default = MinerConfig::default();
     assert!(
@@ -189,7 +189,7 @@ fn invariant_default_similarity_floor_is_0_4() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_2_2_param_limit_above_1_kib_rejected_at_startup() {
-    use ourios_core::config::{MinerConfig, MinerConfigError};
+    use ourios_config::{MinerConfig, MinerConfigError};
 
     // Arrange — explicit attempt to set the limit one byte above
     // the §3.2 ceiling (1024 B).
@@ -231,7 +231,7 @@ fn invariant_3_2_2_param_limit_above_1_kib_rejected_at_startup() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_3_1_separators_captured_on_every_tokenization() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::record::{BodyKind, SharedRecordSink};
     use ourios_core::tenant::TenantId;
@@ -308,7 +308,7 @@ fn invariant_3_3_1_separators_captured_on_every_tokenization() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_5_1_snapshot_format_carries_leading_version_byte() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -356,7 +356,7 @@ fn invariant_3_5_1_snapshot_format_carries_leading_version_byte() {
 /// assertion.
 #[test]
 fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -448,7 +448,7 @@ fn invariant_3_5_2_unknown_snapshot_version_triggers_wal_replay() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -534,7 +534,7 @@ fn invariant_3_7_1_tenant_trees_never_cross_pollinate() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn invariant_3_7_2_same_template_two_tenants_distinct_template_ids() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;

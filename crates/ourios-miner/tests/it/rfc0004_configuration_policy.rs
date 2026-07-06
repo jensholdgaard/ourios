@@ -13,7 +13,7 @@
 /// examples.
 #[test]
 fn rfc0004_1_prefix_depth_above_ceiling_rejected_at_startup() {
-    use ourios_core::config::{MinerConfig, MinerConfigError, PREFIX_DEPTH_CEILING};
+    use ourios_config::{MinerConfig, MinerConfigError, PREFIX_DEPTH_CEILING};
 
     // Arrange — one byte above the §6.1 ceiling.
     let over_ceiling: u8 = PREFIX_DEPTH_CEILING + 1;
@@ -53,7 +53,7 @@ fn rfc0004_1_prefix_depth_above_ceiling_rejected_at_startup() {
 /// values must refuse to serve the tenant" contract).
 #[test]
 fn rfc0004_1_param_byte_limit_zero_rejected_at_startup() {
-    use ourios_core::config::{MinerConfig, MinerConfigError, PARAM_BYTE_LIMIT_CEILING};
+    use ourios_config::{MinerConfig, MinerConfigError, PARAM_BYTE_LIMIT_CEILING};
 
     // Act
     let r = MinerConfig::try_new_full(0.7, 0.4, 0);
@@ -88,7 +88,7 @@ fn rfc0004_1_param_byte_limit_zero_rejected_at_startup() {
 /// override stays in the Clean zone and widens.
 #[test]
 fn rfc0004_2_per_tenant_override_is_honoured_at_decision_boundary() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -153,7 +153,7 @@ fn rfc0004_2_per_tenant_override_is_honoured_at_decision_boundary() {
 /// runtime check.
 #[test]
 fn rfc0004_3_no_invariant_breaking_field_exists_on_miner_config() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
 
     // Adding a new field forces this destructure pattern to be
     // updated (compile error: missing field `<new_field>`).

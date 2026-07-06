@@ -15,6 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
+ourios-config = { path = "../crates/ourios-config" }
 ourios-core = { path = "../crates/ourios-core" }
 ourios-miner = { path = "../crates/ourios-miner" }
 ourios-ingester = { path = "../crates/ourios-ingester" }

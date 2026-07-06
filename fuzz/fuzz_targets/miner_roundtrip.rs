@@ -11,7 +11,7 @@
 
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::record::SharedRecordSink;
 use ourios_core::tenant::TenantId;

@@ -19,6 +19,8 @@ name = "ourios-server"
 path = "src/main.rs"
 
 [dependencies]
+# Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
+ourios-config = { path = "../ourios-config" }
 # The background compaction daemon (RFC 0009 §3.2) + the OTLP receiver
 # building blocks (RFC 0003 §6.2): the ingest pipeline, the axum HTTP
 # router, and the tonic `LogsService` impl the receiver role serves.

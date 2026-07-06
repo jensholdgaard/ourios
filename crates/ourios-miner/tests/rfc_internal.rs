@@ -20,8 +20,8 @@
 /// (and `docs/rfcs/0001-template-miner.md` §5 for the original scenario).
 #[test]
 fn rfc0001_1_fresh_leaf_creation_emits_template_created() {
+    use ourios_config::MinerConfig;
     use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
-    use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -64,8 +64,8 @@ fn rfc0001_1_fresh_leaf_creation_emits_template_created() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_2_degenerate_template_guard_rejects_fully_wildcard_widening() {
+    use ourios_config::MinerConfig;
     use ourios_core::audit::{AuditPayload, SharedAuditSink, TemplateChange};
-    use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::{MinerCluster, NO_TEMPLATE};
@@ -273,8 +273,8 @@ fn rfc0001_3_regression_separators_always_borrow_from_input() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_4_confidence_ratio_decision_boundary_at_one() {
+    use ourios_config::MinerConfig;
     use ourios_core::confidence::ConfidenceZone;
-    use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -350,8 +350,8 @@ fn rfc0001_4_confidence_ratio_decision_boundary_at_one() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_7_combined_widening_and_type_expansion_emits_two_events_in_order() {
+    use ourios_config::MinerConfig;
     use ourios_core::audit::{AuditPayload, ParamType, SharedAuditSink, TemplateChange};
-    use ourios_core::config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;
@@ -473,7 +473,7 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
         AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics,
     };
 
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{AnyValue, Body, KeyValue, OtlpLogRecord, any_value};
     use ourios_core::record::SharedRecordSink;
     use ourios_core::tenant::TenantId;
@@ -598,7 +598,7 @@ async fn rfc0001_8_confidence_p50_and_p01_are_emitted_as_gauges() {
 /// See `docs/rfcs/0001-template-miner.md` §5.
 #[test]
 fn rfc0001_9_structured_body_short_circuits_to_structured_template_id() {
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{
         AnyValue, Body, KeyValue, KeyValueList, OtlpLogRecord, any_value, canonical,
     };
@@ -711,7 +711,7 @@ fn rfc0001_9_structured_body_short_circuits_to_structured_template_id() {
 fn rfc0001_11_severity_zero_and_scope_none_are_distinct_key_buckets() {
     use std::collections::HashSet;
 
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
     use ourios_core::otlp::{Body, OtlpLogRecord};
     use ourios_core::tenant::TenantId;
     use ourios_miner::cluster::MinerCluster;

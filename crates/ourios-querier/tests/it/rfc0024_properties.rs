@@ -12,7 +12,7 @@
 //! by eye (RFC 0024 §3.3).
 
 use crate::common::{no_aliases, write_all_with_promoted};
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{OtlpLogRecord, any_value};
 use ourios_core::record::{BodyKind, MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;

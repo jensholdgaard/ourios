@@ -233,8 +233,8 @@ pub fn sim_seq_owned(
 /// bypassing config validation gets a loud failure rather than
 /// `+inf` or `NaN`.
 ///
-/// [`MinerConfig`]: ourios_core::config::MinerConfig
-/// [`MinerConfig::try_new`]: ourios_core::config::MinerConfig::try_new
+/// [`MinerConfig`]: ourios_config::MinerConfig
+/// [`MinerConfig::try_new`]: ourios_config::MinerConfig::try_new
 #[must_use]
 pub fn confidence_ratio(sim_seq: f32, threshold: f32) -> f32 {
     assert!(

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::grpc::{AuthInterceptor, LogsReceiver};

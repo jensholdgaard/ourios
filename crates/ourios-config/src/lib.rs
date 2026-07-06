@@ -1,4 +1,9 @@
-//! Per-tenant configuration for the Ourios miner.
+//! `ourios-config` — per-tenant configuration for the Ourios miner.
+//!
+//! Extracted from `ourios-core` (RFC 0028 §3.2, slice 3) so a tunables
+//! edit recompiles only the crates that actually read configuration —
+//! the type-only core consumers (the parquet and querier stacks) stay
+//! untouched (RFC0028.4).
 //!
 //! Defaults satisfy RFC 0001 §3.1.1 (similarity threshold) and
 //! §3.2.1 (per-parameter byte limit). Values outside the
@@ -16,6 +21,8 @@
 //! mining) live in the algorithm itself and never appear as
 //! fields here. Adding a field that touches those areas requires
 //! a `meta:` RFC against `CLAUDE.md` §3 — see RFC 0004 §3.5.
+
+#![deny(unsafe_code)]
 
 use std::error::Error;
 use std::fmt;

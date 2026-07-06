@@ -447,7 +447,7 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
-    use ourios_core::config::MinerConfig;
+    use ourios_config::MinerConfig;
 
     /// Persists nothing; `sync` reports the configured offset and counts
     /// its calls, so a test can assert WAL-before-ack ordering and

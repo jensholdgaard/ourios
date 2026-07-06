@@ -11,7 +11,7 @@
 //! `docs/benchmarks.md` §9 record, not a `cargo test` — the runner
 //! lives in the maintainer's `scratch/baseline/` tooling.
 
-use ourios_core::config::MinerConfig;
+use ourios_config::MinerConfig;
 use ourios_core::otlp::{Body, OtlpLogRecord};
 use ourios_core::record::SharedRecordSink;
 use ourios_core::tenant::TenantId;
@@ -50,7 +50,7 @@ fn template_set(cluster: &MinerCluster, tenant: &TenantId) -> Vec<(String, u64)>
 /// `tests/invariants.rs`.
 #[test]
 fn zero_bounds_are_rejected_at_startup() {
-    use ourios_core::config::MinerConfigError;
+    use ourios_config::MinerConfigError;
     assert_eq!(
         MinerConfig::default().with_max_node_children(0),
         Err(MinerConfigError::BoundZero("max_node_children")),

@@ -78,7 +78,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 ourios-miner = { path = "../ourios-miner" }
 # RFC0021.4 view-representation test: cast a plain batch's string/binary
 # columns to Utf8View/BinaryView and prove the shared decoder reads both.
-arrow-cast = { version = "=58.3.0", default-features = false }
+arrow-cast = { version = "=59.0.0", default-features = false }
 # Used by tests that build `MinedRecord` fixtures.
 tempfile = "=3.27.0"
 # Property tests for the compaction row-conservation invariant

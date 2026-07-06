@@ -268,6 +268,15 @@ mod tests {
     }
 
     #[test]
+    fn tenant_denied_is_403() {
+        let e = ReceiveError::TenantDenied {
+            token_name: "edge".to_string(),
+            tenant: ourios_core::tenant::TenantId::new("intruder"),
+        };
+        assert_eq!(ingest_error_status(&e), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn oversize_payload_is_413() {
         let e = ReceiveError::WalAppend(AppendError::TooLarge {
             len: 32 * 1024 * 1024,

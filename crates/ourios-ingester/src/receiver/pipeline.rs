@@ -416,7 +416,7 @@ impl std::fmt::Display for ReceiveError {
             // client's error text.
             Self::TenantDenied { tenant, .. } => write!(
                 f,
-                "tenant {:?} is outside the authenticated token's allowed \
+                "tenant `{}` is outside the authenticated token's allowed \
                  tenant set (RFC 0026 §3.2)",
                 tenant.as_str(),
             ),

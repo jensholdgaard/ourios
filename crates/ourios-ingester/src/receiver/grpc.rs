@@ -155,6 +155,15 @@ mod tests {
     }
 
     #[test]
+    fn tenant_denied_is_permission_denied() {
+        let e = ReceiveError::TenantDenied {
+            token_name: "edge".to_string(),
+            tenant: ourios_core::tenant::TenantId::new("intruder"),
+        };
+        assert_eq!(ingest_error_status(&e).code(), Code::PermissionDenied);
+    }
+
+    #[test]
     fn oversize_payload_is_invalid_argument() {
         let e = ReceiveError::WalAppend(AppendError::TooLarge {
             len: 32 * 1024 * 1024,

@@ -2972,6 +2972,7 @@ dependencies = [
  "ourios-telemetry",
  "proptest",
  "serde_json",
+ "subtle",
  "tokio",
 ]
 
@@ -3092,7 +3093,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "subtle",
  "tempfile",
  "testcontainers-modules",
  "tokio",

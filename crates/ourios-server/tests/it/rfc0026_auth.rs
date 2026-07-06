@@ -137,13 +137,15 @@ fn query_store(tenants: &[&str]) -> std::sync::Arc<ourios_core::auth::TokenStore
     )
 }
 
-/// `POST /v1/query` against an authed router. Returns the status.
+/// `POST /v1/query` against an authed router. Returns the status and the
+/// parsed JSON body, so the error contract (kind/message) is assertable,
+/// not just the status line.
 async fn post_query(
     router: axum::Router,
     bearer: Option<&str>,
     tenant: Option<&str>,
     body: &str,
-) -> axum::http::StatusCode {
+) -> (axum::http::StatusCode, serde_json::Value) {
     use tower::ServiceExt as _;
     let mut req = axum::http::Request::builder()
         .method("POST")
@@ -155,14 +157,19 @@ async fn post_query(
     if let Some(t) = tenant {
         req = req.header("x-ourios-tenant", t);
     }
-    router
+    let response = router
         .oneshot(
             req.body(axum::body::Body::from(body.to_owned()))
                 .expect("build request"),
         )
         .await
-        .expect("oneshot")
-        .status()
+        .expect("oneshot");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
 }
 
 /// Scenario RFC0026.4 — query enforcement and status contract.
@@ -181,16 +188,26 @@ async fn rfc0026_4_query_status_contract() {
         )
     };
 
-    // 401: missing and unknown bearer — before the tenant contract.
+    // 401: missing and unknown bearer — before the tenant contract, one
+    // undifferentiated static body, never a token value.
     for bearer in [None, Some("Bearer tok-wrong")] {
-        let status = post_query(router(), bearer, Some("acme"), "template_id == 1").await;
+        let (status, json) = post_query(router(), bearer, Some("acme"), "template_id == 1").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer:?}");
+        assert_eq!(json["error"]["kind"], "unauthenticated", "{json}");
+        assert_eq!(
+            json["error"]["message"], "a valid bearer token is required",
+            "one undifferentiated message for every rejected shape",
+        );
+        assert!(
+            !json.to_string().contains("tok-"),
+            "no token value on the surface: {json}",
+        );
     }
 
     // 400: missing/empty tenant with a VALID bearer — today's contract,
     // unchanged by the gate.
     for tenant in [None, Some("")] {
-        let status = post_query(
+        let (status, json) = post_query(
             router(),
             Some("Bearer tok-query"),
             tenant,
@@ -198,10 +215,17 @@ async fn rfc0026_4_query_status_contract() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{tenant:?}");
+        assert_eq!(json["error"]["kind"], "missing_tenant", "{json}");
+        assert_eq!(
+            json["error"]["message"],
+            "the X-Ourios-Tenant header is required and must be non-empty",
+            "the pre-gate contract is unchanged",
+        );
     }
 
-    // 403: a well-formed tenant outside the token's set.
-    let status = post_query(
+    // 403: a well-formed tenant outside the token's set — a static body
+    // naming neither token nor set.
+    let (status, json) = post_query(
         router(),
         Some("Bearer tok-query"),
         Some("globex"),
@@ -209,10 +233,15 @@ async fn rfc0026_4_query_status_contract() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["error"]["kind"], "tenant_denied", "{json}");
+    assert!(
+        !json.to_string().contains("tok-"),
+        "no token value on the surface: {json}",
+    );
 
     // 200: in-set tenant serves the query (an empty store answers with an
     // empty, well-formed result).
-    let status = post_query(
+    let (status, json) = post_query(
         router(),
         Some("Bearer tok-query"),
         Some("acme"),
@@ -220,19 +249,24 @@ async fn rfc0026_4_query_status_contract() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert!(json["records"].is_array(), "well-formed result: {json}");
 
     // The drift endpoint sits under the same gate: 401 / 403 / 200.
     let drift = "drift from 2026-06-01T00:00:00Z to 2026-06-02T00:00:00Z";
     assert_eq!(
-        post_query(router(), None, Some("acme"), drift).await,
+        post_query(router(), None, Some("acme"), drift).await.0,
         StatusCode::UNAUTHORIZED,
     );
     assert_eq!(
-        post_query(router(), Some("Bearer tok-query"), Some("globex"), drift).await,
+        post_query(router(), Some("Bearer tok-query"), Some("globex"), drift)
+            .await
+            .0,
         StatusCode::FORBIDDEN,
     );
     assert_eq!(
-        post_query(router(), Some("Bearer tok-query"), Some("acme"), drift).await,
+        post_query(router(), Some("Bearer tok-query"), Some("acme"), drift)
+            .await
+            .0,
         StatusCode::OK,
     );
 }
@@ -244,7 +278,7 @@ async fn rfc0026_5_wildcard_binding_query() {
     let bucket = tempfile::tempdir().expect("temp");
     let auth = query_store(&["*"]);
     for tenant in ["alpha", "beta", "entirely-new-tenant"] {
-        let status = post_query(
+        let (status, _) = post_query(
             ourios_server::querier::router_with_auth(
                 bucket.path().to_path_buf(),
                 3_600_000_000_000,
@@ -292,6 +326,19 @@ async fn rfc0026_6_open_mode_parity() {
         .spawn()
         .expect("spawn ourios-server");
 
+    // Take stderr up front and buffer it concurrently, so the pipe cannot
+    // fill and block the child before the stdout readiness line; the
+    // collected lines feed the exactly-once count after the kill below.
+    let stderr = child.stderr.take().expect("stderr piped");
+    let drain = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut collected = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            collected.push(line);
+        }
+        collected
+    });
+
     // Readiness bound: both roles announce on stdout; collect until the
     // querier line (printed last).
     let stdout = child.stdout.take().expect("stdout piped");
@@ -307,21 +354,19 @@ async fn rfc0026_6_open_mode_parity() {
     .await
     .expect("server ready before timeout");
 
-    // Exactly one open-mode warning: scan stderr for a bounded window
-    // after readiness (the warning precedes the role start, so it has
-    // already been written).
-    let stderr = child.stderr.take().expect("stderr piped");
-    let mut err_lines = BufReader::new(stderr).lines();
-    let mut count = 0;
-    let _ = timeout(Duration::from_secs(2), async {
-        while let Some(line) = err_lines.next_line().await.expect("read stderr") {
-            if line.contains("RFC 0026 open mode") {
-                count += 1;
-            }
-        }
-    })
-    .await;
-    assert_eq!(count, 1, "the open-mode warning is emitted exactly once");
-
+    // Both roles are up (open really is open). Kill the child, which
+    // closes its stderr; the drain task then reaches EOF and returns the
+    // complete, finite stream — a deterministic exactly-once count with
+    // no timing window (the warning precedes the role start, so it is
+    // already in the stream by readiness).
     child.kill().await.expect("kill the server");
+    let collected = timeout(Duration::from_secs(15), drain)
+        .await
+        .expect("stderr drains before timeout")
+        .expect("drain task");
+    let count = collected
+        .iter()
+        .filter(|line| line.contains("RFC 0026 open mode"))
+        .count();
+    assert_eq!(count, 1, "the open-mode warning is emitted exactly once");
 }

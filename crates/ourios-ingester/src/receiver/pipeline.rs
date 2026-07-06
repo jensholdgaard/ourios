@@ -173,11 +173,23 @@ impl IngestPipeline {
         self
     }
 
-    /// Ingest one decoded export per the §6.5 sequence: fan out, append
-    /// the export as a single `OtlpBatch` frame, **fsync** (batched via
-    /// the group-commit coordinator), then hand the records to the miner,
-    /// then ack. Returns the number of records ingested (`0` for the
-    /// empty fast path).
+    /// [`Self::ingest_bound`] without an authenticated binding — the open
+    /// mode (RFC 0026 §3.1) and pre-auth call sites, byte-for-byte today's
+    /// behavior.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ingest_bound`], minus the binding rejection.
+    pub async fn ingest(&self, request: ExportLogsServiceRequest) -> Result<usize, ReceiveError> {
+        self.ingest_bound(request, None).await
+    }
+
+    /// Ingest one decoded export per the §6.5 sequence: enforce the
+    /// RFC 0026 §3.2 tenant binding (when `binding` is present), fan out,
+    /// append the export as a single `OtlpBatch` frame, **fsync** (batched
+    /// via the group-commit coordinator), then hand the records to the
+    /// miner, then ack. Returns the number of records ingested (`0` for
+    /// the empty fast path).
     ///
     /// The covering fsync completes before this returns `Ok`, so the
     /// caller never acks a batch that isn't durable (`[§3.4]`). `&self`
@@ -186,12 +198,25 @@ impl IngestPipeline {
     ///
     /// # Errors
     ///
+    /// - [`ReceiveError::TenantDenied`] if any `ResourceLogs` group's
+    ///   derived tenant falls outside the binding's set — the whole batch
+    ///   is rejected before any WAL write, with no partial success
+    ///   (RFC 0026 §3.2).
     /// - [`ReceiveError::TenantResolution`] if any `ResourceLogs` fails
     ///   tenant resolution — the whole batch is rejected before any WAL
     ///   write (RFC0003.4).
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
-    pub async fn ingest(&self, request: ExportLogsServiceRequest) -> Result<usize, ReceiveError> {
+    pub async fn ingest_bound(
+        &self,
+        request: ExportLogsServiceRequest,
+        binding: Option<&super::auth::AuthBinding>,
+    ) -> Result<usize, ReceiveError> {
+        // RFC 0026 §3.2: authz precedes every other ingest step — a denied
+        // batch does no encode, fan-out, or WAL work.
+        if let Some(binding) = binding {
+            super::auth::check_binding(&request, &self.rule, binding)?;
+        }
         // Encode before fan-out consumes the request: the WAL frame is a
         // protobuf `ExportLogsServiceRequest` (§6.5 step 3). Byte-equality
         // to the wire isn't required — recoverability is.
@@ -357,6 +382,16 @@ impl IngestPipeline {
 pub enum ReceiveError {
     /// A `ResourceLogs` group's Resource did not resolve to a tenant.
     TenantResolution(TenantResolutionError),
+    /// A group's derived tenant falls outside the authenticated token's
+    /// allowed set — the whole batch is denied before any WAL work
+    /// (RFC 0026 §3.2, `PERMISSION_DENIED` / 403).
+    TenantDenied {
+        /// The rejecting token's audit/metric label (never the value) —
+        /// what the §3.4 rejection audit event will carry.
+        token_name: String,
+        /// The offending derived tenant.
+        tenant: ourios_core::tenant::TenantId,
+    },
     /// Appending the `OtlpBatch` frame to the WAL failed.
     WalAppend(ourios_wal::AppendError),
     /// Fsyncing the WAL failed — the batch must not be acked.
@@ -375,6 +410,16 @@ impl std::fmt::Display for ReceiveError {
             // `TenantResolutionError`'s own Display already leads with
             // "tenant resolution failed: …"; delegate, don't re-prefix.
             Self::TenantResolution(e) => write!(f, "{e}"),
+            // The wire message names the tenant, not the token: the caller
+            // knows its own credential, and the token's label belongs to
+            // the operator's audit surface (RFC 0026 §3.4), not the
+            // client's error text.
+            Self::TenantDenied { tenant, .. } => write!(
+                f,
+                "tenant {:?} is outside the authenticated token's allowed \
+                 tenant set (RFC 0026 §3.2)",
+                tenant.as_str(),
+            ),
             Self::WalAppend(e) => write!(f, "{e}"),
             Self::WalSync(e) => write!(f, "{e}"),
         }
@@ -385,6 +430,7 @@ impl std::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TenantResolution(e) => Some(e),
+            Self::TenantDenied { .. } => None,
             Self::WalAppend(e) => Some(e),
             Self::WalSync(e) => Some(e),
         }

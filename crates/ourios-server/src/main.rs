@@ -524,6 +524,20 @@ async fn terminate_signal() {
     std::future::pending::<()>().await;
 }
 
+/// RFC 0026 §3.1 open mode: with no `auth` configured, any client that can
+/// reach a listener can write into and read from any tenant. Warn once at
+/// startup so the exposure is a visible choice, not a silent default. A
+/// compactor-only process binds nothing, so it has nothing to expose.
+fn warn_if_open_mode(config: &ServerConfig) {
+    if config.auth.is_none() && (config.receiver.is_some() || config.querier.is_some()) {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_SERVER_AUTH_OPEN_MODE,
+            "auth is not configured: the network listeners accept unauthenticated \
+             requests for any tenant (RFC 0026 open mode)"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
@@ -558,17 +572,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
     let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
 
-    // RFC 0026 §3.1 open mode: with no `auth` configured, any client that can
-    // reach a listener can write into and read from any tenant. Warn once at
-    // startup so the exposure is a visible choice, not a silent default. A
-    // compactor-only process binds nothing, so it has nothing to expose.
-    if config.auth.is_none() && (config.receiver.is_some() || config.querier.is_some()) {
-        tracing::warn!(
-            name: ourios_semconv::EVENT_OURIOS_SERVER_AUTH_OPEN_MODE,
-            "auth is not configured: the network listeners accept unauthenticated \
-             requests for any tenant (RFC 0026 open mode)"
-        );
-    }
+    warn_if_open_mode(&config);
 
     // Start the OTLP receiver role if enabled (RFC 0003 §9). Report the
     // bound addresses on stdout so an operator — or a test binding `:0` —
@@ -587,6 +591,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // handle is cheap to share, the compactor keeps the original).
                 store: store.clone(),
                 promoted: config.promoted.clone(),
+                auth: config.auth.clone().map(std::sync::Arc::new),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);

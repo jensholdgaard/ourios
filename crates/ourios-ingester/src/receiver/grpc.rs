@@ -64,7 +64,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
             }
             // One undifferentiated message: missing vs malformed vs unknown
             // would be a probing oracle (RFC 0026 §3.2).
-            Err(_) => Err(Status::unauthenticated("missing or unknown bearer token")),
+            Err(_) => Err(Status::unauthenticated("a valid bearer token is required")),
         }
     }
 }

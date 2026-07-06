@@ -270,13 +270,11 @@ mod wellformed {
     }
 }
 
-mod common;
-
 /// Scenario RFC0002.1 — A Branch-B predicate parses and compiles to a filter.
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_1_predicate_compiles_to_a_filter() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryRequest};
 
@@ -288,7 +286,10 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
         bucket.path(),
         &[simple("a", 1, TS0), simple("a", 1, TS0 + 1_000_000)],
     );
-    write_all(bucket.path(), &[simple("a", 2, TS0 + common::HOUR_NS)]);
+    write_all(
+        bucket.path(),
+        &[simple("a", 2, TS0 + crate::common::HOUR_NS)],
+    );
     let q = Querier::new(bucket.path());
     let tenant = TenantId::new("a");
 
@@ -300,7 +301,7 @@ async fn rfc0002_1_predicate_compiles_to_a_filter() {
             &tenant,
             NOW,
             DEFAULT_WINDOW_NS,
-            Some(&common::no_aliases()),
+            Some(&crate::common::no_aliases()),
         )
         .await
         .expect("run_query");
@@ -380,7 +381,7 @@ fn rfc0002_2_string_and_structured_surfaces_agree() {
 /// an error message from the compile path names no engine token (§4.6).
 #[tokio::test]
 async fn rfc0002_3_no_datafusion_leakage() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
@@ -411,7 +412,7 @@ async fn rfc0002_3_no_datafusion_leakage() {
             &tenant,
             NOW,
             DEFAULT_WINDOW_NS,
-            Some(&common::no_aliases()),
+            Some(&crate::common::no_aliases()),
         )
         .await
         .expect_err("an out-of-scope attribute comparison must be rejected");
@@ -432,13 +433,13 @@ async fn rfc0002_3_no_datafusion_leakage() {
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_4_default_time_window() {
-    use common::{HOUR_NS, simple, write_all};
+    use crate::common::{HOUR_NS, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
     // Arrange — `now` and a 1-hour default window. One row sits inside
     // `[now - 1h, now]`; one sits two hours before `now`, outside it.
-    let now = common::TS0 + 10 * HOUR_NS;
+    let now = crate::common::TS0 + 10 * HOUR_NS;
     let window = HOUR_NS;
     let in_window = now - HOUR_NS / 2;
     let out_of_window = now - 2 * HOUR_NS;
@@ -454,7 +455,13 @@ async fn rfc0002_4_default_time_window() {
     // Act — a query with NO range stage (match-all predicate).
     let query = ourios_querier::dsl::parse("true").expect("parse");
     let r = q
-        .run_query(&query, &tenant, now, window, Some(&common::no_aliases()))
+        .run_query(
+            &query,
+            &tenant,
+            now,
+            window,
+            Some(&crate::common::no_aliases()),
+        )
         .await
         .expect("run_query");
 
@@ -471,7 +478,7 @@ async fn rfc0002_4_default_time_window() {
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_5_severity_name_maps_to_severity_number() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -515,7 +522,7 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                Some(&common::no_aliases()),
+                Some(&crate::common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -558,7 +565,7 @@ async fn rfc0002_5_severity_name_maps_to_severity_number() {
 /// floor. See `docs/rfcs/0002-query-dsl.md` §5 / §6.1.
 #[tokio::test]
 async fn rfc0002_5_named_severity_equality_is_a_band() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -594,7 +601,7 @@ async fn rfc0002_5_named_severity_equality_is_a_band() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                Some(&common::no_aliases()),
+                Some(&crate::common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -629,7 +636,7 @@ async fn rfc0002_5_named_severity_equality_is_a_band() {
 /// See `docs/rfcs/0002-query-dsl.md` §5.
 #[tokio::test]
 async fn rfc0002_6_first_class_fields_resolve() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, rec, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -661,7 +668,7 @@ async fn rfc0002_6_first_class_fields_resolve() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                Some(&common::no_aliases()),
+                Some(&crate::common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -712,7 +719,7 @@ async fn rfc0002_6_first_class_fields_resolve() {
 /// `docs/rfcs/0002-query-dsl.md` §5 and issue #147 (the JSON-LIKE stopgap).
 #[tokio::test]
 async fn rfc0002_6_attr_not_equal_requires_present_key() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, kv, rec_with_resource, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, kv, rec_with_resource, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -740,7 +747,7 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                Some(&common::no_aliases()),
+                Some(&crate::common::no_aliases()),
             )
             .await
             .expect("run_query")
@@ -769,7 +776,7 @@ async fn rfc0002_6_attr_not_equal_requires_present_key() {
 /// `docs/rfcs/0002-query-dsl.md` §5 / hazard `CLAUDE.md` §4.6.
 #[tokio::test]
 async fn rfc0002_6_non_text_operators_rejected() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
@@ -799,7 +806,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                Some(&common::no_aliases()),
+                Some(&crate::common::no_aliases()),
             )
             .await
             .expect_err(&format!("{text:?} must be rejected at compile"));
@@ -822,7 +829,7 @@ async fn rfc0002_6_non_text_operators_rejected() {
 /// rejected with a clear error rather than silently dropped.
 #[tokio::test]
 async fn rfc0002_6_unsupported_stage_rejected() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::{Querier, QueryError};
 
@@ -847,7 +854,7 @@ async fn rfc0002_6_unsupported_stage_rejected() {
                 &tenant,
                 NOW,
                 DEFAULT_WINDOW_NS,
-                Some(&common::no_aliases()),
+                Some(&crate::common::no_aliases()),
             )
             .await
             .expect_err(&format!("{text:?} must be rejected, not dropped"));
@@ -866,7 +873,7 @@ async fn rfc0002_6_unsupported_stage_rejected() {
         &tenant,
         NOW,
         DEFAULT_WINDOW_NS,
-        Some(&common::no_aliases()),
+        Some(&crate::common::no_aliases()),
     )
     .await
     .expect("range + limit stay supported");
@@ -1021,7 +1028,7 @@ fn rfc0002_8_malformed_query_specific_error() {
 /// (the un-expanded singleton), `lossy == true`, and `confidence < 0.7`.
 #[tokio::test]
 async fn rfc0002_9_resolves_to_expands_via_alias_map() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, simple, write_all};
     use ourios_core::alias::{ActorId, AliasMap, Operator};
     use ourios_core::audit::InMemoryAuditSink;
     use ourios_core::tenant::TenantId;
@@ -1040,10 +1047,10 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
         &[
             simple("T", A, TS0),
             simple("T", A, TS0 + 1_000),
-            simple("T", B, TS0 + common::HOUR_NS),
-            simple("T", C, TS0 + 2 * common::HOUR_NS),
+            simple("T", B, TS0 + crate::common::HOUR_NS),
+            simple("T", C, TS0 + 2 * crate::common::HOUR_NS),
             simple("T2", A, TS0),
-            simple("T2", B, TS0 + common::HOUR_NS),
+            simple("T2", B, TS0 + crate::common::HOUR_NS),
             // Distinct-id rows under T so the other template primitives have
             // something to match: one lossy (a lossy String row retains its
             // body, invariant §3.3) and one low-confidence.
@@ -1133,7 +1140,7 @@ async fn rfc0002_9_resolves_to_expands_via_alias_map() {
 /// `T` is invisible to `T2`'s derived map (`CLAUDE.md` §3.7).
 #[tokio::test]
 async fn rfc0002_9_storage_backed_resolves_to_expands_via_derived_map() {
-    use common::{DEFAULT_WINDOW_NS, NOW, TS0, at, simple, write_all, write_audit};
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, at, simple, write_all, write_audit};
     use ourios_core::alias::ActorId;
     use ourios_core::audit::{AuditEvent, AuditPayload};
     use ourios_core::tenant::TenantId;
@@ -1151,10 +1158,10 @@ async fn rfc0002_9_storage_backed_resolves_to_expands_via_derived_map() {
         &[
             simple("T", A, TS0),
             simple("T", A, TS0 + 1_000),
-            simple("T", B, TS0 + common::HOUR_NS),
-            simple("T", C, TS0 + 2 * common::HOUR_NS),
+            simple("T", B, TS0 + crate::common::HOUR_NS),
+            simple("T", C, TS0 + 2 * crate::common::HOUR_NS),
             simple("T2", A, TS0),
-            simple("T2", B, TS0 + common::HOUR_NS),
+            simple("T2", B, TS0 + crate::common::HOUR_NS),
         ],
     );
     write_audit(
@@ -1346,7 +1353,7 @@ fn rfc0002_11_structured_surface_schema_validation() {
     // compilable JSON Schema (not just any JSON). A drift between the file and
     // the source-of-truth `include_str!` cannot happen silently.
     let served = ourios_querier::dsl::structured_query_schema();
-    let committed = include_str!("../src/dsl/structured_query.schema.json");
+    let committed = include_str!("../../src/dsl/structured_query.schema.json");
     assert_eq!(
         served, committed,
         "the served schema must equal the committed snapshot (RFC0002.11 / §6.6)",

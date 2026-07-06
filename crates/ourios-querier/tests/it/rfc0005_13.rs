@@ -27,8 +27,6 @@
 //! wire zero) lives in
 //! `crates/ourios-parquet/tests/effective_timestamp.rs`.
 
-mod common;
-
 use std::fs::File;
 use std::path::Path;
 
@@ -37,7 +35,7 @@ use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
 use parquet::arrow::ArrowWriter;
 
-use common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, no_aliases, simple, write_all};
+use crate::common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, no_aliases, simple, write_all};
 use ourios_parquet::{PartitionKey, columns, mined_records_to_batch};
 use ourios_querier::Querier;
 

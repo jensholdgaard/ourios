@@ -8,8 +8,6 @@
 //! `tests/common` (`simple`, `write_all`) plus the RFC0002.9 operator-built
 //! `AliasMap` pattern.
 
-mod common;
-
 /// Scenario RFC0001.5 — Bare `template_id = X` spans all versions of leaf X.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
@@ -20,7 +18,7 @@ mod common;
 /// excluded.
 #[tokio::test]
 async fn rfc0001_5_bare_template_id_spans_all_versions_of_leaf() {
-    use common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, no_aliases, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, no_aliases, simple, write_all};
     use ourios_core::tenant::TenantId;
     use ourios_querier::Querier;
 
@@ -74,7 +72,7 @@ async fn rfc0001_5_bare_template_id_spans_all_versions_of_leaf() {
 /// side.
 #[tokio::test]
 async fn rfc0001_6_bare_template_id_does_not_follow_alias_chains() {
-    use common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, simple, write_all};
+    use crate::common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, simple, write_all};
     use ourios_core::alias::{ActorId, AliasMap, Operator};
     use ourios_core::audit::InMemoryAuditSink;
     use ourios_core::tenant::TenantId;

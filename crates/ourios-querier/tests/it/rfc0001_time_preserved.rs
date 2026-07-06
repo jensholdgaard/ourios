@@ -9,8 +9,6 @@
 //! reuses the RFC 0005 store fixtures shared via `tests/common`
 //! (`simple`, `write_all`).
 
-mod common;
-
 /// Scenario RFC0001.10 — `time_unix_nano` is preserved verbatim from the wire.
 /// See `docs/rfcs/0001-template-miner.md` §5.
 ///
@@ -26,7 +24,7 @@ mod common;
 /// 2026-based `NOW`/window fixtures don't gate the 2024 instant.
 #[tokio::test]
 async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
-    use common::{NOW, no_aliases, simple, write_all};
+    use crate::common::{NOW, no_aliases, simple, write_all};
     use ourios_core::record::MinedRecord;
     use ourios_core::tenant::TenantId;
     use ourios_parquet::{PartitionKey, Reader};
@@ -40,7 +38,7 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
     // partition prune) can exclude it. Together they exercise both the
     // partition prune and the row-level range filter.
     const TS: u64 = 1_715_700_000_000_000_000;
-    const BEFORE: u64 = 1_715_600_000_000_000_000 - common::HOUR_NS;
+    const BEFORE: u64 = 1_715_600_000_000_000_000 - crate::common::HOUR_NS;
     const AT_HI: u64 = 1_715_800_000_000_000_000; // == WINDOW_HI; excluded (half-open)
     // RFC 3339 forms of the §5 window bounds (whole-second instants, so they
     // round-trip to the exact nanos the column stores — RFC 0002 §7 `time`).
@@ -70,7 +68,7 @@ async fn rfc0001_10_time_unix_nano_preserved_verbatim_from_wire() {
             &query,
             &tenant,
             NOW,
-            common::DEFAULT_WINDOW_NS,
+            crate::common::DEFAULT_WINDOW_NS,
             Some(&no_aliases()),
         )
         .await

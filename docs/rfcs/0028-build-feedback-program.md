@@ -136,10 +136,10 @@ proposed scenarios accompanied the drafting PR, #383).
 > inventory.** Given the pre-consolidation
 > `cargo test -p <crate> -- --list` inventory, When the crate's
 > harness consolidation lands, Then the post-consolidation inventory
-> contains the identical test names, each changed only by the
-> harness's module-path prefix (`--list` prints test names as module
-> paths; a file moving under `tests/it/` gains its module segment),
-> And no test body changed in the move.
+> lists the same set of tests, differing only by the harness's
+> module-path prefix (`--list` prints test names as module paths; a
+> file moving under `tests/it/` gains its module segment), And no
+> test body changed in the move.
 
 > **Scenario RFC0028.2 — isolation-sensitive tests stay isolated.**
 > Given the slice-1 inventory of tests requiring process isolation

@@ -19,6 +19,15 @@ groups:
     brief: >
       Installing the SIGTERM handler failed; SIGINT remains the shutdown
       path.
+  - id: event.ourios.server.auth.open_mode
+    type: event
+    name: ourios.server.auth.open_mode
+    stability: development
+    brief: >
+      A network role started with no `auth` section configured
+      (RFC 0026 §3.1 open mode): the listeners accept unauthenticated
+      requests, and any client that can reach them can write into and
+      read from any tenant.
   - id: event.ourios.compaction.sweep.error
     type: event
     name: ourios.compaction.sweep.error

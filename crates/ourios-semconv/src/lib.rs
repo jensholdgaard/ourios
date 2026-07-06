@@ -196,6 +196,9 @@ pub const EVENT_OURIOS_RECEIVER_SNAPSHOT_ERROR: &str = "ourios.receiver.snapshot
 /// `ourios.receiver.wal.truncated` log event name.
 pub const EVENT_OURIOS_RECEIVER_WAL_TRUNCATED: &str = "ourios.receiver.wal.truncated";
 
+/// `ourios.server.auth.open_mode` log event name.
+pub const EVENT_OURIOS_SERVER_AUTH_OPEN_MODE: &str = "ourios.server.auth.open_mode";
+
 /// `ourios.server.compaction.disabled` log event name.
 pub const EVENT_OURIOS_SERVER_COMPACTION_DISABLED: &str = "ourios.server.compaction.disabled";
 

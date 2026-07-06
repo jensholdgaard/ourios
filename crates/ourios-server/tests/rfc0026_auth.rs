@@ -5,19 +5,125 @@
 //! `.5`, and `.7`) live in
 //! `crates/ourios-ingester/tests/rfc0026_auth.rs`.
 //!
-//! Stubs are `#[ignore]`d so the default run stays green while the
-//! RFC is red; each names the green slice that discharges it.
+//! Remaining stubs are `#[ignore]`d so the default run stays green
+//! while the RFC is red; each names the green slice that discharges
+//! it. `.1` is green: the schema/substitution/redaction arms live in
+//! `ourios_server::config::file`, the store-validation matrix in
+//! `ourios_server::auth`, the file→store mapping in `src/main.rs`
+//! (`rfc0026_1_*`), and the startup-observable arms — the empty-list
+//! startup error and the open-mode warning — here, against the spawned
+//! binary (the `rfc0016_5_7_served_querier` pattern).
 
-/// Scenario RFC0026.1 — token store configuration.
+use std::io::Write as _;
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::time::timeout;
+
+/// Scenario RFC0026.1 (startup error) — an *empty* `auth.tokens` list is a
+/// startup configuration error (a locked-out server is never the intent,
+/// RFC 0026 §3.1): the process exits non-zero, naming the key.
 /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
-#[test]
-#[ignore = "RFC0026.1 stub — implemented in the config green slice"]
-fn rfc0026_1_token_store_configuration() {
-    todo!(
-        "RFC0026.1 — auth.tokens resolves env-var indirection (the RFC 0020 \
-         substitution syntax) at startup; empty tokens list is a startup \
-         error; a missing auth section starts open with a structured warning"
+#[tokio::test]
+async fn rfc0026_1_empty_token_list_is_a_startup_error() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let config_path = tmp.path().join("ourios.yaml");
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    write!(
+        file,
+        "storage:\n  local:\n    bucket_root: {}\nauth:\n  tokens: []\n",
+        tmp.path().display(),
+    )
+    .expect("write config");
+
+    let output = timeout(
+        Duration::from_secs(15),
+        Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+            .arg("--config")
+            .arg(&config_path)
+            // If the startup error ever regressed into a running server, the
+            // timeout would drop this future — don't leave that child behind.
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("server exits before timeout")
+    .expect("run ourios-server");
+
+    assert!(
+        !output.status.success(),
+        "an empty auth.tokens list must fail startup, got {:?}",
+        output.status,
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("auth.tokens"),
+        "the error names the key: {stderr}"
+    );
+}
+
+/// Scenario RFC0026.1 (open mode) — a missing `auth` section starts in open
+/// mode: the role comes up, and a structured startup warning names the
+/// exposure (RFC 0026 §3.1). The human-readable copy asserted here reaches
+/// stderr through the tracing `fmt` mirror (which renders the target and
+/// message, not the event name); the registry-backed event name
+/// (`ourios.server.auth.open_mode`) travels the `OTel` Logs signal, where
+/// `weaver registry live-check` enforces it in CI.
+/// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
+#[tokio::test]
+async fn rfc0026_1_missing_auth_section_starts_open_with_a_warning() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .env("OURIOS_BUCKET_ROOT", tmp.path())
+        .env("OURIOS_QUERIER_ENABLED", "1")
+        .env("OURIOS_QUERIER_HTTP_ADDR", "127.0.0.1:0")
+        // Deterministic regardless of the harness environment: an inherited
+        // RUST_LOG=error would filter the warning off stderr.
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ourios-server");
+
+    // The warning precedes the role start, so it appears promptly; the
+    // timeout bounds the scan if it never does.
+    let stderr = child.stderr.take().expect("server stderr piped");
+    let mut lines = BufReader::new(stderr).lines();
+    let saw_warning = timeout(Duration::from_secs(15), async {
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            if line.contains("RFC 0026 open mode") {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("warning appears before timeout");
+    assert!(saw_warning, "the open-mode warning names the exposure");
+
+    // Keep draining stderr: the server logs there for its lifetime, and an
+    // undrained pipe can fill and block it before the stdout line below.
+    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
+
+    // Open mode is *open*: the role still starts (the listener binds).
+    let stdout = child.stdout.take().expect("server stdout piped");
+    let mut out_lines = BufReader::new(stdout).lines();
+    let bound = timeout(Duration::from_secs(15), async {
+        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+            if line.contains("querier HTTP listening on") {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("querier binds before timeout");
+    assert!(bound, "open mode still serves");
+
+    child.kill().await.expect("kill the server");
 }
 
 /// Scenario RFC0026.4 — query enforcement and status contract.

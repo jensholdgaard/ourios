@@ -86,6 +86,12 @@ struct ServerConfig {
     /// (`storage.promoted_attributes`, §3.2) — applied by every write path
     /// (receiver flushes and compaction rewrites; §3.4).
     promoted: PromotedAttributes,
+    /// The RFC 0026 token store (`auth.tokens`), or `None` for open mode.
+    /// Config-file only (§3.1 — tokens ride the `${env:…}` indirection); the
+    /// env-only path always resolves open. Enforcement on the listeners lands
+    /// with the ingest/query slices; this slice resolves and validates the
+    /// store and makes open mode observable at startup.
+    auth: Option<ourios_server::auth::TokenStore>,
 }
 
 /// Resolved querier-role configuration (RFC 0016 §3.2).
@@ -252,6 +258,7 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
         &file.storage.promoted_attributes.resource,
         &file.storage.promoted_attributes.log,
     )?;
+    config.auth = ourios_server::auth::build_token_store(file.auth.as_ref())?;
     Ok(config)
 }
 
@@ -467,6 +474,7 @@ fn build_config(
         receiver: None,
         querier: None,
         promoted: PromotedAttributes::default(),
+        auth: None,
     })
 }
 
@@ -549,6 +557,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // (RFC 0001 §6.8). The guard flushes pending metrics on shutdown;
     // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
     let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
+
+    // RFC 0026 §3.1 open mode: with no `auth` configured, any client that can
+    // reach a listener can write into and read from any tenant. Warn once at
+    // startup so the exposure is a visible choice, not a silent default. A
+    // compactor-only process binds nothing, so it has nothing to expose.
+    if config.auth.is_none() && (config.receiver.is_some() || config.querier.is_some()) {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_SERVER_AUTH_OPEN_MODE,
+            "auth is not configured: the network listeners accept unauthenticated \
+             requests for any tenant (RFC 0026 open mode)"
+        );
+    }
 
     // Start the OTLP receiver role if enabled (RFC 0003 §9). Report the
     // bound addresses on stdout so an operator — or a test binding `:0` —
@@ -864,6 +884,46 @@ storage:
             !err.contains(secret),
             "the resolved secret must not leak: {err}"
         );
+    }
+
+    /// Scenario RFC0026.1 (mapping) — the file's `auth` section resolves
+    /// through the shared validators like every other section: a token that
+    /// arrived via `${env:…}` substitution authenticates in the resolved
+    /// store, an absent section resolves open (`None`), and an empty token
+    /// list fails the mapping. The schema/substitution/redaction arms live in
+    /// `config::file`, the store validation matrix in `ourios_server::auth`,
+    /// and the startup-observable arms in `tests/rfc0026_auth.rs`.
+    /// See `docs/rfcs/0026-authentication-tenant-binding.md` §5.
+    #[test]
+    fn rfc0026_1_auth_section_maps_onto_the_token_store() {
+        let yaml = "\
+storage:
+  backend: local
+  local:
+    bucket_root: /var/lib/ourios
+auth:
+  tokens:
+    - name: edge-collector
+      token: ${env:TOK}
+      tenants: [acme]
+";
+        let file = parse(yaml, &|name| {
+            (name == "TOK").then(|| "resolved-token".to_owned())
+        })
+        .expect("well-formed file");
+        let config = server_config_from_file(&file).expect("valid");
+        let store = config.auth.expect("auth resolved");
+        assert_eq!(
+            store.authenticate("resolved-token").expect("match").name(),
+            "edge-collector",
+        );
+
+        let open = server_config("storage:\n  local:\n    bucket_root: /x\n").expect("valid");
+        assert!(open.auth.is_none(), "no auth section resolves open");
+
+        let err = server_config("storage:\n  local:\n    bucket_root: /x\nauth:\n  tokens: []\n")
+            .expect_err("empty token list");
+        assert!(err.contains("auth.tokens"), "names the key: {err}");
     }
 
     /// `config_from_file` end-to-end through the real filesystem: a valid file

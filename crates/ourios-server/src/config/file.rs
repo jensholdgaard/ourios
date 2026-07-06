@@ -79,6 +79,13 @@ pub enum FileConfigError {
         /// The offending `storage.s3.*` credential field name.
         key: &'static str,
     },
+    /// An `auth.tokens[…].token` holds an inline literal instead of an
+    /// `${env:…}` reference (RFC 0026 §3.1). Names the entry's position only,
+    /// never the value.
+    InlineToken {
+        /// The offending entry's index in `auth.tokens`.
+        index: usize,
+    },
 }
 
 impl fmt::Display for FileConfigError {
@@ -91,6 +98,11 @@ impl fmt::Display for FileConfigError {
                 "storage.s3.{key} must be an ${{env:…}} reference, not an inline \
                  literal (RFC 0020 §3.5)"
             ),
+            Self::InlineToken { index } => write!(
+                f,
+                "auth.tokens[{index}].token must be an ${{env:…}} reference, not \
+                 an inline literal (RFC 0026 §3.1)"
+            ),
         }
     }
 }
@@ -100,7 +112,7 @@ impl std::error::Error for FileConfigError {
         match self {
             Self::Substitution(e) => Some(e),
             Self::Schema(e) => Some(e),
-            Self::InlineCredential { .. } => None,
+            Self::InlineCredential { .. } | Self::InlineToken { .. } => None,
         }
     }
 }
@@ -122,6 +134,11 @@ pub struct FileConfig {
     pub querier: QuerierSection,
     /// Background compaction (`compaction.*`, RFC 0009).
     pub compaction: CompactionSection,
+    /// Bearer-token authentication (`auth.*`, RFC 0026). `Option` because
+    /// presence is meaningful: an absent section is open mode, a present one
+    /// enables enforcement (and an empty token list inside it is a startup
+    /// error) — see RFC 0026 §3.1.
+    pub auth: Option<AuthSection>,
 }
 
 /// `storage.*` — the data + audit store backend selection (RFC 0019 §3.1/§3.2).
@@ -230,6 +247,48 @@ pub struct QuerierSection {
     pub default_window_secs: Option<String>,
 }
 
+/// `auth.*` — bearer-token authentication and tenant binding (RFC 0026 §3.1).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthSection {
+    /// The configured tokens. Empty (or absent inside a present `auth`
+    /// section) is a startup configuration error — a locked-out server is
+    /// never the intent (RFC 0026 §3.1).
+    pub tokens: Vec<TokenEntry>,
+}
+
+/// One `auth.tokens[…]` entry (RFC 0026 §3.1).
+///
+/// The `token` field is **secret**: the manual [`fmt::Debug`] impl redacts its
+/// value (showing only presence), mirroring [`S3Section`], and [`parse`]
+/// rejects an inline literal — the file may hold it only as an `${env:…}`
+/// reference.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenEntry {
+    /// Audit/metric label for this token — never secret (RFC 0026 §3.4).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub name: Option<String>,
+    /// The bearer token value (**secret**; `${env:…}` reference only).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub token: Option<String>,
+    /// The allowed tenant set: exact tenant ids, or the single wildcard `"*"`.
+    #[serde(deserialize_with = "scalar_vec")]
+    pub tenants: Vec<String>,
+}
+
+impl fmt::Debug for TokenEntry {
+    /// Redacts the token value — a `Debug` rendering shows only whether it is
+    /// present, never its value (RFC 0026 §3.1 / RFC 0020 §3.5).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenEntry")
+            .field("name", &self.name)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("tenants", &self.tenants)
+            .finish()
+    }
+}
+
 /// `compaction.*` — the background compaction sweep (RFC 0009 §3.2).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -273,6 +332,9 @@ pub fn parse(
     // Enforce §3.5 on the *raw* credential values — after substitution a
     // reference is indistinguishable from a literal.
     check_credentials_are_references(&config.storage.s3)?;
+    if let Some(auth) = &config.auth {
+        check_tokens_are_references(auth)?;
+    }
     config
         .substitute(lookup)
         .map_err(FileConfigError::Substitution)?;
@@ -294,6 +356,23 @@ fn check_credentials_are_references(s3: &S3Section) -> Result<(), FileConfigErro
             && !is_env_reference(raw)
         {
             return Err(FileConfigError::InlineCredential { key });
+        }
+    }
+    Ok(())
+}
+
+/// Enforce RFC 0026 §3.1: bearer-token values must be `${env:…}` references,
+/// never inline literals, so config files stay committable. Runs on the **raw**
+/// (pre-substitution) values; the [`check_credentials_are_references`] rule,
+/// applied to `auth.tokens`. An absent or empty token is not a literal — it is
+/// rejected later, by the token-store validation, which can name the entry.
+fn check_tokens_are_references(auth: &AuthSection) -> Result<(), FileConfigError> {
+    for (index, entry) in auth.tokens.iter().enumerate() {
+        if let Some(raw) = &entry.token
+            && !raw.is_empty()
+            && !is_env_reference(raw)
+        {
+            return Err(FileConfigError::InlineToken { index });
         }
     }
     Ok(())
@@ -327,7 +406,27 @@ impl FileConfig {
         self.storage.substitute(lookup)?;
         self.receiver.substitute(lookup)?;
         self.querier.substitute(lookup)?;
-        self.compaction.substitute(lookup)
+        self.compaction.substitute(lookup)?;
+        if let Some(auth) = &mut self.auth {
+            auth.substitute(lookup)?;
+        }
+        Ok(())
+    }
+}
+
+impl AuthSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        for entry in &mut self.tokens {
+            substitute(&mut entry.name, lookup)?;
+            substitute(&mut entry.token, lookup)?;
+            for tenant in &mut entry.tenants {
+                *tenant = env_subst::resolve(tenant, lookup)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -795,6 +894,89 @@ compaction:
         assert!(cfg.receiver.enabled.is_none());
         assert!(cfg.querier.enabled.is_none());
         assert!(cfg.compaction.enabled.is_none());
+    }
+
+    /// RFC0026.1 (schema) — `auth.tokens` parses with per-entry `${env:…}`
+    /// substitution on name, token, and tenant elements; a file with no
+    /// `auth` section parses to `None` (open mode), distinguishable from a
+    /// present-but-empty section.
+    #[test]
+    fn auth_tokens_parse_and_substitute() {
+        let lookup = env(&[("TOK_EDGE", "s3cr3t-edge"), ("TENANT", "acme")]);
+        let yaml = "
+auth:
+  tokens:
+    - name: edge-collector
+      token: ${env:TOK_EDGE}
+      tenants:
+        - ${env:TENANT}
+        - globex
+    - name: admin-cli
+      token: ${env:TOK_ADMIN}
+      tenants: [\"*\"]
+";
+        let cfg = parse(yaml, &lookup).expect("valid");
+        let auth = cfg.auth.expect("auth section present");
+        assert_eq!(auth.tokens.len(), 2);
+        assert_eq!(auth.tokens[0].name.as_deref(), Some("edge-collector"));
+        assert_eq!(auth.tokens[0].token.as_deref(), Some("s3cr3t-edge"));
+        assert_eq!(auth.tokens[0].tenants, ["acme", "globex"]);
+        assert_eq!(auth.tokens[1].token.as_deref(), Some("")); // undefined, no default
+        assert_eq!(auth.tokens[1].tenants, ["*"]);
+
+        assert!(
+            parse("storage:\n  backend: local\n", &lookup)
+                .expect("valid")
+                .auth
+                .is_none(),
+            "no auth section parses to None (open mode)",
+        );
+        let empty = parse("auth:\n  tokens: []\n", &lookup).expect("valid");
+        assert!(
+            empty.auth.expect("present").tokens.is_empty(),
+            "a present-but-empty section is distinguishable from an absent one",
+        );
+    }
+
+    /// RFC0026.1 (secret hygiene) — an inline-literal token is rejected with
+    /// an error naming the entry's index, never the value; and a resolved
+    /// token is redacted in the entry's `Debug` (the [`S3Section`] rules,
+    /// applied to `auth.tokens`).
+    #[test]
+    fn inline_token_literal_is_rejected_and_debug_redacts() {
+        let lookup = env(&[("TOK", "s3cr3t-token-value")]);
+
+        let err = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:TOK}\n      tenants: [x]\n    - name: b\n      token: hardcoded-secret\n      tenants: [y]\n",
+            &lookup,
+        )
+        .expect_err("inline literal");
+        assert!(
+            matches!(err, FileConfigError::InlineToken { index: 1 }),
+            "got {err:?}",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auth.tokens[1].token"),
+            "names the entry: {msg}"
+        );
+        assert!(!msg.contains("hardcoded-secret"), "never the value: {msg}");
+
+        let cfg = parse(
+            "auth:\n  tokens:\n    - name: a\n      token: ${env:TOK}\n      tenants: [x]\n",
+            &lookup,
+        )
+        .expect("valid");
+        let rendered = format!("{:?}", cfg.auth.expect("present").tokens[0]);
+        assert!(rendered.contains("\"a\""), "the name stays visible");
+        assert!(
+            !rendered.contains("s3cr3t-token-value"),
+            "token redacted: {rendered}",
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "shows presence: {rendered}"
+        );
     }
 
     /// An omitted section leaves its fields unset (`None`), matching an unset

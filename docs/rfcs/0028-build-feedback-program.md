@@ -169,6 +169,34 @@ proposed scenarios accompanied the drafting PR, #383).
 > harnesses (and nextest, if slice 5 adopts it), Then CI runs the
 > identical suite inventory and stays green.
 
+### 5.1 Discharge record (green, 2026-07-06)
+
+- **RFC0028.1** — per-PR inventory proofs: #399 (ingester, 129/129),
+  #400 (querier, 162/162), #401 (parquet, 162/162), #402 (wal, 64/64),
+  #403 (server, 90/90), #404 (miner, 206/206); every diff a pure
+  module-path-prefix rename.
+- **RFC0028.2** — committed exemption lists:
+  `crates/ourios-ingester/tests/README.md` and
+  `crates/ourios-miner/tests/README.md` (+ the server harness header);
+  all exemptions are process-global `OTel` meter-provider installers.
+- **RFC0028.3** — both gates pass (measurement tables on epic #382,
+  2026-07-06): `touch core → querier --no-run` 57 s → 28.6 s (< 30 s);
+  warm workspace suite ~10 min → 48.2 s under nextest (≥ 30% gate).
+  Steady-state protocol notes (macOS first-exec assessment) recorded
+  with the numbers.
+- **RFC0028.4** — proven in #405: a `MinerConfig` whitespace edit
+  leaves `ourios-core` and `ourios-parquet` `Fresh`; the rebuild set is
+  the semantic one (`config → miner → querier`).
+- **RFC0028.5** — #406: CI runs `cargo nextest run --workspace
+  --all-features` + `cargo test --doc`, preserving the exact suite
+  inventory; the workflow invocations that named old binaries were
+  retargeted in the same PRs that moved them (#401, #403, #404).
+- **Slice 4 (parquet split)** — closed *not-triggered* per the §3.3
+  tripwire: the probe-A gate passed without it.
+- **`red` note** — this RFC's scenarios are review/measurement
+  mechanisms (§6), not stub-able tests; there was no `red` rung, as
+  recorded in the slice-1 PR.
+
 ## 6. Testing strategy
 
 Inventory diffs are the mechanism for RFC0028.1/RFC0028.5's name
@@ -205,35 +233,7 @@ type-only core consumer, asserting the build reports the consumer
    RFC 0020 file-config layer's schema (currently in
    `ourios-server`) eventually belong beside it?
 
-## 8. Scenario discharge record (green, 2026-07-06)
-
-- **RFC0028.1** — per-PR inventory proofs: #399 (ingester, 129/129),
-  #400 (querier, 162/162), #401 (parquet, 162/162), #402 (wal, 64/64),
-  #403 (server, 90/90), #404 (miner, 206/206); every diff a pure
-  module-path-prefix rename.
-- **RFC0028.2** — committed exemption lists:
-  `crates/ourios-ingester/tests/README.md` and
-  `crates/ourios-miner/tests/README.md` (+ the server harness header);
-  all exemptions are process-global `OTel` meter-provider installers.
-- **RFC0028.3** — both gates pass (measurement tables on epic #382,
-  2026-07-06): `touch core → querier --no-run` 57 s → 28.6 s (< 30 s);
-  warm workspace suite ~10 min → 48.2 s under nextest (≥ 30% gate).
-  Steady-state protocol notes (macOS first-exec assessment) recorded
-  with the numbers.
-- **RFC0028.4** — proven in #405: a `MinerConfig` whitespace edit
-  leaves `ourios-core` and `ourios-parquet` `Fresh`; the rebuild set is
-  the semantic one (`config → miner → querier`).
-- **RFC0028.5** — #406: CI runs `cargo nextest run --workspace
-  --all-features` + `cargo test --doc`, preserving the exact suite
-  inventory; the workflow invocations that named old binaries were
-  retargeted in the same PRs that moved them (#401, #403, #404).
-- **Slice 4 (parquet split)** — closed *not-triggered* per the §3.3
-  tripwire: the probe-A gate passed without it.
-- **`red` note** — this RFC's scenarios are review/measurement
-  mechanisms (§6), not stub-able tests; there was no `red` rung, as
-  recorded in the slice-1 PR.
-
-## 9. References
+## 8. References
 
 - Epic #382 (measurements, 2026-07-06), maintainer precedence
   instruction (same date), #373 (debuginfo trim), CLAUDE.md §6.2

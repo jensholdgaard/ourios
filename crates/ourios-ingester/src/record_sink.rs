@@ -139,9 +139,6 @@ fn estimate_bytes(r: &MinedRecord) -> usize {
         + (r.attributes.len() + r.resource_attributes.len()) * 48
 }
 
-/// `/`-delimited object key for a partition's flushed file: the RFC 0005 §3.4
-/// Hive path (relative to the store root) plus a `UUIDv7` name. Mirrors
-/// `ourios_parquet::Writer`'s key; object keys are `/`-delimited on every host.
 /// Whether `e` condemns a specific record (RFC 0025 §3.3 quarantine
 /// territory) rather than signalling an internal invariant violation.
 /// `Arrow` means *our* batch-building broke — quarantining on it
@@ -186,6 +183,9 @@ fn split_poisoned(
     }
 }
 
+/// `/`-delimited object key for a partition's flushed file: the RFC 0005 §3.4
+/// Hive path (relative to the store root) plus a `UUIDv7` name. Mirrors
+/// `ourios_parquet::Writer`'s key; object keys are `/`-delimited on every host.
 fn object_key(partition: &PartitionKey) -> String {
     let rel = partition.data_path(Path::new(""));
     format!(
@@ -373,12 +373,6 @@ impl ParquetRecordSink {
         Ok(())
     }
 
-    /// Split `key`'s buffer into encodable records and permanently
-    /// rejected ones; emit a `record_quarantined` audit event and the
-    /// `error.type`-attributed flush-error count for each rejection,
-    /// then drop the poison from the buffer (RFC 0025 §3.3 — the WAL
-    /// remains the durability of record; the audit event is the
-    /// operator's pointer for replay after a fix).
     /// Remove `key`'s (empty) buffer entry and release its byte
     /// accounting — the flush-success bookkeeping minus the flush
     /// counters (nothing was published).
@@ -391,6 +385,13 @@ impl ParquetRecordSink {
         }
     }
 
+    /// Split `key`'s buffer into encodable records and permanently
+    /// rejected ones; emit a `record_quarantined` audit event and the
+    /// `error.type`-attributed flush-error count for each rejection,
+    /// then drop the poison from the buffer and release its byte
+    /// accounting (RFC 0025 §3.3 — the WAL remains the durability of
+    /// record; the audit event is the operator's pointer for replay
+    /// after a fix).
     fn quarantine_poisoned(&mut self, key: &PartitionKey) {
         let records = match self.buffers.get_mut(key) {
             Some(buf) => std::mem::take(&mut buf.records),

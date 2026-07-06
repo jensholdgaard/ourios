@@ -142,6 +142,15 @@ fn estimate_bytes(r: &MinedRecord) -> usize {
 /// `/`-delimited object key for a partition's flushed file: the RFC 0005 §3.4
 /// Hive path (relative to the store root) plus a `UUIDv7` name. Mirrors
 /// `ourios_parquet::Writer`'s key; object keys are `/`-delimited on every host.
+/// Whether `e` condemns a specific record (RFC 0025 §3.3 quarantine
+/// territory) rather than signalling an internal invariant violation.
+/// `Arrow` means *our* batch-building broke — quarantining on it
+/// would drop data on our own bug; those retain the buffer for retry
+/// and investigation like any other non-record failure.
+fn is_per_record_rejection(e: &ourios_parquet::BatchError) -> bool {
+    !matches!(e, ourios_parquet::BatchError::Arrow(_))
+}
+
 /// Bisect `records` into `(encodable, permanently rejected)` using
 /// the batch conversion as the probe — `BatchError` is deterministic,
 /// so a failing subset always shrinks to its poison records.
@@ -157,6 +166,11 @@ fn split_poisoned(
         Ok(_) => (records, Vec::new()),
         Err(error) => {
             if records.len() == 1 {
+                if !is_per_record_rejection(&error) {
+                    // Internal invariant violation, not this record's
+                    // fault — keep it; the flush will fail and retain.
+                    return (records, Vec::new());
+                }
                 let record = records.into_iter().next().expect("len checked");
                 return (Vec::new(), vec![(record, error)]);
             }
@@ -312,7 +326,7 @@ impl ParquetRecordSink {
                     &self.promoted,
                 ) {
                     Ok(bytes) => bytes,
-                    Err(WriterError::Batch(_)) => {
+                    Err(WriterError::Batch(e)) if is_per_record_rejection(&e) => {
                         // A permanent per-record rejection (RFC 0025
                         // §3.3): retrying the whole buffer would wedge
                         // the partition forever (#362). Quarantine the
@@ -328,7 +342,14 @@ impl ParquetRecordSink {
                                 )
                                 .map_err(FlushError::Encode)?
                             }
-                            _ => return Ok(()),
+                            _ => {
+                                // Every record quarantined: drop the
+                                // emptied entry and release its byte
+                                // accounting, or the ceiling logic and
+                                // buffer gauge drift forever.
+                                self.drop_emptied_buffer(key);
+                                return Ok(());
+                            }
                         }
                     }
                     Err(e) => return Err(FlushError::Encode(e)),
@@ -358,6 +379,18 @@ impl ParquetRecordSink {
     /// then drop the poison from the buffer (RFC 0025 §3.3 — the WAL
     /// remains the durability of record; the audit event is the
     /// operator's pointer for replay after a fix).
+    /// Remove `key`'s (empty) buffer entry and release its byte
+    /// accounting — the flush-success bookkeeping minus the flush
+    /// counters (nothing was published).
+    fn drop_emptied_buffer(&mut self, key: &PartitionKey) {
+        if let Some(buf) = self.buffers.remove(key) {
+            debug_assert!(buf.records.is_empty(), "only for emptied buffers");
+            self.total_bytes = self.total_bytes.saturating_sub(buf.est_bytes);
+            self.metrics
+                .add_buffered(-i64::try_from(buf.est_bytes).unwrap_or(i64::MAX));
+        }
+    }
+
     fn quarantine_poisoned(&mut self, key: &PartitionKey) {
         let records = match self.buffers.get_mut(key) {
             Some(buf) => std::mem::take(&mut buf.records),
@@ -664,7 +697,7 @@ impl SharedParquetSink {
                     self.lock()
                         .note_published(records.len(), start.elapsed(), trigger);
                 }
-                Err(FlushError::Encode(WriterError::Batch(_))) => {
+                Err(FlushError::Encode(WriterError::Batch(e))) if is_per_record_rejection(&e) => {
                     // Permanent per-record rejection: requeueing would
                     // re-fail forever (#362 via the cadence path).
                     // Quarantine and publish the remainder once.

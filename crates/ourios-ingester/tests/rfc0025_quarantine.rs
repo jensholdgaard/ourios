@@ -127,6 +127,36 @@ fn rfc0025_4_sink_quarantines_instead_of_wedging() {
     assert_eq!(walk_parquet(bucket.path()).len(), 2, "second object landed");
 }
 
+/// The all-poison edge: quarantining every record must release the
+/// buffer entry and its byte accounting (no permanent gauge drift),
+/// and the partition must keep working afterward.
+#[test]
+fn all_poison_buffer_releases_its_accounting() {
+    let bucket = TempDir::new().expect("temp dir");
+    let audit = SharedAuditSink::new();
+    let mut sink = ParquetRecordSink::new(
+        Store::local(bucket.path()).expect("local store"),
+        never_flush_config(),
+    )
+    .with_audit_sink(Box::new(audit.clone()));
+
+    sink.emit(poisoned());
+    sink.flush_all();
+
+    assert_eq!(audit.drain().len(), 1, "the record quarantined");
+    assert!(walk_parquet(bucket.path()).is_empty(), "nothing published");
+    assert_eq!(sink.buffered_partitions(), 0, "the emptied entry is gone");
+    assert_eq!(sink.buffered_bytes(), 0, "byte accounting released");
+
+    sink.emit(healthy(1_000));
+    sink.flush_all();
+    assert_eq!(
+        walk_parquet(bucket.path()).len(),
+        1,
+        "partition works after"
+    );
+}
+
 /// Scenario RFC0025.5 — quarantine telemetry.
 /// See `docs/rfcs/0025-absent-body-representation.md` §5.
 #[test]

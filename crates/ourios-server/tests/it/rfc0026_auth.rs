@@ -236,6 +236,10 @@ async fn rfc0026_4_query_status_contract() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(json["error"]["kind"], "tenant_denied", "{json}");
+    assert_eq!(
+        json["error"]["message"], "the tenant is outside the authenticated token's allowed set",
+        "a static body naming neither token nor set",
+    );
     assert!(
         !json.to_string().contains("tok-"),
         "no token value on the surface: {json}",

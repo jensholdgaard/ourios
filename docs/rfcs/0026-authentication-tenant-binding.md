@@ -1,7 +1,7 @@
 ---
 rfc: 0026
 title: Authentication and tenant binding (ingest + query)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -201,6 +201,25 @@ Scenario ids `RFC0026.<m>`.
 > rejection emits an audit event carrying the token *name* and the
 > offending tenant — and never any token value, on any surface
 > (metrics, audit, logs, errors).
+
+### 5.1 Discharge record (green, 2026-07-06)
+
+- **RFC0026.1** — #390 (token store: config schema, `${env:…}`-only
+  secrets, startup error/warning arms) + #395 (store moved to
+  `ourios_core::auth` for the ingest enforcement point).
+- **RFC0026.2/.3** — #398: bearer authn before wire decode on both
+  listeners (gRPC interceptor / HTTP handler), whole-batch tenant
+  binding before the WAL append, served-stack gRPC arm; WAL emptiness
+  asserted on the journal.
+- **RFC0026.4/.5/.6** — #408: the 401→400→403 gate order pinned with
+  exact bodies, wildcard binding on both halves, open-mode parity
+  (exactly-once warning + a live listener connection).
+- **RFC0026.7** — #409: rejections on the existing counters via
+  `error.type` (`unauthenticated` | `permission_denied`; the query
+  histogram under the new `rejected` kind member), and the
+  `ingest_denied` audit event (kind 8, `denied_token_name` column —
+  §3.7 additive-OPTIONAL, schema pin updated) with a no-token-value
+  sweep across every surface.
 
 ## 6. Testing strategy
 

@@ -2,6 +2,7 @@
 
 pub mod alias;
 pub mod audit;
+pub mod auth;
 pub mod clock;
 pub mod confidence;
 pub mod config;

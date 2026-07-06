@@ -56,9 +56,6 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 # these events to OTel log records pushed over OTLP (the dogfooding path) and
 # mirrors them to stderr; this crate only emits.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-# Constant-time bearer-token comparison for the RFC 0026 token store (§6).
-# Already in the dep tree transitively (rustls), so no new cargo-deny surface.
-subtle = { version = "2.6", default-features = false }
 # RFC 0020 configuration-file schema (config::file): deserialise the YAML into
 # the schema, then substitute `${env:…}` in the typed scalar leaves (schema
 # validation runs on the raw text first, so an error never echoes a resolved

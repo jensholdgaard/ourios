@@ -43,6 +43,16 @@
         "cargo"
       ],
       "matchPackageNames": [
+        "/^arrow(-[a-z]+)*$/"
+      ],
+      "allowedVersions": "<59",
+      "description": "Hold the arrow crate family at 58.x. DataFusion 54 pins arrow ^58, so a standalone arrow 59 bump splits the workspace's arrow types and breaks the build. Lift together with the DataFusion 55 upgrade (RFC 0021 phase 2, which also gates the thrift advisory, #295) - the same pattern as the object_store hold below."
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
         "object_store"
       ],
       "allowedVersions": "<0.14.0",

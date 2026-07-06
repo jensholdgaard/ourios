@@ -7,7 +7,8 @@
 //! unbound). The gRPC interceptor and the HTTP handler run it *before any
 //! wire decode*, then attach the resulting [`AuthBinding`] to the request;
 //! the pipeline enforces the §3.2 per-batch tenant binding against it via
-//! [`check_binding`] — every `ResourceLogs` group's derived tenant must
+//! `check_binding` (crate-internal) — every `ResourceLogs` group's derived
+//! tenant must
 //! fall inside the token's set, else the **whole batch** is rejected
 //! before the WAL append (partial acceptance would make the OTLP
 //! partial-success surface a tenancy oracle).

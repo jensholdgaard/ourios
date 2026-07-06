@@ -396,8 +396,18 @@ impl ParquetRecordSink {
             Some(buf) => std::mem::take(&mut buf.records),
             None => return,
         };
+        let before: usize = records.iter().map(estimate_bytes).sum();
         let kept = self.quarantine_owned(key, records);
+        let after: usize = kept.iter().map(estimate_bytes).sum();
+        // Release the dropped records' share of the byte accounting
+        // (same estimator as emit) so ceiling triggers and the buffer
+        // gauge track what is actually buffered.
+        let freed = before.saturating_sub(after);
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
+        self.metrics
+            .add_buffered(-i64::try_from(freed).unwrap_or(i64::MAX));
         if let Some(buf) = self.buffers.get_mut(key) {
+            buf.est_bytes = buf.est_bytes.saturating_sub(freed);
             buf.records = kept;
         }
     }

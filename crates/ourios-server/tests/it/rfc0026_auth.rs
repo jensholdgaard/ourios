@@ -206,6 +206,21 @@ async fn rfc0026_4_query_status_contract() {
         );
     }
 
+    // The gate ORDER is part of the contract: with no (or an unknown)
+    // bearer AND a missing/empty tenant, authentication answers first —
+    // 401, never the tenant 400.
+    for bearer in [None, Some("Bearer tok-wrong")] {
+        for tenant in [None, Some("")] {
+            let (status, json) = post_query(router(), bearer, tenant, "template_id == 1").await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "401 precedes the tenant contract for {bearer:?}/{tenant:?}",
+            );
+            assert_eq!(json["error"]["kind"], "unauthenticated", "{json}");
+        }
+    }
+
     // 400: missing/empty tenant with a VALID bearer — today's contract,
     // unchanged by the gate.
     for tenant in [None, Some("")] {
@@ -349,16 +364,22 @@ async fn rfc0026_6_open_mode_parity() {
     // querier line (printed last).
     let stdout = child.stdout.take().expect("stdout piped");
     let mut out_lines = BufReader::new(stdout).lines();
-    timeout(Duration::from_secs(15), async {
+    let querier_addr: std::net::SocketAddr = timeout(Duration::from_secs(15), async {
         while let Some(line) = out_lines.next_line().await.expect("read stdout") {
-            if line.contains("querier HTTP listening on") {
-                return;
+            if let Some(addr) = line.strip_prefix("querier HTTP listening on ") {
+                return addr.trim().parse().expect("parse announced addr");
             }
         }
         panic!("querier line never appeared");
     })
     .await
     .expect("server ready before timeout");
+
+    // "Open really is open": the announced listener accepts a connection —
+    // served, not merely printed.
+    tokio::net::TcpStream::connect(querier_addr)
+        .await
+        .expect("open-mode querier accepts a connection");
 
     // Both roles are up (open really is open). Kill the child, which
     // closes its stderr; the drain task then reaches EOF and returns the

@@ -10,9 +10,7 @@
 //! also covered by RFC0003.3; this scenario carries it the rest of the way,
 //! through the miner, to prove no record lands in the wrong tenant's tree.
 
-mod ingest_support;
-
-use ingest_support::{coordinator, request, resource_logs, wal_config};
+use crate::ingest_support::{coordinator, request, resource_logs, wal_config};
 use ourios_core::config::MinerConfig;
 use ourios_core::record::{MinedRecord, SharedRecordSink};
 use ourios_core::tenant::TenantId;

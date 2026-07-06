@@ -5,9 +5,7 @@
 //! finds the frame on disk (it was fsync'd before the ack), and its
 //! payload recovers the export.
 
-mod ingest_support;
-
-use ingest_support::{
+use crate::ingest_support::{
     CallLog, JournalCall, open_pipeline, replay_frames, request, resource_logs, spy_pipeline,
 };
 use opentelemetry_proto::tonic::common::v1::any_value::Value;

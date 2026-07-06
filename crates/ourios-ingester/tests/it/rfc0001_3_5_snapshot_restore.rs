@@ -9,11 +9,9 @@
 //! the driver) with the stale-gap arm (§3.5.4 — externally truncated
 //! WAL degrades loudly, not silently), and the no-snapshot cold start.
 
-mod ingest_support;
-
 use std::path::{Path, PathBuf};
 
-use ingest_support::{open_pipeline, request, resource_logs, wal_config};
+use crate::ingest_support::{open_pipeline, request, resource_logs, wal_config};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::config::MinerConfig;
 use ourios_ingester::receiver::{TenantRule, fan_out};

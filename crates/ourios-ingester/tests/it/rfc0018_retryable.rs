@@ -11,15 +11,13 @@
 //!
 //! See `docs/rfcs/0018-otlp-log-spec-compliance.md` §5 / §3.2.
 
-mod ingest_support;
-
 use std::sync::Arc;
 
-use axum::http::StatusCode;
-use ingest_support::{
+use crate::ingest_support::{
     capturing_pipeline, failing_append_pipeline_transient, failing_sync_pipeline,
     oversize_append_pipeline, post_request, request, resource_logs, send,
 };
+use axum::http::StatusCode;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;

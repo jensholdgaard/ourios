@@ -7,10 +7,8 @@
 //! gRPC-listener slice, so `rfc0003_11` stays `#[ignore]`'d until both
 //! transports' arms exist.
 
-mod ingest_support;
-
+use crate::ingest_support::{capturing_pipeline, gzip, post_request, send};
 use axum::http::StatusCode;
-use ingest_support::{capturing_pipeline, gzip, post_request, send};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use prost::Message;

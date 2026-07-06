@@ -18,9 +18,7 @@
 //! (a follow-up); flagged to the maintainer as an OTLP/tonic nuance
 //! rather than faked here.
 
-mod ingest_support;
-
-use ingest_support::{capturing_pipeline, request, resource_logs};
+use crate::ingest_support::{capturing_pipeline, request, resource_logs};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;

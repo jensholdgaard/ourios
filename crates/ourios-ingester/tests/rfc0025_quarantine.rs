@@ -127,6 +127,46 @@ fn rfc0025_4_sink_quarantines_instead_of_wedging() {
     assert_eq!(walk_parquet(bucket.path()).len(), 2, "second object landed");
 }
 
+/// The cadence-drain path (RFC 0025 §3.3's "both routes"): a poison
+/// record in an owned batch quarantines instead of requeueing forever
+/// — the #362 wedge through the second door.
+#[test]
+fn cadence_drain_publish_quarantines_instead_of_requeueing() {
+    use ourios_ingester::record_sink::SharedParquetSink;
+
+    let bucket = TempDir::new().expect("temp dir");
+    let audit = SharedAuditSink::new();
+    let shared = SharedParquetSink::new(
+        ParquetRecordSink::new(
+            Store::local(bucket.path()).expect("local store"),
+            never_flush_config(),
+        )
+        .with_audit_sink(Box::new(audit.clone())),
+    );
+
+    let key = ourios_parquet::PartitionKey::derive(&healthy(1_000)).expect("derive");
+    let all_published = shared.publish_owned(
+        vec![(key, vec![healthy(1_000), poisoned(), healthy(2_000)])],
+        "cadence",
+    );
+
+    assert!(all_published, "the remainder publishes — nothing requeues");
+    assert_eq!(
+        shared.buffered_records(),
+        0,
+        "no requeue: the poison is quarantined, not re-buffered",
+    );
+    let files = walk_parquet(bucket.path());
+    assert_eq!(files.len(), 1, "one object landed");
+    assert_eq!(read_rows(&files[0]).len(), 2, "the two healthy rows");
+    let events = audit.drain();
+    assert_eq!(events.len(), 1, "one quarantine event via the cadence path");
+    assert!(matches!(
+        events[0].payload,
+        AuditPayload::RecordQuarantined { .. }
+    ));
+}
+
 /// The all-poison edge: quarantining every record must release the
 /// buffer entry and its byte accounting (no permanent gauge drift),
 /// and the partition must keep working afterward.

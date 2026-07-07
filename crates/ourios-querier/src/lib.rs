@@ -719,27 +719,6 @@ impl Querier {
         .await
     }
 
-    /// Execute a RFC 0010 `drift` query against the tenant's RFC 0005 `audit/`
-    /// stream and return the per-template [`DriftRow`]s + pruning stats —
-    /// without leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 /
-    /// RFC0010.8).
-    ///
-    /// Drift is the audit-stream sibling of [`run_query`](Self::run_query): it
-    /// scans `audit/tenant_id=<tenant>/`, filters to the widening /
-    /// type-expansion events in the half-open window `[from, to)`, and folds
-    /// them per `template_id` (RFC 0010 §6.3). Tenant isolation is a partition
-    /// prune on the `audit/tenant_id=…` Hive root (RFC0010.4 / §3.7); a drift
-    /// query with no tenant is unrepresentable (the `tenant` argument is
-    /// required). An empty window or a tenant with no qualifying events yields
-    /// an empty [`DriftResult`], never an error (RFC0010.5).
-    ///
-    /// `now_unix_nano` is the wall-clock reference the relative `from`/`to`
-    /// bounds (`-7d`, `now`) resolve against; the caller supplies it so
-    /// execution is deterministic and testable.
-    ///
-    /// # Errors
-    ///
-    /// See [`QueryError`].
     /// Derive `tenant`'s template registry (RFC 0017 §3.2) — the
     /// `(template_id, version) → tokens` fold of its audit stream — with
     /// the blocking store reads offloaded like every other derivation.
@@ -761,6 +740,27 @@ impl Querier {
         .await
     }
 
+    /// Execute a RFC 0010 `drift` query against the tenant's RFC 0005 `audit/`
+    /// stream and return the per-template [`DriftRow`]s + pruning stats —
+    /// without leaking `DataFusion`/arrow/SQL (hazard `CLAUDE.md` §4.6 /
+    /// RFC0010.8).
+    ///
+    /// Drift is the audit-stream sibling of [`run_query`](Self::run_query): it
+    /// scans `audit/tenant_id=<tenant>/`, filters to the widening /
+    /// type-expansion events in the half-open window `[from, to)`, and folds
+    /// them per `template_id` (RFC 0010 §6.3). Tenant isolation is a partition
+    /// prune on the `audit/tenant_id=…` Hive root (RFC0010.4 / §3.7); a drift
+    /// query with no tenant is unrepresentable (the `tenant` argument is
+    /// required). An empty window or a tenant with no qualifying events yields
+    /// an empty [`DriftResult`], never an error (RFC0010.5).
+    ///
+    /// `now_unix_nano` is the wall-clock reference the relative `from`/`to`
+    /// bounds (`-7d`, `now`) resolve against; the caller supplies it so
+    /// execution is deterministic and testable.
+    ///
+    /// # Errors
+    ///
+    /// See [`QueryError`].
     pub async fn run_drift(
         &self,
         query: &dsl::DriftQuery,

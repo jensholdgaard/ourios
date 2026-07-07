@@ -56,10 +56,10 @@ const TENANT_HEADER: &str = "x-ourios-tenant";
 /// The endpoint returns rows by design, so an unbounded query is given this
 /// cap rather than a count-only result (RFC 0017 populates `records` only when
 /// the query has a limit).
-pub const DEFAULT_LIMIT: u64 = 1000;
+pub(crate) const DEFAULT_LIMIT: u64 = 1000;
 /// Hard cap on returned rows (RFC 0016 §7): a query's own `limit` is clamped to
 /// this so a client can't request an unbounded materialisation.
-pub const MAX_LIMIT: u64 = 10_000;
+pub(crate) const MAX_LIMIT: u64 = 10_000;
 /// Max request-body size (a DSL statement is small; cap it so an oversized body
 /// can't exhaust memory via the `Bytes` extractor — mirrors the receiver's
 /// `DefaultBodyLimit`).
@@ -251,14 +251,18 @@ fn router_from_querier(
         metrics: Arc::new(QuerierMetrics::new()),
         auth: auth.clone(),
     };
+    let mcp_querier = state.querier.clone();
     let router = Router::new()
         .route("/v1/query", post(handle_query))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
     if mcp_enabled {
         // RFC 0027 §3.1: the MCP surface rides the same listener at
-        // `/mcp`, behind the same RFC 0026 gate.
-        router.nest("/mcp", crate::mcp::mcp_router(auth))
+        // `/mcp`, behind the same RFC 0026 gate, over the same engine.
+        router.nest(
+            "/mcp",
+            crate::mcp::mcp_router(mcp_querier, default_window_nanos, auth),
+        )
     } else {
         router
     }
@@ -481,7 +485,7 @@ fn parse_body(headers: &HeaderMap, body: &[u8]) -> Result<Statement, String> {
 /// §7): a query's own limit is clamped to `cap`; a query with none gets
 /// `default`. Normalizes to **exactly one** `Limit` stage so the engine returns
 /// rows.
-fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
+pub(crate) fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
     // The compiler reads the *last* `Limit`. Normalize to exactly one — the
     // clamped last — keeping its position relative to the non-limit stages
     // (stage order is DSL pipeline semantics, RFC 0002) and dropping any
@@ -536,7 +540,7 @@ impl From<&QueryStats> for StatsDto {
 }
 
 #[derive(Serialize)]
-struct LogQueryResponse {
+pub(crate) struct LogQueryResponse {
     /// Total matching rows (the count) — unbounded by the `limit` (RFC 0017).
     rows: u64,
     stats: StatsDto,
@@ -665,7 +669,7 @@ impl From<&LogBody> for LogBodyDto {
 }
 
 #[derive(Serialize)]
-struct DriftResponse {
+pub(crate) struct DriftResponse {
     rows: Vec<DriftRowDto>,
     stats: StatsDto,
 }

@@ -272,7 +272,9 @@ testcontainers job (.7), CI-gated alongside RFC 0019's
 > upstream (dexidp/dex#4691) but not yet in a Dex release — v2.45.1
 > predates both. The CI job therefore runs Dex `master` **pinned by
 > image digest** (reproducible; recorded in `ci.yml` and the test).
-> Bump to the release tag when Dex v2.46 ships. The RFC 0026 §5 suite re-runs
+> Bump to the release tag when Dex v2.46 ships.
+
+The RFC 0026 §5 suite re-runs
 unchanged with an OIDC-resolved binding substituted for the static
 one — the enforcement-invariance proof behind .3–.5.
 

@@ -809,42 +809,63 @@ mod dex {
         use testcontainers_modules::testcontainers::runners::AsyncRunner;
         use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
 
-        // Reserve a host port up front: Dex validates that its discovery
-        // document's issuer equals the URL it is served under, and the
-        // verifier enforces the same equality, so the issuer URL must be
-        // known before the container starts.
-        let host_port = {
+        // Reserve a host port up front: the verifier enforces issuer
+        // equality against the discovery document, so the issuer URL must
+        // be known before the container starts. Reservation is
+        // inherently racy (the listener drops before Docker binds), so a
+        // failed container start retries on a fresh port.
+        fn reserve_port() -> u16 {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
             l.local_addr().expect("addr").port()
-        };
-        let issuer = format!("http://127.0.0.1:{host_port}/dex");
+        }
 
         // Short-TTL tokens make the expiry arm real time rather than
-        // clock-skew fiction: every arm below completes in milliseconds,
-        // then one sleep crosses the boundary. `enablePasswordDB` is the
-        // inert built-in connector — Dex refuses to start with zero
+        // clock-skew fiction: the pre-expiry arms complete in milliseconds
+        // and 20 s leaves headroom for a slow runner, then the expiry wait
+        // sleeps past the token's own `expires_in`. `enablePasswordDB` is
+        // the inert built-in connector — Dex refuses to start with zero
         // connectors, though client-credentials never touches one.
-        let dex_config = format!(
-            "issuer: {issuer}\n\
+        let dex_config_for = |issuer: &str| {
+            format!(
+                "issuer: {issuer}\n\
              storage:\n  type: memory\n\
              web:\n  http: 0.0.0.0:5556\n\
              enablePasswordDB: true\n\
              oauth2:\n  grantTypes: [\"client_credentials\"]\n\
-             expiry:\n  idTokens: \"8s\"\n\
+             expiry:\n  idTokens: \"20s\"\n\
              staticClients:\n\
              \x20\x20- id: {CLIENT_ID}\n\
              \x20\x20\x20\x20name: {CLIENT_NAME}\n\
              \x20\x20\x20\x20secret: {CLIENT_SECRET}\n\
              \x20\x20\x20\x20clientCredentialsClaims:\n\
              \x20\x20\x20\x20\x20\x20groups: [\"acme\", \"globex\"]\n"
-        );
-        let container = GenericImage::new(DEX_IMAGE, DEX_TAG)
-            .with_copy_to("/etc/dex/config.docker.yaml", dex_config.into_bytes())
-            .with_env_var("DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
-            .with_mapped_port(host_port, ContainerPort::Tcp(5556))
-            .start()
-            .await
-            .expect("start dex");
+            )
+        };
+        let mut started = None;
+        for attempt in 0..3 {
+            let host_port = reserve_port();
+            let issuer = format!("http://127.0.0.1:{host_port}/dex");
+            match GenericImage::new(DEX_IMAGE, DEX_TAG)
+                .with_copy_to(
+                    "/etc/dex/config.docker.yaml",
+                    dex_config_for(&issuer).into_bytes(),
+                )
+                .with_env_var("DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
+                .with_mapped_port(host_port, ContainerPort::Tcp(5556))
+                .start()
+                .await
+            {
+                Ok(container) => {
+                    started = Some((container, issuer));
+                    break;
+                }
+                Err(e) if attempt < 2 => {
+                    eprintln!("dex start attempt {attempt} failed (port race?): {e}");
+                }
+                Err(e) => panic!("dex never started: {e}"),
+            }
+        }
+        let (container, issuer) = started.expect("dex started");
 
         // Readiness: Dex's own discovery document, served under the
         // reserved issuer URL. On timeout, surface the container's own
@@ -956,6 +977,10 @@ mod dex {
             .as_str()
             .expect("access_token in the response")
             .to_string();
+        let expires_in = token_response["expires_in"]
+            .as_u64()
+            .expect("expires_in in the response");
+        let minted_at = tokio::time::Instant::now();
 
         // Ingest: in-claim tenant acks; a cross-tenant batch is denied
         // (the audit arm below reads the denial event back).
@@ -1040,9 +1065,9 @@ mod dex {
             authenticated.status()
         );
 
-        // Expiry: cross the 8-second TTL (zero configured skew) and the
-        // same token collapses to the undifferentiated 401.
-        tokio::time::sleep(Duration::from_secs(9)).await;
+        // Expiry: sleep past the token's own `expires_in` (zero configured
+        // skew) and the same token collapses to the undifferentiated 401.
+        tokio::time::sleep_until(minted_at + Duration::from_secs(expires_in + 2)).await;
         let expired = query(Some(token.clone()), "globex").await;
         assert_eq!(
             expired.status(),
@@ -1057,10 +1082,12 @@ mod dex {
         // Graceful shutdown (SIGTERM — what k8s sends) flushes the audit
         // sink, making the denial event durable and readable.
         let pid = child.id().expect("child pid").to_string();
-        std::process::Command::new("kill")
+        let signalled = Command::new("kill")
             .args(["-TERM", &pid])
             .status()
-            .expect("send SIGTERM");
+            .await
+            .expect("run kill");
+        assert!(signalled.success(), "SIGTERM delivered");
         timeout(Duration::from_secs(15), child.wait())
             .await
             .expect("exit before timeout")

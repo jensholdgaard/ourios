@@ -264,9 +264,9 @@ Unit level: .1 is pure config resolution (no issuer at all); the
 §5 fixture issuer (local keypair) covers .2–.6 — fast,
 deterministic, no container. Acceptance level: the real-Dex
 testcontainers job (.7), CI-gated alongside RFC 0019's
-`s3 integration (localstack)` job. The RFC 0026 §5 suite re-runs unchanged with an OIDC-resolved
-binding substituted for the static one — the enforcement-invariance
-proof behind .3–.5.
+`s3 integration (localstack)` job. The RFC 0026 §5 suite re-runs
+unchanged with an OIDC-resolved binding substituted for the static
+one — the enforcement-invariance proof behind .3–.5.
 
 ## 7. Open questions
 

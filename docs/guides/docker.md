@@ -45,7 +45,7 @@ docker run --rm \
   -v ourios-data:/var/lib/ourios \
   -v "$PWD/ourios.yaml:/etc/ourios/ourios.yaml:ro" \
   -e OURIOS_EDGE_TOKEN \
-  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  -e OURIOS_S3_ACCESS_KEY_ID -e OURIOS_S3_SECRET_ACCESS_KEY \
   ghcr.io/jensholdgaard/ourios:0.1.1 \
   --config /etc/ourios/ourios.yaml
 ```
@@ -54,7 +54,7 @@ Secrets stay out of the file via `${env:…}` references — pass through
 **every** variable your file references (the example forwards the
 auth token and, for an S3-backend file like the
 [Configuration](./configuration.md) example, the store credentials;
-a local-backend file needs neither `AWS_*`). The server shuts down
+a local-backend file needs neither `OURIOS_S3_*` variable). The server shuts down
 gracefully on SIGTERM — `docker stop` flushes the ingest pipeline
 before exit.
 

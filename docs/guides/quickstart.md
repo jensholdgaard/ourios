@@ -18,9 +18,15 @@ tar -xf ourios-server-x86_64-unknown-linux-gnu.tar.xz
 ```
 
 Every release artifact carries SLSA provenance (`*.intoto.jsonl`
-alongside it) verifiable offline with
-`gh attestation verify --bundle`; or build from source with
-`cargo build --release -p ourios-server`.
+alongside it), verifiable offline:
+
+```sh
+gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \
+  --repo jensholdgaard/ourios \
+  --bundle ourios-server-x86_64-unknown-linux-gnu.intoto.jsonl
+```
+
+Or build from source with `cargo build --release -p ourios-server`.
 
 ## 2. Run it
 

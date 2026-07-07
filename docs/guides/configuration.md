@@ -28,8 +28,8 @@ storage:
     endpoint: https://s3.eu-central-1.amazonaws.com
     # Secret hygiene is enforced: credentials MUST be ${env:…}
     # references — inline literals fail startup.
-    access_key_id: ${env:AWS_ACCESS_KEY_ID}
-    secret_access_key: ${env:AWS_SECRET_ACCESS_KEY}
+    access_key_id: ${env:OURIOS_S3_ACCESS_KEY_ID}
+    secret_access_key: ${env:OURIOS_S3_SECRET_ACCESS_KEY}
   # RFC 0022: per-key promoted attribute columns (service.name is
   # always promoted). Each key costs bytes on every row — opt in
   # deliberately.

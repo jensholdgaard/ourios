@@ -20,11 +20,11 @@ use std::sync::Arc;
 use crate::ingest_support::{capturing_pipeline, post_request, request, resource_logs, send};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use ourios_core::auth::{TokenSpec, TokenStore, build_token_store};
-use ourios_ingester::receiver::grpc::{AuthInterceptor, LogsReceiver};
+use ourios_ingester::receiver::AuthResolver;
+use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::{AuthBinding, ReceiveError, authenticate_bearer};
 use prost::Message;
-use tonic::service::Interceptor;
 
 /// A store with one token bound to `tenants`.
 fn store(tenants: &[&str]) -> Arc<TokenStore> {
@@ -82,7 +82,7 @@ async fn rfc0026_2_ingest_authentication() {
     // and nothing reaches the WAL — the journal records no append.
     let (pipeline, captured) = capturing_pipeline();
     let config = HttpConfig {
-        auth: Some(store(&["checkout"])),
+        auth: AuthResolver::static_only(Some(store(&["checkout"]))),
         ..HttpConfig::default()
     };
     for bearer in [None, Some("Bearer tok-unknown"), Some("Basic dXNlcg==")] {
@@ -115,41 +115,26 @@ async fn rfc0026_2_ingest_authentication() {
         "the authenticated batch is appended",
     );
 
-    // gRPC: the interceptor — which `LogsServiceServer::with_interceptor`
-    // runs before the message decode — rejects the same credentials with
-    // UNAUTHENTICATED, so the decoding service (and everything behind it,
-    // WAL included) never runs.
-    let mut interceptor = AuthInterceptor::new(Some(store(&["checkout"])));
-    for metadata in [None, Some("Bearer tok-unknown"), Some("Basic dXNlcg==")] {
-        let mut request = tonic::Request::new(());
-        if let Some(value) = metadata {
-            request
-                .metadata_mut()
-                .insert("authorization", value.parse().expect("metadata"));
-        }
-        let status = interceptor.call(request).expect_err("rejected");
-        assert_eq!(
-            status.code(),
-            tonic::Code::Unauthenticated,
-            "{metadata:?} must be rejected",
+    // gRPC: the auth layer — which the server installs on the tonic
+    // stack — resolves before the message decode; the same credentials
+    // are rejected as one undifferentiated failure, so the decoding
+    // service (and everything behind it, WAL included) never runs. The
+    // served-stack arm below asserts the wire-level UNAUTHENTICATED.
+    let resolver = AuthResolver::static_only(Some(store(&["checkout"])));
+    for authorization in [None, Some("Bearer tok-unknown"), Some("Basic dXNlcg==")] {
+        assert!(
+            resolver.authenticate(authorization).await.is_err(),
+            "{authorization:?} must be rejected",
         );
     }
 
-    // A known bearer passes the interceptor and attaches the binding the
-    // handler enforces with.
-    let mut request = tonic::Request::new(());
-    request
-        .metadata_mut()
-        .insert("authorization", "Bearer tok-edge".parse().expect("md"));
-    let passed = interceptor.call(request).expect("authenticated");
-    assert_eq!(
-        passed
-            .extensions()
-            .get::<AuthBinding>()
-            .expect("binding attached")
-            .token_name(),
-        "edge-collector",
-    );
+    // A known bearer resolves to the binding the handler enforces with.
+    let passed = resolver
+        .authenticate(Some("Bearer tok-edge"))
+        .await
+        .expect("authenticated")
+        .expect("bound");
+    assert_eq!(passed.token_name(), "edge-collector");
 }
 
 /// Scenario RFC0026.2 (served gRPC stack) — the metadata → interceptor →
@@ -164,16 +149,15 @@ async fn rfc0026_2_served_grpc_stack_authenticates() {
     use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 
     let (pipeline, captured) = capturing_pipeline();
-    let service = LogsServiceServer::with_interceptor(
-        LogsReceiver::new(pipeline),
-        AuthInterceptor::new(Some(store(&["checkout"]))),
-    );
+    let service = LogsServiceServer::new(LogsReceiver::new(pipeline));
+    let layer = AuthLayer::new(AuthResolver::static_only(Some(store(&["checkout"]))));
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
             .expect("bind");
     let addr = incoming.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
+            .layer(layer)
             .add_service(service)
             .serve_with_incoming(incoming)
             .await
@@ -264,7 +248,7 @@ async fn rfc0026_3_ingest_tenant_binding() {
         router(
             pipeline.clone(),
             &HttpConfig {
-                auth: Some(store(&["tenant-a", "tenant-b"])),
+                auth: AuthResolver::static_only(Some(store(&["tenant-a", "tenant-b"]))),
                 ..HttpConfig::default()
             },
         ),

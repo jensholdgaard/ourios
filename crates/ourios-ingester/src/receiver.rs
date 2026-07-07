@@ -40,7 +40,7 @@ pub mod materialize;
 pub mod pipeline;
 pub mod tenant;
 
-pub use auth::{AuthBinding, Unauthenticated, authenticate_bearer};
+pub use auth::{AuthBinding, AuthResolver, Unauthenticated, authenticate_bearer};
 pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};

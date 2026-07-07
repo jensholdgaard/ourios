@@ -85,6 +85,10 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # (`State`, `Bytes`, `HeaderMap`) are core. On hyper 1.x, already in the
 # tree.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+# The RFC 0029 §3.3 async auth gate on the gRPC listener is a tower
+# Layer/Service (the sync tonic interceptor cannot await a JWKS refetch).
+tower = { version = "0.5", default-features = false }
+http = { version = "1", default-features = false, features = ["std"] }
 # gzip decode for OTLP/HTTP `Content-Encoding: gzip` (an OTLP MUST,
 # RFC0003.13). Pure-Rust backend — no zlib C dependency (CLAUDE.md).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -97,6 +101,10 @@ tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 # `uuid::Uuid` of `ourios_wal::WalOffset` (RFC 0001 §6.9 / RFC 0008
 # §6.6). Same major as ourios-wal's, so the types unify.
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+
+[features]
+# RFC 0029: OIDC bearer resolution in front of the RFC 0026 enforcement.
+oidc = ["ourios-core/oidc"]
 
 [dev-dependencies]
 # The RFC0026.2 served-stack arm: serve `LogsServiceServer::with_interceptor`

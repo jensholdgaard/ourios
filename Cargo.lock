@@ -3225,6 +3225,7 @@ version = "0.1.1"
 dependencies = [
  "axum",
  "flate2",
+ "http",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -3323,7 +3324,9 @@ name = "ourios-server"
 version = "0.1.1"
 dependencies = [
  "axum",
+ "base64",
  "clap",
+ "jsonwebtoken",
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -3336,8 +3339,10 @@ dependencies = [
  "ourios-semconv",
  "ourios-telemetry",
  "ourios-wal",
+ "p256",
  "proptest",
  "prost",
+ "rand 0.8.6",
  "rmcp",
  "schemars 1.2.1",
  "serde",

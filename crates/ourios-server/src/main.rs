@@ -590,6 +590,34 @@ fn enforcement_store(
         .map(|auth| std::sync::Arc::new(auth.enforcement_store()))
 }
 
+/// Build the ingest listeners' RFC 0026/0029 credential resolver from the
+/// resolved auth config. OIDC discovery contacts the issuer once, here at
+/// startup — a failure (unreachable issuer, issuer mismatch, unusable
+/// JWKS) is a startup error, not a degraded mode (§3.2: with no cached
+/// keys nothing could ever verify).
+async fn ingest_resolver(
+    config: &ServerConfig,
+) -> Result<ourios_ingester::receiver::AuthResolver, String> {
+    use ourios_ingester::receiver::AuthResolver;
+    let static_store = config
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.static_tokens.clone())
+        .map(std::sync::Arc::new);
+    match config.auth.as_ref().and_then(|auth| auth.oidc.clone()) {
+        Some(oidc) => {
+            let verifier = ourios_core::auth::oidc::OidcVerifier::discover(oidc)
+                .await
+                .map_err(|e| format!("auth.oidc: {e}"))?;
+            Ok(AuthResolver::with_oidc(
+                static_store,
+                std::sync::Arc::new(verifier),
+            ))
+        }
+        None => Ok(AuthResolver::static_only(static_store)),
+    }
+}
+
 /// Resolve the configuration (file or env, RFC 0020 §3.2) and pre-create
 /// a local store root (`Store::local` canonicalises it and errors on a
 /// missing dir; an S3 backend needs no such step — mirrors the querier
@@ -651,7 +679,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // handle is cheap to share, the compactor keeps the original).
                 store: store.clone(),
                 promoted: config.promoted.clone(),
-                auth: enforcement_store(&config),
+                auth: ingest_resolver(&config).await?,
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);

@@ -18,67 +18,119 @@
 //! coordinator — RFC0008.8 — which offloads the blocking `sync` itself),
 //! so the handler simply `.await`s it; the handler never panics.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
-use ourios_core::auth::TokenStore;
 use tonic::{Request, Response, Status};
 
-use crate::receiver::auth::{AuthBinding, authenticate_bearer};
+use crate::receiver::auth::{AuthBinding, AuthResolver};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 
-/// The RFC 0026 §3.2 authentication gate for the gRPC listener, installed
-/// via `LogsServiceServer::with_interceptor`. It runs **before the message
-/// decode** (an interceptor sees only metadata), rejecting a missing or
-/// unknown bearer with `UNAUTHENTICATED`; on success it attaches the
-/// resolved [`AuthBinding`] as a request extension for the handler's
-/// tenant-binding check. With no store configured it passes every request
-/// through unbound (open mode, §3.1) — one service type either way.
+/// The authentication gate for the gRPC listener (RFC 0026 §3.2 /
+/// RFC 0029 §3.3), applied as a tower layer on the tonic server. A tower
+/// service (unlike a sync tonic interceptor) can await the resolver — an
+/// OIDC unseen-`kid` miss refetches the JWKS — while still running
+/// **before the message decode** (it sees only the HTTP envelope). A
+/// rejection is a trailers-only `UNAUTHENTICATED` (grpc-status 16)
+/// response; on success the resolved [`AuthBinding`] rides the request
+/// extensions into the handler's tenant-binding check. With nothing
+/// configured every request passes through unbound (open mode, §3.1).
 #[derive(Clone)]
-pub struct AuthInterceptor {
-    store: Option<Arc<TokenStore>>,
+pub struct AuthLayer {
+    resolver: AuthResolver,
     /// Rejection telemetry (RFC 0026 §3.4). The instruments resolve by
     /// name through the global meter, so this instance aggregates with
     /// the pipeline's.
     metrics: Arc<crate::metrics::IngestMetrics>,
 }
 
-impl AuthInterceptor {
-    /// An interceptor over `store` (`None` = open mode pass-through).
+impl AuthLayer {
+    /// A layer over `resolver` (see [`AuthResolver`] for open mode).
     #[must_use]
-    pub fn new(store: Option<Arc<TokenStore>>) -> Self {
+    pub fn new(resolver: AuthResolver) -> Self {
         Self {
-            store,
+            resolver,
             metrics: Arc::new(crate::metrics::IngestMetrics::new()),
         }
     }
 }
 
-impl tonic::service::Interceptor for AuthInterceptor {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        let authorization = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        match authenticate_bearer(self.store.as_deref(), authorization) {
-            Ok(None) => Ok(request),
-            Ok(Some(binding)) => {
-                request.extensions_mut().insert(binding);
-                Ok(request)
-            }
-            // One undifferentiated message: missing vs malformed vs unknown
-            // would be a probing oracle (RFC 0026 §3.2). §3.4: the
-            // rejection counts on `ourios.ingest.batches`
-            // (`error.type = unauthenticated`).
-            Err(_) => {
-                self.metrics
-                    .record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
-                Err(Status::unauthenticated("a valid bearer token is required"))
-            }
+impl<S> tower::Layer<S> for AuthLayer {
+    type Service = AuthService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AuthService {
+            inner,
+            resolver: self.resolver.clone(),
+            metrics: Arc::clone(&self.metrics),
         }
+    }
+}
+
+/// The [`AuthLayer`] service: authenticate, then delegate.
+#[derive(Clone)]
+pub struct AuthService<S> {
+    inner: S,
+    resolver: AuthResolver,
+    metrics: Arc<crate::metrics::IngestMetrics>,
+}
+
+impl<S, ReqBody, ResBody> tower::Service<http::Request<ReqBody>> for AuthService<S>
+where
+    S: tower::Service<http::Request<ReqBody>, Response = http::Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    ReqBody: Send + 'static,
+    ResBody: Default,
+{
+    type Response = http::Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: http::Request<ReqBody>) -> Self::Future {
+        // The tower readiness dance: `poll_ready` reserved capacity on
+        // `self.inner`, so that instance (not a fresh clone) must serve
+        // this call; the clone waits for its own `poll_ready` next time.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let resolver = self.resolver.clone();
+        let metrics = Arc::clone(&self.metrics);
+        Box::pin(async move {
+            let authorization = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            match resolver.authenticate(authorization.as_deref()).await {
+                Ok(None) => {}
+                Ok(Some(binding)) => {
+                    request.extensions_mut().insert(binding);
+                }
+                // One undifferentiated message: missing vs malformed vs
+                // unknown would be a probing oracle (RFC 0026 §3.2). §3.4:
+                // the rejection counts on `ourios.ingest.batches`
+                // (`error.type = unauthenticated`).
+                Err(_) => {
+                    metrics.record_rejected_batch(crate::metrics::ERROR_TYPE_UNAUTHENTICATED);
+                    return Ok(
+                        Status::unauthenticated("a valid bearer token is required").into_http()
+                    );
+                }
+            }
+            inner.call(request).await
+        })
     }
 }
 

@@ -88,6 +88,20 @@ pub(crate) struct OuriosMcp {
     metrics: Arc<crate::querier::QuerierMetrics>,
 }
 
+/// Normalize a tool's `tenant` argument the way the HTTP surface treats
+/// the header: trimmed, and empty is a caller error — never a distinct
+/// tenant id.
+fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
+    let tenant = raw.trim();
+    if tenant.is_empty() {
+        return Err(ErrorData::invalid_params(
+            "the tenant argument is required and must be non-empty",
+            None,
+        ));
+    }
+    Ok(tenant)
+}
+
 impl OuriosMcp {
     /// RFC 0026 per-call tenant binding: re-resolve the request's bearer
     /// (rmcp forwards the HTTP parts into the tool context) and require
@@ -145,7 +159,8 @@ impl OuriosMcp {
         Parameters(args): Parameters<QueryLogsArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.check_tenant(&ctx, &args.tenant)?;
+        let tenant_arg = normalize_tenant(&args.tenant)?;
+        self.check_tenant(&ctx, tenant_arg)?;
         let statement = dsl::parse_statement(&args.query)
             .map_err(|e| ErrorData::invalid_params(format!("invalid query: {e}"), None))?;
         let Statement::Logs(mut query) = statement else {
@@ -159,7 +174,7 @@ impl OuriosMcp {
         // documented "maximum rendered rows" contract holds.
         let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         apply_limit(&mut query.stages, cap, cap);
-        let tenant = TenantId::new(&args.tenant);
+        let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let result = self
             .querier
@@ -202,8 +217,9 @@ impl OuriosMcp {
         Parameters(args): Parameters<ListTemplatesArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.check_tenant(&ctx, &args.tenant)?;
-        let tenant = TenantId::new(&args.tenant);
+        let tenant_arg = normalize_tenant(&args.tenant)?;
+        self.check_tenant(&ctx, tenant_arg)?;
+        let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let registry = match self.querier.template_registry(&tenant).await {
             Ok(registry) => {
@@ -249,7 +265,8 @@ impl OuriosMcp {
         Parameters(args): Parameters<TemplateDriftArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.check_tenant(&ctx, &args.tenant)?;
+        let tenant_arg = normalize_tenant(&args.tenant)?;
+        self.check_tenant(&ctx, tenant_arg)?;
         // One grammar, one boundary rule: the drift window parses through
         // the DSL front-end exactly as the JSON API's statement does
         // (RFC0010.2's half-open rule inherited verbatim).
@@ -262,7 +279,7 @@ impl OuriosMcp {
                 None,
             ));
         };
-        let tenant = TenantId::new(&args.tenant);
+        let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let result = self
             .querier

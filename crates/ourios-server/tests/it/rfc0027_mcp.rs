@@ -485,6 +485,11 @@ async fn rfc0027_6_grammar_resource() {
     assert_eq!(resources.len(), 1, "one resource: {rpc}");
     let uri = resources[0]["uri"].as_str().expect("uri");
     assert_eq!(uri, "ourios://dsl-grammar");
+    assert_eq!(
+        resources[0]["mimeType"], "text/markdown",
+        "advertised as markdown: {}",
+        resources[0],
+    );
 
     // resources/read serves text byte-identical to the RFC 0002 §7
     // section — extracted here independently from the same repo file.

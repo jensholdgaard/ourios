@@ -52,10 +52,11 @@ const DSL_RFC: &str = include_str!("../../../docs/rfcs/0002-query-dsl.md");
 const GRAMMAR_URI: &str = "ourios://dsl-grammar";
 
 /// The §7 grammar section of the embedded RFC (heading inclusive, next
-/// top-level heading exclusive). Panics at startup if the RFC loses its
-/// §7 heading — a build-time-embedded doc changing shape is a bug to
-/// surface loudly, not to serve emptily.
-fn grammar_section() -> &'static str {
+/// top-level heading exclusive), extracted once. [`mcp_router`] touches
+/// this at role startup, so an RFC that lost its §7 heading panics
+/// there — a build-time-embedded doc changing shape is a bug to surface
+/// loudly at startup, not to serve emptily (or panic mid-request).
+static GRAMMAR_SECTION: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
     let start = DSL_RFC
         .find("\n## 7.")
         .expect("RFC 0002 carries its §7 grammar section")
@@ -64,7 +65,7 @@ fn grammar_section() -> &'static str {
         .find("\n## ")
         .map_or(DSL_RFC.len(), |offset| start + offset + 1);
     &DSL_RFC[start..end]
-}
+});
 
 /// The `ourios.query.kind` value for the registry fold (a registry
 /// member alongside `logs`/`drift`/`rejected`).
@@ -384,7 +385,7 @@ impl ServerHandler for OuriosMcp {
             ));
         }
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            grammar_section(),
+            *GRAMMAR_SECTION,
             GRAMMAR_URI,
         )]))
     }
@@ -455,6 +456,9 @@ pub(crate) fn mcp_router(
     // Host filter opens; in open mode there is no compensating control,
     // so the upstream loopback-only default stays — open mode is the
     // local/dev posture, where loopback is exactly right.
+    // Startup-fail the grammar extraction (RFC0027.6's loud-panic
+    // contract): the role never comes up serving a malformed resource.
+    let _ = *GRAMMAR_SECTION;
     let mut config = StreamableHttpServerConfig::default();
     if auth.is_some() {
         config.allowed_hosts = Vec::new();
@@ -483,4 +487,22 @@ pub(crate) fn mcp_router(
         .layer(middleware::from_fn(move |request, next| {
             require_bearer(auth.clone(), request, next)
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GRAMMAR_SECTION;
+
+    /// The extraction invariants RFC0027.6 leans on: heading-first,
+    /// non-empty, and bounded before the next top-level section.
+    #[test]
+    fn grammar_section_is_the_section_7_slice() {
+        let section = *GRAMMAR_SECTION;
+        assert!(section.starts_with("## 7. Grammar specification"));
+        assert!(section.len() > 200, "a real grammar, not a stub");
+        assert!(
+            !section[3..].contains("\n## "),
+            "ends before the next top-level heading",
+        );
+    }
 }

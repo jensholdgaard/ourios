@@ -257,14 +257,38 @@ pub struct McpSection {
     pub enabled: Option<String>,
 }
 
-/// `auth.*` — bearer-token authentication and tenant binding (RFC 0026 §3.1).
+/// `auth.*` — bearer-token authentication and tenant binding (RFC 0026
+/// §3.1), plus the OIDC layer (RFC 0029 §3.1).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthSection {
-    /// The configured tokens. Empty (or absent inside a present `auth`
-    /// section) is a startup configuration error — a locked-out server is
-    /// never the intent (RFC 0026 §3.1).
-    pub tokens: Vec<TokenEntry>,
+    /// The configured static tokens. `Option` because absent and explicitly
+    /// empty differ (RFC 0029 §3.1): omitting `tokens` is how an oidc-only
+    /// section disables the static half, while an explicit `tokens: []` is
+    /// **always** a startup configuration error — a locked-out static store
+    /// is never the intent (RFC 0026 §3.1).
+    pub tokens: Option<Vec<TokenEntry>>,
+    /// The OIDC layer (RFC 0029 §3.1). Nothing in it is secret.
+    pub oidc: Option<OidcSection>,
+}
+
+/// `auth.oidc.*` — the OIDC bearer layer (RFC 0029 §3.1). Issuer, audience,
+/// and claim names are deployment topology, not credentials — plain `Debug`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OidcSection {
+    /// The OIDC discovery root.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub issuer: Option<String>,
+    /// The required `aud` value.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub audience: Option<String>,
+    /// The claim carrying the tenant list.
+    #[serde(deserialize_with = "scalar_opt")]
+    pub tenant_claim: Option<String>,
+    /// The claim feeding the audit/metric label (default `sub`).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub name_claim: Option<String>,
 }
 
 /// One `auth.tokens[…]` entry (RFC 0026 §3.1).
@@ -379,7 +403,7 @@ fn check_credentials_are_references(s3: &S3Section) -> Result<(), FileConfigErro
 /// bearer token. Only an *absent* token (no `token` key) is deferred to the
 /// token-store validation, which can name the entry.
 fn check_tokens_are_references(auth: &AuthSection) -> Result<(), FileConfigError> {
-    for (index, entry) in auth.tokens.iter().enumerate() {
+    for (index, entry) in auth.tokens.iter().flatten().enumerate() {
         if let Some(raw) = &entry.token
             && !is_env_reference(raw)
         {
@@ -430,12 +454,18 @@ impl AuthSection {
         &mut self,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), MalformedReference> {
-        for entry in &mut self.tokens {
+        for entry in self.tokens.iter_mut().flatten() {
             substitute(&mut entry.name, lookup)?;
             substitute(&mut entry.token, lookup)?;
             for tenant in &mut entry.tenants {
                 *tenant = env_subst::resolve(tenant, lookup)?;
             }
+        }
+        if let Some(oidc) = &mut self.oidc {
+            substitute(&mut oidc.issuer, lookup)?;
+            substitute(&mut oidc.audience, lookup)?;
+            substitute(&mut oidc.tenant_claim, lookup)?;
+            substitute(&mut oidc.name_claim, lookup)?;
         }
         Ok(())
     }
@@ -929,12 +959,13 @@ auth:
 ";
         let cfg = parse(yaml, &lookup).expect("valid");
         let auth = cfg.auth.expect("auth section present");
-        assert_eq!(auth.tokens.len(), 2);
-        assert_eq!(auth.tokens[0].name.as_deref(), Some("edge-collector"));
-        assert_eq!(auth.tokens[0].token.as_deref(), Some("s3cr3t-edge"));
-        assert_eq!(auth.tokens[0].tenants, ["acme", "globex"]);
-        assert_eq!(auth.tokens[1].token.as_deref(), Some("")); // undefined, no default
-        assert_eq!(auth.tokens[1].tenants, ["*"]);
+        let tokens = auth.tokens.as_deref().expect("tokens list present");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].name.as_deref(), Some("edge-collector"));
+        assert_eq!(tokens[0].token.as_deref(), Some("s3cr3t-edge"));
+        assert_eq!(tokens[0].tenants, ["acme", "globex"]);
+        assert_eq!(tokens[1].token.as_deref(), Some("")); // undefined, no default
+        assert_eq!(tokens[1].tenants, ["*"]);
 
         assert!(
             parse("storage:\n  backend: local\n", &lookup)
@@ -945,9 +976,36 @@ auth:
         );
         let empty = parse("auth:\n  tokens: []\n", &lookup).expect("valid");
         assert!(
-            empty.auth.expect("present").tokens.is_empty(),
-            "a present-but-empty section is distinguishable from an absent one",
+            matches!(empty.auth.expect("present").tokens.as_deref(), Some([])),
+            "an explicit empty list is distinguishable from an omitted one (RFC 0029 §3.1)",
         );
+    }
+
+    /// RFC0029.1 (schema) — `auth.oidc` parses with `${env:…}` substitution
+    /// on every scalar, an omitted `tokens` list inside a present `auth`
+    /// section parses to `None` (the oidc-only shape), and an unknown
+    /// `oidc` field is a schema error.
+    #[test]
+    fn auth_oidc_parses_and_substitutes() {
+        let lookup = env(&[("ISSUER", "https://dex.internal.example")]);
+        let yaml = "
+auth:
+  oidc:
+    issuer: ${env:ISSUER}
+    audience: ourios
+    tenant_claim: ourios_tenants
+";
+        let cfg = parse(yaml, &lookup).expect("valid");
+        let auth = cfg.auth.expect("auth section present");
+        assert!(auth.tokens.is_none(), "omitted tokens parses to None");
+        let oidc = auth.oidc.expect("oidc present");
+        assert_eq!(oidc.issuer.as_deref(), Some("https://dex.internal.example"));
+        assert_eq!(oidc.audience.as_deref(), Some("ourios"));
+        assert_eq!(oidc.tenant_claim.as_deref(), Some("ourios_tenants"));
+        assert_eq!(oidc.name_claim, None, "name_claim defaults later, in core");
+
+        let err = parse("auth:\n  oidc:\n    isser: x\n", &lookup).expect_err("typo");
+        assert!(matches!(err, FileConfigError::Schema(_)), "got {err:?}");
     }
 
     /// RFC0026.1 (secret hygiene) — an inline-literal token is rejected with
@@ -991,7 +1049,10 @@ auth:
             &lookup,
         )
         .expect("valid");
-        let rendered = format!("{:?}", cfg.auth.expect("present").tokens[0]);
+        let rendered = format!(
+            "{:?}",
+            cfg.auth.expect("present").tokens.expect("list present")[0]
+        );
         assert!(rendered.contains("\"a\""), "the name stays visible");
         assert!(
             !rendered.contains("s3cr3t-token-value"),

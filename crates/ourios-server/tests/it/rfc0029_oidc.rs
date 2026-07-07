@@ -835,7 +835,7 @@ mod dex {
              \x20\x20\x20\x20clientCredentialsClaims:\n\
              \x20\x20\x20\x20\x20\x20groups: [\"acme\", \"globex\"]\n"
         );
-        let _container = GenericImage::new(DEX_IMAGE, DEX_TAG)
+        let container = GenericImage::new(DEX_IMAGE, DEX_TAG)
             .with_copy_to("/etc/dex/config.docker.yaml", dex_config.into_bytes())
             .with_env_var("DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
             .with_mapped_port(host_port, ContainerPort::Tcp(5556))
@@ -844,10 +844,11 @@ mod dex {
             .expect("start dex");
 
         // Readiness: Dex's own discovery document, served under the
-        // reserved issuer URL.
+        // reserved issuer URL. On timeout, surface the container's own
+        // logs — a config rejection otherwise reads as a bare timeout.
         let http = reqwest::Client::new();
         let discovery_url = format!("{issuer}/.well-known/openid-configuration");
-        timeout(Duration::from_secs(60), async {
+        if timeout(Duration::from_secs(90), async {
             loop {
                 if let Ok(response) = http.get(&discovery_url).send().await
                     && response.status().is_success()
@@ -858,7 +859,22 @@ mod dex {
             }
         })
         .await
-        .expect("dex ready before timeout");
+        .is_err()
+        {
+            let stdout = container
+                .stdout_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            let stderr = container
+                .stderr_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            panic!(
+                "dex never became ready.\n--- dex stdout ---\n{stdout}\n--- dex stderr ---\n{stderr}"
+            );
+        }
 
         // The served instance verifies against Dex's real JWKS. Zero clock
         // skew so the expiry arm crosses at exactly the token TTL; MCP on.

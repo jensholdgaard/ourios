@@ -102,13 +102,11 @@ auth:
   label. The mapping is deliberately dumb — group-to-tenant
   indirection lives in the issuer (Dex connectors already map
   upstream groups into claims), not in Ourios.
-- At least one of `tokens` / `oidc` must be **configured** in an
+- At least one of `tokens` / `oidc` must be configured in an
   `auth` section; both together are valid. The RFC 0026 empty-list
-  rule generalises rather than conflicts: `tokens: []` stays a
-  startup error **unless** `oidc` is configured (with `oidc`
-  present, disable static tokens by omitting `tokens` — an explicit
-  empty list still reads as a misconfiguration and still fails
-  startup). No `auth` section remains open mode with the RFC 0026
+  rule is unchanged and unconditional: an explicit `tokens: []`
+  **always** fails startup — to run OIDC-only, omit `tokens`
+  entirely. No `auth` section remains open mode with the RFC 0026
   startup warning.
 
 ### 3.2 Verification and resolution
@@ -120,7 +118,9 @@ auth:
   (asymmetric algorithms only: RS256/ES256 family; `alg: none` and
   HMAC are rejected outright), `iss` equality, `aud` containment,
   `exp`/`nbf` with a small configured clock skew. A verified token
-  resolves to `(name_claim, tenant_claim)` and flows into the
+  resolves to the RFC 0026 `(name, tenants)` binding — the *values*
+  of the configured `name_claim` / `tenant_claim` keys — and flows
+  into the
   **unchanged** RFC 0026 enforcement: whole-batch tenant binding
   before the WAL ack, the query/MCP 403 contract, the same
   rejection telemetry (`error.type` values unchanged) and

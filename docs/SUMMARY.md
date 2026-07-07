@@ -46,6 +46,7 @@
 - [RFC 0026 — Authentication & tenant binding](./rfcs/0026-authentication-tenant-binding.md)
 - [RFC 0027 — MCP query surface](./rfcs/0027-mcp-query-surface.md)
 - [RFC 0028 — Build-feedback program](./rfcs/0028-build-feedback-program.md)
+- [RFC 0029 — OIDC bearer layer](./rfcs/0029-oidc-bearer-layer.md)
 
 # Talks
 

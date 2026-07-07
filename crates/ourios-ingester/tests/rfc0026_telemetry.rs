@@ -82,8 +82,8 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
             .headers()
             .get("grpc-status")
             .and_then(|v| v.to_str().ok()),
-        Some((tonic::Code::Unauthenticated as i32).to_string().as_str()),
-        "trailers-only grpc-status 16"
+        Some("16"),
+        "trailers-only grpc-status UNAUTHENTICATED"
     );
 
     // Authz rejection through the pipeline: error.type = permission_denied

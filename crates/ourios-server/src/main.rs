@@ -575,23 +575,28 @@ fn warn_if_open_mode(config: &ServerConfig) {
     }
 }
 
+/// Resolve the configuration (file or env, RFC 0020 §3.2) and pre-create
+/// a local store root (`Store::local` canonicalises it and errors on a
+/// missing dir; an S3 backend needs no such step — mirrors the querier
+/// role's `serve()`).
+fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
+    let config = match config_path {
+        Some(path) => config_from_file(path)?,
+        None => config_from_env()?,
+    };
+    if let StoreConfig::Local(root) = &config.store {
+        std::fs::create_dir_all(root)
+            .map_err(|e| format!("create store root {}: {e}", root.display()))?;
+    }
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
     // env-only path runs unchanged (§3.2). Both resolve the same `ServerConfig`.
     let cli = Cli::parse();
-    let config = match cli.config.as_deref() {
-        Some(path) => config_from_file(path)?,
-        None => config_from_env()?,
-    };
-
-    // Pre-create a local store root (`Store::local` canonicalises it and errors
-    // on a missing dir); an S3 backend needs no such step. Mirrors the querier
-    // role's `serve()`.
-    if let StoreConfig::Local(root) = &config.store {
-        std::fs::create_dir_all(root)
-            .map_err(|e| format!("create store root {}: {e}", root.display()))?;
-    }
+    let config = resolve_config(cli.config.as_deref())?;
 
     // Preflight the data store *before* binding any network role, so a
     // store-open failure early-returns here rather than after the

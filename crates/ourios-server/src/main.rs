@@ -514,23 +514,51 @@ fn build_promoted_attributes(
     ))
 }
 
-/// Resolve when the process receives `SIGTERM` (what k8s / `nerdctl stop`
-/// send). Non-Unix targets have no `SIGTERM`, so this never resolves and
-/// SIGINT (`ctrl_c`) stays the shutdown path; a SIGTERM-handler install
-/// failure is logged and likewise leaves SIGINT in charge.
-async fn terminate_signal() {
-    #[cfg(unix)]
+/// The installed `SIGTERM` stream (what k8s / `nerdctl stop` send), or
+/// `None` on non-Unix targets / install failure — SIGINT (`ctrl_c`) then
+/// stays the shutdown path.
+///
+/// **Install this before any role announces readiness**: registration
+/// happens at `signal()` call time, and a SIGTERM arriving before it
+/// kills the process by default disposition — a supervisor (or test)
+/// that signals on the readiness line would race the handler otherwise
+/// (seen twice in CI as `rfc0016_5` exiting on `unix_wait_status(15)`).
+#[cfg(unix)]
+fn install_terminate_signal() -> Option<tokio::signal::unix::Signal> {
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(mut sigterm) => {
-            sigterm.recv().await;
-        }
+        Ok(sigterm) => Some(sigterm),
         Err(e) => {
             tracing::error!(name: ourios_semconv::EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR, "install SIGTERM handler (SIGINT remains the shutdown path): {e}");
-            std::future::pending::<()>().await;
+            None
         }
+    }
+}
+
+/// Resolve when `sigterm` fires; pend forever when there is no stream.
+async fn terminate_signal(#[cfg(unix)] sigterm: Option<tokio::signal::unix::Signal>) {
+    #[cfg(unix)]
+    match sigterm {
+        Some(mut sigterm) => {
+            sigterm.recv().await;
+        }
+        None => std::future::pending::<()>().await,
     }
     #[cfg(not(unix))]
     std::future::pending::<()>().await;
+}
+
+/// The pre-readiness startup guards: the RFC 0026 open-mode warning and
+/// the SIGTERM registration — both must precede any role announcing
+/// readiness (see `install_terminate_signal` for the signal race).
+#[cfg(unix)]
+fn startup_guards(config: &ServerConfig) -> Option<tokio::signal::unix::Signal> {
+    warn_if_open_mode(config);
+    install_terminate_signal()
+}
+
+#[cfg(not(unix))]
+fn startup_guards(config: &ServerConfig) {
+    warn_if_open_mode(config);
 }
 
 /// RFC 0026 §3.1 open mode: with no `auth` configured, any client that can
@@ -581,7 +609,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
     let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
 
-    warn_if_open_mode(&config);
+    #[cfg(unix)]
+    let sigterm = startup_guards(&config);
+    #[cfg(not(unix))]
+    startup_guards(&config);
 
     // Start the OTLP receiver role if enabled (RFC 0003 §9). Report the
     // bound addresses on stdout so an operator — or a test binding `:0` —
@@ -680,7 +711,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let shutdown = tokio::select! {
         () = compaction => Ok(()),
         signal = tokio::signal::ctrl_c() => signal,
-        () = terminate_signal() => Ok(()),
+        () = terminate_signal(
+            #[cfg(unix)]
+            sigterm,
+        ) => Ok(()),
     };
 
     // Drain the listeners gracefully (the receiver release frees the single

@@ -244,8 +244,9 @@ acceptance arm.
 > key set no longer contains it.
 
 > **Scenario RFC0029.7 — Dex end-to-end with telemetry parity.**
-> Given a real Dex container (testcontainers, CI-gated like the
-> RFC 0019 S3 jobs) with the client-credentials grant enabled and a
+> Given a real Dex container (testcontainers, CI-gated like
+> RFC 0019's `s3 integration (localstack)` job) with the
+> client-credentials grant enabled and a
 > static client whose claims carry the tenant list, When a token
 > minted from Dex's token endpoint drives ingest, query, and MCP
 > against a served instance verifying Dex's real JWKS, Then all
@@ -259,10 +260,11 @@ acceptance arm.
 
 ## 6. Testing strategy
 
-Unit level: the §5 fixture issuer (local keypair) covers .1–.6 —
-fast, deterministic, no container. Acceptance level: the real-Dex
-testcontainers job (.7), CI-gated alongside the S3 integration
-jobs. The RFC 0026 §5 suite re-runs unchanged with an OIDC-resolved
+Unit level: .1 is pure config resolution (no issuer at all); the
+§5 fixture issuer (local keypair) covers .2–.6 — fast,
+deterministic, no container. Acceptance level: the real-Dex
+testcontainers job (.7), CI-gated alongside RFC 0019's
+`s3 integration (localstack)` job. The RFC 0026 §5 suite re-runs unchanged with an OIDC-resolved
 binding substituted for the static one — the enforcement-invariance
 proof behind .3–.5.
 

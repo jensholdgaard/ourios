@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use tokio::sync::RwLock;
 
@@ -314,7 +314,6 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
         let Some(kid) = jwk.common.key_id.clone() else {
             continue;
         };
-        use jsonwebtoken::jwk::KeyAlgorithm;
         let allowed: Vec<Algorithm> = match &jwk.algorithm {
             AlgorithmParameters::RSA(_) => match jwk.common.key_algorithm {
                 // Explicit `alg` pins exactly that algorithm.

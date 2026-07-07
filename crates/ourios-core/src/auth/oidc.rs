@@ -89,9 +89,14 @@ struct DiscoveryDocument {
 /// One cached verification key.
 struct CachedKey {
     key: DecodingKey,
-    /// The key's own algorithm family, pinned from the JWK (never from a
-    /// presented token's header — the header only *selects* the key).
-    algorithm: Algorithm,
+    /// The algorithms this key may verify, pinned from the JWK itself
+    /// (never from a presented token's header — the header only *selects*
+    /// the key). A JWK carrying an explicit `alg` pins exactly that
+    /// algorithm; one without pins its whole key *family* (issuers
+    /// routinely omit `alg`, and an RSA key legitimately signs any RS*/PS*
+    /// variant). Cross-family re-typing — the HMAC/EC downgrade shapes —
+    /// stays impossible.
+    allowed: Vec<Algorithm>,
 }
 
 /// The RFC 0029 §3.2 verifier: config + cached JWKS + the refresh path.
@@ -209,12 +214,13 @@ impl OidcVerifier {
         let Some(cached) = keys.get(kid) else {
             return DecodeAttempt::UnknownKid;
         };
-        // The token's header must claim the key's own algorithm — a header
-        // is never allowed to re-type a key (the downgrade shape).
-        if cached.algorithm != token_alg {
+        // The token's header must claim an algorithm the key itself
+        // permits — a header is never allowed to re-type a key into
+        // another family (the downgrade shape).
+        if !cached.allowed.contains(&token_alg) {
             return DecodeAttempt::Rejected;
         }
-        let mut validation = Validation::new(cached.algorithm);
+        let mut validation = Validation::new(token_alg);
         validation.set_issuer(&[self.config.issuer()]);
         validation.set_audience(&[self.config.audience()]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
@@ -308,18 +314,36 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
         let Some(kid) = jwk.common.key_id.clone() else {
             continue;
         };
-        let algorithm = match &jwk.algorithm {
+        use jsonwebtoken::jwk::KeyAlgorithm;
+        let allowed: Vec<Algorithm> = match &jwk.algorithm {
             AlgorithmParameters::RSA(_) => match jwk.common.key_algorithm {
-                Some(jsonwebtoken::jwk::KeyAlgorithm::RS384) => Algorithm::RS384,
-                Some(jsonwebtoken::jwk::KeyAlgorithm::RS512) => Algorithm::RS512,
-                Some(jsonwebtoken::jwk::KeyAlgorithm::PS256) => Algorithm::PS256,
-                Some(jsonwebtoken::jwk::KeyAlgorithm::PS384) => Algorithm::PS384,
-                Some(jsonwebtoken::jwk::KeyAlgorithm::PS512) => Algorithm::PS512,
-                _ => Algorithm::RS256,
+                // Explicit `alg` pins exactly that algorithm.
+                Some(KeyAlgorithm::RS256) => vec![Algorithm::RS256],
+                Some(KeyAlgorithm::RS384) => vec![Algorithm::RS384],
+                Some(KeyAlgorithm::RS512) => vec![Algorithm::RS512],
+                Some(KeyAlgorithm::PS256) => vec![Algorithm::PS256],
+                Some(KeyAlgorithm::PS384) => vec![Algorithm::PS384],
+                Some(KeyAlgorithm::PS512) => vec![Algorithm::PS512],
+                // No `alg`: the whole RSA family — issuers routinely omit
+                // it, and rejecting their RS384/PS* tokens would be a
+                // false negative, not a hardening.
+                None => vec![
+                    Algorithm::RS256,
+                    Algorithm::RS384,
+                    Algorithm::RS512,
+                    Algorithm::PS256,
+                    Algorithm::PS384,
+                    Algorithm::PS512,
+                ],
+                // An RSA key claiming a non-RSA algorithm is malformed:
+                // skip-don't-fail, like any other unusable key.
+                Some(_) => continue,
             },
+            // For EC the curve *is* the algorithm; a present `alg` can
+            // only agree or be malformed, so the curve decides.
             AlgorithmParameters::EllipticCurve(ec) => match ec.curve {
-                jsonwebtoken::jwk::EllipticCurve::P256 => Algorithm::ES256,
-                jsonwebtoken::jwk::EllipticCurve::P384 => Algorithm::ES384,
+                jsonwebtoken::jwk::EllipticCurve::P256 => vec![Algorithm::ES256],
+                jsonwebtoken::jwk::EllipticCurve::P384 => vec![Algorithm::ES384],
                 _ => continue,
             },
             _ => continue,
@@ -327,7 +351,7 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
         let Ok(key) = DecodingKey::from_jwk(jwk) else {
             continue;
         };
-        keys.insert(kid, CachedKey { key, algorithm });
+        keys.insert(kid, CachedKey { key, allowed });
     }
     keys
 }
@@ -383,6 +407,21 @@ mod tests {
             "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": kid,
             "x": URL_SAFE_NO_PAD.encode(point.x().expect("x")),
             "y": URL_SAFE_NO_PAD.encode(point.y().expect("y")),
+        });
+        (encoding, jwk)
+    }
+
+    /// A fixed RSA test key (checked-in PEM — debug-build RSA keygen is
+    /// too slow to run per test) whose JWK deliberately omits `alg`: the
+    /// shape issuers commonly publish, which must pin the whole RSA
+    /// family rather than defaulting to RS256.
+    fn make_rsa_key_without_alg(kid: &str) -> (EncodingKey, Value) {
+        let pem = include_bytes!("../../testdata/rfc0029-test-rsa.pem");
+        let encoding = EncodingKey::from_rsa_pem(pem).expect("rsa pem");
+        let jwk = json!({
+            "kty": "RSA", "use": "sig", "kid": kid,
+            "n": "sS2e5TBHMyHx5m_yq1ChQFBk31gRLuNW8xyOFVgVKxFo7itxZaR2gEEGq7kRnr6IXFrk7qFPAOdUfvDkDk9GcAciLmN9_I7LrqBIcOhj_UJKYZn2_Gw9zaaH1LyAcafu5fAOid3jYApEyz-GeC10reaXxoxdOivfl_Bta0T_q9kNUSPXDTID3KfzdbCIsM1mMax67-eNZNLicZmpKPwDqzIn_rPsRpAVbF5xtqjklbCJHXaPQGxm-rcMo7-vLngplhP4N6d6G0m-jWHNnO9heKL-_npDDquvej6zZ1fYl3WJdWpy_-BxFO07WqQAvxWAkTI0l1szBEsm8dKWv1dbrQ",
+            "e": "AQAB",
         });
         (encoding, jwk)
     }
@@ -635,6 +674,46 @@ mod tests {
         assert!(
             verifier.verify(&old_token).await.is_none(),
             "the withdrawn key's tokens are rejected once the set drops it"
+        );
+    }
+
+    /// A JWK published without `alg` (the common issuer shape) pins its
+    /// key *family*: RS384/RS512/PS* tokens verify against the same RSA
+    /// key, while a cross-family header (the ES/HMAC re-typing shapes)
+    /// still rejects.
+    #[tokio::test]
+    async fn jwk_without_alg_accepts_its_family_only() {
+        let (rsa_encoding, rsa_jwk) = make_rsa_key_without_alg("key-rsa");
+        let jwks = Arc::new(StdRwLock::new(json!({ "keys": [rsa_jwk] })));
+        let (issuer, _) = serve_issuer(jwks).await;
+        let verifier = OidcVerifier::discover(config_for(&issuer))
+            .await
+            .expect("discover");
+
+        for alg in [
+            super::Algorithm::RS256,
+            super::Algorithm::RS384,
+            super::Algorithm::RS512,
+        ] {
+            let mut header = Header::new(alg);
+            header.kid = Some("key-rsa".to_string());
+            let token =
+                jsonwebtoken::encode(&header, &claims(&issuer), &rsa_encoding).expect("mint rsa");
+            assert!(
+                verifier.verify(&token).await.is_some(),
+                "{alg:?} verifies against the alg-less RSA JWK"
+            );
+        }
+
+        // Cross-family: an ES256 header selecting the RSA key must reject
+        // before any signature work (family pin, not just bad-signature).
+        let (ec_encoding, _) = make_key("unpublished");
+        let mut header = Header::new(super::Algorithm::ES256);
+        header.kid = Some("key-rsa".to_string());
+        let cross = jsonwebtoken::encode(&header, &claims(&issuer), &ec_encoding).expect("mint");
+        assert!(
+            verifier.verify(&cross).await.is_none(),
+            "a header must not re-type an RSA key into the EC family"
         );
     }
 

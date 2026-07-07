@@ -1,7 +1,7 @@
 ---
 rfc: 0027
 title: MCP query surface (agent-facing read tools over the querier)
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05

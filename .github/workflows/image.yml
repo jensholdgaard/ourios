@@ -140,15 +140,18 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
-        # Intentional word-splitting (SC2046): the `jq` substitutions expand to
-        # multiple `-t <tag>` / `--annotation <a>` flags and the `printf` to one
-        # `IMAGE@sha256:<hex>` ref per downloaded digest file — quoting would
-        # collapse them.
+        # Tags and annotations are built as bash arrays: annotation values
+        # (e.g. the image description) can contain spaces, which naked
+        # command substitution would word-split, and substituted quotes are
+        # literal characters, not shell syntax. The digest refs keep the
+        # `printf` substitution (SC2046) — hex digests never contain spaces.
         run: |
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          mapfile -t annotation_args < <(jq -r '(.annotations // [])[] | "--annotation", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           # shellcheck disable=SC2046
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(jq -cr '(.annotations // []) | map("--annotation \"" + . + "\"") | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            "${tag_args[@]}" \
+            "${annotation_args[@]}" \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - name: Resolve manifest-list digest

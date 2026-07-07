@@ -1,7 +1,7 @@
 ---
 rfc: 0027
 title: MCP query surface (agent-facing read tools over the querier)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -171,6 +171,24 @@ authn); that gate is **satisfied** as of RFC 0026's green,
 > serialization boundary), And every tool description carries the
 > treat-log-bodies-as-data warning, And no tool or resource enumerates
 > tenants or accepts SQL.
+
+### 5.1 Discharge record (green, 2026-07-07)
+
+- **RFC0027.1** — #413 (transport): `rmcp` server-side at `/mcp`
+  behind `querier.mcp.enabled` (file + env paths), the RFC 0026 bearer
+  layer answering before any MCP dispatch, the loopback Host guard
+  kept in open mode, the body cap on the nested router.
+- **RFC0027.2/.3/.4/.5/.7** — #414 (tools): the §3.2 three over the
+  querier engine with per-call tenant binding off the request's own
+  `Authorization` (sessions outlive requests); `.3`/`.5` are
+  payload-equality proofs against the JSON API over the same seeded
+  store; the `limit` argument is a hard cap; all tools record on the
+  shared `ourios.query.duration` histogram (`logs`/`drift`/the new
+  `templates` kind member).
+- **RFC0027.6** — #415 (resource): `ourios://dsl-grammar` serves the
+  RFC 0002 §7 section byte-identically (`include_str!`, extracted once
+  at role startup with a loud panic on shape drift), `text/markdown`,
+  asserted by an independent extraction in the test.
 
 ## 6. Testing strategy
 

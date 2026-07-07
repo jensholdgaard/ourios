@@ -262,8 +262,13 @@ impl OidcVerifier {
     }
 
     /// Refetch the JWKS (rotation / unseen kid), throttled to one fetch
-    /// per [`REFRESH_MIN_INTERVAL`]. `None` when throttled or when the
-    /// fetch fails — the cached set stays authoritative either way.
+    /// per [`REFRESH_MIN_INTERVAL`]. `None` when throttled, when the fetch
+    /// fails, or when the refetched set filters down to zero usable keys —
+    /// the cached set stays authoritative in every one of those cases. A
+    /// real rotation always publishes at least one usable key, so an empty
+    /// result is treated as an issuer glitch (availability) rather than a
+    /// total withdrawal; withdrawn keys still stop verifying on the next
+    /// non-empty refresh.
     async fn refresh_keys(&self) -> Option<()> {
         {
             let last = self.last_refresh.read().await;
@@ -280,6 +285,9 @@ impl OidcVerifier {
         *last = Instant::now();
         let jwks: JwkSet = fetch_json(&self.http, &self.jwks_uri).await.ok()?;
         let fresh = cache_keys(&jwks);
+        if fresh.is_empty() {
+            return None;
+        }
         *self.keys.write().await = fresh;
         Some(())
     }
@@ -338,13 +346,24 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
                 // skip-don't-fail, like any other unusable key.
                 Some(_) => continue,
             },
-            // For EC the curve *is* the algorithm; a present `alg` can
-            // only agree or be malformed, so the curve decides.
-            AlgorithmParameters::EllipticCurve(ec) => match ec.curve {
-                jsonwebtoken::jwk::EllipticCurve::P256 => vec![Algorithm::ES256],
-                jsonwebtoken::jwk::EllipticCurve::P384 => vec![Algorithm::ES384],
-                _ => continue,
-            },
+            // For EC the curve *is* the algorithm; a present `alg` must
+            // agree with it or the key is malformed (skip-don't-fail).
+            AlgorithmParameters::EllipticCurve(ec) => {
+                let (derived, agreeing) = match ec.curve {
+                    jsonwebtoken::jwk::EllipticCurve::P256 => {
+                        (Algorithm::ES256, KeyAlgorithm::ES256)
+                    }
+                    jsonwebtoken::jwk::EllipticCurve::P384 => {
+                        (Algorithm::ES384, KeyAlgorithm::ES384)
+                    }
+                    _ => continue,
+                };
+                match jwk.common.key_algorithm {
+                    None => vec![derived],
+                    Some(ka) if ka == agreeing => vec![derived],
+                    Some(_) => continue,
+                }
+            }
             _ => continue,
         };
         let Ok(key) = DecodingKey::from_jwk(jwk) else {
@@ -725,6 +744,56 @@ mod tests {
             verifier.verify(&cross).await.is_none(),
             "a header must not re-type an RSA key into the EC family"
         );
+    }
+
+    /// A refresh that fetches an *empty* usable-key set retains the
+    /// cached keys (issuer glitch ≠ total withdrawal): verification of
+    /// already-cached kids survives, and the withdrawn-key semantics
+    /// resume on the next non-empty refresh.
+    #[tokio::test]
+    async fn empty_jwks_refresh_retains_the_cached_set() {
+        let (encoding, jwk) = make_key("key-1");
+        let jwks = Arc::new(StdRwLock::new(json!({ "keys": [jwk] })));
+        let (issuer, jwks_hits) = serve_issuer(Arc::clone(&jwks)).await;
+        let verifier = OidcVerifier::discover(config_for(&issuer))
+            .await
+            .expect("discover");
+
+        // The issuer glitches to an empty set; an unseen kid triggers the
+        // (backdated-allowed) refresh, which must not wipe the cache.
+        *jwks.write().expect("jwks lock") = json!({ "keys": [] });
+        let ghost = mint(&encoding, "key-ghost", &claims(&issuer));
+        assert!(verifier.verify(&ghost).await.is_none(), "unknown kid");
+        assert_eq!(
+            jwks_hits.load(Ordering::SeqCst),
+            2,
+            "the unseen kid did refetch"
+        );
+
+        let cached = mint(&encoding, "key-1", &claims(&issuer));
+        assert!(
+            verifier.verify(&cached).await.is_some(),
+            "the cached key survives an empty-JWKS refresh"
+        );
+    }
+
+    /// An EC JWK whose explicit `alg` disagrees with its curve is
+    /// malformed and skipped (the curve is authoritative); an agreeing
+    /// `alg` caches normally.
+    #[test]
+    fn ec_jwk_with_disagreeing_alg_is_skipped() {
+        let (_, mut jwk) = make_key("key-ec");
+        jwk["alg"] = json!("ES384"); // P-256 curve claiming ES384: malformed
+        let set: super::JwkSet = serde_json::from_value(json!({ "keys": [jwk] })).expect("jwk set");
+        assert!(
+            super::cache_keys(&set).is_empty(),
+            "curve/alg disagreement must skip the key"
+        );
+
+        let (_, agreeing) = make_key("key-ec2"); // fixture sets alg: ES256
+        let set: super::JwkSet =
+            serde_json::from_value(json!({ "keys": [agreeing] })).expect("jwk set");
+        assert_eq!(super::cache_keys(&set).len(), 1, "agreeing alg caches");
     }
 
     /// Startup arms: a discovery document naming a different issuer and a

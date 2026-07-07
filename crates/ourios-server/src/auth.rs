@@ -43,6 +43,7 @@ pub fn build_auth_config(section: Option<&AuthSection>) -> Result<Option<AuthCon
         audience: oidc.audience.clone(),
         tenant_claim: oidc.tenant_claim.clone(),
         name_claim: oidc.name_claim.clone(),
+        clock_skew_secs: oidc.clock_skew_secs.clone(),
     });
     ourios_core::auth::build_auth_config(token_specs.as_deref(), oidc_spec.as_ref()).map(Some)
 }
@@ -67,6 +68,7 @@ mod tests {
             audience: Some("ourios".to_string()),
             tenant_claim: Some("ourios_tenants".to_string()),
             name_claim: None,
+            clock_skew_secs: None,
         }
     }
 

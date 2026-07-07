@@ -48,6 +48,32 @@ opentelemetry = { version = "0.32", default-features = false, features = ["metri
 # counters' metric names + `ourios.tenant` attribute key (§6.8).
 # Zero-dep leaf crate.
 ourios-semconv = { path = "../ourios-semconv" }
+# RFC 0029 §3.2 OIDC verification (feature `oidc`; only the two
+# enforcement consumers — ourios-ingester and ourios-server — enable
+# it, so the miner/parquet/wal build graphs stay untouched, per the
+# RFC 0028 build-feedback posture). `jsonwebtoken` with the RustCrypto
+# backend: the umbrella `rust_crypto` feature is required — the crate's
+# CryptoProvider only exists behind it (granular `rsa`/`p256` compile
+# key types but no provider, and every decode panics). The §3.2
+# asymmetric allow-list (RS256/ES256 family) is enforced by the
+# verifier: JWKS caching keeps only allow-listed key families, each
+# decode pins the cached key's algorithm, so `alg: none` and HMAC are
+# rejected whatever a token's header claims.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"], optional = true }
+# JWKS discovery + rotation refetch (§3.2: the issuer is contacted at
+# startup, on rotation, and on kid misses — never per request).
+# Already in the dep tree via `object_store`'s S3 backend, same
+# rustls stack — no new cargo-deny surface.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# Derive for the discovery-document subset the verifier reads.
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+# Async runtime types for the JWKS cache (`RwLock`) and the verifier's
+# refresh path. Runtime-free feature set; the binary provides the runtime.
+tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
+
+[features]
+# The RFC 0029 OIDC bearer layer (verifier + JWKS cache).
+oidc = ["dep:jsonwebtoken", "dep:reqwest", "dep:serde", "dep:tokio"]
 
 [dev-dependencies]
 # `init_in_memory` collects the alias counters' exported metric stream
@@ -58,6 +84,15 @@ ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # round-trip (#130).
 proptest = "=1.11.0"
 tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+# Loopback fixture issuer (discovery + JWKS + rotation) for the RFC 0029
+# §5.2/§5.6 verification-matrix and rotation tests — test-only.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+# Mints the fixture issuer's ES256 keypair at test runtime (instant P-256
+# keygen; no committed private-key fixtures for scanners to flag).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+rand = "0.8"
+# base64url (no pad) for the fixture issuer's JWK coordinates.
+base64 = "0.22"
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 
 [lints]

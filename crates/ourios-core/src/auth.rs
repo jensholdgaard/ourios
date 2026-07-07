@@ -53,6 +53,141 @@ impl fmt::Debug for TokenSpec {
     }
 }
 
+/// The raw `auth.oidc` section as the config layer hands it over (RFC 0029
+/// §3.1) — substituted but not yet validated. Nothing here is secret: the
+/// issuer, audience, and claim names are deployment topology, not
+/// credentials.
+#[derive(Debug, Default, Clone)]
+pub struct OidcSpec {
+    /// The OIDC discovery root (`/.well-known/openid-configuration` lives
+    /// under it).
+    pub issuer: Option<String>,
+    /// The required `aud` value — a deployment must never accept tokens
+    /// minted for another service (RFC 0029 §3.1).
+    pub audience: Option<String>,
+    /// The claim carrying the tenant list (or the wildcard `"*"`).
+    pub tenant_claim: Option<String>,
+    /// The claim feeding the audit/metric label. Defaults to `sub`.
+    pub name_claim: Option<String>,
+}
+
+/// The validated `auth.oidc` configuration (RFC 0029 §3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcConfig {
+    issuer: String,
+    audience: String,
+    tenant_claim: String,
+    name_claim: String,
+}
+
+impl OidcConfig {
+    /// The OIDC discovery root.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// The required `aud` value.
+    #[must_use]
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
+
+    /// The claim carrying the tenant list.
+    #[must_use]
+    pub fn tenant_claim(&self) -> &str {
+        &self.tenant_claim
+    }
+
+    /// The claim feeding the audit/metric label (`sub` unless configured).
+    #[must_use]
+    pub fn name_claim(&self) -> &str {
+        &self.name_claim
+    }
+}
+
+/// The resolved `auth` section (RFC 0026 §3.1 + RFC 0029 §3.1): the static
+/// token store, the OIDC layer, or both — at least one by construction
+/// ([`build_auth_config`]). An absent `auth` section never constructs this
+/// type; open mode stays `None` at the callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    /// The static bearer-token store (RFC 0026), if configured.
+    pub static_tokens: Option<TokenStore>,
+    /// The OIDC layer (RFC 0029), if configured.
+    pub oidc: Option<OidcConfig>,
+}
+
+impl AuthConfig {
+    /// The store the enforcement points consume today.
+    ///
+    /// With OIDC configured but no static tokens this is an *empty* store:
+    /// auth stays enforced (every bearer is rejected) rather than open. The
+    /// RFC 0029 verifier slice replaces the gates' store parameter with the
+    /// full config and retires this bridge.
+    #[must_use]
+    pub fn enforcement_store(&self) -> TokenStore {
+        self.static_tokens.clone().unwrap_or(TokenStore {
+            entries: Vec::new(),
+        })
+    }
+}
+
+/// Validate a raw `auth` section's halves into the resolved [`AuthConfig`]
+/// (RFC 0026 §3.1 + RFC 0029 §3.1). Callers only invoke this for a present
+/// `auth` section — an absent section is open mode and never reaches here.
+///
+/// # Errors
+///
+/// Neither half configured is a startup error (a present-but-empty `auth`
+/// section is never the intent); each present half fails on its own rules
+/// ([`build_token_store`] — including the unconditional empty-list error —
+/// and [`build_oidc_config`]).
+pub fn build_auth_config(
+    tokens: Option<&[TokenSpec]>,
+    oidc: Option<&OidcSpec>,
+) -> Result<AuthConfig, String> {
+    if tokens.is_none() && oidc.is_none() {
+        return Err(
+            "auth must configure tokens, oidc, or both — remove the auth section \
+             entirely for open mode (RFC 0026 §3.1, RFC 0029 §3.1)"
+                .to_string(),
+        );
+    }
+    Ok(AuthConfig {
+        static_tokens: build_token_store(tokens)?,
+        oidc: oidc.map(build_oidc_config).transpose()?,
+    })
+}
+
+/// Validate a raw [`OidcSpec`] into the resolved [`OidcConfig`] (RFC 0029
+/// §3.1).
+///
+/// # Errors
+///
+/// `issuer`, `audience`, and `tenant_claim` are each required and must be
+/// non-empty without surrounding whitespace; `name_claim` defaults to `sub`
+/// and must be non-empty without surrounding whitespace when given.
+pub fn build_oidc_config(spec: &OidcSpec) -> Result<OidcConfig, String> {
+    let required = |key: &str, value: Option<&str>| match value {
+        Some(v) if !v.is_empty() && v.trim() == v => Ok(v.to_string()),
+        _ => Err(format!(
+            "auth.oidc.{key} is required and must be non-empty without \
+             surrounding whitespace (RFC 0029 §3.1)"
+        )),
+    };
+    let name_claim = match spec.name_claim.as_deref() {
+        None => "sub".to_string(),
+        some => required("name_claim", some)?,
+    };
+    Ok(OidcConfig {
+        issuer: required("issuer", spec.issuer.as_deref())?,
+        audience: required("audience", spec.audience.as_deref())?,
+        tenant_claim: required("tenant_claim", spec.tenant_claim.as_deref())?,
+        name_claim,
+    })
+}
+
 /// The tenant set a token is bound to (RFC 0026 §3.1): the single wildcard
 /// `"*"`, or an exact-string allow-list. An enum rather than an optional
 /// list so "all tenants" and "no tenants" cannot be conflated.
@@ -148,8 +283,8 @@ pub fn build_token_store(specs: Option<&[TokenSpec]>) -> Result<Option<TokenStor
     };
     if specs.is_empty() {
         return Err(
-            "auth.tokens must not be empty — remove the auth section entirely for \
-             open mode (RFC 0026 §3.1)"
+            "auth.tokens must not be empty — omit the tokens list (oidc-only) or \
+             the whole auth section (open mode) (RFC 0026 §3.1, RFC 0029 §3.1)"
                 .to_string(),
         );
     }
@@ -235,7 +370,9 @@ fn build_tenant_set(index: usize, spec: &TokenSpec) -> Result<TenantSet, String>
 
 #[cfg(test)]
 mod tests {
-    use super::{TenantSet, TokenSpec, build_token_store};
+    use super::{
+        OidcSpec, TenantSet, TokenSpec, build_auth_config, build_oidc_config, build_token_store,
+    };
 
     fn spec(name: &str, token: &str, tenants: &[&str]) -> TokenSpec {
         TokenSpec {
@@ -340,6 +477,122 @@ mod tests {
             assert!(err.contains(needle), "{needle:?} not in {err:?}");
             assert!(!err.contains("tok-"), "no token value leaks: {err:?}");
         }
+    }
+
+    fn oidc_spec() -> OidcSpec {
+        OidcSpec {
+            issuer: Some("https://dex.internal.example".to_string()),
+            audience: Some("ourios".to_string()),
+            tenant_claim: Some("ourios_tenants".to_string()),
+            name_claim: None,
+        }
+    }
+
+    /// Scenario RFC0029.1 (validation matrix) — `issuer`, `audience`, and
+    /// `tenant_claim` are each required (a missing `audience` in particular
+    /// is a startup error, RFC 0029 §3.1); `name_claim` defaults to `sub`.
+    /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    #[test]
+    fn oidc_config_requires_its_fields_and_defaults_name_claim() {
+        let full = build_oidc_config(&oidc_spec()).expect("valid");
+        assert_eq!(full.issuer(), "https://dex.internal.example");
+        assert_eq!(full.audience(), "ourios");
+        assert_eq!(full.tenant_claim(), "ourios_tenants");
+        assert_eq!(full.name_claim(), "sub", "defaults to sub");
+
+        let named = build_oidc_config(&OidcSpec {
+            name_claim: Some("email".to_string()),
+            ..oidc_spec()
+        })
+        .expect("valid");
+        assert_eq!(named.name_claim(), "email");
+
+        for (key, spec) in [
+            (
+                "issuer",
+                OidcSpec {
+                    issuer: None,
+                    ..oidc_spec()
+                },
+            ),
+            (
+                "audience",
+                OidcSpec {
+                    audience: None,
+                    ..oidc_spec()
+                },
+            ),
+            (
+                "tenant_claim",
+                OidcSpec {
+                    tenant_claim: None,
+                    ..oidc_spec()
+                },
+            ),
+            (
+                "audience",
+                OidcSpec {
+                    audience: Some(" ourios".to_string()),
+                    ..oidc_spec()
+                },
+            ),
+            (
+                "name_claim",
+                OidcSpec {
+                    name_claim: Some(String::new()),
+                    ..oidc_spec()
+                },
+            ),
+        ] {
+            let err = build_oidc_config(&spec).expect_err("invalid");
+            assert!(
+                err.contains(&format!("auth.oidc.{key}")),
+                "{key} named: {err}"
+            );
+        }
+    }
+
+    /// Scenario RFC0029.1 (section rules) — neither half is a startup error;
+    /// an explicit empty token list stays a startup error **even with oidc
+    /// configured**; oidc-only and both-halves resolve; the oidc-only
+    /// enforcement bridge rejects every bearer rather than opening the
+    /// gates. See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    #[test]
+    fn auth_config_rules_and_oidc_only_bridge() {
+        let err = build_auth_config(None, None).expect_err("neither half");
+        assert!(
+            err.contains("tokens, oidc, or both"),
+            "names the rule: {err}"
+        );
+
+        let err = build_auth_config(Some(&[]), Some(&oidc_spec())).expect_err("empty list");
+        assert!(
+            err.contains("auth.tokens") && err.contains("oidc-only"),
+            "the unconditional empty-list error points at omitting the list: {err}"
+        );
+
+        let oidc_only = build_auth_config(None, Some(&oidc_spec())).expect("oidc-only");
+        assert!(oidc_only.static_tokens.is_none());
+        assert_eq!(oidc_only.oidc.as_ref().expect("oidc").audience(), "ourios");
+        let bridge = oidc_only.enforcement_store();
+        assert!(
+            bridge.authenticate("any-bearer").is_none(),
+            "the bridge store matches nothing — enforced, not open"
+        );
+
+        let both = build_auth_config(
+            Some(&[spec("edge", "tok-edge", &["acme"])]),
+            Some(&oidc_spec()),
+        )
+        .expect("both halves");
+        assert_eq!(
+            both.enforcement_store()
+                .authenticate("tok-edge")
+                .expect("static half intact")
+                .name(),
+            "edge"
+        );
+        assert!(both.oidc.is_some());
     }
 
     /// `Debug` renders names and tenant sets, never a token value — the

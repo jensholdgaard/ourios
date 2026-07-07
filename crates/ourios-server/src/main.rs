@@ -86,12 +86,13 @@ struct ServerConfig {
     /// (`storage.promoted_attributes`, §3.2) — applied by every write path
     /// (receiver flushes and compaction rewrites; §3.4).
     promoted: PromotedAttributes,
-    /// The RFC 0026 token store (`auth.tokens`), or `None` for open mode.
-    /// Config-file only (§3.1 — tokens ride the `${env:…}` indirection); the
-    /// env-only path always resolves open. Enforcement on the listeners lands
-    /// with the ingest/query slices; this slice resolves and validates the
-    /// store and makes open mode observable at startup.
-    auth: Option<ourios_server::auth::TokenStore>,
+    /// The resolved `auth` section (RFC 0026 static tokens + RFC 0029 OIDC),
+    /// or `None` for open mode. Config-file only (§3.1 — tokens ride the
+    /// `${env:…}` indirection); the env-only path always resolves open. The
+    /// listeners consume the config's enforcement store: with OIDC configured
+    /// and no static tokens that store is empty — enforced, not open — until
+    /// the RFC 0029 verifier slice teaches the gates the full config.
+    auth: Option<ourios_server::auth::AuthConfig>,
 }
 
 /// Resolved querier-role configuration (RFC 0016 §3.2).
@@ -263,7 +264,7 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
         &file.storage.promoted_attributes.resource,
         &file.storage.promoted_attributes.log,
     )?;
-    config.auth = ourios_server::auth::build_token_store(file.auth.as_ref())?;
+    config.auth = ourios_server::auth::build_auth_config(file.auth.as_ref())?;
     Ok(config)
 }
 
@@ -575,6 +576,19 @@ fn warn_if_open_mode(config: &ServerConfig) {
     }
 }
 
+/// The store the listeners enforce against (RFC 0026 §3.2/§3.3), shared by
+/// both roles. Open mode stays `None`; an oidc-only config yields an empty
+/// store — enforced, not open — until the RFC 0029 verifier slice teaches
+/// the gates the full [`ourios_server::auth::AuthConfig`].
+fn enforcement_store(
+    config: &ServerConfig,
+) -> Option<std::sync::Arc<ourios_server::auth::TokenStore>> {
+    config
+        .auth
+        .as_ref()
+        .map(|auth| std::sync::Arc::new(auth.enforcement_store()))
+}
+
 /// Resolve the configuration (file or env, RFC 0020 §3.2) and pre-create
 /// a local store root (`Store::local` canonicalises it and errors on a
 /// missing dir; an S3 backend needs no such step — mirrors the querier
@@ -636,7 +650,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // handle is cheap to share, the compactor keeps the original).
                 store: store.clone(),
                 promoted: config.promoted.clone(),
-                auth: config.auth.clone().map(std::sync::Arc::new),
+                auth: enforcement_store(&config),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -657,7 +671,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // The querier engine is Store-capable (RFC 0019 slice 2a), so it
                 // reads whichever backend config resolved (local or S3).
                 store: config.store.clone(),
-                auth: config.auth.clone().map(std::sync::Arc::new),
+                auth: enforcement_store(&config),
                 default_window_nanos: params.default_window_nanos,
                 mcp_enabled: params.mcp_enabled,
             })
@@ -967,7 +981,7 @@ auth:
         })
         .expect("well-formed file");
         let config = server_config_from_file(&file).expect("valid");
-        let store = config.auth.expect("auth resolved");
+        let store = config.auth.expect("auth resolved").enforcement_store();
         assert_eq!(
             store.authenticate("resolved-token").expect("match").name(),
             "edge-collector",
@@ -978,6 +992,55 @@ auth:
 
         let err = server_config("storage:\n  local:\n    bucket_root: /x\nauth:\n  tokens: []\n")
             .expect_err("empty token list");
+        assert!(err.contains("auth.tokens"), "names the key: {err}");
+    }
+
+    /// Scenario RFC0029.1 (mapping) — the file's `auth.oidc` section resolves
+    /// through the shared validators: an `${env:…}`-substituted issuer lands
+    /// in the resolved config, an oidc-only section resolves with an *empty*
+    /// enforcement store (enforced, not open), a missing `audience` fails,
+    /// and `tokens: []` fails even with `oidc` present. The schema arms live
+    /// in `config::file`, the validation matrix in `ourios_core::auth`, and
+    /// the startup-observable arms in `tests/it/rfc0029_oidc.rs`.
+    /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    #[test]
+    fn rfc0029_1_oidc_section_maps_onto_the_auth_config() {
+        let yaml = "\
+storage:
+  backend: local
+  local:
+    bucket_root: /var/lib/ourios
+auth:
+  oidc:
+    issuer: ${env:ISSUER}
+    audience: ourios
+    tenant_claim: ourios_tenants
+";
+        let file = parse(yaml, &|name| {
+            (name == "ISSUER").then(|| "https://dex.internal.example".to_owned())
+        })
+        .expect("well-formed file");
+        let config = server_config_from_file(&file).expect("valid");
+        let auth = config.auth.expect("auth resolved");
+        let oidc = auth.oidc.as_ref().expect("oidc half");
+        assert_eq!(oidc.issuer(), "https://dex.internal.example");
+        assert_eq!(oidc.name_claim(), "sub", "core default applied");
+        assert!(auth.static_tokens.is_none(), "no static half");
+        assert!(
+            auth.enforcement_store().authenticate("any").is_none(),
+            "oidc-only enforces (rejects) rather than opening the gates",
+        );
+
+        let err = server_config(
+            "storage:\n  local:\n    bucket_root: /x\nauth:\n  oidc:\n    issuer: https://x\n    tenant_claim: t\n",
+        )
+        .expect_err("missing audience");
+        assert!(err.contains("auth.oidc.audience"), "names the key: {err}");
+
+        let err = server_config(
+            "storage:\n  local:\n    bucket_root: /x\nauth:\n  tokens: []\n  oidc:\n    issuer: https://x\n    audience: a\n    tenant_claim: t\n",
+        )
+        .expect_err("explicit empty list stays an error with oidc present");
         assert!(err.contains("auth.tokens"), "names the key: {err}");
     }
 

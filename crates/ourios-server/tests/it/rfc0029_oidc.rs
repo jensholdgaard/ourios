@@ -1,19 +1,160 @@
 //! RFC 0029 §5 — the OIDC bearer layer, all seven scenarios.
 //!
-//! Stubs are `#[ignore]`d so the default run stays green while the
-//! RFC is red; each names the green slice that discharges it.
+//! `.1` is green: the schema/substitution arms live in
+//! `ourios_server::config::file`, the validation matrix in
+//! `ourios_core::auth`, the file→config mapping in `src/main.rs`
+//! (`rfc0029_1_*`), and the startup-observable arms — the three
+//! configuration errors and the oidc-only-serves-enforced shape —
+//! here, against the spawned binary (the `rfc0026_auth` pattern; the
+//! missing-`auth` open-mode arm is RFC 0026 §5.1's, re-asserted there).
+//! Remaining stubs are `#[ignore]`d so the default run stays green
+//! while the RFC is red; each names the green slice that discharges it.
 
-/// Scenario RFC0029.1 — config resolution.
+use std::io::Write as _;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::time::timeout;
+
+/// Scenario RFC0029.1 (startup errors) — a missing `auth.oidc.audience`,
+/// an `auth` section with neither half, and an explicit `tokens: []`
+/// (even with `oidc` configured) each fail startup, naming the key.
 /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
-#[test]
-#[ignore = "RFC0029.1 stub — implemented in the config green slice"]
-fn rfc0029_1_config_resolution() {
-    todo!(
-        "RFC0029.1 — auth.oidc resolves through ${{env:VAR}}; missing \
-         audience is a startup error; neither tokens nor oidc is a \
-         startup error; explicit tokens: [] is a startup error even \
-         with oidc present; oidc-only serves; missing auth stays open \
-         mode with the RFC 0026 warning"
+#[tokio::test]
+async fn rfc0029_1_startup_configuration_errors() {
+    let oidc = "  oidc:\n    issuer: https://dex.internal.example\n    audience: ourios\n    tenant_claim: ourios_tenants\n";
+    let cases: [(&str, String); 3] = [
+        (
+            "auth.oidc.audience",
+            "auth:\n  oidc:\n    issuer: https://dex.internal.example\n    tenant_claim: ourios_tenants\n".to_string(),
+        ),
+        ("tokens, oidc, or both", "auth: {}\n".to_string()),
+        ("auth.tokens", format!("auth:\n  tokens: []\n{oidc}")),
+    ];
+    for (needle, auth_section) in cases {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let config_path = tmp.path().join("ourios.yaml");
+        let mut file = std::fs::File::create(&config_path).expect("create config");
+        write!(
+            file,
+            "storage:\n  local:\n    bucket_root: {}\n{auth_section}",
+            tmp.path().display(),
+        )
+        .expect("write config");
+
+        let output = timeout(
+            Duration::from_secs(15),
+            Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+                .arg("--config")
+                .arg(&config_path)
+                // If the startup error ever regressed into a running
+                // server, the timeout would drop this future — don't
+                // leave that child behind.
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("server exits before timeout")
+        .expect("run ourios-server");
+
+        assert!(
+            !output.status.success(),
+            "{needle}: the config must fail startup, got {:?}",
+            output.status,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "names the rule: {stderr}");
+    }
+}
+
+/// Scenario RFC0029.1 (oidc-only serves, enforced) — an `auth` section
+/// with only `oidc` starts and serves, and the gates stay *enforced*:
+/// until the verifier lands, no bearer matches, so a query without one
+/// is 401 — never open mode (and no open-mode warning is emitted).
+/// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+#[tokio::test]
+async fn rfc0029_1_oidc_only_starts_and_enforces() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let config_path = tmp.path().join("ourios.yaml");
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    write!(
+        file,
+        "storage:\n  local:\n    bucket_root: {}\n\
+         querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n\
+         auth:\n  oidc:\n    issuer: https://dex.internal.example\n    audience: ourios\n    tenant_claim: ourios_tenants\n",
+        tmp.path().display(),
+    )
+    .expect("write config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .env("RUST_LOG", "info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ourios-server");
+
+    // Buffer stderr concurrently (an undrained pipe can block the child);
+    // the collected lines feed the no-open-mode-warning assertion below.
+    let stderr = child.stderr.take().expect("stderr piped");
+    let drain = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut collected = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            collected.push(line);
+        }
+        collected
+    });
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut out_lines = BufReader::new(stdout).lines();
+    let querier_addr: std::net::SocketAddr = timeout(Duration::from_secs(15), async {
+        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+            if let Some(addr) = line.strip_prefix("querier HTTP listening on ") {
+                return addr.trim().parse().expect("parse announced addr");
+            }
+        }
+        panic!("querier line never appeared — oidc-only must serve");
+    })
+    .await
+    .expect("server ready before timeout");
+
+    // Enforced, not open: a query with no bearer is 401 on the wire.
+    let mut stream = tokio::net::TcpStream::connect(querier_addr)
+        .await
+        .expect("oidc-only querier accepts a connection");
+    stream
+        .write_all(
+            b"POST /v1/query HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+              Content-Type: application/json\r\nContent-Length: 2\r\n\
+              Connection: close\r\n\r\n{}",
+        )
+        .await
+        .expect("write request");
+    let mut response = String::new();
+    timeout(
+        Duration::from_secs(15),
+        stream.read_to_string(&mut response),
+    )
+    .await
+    .expect("response before timeout")
+    .expect("read response");
+    assert!(
+        response.starts_with("HTTP/1.1 401 "),
+        "oidc-only enforces (401), never open: {response}",
+    );
+
+    child.kill().await.expect("kill the server");
+    let collected = timeout(Duration::from_secs(15), drain)
+        .await
+        .expect("stderr drains before timeout")
+        .expect("drain task");
+    assert!(
+        !collected.iter().any(|l| l.contains("RFC 0026 open mode")),
+        "auth is configured — no open-mode warning",
     );
 }
 

@@ -122,6 +122,12 @@ jobs:
 
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        # The per-arch manifests already carry OCI labels (the build job's
+        # `labels:`); GHCR's package page reads the **index** annotations,
+        # which `imagetools create` does not inherit — emit them here and
+        # attach below (#364).
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
           # Explicit tags only — suppresses the default branch tag (e.g.
@@ -134,13 +140,15 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
-        # Intentional word-splitting (SC2046): the `jq` substitution expands to
-        # multiple `-t <tag>` flags and the `printf` to one `IMAGE@sha256:<hex>`
-        # ref per downloaded digest file — quoting would collapse them.
+        # Intentional word-splitting (SC2046): the `jq` substitutions expand to
+        # multiple `-t <tag>` / `--annotation <a>` flags and the `printf` to one
+        # `IMAGE@sha256:<hex>` ref per downloaded digest file — quoting would
+        # collapse them.
         run: |
           # shellcheck disable=SC2046
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(jq -cr '(.annotations // []) | map("--annotation \"" + . + "\"") | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - name: Resolve manifest-list digest

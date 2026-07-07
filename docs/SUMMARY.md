@@ -2,6 +2,14 @@
 
 [Introduction](./introduction.md)
 
+# Getting started
+
+- [Quickstart (single binary)](./guides/quickstart.md)
+- [Configuration](./guides/configuration.md)
+- [Docker](./guides/docker.md)
+- [Kubernetes (Helm)](./guides/kubernetes.md)
+- [Authentication](./guides/authentication.md)
+
 # Architecture
 
 - [Overview]()

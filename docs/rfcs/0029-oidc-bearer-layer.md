@@ -1,7 +1,7 @@
 ---
 rfc: 0029
 title: OIDC bearer layer (issuer-agnostic, Dex-validated)
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-07
@@ -186,24 +186,87 @@ auth:
 
 ## 5. Acceptance criteria
 
-Written at the `specified` gate (docs/rfcs/README.md lifecycle).
-Expected shape: config resolution (`oidc` section, coexistence, at
-least-one rule); verification matrix (valid/expired/wrong-aud/
-wrong-iss/bad-sig/`alg:none`/HMAC-downgrade all rejected as one
-401); claim → tenant binding driving the unchanged ingest/query/MCP
-enforcement incl. wildcard; JWKS rotation mid-run; static+OIDC
-coexistence; the Dex-container end-to-end (Collector
-client-credentials flow included); telemetry/audit parity with
-RFC 0026 §5.7.
+Scenario ids `RFC0029.<m>`. Scenario .1 is pure config resolution
+(no issuer); .2–.6 run against a fixture issuer (a local keypair
+serving discovery + JWKS over a loopback listener — fast,
+deterministic, no container); .7 is the real-Dex acceptance arm.
+
+> **Scenario RFC0029.1 — config resolution.** Given a config with an
+> `auth.oidc` section whose values use `${env:VAR}`, When the server
+> starts, Then they resolve through the RFC 0020 substitution
+> engine; a missing `audience` is a startup configuration error; an
+> `auth` section with neither `tokens` nor `oidc` is a startup
+> configuration error; an explicit `tokens: []` is a startup
+> configuration error **regardless of whether `oidc` is present**;
+> an `oidc`-only section starts and serves; a missing `auth` section
+> starts in open mode with the RFC 0026 warning, unchanged.
+
+> **Scenario RFC0029.2 — verification matrix.** Given OIDC
+> configured against the fixture issuer, When a request presents a
+> bearer that is (a) a valid in-audience token, Then it is accepted;
+> and when it presents (b) an expired token, (c) a token before its
+> `nbf` beyond the configured skew, (d) a wrong-`aud` token, (e) a
+> wrong-`iss` token, (f) a token with a corrupted signature, (g) an
+> `alg: none` token, (h) an HMAC-signed token whose key is the
+> public JWKS material (downgrade), or (i) a non-JWT unknown bearer,
+> Then every one of (b)–(i) is rejected as the **same
+> undifferentiated 401** (identical status and body — no oracle),
+> before wire decode on ingest, and nothing reaches the WAL.
+
+> **Scenario RFC0029.3 — claim binding drives unchanged
+> enforcement.** Given a verified token whose `tenant_claim` value
+> is `["a", "b"]`, Then the RFC 0026 §5.3/§5.4 contracts hold
+> verbatim with the OIDC-resolved binding substituted for the static
+> one: in-set ingest batches ack; any batch touching a tenant
+> outside `{a, b}` is whole-batch 403 with no WAL append; the query
+> API and the MCP surface enforce the same 401→400→403 order; and
+> the `name_claim` value appears as the name label where the token
+> name appears today.
+
+> **Scenario RFC0029.4 — wildcard claim.** Given a verified token
+> whose `tenant_claim` value is `["*"]`, Then ingest and query to
+> arbitrary tenants behave as if every tenant were listed
+> (RFC 0026 §5.5 parity).
+
+> **Scenario RFC0029.5 — coexistence and resolution order.** Given
+> one config with both `tokens` and `oidc`, Then a static token
+> authenticates via the constant-time store, a JWT from the issuer
+> authenticates via OIDC, each carrying its own tenant binding
+> side by side; a static-only config and an `oidc`-only config each
+> serve; and with no `auth` section the full RFC 0026 §5.6 open-mode
+> parity arm passes unchanged.
+
+> **Scenario RFC0029.6 — JWKS rotation.** Given a served instance
+> verifying against the fixture issuer, When the issuer rotates its
+> signing key mid-run, Then a token signed by the new key (unseen
+> `kid`) triggers a JWKS re-fetch and verifies without restart, and
+> a token signed by the withdrawn key is rejected once the refreshed
+> key set no longer contains it.
+
+> **Scenario RFC0029.7 — Dex end-to-end with telemetry parity.**
+> Given a real Dex container (testcontainers, CI-gated like
+> RFC 0019's `s3 integration (localstack)` job) with the
+> client-credentials grant enabled and a
+> static client whose claims carry the tenant list, When a token
+> minted from Dex's token endpoint drives ingest, query, and MCP
+> against a served instance verifying Dex's real JWKS, Then all
+> three succeed; a short-TTL token is rejected with the
+> undifferentiated 401 after expiry; rejections increment the
+> existing counters with the unchanged `error.type` values and an
+> ingest authz denial emits the `ingest_denied` audit event carrying
+> the `name_claim` value — and no JWT material (token, header,
+> claims payload) appears on any surface (metrics, audit, logs,
+> error bodies).
 
 ## 6. Testing strategy
 
-Follows §5 at the `specified` gate. Unit level: a fixture issuer
-(local keypair) for the verification matrix — fast, deterministic,
-no container. Acceptance level: the real-Dex testcontainers job,
-CI-gated alongside the S3 integration jobs. The RFC 0026 §5 suite
-re-runs unchanged with an OIDC-resolved binding substituted for the
-static one — the enforcement-invariance proof.
+Unit level: .1 is pure config resolution (no issuer at all); the
+§5 fixture issuer (local keypair) covers .2–.6 — fast,
+deterministic, no container. Acceptance level: the real-Dex
+testcontainers job (.7), CI-gated alongside RFC 0019's
+`s3 integration (localstack)` job. The RFC 0026 §5 suite re-runs
+unchanged with an OIDC-resolved binding substituted for the static
+one — the enforcement-invariance proof behind .3–.5.
 
 ## 7. Open questions
 

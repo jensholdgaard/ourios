@@ -90,6 +90,11 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # Mints the fixture issuer's ES256 keypair at test runtime (instant P-256
 # keygen; no committed private-key fixtures for scanners to flag).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+# Mints the RSA-family fixture key at test runtime for the same reason —
+# 1024-bit keygen (test-only; signature shape, not strength, is under
+# test) keeps it fast in unoptimized builds. Already in the tree via
+# jsonwebtoken's rust_crypto backend.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 rand = "0.8"
 # base64url (no pad) for the fixture issuer's JWK coordinates.
 base64 = "0.22"

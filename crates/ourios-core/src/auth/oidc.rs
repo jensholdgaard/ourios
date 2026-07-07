@@ -410,17 +410,28 @@ mod tests {
         (encoding, jwk)
     }
 
-    /// A fixed RSA test key (checked-in PEM — debug-build RSA keygen is
-    /// too slow to run per test) whose JWK deliberately omits `alg`: the
-    /// shape issuers commonly publish, which must pin the whole RSA
-    /// family rather than defaulting to RS256.
+    /// The RSA-family fixture key, generated once per test process (no
+    /// committed private-key fixtures for scanners to flag — same policy
+    /// as the P-256 fixture). 1024-bit keeps unoptimized keygen fast; the
+    /// tests exercise signature *shape*, not strength. Its JWK
+    /// deliberately omits `alg`: the shape issuers commonly publish,
+    /// which must pin the whole RSA family rather than defaulting to
+    /// RS256.
     fn make_rsa_key_without_alg(kid: &str) -> (EncodingKey, Value) {
-        let pem = include_bytes!("../../testdata/rfc0029-test-rsa.pem");
-        let encoding = EncodingKey::from_rsa_pem(pem).expect("rsa pem");
+        use rsa::traits::PublicKeyParts;
+        static KEY: std::sync::OnceLock<(String, Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+        let (pem, n, e) = KEY.get_or_init(|| {
+            let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).expect("rsa keygen");
+            let pem = rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&key, rsa::pkcs8::LineEnding::LF)
+                .expect("pkcs8 pem")
+                .to_string();
+            (pem, key.n().to_bytes_be(), key.e().to_bytes_be())
+        });
+        let encoding = EncodingKey::from_rsa_pem(pem.as_bytes()).expect("rsa pem");
         let jwk = json!({
             "kty": "RSA", "use": "sig", "kid": kid,
-            "n": "sS2e5TBHMyHx5m_yq1ChQFBk31gRLuNW8xyOFVgVKxFo7itxZaR2gEEGq7kRnr6IXFrk7qFPAOdUfvDkDk9GcAciLmN9_I7LrqBIcOhj_UJKYZn2_Gw9zaaH1LyAcafu5fAOid3jYApEyz-GeC10reaXxoxdOivfl_Bta0T_q9kNUSPXDTID3KfzdbCIsM1mMax67-eNZNLicZmpKPwDqzIn_rPsRpAVbF5xtqjklbCJHXaPQGxm-rcMo7-vLngplhP4N6d6G0m-jWHNnO9heKL-_npDDquvej6zZ1fYl3WJdWpy_-BxFO07WqQAvxWAkTI0l1szBEsm8dKWv1dbrQ",
-            "e": "AQAB",
+            "n": URL_SAFE_NO_PAD.encode(n),
+            "e": URL_SAFE_NO_PAD.encode(e),
         });
         (encoding, jwk)
     }

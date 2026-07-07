@@ -1,7 +1,7 @@
 ---
 rfc: 0026
 title: Authentication and tenant binding (ingest + query)
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -220,6 +220,24 @@ Scenario ids `RFC0026.<m>`.
   `ingest_denied` audit event (kind 8, `denied_token_name` column —
   §3.7 additive-OPTIONAL, schema pin updated) with a no-token-value
   sweep across every surface.
+
+### 5.2 Validation record (validated, 2026-07-07)
+
+Run: `scratch/validation/rfc0026-0027-validate.sh` — the release
+binary served over real sockets with a file config whose tokens
+resolve through `${env:…}` (RFC 0020), two tokens (tenant-bound +
+wildcard), both roles + MCP enabled. 16/16 checks pass:
+
+- **Ingest matrix** (OTLP/HTTP): no bearer 401, unknown bearer 401,
+  out-of-set tenant 403, in-set 200, wildcard-to-arbitrary-tenant 200.
+- **Query matrix**: no bearer 401, missing tenant 400 (valid bearer),
+  out-of-set 403, in-set 200.
+- **Denial audit**: the `ingest_denied` event is durable in the
+  store's audit Parquet (event-type string present in the flushed
+  files) after the cadence/shutdown flush.
+- **End-to-end data flow**: rows ingested under a valid token survive
+  a graceful restart (the RFC 0014 drain) and serve on both query
+  surfaces.
 
 ## 6. Testing strategy
 

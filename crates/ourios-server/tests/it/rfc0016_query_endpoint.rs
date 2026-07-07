@@ -108,6 +108,36 @@ fn widened(tenant: &str, template_id: u64, ts_ns: u64) -> AuditEvent {
     }
 }
 
+// ---- RFC 0027 equivalence-test seams (used by `rfc0027_mcp`) ----
+
+/// The RFC 0016 fixture window, shared with the MCP equivalence tests.
+pub(crate) const SHARED_HUGE_WINDOW: u64 = HUGE_WINDOW;
+
+/// Seed two `template_id == 1` records for tenant `acme` (the standard
+/// RFC 0016 fixture), for cross-surface equivalence assertions.
+pub(crate) fn seed_two_records(bucket: &Path) {
+    write_records(bucket, &[mined("acme", 1), mined("acme", 1)]);
+}
+
+/// Seed a widening audit event for `tenant` (template 5, v1→v2 at
+/// 2026-06-01T12:00:00Z) — enough for both the registry fold and a drift
+/// window to find.
+pub(crate) fn seed_template_audit(bucket: &Path, tenant: &str) {
+    let mut sink = ParquetAuditSink::new(Store::local(bucket).expect("store"));
+    sink.emit(widened(tenant, 5, 1_780_315_200_000_000_000));
+    assert_eq!(sink.write_failures(), 0, "audit fixture persisted");
+}
+
+/// The JSON API's answer for `body` — the equivalence oracle the MCP
+/// tools are asserted against.
+pub(crate) async fn post_for_equivalence(
+    bucket: &Path,
+    tenant: Option<&str>,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    post(bucket, tenant, "text/plain", body).await
+}
+
 /// `POST /v1/query` against `router`, optionally with an `X-Ourios-Tenant`
 /// header. Returns the status + the parsed JSON body.
 async fn post(

@@ -136,6 +136,10 @@ groups:
               value: "drift"
               stability: development
               brief: A template-drift query (`run_drift`).
+            - id: templates
+              value: "templates"
+              stability: development
+              brief: An RFC 0027 `list_templates` registry fold.
             - id: rejected
               value: "rejected"
               stability: development

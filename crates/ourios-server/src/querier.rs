@@ -56,10 +56,10 @@ const TENANT_HEADER: &str = "x-ourios-tenant";
 /// The endpoint returns rows by design, so an unbounded query is given this
 /// cap rather than a count-only result (RFC 0017 populates `records` only when
 /// the query has a limit).
-pub const DEFAULT_LIMIT: u64 = 1000;
+pub(crate) const DEFAULT_LIMIT: u64 = 1000;
 /// Hard cap on returned rows (RFC 0016 §7): a query's own `limit` is clamped to
 /// this so a client can't request an unbounded materialisation.
-pub const MAX_LIMIT: u64 = 10_000;
+pub(crate) const MAX_LIMIT: u64 = 10_000;
 /// Max request-body size (a DSL statement is small; cap it so an oversized body
 /// can't exhaust memory via the `Bytes` extractor — mirrors the receiver's
 /// `DefaultBodyLimit`).
@@ -114,8 +114,8 @@ impl QuerierHandle {
 }
 
 /// `ourios.query.kind` attribute values (RFC 0016 §3.6).
-const QUERY_KIND_LOGS: &str = "logs";
-const QUERY_KIND_DRIFT: &str = "drift";
+pub(crate) const QUERY_KIND_LOGS: &str = "logs";
+pub(crate) const QUERY_KIND_DRIFT: &str = "drift";
 /// The `ourios.query.kind` value for a request rejected before kind
 /// dispatch (RFC 0026 §3.4) — authn/authz answer before the body parse,
 /// so neither `logs` nor `drift` applies.
@@ -132,7 +132,7 @@ const ERROR_TYPE: &str = "error.type";
 /// histogram (by kind, and `error.type` on failure) and the scanned-vs-pruned
 /// row-group counter. Built against the global meter, so they resolve to
 /// whatever `MeterProvider` the process installed (RFC 0001 §6.8).
-struct QuerierMetrics {
+pub(crate) struct QuerierMetrics {
     duration: Histogram<f64>,
     row_groups: Counter<u64>,
 }
@@ -167,7 +167,7 @@ impl QuerierMetrics {
     /// Record a successful query: its wall-clock duration (by kind) and the
     /// scanned/pruned row-group split (the two states partition the candidates,
     /// so the B1 pruned fraction is derivable in the backend).
-    fn record_ok(&self, kind: &'static str, elapsed: Duration, stats: &QueryStats) {
+    pub(crate) fn record_ok(&self, kind: &'static str, elapsed: Duration, stats: &QueryStats) {
         self.duration.record(
             elapsed.as_secs_f64(),
             &[KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)],
@@ -183,7 +183,21 @@ impl QuerierMetrics {
     }
 
     /// Record a failed query: its duration, tagged with `error.type`.
-    fn record_err(&self, kind: &'static str, elapsed: Duration, error_type: &'static str) {
+    /// Record a stats-less operation's duration (the RFC 0027 registry
+    /// fold has no scan, so no row-group split to add).
+    pub(crate) fn record_duration(&self, kind: &'static str, elapsed: Duration) {
+        self.duration.record(
+            elapsed.as_secs_f64(),
+            &[KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)],
+        );
+    }
+
+    pub(crate) fn record_err(
+        &self,
+        kind: &'static str,
+        elapsed: Duration,
+        error_type: &'static str,
+    ) {
         self.duration.record(
             elapsed.as_secs_f64(),
             &[
@@ -251,14 +265,19 @@ fn router_from_querier(
         metrics: Arc::new(QuerierMetrics::new()),
         auth: auth.clone(),
     };
+    let mcp_querier = state.querier.clone();
+    let mcp_metrics = state.metrics.clone();
     let router = Router::new()
         .route("/v1/query", post(handle_query))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
     if mcp_enabled {
         // RFC 0027 §3.1: the MCP surface rides the same listener at
-        // `/mcp`, behind the same RFC 0026 gate.
-        router.nest("/mcp", crate::mcp::mcp_router(auth))
+        // `/mcp`, behind the same RFC 0026 gate, over the same engine.
+        router.nest(
+            "/mcp",
+            crate::mcp::mcp_router(mcp_querier, default_window_nanos, auth, mcp_metrics),
+        )
     } else {
         router
     }
@@ -424,7 +443,7 @@ async fn handle_query(
 
 /// The stable `error.type` token for a [`QueryError`] (RFC 0016 §3.6) — a low
 /// cardinality class, never the engine's detail (H6).
-fn query_error_type(error: &ourios_querier::QueryError) -> &'static str {
+pub(crate) fn query_error_type(error: &ourios_querier::QueryError) -> &'static str {
     use ourios_querier::QueryError;
     match error {
         QueryError::TenantRequired => "tenant_required",
@@ -481,7 +500,7 @@ fn parse_body(headers: &HeaderMap, body: &[u8]) -> Result<Statement, String> {
 /// §7): a query's own limit is clamped to `cap`; a query with none gets
 /// `default`. Normalizes to **exactly one** `Limit` stage so the engine returns
 /// rows.
-fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
+pub(crate) fn apply_limit(stages: &mut Vec<Stage>, default: u64, cap: u64) {
     // The compiler reads the *last* `Limit`. Normalize to exactly one — the
     // clamped last — keeping its position relative to the non-limit stages
     // (stage order is DSL pipeline semantics, RFC 0002) and dropping any
@@ -536,7 +555,7 @@ impl From<&QueryStats> for StatsDto {
 }
 
 #[derive(Serialize)]
-struct LogQueryResponse {
+pub(crate) struct LogQueryResponse {
     /// Total matching rows (the count) — unbounded by the `limit` (RFC 0017).
     rows: u64,
     stats: StatsDto,
@@ -665,7 +684,7 @@ impl From<&LogBody> for LogBodyDto {
 }
 
 #[derive(Serialize)]
-struct DriftResponse {
+pub(crate) struct DriftResponse {
     rows: Vec<DriftRowDto>,
     stats: StatsDto,
 }

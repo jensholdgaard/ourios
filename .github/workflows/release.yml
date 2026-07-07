@@ -400,6 +400,34 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  # Publish the Helm chart as an OCI artifact alongside the binaries
+  # (#364; the Artifact Hub prerequisite). Runs only on a real publish
+  # (same gate as `host`) and carries the chart's own Chart.yaml version
+  # — chart and server version independently by design.
+  publish-chart:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' }}
+    runs-on: "ubuntu-24.04"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Push the chart to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          helm package deploy/helm/ourios --destination /tmp/chart
+          helm push /tmp/chart/ourios-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
+
   announce:
     needs:
       - plan

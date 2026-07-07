@@ -740,6 +740,27 @@ impl Querier {
     /// # Errors
     ///
     /// See [`QueryError`].
+    /// Derive `tenant`'s template registry (RFC 0017 §3.2) — the
+    /// `(template_id, version) → tokens` fold of its audit stream — with
+    /// the blocking store reads offloaded like every other derivation.
+    /// The RFC 0027 `list_templates` tool serves this directly; the JSON
+    /// API consumes it internally via row rendering.
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::Storage`] as [`derive_template_registry`].
+    pub async fn template_registry(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<TemplateRegistry, QueryError> {
+        self.spawn_blocking_audit({
+            let backend = self.backend.clone();
+            let tenant = tenant.clone();
+            move || derive_template_registry(backend.store_ref(), &tenant)
+        })
+        .await
+    }
+
     pub async fn run_drift(
         &self,
         query: &dsl::DriftQuery,

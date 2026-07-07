@@ -75,6 +75,11 @@ async fn rfc0029_1_startup_configuration_errors() {
 /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
 #[tokio::test]
 async fn rfc0029_1_oidc_only_starts_and_enforces() {
+    // The querier role resolves OIDC at startup now (the binding slice),
+    // so an oidc-only config needs a reachable issuer: the loopback
+    // fixture (discovery + JWKS), same as the receiver arms.
+    let (_, jwk) = ingest_binding::make_key("key-1");
+    let issuer = ingest_binding::serve_issuer(jwk).await;
     let tmp = tempfile::TempDir::new().expect("temp");
     let config_path = tmp.path().join("ourios.yaml");
     let mut file = std::fs::File::create(&config_path).expect("create config");
@@ -82,8 +87,9 @@ async fn rfc0029_1_oidc_only_starts_and_enforces() {
         file,
         "storage:\n  local:\n    bucket_root: {}\n\
          querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n\
-         auth:\n  oidc:\n    issuer: https://dex.internal.example\n    audience: ourios\n    tenant_claim: ourios_tenants\n",
+         auth:\n  oidc:\n    issuer: {}\n    audience: ourios\n    tenant_claim: ourios_tenants\n",
         tmp.path().display(),
+        issuer,
     )
     .expect("write config");
 
@@ -161,66 +167,14 @@ async fn rfc0029_1_oidc_only_starts_and_enforces() {
 /// Scenario RFC0029.2 — verification matrix.
 /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
 #[test]
-#[ignore = "RFC0029.2 stub — implemented in the verifier green slice"]
-fn rfc0029_2_verification_matrix() {
-    todo!(
-        "RFC0029.2 — fixture-issuer valid token accepted; expired / \
-         nbf-beyond-skew / wrong-aud / wrong-iss / bad-sig / alg:none \
-         / HMAC-downgrade / non-JWT all one undifferentiated 401 \
-         before wire decode, nothing reaching the WAL"
-    );
-}
-
-/// Scenario RFC0029.3 — claim binding drives unchanged enforcement.
-/// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
-#[test]
-#[ignore = "RFC0029.3 stub — implemented in the binding green slice"]
-fn rfc0029_3_claim_binding_enforcement() {
-    todo!(
-        "RFC0029.3 — tenant_claim [a, b]: RFC 0026 §5.3/§5.4 verbatim \
-         with the OIDC-resolved binding — in-set ingest acks, any \
-         out-of-set batch whole-batch 403 with no WAL append, \
-         401→400→403 on query + MCP, name_claim as the name label"
-    );
-}
-
-/// Scenario RFC0029.4 — wildcard claim.
-/// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
-#[test]
-#[ignore = "RFC0029.4 stub — implemented in the binding green slice"]
-fn rfc0029_4_wildcard_claim() {
-    todo!(
-        "RFC0029.4 — tenant_claim [\"*\"]: ingest and query to \
-         arbitrary tenants as if every tenant were listed \
-         (RFC 0026 §5.5 parity)"
-    );
-}
-
-/// Scenario RFC0029.5 — coexistence and resolution order.
-/// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
-#[test]
-#[ignore = "RFC0029.5 stub — implemented in the binding green slice"]
-fn rfc0029_5_coexistence_and_resolution_order() {
-    todo!(
-        "RFC0029.5 — static + oidc side by side, each with its own \
-         binding; static-only and oidc-only both serve; no auth \
-         section passes the RFC 0026 §5.6 open-mode parity arm \
-         unchanged"
-    );
-}
+#[ignore = "RFC0029.2 discharged — `ourios_core::auth::oidc::tests::rfc0029_2_verification_matrix` is the oracle (every arm, one undifferentiated None); the pre-decode/nothing-reaches-the-WAL half is the served ingest_binding arm here"]
+fn rfc0029_2_verification_matrix() {}
 
 /// Scenario RFC0029.6 — JWKS rotation.
 /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
 #[test]
-#[ignore = "RFC0029.6 stub — implemented in the verifier green slice"]
-fn rfc0029_6_jwks_rotation() {
-    todo!(
-        "RFC0029.6 — issuer rotates mid-run: unseen kid triggers a \
-         JWKS re-fetch and the new-key token verifies without \
-         restart; the withdrawn key's tokens are rejected once the \
-         refreshed set drops it"
-    );
-}
+#[ignore = "RFC0029.6 discharged — `ourios_core::auth::oidc::tests::rfc0029_6_jwks_rotation` is the oracle (unseen-kid refetch under the real throttle; withdrawn-kid rejection)"]
+fn rfc0029_6_jwks_rotation() {}
 
 /// Scenario RFC0029.7 — Dex end-to-end with telemetry parity.
 /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
@@ -261,7 +215,7 @@ mod ingest_binding {
     use tokio::time::timeout;
 
     /// A fresh ES256 keypair (runtime-generated) and its public JWK.
-    fn make_key(kid: &str) -> (EncodingKey, serde_json::Value) {
+    pub(super) fn make_key(kid: &str) -> (EncodingKey, serde_json::Value) {
         let signing = SigningKey::random(&mut rand::rngs::OsRng);
         let pem = signing
             .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
@@ -277,7 +231,7 @@ mod ingest_binding {
     }
 
     /// A loopback issuer serving discovery + a fixed JWKS.
-    async fn serve_issuer(jwk: serde_json::Value) -> String {
+    pub(super) async fn serve_issuer(jwk: serde_json::Value) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture issuer");
@@ -311,7 +265,12 @@ mod ingest_binding {
         issuer
     }
 
-    fn mint(encoding: &EncodingKey, kid: &str, issuer: &str, tenants: &[&str]) -> String {
+    pub(super) fn mint(
+        encoding: &EncodingKey,
+        kid: &str,
+        issuer: &str,
+        tenants: &[&str],
+    ) -> String {
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -329,7 +288,7 @@ mod ingest_binding {
     }
 
     /// One `ResourceLogs` batch whose tenant derives from `service.name`.
-    fn batch(tenant: &str) -> ExportLogsServiceRequest {
+    pub(super) fn batch(tenant: &str) -> ExportLogsServiceRequest {
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
@@ -528,5 +487,293 @@ mod ingest_binding {
             stderr.contains("auth.oidc"),
             "names the failing key: {stderr}"
         );
+    }
+}
+
+// --- RFC 0029 §5 .3/.4/.5 — the query/MCP binding slice: the OIDC-resolved
+// binding drives the RFC 0026 contracts verbatim on the served binary.
+
+mod claim_binding {
+    use std::io::Write as _;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+    use tokio::time::timeout;
+
+    use super::ingest_binding::{batch, make_key, mint, serve_issuer};
+
+    /// Spawn the binary with receiver+querier and the given `auth` YAML
+    /// block; return (child, grpc, http-receiver, http-querier).
+    async fn spawn_with_auth(
+        tmp: &tempfile::TempDir,
+        auth_yaml: &str,
+        envs: &[(&str, &str)],
+    ) -> (tokio::process::Child, String, String, std::net::SocketAddr) {
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(&wal).expect("wal dir");
+        let config_path = tmp.path().join("ourios.yaml");
+        let mut file = std::fs::File::create(&config_path).expect("create config");
+        write!(
+            file,
+            "storage:\n  local:\n    bucket_root: {}\n\
+             receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
+             querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n\
+             {auth_yaml}",
+            tmp.path().display(),
+            wal.display(),
+        )
+        .expect("write config");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ourios-server"));
+        command
+            .arg("--config")
+            .arg(&config_path)
+            .env("RUST_LOG", "info")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn ourios-server");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let mut out_lines = BufReader::new(stdout).lines();
+        let (grpc, http, querier) = timeout(Duration::from_secs(15), async {
+            let (mut g, mut h, mut q) = (None, None, None);
+            while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+                if let Some(a) = line.strip_prefix("receiver gRPC listening on ") {
+                    g = Some(a.trim().to_string());
+                }
+                if let Some(a) = line.strip_prefix("receiver HTTP listening on ") {
+                    h = Some(a.trim().to_string());
+                }
+                if let Some(a) = line.strip_prefix("querier HTTP listening on ") {
+                    q = Some(a.trim().parse().expect("addr"));
+                }
+                if let (Some(g), Some(h), Some(q)) = (&g, &h, &q) {
+                    return (g.clone(), h.clone(), *q);
+                }
+            }
+            panic!("role announcements never appeared");
+        })
+        .await
+        .expect("server ready before timeout");
+        (child, grpc, http, querier)
+    }
+
+    /// Raw `POST /v1/query` with optional bearer + tenant headers; returns
+    /// the status line.
+    async fn query_status(
+        addr: std::net::SocketAddr,
+        bearer: Option<&str>,
+        tenant: Option<&str>,
+    ) -> String {
+        use std::fmt::Write as _;
+        let mut request = String::from("POST /v1/query HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        if let Some(b) = bearer {
+            write!(request, "Authorization: Bearer {b}\r\n").expect("write header");
+        }
+        if let Some(t) = tenant {
+            write!(request, "x-ourios-tenant: {t}\r\n").expect("write header");
+        }
+        request.push_str(
+            "Content-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\ntemplate_id == 1",
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        timeout(
+            Duration::from_secs(15),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("response before timeout")
+        .expect("read");
+        response.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// Scenario RFC0029.3 — claim binding drives unchanged enforcement:
+    /// with `tenant_claim` = `["a", "b"]`, the RFC 0026 §5.3/§5.4
+    /// contracts hold verbatim with the OIDC-resolved binding — in-set
+    /// ingest acks, out-of-set is whole-batch denied before the WAL, and
+    /// the query surface enforces 401 → 400 → 403 in order. (The
+    /// `name_claim` → name-label arm is the resolver's one-line mapping,
+    /// pinned by the core verifier tests.)
+    /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc0029_3_claim_binding_enforcement() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+        let (encoding, jwk) = make_key("key-1");
+        let issuer = serve_issuer(jwk).await;
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let auth = format!(
+            "auth:\n  oidc:\n    issuer: {issuer}\n    audience: ourios\n    tenant_claim: ourios_tenants\n"
+        );
+        let (mut child, grpc, _http, querier) = spawn_with_auth(&tmp, &auth, &[]).await;
+
+        let token = mint(&encoding, "key-1", &issuer, &["a", "b"]);
+
+        // Ingest: in-set acks; out-of-set is whole-batch denied.
+        let mut client = LogsServiceClient::connect(format!("http://{grpc}"))
+            .await
+            .expect("grpc connect");
+        let authorization: tonic::metadata::MetadataValue<_> =
+            format!("Bearer {token}").parse().expect("metadata");
+        let mut request = tonic::Request::new(batch("b"));
+        request
+            .metadata_mut()
+            .insert("authorization", authorization.clone());
+        client.export(request).await.expect("in-set batch acks");
+        let mut request = tonic::Request::new(batch("c"));
+        request
+            .metadata_mut()
+            .insert("authorization", authorization);
+        let status = client
+            .export(request)
+            .await
+            .expect_err("out-of-set tenant is denied");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+        // Query: 401 (no bearer) → 400 (bearer, no tenant) → 403
+        // (bearer, out-of-set tenant) → 200 (in-set).
+        assert!(
+            query_status(querier, None, Some("a")).await.contains("401"),
+            "authentication answers first"
+        );
+        assert!(
+            query_status(querier, Some(&token), None)
+                .await
+                .contains("400"),
+            "then the tenant contract"
+        );
+        assert!(
+            query_status(querier, Some(&token), Some("c"))
+                .await
+                .contains("403"),
+            "then the binding"
+        );
+        assert!(
+            query_status(querier, Some(&token), Some("a"))
+                .await
+                .contains("200"),
+            "in-set queries serve"
+        );
+
+        child.kill().await.expect("kill the server");
+    }
+
+    /// Scenario RFC0029.4 — wildcard claim: `["*"]` behaves as if every
+    /// tenant were listed (RFC 0026 §5.5 parity) on ingest and query.
+    /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc0029_4_wildcard_claim() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+        let (encoding, jwk) = make_key("key-1");
+        let issuer = serve_issuer(jwk).await;
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let auth = format!(
+            "auth:\n  oidc:\n    issuer: {issuer}\n    audience: ourios\n    tenant_claim: ourios_tenants\n"
+        );
+        let (mut child, grpc, _http, querier) = spawn_with_auth(&tmp, &auth, &[]).await;
+
+        let token = mint(&encoding, "key-1", &issuer, &["*"]);
+        let mut client = LogsServiceClient::connect(format!("http://{grpc}"))
+            .await
+            .expect("grpc connect");
+        for tenant in ["alpha", "beta", "entirely-new-tenant"] {
+            let authorization: tonic::metadata::MetadataValue<_> =
+                format!("Bearer {token}").parse().expect("metadata");
+            let mut request = tonic::Request::new(batch(tenant));
+            request
+                .metadata_mut()
+                .insert("authorization", authorization);
+            client
+                .export(request)
+                .await
+                .unwrap_or_else(|e| panic!("wildcard ingests {tenant}: {e}"));
+            assert!(
+                query_status(querier, Some(&token), Some(tenant))
+                    .await
+                    .contains("200"),
+                "wildcard queries {tenant}"
+            );
+        }
+        child.kill().await.expect("kill the server");
+    }
+
+    /// Scenario RFC0029.5 — coexistence and resolution order: one config
+    /// with both `tokens` and `oidc`; a static bearer and a JWT each
+    /// authenticate via their own path, carrying their own binding. (The
+    /// static-only serving arm is the RFC 0026 suite; the oidc-only arm is
+    /// `rfc0029_1_oidc_only_starts_and_enforces`; the no-`auth` open-mode
+    /// parity arm is `rfc0026_6_open_mode_parity` — all unchanged.)
+    /// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc0029_5_coexistence_and_resolution_order() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+
+        let (encoding, jwk) = make_key("key-1");
+        let issuer = serve_issuer(jwk).await;
+        let tmp = tempfile::TempDir::new().expect("temp");
+        // RFC 0026 §3.1 secret hygiene: the static token must be an
+        // ${env:…} reference, resolved from the child's environment.
+        let auth = format!(
+            "auth:\n  tokens:\n    - name: edge-collector\n      token: ${{env:EDGE_TOK}}\n      tenants: [acme]\n\
+             \x20\x20oidc:\n    issuer: {issuer}\n    audience: ourios\n    tenant_claim: ourios_tenants\n"
+        );
+        let (mut child, grpc, _http, querier) =
+            spawn_with_auth(&tmp, &auth, &[("EDGE_TOK", "tok-edge")]).await;
+
+        let jwt = mint(&encoding, "key-1", &issuer, &["globex"]);
+        let mut client = LogsServiceClient::connect(format!("http://{grpc}"))
+            .await
+            .expect("grpc connect");
+
+        // Each credential authenticates via its own path, each with its
+        // own binding: the static token speaks for acme only, the JWT for
+        // globex only — in-set acks, cross-binding denies.
+        for (label, bearer, in_set, out_of_set) in [
+            ("static", "tok-edge".to_string(), "acme", "globex"),
+            ("oidc", jwt.clone(), "globex", "acme"),
+        ] {
+            let authorization: tonic::metadata::MetadataValue<_> =
+                format!("Bearer {bearer}").parse().expect("metadata");
+            let mut request = tonic::Request::new(batch(in_set));
+            request
+                .metadata_mut()
+                .insert("authorization", authorization.clone());
+            client
+                .export(request)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: in-set batch acks: {e}"));
+            let mut request = tonic::Request::new(batch(out_of_set));
+            request
+                .metadata_mut()
+                .insert("authorization", authorization);
+            let status = client
+                .export(request)
+                .await
+                .expect_err("cross-binding tenant is denied");
+            assert_eq!(status.code(), tonic::Code::PermissionDenied, "{label}");
+        }
+
+        // And side by side on the query surface.
+        assert!(
+            query_status(querier, Some("tok-edge"), Some("acme"))
+                .await
+                .contains("200"),
+            "static binding queries acme"
+        );
+        assert!(
+            query_status(querier, Some(&jwt), Some("globex"))
+                .await
+                .contains("200"),
+            "oidc binding queries globex"
+        );
+
+        child.kill().await.expect("kill the server");
     }
 }

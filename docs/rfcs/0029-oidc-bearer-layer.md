@@ -186,10 +186,10 @@ auth:
 
 ## 5. Acceptance criteria
 
-Scenario ids `RFC0029.<m>`. Scenarios .1–.6 run against a fixture
-issuer (a local keypair serving discovery + JWKS over a loopback
-listener — fast, deterministic, no container); .7 is the real-Dex
-acceptance arm.
+Scenario ids `RFC0029.<m>`. Scenario .1 is pure config resolution
+(no issuer); .2–.6 run against a fixture issuer (a local keypair
+serving discovery + JWKS over a loopback listener — fast,
+deterministic, no container); .7 is the real-Dex acceptance arm.
 
 > **Scenario RFC0029.1 — config resolution.** Given a config with an
 > `auth.oidc` section whose values use `${env:VAR}`, When the server

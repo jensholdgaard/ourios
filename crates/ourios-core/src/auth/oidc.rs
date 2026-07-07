@@ -29,21 +29,32 @@ use super::{OidcConfig, TenantSet};
 /// The §3.2 asymmetric allow-list. `alg: none` and every HMAC variant are
 /// outside this set and therefore unverifiable, whatever a token's header
 /// claims.
-const ALLOWED_ALGORITHMS: [Algorithm; 6] = [
+const ALLOWED_ALGORITHMS: [Algorithm; 8] = [
     Algorithm::RS256,
     Algorithm::RS384,
     Algorithm::RS512,
     Algorithm::ES256,
+    // ES512 is not in `jsonwebtoken`'s Algorithm set.
     Algorithm::ES384,
-    // ES512 is not in `jsonwebtoken`'s Algorithm set; PS* completes the
-    // RSA family.
+    // PS256/384/512 complete the RSA family.
     Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
 ];
 
 /// Unseen-`kid` refresh throttle: a burst of unknown-`kid` tokens (a
 /// probing client, or the window right after a rotation) collapses to one
 /// JWKS fetch per interval rather than one per request.
 const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One decode attempt against the current key cache. `UnknownKid` is the
+/// only outcome that may trigger a (throttled) JWKS refetch — the §3.2
+/// rotation path; everything else is a terminal rejection.
+enum DecodeAttempt {
+    Verified(serde_json::Map<String, serde_json::Value>),
+    UnknownKid,
+    Rejected,
+}
 
 /// The verified identity a token resolves to: the RFC 0026 binding shape,
 /// derived from the configured claims' **values** (RFC 0029 §3.2).
@@ -142,7 +153,15 @@ impl OidcVerifier {
             http,
             jwks_uri: document.jwks_uri,
             keys: RwLock::new(keys),
-            last_refresh: RwLock::new(Instant::now()),
+            // Backdated one interval so the FIRST unseen-kid miss can
+            // refresh immediately — the throttle bounds the gap *between*
+            // refreshes, not the time to the first one (a rotation just
+            // before startup must not eat a 401 window).
+            last_refresh: RwLock::new(
+                Instant::now()
+                    .checked_sub(REFRESH_MIN_INTERVAL)
+                    .unwrap_or_else(Instant::now),
+            ),
             refresh_min_interval: REFRESH_MIN_INTERVAL,
         })
     }
@@ -162,32 +181,38 @@ impl OidcVerifier {
         }
         let kid = header.kid?;
 
-        let claims = if let Some(claims) = self.try_decode(token, &kid, header.alg).await {
-            claims
-        } else {
-            // Unseen kid (or a key swap): refresh once, throttled, and
-            // retry — the §3.2 rotation path.
-            self.refresh_keys().await?;
-            self.try_decode(token, &kid, header.alg).await?
+        let claims = match self.try_decode(token, &kid, header.alg).await {
+            DecodeAttempt::Verified(claims) => claims,
+            DecodeAttempt::UnknownKid => {
+                // Unseen kid: refresh once, throttled, and retry — the §3.2
+                // rotation path. Only a key miss refetches: any other
+                // failure is terminal, because a refetch cannot make an
+                // invalid token valid and invalid tokens must not be able
+                // to drive issuer traffic.
+                self.refresh_keys().await?;
+                match self.try_decode(token, &kid, header.alg).await {
+                    DecodeAttempt::Verified(claims) => claims,
+                    _ => return None,
+                }
+            }
+            DecodeAttempt::Rejected => return None,
         };
         self.resolve_identity(&claims)
     }
 
-    /// Decode + validate against the currently cached key for `kid`.
-    /// `None` on an unknown kid, an alg/key family mismatch, or any
-    /// validation failure.
-    async fn try_decode(
-        &self,
-        token: &str,
-        kid: &str,
-        token_alg: Algorithm,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    /// Decode + validate against the currently cached key for `kid`,
+    /// distinguishing the one outcome that may refetch (an unknown `kid`)
+    /// from terminal rejections (alg/key family mismatch, any validation
+    /// failure).
+    async fn try_decode(&self, token: &str, kid: &str, token_alg: Algorithm) -> DecodeAttempt {
         let keys = self.keys.read().await;
-        let cached = keys.get(kid)?;
+        let Some(cached) = keys.get(kid) else {
+            return DecodeAttempt::UnknownKid;
+        };
         // The token's header must claim the key's own algorithm — a header
         // is never allowed to re-type a key (the downgrade shape).
         if cached.algorithm != token_alg {
-            return None;
+            return DecodeAttempt::Rejected;
         }
         let mut validation = Validation::new(cached.algorithm);
         validation.set_issuer(&[self.config.issuer()]);
@@ -198,9 +223,11 @@ impl OidcVerifier {
         // are required above).
         validation.validate_nbf = true;
         validation.leeway = self.config.clock_skew_secs();
-        decode::<serde_json::Map<String, serde_json::Value>>(token, &cached.key, &validation)
-            .ok()
-            .map(|data| data.claims)
+        match decode::<serde_json::Map<String, serde_json::Value>>(token, &cached.key, &validation)
+        {
+            Ok(data) => DecodeAttempt::Verified(data.claims),
+            Err(_) => DecodeAttempt::Rejected,
+        }
     }
 
     /// Map the configured claims' values onto the binding shape. `None`
@@ -286,6 +313,8 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
                 Some(jsonwebtoken::jwk::KeyAlgorithm::RS384) => Algorithm::RS384,
                 Some(jsonwebtoken::jwk::KeyAlgorithm::RS512) => Algorithm::RS512,
                 Some(jsonwebtoken::jwk::KeyAlgorithm::PS256) => Algorithm::PS256,
+                Some(jsonwebtoken::jwk::KeyAlgorithm::PS384) => Algorithm::PS384,
+                Some(jsonwebtoken::jwk::KeyAlgorithm::PS512) => Algorithm::PS512,
                 _ => Algorithm::RS256,
             },
             AlgorithmParameters::EllipticCurve(ec) => match ec.curve {
@@ -323,6 +352,7 @@ fn validate_tenant_list(tenants: &[String]) -> Option<TenantSet> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock as StdRwLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -358,15 +388,20 @@ mod tests {
     }
 
     /// A loopback issuer serving discovery + a swappable JWKS — the §6
-    /// fixture-issuer tier (no container).
-    async fn serve_issuer(jwks: Arc<StdRwLock<Value>>) -> String {
+    /// fixture-issuer tier (no container). Returns the issuer URL and a
+    /// counter of `/jwks` fetches (construction is fetch #1), so tests can
+    /// assert exactly when the verifier goes back to the issuer.
+    async fn serve_issuer(jwks: Arc<StdRwLock<Value>>) -> (String, Arc<AtomicUsize>) {
         serve_issuer_claiming(None, jwks).await
     }
 
     /// The fixture, optionally publishing a discovery document that names
     /// a *different* issuer than the one it serves under (the §3.2
     /// mismatch arm).
-    async fn serve_issuer_claiming(claimed: Option<&str>, jwks: Arc<StdRwLock<Value>>) -> String {
+    async fn serve_issuer_claiming(
+        claimed: Option<&str>,
+        jwks: Arc<StdRwLock<Value>>,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fixture issuer");
@@ -375,26 +410,28 @@ mod tests {
             "issuer": claimed.unwrap_or(&issuer),
             "jwks_uri": format!("{issuer}/jwks"),
         });
+        let jwks_hits = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
             .route(
                 "/.well-known/openid-configuration",
-                get(|State((discovery, _)): DiscState| async move { Json(discovery) }),
+                get(|State((discovery, _, _)): DiscState| async move { Json(discovery) }),
             )
             .route(
                 "/jwks",
-                get(|State((_, jwks)): DiscState| async move {
+                get(|State((_, jwks, hits)): DiscState| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
                     let current = jwks.read().expect("jwks lock").clone();
                     Json(current)
                 }),
             )
-            .with_state((discovery, jwks));
+            .with_state((discovery, jwks, Arc::clone(&jwks_hits)));
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve issuer");
         });
-        issuer
+        (issuer, jwks_hits)
     }
 
-    type DiscState = State<(Value, Arc<StdRwLock<Value>>)>;
+    type DiscState = State<(Value, Arc<StdRwLock<Value>>, Arc<AtomicUsize>)>;
 
     fn now_secs() -> i64 {
         i64::try_from(
@@ -439,7 +476,7 @@ mod tests {
     async fn rfc0029_2_verification_matrix() {
         let (encoding, jwk) = make_key("key-1");
         let jwks = Arc::new(StdRwLock::new(json!({ "keys": [jwk] })));
-        let issuer = serve_issuer(jwks).await;
+        let (issuer, jwks_hits) = serve_issuer(jwks).await;
         let verifier = OidcVerifier::discover(config_for(&issuer))
             .await
             .expect("discover");
@@ -542,6 +579,16 @@ mod tests {
             "an identity the audit surface cannot label is not an identity"
         );
 
+        // None of the rejections above may drive issuer traffic: every arm
+        // used a cached kid (or died before key lookup), so the only JWKS
+        // fetch on record is construction's. Only an unknown kid refetches
+        // (the rotation test's territory).
+        assert_eq!(
+            jwks_hits.load(Ordering::SeqCst),
+            1,
+            "invalid tokens must not trigger JWKS refetches"
+        );
+
         // Wildcard resolves to the RFC 0026 all-tenants set.
         let mut wildcard = claims(&issuer);
         wildcard["ourios_tenants"] = json!(["*"]);
@@ -560,13 +607,15 @@ mod tests {
     async fn rfc0029_6_jwks_rotation() {
         let (old_encoding, old_jwk) = make_key("key-old");
         let jwks = Arc::new(StdRwLock::new(json!({ "keys": [old_jwk] })));
-        let issuer = serve_issuer(Arc::clone(&jwks)).await;
-        let mut verifier = OidcVerifier::discover(config_for(&issuer))
+        let (issuer, _) = serve_issuer(Arc::clone(&jwks)).await;
+        let verifier = OidcVerifier::discover(config_for(&issuer))
             .await
             .expect("discover");
-        // The production throttle is real time; the test injects zero so
-        // rotation is immediate rather than a 5-second sleep.
-        verifier.refresh_min_interval = Duration::ZERO;
+        // No throttle injection: `last_refresh` is backdated at
+        // construction, so the FIRST unseen-kid miss refreshes under the
+        // real production interval — this test proves that. (The later
+        // withdrawn-key arm is then throttled, and rejects via the
+        // unknown-kid path without a refetch, which is also correct.)
 
         let old_token = mint(&old_encoding, "key-old", &claims(&issuer));
         assert!(
@@ -596,18 +645,23 @@ mod tests {
     async fn discovery_rejects_issuer_mismatch_and_unusable_jwks() {
         let (_, jwk) = make_key("key-1");
         let jwks = Arc::new(StdRwLock::new(json!({ "keys": [jwk] })));
-        let issuer = serve_issuer(jwks).await;
+        let (issuer, _) = serve_issuer(jwks).await;
 
+        // A just-closed loopback port: immediate connection-refused, no
+        // DNS or egress dependency (CI runs with restricted networks).
+        let unreachable = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            format!("http://{}", l.local_addr().expect("addr"))
+        };
         let mut config = OidcSpec {
-            issuer: Some("https://somewhere-else.example".to_string()),
+            issuer: Some(unreachable),
             audience: Some("ourios".to_string()),
             tenant_claim: Some("ourios_tenants".to_string()),
             name_claim: None,
             clock_skew_secs: None,
         };
-        // Point the config at the fixture's address under a different
-        // issuer name: unreachable → fetch error, which also covers the
-        // unreachable-issuer startup arm.
         let err = OidcVerifier::discover(build_oidc_config(&config).expect("valid"))
             .await
             .expect_err("unreachable issuer fails startup");
@@ -615,7 +669,7 @@ mod tests {
 
         config.issuer = Some(issuer.clone());
         let empty = Arc::new(StdRwLock::new(json!({ "keys": [] })));
-        let empty_issuer = serve_issuer(empty).await;
+        let (empty_issuer, _) = serve_issuer(empty).await;
         config.issuer = Some(empty_issuer);
         let err = OidcVerifier::discover(build_oidc_config(&config).expect("valid"))
             .await
@@ -628,7 +682,7 @@ mod tests {
         // verifies.
         let (_, jwk) = make_key("key-1");
         let lying = Arc::new(StdRwLock::new(json!({ "keys": [jwk] })));
-        let lying_issuer =
+        let (lying_issuer, _) =
             serve_issuer_claiming(Some("https://somewhere-else.example"), lying).await;
         config.issuer = Some(lying_issuer);
         let err = OidcVerifier::discover(build_oidc_config(&config).expect("valid"))

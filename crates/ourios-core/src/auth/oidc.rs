@@ -367,7 +367,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::{OidcSpec, TenantSet, build_oidc_config};
-    use super::{Duration, OidcVerifier};
+    use super::OidcVerifier;
 
     /// One fixture signing key: the private half for minting, the public
     /// half as a JWK. Generated at test runtime — no committed key

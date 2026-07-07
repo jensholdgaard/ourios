@@ -30,8 +30,9 @@ ignore = [
     # verifier (jsonwebtoken's rust_crypto backend, `oidc` feature) only
     # verifies signatures against the issuer's *public* JWKS keys, and the
     # ourios-core dev-dependency only generates throwaway per-test-process
-    # fixture keys that never leave the test. No token is ever signed and no
-    # RSA private key exists in production. Re-evaluate if we ever sign
+    # fixture keys (tests DO sign with those, locally and ephemerally). In
+    # production no token is ever signed and no RSA private key exists —
+    # the timing side-channel has nothing to leak. Re-evaluate if we ever sign
     # (issuer-side) rather than verify, or when the constant-time rewrite
     # ships upstream.
     "RUSTSEC-2023-0071",

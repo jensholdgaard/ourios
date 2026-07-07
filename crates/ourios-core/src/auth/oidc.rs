@@ -293,22 +293,38 @@ impl OidcVerifier {
     }
 }
 
-/// GET + JSON-decode one document, with a bounded timeout.
+/// Documents the verifier fetches (discovery, JWKS) are a few KiB in
+/// practice; anything past this is a misconfigured or hostile issuer, and
+/// the fetch fails rather than buffering it.
+const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+/// GET + JSON-decode one document, with a bounded timeout and a bounded
+/// body size (streamed via `chunk`, so an oversized response is rejected
+/// without ever being fully buffered).
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<T, DiscoveryError> {
-    let response = http
+    let mut response = http
         .get(url)
         .timeout(Duration::from_secs(10))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| DiscoveryError(format!("fetch {url}: {e}")))?;
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| DiscoveryError(format!("read {url}: {e}")))?;
+        .map_err(|e| DiscoveryError(format!("read {url}: {e}")))?
+    {
+        if bytes.len() + chunk.len() > MAX_DOCUMENT_BYTES {
+            return Err(DiscoveryError(format!(
+                "read {url}: response exceeds the {MAX_DOCUMENT_BYTES}-byte document bound"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     serde_json::from_slice(&bytes).map_err(|e| DiscoveryError(format!("decode {url}: {e}")))
 }
 
@@ -760,6 +776,27 @@ mod tests {
             verifier.verify(&cross).await.is_none(),
             "a header must not re-type an RSA key into the EC family"
         );
+    }
+
+    /// An issuer returning an oversized document fails discovery at the
+    /// byte bound instead of buffering it.
+    #[tokio::test]
+    async fn oversized_discovery_document_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let issuer = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            get(|| async { "x".repeat(2 * 1024 * 1024) }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let err = OidcVerifier::discover(config_for(&issuer))
+            .await
+            .expect_err("an oversized document fails startup");
+        assert!(err.to_string().contains("document bound"), "{err}");
     }
 
     /// A refresh that fetches an *empty* usable-key set retains the

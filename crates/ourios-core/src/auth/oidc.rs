@@ -322,6 +322,19 @@ fn cache_keys(jwks: &JwkSet) -> HashMap<String, CachedKey> {
         let Some(kid) = jwk.common.key_id.clone() else {
             continue;
         };
+        // RFC 7517 usage gating: a key declaring itself for encryption
+        // (`use: "enc"`) or whose `key_ops` omit `verify` is not a
+        // signature-verification key — never cache it, whatever its shape.
+        // Absent fields impose no restriction (the common issuer shape).
+        match &jwk.common.public_key_use {
+            None | Some(jsonwebtoken::jwk::PublicKeyUse::Signature) => {}
+            Some(_) => continue,
+        }
+        if let Some(ops) = &jwk.common.key_operations
+            && !ops.contains(&jsonwebtoken::jwk::KeyOperations::Verify)
+        {
+            continue;
+        }
         let allowed: Vec<Algorithm> = match &jwk.algorithm {
             AlgorithmParameters::RSA(_) => match jwk.common.key_algorithm {
                 // Explicit `alg` pins exactly that algorithm.
@@ -431,8 +444,8 @@ mod tests {
 
     /// The RSA-family fixture key, generated once per test process (no
     /// committed private-key fixtures for scanners to flag — same policy
-    /// as the P-256 fixture). 1024-bit keeps unoptimized keygen fast; the
-    /// tests exercise signature *shape*, not strength. Its JWK
+    /// as the P-256 fixture). 2048-bit — PS512's PSS salt+hash needs more
+    /// than 1024 bits — generated once per process to bound the cost. Its JWK
     /// deliberately omits `alg`: the shape issuers commonly publish,
     /// which must pin the whole RSA family rather than defaulting to
     /// RS256.
@@ -440,7 +453,7 @@ mod tests {
         use rsa::traits::PublicKeyParts;
         static KEY: std::sync::OnceLock<(String, Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
         let (pem, n, e) = KEY.get_or_init(|| {
-            let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).expect("rsa keygen");
+            let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("rsa keygen");
             let pem = rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&key, rsa::pkcs8::LineEnding::LF)
                 .expect("pkcs8 pem")
                 .to_string();
@@ -723,6 +736,9 @@ mod tests {
             super::Algorithm::RS256,
             super::Algorithm::RS384,
             super::Algorithm::RS512,
+            super::Algorithm::PS256,
+            super::Algorithm::PS384,
+            super::Algorithm::PS512,
         ] {
             let mut header = Header::new(alg);
             header.kid = Some("key-rsa".to_string());
@@ -777,6 +793,27 @@ mod tests {
         );
     }
 
+    /// RFC 7517 usage gating: `use: "enc"` and `key_ops` without
+    /// `verify` never cache; `use: "sig"` (the fixture default) does.
+    #[test]
+    fn non_verification_jwks_are_skipped() {
+        let (_, mut enc_use) = make_key("key-enc");
+        enc_use["use"] = json!("enc");
+        let set: super::JwkSet =
+            serde_json::from_value(json!({ "keys": [enc_use] })).expect("jwk set");
+        assert!(super::cache_keys(&set).is_empty(), "use: enc must skip");
+
+        let (_, mut no_verify) = make_key("key-ops");
+        no_verify.as_object_mut().expect("map").remove("use");
+        no_verify["key_ops"] = json!(["sign"]);
+        let set: super::JwkSet =
+            serde_json::from_value(json!({ "keys": [no_verify] })).expect("jwk set");
+        assert!(
+            super::cache_keys(&set).is_empty(),
+            "key_ops without verify must skip"
+        );
+    }
+
     /// An EC JWK whose explicit `alg` disagrees with its curve is
     /// malformed and skipped (the curve is authoritative); an agreeing
     /// `alg` caches normally.
@@ -825,7 +862,6 @@ mod tests {
             .expect_err("unreachable issuer fails startup");
         assert!(err.to_string().contains("fetch"), "{err}");
 
-        config.issuer = Some(issuer.clone());
         let empty = Arc::new(StdRwLock::new(json!({ "keys": [] })));
         let (empty_issuer, _) = serve_issuer(empty).await;
         config.issuer = Some(empty_issuer);

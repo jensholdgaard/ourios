@@ -1,7 +1,7 @@
 ---
 rfc: 0029
 title: OIDC bearer layer (issuer-agnostic, Dex-validated)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-07
@@ -264,7 +264,17 @@ Unit level: .1 is pure config resolution (no issuer at all); the
 §5 fixture issuer (local keypair) covers .2–.6 — fast,
 deterministic, no container. Acceptance level: the real-Dex
 testcontainers job (.7), CI-gated alongside RFC 0019's
-`s3 integration (localstack)` job. The RFC 0026 §5 suite re-runs
+`s3 integration (localstack)` job.
+
+> **Image note (2026-07-07, .7 green slice):** the client-credentials
+> grant and `staticClients[].clientCredentialsClaims` (the static
+> client's tenant-list claims this scenario relies on) are merged
+> upstream (dexidp/dex#4691) but not yet in a Dex release — v2.45.1
+> predates both. The CI job therefore runs Dex `master` **pinned by
+> image digest** (reproducible; recorded in `ci.yml` and the test).
+> Bump to the release tag when Dex v2.46 ships.
+
+The RFC 0026 §5 suite re-runs
 unchanged with an OIDC-resolved binding substituted for the static
 one — the enforcement-invariance proof behind .3–.5.
 

@@ -132,6 +132,31 @@ jobs:
           rfc0019_storage_backend::rfc0019_4_compaction_operates_on_s3
           rfc0019_storage_backend::rfc0019_5_tenant_isolation_on_s3
 
+  # RFC 0029 §5 .7: the Dex end-to-end acceptance arm — a real Dex
+  # container (testcontainers) mints client-credentials tokens the served
+  # binary verifies against Dex's real JWKS. `#[ignore]`d in the default
+  # run (needs Docker), executed here by exact name — the same pattern as
+  # the localstack job above. The image is Dex `master` pinned by digest:
+  # the client-credentials grant + `clientCredentialsClaims` are merged
+  # upstream but not yet in a release (post-v2.45.1); bump to the release
+  # tag when Dex v2.46 ships. A required check (in `ci-success`'s
+  # `needs`).
+  dex-oidc:
+    name: dex oidc (testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: >
+          cargo test -p ourios-server --test it --
+          --ignored --exact
+          rfc0029_oidc::dex::rfc0029_7_dex_end_to_end
+
   book:
     name: mdbook build
     runs-on: ubuntu-latest
@@ -427,7 +452,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, docs, test, book, semconv, live-check, deny, s3-integration]
+    needs: [fmt, clippy, docs, test, book, semconv, live-check, deny, s3-integration, dex-oidc]
     if: always()
     steps:
       - name: Verify required checks

@@ -176,19 +176,7 @@ fn rfc0029_2_verification_matrix() {}
 #[ignore = "RFC0029.6 discharged — `ourios_core::auth::oidc::tests::rfc0029_6_jwks_rotation` is the oracle (unseen-kid refetch under the real throttle; withdrawn-kid rejection)"]
 fn rfc0029_6_jwks_rotation() {}
 
-/// Scenario RFC0029.7 — Dex end-to-end with telemetry parity.
-/// See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
-#[test]
-#[ignore = "RFC0029.7 stub — implemented in the dex acceptance green slice"]
-fn rfc0029_7_dex_end_to_end() {
-    todo!(
-        "RFC0029.7 — real Dex container (testcontainers, CI-gated): \
-         client-credentials mint drives ingest/query/MCP; short-TTL \
-         expiry rejected as the undifferentiated 401; unchanged \
-         error.type values; ingest_denied carries the name_claim \
-         value; no JWT material on any surface"
-    );
-}
+// RFC0029.7 lives in `mod dex` below (CI-gated: needs Docker).
 
 // --- RFC 0029 §3.3 ingest-binding arms (the verifier + tower-layer slice):
 // a loopback fixture issuer, ES256 minting with a runtime-generated key
@@ -777,5 +765,383 @@ mod claim_binding {
         );
 
         child.kill().await.expect("kill the server");
+    }
+}
+
+/// Scenario RFC0029.7 — Dex end-to-end with telemetry parity, against a
+/// **real Dex container** (testcontainers; CI-gated like RFC 0019's
+/// `s3 integration (localstack)` job — `#[ignore]`d in the default run).
+///
+/// Image note: the client-credentials grant and
+/// `staticClients[].clientCredentialsClaims` are post-v2.45.1 (merged to
+/// Dex master 2026-04; dexidp/dex#4691), so the test pins the `master`
+/// image **by digest** for reproducibility. Bump to the release tag once
+/// Dex v2.46 ships.
+mod dex {
+    use std::io::Write as _;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+    use tokio::time::timeout;
+
+    use super::ingest_binding::batch;
+
+    const DEX_IMAGE: &str = "ghcr.io/dexidp/dex";
+    const DEX_TAG: &str =
+        "master@sha256:c382922b8f065f2f1ba142fde5b0ec1736b8fb7bc5bf18832f68c9aced95f243";
+    /// The static client: its id is the token audience, its `name` is the
+    /// `name_claim` label, its claims carry the tenant list.
+    const CLIENT_ID: &str = "ourios-collector";
+    const CLIENT_NAME: &str = "Edge Collector";
+    const CLIENT_SECRET: &str = "dex-test-secret";
+
+    /// Scenario RFC0029.7. See `docs/rfcs/0029-oidc-bearer-layer.md` §5.
+    // One linear served scenario — container, mint, then the §5 arms in
+    // their specified order; fragmenting into helpers would hide that
+    // order (the cluster.rs precedent for this lint).
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "RFC0029.7 — needs Docker (real Dex container); run by the dex-oidc CI job via --ignored"]
+    async fn rfc0029_7_dex_end_to_end() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+        use testcontainers_modules::testcontainers::core::ContainerPort;
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+        use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+        // Reserve a host port up front: the verifier enforces issuer
+        // equality against the discovery document, so the issuer URL must
+        // be known before the container starts. Reservation is
+        // inherently racy (the listener drops before Docker binds), so a
+        // failed container start retries on a fresh port.
+        fn reserve_port() -> u16 {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            l.local_addr().expect("addr").port()
+        }
+
+        // Short-TTL tokens make the expiry arm real time rather than
+        // clock-skew fiction: the pre-expiry arms complete in milliseconds
+        // and 20 s leaves headroom for a slow runner, then the expiry wait
+        // sleeps past the token's own `expires_in`. `enablePasswordDB` is
+        // the inert built-in connector — Dex refuses to start with zero
+        // connectors, though client-credentials never touches one.
+        let dex_config_for = |issuer: &str| {
+            format!(
+                "issuer: {issuer}\n\
+             storage:\n  type: memory\n\
+             web:\n  http: 0.0.0.0:5556\n\
+             enablePasswordDB: true\n\
+             oauth2:\n  grantTypes: [\"client_credentials\"]\n\
+             expiry:\n  idTokens: \"20s\"\n\
+             staticClients:\n\
+             \x20\x20- id: {CLIENT_ID}\n\
+             \x20\x20\x20\x20name: {CLIENT_NAME}\n\
+             \x20\x20\x20\x20secret: {CLIENT_SECRET}\n\
+             \x20\x20\x20\x20clientCredentialsClaims:\n\
+             \x20\x20\x20\x20\x20\x20groups: [\"acme\", \"globex\"]\n"
+            )
+        };
+        let mut started = None;
+        for attempt in 0..3 {
+            let host_port = reserve_port();
+            let issuer = format!("http://127.0.0.1:{host_port}/dex");
+            match GenericImage::new(DEX_IMAGE, DEX_TAG)
+                .with_copy_to(
+                    "/etc/dex/config.docker.yaml",
+                    dex_config_for(&issuer).into_bytes(),
+                )
+                .with_env_var("DEX_CLIENT_CREDENTIAL_GRANT_ENABLED_BY_DEFAULT", "true")
+                .with_mapped_port(host_port, ContainerPort::Tcp(5556))
+                .start()
+                .await
+            {
+                Ok(container) => {
+                    started = Some((container, issuer));
+                    break;
+                }
+                Err(e) if attempt < 2 => {
+                    eprintln!("dex start attempt {attempt} failed (port race?): {e}");
+                }
+                Err(e) => panic!("dex never started: {e}"),
+            }
+        }
+        let (container, issuer) = started.expect("dex started");
+
+        // Readiness: Dex's own discovery document, served under the
+        // reserved issuer URL. On timeout, surface the container's own
+        // logs — a config rejection otherwise reads as a bare timeout.
+        let http = reqwest::Client::new();
+        let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+        if timeout(Duration::from_secs(90), async {
+            loop {
+                if let Ok(response) = http.get(&discovery_url).send().await
+                    && response.status().is_success()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            let stdout = container
+                .stdout_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            let stderr = container
+                .stderr_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            panic!(
+                "dex never became ready.\n--- dex stdout ---\n{stdout}\n--- dex stderr ---\n{stderr}"
+            );
+        }
+
+        // The served instance verifies against Dex's real JWKS. Zero clock
+        // skew so the expiry arm crosses at exactly the token TTL; MCP on.
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(&wal).expect("wal dir");
+        let config_path = tmp.path().join("ourios.yaml");
+        let mut file = std::fs::File::create(&config_path).expect("create config");
+        write!(
+            file,
+            "storage:\n  local:\n    bucket_root: {}\n\
+             receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n  http_addr: 127.0.0.1:0\n  wal_root: {}\n\
+             querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n  mcp:\n    enabled: true\n\
+             auth:\n  oidc:\n    issuer: {issuer}\n    audience: {CLIENT_ID}\n    tenant_claim: groups\n    name_claim: name\n    clock_skew_secs: 0\n",
+            tmp.path().display(),
+            wal.display(),
+        )
+        .expect("write config");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+            .arg("--config")
+            .arg(&config_path)
+            .env("RUST_LOG", "info")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn ourios-server");
+        // Drain stderr into a buffer: the no-JWT-material arm scans it,
+        // and an undrained pipe could block the child.
+        let stderr = child.stderr.take().expect("stderr piped");
+        let drain = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut collected = Vec::new();
+            while let Some(line) = lines.next_line().await.expect("read stderr") {
+                collected.push(line);
+            }
+            collected
+        });
+        let stdout = child.stdout.take().expect("stdout piped");
+        let mut out_lines = BufReader::new(stdout).lines();
+        let (grpc_addr, querier_addr) = timeout(Duration::from_secs(15), async {
+            let (mut grpc, mut querier) = (None, None);
+            while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+                if let Some(addr) = line.strip_prefix("receiver gRPC listening on ") {
+                    grpc = Some(addr.trim().to_string());
+                }
+                if let Some(addr) = line.strip_prefix("querier HTTP listening on ") {
+                    querier = Some(addr.trim().to_string());
+                }
+                if let (Some(g), Some(q)) = (&grpc, &querier) {
+                    return (g.clone(), q.clone());
+                }
+            }
+            panic!("role announcements never appeared — discovery against dex must succeed");
+        })
+        .await
+        .expect("server ready before timeout");
+
+        // Mint a real token from Dex's token endpoint — the OTel
+        // Collector `oauth2client` flow, verbatim.
+        let token_response: serde_json::Value = http
+            .post(format!("{issuer}/token"))
+            .basic_auth(CLIENT_ID, Some(CLIENT_SECRET))
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("scope", "openid profile groups"),
+            ])
+            .send()
+            .await
+            .expect("token endpoint")
+            .json()
+            .await
+            .expect("token json");
+        let token = token_response["access_token"]
+            .as_str()
+            .expect("access_token in the response")
+            .to_string();
+        let expires_in = token_response["expires_in"]
+            .as_u64()
+            .expect("expires_in in the response");
+        let minted_at = tokio::time::Instant::now();
+
+        // Ingest: in-claim tenant acks; a cross-tenant batch is denied
+        // (the audit arm below reads the denial event back).
+        let mut client = LogsServiceClient::connect(format!("http://{grpc_addr}"))
+            .await
+            .expect("grpc connect");
+        let authorization: tonic::metadata::MetadataValue<_> =
+            format!("Bearer {token}").parse().expect("metadata");
+        let mut request = tonic::Request::new(batch("acme"));
+        request
+            .metadata_mut()
+            .insert("authorization", authorization.clone());
+        client.export(request).await.expect("in-claim batch acks");
+        let mut request = tonic::Request::new(batch("intruder"));
+        request
+            .metadata_mut()
+            .insert("authorization", authorization.clone());
+        let denied = client
+            .export(request)
+            .await
+            .expect_err("cross-tenant batch is denied");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !denied.message().contains(&token),
+            "no JWT material in the denial"
+        );
+
+        // Query: the same token reads its own tenants.
+        let query = |bearer: Option<String>, tenant: &'static str| {
+            let http = http.clone();
+            let url = format!("http://{querier_addr}/v1/query");
+            async move {
+                let mut req = http
+                    .post(url)
+                    .header("content-type", "text/plain")
+                    .header("x-ourios-tenant", tenant)
+                    .body("template_id == 1");
+                if let Some(b) = bearer {
+                    req = req.header("authorization", format!("Bearer {b}"));
+                }
+                req.send().await.expect("query send")
+            }
+        };
+        assert_eq!(
+            query(Some(token.clone()), "globex").await.status(),
+            reqwest::StatusCode::OK,
+            "in-claim query serves"
+        );
+
+        // MCP: the same bearer passes the transport gate; bearer-less is
+        // the one undifferentiated 401.
+        let mcp_url = format!("http://{querier_addr}/mcp");
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "rfc0029-7", "version": "0"}}
+        });
+        let unauthenticated = http
+            .post(&mcp_url)
+            .json(&initialize)
+            .header("accept", "application/json, text/event-stream")
+            .send()
+            .await
+            .expect("mcp send");
+        assert_eq!(
+            unauthenticated.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "mcp without a bearer is 401"
+        );
+        let authenticated = http
+            .post(&mcp_url)
+            .bearer_auth(&token)
+            .json(&initialize)
+            .header("accept", "application/json, text/event-stream")
+            .send()
+            .await
+            .expect("mcp send");
+        assert!(
+            authenticated.status().is_success(),
+            "the dex bearer passes the MCP gate: {}",
+            authenticated.status()
+        );
+
+        // Expiry: sleep past the token's own `expires_in` (zero configured
+        // skew) and the same token collapses to the undifferentiated 401.
+        tokio::time::sleep_until(minted_at + Duration::from_secs(expires_in + 2)).await;
+        let expired = query(Some(token.clone()), "globex").await;
+        assert_eq!(
+            expired.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "an expired dex token is the one undifferentiated 401"
+        );
+        assert!(
+            !expired.text().await.expect("body").contains(&token),
+            "no JWT material in the 401 body"
+        );
+
+        // Graceful shutdown (SIGTERM — what k8s sends) flushes the audit
+        // sink, making the denial event durable and readable.
+        let pid = child.id().expect("child pid").to_string();
+        let signalled = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .await
+            .expect("run kill");
+        assert!(signalled.success(), "SIGTERM delivered");
+        timeout(Duration::from_secs(15), child.wait())
+            .await
+            .expect("exit before timeout")
+            .expect("child exits");
+        let stderr_lines = timeout(Duration::from_secs(15), drain)
+            .await
+            .expect("stderr drains")
+            .expect("drain task");
+
+        // §3.4 telemetry parity, the audit half: the denial emitted
+        // `ingest_denied` carrying the `name_claim` value (the client's
+        // display name), and nothing on the log surface carries the JWT.
+        let mut denied_names = Vec::new();
+        for entry in walkdir(&tmp.path().join("audit")) {
+            let events = ourios_parquet::AuditReader::open_file(&entry)
+                .expect("open audit file")
+                .read_all()
+                .expect("read audit file");
+            for event in events {
+                if let ourios_core::audit::AuditPayload::IngestDenied { token_name } = event.payload
+                {
+                    denied_names.push(token_name);
+                }
+            }
+        }
+        assert_eq!(
+            denied_names,
+            [CLIENT_NAME],
+            "ingest_denied carries the name_claim value"
+        );
+        assert!(
+            !stderr_lines.iter().any(|line| line.contains(&token)),
+            "no JWT material on the log surface"
+        );
+    }
+
+    /// All `.parquet` files under `root`, recursively (empty when the
+    /// directory does not exist).
+    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "parquet") {
+                    files.push(path);
+                }
+            }
+        }
+        files
     }
 }

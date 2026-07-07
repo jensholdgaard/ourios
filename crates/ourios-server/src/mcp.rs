@@ -334,9 +334,11 @@ impl OuriosMcp {
 
 #[tool_handler]
 impl ServerHandler for OuriosMcp {
+    // `ServerInfo` is `#[non_exhaustive]` upstream, so struct-update
+    // syntax is a compile error (E0639); mutate-a-default is the only
+    // construction.
+    #[allow(clippy::field_reassign_with_default)]
     fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]` upstream, so struct-update
-        // syntax is a compile error (E0639); mutate a default instead.
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
@@ -434,6 +436,9 @@ async fn require_bearer(
 /// Build the `/mcp` sub-router: the streamable-HTTP MCP service behind
 /// the RFC 0026 bearer layer. Nested by `querier::router` only when
 /// `querier.mcp.enabled` is set (RFC0027.1).
+// `StreamableHttpServerConfig` is `#[non_exhaustive]` upstream (E0639
+// forbids struct-update), so the config is a mutated default.
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) fn mcp_router(
     querier: Arc<Querier>,
     default_window_nanos: u64,

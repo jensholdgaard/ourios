@@ -17,8 +17,9 @@ curl -LO https://github.com/jensholdgaard/ourios/releases/latest/download/ourios
 tar -xf ourios-server-x86_64-unknown-linux-gnu.tar.xz
 ```
 
-Every release artifact carries SLSA provenance (`*.intoto.jsonl`
-alongside it), verifiable offline:
+Releases from `v0.1.1` on attach offline provenance bundles
+(`*.intoto.jsonl`) alongside their assets, verifiable without any
+network round-trip:
 
 ```sh
 gh attestation verify ourios-server-x86_64-unknown-linux-gnu.tar.xz \
@@ -111,7 +112,7 @@ a header:
 
 ```sh
 curl -s http://localhost:4319/v1/query \
-  -H 'x-ourios-tenant: checkout' \
+  -H 'X-Ourios-Tenant: checkout' \
   -H 'Content-Type: text/plain' \
   -d 'severity >= info | limit 10'
 ```

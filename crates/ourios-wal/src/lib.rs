@@ -114,9 +114,9 @@ pub struct WalConfig {
     pub housekeeping_secs: u64,
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
-    /// §6.3 / §9: on Apple platforms `fsync`/`fdatasync` do not
-    /// flush the drive's write cache, so true power-loss
-    /// durability needs the full-fsync fcntl (via rustix's safe
+    /// §6.3 / §9: on macOS `fsync`/`fdatasync` do not flush the
+    /// drive's write cache, so true power-loss durability needs
+    /// the full-fsync fcntl (via rustix's safe
     /// wrapper — the workspace denies `unsafe_code`). Ignored on
     /// other platforms, where `fdatasync` already carries the
     /// §6.3 contract.
@@ -517,9 +517,9 @@ impl Wal {
     }
 
     /// The §6.3 segment-data sync: `fdatasync`, upgraded to
-    /// `fcntl(F_FULLFSYNC)` on macOS when
-    /// [`WalConfig::macos_full_fsync`] opts in (Apple's
-    /// `fsync`/`fdatasync` do not flush the drive cache).
+    /// `fcntl(F_FULLFSYNC)` when [`WalConfig::macos_full_fsync`]
+    /// opts in (macOS's `fsync`/`fdatasync` do not flush the
+    /// drive cache).
     #[cfg(target_os = "macos")]
     fn sync_segment_data(&self) -> Result<(), SyncError> {
         if self.config.macos_full_fsync {

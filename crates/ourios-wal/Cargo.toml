@@ -49,6 +49,13 @@ ourios-core = { path = "../ourios-core" }
 # default; not part of the stable public API.
 fuzzing = []
 
+# §6.3's macOS strong-durability path: `fcntl(F_FULLFSYNC)` behind
+# rustix's safe wrapper (already in the tree via tempfile) — the
+# workspace denies `unsafe_code`, so the raw fcntl is not an option
+# (#125).
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
 [dev-dependencies]
 # Scratch directories for the segment-on-disk tests.
 tempfile = "=3.27.0"

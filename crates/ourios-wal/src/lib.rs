@@ -114,17 +114,12 @@ pub struct WalConfig {
     pub housekeeping_secs: u64,
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
-    /// §6.3 / §9. Ignored on other platforms.
-    ///
-    /// **Not yet honoured.** [`Wal::sync`] currently always
-    /// uses `fdatasync` (`File::sync_data`) regardless of this
-    /// flag; the `F_FULLFSYNC` path is deferred to a follow-up.
-    /// The raw `fcntl(F_FULLFSYNC)` needs `unsafe`, which the
-    /// workspace's `unsafe_code = "deny"` lint (CLAUDE.md §6.1)
-    /// forbids without an RFC, so wiring it means either a
-    /// safe-wrapper dependency or an unsafe waiver — a
-    /// maintainer decision tracked separately. Setting it
-    /// `true` today is accepted but has no effect.
+    /// §6.3 / §9: on Apple platforms `fsync`/`fdatasync` do not
+    /// flush the drive's write cache, so true power-loss
+    /// durability needs the full-fsync fcntl (via rustix's safe
+    /// wrapper — the workspace denies `unsafe_code`). Ignored on
+    /// other platforms, where `fdatasync` already carries the
+    /// §6.3 contract.
     pub macos_full_fsync: bool,
 }
 
@@ -485,21 +480,15 @@ impl Wal {
     /// the full `File::sync_all` — `fdatasync` is undefined on
     /// directories under POSIX.
     ///
-    /// [`WalConfig::macos_full_fsync`] is **not yet consulted**:
-    /// this always uses `fdatasync`, never `fcntl(F_FULLFSYNC)`.
-    /// See that field's doc for why the stronger-durability path
-    /// is deferred.
+    /// With [`WalConfig::macos_full_fsync`] set (macOS only),
+    /// the segment sync is `fcntl(F_FULLFSYNC)` instead — see
+    /// that field's doc.
     ///
     /// # Errors
     ///
     /// See [`SyncError`].
     pub fn sync(&mut self) -> Result<WalOffset, SyncError> {
-        self.current_segment
-            .sync_data()
-            .map_err(|source| SyncError::Io {
-                op: "fdatasync(current_segment)",
-                source,
-            })?;
+        self.sync_segment_data()?;
         if self.dir_fsync_pending {
             sync_parent_dir(&self.config.root).map_err(|source| SyncError::Io {
                 op: "fsync(wal_root)",
@@ -525,6 +514,40 @@ impl Wal {
             segment: self.current_segment_uuid,
             byte,
         })
+    }
+
+    /// The §6.3 segment-data sync: `fdatasync`, upgraded to
+    /// `fcntl(F_FULLFSYNC)` on macOS when
+    /// [`WalConfig::macos_full_fsync`] opts in (Apple's
+    /// `fsync`/`fdatasync` do not flush the drive cache).
+    #[cfg(target_os = "macos")]
+    fn sync_segment_data(&self) -> Result<(), SyncError> {
+        if self.config.macos_full_fsync {
+            return rustix::fs::fcntl_fullfsync(&self.current_segment).map_err(|errno| {
+                SyncError::Io {
+                    op: "fcntl(current_segment, F_FULLFSYNC)",
+                    source: errno.into(),
+                }
+            });
+        }
+        self.current_segment
+            .sync_data()
+            .map_err(|source| SyncError::Io {
+                op: "fdatasync(current_segment)",
+                source,
+            })
+    }
+
+    /// See the macOS variant: everywhere else `fdatasync` is the
+    /// §6.3 contract and the knob is ignored.
+    #[cfg(not(target_os = "macos"))]
+    fn sync_segment_data(&self) -> Result<(), SyncError> {
+        self.current_segment
+            .sync_data()
+            .map_err(|source| SyncError::Io {
+                op: "fdatasync(current_segment)",
+                source,
+            })
     }
 
     /// Record that records ≤ `durable_to` are on object
@@ -1332,6 +1355,25 @@ mod tests {
     //! layer surfaces here rather than as a cascading failure
     //! in the integration suite.
     use super::*;
+
+    /// §6.3 macOS strong durability (#125): with the knob set, the
+    /// segment sync goes through `fcntl(F_FULLFSYNC)` and the
+    /// append→sync contract (durable offset advances) holds exactly as
+    /// with `fdatasync`. On non-macOS targets the knob is accepted and
+    /// ignored — the same assertions pass through the `fdatasync` arm,
+    /// so this test runs everywhere and exercises the fcntl only where
+    /// it exists.
+    #[test]
+    fn macos_full_fsync_knob_keeps_the_sync_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = default_config(dir.path());
+        config.macos_full_fsync = true;
+        let mut wal = Wal::open(config).expect("open");
+        wal.append(FrameKind::OtlpBatch, b"full-fsync me")
+            .expect("append");
+        let offset = wal.sync().expect("sync with the knob set");
+        assert!(offset.byte > 0, "durable offset advances");
+    }
 
     fn default_config(root: &std::path::Path) -> WalConfig {
         WalConfig {

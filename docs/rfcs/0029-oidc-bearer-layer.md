@@ -102,9 +102,14 @@ auth:
   label. The mapping is deliberately dumb — group-to-tenant
   indirection lives in the issuer (Dex connectors already map
   upstream groups into claims), not in Ourios.
-- At least one of `tokens` / `oidc` must be present in an `auth`
-  section; both together are valid. No `auth` section remains open
-  mode with the RFC 0026 startup warning.
+- At least one of `tokens` / `oidc` must be **configured** in an
+  `auth` section; both together are valid. The RFC 0026 empty-list
+  rule generalises rather than conflicts: `tokens: []` stays a
+  startup error **unless** `oidc` is configured (with `oidc`
+  present, disable static tokens by omitting `tokens` — an explicit
+  empty list still reads as a misconfiguration and still fails
+  startup). No `auth` section remains open mode with the RFC 0026
+  startup warning.
 
 ### 3.2 Verification and resolution
 

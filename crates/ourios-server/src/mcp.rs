@@ -365,9 +365,11 @@ impl ServerHandler for OuriosMcp {
                 .to_string(),
         );
         resource.mime_type = Some("text/markdown".to_string());
-        let mut result = ListResourcesResult::default();
-        result.resources = vec![resource];
-        Ok(result)
+        // (Exhaustive by design upstream — struct-update works here.)
+        Ok(ListResourcesResult {
+            resources: vec![resource],
+            ..ListResourcesResult::default()
+        })
     }
 
     async fn read_resource(

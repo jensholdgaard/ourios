@@ -480,13 +480,23 @@ mod ingest_binding {
     /// nonzero naming `auth.oidc`.
     #[tokio::test]
     async fn oidc_unreachable_issuer_fails_receiver_startup() {
-        // A just-closed loopback port (no DNS/egress dependency).
-        let unreachable = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            format!("http://{}", l.local_addr().expect("addr"))
-        };
+        // A held loopback port that deterministically fails every
+        // connection (accept-then-close). Holding the listener for the
+        // test's lifetime avoids the race where a dropped port is re-bound
+        // by another local process before the child runs discovery; no
+        // DNS or egress dependency either way.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let unreachable = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
         let tmp = tempfile::TempDir::new().expect("temp");
         let wal = tmp.path().join("wal");
         std::fs::create_dir_all(&wal).expect("wal dir");

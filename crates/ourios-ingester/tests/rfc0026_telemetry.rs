@@ -58,8 +58,9 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
     .expect("valid")
     .expect("enabled");
 
-    // Authn rejection through the gRPC auth layer (the transport that
-    // owns the 401 surface): error.type = unauthenticated. The layer
+    // Authn rejection through the gRPC auth layer (the transport's own
+    // rejection surface — UNAUTHENTICATED / grpc-status 16; HTTP's is the
+    // 401): error.type = unauthenticated. The layer
     // answers a bearer-less request itself with a trailers-only
     // UNAUTHENTICATED response — the inner service never runs.
     let layer = AuthLayer::new(AuthResolver::static_only(Some(Arc::new(store.clone()))));

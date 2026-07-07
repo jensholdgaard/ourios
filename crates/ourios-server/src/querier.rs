@@ -32,8 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
-use ourios_core::auth::TokenStore;
-use ourios_ingester::receiver::auth::{AuthBinding, authenticate_bearer};
+use ourios_ingester::receiver::auth::{AuthBinding, AuthResolver};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -77,11 +76,12 @@ pub struct QuerierConfig {
     /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled`;
     /// default off). The RFC 0026 gate applies to it identically.
     pub mcp_enabled: bool,
-    /// The RFC 0026 token store; `None` is open mode (§3.1). With a store,
-    /// every request must carry a known `Authorization: Bearer` credential
-    /// (→ 401) and its `x-ourios-tenant` must fall inside the token's set
+    /// The RFC 0026/0029 credential resolver (`is_open()` = open mode,
+    /// §3.1). Otherwise every request must carry a resolvable
+    /// `Authorization: Bearer` credential (→ 401) and its
+    /// `x-ourios-tenant` must fall inside the resolved binding's set
     /// (→ 403); the missing-tenant 400 is unchanged (§3.3).
-    pub auth: Option<Arc<TokenStore>>,
+    pub auth: AuthResolver,
     /// The look-back applied to a query with no `range(...)` stage — the
     /// server-supplied default window the DSL compiler expects (RFC 0002 §4 P5;
     /// RFC 0016 §7).
@@ -214,14 +214,18 @@ struct QuerierState {
     querier: Arc<Querier>,
     default_window_nanos: u64,
     metrics: Arc<QuerierMetrics>,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
 }
 
 /// Build the querier role's axum router over a **local** store root (RFC 0016
 /// §3.3). Split out from [`serve`] so it can be driven in-process by tests; the
 /// local backend is the test/dev default and the RFC 0019 regression guard.
 pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
-    router_with_auth(bucket_root, default_window_nanos, None)
+    router_with_auth(
+        bucket_root,
+        default_window_nanos,
+        AuthResolver::static_only(None),
+    )
 }
 
 /// [`router_with_auth`] plus the RFC 0027 `/mcp` surface — the fully
@@ -229,7 +233,7 @@ pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
 pub fn router_with_mcp(
     bucket_root: PathBuf,
     default_window_nanos: u64,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
     mcp_enabled: bool,
 ) -> Router {
     router_from_querier(
@@ -240,12 +244,13 @@ pub fn router_with_mcp(
     )
 }
 
-/// [`router`] with an RFC 0026 token store — the authenticated variant
+/// [`router`] with an RFC 0026/0029 credential resolver — the authenticated
+/// variant (`AuthResolver::is_open()` = open mode)
 /// (`None` = open mode, identical to [`router`]).
 pub fn router_with_auth(
     bucket_root: PathBuf,
     default_window_nanos: u64,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
 ) -> Router {
     router_from_querier(Querier::new(bucket_root), default_window_nanos, auth, false)
 }
@@ -256,7 +261,7 @@ pub fn router_with_auth(
 fn router_from_querier(
     querier: Querier,
     default_window_nanos: u64,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
     mcp_enabled: bool,
 ) -> Router {
     let state = QuerierState {
@@ -345,7 +350,7 @@ async fn handle_query(
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let Ok(binding) = authenticate_bearer(state.auth.as_deref(), authorization) else {
+    let Ok(binding) = state.auth.authenticate(authorization).await else {
         // RFC 0026 §3.4: the rejection records on the existing
         // `ourios.query.duration` histogram, kind `rejected`
         // (pre-dispatch), tagged with `error.type`.

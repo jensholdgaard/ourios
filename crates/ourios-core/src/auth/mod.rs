@@ -130,21 +130,6 @@ pub struct AuthConfig {
     pub oidc: Option<OidcConfig>,
 }
 
-impl AuthConfig {
-    /// The store the enforcement points consume today.
-    ///
-    /// With OIDC configured but no static tokens this is an *empty* store:
-    /// auth stays enforced (every bearer is rejected) rather than open. The
-    /// RFC 0029 verifier slice replaces the gates' store parameter with the
-    /// full config and retires this bridge.
-    #[must_use]
-    pub fn enforcement_store(&self) -> TokenStore {
-        self.static_tokens.clone().unwrap_or(TokenStore {
-            entries: Vec::new(),
-        })
-    }
-}
-
 /// Validate a raw `auth` section's halves into the resolved [`AuthConfig`]
 /// (RFC 0026 §3.1 + RFC 0029 §3.1). Callers only invoke this for a present
 /// `auth` section — an absent section is open mode and never reaches here.
@@ -266,9 +251,7 @@ impl fmt::Debug for ResolvedToken {
 
 /// The validated `auth.tokens` store (RFC 0026 §3.1). Non-empty when it
 /// comes from [`build_token_store`] (an empty *config list* is a startup
-/// error); the one deliberate empty state is
-/// [`AuthConfig::enforcement_store`]'s oidc-only bridge, where matching
-/// nothing — rejecting every bearer — is the point.
+/// error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenStore {
     entries: Vec<ResolvedToken>,
@@ -598,11 +581,6 @@ mod tests {
         let oidc_only = build_auth_config(None, Some(&oidc_spec())).expect("oidc-only");
         assert!(oidc_only.static_tokens.is_none());
         assert_eq!(oidc_only.oidc.as_ref().expect("oidc").audience(), "ourios");
-        let bridge = oidc_only.enforcement_store();
-        assert!(
-            bridge.authenticate("any-bearer").is_none(),
-            "the bridge store matches nothing — enforced, not open"
-        );
 
         let both = build_auth_config(
             Some(&[spec("edge", "tok-edge", &["acme"])]),
@@ -610,7 +588,9 @@ mod tests {
         )
         .expect("both halves");
         assert_eq!(
-            both.enforcement_store()
+            both.static_tokens
+                .as_ref()
+                .expect("static half intact")
                 .authenticate("tok-edge")
                 .expect("static half intact")
                 .name(),

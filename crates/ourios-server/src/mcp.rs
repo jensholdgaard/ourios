@@ -23,9 +23,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use ourios_core::auth::TokenStore;
 use ourios_core::tenant::TenantId;
-use ourios_ingester::receiver::authenticate_bearer;
+use ourios_ingester::receiver::{AuthBinding, AuthResolver};
 use ourios_querier::Querier;
 use ourios_querier::dsl::{self, Statement};
 use rmcp::handler::server::ServerHandler;
@@ -112,7 +111,7 @@ pub(crate) struct TemplateDriftArgs {
 pub(crate) struct OuriosMcp {
     querier: Arc<Querier>,
     default_window_nanos: u64,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
     metrics: Arc<crate::querier::QuerierMetrics>,
 }
 
@@ -141,22 +140,28 @@ impl OuriosMcp {
         ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
         tenant: &str,
     ) -> Result<(), ErrorData> {
-        let Some(store) = self.auth.as_deref() else {
+        if self.auth.is_open() {
             return Ok(());
-        };
-        let authorization = ctx
+        }
+        // The transport layer (`require_bearer`) already authenticated and
+        // cached the resolved binding on the request — read it from the
+        // forwarded parts rather than verifying the credential twice. A
+        // missing binding here means the transport gate did not run: fail
+        // closed.
+        let binding = ctx
             .extensions
             .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.headers.get(header::AUTHORIZATION))
-            .and_then(|value| value.to_str().ok());
-        let binding = authenticate_bearer(Some(store), authorization)
-            .map_err(|_| ErrorData::invalid_request("a valid bearer token is required", None))?;
+            .and_then(|parts| parts.extensions.get::<AuthBinding>());
         match binding {
-            Some(binding) if !binding.tenants().allows(tenant) => Err(ErrorData::invalid_request(
+            Some(binding) if binding.tenants().allows(tenant) => Ok(()),
+            Some(_) => Err(ErrorData::invalid_request(
                 "the tenant is outside the authenticated token's allowed set",
                 None,
             )),
-            _ => Ok(()),
+            None => Err(ErrorData::invalid_request(
+                "a valid bearer token is required",
+                None,
+            )),
         }
     }
 }
@@ -166,7 +171,7 @@ impl OuriosMcp {
     fn new(
         querier: Arc<Querier>,
         default_window_nanos: u64,
-        auth: Option<Arc<TokenStore>>,
+        auth: AuthResolver,
         metrics: Arc<crate::querier::QuerierMetrics>,
     ) -> Self {
         Self {
@@ -417,21 +422,28 @@ fn json_content<T: serde::Serialize>(value: &T) -> Result<CallToolResult, ErrorD
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
-/// The RFC 0026 bearer gate as an axum layer over the MCP service
-/// (§3.1): open mode passes through; with a store, a missing/malformed/
-/// unknown credential is one undifferentiated 401 before any MCP
-/// dispatch.
-async fn require_bearer(
-    auth: Option<Arc<TokenStore>>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
+/// The RFC 0026/0029 bearer gate as an axum layer over the MCP service
+/// (§3.1): open mode passes through; with auth configured (static
+/// tokens, OIDC, or both), a missing/malformed/unknown/unverifiable
+/// credential is one undifferentiated 401 before any MCP dispatch.
+async fn require_bearer(auth: AuthResolver, mut request: Request<Body>, next: Next) -> Response {
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    if authenticate_bearer(auth.as_deref(), authorization).is_err() {
-        return (StatusCode::UNAUTHORIZED, "a valid bearer token is required").into_response();
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match auth.authenticate(authorization.as_deref()).await {
+        Ok(None) => {}
+        // Cache the resolved binding on the request so the per-tool
+        // tenant check reads it from the forwarded parts instead of
+        // verifying the credential a second time (with OIDC that second
+        // pass could even refetch the JWKS).
+        Ok(Some(binding)) => {
+            request.extensions_mut().insert(binding);
+        }
+        Err(_) => {
+            return (StatusCode::UNAUTHORIZED, "a valid bearer token is required").into_response();
+        }
     }
     next.run(request).await
 }
@@ -445,7 +457,7 @@ async fn require_bearer(
 pub(crate) fn mcp_router(
     querier: Arc<Querier>,
     default_window_nanos: u64,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
     metrics: Arc<crate::querier::QuerierMetrics>,
 ) -> Router {
     // (`StreamableHttpServerConfig` is `#[non_exhaustive]`; mutate a
@@ -460,7 +472,7 @@ pub(crate) fn mcp_router(
     // contract): the role never comes up serving a malformed resource.
     let _ = *GRAMMAR_SECTION;
     let mut config = StreamableHttpServerConfig::default();
-    if auth.is_some() {
+    if !auth.is_open() {
         config.allowed_hosts = Vec::new();
     }
     let handler_auth = auth.clone();

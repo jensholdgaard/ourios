@@ -576,29 +576,22 @@ fn warn_if_open_mode(config: &ServerConfig) {
     }
 }
 
-/// The store the listeners enforce against (RFC 0026 §3.2/§3.3) — each
-/// role derives its own instance from the one resolved config. Open mode
-/// stays `None`; an oidc-only config yields an empty store — enforced,
-/// not open — until the RFC 0029 verifier slice teaches the gates the
-/// full [`ourios_server::auth::AuthConfig`].
-fn enforcement_store(
-    config: &ServerConfig,
-) -> Option<std::sync::Arc<ourios_server::auth::TokenStore>> {
-    config
-        .auth
-        .as_ref()
-        .map(|auth| std::sync::Arc::new(auth.enforcement_store()))
-}
-
-/// Build the ingest listeners' RFC 0026/0029 credential resolver from the
+/// Build a network role's RFC 0026/0029 credential resolver from the
 /// resolved auth config. OIDC discovery contacts the issuer once, here at
 /// startup — a failure (unreachable issuer, issuer mismatch, unusable
 /// JWKS) is a startup error, not a degraded mode (§3.2: with no cached
 /// keys nothing could ever verify).
-async fn ingest_resolver(
+/// `None` when no network role is enabled (nothing to authenticate — and
+/// no issuer round-trip on a compactor-only process); otherwise built
+/// exactly once and cloned into each role, so OIDC discovery runs once
+/// and the roles share the verifier's JWKS cache + refresh throttle.
+async fn auth_resolver(
     config: &ServerConfig,
-) -> Result<ourios_ingester::receiver::AuthResolver, String> {
+) -> Result<Option<ourios_ingester::receiver::AuthResolver>, String> {
     use ourios_ingester::receiver::AuthResolver;
+    if config.receiver.is_none() && config.querier.is_none() {
+        return Ok(None);
+    }
     let static_store = config
         .auth
         .as_ref()
@@ -609,12 +602,12 @@ async fn ingest_resolver(
             let verifier = ourios_core::auth::oidc::OidcVerifier::discover(oidc)
                 .await
                 .map_err(|e| format!("auth.oidc: {e}"))?;
-            Ok(AuthResolver::with_oidc(
+            Ok(Some(AuthResolver::with_oidc(
                 static_store,
                 std::sync::Arc::new(verifier),
-            ))
+            )))
         }
-        None => Ok(AuthResolver::static_only(static_store)),
+        None => Ok(Some(AuthResolver::static_only(static_store))),
     }
 }
 
@@ -665,6 +658,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Start the OTLP receiver role if enabled (RFC 0003 §9). Report the
     // bound addresses on stdout so an operator — or a test binding `:0` —
     // learns the actual ports.
+    // One resolver, built once, shared by every enabled network role.
+    let resolver = auth_resolver(&config).await?;
+
     let receiver = match &config.receiver {
         // The receiver's RFC 0014 data write path runs on the resolved store
         // (local or S3, RFC 0019 slice 2c) — the same store the querier reads
@@ -679,7 +675,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // handle is cheap to share, the compactor keeps the original).
                 store: store.clone(),
                 promoted: config.promoted.clone(),
-                auth: ingest_resolver(&config).await?,
+                auth: resolver.clone().expect("resolver built for enabled roles"),
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -700,7 +696,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // The querier engine is Store-capable (RFC 0019 slice 2a), so it
                 // reads whichever backend config resolved (local or S3).
                 store: config.store.clone(),
-                auth: enforcement_store(&config),
+                auth: resolver.clone().expect("resolver built for enabled roles"),
                 default_window_nanos: params.default_window_nanos,
                 mcp_enabled: params.mcp_enabled,
             })
@@ -1010,7 +1006,11 @@ auth:
         })
         .expect("well-formed file");
         let config = server_config_from_file(&file).expect("valid");
-        let store = config.auth.expect("auth resolved").enforcement_store();
+        let store = config
+            .auth
+            .expect("auth resolved")
+            .static_tokens
+            .expect("static half");
         assert_eq!(
             store.authenticate("resolved-token").expect("match").name(),
             "edge-collector",
@@ -1055,10 +1055,10 @@ auth:
         assert_eq!(oidc.issuer(), "https://dex.internal.example");
         assert_eq!(oidc.name_claim(), "sub", "core default applied");
         assert!(auth.static_tokens.is_none(), "no static half");
-        assert!(
-            auth.enforcement_store().authenticate("any").is_none(),
-            "oidc-only enforces (rejects) rather than opening the gates",
-        );
+        // Enforced-not-open for oidc-only is a resolver/serving property
+        // now (the `enforcement_store` bridge is retired): the served
+        // `rfc0029_oidc` arms assert the wire-level 401.
+        assert!(auth.oidc.is_some() && auth.static_tokens.is_none());
 
         let err = server_config(
             "storage:\n  local:\n    bucket_root: /x\nauth:\n  oidc:\n    issuer: https://x\n    tenant_claim: t\n",

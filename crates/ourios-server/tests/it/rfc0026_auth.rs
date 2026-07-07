@@ -186,7 +186,7 @@ async fn rfc0026_4_query_status_contract() {
         ourios_server::querier::router_with_auth(
             bucket.path().to_path_buf(),
             3_600_000_000_000,
-            Some(auth.clone()),
+            ourios_ingester::receiver::AuthResolver::static_only(Some(auth.clone())),
         )
     };
 
@@ -303,7 +303,7 @@ async fn rfc0026_5_wildcard_binding_query() {
             ourios_server::querier::router_with_auth(
                 bucket.path().to_path_buf(),
                 3_600_000_000_000,
-                Some(auth.clone()),
+                ourios_ingester::receiver::AuthResolver::static_only(Some(auth.clone())),
             ),
             Some("Bearer tok-query"),
             Some(tenant),

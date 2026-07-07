@@ -24,7 +24,7 @@ use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use ourios_core::tenant::TenantId;
-use ourios_ingester::receiver::AuthResolver;
+use ourios_ingester::receiver::{AuthBinding, AuthResolver};
 use ourios_querier::Querier;
 use ourios_querier::dsl::{self, Statement};
 use rmcp::handler::server::ServerHandler;
@@ -135,7 +135,7 @@ impl OuriosMcp {
     /// `tenant` inside its set. Open mode passes. The transport layer
     /// already answered 401 for missing/unknown credentials; this is the
     /// 403 half, per tool call, before any data is touched.
-    async fn check_tenant(
+    fn check_tenant(
         &self,
         ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
         tenant: &str,
@@ -143,21 +143,25 @@ impl OuriosMcp {
         if self.auth.is_open() {
             return Ok(());
         }
-        let authorization = ctx
+        // The transport layer (`require_bearer`) already authenticated and
+        // cached the resolved binding on the request — read it from the
+        // forwarded parts rather than verifying the credential twice. A
+        // missing binding here means the transport gate did not run: fail
+        // closed.
+        let binding = ctx
             .extensions
             .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.headers.get(header::AUTHORIZATION))
-            .and_then(|value| value.to_str().ok());
-        let binding =
-            self.auth.authenticate(authorization).await.map_err(|_| {
-                ErrorData::invalid_request("a valid bearer token is required", None)
-            })?;
+            .and_then(|parts| parts.extensions.get::<AuthBinding>());
         match binding {
-            Some(binding) if !binding.tenants().allows(tenant) => Err(ErrorData::invalid_request(
+            Some(binding) if binding.tenants().allows(tenant) => Ok(()),
+            Some(_) => Err(ErrorData::invalid_request(
                 "the tenant is outside the authenticated token's allowed set",
                 None,
             )),
-            _ => Ok(()),
+            None => Err(ErrorData::invalid_request(
+                "a valid bearer token is required",
+                None,
+            )),
         }
     }
 }
@@ -189,7 +193,7 @@ impl OuriosMcp {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        self.check_tenant(&ctx, tenant_arg).await?;
+        self.check_tenant(&ctx, tenant_arg)?;
         let statement = dsl::parse_statement(&args.query)
             .map_err(|e| ErrorData::invalid_params(format!("invalid query: {e}"), None))?;
         let Statement::Logs(mut query) = statement else {
@@ -247,7 +251,7 @@ impl OuriosMcp {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        self.check_tenant(&ctx, tenant_arg).await?;
+        self.check_tenant(&ctx, tenant_arg)?;
         let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let registry = match self.querier.template_registry(&tenant).await {
@@ -295,7 +299,7 @@ impl OuriosMcp {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tenant_arg = normalize_tenant(&args.tenant)?;
-        self.check_tenant(&ctx, tenant_arg).await?;
+        self.check_tenant(&ctx, tenant_arg)?;
         // One grammar, one boundary rule: the drift window parses through
         // the DSL front-end exactly as the JSON API's statement does
         // (RFC0010.2's half-open rule inherited verbatim).
@@ -422,13 +426,24 @@ fn json_content<T: serde::Serialize>(value: &T) -> Result<CallToolResult, ErrorD
 /// (§3.1): open mode passes through; with auth configured (static
 /// tokens, OIDC, or both), a missing/malformed/unknown/unverifiable
 /// credential is one undifferentiated 401 before any MCP dispatch.
-async fn require_bearer(auth: AuthResolver, request: Request<Body>, next: Next) -> Response {
+async fn require_bearer(auth: AuthResolver, mut request: Request<Body>, next: Next) -> Response {
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    if auth.authenticate(authorization).await.is_err() {
-        return (StatusCode::UNAUTHORIZED, "a valid bearer token is required").into_response();
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match auth.authenticate(authorization.as_deref()).await {
+        Ok(None) => {}
+        // Cache the resolved binding on the request so the per-tool
+        // tenant check reads it from the forwarded parts instead of
+        // verifying the credential a second time (with OIDC that second
+        // pass could even refetch the JWKS).
+        Ok(Some(binding)) => {
+            request.extensions_mut().insert(binding);
+        }
+        Err(_) => {
+            return (StatusCode::UNAUTHORIZED, "a valid bearer token is required").into_response();
+        }
     }
     next.run(request).await
 }

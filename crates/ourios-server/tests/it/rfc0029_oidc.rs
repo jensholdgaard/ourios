@@ -531,7 +531,9 @@ mod claim_binding {
             .arg(&config_path)
             .env("RUST_LOG", "info")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Inherited so a pre-announcement startup failure lands the
+            // child's actual error in the test output, not a bare timeout.
+            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
         for (key, value) in envs {
             command.env(key, value);

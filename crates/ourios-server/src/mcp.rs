@@ -418,10 +418,10 @@ fn json_content<T: serde::Serialize>(value: &T) -> Result<CallToolResult, ErrorD
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
-/// The RFC 0026 bearer gate as an axum layer over the MCP service
-/// (§3.1): open mode passes through; with a store, a missing/malformed/
-/// unknown credential is one undifferentiated 401 before any MCP
-/// dispatch.
+/// The RFC 0026/0029 bearer gate as an axum layer over the MCP service
+/// (§3.1): open mode passes through; with auth configured (static
+/// tokens, OIDC, or both), a missing/malformed/unknown/unverifiable
+/// credential is one undifferentiated 401 before any MCP dispatch.
 async fn require_bearer(auth: AuthResolver, request: Request<Body>, next: Next) -> Response {
     let authorization = request
         .headers()

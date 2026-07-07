@@ -76,9 +76,10 @@ pub struct QuerierConfig {
     /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled`;
     /// default off). The RFC 0026 gate applies to it identically.
     pub mcp_enabled: bool,
-    /// The RFC 0026 token store; `None` is open mode (§3.1). With a store,
-    /// every request must carry a known `Authorization: Bearer` credential
-    /// (→ 401) and its `x-ourios-tenant` must fall inside the token's set
+    /// The RFC 0026/0029 credential resolver (`is_open()` = open mode,
+    /// §3.1). Otherwise every request must carry a resolvable
+    /// `Authorization: Bearer` credential (→ 401) and its
+    /// `x-ourios-tenant` must fall inside the resolved binding's set
     /// (→ 403); the missing-tenant 400 is unchanged (§3.3).
     pub auth: AuthResolver,
     /// The look-back applied to a query with no `range(...)` stage — the
@@ -243,7 +244,8 @@ pub fn router_with_mcp(
     )
 }
 
-/// [`router`] with an RFC 0026 token store — the authenticated variant
+/// [`router`] with an RFC 0026/0029 credential resolver — the authenticated
+/// variant (`AuthResolver::is_open()` = open mode)
 /// (`None` = open mode, identical to [`router`]).
 pub fn router_with_auth(
     bucket_root: PathBuf,

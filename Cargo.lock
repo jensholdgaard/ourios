@@ -3343,6 +3343,7 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.8.6",
+ "reqwest",
  "rmcp",
  "schemars 1.2.1",
  "serde",

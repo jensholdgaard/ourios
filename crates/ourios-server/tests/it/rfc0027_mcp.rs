@@ -117,9 +117,18 @@ fn tool_text(body: &str) -> serde_json::Value {
 /// The tool-level error message from an SSE or JSON JSON-RPC body.
 fn tool_error(body: &str) -> String {
     let rpc = rpc_payload(body);
-    rpc["error"]["message"]
-        .as_str()
-        .map_or_else(|| rpc["result"].to_string(), str::to_owned)
+    // Failures surface either as a JSON-RPC error or as a successful
+    // response whose result carries `isError: true` with the message in
+    // the text content — cover both shapes.
+    if let Some(message) = rpc["error"]["message"].as_str() {
+        return message.to_owned();
+    }
+    if rpc["result"]["isError"] == true
+        && let Some(text) = rpc["result"]["content"][0]["text"].as_str()
+    {
+        return text.to_owned();
+    }
+    rpc["result"].to_string()
 }
 
 /// A minimal MCP `initialize` request (JSON-RPC over streamable HTTP).
@@ -337,20 +346,15 @@ async fn rfc0027_3_query_logs() {
         "pruning stats present: {mcp_payload}",
     );
 
-    // A malformed statement is a tool error, never a transport failure.
-    let bad = serde_json::json!({
-        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {"name": "query_logs",
-                    "arguments": {"tenant": "acme", "query": "not a dsl ((("}}
-    });
-    let init = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                   "clientInfo": {"name": "rfc0027-test", "version": "0"}}
-    });
-    let (_, _, session) = mcp_post(router.clone(), None, None, init).await;
-    let (status, body, _) = mcp_post(router.clone(), None, session.as_deref(), bad).await;
-    assert_eq!(status, StatusCode::OK, "transport stays 200");
+    // A malformed statement is a tool error, never a transport failure —
+    // through the full protocol dance (mcp_tool_call asserts 200).
+    let body = mcp_tool_call(
+        &router,
+        None,
+        "query_logs",
+        serde_json::json!({"tenant": "acme", "query": "not a dsl ((("}),
+    )
+    .await;
     assert!(
         tool_error(&body).contains("invalid query"),
         "the DSL error surfaces as a tool error: {body}",

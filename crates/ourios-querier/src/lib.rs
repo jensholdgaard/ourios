@@ -939,15 +939,9 @@ impl Querier {
                 });
             }
         }
-        // Offload the blocking registry derivation (S3 `get_blocking` / local
-        // `std::fs` reads) off the runtime worker, like the alias derivation.
-        let registry = self
-            .spawn_blocking_audit({
-                let backend = self.backend.clone();
-                let tenant = tenant.clone();
-                move || derive_template_registry(backend.store_ref(), &tenant)
-            })
-            .await?;
+        // The single registry derivation ([`Self::template_registry`]) —
+        // blocking store reads offloaded there.
+        let registry = self.template_registry(tenant).await?;
         Ok(mined
             .iter()
             .map(|record| LogRow::from_record(record, &registry))

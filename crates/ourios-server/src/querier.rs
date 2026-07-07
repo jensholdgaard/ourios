@@ -114,8 +114,8 @@ impl QuerierHandle {
 }
 
 /// `ourios.query.kind` attribute values (RFC 0016 §3.6).
-const QUERY_KIND_LOGS: &str = "logs";
-const QUERY_KIND_DRIFT: &str = "drift";
+pub(crate) const QUERY_KIND_LOGS: &str = "logs";
+pub(crate) const QUERY_KIND_DRIFT: &str = "drift";
 /// The `ourios.query.kind` value for a request rejected before kind
 /// dispatch (RFC 0026 §3.4) — authn/authz answer before the body parse,
 /// so neither `logs` nor `drift` applies.
@@ -132,7 +132,7 @@ const ERROR_TYPE: &str = "error.type";
 /// histogram (by kind, and `error.type` on failure) and the scanned-vs-pruned
 /// row-group counter. Built against the global meter, so they resolve to
 /// whatever `MeterProvider` the process installed (RFC 0001 §6.8).
-struct QuerierMetrics {
+pub(crate) struct QuerierMetrics {
     duration: Histogram<f64>,
     row_groups: Counter<u64>,
 }
@@ -167,7 +167,7 @@ impl QuerierMetrics {
     /// Record a successful query: its wall-clock duration (by kind) and the
     /// scanned/pruned row-group split (the two states partition the candidates,
     /// so the B1 pruned fraction is derivable in the backend).
-    fn record_ok(&self, kind: &'static str, elapsed: Duration, stats: &QueryStats) {
+    pub(crate) fn record_ok(&self, kind: &'static str, elapsed: Duration, stats: &QueryStats) {
         self.duration.record(
             elapsed.as_secs_f64(),
             &[KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)],
@@ -183,7 +183,21 @@ impl QuerierMetrics {
     }
 
     /// Record a failed query: its duration, tagged with `error.type`.
-    fn record_err(&self, kind: &'static str, elapsed: Duration, error_type: &'static str) {
+    /// Record a stats-less operation's duration (the RFC 0027 registry
+    /// fold has no scan, so no row-group split to add).
+    pub(crate) fn record_duration(&self, kind: &'static str, elapsed: Duration) {
+        self.duration.record(
+            elapsed.as_secs_f64(),
+            &[KeyValue::new(semconv::OURIOS_QUERY_KIND, kind)],
+        );
+    }
+
+    pub(crate) fn record_err(
+        &self,
+        kind: &'static str,
+        elapsed: Duration,
+        error_type: &'static str,
+    ) {
         self.duration.record(
             elapsed.as_secs_f64(),
             &[
@@ -252,6 +266,7 @@ fn router_from_querier(
         auth: auth.clone(),
     };
     let mcp_querier = state.querier.clone();
+    let mcp_metrics = state.metrics.clone();
     let router = Router::new()
         .route("/v1/query", post(handle_query))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -261,7 +276,7 @@ fn router_from_querier(
         // `/mcp`, behind the same RFC 0026 gate, over the same engine.
         router.nest(
             "/mcp",
-            crate::mcp::mcp_router(mcp_querier, default_window_nanos, auth),
+            crate::mcp::mcp_router(mcp_querier, default_window_nanos, auth, mcp_metrics),
         )
     } else {
         router
@@ -428,7 +443,7 @@ async fn handle_query(
 
 /// The stable `error.type` token for a [`QueryError`] (RFC 0016 §3.6) — a low
 /// cardinality class, never the engine's detail (H6).
-fn query_error_type(error: &ourios_querier::QueryError) -> &'static str {
+pub(crate) fn query_error_type(error: &ourios_querier::QueryError) -> &'static str {
     use ourios_querier::QueryError;
     match error {
         QueryError::TenantRequired => "tenant_required",

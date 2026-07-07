@@ -41,7 +41,10 @@ mkdir -p /tmp/ourios/data /tmp/ourios/wal
 OURIOS_BUCKET_ROOT=/tmp/ourios/data \
 OURIOS_WAL_ROOT=/tmp/ourios/wal \
 OURIOS_RECEIVER_ENABLED=1 \
+OURIOS_RECEIVER_GRPC_ADDR=127.0.0.1:4317 \
+OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:4318 \
 OURIOS_QUERIER_ENABLED=1 \
+OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
 ./ourios-server
 ```
 
@@ -49,13 +52,14 @@ Startup prints the bound addresses and warns once that auth is in
 open mode:
 
 ```text
-receiver gRPC listening on 0.0.0.0:4317
-receiver HTTP listening on 0.0.0.0:4318
-querier HTTP listening on 0.0.0.0:4319
+receiver gRPC listening on 127.0.0.1:4317
+receiver HTTP listening on 127.0.0.1:4318
+querier HTTP listening on 127.0.0.1:4319
 ```
 
 The ports are the OTLP defaults (4317 gRPC, 4318 HTTP) plus 4319 for
-the query API. Prefer a config file over env vars? See
+the query API; the explicit `127.0.0.1` binds keep this quickstart on
+localhost (the server defaults to `0.0.0.0` for container use). Prefer a config file over env vars? See
 [Configuration](./configuration.md) — `--config ourios.yaml` makes
 the file the sole source.
 

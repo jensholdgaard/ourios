@@ -11,8 +11,10 @@ Two mutually exclusive sources ([RFC
 - **`OURIOS_*` environment variables** when no `--config` is given —
   the container/dev posture.
 
-Parsing is **strict** in both modes: an unknown key or a malformed
-value is a startup error, never a silent ignore.
+Parsing is **strict**: a malformed value is a startup error in either
+mode, and in config-file mode an unknown YAML key is rejected too
+(unrecognised `OURIOS_*`-lookalike env vars are simply not read —
+there is no unknown-key concept in the environment).
 
 ## A complete file example
 

@@ -19,6 +19,7 @@ kubectl create secret generic ourios-s3 \
   --from-literal=OURIOS_S3_SECRET_ACCESS_KEY=…
 
 helm install ourios deploy/helm/ourios \
+  --set storage.backend=s3 \
   --set storage.s3.bucket=ourios-logs \
   --set storage.s3.region=eu-central-1 \
   --set storage.s3.endpoint=https://s3.eu-central-1.amazonaws.com \

@@ -37,7 +37,7 @@ extensions:
     token: ${env:OURIOS_EDGE_TOKEN}
 exporters:
   otlp:
-    endpoint: https://ourios.example.com:4317
+    endpoint: ourios.example.com:4317   # TLS by default; gRPC host:port
     auth:
       authenticator: bearertokenauth
 ```
@@ -63,8 +63,9 @@ auth:
 
 Verification is local: the issuer is contacted once at startup
 (discovery + JWKS — an unreachable issuer fails startup, by design)
-and again only when an unseen key id appears (rotation). Signatures
-are RS256/ES256-family only; `alg: none` and HMAC never verify.
+and again only when an unseen key id appears (rotation). Signatures verify against the asymmetric allow-list only —
+RS256/384/512, PS256/384/512, ES256/384; `alg: none` and HMAC never
+verify.
 
 Machine senders use the OAuth2 client-credentials flow — with a
 Collector this is zero custom code:
@@ -78,7 +79,7 @@ extensions:
     scopes: [openid, profile, groups]
 exporters:
   otlp:
-    endpoint: https://ourios.example.com:4317
+    endpoint: ourios.example.com:4317   # TLS by default; gRPC host:port
     auth:
       authenticator: oauth2client
 ```

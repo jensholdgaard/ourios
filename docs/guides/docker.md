@@ -8,7 +8,8 @@ docker pull ghcr.io/jensholdgaard/ourios:0.1.1
 ```
 
 Verify the signature before trusting it — the identity is pinned to
-the exact release tag
+the exact release tag, so **substitute both occurrences of the
+version** when verifying another release
 ([SECURITY.md](https://github.com/jensholdgaard/ourios/blob/main/SECURITY.md)
 is the authoritative verification reference):
 
@@ -44,14 +45,18 @@ docker run --rm \
   -v ourios-data:/var/lib/ourios \
   -v "$PWD/ourios.yaml:/etc/ourios/ourios.yaml:ro" \
   -e OURIOS_EDGE_TOKEN \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
   ghcr.io/jensholdgaard/ourios:0.1.1 \
   --config /etc/ourios/ourios.yaml
 ```
 
-Secrets stay out of the file via `${env:OURIOS_EDGE_TOKEN}`
-references (the `-e` above passes it through), and the server shuts
-down gracefully on SIGTERM — `docker stop` flushes the ingest
-pipeline before exit.
+Secrets stay out of the file via `${env:…}` references — pass through
+**every** variable your file references (the example forwards the
+auth token and, for an S3-backend file like the
+[Configuration](./configuration.md) example, the store credentials;
+a local-backend file needs neither `AWS_*`). The server shuts down
+gracefully on SIGTERM — `docker stop` flushes the ingest pipeline
+before exit.
 
 Local note: any OCI runtime works — with containerd,
 `nerdctl run`/`nerdctl compose` take the same arguments.

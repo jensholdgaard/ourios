@@ -25,8 +25,8 @@ alongside it) verifiable offline with
 ## 2. Run it
 
 The binary is one server with three roles — **receiver** (OTLP
-ingest), **querier** (the logs-DSL API), and the always-on
-**compactor**. Enable the two network roles and point everything at a
+ingest), **querier** (the logs-DSL API), and the background
+**compactor** (on by default). Enable the two network roles and point everything at a
 scratch directory:
 
 ```sh
@@ -64,7 +64,9 @@ With a Collector, point the OTLP exporter at it:
 ```yaml
 exporters:
   otlp:
-    endpoint: http://localhost:4317
+    # host:port is version-proof for the gRPC exporter; recent
+    # Collectors also accept scheme'd forms.
+    endpoint: localhost:4317
     tls:
       insecure: true
 ```
@@ -104,8 +106,8 @@ curl -s http://localhost:4319/v1/query \
   -d 'severity >= info | limit 10'
 ```
 
-The response carries the total match count, the returned rows (bodies
-reconstructed bit-identically from their mined templates), and scan
+The response carries the total match count, the returned rows
+(bodies reconstructed from their mined templates), and scan
 statistics that show the Parquet pruning at work:
 
 ```json

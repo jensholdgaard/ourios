@@ -18,8 +18,8 @@ value is a startup error, never a silent ignore.
 
 ```yaml
 storage:
-  # local | s3 — object storage is the source of truth either way
-  # (local disk is cache + WAL; RFC 0019).
+  # local (a filesystem directory as the store — dev/single-node) or
+  # s3 (object storage as the source of truth — production; RFC 0019).
   backend: s3
   s3:
     bucket: ourios-logs

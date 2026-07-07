@@ -147,7 +147,12 @@ jobs:
         # `printf` substitution (SC2046) — hex digests never contain spaces.
         run: |
           mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          mapfile -t annotation_args < <(jq -r '(.annotations // [])[] | "--annotation", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # Annotations are NOT in the action's json output (tags + labels
+          # only) — they arrive newline-separated in the dedicated env var.
+          annotation_args=()
+          while IFS= read -r annotation; do
+            [ -n "$annotation" ] && annotation_args+=("--annotation" "$annotation")
+          done <<< "$DOCKER_METADATA_OUTPUT_ANNOTATIONS"
           # shellcheck disable=SC2046
           docker buildx imagetools create \
             "${tag_args[@]}" \

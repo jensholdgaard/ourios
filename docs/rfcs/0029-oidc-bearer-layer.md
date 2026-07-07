@@ -1,7 +1,7 @@
 ---
 rfc: 0029
 title: OIDC bearer layer (issuer-agnostic, Dex-validated)
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-07

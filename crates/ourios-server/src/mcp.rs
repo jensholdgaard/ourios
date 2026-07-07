@@ -30,7 +30,10 @@ use ourios_querier::Querier;
 use ourios_querier::dsl::{self, Statement};
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ListResourcesResult, ReadResourceRequestParams,
+    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
+};
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
@@ -38,6 +41,31 @@ use rmcp::{ErrorData, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
 use crate::querier::{DEFAULT_LIMIT, LogQueryResponse, MAX_LIMIT, apply_limit};
+
+/// The RFC 0002 DSL reference, embedded at compile time and trimmed to
+/// its §7 grammar section at startup (RFC 0027 §3.2 / RFC0027.6): the
+/// served resource is byte-identical to that section, so it cannot
+/// drift from the documentation.
+const DSL_RFC: &str = include_str!("../../../docs/rfcs/0002-query-dsl.md");
+
+/// The resource's URI (RFC0027.6).
+const GRAMMAR_URI: &str = "ourios://dsl-grammar";
+
+/// The §7 grammar section of the embedded RFC (heading inclusive, next
+/// top-level heading exclusive), extracted once. [`mcp_router`] touches
+/// this at role startup, so an RFC that lost its §7 heading panics
+/// there — a build-time-embedded doc changing shape is a bug to surface
+/// loudly at startup, not to serve emptily (or panic mid-request).
+static GRAMMAR_SECTION: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+    let start = DSL_RFC
+        .find("\n## 7.")
+        .expect("RFC 0002 carries its §7 grammar section")
+        + 1;
+    let end = DSL_RFC[start..]
+        .find("\n## ")
+        .map_or(DSL_RFC.len(), |offset| start + offset + 1);
+    &DSL_RFC[start..end]
+});
 
 /// The `ourios.query.kind` value for the registry fold (a registry
 /// member alongside `logs`/`drift`/`rejected`).
@@ -307,15 +335,59 @@ impl OuriosMcp {
 
 #[tool_handler]
 impl ServerHandler for OuriosMcp {
+    // `ServerInfo` is `#[non_exhaustive]` upstream, so struct-update
+    // syntax is a compile error (E0639); mutate-a-default is the only
+    // construction.
+    #[allow(clippy::field_reassign_with_default)]
     fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]` upstream, so struct-update
-        // syntax is a compile error (E0639); mutate a default instead.
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         info.instructions = Some(format!(
             "Read-only query access to the Ourios log backend. {UNTRUSTED_NOTE}"
         ));
         info
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        // One resource: the DSL grammar, served from the canonical doc
+        // (RFC0027.6) so agents learn the query language from the
+        // protocol rather than prompt engineering.
+        let mut resource = Resource::new(GRAMMAR_URI, "Ourios logs DSL grammar");
+        resource.description = Some(
+            "The RFC 0002 §7 grammar for the logs DSL the query_logs tool \
+             accepts, verbatim from the project documentation."
+                .to_string(),
+        );
+        resource.mime_type = Some("text/markdown".to_string());
+        // (Exhaustive by design upstream — struct-update works here.)
+        Ok(ListResourcesResult {
+            resources: vec![resource],
+            ..ListResourcesResult::default()
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        if request.uri != GRAMMAR_URI {
+            return Err(ErrorData::resource_not_found(
+                format!("unknown resource: {}", request.uri),
+                None,
+            ));
+        }
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            *GRAMMAR_SECTION,
+            GRAMMAR_URI,
+        )]))
     }
 }
 
@@ -367,6 +439,9 @@ async fn require_bearer(
 /// Build the `/mcp` sub-router: the streamable-HTTP MCP service behind
 /// the RFC 0026 bearer layer. Nested by `querier::router` only when
 /// `querier.mcp.enabled` is set (RFC0027.1).
+// `StreamableHttpServerConfig` is `#[non_exhaustive]` upstream (E0639
+// forbids struct-update), so the config is a mutated default.
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) fn mcp_router(
     querier: Arc<Querier>,
     default_window_nanos: u64,
@@ -381,6 +456,9 @@ pub(crate) fn mcp_router(
     // Host filter opens; in open mode there is no compensating control,
     // so the upstream loopback-only default stays — open mode is the
     // local/dev posture, where loopback is exactly right.
+    // Startup-fail the grammar extraction (RFC0027.6's loud-panic
+    // contract): the role never comes up serving a malformed resource.
+    let _ = *GRAMMAR_SECTION;
     let mut config = StreamableHttpServerConfig::default();
     if auth.is_some() {
         config.allowed_hosts = Vec::new();
@@ -409,4 +487,22 @@ pub(crate) fn mcp_router(
         .layer(middleware::from_fn(move |request, next| {
             require_bearer(auth.clone(), request, next)
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GRAMMAR_SECTION;
+
+    /// The extraction invariants RFC0027.6 leans on: heading-first,
+    /// non-empty, and bounded before the next top-level section.
+    #[test]
+    fn grammar_section_is_the_section_7_slice() {
+        let section = *GRAMMAR_SECTION;
+        assert!(section.starts_with("## 7. Grammar specification"));
+        assert!(section.len() > 200, "a real grammar, not a stub");
+        assert!(
+            !section[3..].contains("\n## "),
+            "ends before the next top-level heading",
+        );
+    }
 }

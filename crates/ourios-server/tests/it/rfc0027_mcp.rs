@@ -1,8 +1,7 @@
 //! RFC 0027 §5 — the MCP query surface, all seven scenarios.
 //!
-//! `.1` is green (the transport slice); the remaining stubs are
-//! `#[ignore]`d so the default run stays green while the RFC works
-//! through its slices, each naming the slice that discharges it.
+//! All seven scenarios are green: `.1` (transport), `.2`–`.5`/`.7`
+//! (tools), `.6` (the grammar resource).
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -452,13 +451,70 @@ async fn rfc0027_5_template_drift() {
 
 /// Scenario RFC0027.6 — the grammar resource.
 /// See `docs/rfcs/0027-mcp-query-surface.md` §5.
-#[test]
-#[ignore = "RFC0027.6 stub — implemented in the resource green slice"]
-fn rfc0027_6_grammar_resource() {
-    todo!(
-        "RFC0027.6 — the served resource is byte-identical to the \
-         RFC 0002 §7 grammar section of docs/rfcs/0002-query-dsl.md \
-         (include_str!, trimmed at startup)"
+#[tokio::test]
+async fn rfc0027_6_grammar_resource() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let router = ourios_server::querier::router_with_mcp(
+        bucket.path().to_path_buf(),
+        3_600_000_000_000,
+        None,
+        true,
+    );
+    let init = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "rfc0027-test", "version": "0"}}
+    });
+    let (status, _, session) = mcp_post(router.clone(), None, None, init).await;
+    assert_eq!(status, StatusCode::OK, "initialize");
+    let session = session.expect("session id issued");
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0", "method": "notifications/initialized"
+    });
+    let (status, _, _) = mcp_post(router.clone(), None, Some(&session), initialized).await;
+    assert!(status.is_success(), "initialized: {status}");
+
+    // resources/list advertises exactly the grammar.
+    let list = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}
+    });
+    let (status, body, _) = mcp_post(router.clone(), None, Some(&session), list).await;
+    assert_eq!(status, StatusCode::OK);
+    let rpc = rpc_payload(&body);
+    let resources = rpc["result"]["resources"].as_array().expect("resources");
+    assert_eq!(resources.len(), 1, "one resource: {rpc}");
+    let uri = resources[0]["uri"].as_str().expect("uri");
+    assert_eq!(uri, "ourios://dsl-grammar");
+    assert_eq!(
+        resources[0]["mimeType"], "text/markdown",
+        "advertised as markdown: {}",
+        resources[0],
+    );
+
+    // resources/read serves text byte-identical to the RFC 0002 §7
+    // section — extracted here independently from the same repo file.
+    let read = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+        "params": {"uri": uri}
+    });
+    let (status, body, _) = mcp_post(router.clone(), None, Some(&session), read).await;
+    assert_eq!(status, StatusCode::OK);
+    let rpc = rpc_payload(&body);
+    let served = rpc["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("text contents");
+
+    let rfc = include_str!("../../../../docs/rfcs/0002-query-dsl.md");
+    let start = rfc.find("\n## 7.").expect("§7 heading") + 1;
+    let end = rfc[start..]
+        .find("\n## ")
+        .map_or(rfc.len(), |offset| start + offset + 1);
+    let expected = &rfc[start..end];
+    assert_eq!(served, expected, "byte-identical to the §7 section");
+    assert!(
+        served.starts_with("## 7. Grammar specification"),
+        "the section, heading-first: {}",
+        &served[..60.min(served.len())],
     );
 }
 

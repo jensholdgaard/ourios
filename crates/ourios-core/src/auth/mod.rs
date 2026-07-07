@@ -16,6 +16,9 @@
 //! and validation errors name an entry's `name`/index, never its token
 //! (RFC 0026 §3.1 / RFC 0020 §3.5).
 
+#[cfg(feature = "oidc")]
+pub mod oidc;
+
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -69,6 +72,8 @@ pub struct OidcSpec {
     pub tenant_claim: Option<String>,
     /// The claim feeding the audit/metric label. Defaults to `sub`.
     pub name_claim: Option<String>,
+    /// `exp`/`nbf` clock-skew allowance in seconds (§3.2). Defaults to 60.
+    pub clock_skew_secs: Option<String>,
 }
 
 /// The validated `auth.oidc` configuration (RFC 0029 §3.1).
@@ -78,6 +83,7 @@ pub struct OidcConfig {
     audience: String,
     tenant_claim: String,
     name_claim: String,
+    clock_skew_secs: u64,
 }
 
 impl OidcConfig {
@@ -103,6 +109,12 @@ impl OidcConfig {
     #[must_use]
     pub fn name_claim(&self) -> &str {
         &self.name_claim
+    }
+
+    /// The `exp`/`nbf` clock-skew allowance in seconds (§3.2).
+    #[must_use]
+    pub fn clock_skew_secs(&self) -> u64 {
+        self.clock_skew_secs
     }
 }
 
@@ -180,11 +192,19 @@ pub fn build_oidc_config(spec: &OidcSpec) -> Result<OidcConfig, String> {
         None => "sub".to_string(),
         some => required("name_claim", some)?,
     };
+    let clock_skew_secs = match spec.clock_skew_secs.as_deref() {
+        None => 60,
+        Some(raw) => raw.trim().parse().map_err(|_| {
+            "auth.oidc.clock_skew_secs must be a non-negative integer number of              seconds (RFC 0029 §3.2)"
+                .to_string()
+        })?,
+    };
     Ok(OidcConfig {
         issuer: required("issuer", spec.issuer.as_deref())?,
         audience: required("audience", spec.audience.as_deref())?,
         tenant_claim: required("tenant_claim", spec.tenant_claim.as_deref())?,
         name_claim,
+        clock_skew_secs,
     })
 }
 
@@ -488,6 +508,7 @@ mod tests {
             audience: Some("ourios".to_string()),
             tenant_claim: Some("ourios_tenants".to_string()),
             name_claim: None,
+            clock_skew_secs: None,
         }
     }
 

@@ -24,6 +24,18 @@ ignore = [
     # DataFusion/Arrow upgrade, epic #314).
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # reason: `rsa` Marvin timing side-channel (RUSTSEC-2023-0071, no patch
+    # released) leaks *private-key* material through private-key-operation
+    # timing. Ourios never performs RSA private-key operations: the RFC 0029
+    # verifier (jsonwebtoken's rust_crypto backend, `oidc` feature) only
+    # verifies signatures against the issuer's *public* JWKS keys, and the
+    # ourios-core dev-dependency only generates throwaway per-test-process
+    # fixture keys (tests DO sign with those, locally and ephemerally). In
+    # production no token is ever signed and no RSA private key exists —
+    # the timing side-channel has nothing to leak. Re-evaluate if we ever sign
+    # (issuer-side) rather than verify, or when the constant-time rewrite
+    # ships upstream.
+    "RUSTSEC-2023-0071",
 ]
 
 [licenses]

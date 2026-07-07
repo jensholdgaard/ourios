@@ -289,6 +289,9 @@ pub struct OidcSection {
     /// The claim feeding the audit/metric label (default `sub`).
     #[serde(deserialize_with = "scalar_opt")]
     pub name_claim: Option<String>,
+    /// `exp`/`nbf` clock-skew allowance in seconds (default 60).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub clock_skew_secs: Option<String>,
 }
 
 /// One `auth.tokens[…]` entry (RFC 0026 §3.1).
@@ -466,6 +469,7 @@ impl AuthSection {
             substitute(&mut oidc.audience, lookup)?;
             substitute(&mut oidc.tenant_claim, lookup)?;
             substitute(&mut oidc.name_claim, lookup)?;
+            substitute(&mut oidc.clock_skew_secs, lookup)?;
         }
         Ok(())
     }

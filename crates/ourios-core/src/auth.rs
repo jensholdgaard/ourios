@@ -244,8 +244,11 @@ impl fmt::Debug for ResolvedToken {
     }
 }
 
-/// The validated `auth.tokens` store (RFC 0026 §3.1) — non-empty by
-/// construction ([`build_token_store`]).
+/// The validated `auth.tokens` store (RFC 0026 §3.1). Non-empty when it
+/// comes from [`build_token_store`] (an empty *config list* is a startup
+/// error); the one deliberate empty state is
+/// [`AuthConfig::enforcement_store`]'s oidc-only bridge, where matching
+/// nothing — rejecting every bearer — is the point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenStore {
     entries: Vec<ResolvedToken>,

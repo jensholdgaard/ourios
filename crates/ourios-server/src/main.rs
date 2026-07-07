@@ -576,10 +576,11 @@ fn warn_if_open_mode(config: &ServerConfig) {
     }
 }
 
-/// The store the listeners enforce against (RFC 0026 §3.2/§3.3), shared by
-/// both roles. Open mode stays `None`; an oidc-only config yields an empty
-/// store — enforced, not open — until the RFC 0029 verifier slice teaches
-/// the gates the full [`ourios_server::auth::AuthConfig`].
+/// The store the listeners enforce against (RFC 0026 §3.2/§3.3) — each
+/// role derives its own instance from the one resolved config. Open mode
+/// stays `None`; an oidc-only config yields an empty store — enforced,
+/// not open — until the RFC 0029 verifier slice teaches the gates the
+/// full [`ourios_server::auth::AuthConfig`].
 fn enforcement_store(
     config: &ServerConfig,
 ) -> Option<std::sync::Arc<ourios_server::auth::TokenStore>> {

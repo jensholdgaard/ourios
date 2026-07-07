@@ -1,7 +1,7 @@
 ---
 rfc: 0027
 title: MCP query surface (agent-facing read tools over the querier)
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-05
@@ -189,6 +189,22 @@ authn); that gate is **satisfied** as of RFC 0026's green,
   RFC 0002 §7 section byte-identically (`include_str!`, extracted once
   at role startup with a loud panic on shape drift), `text/markdown`,
   asserted by an independent extraction in the test.
+
+### 5.2 Validation record (validated, 2026-07-07)
+
+Run: `scratch/validation/rfc0026-0027-validate.sh` — the release
+binary with `querier.mcp.enabled` + RFC 0026 auth, driven by the
+**official MCP inspector CLI** (`@modelcontextprotocol/inspector`,
+the TypeScript SDK — an independent client implementation, not this
+repo's test client). 16/16 checks pass; the RFC 0027 arms:
+
+- `tools/list` advertises exactly the §3.2 three.
+- `resources/read ourios://dsl-grammar` serves the §7 section
+  (heading-checked; byte-identity is the §5.1 CI test's oracle).
+- `query_logs` over really-ingested rows returns a payload **equal**
+  to `/v1/query`'s for the same statement and tenant.
+- `template_drift` answers over the audit stream.
+- An unknown bearer is rejected before any MCP dispatch.
 
 ## 6. Testing strategy
 

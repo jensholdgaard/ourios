@@ -821,11 +821,14 @@ mod dex {
 
         // Short-TTL tokens make the expiry arm real time rather than
         // clock-skew fiction: every arm below completes in milliseconds,
-        // then one sleep crosses the boundary.
+        // then one sleep crosses the boundary. `enablePasswordDB` is the
+        // inert built-in connector — Dex refuses to start with zero
+        // connectors, though client-credentials never touches one.
         let dex_config = format!(
             "issuer: {issuer}\n\
              storage:\n  type: memory\n\
              web:\n  http: 0.0.0.0:5556\n\
+             enablePasswordDB: true\n\
              oauth2:\n  grantTypes: [\"client_credentials\"]\n\
              expiry:\n  idTokens: \"8s\"\n\
              staticClients:\n\

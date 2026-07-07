@@ -325,7 +325,9 @@ fn now_unix_nano() -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    u64::try_from(nanos).unwrap_or(0)
+    // Saturate high like the HTTP surface: epoch-anchoring on overflow
+    // would open a pathological look-back window.
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 /// A query-engine failure as a tool error: the engine's `Display` is the

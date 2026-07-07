@@ -483,11 +483,18 @@ async fn rfc0027_7_output_discipline() {
         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                    "clientInfo": {"name": "rfc0027-test", "version": "0"}}
     });
-    let (_, _, session) = mcp_post(router.clone(), None, None, init).await;
+    let (status, _, session) = mcp_post(router.clone(), None, None, init).await;
+    assert_eq!(status, StatusCode::OK, "initialize");
+    let session = session.expect("session id issued");
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0", "method": "notifications/initialized"
+    });
+    let (status, _, _) = mcp_post(router.clone(), None, Some(&session), initialized).await;
+    assert!(status.is_success(), "initialized notification: {status}");
     let list = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
     });
-    let (status, body, _) = mcp_post(router.clone(), None, session.as_deref(), list).await;
+    let (status, body, _) = mcp_post(router.clone(), None, Some(&session), list).await;
     assert_eq!(status, StatusCode::OK);
     let rpc = rpc_payload(&body);
     let tools = rpc["result"]["tools"].as_array().expect("tools array");

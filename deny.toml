@@ -56,7 +56,14 @@ allow = [
     "CC0-1.0",
 ]
 confidence-threshold = 0.8
-exceptions = []
+exceptions = [
+    # CDLA-Permissive-2.0 covers the Mozilla CA-certificate *data* bundled by
+    # webpki-roots (the standard rustls root store, via reqwest's rustls-tls —
+    # the RFC 0029 verifier's HTTPS to the issuer). A permissive data license
+    # (attribution-free redistribution); scoped to this one crate rather than
+    # allowed globally.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 # The allow-list is a stable permissive baseline; the set of licenses actually
 # encountered varies by target/platform, so don't warn on allowed-but-unused
 # entries (they are not policy violations).

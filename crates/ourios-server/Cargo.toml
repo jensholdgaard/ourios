@@ -24,7 +24,7 @@ ourios-config = { path = "../ourios-config" }
 # The background compaction daemon (RFC 0009 §3.2) + the OTLP receiver
 # building blocks (RFC 0003 §6.2): the ingest pipeline, the axum HTTP
 # router, and the tonic `LogsService` impl the receiver role serves.
-ourios-ingester = { path = "../ourios-ingester" }
+ourios-ingester = { path = "../ourios-ingester", features = ["oidc"] }
 # Durable compaction-audit sink (RFC 0005 §3.7) + the compaction policy.
 ourios-parquet = { path = "../ourios-parquet" }
 # OTel SDK + OTLP push MeterProvider bootstrap (RFC 0001 §6.8).
@@ -38,7 +38,7 @@ ourios-semconv = { path = "../ourios-semconv" }
 # over a single `Wal`, RFC 0003 §6.5 / RFC 0008 §3.1).
 ourios-wal = { path = "../ourios-wal" }
 ourios-miner = { path = "../ourios-miner" }
-ourios-core = { path = "../ourios-core" }
+ourios-core = { path = "../ourios-core", features = ["oidc"] }
 # The query engine (RFC 0007) the querier role (RFC 0016) serves: the DSL
 # front-ends (`dsl::parse_statement` / `parse_structured_statement`) + the
 # `Querier` (`run_query` / `run_drift`). Its types are kept internal — no
@@ -107,6 +107,13 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 # `Store::s3`. `#[ignore]`d — run only by the `s3-integration` CI job (Docker +
 # AWS_* env); the default `cargo test` compiles but skips them.
 testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
+# RFC 0029 §5 served arms: a loopback fixture issuer (axum, already a lib
+# dep) plus ES256 minting — the same runtime-generated-key policy as the
+# ourios-core fixture (no committed private keys).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+rand = "0.8"
+base64 = "0.22"
 
 [lints]
 workspace = true

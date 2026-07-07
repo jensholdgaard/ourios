@@ -15,8 +15,6 @@
 //! §3.1) while letting concurrent requests batch their fsyncs
 //! (RFC0008.8). `ingest` is async, so the handler simply `.await`s it.
 
-use std::sync::Arc;
-
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -24,10 +22,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
-use ourios_core::auth::TokenStore;
 use prost::Message;
 
-use crate::receiver::auth::authenticate_bearer;
+use crate::receiver::auth::AuthResolver;
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
 
@@ -40,11 +37,12 @@ pub struct HttpConfig {
     /// Maximum request body size in bytes; a larger body is rejected with
     /// 413 (RFC0003.11).
     pub max_body_bytes: usize,
-    /// The RFC 0026 token store; `None` (the default) is open mode
-    /// (§3.1). With a store, every request must carry a known
-    /// `Authorization: Bearer` credential (→ 401) and its batch is bound
-    /// to the token's tenant set (→ 403).
-    pub auth: Option<Arc<TokenStore>>,
+    /// The RFC 0026 / RFC 0029 credential resolver; the default
+    /// (`AuthResolver::static_only(None)`) is open mode (§3.1). Otherwise
+    /// every request must carry a resolvable `Authorization: Bearer`
+    /// credential (→ 401) and its batch is bound to the resolved tenant
+    /// set (→ 403).
+    pub auth: AuthResolver,
 }
 
 impl Default for HttpConfig {
@@ -52,7 +50,7 @@ impl Default for HttpConfig {
         Self {
             path: "/v1/logs".to_owned(),
             max_body_bytes: 4 * 1024 * 1024,
-            auth: None,
+            auth: AuthResolver::static_only(None),
         }
     }
 }
@@ -65,7 +63,7 @@ impl Default for HttpConfig {
 struct AppState {
     pipeline: SharedPipeline,
     max_decompressed_bytes: usize,
-    auth: Option<Arc<TokenStore>>,
+    auth: AuthResolver,
 }
 
 /// Build the OTLP/HTTP router over `pipeline`.
@@ -101,7 +99,7 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let Ok(binding) = authenticate_bearer(state.auth.as_deref(), authorization) else {
+    let Ok(binding) = state.auth.authenticate(authorization).await else {
         // RFC 0026 §3.4: the rejection counts on `ourios.ingest.batches` (`error.type = unauthenticated`).
         state.pipeline.record_unauthenticated();
         return StatusCode::UNAUTHORIZED.into_response();

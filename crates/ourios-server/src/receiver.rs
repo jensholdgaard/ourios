@@ -20,7 +20,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use ourios_config::MinerConfig;
 use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
 use ourios_ingester::publish::PublishCoordinator;
-use ourios_ingester::receiver::grpc::{AuthInterceptor, LogsReceiver};
+use ourios_ingester::receiver::AuthResolver;
+use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
@@ -211,11 +212,12 @@ pub struct ReceiverConfig {
     /// The RFC 0022 promoted attribute set every flushed data file projects
     /// (`storage.promoted_attributes`, §3.2).
     pub promoted: PromotedAttributes,
-    /// The RFC 0026 token store; `None` is open mode (§3.1). Applied to
-    /// both listeners: the gRPC interceptor and the HTTP handler
-    /// authenticate before decode, and the pipeline binds each batch to
-    /// the token's tenant set before the WAL append (§3.2).
-    pub auth: Option<Arc<ourios_core::auth::TokenStore>>,
+    /// The RFC 0026 / RFC 0029 credential resolver (static store and/or
+    /// OIDC verifier; `AuthResolver::static_only(None)` is open mode,
+    /// §3.1). Applied to both listeners: the gRPC auth layer and the HTTP
+    /// handler authenticate before decode, and the pipeline binds each
+    /// batch to the resolved tenant set before the WAL append (§3.2).
+    pub auth: AuthResolver,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -472,17 +474,18 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         shutdown_rx.clone(),
     );
 
-    // RFC 0026 §3.2: the interceptor authenticates before the message
-    // decode (open mode passes through unbound); the handler's pipeline
-    // enforces the tenant binding it attaches.
-    let grpc_service = LogsServiceServer::with_interceptor(
-        LogsReceiver::new(pipeline.clone()),
-        AuthInterceptor::new(config.auth.clone()),
-    );
+    // RFC 0026 §3.2 / RFC 0029 §3.3: the auth layer resolves before the
+    // message decode (open mode passes through unbound); the handler's
+    // pipeline enforces the tenant binding it attaches. A tower layer
+    // rather than a sync interceptor because OIDC resolution may await a
+    // JWKS refetch.
+    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()));
+    let auth_layer = AuthLayer::new(config.auth.clone());
     let grpc = tokio::spawn({
         let mut rx = shutdown_rx.clone();
         async move {
             Server::builder()
+                .layer(auth_layer)
                 .add_service(grpc_service)
                 .serve_with_incoming_shutdown(grpc_incoming, async move {
                     let _ = rx.changed().await;
@@ -746,7 +749,7 @@ mod tests {
             wal: test_wal_config(wal_dir.path()),
             store,
             promoted: PromotedAttributes::default(),
-            auth: None,
+            auth: AuthResolver::static_only(None),
         })
         .await
         .expect("serve");
@@ -865,7 +868,7 @@ mod tests {
             wal: test_wal_config(wal_dir.path()),
             store,
             promoted: PromotedAttributes::default(),
-            auth: None,
+            auth: AuthResolver::static_only(None),
         })
         .await
         .expect("serve");

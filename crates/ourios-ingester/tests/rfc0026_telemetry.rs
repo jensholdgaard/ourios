@@ -16,9 +16,9 @@ use ingest_support::{request, resource_logs};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use ourios_core::audit::{AuditPayload, SharedAuditSink};
 use ourios_core::auth::{TokenSpec, build_token_store};
-use ourios_ingester::receiver::grpc::AuthInterceptor;
+use ourios_ingester::receiver::AuthResolver;
+use ourios_ingester::receiver::grpc::AuthLayer;
 use ourios_ingester::receiver::{ReceiveError, authenticate_bearer};
-use tonic::service::Interceptor as _;
 
 /// The exported `ourios.ingest.batches` datapoint value for `error.type ==
 /// wanted`, across all resource metrics.
@@ -58,13 +58,33 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
     .expect("valid")
     .expect("enabled");
 
-    // Authn rejection through the gRPC interceptor (the transport that
-    // owns the 401 surface): error.type = unauthenticated.
-    let mut interceptor = AuthInterceptor::new(Some(Arc::new(store.clone())));
-    let status = interceptor
-        .call(tonic::Request::new(()))
-        .expect_err("no bearer");
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    // Authn rejection through the gRPC auth layer (the transport's own
+    // rejection surface — UNAUTHENTICATED / grpc-status 16; HTTP's is the
+    // 401): error.type = unauthenticated. The layer
+    // answers a bearer-less request itself with a trailers-only
+    // UNAUTHENTICATED response — the inner service never runs.
+    let layer = AuthLayer::new(AuthResolver::static_only(Some(Arc::new(store.clone()))));
+    let service = tower::Layer::layer(
+        &layer,
+        tower::service_fn(|_req: http::Request<()>| async {
+            panic!("the inner service must not run for a rejected request");
+            #[allow(unreachable_code)]
+            Ok::<http::Response<tonic::body::Body>, std::convert::Infallible>(http::Response::new(
+                tonic::body::Body::default(),
+            ))
+        }),
+    );
+    let response = tower::ServiceExt::oneshot(service, http::Request::new(()))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok()),
+        Some("16"),
+        "trailers-only grpc-status UNAUTHENTICATED"
+    );
 
     // Authz rejection through the pipeline: error.type = permission_denied
     // + the ingest_denied audit event.

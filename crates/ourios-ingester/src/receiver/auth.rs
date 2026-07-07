@@ -16,6 +16,8 @@
 //! Nothing here carries or renders a token value: the binding holds the
 //! token's audit *name* and its tenant set only.
 
+use std::sync::Arc;
+
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_core::auth::{TenantSet, TokenStore};
 
@@ -91,6 +93,109 @@ fn parse_bearer(value: &str) -> Option<&str> {
     }
     let token = token.trim();
     (!token.is_empty()).then_some(token)
+}
+
+/// The full request resolution in front of the RFC 0026 enforcement:
+/// the constant-time static store first, then — when configured and the
+/// static store does not match — RFC 0029 OIDC verification (`oidc`
+/// feature). Open mode (§3.1) only when *nothing* is configured. Async
+/// because an OIDC unseen-`kid` miss may refetch the JWKS; the static
+/// path never awaits.
+#[derive(Clone)]
+pub struct AuthResolver {
+    store: Option<Arc<TokenStore>>,
+    #[cfg(feature = "oidc")]
+    oidc: Option<Arc<ourios_core::auth::oidc::OidcVerifier>>,
+}
+
+impl std::fmt::Debug for AuthResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("AuthResolver");
+        d.field("static_store", &self.store.is_some());
+        #[cfg(feature = "oidc")]
+        d.field("oidc", &self.oidc.is_some());
+        d.finish()
+    }
+}
+
+impl AuthResolver {
+    /// A resolver over the static store only (`None` = open mode) — the
+    /// RFC 0026 shape, and the whole story when the `oidc` feature is
+    /// off or unconfigured.
+    #[must_use]
+    pub fn static_only(store: Option<Arc<TokenStore>>) -> Self {
+        Self {
+            store,
+            #[cfg(feature = "oidc")]
+            oidc: None,
+        }
+    }
+
+    /// A resolver with an OIDC verifier alongside the (optional) static
+    /// store — RFC 0029 §3.3 coexistence: each credential authenticates
+    /// via its own path, carrying its own tenant binding.
+    #[cfg(feature = "oidc")]
+    #[must_use]
+    pub fn with_oidc(
+        store: Option<Arc<TokenStore>>,
+        oidc: Arc<ourios_core::auth::oidc::OidcVerifier>,
+    ) -> Self {
+        Self {
+            store,
+            oidc: Some(oidc),
+        }
+    }
+
+    /// Whether every request passes unbound (§3.1 open mode).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        #[cfg(feature = "oidc")]
+        {
+            self.store.is_none() && self.oidc.is_none()
+        }
+        #[cfg(not(feature = "oidc"))]
+        {
+            self.store.is_none()
+        }
+    }
+
+    /// Resolve a request's `Authorization` value (RFC 0026 §3.2 /
+    /// RFC 0029 §3.3). Same contract as [`authenticate_bearer`]:
+    /// `Ok(None)` in open mode, one undifferentiated error otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`Unauthenticated`] on a missing, malformed, or unknown credential
+    /// — including a JWT that fails verification.
+    pub async fn authenticate(
+        &self,
+        authorization: Option<&str>,
+    ) -> Result<Option<AuthBinding>, Unauthenticated> {
+        if self.is_open() {
+            return Ok(None);
+        }
+        let token = authorization
+            .and_then(parse_bearer)
+            .ok_or(Unauthenticated)?;
+        if let Some(store) = self.store.as_deref()
+            && let Some(entry) = store.authenticate(token)
+        {
+            return Ok(Some(AuthBinding {
+                token_name: entry.name().to_string(),
+                tenants: entry.tenants().clone(),
+            }));
+        }
+        #[cfg(feature = "oidc")]
+        if let Some(oidc) = &self.oidc
+            && let Some(identity) = oidc.verify(token).await
+        {
+            return Ok(Some(AuthBinding {
+                token_name: identity.name,
+                tenants: identity.tenants,
+            }));
+        }
+        Err(Unauthenticated)
+    }
 }
 
 /// Enforce the §3.2 per-batch tenant binding: derive every `ResourceLogs`

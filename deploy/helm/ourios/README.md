@@ -22,9 +22,9 @@ them as three workloads sharing a data + audit store on object storage:
 
 ## Topology
 
-![Ourios Helm chart topology](https://raw.githubusercontent.com/jensholdgaard/ourios/main/deploy/helm/ourios/docs/topology.png)
+![Ourios Helm chart topology](https://raw.githubusercontent.com/jensholdgaard/ourios/5a5b1ed398f60ee23117d4f4032f564691a7a1a7/deploy/helm/ourios/docs/topology.png)
 
-Text version:
+Text fallback (for `helm show readme` in a terminal):
 
 ```
             OTLP                         query
@@ -49,7 +49,8 @@ local durable PVC, never object storage** (CLAUDE.md §3.4 WAL-before-ack / §3.
 object storage is the source of truth).
 
 Diagram source: `docs/topology.py` in the repo checkout (regeneration
-instructions in its docstring).
+instructions in its docstring). The image URL above is pinned to the
+commit that last regenerated the PNG — re-pin it when regenerating.
 
 ## Install
 

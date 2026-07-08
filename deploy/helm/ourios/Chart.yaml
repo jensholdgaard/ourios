@@ -11,10 +11,10 @@ description: |
 type: application
 # Chart version — bumped on chart changes, independent of the app version.
 version: 0.3.0
-# Tracks the ourios-server crate version (pre-release; no image is published
-# for 0.0.0). Surfaces as the app.kubernetes.io/version label. The deployed
-# image tag is set via image.tag (defaults to `latest`), not this field.
-appVersion: "0.0.0"
+# Tracks the ourios-server release the chart publishes alongside.
+# Surfaces as the app.kubernetes.io/version label. The deployed image
+# tag is set via image.tag (defaults to `latest`), not this field.
+appVersion: "0.1.2"
 keywords:
   - logs
   - observability

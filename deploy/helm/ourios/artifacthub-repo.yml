@@ -1,0 +1,11 @@
+# Artifact Hub repository metadata (verified-publisher badge). For an
+# OCI-based chart repo this file is NOT packaged into the chart —
+# the release pipeline pushes it as a separate ORAS artifact to the
+# `:artifacthub.io` tag of the chart reference, per
+# https://artifacthub.io/docs/topics/repositories/helm-charts/#oci-support
+# The ID Artifact Hub assigned this repository at registration
+# (control panel → Repositories → Ourios) — the badge matches on it.
+repositoryID: 1c1b262d-22ac-4946-9cd9-f4e2609cae27
+owners:
+  - name: Jens Holdgaard Pedersen
+    email: jens@holdgaard.org

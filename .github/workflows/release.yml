@@ -404,6 +404,11 @@ jobs:
   # (#364; the Artifact Hub prerequisite). Runs only on a real publish
   # (same gate as `host`) and carries the chart's own Chart.yaml version
   # — chart and server version independently by design.
+  #
+  # MANUAL CUSTOMIZATION (like the pinned installers above): this job is
+  # NOT cargo-dist-generated — re-running `dist init` regenerates the
+  # file and will drop it; re-apply this job (and the pinned-install
+  # blocks) after any regeneration.
   publish-chart:
     needs:
       - plan
@@ -427,6 +432,26 @@ jobs:
             --username "${{ github.actor }}" --password-stdin
           helm package deploy/helm/ourios --destination /tmp/chart
           helm push /tmp/chart/ourios-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
+      - name: Push the Artifact Hub repository metadata
+        # The verified-publisher metadata rides the chart repo's
+        # `:artifacthub.io` tag as an ORAS artifact (the documented OCI
+        # mechanism — it is deliberately not packaged into the chart).
+        # oras is download → sha256-verify → extract, per the #366 posture.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf -o /tmp/oras.tar.gz \
+            https://github.com/oras-project/oras/releases/download/v1.3.2/oras_1.3.2_linux_amd64.tar.gz
+          echo "9229ccc6d17bb282039ad4a69abb16dcb887a5bce567c075d731d9b3c7ad8eaf  /tmp/oras.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/oras.tar.gz -C /tmp oras
+          echo "$GH_TOKEN" | /tmp/oras login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          cd deploy/helm/ourios
+          /tmp/oras push \
+            "ghcr.io/${{ github.repository_owner }}/charts/ourios:artifacthub.io" \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
 
   announce:
     needs:

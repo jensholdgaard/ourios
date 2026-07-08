@@ -22,7 +22,9 @@ observer can replay them. This RFC closes the gap identified as
 1. **Server TLS on all three listeners** — OTLP gRPC (:4317), OTLP
    HTTP (:4318), and the querier HTTP surface (:4319, including the
    RFC 0027 `/mcp` route) — via **rustls** (already the workspace TLS
-   stack; no OpenSSL link appears).
+   stack; no OpenSSL *linkage* is required — the only openssl-named
+   crate in the tree stays `openssl-probe`, rustls-native-certs's
+   pure-Rust trust-store path prober).
 2. **Optional mTLS** per listener: a configured client CA turns on
    require-and-verify client-certificate authentication, as
    *transport* hardening. Identity stays with the RFC 0026/0029
@@ -216,17 +218,22 @@ fixture-key incident).
 > the transport layer and nothing reaches the auth layer or the WAL.
 
 > **Scenario RFC0030.3 — querier + MCP over TLS.** Given a querier
-> listener with TLS enabled, When a query request and an MCP
-> `initialize` arrive over TLS, Then both succeed; And a plaintext
-> request to the same port fails at the transport layer.
+> listener with TLS enabled and a static bearer configured, When a
+> query request (valid bearer + `X-Ourios-Tenant` for a tenant the
+> token binds) and an MCP `initialize` (valid bearer) arrive over
+> TLS, Then both succeed — transport is the only variable under
+> test; And a plaintext request to the same port fails at the
+> transport layer.
 
 > **Scenario RFC0030.4 — mTLS require-and-verify.** Given a listener
-> with `client_ca_file` set, When a client presents a cert signed by
-> that CA, Then the request proceeds (and still passes bearer auth
-> per RFC 0026); When a client presents no cert, Then the handshake
-> fails; When a client presents a cert from a different CA, Then the
-> handshake fails. Nothing about the three cases reaches the request
-> handler.
+> with `client_ca_file` set and a static bearer configured, and a
+> valid bearer presented in every case below (only the client cert
+> varies), When the client presents a cert signed by that CA, Then
+> the request proceeds through bearer auth (RFC 0026) and is
+> ingested; When the client presents no cert, Then the handshake
+> fails; When the client presents a cert from a different CA, Then
+> the handshake fails. In the two failure cases nothing reaches the
+> request handler or the auth layer.
 
 > **Scenario RFC0030.5 — config validation.** Given `cert_file`
 > without `key_file`, or `client_ca_file` without a server pair, or

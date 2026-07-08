@@ -15,8 +15,10 @@
 # architecture leg needs — the CI legs run on native runners, so this is
 # a native musl build, not a cross-compile.
 FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+# ca-certificates is installed explicitly rather than assumed from the
+# base image — the scratch runtime stage COPYs the bundle out of here.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools \
+    && apt-get install -y --no-install-recommends musl-tools ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 # cc-rs looks for `<target>-gcc` and finds plain `musl-gcc` only via CC —
 # point both target-scoped CC vars at it; only the leg-matching one is read.

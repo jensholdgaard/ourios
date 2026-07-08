@@ -41,3 +41,4 @@ mod rfc0018_retryable;
 mod rfc0022_promoted_threading;
 mod rfc0023_overflow_roundtrip;
 mod rfc0026_auth;
+mod rfc0030_tls;

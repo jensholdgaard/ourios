@@ -404,6 +404,11 @@ jobs:
   # (#364; the Artifact Hub prerequisite). Runs only on a real publish
   # (same gate as `host`) and carries the chart's own Chart.yaml version
   # — chart and server version independently by design.
+  #
+  # MANUAL CUSTOMIZATION (like the pinned installers above): this job is
+  # NOT cargo-dist-generated — re-running `dist init` regenerates the
+  # file and will drop it; re-apply this job (and the pinned-install
+  # blocks) after any regeneration.
   publish-chart:
     needs:
       - plan

@@ -19,3 +19,8 @@ deploy/
 LICENSE
 # NB: do NOT exclude .clusterfuzzlite/ — its Dockerfile `COPY`s
 # .clusterfuzzlite/build.sh from the build context.
+# Exception (must stay LAST — dockerignore is last-match-wins, so it
+# has to override both `docs/` and `*.md` above): the DSL grammar the
+# MCP server embeds at compile time (`include_str!` in ourios-server's
+# mcp.rs, RFC0027.6); without it the image build cannot compile.
+!docs/rfcs/0002-query-dsl.md

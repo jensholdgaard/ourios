@@ -131,16 +131,17 @@ One shared `ourios-ingester`-side (receiver) and `ourios-server`-side
   of tonic's `Server::serve_with_incoming` (tonic's own `tls` feature
   is not enabled — one rustls wiring for all three listeners instead
   of two).
-- **Reload** (`reload_interval_secs`): the acceptor holds an
-  `ArcSwap<rustls::ServerConfig>`; a task re-reads the files on the
-  interval and swaps on content change. In-flight connections keep
+- **Reload** (`reload_interval_secs`): the acceptor holds the active
+  `Arc<rustls::ServerConfig>` behind a read-mostly `std::sync::RwLock`
+  (each handshake clones the `Arc` out); a task re-reads the files on
+  the interval and swaps on content change. In-flight connections keep
   their session; new handshakes see the new material. A reload
   failure (unreadable/invalid files) logs an error and keeps the last
   good config — it never takes the listener down.
-- New dependencies: `tokio-rustls` + `arc-swap` (both already in the
-  transitive tree via DataFusion/object_store; declared directly at
-  the seam's home). `rcgen` as a dev-dependency to mint test CAs and
-  leaf/client certs.
+- New dependencies: `tokio-rustls` only (already in the transitive
+  tree; declared directly at the seam's home), plus `rcgen` as a
+  dev-dependency to mint test CAs and leaf/client certs. The reload
+  swap uses `std::sync::RwLock` — no new runtime crate.
 
 ### 3.3 mTLS semantics
 

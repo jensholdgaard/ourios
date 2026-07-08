@@ -3388,6 +3388,7 @@ dependencies = [
  "crc32c",
  "ourios-core",
  "proptest",
+ "rustix 1.1.4",
  "tempfile",
  "uuid",
 ]

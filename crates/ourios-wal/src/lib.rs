@@ -441,7 +441,7 @@ impl Wal {
         // benign crash turned into OpenError::Corrupt. (`open`'s own
         // fresh segment doesn't carry this ordering: nothing fsyncs
         // its directory entry until the first `sync`, which
-        // fdatasyncs the segment first.)
+        // syncs the segment data first.)
         if let Err(source) = sync_file_data(&file, self.config.macos_full_fsync) {
             self.quiesced = true;
             return Err(AppendError::Io {

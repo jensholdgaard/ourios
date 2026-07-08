@@ -20,6 +20,24 @@ cosign verify \
   ghcr.io/jensholdgaard/ourios:0.1.1
 ```
 
+## Image variants
+
+Every release publishes three signed multi-arch images from the same
+source:
+
+- **default** (`:<version>`) — glibc binary on `distroless/cc`.
+- **`-static`** (`:<version>-static`) — static musl binary on
+  `distroless/static`: no libc, libgcc, or libssl in the image, so the
+  OS-package vulnerability surface scanners report is ~empty. Pick this
+  one for the strictest supply-chain posture with the operational
+  niceties (CA bundle, tzdata, nonroot passwd entry) kept.
+- **`-scratch`** (`:<version>-scratch`) — the same musl binary on bare
+  `scratch`, plus only the CA bundle TLS needs. Nothing else in the
+  filesystem: the absolute minimum attack surface, at the cost of no
+  shell-less debugging conveniences at all.
+
+All three run identically (same flags, ports, and config surface below).
+
 ## Run
 
 Same binary, same configuration surface as the

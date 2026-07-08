@@ -24,18 +24,35 @@ env:
 
 jobs:
   build:
-    name: build ${{ matrix.platform }}
+    name: build ${{ matrix.variant }} ${{ matrix.platform-spec.platform }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # Three variants (#263): `cc` = glibc binary on distroless/cc
+        # (`Dockerfile`, the default tags); `static` = musl static binary
+        # on distroless/static (`-static` tags); `scratch` = the same musl
+        # binary on bare `scratch` (`-scratch` tags). static and scratch
+        # are stage targets of the one `Dockerfile.static`, so the builder
+        # layer cache is shared between them.
+        variant: [cc, static, scratch]
+        platform-spec:
           - platform: linux/amd64
             pair: linux-amd64
             runner: ubuntu-latest
           - platform: linux/arm64
             pair: linux-arm64
             runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+        include:
+          - variant: cc
+            dockerfile: Dockerfile
+            target: ''
+          - variant: static
+            dockerfile: Dockerfile.static
+            target: runtime-static
+          - variant: scratch
+            dockerfile: Dockerfile.static
+            target: runtime-scratch
+    runs-on: ${{ matrix.platform-spec.runner }}
     permissions:
       contents: read
       # Push the per-arch image (by digest) + its attestations to GHCR.
@@ -65,20 +82,32 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform-spec.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           # BuildKit-generated supply-chain attestations, per arch.
           provenance: mode=max
           sbom: true
           # Per-arch GHA layer cache — native build, but caching still keeps
-          # incremental release builds fast. Scoped per platform so the two
-          # legs don't clobber each other's cache.
-          cache-from: type=gha,scope=${{ matrix.pair }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.pair }}
+          # incremental release builds fast. Scoped per dockerfile+platform:
+          # static and scratch build from the same Dockerfile.static builder
+          # stage, so they share one cache instead of compiling musl twice.
+          cache-from: type=gha,scope=${{ matrix.dockerfile }}-${{ matrix.platform-spec.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.dockerfile }}-${{ matrix.platform-spec.pair }}
           # Push by digest only; the manifest list (with the real tags) is
           # assembled in the merge job. `name-canonical` records the canonical
           # image name so imagetools can reference the pushed digest.
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Smoke-test the image
+        # Native runner per leg, so the built image executes here. `--help`
+        # (clap) proves the binary starts in the distroless runtime — for the
+        # static variant that is the "musl static binary actually runs
+        # without a libc" acceptance check from #263.
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: docker run --rm "$REF" --help
 
       - name: Export digest
         run: |
@@ -89,14 +118,28 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: digests-${{ matrix.pair }}
+          name: digests-${{ matrix.variant }}-${{ matrix.platform-spec.pair }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: merge manifest + sign
+    name: merge manifest + sign (${{ matrix.variant }})
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        # One manifest list per variant. The musl variants' tags carry a
+        # suffix (0.2.2-static, latest-scratch, …) via the flavor block
+        # below; the cc variant keeps the unsuffixed default tags.
+        variant: [cc, static, scratch]
+        include:
+          - variant: cc
+            suffix: ''
+          - variant: static
+            suffix: '-static'
+          - variant: scratch
+            suffix: '-scratch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -109,7 +152,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.variant }}-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -137,6 +180,10 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
+          # `onlatest` extends the suffix to the auto `latest` tag
+          # (`latest-static`); empty suffix (cc) is a no-op.
+          flavor: |
+            suffix=${{ matrix.suffix }},onlatest=true
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
@@ -161,11 +208,12 @@ jobs:
 
       - name: Resolve manifest-list digest
         id: digest
-        env:
-          IMAGE: ${{ env.IMAGE }}
-          VERSION: ${{ steps.meta.outputs.version }}
+        # Inspect by the first pushed tag (already fully suffixed by the
+        # flavor block) rather than reconstructing it from the `version`
+        # output.
         run: |
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          ref="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+          digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest)"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3

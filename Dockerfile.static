@@ -1,0 +1,71 @@
+# Static-musl OCI image variant for the `ourios-server` binary (#263):
+# the same MSRV-pinned Debian builder as `Dockerfile`, but targeting
+# `*-unknown-linux-musl` (static by default for musl targets), with a
+# `distroless/static` runtime — no libc, no libgcc, no libssl, so the
+# OS-package vulnerability surface Trivy scans is ~empty. Published
+# alongside the glibc image under `-static`-suffixed tags.
+#
+# TLS trust: the object-store client loads the *system* store at runtime
+# via rustls-native-certs; `distroless/static` bundles ca-certificates
+# (plus the nonroot passwd entry and tzdata), which is why it is used
+# here instead of `scratch`.
+
+# Builder: same base + digest as `Dockerfile` (Renovate bumps both via
+# the tag comment). musl-tools provides the native musl-gcc each
+# architecture leg needs — the CI legs run on native runners, so this is
+# a native musl build, not a cross-compile.
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+# cc-rs looks for `<target>-gcc` and finds plain `musl-gcc` only via CC —
+# point both target-scoped CC vars at it; only the leg-matching one is read.
+ENV CC_x86_64_unknown_linux_musl=musl-gcc \
+    CC_aarch64_unknown_linux_musl=musl-gcc
+WORKDIR /build
+COPY . .
+# Same build shape as `Dockerfile` (--locked, cache mounts, copy out of
+# the cached target/) plus the musl target. TARGETARCH (amd64|arm64) maps
+# to the rust triple prefix (x86_64|aarch64).
+ARG TARGETARCH
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target,id=ourios-static-target-${TARGETARCH} \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && rustup target add "$triple" \
+    && cargo build --release --locked -p ourios-server --target "$triple" \
+    && cp "/build/target/$triple/release/ourios-server" /ourios-server
+
+# Bare `scratch` runtime (#263's opt-in variant, `-scratch` tags): only
+# the binary + the CA bundle rustls-native-certs needs for TLS to object
+# storage. No passwd/tzdata — the numeric USER needs no passwd entry,
+# and the server never reads local time (chrono's `clock` feature is
+# off). Selected via the build `target:`.
+FROM scratch AS runtime-scratch
+COPY --from=builder /ourios-server /usr/local/bin/ourios-server
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
+# the future query endpoint (RFC 0016) and is intentionally not exposed
+# yet.
+EXPOSE 4317 4318
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/ourios-server"]
+
+# Runtime: distroless `static` — ca-certificates + tzdata + passwd, no
+# libc (the binary is static). Digest-pinned for reproducibility
+# (Renovate bumps via the tag comment). Last stage = the default target,
+# so a plain `docker build -f Dockerfile.static` yields this variant.
+FROM gcr.io/distroless/static-debian12@sha256:9c346e4be81b5ca7ff31a0d89eaeade58b0f95cfd3baed1f36083ddb47ca3160 AS runtime-static
+COPY --from=builder /ourios-server /usr/local/bin/ourios-server
+# OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
+# the future query endpoint (RFC 0016) and is intentionally not exposed
+# yet.
+EXPOSE 4317 4318
+# Run as distroless's built-in nonroot user (uid 65532) — the numeric
+# form lets a Kubernetes `runAsNonRoot` securityContext verify it.
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/ourios-server"]

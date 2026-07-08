@@ -3170,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "criterion",
@@ -3193,11 +3193,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-config"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "ourios-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64",
@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-ingester"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "flate2",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-miner"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3267,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-parquet"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-querier"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3317,11 +3317,11 @@ dependencies = [
 
 [[package]]
 name = "ourios-semconv"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "ourios-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64",
@@ -3359,7 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-telemetry"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -3372,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-testgen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ourios-config",
  "ourios-core",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "ourios-wal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crc32c",
  "ourios-core",

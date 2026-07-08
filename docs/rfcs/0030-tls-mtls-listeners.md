@@ -13,8 +13,9 @@ superseded-by: —
 
 ## 1. Summary
 
-Ourios authenticates every data-plane surface (RFC 0026 static
-bearers, RFC 0029 OIDC JWTs) but serves all of them over plaintext
+Ourios supports authentication on every data-plane surface
+(RFC 0026 static bearers, RFC 0029 OIDC JWTs; open mode remains for
+perimeter-trust deployments) but serves all of them over plaintext
 TCP. Bearer credentials over plaintext are not auth — any on-path
 observer can replay them. This RFC closes the gap identified as
 "gates everything below" in the #331 epic:

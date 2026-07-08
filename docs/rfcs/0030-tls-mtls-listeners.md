@@ -199,64 +199,69 @@ Each criterion is a Given/When/Then that lands as a red test first
 `rcgen` — no committed key material (house rule since the RFC 0029
 fixture-key incident).
 
-**RFC0030.1 — gRPC ingest over TLS.**
-Given a receiver `grpc` listener with `cert_file`/`key_file` from a
-test CA, When an OTLP gRPC client connects over TLS trusting that CA
-and exports a batch, Then the export succeeds and the batch is
-ingested; And When a plaintext gRPC client dials the same port, Then
-the connection fails at the transport layer and nothing reaches the
-auth layer or the WAL.
+> **Scenario RFC0030.1 — gRPC ingest over TLS.** Given a receiver
+> `grpc` listener with `cert_file`/`key_file` from a test CA, When an
+> OTLP gRPC client connects over TLS trusting that CA and exports a
+> batch, Then the export succeeds and the batch is ingested; And When
+> a plaintext gRPC client dials the same port, Then the connection
+> fails at the transport layer and nothing reaches the auth layer or
+> the WAL.
 
-**RFC0030.2 — HTTP ingest over TLS.**
-Same as RFC0030.1 for the `http` listener (`https://…:4318`),
-plaintext `http://` request to the TLS port fails.
+> **Scenario RFC0030.2 — HTTP ingest over TLS.** Given a receiver
+> `http` listener with `cert_file`/`key_file` from a test CA, When an
+> OTLP/HTTP client posts a batch to `https://…:4318` trusting that
+> CA, Then the export succeeds and the batch is ingested; And When a
+> plaintext `http://` request hits the same port, Then it fails at
+> the transport layer and nothing reaches the auth layer or the WAL.
 
-**RFC0030.3 — querier + MCP over TLS.**
-Given a querier listener with TLS enabled, When a query request and
-an MCP `initialize` arrive over TLS, Then both succeed; And a
-plaintext request to the same port fails at the transport layer.
+> **Scenario RFC0030.3 — querier + MCP over TLS.** Given a querier
+> listener with TLS enabled, When a query request and an MCP
+> `initialize` arrive over TLS, Then both succeed; And a plaintext
+> request to the same port fails at the transport layer.
 
-**RFC0030.4 — mTLS require-and-verify.**
-Given a listener with `client_ca_file` set, When a client presents a
-cert signed by that CA, Then the request proceeds (and still passes
-bearer auth per RFC 0026); When a client presents no cert, Then the
-handshake fails; When a client presents a cert from a different CA,
-Then the handshake fails. Nothing about the three cases reaches the
-request handler.
+> **Scenario RFC0030.4 — mTLS require-and-verify.** Given a listener
+> with `client_ca_file` set, When a client presents a cert signed by
+> that CA, Then the request proceeds (and still passes bearer auth
+> per RFC 0026); When a client presents no cert, Then the handshake
+> fails; When a client presents a cert from a different CA, Then the
+> handshake fails. Nothing about the three cases reaches the request
+> handler.
 
-**RFC0030.5 — config validation.**
-Given `cert_file` without `key_file`, or `client_ca_file` without a
-server pair, or `min_version: "1.1"`, When the server starts, Then
-startup fails with an error naming the exact offending field; Given
-an unreadable or non-PEM `cert_file`, Then startup fails naming the
-path.
+> **Scenario RFC0030.5 — config validation.** Given `cert_file`
+> without `key_file`, or `client_ca_file` without a server pair, or
+> `min_version: "1.1"`, When the server starts, Then startup fails
+> with an error naming the exact offending field; Given an unreadable
+> or non-PEM `cert_file`, Then startup fails naming the path.
 
-**RFC0030.6 — certificate reload.**
-Given a TLS listener with `reload_interval_secs` set and an established
-baseline connection, When the cert/key files are replaced with a new
-pair (same CA) on disk and the interval elapses, Then new handshakes
-serve the new certificate (observed via the peer certificate's serial)
-without a process restart; And When the files are replaced with
-garbage, Then new handshakes keep serving the last good certificate
-and an error is logged.
+> **Scenario RFC0030.6 — certificate reload.** Given a TLS listener
+> with `reload_interval_secs` set and an established baseline
+> connection, When the cert/key files are replaced with a new pair
+> (same CA) on disk and the interval elapses, Then new handshakes
+> serve the new certificate (observed via the peer certificate's
+> serial) without a process restart; And When the files are replaced
+> with garbage, Then new handshakes keep serving the last good
+> certificate and an error is logged.
 
-**RFC0030.7 — plaintext-auth warning.**
-Given `auth.tokens` configured and a listener without a `*_tls`
-block, When the server starts, Then exactly one warning naming that
-listener is emitted; Given the same listener with its `*_tls` block
-configured, Then no such warning.
+> **Scenario RFC0030.7 — plaintext-auth warning.** Given
+> `auth.tokens` configured and a listener without a `*_tls` block,
+> When the server starts, Then exactly one warning naming that
+> listener is emitted; Given the same listener with its `*_tls` block
+> configured, Then no such warning.
 
-**RFC0030.8 — served end-to-end (Collector-shaped client).**
-Given the served `ourios-server` binary with TLS on both receiver
-listeners and mTLS on gRPC, When an OTLP exporter configured the
-Collector way (`tls.ca_file` + client cert pair) exports over gRPC
-and a second exporter over HTTPS, Then both batches land and are
-queryable over the TLS querier — the full stack, no plaintext hop.
+> **Scenario RFC0030.8 — served end-to-end (Collector-shaped
+> client).** Given the served `ourios-server` binary running both
+> roles in one process (the deployment-level end-to-end; the test
+> lives in `ourios-server`, §6), with TLS on both receiver listeners,
+> mTLS on gRPC, and TLS on the querier, When an OTLP exporter that is
+> configured the Collector way (`tls.ca_file` plus a client cert
+> pair) exports over gRPC, and a second exporter posts the same way
+> over HTTPS, Then both batches land and are queryable over the TLS
+> querier — the full stack, with no plaintext hop.
 
-**RFC0030.9 — min_version enforcement.**
-Given `min_version: "1.3"`, When a client attempts a TLS 1.2-only
-handshake, Then the handshake is refused; a TLS 1.3 handshake
-succeeds.
+> **Scenario RFC0030.9 — min_version enforcement.** Given
+> `min_version: "1.3"`, When a client attempts a TLS 1.2-only
+> handshake, Then the handshake is refused; a TLS 1.3 handshake
+> succeeds.
 
 ## 6. Testing strategy
 
@@ -297,7 +302,9 @@ succeeds.
 - RFC 0026 — authentication + tenant binding (accepted); RFC 0029 —
   OIDC bearer layer (green). The layers this RFC carries.
 - OTel Collector `configtls` server settings — the config model
-  mirrored here (cert_file/key_file/client_ca_file/min_version/
-  reload_interval; `client_ca_file` ⇒ RequireAndVerifyClientCert).
+  mirrored here (`cert_file`/`key_file`/`client_ca_file`/
+  `min_version`; the Collector's `reload_interval` is spelled
+  `reload_interval_secs` in RFC 0020 terms; `client_ca_file` ⇒
+  RequireAndVerifyClientCert).
 - rustls / tokio-rustls — the TLS stack (already the workspace's via
   reqwest/object_store; no OpenSSL).

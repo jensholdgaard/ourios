@@ -122,6 +122,12 @@ jobs:
 
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        # The per-arch manifests already carry OCI labels (the build job's
+        # `labels:`); GHCR's package page reads the **index** annotations,
+        # which `imagetools create` does not inherit — emit them here and
+        # attach below (#364).
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
           # Explicit tags only — suppresses the default branch tag (e.g.
@@ -134,13 +140,23 @@ jobs:
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
-        # Intentional word-splitting (SC2046): the `jq` substitution expands to
-        # multiple `-t <tag>` flags and the `printf` to one `IMAGE@sha256:<hex>`
-        # ref per downloaded digest file — quoting would collapse them.
+        # Tags and annotations are built as bash arrays: annotation values
+        # (e.g. the image description) can contain spaces, which naked
+        # command substitution would word-split, and substituted quotes are
+        # literal characters, not shell syntax. The digest refs keep the
+        # `printf` substitution (SC2046) — hex digests never contain spaces.
         run: |
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # Annotations are NOT in the action's json output (tags + labels
+          # only) — they arrive newline-separated in the dedicated env var.
+          annotation_args=()
+          while IFS= read -r annotation; do
+            [ -n "$annotation" ] && annotation_args+=("--annotation" "$annotation")
+          done <<< "$DOCKER_METADATA_OUTPUT_ANNOTATIONS"
           # shellcheck disable=SC2046
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            "${tag_args[@]}" \
+            "${annotation_args[@]}" \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - name: Resolve manifest-list digest

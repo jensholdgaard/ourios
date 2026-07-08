@@ -7,6 +7,12 @@ name: Publish chart
 on:
   workflow_dispatch:
 
+# Serialize publishes — parallel dispatches would race on the same
+# chart version and `:artifacthub.io` tag. No cancel-in-progress: a
+# publish in flight must finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
 permissions: {}
 
 jobs:

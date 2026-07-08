@@ -55,6 +55,7 @@
 - [RFC 0027 — MCP query surface](./rfcs/0027-mcp-query-surface.md)
 - [RFC 0028 — Build-feedback program](./rfcs/0028-build-feedback-program.md)
 - [RFC 0029 — OIDC bearer layer](./rfcs/0029-oidc-bearer-layer.md)
+- [RFC 0030 — TLS/mTLS on the listeners](./rfcs/0030-tls-mtls-listeners.md)
 
 # Talks
 

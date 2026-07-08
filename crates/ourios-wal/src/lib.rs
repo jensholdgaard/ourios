@@ -415,10 +415,10 @@ impl Wal {
     /// segment is still the append target, and acking frames
     /// already written to it is safe.)
     fn rotate(&mut self) -> Result<(), AppendError> {
-        if let Err(source) = self.current_segment.sync_data() {
+        if let Err(source) = sync_file_data(&self.current_segment, self.config.macos_full_fsync) {
             self.quiesced = true;
             return Err(AppendError::Io {
-                op: "fdatasync(rotation: close segment)",
+                op: "sync(rotation: close segment)",
                 source,
             });
         }
@@ -442,10 +442,10 @@ impl Wal {
         // fresh segment doesn't carry this ordering: nothing fsyncs
         // its directory entry until the first `sync`, which
         // fdatasyncs the segment first.)
-        if let Err(source) = file.sync_data() {
+        if let Err(source) = sync_file_data(&file, self.config.macos_full_fsync) {
             self.quiesced = true;
             return Err(AppendError::Io {
-                op: "fdatasync(rotation: fresh segment header)",
+                op: "sync(rotation: fresh segment header)",
                 source,
             });
         }
@@ -516,38 +516,15 @@ impl Wal {
         })
     }
 
-    /// The §6.3 segment-data sync: `fdatasync`, upgraded to
-    /// `fcntl(F_FULLFSYNC)` when [`WalConfig::macos_full_fsync`]
-    /// opts in (macOS's `fsync`/`fdatasync` do not flush the
-    /// drive cache).
-    #[cfg(target_os = "macos")]
+    /// The live segment's §6.3 data sync — [`sync_file_data`] with
+    /// this WAL's knob.
     fn sync_segment_data(&self) -> Result<(), SyncError> {
-        if self.config.macos_full_fsync {
-            return rustix::fs::fcntl_fullfsync(&self.current_segment).map_err(|errno| {
-                SyncError::Io {
-                    op: "fcntl(current_segment, F_FULLFSYNC)",
-                    source: errno.into(),
-                }
-            });
-        }
-        self.current_segment
-            .sync_data()
-            .map_err(|source| SyncError::Io {
-                op: "fdatasync(current_segment)",
+        sync_file_data(&self.current_segment, self.config.macos_full_fsync).map_err(|source| {
+            SyncError::Io {
+                op: "sync(current_segment)",
                 source,
-            })
-    }
-
-    /// See the macOS variant: everywhere else `fdatasync` is the
-    /// §6.3 contract and the knob is ignored.
-    #[cfg(not(target_os = "macos"))]
-    fn sync_segment_data(&self) -> Result<(), SyncError> {
-        self.current_segment
-            .sync_data()
-            .map_err(|source| SyncError::Io {
-                op: "fdatasync(current_segment)",
-                source,
-            })
+            }
+        })
     }
 
     /// Record that records ≤ `durable_to` are on object
@@ -749,12 +726,12 @@ impl Wal {
                 op: "ftruncate(heal newest segment)",
                 source,
             })?;
-        self.current_segment
-            .sync_data()
-            .map_err(|source| RecoveryError::Io {
-                op: "fdatasync(heal newest segment)",
+        sync_file_data(&self.current_segment, self.config.macos_full_fsync).map_err(|source| {
+            RecoveryError::Io {
+                op: "sync(heal newest segment)",
                 source,
-            })?;
+            }
+        })?;
         sync_parent_dir(&self.config.root).map_err(|source| RecoveryError::Io {
             op: "fsync(wal_root after heal)",
             source,
@@ -1095,6 +1072,28 @@ fn replay_segment<S: FrameSink>(
 /// freshly-truncated segment's directory entry is durable
 /// (§6.3 / §6.6 step 4). Opens the directory read-only and
 /// calls the full `fsync` (`File::sync_all`) — `fdatasync` is
+/// The §6.3 file-data sync primitive every durability-critical path
+/// uses — `Wal::sync`, rotation's close-segment and fresh-header
+/// syncs, and recovery's post-truncate heal: `fdatasync`, upgraded to
+/// `fcntl(F_FULLFSYNC)` on macOS when [`WalConfig::macos_full_fsync`]
+/// opts in (macOS's `fsync`/`fdatasync` do not flush the drive cache,
+/// and a torn tail on a closed or healed segment is exactly as fatal
+/// as one on the live segment).
+#[cfg(target_os = "macos")]
+fn sync_file_data(file: &File, macos_full_fsync: bool) -> std::io::Result<()> {
+    if macos_full_fsync {
+        return rustix::fs::fcntl_fullfsync(file).map_err(std::io::Error::from);
+    }
+    file.sync_data()
+}
+
+/// See the macOS variant: everywhere else `fdatasync` is the §6.3
+/// contract and the knob is ignored.
+#[cfg(not(target_os = "macos"))]
+fn sync_file_data(file: &File, _macos_full_fsync: bool) -> std::io::Result<()> {
+    file.sync_data()
+}
+
 /// undefined on directories under POSIX.
 fn sync_parent_dir(root: &std::path::Path) -> std::io::Result<()> {
     File::open(root)?.sync_all()

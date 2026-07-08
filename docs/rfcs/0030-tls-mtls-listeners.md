@@ -1,7 +1,7 @@
 ---
 rfc: 0030
 title: TLS/mTLS on the data-plane listeners
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-08

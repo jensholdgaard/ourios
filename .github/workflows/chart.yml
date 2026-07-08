@@ -1,0 +1,57 @@
+# Publishes the Helm chart (and its Artifact Hub metadata) to GHCR on
+# demand — for chart-only version bumps that don't ride an application
+# release tag. The steps mirror release.yml's `publish-chart` job (which
+# remains the path for tagged releases); keep the two in sync.
+name: Publish chart
+
+on:
+  workflow_dispatch:
+
+# Serialize publishes — parallel dispatches would race on the same
+# chart version and `:artifacthub.io` tag. No cancel-in-progress: a
+# publish in flight must finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+permissions: {}
+
+jobs:
+  publish-chart:
+    runs-on: "ubuntu-24.04"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Push the chart to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | helm registry login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          helm package deploy/helm/ourios --destination /tmp/chart
+          helm push /tmp/chart/ourios-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
+      - name: Push the Artifact Hub repository metadata
+        # The verified-publisher metadata rides the chart repo's
+        # `:artifacthub.io` tag as an ORAS artifact (the documented OCI
+        # mechanism — it is deliberately not packaged into the chart).
+        # oras is download → sha256-verify → extract, per the #366 posture.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf -o /tmp/oras.tar.gz \
+            https://github.com/oras-project/oras/releases/download/v1.3.2/oras_1.3.2_linux_amd64.tar.gz
+          echo "9229ccc6d17bb282039ad4a69abb16dcb887a5bce567c075d731d9b3c7ad8eaf  /tmp/oras.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/oras.tar.gz -C /tmp oras
+          echo "$GH_TOKEN" | /tmp/oras login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          cd deploy/helm/ourios
+          /tmp/oras push \
+            "ghcr.io/${{ github.repository_owner }}/charts/ourios:artifacthub.io" \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml

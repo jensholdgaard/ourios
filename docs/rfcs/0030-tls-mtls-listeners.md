@@ -113,7 +113,7 @@ Rules:
 - Paths may use `${env:VAR}` (RFC 0020 §3.5) like any other config
   value; the *file contents* are read at startup and on reload, never
   embedded in config.
-- Unknown fields under `tls:` are rejected (RFC 0020 strict-mode
+- Unknown fields under a `*_tls` block are rejected (RFC 0020 strict-mode
   parsing, unchanged).
 
 ### 3.2 Implementation shape
@@ -155,7 +155,7 @@ is deliberately out of scope (§7.1).
 ### 3.4 Plaintext + auth = warning
 
 When any credential source (`auth.tokens` / `auth.oidc`) is enabled
-and a listener has no `tls` block, startup logs one prominent warning
+and a listener has no `*_tls` block, startup logs one prominent warning
 naming the listener ("bearer credentials over plaintext"). It is not
 a hard error: TLS may legitimately terminate at a fronting
 proxy/mesh. Whether a future major flips this to opt-out strictness
@@ -165,13 +165,13 @@ is an open question (§7.2).
 
 - The auth layer (RFC 0026/0029): resolvers, bindings, audit events,
   telemetry — untouched. TLS sits strictly below it.
-- Open mode: a listener with neither `tls` nor credentials behaves
+- Open mode: a listener with neither a `*_tls` block nor credentials behaves
   exactly as today.
 - Outbound TLS (object storage): already rustls via `object_store`;
   not this RFC.
-- The Helm chart gains value plumbing (secret-mounted certs → `tls`
-  blocks) in a follow-up chart release; the chart is not part of the
-  acceptance gate here.
+- The Helm chart gains value plumbing (secret-mounted certs → the
+  `grpc_tls`/`http_tls` blocks) in a follow-up chart release; the
+  chart is not part of the acceptance gate here.
 
 ## 4. Alternatives considered
 
@@ -241,10 +241,10 @@ garbage, Then new handshakes keep serving the last good certificate
 and an error is logged.
 
 **RFC0030.7 — plaintext-auth warning.**
-Given `auth.tokens` configured and a listener without `tls`, When the
-server starts, Then exactly one warning naming that listener is
-emitted; Given the same listener with `tls` configured, Then no such
-warning.
+Given `auth.tokens` configured and a listener without a `*_tls`
+block, When the server starts, Then exactly one warning naming that
+listener is emitted; Given the same listener with its `*_tls` block
+configured, Then no such warning.
 
 **RFC0030.8 — served end-to-end (Collector-shaped client).**
 Given the served `ourios-server` binary with TLS on both receiver

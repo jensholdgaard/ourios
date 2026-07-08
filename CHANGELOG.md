@@ -2,6 +2,135 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.2.0] - 2026-07-08
+
+### Added
+
+- Honour the macos_full_fsync knob via rustix (#430) (2e12290)
+- Rfc 0029 green — dex end-to-end acceptance and status flip (#426) (69400a8)
+- Rfc 0029 green (query/mcp binding) — one resolver on every surface (#425) (a2602fc)
+- Rfc 0029 green (ingest binding) — async auth layer on both listeners (#424) (bb02d91)
+- Rfc 0029 green (verifier) — local OIDC JWT verification (#423) (3c8a715)
+- Rfc 0029 green (config) — auth.oidc section, coexistence rules, oidc-only enforced (#422) (095e891)
+- Rfc 0027 green resource — the dsl grammar (RFC0027.6) (#415) (a0fca77)
+- Rfc 0027 green tools — query_logs, list_templates, template_drift (#414) (a8ba334)
+- Rfc 0027 green transport — /mcp behind querier.mcp.enabled (#413) (94743ff)
+- Rfc 0026 green d — rejection telemetry + denial audit (#409) (e0cb265)
+- Rfc 0026 green c — query-path authn + tenant gate (#408) (529a575)
+- Rfc 0026 green b2 — ingest authn + tenant binding (#398) (7cabed1)
+- Rfc 0026 green a — the token store (RFC0026.1) (#390) (a0cb122)
+- Rfc 0025 green c — permanent-error quarantine; RFC green (#386) (a1257cf)
+- Rfc 0025 green b — rendering distinguishes absent from empty (#381) (1971712)
+- **BREAKING** Rfc 0025 green a — body_kind ordinal 2 for absent bodies (#380) (eb28c7c)
+- Green — P4 query oracle + adversarial umbrella (#369) (b255df0)
+- Green — P1/P2/P3 pipeline properties + canonical decode fix (#363) (563f540)
+- Rfc 0024 green — --calibrate pass discharges §5.1/.2 (#361) (6b696e4)
+- Rfc 0024 green slice — the ourios-testgen generator crate (#360) (c199701)
+- Rfc 0023 green pt2 — parse-failure reason telemetry (RFC0023.6) (#355) (19e0886)
+- Rfc 0023 green pt1 — bounded template memory (RFC0023.1–.5) (#354) (d171457)
+- Rfc 0022 green pt4 — storage.promoted_attributes config plumbing, status → green (#348) (6e3301b)
+- Rfc 0022 green pt2 — promoted predicate compile (RFC0022.3/.4/.6) (#346) (d4eb729)
+- Rfc 0022 green pt1 — promoted attribute columns in the writer (#345) (30d0daf)
+- One RFC 0005 decoder — delete the RFC 0017 duplicate (rfc0021.4) (#340) (69117e9)
+- **BREAKING** Upgrade to datafusion 54 / arrow 58 — one arrow across the workspace (#339) (6ee5e2f)
+- Strict registry-backed log events + weaver live-check CI gate (#335) (552d350)
+
+### Build
+
+- Line-tables-only debuginfo for the dev profile (#373) (1a4db29)
+
+### CI
+
+- Attach oci annotations to the multi-arch manifest list (#428) (20fea99)
+- Publish the helm chart as an oci artifact on ghcr (#364) (#431) (f6de5b4)
+- Pin the cargo-dist installer downloads by hash (#366) (#429) (c8dbf94)
+- Rfc 0028 slice 5 — nextest runs the workspace suite (#406) (c1c5ec7)
+- Verify the cargo-cyclonedx installer by pinned sha256 (#370) (acc7c61)
+- Weekly deep run at elevated proptest cases (#371) (9feef6f)
+- Migrate workflow actions off the deprecated node20 runtime (#305) (#342) (de52ce8)
+
+### Changed
+
+- **BREAKING** Rfc 0028 slice 3 — miner tunables extract to ourios-config (#405) (adb1cbd)
+- Rfc 0026 green b1 — token store moves to ourios-core (#395) (a000daa)
+
+### Chore
+
+- Artifact hub metadata + appVersion for the first chart publish (#432) (4ef45a2)
+- Update dependency ubuntu to v24 (#392) (fcd5a70)
+- Update rust:1.96-bookworm docker digest to a339861 (#388) (a054129)
+- Hold the arrow family at 58.x until DataFusion 55 (#396) (7ce71b4)
+- Update rust crate jsonschema to v0.46.10 (#391) (f86aae1)
+- Update github-actions (#387) (b7a6ee3)
+- Don't digest-pin the chart's default image tag (#389) (0a466ed)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 0ca3a7a (#385) (6f55a03)
+
+### Documentation
+
+- Getting-started section for the deployment types (#427) (eeedd13)
+- Rfc 0029 specified — §5 acceptance criteria (#420) (47fa28f)
+- Rfc 0029 — oidc bearer layer (issuer-agnostic, dex-validated), drafted (#419) (877f0df)
+- Rfc 0026 + 0027 accepted — maintainer sign-off 2026-07-07 (#418) (6fc8859)
+- Rfc 0026 + 0027 validated — served-binary + independent-client run (#417) (87d6eb2)
+- Rfc 0027 green — all seven scenarios discharged (#416) (4c62d55)
+- Rfc 0027 §5/§6 — mcp query surface specified (#411) (c79b474)
+- Rfc 0026 green — all seven scenarios discharged (#410) (df7d864)
+- Rfc 0028 green — all five scenarios discharged (#407) (ea798a2)
+- Rfc 0028 §5/§6 — build-feedback program specified (#397) (4e0966b)
+- Rfc 0028 — build-feedback program (drafted) (#383) (d22c0cc)
+- §5/§6 land, status drafted → specified (#376) (8449dcc)
+- §5/§6 land, status drafted -> specified (#377) (acd8272)
+- Rfc 0026 authn/tenant binding + rfc 0027 mcp query surface (#374) (083ea96)
+- Rfc 0025 — absent-body representation (rfc 0005 amendment) (#372) (97258de)
+- Top up bestpractices.json — the ten criteria the 93% run surfaced (#368) (90ddae2)
+- Maturity artifacts — maintainers, adopters scaffold, bestpractices.json (#367) (b4ceb4a)
+- Rfc 0024 — otlp-envelope property testing (rfc 0006 amendment) (#358) (6870d29)
+- §9.11 — authoritative 16 GiB B1/B2 + RFC0023.7 pass; rfc 0023 red→green (#356) (c7ea8c6)
+- Rfc 0023 — bounded template memory (rfc 0001 amendment) (#352) (77851ed)
+- §9.9 — indicative ci-runner B1/B2 rerun post-RFC 0022 (#349) (d8a9ede)
+- Rfc 0022 — queryable attribute columns (rfc 0005 amendment) (#343) (2f22c96)
+- DataFusion / Arrow upgrade, phased behind upstream (RFC 0021, drafted) (#337) (f769d5d)
+
+### Fixed
+
+- Busiest-template picker skips NO_TEMPLATE (#357) (167ecc5)
+- Skip template-snapshot capture in the query-store builds (#351) (6e05cb8)
+
+### Tests
+
+- Red — all seven §5 stubs land, status specified→red (#421) (7cb852e)
+- Red — all seven §5 stubs land, status specified→red (#412) (48bc4d8)
+- Rfc 0028 slice 2e — 3 test binaries fold into one harness (#404) (08912b7)
+- Rfc 0028 slice 2d — 8 test binaries fold into one harness (#403) (2618c3c)
+- Rfc 0028 slice 2c — 11 test binaries fold into one harness (#402) (928dbc1)
+- Rfc 0028 slice 2b — 17 test binaries fold into one harness (#401) (cc3ce1b)
+- Rfc 0028 slice 2a — 19 test binaries fold into one harness (#400) (36f28ff)
+- Rfc 0028 slice 1 — 27 test binaries fold into one harness (#399) (24c2c7c)
+- Red — all five §5 stubs land, status specified -> red (#379) (180132d)
+- Red — all seven §5 stubs land, status specified -> red (#378) (4e676d4)
+- Calibration manifest for the otel-demo-v7 release (#375) (c8005ae)
+- Red — all seven §5 stubs land, status drafted→red (#359) (8a01c6a)
+- Red — all seven §5 stubs land, status drafted→red (#353) (2eb892d)
+- Streaming corpus store builds + opt-in log4j severity (#350) (2655bac)
+- Rfc 0022 green pt3 — pruning + promoted-set drift (RFC0022.5/.7) (#347) (3f08632)
+- Red — all seven §5 stubs land, status specified→red (#344) (df879d3)
+- Rfc 0021 phase 1 green — live lockfile gate + discharged markers (#341) (e47b525)
+- Rfc 0021 red — §5 stubs + the pre-upgrade parquet fixture (#338) (b543309)
+
+## [corpus/otel-demo-v7] - 2026-07-02
+
+### Added
+
+- Dogfood our own logs over OTLP (tracing → OTel Logs signal) (#334) (f4da8e5)
+
+### CI
+
+- Fix release publishing (GH_REPO) + publish-only recovery path (#336) (c8e2ea2)
+
+### Documentation
+
+- Finish #177's doc sweep — Ourios-canonical, not OTLP-canonical (#333) (e15a0e8)
+
 ## [0.1.1] - 2026-07-02
 
 ### Added

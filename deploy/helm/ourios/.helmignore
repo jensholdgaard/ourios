@@ -25,3 +25,4 @@
 # topology.png IS shipped so the README image resolves from the chart artifact
 # (e.g. Artifact Hub).
 docs/*.py
+artifacthub-repo.yml

@@ -1,0 +1,8 @@
+# Artifact Hub repository metadata (verified-publisher badge). For an
+# OCI-based chart repo this file is NOT packaged into the chart —
+# the release pipeline pushes it as a separate ORAS artifact to the
+# `:artifacthub.io` tag of the chart reference, per
+# https://artifacthub.io/docs/topics/repositories/helm-charts/#oci-support
+owners:
+  - name: Jens Holdgaard Pedersen
+    email: jens@holdgaard.org

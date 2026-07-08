@@ -22,15 +22,9 @@ them as three workloads sharing a data + audit store on object storage:
 
 ## Topology
 
-![Ourios Helm chart topology](docs/topology.png)
+![Ourios Helm chart topology](https://raw.githubusercontent.com/jensholdgaard/ourios/5a5b1ed398f60ee23117d4f4032f564691a7a1a7/deploy/helm/ourios/docs/topology.png)
 
-Diagram source: [`docs/topology.py`](docs/topology.py) (mingrammer
-[`diagrams`](https://diagrams.mingrammer.com/), k8s node set) — shipped in the
-**repo checkout** only; it is excluded from the packaged chart (`.helmignore`),
-so the link above resolves on GitHub, not from a chart artifact. Regenerate from
-a repo checkout with `python docs/topology.py` in this chart directory (or
-`python deploy/helm/ourios/docs/topology.py` from the repo root; needs Graphviz +
-`pip install diagrams`). A text fallback follows for terminal / `helm show readme`:
+Text fallback (for `helm show readme` in a terminal):
 
 ```
             OTLP                         query
@@ -53,6 +47,10 @@ a repo checkout with `python docs/topology.py` in this chart directory (or
 Only the data/audit/manifest live on object storage. The **WAL is always a
 local durable PVC, never object storage** (CLAUDE.md §3.4 WAL-before-ack / §3.6
 object storage is the source of truth).
+
+Diagram source: `docs/topology.py` in the repo checkout (regeneration
+instructions in its docstring). The image URL above is pinned to the
+commit that last regenerated the PNG — re-pin it when regenerating.
 
 ## Install
 

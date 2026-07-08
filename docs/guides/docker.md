@@ -33,8 +33,9 @@ source:
   niceties (CA bundle, tzdata, nonroot passwd entry) kept.
 - **`-scratch`** (`:<version>-scratch`) — the same musl binary on bare
   `scratch`, plus only the CA bundle TLS needs. Nothing else in the
-  filesystem: the absolute minimum attack surface, at the cost of no
-  shell-less debugging conveniences at all.
+  filesystem: the absolute minimum attack surface, but also zero
+  operational conveniences — no tzdata, no passwd entry, and CA-bundle
+  updates arrive only with Ourios releases rather than base-image bumps.
 
 All three run identically (same flags, ports, and config surface below).
 

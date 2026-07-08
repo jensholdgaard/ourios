@@ -199,7 +199,7 @@ is an open question (§7.2).
 ## 5. Acceptance criteria
 
 Each criterion is a Given/When/Then that lands as a red test first
-(RFC process §Red). Test CAs/certs are minted at test-time with
+(the *Red* gate, `docs/verification.md`). Test CAs/certs are minted at test-time with
 `rcgen` — no committed key material (house rule since the RFC 0029
 fixture-key incident).
 

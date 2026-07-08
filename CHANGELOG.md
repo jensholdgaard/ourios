@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.2.1] - 2026-07-08
+
+### Fixed
+
+- Re-include the DSL grammar the mcp server embeds at compile time (#434) (06e16f6)
+
 ## [0.2.0] - 2026-07-08
 
 ### Added

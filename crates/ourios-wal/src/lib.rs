@@ -114,17 +114,12 @@ pub struct WalConfig {
     pub housekeeping_secs: u64,
     /// `wal_macos_full_fsync` — opt into `fcntl(F_FULLFSYNC)`
     /// on macOS for the slower-but-stronger durability per
-    /// §6.3 / §9. Ignored on other platforms.
-    ///
-    /// **Not yet honoured.** [`Wal::sync`] currently always
-    /// uses `fdatasync` (`File::sync_data`) regardless of this
-    /// flag; the `F_FULLFSYNC` path is deferred to a follow-up.
-    /// The raw `fcntl(F_FULLFSYNC)` needs `unsafe`, which the
-    /// workspace's `unsafe_code = "deny"` lint (CLAUDE.md §6.1)
-    /// forbids without an RFC, so wiring it means either a
-    /// safe-wrapper dependency or an unsafe waiver — a
-    /// maintainer decision tracked separately. Setting it
-    /// `true` today is accepted but has no effect.
+    /// §6.3 / §9: on macOS `fsync`/`fdatasync` do not flush the
+    /// drive's write cache, so true power-loss durability needs
+    /// the full-fsync fcntl (via rustix's safe
+    /// wrapper — the workspace denies `unsafe_code`). Ignored on
+    /// other platforms, where `fdatasync` already carries the
+    /// §6.3 contract.
     pub macos_full_fsync: bool,
 }
 
@@ -192,7 +187,7 @@ pub struct Wal {
     /// process may have created the segment and crashed before
     /// its own first `sync`, so its directory entry could still
     /// be page-cache-only. Acking a frame appended into such a
-    /// segment after only an `fdatasync` (which persists the
+    /// segment after only a data sync (which persists the
     /// file's data + size but not its directory link) would
     /// risk losing that acked frame to an orphaned inode on
     /// power loss — a §3.4 violation. One extra fsync per
@@ -205,7 +200,7 @@ pub struct Wal {
     /// and one of housekeeping's two truncation bounds.
     checkpoint: Option<WalOffset>,
     /// A rotation step failed (§6.5): the closing segment's
-    /// `fdatasync`, the fresh segment's creation, or the
+    /// data sync, the fresh segment's creation, or the
     /// parent-dir `fsync`. Once set, every `append` is refused
     /// until an operator intervenes — continuing would risk
     /// either a torn tail on a *closed* segment (which recovery
@@ -214,7 +209,7 @@ pub struct Wal {
     quiesced: bool,
     /// §6.8 counters. `unflushed_bytes` is the H3 detection
     /// metric: grows on `append`, resets on a successful
-    /// `sync` (or on the closing `fdatasync` of a rotation).
+    /// `sync` (or on a rotation's closing segment sync).
     appends_total: u64,
     syncs_total: u64,
     unflushed_bytes: u64,
@@ -293,8 +288,8 @@ impl Wal {
     /// Rotation (§6.5) happens here, *before* the write: when the
     /// segment would exceed `wal_segment_size_bytes` with this
     /// frame, or its age (from the `UUIDv7` mint time) exceeds
-    /// `wal_segment_age_secs`, the segment is closed (final
-    /// `fdatasync`), a fresh one is created, and the parent dir
+    /// `wal_segment_age_secs`, the segment is closed (its final
+    /// data sync), a fresh one is created, and the parent dir
     /// is fsync'd before the frame lands — so a frame never
     /// straddles segments and never lands in a segment without a
     /// durable directory entry. A failed rotation quiesces the
@@ -407,7 +402,7 @@ impl Wal {
     }
 
     /// Close the current segment and open a fresh one (§6.5):
-    /// `fdatasync` the old segment (the last fsync it ever
+    /// sync the old segment's data (the last sync it ever
     /// receives — a torn tail on a *closed* segment is RFC0008.5
     /// corruption, so closing without it would convert a benign
     /// crash into a recovery halt), create the new `UUIDv7`
@@ -420,14 +415,14 @@ impl Wal {
     /// segment is still the append target, and acking frames
     /// already written to it is safe.)
     fn rotate(&mut self) -> Result<(), AppendError> {
-        if let Err(source) = self.current_segment.sync_data() {
+        if let Err(source) = sync_file_data(&self.current_segment, self.config.macos_full_fsync) {
             self.quiesced = true;
             return Err(AppendError::Io {
-                op: "fdatasync(rotation: close segment)",
+                op: "sync(rotation: close segment)",
                 source,
             });
         }
-        // The closing fdatasync flushed everything appended so far.
+        // The closing data sync flushed everything appended so far.
         self.unflushed_bytes = 0;
         let (file, path, uuid) = match create_fresh_segment(&self.config.root) {
             Ok(fresh) => fresh,
@@ -446,11 +441,11 @@ impl Wal {
         // benign crash turned into OpenError::Corrupt. (`open`'s own
         // fresh segment doesn't carry this ordering: nothing fsyncs
         // its directory entry until the first `sync`, which
-        // fdatasyncs the segment first.)
-        if let Err(source) = file.sync_data() {
+        // syncs the segment data first.)
+        if let Err(source) = sync_file_data(&file, self.config.macos_full_fsync) {
             self.quiesced = true;
             return Err(AppendError::Io {
-                op: "fdatasync(rotation: fresh segment header)",
+                op: "sync(rotation: fresh segment header)",
                 source,
             });
         }
@@ -479,27 +474,22 @@ impl Wal {
     /// durable — the receiver gates its acks on this returning
     /// `Ok(_)`.
     ///
-    /// Uses `fdatasync` (`File::sync_data`) on the segment per
-    /// §6.3: the payload + size are what must survive, not the
-    /// inode's every metadata field. The directory `fsync` is
-    /// the full `File::sync_all` — `fdatasync` is undefined on
-    /// directories under POSIX.
+    /// Uses `sync_file_data` on the segment per §6.3 —
+    /// `fdatasync`, or `fcntl(F_FULLFSYNC)` under the macOS knob:
+    /// the payload + size are what must survive, not the inode's
+    /// every metadata field. The directory `fsync` is the full
+    /// `File::sync_all` — `fdatasync` is undefined on directories
+    /// under POSIX.
     ///
-    /// [`WalConfig::macos_full_fsync`] is **not yet consulted**:
-    /// this always uses `fdatasync`, never `fcntl(F_FULLFSYNC)`.
-    /// See that field's doc for why the stronger-durability path
-    /// is deferred.
+    /// With [`WalConfig::macos_full_fsync`] set (macOS only),
+    /// the segment sync is `fcntl(F_FULLFSYNC)` instead — see
+    /// that field's doc.
     ///
     /// # Errors
     ///
     /// See [`SyncError`].
     pub fn sync(&mut self) -> Result<WalOffset, SyncError> {
-        self.current_segment
-            .sync_data()
-            .map_err(|source| SyncError::Io {
-                op: "fdatasync(current_segment)",
-                source,
-            })?;
+        self.sync_segment_data()?;
         if self.dir_fsync_pending {
             sync_parent_dir(&self.config.root).map_err(|source| SyncError::Io {
                 op: "fsync(wal_root)",
@@ -524,6 +514,17 @@ impl Wal {
         Ok(WalOffset {
             segment: self.current_segment_uuid,
             byte,
+        })
+    }
+
+    /// The live segment's §6.3 data sync — [`sync_file_data`] with
+    /// this WAL's knob.
+    fn sync_segment_data(&self) -> Result<(), SyncError> {
+        sync_file_data(&self.current_segment, self.config.macos_full_fsync).map_err(|source| {
+            SyncError::Io {
+                op: "sync(current_segment)",
+                source,
+            }
         })
     }
 
@@ -665,7 +666,7 @@ impl Wal {
     /// A torn (partial) *tail* frame is the one exception: on the
     /// newest segment it is RFC0008.4 clean truncation, so the
     /// scan stops cleanly and the segment is healed —
-    /// `ftruncate` to the last valid boundary, `fdatasync`, and
+    /// `ftruncate` to the last valid boundary, a data sync, and
     /// `fsync` the parent dir — so the next `append` resumes on a
     /// frame boundary. On any *closed* segment a torn tail is
     /// instead RFC0008.5 corruption (its rotation fsync should
@@ -726,12 +727,12 @@ impl Wal {
                 op: "ftruncate(heal newest segment)",
                 source,
             })?;
-        self.current_segment
-            .sync_data()
-            .map_err(|source| RecoveryError::Io {
-                op: "fdatasync(heal newest segment)",
+        sync_file_data(&self.current_segment, self.config.macos_full_fsync).map_err(|source| {
+            RecoveryError::Io {
+                op: "sync(heal newest segment)",
                 source,
-            })?;
+            }
+        })?;
         sync_parent_dir(&self.config.root).map_err(|source| RecoveryError::Io {
             op: "fsync(wal_root after heal)",
             source,
@@ -1068,6 +1069,28 @@ fn replay_segment<S: FrameSink>(
     }
 }
 
+/// The §6.3 file-data sync primitive every durability-critical path
+/// uses — `Wal::sync`, rotation's close-segment and fresh-header
+/// syncs, and recovery's post-truncate heal: `fdatasync`, upgraded to
+/// `fcntl(F_FULLFSYNC)` on macOS when [`WalConfig::macos_full_fsync`]
+/// opts in (macOS's `fsync`/`fdatasync` do not flush the drive cache,
+/// and a torn tail on a closed or healed segment is exactly as fatal
+/// as one on the live segment).
+#[cfg(target_os = "macos")]
+fn sync_file_data(file: &File, macos_full_fsync: bool) -> std::io::Result<()> {
+    if macos_full_fsync {
+        return rustix::fs::fcntl_fullfsync(file).map_err(std::io::Error::from);
+    }
+    file.sync_data()
+}
+
+/// See the macOS variant: everywhere else `fdatasync` is the §6.3
+/// contract and the knob is ignored.
+#[cfg(not(target_os = "macos"))]
+fn sync_file_data(file: &File, _macos_full_fsync: bool) -> std::io::Result<()> {
+    file.sync_data()
+}
+
 /// `fsync` the WAL root directory so a freshly-created or
 /// freshly-truncated segment's directory entry is durable
 /// (§6.3 / §6.6 step 4). Opens the directory read-only and
@@ -1168,7 +1191,7 @@ pub enum AppendError {
         source: std::io::Error,
     },
     /// A prior rotation failed (the closing segment's
-    /// `fdatasync`, the fresh segment's creation, or the
+    /// data sync, the fresh segment's creation, or the
     /// parent-dir `fsync`) and the WAL is quiesced per §6.5 —
     /// operator intervention is required before further appends
     /// are accepted. The append that triggered the failed
@@ -1332,6 +1355,25 @@ mod tests {
     //! layer surfaces here rather than as a cascading failure
     //! in the integration suite.
     use super::*;
+
+    /// §6.3 macOS strong durability (#125): with the knob set, the
+    /// segment sync goes through `fcntl(F_FULLFSYNC)` and the
+    /// append→sync contract (durable offset advances) holds exactly as
+    /// with `fdatasync`. On non-macOS targets the knob is accepted and
+    /// ignored — the same assertions pass through the `fdatasync` arm,
+    /// so this test runs everywhere and exercises the fcntl only where
+    /// it exists.
+    #[test]
+    fn macos_full_fsync_knob_keeps_the_sync_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = default_config(dir.path());
+        config.macos_full_fsync = true;
+        let mut wal = Wal::open(config).expect("open");
+        wal.append(FrameKind::OtlpBatch, b"full-fsync me")
+            .expect("append");
+        let offset = wal.sync().expect("sync with the knob set");
+        assert!(offset.byte > 0, "durable offset advances");
+    }
 
     fn default_config(root: &std::path::Path) -> WalConfig {
         WalConfig {

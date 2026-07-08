@@ -204,3 +204,7 @@ pub const EVENT_OURIOS_SERVER_COMPACTION_DISABLED: &str = "ourios.server.compact
 
 /// `ourios.server.signal_handler.error` log event name.
 pub const EVENT_OURIOS_SERVER_SIGNAL_HANDLER_ERROR: &str = "ourios.server.signal_handler.error";
+
+/// `ourios.server.tls.plaintext_credentials` log event name.
+pub const EVENT_OURIOS_SERVER_TLS_PLAINTEXT_CREDENTIALS: &str =
+    "ourios.server.tls.plaintext_credentials";

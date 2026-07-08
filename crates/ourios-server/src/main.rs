@@ -41,10 +41,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use ourios_ingester::Compactor;
+use ourios_ingester::receiver::tls::TlsSettings;
 use ourios_parquet::{
     CompactionPolicy, ParquetAuditSink, PromotedAttributes, S3Config, StoreConfig,
 };
-use ourios_server::config::file::FileConfig;
+use ourios_server::config::file::{FileConfig, TlsSection};
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
 
@@ -99,6 +100,10 @@ struct ServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QuerierParams {
     http_addr: SocketAddr,
+    /// RFC 0030 §3.1 — TLS on the querier listener (config-file only;
+    /// `None` = plaintext). Carried here from this slice on; the
+    /// acceptor wiring consumes it in the RFC0030.3 slice.
+    http_tls: Option<TlsSettings>,
     default_window_nanos: u64,
     /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled` /
     /// `OURIOS_QUERIER_MCP_ENABLED`; default off).
@@ -109,7 +114,12 @@ struct QuerierParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiverParams {
     grpc_addr: SocketAddr,
+    /// RFC 0030 §3.1 — TLS per listener (config-file only; `None` =
+    /// plaintext). Carried here from this slice on; the acceptor wiring
+    /// consumes them in the RFC0030.1/.2 slices.
+    grpc_tls: Option<TlsSettings>,
     http_addr: SocketAddr,
+    http_tls: Option<TlsSettings>,
     wal_root: PathBuf,
 }
 
@@ -254,12 +264,19 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
         file.receiver.http_addr.as_deref(),
         file.receiver.wal_root.as_deref().map(PathBuf::from),
     )?;
+    if let Some(receiver) = config.receiver.as_mut() {
+        receiver.grpc_tls = tls_settings("receiver.grpc_tls", &file.receiver.grpc_tls)?;
+        receiver.http_tls = tls_settings("receiver.http_tls", &file.receiver.http_tls)?;
+    }
     config.querier = build_querier_config(
         file.querier.enabled.as_deref(),
         file.querier.http_addr.as_deref(),
         file.querier.default_window_secs.as_deref(),
         file.querier.mcp.enabled.as_deref(),
     )?;
+    if let Some(querier) = config.querier.as_mut() {
+        querier.http_tls = tls_settings("querier.http_tls", &file.querier.http_tls)?;
+    }
     config.promoted = build_promoted_attributes(
         &file.storage.promoted_attributes.resource,
         &file.storage.promoted_attributes.log,
@@ -393,6 +410,7 @@ fn build_querier_config(
         .ok_or("OURIOS_QUERIER_DEFAULT_WINDOW_SECS overflows when converted to nanoseconds")?;
     Ok(Some(QuerierParams {
         http_addr,
+        http_tls: None,
         default_window_nanos,
         mcp_enabled,
     }))
@@ -416,7 +434,9 @@ fn build_receiver_config(
         .ok_or("OURIOS_WAL_ROOT must be set when the receiver role is enabled")?;
     Ok(Some(ReceiverParams {
         grpc_addr,
+        grpc_tls: None,
         http_addr,
+        http_tls: None,
         wal_root,
     }))
 }
@@ -554,12 +574,87 @@ async fn terminate_signal(#[cfg(unix)] sigterm: Option<tokio::signal::unix::Sign
 #[cfg(unix)]
 fn startup_guards(config: &ServerConfig) -> Option<tokio::signal::unix::Signal> {
     warn_if_open_mode(config);
+    warn_if_plaintext_credentials(config);
     install_terminate_signal()
 }
 
 #[cfg(not(unix))]
 fn startup_guards(config: &ServerConfig) {
     warn_if_open_mode(config);
+    warn_if_plaintext_credentials(config);
+}
+
+/// One `*_tls` block through the single validation path (RFC 0030
+/// §3.1): the raw file leaves into [`TlsSettings::from_parts`], with
+/// the block's YAML key as the error prefix.
+fn tls_settings(prefix: &str, section: &TlsSection) -> Result<Option<TlsSettings>, String> {
+    TlsSettings::from_parts(
+        prefix,
+        section.cert_file.as_deref(),
+        section.key_file.as_deref(),
+        section.client_ca_file.as_deref(),
+        section.min_version.as_deref(),
+        section.reload_interval_secs.as_deref(),
+    )
+}
+
+/// Fail fast on unusable TLS material (RFC0030.5): every configured
+/// `*_tls` block's files are read and built into a `rustls` config at
+/// startup, so an unreadable or malformed PEM is a startup error naming
+/// the block and the path — not a first-handshake surprise.
+fn preflight_tls(config: &ServerConfig) -> Result<(), String> {
+    let blocks = [
+        (
+            "receiver.grpc_tls",
+            config.receiver.as_ref().and_then(|r| r.grpc_tls.as_ref()),
+        ),
+        (
+            "receiver.http_tls",
+            config.receiver.as_ref().and_then(|r| r.http_tls.as_ref()),
+        ),
+        (
+            "querier.http_tls",
+            config.querier.as_ref().and_then(|q| q.http_tls.as_ref()),
+        ),
+    ];
+    for (key, settings) in blocks {
+        if let Some(settings) = settings {
+            settings.load().map_err(|e| format!("{key}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// RFC 0030 §3.4: credentials over a plaintext listener get one startup
+/// warning naming the listener — visible, not fatal (TLS may
+/// legitimately terminate at a fronting proxy or mesh).
+fn warn_if_plaintext_credentials(config: &ServerConfig) {
+    if config.auth.is_none() {
+        return;
+    }
+    let mut plaintext: Vec<&str> = Vec::new();
+    if let Some(receiver) = &config.receiver {
+        if receiver.grpc_tls.is_none() {
+            plaintext.push("receiver.grpc_addr");
+        }
+        if receiver.http_tls.is_none() {
+            plaintext.push("receiver.http_addr");
+        }
+    }
+    if let Some(querier) = &config.querier
+        && querier.http_tls.is_none()
+    {
+        plaintext.push("querier.http_addr");
+    }
+    for listener in plaintext {
+        tracing::warn!(
+            name: ourios_semconv::EVENT_OURIOS_SERVER_TLS_PLAINTEXT_CREDENTIALS,
+            listener,
+            "{listener} serves bearer credentials over plaintext (no *_tls \
+             block; RFC 0030 §3.4) — acceptable only behind a \
+             TLS-terminating proxy or mesh"
+        );
+    }
 }
 
 /// RFC 0026 §3.1 open mode: with no `auth` configured, any client that can
@@ -624,6 +719,7 @@ fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
         std::fs::create_dir_all(root)
             .map_err(|e| format!("create store root {}: {e}", root.display()))?;
     }
+    preflight_tls(&config)?;
     Ok(config)
 }
 

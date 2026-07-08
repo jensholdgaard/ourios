@@ -84,6 +84,9 @@ rmcp = { version = "2.1.0", default-features = false, features = ["macros", "ser
 schemars = { version = "1.2.1", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
+# RFC 0030 test CAs / leaf certs, minted at test time — no committed
+# key material (the RFC 0029 house rule).
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
 # RFC 0020 env-substitution resolver property tests (config::env_subst): the
 # OTel Config WG vector table + invariants (escape round-trip, non-recursion).
 proptest = "=1.11.0"

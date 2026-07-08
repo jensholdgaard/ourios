@@ -39,6 +39,7 @@ pub mod http;
 pub mod materialize;
 pub mod pipeline;
 pub mod tenant;
+pub mod tls;
 
 pub use auth::{AuthBinding, AuthResolver, Unauthenticated, authenticate_bearer};
 pub use commit::CommitCoordinator;

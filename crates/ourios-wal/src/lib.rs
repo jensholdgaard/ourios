@@ -187,7 +187,7 @@ pub struct Wal {
     /// process may have created the segment and crashed before
     /// its own first `sync`, so its directory entry could still
     /// be page-cache-only. Acking a frame appended into such a
-    /// segment after only an `fdatasync` (which persists the
+    /// segment after only a data sync (which persists the
     /// file's data + size but not its directory link) would
     /// risk losing that acked frame to an orphaned inode on
     /// power loss — a §3.4 violation. One extra fsync per
@@ -200,7 +200,7 @@ pub struct Wal {
     /// and one of housekeeping's two truncation bounds.
     checkpoint: Option<WalOffset>,
     /// A rotation step failed (§6.5): the closing segment's
-    /// `fdatasync`, the fresh segment's creation, or the
+    /// data sync, the fresh segment's creation, or the
     /// parent-dir `fsync`. Once set, every `append` is refused
     /// until an operator intervenes — continuing would risk
     /// either a torn tail on a *closed* segment (which recovery
@@ -209,7 +209,7 @@ pub struct Wal {
     quiesced: bool,
     /// §6.8 counters. `unflushed_bytes` is the H3 detection
     /// metric: grows on `append`, resets on a successful
-    /// `sync` (or on the closing `fdatasync` of a rotation).
+    /// `sync` (or on a rotation's closing segment sync).
     appends_total: u64,
     syncs_total: u64,
     unflushed_bytes: u64,
@@ -288,8 +288,8 @@ impl Wal {
     /// Rotation (§6.5) happens here, *before* the write: when the
     /// segment would exceed `wal_segment_size_bytes` with this
     /// frame, or its age (from the `UUIDv7` mint time) exceeds
-    /// `wal_segment_age_secs`, the segment is closed (final
-    /// `fdatasync`), a fresh one is created, and the parent dir
+    /// `wal_segment_age_secs`, the segment is closed (its final
+    /// data sync), a fresh one is created, and the parent dir
     /// is fsync'd before the frame lands — so a frame never
     /// straddles segments and never lands in a segment without a
     /// durable directory entry. A failed rotation quiesces the
@@ -402,7 +402,7 @@ impl Wal {
     }
 
     /// Close the current segment and open a fresh one (§6.5):
-    /// `fdatasync` the old segment (the last fsync it ever
+    /// sync the old segment's data (the last sync it ever
     /// receives — a torn tail on a *closed* segment is RFC0008.5
     /// corruption, so closing without it would convert a benign
     /// crash into a recovery halt), create the new `UUIDv7`
@@ -422,7 +422,7 @@ impl Wal {
                 source,
             });
         }
-        // The closing fdatasync flushed everything appended so far.
+        // The closing data sync flushed everything appended so far.
         self.unflushed_bytes = 0;
         let (file, path, uuid) = match create_fresh_segment(&self.config.root) {
             Ok(fresh) => fresh,
@@ -474,11 +474,12 @@ impl Wal {
     /// durable — the receiver gates its acks on this returning
     /// `Ok(_)`.
     ///
-    /// Uses `fdatasync` (`File::sync_data`) on the segment per
-    /// §6.3: the payload + size are what must survive, not the
-    /// inode's every metadata field. The directory `fsync` is
-    /// the full `File::sync_all` — `fdatasync` is undefined on
-    /// directories under POSIX.
+    /// Uses `sync_file_data` on the segment per §6.3 —
+    /// `fdatasync`, or `fcntl(F_FULLFSYNC)` under the macOS knob:
+    /// the payload + size are what must survive, not the inode's
+    /// every metadata field. The directory `fsync` is the full
+    /// `File::sync_all` — `fdatasync` is undefined on directories
+    /// under POSIX.
     ///
     /// With [`WalConfig::macos_full_fsync`] set (macOS only),
     /// the segment sync is `fcntl(F_FULLFSYNC)` instead — see
@@ -665,7 +666,7 @@ impl Wal {
     /// A torn (partial) *tail* frame is the one exception: on the
     /// newest segment it is RFC0008.4 clean truncation, so the
     /// scan stops cleanly and the segment is healed —
-    /// `ftruncate` to the last valid boundary, `fdatasync`, and
+    /// `ftruncate` to the last valid boundary, a data sync, and
     /// `fsync` the parent dir — so the next `append` resumes on a
     /// frame boundary. On any *closed* segment a torn tail is
     /// instead RFC0008.5 corruption (its rotation fsync should
@@ -1190,7 +1191,7 @@ pub enum AppendError {
         source: std::io::Error,
     },
     /// A prior rotation failed (the closing segment's
-    /// `fdatasync`, the fresh segment's creation, or the
+    /// data sync, the fresh segment's creation, or the
     /// parent-dir `fsync`) and the WAL is quiesced per §6.5 —
     /// operator intervention is required before further appends
     /// are accepted. The append that triggered the failed

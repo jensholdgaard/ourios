@@ -1068,10 +1068,6 @@ fn replay_segment<S: FrameSink>(
     }
 }
 
-/// `fsync` the WAL root directory so a freshly-created or
-/// freshly-truncated segment's directory entry is durable
-/// (§6.3 / §6.6 step 4). Opens the directory read-only and
-/// calls the full `fsync` (`File::sync_all`) — `fdatasync` is
 /// The §6.3 file-data sync primitive every durability-critical path
 /// uses — `Wal::sync`, rotation's close-segment and fresh-header
 /// syncs, and recovery's post-truncate heal: `fdatasync`, upgraded to
@@ -1094,6 +1090,10 @@ fn sync_file_data(file: &File, _macos_full_fsync: bool) -> std::io::Result<()> {
     file.sync_data()
 }
 
+/// `fsync` the WAL root directory so a freshly-created or
+/// freshly-truncated segment's directory entry is durable
+/// (§6.3 / §6.6 step 4). Opens the directory read-only and
+/// calls the full `fsync` (`File::sync_all`) — `fdatasync` is
 /// undefined on directories under POSIX.
 fn sync_parent_dir(root: &std::path::Path) -> std::io::Result<()> {
     File::open(root)?.sync_all()

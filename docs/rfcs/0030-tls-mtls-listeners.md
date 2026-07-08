@@ -33,8 +33,9 @@ observer can replay them. This RFC closes the gap identified as
    with no dropped listener.
 4. **Config mirrors the OTel Collector's `configtls` server model**
    (`cert_file`, `key_file`, `client_ca_file`, `min_version`,
-   `reload_interval`) so operators configure Ourios exactly like the
-   Collector in front of it.
+   `reload_interval_secs`) so operators configure Ourios like the
+   Collector in front of it (names adapted to RFC 0020's flat
+   `*_secs` conventions; semantics identical).
 
 TLS remains **opt-in per listener**: an unconfigured listener serves
 plaintext, preserving the documented perimeter-trust deployment mode
@@ -69,27 +70,32 @@ confidentiality); no storage or query semantics change.
 
 ### 3.1 Configuration (RFC 0020 amendment)
 
-Each listener config grows an optional `tls` block with the
-Collector's server-side field names and semantics:
+The amendment is **purely additive** to RFC 0020's existing flat
+listener keys (`receiver.grpc_addr`, `receiver.http_addr`,
+`querier.http_addr` are untouched): each listener gains an optional
+sibling `*_tls` block.
 
 ```yaml
 receiver:
-  grpc:
-    endpoint: 0.0.0.0:4317
-    tls:
-      cert_file: /etc/ourios/tls/server.crt     # required to enable TLS
-      key_file: /etc/ourios/tls/server.key      # required alongside cert_file
-      client_ca_file: /etc/ourios/tls/ca.crt    # optional: enables mTLS
-      min_version: "1.2"                        # default; "1.3" allowed
-      reload_interval: 5m                       # optional: never if unset
-  http:
-    endpoint: 0.0.0.0:4318
-    tls: { ... }                                # same shape
+  grpc_addr: 0.0.0.0:4317
+  grpc_tls:
+    cert_file: /etc/ourios/tls/server.crt     # required to enable TLS
+    key_file: /etc/ourios/tls/server.key      # required alongside cert_file
+    client_ca_file: /etc/ourios/tls/ca.crt    # optional: enables mTLS
+    min_version: "1.2"                        # default; "1.3" allowed
+    reload_interval_secs: 300                 # optional: never if unset
+  http_addr: 0.0.0.0:4318
+  http_tls: { ... }                           # same shape
 querier:
-  http:
-    endpoint: 0.0.0.0:4319
-    tls: { ... }                                # same shape, covers /mcp
+  http_addr: 0.0.0.0:4319
+  http_tls: { ... }                           # same shape, covers /mcp
 ```
+
+The field names and semantics inside the block are the Collector's
+`configtls` server settings; the two adaptations to RFC 0020's house
+conventions are the flat `<listener>_tls` placement (no nested
+listener objects exist to hang a `tls:` key off) and the duration
+spelling (below).
 
 Rules:
 
@@ -100,6 +106,10 @@ Rules:
 - `min_version` accepts `"1.2"` (default) and `"1.3"` only. TLS 1.0
   and 1.1 are not implemented (rustls does not ship them; the
   Collector deprecates them).
+- `reload_interval_secs` is a positive integer number of seconds —
+  RFC 0020's existing duration convention (`default_window_secs`,
+  `interval_secs`), not the Collector's Go-style duration string.
+  Zero or negative is a config error; unset means never reload.
 - Paths may use `${env:VAR}` (RFC 0020 §3.5) like any other config
   value; the *file contents* are read at startup and on reload, never
   embedded in config.
@@ -121,7 +131,7 @@ One shared `ourios-ingester`-side (receiver) and `ourios-server`-side
   of tonic's `Server::serve_with_incoming` (tonic's own `tls` feature
   is not enabled — one rustls wiring for all three listeners instead
   of two).
-- **Reload** (`reload_interval`): the acceptor holds an
+- **Reload** (`reload_interval_secs`): the acceptor holds an
   `ArcSwap<rustls::ServerConfig>`; a task re-reads the files on the
   interval and swaps on content change. In-flight connections keep
   their session; new handshakes see the new material. A reload
@@ -222,7 +232,7 @@ an unreadable or non-PEM `cert_file`, Then startup fails naming the
 path.
 
 **RFC0030.6 — certificate reload.**
-Given a TLS listener with `reload_interval` set and an established
+Given a TLS listener with `reload_interval_secs` set and an established
 baseline connection, When the cert/key files are replaced with a new
 pair (same CA) on disk and the interval elapses, Then new handshakes
 serve the new certificate (observed via the peer certificate's serial)

@@ -222,3 +222,21 @@ groups:
           handler (the `ourios.receiver.tls.handshake_failures` counter's
           cause dimension, per the OTel error.type-on-one-instrument
           convention).
+
+      - id: ourios.tls.reload_error
+        type:
+          members:
+            - id: unreadable
+              value: "unreadable"
+              stability: development
+              brief: A cert/key/CA file could not be read on reload (writer mid-swap).
+            - id: invalid
+              value: "invalid"
+              stability: development
+              brief: The re-read material did not build a valid config (bad PEM, cert/key mismatch).
+        stability: development
+        brief: >-
+          Why a TLS certificate reload was skipped (the
+          `ourios.receiver.tls.reload_failures` counter's cause
+          dimension). The listener keeps the last good certificate in
+          both cases (RFC0030.6).

@@ -25,7 +25,9 @@ use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
 use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
-use ourios_ingester::receiver::tls_serve::{TlsListener, tls_incoming};
+use ourios_ingester::receiver::tls_serve::{
+    LISTENER_GRPC, LISTENER_HTTP, TlsListener, reloading_acceptor, tls_incoming,
+};
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
@@ -499,14 +501,14 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // (axum is built with just the http1 feature).
     let grpc_acceptor = match &config.grpc_tls {
         Some(tls) => Some(
-            tls.acceptor(ALPN_GRPC)
+            reloading_acceptor(tls, ALPN_GRPC, LISTENER_GRPC)
                 .map_err(|e| format!("receiver.grpc_tls: {e}"))?,
         ),
         None => None,
     };
     let http_acceptor = match &config.http_tls {
         Some(tls) => Some(
-            tls.acceptor(ALPN_HTTP)
+            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
                 .map_err(|e| format!("receiver.http_tls: {e}"))?,
         ),
         None => None,

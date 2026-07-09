@@ -254,8 +254,9 @@ fn token_store(tenants: &[&str]) -> std::sync::Arc<ourios_core::auth::TokenStore
 /// Scenario RFC0030.4 — mTLS require-and-verify. With `client_ca_file`
 /// set (⇒ `RequireAndVerifyClientCert`) and a static bearer configured:
 /// a CA-trusted client cert *plus* a valid bearer is ingested; the same
-/// cert with no bearer is 401 (mTLS composes with, does not replace,
-/// bearer auth); a client with no cert, and one with a cert from an
+/// cert with no bearer is rejected `Unauthenticated` (the gRPC status;
+/// mTLS composes with, does not replace, bearer auth); a client with no
+/// cert, and one with a cert from an
 /// untrusted CA, both fail the handshake — reaching neither the handler
 /// nor the auth layer.
 /// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
@@ -346,7 +347,7 @@ async fn rfc0030_4_mtls_require_and_verify() {
     assert_eq!(
         captured.lock().expect("captured").len(),
         1,
-        "the un-bearered request reached the auth layer but not the WAL",
+        "the request without a bearer reached the auth layer but not the WAL",
     );
 
     // Connect (tonic defers the handshake) then export, so the mTLS

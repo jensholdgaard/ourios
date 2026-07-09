@@ -130,7 +130,7 @@ impl TlsSettings {
     /// `rustls::ServerConfig`. Called at startup (fail fast — RFC0030.5
     /// names the unreadable/malformed path) and again on each reload
     /// tick (RFC0030.6). ALPN is left to the listener wiring — gRPC
-    /// requires `h2`, the HTTP surfaces offer both (§3.2).
+    /// requires `h2`, the HTTP surfaces offer `http/1.1` (§3.2).
     ///
     /// The crypto provider is pinned to ring explicitly: the workspace
     /// dependency tree is what decides which providers are compiled in,
@@ -202,7 +202,7 @@ impl TlsSettings {
 
     /// Build the listener's [`tokio_rustls::TlsAcceptor`] from freshly
     /// read PEM material, advertising `alpn` (gRPC passes `[b"h2"]`, the
-    /// HTTP surfaces pass `[b"h2", b"http/1.1"]`). One acceptor per
+    /// HTTP surfaces pass `[b"http/1.1"]`). One acceptor per
     /// listener; the caller wraps each accepted `TcpStream`.
     ///
     /// # Errors

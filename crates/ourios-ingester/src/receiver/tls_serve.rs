@@ -39,6 +39,13 @@ use tokio_rustls::server::TlsStream;
 /// exchange over a slow link, short enough to bound a slowloris.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Cap on in-flight handshakes per listener. With the deadline above, a
+/// flood of connect-and-stall clients would otherwise accumulate
+/// unbounded handshake tasks (a resource-exhaustion `DoS`); at the cap,
+/// new connections wait in the OS accept backlog until a slot frees —
+/// backpressure, not unbounded growth.
+pub const MAX_CONCURRENT_HANDSHAKES: usize = 256;
+
 /// `ourios.tls.listener` values.
 const LISTENER_GRPC: &str = "grpc";
 const LISTENER_HTTP: &str = "http";
@@ -76,22 +83,28 @@ impl HandshakeFailures {
 }
 
 /// Handshake one accepted `TcpStream` under the deadline, recording the
-/// cause of any failure. `Ok(None)` means "dropped, already counted".
+/// cause of any failure. Returns `None` when the connection is dropped
+/// (already counted + logged with the peer address for diagnosis).
 async fn handshake(
     acceptor: &TlsAcceptor,
     tcp: TcpStream,
     metrics: &HandshakeFailures,
 ) -> Option<TlsStream<TcpStream>> {
+    // Capture the peer before the stream is consumed by the handshake —
+    // it's the only thread through which an intermittent client failure
+    // (wrong CA, protocol mismatch, slowloris) can be diagnosed.
+    let peer = tcp.peer_addr().ok();
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
         Ok(Ok(tls)) => Some(tls),
         Ok(Err(e)) => {
-            tracing::debug!(error = %e, listener = metrics.listener, "TLS handshake failed");
+            tracing::debug!(error = %e, listener = metrics.listener, ?peer, "TLS handshake failed");
             metrics.record(FAILURE_HANDSHAKE);
             None
         }
         Err(_) => {
             tracing::debug!(
                 listener = metrics.listener,
+                ?peer,
                 "TLS handshake timed out; dropping the connection",
             );
             metrics.record(FAILURE_TIMEOUT);
@@ -117,6 +130,10 @@ where
     // Successful handshakes flow through this channel; the bound caps
     // in-flight completed-but-unconsumed connections.
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    // Bound concurrent handshake tasks: the driver waits for a free slot
+    // before spawning, so a stall flood queues in the accept backlog
+    // rather than accumulating tasks.
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     tokio::spawn(async move {
         use tokio_stream::StreamExt as _;
         tokio::pin!(incoming);
@@ -132,12 +149,20 @@ where
                     continue;
                 }
             };
+            // Backpressure: block accepting until a handshake slot frees.
+            // `acquire_owned` errors only if the semaphore is closed,
+            // which never happens (it lives as long as this task).
+            let Ok(permit) = slots.clone().acquire_owned().await else {
+                break;
+            };
             let acceptor = acceptor.clone();
             let metrics = metrics.clone();
             let tx = tx.clone();
             // One task per connection: the handshake can't block the
-            // accept loop or any sibling.
+            // accept loop or any sibling. The permit is held for the
+            // handshake's lifetime and released on completion.
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Some(tls) = handshake(&acceptor, tcp, &metrics).await {
                     let _ = tx.send(Ok(tls)).await;
                 }
@@ -182,7 +207,12 @@ impl axum::serve::Listener for TlsListener {
             tokio::select! {
                 // A new TCP connection → spawn its handshake; don't wait
                 // on it here, so a slow ClientHello can't stall the loop.
-                accepted = self.inner.accept() => {
+                // Gated by the in-flight cap: at capacity the arm is
+                // disabled, so `select!` only drains completions until a
+                // slot frees, and excess connections wait in the accept
+                // backlog (backpressure, not unbounded task growth).
+                accepted = self.inner.accept(),
+                    if self.handshakes.len() < MAX_CONCURRENT_HANDSHAKES => {
                     match accepted {
                         Ok((tcp, addr)) => {
                             let acceptor = self.acceptor.clone();

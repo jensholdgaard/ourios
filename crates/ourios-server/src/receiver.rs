@@ -495,7 +495,8 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // RFC 0030 §3.2: build each listener's TLS acceptor at startup so
     // unusable material fails here (the config path already preflighted
     // it, but the served role re-derives from `TlsSettings`). ALPN is
-    // per-listener — gRPC is h2-only, HTTP offers h2 + http/1.1.
+    // per-listener — gRPC is h2-only, HTTP offers http/1.1 only
+    // (axum is built with just the http1 feature).
     let grpc_acceptor = match &config.grpc_tls {
         Some(tls) => Some(
             tls.acceptor(ALPN_GRPC)

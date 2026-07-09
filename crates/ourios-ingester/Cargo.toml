@@ -50,9 +50,7 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 # the RFC 0030 listener acceptors; pinned to rustls 0.23's `ring`
 # provider (matching tls.rs) — already in the tree via reqwest.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-# async-stream builds the gRPC TLS incoming adapter (per-conn handshake
-# → stream of TlsStreams); futures-core supplies the `Stream` bound.
-async-stream = { version = "0.3", default-features = false }
+# futures-core supplies the `Stream` bound on the gRPC TLS adapter.
 futures-core = { version = "0.3", default-features = false }
 # `.next()` on the incoming stream inside the gRPC TLS adapter.
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }

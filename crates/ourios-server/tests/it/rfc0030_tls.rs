@@ -73,8 +73,13 @@ async fn warnings_before_ready(config_yaml: &str, tmp: &tempfile::TempDir, needl
     .expect("readiness before timeout");
 
     // Readiness follows the startup guards, so the warning (if any) is
-    // already written; kill the child to end the stderr stream.
+    // already written; kill the child to end the stderr stream, and
+    // reap it so no zombie outlives the test.
     child.start_kill().expect("kill server");
+    timeout(Duration::from_secs(15), child.wait())
+        .await
+        .expect("child exits after kill")
+        .expect("wait on child");
     let collected = timeout(Duration::from_secs(15), collector)
         .await
         .expect("stderr drains after kill")

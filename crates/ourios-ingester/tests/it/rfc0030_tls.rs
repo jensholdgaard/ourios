@@ -179,13 +179,33 @@ fn rfc0030_5_config_validation() {
         "names the path: {err}"
     );
 
-    // And a valid pair loads — for both min_version selections.
+    // An empty client-CA file fails at load, naming the path — never a
+    // silently empty trust store.
     let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()])
         .expect("mint a self-signed pair");
     let cert_path = tmp.path().join("server.crt");
     let key_path = tmp.path().join("server.key");
     std::fs::write(&cert_path, signed.cert.pem()).expect("write cert");
     std::fs::write(&key_path, signed.signing_key.serialize_pem()).expect("write key");
+    let empty_ca = tmp.path().join("empty-ca.crt");
+    std::fs::write(&empty_ca, b"").expect("write empty CA");
+    let with_empty_ca = TlsSettings::from_parts(
+        "receiver.grpc_tls",
+        Some(&cert_path.display().to_string()),
+        Some(&key_path.display().to_string()),
+        Some(&empty_ca.display().to_string()),
+        None,
+        None,
+    )
+    .expect("shape-valid settings")
+    .expect("configured");
+    let err = with_empty_ca.load().expect_err("empty CA file");
+    assert!(
+        err.contains(&empty_ca.display().to_string()),
+        "names the path: {err}"
+    );
+
+    // And a valid pair loads — for both min_version selections.
     for (raw, expected) in [
         (None, TlsMinVersion::V1_2),
         (Some("1.3"), TlsMinVersion::V1_3),

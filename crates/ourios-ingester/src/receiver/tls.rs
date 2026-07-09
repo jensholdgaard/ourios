@@ -177,6 +177,12 @@ impl TlsSettings {
                         .add(ca)
                         .map_err(|e| format!("cannot use a CA from {}: {e}", ca_path.display()))?;
                 }
+                if roots.is_empty() {
+                    return Err(format!(
+                        "no PEM certificates found in {}",
+                        ca_path.display()
+                    ));
+                }
                 let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
                     .build()
                     .map_err(|e| {

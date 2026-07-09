@@ -1090,7 +1090,7 @@ and priced.
 **Corpus.** `corpus/otel-demo-v8` (published GitHub release): a
 **48-hour** OTel-Demo 2.2.0 capture at 150 locust users with the
 `adFailure` + `paymentFailure` feature flags active — 690,355 OTLP
-LogsData batches / 4,948,579 log records / 2.96 GB uncompressed, the
+LogsData batches / 4,948,596 log records / 2.96 GB uncompressed, the
 largest and most hostile real capture to date (deliberately injected
 failure modes, multi-service, long-horizon). Calibration manifest at
 `testdata/calibration/otel-demo-v8.json` (RFC 0024 §3.1).

@@ -1130,3 +1130,35 @@ a red herring. Tracked as **#444** (tokenizer masking vs.
 length-aware thresholding vs. accept-and-scope-C2-per-service — an
 RFC-level pillar #2 decision); the safety story held throughout
 (bounded memory per RFC 0023, per-service C1 perfect).
+
+The per-service decomposition is now a **first-class bench diagnostic**
+(`ourios-bench --gates c2` prints it whenever a corpus resolves to more
+than one bucket — distinct `service.name` values plus any
+`<unknown>`/`<other>`); template creation is a globally-monotonic
+event attributed to the minting service, so per-service creations
+partition the whole-corpus count exactly (2 + 17 + 1 + 3 + 14,608 =
+14,631) in `O(services)` memory — no per-service id set. The gate
+itself is unchanged (whole-corpus); the breakdown is additive, so
+option 3 of #444 ("scope C2 per service") can be evaluated on real
+numbers without a code change first.
+
+**What the fragmentation actually costs — B2 pricing (indicative,
+local M-series).** Running the B2 windowed query on the fragmented
+(kafka) vs. converged (cart) service isolates the impact:
+
+| service | templates | 1 h-window query | row groups pruned |
+|---|---|---|---|
+| cart | 2 | 3.66 ms | 48 / 49 |
+| kafka | 14,608 | 3.40 ms | 48 / 49 |
+
+The deployed **time/column pruning floor is identical** whether a
+service has 2 templates or 14,608 — a 1 h window prunes 48 of 49 row
+groups either way (reconfirming the RFC 0023 graceful-degradation
+result on a fresh corpus). Fragmentation does **not** cost query
+*latency* or pruning. What it costs is template-exact query
+*precision*: the `template_id == 1` probe recovers 1.78 M / 2.76 M
+rows on cart (one template is most of the corpus) but only 11,523 /
+136,790 on kafka, because kafka's dominant event is scattered across
+~11,651 ids — no single template query recovers it. So #444 is a
+**query-capability / thesis-value** decision, not a performance one;
+the pruning path degrades to the first-class-column floor unharmed.

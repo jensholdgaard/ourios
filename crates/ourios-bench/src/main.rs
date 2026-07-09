@@ -331,6 +331,28 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
             "  C2 convergence: ratio {ratio} (end template count {}, sample cadence {}) — {verdict}",
             c2.template_count_at_end, c2.sample_cadence,
         );
+        // Per-service decomposition (diagnostic) — printed whenever the
+        // corpus resolves to more than one bucket (distinct `service.name`
+        // values plus any `<unknown>`/`<other>`), since a whole-corpus
+        // ratio then conflates a noisy broker with clean application
+        // services (v8 §9.12 / #444).
+        if c2.by_service.len() > 1 {
+            println!("  C2 by service (diagnostic; creations sum to the end count):");
+            for svc in &c2.by_service {
+                let per = match (svc.convergence_ratio, svc.pass) {
+                    (Some(r), Some(true)) => format!("ratio {r:.3} PASS"),
+                    (Some(r), Some(false)) => format!("ratio {r:.3} FAIL"),
+                    _ => "abstain (< 1 M lines)".to_string(),
+                };
+                println!(
+                    "    {:<24} {:>10} lines, {:>7} created — {per}",
+                    svc.service_name, svc.lines, svc.templates_created,
+                );
+            }
+            if c2.services_truncated {
+                println!("    (service cardinality cap hit — extras folded into <other>)");
+            }
+        }
     }
 }
 

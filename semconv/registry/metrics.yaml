@@ -417,3 +417,20 @@ groups:
       (a pre-epoch / overflowing timestamp).
     instrument: counter
     unit: "{error}"
+
+  - id: metric.ourios.receiver.tls.handshake_failures
+    type: metric
+    metric_name: ourios.receiver.tls.handshake_failures
+    stability: development
+    brief: >-
+      TLS connections that failed before reaching the request handler
+      (RFC 0030 §3.2), split by listener and cause. A dropped handshake
+      never reaches the auth layer or the WAL; the counter is the only
+      signal it happened.
+    instrument: counter
+    unit: "{failure}"
+    attributes:
+      - ref: ourios.tls.listener
+        requirement_level: required
+      - ref: ourios.tls.failure
+        requirement_level: required

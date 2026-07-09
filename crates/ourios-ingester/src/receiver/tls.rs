@@ -219,5 +219,8 @@ impl TlsSettings {
 /// ALPN for a gRPC (`tonic`/HTTP/2-only) listener.
 pub const ALPN_GRPC: &[&[u8]] = &[b"h2"];
 
-/// ALPN for an HTTP listener that speaks HTTP/2 and HTTP/1.1.
-pub const ALPN_HTTP: &[&[u8]] = &[b"h2", b"http/1.1"];
+/// ALPN for the OTLP/HTTP listener. **HTTP/1.1 only** — the receiver's
+/// `axum` is built with just the `http1` feature (OTLP/HTTP is a 1.1
+/// protocol), so advertising `h2` would let a dual-protocol client
+/// negotiate a version the server cannot actually serve.
+pub const ALPN_HTTP: &[&[u8]] = &[b"http/1.1"];

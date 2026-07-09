@@ -55,7 +55,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 async-stream = { version = "0.3", default-features = false }
 futures-core = { version = "0.3", default-features = false }
 # `.next()` on the incoming stream inside the gRPC TLS adapter.
-tokio-stream = { version = "0.1", default-features = false }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 # Structured per-connection handshake-failure logs on the TLS listeners.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /

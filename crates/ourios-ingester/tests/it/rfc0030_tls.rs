@@ -154,7 +154,7 @@ async fn rfc0030_2_http_ingest_over_tls() {
         .build()
         .expect("client");
     let resp = client
-        .post(format!("https://localhost:{}/v1/logs", addr.port()))
+        .post(format!("https://127.0.0.1:{}/v1/logs", addr.port()))
         .header("content-type", "application/x-protobuf")
         .body(body.clone())
         .send()
@@ -176,6 +176,61 @@ async fn rfc0030_2_http_ingest_over_tls() {
         1,
         "the plaintext attempt reached nothing",
     );
+
+    server.abort();
+}
+
+/// Regression for the §3.2 stall guard (not a §5 scenario): a client
+/// that opens a TCP connection and never sends its `ClientHello` must
+/// not block a healthy client from being served. Proven on the HTTP
+/// `TlsListener`, whose `accept` drives handshakes concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_handshake_does_not_block_the_listener() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (cert, key, cert_pem) = cert_pair(tmp.path());
+    let acceptor = tls_settings("receiver.http_tls", &cert, &key)
+        .acceptor(ALPN_HTTP)
+        .expect("acceptor");
+    let (pipeline, captured) = capturing_pipeline();
+    let app = router(pipeline, &HttpConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            TlsListener::new(listener, acceptor),
+            app.into_make_service(),
+        )
+        .await
+    });
+
+    // A stalled client: connect at TCP, then send nothing (no
+    // ClientHello). Held open for the duration of the test.
+    let _stalled = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("stall connect");
+
+    // A healthy client must still be served promptly — well within the
+    // 10 s handshake deadline the stalled connection is subject to.
+    let body = request(vec![resource_logs("checkout", &["one line"])]).encode_to_vec();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("root"))
+        .build()
+        .expect("client");
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .post(format!("https://127.0.0.1:{}/v1/logs", addr.port()))
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send(),
+    )
+    .await
+    .expect("the healthy client is served despite the stalled one")
+    .expect("HTTPS post");
+    assert!(resp.status().is_success(), "status {}", resp.status());
+    assert_eq!(captured.lock().expect("captured").len(), 1);
 
     server.abort();
 }

@@ -190,3 +190,35 @@ groups:
         brief: >-
           The disposition of a failed audit partition flush (issue #302):
           whether the batch was retained for retry or dropped.
+
+      - id: ourios.tls.listener
+        type:
+          members:
+            - id: grpc
+              value: "grpc"
+              stability: development
+              brief: The OTLP gRPC receiver listener (RFC 0030 §3.1).
+            - id: http
+              value: "http"
+              stability: development
+              brief: The OTLP HTTP receiver listener (RFC 0030 §3.1).
+        stability: development
+        brief: Which TLS-terminating listener a handshake failure occurred on.
+
+      - id: ourios.tls.failure
+        type:
+          members:
+            - id: handshake
+              value: "handshake"
+              stability: development
+              brief: The TLS handshake was rejected (bad/absent client cert, protocol mismatch).
+            - id: timeout
+              value: "timeout"
+              stability: development
+              brief: The handshake did not complete within the deadline (slow / stalled client).
+        stability: development
+        brief: >-
+          Why a TLS connection failed before it reached the request
+          handler (the `ourios.receiver.tls.handshake_failures` counter's
+          cause dimension, per the OTel error.type-on-one-instrument
+          convention).

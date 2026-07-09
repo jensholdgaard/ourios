@@ -46,6 +46,16 @@ ourios-core = { path = "../ourios-core" }
 # `pem` feature reads the cert/key/CA files.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
+# tokio-rustls wraps each accepted TcpStream in the TLS handshake for
+# the RFC 0030 listener acceptors; pinned to rustls 0.23's `ring`
+# provider (matching tls.rs) — already in the tree via reqwest.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# futures-core supplies the `Stream` bound on the gRPC TLS adapter.
+futures-core = { version = "0.3", default-features = false }
+# `.next()` on the incoming stream inside the gRPC TLS adapter.
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+# Structured per-connection handshake-failure logs on the TLS listeners.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /
 # CLAUDE.md §3.4): append the OtlpBatch frame + fsync before acking.
 ourios-wal = { path = "../ourios-wal" }
@@ -113,13 +123,17 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 oidc = ["ourios-core/oidc"]
 
 [dev-dependencies]
+# RFC0030.2 HTTPS client: a real TLS handshake to the http listener
+# (the other http tests use in-process oneshot, which skips TLS).
+# rustls-tls-manual-roots so the test trusts only its rcgen CA.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "http2"] }
 # RFC 0030 test CAs / leaf certs, minted at test time — no committed
 # key material (the RFC 0029 house rule).
 rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
 # The RFC0026.2 served-stack arm: serve `LogsServiceServer::with_interceptor`
 # over a local socket and drive it with a real tonic client, so the
 # metadata → interceptor → extension → handler handoff is covered end to end.
-tonic = { version = "=0.14.6", default-features = false, features = ["transport", "router", "channel"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["transport", "router", "channel", "tls-ring", "tls-connect-info"] }
 tempfile = "=3.27.0"
 # Read flushed files' Parquet schemas back in the RFC 0022 promoted-set
 # threading test (pinned in lockstep with ourios-parquet's arrow stack,

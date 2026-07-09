@@ -130,7 +130,7 @@ impl TlsSettings {
     /// `rustls::ServerConfig`. Called at startup (fail fast — RFC0030.5
     /// names the unreadable/malformed path) and again on each reload
     /// tick (RFC0030.6). ALPN is left to the listener wiring — gRPC
-    /// requires `h2`, the HTTP surfaces offer both (§3.2).
+    /// requires `h2`, the HTTP surfaces offer `http/1.1` (§3.2).
     ///
     /// The crypto provider is pinned to ring explicitly: the workspace
     /// dependency tree is what decides which providers are compiled in,
@@ -199,4 +199,28 @@ impl TlsSettings {
             .with_single_cert(certs, key)
             .map_err(|e| format!("cannot use {}: {e}", self.cert_file.display()))
     }
+
+    /// Build the listener's [`tokio_rustls::TlsAcceptor`] from freshly
+    /// read PEM material, advertising `alpn` (gRPC passes `[b"h2"]`, the
+    /// HTTP surfaces pass `[b"http/1.1"]`). One acceptor per
+    /// listener; the caller wraps each accepted `TcpStream`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::load`] returns (unreadable/malformed PEM, empty
+    /// chain, unusable CA, cert/key mismatch), naming the path.
+    pub fn acceptor(&self, alpn: &[&[u8]]) -> Result<tokio_rustls::TlsAcceptor, String> {
+        let mut config = self.load()?;
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+    }
 }
+
+/// ALPN for a gRPC (`tonic`/HTTP/2-only) listener.
+pub const ALPN_GRPC: &[&[u8]] = &[b"h2"];
+
+/// ALPN for the OTLP/HTTP listener. **HTTP/1.1 only** — the receiver's
+/// `axum` is built with just the `http1` feature (OTLP/HTTP is a 1.1
+/// protocol), so advertising `h2` would let a dual-protocol client
+/// negotiate a version the server cannot actually serve.
+pub const ALPN_HTTP: &[&[u8]] = &[b"http/1.1"];

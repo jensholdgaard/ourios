@@ -1,37 +1,238 @@
 //! RFC 0030 §5 — TLS/mTLS on the receiver listeners (six of the nine
 //! scenarios; .3/.7/.8 live in the `ourios-server` harness per §6 —
 //! .7 asserts a startup warning of the served binary, which only the
-//! server crate can spawn).
-//!
-//! Remaining stubs are `#[ignore]`d so the default run stays green
-//! while the RFC is red; each names the green slice that discharges it.
+//! server crate can spawn). .1/.2/.5/.9 are live; .4/.6 remain
+//! `#[ignore]`d stubs naming the green slice that discharges them.
 
-use ourios_ingester::receiver::tls::{TlsMinVersion, TlsSettings};
+use std::path::{Path, PathBuf};
 
-/// Scenario RFC0030.1 — gRPC ingest over TLS.
-/// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.1 stub — implemented in the acceptor green slice"]
-fn rfc0030_1_grpc_ingest_over_tls() {
-    todo!(
-        "RFC0030.1 — grpc_tls with a test-CA pair: TLS OTLP export \
-         succeeds and is ingested; a plaintext dial of the same port \
-         fails at the transport layer, nothing reaching the auth \
-         layer or the WAL"
-    );
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
+use ourios_ingester::receiver::grpc::LogsReceiver;
+use ourios_ingester::receiver::http::{HttpConfig, router};
+use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsMinVersion, TlsSettings};
+use ourios_ingester::receiver::tls_serve::{TlsListener, tls_incoming};
+use prost::Message as _;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+use crate::ingest_support::{capturing_pipeline, request, resource_logs};
+
+/// Mint a self-signed leaf (its own CA) with `localhost` + `127.0.0.1`
+/// SANs — so a tonic client can pin `domain_name("localhost")` and a
+/// reqwest client can verify the `127.0.0.1` it dials — and write the
+/// cert/key PEM into `dir`. Returns the paths plus the cert PEM (the
+/// client's trusted root). No committed key material (RFC 0029 rule).
+fn cert_pair(dir: &Path) -> (PathBuf, PathBuf, String) {
+    let signed =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("mint a self-signed cert");
+    let cert_pem = signed.cert.pem();
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, &cert_pem).expect("write cert");
+    std::fs::write(&key_path, signed.signing_key.serialize_pem()).expect("write key");
+    (cert_path, key_path, cert_pem)
 }
 
-/// Scenario RFC0030.2 — HTTP ingest over TLS.
+/// TLS settings for a listener from a freshly minted cert pair.
+fn tls_settings(prefix: &str, cert: &Path, key: &Path) -> TlsSettings {
+    TlsSettings::from_parts(
+        prefix,
+        Some(&cert.display().to_string()),
+        Some(&key.display().to_string()),
+        None,
+        None,
+        None,
+    )
+    .expect("valid settings")
+    .expect("configured")
+}
+
+/// Scenario RFC0030.1 — gRPC ingest over TLS: a TLS client trusting the
+/// test CA exports and the batch lands; a plaintext dial of the same
+/// port fails at the transport layer, nothing reaching the WAL.
 /// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.2 stub — implemented in the acceptor green slice"]
-fn rfc0030_2_http_ingest_over_tls() {
-    todo!(
-        "RFC0030.2 — http_tls with a test-CA pair: OTLP/HTTP post \
-         over https succeeds and is ingested; a plaintext http \
-         request to the same port fails at the transport layer, \
-         nothing reaching the auth layer or the WAL"
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0030_1_grpc_ingest_over_tls() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (cert, key, cert_pem) = cert_pair(tmp.path());
+    let acceptor = tls_settings("receiver.grpc_tls", &cert, &key)
+        .acceptor(ALPN_GRPC)
+        .expect("acceptor");
+
+    let (pipeline, captured) = capturing_pipeline();
+    let service = LogsServiceServer::new(LogsReceiver::new(pipeline));
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let addr = incoming.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(tls_incoming(incoming, acceptor))
+            .await
+    });
+
+    // TLS client trusting the minted cert, SNI pinned to a cert SAN.
+    let channel = Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(cert_pem.as_bytes()))
+                .domain_name("localhost"),
+        )
+        .expect("tls config")
+        .connect()
+        .await
+        .expect("TLS connect");
+    let mut client = LogsServiceClient::new(channel);
+    client
+        .export(tonic::Request::new(request(vec![resource_logs(
+            "checkout",
+            &["one line"],
+        )])))
+        .await
+        .expect("TLS export");
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+
+    // A plaintext client dialling the TLS port fails: the server's
+    // handshake sees the cleartext HTTP/2 preface, not a ClientHello.
+    let plaintext = LogsServiceClient::connect(format!("http://{addr}")).await;
+    let plaintext_export = match plaintext {
+        Ok(mut c) => c
+            .export(tonic::Request::new(request(vec![resource_logs(
+                "checkout",
+                &["nope"],
+            )])))
+            .await
+            .map(|_| ()),
+        Err(_) => Err(tonic::Status::unavailable("connect failed")),
+    };
+    assert!(
+        plaintext_export.is_err(),
+        "plaintext to the TLS port must fail"
     );
+    assert_eq!(
+        captured.lock().expect("captured").len(),
+        1,
+        "the plaintext attempt reached nothing",
+    );
+
+    server.abort();
+}
+
+/// Scenario RFC0030.2 — HTTP ingest over TLS: an HTTPS client trusting
+/// the test CA posts a batch and it lands; a plaintext `http://`
+/// request to the TLS port fails at the transport layer.
+/// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0030_2_http_ingest_over_tls() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (cert, key, cert_pem) = cert_pair(tmp.path());
+    let acceptor = tls_settings("receiver.http_tls", &cert, &key)
+        .acceptor(ALPN_HTTP)
+        .expect("acceptor");
+
+    let (pipeline, captured) = capturing_pipeline();
+    let app = router(pipeline, &HttpConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            TlsListener::new(listener, acceptor),
+            app.into_make_service(),
+        )
+        .await
+    });
+
+    let body = request(vec![resource_logs("checkout", &["one line"])]).encode_to_vec();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("root cert"),
+        )
+        .build()
+        .expect("client");
+    let resp = client
+        .post(format!("https://127.0.0.1:{}/v1/logs", addr.port()))
+        .header("content-type", "application/x-protobuf")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("HTTPS post");
+    assert!(resp.status().is_success(), "status {}", resp.status());
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+
+    // Plaintext `http://` to the TLS port fails the handshake.
+    let plaintext = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/v1/logs", addr.port()))
+        .header("content-type", "application/x-protobuf")
+        .body(body)
+        .send()
+        .await;
+    assert!(plaintext.is_err(), "plaintext to the TLS port must fail");
+    assert_eq!(
+        captured.lock().expect("captured").len(),
+        1,
+        "the plaintext attempt reached nothing",
+    );
+
+    server.abort();
+}
+
+/// Regression for the §3.2 stall guard (not a §5 scenario): a client
+/// that opens a TCP connection and never sends its `ClientHello` must
+/// not block a healthy client from being served. Proven on the HTTP
+/// `TlsListener`, whose `accept` drives handshakes concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_handshake_does_not_block_the_listener() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (cert, key, cert_pem) = cert_pair(tmp.path());
+    let acceptor = tls_settings("receiver.http_tls", &cert, &key)
+        .acceptor(ALPN_HTTP)
+        .expect("acceptor");
+    let (pipeline, captured) = capturing_pipeline();
+    let app = router(pipeline, &HttpConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            TlsListener::new(listener, acceptor),
+            app.into_make_service(),
+        )
+        .await
+    });
+
+    // A stalled client: connect at TCP, then send nothing (no
+    // ClientHello). Held open for the duration of the test.
+    let _stalled = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("stall connect");
+
+    // A healthy client must still be served promptly — well within the
+    // 10 s handshake deadline the stalled connection is subject to.
+    let body = request(vec![resource_logs("checkout", &["one line"])]).encode_to_vec();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("root"))
+        .build()
+        .expect("client");
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .post(format!("https://127.0.0.1:{}/v1/logs", addr.port()))
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send(),
+    )
+    .await
+    .expect("the healthy client is served despite the stalled one")
+    .expect("HTTPS post");
+    assert!(resp.status().is_success(), "status {}", resp.status());
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+
+    server.abort();
 }
 
 /// Scenario RFC0030.4 — mTLS require-and-verify.
@@ -237,13 +438,85 @@ fn rfc0030_6_certificate_reload() {
     );
 }
 
-/// Scenario RFC0030.9 — `min_version` enforcement.
+/// Scenario RFC0030.9 — `min_version` enforcement: against a server
+/// pinned to TLS 1.3, a client offering only TLS 1.2 is refused and a
+/// TLS 1.3 client succeeds. Exercised at the raw `tokio-rustls`
+/// handshake layer — a tonic/reqwest client can't be pinned to a single
+/// version, and the handshake is exactly what `min_version` governs.
 /// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.9 stub — implemented in the acceptor green slice"]
-fn rfc0030_9_min_version_enforcement() {
-    todo!(
-        "RFC0030.9 — min_version 1.3: a TLS 1.2-only handshake is \
-         refused; a TLS 1.3 handshake succeeds"
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0030_9_min_version_enforcement() {
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::pki_types::pem::PemObject as _;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+    use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
+
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (cert, key, cert_pem) = cert_pair(tmp.path());
+    // Server accepts TLS 1.3 only.
+    let settings = TlsSettings::from_parts(
+        "receiver.grpc_tls",
+        Some(&cert.display().to_string()),
+        Some(&key.display().to_string()),
+        None,
+        Some("1.3"),
+        None,
+    )
+    .expect("valid")
+    .expect("configured");
+    let acceptor = settings.acceptor(ALPN_GRPC).expect("acceptor");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    // Accept a few connections; each handshake either completes or
+    // errors — the server just drives them so the client observes the
+    // outcome.
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let _ = acceptor.accept(tcp).await;
+            });
+        }
+    });
+
+    // A client trusting the cert, restricted to a single TLS version.
+    let connector = |versions: &[&'static rustls::SupportedProtocolVersion]| {
+        let mut roots = RootCertStore::empty();
+        for c in CertificateDer::pem_slice_iter(cert_pem.as_bytes()).map(|c| c.expect("pem cert")) {
+            roots.add(c).expect("add root");
+        }
+        let config = ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(versions)
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        TlsConnector::from(std::sync::Arc::new(config))
+    };
+    let domain = ServerName::try_from("localhost").expect("server name");
+
+    // TLS 1.2-only client: refused by the 1.3-only server.
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let refused = connector(&[&rustls::version::TLS12])
+        .connect(domain.clone(), tcp)
+        .await;
+    assert!(refused.is_err(), "a TLS 1.2-only client must be refused");
+
+    // TLS 1.3 client: succeeds.
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut accepted = connector(&[&rustls::version::TLS13])
+        .connect(domain, tcp)
+        .await
+        .expect("a TLS 1.3 client handshakes");
+    accepted.flush().await.ok();
+
+    server.abort();
 }

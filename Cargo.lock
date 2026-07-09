@@ -3310,8 +3310,10 @@ dependencies = [
 name = "ourios-ingester"
 version = "0.2.1"
 dependencies = [
+ "async-stream",
  "axum",
  "flate2",
+ "futures-core",
  "http",
  "opentelemetry",
  "opentelemetry-proto",
@@ -3327,13 +3329,17 @@ dependencies = [
  "proptest",
  "prost",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "tonic",
  "tower",
+ "tracing",
  "uuid",
 ]
 
@@ -5104,6 +5110,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

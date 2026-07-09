@@ -764,7 +764,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(params) => {
             let handle = receiver::serve(receiver::ReceiverConfig {
                 grpc_addr: params.grpc_addr,
+                grpc_tls: params.grpc_tls.clone(),
                 http_addr: params.http_addr,
+                http_tls: params.http_tls.clone(),
                 wal: wal_config(&params.wal_root),
                 // The data store the receiver's RFC 0014 write path lands
                 // Parquet in — the same store the compactor sweeps (cloned; the

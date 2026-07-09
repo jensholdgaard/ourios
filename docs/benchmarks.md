@@ -1084,3 +1084,35 @@ query on such corpora.
 pruning compounds with scale (B1), result-bound latency holds (B2),
 and the mining-fragmentation failure mode is now bounded, observable,
 and priced.
+
+### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2
+
+**Corpus.** `corpus/otel-demo-v8` (published GitHub release): a
+**48-hour** OTel-Demo 2.2.0 capture at 150 locust users with the
+`adFailure` + `paymentFailure` feature flags active — 690,355 OTLP
+LogsData batches / 4,948,579 log records / 2.96 GB uncompressed, the
+largest and most hostile real capture to date (deliberately injected
+failure modes, multi-service, long-horizon). Calibration manifest at
+`testdata/calibration/otel-demo-v8.json` (RFC 0024 §3.1).
+
+**C1 — bit-identical reconstruction: PASS, perfect.** 4,948,579 /
+4,948,579 rows non-lossy (lossy ratio 0.0000) — the §3.3 honesty
+contract holds at 4.9 M rows through failure-mode churn.
+
+**C2 — template-count convergence (bar: ratio ≥ 0.5 at 1 M lines):
+FAIL.** Ratio **0.199**, end template count **14,631** (sample
+cadence 4,833) — an order of magnitude above v5/v6's ~1,600, with
+discovery continuing late into the corpus.
+
+**Reading it honestly.** Two confounds before a pillar-level verdict:
+(1) C2's metric is defined over "a corpus from a single stable
+service" (§C2); v8 is the whole multi-service demo. (2) The capture
+*deliberately* flips failure flags, injecting new log shapes mid-run
+— late template discovery is partly the corpus doing what it was told
+to do. Neither confound excuses the absolute count: 14,631 templates
+on ~15 services warrants a fragmentation analysis (which services,
+which shapes, how much rides `NO_TEMPLATE` id 0 vs. genuinely
+distinct templates — the §9.11 methodology). **Open**: per-service C2
+decomposition on v8 before deciding whether this is a miner finding
+(RFC 0001 hazard H1-adjacent) or a gate-scope finding (C2 should run
+per service).

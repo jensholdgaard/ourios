@@ -199,4 +199,25 @@ impl TlsSettings {
             .with_single_cert(certs, key)
             .map_err(|e| format!("cannot use {}: {e}", self.cert_file.display()))
     }
+
+    /// Build the listener's [`tokio_rustls::TlsAcceptor`] from freshly
+    /// read PEM material, advertising `alpn` (gRPC passes `[b"h2"]`, the
+    /// HTTP surfaces pass `[b"h2", b"http/1.1"]`). One acceptor per
+    /// listener; the caller wraps each accepted `TcpStream`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::load`] returns (unreadable/malformed PEM, empty
+    /// chain, unusable CA, cert/key mismatch), naming the path.
+    pub fn acceptor(&self, alpn: &[&[u8]]) -> Result<tokio_rustls::TlsAcceptor, String> {
+        let mut config = self.load()?;
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+    }
 }
+
+/// ALPN for a gRPC (`tonic`/HTTP/2-only) listener.
+pub const ALPN_GRPC: &[&[u8]] = &[b"h2"];
+
+/// ALPN for an HTTP listener that speaks HTTP/2 and HTTP/1.1.
+pub const ALPN_HTTP: &[&[u8]] = &[b"h2", b"http/1.1"];

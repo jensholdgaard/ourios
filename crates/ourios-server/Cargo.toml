@@ -68,7 +68,7 @@ serde_yaml = { version = "=0.9.34", default-features = false }
 # `LogsServiceServer` to host the receiver's `LogsService` impl over gRPC.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs"] }
 # gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16).
-tonic = { version = "0.14", default-features = false, features = ["transport", "router"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "router", "tls-connect-info"] }
 # HTTP transport (serve) for the OTLP/HTTP listener (RFC0003.16); reuses
 # the receiver crate's `router`.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }

@@ -24,6 +24,8 @@ use ourios_ingester::receiver::AuthResolver;
 use ourios_ingester::receiver::grpc::{AuthLayer, LogsReceiver};
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::pipeline::RotationHook;
+use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsSettings};
+use ourios_ingester::receiver::tls_serve::{TlsListener, tls_incoming};
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, SharedPipeline, TenantRule};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_ingester::recovery;
@@ -202,7 +204,13 @@ fn flush_then_snapshot(
 /// store its mined data lands in.
 pub struct ReceiverConfig {
     pub grpc_addr: SocketAddr,
+    /// RFC 0030 §3.1 — TLS on the gRPC listener (`receiver.grpc_tls`);
+    /// `None` serves plaintext.
+    pub grpc_tls: Option<TlsSettings>,
     pub http_addr: SocketAddr,
+    /// RFC 0030 §3.1 — TLS on the HTTP listener (`receiver.http_tls`);
+    /// `None` serves plaintext.
+    pub http_tls: Option<TlsSettings>,
     pub wal: WalConfig,
     /// The data store (RFC 0013/0019), opened by the server — local or S3. The
     /// data write path (RFC 0014) flushes Parquet through it; the WAL stays
@@ -390,6 +398,11 @@ async fn bind_listeners(
     Ok((grpc_incoming, grpc_addr, http_listener, http_addr))
 }
 
+// Straight-line orchestration: recovery, sink/pipeline assembly, the
+// cadence sweep, and the two listener spawns. The RFC 0030 TLS branches
+// pushed it past the line cap; splitting it would scatter the shared
+// setup across helpers with long capture lists for no clarity gain.
+#[allow(clippy::too_many_lines)]
 pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let snapshots_root = config.wal.root.join(SNAPSHOTS_DIR);
     // The §3.4 group-commit knobs, captured before `config.wal` is moved
@@ -479,18 +492,54 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     // pipeline enforces the tenant binding it attaches. A tower layer
     // rather than a sync interceptor because OIDC resolution may await a
     // JWKS refetch.
+    // RFC 0030 §3.2: build each listener's TLS acceptor at startup so
+    // unusable material fails here (the config path already preflighted
+    // it, but the served role re-derives from `TlsSettings`). ALPN is
+    // per-listener — gRPC is h2-only, HTTP offers h2 + http/1.1.
+    let grpc_acceptor = match &config.grpc_tls {
+        Some(tls) => Some(
+            tls.acceptor(ALPN_GRPC)
+                .map_err(|e| format!("receiver.grpc_tls: {e}"))?,
+        ),
+        None => None,
+    };
+    let http_acceptor = match &config.http_tls {
+        Some(tls) => Some(
+            tls.acceptor(ALPN_HTTP)
+                .map_err(|e| format!("receiver.http_tls: {e}"))?,
+        ),
+        None => None,
+    };
+
     let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()));
     let auth_layer = AuthLayer::new(config.auth.clone());
     let grpc = tokio::spawn({
         let mut rx = shutdown_rx.clone();
+        // `tokio::spawn` heap-allocates the task, so tonic's large serve
+        // future never sits on the caller's stack — the lint's concern.
+        #[allow(clippy::large_futures)]
         async move {
-            Server::builder()
+            let shutdown = async move {
+                let _ = rx.changed().await;
+            };
+            let server = Server::builder()
                 .layer(auth_layer)
-                .add_service(grpc_service)
-                .serve_with_incoming_shutdown(grpc_incoming, async move {
-                    let _ = rx.changed().await;
-                })
-                .await
+                .add_service(grpc_service);
+            match grpc_acceptor {
+                Some(acceptor) => {
+                    server
+                        .serve_with_incoming_shutdown(
+                            tls_incoming(grpc_incoming, acceptor),
+                            shutdown,
+                        )
+                        .await
+                }
+                None => {
+                    server
+                        .serve_with_incoming_shutdown(grpc_incoming, shutdown)
+                        .await
+                }
+            }
         }
     });
 
@@ -504,11 +553,22 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
     let http = tokio::spawn({
         let mut rx = shutdown_rx;
         async move {
-            axum::serve(http_listener, http_router.into_make_service())
-                .with_graceful_shutdown(async move {
-                    let _ = rx.changed().await;
-                })
-                .await
+            let shutdown = async move {
+                let _ = rx.changed().await;
+            };
+            let make = http_router.into_make_service();
+            match http_acceptor {
+                Some(acceptor) => {
+                    axum::serve(TlsListener::new(http_listener, acceptor), make)
+                        .with_graceful_shutdown(shutdown)
+                        .await
+                }
+                None => {
+                    axum::serve(http_listener, make)
+                        .with_graceful_shutdown(shutdown)
+                        .await
+                }
+            }
         }
     });
 
@@ -745,7 +805,9 @@ mod tests {
         let store = Store::local(data_dir.path()).expect("local store");
         let handle = serve(ReceiverConfig {
             grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
             http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
             wal: test_wal_config(wal_dir.path()),
             store,
             promoted: PromotedAttributes::default(),
@@ -864,7 +926,9 @@ mod tests {
         let store = Store::local(data_dir.path()).expect("local store");
         let handle = serve(ReceiverConfig {
             grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
             http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
             wal: test_wal_config(wal_dir.path()),
             store,
             promoted: PromotedAttributes::default(),

@@ -393,13 +393,16 @@ pub struct TlsListener {
 }
 
 impl TlsListener {
-    /// Wrap a bound `TcpListener` with `acceptor`.
+    /// Wrap a bound `TcpListener` with `acceptor`. `listener` is the
+    /// `ourios.tls.listener` label for this listener's handshake-failure
+    /// metric (e.g. `LISTENER_HTTP` for the receiver, `LISTENER_QUERIER`
+    /// for the querier) — so the two HTTP listeners don't aggregate.
     #[must_use]
-    pub fn new(inner: TcpListener, acceptor: ReloadingAcceptor) -> Self {
+    pub fn new(inner: TcpListener, acceptor: ReloadingAcceptor, listener: &'static str) -> Self {
         Self {
             inner,
             acceptor,
-            metrics: HandshakeFailures::new(LISTENER_HTTP),
+            metrics: HandshakeFailures::new(listener),
             handshakes: JoinSet::new(),
         }
     }

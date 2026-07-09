@@ -143,7 +143,7 @@ async fn rfc0030_2_http_ingest_over_tls() {
     let addr = listener.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
         axum::serve(
-            TlsListener::new(listener, acceptor),
+            TlsListener::new(listener, acceptor, LISTENER_HTTP),
             app.into_make_service(),
         )
         .await
@@ -203,7 +203,7 @@ async fn stalled_handshake_does_not_block_the_listener() {
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(async move {
         axum::serve(
-            TlsListener::new(listener, acceptor),
+            TlsListener::new(listener, acceptor, LISTENER_HTTP),
             app.into_make_service(),
         )
         .await
@@ -678,7 +678,7 @@ async fn rfc0030_6_certificate_reload() {
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(async move {
         axum::serve(
-            TlsListener::new(listener, acceptor),
+            TlsListener::new(listener, acceptor, LISTENER_HTTP),
             app.into_make_service(),
         )
         .await

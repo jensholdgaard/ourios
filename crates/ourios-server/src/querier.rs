@@ -344,7 +344,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         let make = app.into_make_service();
         match acceptor {
             Some(acceptor) => {
-                axum::serve(TlsListener::new(listener, acceptor), make)
+                axum::serve(TlsListener::new(listener, acceptor, LISTENER_QUERIER), make)
                     .with_graceful_shutdown(shutdown)
                     .await
             }

@@ -202,6 +202,10 @@ groups:
               value: "http"
               stability: development
               brief: The OTLP HTTP receiver listener (RFC 0030 §3.1).
+            - id: querier
+              value: "querier"
+              stability: development
+              brief: The querier HTTP listener (RFC 0016 / RFC 0030 §3.1), serving /v1/query + /mcp.
         stability: development
         brief: Which TLS-terminating listener a handshake failure occurred on.
 

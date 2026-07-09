@@ -34,7 +34,7 @@ use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 use ourios_ingester::receiver::auth::{AuthBinding, AuthResolver};
 use ourios_ingester::receiver::tls::{ALPN_HTTP, TlsSettings};
-use ourios_ingester::receiver::tls_serve::{LISTENER_HTTP, TlsListener, reloading_acceptor};
+use ourios_ingester::receiver::tls_serve::{LISTENER_QUERIER, TlsListener, reloading_acceptor};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -71,8 +71,9 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub struct QuerierConfig {
     /// The HTTP listen address (`OURIOS_QUERIER_HTTP_ADDR`).
     pub http_addr: SocketAddr,
-    /// RFC 0030 §3.1 — TLS on the querier listener (`querier.http_tls`,
-    /// covering `/mcp`); `None` serves plaintext.
+    /// RFC 0030 §3.1 — TLS on the querier listener (`querier.http_tls`),
+    /// covering the whole HTTP surface (`/v1/query` and `/mcp`); `None`
+    /// serves plaintext.
     pub http_tls: Option<TlsSettings>,
     /// The data + audit store to query (RFC 0019): a local-filesystem root
     /// (`OURIOS_BUCKET_ROOT`) or an S3-compatible bucket (`OURIOS_S3_*`),
@@ -323,7 +324,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
     // reloading acceptor re-reads the cert on `reload_interval_secs`.
     let acceptor = match &config.http_tls {
         Some(tls) => Some(
-            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
+            reloading_acceptor(tls, ALPN_HTTP, LISTENER_QUERIER)
                 .map_err(|e| format!("querier.http_tls: {e}"))?,
         ),
         None => None,

@@ -242,6 +242,8 @@ pub const MAX_CONCURRENT_HANDSHAKES: usize = 256;
 /// `ourios.tls.listener` values.
 pub const LISTENER_GRPC: &str = "grpc";
 pub const LISTENER_HTTP: &str = "http";
+/// The querier HTTP listener (distinct from the receiver HTTP listener).
+pub const LISTENER_QUERIER: &str = "querier";
 /// `ourios.tls.failure` values.
 const FAILURE_HANDSHAKE: &str = "handshake";
 const FAILURE_TIMEOUT: &str = "timeout";

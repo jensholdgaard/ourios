@@ -146,6 +146,10 @@ pub fn reloading_acceptor(
         let initial = fingerprint(&settings);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
+            // Steady cadence: a long reload or a paused runtime must not
+            // make the interval "catch up" with a burst of back-to-back
+            // re-reads (mirrors the age-sweep task).
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // the first tick is immediate; skip it
             let mut last = initial;
             loop {

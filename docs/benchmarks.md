@@ -1132,8 +1132,9 @@ RFC-level pillar #2 decision); the safety story held throughout
 (bounded memory per RFC 0023, per-service C1 perfect).
 
 The per-service decomposition is now a **first-class bench diagnostic**
-(`ourios-bench --gates c2` prints it whenever a corpus carries more
-than one `service.name`); template creation is a globally-monotonic
+(`ourios-bench --gates c2` prints it whenever a corpus resolves to more
+than one bucket — distinct `service.name` values plus any
+`<unknown>`/`<other>`); template creation is a globally-monotonic
 event attributed to the minting service, so per-service creations
 partition the whole-corpus count exactly (2 + 17 + 1 + 3 + 14,608 =
 14,631) in `O(services)` memory — no per-service id set. The gate

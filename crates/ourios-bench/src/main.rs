@@ -331,9 +331,11 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
             "  C2 convergence: ratio {ratio} (end template count {}, sample cadence {}) — {verdict}",
             c2.template_count_at_end, c2.sample_cadence,
         );
-        // Per-service decomposition (diagnostic) — on a multi-service
-        // corpus a whole-corpus ratio conflates a noisy broker with
-        // clean application services (v8 §9.12 / #444), so localise it.
+        // Per-service decomposition (diagnostic) — printed whenever the
+        // corpus resolves to more than one bucket (distinct `service.name`
+        // values plus any `<unknown>`/`<other>`), since a whole-corpus
+        // ratio then conflates a noisy broker with clean application
+        // services (v8 §9.12 / #444).
         if c2.by_service.len() > 1 {
             println!("  C2 by service (diagnostic; creations sum to the end count):");
             for svc in &c2.by_service {

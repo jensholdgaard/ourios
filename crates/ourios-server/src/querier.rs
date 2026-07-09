@@ -33,6 +33,8 @@ use axum::routing::post;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 use ourios_ingester::receiver::auth::{AuthBinding, AuthResolver};
+use ourios_ingester::receiver::tls::{ALPN_HTTP, TlsSettings};
+use ourios_ingester::receiver::tls_serve::{LISTENER_HTTP, TlsListener, reloading_acceptor};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -69,6 +71,9 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub struct QuerierConfig {
     /// The HTTP listen address (`OURIOS_QUERIER_HTTP_ADDR`).
     pub http_addr: SocketAddr,
+    /// RFC 0030 §3.1 — TLS on the querier listener (`querier.http_tls`,
+    /// covering `/mcp`); `None` serves plaintext.
+    pub http_tls: Option<TlsSettings>,
     /// The data + audit store to query (RFC 0019): a local-filesystem root
     /// (`OURIOS_BUCKET_ROOT`) or an S3-compatible bucket (`OURIOS_S3_*`),
     /// resolved by the server (`main.rs`).
@@ -314,6 +319,16 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         .local_addr()
         .map_err(|e| format!("HTTP local_addr: {e}"))?;
 
+    // RFC 0030 §3.2 — TLS on the querier listener when configured; the
+    // reloading acceptor re-reads the cert on `reload_interval_secs`.
+    let acceptor = match &config.http_tls {
+        Some(tls) => Some(
+            reloading_acceptor(tls, ALPN_HTTP, LISTENER_HTTP)
+                .map_err(|e| format!("querier.http_tls: {e}"))?,
+        ),
+        None => None,
+    };
+
     let app = router_from_querier(
         querier,
         config.default_window_nanos,
@@ -322,11 +337,22 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
     );
     let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.changed().await;
-            })
-            .await
+        let shutdown = async move {
+            let _ = shutdown_rx.changed().await;
+        };
+        let make = app.into_make_service();
+        match acceptor {
+            Some(acceptor) => {
+                axum::serve(TlsListener::new(listener, acceptor), make)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+            None => {
+                axum::serve(listener, make)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+        }
     });
 
     Ok(QuerierHandle {

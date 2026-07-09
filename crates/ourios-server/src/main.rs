@@ -791,6 +791,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(params) => {
             let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
                 http_addr: params.http_addr,
+                http_tls: params.http_tls.clone(),
                 // The querier engine is Store-capable (RFC 0019 slice 2a), so it
                 // reads whichever backend config resolved (local or S3).
                 store: config.store.clone(),

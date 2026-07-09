@@ -599,14 +599,36 @@ async fn served_leaf(addr: std::net::SocketAddr, roots: &[Vec<u8>]) -> Vec<u8> {
     .with_no_client_auth();
     let connector = TlsConnector::from(std::sync::Arc::new(config));
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let tls = connector
-        .connect(ServerName::try_from("localhost").expect("name"), tcp)
-        .await
-        .expect("handshake");
+    // Bound the handshake so a listener regression (stalled handshake)
+    // fails the test instead of hanging it.
+    let tls = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        connector.connect(ServerName::try_from("localhost").expect("name"), tcp),
+    )
+    .await
+    .expect("handshake completes within the deadline")
+    .expect("handshake");
     let (_, session) = tls.get_ref();
     session.peer_certificates().expect("peer certs")[0]
         .as_ref()
         .to_vec()
+}
+
+/// Poll `served_leaf` until it returns `expected` (bounded), so the test
+/// tracks the reload's own cadence rather than a fixed sleep.
+async fn wait_for_leaf(addr: std::net::SocketAddr, roots: &[Vec<u8>], expected: &[u8], why: &str) {
+    let deadline = std::time::Duration::from_secs(15);
+    let poll = std::time::Duration::from_millis(200);
+    let ok = tokio::time::timeout(deadline, async {
+        loop {
+            if served_leaf(addr, roots).await == expected {
+                return;
+            }
+            tokio::time::sleep(poll).await;
+        }
+    })
+    .await;
+    assert!(ok.is_ok(), "{why}");
 }
 
 /// Scenario RFC0030.6 — certificate reload: with `reload_interval_secs`
@@ -665,21 +687,25 @@ async fn rfc0030_6_certificate_reload() {
     // Before any reload: generation A.
     assert_eq!(served_leaf(addr, &roots).await, a_der, "serves A initially");
 
-    // Swap to generation B on disk; after the interval, new handshakes
-    // serve B — no restart.
+    // Swap to generation B on disk; poll until new handshakes serve B —
+    // no restart. Polling tracks the reload cadence rather than a fixed
+    // sleep (robust under CI load).
     std::fs::write(&cert_path, gen_b.cert.pem()).expect("write B cert");
     std::fs::write(&key_path, gen_b.signing_key.serialize_pem()).expect("write B key");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    assert_eq!(served_leaf(addr, &roots).await, b_der, "reloaded to B");
+    wait_for_leaf(addr, &roots, &b_der, "reloaded to B within the deadline").await;
 
-    // Garbage on disk: the reload keeps the last good certificate (B).
+    // Garbage on disk: the listener keeps serving B. Assert repeatedly
+    // over a window that spans several reload ticks, so a race with a
+    // reload attempt can't produce a false pass.
     std::fs::write(&cert_path, b"not a certificate").expect("write garbage");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    assert_eq!(
-        served_leaf(addr, &roots).await,
-        b_der,
-        "garbage keeps the last good certificate",
-    );
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            served_leaf(addr, &roots).await,
+            b_der,
+            "garbage keeps the last good certificate",
+        );
+    }
 
     server.abort();
 }

@@ -64,26 +64,63 @@ impl ReloadingAcceptor {
     }
 }
 
-/// Concatenated cert + key (+ CA) file bytes — the fingerprint the
-/// reload task compares to decide whether the material changed, and the
-/// unreadable-file signal (`None`) that makes it keep the last good
-/// config. Not a security boundary; a plain byte compare.
-fn material(settings: &TlsSettings) -> Option<Vec<u8>> {
-    let mut bytes = std::fs::read(&settings.cert_file).ok()?;
-    bytes.extend(std::fs::read(&settings.key_file).ok()?);
+/// `ourios.tls.reload_error` values.
+const RELOAD_UNREADABLE: &str = "unreadable";
+const RELOAD_INVALID: &str = "invalid";
+
+/// The outcome of one reload attempt (computed off the async worker in
+/// `spawn_blocking`, since it reads + parses PEM files). `Reloaded`
+/// carries the rebuilt acceptor and the new fingerprint; the failure
+/// variants keep the last good config.
+enum ReloadOutcome {
+    Unchanged,
+    Reloaded(u64, Box<TlsAcceptor>),
+    Unreadable,
+    Invalid(String),
+}
+
+/// A stable fingerprint of the cert + key (+ CA) file *contents* — a
+/// hash, not the bytes, so the reload task never retains a long-lived
+/// copy of the private key just to detect changes. `None` when any file
+/// is unreadable. Change detection only; a hash collision (missing a
+/// rotation) is astronomically unlikely.
+fn fingerprint(settings: &TlsSettings) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::fs::read(&settings.cert_file).ok()?.hash(&mut hasher);
+    std::fs::read(&settings.key_file).ok()?.hash(&mut hasher);
     if let Some(ca) = &settings.client_ca_file {
-        bytes.extend(std::fs::read(ca).ok()?);
+        std::fs::read(ca).ok()?.hash(&mut hasher);
     }
-    Some(bytes)
+    Some(hasher.finish())
+}
+
+/// Read the files, and if they changed, rebuild the acceptor. All the
+/// blocking filesystem + PEM work, so the caller runs it in
+/// `spawn_blocking`.
+fn reload_once(settings: &TlsSettings, alpn: &[Vec<u8>], last: Option<u64>) -> ReloadOutcome {
+    let Some(fp) = fingerprint(settings) else {
+        return ReloadOutcome::Unreadable;
+    };
+    if Some(fp) == last {
+        return ReloadOutcome::Unchanged;
+    }
+    let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
+    match settings.acceptor(&alpn_refs) {
+        Ok(acceptor) => ReloadOutcome::Reloaded(fp, Box::new(acceptor)),
+        Err(e) => ReloadOutcome::Invalid(e),
+    }
 }
 
 /// Build a [`ReloadingAcceptor`] for `settings` advertising `alpn`. When
 /// `settings.reload_interval` is set, spawn a task that re-reads the
 /// cert/key(/CA) files on the interval and swaps the acceptor on a
-/// content change; an unreadable or invalid reload logs an error and
-/// keeps the last good config — it never takes the listener down. The
-/// task self-terminates when the returned acceptor (and all clones) is
-/// dropped, via a `Weak` upgrade check.
+/// content change; an unreadable or invalid reload logs, counts
+/// `ourios.receiver.tls.reload_failures`, and keeps the last good config
+/// — it never takes the listener down. The re-read + rebuild run in
+/// `spawn_blocking` so the sync filesystem I/O never stalls a runtime
+/// worker. The task self-terminates when the returned acceptor (and all
+/// clones) is dropped, via a `Weak` upgrade check.
 ///
 /// # Errors
 ///
@@ -100,39 +137,62 @@ pub fn reloading_acceptor(
         let settings = settings.clone();
         let alpn: Vec<Vec<u8>> = alpn.iter().map(|p| p.to_vec()).collect();
         let weak = Arc::downgrade(&current);
-        let mut last = material(&settings);
+        let failures = global::meter("ourios.receiver")
+            .u64_counter(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES)
+            .build();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // the first tick is immediate; skip it
+            let mut last = None;
             loop {
                 tick.tick().await;
                 // Stop once the listener drops its acceptor.
-                let Some(current) = weak.upgrade() else { break };
-                let now = material(&settings);
-                match &now {
-                    // Unreadable mid-rotation (writer swapping files) —
-                    // keep the last good config and try again next tick.
-                    None => {
-                        tracing::warn!(
-                            cert = %settings.cert_file.display(),
-                            "TLS material unreadable on reload; keeping the last good certificate",
-                        );
-                        continue;
-                    }
-                    Some(bytes) if Some(bytes) == last.as_ref() => continue, // unchanged
-                    Some(_) => {}
+                if weak.upgrade().is_none() {
+                    break;
                 }
-                let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
-                match settings.acceptor(&alpn_refs) {
-                    Ok(rebuilt) => {
-                        *current.write().unwrap_or_else(PoisonError::into_inner) = rebuilt;
-                        last = now;
+                // The read + parse + rebuild is blocking — keep it off
+                // the async worker.
+                let (s, a) = (settings.clone(), alpn.clone());
+                let Ok(outcome) =
+                    tokio::task::spawn_blocking(move || reload_once(&s, &a, last)).await
+                else {
+                    break; // runtime shutting down
+                };
+                // Re-check the acceptor is still alive after the await.
+                let Some(current) = weak.upgrade() else { break };
+                match outcome {
+                    ReloadOutcome::Unchanged => {}
+                    ReloadOutcome::Reloaded(fp, acceptor) => {
+                        *current.write().unwrap_or_else(PoisonError::into_inner) = *acceptor;
+                        last = Some(fp);
                         tracing::info!(
                             cert = %settings.cert_file.display(),
                             "reloaded the TLS certificate",
                         );
                     }
-                    Err(e) => {
+                    ReloadOutcome::Unreadable => {
+                        failures.add(
+                            1,
+                            &[KeyValue::new(
+                                semconv::OURIOS_TLS_RELOAD_ERROR,
+                                RELOAD_UNREADABLE,
+                            )],
+                        );
+                        tracing::warn!(
+                            cert = %settings.cert_file.display(),
+                            key = %settings.key_file.display(),
+                            ca = settings.client_ca_file.as_ref().map(|p| p.display().to_string()),
+                            "TLS material unreadable on reload; keeping the last good certificate",
+                        );
+                    }
+                    ReloadOutcome::Invalid(e) => {
+                        failures.add(
+                            1,
+                            &[KeyValue::new(
+                                semconv::OURIOS_TLS_RELOAD_ERROR,
+                                RELOAD_INVALID,
+                            )],
+                        );
                         tracing::error!(
                             error = %e,
                             "TLS reload produced an invalid config; keeping the last good certificate",

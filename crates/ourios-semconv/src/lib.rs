@@ -121,6 +121,9 @@ pub const OURIOS_QUERY_ROW_GROUPS: &str = "ourios.query.row_groups";
 /// `ourios.receiver.tls.handshake_failures` (counter, unit `{failure}`).
 pub const OURIOS_RECEIVER_TLS_HANDSHAKE_FAILURES: &str = "ourios.receiver.tls.handshake_failures";
 
+/// `ourios.receiver.tls.reload_failures` (counter, unit `{failure}`).
+pub const OURIOS_RECEIVER_TLS_RELOAD_FAILURES: &str = "ourios.receiver.tls.reload_failures";
+
 /// `ourios.sink.buffer.usage` (updowncounter, unit `By`).
 pub const OURIOS_SINK_BUFFER_USAGE: &str = "ourios.sink.buffer.usage";
 
@@ -179,6 +182,9 @@ pub const OURIOS_TLS_FAILURE: &str = "ourios.tls.failure";
 
 /// `ourios.tls.listener` attribute key.
 pub const OURIOS_TLS_LISTENER: &str = "ourios.tls.listener";
+
+/// `ourios.tls.reload_error` attribute key.
+pub const OURIOS_TLS_RELOAD_ERROR: &str = "ourios.tls.reload_error";
 
 // Log event names (the server's own dogfooded logs; every `tracing` call
 // site names its event with one of these — `weaver registry live-check`

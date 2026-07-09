@@ -434,3 +434,18 @@ groups:
         requirement_level: required
       - ref: ourios.tls.failure
         requirement_level: required
+
+  - id: metric.ourios.receiver.tls.reload_failures
+    type: metric
+    metric_name: ourios.receiver.tls.reload_failures
+    stability: development
+    brief: >-
+      TLS certificate reloads that were skipped (RFC0030.6), by cause.
+      The listener keeps serving the last good certificate; this counter
+      (and the accompanying log) is the signal that a rotation did not
+      take effect.
+    instrument: counter
+    unit: "{failure}"
+    attributes:
+      - ref: ourios.tls.reload_error
+        requirement_level: required

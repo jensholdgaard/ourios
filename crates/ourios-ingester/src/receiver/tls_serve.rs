@@ -140,10 +140,14 @@ pub fn reloading_acceptor(
         let failures = global::meter("ourios.receiver")
             .u64_counter(semconv::OURIOS_RECEIVER_TLS_RELOAD_FAILURES)
             .build();
+        // Seed with the startup material's fingerprint so the first tick
+        // only reloads if the files actually changed since startup — no
+        // needless rebuild + "reloaded" log on every listener start.
+        let initial = fingerprint(&settings);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await; // the first tick is immediate; skip it
-            let mut last = None;
+            let mut last = initial;
             loop {
                 tick.tick().await;
                 // Stop once the listener drops its acceptor.

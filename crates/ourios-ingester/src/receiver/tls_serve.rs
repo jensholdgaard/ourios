@@ -137,7 +137,17 @@ where
     tokio::spawn(async move {
         use tokio_stream::StreamExt as _;
         tokio::pin!(incoming);
-        while let Some(conn) = incoming.next().await {
+        loop {
+            // Stop as soon as the consumer (tonic's server) drops the
+            // stream — otherwise this detached task would keep accepting
+            // and handshaking forever, leaking the listener past
+            // shutdown. `closed()` tracks the receiver, not the cloned
+            // senders held by in-flight handshakes.
+            let conn = tokio::select! {
+                () = tx.closed() => break,
+                conn = incoming.next() => conn,
+            };
+            let Some(conn) = conn else { break };
             let tcp = match conn {
                 Ok(tcp) => tcp,
                 // A TCP-accept error is the listener's, not a

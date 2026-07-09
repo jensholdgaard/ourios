@@ -11,7 +11,7 @@ use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsMinVersion, TlsSettings};
 use ourios_ingester::receiver::tls_serve::{
-    ReloadingAcceptor, TlsListener, reloading_acceptor, tls_incoming,
+    LISTENER_HTTP, ReloadingAcceptor, TlsListener, reloading_acceptor, tls_incoming,
 };
 use prost::Message as _;
 use tonic::transport::server::TcpIncoming;
@@ -668,7 +668,7 @@ async fn rfc0030_6_certificate_reload() {
     )
     .expect("valid")
     .expect("configured");
-    let acceptor = reloading_acceptor(&settings, ALPN_HTTP).expect("acceptor");
+    let acceptor = reloading_acceptor(&settings, ALPN_HTTP, LISTENER_HTTP).expect("acceptor");
 
     let (pipeline, _captured) = capturing_pipeline();
     let app = router(pipeline, &HttpConfig::default());

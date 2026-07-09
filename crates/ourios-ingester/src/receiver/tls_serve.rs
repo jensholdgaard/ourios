@@ -130,6 +130,7 @@ fn reload_once(settings: &TlsSettings, alpn: &[Vec<u8>], last: Option<u64>) -> R
 pub fn reloading_acceptor(
     settings: &TlsSettings,
     alpn: &[&[u8]],
+    listener: &'static str,
 ) -> Result<ReloadingAcceptor, String> {
     let acceptor = settings.acceptor(alpn)?;
     let current = Arc::new(RwLock::new(acceptor));
@@ -190,31 +191,31 @@ pub fn reloading_acceptor(
                     ReloadOutcome::Unreadable => {
                         failures.add(
                             1,
-                            &[KeyValue::new(
-                                semconv::OURIOS_TLS_RELOAD_ERROR,
-                                RELOAD_UNREADABLE,
-                            )],
+                            &[
+                                KeyValue::new(semconv::OURIOS_TLS_LISTENER, listener),
+                                KeyValue::new(semconv::OURIOS_TLS_RELOAD_ERROR, RELOAD_UNREADABLE),
+                            ],
                         );
                         tracing::warn!(
                             cert = %settings.cert_file.display(),
                             key = %settings.key_file.display(),
-                            ca = settings.client_ca_file.as_ref().map(|p| p.display().to_string()),
+                            ca = ?settings.client_ca_file,
                             "TLS material unreadable on reload; keeping the last good certificate",
                         );
                     }
                     ReloadOutcome::Invalid(e) => {
                         failures.add(
                             1,
-                            &[KeyValue::new(
-                                semconv::OURIOS_TLS_RELOAD_ERROR,
-                                RELOAD_INVALID,
-                            )],
+                            &[
+                                KeyValue::new(semconv::OURIOS_TLS_LISTENER, listener),
+                                KeyValue::new(semconv::OURIOS_TLS_RELOAD_ERROR, RELOAD_INVALID),
+                            ],
                         );
                         tracing::error!(
                             error = %e,
                             cert = %settings.cert_file.display(),
                             key = %settings.key_file.display(),
-                            ca = settings.client_ca_file.as_ref().map(|p| p.display().to_string()),
+                            ca = ?settings.client_ca_file,
                             "TLS reload produced an invalid config; keeping the last good certificate",
                         );
                     }
@@ -239,8 +240,8 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 256;
 
 /// `ourios.tls.listener` values.
-const LISTENER_GRPC: &str = "grpc";
-const LISTENER_HTTP: &str = "http";
+pub const LISTENER_GRPC: &str = "grpc";
+pub const LISTENER_HTTP: &str = "http";
 /// `ourios.tls.failure` values.
 const FAILURE_HANDSHAKE: &str = "handshake";
 const FAILURE_TIMEOUT: &str = "timeout";

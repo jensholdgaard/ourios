@@ -1095,24 +1095,38 @@ largest and most hostile real capture to date (deliberately injected
 failure modes, multi-service, long-horizon). Calibration manifest at
 `testdata/calibration/otel-demo-v8.json` (RFC 0024 §3.1).
 
-**C1 — bit-identical reconstruction: PASS, perfect.** 4,948,579 /
-4,948,579 rows non-lossy (lossy ratio 0.0000) — the §3.3 honesty
-contract holds at 4.9 M rows through failure-mode churn.
+**C1 — bit-identical reconstruction: PASS, perfect.** The corpus
+holds **4,948,596** records (the calibration manifest's count); 17 of
+them (all kafka, 0.0003 %) took the §3.3 lossy-flag path with their
+bodies retained, and C1 = 1.000000 over the remaining 4,948,579 rows
+— the honesty contract holds at 4.9 M rows through failure-mode
+churn.
 
 **C2 — template-count convergence (bar: ratio ≥ 0.5 at 1 M lines):
-FAIL.** Ratio **0.199**, end template count **14,631** (sample
-cadence 4,833) — an order of magnitude above v5/v6's ~1,600, with
-discovery continuing late into the corpus.
+FAIL on the whole corpus — attributed.** Ratio **0.199**, end
+template count **14,631** (sample cadence 4,833). The per-service
+decomposition (splitting the corpus on `service.name` and re-running
+the gates per service) localises the failure completely:
 
-**Reading it honestly.** Two confounds before a pillar-level verdict:
-(1) C2's metric is defined over "a corpus from a single stable
-service" (§C2); v8 is the whole multi-service demo. (2) The capture
-*deliberately* flips failure flags, injecting new log shapes mid-run
-— late template discovery is partly the corpus doing what it was told
-to do. Neither confound excuses the absolute count: 14,631 templates
-on ~15 services warrants a fragmentation analysis (which services,
-which shapes, how much rides `NO_TEMPLATE` id 0 vs. genuinely
-distinct templates — the §9.11 methodology). **Open**: per-service C2
-decomposition on v8 before deciding whether this is a miner finding
-(RFC 0001 hazard H1-adjacent) or a gate-scope finding (C2 should run
-per service).
+| service | lines | end templates | C2 |
+|---|---|---|---|
+| cart | 2,756,331 | 2 | ratio 1.000 **PASS** |
+| recommendation | 971,490 | 17 | abstain (< 1 M) |
+| currency | 597,259 | 1 | abstain |
+| ad | 486,726 | 3 | abstain |
+| **kafka** | **136,790** | **14,608** | abstain |
+
+Every application service converges essentially perfectly — cart
+passes the formal gate at 2.76 M lines with **two** templates. The
+kafka broker mints 14,608 templates on 2.8 % of the lines. Mechanism
+(measured): kafka's cleaner logs emit **3-token lines whose third
+token is a unique offset-bearing path**
+(`Deleted log /tmp/kafka-logs/…/00000000000000000429.log.deleted.`,
+11,651 distinct) — one varying token in a 3-token line is similarity
+2/3 ≈ 0.67, below the strict 0.7 threshold (§3.1 no-silent-merges),
+so each line mints a template; the 4-token siblings of the same
+family (0.75) merge fine. The failure-flag confound turned out to be
+a red herring. Tracked as **#444** (tokenizer masking vs.
+length-aware thresholding vs. accept-and-scope-C2-per-service — an
+RFC-level pillar #2 decision); the safety story held throughout
+(bounded memory per RFC 0023, per-service C1 perfect).

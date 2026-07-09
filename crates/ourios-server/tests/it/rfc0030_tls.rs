@@ -4,7 +4,6 @@
 //! (`.3`), and the served end-to-end (`.8`). The receiver arms live in
 //! `crates/ourios-ingester/tests/it/rfc0030_tls.rs` per §6.
 
-use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -32,8 +31,8 @@ fn rfc0030_3_querier_and_mcp_over_tls() {
 /// readiness, so a warning that exists is on stderr by then.
 async fn warnings_before_ready(config_yaml: &str, tmp: &tempfile::TempDir, needle: &str) -> usize {
     let config_path = tmp.path().join("ourios.yaml");
-    let mut file = std::fs::File::create(&config_path).expect("create config");
-    write!(file, "{config_yaml}").expect("write config");
+    // write + close before the spawn — no handle stays open across it.
+    std::fs::write(&config_path, config_yaml).expect("write config");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
         .arg("--config")
@@ -54,7 +53,7 @@ async fn warnings_before_ready(config_yaml: &str, tmp: &tempfile::TempDir, needl
     let collector = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         let mut collected = Vec::new();
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
             collected.push(line);
         }
         collected

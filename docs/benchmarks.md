@@ -1084,3 +1084,49 @@ query on such corpora.
 pruning compounds with scale (B1), result-bound latency holds (B2),
 and the mining-fragmentation failure mode is now bounded, observable,
 and priced.
+
+### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2
+
+**Corpus.** `corpus/otel-demo-v8` (published GitHub release): a
+**48-hour** OTel-Demo 2.2.0 capture at 150 locust users with the
+`adFailure` + `paymentFailure` feature flags active — 690,355 OTLP
+LogsData batches / 4,948,596 log records / 2.96 GB uncompressed, the
+largest and most hostile real capture to date (deliberately injected
+failure modes, multi-service, long-horizon). Calibration manifest at
+`testdata/calibration/otel-demo-v8.json` (RFC 0024 §3.1).
+
+**C1 — bit-identical reconstruction: PASS, perfect.** The corpus
+holds **4,948,596** records (the calibration manifest's count); 17 of
+them (all kafka, 0.0003 %) took the §3.3 lossy-flag path with their
+bodies retained, and C1 = 1.000000 over the remaining 4,948,579 rows
+— the honesty contract holds at 4.9 M rows through failure-mode
+churn.
+
+**C2 — template-count convergence (bar: ratio ≥ 0.5 at 1 M lines):
+FAIL on the whole corpus — attributed.** Ratio **0.199**, end
+template count **14,631** (sample cadence 4,833). The per-service
+decomposition (splitting the corpus on `service.name` and re-running
+the gates per service) localises the failure completely:
+
+| service | lines | end templates | C2 |
+|---|---|---|---|
+| cart | 2,756,331 | 2 | ratio 1.000 **PASS** |
+| recommendation | 971,490 | 17 | abstain (< 1 M) |
+| currency | 597,259 | 1 | abstain (< 1 M) |
+| ad | 486,726 | 3 | abstain (< 1 M) |
+| **kafka** | **136,790** | **14,608** | abstain (< 1 M) |
+
+Every application service converges essentially perfectly — cart
+passes the formal gate at 2.76 M lines with **two** templates. The
+kafka broker mints 14,608 templates on 2.8 % of the lines. Mechanism
+(measured): kafka's cleaner logs emit **3-token lines whose third
+token is a unique offset-bearing path**
+(`Deleted log /tmp/kafka-logs/…/00000000000000000429.log.deleted.`,
+11,651 distinct) — one varying token in a 3-token line is similarity
+2/3 ≈ 0.67, below the strict 0.7 threshold (§3.1 no-silent-merges),
+so each line mints a template; the 4-token siblings of the same
+family (0.75) merge fine. The failure-flag confound turned out to be
+a red herring. Tracked as **#444** (tokenizer masking vs.
+length-aware thresholding vs. accept-and-scope-C2-per-service — an
+RFC-level pillar #2 decision); the safety story held throughout
+(bounded memory per RFC 0023, per-service C1 perfect).

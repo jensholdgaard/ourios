@@ -1138,7 +1138,7 @@ event attributed to the minting service, so per-service creations
 partition the whole-corpus count exactly (2 + 17 + 1 + 3 + 14,608 =
 14,631) in `O(services)` memory — no per-service id set. The gate
 itself is unchanged (whole-corpus); the breakdown is additive, so
-#444's option-3 ("scope C2 per service") can be evaluated on real
+option 3 of #444 ("scope C2 per service") can be evaluated on real
 numbers without a code change first.
 
 **What the fragmentation actually costs — B2 pricing (indicative,

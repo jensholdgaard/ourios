@@ -178,7 +178,17 @@ impl C2Accumulator {
             self.services_truncated = true;
             OTHER_SERVICES
         };
-        let entry = self.by_service.entry(key.to_string()).or_default();
+        // Allocate the owned key only on a service's first sighting —
+        // `entry(key.to_string())` would copy on every line, a
+        // per-record allocation across a multi-million-line corpus.
+        if !self.by_service.contains_key(key) {
+            self.by_service
+                .insert(key.to_string(), PerService::default());
+        }
+        let entry = self
+            .by_service
+            .get_mut(key)
+            .expect("bucket present after the insert above");
         entry.lines += 1;
         if created {
             entry.created += 1;

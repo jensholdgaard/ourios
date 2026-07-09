@@ -600,8 +600,10 @@ pub struct C2Result {
     /// corpus; this decomposition attributes it. On a multi-service
     /// corpus (every OTel-Demo capture) a whole-corpus C2 conflates a
     /// noisy broker with clean application services, so this surfaces
-    /// where non-convergence actually lives (v8 §9.12 / #444). Empty on
-    /// a corpus with no `service.name` attribute (the plain-text form).
+    /// where non-convergence actually lives (v8 §9.12 / #444). A
+    /// plain-text corpus (no `service.name`) collapses to a single
+    /// `<unknown>` bucket rather than being empty; empty only when C2
+    /// did not run.
     #[serde(default)]
     pub by_service: Vec<PerServiceC2>,
     /// The distinct-`service.name` cap (`MAX_SERVICES`) was hit and

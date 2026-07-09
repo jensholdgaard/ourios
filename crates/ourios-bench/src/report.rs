@@ -740,6 +740,8 @@ mod tests {
             convergence_curve: Vec::new(),
             pass: Some(true),
             corpus_at_least_1m: true,
+            by_service: Vec::new(),
+            services_truncated: false,
         });
         let err =
             update_status_section(&md_with_status(), &r).expect_err("inconsistent C2 must error");

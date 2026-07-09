@@ -595,6 +595,36 @@ pub struct C2Result {
     pub convergence_curve: Vec<ConvergenceSample>,
     pub pass: Option<bool>,
     pub corpus_at_least_1m: bool,
+    /// Per-`service.name` convergence, largest service first.
+    /// **Diagnostic only** — the gate above is defined on the whole
+    /// corpus; this decomposition attributes it. On a multi-service
+    /// corpus (every OTel-Demo capture) a whole-corpus C2 conflates a
+    /// noisy broker with clean application services, so this surfaces
+    /// where non-convergence actually lives (v8 §9.12 / #444). Empty on
+    /// a corpus with no `service.name` attribute (the plain-text form).
+    #[serde(default)]
+    pub by_service: Vec<PerServiceC2>,
+    /// The distinct-`service.name` cap (`MAX_SERVICES`) was hit and
+    /// further services were folded into an `<other>` bucket — a
+    /// cardinality guard, never expected on real corpora.
+    #[serde(default)]
+    pub services_truncated: bool,
+}
+
+/// One service's slice of the [`C2Result`] decomposition. Template
+/// creation is a globally-monotonic event attributed to the service of
+/// the creating line, so `templates_created` sums across services to
+/// the whole-corpus `template_count_at_end`. `pass`/`ratio` follow the
+/// §3.4.3 gate rule applied to this service's own line count (abstain
+/// below 1 M).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PerServiceC2 {
+    pub service_name: String,
+    pub lines: u64,
+    pub templates_created: u64,
+    pub templates_created_at_1m_lines: Option<u64>,
+    pub convergence_ratio: Option<f64>,
+    pub pass: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

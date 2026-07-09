@@ -1112,9 +1112,9 @@ the gates per service) localises the failure completely:
 |---|---|---|---|
 | cart | 2,756,331 | 2 | ratio 1.000 **PASS** |
 | recommendation | 971,490 | 17 | abstain (< 1 M) |
-| currency | 597,259 | 1 | abstain |
-| ad | 486,726 | 3 | abstain |
-| **kafka** | **136,790** | **14,608** | abstain |
+| currency | 597,259 | 1 | abstain (< 1 M) |
+| ad | 486,726 | 3 | abstain (< 1 M) |
+| **kafka** | **136,790** | **14,608** | abstain (< 1 M) |
 
 Every application service converges essentially perfectly — cart
 passes the formal gate at 2.76 M lines with **two** templates. The

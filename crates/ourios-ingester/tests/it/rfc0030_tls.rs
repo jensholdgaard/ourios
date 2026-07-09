@@ -1,8 +1,7 @@
-//! RFC 0030 §5 — TLS/mTLS on the receiver listeners (six of the nine
-//! scenarios; .3/.7/.8 live in the `ourios-server` harness per §6 —
-//! .7 asserts a startup warning of the served binary, which only the
-//! server crate can spawn). .1/.2/.4/.5/.9 are live; .6 remains an
-//! `#[ignore]`d stub naming the green slice that discharges it.
+//! RFC 0030 §5 — TLS/mTLS on the receiver listeners. Every receiver
+//! arm is live here — .1/.2/.4/.5/.6/.9; the .3/.7/.8 arms live in the
+//! `ourios-server` harness per §6 (.7 asserts a startup warning of the
+//! served binary, which only the server crate can spawn).
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +10,9 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use ourios_ingester::receiver::grpc::LogsReceiver;
 use ourios_ingester::receiver::http::{HttpConfig, router};
 use ourios_ingester::receiver::tls::{ALPN_GRPC, ALPN_HTTP, TlsMinVersion, TlsSettings};
-use ourios_ingester::receiver::tls_serve::{TlsListener, tls_incoming};
+use ourios_ingester::receiver::tls_serve::{
+    ReloadingAcceptor, TlsListener, reloading_acceptor, tls_incoming,
+};
 use prost::Message as _;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
@@ -59,6 +60,7 @@ async fn rfc0030_1_grpc_ingest_over_tls() {
     let (cert, key, cert_pem) = cert_pair(tmp.path());
     let acceptor = tls_settings("receiver.grpc_tls", &cert, &key)
         .acceptor(ALPN_GRPC)
+        .map(ReloadingAcceptor::fixed)
         .expect("acceptor");
 
     let (pipeline, captured) = capturing_pipeline();
@@ -130,6 +132,7 @@ async fn rfc0030_2_http_ingest_over_tls() {
     let (cert, key, cert_pem) = cert_pair(tmp.path());
     let acceptor = tls_settings("receiver.http_tls", &cert, &key)
         .acceptor(ALPN_HTTP)
+        .map(ReloadingAcceptor::fixed)
         .expect("acceptor");
 
     let (pipeline, captured) = capturing_pipeline();
@@ -190,6 +193,7 @@ async fn stalled_handshake_does_not_block_the_listener() {
     let (cert, key, cert_pem) = cert_pair(tmp.path());
     let acceptor = tls_settings("receiver.http_tls", &cert, &key)
         .acceptor(ALPN_HTTP)
+        .map(ReloadingAcceptor::fixed)
         .expect("acceptor");
     let (pipeline, captured) = capturing_pipeline();
     let app = router(pipeline, &HttpConfig::default());
@@ -285,7 +289,7 @@ async fn rfc0030_4_mtls_require_and_verify() {
     )
     .expect("valid")
     .expect("configured");
-    let acceptor = settings.acceptor(ALPN_GRPC).expect("acceptor");
+    let acceptor = ReloadingAcceptor::fixed(settings.acceptor(ALPN_GRPC).expect("acceptor"));
 
     let (pipeline, captured) = capturing_pipeline();
     let service = LogsServiceServer::new(LogsReceiver::new(pipeline));
@@ -572,16 +576,112 @@ fn rfc0030_5_config_validation() {
     }
 }
 
-/// Scenario RFC0030.6 — certificate reload.
+/// Raw TLS handshake to `addr` trusting `roots` (DER), returning the
+/// leaf certificate the server presented — the observable that tells
+/// which cert generation the listener is serving.
+async fn served_leaf(addr: std::net::SocketAddr, roots: &[Vec<u8>]) -> Vec<u8> {
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+    use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
+
+    let mut store = RootCertStore::empty();
+    for der in roots {
+        store
+            .add(CertificateDer::from(der.clone()))
+            .expect("trust root");
+    }
+    let config = ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    .expect("versions")
+    .with_root_certificates(store)
+    .with_no_client_auth();
+    let connector = TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let tls = connector
+        .connect(ServerName::try_from("localhost").expect("name"), tcp)
+        .await
+        .expect("handshake");
+    let (_, session) = tls.get_ref();
+    session.peer_certificates().expect("peer certs")[0]
+        .as_ref()
+        .to_vec()
+}
+
+/// Scenario RFC0030.6 — certificate reload: with `reload_interval_secs`
+/// set, replacing the cert/key on disk makes new handshakes serve the
+/// new certificate without a restart; replacing them with garbage keeps
+/// the last good certificate (and logs) rather than taking the listener
+/// down.
 /// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.6 stub — implemented in the reload green slice"]
-fn rfc0030_6_certificate_reload() {
-    todo!(
-        "RFC0030.6 — reload_interval_secs set: swapped cert/key pair \
-         serves new handshakes (peer-cert serial) without restart; \
-         garbage files keep the last good config and log an error"
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0030_6_certificate_reload() {
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let cert_path = tmp.path().join("server.crt");
+    let key_path = tmp.path().join("server.key");
+    let mint = || {
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("mint")
+    };
+
+    // Generation A on disk; B minted up front so the client can trust
+    // both leaves across the swap.
+    let gen_a = mint();
+    std::fs::write(&cert_path, gen_a.cert.pem()).expect("write A cert");
+    std::fs::write(&key_path, gen_a.signing_key.serialize_pem()).expect("write A key");
+    let a_der = gen_a.cert.der().as_ref().to_vec();
+    let gen_b = mint();
+    let b_der = gen_b.cert.der().as_ref().to_vec();
+    let roots = [a_der.clone(), b_der.clone()];
+
+    // Reload every second.
+    let settings = TlsSettings::from_parts(
+        "receiver.http_tls",
+        Some(&cert_path.display().to_string()),
+        Some(&key_path.display().to_string()),
+        None,
+        None,
+        Some("1"),
+    )
+    .expect("valid")
+    .expect("configured");
+    let acceptor = reloading_acceptor(&settings, ALPN_HTTP).expect("acceptor");
+
+    let (pipeline, _captured) = capturing_pipeline();
+    let app = router(pipeline, &HttpConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            TlsListener::new(listener, acceptor),
+            app.into_make_service(),
+        )
+        .await
+    });
+
+    // Before any reload: generation A.
+    assert_eq!(served_leaf(addr, &roots).await, a_der, "serves A initially");
+
+    // Swap to generation B on disk; after the interval, new handshakes
+    // serve B — no restart.
+    std::fs::write(&cert_path, gen_b.cert.pem()).expect("write B cert");
+    std::fs::write(&key_path, gen_b.signing_key.serialize_pem()).expect("write B key");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(served_leaf(addr, &roots).await, b_der, "reloaded to B");
+
+    // Garbage on disk: the reload keeps the last good certificate (B).
+    std::fs::write(&cert_path, b"not a certificate").expect("write garbage");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        served_leaf(addr, &roots).await,
+        b_der,
+        "garbage keeps the last good certificate",
     );
+
+    server.abort();
 }
 
 /// Scenario RFC0030.9 — `min_version` enforcement: against a server
@@ -611,6 +711,8 @@ async fn rfc0030_9_min_version_enforcement() {
     )
     .expect("valid")
     .expect("configured");
+    // Raw acceptor (this test drives handshakes directly, not through
+    // an adapter).
     let acceptor = settings.acceptor(ALPN_GRPC).expect("acceptor");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

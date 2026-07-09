@@ -22,6 +22,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -32,6 +33,117 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+
+use super::tls::TlsSettings;
+
+/// A [`TlsAcceptor`] whose backing config can be hot-swapped without
+/// dropping the listener (RFC0030.6). Cheap to clone — clones share the
+/// lock; [`Self::current`] reads the live acceptor per handshake, so a
+/// swap is visible to the next connection while in-flight ones keep
+/// their session.
+#[derive(Clone)]
+pub struct ReloadingAcceptor {
+    current: Arc<RwLock<TlsAcceptor>>,
+}
+
+impl ReloadingAcceptor {
+    /// A non-reloading acceptor — a fixed config wrapped so the serve
+    /// adapters take one type whether or not reload is configured.
+    #[must_use]
+    pub fn fixed(acceptor: TlsAcceptor) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(acceptor)),
+        }
+    }
+
+    fn current(&self) -> TlsAcceptor {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Concatenated cert + key (+ CA) file bytes — the fingerprint the
+/// reload task compares to decide whether the material changed, and the
+/// unreadable-file signal (`None`) that makes it keep the last good
+/// config. Not a security boundary; a plain byte compare.
+fn material(settings: &TlsSettings) -> Option<Vec<u8>> {
+    let mut bytes = std::fs::read(&settings.cert_file).ok()?;
+    bytes.extend(std::fs::read(&settings.key_file).ok()?);
+    if let Some(ca) = &settings.client_ca_file {
+        bytes.extend(std::fs::read(ca).ok()?);
+    }
+    Some(bytes)
+}
+
+/// Build a [`ReloadingAcceptor`] for `settings` advertising `alpn`. When
+/// `settings.reload_interval` is set, spawn a task that re-reads the
+/// cert/key(/CA) files on the interval and swaps the acceptor on a
+/// content change; an unreadable or invalid reload logs an error and
+/// keeps the last good config — it never takes the listener down. The
+/// task self-terminates when the returned acceptor (and all clones) is
+/// dropped, via a `Weak` upgrade check.
+///
+/// # Errors
+///
+/// Whatever [`TlsSettings::acceptor`] returns for the initial build
+/// (unusable PEM, naming the path) — startup fails fast, as at config
+/// preflight.
+pub fn reloading_acceptor(
+    settings: &TlsSettings,
+    alpn: &[&[u8]],
+) -> Result<ReloadingAcceptor, String> {
+    let acceptor = settings.acceptor(alpn)?;
+    let current = Arc::new(RwLock::new(acceptor));
+    if let Some(interval) = settings.reload_interval {
+        let settings = settings.clone();
+        let alpn: Vec<Vec<u8>> = alpn.iter().map(|p| p.to_vec()).collect();
+        let weak = Arc::downgrade(&current);
+        let mut last = material(&settings);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // the first tick is immediate; skip it
+            loop {
+                tick.tick().await;
+                // Stop once the listener drops its acceptor.
+                let Some(current) = weak.upgrade() else { break };
+                let now = material(&settings);
+                match &now {
+                    // Unreadable mid-rotation (writer swapping files) —
+                    // keep the last good config and try again next tick.
+                    None => {
+                        tracing::warn!(
+                            cert = %settings.cert_file.display(),
+                            "TLS material unreadable on reload; keeping the last good certificate",
+                        );
+                        continue;
+                    }
+                    Some(bytes) if Some(bytes) == last.as_ref() => continue, // unchanged
+                    Some(_) => {}
+                }
+                let alpn_refs: Vec<&[u8]> = alpn.iter().map(Vec::as_slice).collect();
+                match settings.acceptor(&alpn_refs) {
+                    Ok(rebuilt) => {
+                        *current.write().unwrap_or_else(PoisonError::into_inner) = rebuilt;
+                        last = now;
+                        tracing::info!(
+                            cert = %settings.cert_file.display(),
+                            "reloaded the TLS certificate",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "TLS reload produced an invalid config; keeping the last good certificate",
+                        );
+                    }
+                }
+            }
+        });
+    }
+    Ok(ReloadingAcceptor { current })
+}
 
 /// Per-connection handshake deadline. A handshake that has not completed
 /// within this bound is abandoned (RFC 0030 §3.2 — a stalled peer must
@@ -121,7 +233,7 @@ async fn handshake(
 /// yielded.
 pub fn tls_incoming<S>(
     incoming: S,
-    acceptor: TlsAcceptor,
+    acceptor: ReloadingAcceptor,
 ) -> impl Stream<Item = io::Result<TlsStream<TcpStream>>>
 where
     S: Stream<Item = io::Result<TcpStream>> + Send + 'static,
@@ -165,7 +277,9 @@ where
             let Ok(permit) = slots.clone().acquire_owned().await else {
                 break;
             };
-            let acceptor = acceptor.clone();
+            // Read the live acceptor per connection so a reload is
+            // visible to the next handshake.
+            let acceptor = acceptor.current();
             let metrics = metrics.clone();
             let tx = tx.clone();
             // One task per connection: the handshake can't block the
@@ -190,7 +304,7 @@ where
 /// own retry and never fail.
 pub struct TlsListener {
     inner: TcpListener,
-    acceptor: TlsAcceptor,
+    acceptor: ReloadingAcceptor,
     metrics: HandshakeFailures,
     handshakes: JoinSet<Option<(TlsStream<TcpStream>, SocketAddr)>>,
 }
@@ -198,7 +312,7 @@ pub struct TlsListener {
 impl TlsListener {
     /// Wrap a bound `TcpListener` with `acceptor`.
     #[must_use]
-    pub fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+    pub fn new(inner: TcpListener, acceptor: ReloadingAcceptor) -> Self {
         Self {
             inner,
             acceptor,
@@ -225,7 +339,8 @@ impl axum::serve::Listener for TlsListener {
                     if self.handshakes.len() < MAX_CONCURRENT_HANDSHAKES => {
                     match accepted {
                         Ok((tcp, addr)) => {
-                            let acceptor = self.acceptor.clone();
+                            // Live acceptor per connection (reload-visible).
+                            let acceptor = self.acceptor.current();
                             let metrics = self.metrics.clone();
                             self.handshakes.spawn(async move {
                                 handshake(&acceptor, tcp, &metrics).await.map(|tls| (tls, addr))

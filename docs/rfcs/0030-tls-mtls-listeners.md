@@ -275,9 +275,10 @@ fixture-key incident).
 ## 6. Testing strategy
 
 - §5 arms live as integration tests in the owning crates
-  (`ourios-ingester` for .1/.2/.4–.7/.9 receiver arms,
-  `ourios-server` for .3/.8), joining the consolidated harnesses
-  (RFC 0028) — no new test binaries.
+  (`ourios-ingester` for the .1/.2/.4/.5/.6/.9 receiver + seam arms,
+  `ourios-server` for .3/.7/.8 — .7 observes the spawned binary's
+  startup warning, which only the server crate can do), joining the
+  consolidated harnesses (RFC 0028) — no new test binaries.
 - `rcgen` mints a CA + server/client leaves per test; nothing
   key-shaped is committed (RFC 0029 precedent).
 - Reload (.6) drives a temp-dir cert swap and polls handshakes with a

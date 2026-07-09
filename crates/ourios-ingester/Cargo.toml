@@ -40,6 +40,12 @@ doctest = false
 ourios-config = { path = "../ourios-config" }
 # Shared types (TenantId, config) for the ingest path.
 ourios-core = { path = "../ourios-core" }
+# RFC 0030 TLS seam: rustls builds each listener's ServerConfig (already
+# in the workspace tree via reqwest; the provider is pinned to ring in
+# code, so only that provider feature is enabled here), and pki-types'
+# `pem` feature reads the cert/key/CA files.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 # The ingest pipeline's WAL-before-ack durability (RFC 0003 §6.5 /
 # CLAUDE.md §3.4): append the OtlpBatch frame + fsync before acking.
 ourios-wal = { path = "../ourios-wal" }
@@ -107,6 +113,9 @@ uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 oidc = ["ourios-core/oidc"]
 
 [dev-dependencies]
+# RFC 0030 test CAs / leaf certs, minted at test time — no committed
+# key material (the RFC 0029 house rule).
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
 # The RFC0026.2 served-stack arm: serve `LogsServiceServer::with_interceptor`
 # over a local socket and drive it with a real tonic client, so the
 # metadata → interceptor → extension → handler handoff is covered end to end.

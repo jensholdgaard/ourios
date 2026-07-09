@@ -229,10 +229,46 @@ pub struct ReceiverSection {
     pub enabled: Option<String>,
     #[serde(deserialize_with = "scalar_opt")]
     pub grpc_addr: Option<String>,
+    /// RFC 0030 §3.1 — TLS on the gRPC listener (`receiver.grpc_tls`).
+    pub grpc_tls: TlsSection,
     #[serde(deserialize_with = "scalar_opt")]
     pub http_addr: Option<String>,
+    /// RFC 0030 §3.1 — TLS on the HTTP listener (`receiver.http_tls`).
+    pub http_tls: TlsSection,
     #[serde(deserialize_with = "scalar_opt")]
     pub wal_root: Option<String>,
+}
+
+/// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
+/// rules live in `TlsSettings::from_parts` (the single validation
+/// path); paths may ride `${env:…}` like any other value, the file
+/// contents never appear in config.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsSection {
+    #[serde(deserialize_with = "scalar_opt")]
+    pub cert_file: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub key_file: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub client_ca_file: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub min_version: Option<String>,
+    #[serde(deserialize_with = "scalar_opt")]
+    pub reload_interval_secs: Option<String>,
+}
+
+impl TlsSection {
+    fn substitute(
+        &mut self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), MalformedReference> {
+        substitute(&mut self.cert_file, lookup)?;
+        substitute(&mut self.key_file, lookup)?;
+        substitute(&mut self.client_ca_file, lookup)?;
+        substitute(&mut self.min_version, lookup)?;
+        substitute(&mut self.reload_interval_secs, lookup)
+    }
 }
 
 /// `querier.*` — the query role (RFC 0016 §3.2).
@@ -243,6 +279,9 @@ pub struct QuerierSection {
     pub enabled: Option<String>,
     #[serde(deserialize_with = "scalar_opt")]
     pub http_addr: Option<String>,
+    /// RFC 0030 §3.1 — TLS on the querier listener (`querier.http_tls`),
+    /// covering `/mcp`.
+    pub http_tls: TlsSection,
     #[serde(deserialize_with = "scalar_opt")]
     pub default_window_secs: Option<String>,
     /// The RFC 0027 MCP surface (`querier.mcp.*`).
@@ -530,7 +569,9 @@ impl ReceiverSection {
     ) -> Result<(), MalformedReference> {
         substitute(&mut self.enabled, lookup)?;
         substitute(&mut self.grpc_addr, lookup)?;
+        self.grpc_tls.substitute(lookup)?;
         substitute(&mut self.http_addr, lookup)?;
+        self.http_tls.substitute(lookup)?;
         substitute(&mut self.wal_root, lookup)
     }
 }
@@ -542,6 +583,7 @@ impl QuerierSection {
     ) -> Result<(), MalformedReference> {
         substitute(&mut self.enabled, lookup)?;
         substitute(&mut self.http_addr, lookup)?;
+        self.http_tls.substitute(lookup)?;
         substitute(&mut self.default_window_secs, lookup)?;
         substitute(&mut self.mcp.enabled, lookup)
     }

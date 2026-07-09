@@ -28,6 +28,15 @@ groups:
       (RFC 0026 §3.1 open mode): the listeners accept unauthenticated
       requests, and any client that can reach them can write into and
       read from any tenant.
+  - id: event.ourios.server.tls.plaintext_credentials
+    type: event
+    name: ourios.server.tls.plaintext_credentials
+    stability: development
+    brief: >
+      Credentials (`auth.tokens` / `auth.oidc`) are configured but a
+      listener has no `*_tls` block (RFC 0030 §3.4): bearer tokens
+      cross the network in cleartext unless TLS terminates at a
+      fronting proxy or mesh.
   - id: event.ourios.compaction.sweep.error
     type: event
     name: ourios.compaction.sweep.error

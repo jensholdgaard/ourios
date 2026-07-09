@@ -38,7 +38,7 @@ use super::tls::TlsSettings;
 
 /// A [`TlsAcceptor`] whose backing config can be hot-swapped without
 /// dropping the listener (RFC0030.6). Cheap to clone — clones share the
-/// lock; [`Self::current`] reads the live acceptor per handshake, so a
+/// lock; the serve adapters read the live acceptor per handshake, so a
 /// swap is visible to the next connection while in-flight ones keep
 /// their session.
 #[derive(Clone)]

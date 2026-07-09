@@ -343,7 +343,7 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
                     _ => "abstain (< 1 M lines)".to_string(),
                 };
                 println!(
-                    "    {:<24} {:>10} lines, {:>7} templates — {per}",
+                    "    {:<24} {:>10} lines, {:>7} created — {per}",
                     svc.service_name, svc.lines, svc.templates_created,
                 );
             }

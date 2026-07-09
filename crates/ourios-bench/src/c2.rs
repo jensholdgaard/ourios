@@ -169,19 +169,28 @@ impl C2Accumulator {
     fn attribute(&mut self, service: &str, created: bool) {
         // Cardinality guard: a known service (or a new one below the
         // cap) keeps its name; once the cap is hit, unseen services fold
-        // into one `<other>` bucket rather than grow unboundedly.
-        let known_or_has_room =
-            self.by_service.contains_key(service) || self.by_service.len() < MAX_SERVICES;
-        let key = if known_or_has_room {
+        // into one `<other>` bucket rather than grow unboundedly. The
+        // one presence lookup here is reused below, so the hot path is
+        // two map ops (this + `get_mut`), never three.
+        let present = self.by_service.contains_key(service);
+        let key = if present || self.by_service.len() < MAX_SERVICES {
             service
         } else {
             self.services_truncated = true;
             OTHER_SERVICES
         };
-        // Allocate the owned key only on a service's first sighting —
-        // `entry(key.to_string())` would copy on every line, a
-        // per-record allocation across a multi-million-line corpus.
-        if !self.by_service.contains_key(key) {
+        // Insert (allocating the owned key) only on a first sighting;
+        // `entry(key.to_string())` would copy on every line, a per-record
+        // allocation across a multi-million-line corpus. A known service
+        // is already answered by `present`; only the `<other>` sentinel
+        // needs its own check, since the cap path can arrive with the
+        // bucket already created.
+        let needs_insert = if key == service {
+            !present
+        } else {
+            !self.by_service.contains_key(key)
+        };
+        if needs_insert {
             self.by_service
                 .insert(key.to_string(), PerService::default());
         }

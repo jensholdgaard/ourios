@@ -1,8 +1,8 @@
 //! RFC 0030 §5 — TLS/mTLS on the receiver listeners (six of the nine
 //! scenarios; .3/.7/.8 live in the `ourios-server` harness per §6 —
 //! .7 asserts a startup warning of the served binary, which only the
-//! server crate can spawn). .1/.2/.5/.9 are live; .4/.6 remain
-//! `#[ignore]`d stubs naming the green slice that discharges them.
+//! server crate can spawn). .1/.2/.4/.5/.9 are live; .6 remains an
+//! `#[ignore]`d stub naming the green slice that discharges it.
 
 use std::path::{Path, PathBuf};
 
@@ -235,17 +235,163 @@ async fn stalled_handshake_does_not_block_the_listener() {
     server.abort();
 }
 
-/// Scenario RFC0030.4 — mTLS require-and-verify.
+/// A static token store + the matching `Bearer` header, mirroring the
+/// RFC 0026 ingester tests: the mTLS handshake gates admission, the
+/// bearer still binds the tenant.
+fn token_store(tenants: &[&str]) -> std::sync::Arc<ourios_core::auth::TokenStore> {
+    use ourios_core::auth::{TokenSpec, build_token_store};
+    std::sync::Arc::new(
+        build_token_store(Some(&[TokenSpec {
+            name: Some("edge-collector".to_string()),
+            token: Some("tok-edge".to_string()),
+            tenants: tenants.iter().map(|t| (*t).to_string()).collect(),
+        }]))
+        .expect("valid")
+        .expect("enabled"),
+    )
+}
+
+/// Scenario RFC0030.4 — mTLS require-and-verify. With `client_ca_file`
+/// set (⇒ `RequireAndVerifyClientCert`) and a static bearer configured:
+/// a CA-trusted client cert *plus* a valid bearer is ingested; the same
+/// cert with no bearer is rejected `Unauthenticated` (the gRPC status;
+/// mTLS composes with, does not replace, bearer auth); a client with no
+/// cert, and one with a cert from an
+/// untrusted CA, both fail the handshake — reaching neither the handler
+/// nor the auth layer.
 /// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.4 stub — implemented in the mTLS green slice"]
-fn rfc0030_4_mtls_require_and_verify() {
-    todo!(
-        "RFC0030.4 — client_ca_file set, valid bearer held constant: \
-         CA-signed client cert proceeds through bearer auth and is \
-         ingested; no cert and wrong-CA cert fail the handshake, \
-         nothing reaching the handler or the auth layer"
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn rfc0030_4_mtls_require_and_verify() {
+    use ourios_ingester::receiver::AuthResolver;
+    use ourios_ingester::receiver::grpc::AuthLayer;
+
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let (server_cert, server_key, server_pem) = cert_pair(tmp.path());
+    // The trusted client is its own CA: its cert PEM is the
+    // `client_ca_file` root the server verifies against.
+    let trusted_client =
+        rcgen::generate_simple_self_signed(vec!["edge-collector".to_string()]).expect("client");
+    let client_ca = tmp.path().join("client-ca.crt");
+    std::fs::write(&client_ca, trusted_client.cert.pem()).expect("write client CA");
+
+    let settings = TlsSettings::from_parts(
+        "receiver.grpc_tls",
+        Some(&server_cert.display().to_string()),
+        Some(&server_key.display().to_string()),
+        Some(&client_ca.display().to_string()),
+        None,
+        None,
+    )
+    .expect("valid")
+    .expect("configured");
+    let acceptor = settings.acceptor(ALPN_GRPC).expect("acceptor");
+
+    let (pipeline, captured) = capturing_pipeline();
+    let service = LogsServiceServer::new(LogsReceiver::new(pipeline));
+    let auth_layer = AuthLayer::new(AuthResolver::static_only(Some(token_store(&["checkout"]))));
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let addr = incoming.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(auth_layer)
+            .add_service(service)
+            .serve_with_incoming(tls_incoming(incoming, acceptor))
+            .await
+    });
+
+    // A client config presenting `identity`, trusting the server cert.
+    let tls_with_identity = |cert_pem: String, key_pem: String| {
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(server_pem.as_bytes()))
+            .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+            .domain_name("localhost")
+    };
+    let trusted_id = tls_with_identity(
+        trusted_client.cert.pem(),
+        trusted_client.signing_key.serialize_pem(),
     );
+
+    // (1) Trusted client cert + valid bearer → ingested.
+    let channel = Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(trusted_id.clone())
+        .expect("tls")
+        .connect()
+        .await
+        .expect("mTLS connect");
+    let mut client = LogsServiceClient::new(channel);
+    let mut req = tonic::Request::new(request(vec![resource_logs("checkout", &["one line"])]));
+    req.metadata_mut()
+        .insert("authorization", "Bearer tok-edge".parse().expect("md"));
+    client.export(req).await.expect("authed mTLS export");
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+
+    // (2) Same trusted cert, NO bearer → mTLS admits, bearer rejects.
+    let channel = Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(trusted_id)
+        .expect("tls")
+        .connect()
+        .await
+        .expect("mTLS connect");
+    let mut client = LogsServiceClient::new(channel);
+    let status = client
+        .export(tonic::Request::new(request(vec![resource_logs(
+            "checkout",
+            &["no bearer"],
+        )])))
+        .await
+        .expect_err("no bearer is rejected even over mTLS");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        captured.lock().expect("captured").len(),
+        1,
+        "the request without a bearer reached the auth layer but not the WAL",
+    );
+
+    // Connect (tonic defers the handshake) then export, so the mTLS
+    // rejection surfaces whether it lands at handshake or first RPC.
+    let ingest_attempt = |config: ClientTlsConfig| async move {
+        let channel = Endpoint::from_shared(format!("https://{addr}"))?
+            .tls_config(config)?
+            .connect()
+            .await?;
+        let mut client = LogsServiceClient::new(channel);
+        let mut req = tonic::Request::new(request(vec![resource_logs("checkout", &["x"])]));
+        req.metadata_mut()
+            .insert("authorization", "Bearer tok-edge".parse().expect("md"));
+        client.export(req).await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
+
+    // (3) No client cert → rejected, never reaching the handler.
+    let no_cert = ingest_attempt(
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(server_pem.as_bytes()))
+            .domain_name("localhost"),
+    )
+    .await;
+    assert!(no_cert.is_err(), "a client with no cert must be rejected");
+
+    // (4) Cert from an untrusted CA → rejected.
+    let untrusted = rcgen::generate_simple_self_signed(vec!["rogue".to_string()]).expect("rogue");
+    let wrong_ca = ingest_attempt(tls_with_identity(
+        untrusted.cert.pem(),
+        untrusted.signing_key.serialize_pem(),
+    ))
+    .await;
+    assert!(
+        wrong_ca.is_err(),
+        "an untrusted-CA client cert must be rejected"
+    );
+
+    assert_eq!(
+        captured.lock().expect("captured").len(),
+        1,
+        "only the fully-authorized request reached the WAL",
+    );
+    server.abort();
 }
 
 /// Scenario RFC0030.5 — config validation. The §3.1 rules live in

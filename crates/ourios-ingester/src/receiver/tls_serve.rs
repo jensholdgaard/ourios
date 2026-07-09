@@ -157,10 +157,19 @@ pub fn reloading_acceptor(
                 // The read + parse + rebuild is blocking — keep it off
                 // the async worker.
                 let (s, a) = (settings.clone(), alpn.clone());
-                let Ok(outcome) =
-                    tokio::task::spawn_blocking(move || reload_once(&s, &a, last)).await
-                else {
-                    break; // runtime shutting down
+                let outcome = match tokio::task::spawn_blocking(move || reload_once(&s, &a, last))
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    // Cancelled → the runtime is shutting down; stop.
+                    Err(e) if e.is_cancelled() => break,
+                    // A panic in the (pure) reload path is a bug, not a
+                    // shutdown — log and retry next tick rather than
+                    // silently disabling all future rotations.
+                    Err(e) => {
+                        tracing::error!(error = %e, "TLS reload task panicked; retrying next tick");
+                        continue;
+                    }
                 };
                 // Re-check the acceptor is still alive after the await.
                 let Some(current) = weak.upgrade() else { break };
@@ -199,6 +208,9 @@ pub fn reloading_acceptor(
                         );
                         tracing::error!(
                             error = %e,
+                            cert = %settings.cert_file.display(),
+                            key = %settings.key_file.display(),
+                            ca = settings.client_ca_file.as_ref().map(|p| p.display().to_string()),
                             "TLS reload produced an invalid config; keeping the last good certificate",
                         );
                     }

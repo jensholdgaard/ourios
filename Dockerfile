@@ -7,7 +7,7 @@
 # Builder: at or above the workspace MSRV (Cargo.toml `rust-version = 1.88`)
 # by digest for reproducibility; the tag comment lets Renovate's docker
 # manager bump it.
-FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+FROM rust:1.97-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
 WORKDIR /build
 COPY . .
 # `--locked` so a stale Cargo.lock fails the build instead of being
@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime: distroless `cc` carries glibc (the builder is glibc, not musl)
 # and is published multi-arch, so it works under the QEMU cross-build.
 # Digest-pinned for reproducibility (Renovate bumps via the tag comment).
-FROM gcr.io/distroless/cc-debian12@sha256:d703b626ba455c4e6c6fbe5f36e6f427c85d51445598d564652a2f334179f96e
+FROM gcr.io/distroless/cc-debian12@sha256:a90cf0f046efb32466b38b0972fef3a95e7c580e392e79ff1b7ac08c15fed0bc
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
 # the future query endpoint (RFC 0016) and is intentionally not exposed

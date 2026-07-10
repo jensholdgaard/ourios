@@ -1093,7 +1093,11 @@ pruning compounds with scale (B1), result-bound latency holds (B2),
 and the mining-fragmentation failure mode is now bounded, observable,
 and priced.
 
-### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2 (C2 re-scored under the per-service gate on 2026-07-10, #444 / RFC 0006 §3.4.3)
+### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2
+
+_The run is dated 2026-07-09; its C2 verdict was re-scored under the
+per-service gate on 2026-07-10 (#444 / RFC 0006 §3.4.3), so the
+resolution dates below post-date the heading._
 
 **Corpus.** `corpus/otel-demo-v8` (published GitHub release): a
 **48-hour** OTel-Demo 2.2.0 capture at 150 locust users with the
@@ -1149,7 +1153,7 @@ a red herring. **#444** resolved it (2026-07-10, maintainer-approved):
 of the three options — tokenizer masking, length-aware thresholding,
 and accept-and-scope-C2-per-service — **option 3 shipped** (the
 per-service gate below, RFC 0006 §3.4.3, PR #451); masking is parked as
-a future strategic RFC (no commitment; a Collector `transform`/
+a future strategic RFC (no commitment; a Collector `transform` or
 `redaction` processor can polish high-cardinality infra tokens
 upstream) and length-thresholding was rejected. The safety story held
 throughout (bounded memory per RFC 0023, per-service C1 perfect).

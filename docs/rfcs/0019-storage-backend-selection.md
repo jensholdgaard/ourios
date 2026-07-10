@@ -264,7 +264,7 @@ material. (Introduced by the 2026-06-28 amendment, §9.)
 
 ## 6. Testing strategy
 
-All eight scenarios have passing tests; the RFC is `green`.
+All eight scenarios have passing tests; the RFC is `accepted` (§9).
 
 - **RFC0019.1 / .6 / .7** — unit tests on `build_store_config` / `build_config`
   (the `main.rs` pattern), including the missing-key / secret-scrub assertion

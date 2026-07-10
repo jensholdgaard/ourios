@@ -238,7 +238,7 @@ where
     // pass updates them line-by-line but nothing else reads them (#446).
     // Single bench tenant, so `template_count(&tenant)` is the corpus total.
     let miner_stats = crate::MinerStats {
-        template_count: u64::try_from(cluster.template_count(&tenant)).unwrap_or(u64::MAX),
+        template_count: cluster.template_count(&tenant) as u64,
         merges_total: cluster.merges_total(),
         parse_failures_total: cluster.parse_failures_total(),
         body_retentions_total: cluster.body_retentions_total(),

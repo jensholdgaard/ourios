@@ -1,8 +1,7 @@
-//! RFC 0030 §5 — the server-owned scenarios: the plaintext-auth
-//! startup warning (`.7`) and TLS on the querier surface (`.3`) are
-//! live; the served end-to-end (`.8`) remains a stub. The receiver arms
-//! live in
-//! `crates/ourios-ingester/tests/it/rfc0030_tls.rs` per §6.
+//! RFC 0030 §5 — the server-owned scenarios: the plaintext-auth startup
+//! warning (`.7`), TLS on the querier surface (`.3`), and the served
+//! end-to-end (`.8`, transport-only scope) are all live. The receiver arms
+//! live in `crates/ourios-ingester/tests/it/rfc0030_tls.rs` per §6.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -222,16 +221,287 @@ async fn rfc0030_7_plaintext_auth_warning() {
     assert_eq!(count, 0, "a TLS-configured listener draws no warning");
 }
 
-/// Scenario RFC0030.8 — served end-to-end (Collector-shaped client).
-/// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.8 stub — implemented in the served green slice"]
-fn rfc0030_8_served_end_to_end() {
-    todo!(
-        "RFC0030.8 — served ourios-server, both roles, TLS on both \
-         receiver listeners + mTLS on gRPC + TLS querier: a \
-         Collector-shaped gRPC exporter (ca_file + client pair) and \
-         an HTTPS exporter both land batches queryable over the TLS \
-         querier, no plaintext hop"
+/// Scenario RFC0030.8 — served end-to-end, **transport-only** scope (§5 as
+/// amended 2026-07-10). The served `ourios-server` binary runs both roles
+/// with TLS on both receiver listeners, mTLS on gRPC, and TLS on the
+/// querier. A Collector-shaped gRPC exporter (CA + client pair + bearer)
+/// and an HTTPS exporter (CA + bearer) both land batches; the query surface
+/// serves over TLS; and no listener answers plaintext. Landing is read back
+/// from the store after a graceful drain — the full stack, no plaintext
+/// hop. See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
+///
+/// Unix-only: graceful shutdown (which flushes the sink so the batches
+/// become readable) is driven by `kill -TERM` (the `rfc0003_16` /
+/// `rfc0008_10` precedent).
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0030_8_served_end_to_end() {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+    use prost::Message as _;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+    const BEARER: &str = "rfc0030-8-token";
+    const TENANT: &str = "acme";
+    const GRPC_BODY: &str = "logged in over mtls grpc";
+    const HTTP_BODY: &str = "logged in over https";
+
+    // One string-body OTLP batch; `service.name` is the tenant (RFC 0003
+    // §6.3), which the bearer's tenant set must contain.
+    fn batch(service: &str, body: &str) -> ExportLogsServiceRequest {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        let string = |s: &str| AnyValue {
+            value: Some(Value::StringValue(s.to_owned())),
+        };
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_owned(),
+                        value: Some(string(service)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(string(body)),
+                        severity_number: 9,
+                        time_unix_nano: 1_775_127_480_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    let tmp = tempfile::TempDir::new().expect("temp");
+    // Server leaf (loopback SANs so tonic pins `localhost` and reqwest
+    // verifies `127.0.0.1`); a separate client leaf is the mTLS identity and
+    // its own PEM is the `client_ca_file` the gRPC listener verifies against.
+    let server =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("server cert");
+    let client = rcgen::generate_simple_self_signed(vec!["edge-collector".to_string()])
+        .expect("client cert");
+    let server_pem = server.cert.pem();
+    let cert_path = tmp.path().join("server.crt");
+    let key_path = tmp.path().join("server.key");
+    let client_ca_path = tmp.path().join("client-ca.crt");
+    std::fs::write(&cert_path, &server_pem).expect("write cert");
+    std::fs::write(&key_path, server.signing_key.serialize_pem()).expect("write key");
+    std::fs::write(&client_ca_path, client.cert.pem()).expect("write client CA");
+
+    let wal = tmp.path().join("wal");
+    std::fs::create_dir_all(&wal).expect("wal dir");
+    let config_path = tmp.path().join("ourios.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "storage:\n  local:\n    bucket_root: {bucket}\n\
+             receiver:\n  enabled: true\n  grpc_addr: 127.0.0.1:0\n\
+             \x20\x20grpc_tls:\n    cert_file: {cert}\n    key_file: {key}\n    client_ca_file: {cca}\n\
+             \x20\x20http_addr: 127.0.0.1:0\n\
+             \x20\x20http_tls:\n    cert_file: {cert}\n    key_file: {key}\n  wal_root: {wal}\n\
+             querier:\n  enabled: true\n  http_addr: 127.0.0.1:0\n\
+             \x20\x20http_tls:\n    cert_file: {cert}\n    key_file: {key}\n\
+             auth:\n  tokens:\n    - name: edge\n      token: ${{env:EDGE_TOKEN}}\n      tenants: [\"{TENANT}\"]\n",
+            bucket = tmp.path().display(),
+            cert = cert_path.display(),
+            key = key_path.display(),
+            cca = client_ca_path.display(),
+            wal = wal.display(),
+        ),
+    )
+    .expect("write config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ourios-server"))
+        .arg("--config")
+        .arg(&config_path)
+        .env("EDGE_TOKEN", BEARER)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn ourios-server");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut out_lines = BufReader::new(stdout).lines();
+    let (grpc_addr, http_addr, querier_addr) = timeout(Duration::from_secs(15), async {
+        let (mut g, mut h, mut q) = (None, None, None);
+        while let Some(line) = out_lines.next_line().await.expect("read stdout") {
+            if let Some(a) = line.strip_prefix("receiver gRPC listening on ") {
+                g = Some(a.trim().to_string());
+            }
+            if let Some(a) = line.strip_prefix("receiver HTTP listening on ") {
+                h = Some(a.trim().to_string());
+            }
+            if let Some(a) = line.strip_prefix("querier HTTP listening on ") {
+                q = Some(a.trim().to_string());
+            }
+            if let (Some(g), Some(h), Some(q)) = (&g, &h, &q) {
+                return (g.clone(), h.clone(), q.clone());
+            }
+        }
+        panic!("all three listeners must announce readiness");
+    })
+    .await
+    .expect("server ready before timeout");
+
+    // gRPC over mTLS (client identity) + bearer → the batch acks.
+    let channel = Endpoint::from_shared(format!("https://{grpc_addr}"))
+        .expect("endpoint")
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(server_pem.as_bytes()))
+                .identity(Identity::from_pem(
+                    client.cert.pem(),
+                    client.signing_key.serialize_pem(),
+                ))
+                .domain_name("localhost"),
+        )
+        .expect("tls config")
+        .connect()
+        .await
+        .expect("mTLS connect");
+    let mut grpc = LogsServiceClient::new(channel);
+    let mut req = tonic::Request::new(batch(TENANT, GRPC_BODY));
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {BEARER}").parse().expect("md"),
+    );
+    grpc.export(req).await.expect("mTLS gRPC export acks");
+
+    // OTLP/HTTP over TLS + bearer → 200.
+    let https = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(server_pem.as_bytes()).expect("root"))
+        .build()
+        .expect("https client");
+    let resp = https
+        .post(format!("https://{http_addr}/v1/logs"))
+        .header("content-type", "application/x-protobuf")
+        .header("authorization", format!("Bearer {BEARER}"))
+        .body(batch(TENANT, HTTP_BODY).encode_to_vec())
+        .send()
+        .await
+        .expect("HTTPS export");
+    assert!(
+        resp.status().is_success(),
+        "HTTPS export status {}",
+        resp.status()
+    );
+
+    // The query surface serves over TLS with the same bearer (empty store
+    // pre-flush → 200, zero rows): the read transport composes.
+    let query = https
+        .post(format!("https://{querier_addr}/v1/query"))
+        .header("content-type", "text/plain")
+        .header("x-ourios-tenant", TENANT)
+        .header("authorization", format!("Bearer {BEARER}"))
+        .body("template_id == 1")
+        .send()
+        .await
+        .expect("TLS query");
+    assert_eq!(query.status(), reqwest::StatusCode::OK, "TLS query serves");
+
+    // No plaintext hop: every listener refuses plaintext.
+    let plain = reqwest::Client::new();
+    assert!(
+        plain
+            .post(format!("http://{http_addr}/v1/logs"))
+            .body(batch(TENANT, "plaintext").encode_to_vec())
+            .send()
+            .await
+            .is_err(),
+        "plaintext to the TLS HTTP receiver must fail",
+    );
+    assert!(
+        plain
+            .post(format!("http://{querier_addr}/v1/query"))
+            .header("x-ourios-tenant", TENANT)
+            .body("template_id == 1")
+            .send()
+            .await
+            .is_err(),
+        "plaintext to the TLS querier must fail",
+    );
+    // tonic defers the handshake to the first RPC, so connect can lazily
+    // succeed — the plaintext export against the TLS listener is where it
+    // fails. Fold connect + export so either failure counts.
+    let plaintext_grpc = async {
+        let mut c = LogsServiceClient::connect(format!("http://{grpc_addr}")).await?;
+        c.export(tonic::Request::new(batch(TENANT, "plaintext")))
+            .await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    assert!(
+        plaintext_grpc.await.is_err(),
+        "plaintext to the TLS+mTLS gRPC receiver must fail",
+    );
+
+    // Graceful drain (SIGTERM) flushes the sink; then read the store back and
+    // assert both TLS-delivered batches landed under the bearer's tenant.
+    let pid = child.id().expect("pid").to_string();
+    Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .await
+        .expect("kill")
+        .success()
+        .then_some(())
+        .expect("SIGTERM delivered");
+    timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("exit before timeout")
+        .expect("child exits");
+
+    let tenant = ourios_core::tenant::TenantId::new(TENANT);
+    let registry = ourios_querier::derive_template_registry(
+        ourios_querier::StoreRef::Local(tmp.path()),
+        &tenant,
+    )
+    .expect("derive registry");
+    let mut rendered = Vec::new();
+    let mut stack = vec![tmp.path().join("data")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                for record in ourios_parquet::Reader::open_file(&path)
+                    .expect("open data file")
+                    .read_all()
+                    .expect("read records")
+                {
+                    assert_eq!(
+                        record.tenant_id, tenant,
+                        "records bind to the bearer's tenant"
+                    );
+                    if let ourios_querier::LogBody::Rendered { line, .. } =
+                        ourios_querier::render_log_body(&record, &registry)
+                    {
+                        rendered.push(String::from_utf8(line).expect("utf8"));
+                    }
+                }
+            }
+        }
+    }
+    rendered.sort();
+    let mut want = vec![GRPC_BODY.to_owned(), HTTP_BODY.to_owned()];
+    want.sort();
+    assert_eq!(
+        rendered, want,
+        "both the mTLS-gRPC and HTTPS batches landed and reconstruct — the \
+         full stack, no plaintext hop",
     );
 }

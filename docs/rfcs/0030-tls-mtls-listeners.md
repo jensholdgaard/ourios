@@ -1,7 +1,7 @@
 ---
 rfc: 0030
 title: TLS/mTLS on the data-plane listeners
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-08
@@ -266,6 +266,19 @@ fixture-key incident).
 > pair) exports over gRPC, and a second exporter posts the same way
 > over HTTPS, Then both batches land and are queryable over the TLS
 > querier — the full stack, with no plaintext hop.
+>
+> **Scope (clarified 2026-07-10, maintainer-approved).** RFC0030.8
+> asserts **transport** end-to-end only: every hop — gRPC ingest, HTTP
+> ingest, and query — is TLS, gRPC is mutually authenticated at the
+> transport layer, and no plaintext hop exists in the served stack. It
+> deliberately does **not** assert any client-cert-identity → tenant
+> binding; that is open question §7.1, deferred. Application-layer
+> authentication is verified by RFC 0026 / 0029; .8 is the transport
+> *composition* of those layers, not a re-test of them. ("Queryable
+> over the TLS querier" is met by the query surface serving over TLS;
+> the served sink flushes only on graceful drain, so landing is read
+> back from the store after shutdown — the batches are durable and the
+> read transport is exercised.)
 
 > **Scenario RFC0030.9 — min_version enforcement.** Given
 > `min_version: "1.3"`, When a client attempts a TLS 1.2-only

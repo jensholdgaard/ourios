@@ -1280,14 +1280,14 @@ fn assert_round_trips_through_yaml(beta: &str, expected: &ourios_querier::dsl::Q
         "canonical serialisation must be single-line: {beta:?}",
     );
 
-    // serde_yaml emits a correctly-quoted scalar for any string, so building
+    // serde_yaml_ng emits a correctly-quoted scalar for any string, so building
     // the document via the serializer is itself part of the round-trip.
     let mut doc = std::collections::BTreeMap::new();
     doc.insert("query".to_string(), beta.to_string());
-    let yaml = serde_yaml::to_string(&doc).expect("embed query as a YAML scalar");
+    let yaml = serde_yaml_ng::to_string(&doc).expect("embed query as a YAML scalar");
 
     let recovered: std::collections::BTreeMap<String, String> =
-        serde_yaml::from_str(&yaml).expect("YAML round-trips");
+        serde_yaml_ng::from_str(&yaml).expect("YAML round-trips");
     let extracted = recovered.get("query").expect("query scalar survives");
 
     let reparsed = ourios_querier::dsl::parse(extracted)
@@ -1313,10 +1313,11 @@ fn yaml_round_trip_property() {
 
             let mut doc = std::collections::BTreeMap::new();
             doc.insert("query".to_string(), beta.clone());
-            let yaml = serde_yaml::to_string(&doc)
+            let yaml = serde_yaml_ng::to_string(&doc)
                 .map_err(|e| TestCaseError::fail(format!("YAML embed failed: {e}")))?;
-            let recovered: std::collections::BTreeMap<String, String> = serde_yaml::from_str(&yaml)
-                .map_err(|e| TestCaseError::fail(format!("YAML parse failed: {e}")))?;
+            let recovered: std::collections::BTreeMap<String, String> =
+                serde_yaml_ng::from_str(&yaml)
+                    .map_err(|e| TestCaseError::fail(format!("YAML parse failed: {e}")))?;
             let extracted = recovered
                 .get("query")
                 .ok_or_else(|| TestCaseError::fail("query scalar missing".to_string()))?;

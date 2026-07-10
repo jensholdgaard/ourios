@@ -20,7 +20,7 @@
 //! resolved value without re-scanning it.
 //!
 //! **Type after substitution** (rule 7) is resolved at the typed boundary rather
-//! than by re-tagging a node tree. `serde_yaml`'s `Value` does not preserve a
+//! than by re-tagging a node tree. `serde_yaml_ng`'s `Value` does not preserve a
 //! scalar's quoting style, so a literal "re-interpret the substituted scalar by
 //! YAML's type rules" pass cannot tell a quoted string from a bare one and would
 //! wrongly coerce `"01"` to an integer. Instead every leaf is captured as its
@@ -71,7 +71,7 @@ pub enum FileConfigError {
     Substitution(MalformedReference),
     /// A YAML syntax error, an unknown key (`deny_unknown_fields`), or a value
     /// whose shape does not match the schema.
-    Schema(serde_yaml::Error),
+    Schema(serde_yaml_ng::Error),
     /// A `storage.s3.*` credential holds an inline literal instead of an
     /// `${env:…}` reference (RFC 0020 §3.5). Names the offending key only, never
     /// the value.
@@ -396,13 +396,14 @@ pub fn parse(
     yaml: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<FileConfig, FileConfigError> {
-    // Deserialise straight from the text (not via an intermediate `serde_yaml::
-    // Value`) so a schema error keeps its source location. Validation runs on the
+    // Deserialise straight from the text (not via an intermediate
+    // `serde_yaml_ng::Value`) so a schema error keeps its source location.
+    // Validation runs on the
     // raw (pre-substitution) text, so any shape / unknown-key error names the
     // file's own text, never a resolved secret (RFC 0020 §3.5). `Option` lets an
     // empty / null document resolve to an all-default config (`None`) rather than
     // fail the `null`-into-struct type check.
-    let mut config: FileConfig = serde_yaml::from_str::<Option<FileConfig>>(yaml)
+    let mut config: FileConfig = serde_yaml_ng::from_str::<Option<FileConfig>>(yaml)
         .map_err(FileConfigError::Schema)?
         .unwrap_or_default();
     // Enforce §3.5 on the *raw* credential values — after substitution a

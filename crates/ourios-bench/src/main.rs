@@ -333,22 +333,20 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
              — whole-corpus ratio {ratio} (diagnostic; end templates {}, cadence {})",
             c2.template_count_at_end, c2.sample_cadence,
         );
-        // Per-service breakdown — the gate basis. Printed whenever the
-        // corpus resolves to more than one bucket (distinct `service.name`
-        // values plus any `<unknown>`/`<other>`).
-        if c2.by_service.len() > 1 {
+        // Per-service breakdown — the gate basis, so it is printed
+        // whenever any service bucket exists (including a single-service
+        // or plain-text `<unknown>` corpus): the whole-corpus line above
+        // is only the diagnostic, and the operator needs the per-service
+        // measurement to reproduce the verdict.
+        if !c2.by_service.is_empty() {
             println!("  C2 by service (the gate; creations sum to the end count):");
             for svc in &c2.by_service {
-                let per = match (svc.convergence_ratio, svc.pass) {
-                    (Some(r), Some(true)) => format!("ratio {r:.3} PASS"),
-                    (Some(r), Some(false)) => format!("ratio {r:.3} FAIL"),
-                    (None, Some(true)) => "0 templates, converged PASS".to_string(),
-                    (_, Some(false)) => "FAIL".to_string(),
-                    (_, None) => "abstain (< 1 M lines)".to_string(),
-                };
                 println!(
-                    "    {:<24} {:>10} lines, {:>7} created — {per}",
-                    svc.service_name, svc.lines, svc.templates_created,
+                    "    {:<24} {:>10} lines, {:>7} created — {}",
+                    svc.service_name,
+                    svc.lines,
+                    svc.templates_created,
+                    per_service_status(svc),
                 );
             }
             if c2.services_truncated {
@@ -358,9 +356,50 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
     }
 }
 
+/// One-line per-service C2 status for the CLI breakdown. The gate is the
+/// per-service ratio; a zero-template ≥ 1 M service (SS = 0) reads as a
+/// trivial pass with no ratio, and a service below 1 M lines abstains.
+fn per_service_status(svc: &ourios_bench::PerServiceC2) -> String {
+    match (svc.convergence_ratio, svc.pass) {
+        (Some(r), Some(true)) => format!("ratio {r:.3} PASS"),
+        (Some(r), Some(false)) => format!("ratio {r:.3} FAIL"),
+        (None, Some(true)) => "0 templates, converged PASS".to_string(),
+        (_, Some(false)) => "FAIL".to_string(),
+        (_, None) => "abstain (< 1 M lines)".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-service CLI status covers every gate state: a defined
+    /// ratio that passes/fails, the SS = 0 trivial pass (no ratio), and a
+    /// sub-1M abstention.
+    #[test]
+    fn per_service_status_covers_gate_states() {
+        let mk = |ratio, pass| ourios_bench::PerServiceC2 {
+            service_name: "s".to_string(),
+            lines: 1_000_000,
+            templates_created: 5,
+            templates_created_at_1m_lines: None,
+            convergence_ratio: ratio,
+            pass,
+        };
+        assert_eq!(
+            per_service_status(&mk(Some(0.9), Some(true))),
+            "ratio 0.900 PASS"
+        );
+        assert_eq!(
+            per_service_status(&mk(Some(0.2), Some(false))),
+            "ratio 0.200 FAIL"
+        );
+        assert_eq!(
+            per_service_status(&mk(None, Some(true))),
+            "0 templates, converged PASS"
+        );
+        assert_eq!(per_service_status(&mk(None, None)), "abstain (< 1 M lines)");
+    }
 
     /// RFC0006.5 — `--hardware-kind` is required unless
     /// `--allow-unknown-hardware`. clap rejects the bare

@@ -1095,6 +1095,10 @@ and priced.
 
 ### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2
 
+_The run is dated 2026-07-09; its C2 verdict was re-scored under the
+per-service gate on 2026-07-10 (#444 / RFC 0006 §3.4.3), so the
+resolution dates below post-date the heading._
+
 **Corpus.** `corpus/otel-demo-v8` (published GitHub release): a
 **48-hour** OTel-Demo 2.2.0 capture at 150 locust users with the
 `adFailure` + `paymentFailure` feature flags active — 690,355 OTLP
@@ -1145,10 +1149,15 @@ token is a unique offset-bearing path**
 2/3 ≈ 0.67, below the strict 0.7 threshold (§3.1 no-silent-merges),
 so each line mints a template; the 4-token siblings of the same
 family (0.75) merge fine. The failure-flag confound turned out to be
-a red herring. Tracked as **#444** (tokenizer masking vs.
-length-aware thresholding vs. accept-and-scope-C2-per-service — an
-RFC-level pillar #2 decision); the safety story held throughout
-(bounded memory per RFC 0023, per-service C1 perfect).
+a red herring. **#444** settled how to handle the fragmentation
+(2026-07-10, maintainer-approved): of the three options — tokenizer
+masking, length-aware thresholding,
+and accept-and-scope-C2-per-service — **option 3 shipped** (the
+per-service gate, RFC 0006 §3.4.3, PR #451); masking is parked as
+a future strategic RFC (no commitment; a Collector `transform` or
+`redaction` processor can polish high-cardinality infra tokens
+upstream) and length-aware thresholding was rejected. The safety story held
+throughout (bounded memory per RFC 0023, per-service C1 perfect).
 
 The per-service decomposition is now the **first-class bench gate**
 (`ourios-bench --gates c2` prints it whenever any service bucket exists
@@ -1176,9 +1185,15 @@ service has 2 templates or 14,608 — a 1 h window prunes 48 of 49 row
 groups either way (reconfirming the RFC 0023 graceful-degradation
 result on a fresh corpus). Fragmentation does **not** cost query
 *latency* or pruning. What it costs is template-exact query
-*precision*: the `template_id == 1` probe recovers 1.78 M / 2.76 M
-rows on cart (one template is most of the corpus) but only 11,523 /
+*precision*: probing cart's dominant template (id 1 in this run — a
+run-specific identifier, not a canonical one) recovers 1.78 M / 2.76 M
+rows (one template is most of the corpus) but only 11,523 /
 136,790 on kafka, because kafka's dominant event is scattered across
-~11,651 ids — no single template query recovers it. So #444 is a
-**query-capability / thesis-value** decision, not a performance one;
-the pruning path degrades to the first-class-column floor unharmed.
+~11,651 ids — a single `template_id` probe recovers only that one id's
+slice (11,523 rows), not the full dominant event. So the
+fragmentation is a **query-capability / thesis-value** tradeoff, not a
+performance one; the pruning path degrades to the first-class-column
+floor unharmed. #444 **accepted** that tradeoff on hostile infra logs:
+the per-service gate makes C2 acceptance honest without masking, and
+any future masking is deferred to an upstream Collector processor or a
+dedicated RFC.

@@ -21,6 +21,11 @@
 //!
 //! Like RFC0029.7 this needs a Docker-API runtime, so it is `#[ignore]`d and
 //! run by the `collector-interop` CI job via `--ignored --exact`.
+//!
+//! Unix-only: graceful shutdown is driven by `kill -TERM`, and the server's
+//! SIGTERM handling is itself Unix-only (the `rfc0003_16` / `rfc0008_10`
+//! served-binary precedent).
+#![cfg(unix)]
 
 use std::io::Write as _;
 use std::time::Duration;

@@ -359,7 +359,7 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
     // directly instead of reconstructing by hand.
     if let Some(m) = &results.miner_stats {
         println!(
-            "  miner §3.1: {} templates · {} merges · {} parse-failures · \
+            "  miner §3.1: {} templates · {} merges · {} no-template · \
              {} body-retentions · {} params-overflow",
             m.template_count,
             m.merges_total,

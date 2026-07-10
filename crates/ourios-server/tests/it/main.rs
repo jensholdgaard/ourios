@@ -11,6 +11,7 @@
 //! provider (`init_in_memory`), which cannot share a process with another
 //! installer.
 
+mod collector_interop;
 mod rfc0003_16_served_binary;
 mod rfc0008_10_recovery_driver;
 mod rfc0013_6_wal_stays_local;

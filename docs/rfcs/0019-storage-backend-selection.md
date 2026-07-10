@@ -1,7 +1,7 @@
 ---
 rfc: 0019
 title: Storage-backend selection — wiring the server to choose local vs S3
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-06-22
@@ -264,7 +264,7 @@ material. (Introduced by the 2026-06-28 amendment, §9.)
 
 ## 6. Testing strategy
 
-All eight scenarios have passing tests; the RFC is `green`.
+All eight scenarios have passing tests; the RFC is `accepted` (§9).
 
 - **RFC0019.1 / .6 / .7** — unit tests on `build_store_config` / `build_config`
   (the `main.rs` pattern), including the missing-key / secret-scrub assertion
@@ -344,3 +344,11 @@ All eight scenarios have passing tests; the RFC is `green`.
   fail-fast and the widened redaction, and added acceptance scenario RFC0019.8
   (§5). Specified, then implemented in the same change set; the RFC stays
   `green` (all eight §5 criteria pass).
+- **2026-07-10 — accepted (maintainer sign-off).** Promoted `green →
+  accepted` (terminal). All eight §5 criteria have passing tests (green since
+  #301, amended #306/#307): unit coverage of backend selection + credential
+  scrub, and the localstack S3 integration covering WAL-stays-local, the
+  ingest→query round-trip on S3, the compactor's conditional-PUT manifest
+  swap, and cross-tenant isolation. No `validated` stage applies — backend
+  selection is server wiring, not a thesis-gate benchmark — so acceptance
+  follows `green` directly (the RFC 0001 / 0008 precedent).

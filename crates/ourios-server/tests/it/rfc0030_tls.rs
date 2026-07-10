@@ -234,6 +234,8 @@ async fn rfc0030_7_plaintext_auth_warning() {
 /// become readable) is driven by `kill -TERM` (the `rfc0003_16` /
 /// `rfc0008_10` precedent).
 #[cfg(unix)]
+// One end-to-end scenario: the full stack must be exercised in one function —
+// splitting would obscure the transport composition under test.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc0030_8_served_end_to_end() {
@@ -282,9 +284,11 @@ async fn rfc0030_8_served_end_to_end() {
     }
 
     let tmp = tempfile::TempDir::new().expect("temp");
-    // Server leaf (loopback SANs so tonic pins `localhost` and reqwest
-    // verifies `127.0.0.1`); a separate client leaf is the mTLS identity and
-    // its own PEM is the `client_ca_file` the gRPC listener verifies against.
+    // Server leaf carries both loopback SANs: the gRPC client dials the IP
+    // but overrides SNI to `localhost` (`domain_name`), so it verifies the
+    // `localhost` SAN; the HTTPS client dials and verifies `127.0.0.1`. The
+    // separate client leaf is the mTLS identity, and its own PEM is the
+    // `client_ca_file` the gRPC listener verifies clients against.
     let server =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .expect("server cert");

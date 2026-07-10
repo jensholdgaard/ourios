@@ -1145,10 +1145,14 @@ token is a unique offset-bearing path**
 2/3 ≈ 0.67, below the strict 0.7 threshold (§3.1 no-silent-merges),
 so each line mints a template; the 4-token siblings of the same
 family (0.75) merge fine. The failure-flag confound turned out to be
-a red herring. Tracked as **#444** (tokenizer masking vs.
-length-aware thresholding vs. accept-and-scope-C2-per-service — an
-RFC-level pillar #2 decision); the safety story held throughout
-(bounded memory per RFC 0023, per-service C1 perfect).
+a red herring. **#444** resolved it (2026-07-10, maintainer-approved):
+of the three options — tokenizer masking, length-aware thresholding,
+and accept-and-scope-C2-per-service — **option 3 shipped** (the
+per-service gate below, RFC 0006 §3.4.3, PR #451); masking is parked as
+a future strategic RFC (no commitment; a Collector `transform`/
+`redaction` processor can polish high-cardinality infra tokens
+upstream) and length-thresholding was rejected. The safety story held
+throughout (bounded memory per RFC 0023, per-service C1 perfect).
 
 The per-service decomposition is now the **first-class bench gate**
 (`ourios-bench --gates c2` prints it whenever any service bucket exists
@@ -1179,6 +1183,10 @@ result on a fresh corpus). Fragmentation does **not** cost query
 *precision*: the `template_id == 1` probe recovers 1.78 M / 2.76 M
 rows on cart (one template is most of the corpus) but only 11,523 /
 136,790 on kafka, because kafka's dominant event is scattered across
-~11,651 ids — no single template query recovers it. So #444 is a
-**query-capability / thesis-value** decision, not a performance one;
-the pruning path degrades to the first-class-column floor unharmed.
+~11,651 ids — no single template query recovers it. So the
+fragmentation is a **query-capability / thesis-value** tradeoff, not a
+performance one; the pruning path degrades to the first-class-column
+floor unharmed. #444 **accepted** that tradeoff on hostile infra logs:
+the per-service gate makes C2 acceptance honest without masking, and
+any future masking is deferred to an upstream Collector processor or a
+dedicated RFC.

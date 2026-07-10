@@ -215,8 +215,12 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
         // self-contradictory row.
         let measurement = match (c2.template_count_at_1m_lines, c2.convergence_ratio) {
             (Some(count_1m), Some(ratio)) => {
+                // Whole-corpus ratio — a diagnostic since #444; the gate
+                // verdict (Verdict column) is per-service, so a
+                // multi-service corpus can show a sub-0.5 ratio here with a
+                // PASS verdict. Label it so the two aren't conflated.
                 format!(
-                    "ratio {ratio:.3} (count@1M {count_1m} / SS {})",
+                    "whole-corpus ratio {ratio:.3} (count@1M {count_1m} / SS {}) — diagnostic; verdict is per-service",
                     c2.template_count_at_end,
                 )
             }

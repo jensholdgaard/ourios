@@ -503,7 +503,16 @@ Pinned definitions:
   polishing of high-cardinality infra logs is an OTel Collector
   concern (a `transform`/`redaction` processor upstream), not
   the miner's — consistent with "format parsing is the
-  Collector's job".
+  Collector's job". **Cardinality cap**: the decomposition holds
+  at most `MAX_SERVICES = 1024` distinct `service.name` buckets
+  (an O(services) memory guard mirroring §3.2); beyond that,
+  further services fold into one `<other>` bucket and
+  `c2.services_truncated` is set. A real OTLP capture carries
+  tens of services, so the cap is not expected to bind; if it
+  does, the folded `<other>` bucket mixes services and its
+  per-service ratio is no longer strictly single-service —
+  `services_truncated` flags that the run should be re-scoped
+  (the truncation is surfaced, never silent).
 - **Plateau-detection diagnostic** (not a gate): the curve
   is "plateaued" at the sample where the trailing `K = 64`
   samples all lie within `± 5%` of the SS. The diagnostic is

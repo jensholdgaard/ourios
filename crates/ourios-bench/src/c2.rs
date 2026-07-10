@@ -322,9 +322,9 @@ impl C2Accumulator {
 /// a corpus passes iff every service with ≥ 1 M lines passes its own
 /// ratio ≥ 0.5. `finalize` sets `pass = Some(_)` for *every* ≥ 1 M
 /// service (a zero-template service passes trivially — flat count), so
-/// the `filter_map` below picks up exactly the gated services and `None`
-/// means "no service reached 1 M lines", never a silently-dropped
-/// ≥ 1 M service. A single-service
+/// the fold below considers exactly the gated services (`s.pass.is_some()`)
+/// and `None` means "no service reached 1 M lines", never a
+/// silently-dropped ≥ 1 M service. A single-service
 /// corpus — including the plain-text `<unknown>` bucket — is gated on
 /// that one service's ratio, measured at its **exact** millionth line
 /// (`created_at_1m`). That reproduces the pre-#444 whole-corpus verdict

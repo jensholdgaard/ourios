@@ -476,10 +476,14 @@ async fn rfc0030_8_served_end_to_end() {
         .success()
         .then_some(())
         .expect("SIGTERM delivered");
-    timeout(Duration::from_secs(20), child.wait())
+    let status = timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("exit before timeout")
-        .expect("child exits");
+        .expect("await server exit");
+    assert!(
+        status.success(),
+        "graceful shutdown exits cleanly, got {status:?}",
+    );
     // The pipe closed on exit, so the drain has finished; join it so no task
     // outlives the test.
     let _ = timeout(Duration::from_secs(5), stderr_drain).await;

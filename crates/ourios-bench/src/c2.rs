@@ -36,9 +36,11 @@
 //! - **Count at 1 M lines**: the count at the sample whose
 //!   1-based line number is closest to `1_000_000`, floor
 //!   tie-break. Defined only on corpora ≥ 1 M lines.
-//! - **Convergence ratio** = `count_1m / SS`, in `(0, 1]` when
-//!   defined (undefined — `None` — for a ≥ 1 M service that mints
-//!   zero templates; see the gate).
+//! - **Convergence ratio** = `count_1m / SS`, in `[0, 1]` when
+//!   defined — `0` when the first template is minted only after
+//!   the 1 M mark (`count_1m == 0`, `SS > 0`); undefined (`None`)
+//!   for a ≥ 1 M service that mints zero templates at all (see
+//!   the gate).
 //! - **Pass** (per service, RFC 0006 §3.4.3 as amended for #444):
 //!   the gate is evaluated **per `service.name`**, since C2 is
 //!   defined over a single stable service. A corpus passes iff

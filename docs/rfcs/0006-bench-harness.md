@@ -455,8 +455,10 @@ Pinned definitions:
   line, zero-indexed). When two samples are equidistant, the
   earlier one wins (floor tie-break). Defined only on
   corpora of `≥ 1_000_000` lines.
-- **Convergence ratio**: `count_at_1m / SS`. By monotonicity,
-  this lives in `(0.0, 1.0]`.
+- **Convergence ratio**: `count_at_1m / SS`. By monotonicity
+  (`count_at_1m ≤ SS`) this is `≤ 1.0`; it is `0.0` when the
+  first template is minted only after the 1 M-line mark
+  (`count_at_1m == 0`, `SS > 0`), so the range is `[0.0, 1.0]`.
 - **Pass condition** (gate) — **per service** (amended for
   #444, maintainer-approved 2026-07-10): C2 is defined over
   "a corpus from a single **stable service**", so on a

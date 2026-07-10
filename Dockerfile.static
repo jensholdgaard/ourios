@@ -10,8 +10,8 @@
 # (plus the nonroot passwd entry and tzdata), which is why it is used
 # here instead of `scratch`.
 
-# Builder: same base + digest as `Dockerfile` (Renovate bumps the
-# tag+digest on each FROM line). musl-tools provides the native musl-gcc each
+# Builder: same base + digest as `Dockerfile` (this rust ref carries a tag,
+# so Renovate bumps tag + digest). musl-tools provides the native musl-gcc each
 # architecture leg needs — the CI legs run on native runners, so this is
 # a native musl build, not a cross-compile.
 FROM rust:1.97-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
@@ -58,8 +58,9 @@ USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/ourios-server"]
 
 # Runtime: distroless `static` — ca-certificates + tzdata + passwd, no
-# libc (the binary is static). Pinned by digest for reproducibility;
-# Renovate bumps the tag+digest on the FROM line. Last stage = the default target,
+# libc (the binary is static). Pinned by digest for reproducibility; this
+# distroless ref is digest-only (no tag), so Renovate bumps the digest.
+# Last stage = the default target,
 # so a plain `docker build -f Dockerfile.static` yields this variant.
 FROM gcr.io/distroless/static-debian12@sha256:22fd79fd75eab2372585b44517f8a094349938919dc613aafc37e4bdc9967c82 AS runtime-static
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server

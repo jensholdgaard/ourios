@@ -5,8 +5,9 @@
 # CI build cross-builds linux/amd64 + linux/arm64 from one Dockerfile.
 
 # Builder: at or above the workspace MSRV (Cargo.toml `rust-version = 1.88`),
-# pinned by digest for reproducibility. Renovate's docker manager reads the
-# tag+digest on the FROM line and bumps both — no directive comment needed.
+# pinned by digest for reproducibility. This rust ref carries a tag, so
+# Renovate's docker manager bumps both the tag and the digest — no directive
+# comment needed.
 FROM rust:1.97-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
 WORKDIR /build
 COPY . .
@@ -27,8 +28,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Runtime: distroless `cc` carries glibc (the builder is glibc, not musl)
 # and is published multi-arch, so it works under the QEMU cross-build.
-# Pinned by digest for reproducibility; Renovate bumps the tag+digest on
-# the FROM line.
+# Pinned by digest for reproducibility; this distroless ref is digest-only
+# (no tag), so Renovate bumps the digest.
 FROM gcr.io/distroless/cc-debian12@sha256:a90cf0f046efb32466b38b0972fef3a95e7c580e392e79ff1b7ac08c15fed0bc
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for

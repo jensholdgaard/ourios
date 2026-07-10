@@ -1184,8 +1184,9 @@ service has 2 templates or 14,608 — a 1 h window prunes 48 of 49 row
 groups either way (reconfirming the RFC 0023 graceful-degradation
 result on a fresh corpus). Fragmentation does **not** cost query
 *latency* or pruning. What it costs is template-exact query
-*precision*: the `template_id == 1` probe recovers 1.78 M / 2.76 M
-rows on cart (one template is most of the corpus) but only 11,523 /
+*precision*: probing cart's dominant template (id 1 in this run — a
+run-specific identifier, not a canonical one) recovers 1.78 M / 2.76 M
+rows (one template is most of the corpus) but only 11,523 /
 136,790 on kafka, because kafka's dominant event is scattered across
 ~11,651 ids — a single `template_id` probe recovers only that one id's
 slice (11,523 rows), not the full dominant event. So the

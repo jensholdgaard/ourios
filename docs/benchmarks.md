@@ -1150,10 +1150,11 @@ length-aware thresholding vs. accept-and-scope-C2-per-service — an
 RFC-level pillar #2 decision); the safety story held throughout
 (bounded memory per RFC 0023, per-service C1 perfect).
 
-The per-service decomposition is now a **first-class bench diagnostic**
-(`ourios-bench --gates c2` prints it whenever a corpus resolves to more
-than one bucket — distinct `service.name` values plus any
-`<unknown>`/`<other>`); template creation is a globally-monotonic
+The per-service decomposition is now the **first-class bench gate**
+(`ourios-bench --gates c2` prints it whenever any service bucket exists
+— distinct `service.name` values plus any `<unknown>`/`<other>`, so a
+single-service or plain-text corpus shows its one gated row too);
+template creation is a globally-monotonic
 event attributed to the minting service, so per-service creations
 partition the whole-corpus count exactly (2 + 17 + 1 + 3 + 14,608 =
 14,631) in `O(services)` memory — no per-service id set. As of #444

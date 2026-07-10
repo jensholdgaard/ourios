@@ -404,9 +404,10 @@ mod tests {
     }
 
     /// A ≥ 1 M-line corpus with a bounded alphabet plateaus
-    /// immediately, so `count_1m == SS` → ratio 1.0 → pass.
-    /// Exercises the full ≥ 1 M gate math at scale without the
-    /// miner.
+    /// immediately, so `count_1m == SS` → whole-corpus diagnostic
+    /// ratio 1.0. Exercises the ≥ 1 M ratio math at scale without
+    /// the miner; the per-service *gate* abstains here (no
+    /// `service.name`), as the body notes.
     #[test]
     fn stable_curve_ratio_is_one() {
         // `run_stable` drives `observe` (no `service.name`), so it

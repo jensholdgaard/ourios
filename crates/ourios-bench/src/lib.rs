@@ -260,6 +260,7 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
         a1: a1_result,
         c1: c1_result,
         c2: c2_result,
+        miner_stats: Some(harness_result.miner_stats),
     })
 }
 
@@ -511,6 +512,36 @@ pub struct ResultsFile {
     /// being `null` inside the block (§3.4.3), not as the
     /// whole `c2` field being absent.
     pub c2: Option<C2Result>,
+    /// The miner's §3.1 diagnostic counters, harvested from its read-only
+    /// accessors at end of the pass (#446). A run always records `Some(..)`;
+    /// `None` marks pre-#446 result JSON where the field was never written, so
+    /// "not recorded" stays distinct from a genuine measured all-zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miner_stats: Option<MinerStats>,
+}
+
+/// The miner's §3.1 diagnostic counters (CLAUDE.md §3.1), snapshotted into
+/// the results so a corpus analysis (e.g. the v8 kafka `NO_TEMPLATE` datum,
+/// §9.12) reads them directly instead of reconstructing them by hand.
+/// Read-only, additive; not a gate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct MinerStats {
+    /// Distinct templates at end of the pass.
+    pub template_count: u64,
+    /// Structural-widening events that count as a merge (§3.1):
+    /// `TemplateWidened` today, `TemplateTypeExpanded` once it has an
+    /// emitter. Rejections are audited but excluded.
+    pub merges_total: u64,
+    /// Lines that produced no template (`template_id == NO_TEMPLATE`) —
+    /// the miner folds both no-template sources into one gauge: the
+    /// §6.3/§6.4 body-retention paths and the §6.6 tokenizer failures.
+    pub parse_failures_total: u64,
+    /// Low-confidence lines that retained their original body (§3.1).
+    pub body_retentions_total: u64,
+    /// `params`-slot overflow events against the configured per-parameter
+    /// byte limit (§3.2; default 256 B, ceiling 1024), counted per
+    /// oversized slot.
+    pub params_overflow_total: u64,
 }
 
 /// §3.6 `corpus` block.
@@ -781,6 +812,14 @@ mod tests {
             a1: None,
             c1: None,
             c2: None,
+            // Sentinel non-defaults so the round-trip proves the field.
+            miner_stats: Some(MinerStats {
+                template_count: 40,
+                merges_total: 1,
+                parse_failures_total: 2,
+                body_retentions_total: 3,
+                params_overflow_total: 4,
+            }),
         };
 
         let json = serde_json::to_string(&original).expect("serialise");
@@ -791,6 +830,21 @@ mod tests {
         assert!(parsed.a1.is_none(), "skipped-gate nullability holds");
         assert!(parsed.c1.is_none());
         assert!(parsed.c2.is_none());
+        assert_eq!(parsed.miner_stats, original.miner_stats);
+
+        // Pre-#446 JSON (no `miner_stats` key) parses to `None`, keeping
+        // "not recorded" distinct from a measured all-zero.
+        let legacy = json.replacen(",\"miner_stats\":", ",\"_gone\":", 1);
+        let legacy_parsed: ResultsFile = serde_json::from_str(&legacy).expect("parse legacy");
+        assert!(legacy_parsed.miner_stats.is_none());
+
+        // Re-serializing that `None` keeps the key absent (not `null`), so a
+        // read/rewrite of a pre-#446 file preserves "not recorded".
+        let rewritten = serde_json::to_string(&legacy_parsed).expect("reserialise");
+        assert!(
+            !rewritten.contains("miner_stats"),
+            "None must serialise as absent"
+        );
     }
 
     /// `civil_from_days` is the inlined Howard-Hinnant

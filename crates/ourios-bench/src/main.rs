@@ -354,6 +354,20 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
             }
         }
     }
+    // The miner's §3.1 diagnostic counters (#446) — not a gate, but the
+    // context a corpus analysis (NO_TEMPLATE fraction, merge rate) reads
+    // directly instead of reconstructing by hand.
+    if let Some(m) = &results.miner_stats {
+        println!(
+            "  miner §3.1: {} templates · {} merges · {} no-template · \
+             {} body-retentions · {} params-overflow",
+            m.template_count,
+            m.merges_total,
+            m.parse_failures_total,
+            m.body_retentions_total,
+            m.params_overflow_total,
+        );
+    }
 }
 
 /// One-line per-service C2 status for the CLI breakdown. The gate is the

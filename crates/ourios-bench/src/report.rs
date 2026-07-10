@@ -564,6 +564,13 @@ mod tests {
                 mismatches: Vec::new(),
             }),
             c2: None,
+            miner_stats: Some(crate::MinerStats {
+                template_count: 42,
+                merges_total: 3,
+                parse_failures_total: 5,
+                body_retentions_total: 7,
+                params_overflow_total: 2,
+            }),
         }
     }
 

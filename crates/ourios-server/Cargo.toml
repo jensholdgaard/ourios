@@ -67,8 +67,10 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 serde_yaml = { version = "=0.9.34", default-features = false }
 # `LogsServiceServer` to host the receiver's `LogsService` impl over gRPC.
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs"] }
-# gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16).
-tonic = { version = "0.14", default-features = false, features = ["transport", "router", "tls-connect-info"] }
+# gRPC transport (server) for the OTLP/gRPC listener (RFC0003.16). `gzip`
+# so the receiver accepts the OTel Collector's default-gzip OTLP exporter
+# (tests/it/collector_interop.rs).
+tonic = { version = "0.14", default-features = false, features = ["transport", "router", "tls-connect-info", "gzip"] }
 # HTTP transport (serve) for the OTLP/HTTP listener (RFC0003.16); reuses
 # the receiver crate's `router`.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
@@ -95,7 +97,7 @@ proptest = "=1.11.0"
 # prost to encode the request, the WAL to replay + assert durability.
 tempfile = "=3.27.0"
 prost = { version = "=0.14.4", default-features = false, features = ["std"] }
-tonic = { version = "=0.14.6", default-features = false, features = ["channel"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["channel", "gzip"] }
 tokio = { version = "=1.52.3", default-features = false, features = ["io-util", "time", "process"] }
 # Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
 # RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).

@@ -421,11 +421,17 @@ async fn rfc0030_8_served_end_to_end() {
         .expect("TLS query");
     assert_eq!(query.status(), reqwest::StatusCode::OK, "TLS query serves");
 
-    // No plaintext hop: every listener refuses plaintext.
+    // No plaintext hop: every listener refuses plaintext. Each probe carries
+    // the valid bearer, so `is_err` isolates the *transport* rejection — a
+    // plaintext request accepted at the transport layer would then pass auth
+    // and succeed, surfacing the regression (the .3 "auth held valid so
+    // transport is the only variable" pattern).
     let plain = reqwest::Client::new();
     assert!(
         plain
             .post(format!("http://{http_addr}/v1/logs"))
+            .header("content-type", "application/x-protobuf")
+            .header("authorization", format!("Bearer {BEARER}"))
             .body(batch(TENANT, "plaintext").encode_to_vec())
             .send()
             .await
@@ -436,6 +442,7 @@ async fn rfc0030_8_served_end_to_end() {
         plain
             .post(format!("http://{querier_addr}/v1/query"))
             .header("x-ourios-tenant", TENANT)
+            .header("authorization", format!("Bearer {BEARER}"))
             .body("template_id == 1")
             .send()
             .await
@@ -447,8 +454,10 @@ async fn rfc0030_8_served_end_to_end() {
     // fails. Fold connect + export so either failure counts.
     let plaintext_grpc = async {
         let mut c = LogsServiceClient::connect(format!("http://{grpc_addr}")).await?;
-        c.export(tonic::Request::new(batch(TENANT, "plaintext")))
-            .await?;
+        let mut req = tonic::Request::new(batch(TENANT, "plaintext"));
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {BEARER}").parse()?);
+        c.export(req).await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
     assert!(

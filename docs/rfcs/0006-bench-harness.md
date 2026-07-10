@@ -457,11 +457,34 @@ Pinned definitions:
   corpora of `≥ 1_000_000` lines.
 - **Convergence ratio**: `count_at_1m / SS`. By monotonicity,
   this lives in `(0.0, 1.0]`.
-- **Pass condition** (gate): `convergence_ratio ≥ 0.5` on a
-  corpus of `≥ 1_000_000` lines. This is the "within 2× of
-  SS by 1 M lines" rule. Corpora smaller than 1 M lines are
-  recorded as `c2.pass = null` (insufficient data); the §9
-  row notes the corpus size and the gate is not asserted.
+- **Pass condition** (gate) — **per service** (amended for
+  #444, maintainer-approved 2026-07-10): C2 is defined over
+  "a corpus from a single **stable service**", so on a
+  multi-service corpus the gate is evaluated **per
+  `service.name`**, not on the whole corpus. Each service's
+  ratio is `count_at_1m / SS` over *that service's* lines
+  (template creation is a globally-monotonic event attributed
+  to the minting service, so per-service creations partition
+  the whole-corpus template count exactly). A corpus **passes**
+  iff every service with `≥ 1_000_000` lines has ratio `≥ 0.5`;
+  it **fails** if any such service is below `0.5`; it **abstains**
+  (`c2.pass = null`) when no service reaches 1 M lines. A
+  single-service corpus — including the plain-text `<unknown>`
+  bucket (no `service.name`) — collapses to the whole-corpus
+  verdict, so every historical text-corpus row is unchanged;
+  only multi-service OTLP corpora differ. **Rationale**:
+  running one whole-corpus ratio over a multi-service capture
+  (e.g. the OTel-Demo) is a category error — it conflates a
+  noisy infra service (a broker emitting high-cardinality
+  offset/path tokens) with clean application services, so the
+  whole-corpus number fails even when every application service
+  converges perfectly (v8 §9.12). The whole-corpus
+  `convergence_ratio` is retained as a **diagnostic** (the
+  `by_service` breakdown is the gate basis). Note: token-level
+  polishing of high-cardinality infra logs is an OTel Collector
+  concern (a `transform`/`redaction` processor upstream), not
+  the miner's — consistent with "format parsing is the
+  Collector's job".
 - **Plateau-detection diagnostic** (not a gate): the curve
   is "plateaued" at the sample where the trailing `K = 64`
   samples all lie within `± 5%` of the SS. The diagnostic is

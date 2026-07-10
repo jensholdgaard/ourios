@@ -315,29 +315,29 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
         );
     }
     if let Some(c2) = &results.c2 {
-        // `pass = None` is the §3.4.3 abstention (corpus
-        // < 1 M lines) — surface it as ABSTAIN, not a silent
-        // omission. (C2 isn't computed yet; this line is ready
-        // for when it lands.)
+        // The gate is per service (RFC 0006 §3.4.3, #444). `None` is the
+        // abstention — no service reaches 1 M lines.
         let verdict = match c2.pass {
             Some(true) => "PASS",
             Some(false) => "FAIL",
-            None => "ABSTAIN (corpus < 1 M lines)",
+            None => "ABSTAIN (no service ≥ 1 M lines)",
         };
         let ratio = c2
             .convergence_ratio
             .map_or_else(|| "n/a".to_string(), |r| format!("{r:.3}"));
+        // The verdict is per-service; the whole-corpus ratio is a
+        // diagnostic, so it is labelled as such to avoid reading as the
+        // gate (on a multi-service corpus the two can disagree).
         println!(
-            "  C2 convergence: ratio {ratio} (end template count {}, sample cadence {}) — {verdict}",
+            "  C2 convergence (per-service gate): {verdict} \
+             — whole-corpus ratio {ratio} (diagnostic; end templates {}, cadence {})",
             c2.template_count_at_end, c2.sample_cadence,
         );
-        // Per-service decomposition (diagnostic) — printed whenever the
+        // Per-service breakdown — the gate basis. Printed whenever the
         // corpus resolves to more than one bucket (distinct `service.name`
-        // values plus any `<unknown>`/`<other>`), since a whole-corpus
-        // ratio then conflates a noisy broker with clean application
-        // services (v8 §9.12 / #444).
+        // values plus any `<unknown>`/`<other>`).
         if c2.by_service.len() > 1 {
-            println!("  C2 by service (diagnostic; creations sum to the end count):");
+            println!("  C2 by service (the gate; creations sum to the end count):");
             for svc in &c2.by_service {
                 let per = match (svc.convergence_ratio, svc.pass) {
                     (Some(r), Some(true)) => format!("ratio {r:.3} PASS"),

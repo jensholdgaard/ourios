@@ -218,7 +218,12 @@ impl C2Accumulator {
         let template_count_at_end = self.curve.last().map_or(0, |s| s.template_count);
         let corpus_at_least_1m = self.total_lines >= ONE_MILLION;
 
-        let (template_count_at_1m_lines, convergence_ratio, pass) = if corpus_at_least_1m {
+        // Whole-corpus convergence — a **diagnostic** now, not the gate
+        // (the gate is per-service below, RFC 0006 §3.4.3 as amended
+        // for #444): on a multi-service corpus a whole-corpus ratio
+        // conflates a noisy broker with clean application services
+        // (v8 §9.12).
+        let (template_count_at_1m_lines, convergence_ratio) = if corpus_at_least_1m {
             // Sample whose 1-based line number is closest to
             // 1 M; on a tie the earlier (smaller `lines`)
             // sample wins — the `(distance, lines)` key makes
@@ -231,10 +236,9 @@ impl C2Accumulator {
             let ratio = count_1m.and_then(|c| {
                 (template_count_at_end > 0).then(|| (c as f64) / (template_count_at_end as f64))
             });
-            let pass = ratio.map(|r| r >= 0.5);
-            (count_1m, ratio, pass)
+            (count_1m, ratio)
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         // Per-service decomposition, largest service first. Each
@@ -268,6 +272,8 @@ impl C2Accumulator {
                 .then(a.service_name.cmp(&b.service_name))
         });
 
+        let pass = gate_pass(&by_service);
+
         C2Result {
             sample_cadence: self.cadence,
             total_lines: self.total_lines,
@@ -280,6 +286,22 @@ impl C2Accumulator {
             by_service,
             services_truncated: self.services_truncated,
         }
+    }
+}
+
+/// The per-service C2 **gate** (RFC 0006 §3.4.3 as amended for #444):
+/// a corpus passes iff every service with ≥ 1 M lines passes its own
+/// ratio ≥ 0.5 (each such service has `pass = Some(_)`); a corpus where
+/// no service reaches 1 M lines abstains (`None`). A single-service
+/// corpus — including the plain-text `<unknown>` bucket — collapses to
+/// the whole-corpus verdict, so historical text-corpus rows are
+/// unchanged; only multi-service OTLP corpora differ.
+fn gate_pass(by_service: &[PerServiceC2]) -> Option<bool> {
+    let gated: Vec<bool> = by_service.iter().filter_map(|s| s.pass).collect();
+    if gated.is_empty() {
+        None
+    } else {
+        Some(gated.iter().all(|&p| p))
     }
 }
 
@@ -346,17 +368,22 @@ mod tests {
     /// Exercises the full ≥ 1 M gate math at scale without the
     /// miner.
     #[test]
-    fn stable_corpus_passes_the_gate() {
+    fn stable_curve_ratio_is_one() {
+        // `run_stable` drives `observe` (no `service.name`), so it
+        // exercises the whole-corpus ratio *diagnostic*; the per-service
+        // gate needs record input and is covered by `gate_pass_*` +
+        // the partition test.
         let r = run_stable(1_000_000, 8);
         assert!(r.corpus_at_least_1m);
         assert_eq!(r.template_count_at_end, 8);
         assert_eq!(r.template_count_at_1m_lines, Some(8));
         assert_eq!(r.convergence_ratio, Some(1.0));
-        assert_eq!(r.pass, Some(true));
+        // No service data → the per-service gate abstains.
+        assert_eq!(r.pass, None);
     }
 
-    /// A corpus below 1 M lines abstains: no 1 M count, no
-    /// ratio, `pass = None`.
+    /// A corpus below 1 M lines has no 1 M count, no ratio; the gate
+    /// abstains.
     #[test]
     fn short_corpus_abstains() {
         let r = run_stable(10_000, 5);
@@ -367,6 +394,33 @@ mod tests {
         // The curve is still produced (a diagnostic), and SS is
         // the bounded alphabet size.
         assert_eq!(r.template_count_at_end, 5);
+    }
+
+    /// The per-service gate fold: pass iff every ≥ 1 M service passes;
+    /// abstain when none are gated; a `<1 M` service (pass = None) does
+    /// not veto a passing sibling.
+    #[test]
+    fn gate_pass_folds_over_gated_services() {
+        let svc = |name: &str, pass: Option<bool>| PerServiceC2 {
+            service_name: name.to_string(),
+            lines: 0,
+            templates_created: 0,
+            templates_created_at_1m_lines: None,
+            convergence_ratio: None,
+            pass,
+        };
+        // No gated service → abstain.
+        assert_eq!(gate_pass(&[svc("a", None), svc("b", None)]), None);
+        // All gated services pass → pass.
+        assert_eq!(
+            gate_pass(&[svc("a", Some(true)), svc("b", None), svc("c", Some(true))]),
+            Some(true)
+        );
+        // One gated service fails → fail (even with passing siblings).
+        assert_eq!(
+            gate_pass(&[svc("a", Some(true)), svc("b", Some(false))]),
+            Some(false)
+        );
     }
 
     /// A corpus whose template count is still climbing steeply
@@ -396,13 +450,11 @@ mod tests {
         let ratio = r.convergence_ratio.expect("ratio on ≥1M corpus");
         assert!(
             ratio < 0.5,
-            "templates still climbing at 1 M → ratio {ratio} must be < 0.5",
+            "templates still climbing at 1 M → whole-corpus ratio {ratio} must be < 0.5",
         );
-        assert_eq!(
-            r.pass,
-            Some(false),
-            "a non-converged corpus must fail the C2 gate",
-        );
+        // `observe` has no service data, so the per-service gate abstains
+        // here — the fold's fail path is covered by `gate_pass_*`.
+        assert_eq!(r.pass, None);
     }
 
     /// A `MinedRecord` carrying just the two fields the per-service

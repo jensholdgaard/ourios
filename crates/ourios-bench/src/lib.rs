@@ -583,27 +583,37 @@ pub struct C1Mismatch {
     pub actual: String,
 }
 
-/// §3.6 `c2` block (populated only when C2 ran). `pass` is
-/// `None` when the corpus is `< 1 M lines` (§3.4.3 abstention).
+/// §3.6 `c2` block (populated only when C2 ran).
+///
+/// The gate is **per service** (RFC 0006 §3.4.3 as amended for #444):
+/// `pass` is the fold over [`Self::by_service`] — `Some(true)` iff every
+/// service with ≥ 1 M lines passes its own ratio ≥ 0.5, `Some(false)` if
+/// any ≥ 1 M service fails, `None` when no service reaches 1 M lines.
+/// The whole-corpus [`Self::convergence_ratio`] /
+/// [`Self::template_count_at_1m_lines`] are retained as **diagnostics**
+/// (on a multi-service corpus they conflate a noisy broker with clean
+/// application services — v8 §9.12).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct C2Result {
     pub sample_cadence: u64,
     pub total_lines: u64,
+    /// Whole-corpus diagnostic (not the gate — see the type doc).
     pub template_count_at_1m_lines: Option<u64>,
     pub template_count_at_end: u64,
+    /// Whole-corpus diagnostic (not the gate — see the type doc).
     pub convergence_ratio: Option<f64>,
     pub convergence_curve: Vec<ConvergenceSample>,
+    /// The per-service gate verdict (see the type doc).
     pub pass: Option<bool>,
     pub corpus_at_least_1m: bool,
-    /// Per-`service.name` convergence, largest service first.
-    /// **Diagnostic only** — the gate above is defined on the whole
-    /// corpus; this decomposition attributes it. On a multi-service
-    /// corpus (every OTel-Demo capture) a whole-corpus C2 conflates a
-    /// noisy broker with clean application services, so this surfaces
-    /// where non-convergence actually lives (v8 §9.12 / #444). A
-    /// plain-text corpus (no `service.name`) collapses to a single
-    /// `<unknown>` bucket rather than being empty; empty only when C2
-    /// did not run.
+    /// Per-`service.name` convergence, largest service first — the
+    /// **gate basis** (RFC 0006 §3.4.3 as amended for #444). On a
+    /// multi-service corpus (every OTel-Demo capture) a whole-corpus C2
+    /// conflates a noisy broker with clean application services, so the
+    /// gate is evaluated here per service; this also surfaces where
+    /// non-convergence actually lives (v8 §9.12). A plain-text corpus
+    /// (no `service.name`) collapses to a single `<unknown>` bucket
+    /// rather than being empty; empty only when C2 did not run.
     #[serde(default)]
     pub by_service: Vec<PerServiceC2>,
     /// The distinct-`service.name` cap (`MAX_SERVICES`) was hit and

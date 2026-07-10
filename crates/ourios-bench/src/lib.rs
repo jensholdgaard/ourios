@@ -516,7 +516,7 @@ pub struct ResultsFile {
     /// accessors at end of the pass (#446). A run always records `Some(..)`;
     /// `None` marks pre-#446 result JSON where the field was never written, so
     /// "not recorded" stays distinct from a genuine measured all-zero.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miner_stats: Option<MinerStats>,
 }
 
@@ -835,6 +835,14 @@ mod tests {
         let legacy = json.replacen(",\"miner_stats\":", ",\"_gone\":", 1);
         let legacy_parsed: ResultsFile = serde_json::from_str(&legacy).expect("parse legacy");
         assert!(legacy_parsed.miner_stats.is_none());
+
+        // Re-serializing that `None` keeps the key absent (not `null`), so a
+        // read/rewrite of a pre-#446 file preserves "not recorded".
+        let rewritten = serde_json::to_string(&legacy_parsed).expect("reserialise");
+        assert!(
+            !rewritten.contains("miner_stats"),
+            "None must serialise as absent"
+        );
     }
 
     /// `civil_from_days` is the inlined Howard-Hinnant

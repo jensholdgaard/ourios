@@ -587,8 +587,11 @@ pub struct C1Mismatch {
 ///
 /// The gate is **per service** (RFC 0006 §3.4.3 as amended for #444):
 /// `pass` is the fold over [`Self::by_service`] — `Some(true)` iff every
-/// service with ≥ 1 M lines passes its own ratio ≥ 0.5, `Some(false)` if
-/// any ≥ 1 M service fails, `None` when no service reaches 1 M lines.
+/// service with ≥ 1 M lines passes its own ratio ≥ 0.5 (a service that
+/// mints zero templates over its ≥ 1 M lines passes *trivially* — SS = 0,
+/// an undefined 0/0 ratio, a flat count being the strongest convergence),
+/// `Some(false)` if any ≥ 1 M service with a defined ratio fails, `None`
+/// when no service reaches 1 M lines.
 /// The whole-corpus [`Self::convergence_ratio`] /
 /// [`Self::template_count_at_1m_lines`] are retained as **diagnostics**
 /// (on a multi-service corpus they conflate a noisy broker with clean

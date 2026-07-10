@@ -293,9 +293,13 @@ impl C2Accumulator {
 /// a corpus passes iff every service with ≥ 1 M lines passes its own
 /// ratio ≥ 0.5 (each such service has `pass = Some(_)`); a corpus where
 /// no service reaches 1 M lines abstains (`None`). A single-service
-/// corpus — including the plain-text `<unknown>` bucket — collapses to
-/// the whole-corpus verdict, so historical text-corpus rows are
-/// unchanged; only multi-service OTLP corpora differ.
+/// corpus — including the plain-text `<unknown>` bucket — is gated on
+/// that one service's ratio, measured at its **exact** millionth line
+/// (`created_at_1m`). That reproduces the pre-#444 whole-corpus verdict
+/// for every historical converged corpus (their ratio sits far from the
+/// 0.5 boundary); it is not bit-identical to the whole-corpus
+/// `convergence_ratio`, which is sampled at the nearest curve point and
+/// is only a diagnostic. Only multi-service OTLP corpora change verdict.
 fn gate_pass(by_service: &[PerServiceC2]) -> Option<bool> {
     let gated: Vec<bool> = by_service.iter().filter_map(|s| s.pass).collect();
     if gated.is_empty() {

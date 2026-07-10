@@ -263,7 +263,9 @@ every run.
   defined *per stable service*, the gate is evaluated **per
   `service.name`** on a multi-service corpus, not on the whole corpus.
   A corpus passes iff every service with ≥ 1 M lines converges; a
-  single-service (or plain-text `<unknown>`) corpus is unchanged. The
+  single-service (or plain-text `<unknown>`) corpus is gated on that
+  one service's exact-millionth-line ratio, reproducing the
+  pre-amendment verdict for historical converged corpora. The
   whole-corpus ratio is retained as a diagnostic. See RFC 0006 §3.4.3.
 - **Target**: template count grows **sub-linearly** and plateaus
   within **2×** of its steady-state value by 1 M lines. Steady-state
@@ -1129,10 +1131,13 @@ localises the whole-corpus fragmentation completely:
 | **kafka** | **136,790** | **14,608** | abstain (< 1 M) |
 
 The gate folds over the gated services (those ≥ 1 M lines): cart is
-the sole such service and it passes, so the corpus passes. Every
-application service converges essentially perfectly — cart
-passes the formal gate at 2.76 M lines with **two** templates. The
-kafka broker mints 14,608 templates on 2.8 % of the lines. Mechanism
+the sole such service and it passes, so the corpus passes. cart clears
+the formal gate at 2.76 M lines with **two** templates; the smaller
+services abstain below the 1 M-line floor, so they are not graded —
+though their *observed* counts (1–17 templates over 0.5–1.0 M lines)
+sit at the same near-flat convergence. The kafka broker, also
+abstaining, is the outlier: it mints 14,608 templates on 2.8 % of the
+lines. Mechanism
 (measured): kafka's cleaner logs emit **3-token lines whose third
 token is a unique offset-bearing path**
 (`Deleted log /tmp/kafka-logs/…/00000000000000000429.log.deleted.`,

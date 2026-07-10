@@ -470,9 +470,14 @@ Pinned definitions:
   it **fails** if any such service is below `0.5`; it **abstains**
   (`c2.pass = null`) when no service reaches 1 M lines. A
   single-service corpus — including the plain-text `<unknown>`
-  bucket (no `service.name`) — collapses to the whole-corpus
-  verdict, so every historical text-corpus row is unchanged;
-  only multi-service OTLP corpora differ. **Rationale**:
+  bucket (no `service.name`) — is gated on that one service's
+  ratio, measured at its **exact** millionth line. That
+  reproduces the pre-amendment whole-corpus verdict for every
+  historical converged corpus (whose ratio sits far from the
+  0.5 boundary); it is not bit-identical to the whole-corpus
+  `convergence_ratio`, which is sampled at the nearest curve
+  point (cadence granularity) and is now only a diagnostic.
+  Only multi-service OTLP corpora change verdict. **Rationale**:
   running one whole-corpus ratio over a multi-service capture
   (e.g. the OTel-Demo) is a category error — it conflates a
   noisy infra service (a broker emitting high-cardinality

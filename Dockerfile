@@ -28,8 +28,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Runtime: distroless `cc` carries glibc (the builder is glibc, not musl)
 # and is published multi-arch, so it works under the QEMU cross-build.
-# Pinned by digest for reproducibility; this distroless ref is digest-only
-# (no tag), so Renovate bumps the digest.
+# Pinned by digest for reproducibility; this distroless ref has no explicit
+# tag (implicit :latest), so Renovate updates only the digest.
 FROM gcr.io/distroless/cc-debian12@sha256:a90cf0f046efb32466b38b0972fef3a95e7c580e392e79ff1b7ac08c15fed0bc
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for

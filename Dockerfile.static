@@ -59,8 +59,8 @@ ENTRYPOINT ["/usr/local/bin/ourios-server"]
 
 # Runtime: distroless `static` — ca-certificates + tzdata + passwd, no
 # libc (the binary is static). Pinned by digest for reproducibility; this
-# distroless ref is digest-only (no tag), so Renovate bumps the digest.
-# Last stage = the default target,
+# distroless ref has no explicit tag (implicit :latest), so Renovate updates
+# only the digest. Last stage = the default target,
 # so a plain `docker build -f Dockerfile.static` yields this variant.
 FROM gcr.io/distroless/static-debian12@sha256:22fd79fd75eab2372585b44517f8a094349938919dc613aafc37e4bdc9967c82 AS runtime-static
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server

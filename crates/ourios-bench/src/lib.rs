@@ -528,7 +528,9 @@ pub struct ResultsFile {
 pub struct MinerStats {
     /// Distinct templates at end of the pass.
     pub template_count: u64,
-    /// Silent-merge audit events (each carries an audit event, §3.1).
+    /// Structural-widening events that count as a merge (§3.1):
+    /// `TemplateWidened` today, `TemplateTypeExpanded` once it has an
+    /// emitter. Rejections are audited but excluded.
     pub merges_total: u64,
     /// Lines that produced no template (`template_id == NO_TEMPLATE`) —
     /// the miner folds both no-template sources into one gauge: the

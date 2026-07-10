@@ -530,12 +530,15 @@ pub struct MinerStats {
     pub template_count: u64,
     /// Silent-merge audit events (each carries an audit event, §3.1).
     pub merges_total: u64,
-    /// Lines that took the §6.3 parse-failure path (body retained,
-    /// `template_id == NO_TEMPLATE`).
+    /// Lines that produced no template (`template_id == NO_TEMPLATE`) —
+    /// the miner folds both no-template sources into one gauge: the
+    /// §6.3/§6.4 body-retention paths and the §6.6 tokenizer failures.
     pub parse_failures_total: u64,
     /// Low-confidence lines that retained their original body (§3.1).
     pub body_retentions_total: u64,
-    /// Rows where a `params` slot hit the 256 B limit (§3.2 overflow).
+    /// `params`-slot overflow events against the configured per-parameter
+    /// byte limit (§3.2; default 256 B, ceiling 1024), counted per
+    /// oversized slot.
     pub params_overflow_total: u64,
 }
 

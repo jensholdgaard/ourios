@@ -1093,7 +1093,7 @@ pruning compounds with scale (B1), result-bound latency holds (B2),
 and the mining-fragmentation failure mode is now bounded, observable,
 and priced.
 
-### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2
+### 9.12 Results — 2026-07-09 (indicative, local M-series) — otel-demo v8 capture: C1 / C2 (C2 re-scored under the per-service gate on 2026-07-10, #444 / RFC 0006 §3.4.3)
 
 **Corpus.** `corpus/otel-demo-v8` (published GitHub release): a
 **48-hour** OTel-Demo 2.2.0 capture at 150 locust users with the
@@ -1183,7 +1183,8 @@ result on a fresh corpus). Fragmentation does **not** cost query
 *precision*: the `template_id == 1` probe recovers 1.78 M / 2.76 M
 rows on cart (one template is most of the corpus) but only 11,523 /
 136,790 on kafka, because kafka's dominant event is scattered across
-~11,651 ids — no single template query recovers it. So the
+~11,651 ids — a single `template_id` probe recovers only that one id's
+slice (11,523 rows), not the full dominant event. So the
 fragmentation is a **query-capability / thesis-value** tradeoff, not a
 performance one; the pruning path degrades to the first-class-column
 floor unharmed. #444 **accepted** that tradeoff on hostile infra logs:

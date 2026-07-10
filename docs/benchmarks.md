@@ -1149,8 +1149,9 @@ token is a unique offset-bearing path**
 2/3 ≈ 0.67, below the strict 0.7 threshold (§3.1 no-silent-merges),
 so each line mints a template; the 4-token siblings of the same
 family (0.75) merge fine. The failure-flag confound turned out to be
-a red herring. **#444** resolved it (2026-07-10, maintainer-approved):
-of the three options — tokenizer masking, length-aware thresholding,
+a red herring. **#444** settled how to handle the fragmentation
+(2026-07-10, maintainer-approved): of the three options — tokenizer
+masking, length-aware thresholding,
 and accept-and-scope-C2-per-service — **option 3 shipped** (the
 per-service gate, RFC 0006 §3.4.3, PR #451); masking is parked as
 a future strategic RFC (no commitment; a Collector `transform` or

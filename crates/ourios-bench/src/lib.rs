@@ -260,7 +260,7 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
         a1: a1_result,
         c1: c1_result,
         c2: c2_result,
-        miner_stats: harness_result.miner_stats,
+        miner_stats: Some(harness_result.miner_stats),
     })
 }
 
@@ -513,11 +513,11 @@ pub struct ResultsFile {
     /// whole `c2` field being absent.
     pub c2: Option<C2Result>,
     /// The miner's §3.1 diagnostic counters, harvested from its read-only
-    /// accessors at end of the pass (#446). Always produced by a run (the
-    /// harness always drives the miner); `#[serde(default)]` (all-zero) so
-    /// pre-#446 result JSON still parses.
+    /// accessors at end of the pass (#446). A run always records `Some(..)`;
+    /// `None` marks pre-#446 result JSON where the field was never written, so
+    /// "not recorded" stays distinct from a genuine measured all-zero.
     #[serde(default)]
-    pub miner_stats: MinerStats,
+    pub miner_stats: Option<MinerStats>,
 }
 
 /// The miner's §3.1 diagnostic counters (CLAUDE.md §3.1), snapshotted into
@@ -808,13 +808,13 @@ mod tests {
             c1: None,
             c2: None,
             // Sentinel non-defaults so the round-trip proves the field.
-            miner_stats: MinerStats {
+            miner_stats: Some(MinerStats {
                 template_count: 40,
                 merges_total: 1,
                 parse_failures_total: 2,
                 body_retentions_total: 3,
                 params_overflow_total: 4,
-            },
+            }),
         };
 
         let json = serde_json::to_string(&original).expect("serialise");
@@ -825,6 +825,13 @@ mod tests {
         assert!(parsed.a1.is_none(), "skipped-gate nullability holds");
         assert!(parsed.c1.is_none());
         assert!(parsed.c2.is_none());
+        assert_eq!(parsed.miner_stats, original.miner_stats);
+
+        // Pre-#446 JSON (no `miner_stats` key) parses to `None`, keeping
+        // "not recorded" distinct from a measured all-zero.
+        let legacy = json.replacen(",\"miner_stats\":", ",\"_gone\":", 1);
+        let legacy_parsed: ResultsFile = serde_json::from_str(&legacy).expect("parse legacy");
+        assert!(legacy_parsed.miner_stats.is_none());
     }
 
     /// `civil_from_days` is the inlined Howard-Hinnant

@@ -53,6 +53,9 @@ use crate::corpus::{BENCH_TENANT, CorpusLoad, TIME_BASELINE_NS};
 /// loop, so they aren't surfaced until a gate needs them.
 pub(crate) struct HarnessResult {
     pub audit_events: Vec<AuditEvent>,
+    /// The miner's §3.1 diagnostic counters, snapshotted at end of the
+    /// pass (the accessors are otherwise discarded — #446).
+    pub miner_stats: crate::MinerStats,
 }
 
 /// Drive the miner over every line in `corpus`, snapshotting
@@ -231,8 +234,19 @@ where
         on_record(input, &record, template_snapshot)?;
     }
 
+    // Snapshot the miner's §3.1 counters before the cluster drops — the
+    // pass updates them line-by-line but nothing else reads them (#446).
+    // Single bench tenant, so `template_count(&tenant)` is the corpus total.
+    let miner_stats = crate::MinerStats {
+        template_count: u64::try_from(cluster.template_count(&tenant)).unwrap_or(u64::MAX),
+        merges_total: cluster.merges_total(),
+        parse_failures_total: cluster.parse_failures_total(),
+        body_retentions_total: cluster.body_retentions_total(),
+        params_overflow_total: cluster.params_overflow_total(),
+    };
     Ok(HarnessResult {
         audit_events: audit_sink.map(|s| s.drain()).unwrap_or_default(),
+        miner_stats,
     })
 }
 
@@ -523,5 +537,30 @@ mod tests {
             ),
             "expected Pipeline naming the missing (id, version), got {err:?}",
         );
+    }
+
+    /// The §3.1 miner counters are snapshotted into the harness result
+    /// (#446): two lines that differ only in a masked number token merge
+    /// into one clean template, so `template_count == 1` with no parse
+    /// failures and no merges (a match is not a merge).
+    #[test]
+    fn harness_snapshots_miner_stats() {
+        let (_tmp, load) = load_lines(&["user 42 logged in", "user 43 logged in"]);
+        let result = run_streaming(
+            load.lines.iter().map(Ok),
+            /* capture_audit */ false,
+            /* capture_snapshots */ false,
+            |_input, _record, _snap| Ok(()),
+        )
+        .expect("harness runs");
+        assert_eq!(
+            result.miner_stats.template_count, 1,
+            "the two lines share one `user <*> logged in` template",
+        );
+        assert_eq!(
+            result.miner_stats.parse_failures_total, 0,
+            "both mine cleanly"
+        );
+        assert_eq!(result.miner_stats.merges_total, 0, "a match is not a merge");
     }
 }

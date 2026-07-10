@@ -260,6 +260,7 @@ pub fn run(config: &BenchConfig) -> Result<ResultsFile, BenchError> {
         a1: a1_result,
         c1: c1_result,
         c2: c2_result,
+        miner_stats: harness_result.miner_stats,
     })
 }
 
@@ -511,6 +512,31 @@ pub struct ResultsFile {
     /// being `null` inside the block (§3.4.3), not as the
     /// whole `c2` field being absent.
     pub c2: Option<C2Result>,
+    /// The miner's §3.1 diagnostic counters, harvested from its read-only
+    /// accessors at end of the pass (#446). Always produced by a run (the
+    /// harness always drives the miner); `#[serde(default)]` (all-zero) so
+    /// pre-#446 result JSON still parses.
+    #[serde(default)]
+    pub miner_stats: MinerStats,
+}
+
+/// The miner's §3.1 diagnostic counters (CLAUDE.md §3.1), snapshotted into
+/// the results so a corpus analysis (e.g. the v8 kafka `NO_TEMPLATE` datum,
+/// §9.12) reads them directly instead of reconstructing them by hand.
+/// Read-only, additive; not a gate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct MinerStats {
+    /// Distinct templates at end of the pass.
+    pub template_count: u64,
+    /// Silent-merge audit events (each carries an audit event, §3.1).
+    pub merges_total: u64,
+    /// Lines that took the §6.3 parse-failure path (body retained,
+    /// `template_id == NO_TEMPLATE`).
+    pub parse_failures_total: u64,
+    /// Low-confidence lines that retained their original body (§3.1).
+    pub body_retentions_total: u64,
+    /// Rows where a `params` slot hit the 256 B limit (§3.2 overflow).
+    pub params_overflow_total: u64,
 }
 
 /// §3.6 `corpus` block.
@@ -781,6 +807,14 @@ mod tests {
             a1: None,
             c1: None,
             c2: None,
+            // Sentinel non-defaults so the round-trip proves the field.
+            miner_stats: MinerStats {
+                template_count: 40,
+                merges_total: 1,
+                parse_failures_total: 2,
+                body_retentions_total: 3,
+                params_overflow_total: 4,
+            },
         };
 
         let json = serde_json::to_string(&original).expect("serialise");

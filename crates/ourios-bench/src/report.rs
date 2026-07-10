@@ -564,6 +564,7 @@ mod tests {
                 mismatches: Vec::new(),
             }),
             c2: None,
+            miner_stats: crate::MinerStats::default(),
         }
     }
 

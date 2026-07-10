@@ -259,6 +259,14 @@ every run.
 - **Bar**: must-win.
 - **Metric**: template count as a function of lines ingested, on a
   corpus from a single stable service.
+- **Grain (amended for #444, 2026-07-10)**: because the metric is
+  defined *per stable service*, the gate is evaluated **per
+  `service.name`** on a multi-service corpus, not on the whole corpus.
+  A corpus passes iff every service with ≥ 1 M lines converges; a
+  single-service (or plain-text `<unknown>`) corpus is gated on that
+  one service's exact-millionth-line ratio, reproducing the
+  pre-amendment verdict for historical converged corpora. The
+  whole-corpus ratio is retained as a diagnostic. See RFC 0006 §3.4.3.
 - **Target**: template count grows **sub-linearly** and plateaus
   within **2×** of its steady-state value by 1 M lines. Steady-state
   value is corpus-specific but is on the order of 10²–10⁴ templates
@@ -1102,11 +1110,17 @@ bodies retained, and C1 = 1.000000 over the remaining 4,948,579 rows
 — the honesty contract holds at 4.9 M rows through failure-mode
 churn.
 
-**C2 — template-count convergence (bar: ratio ≥ 0.5 at 1 M lines):
-FAIL on the whole corpus — attributed.** Ratio **0.199**, end
-template count **14,631** (sample cadence 4,833). The per-service
-decomposition (splitting the corpus on `service.name` and re-running
-the gates per service) localises the failure completely:
+**C2 — template-count convergence (bar: ratio ≥ 0.5 at 1 M lines,
+evaluated per service since #444): PASS.** Under the per-service gate
+(RFC 0006 §3.4.3, amended 2026-07-10) the corpus passes: the only
+service that clears the 1 M-line evaluation floor is **cart**, which
+converges at ratio **1.000** with two templates. Every other service
+abstains for want of volume; the whole-corpus ratio (**0.199**, end
+template count **14,631**, sample cadence 4,833) is retained below as
+a diagnostic — it is a category error to grade a multi-service corpus
+as one Drain stream (§3.4.3 rationale). The per-service decomposition
+(splitting on `service.name` and re-running the gates per service)
+localises the whole-corpus fragmentation completely:
 
 | service | lines | end templates | C2 |
 |---|---|---|---|
@@ -1116,9 +1130,14 @@ the gates per service) localises the failure completely:
 | ad | 486,726 | 3 | abstain (< 1 M) |
 | **kafka** | **136,790** | **14,608** | abstain (< 1 M) |
 
-Every application service converges essentially perfectly — cart
-passes the formal gate at 2.76 M lines with **two** templates. The
-kafka broker mints 14,608 templates on 2.8 % of the lines. Mechanism
+The gate folds over the gated services (those ≥ 1 M lines): cart is
+the sole such service and it passes, so the corpus passes. cart clears
+the formal gate at 2.76 M lines with **two** templates; the smaller
+services abstain below the 1 M-line floor, so they are not graded —
+though their *observed* counts (1–17 templates over 0.5–1.0 M lines)
+sit at the same near-flat convergence. The kafka broker, also
+abstaining, is the outlier: it mints 14,608 templates on 2.8 % of the
+lines. Mechanism
 (measured): kafka's cleaner logs emit **3-token lines whose third
 token is a unique offset-bearing path**
 (`Deleted log /tmp/kafka-logs/…/00000000000000000429.log.deleted.`,
@@ -1131,16 +1150,17 @@ length-aware thresholding vs. accept-and-scope-C2-per-service — an
 RFC-level pillar #2 decision); the safety story held throughout
 (bounded memory per RFC 0023, per-service C1 perfect).
 
-The per-service decomposition is now a **first-class bench diagnostic**
-(`ourios-bench --gates c2` prints it whenever a corpus resolves to more
-than one bucket — distinct `service.name` values plus any
-`<unknown>`/`<other>`); template creation is a globally-monotonic
+The per-service decomposition is now the **first-class bench gate**
+(`ourios-bench --gates c2` prints it whenever any service bucket exists
+— distinct `service.name` values plus any `<unknown>`/`<other>`, so a
+single-service or plain-text corpus shows its one gated row too);
+template creation is a globally-monotonic
 event attributed to the minting service, so per-service creations
 partition the whole-corpus count exactly (2 + 17 + 1 + 3 + 14,608 =
-14,631) in `O(services)` memory — no per-service id set. The gate
-itself is unchanged (whole-corpus); the breakdown is additive, so
-option 3 of #444 ("scope C2 per service") can be evaluated on real
-numbers without a code change first.
+14,631) in `O(services)` memory — no per-service id set. As of #444
+(option 3) this decomposition **is** the gate: C2 is evaluated per
+service and folds over the services that clear the 1 M-line floor,
+with the whole-corpus ratio kept as a diagnostic (RFC 0006 §3.4.3).
 
 **What the fragmentation actually costs — B2 pricing (indicative,
 local M-series).** Running the B2 windowed query on the fragmented

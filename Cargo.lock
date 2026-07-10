@@ -3310,7 +3310,6 @@ dependencies = [
 name = "ourios-ingester"
 version = "0.2.1"
 dependencies = [
- "async-stream",
  "axum",
  "flate2",
  "futures-core",

@@ -455,13 +455,64 @@ Pinned definitions:
   line, zero-indexed). When two samples are equidistant, the
   earlier one wins (floor tie-break). Defined only on
   corpora of `≥ 1_000_000` lines.
-- **Convergence ratio**: `count_at_1m / SS`. By monotonicity,
-  this lives in `(0.0, 1.0]`.
-- **Pass condition** (gate): `convergence_ratio ≥ 0.5` on a
-  corpus of `≥ 1_000_000` lines. This is the "within 2× of
-  SS by 1 M lines" rule. Corpora smaller than 1 M lines are
-  recorded as `c2.pass = null` (insufficient data); the §9
-  row notes the corpus size and the gate is not asserted.
+- **Convergence ratio**: `count_at_1m / SS`, defined only when
+  `SS > 0`. By monotonicity (`count_at_1m ≤ SS`) it is `≤ 1.0`;
+  it is `0.0` when no template has been minted as of the sample
+  nearest the 1 M-line mark (`count_at_1m == 0`, `SS > 0`) —
+  `count_at_1m` is that nearest sample, not the exact millionth
+  line — so the defined range is `[0.0, 1.0]`. It is **undefined**
+  (`null`, paired with a `null` `count_at_1m`) when `SS == 0` — a
+  ≥ 1 M corpus that mints no templates at all, a `0/0` ratio.
+- **Pass condition** (gate) — **per service** (amended for
+  #444, maintainer-approved 2026-07-10): C2 is defined over
+  "a corpus from a single **stable service**", so on a
+  multi-service corpus the gate is evaluated **per
+  `service.name`**, not on the whole corpus. Each service's
+  ratio is `count_at_1m / SS` over *that service's* lines, with
+  `count_at_1m` taken at that service's **exact** millionth line
+  (not the whole-corpus nearest-sample; template creation is a
+  globally-monotonic event attributed to the minting service, so
+  per-service creations partition the whole-corpus template count
+  exactly). A corpus **passes** iff every service with
+  `≥ 1_000_000` lines has ratio `≥ 0.5` — with one exception: a
+  service that mints **zero** templates over its ≥ 1 M lines
+  (`SS == 0`, an undefined `0/0` ratio) passes *trivially*, since
+  a flat-zero count is the strongest possible convergence (C2's
+  falsifier is *linear* growth; an all-`NO_TEMPLATE` service is a
+  body-retention / parse-failure concern, caught by §3.1's
+  counters, not a convergence failure). It **fails** if any ≥ 1 M
+  service has a defined ratio below `0.5`; it **abstains**
+  (`c2.pass = null`) when no service reaches 1 M lines. A
+  single-service corpus — including the plain-text `<unknown>`
+  bucket (no `service.name`) — is gated on that one service's
+  ratio, measured at its **exact** millionth line. That
+  reproduces the pre-amendment whole-corpus verdict for every
+  historical converged corpus (whose ratio sits far from the
+  0.5 boundary); it is not bit-identical to the whole-corpus
+  `convergence_ratio`, which is sampled at the nearest curve
+  point (cadence granularity) and is now only a diagnostic.
+  Only multi-service OTLP corpora change verdict. **Rationale**:
+  running one whole-corpus ratio over a multi-service capture
+  (e.g. the OTel-Demo) is a category error — it conflates a
+  noisy infra service (a broker emitting high-cardinality
+  offset/path tokens) with clean application services, so the
+  whole-corpus number fails even when every application service
+  converges perfectly (v8 §9.12). The whole-corpus
+  `convergence_ratio` is retained as a **diagnostic** (the
+  `by_service` breakdown is the gate basis). Note: token-level
+  polishing of high-cardinality infra logs is an OTel Collector
+  concern (a `transform`/`redaction` processor upstream), not
+  the miner's — consistent with "format parsing is the
+  Collector's job". **Cardinality cap**: the decomposition holds
+  at most `MAX_SERVICES = 1024` distinct `service.name` buckets
+  (an O(services) memory guard mirroring §3.2); beyond that,
+  further services fold into one `<other>` bucket and
+  `c2.services_truncated` is set. A real OTLP capture carries
+  tens of services, so the cap is not expected to bind; if it
+  does, the folded `<other>` bucket mixes services and its
+  per-service ratio is no longer strictly single-service —
+  `services_truncated` flags that the run should be re-scoped
+  (the truncation is surfaced, never silent).
 - **Plateau-detection diagnostic** (not a gate): the curve
   is "plateaued" at the sample where the trailing `K = 64`
   samples all lie within `± 5%` of the SS. The diagnostic is
@@ -470,9 +521,12 @@ Pinned definitions:
   RFC — the gate is the 2× rule above.
 
 Reported as: `template_count_at_1m_lines` (integer; `null` for
-corpora < 1 M lines), `template_count_at_end` (integer;
-this is SS), `convergence_ratio` (three-decimal float; `null`
-for short corpora), `pass` (bool or `null`),
+corpora < 1 M lines **or** a ≥ 1 M corpus with `SS == 0`),
+`template_count_at_end` (integer; this is SS),
+`convergence_ratio` (three-decimal float; `null` under the same
+two conditions). These two form a matched pair — both `null` or
+both set, never mixed — which the report layer relies on
+(`report.rs` errors on a mixed pair). `pass` (bool or `null`),
 `corpus_at_least_1m` (bool).
 
 v1 records the convergence curve in the results JSON (as

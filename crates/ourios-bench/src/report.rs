@@ -206,16 +206,20 @@ pub fn update_status_section(md: &str, results: &ResultsFile) -> Result<String, 
     }
     if let Some(c2) = &results.c2 {
         // §3.4.3 pairs `convergence_ratio` and
-        // `template_count_at_1m_lines`: both `Some` on a ≥ 1 M
-        // corpus, both `None` on abstention. A mixed state is
-        // a corrupt `ResultsFile`, surfaced rather than papered
-        // over with a `0` count.
+        // `template_count_at_1m_lines`: both `Some` when the whole-corpus
+        // ratio is defined, both `None` otherwise (corpus < 1 M lines, or
+        // a ≥ 1 M corpus that mints zero templates — SS = 0, a 0/0 ratio).
+        // A mixed state is a corrupt `ResultsFile`, surfaced rather than
+        // papered over with a `0` count.
         let measurement = match (c2.template_count_at_1m_lines, c2.convergence_ratio) {
             (Some(count_1m), Some(ratio)) => {
                 format!(
                     "ratio {ratio:.3} (count@1M {count_1m} / SS {})",
                     c2.template_count_at_end,
                 )
+            }
+            (None, None) if c2.corpus_at_least_1m => {
+                format!("n/a (SS {} — no templates mined)", c2.template_count_at_end)
             }
             (None, None) => format!("n/a (SS {}, corpus < 1 M lines)", c2.template_count_at_end),
             _ => {
@@ -746,6 +750,38 @@ mod tests {
         let err =
             update_status_section(&md_with_status(), &r).expect_err("inconsistent C2 must error");
         assert!(matches!(err, BenchError::Report { .. }), "got {err:?}");
+    }
+
+    /// A ≥ 1 M corpus that mints zero templates (SS = 0) is a *consistent*
+    /// `(None, None)` diagnostic pair, not the inconsistent state above:
+    /// it renders an "SS 0 — no templates mined" measurement (distinct
+    /// from the sub-1M "corpus < 1 M lines" abstention) with the
+    /// per-service verdict, and must not error (#444/#451).
+    #[test]
+    fn zero_template_corpus_renders_no_templates_mined() {
+        let mut r = sample_results();
+        r.c2 = Some(crate::C2Result {
+            sample_cadence: 1000,
+            total_lines: 1_000_000,
+            template_count_at_1m_lines: None,
+            template_count_at_end: 0,
+            convergence_ratio: None,
+            convergence_curve: Vec::new(),
+            pass: Some(true),
+            corpus_at_least_1m: true,
+            by_service: Vec::new(),
+            services_truncated: false,
+        });
+        let md = update_status_section(&md_with_status(), &r).expect("SS=0 corpus must render");
+        assert!(md.contains("| C2 |"), "C2 row present");
+        assert!(
+            md.contains("no templates mined"),
+            "SS=0 ≥1M renders the no-templates measurement, not < 1 M lines: {md}",
+        );
+        assert!(
+            !md.contains("corpus < 1 M lines"),
+            "not the sub-1M abstention"
+        );
     }
 
     /// A malformed `timestamp` (not RFC3339-shaped) errors

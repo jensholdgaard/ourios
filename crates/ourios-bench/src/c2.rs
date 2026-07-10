@@ -236,24 +236,26 @@ impl C2Accumulator {
         // (the gate is per-service below, RFC 0006 §3.4.3 as amended
         // for #444): on a multi-service corpus a whole-corpus ratio
         // conflates a noisy broker with clean application services
-        // (v8 §9.12).
-        let (template_count_at_1m_lines, convergence_ratio) = if corpus_at_least_1m {
-            // Sample whose 1-based line number is closest to
-            // 1 M; on a tie the earlier (smaller `lines`)
-            // sample wins — the `(distance, lines)` key makes
-            // that the strict minimum.
-            let count_1m = self
-                .curve
-                .iter()
-                .min_by_key(|s| (s.lines.abs_diff(ONE_MILLION), s.lines))
-                .map(|s| s.template_count);
-            let ratio = count_1m.and_then(|c| {
-                (template_count_at_end > 0).then(|| (c as f64) / (template_count_at_end as f64))
-            });
-            (count_1m, ratio)
-        } else {
-            (None, None)
-        };
+        // (v8 §9.12). Undefined (both `None`) below 1 M lines *and* when
+        // the corpus mints zero templates (SS = 0, ratio 0/0): the count
+        // and the ratio stay a matched pair — both `Some` or both `None`,
+        // never mixed — which the report layer relies on (report.rs).
+        let (template_count_at_1m_lines, convergence_ratio) =
+            if corpus_at_least_1m && template_count_at_end > 0 {
+                // Sample whose 1-based line number is closest to
+                // 1 M; on a tie the earlier (smaller `lines`)
+                // sample wins — the `(distance, lines)` key makes
+                // that the strict minimum.
+                let count_1m = self
+                    .curve
+                    .iter()
+                    .min_by_key(|s| (s.lines.abs_diff(ONE_MILLION), s.lines))
+                    .map(|s| s.template_count);
+                let ratio = count_1m.map(|c| (c as f64) / (template_count_at_end as f64));
+                (count_1m, ratio)
+            } else {
+                (None, None)
+            };
 
         // Per-service decomposition, largest service first. Each
         // service's gate follows §3.4.3 on its own line count; template
@@ -331,12 +333,16 @@ impl C2Accumulator {
 /// `convergence_ratio`, which is sampled at the nearest curve point and
 /// is only a diagnostic. Only multi-service OTLP corpora change verdict.
 fn gate_pass(by_service: &[PerServiceC2]) -> Option<bool> {
-    let gated: Vec<bool> = by_service.iter().filter_map(|s| s.pass).collect();
-    if gated.is_empty() {
-        None
-    } else {
-        Some(gated.iter().all(|&p| p))
+    let mut verdict = None;
+    for s in by_service {
+        match s.pass {
+            // Any gated service that fails is decisive — short-circuit.
+            Some(false) => return Some(false),
+            Some(true) => verdict = Some(true),
+            None => {}
+        }
     }
+    verdict
 }
 
 /// The record's `service.name` resource attribute, or a sentinel when
@@ -637,5 +643,11 @@ mod tests {
         // Gated as a PASS, not folded away as an abstention.
         assert_eq!(r.pass, Some(true));
         assert_eq!(r.template_count_at_end, 0);
+        // Whole-corpus diagnostic stays a matched pair (SS = 0 → both
+        // `None`, never the mixed `(Some(0), None)` the report layer
+        // rejects) even though the corpus cleared 1 M lines.
+        assert!(r.corpus_at_least_1m);
+        assert_eq!(r.template_count_at_1m_lines, None);
+        assert_eq!(r.convergence_ratio, None);
     }
 }

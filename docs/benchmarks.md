@@ -1156,7 +1156,7 @@ and accept-and-scope-C2-per-service — **option 3 shipped** (the
 per-service gate, RFC 0006 §3.4.3, PR #451); masking is parked as
 a future strategic RFC (no commitment; a Collector `transform` or
 `redaction` processor can polish high-cardinality infra tokens
-upstream) and length-thresholding was rejected. The safety story held
+upstream) and length-aware thresholding was rejected. The safety story held
 throughout (bounded memory per RFC 0023, per-service C1 perfect).
 
 The per-service decomposition is now the **first-class bench gate**

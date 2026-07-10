@@ -3,7 +3,7 @@
 # cargo-fuzz preinstalled and the sanitizer flags wired up, so build.sh
 # only has to `cargo fuzz build` and stage the binaries. Its presence is
 # also what OpenSSF Scorecard's Fuzzing check detects (RFC0015.7).
-FROM gcr.io/oss-fuzz-base/base-builder-rust@sha256:0ca3a7a12278d0feb565f7667b6b8056bb8c542570c7ccaa81daed889159913e
+FROM gcr.io/oss-fuzz-base/base-builder-rust@sha256:a960440a8543df2411ca489eff995366ce8041b086141cc5092664d793f20e9e
 
 COPY . $SRC/ourios
 WORKDIR $SRC/ourios

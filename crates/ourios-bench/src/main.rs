@@ -342,7 +342,9 @@ fn print_summary(results: &ourios_bench::ResultsFile) {
                 let per = match (svc.convergence_ratio, svc.pass) {
                     (Some(r), Some(true)) => format!("ratio {r:.3} PASS"),
                     (Some(r), Some(false)) => format!("ratio {r:.3} FAIL"),
-                    _ => "abstain (< 1 M lines)".to_string(),
+                    (None, Some(true)) => "0 templates, converged PASS".to_string(),
+                    (_, Some(false)) => "FAIL".to_string(),
+                    (_, None) => "abstain (< 1 M lines)".to_string(),
                 };
                 println!(
                     "    {:<24} {:>10} lines, {:>7} created — {per}",

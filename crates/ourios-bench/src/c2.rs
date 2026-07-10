@@ -36,9 +36,20 @@
 //! - **Count at 1 M lines**: the count at the sample whose
 //!   1-based line number is closest to `1_000_000`, floor
 //!   tie-break. Defined only on corpora ≥ 1 M lines.
-//! - **Convergence ratio** = `count_1m / SS`, in `(0, 1]`.
-//! - **Pass**: `ratio ≥ 0.5` on a ≥ 1 M-line corpus; corpora
-//!   below 1 M lines abstain (`pass = None`).
+//! - **Convergence ratio** = `count_1m / SS`, in `(0, 1]` when
+//!   defined (undefined — `None` — for a ≥ 1 M service that mints
+//!   zero templates; see the gate).
+//! - **Pass** (per service, RFC 0006 §3.4.3 as amended for #444):
+//!   the gate is evaluated **per `service.name`**, since C2 is
+//!   defined over a single stable service. A corpus passes iff
+//!   every service with ≥ 1 M lines has `ratio ≥ 0.5` (a zero-
+//!   template ≥ 1 M service passes trivially — flat count); it
+//!   abstains (`pass = None`) only when no service reaches 1 M
+//!   lines. The whole-corpus [`crate::C2Result::convergence_ratio`]
+//!   is retained as a diagnostic — on a multi-service corpus it
+//!   conflates a noisy broker with clean application services
+//!   (`docs/benchmarks.md` §9.12). A single-service (or plain-text
+//!   `<unknown>`) corpus collapses to that one service's verdict.
 
 use std::collections::BTreeMap;
 
@@ -164,8 +175,9 @@ impl C2Accumulator {
 
     /// Attribute a line (and any template creation) to its service.
     /// The 1 M-line snapshot is taken at exactly the millionth line of
-    /// *that* service — within one line of the whole-corpus rule's
-    /// nearest-sample, sufficient for a diagnostic.
+    /// *that* service — the **gate** basis (RFC 0006 §3.4.3 as amended
+    /// for #444), and strictly more precise than the whole-corpus rule's
+    /// nearest-sample, which is now only the diagnostic ratio.
     fn attribute(&mut self, service: &str, created: bool) {
         // Cardinality guard: a known service (or a new one below the
         // cap) keeps its name; once the cap is hit, unseen services fold
@@ -249,10 +261,23 @@ impl C2Accumulator {
             .by_service
             .into_iter()
             .map(|(service_name, s)| {
-                let (at_1m, ratio, pass) = if s.lines >= ONE_MILLION && s.created > 0 {
-                    let c = s.created_at_1m.unwrap_or(s.created);
-                    let ratio = (c as f64) / (s.created as f64);
-                    (Some(c), Some(ratio), Some(ratio >= 0.5))
+                let (at_1m, ratio, pass) = if s.lines >= ONE_MILLION {
+                    if s.created > 0 {
+                        let c = s.created_at_1m.unwrap_or(s.created);
+                        let ratio = (c as f64) / (s.created as f64);
+                        (Some(c), Some(ratio), Some(ratio >= 0.5))
+                    } else {
+                        // >= 1 M lines but zero templates minted (every line
+                        // NO_TEMPLATE): the count is flat at zero, the strongest
+                        // possible convergence — C2's falsifier is *linear*
+                        // growth, so this passes trivially with an undefined
+                        // ratio. Gated (`Some`), never abstaining, so
+                        // `gate_pass`'s `None` keeps meaning "no service reached
+                        // 1 M lines" (an all-NO_TEMPLATE service is a body-
+                        // retention / parse-failure concern, caught by §3.1's
+                        // counters — not a convergence failure).
+                        (Some(0), None, Some(true))
+                    }
                 } else {
                     (None, None, None)
                 };
@@ -291,8 +316,11 @@ impl C2Accumulator {
 
 /// The per-service C2 **gate** (RFC 0006 §3.4.3 as amended for #444):
 /// a corpus passes iff every service with ≥ 1 M lines passes its own
-/// ratio ≥ 0.5 (each such service has `pass = Some(_)`); a corpus where
-/// no service reaches 1 M lines abstains (`None`). A single-service
+/// ratio ≥ 0.5. `finalize` sets `pass = Some(_)` for *every* ≥ 1 M
+/// service (a zero-template service passes trivially — flat count), so
+/// the `filter_map` below picks up exactly the gated services and `None`
+/// means "no service reached 1 M lines", never a silently-dropped
+/// ≥ 1 M service. A single-service
 /// corpus — including the plain-text `<unknown>` bucket — is gated on
 /// that one service's ratio, measured at its **exact** millionth line
 /// (`created_at_1m`). That reproduces the pre-#444 whole-corpus verdict
@@ -579,5 +607,33 @@ mod tests {
             2,
             "every line is attributed to some bucket",
         );
+    }
+
+    /// A service that clears the 1 M-line floor but mints zero templates
+    /// (every line `NO_TEMPLATE`) is **gated** and passes trivially — its
+    /// count is flat at zero, the opposite of the linear growth C2 flags.
+    /// Regression for the fold (#451): such a service must not collapse to
+    /// `pass = None` and get silently dropped, which would leave `None`
+    /// meaning both "below 1 M lines" and "≥ 1 M but degenerate".
+    #[test]
+    fn zero_template_service_over_1m_passes_trivially() {
+        let quiet = rec(NO_TEMPLATE, "quiet-svc");
+        let mut acc = C2Accumulator::new(ONE_MILLION);
+        for _ in 0..ONE_MILLION {
+            acc.record(&quiet);
+        }
+        let r = acc.finalize();
+        let svc = r
+            .by_service
+            .iter()
+            .find(|s| s.service_name == "quiet-svc")
+            .expect("quiet-svc bucket");
+        assert_eq!(svc.lines, ONE_MILLION);
+        assert_eq!(svc.templates_created, 0, "no template ever minted");
+        assert_eq!(svc.convergence_ratio, None, "0/0 ratio is undefined");
+        assert_eq!(svc.pass, Some(true), "flat count → trivial convergence");
+        // Gated as a PASS, not folded away as an abstention.
+        assert_eq!(r.pass, Some(true));
+        assert_eq!(r.template_count_at_end, 0);
     }
 }

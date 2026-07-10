@@ -331,6 +331,13 @@ async fn rfc0030_8_served_end_to_end() {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn ourios-server");
+    // Drain stderr on its own task: an undrained pipe fills (~64 KiB) under
+    // `RUST_LOG=info` and blocks the child mid-serve.
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_drain = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while lines.next_line().await.ok().flatten().is_some() {}
+    });
     let stdout = child.stdout.take().expect("stdout piped");
     let mut out_lines = BufReader::new(stdout).lines();
     let (grpc_addr, http_addr, querier_addr) = timeout(Duration::from_secs(15), async {
@@ -460,6 +467,9 @@ async fn rfc0030_8_served_end_to_end() {
         .await
         .expect("exit before timeout")
         .expect("child exits");
+    // The pipe closed on exit, so the drain has finished; join it so no task
+    // outlives the test.
+    let _ = timeout(Duration::from_secs(5), stderr_drain).await;
 
     let tenant = ourios_core::tenant::TenantId::new(TENANT);
     let registry = ourios_querier::derive_template_registry(

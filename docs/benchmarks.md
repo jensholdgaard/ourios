@@ -1152,7 +1152,7 @@ family (0.75) merge fine. The failure-flag confound turned out to be
 a red herring. **#444** resolved it (2026-07-10, maintainer-approved):
 of the three options — tokenizer masking, length-aware thresholding,
 and accept-and-scope-C2-per-service — **option 3 shipped** (the
-per-service gate below, RFC 0006 §3.4.3, PR #451); masking is parked as
+per-service gate, RFC 0006 §3.4.3, PR #451); masking is parked as
 a future strategic RFC (no commitment; a Collector `transform` or
 `redaction` processor can polish high-cardinality infra tokens
 upstream) and length-thresholding was rejected. The safety story held

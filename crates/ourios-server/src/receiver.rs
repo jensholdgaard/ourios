@@ -514,7 +514,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
         None => None,
     };
 
-    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()));
+    // The OTel Collector's OTLP exporter gzip-compresses by default, so the
+    // receiver must accept gzip to interoperate with a stock Collector
+    // (tests/it/collector_interop.rs). Identity stays accepted; this is
+    // additive.
+    let grpc_service = LogsServiceServer::new(LogsReceiver::new(pipeline.clone()))
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
     let auth_layer = AuthLayer::new(config.auth.clone());
     let grpc = tokio::spawn({
         let mut rx = shutdown_rx.clone();
@@ -823,6 +828,44 @@ mod tests {
         .expect("serve");
         assert_ne!(handle.grpc_addr.port(), 0, "gRPC bound to a real port");
         assert_ne!(handle.http_addr.port(), 0, "HTTP bound to a real port");
+        handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// The `OTel` Collector's OTLP exporter gzip-compresses by default, so the
+    /// receiver must accept gzip or a stock Collector fails with
+    /// `Unimplemented: Content is compressed with gzip`. The container
+    /// interop test (`tests/it/collector_interop.rs`) catches this
+    /// end-to-end; this guards it without Docker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_accepts_gzip_compressed_grpc() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+        use tonic::codec::CompressionEncoding;
+
+        let wal_dir = tempfile::TempDir::new().expect("wal dir");
+        let data_dir = tempfile::TempDir::new().expect("data dir");
+        let store = Store::local(data_dir.path()).expect("local store");
+        let handle = serve(ReceiverConfig {
+            grpc_addr: "127.0.0.1:0".parse().expect("addr"),
+            grpc_tls: None,
+            http_addr: "127.0.0.1:0".parse().expect("addr"),
+            http_tls: None,
+            wal: test_wal_config(wal_dir.path()),
+            store,
+            promoted: PromotedAttributes::default(),
+            auth: AuthResolver::static_only(None),
+        })
+        .await
+        .expect("serve");
+
+        let mut client = LogsServiceClient::connect(format!("http://{}", handle.grpc_addr))
+            .await
+            .expect("grpc connect")
+            .send_compressed(CompressionEncoding::Gzip);
+        client
+            .export(tonic::Request::new(export_request("acme", &["gzip line"])))
+            .await
+            .expect("a gzip-compressed OTLP export acks");
+
         handle.shutdown().await.expect("graceful shutdown");
     }
 

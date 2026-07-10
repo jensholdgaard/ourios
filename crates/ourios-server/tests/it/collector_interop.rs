@@ -37,11 +37,12 @@ const DEX_TAG: &str =
     "master@sha256:c382922b8f065f2f1ba142fde5b0ec1736b8fb7bc5bf18832f68c9aced95f243";
 
 // The contrib distribution carries `filelog`, `resource`, and the
-// `oauth2client` extension (the core distro does not).
-// TODO(collector-interop): digest-pin before the CI job is made required,
-// mirroring the Dex master-by-digest pin.
+// `oauth2client` extension (the core distro does not). Pinned by digest
+// (the multi-arch manifest-list index for 0.119.0) so this required check
+// never depends on a mutable tag — same posture as the Dex pin above.
 const COLLECTOR_IMAGE: &str = "otel/opentelemetry-collector-contrib";
-const COLLECTOR_TAG: &str = "0.119.0";
+const COLLECTOR_TAG: &str =
+    "0.119.0@sha256:36c35cc213c0f3b64d6e8a3e844dc90822f00725e0e518eaed5b08bcc2231e72";
 
 /// Dex static client: id is the token audience, `name` is the `name_claim`
 /// value, and its `groups` claim carries the tenant list.

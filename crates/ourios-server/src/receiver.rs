@@ -562,9 +562,12 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
             let make = http_router.into_make_service();
             match http_acceptor {
                 Some(acceptor) => {
-                    axum::serve(TlsListener::new(http_listener, acceptor), make)
-                        .with_graceful_shutdown(shutdown)
-                        .await
+                    axum::serve(
+                        TlsListener::new(http_listener, acceptor, LISTENER_HTTP),
+                        make,
+                    )
+                    .with_graceful_shutdown(shutdown)
+                    .await
                 }
                 None => {
                     axum::serve(http_listener, make)

@@ -242,6 +242,8 @@ pub const MAX_CONCURRENT_HANDSHAKES: usize = 256;
 /// `ourios.tls.listener` values.
 pub const LISTENER_GRPC: &str = "grpc";
 pub const LISTENER_HTTP: &str = "http";
+/// The querier HTTP listener (distinct from the receiver HTTP listener).
+pub const LISTENER_QUERIER: &str = "querier";
 /// `ourios.tls.failure` values.
 const FAILURE_HANDSHAKE: &str = "handshake";
 const FAILURE_TIMEOUT: &str = "timeout";
@@ -391,13 +393,16 @@ pub struct TlsListener {
 }
 
 impl TlsListener {
-    /// Wrap a bound `TcpListener` with `acceptor`.
+    /// Wrap a bound `TcpListener` with `acceptor`. `listener` is the
+    /// `ourios.tls.listener` label for this listener's handshake-failure
+    /// metric (e.g. `LISTENER_HTTP` for the receiver, `LISTENER_QUERIER`
+    /// for the querier) — so the two HTTP listeners don't aggregate.
     #[must_use]
-    pub fn new(inner: TcpListener, acceptor: ReloadingAcceptor) -> Self {
+    pub fn new(inner: TcpListener, acceptor: ReloadingAcceptor, listener: &'static str) -> Self {
         Self {
             inner,
             acceptor,
-            metrics: HandshakeFailures::new(LISTENER_HTTP),
+            metrics: HandshakeFailures::new(listener),
             handshakes: JoinSet::new(),
         }
     }

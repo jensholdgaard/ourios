@@ -1,7 +1,7 @@
 //! RFC 0030 §5 — the server-owned scenarios: the plaintext-auth
-//! startup warning (`.7`, implemented — it observes the spawned
-//! binary, which only this crate can do), TLS on the querier surface
-//! (`.3`), and the served end-to-end (`.8`). The receiver arms live in
+//! startup warning (`.7`) and TLS on the querier surface (`.3`) are
+//! live; the served end-to-end (`.8`) remains a stub. The receiver arms
+//! live in
 //! `crates/ourios-ingester/tests/it/rfc0030_tls.rs` per §6.
 
 use std::process::Stdio;
@@ -11,17 +11,113 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Scenario RFC0030.3 — querier + MCP over TLS.
+/// Scenario RFC0030.3 — querier + MCP over TLS: with the querier's
+/// `http_tls` set and a static bearer configured, a query (valid bearer
+/// + `X-Ourios-Tenant`) and an MCP `initialize` (valid bearer) both
+/// succeed over TLS; a plaintext request to the same port fails at the
+/// transport layer. Drives `querier::serve` directly (a real listener
+/// + handshake) rather than the spawned binary.
 /// See `docs/rfcs/0030-tls-mtls-listeners.md` §5.
-#[test]
-#[ignore = "RFC0030.3 stub — implemented in the querier green slice"]
-fn rfc0030_3_querier_and_mcp_over_tls() {
-    todo!(
-        "RFC0030.3 — querier http_tls enabled, static bearer \
-         configured: query (valid bearer + X-Ourios-Tenant) and MCP \
-         initialize (valid bearer) succeed over TLS; a plaintext \
-         request to the same port fails at the transport layer"
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc0030_3_querier_and_mcp_over_tls() {
+    use ourios_core::auth::{TokenSpec, build_token_store};
+    use ourios_ingester::receiver::AuthResolver;
+    use ourios_ingester::receiver::tls::TlsSettings;
+    use ourios_parquet::StoreConfig;
+    use ourios_server::querier::{QuerierConfig, serve};
+
+    let tmp = tempfile::TempDir::new().expect("temp");
+    let signed =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("mint");
+    let cert_pem = signed.cert.pem();
+    let cert_path = tmp.path().join("server.crt");
+    let key_path = tmp.path().join("server.key");
+    std::fs::write(&cert_path, &cert_pem).expect("write cert");
+    std::fs::write(&key_path, signed.signing_key.serialize_pem()).expect("write key");
+    let http_tls = TlsSettings::from_parts(
+        "querier.http_tls",
+        Some(&cert_path.display().to_string()),
+        Some(&key_path.display().to_string()),
+        None,
+        None,
+        None,
+    )
+    .expect("valid")
+    .expect("configured");
+
+    let store_root = tmp.path().join("store");
+    std::fs::create_dir_all(&store_root).expect("store root");
+    let tokens = build_token_store(Some(&[TokenSpec {
+        name: Some("query-client".to_string()),
+        token: Some("tok-q".to_string()),
+        tenants: vec!["acme".to_string()],
+    }]))
+    .expect("valid")
+    .expect("enabled");
+
+    let handle = serve(QuerierConfig {
+        http_addr: "127.0.0.1:0".parse().expect("addr"),
+        http_tls: Some(http_tls),
+        store: StoreConfig::Local(store_root),
+        mcp_enabled: true,
+        auth: AuthResolver::static_only(Some(std::sync::Arc::new(tokens))),
+        default_window_nanos: 3600 * 1_000_000_000,
+    })
+    .await
+    .expect("querier serves");
+    let port = handle.http_addr.port();
+
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("root"))
+        .build()
+        .expect("client");
+
+    // Query over TLS (empty store → 200, zero rows). Auth is held valid
+    // so transport is the only variable under test.
+    let resp = client
+        .post(format!("https://127.0.0.1:{port}/v1/query"))
+        .header("content-type", "text/plain")
+        .header("x-ourios-tenant", "acme")
+        .header("authorization", "Bearer tok-q")
+        .body("template_id == 1")
+        .send()
+        .await
+        .expect("query over TLS");
+    assert!(resp.status().is_success(), "query status {}", resp.status());
+
+    // MCP `initialize` over TLS.
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "rfc0030-test", "version": "0"}
+        }
+    });
+    let resp = client
+        .post(format!("https://127.0.0.1:{port}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", "Bearer tok-q")
+        .body(initialize.to_string())
+        .send()
+        .await
+        .expect("MCP initialize over TLS");
+    assert!(resp.status().is_success(), "mcp status {}", resp.status());
+
+    // Plaintext to the TLS port fails the handshake.
+    let plaintext = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/query"))
+        .header("x-ourios-tenant", "acme")
+        .body("template_id == 1")
+        .send()
+        .await;
+    assert!(plaintext.is_err(), "plaintext to the TLS querier must fail");
+
+    handle.shutdown().await.ok();
 }
 
 /// Spawn the server with the given config file, collect stderr until

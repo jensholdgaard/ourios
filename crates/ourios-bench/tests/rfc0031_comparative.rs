@@ -501,8 +501,12 @@ struct SelectivePair {
 /// check is meaningful. Generalised from a hardcoded ERROR band because
 /// real captures vary — otel-demo v8 carries no ERROR logs at all (its
 /// failure flags surface in traces/metrics), only INFO/Information and
-/// four WARNs. Picks the FEWEST rows; ties break to the lowest threshold
-/// then the lexicographically smallest service, for deterministic reruns.
+/// four WARNs. Candidate thresholds are the service's **observed**
+/// severity numbers — which is complete, because a gap threshold (say 16
+/// when only 17 occurs) selects exactly the same rows as the next
+/// observed number above it, adding no new candidates. Picks the FEWEST
+/// rows; ties break to the lowest threshold then the lexicographically
+/// smallest service, for deterministic reruns.
 fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
     use std::collections::HashMap;
     use std::io::BufRead as _;
@@ -608,9 +612,19 @@ fn select_pair_candidates(
         std::collections::HashMap<i32, std::collections::HashMap<String, u64>>,
     >,
 ) -> Vec<(u64, i32, &String, &String)> {
+    // Both names are interpolated into quoted DSL and LogQL string
+    // literals; a `"` or `\` (legal in OTLP attributes) would break or
+    // change either query. Rather than implement escaping for two query
+    // languages, a pair whose names fall outside this conservative set is
+    // simply not a candidate.
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ' '))
+    };
     let mut candidates = Vec::new();
     for (svc, bands) in per_service {
-        if svc.is_empty() {
+        if !safe(svc) {
             continue;
         }
         for &threshold in bands.keys() {
@@ -626,7 +640,7 @@ fn select_pair_candidates(
             let [text] = texts.as_slice() else {
                 continue;
             };
-            if !(1..=4000).contains(&rows) {
+            if !safe(text) || !(1..=4000).contains(&rows) {
                 continue;
             }
             let text_total: u64 = bands

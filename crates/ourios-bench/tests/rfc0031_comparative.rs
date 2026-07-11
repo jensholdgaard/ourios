@@ -21,8 +21,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
-    FIXTURE_SERVICE, comparative_fixture, compare_lines, fixture_jsonl, fixture_logs_data,
-    ourios_query_lines, parse_loki_streams,
+    FIXTURE_SERVICE, FixtureRecord, LineKey, comparative_fixture, compare_lines, fixture_jsonl,
+    fixture_logs_data, ourios_query_lines, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
 
@@ -101,116 +101,7 @@ fn rfc0031_1_result_set_equivalence() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (loki_all, loki_narrow) = runtime.block_on(async {
-        use prost::Message as _;
-        use testcontainers_modules::testcontainers::core::ContainerPort;
-        use testcontainers_modules::testcontainers::runners::AsyncRunner;
-        use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
-
-        // The stock image config (schema v13 / TSDB) serves the native
-        // OTLP endpoint and maps `service.name` → the `service_name`
-        // stream label; auth is disabled. Exactly what a competent
-        // single-binary operator gets out of the box.
-        let container = GenericImage::new(LOKI_IMAGE, LOKI_TAG)
-            .with_exposed_port(ContainerPort::Tcp(3100))
-            .with_cmd(["-config.file=/etc/loki/local-config.yaml"])
-            .start()
-            .await
-            .expect("loki container starts");
-        let port = container
-            .get_host_port_ipv4(3100)
-            .await
-            .expect("loki host port");
-        let base = format!("http://127.0.0.1:{port}");
-        let http = reqwest::Client::new();
-
-        // Readiness: /ready flips 200 once the ingester is up. Surface
-        // the container logs on timeout so a config rejection doesn't
-        // read as a bare timeout.
-        let deadline = std::time::Instant::now() + Duration::from_secs(90);
-        loop {
-            if let Ok(r) = http.get(format!("{base}/ready")).send().await
-                && r.status().is_success()
-            {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                let stderr = container
-                    .stderr_to_vec()
-                    .await
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                panic!("loki /ready never turned 200.\n--- loki stderr ---\n{stderr}");
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        // Push the SAME LogsData value the Ourios corpus was rendered
-        // from, as the OTLP/HTTP protobuf body Loki's endpoint takes.
-        let payload = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
-            resource_logs: fixture_logs_data(&records).resource_logs,
-        }
-        .encode_to_vec();
-        let push = http
-            .post(format!("{base}/otlp/v1/logs"))
-            .header("content-type", "application/x-protobuf")
-            .body(payload)
-            .send()
-            .await
-            .expect("otlp push");
-        assert!(
-            push.status().is_success(),
-            "loki otlp push rejected: {} — {}",
-            push.status(),
-            push.text().await.unwrap_or_default(),
-        );
-
-        // Query until every line is visible (ingest is async); then run
-        // the deliberately-narrower query for the mismatch arm.
-        let start = base_ns;
-        let end = base_ns + 10_000;
-        let query_range = |logql: String| {
-            let http = http.clone();
-            let base = base.clone();
-            async move {
-                let resp = http
-                    .get(format!("{base}/loki/api/v1/query_range"))
-                    .query(&[
-                        ("query", logql.as_str()),
-                        ("start", &start.to_string()),
-                        ("end", &end.to_string()),
-                        ("limit", "1000"),
-                        ("direction", "forward"),
-                    ])
-                    .send()
-                    .await
-                    .expect("query_range")
-                    .text()
-                    .await
-                    .expect("query_range body");
-                parse_loki_streams(&resp).expect("parse loki streams")
-            }
-        };
-
-        let all_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}}");
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let loki_all = loop {
-            let lines = query_range(all_logql.clone()).await;
-            if lines.len() >= 3 {
-                break lines;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "loki returned {} of 3 fixture lines before timeout",
-                lines.len(),
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-
-        let narrow_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}} |= `logged in`");
-        let loki_narrow = query_range(narrow_logql).await;
-        (loki_all, loki_narrow)
-    });
+    let (loki_all, loki_narrow) = runtime.block_on(loki_round_trip(&records, base_ns));
 
     // ------------------------------------------------------------------
     // The equivalence check itself (RFC0031.1): identical multisets for
@@ -225,6 +116,123 @@ fn rfc0031_1_result_set_equivalence() {
         !compare_lines(&ourios_lines, &loki_narrow, 8).is_equal(),
         "the deliberately-narrower LogQL must report Mismatch, not silently pass",
     );
+}
+
+/// The Loki half of RFC0031.1: start a real Loki container, push the SAME
+/// `LogsData` value the Ourios corpus was rendered from over the native
+/// OTLP endpoint, then answer two `LogQL` queries — the fixture-equivalent
+/// one (all lines) and a deliberately narrower one (the mismatch arm).
+async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKey>, Vec<LineKey>) {
+    use prost::Message as _;
+    use testcontainers_modules::testcontainers::core::ContainerPort;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+    // The stock image config (schema v13 / TSDB) serves the native OTLP
+    // endpoint and maps `service.name` → the `service_name` stream label;
+    // auth is disabled. Exactly what a competent single-binary operator
+    // gets out of the box.
+    let container = GenericImage::new(LOKI_IMAGE, LOKI_TAG)
+        .with_exposed_port(ContainerPort::Tcp(3100))
+        .with_cmd(["-config.file=/etc/loki/local-config.yaml"])
+        .start()
+        .await
+        .expect("loki container starts");
+    let port = container
+        .get_host_port_ipv4(3100)
+        .await
+        .expect("loki host port");
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+
+    // Readiness: /ready flips 200 once the ingester is up. Surface the
+    // container logs on timeout so a config rejection doesn't read as a
+    // bare timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Ok(r) = http.get(format!("{base}/ready")).send().await
+            && r.status().is_success()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let stderr = container
+                .stderr_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            panic!("loki /ready never turned 200.\n--- loki stderr ---\n{stderr}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Push the SAME LogsData value the Ourios corpus was rendered from,
+    // as the OTLP/HTTP protobuf body Loki's endpoint takes.
+    let payload = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
+        resource_logs: fixture_logs_data(records).resource_logs,
+    }
+    .encode_to_vec();
+    let push = http
+        .post(format!("{base}/otlp/v1/logs"))
+        .header("content-type", "application/x-protobuf")
+        .body(payload)
+        .send()
+        .await
+        .expect("otlp push");
+    assert!(
+        push.status().is_success(),
+        "loki otlp push rejected: {} — {}",
+        push.status(),
+        push.text().await.unwrap_or_default(),
+    );
+
+    // Query until every line is visible (ingest is async); then run the
+    // deliberately-narrower query for the mismatch arm.
+    let (start, end) = (base_ns, base_ns + 10_000);
+    let all_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let loki_all = loop {
+        let lines = loki_query_range(&http, &base, &all_logql, start, end).await;
+        if lines.len() >= 3 {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "loki returned {} of 3 fixture lines before timeout",
+            lines.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let narrow_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}} |= `logged in`");
+    let loki_narrow = loki_query_range(&http, &base, &narrow_logql, start, end).await;
+    (loki_all, loki_narrow)
+}
+
+/// One Loki `query_range` call, parsed to [`LineKey`]s.
+async fn loki_query_range(
+    http: &reqwest::Client,
+    base: &str,
+    logql: &str,
+    start: u64,
+    end: u64,
+) -> Vec<LineKey> {
+    let resp = http
+        .get(format!("{base}/loki/api/v1/query_range"))
+        .query(&[
+            ("query", logql),
+            ("start", &start.to_string()),
+            ("end", &end.to_string()),
+            ("limit", "1000"),
+            ("direction", "forward"),
+        ])
+        .send()
+        .await
+        .expect("query_range")
+        .text()
+        .await
+        .expect("query_range body");
+    parse_loki_streams(&resp).expect("parse loki streams")
 }
 
 /// Scenario RFC0031.2 — L1 selective template lookup wins on bytes read.

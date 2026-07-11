@@ -23,7 +23,11 @@
 //! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
 //! `harness`, `c1`; PR-I2 added `a1`; PR-J1 added `report`
 //! (JSON half) + the CLI; PR-J2 added `c2`; PR-J3 added the
-//! §9 appender.
+//! §9 appender. Later RFCs grew the crate beyond that layout:
+//! `calibrate` + `reference` + `store` (RFC 0024 / the B1/B2 query
+//! stores), and the RFC 0031 comparative harness (`comparative` — the
+//! Loki equivalence check + measurement channel — and `lgates`, the
+//! comparative must-win gate math).
 
 #![deny(unsafe_code)]
 
@@ -37,6 +41,7 @@ mod calibrate;
 mod comparative;
 mod corpus;
 mod harness;
+mod lgates;
 mod reference;
 mod report;
 mod store;
@@ -49,6 +54,7 @@ pub use comparative::{
     parse_loki_streams,
 };
 pub use corpus::TxtSeverity;
+pub use lgates::{BytesGateOutcome, ComparativeMargins, bytes_must_win};
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
 pub use store::{B1Store, BuiltStore, build_b1_store, build_comparative_store, build_query_store};

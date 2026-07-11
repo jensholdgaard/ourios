@@ -23,8 +23,9 @@ use std::fmt::Write as _;
 /// system's ingest/return path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LineKey {
-    /// Log-record timestamp in Unix nanoseconds.
-    pub timestamp_unix_nanos: i64,
+    /// Log-record timestamp in Unix nanoseconds (matching the
+    /// workspace `time_unix_nano` representation).
+    pub timestamp_unix_nanos: u64,
     /// The record body, byte-exact.
     pub body: Vec<u8>,
 }
@@ -34,7 +35,7 @@ pub struct LineKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AggKey {
     /// Inclusive start of the time bucket, Unix nanoseconds.
-    pub bucket_start_unix_nanos: i64,
+    pub bucket_start_unix_nanos: u64,
     /// The `GROUP BY` key value (e.g. an extracted template param).
     pub group_key: String,
 }
@@ -123,12 +124,14 @@ pub fn compare_lines(
         .take(examples_cap)
         .map(|(k, o, l)| {
             let mut s = String::new();
-            // Bodies can be arbitrary bytes; render lossily for the report.
+            // Bodies can be arbitrary bytes and arbitrarily large; render
+            // a truncated, lossy preview so a mismatch report can't blow
+            // up stderr.
             let _ = write!(
                 s,
                 "ts={} body={:?} ourios={o} loki={l}",
                 k.timestamp_unix_nanos,
-                String::from_utf8_lossy(&k.body),
+                body_preview(&k.body),
             );
             s
         })
@@ -185,11 +188,23 @@ fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
     counts
 }
 
+/// A truncated, lossy preview of a body for a mismatch report — bounded
+/// so an arbitrarily large body can't blow up the stderr summary.
+fn body_preview(body: &[u8]) -> String {
+    const CAP: usize = 96;
+    let shown = &body[..body.len().min(CAP)];
+    let mut preview = String::from_utf8_lossy(shown).into_owned();
+    if body.len() > CAP {
+        let _ = write!(preview, "…(+{} bytes)", body.len() - CAP);
+    }
+    preview
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn line(ts: i64, body: &str) -> LineKey {
+    fn line(ts: u64, body: &str) -> LineKey {
         LineKey {
             timestamp_unix_nanos: ts,
             body: body.as_bytes().to_vec(),
@@ -267,7 +282,22 @@ mod tests {
         assert!(m.examples[0].contains("loki=3"));
     }
 
-    fn agg(bucket: i64, group: &str) -> AggKey {
+    #[test]
+    fn body_preview_bounds_large_bodies() {
+        // Small body is shown whole.
+        assert_eq!(body_preview(b"short"), "short");
+        // A large body is truncated with a byte-count suffix (96-byte cap).
+        let big = vec![b'x'; 500];
+        let preview = body_preview(&big);
+        assert!(
+            preview.len() < 200,
+            "preview must be bounded: {}",
+            preview.len()
+        );
+        assert!(preview.contains("+404 bytes"), "{preview}");
+    }
+
+    fn agg(bucket: u64, group: &str) -> AggKey {
         AggKey {
             bucket_start_unix_nanos: bucket,
             group_key: group.to_string(),

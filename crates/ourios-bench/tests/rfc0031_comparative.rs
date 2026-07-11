@@ -1484,10 +1484,11 @@ fn two_service_records(service: &str) -> Vec<(u64, &'static str)> {
             TWO_SERVICE_BASE_NS,
             ["alpha one", "alpha two", "alpha three"],
         ),
-        _ => (
+        "svc-b" => (
             TWO_SERVICE_BASE_NS + 2 * HOUR_NS,
             ["beta one", "beta two", "beta three"],
         ),
+        other => panic!("two_service_records knows svc-a and svc-b, not {other:?}"),
     };
     bodies
         .into_iter()
@@ -1574,6 +1575,7 @@ fn service_predicate_prunes_on_the_promoted_column() {
     let query = ourios_querier::dsl::parse("service == \"svc-a\" | limit 100").expect("parse DSL");
     let querier = ourios_querier::Querier::new(bucket.path());
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .expect("tokio runtime");
     let result = runtime

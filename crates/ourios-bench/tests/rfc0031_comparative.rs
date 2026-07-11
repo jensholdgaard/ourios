@@ -722,9 +722,11 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
     use prost::Message as _;
     use std::io::BufRead as _;
 
-    /// Stay ~1 MiB under Loki's stock 4 MiB cap: the encoded-size
-    /// estimate below is per-`ResourceLogs` and slightly undercounts the
-    /// envelope's field framing.
+    /// Stay ~1 MiB under Loki's stock 4 MiB cap. The per-`ResourceLogs`
+    /// estimate (+8 bytes each for the envelope's field framing) tracks
+    /// the true encoded size closely; the headroom absorbs any residual
+    /// drift, and `push_otlp` asserts the ACTUAL encoded size as the
+    /// checked guarantee.
     const FLUSH_BYTES: usize = 3 * 1024 * 1024;
 
     let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
@@ -768,7 +770,9 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
                 (pending_bytes, pending_lines) = (0, 0);
                 pushed += 1;
                 if pushed % 500 == 0 {
-                    eprintln!("loki ingest: {batched} LogsData batches pushed…");
+                    eprintln!(
+                        "loki ingest: {batched} LogsData lines read, {pushed} requests sent…"
+                    );
                 }
             }
             pending.extend(data.resource_logs);
@@ -783,8 +787,9 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
         }
         .encode_to_vec();
         push_otlp(http, base, payload).await;
+        pushed += 1;
     }
-    eprintln!("loki ingest complete: {batched} LogsData batches");
+    eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests");
 }
 
 /// The §7 calibration input: the first indicative Ourios-vs-Loki

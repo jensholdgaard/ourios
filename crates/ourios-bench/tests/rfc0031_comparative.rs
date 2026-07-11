@@ -558,10 +558,16 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         total += 1;
-                        if lr.time_unix_nano != 0 {
-                            min_ts = min_ts.min(lr.time_unix_nano);
-                            max_ts = max_ts.max(lr.time_unix_nano);
+                        // A zero-timestamp record can't be returned by
+                        // either side's time-windowed query, so it must
+                        // not count into any candidate band either — a
+                        // band containing unreachable rows would fail its
+                        // expected-count check at run time.
+                        if lr.time_unix_nano == 0 {
+                            continue;
                         }
+                        min_ts = min_ts.min(lr.time_unix_nano);
+                        max_ts = max_ts.max(lr.time_unix_nano);
                         let texts = entry.entry(lr.severity_number).or_default();
                         if let Some(count) = texts.get_mut(lr.severity_text.as_str()) {
                             *count += 1;

@@ -314,6 +314,17 @@ pub fn ourios_query_answer(
     let count_scan_bytes = result.stats.bytes_read;
     let materialize_bytes = result.materialize_bytes_read;
     let registry_bytes = result.registry_bytes_read;
+    // A wrapped sum would silently corrupt the primary gate metric —
+    // fail loudly instead (the same rule as the L-gates' checked_mul).
+    let bytes_read = count_scan_bytes
+        .checked_add(materialize_bytes)
+        .and_then(|sum| sum.checked_add(registry_bytes))
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: format!(
+                "total bytes_read overflows u64 (count_scan={count_scan_bytes}, \
+                 materialize={materialize_bytes}, registry={registry_bytes})"
+            ),
+        })?;
     result
         .records
         .iter()
@@ -326,7 +337,7 @@ pub fn ourios_query_answer(
         .collect::<Result<Vec<_>, _>>()
         .map(|lines| OuriosAnswer {
             lines,
-            bytes_read: count_scan_bytes + materialize_bytes + registry_bytes,
+            bytes_read,
             count_scan_bytes,
             materialize_bytes,
             registry_bytes,

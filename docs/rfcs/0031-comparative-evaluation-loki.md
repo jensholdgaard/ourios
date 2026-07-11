@@ -1,7 +1,7 @@
 ---
 rfc: 0031
 title: Comparative evaluation against Grafana Loki
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-11

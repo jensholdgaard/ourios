@@ -306,14 +306,36 @@ fn body_bytes(body: &ourios_querier::LogBody) -> Result<Vec<u8>, BenchError> {
 ///
 /// # Errors
 ///
-/// [`BenchError::Pipeline`] if the JSON doesn't parse, the
-/// `data.result` array is absent, a `values` entry isn't a two-element
-/// `[string, string]`, or the timestamp string isn't a `u64`.
+/// [`BenchError::Pipeline`] if the response isn't JSON; is a Loki **error**
+/// response (`status == "error"` — surfaces Loki's `errorType` / `error`);
+/// is missing the `data.result` array; has a stream missing its `values`
+/// array; has a `values` entry that isn't a two-element `[string, string]`
+/// pair; has a timestamp or log line that isn't a string; or has a
+/// timestamp string that isn't a `u64`. Malformed-entry errors carry the
+/// stream + value indices for debugging against real Loki responses.
 pub fn parse_loki_streams(response_json: &str) -> Result<Vec<LineKey>, BenchError> {
     let root: serde_json::Value =
         serde_json::from_str(response_json).map_err(|e| BenchError::Pipeline {
             detail: format!("Loki response is not JSON: {e}"),
         })?;
+
+    // A Loki error response ({"status":"error", "errorType":..., "error":...})
+    // would otherwise fail below as "missing data.result" — surface Loki's
+    // own diagnostic instead, which is what an operator needs to see.
+    if root.get("status").and_then(serde_json::Value::as_str) == Some("error") {
+        let error_type = root
+            .get("errorType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let error = root
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no message)");
+        return Err(BenchError::Pipeline {
+            detail: format!("Loki query error [{error_type}]: {error}"),
+        });
+    }
+
     let result = root
         .get("data")
         .and_then(|d| d.get("result"))
@@ -323,28 +345,32 @@ pub fn parse_loki_streams(response_json: &str) -> Result<Vec<LineKey>, BenchErro
         })?;
 
     let mut lines = Vec::new();
-    for stream in result {
+    for (si, stream) in result.iter().enumerate() {
         let values = stream
             .get("values")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| BenchError::Pipeline {
-                detail: "Loki stream missing `values` array".to_string(),
+                detail: format!("Loki stream {si} missing `values` array"),
             })?;
-        for pair in values {
+        for (vi, pair) in values.iter().enumerate() {
             let entry =
                 pair.as_array()
                     .filter(|a| a.len() == 2)
                     .ok_or_else(|| BenchError::Pipeline {
-                        detail: "Loki `values` entry is not a [timestamp, line] pair".to_string(),
+                        detail: format!(
+                            "Loki stream {si} value {vi} is not a [timestamp, line] pair"
+                        ),
                     })?;
             let ts_str = entry[0].as_str().ok_or_else(|| BenchError::Pipeline {
-                detail: "Loki `values` timestamp is not a string".to_string(),
+                detail: format!("Loki stream {si} value {vi} timestamp is not a string"),
             })?;
             let timestamp_unix_nanos = ts_str.parse::<u64>().map_err(|e| BenchError::Pipeline {
-                detail: format!("Loki timestamp `{ts_str}` is not a u64: {e}"),
+                detail: format!(
+                    "Loki stream {si} value {vi} timestamp `{ts_str}` is not a u64: {e}"
+                ),
             })?;
             let body = entry[1].as_str().ok_or_else(|| BenchError::Pipeline {
-                detail: "Loki `values` log line is not a string".to_string(),
+                detail: format!("Loki stream {si} value {vi} log line is not a string"),
             })?;
             lines.push(LineKey {
                 timestamp_unix_nanos,
@@ -505,6 +531,18 @@ mod tests {
         assert!(
             parse_loki_streams(r#"{"data":{"result":[{"values":[["notanum","a"]]}]}}"#).is_err()
         );
+
+        // A Loki error response surfaces Loki's own diagnostic, not the
+        // misleading "missing data.result".
+        let err = parse_loki_streams(
+            r#"{"status":"error","errorType":"parse error","error":"unexpected token"}"#,
+        )
+        .expect_err("Loki error response must error");
+        let BenchError::Pipeline { detail } = err else {
+            panic!("expected a pipeline error");
+        };
+        assert!(detail.contains("parse error"), "{detail}");
+        assert!(detail.contains("unexpected token"), "{detail}");
     }
 
     #[test]

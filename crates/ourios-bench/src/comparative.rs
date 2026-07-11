@@ -402,30 +402,20 @@ mod tests {
     }
 
     #[test]
-    fn ourios_query_lines_extracts_one_key_per_stored_row() {
-        // Build a real RFC 0005 store from a text corpus and prove the
-        // Ourios-side extraction returns one LineKey per stored row with
-        // in-span timestamps, and that the result feeds `compare_lines`
-        // cleanly (self-equivalence holds) — the Ourios half of RFC0031.1,
-        // locally verifiable without Loki.
-        //
-        // Body *content* is deliberately not asserted here: reconstructing a
-        // cleanly-mined string body needs the audit-derived template registry
-        // (RFC 0017), and `build_query_store` does not persist the audit
-        // stream (B1/B2 read only row counts). The comparative store-builder —
-        // the next increment — persists it like the A1 gate, so bodies render;
-        // this test pins the extraction + comparator integration, which is
-        // independent of that.
+    fn ourios_query_lines_extracts_bit_identical_bodies() {
+        // Build a registry-bearing comparative store from a text corpus
+        // (build_comparative_store persists the audit stream, so the querier
+        // derives the RFC 0017 template registry and reconstructs bodies),
+        // then prove the Ourios-side extraction returns one LineKey per
+        // stored row with in-span timestamps and **bit-identical bodies** —
+        // the Ourios half of RFC0031.1, locally verifiable without Loki.
         let corpus = tempfile::TempDir::new().expect("corpus dir");
-        std::fs::write(
-            corpus.path().join("fixture.txt"),
-            "user 1 logged in\nuser 2 logged in\nuser 3 logged in",
-        )
-        .expect("write corpus");
+        let lines = ["user 1 logged in", "user 2 logged in", "user 3 logged in"];
+        std::fs::write(corpus.path().join("fixture.txt"), lines.join("\n")).expect("write corpus");
         let bucket = tempfile::TempDir::new().expect("bucket dir");
 
         let built =
-            crate::build_query_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+            crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
                 .expect("build store");
         assert_eq!(built.rows, 3, "one stored row per corpus line");
 
@@ -450,6 +440,19 @@ mod tests {
                 "extracted timestamp is within the corpus span",
             );
         }
+        // Bodies reconstruct bit-identically (RFC 0001 §6 / the C1
+        // invariant), now that the registry is persisted.
+        let mut bodies: Vec<String> = extracted
+            .iter()
+            .map(|k| String::from_utf8(k.body.clone()).expect("utf8 body"))
+            .collect();
+        bodies.sort();
+        let got: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        assert_eq!(
+            got, lines,
+            "extracted bodies are the corpus lines, bit for bit"
+        );
+
         // The extraction feeds the comparator: a result compared to itself
         // is Equal (the multiset round-trips through `compare_lines`).
         assert!(

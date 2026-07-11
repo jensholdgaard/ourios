@@ -227,17 +227,32 @@ pub fn ourios_query_lines(
 }
 
 /// The Ourios side of a comparative query: the matching rows as
-/// [`LineKey`]s plus the **bytes read from storage** to answer it — the
-/// RFC 0031 §3.6 primary gate metric (`QueryStats::bytes_read`, folded
-/// from the engine's `bytes_scanned` scan metric on the RFC 0016 path).
+/// [`LineKey`]s plus the **total bytes read from storage** to answer it —
+/// the RFC 0031 §3.6 primary gate metric (measurement-fidelity amendment,
+/// 2026-07-12: the total, not just the count scan).
 #[derive(Debug, Clone)]
 pub struct OuriosAnswer {
     /// The matching rows, keyed for [`compare_lines`].
     pub lines: Vec<LineKey>,
-    /// Bytes read from object storage to answer the query — the
-    /// measurement the L-gates ratio against Loki's
-    /// `totalBytesProcessed` ([`parse_loki_bytes_processed`]).
+    /// **Total** bytes read from object storage to answer the query — the
+    /// sum of the three components below, so the figure the L-gates ratio
+    /// against Loki's `totalBytesProcessed`
+    /// ([`parse_loki_bytes_processed`]) / storage-side bytes counts
+    /// everything Ourios fetched to deliver the answer, not only the
+    /// count/pruning scan (Loki's counterpart includes delivering
+    /// results, so the §3.7 anti-strawman discipline requires ours to).
     pub bytes_read: u64,
+    /// The count/pruning-scan component (`QueryStats::bytes_read`, folded
+    /// from the engine's `bytes_scanned` scan metric on the RFC 0016
+    /// path — the figure the B1/B2 gates use).
+    pub count_scan_bytes: u64,
+    /// The row-materialization component: the extra scan that fetched the
+    /// ≤ `limit` rendered rows (`QueryResult::materialize_bytes_read`).
+    pub materialize_bytes: u64,
+    /// The template-registry component: the RFC 0017 §3.2 audit-stream
+    /// derivation that reconstructs string bodies
+    /// (`QueryResult::registry_bytes_read`).
+    pub registry_bytes: u64,
 }
 
 /// Run a logs-DSL query against the Ourios store at `bucket_root` and
@@ -296,7 +311,9 @@ pub fn ourios_query_answer(
             ),
         });
     }
-    let bytes_read = result.stats.bytes_read;
+    let count_scan_bytes = result.stats.bytes_read;
+    let materialize_bytes = result.materialize_bytes_read;
+    let registry_bytes = result.registry_bytes_read;
     result
         .records
         .iter()
@@ -307,7 +324,13 @@ pub fn ourios_query_answer(
             })
         })
         .collect::<Result<Vec<_>, _>>()
-        .map(|lines| OuriosAnswer { lines, bytes_read })
+        .map(|lines| OuriosAnswer {
+            lines,
+            bytes_read: count_scan_bytes + materialize_bytes + registry_bytes,
+            count_scan_bytes,
+            materialize_bytes,
+            registry_bytes,
+        })
 }
 
 /// Canonical byte identity of a query row's body for equivalence keying.
@@ -850,6 +873,60 @@ mod tests {
         assert!(
             answer.bytes_read > 0,
             "bytes_read must be non-zero for a query that scanned the store",
+        );
+    }
+
+    #[test]
+    fn honest_total_bytes_breaks_down_additively() {
+        // The §3.6 measurement-fidelity amendment (2026-07-12): the figure
+        // the L-gates ratio is the TOTAL bytes fetched to deliver the answer
+        // — count scan + row materialization + template-registry derivation.
+        // The registry-bearing comparative store makes all three components
+        // real: rendered rows force the materialization scan, and body
+        // reconstruction forces the RFC 0017 audit-stream read.
+        let records = comparative_fixture(crate::corpus::TIME_BASELINE_NS);
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("fixture.jsonl"),
+            fixture_jsonl(&records).expect("fixture jsonl"),
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+        let built =
+            crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+                .expect("build store");
+
+        let tenant = TenantId::new(built.tenant);
+        let now = built.max_effective_time_unix_nano + 1;
+        let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+        let answer = ourios_query_answer(
+            bucket.path(),
+            &tenant,
+            "severity >= 0 | limit 1000",
+            now,
+            window,
+        )
+        .expect("query answer");
+        assert_eq!(answer.lines.len(), 3, "every fixture row rendered");
+
+        assert_eq!(
+            answer.bytes_read,
+            answer.count_scan_bytes + answer.materialize_bytes + answer.registry_bytes,
+            "bytes_read is exactly the sum of its three components",
+        );
+        assert!(answer.count_scan_bytes > 0, "the count scan read data");
+        assert!(
+            answer.materialize_bytes > 0,
+            "rendering rows costs a second scan — it must be counted",
+        );
+        assert!(
+            answer.registry_bytes > 0,
+            "body reconstruction reads the audit stream — it must be counted",
+        );
+        assert!(
+            answer.bytes_read > answer.count_scan_bytes,
+            "the honest total exceeds the count-scan-only figure the old \
+             channel reported",
         );
     }
 

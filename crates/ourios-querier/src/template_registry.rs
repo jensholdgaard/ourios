@@ -52,14 +52,27 @@ pub fn derive_template_registry(
     backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<TemplateRegistry, QueryError> {
+    derive_template_registry_measured(backend, tenant).map(|(registry, _bytes)| registry)
+}
+
+/// [`derive_template_registry`] plus the **bytes fetched** from the audit
+/// stream deriving it — the registry component of a query's total IO
+/// (RFC 0031 §3.6). The byte figure is the audit scan's whole read (the
+/// stream is fetched before template events are filtered out), which is
+/// exactly what answering the query cost.
+pub(crate) fn derive_template_registry_measured(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+) -> Result<(TemplateRegistry, u64), QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
     // tenant backstop; keep only the template events (no window — the registry
     // folds the tenant's whole template history).
-    let events: Vec<AuditEvent> = audit_scan::read_all_events(backend, tenant)?
+    let (all_events, bytes_read) = audit_scan::read_all_events(backend, tenant)?;
+    let events: Vec<AuditEvent> = all_events
         .into_iter()
         .filter(|e| matches!(&e.payload, AuditPayload::Template { .. }))
         .collect();
-    Ok(fold_registry(events))
+    Ok((fold_registry(events), bytes_read))
 }
 
 /// Fold template audit `events` into the registry (RFC 0017 §3.2) — the pure

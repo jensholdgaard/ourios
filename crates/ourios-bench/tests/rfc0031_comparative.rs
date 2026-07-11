@@ -1210,9 +1210,13 @@ fn print_indicative_report(
             .evaluate(ours.bytes_read, *loki_processed, spec.margin);
         println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
         println!("dsl: {}", spec.dsl);
+        // The Ourios figure is the honest TOTAL (§3.6 measurement-fidelity
+        // amendment, 2026-07-12): count scan + row materialization +
+        // template-registry derivation — the gates below ratio against it.
         println!(
-            "ourios bytes_read (compressed, fetched)   = {}",
-            ours.bytes_read
+            "ourios bytes_read (compressed, fetched)   = {} \
+             (count_scan={} + materialize={} + registry={})",
+            ours.bytes_read, ours.count_scan_bytes, ours.materialize_bytes, ours.registry_bytes,
         );
         println!(
             "loki   storage-side bytes (conservative)  = {loki_storage} \

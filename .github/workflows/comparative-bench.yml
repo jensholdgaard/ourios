@@ -42,6 +42,13 @@ jobs:
           CORPUS_TAG: ${{ inputs.corpus_release_tag }}
         run: |
           set -euxo pipefail
+          # Same guard as query-bench.yml: the tag is dispatcher-controlled
+          # and reaches a CLI, so reject anything but a safe corpus/<name>
+          # (a leading `-` could otherwise read as flags).
+          if ! [[ "$CORPUS_TAG" =~ ^corpus/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::invalid corpus tag '$CORPUS_TAG' (expected corpus/<name> with a safe basename)"
+            exit 1
+          fi
           CORPUS_DIR="comparative-corpus"
           mkdir -p "$CORPUS_DIR"
           gh release download "$CORPUS_TAG" --pattern 'logs.jsonl.gz' --dir "$CORPUS_DIR"

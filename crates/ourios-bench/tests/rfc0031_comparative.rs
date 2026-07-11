@@ -526,6 +526,10 @@ fn pick_error_pair(corpus_dir: &std::path::Path) -> ErrorPair {
                         _ => None,
                     })
                     .unwrap_or_default();
+                // One entry lookup per ResourceLogs group (moving the
+                // service string in), not one clone per record — the scan
+                // walks multi-million-record corpora.
+                let entry = per_service.entry(service).or_default();
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         total += 1;
@@ -535,7 +539,6 @@ fn pick_error_pair(corpus_dir: &std::path::Path) -> ErrorPair {
                         }
                         let by_num = lr.severity_number >= 17;
                         let by_text = lr.severity_text == "ERROR";
-                        let entry = per_service.entry(service.clone()).or_default();
                         entry.0 += u64::from(by_num);
                         entry.1 += u64::from(by_text);
                         entry.2 += u64::from(by_num != by_text);
@@ -544,10 +547,18 @@ fn pick_error_pair(corpus_dir: &std::path::Path) -> ErrorPair {
             }
         }
     }
+    assert!(
+        min_ts <= max_ts,
+        "corpus has no record with a non-zero time_unix_nano — no query window derivable",
+    );
 
+    // No-service records (empty key) are counted above — they show in the
+    // failure diagnostic — but are never candidates: an empty service can't
+    // form a valid DSL/LogQL pair (Loki labels the stream differently for
+    // a missing service.name than for an empty one).
     let mut candidates: Vec<(&String, u64)> = per_service
         .iter()
-        .filter(|(_, counts)| counts.2 == 0 && (1..=4000).contains(&counts.0))
+        .filter(|(svc, counts)| !svc.is_empty() && counts.2 == 0 && (1..=4000).contains(&counts.0))
         .map(|(svc, counts)| (svc, counts.0))
         .collect();
     candidates.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));

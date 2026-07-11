@@ -79,7 +79,7 @@ jobs:
           {
             echo "## RFC 0031 indicative comparative run"
             echo '```'
-            grep -A8 '=== RFC 0031 indicative comparative run ===' comparative-run.log \
+            grep -A60 '=== RFC 0031 indicative comparative run ===' comparative-run.log \
               || echo "(no report block — see the run log)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

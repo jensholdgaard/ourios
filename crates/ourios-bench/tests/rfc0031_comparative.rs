@@ -61,7 +61,7 @@ fn rfc0031_1_result_set_equivalence() {
             .as_nanos(),
     )
     .expect("nanos fit u64")
-        - 30_000_000_000; // 30 s ago
+    .saturating_sub(30_000_000_000); // 30 s ago (total even on an absurd clock)
     let records = comparative_fixture(base_ns);
 
     // ------------------------------------------------------------------

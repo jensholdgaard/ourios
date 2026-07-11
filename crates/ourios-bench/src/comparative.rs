@@ -46,6 +46,7 @@ pub struct AggKey {
 /// means the two DSLs did not express the same question, so the harness
 /// writes the summary + examples and skips that class (RFC0031.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EquivalenceOutcome {
     /// The two answers are multiset-identical (or, for aggregations,
     /// map-identical).
@@ -138,9 +139,9 @@ pub fn compare_lines(
 /// Compare two aggregation results as `(bucket, group_key) -> count`
 /// maps (RFC0031.1 for the L4 class): every cell must match exactly.
 #[must_use]
-pub fn compare_aggregations<S: std::hash::BuildHasher>(
-    ourios: &HashMap<AggKey, u64, S>,
-    loki: &HashMap<AggKey, u64, S>,
+pub fn compare_aggregations<S1: std::hash::BuildHasher, S2: std::hash::BuildHasher>(
+    ourios: &HashMap<AggKey, u64, S1>,
+    loki: &HashMap<AggKey, u64, S2>,
     examples_cap: usize,
 ) -> EquivalenceOutcome {
     let mut differing: Vec<(&AggKey, u64, u64)> = ourios

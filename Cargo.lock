@@ -3248,6 +3248,7 @@ dependencies = [
 name = "ourios-bench"
 version = "0.2.1"
 dependencies = [
+ "bytes",
  "clap",
  "criterion",
  "opentelemetry-proto",

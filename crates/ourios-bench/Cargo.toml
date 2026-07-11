@@ -86,6 +86,9 @@ tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 testcontainers-modules = "=0.15.0"
 reqwest = { version = "0.12", default-features = false }
 prost = "0.14"
+# Refcounted request bodies for the corpus replay's retrying pusher (a
+# per-attempt Vec clone would copy ~2 MB per push across thousands).
+bytes = { version = "1", default-features = false }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 # RFC0024.2 draws calibrated records through a fixed-seed
 # `TestRunner` (the strategies come from `ourios-testgen`, already a

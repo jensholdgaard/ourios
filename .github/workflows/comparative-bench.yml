@@ -1,0 +1,85 @@
+name: Comparative bench (RFC 0031)
+
+# The RFC 0031 indicative comparative run: Ourios vs a real Loki on a
+# frozen `corpus/otel-demo-v*` release. `workflow_dispatch`-only — it
+# fetches a multi-GB corpus and drives two full ingest pipelines, so it
+# is on-demand like `bench.yml`, not a per-PR gate. Equivalence is
+# asserted inside the test; the bytes gate is REPORTED (the §7 margins
+# stay provisional until the maintainer freezes them against this run's
+# numbers). Results land in the job summary; folding a number into
+# `docs/benchmarks.md` §9 stays a maintainer step.
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_release_tag:
+        description: Release tag to fetch the frozen corpus from
+        required: false
+        default: corpus/otel-demo-v8
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  comparative:
+    name: ourios vs loki (indicative)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Fetch OTel Demo corpus (frozen release asset)
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # `env:` not `${{ }}` splicing — the tag is a
+          # dispatcher-controllable input (template-injection rule).
+          CORPUS_TAG: ${{ inputs.corpus_release_tag }}
+        run: |
+          set -euxo pipefail
+          # Same guard as query-bench.yml: the tag is dispatcher-controlled
+          # and reaches a CLI, so reject anything but a safe corpus/<name>
+          # (a leading `-` could otherwise read as flags).
+          if ! [[ "$CORPUS_TAG" =~ ^corpus/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::invalid corpus tag '$CORPUS_TAG' (expected corpus/<name> with a safe basename)"
+            exit 1
+          fi
+          CORPUS_DIR="comparative-corpus"
+          mkdir -p "$CORPUS_DIR"
+          gh release download "$CORPUS_TAG" --pattern 'logs.jsonl.gz' --dir "$CORPUS_DIR"
+          gunzip -f "$CORPUS_DIR/logs.jsonl.gz"
+          echo "fetched $(wc -l < "$CORPUS_DIR/logs.jsonl") lines, \
+                $(stat -c%s "$CORPUS_DIR/logs.jsonl") bytes from $CORPUS_TAG"
+          # Absolute path: the test binary's CWD is the package root
+          # (crates/ourios-bench), not the workspace root, so a relative
+          # dir would silently point at the wrong place.
+          echo "corpus_dir=$PWD/$CORPUS_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Run the indicative comparative test (release)
+        env:
+          OURIOS_COMPARATIVE_CORPUS: ${{ steps.fetch.outputs.corpus_dir }}
+        # Release mode: the run mines ~3 GB through the real miner +
+        # Parquet writer (bench.yml pins release for the same reason).
+        # `tee` keeps the full log while the summary step greps the
+        # report block.
+        run: |
+          set -euo pipefail
+          cargo test -p ourios-bench --release --test rfc0031_comparative -- \
+            --ignored --exact rfc0031_indicative_comparative_run --nocapture \
+            2>&1 | tee comparative-run.log
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## RFC 0031 indicative comparative run"
+            echo '```'
+            grep -A8 '=== RFC 0031 indicative comparative run ===' comparative-run.log \
+              || echo "(no report block — see the run log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

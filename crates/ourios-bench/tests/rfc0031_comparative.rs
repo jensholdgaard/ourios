@@ -196,24 +196,34 @@ async fn start_loki(
 /// (429 rate-limit / 5xx) with a short backoff — a sustained-ingest push
 /// must not fail the run on a burst limit.
 async fn push_otlp(http: &reqwest::Client, base: &str, payload: Vec<u8>) {
+    // `Bytes` so the per-attempt body handoff is a refcount bump, not a
+    // multi-MB copy on every push of a long replay.
+    let payload = bytes::Bytes::from(payload);
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let resp = http
+        let sent = http
             .post(format!("{base}/otlp/v1/logs"))
             .header("content-type", "application/x-protobuf")
             .body(payload.clone())
             .send()
-            .await
-            .expect("otlp push");
-        let status = resp.status();
-        if status.is_success() {
-            return;
-        }
-        let retryable = status.as_u16() == 429 || status.is_server_error();
-        let body = resp.text().await.unwrap_or_default();
+            .await;
+        // Transport errors (connection reset, timeout) are as transient as
+        // a 429 during a sustained replay — retry them within the same
+        // deadline rather than aborting the run on a blip.
+        let (status, body) = match sent {
+            Ok(resp) if resp.status().is_success() => return,
+            Ok(resp) => {
+                let status = resp.status();
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                let body = resp.text().await.unwrap_or_default();
+                assert!(retryable, "loki otlp push rejected: {status} — {body}");
+                (status.to_string(), body)
+            }
+            Err(e) => ("transport error".to_string(), e.to_string()),
+        };
         assert!(
-            retryable && std::time::Instant::now() < deadline,
-            "loki otlp push rejected: {status} — {body}",
+            std::time::Instant::now() < deadline,
+            "loki otlp push kept failing past the deadline: {status} — {body}",
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -670,7 +680,7 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
 ///
 /// Loki runs the stock image config plus two explicit, documented
 /// ingest-side deviations (both in LOKI'S favour — the anti-strawman
-/// direction): `reject_old_samples=false` (the frozen captures carry
+/// direction): `-validation.reject-old-samples=false` (the frozen captures carry
 /// their original timestamps, weeks old by run time) and raised
 /// ingest-rate limits so a 2.96 GB replay isn't throttled by dev-scale
 /// defaults. The query side stays stock.

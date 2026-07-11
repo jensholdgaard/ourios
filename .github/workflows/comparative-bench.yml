@@ -55,7 +55,10 @@ jobs:
           gunzip -f "$CORPUS_DIR/logs.jsonl.gz"
           echo "fetched $(wc -l < "$CORPUS_DIR/logs.jsonl") lines, \
                 $(stat -c%s "$CORPUS_DIR/logs.jsonl") bytes from $CORPUS_TAG"
-          echo "corpus_dir=$CORPUS_DIR" >> "$GITHUB_OUTPUT"
+          # Absolute path: the test binary's CWD is the package root
+          # (crates/ourios-bench), not the workspace root, so a relative
+          # dir would silently point at the wrong place.
+          echo "corpus_dir=$PWD/$CORPUS_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Run the indicative comparative test (release)
         env:

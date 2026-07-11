@@ -170,8 +170,9 @@ fn build_query_store_inner(
 }
 
 /// Write the miner's audit-event stream into the `audit/...` partition
-/// series (mirrors the A1 gate), grouped by the canonical audit partition
-/// key. The querier's `derive_template_registry` (RFC 0017) reads it back.
+/// series so the querier's `derive_template_registry` (RFC 0017) reads it
+/// back. Groups by the canonical audit partition key, then hands off to
+/// the shared writer.
 fn write_audit_partition(bucket_root: &Path, events: Vec<AuditEvent>) -> Result<(), BenchError> {
     let mut by_partition: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
     for event in events {
@@ -182,6 +183,17 @@ fn write_audit_partition(bucket_root: &Path, events: Vec<AuditEvent>) -> Result<
         })?;
         by_partition.entry(partition).or_default().push(event);
     }
+    write_audit_partitions(bucket_root, by_partition)
+}
+
+/// Write pre-grouped audit events, one `AuditWriter` per partition. Shared
+/// by [`build_comparative_store`] and the A1 gate — they group by their
+/// respective partition derivation, but the write dance (open / append /
+/// close, with the `audit/...` partition series) is identical.
+pub(crate) fn write_audit_partitions(
+    bucket_root: &Path,
+    by_partition: HashMap<PartitionKey, Vec<AuditEvent>>,
+) -> Result<(), BenchError> {
     for (partition, events) in by_partition {
         let mut writer =
             AuditWriter::open(bucket_root, partition).map_err(|e| BenchError::Pipeline {

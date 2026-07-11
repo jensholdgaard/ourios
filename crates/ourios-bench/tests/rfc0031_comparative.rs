@@ -917,6 +917,31 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
     eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests");
 }
 
+/// Which direction a pair's bytes gate asks its question in (RFC 0031
+/// §2 dispositions): the L1–L4 classes must WIN by the margin, the
+/// L6/L7 family must merely stay WITHIN the floor factor.
+#[derive(Clone, Copy)]
+enum GateKind {
+    MustWin,
+    Floor,
+}
+
+impl GateKind {
+    fn evaluate(self, ourios: u64, loki: u64, margin: u64) -> ourios_bench::BytesGateOutcome {
+        match self {
+            Self::MustWin => ourios_bench::bytes_must_win(ourios, loki, margin),
+            Self::Floor => ourios_bench::bytes_within_floor(ourios, loki, margin),
+        }
+    }
+
+    fn margin_label(self) -> &'static str {
+        match self {
+            Self::MustWin => "must-win margin",
+            Self::Floor => "floor factor",
+        }
+    }
+}
+
 /// One measured query of the indicative run: the equivalent DSL/`LogQL`
 /// question, the window both systems answer it over, and the row count
 /// both must return exactly.
@@ -925,6 +950,9 @@ struct PairSpec {
     /// The pair's §7 margin for the reported gate (`m_l2` for the
     /// severity pair, `f_l6` for the broad time-window slices).
     margin: u64,
+    /// Direction the gate is reported under: must-win for the severity
+    /// pair, floor for the time-window slices.
+    gate: GateKind,
     dsl: String,
     logql: String,
     /// Loki `query_range` window (nanoseconds, `[start, end)` by the
@@ -966,6 +994,7 @@ fn build_pair_specs(
             pair.service, pair.threshold, pair.text
         ),
         margin: margins.m_l2,
+        gate: GateKind::MustWin,
         dsl: format!(
             "service == \"{}\" and severity >= {} | limit 5000",
             pair.service, pair.threshold
@@ -998,6 +1027,7 @@ fn build_pair_specs(
                 pair.service
             ),
             margin: margins.f_l6,
+            gate: GateKind::Floor,
             dsl: format!("service == \"{}\" | limit 5000", pair.service),
             logql: format!("{{service_name=\"{}\"}}", pair.service),
             start,
@@ -1172,9 +1202,12 @@ fn print_indicative_report(
     println!("corpus: {} ({total_records} records)", corpus_dir.display());
     for ((spec, ours), (_, loki_processed, loki_fetched)) in specs.iter().zip(ourios).zip(loki) {
         let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
-        let gate_storage = ourios_bench::bytes_must_win(ours.bytes_read, loki_storage, spec.margin);
-        let gate_processed =
-            ourios_bench::bytes_must_win(ours.bytes_read, *loki_processed, spec.margin);
+        let gate_storage = spec
+            .gate
+            .evaluate(ours.bytes_read, loki_storage, spec.margin);
+        let gate_processed = spec
+            .gate
+            .evaluate(ours.bytes_read, *loki_processed, spec.margin);
         println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
         println!("dsl: {}", spec.dsl);
         println!(
@@ -1188,11 +1221,13 @@ fn print_indicative_report(
         );
         println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
         println!(
-            "gate vs storage-side (PRIMARY, margin {}): {gate_storage:?}",
+            "gate vs storage-side (PRIMARY, {} {}): {gate_storage:?}",
+            spec.gate.margin_label(),
             spec.margin
         );
         println!(
-            "gate vs bytes-processed (context, margin {}): {gate_processed:?}",
+            "gate vs bytes-processed (context, {} {}): {gate_processed:?}",
+            spec.gate.margin_label(),
             spec.margin
         );
     }

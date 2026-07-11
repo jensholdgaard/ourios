@@ -27,7 +27,7 @@
 //! `calibrate` + `reference` + `store` (RFC 0024 / the B1/B2 query
 //! stores), and the RFC 0031 comparative harness (`comparative` — the
 //! Loki equivalence check + measurement channel — and `lgates`, the
-//! comparative must-win gate math).
+//! comparative must-win / floor gate math).
 
 #![deny(unsafe_code)]
 
@@ -54,7 +54,7 @@ pub use comparative::{
     parse_loki_bytes_processed, parse_loki_fetched_bytes, parse_loki_streams,
 };
 pub use corpus::TxtSeverity;
-pub use lgates::{BytesGateOutcome, ComparativeMargins, bytes_must_win};
+pub use lgates::{BytesGateOutcome, ComparativeMargins, bytes_must_win, bytes_within_floor};
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
 pub use store::{B1Store, BuiltStore, build_b1_store, build_comparative_store, build_query_store};

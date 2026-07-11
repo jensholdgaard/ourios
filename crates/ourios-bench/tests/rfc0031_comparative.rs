@@ -558,11 +558,17 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         total += 1;
-                        // A zero-timestamp record can't be returned by
-                        // either side's time-windowed query, so it must
-                        // not count into any candidate band either — a
-                        // band containing unreachable rows would fail its
-                        // expected-count check at run time.
+                        // Zero-`time_unix_nano` records are excluded from
+                        // candidate bands even though both systems could
+                        // still return them (Ourios windows the RFC 0005
+                        // §3.2 EFFECTIVE timestamp, falling back to
+                        // observed; Loki's OTLP ingest falls back to
+                        // observed too): the two sides would answer with
+                        // DIFFERENT timestamps — Ourios's row keeps
+                        // time_unix_nano = 0, Loki stamps its stored
+                        // (observed) time — so their LineKeys can never
+                        // match and any band containing such rows is a
+                        // guaranteed equivalence mismatch.
                         if lr.time_unix_nano == 0 {
                             continue;
                         }

@@ -469,6 +469,7 @@ pub fn parse_loki_fetched_bytes(response_json: &str) -> Result<LokiFetchedBytes,
     let stats = root
         .get("data")
         .and_then(|d| d.get("stats"))
+        .filter(|s| s.is_object())
         .ok_or_else(|| BenchError::Pipeline {
             detail: "Loki response missing `data.stats` — refusing to record 0 storage \
                      bytes for a query that ran"
@@ -897,9 +898,10 @@ mod tests {
         let fetched = parse_loki_fetched_bytes(head_only).expect("empty stats parse");
         assert_eq!((fetched.compressed_bytes, fetched.head_chunk_bytes), (0, 0));
 
-        // ...but a missing stats block is an error, same honesty rule as
-        // the processed-bytes parser.
+        // ...but a missing or non-object stats block is an error, same
+        // honesty rule as the processed-bytes parser.
         assert!(parse_loki_fetched_bytes(r#"{"data":{"result":[]}}"#).is_err());
+        assert!(parse_loki_fetched_bytes(r#"{"data":{"result":[],"stats":null}}"#).is_err());
     }
 
     #[test]

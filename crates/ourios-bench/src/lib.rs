@@ -43,9 +43,10 @@ mod store;
 
 pub use calibrate::{CALIBRATION_DIR, extract_manifest, write_manifest};
 pub use comparative::{
-    AggKey, EquivalenceOutcome, FIXTURE_SERVICE, FixtureRecord, LineKey, Mismatch,
+    AggKey, EquivalenceOutcome, FIXTURE_SERVICE, FixtureRecord, LineKey, Mismatch, OuriosAnswer,
     comparative_fixture, compare_aggregations, compare_lines, fixture_jsonl, fixture_line_keys,
-    fixture_logs_data, ourios_query_lines, parse_loki_streams,
+    fixture_logs_data, ourios_query_answer, ourios_query_lines, parse_loki_bytes_processed,
+    parse_loki_streams,
 };
 pub use corpus::TxtSeverity;
 pub use reference::ReferenceCorpus;

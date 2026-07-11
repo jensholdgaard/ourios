@@ -203,7 +203,47 @@ fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
 
 /// Run a logs-DSL query against the Ourios store at `bucket_root` and
 /// return the matching rows as [`LineKey`]s — the Ourios half of the
-/// RFC0031.1 equivalence check.
+/// RFC0031.1 equivalence check. Thin wrapper over [`ourios_query_answer`]
+/// for callers that need only the lines.
+///
+/// # Errors
+///
+/// Exactly [`ourios_query_answer`]'s.
+pub fn ourios_query_lines(
+    bucket_root: &Path,
+    tenant: &TenantId,
+    dsl: &str,
+    now_unix_nano: u64,
+    default_window_nanos: u64,
+) -> Result<Vec<LineKey>, BenchError> {
+    ourios_query_answer(
+        bucket_root,
+        tenant,
+        dsl,
+        now_unix_nano,
+        default_window_nanos,
+    )
+    .map(|answer| answer.lines)
+}
+
+/// The Ourios side of a comparative query: the matching rows as
+/// [`LineKey`]s plus the **bytes read from storage** to answer it — the
+/// RFC 0031 §3.6 primary gate metric (`QueryStats::bytes_read`, folded
+/// from the engine's `bytes_scanned` scan metric on the RFC 0016 path).
+#[derive(Debug, Clone)]
+pub struct OuriosAnswer {
+    /// The matching rows, keyed for [`compare_lines`].
+    pub lines: Vec<LineKey>,
+    /// Bytes read from object storage to answer the query — the
+    /// measurement the L-gates ratio against Loki's
+    /// `totalBytesProcessed` ([`parse_loki_bytes_processed`]).
+    pub bytes_read: u64,
+}
+
+/// Run a logs-DSL query against the Ourios store at `bucket_root` and
+/// return the matching rows **and** the bytes-read measurement — the
+/// Ourios half of both the RFC0031.1 equivalence check and the
+/// RFC0031.2–.5 bytes-read gates.
 ///
 /// Runs the querier **in-process** (RFC 0031 §7: no served binary). The
 /// query MUST carry a `limit` large enough to render **every** matching
@@ -219,13 +259,13 @@ fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
 /// matching row (missing or too-small `limit`), or a returned row carries
 /// a body kind the equivalence extraction does not yet lower (a structured
 /// or absent body — the string-body case always lowers).
-pub fn ourios_query_lines(
+pub fn ourios_query_answer(
     bucket_root: &Path,
     tenant: &TenantId,
     dsl: &str,
     now_unix_nano: u64,
     default_window_nanos: u64,
-) -> Result<Vec<LineKey>, BenchError> {
+) -> Result<OuriosAnswer, BenchError> {
     let query = ourios_querier::dsl::parse(dsl).map_err(|e| BenchError::Pipeline {
         detail: format!("comparative DSL parse `{dsl}`: {e}"),
     })?;
@@ -256,6 +296,7 @@ pub fn ourios_query_lines(
             ),
         });
     }
+    let bytes_read = result.stats.bytes_read;
     result
         .records
         .iter()
@@ -265,7 +306,8 @@ pub fn ourios_query_lines(
                 body: body_bytes(&row.body)?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|lines| OuriosAnswer { lines, bytes_read })
 }
 
 /// Canonical byte identity of a query row's body for equivalence keying.
@@ -315,28 +357,7 @@ fn body_bytes(body: &ourios_querier::LogBody) -> Result<Vec<u8>, BenchError> {
 /// timestamp string that isn't a `u64`. Malformed-entry errors carry the
 /// stream + value indices for debugging against real Loki responses.
 pub fn parse_loki_streams(response_json: &str) -> Result<Vec<LineKey>, BenchError> {
-    let root: serde_json::Value =
-        serde_json::from_str(response_json).map_err(|e| BenchError::Pipeline {
-            detail: format!("Loki response is not JSON: {e}"),
-        })?;
-
-    // A Loki error response ({"status":"error", "errorType":..., "error":...})
-    // would otherwise fail below as "missing data.result" — surface Loki's
-    // own diagnostic instead, which is what an operator needs to see.
-    if root.get("status").and_then(serde_json::Value::as_str) == Some("error") {
-        let error_type = root
-            .get("errorType")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let error = root
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(no message)");
-        return Err(BenchError::Pipeline {
-            detail: format!("Loki query error [{error_type}]: {error}"),
-        });
-    }
-
+    let root = parse_loki_root(response_json)?;
     let result = root
         .get("data")
         .and_then(|d| d.get("result"))
@@ -380,6 +401,57 @@ pub fn parse_loki_streams(response_json: &str) -> Result<Vec<LineKey>, BenchErro
         }
     }
     Ok(lines)
+}
+
+/// Parse a Loki `query_range` response's **bytes-processed** measurement
+/// (`data.stats.summary.totalBytesProcessed`) — the Loki half of the
+/// RFC 0031 §3.6 bytes-read gate metric, ratioed against
+/// [`OuriosAnswer::bytes_read`]. Loki attaches the stats block to every
+/// successful query response; its absence is an error rather than a
+/// silent `0`, because a zero would fake a perfect pruning ratio.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if the response isn't JSON, is a Loki error
+/// response (surfaces Loki's `errorType` / `error`), or carries no
+/// numeric `data.stats.summary.totalBytesProcessed`.
+pub fn parse_loki_bytes_processed(response_json: &str) -> Result<u64, BenchError> {
+    let root = parse_loki_root(response_json)?;
+    root.get("data")
+        .and_then(|d| d.get("stats"))
+        .and_then(|s| s.get("summary"))
+        .and_then(|s| s.get("totalBytesProcessed"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: "Loki response missing numeric `data.stats.summary.totalBytesProcessed` \
+                     — refusing to record 0 bytes for a query that ran"
+                .to_string(),
+        })
+}
+
+/// Parse a Loki response to its JSON root, surfacing a Loki **error**
+/// response (`status == "error"`) as Loki's own diagnostic — shared by
+/// [`parse_loki_streams`] and [`parse_loki_bytes_processed`] so an error
+/// body never reads as a confusing structural parse failure.
+fn parse_loki_root(response_json: &str) -> Result<serde_json::Value, BenchError> {
+    let root: serde_json::Value =
+        serde_json::from_str(response_json).map_err(|e| BenchError::Pipeline {
+            detail: format!("Loki response is not JSON: {e}"),
+        })?;
+    if root.get("status").and_then(serde_json::Value::as_str) == Some("error") {
+        let error_type = root
+            .get("errorType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let error = root
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no message)");
+        return Err(BenchError::Pipeline {
+            detail: format!("Loki query error [{error_type}]: {error}"),
+        });
+    }
+    Ok(root)
 }
 
 /// The `service.name` every comparative-fixture record carries — the
@@ -690,19 +762,60 @@ mod tests {
         let tenant = TenantId::new(built.tenant);
         let now = built.max_effective_time_unix_nano + 1;
         let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
-        let extracted = ourios_query_lines(
+        let answer = ourios_query_answer(
             bucket.path(),
             &tenant,
             "severity >= 0 | limit 1000",
             now,
             window,
         )
-        .expect("extract lines");
+        .expect("query answer");
 
         assert!(
-            compare_lines(&extracted, &fixture_line_keys(&records), 8).is_equal(),
+            compare_lines(&answer.lines, &fixture_line_keys(&records), 8).is_equal(),
             "Ourios round-trip of the fixture must equal the expected LineKeys",
         );
+        // The measurement channel: answering the query read real bytes from
+        // storage (the RFC 0031 §3.6 primary gate metric must never be a
+        // silent 0 for a query that scanned data).
+        assert!(
+            answer.bytes_read > 0,
+            "bytes_read must be non-zero for a query that scanned the store",
+        );
+    }
+
+    #[test]
+    fn parse_loki_bytes_processed_reads_the_summary() {
+        let response = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "streams",
+                "result": [],
+                "stats": { "summary": { "totalBytesProcessed": 4096 } }
+            }
+        }"#;
+        assert_eq!(
+            parse_loki_bytes_processed(response).expect("parse bytes"),
+            4096,
+        );
+    }
+
+    #[test]
+    fn parse_loki_bytes_processed_refuses_a_missing_summary() {
+        // Absent stats must be an error, not a silent 0 — a zero would fake
+        // a perfect pruning ratio in the L-gates.
+        let no_stats = r#"{"status":"success","data":{"result":[]}}"#;
+        assert!(parse_loki_bytes_processed(no_stats).is_err());
+
+        // And a Loki error response surfaces Loki's own diagnostic.
+        let err = parse_loki_bytes_processed(
+            r#"{"status":"error","errorType":"too_many_requests","error":"throttled"}"#,
+        )
+        .expect_err("error response must error");
+        let BenchError::Pipeline { detail } = err else {
+            panic!("expected a pipeline error");
+        };
+        assert!(detail.contains("throttled"), "{detail}");
     }
 
     #[test]

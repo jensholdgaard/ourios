@@ -448,8 +448,13 @@ mod tests {
             .collect();
         bodies.sort();
         let got: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        // Sort the expected lines too: extraction order is unspecified, so
+        // the comparison must be order-independent (not rely on the fixture
+        // happening to be lexicographically ordered).
+        let mut expected: Vec<&str> = lines.to_vec();
+        expected.sort_unstable();
         assert_eq!(
-            got, lines,
+            got, expected,
             "extracted bodies are the corpus lines, bit for bit"
         );
 

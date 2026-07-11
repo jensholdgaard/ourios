@@ -716,7 +716,7 @@ fn pick_window_pair(clean_ts: &[u64], poison_ts: &[u64], k: usize) -> Option<(u6
     let i = (0..=clean_ts.len() - k)
         .filter(|&i| valid(i))
         .min_by_key(|&i| (i.abs_diff(centre), i))?;
-    Some((clean_ts[i], clean_ts[i + k - 1] + 1))
+    Some((clean_ts[i], clean_ts[i + k - 1].checked_add(1)?))
 }
 
 /// The candidate `(rows, threshold, service, text)` tuples for

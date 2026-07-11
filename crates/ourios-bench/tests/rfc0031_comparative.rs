@@ -196,6 +196,16 @@ async fn start_loki(
 /// (429 rate-limit / 5xx) with a short backoff — a sustained-ingest push
 /// must not fail the run on a burst limit.
 async fn push_otlp(http: &reqwest::Client, base: &str, payload: Vec<u8>) {
+    // Fail FAST on an oversized payload: it would 503 permanently (Loki's
+    // stock 4 MiB internal gRPC cap), and burning the retry deadline on it
+    // masks the real cause. This converts the batcher's byte ESTIMATE into
+    // a checked guarantee at the actual encoded size.
+    assert!(
+        payload.len() < 4 * 1024 * 1024,
+        "OTLP payload is {} bytes — at/over Loki's stock 4 MiB gRPC cap; \
+         the byte-capped batcher under-estimated",
+        payload.len(),
+    );
     // `Bytes` so the per-attempt body handoff is a refcount bump, not a
     // multi-MB copy on every push of a long replay.
     let payload = bytes::Bytes::from(payload);

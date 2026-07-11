@@ -1,9 +1,11 @@
-//! RFC 0031 — comparative evaluation vs Grafana Loki (§5 red stubs).
+//! RFC 0031 — comparative evaluation vs Grafana Loki (§5 scenarios).
 //!
-//! Eleven `#[ignore]`d stubs, one per §5 acceptance scenario
-//! (RFC0031.1–.11). Tagged `#[ignore]` so the default `cargo test`
-//! stays green while the stubs exist and fail-when-run; each is
-//! discharged by its named green slice.
+//! One scenario per §5 acceptance criterion (RFC0031.1–.11). `.1`
+//! (result-set equivalence) is **live**: a real Loki container run,
+//! `#[ignore]`d because it needs Docker — the `loki-interop` CI job
+//! executes it via `--ignored --exact` (the dex-oidc precedent). The
+//! remaining ten are `#[ignore]`d red stubs, each discharged by its
+//! named green slice.
 //!
 //! Placement note: the comparative harness lives in `ourios-bench`
 //! for now (extending the RFC 0006 harness) rather than a new crate,
@@ -16,21 +18,248 @@
 //! expression of the pruning thesis. Latency is corroborating, not
 //! sole-gating. See `docs/rfcs/0031-comparative-evaluation-loki.md`.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ourios_bench::{
+    FIXTURE_SERVICE, FixtureRecord, LineKey, comparative_fixture, compare_lines, fixture_jsonl,
+    fixture_logs_data, ourios_query_lines, parse_loki_streams,
+};
+use ourios_core::tenant::TenantId;
+
+/// `grafana/loki`, digest-pinned like the Dex image (the tag names the
+/// release a competent operator would run; the digest makes CI
+/// reproducible).
+const LOKI_IMAGE: &str = "grafana/loki";
+const LOKI_TAG: &str =
+    "3.5.3@sha256:3165cecce301ce5b9b6e3530284b080934a05cd5cafac3d3d82edcb887b45ecd";
+
 /// Scenario RFC0031.1 — result-set equivalence gates every comparison.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// The full equivalence harness, end to end: the shared OTLP fixture is
+/// ingested by **both** systems — Ourios via the registry-bearing
+/// comparative store (in-process querier per RFC 0031 §7), Loki via its
+/// native OTLP endpoint on a real container — queried equivalently
+/// (logs DSL ↔ `LogQL`), and the two `LineKey` multisets must be
+/// identical. A deliberately narrower `LogQL` then asserts the
+/// mismatch arm reports `Mismatch` rather than silently passing.
+///
+/// Plain `#[test]` by design: `ourios_query_lines` owns its own tokio
+/// runtime, so the Ourios half runs sync and only the container half
+/// runs inside `block_on` (nesting the two would panic).
 #[test]
-#[ignore = "RFC0031.1 stub — implemented in the equivalence-harness green slice"]
+#[ignore = "RFC0031.1 — needs Docker (real Loki container); run by the loki-interop CI job via --ignored"]
 fn rfc0031_1_result_set_equivalence() {
-    todo!(
-        "RFC0031.1 — for a line-returning class the harness keys each \
-         system's matches by (timestamp_unix_nanos, body_bytes) and \
-         asserts the two MULTISETS are identical (per-key counts equal, \
-         so duplicate identical lines are not silently collapsed); for \
-         the L4 aggregation class it asserts the (bucket, group_key) -> \
-         count maps are identical; a mismatch writes no L-metric for \
-         that class, emits the count-delta summary + example keys to \
-         stderr, exits non-zero, and no benchmarks.md §9 row is written"
+    // ------------------------------------------------------------------
+    // Shared fixture, stamped near now: Loki's default reject_old_samples
+    // refuses lines older than its window, so the base must be recent.
+    // ------------------------------------------------------------------
+    let base_ns = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("nanos fit u64")
+    .saturating_sub(30_000_000_000); // 30 s ago (total even on an absurd clock)
+    let records = comparative_fixture(base_ns);
+
+    // ------------------------------------------------------------------
+    // Ourios half (sync, locally-proven path): fixture → JSONL corpus →
+    // registry-bearing store → in-process query → LineKeys.
+    // ------------------------------------------------------------------
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+    let ourios_lines = ourios_query_lines(
+        bucket.path(),
+        &tenant,
+        "severity >= 0 | limit 1000",
+        now,
+        window,
+    )
+    .expect("ourios extraction");
+    assert_eq!(ourios_lines.len(), 3, "Ourios returns every fixture line");
+
+    // ------------------------------------------------------------------
+    // Loki half (async): container → OTLP push → LogQL → LineKeys.
+    // ------------------------------------------------------------------
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (loki_all, loki_narrow) = runtime.block_on(loki_round_trip(&records, base_ns));
+
+    // ------------------------------------------------------------------
+    // The equivalence check itself (RFC0031.1): identical multisets for
+    // the equivalent query pair; Mismatch for the narrower one.
+    // ------------------------------------------------------------------
+    let outcome = compare_lines(&ourios_lines, &loki_all, 8);
+    assert!(
+        outcome.is_equal(),
+        "RFC0031.1 — the two systems' answers must be multiset-identical: {outcome:?}",
     );
+    assert!(
+        !compare_lines(&ourios_lines, &loki_narrow, 8).is_equal(),
+        "the deliberately-narrower LogQL must report Mismatch, not silently pass",
+    );
+}
+
+/// The Loki half of RFC0031.1: start a real Loki container, push the SAME
+/// `LogsData` value the Ourios corpus was rendered from over the native
+/// OTLP endpoint, then answer two `LogQL` queries — the fixture-equivalent
+/// one (all lines) and a deliberately narrower one (the mismatch arm).
+async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKey>, Vec<LineKey>) {
+    use prost::Message as _;
+    use testcontainers_modules::testcontainers::core::ContainerPort;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+    // The stock image config (schema v13 / TSDB) serves the native OTLP
+    // endpoint and maps `service.name` → the `service_name` stream label;
+    // auth is disabled. Exactly what a competent single-binary operator
+    // gets out of the box.
+    let container = GenericImage::new(LOKI_IMAGE, LOKI_TAG)
+        .with_exposed_port(ContainerPort::Tcp(3100))
+        .with_cmd(["-config.file=/etc/loki/local-config.yaml"])
+        .start()
+        .await
+        .expect("loki container starts");
+    let port = container
+        .get_host_port_ipv4(3100)
+        .await
+        .expect("loki host port");
+    let base = format!("http://127.0.0.1:{port}");
+    // A per-request timeout so a wedged container/network stack fails a
+    // request (and the surrounding deadline loop moves on) rather than
+    // hanging the CI job to its global timeout.
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("http client");
+
+    // Readiness: /ready flips 200 once the ingester is up. Surface the
+    // container's own output on timeout so a config rejection doesn't
+    // read as a bare timeout (Loki writes startup errors to both streams).
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Ok(r) = http.get(format!("{base}/ready")).send().await
+            && r.status().is_success()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let stdout = container
+                .stdout_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            let stderr = container
+                .stderr_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            panic!(
+                "loki /ready never turned 200.\n--- loki stdout ---\n{stdout}\n\
+                 --- loki stderr ---\n{stderr}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Push the SAME LogsData value the Ourios corpus was rendered from,
+    // as the OTLP/HTTP protobuf body Loki's endpoint takes.
+    let payload = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
+        resource_logs: fixture_logs_data(records).resource_logs,
+    }
+    .encode_to_vec();
+    let push = http
+        .post(format!("{base}/otlp/v1/logs"))
+        .header("content-type", "application/x-protobuf")
+        .body(payload)
+        .send()
+        .await
+        .expect("otlp push");
+    assert!(
+        push.status().is_success(),
+        "loki otlp push rejected: {} — {}",
+        push.status(),
+        push.text().await.unwrap_or_default(),
+    );
+
+    // Query until every line is visible (ingest is async); then run the
+    // deliberately-narrower query for the mismatch arm.
+    let (start, end) = (base_ns, base_ns + 10_000);
+    let all_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let loki_all = loop {
+        let lines = loki_query_range(&http, &base, &all_logql, start, end).await;
+        if lines.len() >= 3 {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "loki returned {} of 3 fixture lines before timeout",
+            lines.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let narrow_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}} |= \"logged in\"");
+    let loki_narrow = loki_query_range(&http, &base, &narrow_logql, start, end).await;
+    // Pin the narrow result to exactly the 2 "logged in" lines: the
+    // mismatch arm asserts only inequality, so a silently-broken filter
+    // returning 0 lines would otherwise still "pass" it.
+    assert_eq!(
+        loki_narrow.len(),
+        2,
+        "the narrower filter must match exactly the two 'logged in' lines",
+    );
+    (loki_all, loki_narrow)
+}
+
+/// One Loki `query_range` call, parsed to [`LineKey`]s.
+async fn loki_query_range(
+    http: &reqwest::Client,
+    base: &str,
+    logql: &str,
+    start: u64,
+    end: u64,
+) -> Vec<LineKey> {
+    let resp = http
+        .get(format!("{base}/loki/api/v1/query_range"))
+        .query(&[
+            ("query", logql),
+            ("start", &start.to_string()),
+            ("end", &end.to_string()),
+            ("limit", "1000"),
+            ("direction", "forward"),
+        ])
+        .send()
+        .await
+        .expect("query_range");
+    // Check the HTTP status before parsing: a non-2xx body may not be the
+    // streams JSON at all, and "parse failed" would mask the real error.
+    let status = resp.status();
+    let body = resp.text().await.expect("query_range body");
+    assert!(
+        status.is_success(),
+        "loki query_range returned {status}: {body}",
+    );
+    parse_loki_streams(&body).expect("parse loki streams")
 }
 
 /// Scenario RFC0031.2 — L1 selective template lookup wins on bytes read.

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use opentelemetry_proto::tonic::logs::v1::LogsData;
 use ourios_core::tenant::TenantId;
 
 use crate::BenchError;
@@ -381,6 +382,124 @@ pub fn parse_loki_streams(response_json: &str) -> Result<Vec<LineKey>, BenchErro
     Ok(lines)
 }
 
+/// The `service.name` every comparative-fixture record carries — the
+/// resource identity both systems key on (Ourios: promoted service
+/// column; Loki: the `service_name` stream label its OTLP ingest derives).
+pub const FIXTURE_SERVICE: &str = "comparative-fixture";
+
+/// One comparative-fixture log record: the **single source of truth** for
+/// the RFC0031.1 equivalence check. The same records are rendered as the
+/// Ourios corpus (OTLP/JSON Lines via [`fixture_jsonl`]) and as the Loki
+/// OTLP payload (the [`fixture_logs_data`] wire shape), so the two
+/// systems ingest byte-identical `(timestamp, body)` pairs and
+/// [`LineKey`]s align by construction.
+#[derive(Debug, Clone)]
+pub struct FixtureRecord {
+    /// Wire `time_unix_nano` (both systems' returned timestamp).
+    pub time_unix_nano: u64,
+    /// OTLP severity number (1–24).
+    pub severity_number: i32,
+    /// OTLP severity text.
+    pub severity_text: &'static str,
+    /// The log line (string body).
+    pub body: &'static str,
+}
+
+/// The deterministic comparative fixture, timestamped from `base_ns`.
+///
+/// `base_ns` is a parameter — not a baked-in constant — because Loki's
+/// default `reject_old_samples` refuses lines older than its window, so
+/// the container test stamps the fixture near *now*, while local tests
+/// may use any base.
+#[must_use]
+pub fn comparative_fixture(base_ns: u64) -> Vec<FixtureRecord> {
+    // Distinct timestamps (LineKey identity is (timestamp, body)) and a
+    // severity mix so severity-filtered pairs have selective results.
+    [
+        (0, 9, "INFO", "user 1 logged in"),
+        (1_000, 9, "INFO", "user 2 logged in"),
+        (2_000, 17, "ERROR", "payment 7 failed"),
+    ]
+    .into_iter()
+    .map(|(off, num, text, body)| FixtureRecord {
+        time_unix_nano: base_ns + off,
+        severity_number: num,
+        severity_text: text,
+        body,
+    })
+    .collect()
+}
+
+/// The fixture as the OTLP `LogsData` wire shape: one resource whose
+/// `service.name` is [`FIXTURE_SERVICE`], one scope, one `LogRecord` per
+/// fixture record. The Ourios corpus line and the Loki OTLP push are both
+/// derived from this one value.
+#[must_use]
+pub fn fixture_logs_data(records: &[FixtureRecord]) -> LogsData {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    let log_records = records
+        .iter()
+        .map(|r| LogRecord {
+            time_unix_nano: r.time_unix_nano,
+            severity_number: r.severity_number,
+            severity_text: r.severity_text.to_string(),
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(r.body.to_string())),
+            }),
+            ..LogRecord::default()
+        })
+        .collect();
+    LogsData {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(FIXTURE_SERVICE.to_string())),
+                    }),
+                    ..KeyValue::default()
+                }],
+                ..Resource::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records,
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}
+
+/// The fixture rendered as one OTLP/JSON Lines corpus line — the format
+/// `corpus::ingest_otlp_jsonl` parses (`serde_json` against the same
+/// `with-serde` `LogsData` type, so it round-trips by construction).
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if serde serialization fails (structurally
+/// impossible for these types; surfaced rather than unwrapped).
+pub fn fixture_jsonl(records: &[FixtureRecord]) -> Result<String, BenchError> {
+    serde_json::to_string(&fixture_logs_data(records)).map_err(|e| BenchError::Pipeline {
+        detail: format!("fixture LogsData serialization: {e}"),
+    })
+}
+
+/// The [`LineKey`]s both systems must return for a query matching every
+/// fixture record — the expected value of the equivalence check.
+#[must_use]
+pub fn fixture_line_keys(records: &[FixtureRecord]) -> Vec<LineKey> {
+    records
+        .iter()
+        .map(|r| LineKey {
+            timestamp_unix_nanos: r.time_unix_nano,
+            body: r.body.as_bytes().to_vec(),
+        })
+        .collect()
+}
+
 /// A truncated, lossy preview of a body for a mismatch report — bounded
 /// so an arbitrarily large body can't blow up the stderr summary.
 fn body_preview(body: &[u8]) -> String {
@@ -543,6 +662,47 @@ mod tests {
         };
         assert!(detail.contains("parse error"), "{detail}");
         assert!(detail.contains("unexpected token"), "{detail}");
+    }
+
+    #[test]
+    fn fixture_round_trips_through_the_ourios_side() {
+        // The single-source-of-truth proof, Ourios half: the fixture
+        // rendered as an OTLP/JSON Lines corpus, ingested through the
+        // registry-bearing comparative store and queried in-process, comes
+        // back as exactly `fixture_line_keys` — the same expected keys the
+        // Loki container run is compared against. Local, no container.
+        let base_ns = crate::corpus::TIME_BASELINE_NS;
+        let records = comparative_fixture(base_ns);
+
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("fixture.jsonl"),
+            fixture_jsonl(&records).expect("fixture jsonl"),
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built =
+            crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+                .expect("build store");
+        assert_eq!(built.rows, 3, "one stored row per fixture record");
+
+        let tenant = TenantId::new(built.tenant);
+        let now = built.max_effective_time_unix_nano + 1;
+        let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+        let extracted = ourios_query_lines(
+            bucket.path(),
+            &tenant,
+            "severity >= 0 | limit 1000",
+            now,
+            window,
+        )
+        .expect("extract lines");
+
+        assert!(
+            compare_lines(&extracted, &fixture_line_keys(&records), 8).is_equal(),
+            "Ourios round-trip of the fixture must equal the expected LineKeys",
+        );
     }
 
     #[test]

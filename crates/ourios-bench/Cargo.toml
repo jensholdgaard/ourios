@@ -77,6 +77,16 @@ ourios-querier = { path = "../ourios-querier" }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
+# RFC0031.1 Loki container integration (CI-only, like the dex-oidc job):
+# testcontainers spins grafana/loki, reqwest pushes the OTLP fixture and
+# runs the LogQL query, prost encodes the OTLP protobuf payload (0.14 is
+# the generation opentelemetry-proto 0.32's tonic messages implement),
+# and the tokio dev-features give the container half an async runtime
+# (the Ourios half stays sync — `ourios_query_lines` owns its runtime).
+testcontainers-modules = "=0.15.0"
+reqwest = { version = "0.12", default-features = false }
+prost = "0.14"
+tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 # RFC0024.2 draws calibrated records through a fixed-seed
 # `TestRunner` (the strategies come from `ourios-testgen`, already a
 # regular dependency above).

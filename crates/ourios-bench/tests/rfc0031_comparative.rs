@@ -507,8 +507,8 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
     use std::collections::HashMap;
     use std::io::BufRead as _;
 
-    // service -> (severity_number, severity_text) -> row count
-    let mut per_service: HashMap<String, HashMap<(i32, String), u64>> = HashMap::new();
+    // service -> severity_number -> severity_text -> row count
+    let mut per_service: HashMap<String, HashMap<i32, HashMap<String, u64>>> = HashMap::new();
     let (mut total, mut min_ts, mut max_ts) = (0u64, u64::MAX, 0u64);
 
     let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
@@ -546,7 +546,10 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
                     .unwrap_or_default();
                 // One entry lookup per ResourceLogs group (moving the
                 // service string in), not one clone per record — the scan
-                // walks multi-million-record corpora.
+                // walks multi-million-record corpora. Severity texts are
+                // likewise cloned only on their FIRST occurrence per
+                // (service, number): get_mut hits the existing key for the
+                // millions of repeats.
                 let entry = per_service.entry(service).or_default();
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
@@ -555,9 +558,12 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
                             min_ts = min_ts.min(lr.time_unix_nano);
                             max_ts = max_ts.max(lr.time_unix_nano);
                         }
-                        *entry
-                            .entry((lr.severity_number, lr.severity_text.clone()))
-                            .or_default() += 1;
+                        let texts = entry.entry(lr.severity_number).or_default();
+                        if let Some(count) = texts.get_mut(lr.severity_text.as_str()) {
+                            *count += 1;
+                        } else {
+                            texts.insert(lr.severity_text.clone(), 1);
+                        }
                     }
                 }
             }
@@ -568,28 +574,45 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
         "corpus has no record with a non-zero time_unix_nano — no query window derivable",
     );
 
-    // For every service and every distinct severity number T in it: the
-    // rows with number ≥ T are a candidate iff they all share ONE text and
-    // number 1..=4000. No-service (empty-key) records are scanned — they
-    // show in the failure diagnostic — but never form candidates (an empty
-    // service can't make a valid DSL/LogQL pair).
+    // For every service and every DISTINCT severity number T in it (the
+    // nested map dedupes them): the rows with number ≥ T are a candidate
+    // iff (a) they all share ONE text t, (b) the count is 1..=4000, and
+    // (c) — the reverse direction — NO row with text t sits below T, so
+    // LogQL's text filter selects exactly the same rows as the DSL's
+    // number threshold. No-service (empty-key) records are scanned — they
+    // show in the failure diagnostic — but never form candidates (an
+    // empty service can't make a valid DSL/LogQL pair).
     let mut candidates: Vec<(u64, i32, &String, &String)> = Vec::new();
     for (svc, bands) in &per_service {
         if svc.is_empty() {
             continue;
         }
-        for &(threshold, _) in bands.keys() {
-            let selected: Vec<(&(i32, String), &u64)> =
-                bands.iter().filter(|((n, _), _)| *n >= threshold).collect();
-            let rows: u64 = selected.iter().map(|&(_, &c)| c).sum();
-            let mut texts: Vec<&String> = selected.iter().map(|((_, t), _)| t).collect();
+        for &threshold in bands.keys() {
+            let selected: Vec<(&String, u64)> = bands
+                .iter()
+                .filter(|&(&n, _)| n >= threshold)
+                .flat_map(|(_, texts)| texts.iter().map(|(t, c)| (t, *c)))
+                .collect();
+            let rows: u64 = selected.iter().map(|&(_, c)| c).sum();
+            let mut texts: Vec<&String> = selected.iter().map(|&(t, _)| t).collect();
             texts.sort();
             texts.dedup();
-            if let [text] = texts.as_slice()
-                && (1..=4000).contains(&rows)
-            {
-                candidates.push((rows, threshold, svc, text));
+            let [text] = texts.as_slice() else {
+                continue;
+            };
+            if !(1..=4000).contains(&rows) {
+                continue;
             }
+            let text_total: u64 = bands
+                .values()
+                .filter_map(|texts| texts.get(text.as_str()))
+                .sum();
+            if text_total != rows {
+                // Rows with this text exist below the threshold — the
+                // LogQL side would return more than the DSL side.
+                continue;
+            }
+            candidates.push((rows, threshold, svc, text));
         }
     }
     candidates.sort();

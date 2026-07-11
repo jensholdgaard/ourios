@@ -115,7 +115,7 @@ fn rfc0031_6_l5_substring_needle_published() {
 /// Scenario RFC0031.7 — L6 broad scan stays within the floor.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 #[test]
-#[ignore = "RFC0031.7 stub — implemented in the L-gate green slice"]
+#[ignore = "RFC0031.7 stub — implemented in the L-gate + reporting green slice"]
 fn rfc0031_7_l6_broad_scan_floor() {
     todo!(
         "RFC0031.7 — low-selectivity wide-time-range query, RFC0031.1 \
@@ -143,7 +143,7 @@ fn rfc0031_8_l7_ingest_throughput_parity() {
 /// Scenario RFC0031.9 — storage footprint is a diagnostic, not a gate.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 #[test]
-#[ignore = "RFC0031.9 stub — implemented in the reporting green slice"]
+#[ignore = "RFC0031.9 stub — implemented in the reporting + escalation green slice"]
 fn rfc0031_9_storage_footprint_diagnostic() {
     todo!(
         "RFC0031.9 — both systems' persisted bytes on the shared bucket \

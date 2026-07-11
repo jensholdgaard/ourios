@@ -333,6 +333,20 @@ Per query, per system, the harness records:
 - **`peak_rss`** — high-water memory of each system's query path,
   diagnostic.
 
+> **Measurement-fidelity amendment (2026-07-12, RFC in red).** The
+> Ourios-side `bytes_read` figure is the **total** bytes fetched from
+> object storage to answer the query: the count/pruning scan **plus**
+> the row-materialization scan that fetches the ≤ `limit` returned
+> records **plus** the template-registry derivation (the RFC 0017 §3.2
+> audit-stream read that reconstructs string bodies). The channel
+> previously reported the count scan alone, silently excluding two
+> real IO components and biasing the ratio in Ourios's favour; Loki's
+> counterpart figure includes delivering results, so the §3.7
+> anti-strawman discipline requires ours to as well. The querier's
+> `QueryStats::bytes_read` keeps its count-scan-only meaning (the
+> B1/B2 gates and the RFC 0016 metrics depend on it); the two new
+> components are additive `QueryResult` fields the harness sums.
+
 ### 3.7 Reproducibility and anti-strawman commitment
 
 The entire comparison — Loki config (index, chunk, retention, S3,

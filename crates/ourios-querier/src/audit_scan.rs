@@ -118,10 +118,16 @@ pub(crate) fn audit_files(
 /// drop) it. The shared reader for the alias-map and template-registry folds; a
 /// local file is read with [`AuditReader::open_file`], an S3 key via
 /// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
+///
+/// Also returns the **bytes fetched** reading the set (RFC 0031 §3.6 — the
+/// registry component of a query's total IO). The remote branch pays a
+/// full-object GET per key, so the local branch counts each file's length to
+/// keep the two backends' figures equal for identical data.
 pub(crate) fn read_all_events(
     backend: StoreRef<'_>,
     tenant: &TenantId,
-) -> Result<Vec<AuditEvent>, QueryError> {
+) -> Result<(Vec<AuditEvent>, u64), QueryError> {
+    let mut bytes_read: u64 = 0;
     let mut events: Vec<AuditEvent> = Vec::new();
     let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
         for event in read {
@@ -142,6 +148,12 @@ pub(crate) fn read_all_events(
     match backend {
         StoreRef::Local(root) => {
             for path in &local_audit_files(root, tenant, None)? {
+                let len = std::fs::metadata(path)
+                    .map_err(|e| QueryError::Storage {
+                        detail: format!("audit file metadata {}: {e}", path.display()),
+                    })?
+                    .len();
+                bytes_read = add_measured(bytes_read, len)?;
                 let read = AuditReader::open_file(path)
                     .and_then(AuditReader::read_all)
                     .map_err(|e| QueryError::Storage {
@@ -155,6 +167,7 @@ pub(crate) fn read_all_events(
                 let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
                     detail: format!("audit file {key}: {e}"),
                 })?;
+                bytes_read = add_measured(bytes_read, bytes.len() as u64)?;
                 let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
                     .and_then(AuditReader::read_all)
                     .map_err(|e| QueryError::Storage {
@@ -164,7 +177,15 @@ pub(crate) fn read_all_events(
             }
         }
     }
-    Ok(events)
+    Ok((events, bytes_read))
+}
+
+/// Accumulate a measured byte count, failing loudly on overflow — a
+/// wrapped total would silently corrupt the RFC 0031 §3.6 figure.
+fn add_measured(total: u64, len: u64) -> Result<u64, QueryError> {
+    total.checked_add(len).ok_or_else(|| QueryError::Storage {
+        detail: format!("audit bytes_read total overflows u64 (total={total}, next={len})"),
+    })
 }
 
 /// The **local** `std::fs` audit walk (RFC 0019 §3.3 local branch) — the

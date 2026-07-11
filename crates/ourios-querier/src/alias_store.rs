@@ -42,8 +42,11 @@ pub(crate) fn derive_alias_map(
     tenant: &TenantId,
 ) -> Result<AliasMap, QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
-    // tenant backstop; keep only the alias events.
-    let mut events: Vec<_> = audit_scan::read_all_events(backend, tenant)?
+    // tenant backstop; keep only the alias events. The reader's byte
+    // accounting is unused here (RFC 0031 measures the registry derivation,
+    // not the alias fold).
+    let (all_events, _bytes_read) = audit_scan::read_all_events(backend, tenant)?;
+    let mut events: Vec<_> = all_events
         .into_iter()
         .filter(|e| {
             matches!(

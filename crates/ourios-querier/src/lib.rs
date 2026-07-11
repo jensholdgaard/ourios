@@ -101,7 +101,9 @@ pub struct QueryRequest {
     /// count-only (`records` stays empty). The count (`rows`) is unaffected
     /// (always the full matching total), and `stats` continues to report the
     /// count/pruning scan only — the extra IO to materialise the (≤ `n`) record
-    /// rows is **not** folded into `bytes_read`.
+    /// rows is **not** folded into `bytes_read`; it is reported additively as
+    /// [`QueryResult::materialize_bytes_read`] /
+    /// [`QueryResult::registry_bytes_read`] (RFC 0031 §3.6).
     pub limit: Option<usize>,
 }
 
@@ -140,6 +142,18 @@ pub struct QueryResult {
     /// `limit`. Empty when no `limit` was given (count-only). Each [`LogRow`]
     /// is fully Ourios-owned (no engine type — RFC0017.7).
     pub records: Vec<LogRow>,
+    /// Bytes read from storage by the row-materialization pass that fetched
+    /// the ≤ `limit` returned `records` (RFC 0031 §3.6). `0` for a
+    /// count-only query. Additive to `stats.bytes_read`, which keeps its
+    /// count/pruning-scan-only meaning (B1/B2 gates and the RFC 0016
+    /// metrics depend on that semantics) — a caller wanting the honest
+    /// total IO for one query sums the three components.
+    pub materialize_bytes_read: u64,
+    /// Bytes fetched from the tenant's audit stream deriving the read-time
+    /// template registry that rendered the returned `records` (RFC 0017
+    /// §3.2 / RFC 0031 §3.6). `0` when no rows were rendered. Same additive
+    /// contract as `materialize_bytes_read`.
+    pub registry_bytes_read: u64,
 }
 
 /// Errors from [`Querier::run`]. Ourios-owned — no
@@ -574,6 +588,16 @@ pub struct Querier {
 /// from colliding with any real `s3://` / `file://` addressing.
 const STORE_URL: &str = "ourios://store";
 
+/// [`Querier::collect_records`]'s output: the rendered rows plus the
+/// materialization pass's own IO accounting (RFC 0031 §3.6). Defaults to
+/// all-empty/zero — the count-only case.
+#[derive(Default)]
+struct CollectedRecords {
+    records: Vec<LogRow>,
+    materialize_bytes_read: u64,
+    registry_bytes_read: u64,
+}
+
 impl Querier {
     /// Create a querier reading the RFC 0005 store under the **local**
     /// `bucket_root` (the same root the `ourios-parquet` writer writes
@@ -877,29 +901,43 @@ impl Querier {
         // them to `MinedRecord`s, and render each into a `LogRow` via the
         // read-time template registry. Heavy columns are only materialised for
         // these (≤ limit) rows. `None` ⇒ count-only (records stays empty).
-        let records = match row_limit {
-            Some(n) => self.collect_records(df, n, tenant).await?,
-            None => Vec::new(),
+        let collected = match row_limit {
+            Some(n) => self.collect_records(df, n, tenant, ctx.task_ctx()).await?,
+            None => CollectedRecords::default(),
         };
         Ok(QueryResult {
             rows,
             stats,
-            records,
+            records: collected.records,
+            materialize_bytes_read: collected.materialize_bytes_read,
+            registry_bytes_read: collected.registry_bytes_read,
         })
     }
 
     /// Materialise up to `limit` matching rows from the filtered `df`, decode
     /// them, and render each into a [`LogRow`] (RFC 0017 §3.3). The template
     /// registry is derived once (from the tenant's audit stream) only when
-    /// there are rows to render.
+    /// there are rows to render. Returns the rows plus this pass's own IO
+    /// accounting (RFC 0031 §3.6), kept out of [`QueryStats`] so the
+    /// count-scan figures B1/B2 assert on stay exactly the count scan.
     async fn collect_records(
         &self,
         df: datafusion::dataframe::DataFrame,
         limit: usize,
         tenant: &TenantId,
-    ) -> Result<Vec<LogRow>, QueryError> {
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> Result<CollectedRecords, QueryError> {
         let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
-        let batches = limited.collect().await.map_err(storage_err)?;
+        // Plan + collect by hand (rather than `DataFrame::collect`) so the
+        // materialization scan's `bytes_scanned` can be read off the retained
+        // plan. Only the bytes are folded: this scan's row-group counts stay
+        // out of `QueryStats` so the B1 pruned fraction keeps its
+        // count-scan-only meaning.
+        let plan = limited.create_physical_plan().await.map_err(storage_err)?;
+        let batches = collect(Arc::clone(&plan), task_ctx)
+            .await
+            .map_err(storage_err)?;
+        let materialize_bytes_read = scan_stats(plan.as_ref()).bytes_read;
         // The single RFC 0005 decode path (RFC 0021 §3.1 / RFC0021.4):
         // `ShapeValidation::Skip` because `render_log_body` handles every
         // record shape safely — this path renders rather than rejects
@@ -919,7 +957,10 @@ impl Querier {
             mined.extend(records);
         }
         if mined.is_empty() {
-            return Ok(Vec::new());
+            return Ok(CollectedRecords {
+                materialize_bytes_read,
+                ..CollectedRecords::default()
+            });
         }
         // Row-level tenant backstop (`CLAUDE.md` §3.7 / RFC 0005 §3.9
         // row-vs-path): the scan is scoped to the tenant's partition prefix
@@ -939,13 +980,28 @@ impl Querier {
                 });
             }
         }
-        // The single registry derivation ([`Self::template_registry`]) —
-        // blocking store reads offloaded there.
-        let registry = self.template_registry(tenant).await?;
-        Ok(mined
-            .iter()
-            .map(|record| LogRow::from_record(record, &registry))
-            .collect())
+        // The single registry derivation, measured (RFC 0031 §3.6) — the
+        // same blocking-pool offload as [`Self::template_registry`].
+        let (registry, registry_bytes_read) = self
+            .spawn_blocking_audit({
+                let backend = self.backend.clone();
+                let tenant = tenant.clone();
+                move || {
+                    template_registry::derive_template_registry_measured(
+                        backend.store_ref(),
+                        &tenant,
+                    )
+                }
+            })
+            .await?;
+        Ok(CollectedRecords {
+            records: mined
+                .iter()
+                .map(|record| LogRow::from_record(record, &registry))
+                .collect(),
+            materialize_bytes_read,
+            registry_bytes_read,
+        })
     }
 
     /// Run a blocking audit derivation (`derive_alias_map` /

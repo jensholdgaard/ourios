@@ -66,6 +66,71 @@ async fn rfc0017_6_typed_row_payload_returned_b1b2_compatible() {
     );
 }
 
+/// The RFC 0031 §3.6 measurement channel: the row-materialization pass and
+/// the registry derivation report their IO **additively** on `QueryResult`
+/// (`materialize_bytes_read` / `registry_bytes_read`), while `stats` stays
+/// exactly the count/pruning scan — the RFC0017.6 equality above must keep
+/// holding. Count-only queries report both components as 0.
+#[tokio::test]
+async fn materialization_and_registry_io_reported_additively() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ourios_core::audit::{
+        AuditEvent, AuditPayload, AuditSink, TemplateChange, hash_triggering_line,
+    };
+    use ourios_parquet::{ParquetAuditSink, Store};
+
+    let bucket = TempDir::new().unwrap();
+    let recs: Vec<_> = (0..5).map(|i| simple("acme", 1, NOW - 1 - i)).collect();
+    write_all(bucket.path(), &recs);
+    // An audit stream with one template event, so the registry derivation
+    // has real bytes to fetch.
+    let mut sink = ParquetAuditSink::new(Store::local(bucket.path()).expect("store"));
+    sink.emit(AuditEvent {
+        tenant_id: TenantId::new("acme"),
+        timestamp: UNIX_EPOCH + Duration::from_secs(100),
+        payload: AuditPayload::Template {
+            template_id: 1,
+            triggering_line_hash: hash_triggering_line(b"line"),
+            triggering_line_sample: None,
+            change: TemplateChange::Created {
+                new_template: "user <*>".to_owned(),
+            },
+        },
+    });
+    assert_eq!(sink.write_failures(), 0, "fixture event must persist");
+    let querier = Querier::new(bucket.path());
+
+    // Count-only: neither pass runs, both components are 0.
+    let counted = querier.run(count_only()).await.expect("count query");
+    assert_eq!(counted.materialize_bytes_read, 0);
+    assert_eq!(counted.registry_bytes_read, 0);
+
+    // With a limit: both passes ran and report real bytes, and the
+    // count-scan stats are byte-identical to the count-only run — the
+    // additive accounting must not leak into `stats.bytes_read`.
+    let limited = querier
+        .run(QueryRequest {
+            limit: Some(2),
+            ..count_only()
+        })
+        .await
+        .expect("limited query");
+    assert_eq!(limited.records.len(), 2);
+    assert!(
+        limited.materialize_bytes_read > 0,
+        "materialising rows read real bytes",
+    );
+    assert!(
+        limited.registry_bytes_read > 0,
+        "the registry derivation fetched the audit stream",
+    );
+    assert_eq!(
+        limited.stats, counted.stats,
+        "the count-scan stats stay count-scan-only",
+    );
+}
+
 /// Scenario RFC0017.7 — the returned `QueryResult` / `LogRow` / `LogBody`
 /// surface carries no `arrow` / `DataFusion` / SQL type (hazard H6 / §4.6): a
 /// regression that added an engine-typed field would surface its type name in

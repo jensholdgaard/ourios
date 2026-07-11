@@ -858,6 +858,16 @@ fn rfc0031_indicative_comparative_run() {
             "-distributor.ingestion-burst-size-mb=1024",
             "-ingester.per-stream-rate-limit=512MB",
             "-ingester.per-stream-rate-limit-burst=1GB",
+            // Runs #2–#4 all failed on the SAME ~5.27 MB internal message
+            // regardless of our batch size (3 MiB → 1.5 MB outer), proving
+            // a single kafka LogsData line's content alone inflates past
+            // the stock 4 MiB internal gRPC cap. Raising the cap (standard
+            // operator tuning, in Loki's favour — it lets Loki accept the
+            // data at all) preserves the identical-ingest precondition the
+            // equivalence check requires; skipping the line would silently
+            // unequalize the two corpora.
+            "-server.grpc-server-max-recv-msg-size=16777216",
+            "-server.grpc-server-max-send-msg-size=16777216",
         ])
         .await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;

@@ -430,8 +430,8 @@ pub fn comparative_fixture(base_ns: u64) -> Vec<FixtureRecord> {
     .collect()
 }
 
-/// The fixture as the OTLP `LogsData` wire shape: one resource
-/// (`service.name = `[`FIXTURE_SERVICE`]), one scope, one `LogRecord` per
+/// The fixture as the OTLP `LogsData` wire shape: one resource whose
+/// `service.name` is [`FIXTURE_SERVICE`], one scope, one `LogRecord` per
 /// fixture record. The Ourios corpus line and the Loki OTLP push are both
 /// derived from this one value.
 #[must_use]

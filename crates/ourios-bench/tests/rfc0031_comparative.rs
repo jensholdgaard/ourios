@@ -143,11 +143,17 @@ async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKe
         .await
         .expect("loki host port");
     let base = format!("http://127.0.0.1:{port}");
-    let http = reqwest::Client::new();
+    // A per-request timeout so a wedged container/network stack fails a
+    // request (and the surrounding deadline loop moves on) rather than
+    // hanging the CI job to its global timeout.
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("http client");
 
     // Readiness: /ready flips 200 once the ingester is up. Surface the
-    // container logs on timeout so a config rejection doesn't read as a
-    // bare timeout.
+    // container's own output on timeout so a config rejection doesn't
+    // read as a bare timeout (Loki writes startup errors to both streams).
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(r) = http.get(format!("{base}/ready")).send().await
@@ -156,12 +162,20 @@ async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKe
             break;
         }
         if std::time::Instant::now() >= deadline {
+            let stdout = container
+                .stdout_to_vec()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
             let stderr = container
                 .stderr_to_vec()
                 .await
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default();
-            panic!("loki /ready never turned 200.\n--- loki stderr ---\n{stderr}");
+            panic!(
+                "loki /ready never turned 200.\n--- loki stdout ---\n{stdout}\n\
+                 --- loki stderr ---\n{stderr}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -228,11 +242,16 @@ async fn loki_query_range(
         ])
         .send()
         .await
-        .expect("query_range")
-        .text()
-        .await
-        .expect("query_range body");
-    parse_loki_streams(&resp).expect("parse loki streams")
+        .expect("query_range");
+    // Check the HTTP status before parsing: a non-2xx body may not be the
+    // streams JSON at all, and "parse failed" would mask the real error.
+    let status = resp.status();
+    let body = resp.text().await.expect("query_range body");
+    assert!(
+        status.is_success(),
+        "loki query_range returned {status}: {body}",
+    );
+    parse_loki_streams(&body).expect("parse loki streams")
 }
 
 /// Scenario RFC0031.2 — L1 selective template lookup wins on bytes read.

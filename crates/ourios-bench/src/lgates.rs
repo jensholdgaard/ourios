@@ -61,7 +61,7 @@ pub enum BytesGateOutcome {
         /// `ourios_bytes × margin ≤ loki_bytes`.
         pass: bool,
         /// `loki_bytes / ourios_bytes` — how many times fewer bytes
-        /// Ourios read (the headline ratio; > `margin` ⇒ `pass`).
+        /// Ourios read (the headline ratio; ≥ `margin` ⇒ `pass`).
         advantage: f64,
     },
     /// A zero byte-count made the comparison meaningless.
@@ -85,6 +85,15 @@ impl BytesGateOutcome {
 /// `advantage` ratio is derived afterwards for the results table.
 #[must_use]
 pub fn bytes_must_win(ourios_bytes: u64, loki_bytes: u64, margin: u64) -> BytesGateOutcome {
+    // margin == 0 would make `ourios × 0 ≤ loki` pass unconditionally —
+    // a misconfiguration must be loud, not a free win.
+    if margin == 0 {
+        return BytesGateOutcome::Invalid {
+            reason: "margin is 0 — a must-win gate with no margin passes everything, \
+                     which demonstrates nothing"
+                .to_string(),
+        };
+    }
     if ourios_bytes == 0 || loki_bytes == 0 {
         return BytesGateOutcome::Invalid {
             reason: format!(
@@ -147,6 +156,12 @@ mod tests {
         assert!(!bytes_must_win(0, 0, 10).passed());
         assert!(matches!(
             bytes_must_win(0, 1_000, 10),
+            BytesGateOutcome::Invalid { .. }
+        ));
+        // A zero MARGIN would pass unconditionally (0×anything ≤ loki) —
+        // it must be Invalid, not a free win.
+        assert!(matches!(
+            bytes_must_win(100, 1_000, 0),
             BytesGateOutcome::Invalid { .. }
         ));
     }

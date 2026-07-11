@@ -13,9 +13,21 @@
 //! confirm both systems answer the *same* question before any of their
 //! numbers are trusted (RFC0031.1). The Loki-container integration that
 //! drives real answers into it is the next slice.
+//!
+//! The **Ourios side** of that check — [`ourios_query_lines`] — runs a
+//! logs-DSL query against an Ourios store in-process (the querier, no
+//! served binary — RFC 0031 §7) and lowers the rendered rows to
+//! [`LineKey`]s. The Loki side (a container fed the same OTLP corpus,
+//! queried with the equivalent `LogQL`) mirrors it, and the two feed
+//! [`compare_lines`].
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::Path;
+
+use ourios_core::tenant::TenantId;
+
+use crate::BenchError;
 
 /// Stable identity of one returned log line, per RFC0031.1:
 /// `(timestamp_unix_nanos, body_bytes)`. Two lines are the same datum
@@ -188,6 +200,78 @@ fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
     counts
 }
 
+/// Run a logs-DSL query against the Ourios store at `bucket_root` and
+/// return the matching rows as [`LineKey`]s — the Ourios half of the
+/// RFC0031.1 equivalence check.
+///
+/// Runs the querier **in-process** (RFC 0031 §7: no served binary). The
+/// query MUST carry a `limit` — the querier only renders rows when a
+/// limit is set; without one `QueryResult.records` is empty (count-only)
+/// and this returns no lines.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if the DSL fails to parse, the tokio runtime
+/// can't be built, the query fails, or a returned row carries a body
+/// kind the equivalence extraction does not yet lower (see
+/// [`body_bytes`]).
+pub fn ourios_query_lines(
+    bucket_root: &Path,
+    tenant: &TenantId,
+    dsl: &str,
+    now_unix_nano: u64,
+    default_window_nanos: u64,
+) -> Result<Vec<LineKey>, BenchError> {
+    let query = ourios_querier::dsl::parse(dsl).map_err(|e| BenchError::Pipeline {
+        detail: format!("comparative DSL parse `{dsl}`: {e}"),
+    })?;
+    let querier = ourios_querier::Querier::new(bucket_root);
+    // A current-thread runtime is enough: `run_query` offloads its own
+    // blocking IO, and the comparative harness drives one query at a time.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("comparative tokio runtime: {e}"),
+        })?;
+    let result = runtime
+        .block_on(querier.run_query(&query, tenant, now_unix_nano, default_window_nanos, None))
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("comparative query `{dsl}`: {e}"),
+        })?;
+    result
+        .records
+        .iter()
+        .map(|row| {
+            Ok(LineKey {
+                timestamp_unix_nanos: row.time_unix_nano,
+                body: body_bytes(&row.body)?,
+            })
+        })
+        .collect()
+}
+
+/// Canonical byte identity of a query row's body for equivalence keying.
+///
+/// The string-body (`Rendered`) case — the only kind the first
+/// severity-predicate query pair over a text corpus produces — lowers to
+/// its reconstructed bytes. Structured and absent bodies belong to the
+/// OTLP-native gates (L2/L3/L4) and are deferred: they return an error
+/// rather than a lossy encoding, because RFC 0025's absent-vs-empty
+/// distinction (and structured-vs-string) must be represented in the key
+/// deliberately, not collapsed — the follow-up slice that lands those
+/// gates extends [`LineKey`] to carry the body-kind discriminator.
+fn body_bytes(body: &ourios_querier::LogBody) -> Result<Vec<u8>, BenchError> {
+    match body {
+        ourios_querier::LogBody::Rendered { line, .. } => Ok(line.clone()),
+        other => Err(BenchError::Pipeline {
+            detail: format!(
+                "comparative equivalence extraction does not yet lower body kind {other:?} \
+                 (structured/absent bodies land with the OTLP-native L2/L3/L4 gates)"
+            ),
+        }),
+    }
+}
+
 /// A truncated, lossy preview of a body for a mismatch report — bounded
 /// so an arbitrarily large body can't blow up the stderr summary.
 fn body_preview(body: &[u8]) -> String {
@@ -280,6 +364,75 @@ mod tests {
         );
         assert!(m.examples[0].contains("ourios=2"));
         assert!(m.examples[0].contains("loki=3"));
+    }
+
+    #[test]
+    fn body_bytes_defers_non_string_kinds() {
+        // An absent body (RFC 0025) must NOT be silently lowered to an
+        // empty string — that would collapse a legally-distinct record
+        // into an empty-string match. It errors until the OTLP-native
+        // gates extend LineKey with a body-kind discriminator.
+        assert!(
+            body_bytes(&ourios_querier::LogBody::Absent).is_err(),
+            "absent body must not be silently lowered to bytes",
+        );
+    }
+
+    #[test]
+    fn ourios_query_lines_extracts_one_key_per_stored_row() {
+        // Build a real RFC 0005 store from a text corpus and prove the
+        // Ourios-side extraction returns one LineKey per stored row with
+        // in-span timestamps, and that the result feeds `compare_lines`
+        // cleanly (self-equivalence holds) — the Ourios half of RFC0031.1,
+        // locally verifiable without Loki.
+        //
+        // Body *content* is deliberately not asserted here: reconstructing a
+        // cleanly-mined string body needs the audit-derived template registry
+        // (RFC 0017), and `build_query_store` does not persist the audit
+        // stream (B1/B2 read only row counts). The comparative store-builder —
+        // the next increment — persists it like the A1 gate, so bodies render;
+        // this test pins the extraction + comparator integration, which is
+        // independent of that.
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("fixture.txt"),
+            "user 1 logged in\nuser 2 logged in\nuser 3 logged in",
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+
+        let built =
+            crate::build_query_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+                .expect("build store");
+        assert_eq!(built.rows, 3, "one stored row per corpus line");
+
+        let tenant = TenantId::new(built.tenant);
+        // Bracket the whole corpus time span with the default window.
+        let now = built.max_effective_time_unix_nano + 1;
+        let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+        let extracted = ourios_query_lines(
+            bucket.path(),
+            &tenant,
+            "severity >= 0 | limit 100",
+            now,
+            window,
+        )
+        .expect("extract lines");
+
+        assert_eq!(extracted.len(), 3, "one LineKey per stored row");
+        for key in &extracted {
+            assert!(
+                (built.min_effective_time_unix_nano..=built.max_effective_time_unix_nano)
+                    .contains(&key.timestamp_unix_nanos),
+                "extracted timestamp is within the corpus span",
+            );
+        }
+        // The extraction feeds the comparator: a result compared to itself
+        // is Equal (the multiset round-trips through `compare_lines`).
+        assert!(
+            compare_lines(&extracted, &extracted, 8).is_equal(),
+            "self-equivalence must hold",
+        );
     }
 
     #[test]

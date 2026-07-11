@@ -876,3 +876,45 @@ fn pick_selective_pair_finds_the_fixture_error_row() {
     assert_eq!(pair.min_ts, 1_000_000);
     assert_eq!(pair.max_ts, 1_002_000);
 }
+
+#[test]
+fn pick_selective_pair_generalizes_without_error_rows() {
+    // The otel-demo-v8 shape in miniature: an INFO-dominated service with
+    // a rare WARN band and NO ERROR rows anywhere — the generalization
+    // path run #1 surfaced. The picker must select the WARN band.
+    let records = vec![
+        FixtureRecord {
+            time_unix_nano: 1_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "user 1 logged in",
+        },
+        FixtureRecord {
+            time_unix_nano: 2_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "user 2 logged in",
+        },
+        FixtureRecord {
+            time_unix_nano: 3_000,
+            severity_number: 13,
+            severity_text: "WARN",
+            body: "cache nearly full",
+        },
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+
+    let pair = pick_selective_pair(corpus.path());
+    assert_eq!(pair.service, FIXTURE_SERVICE);
+    assert_eq!(
+        pair.threshold, 13,
+        "the WARN band is the rarest single-text band"
+    );
+    assert_eq!(pair.text, "WARN");
+    assert_eq!(pair.rows, 1);
+}

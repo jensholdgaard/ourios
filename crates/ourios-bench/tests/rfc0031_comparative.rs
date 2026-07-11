@@ -526,17 +526,7 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
     let mut per_service: HashMap<String, HashMap<i32, HashMap<String, u64>>> = HashMap::new();
     let (mut total, mut min_ts, mut max_ts) = (0u64, u64::MAX, 0u64);
 
-    let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
-        .expect("read corpus dir")
-        .filter_map(|e| {
-            let p = e.expect("dir entry").path();
-            (p.extension().and_then(|x| x.to_str()) == Some("jsonl")).then_some(p)
-        })
-        .collect();
-    paths.sort();
-    assert!(!paths.is_empty(), "no *.jsonl in {}", corpus_dir.display());
-
-    for path in paths {
+    for path in corpus_jsonl_paths(corpus_dir) {
         let file = std::fs::File::open(&path).expect("open corpus file");
         for line in std::io::BufReader::new(file).lines() {
             let line = line.expect("read corpus line");
@@ -618,6 +608,115 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
         min_ts,
         max_ts,
     }
+}
+
+/// The corpus's `*.jsonl` files, sorted for deterministic scans.
+fn corpus_jsonl_paths(corpus_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
+        .expect("read corpus dir")
+        .filter_map(|e| {
+            let p = e.expect("dir entry").path();
+            (p.extension().and_then(|x| x.to_str()) == Some("jsonl")).then_some(p)
+        })
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no *.jsonl in {}", corpus_dir.display());
+    paths
+}
+
+/// Second streaming pass over the corpus, for the selectivity-curve
+/// window pairs: every log record of `service`, split into CLEAN
+/// timestamps (non-zero `time_unix_nano` — rows both systems answer
+/// with identical keys) and POISON timestamps (the observed-fallback
+/// effective time of zero-`time_unix_nano` rows: both systems would
+/// RETURN such a row if a window covered its fallback time, but with
+/// DIFFERENT answer timestamps — Ourios keeps `time_unix_nano = 0`,
+/// Loki stamps its stored observed time — so any window containing one
+/// is a guaranteed equivalence mismatch). Both sorted ascending.
+fn collect_service_timestamps(corpus_dir: &std::path::Path, service: &str) -> (Vec<u64>, Vec<u64>) {
+    use std::io::BufRead as _;
+
+    let (mut clean, mut poison) = (Vec::new(), Vec::new());
+    for path in corpus_jsonl_paths(corpus_dir) {
+        let file = std::fs::File::open(&path).expect("open corpus file");
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.expect("read corpus line");
+            if line.trim().is_empty() {
+                continue;
+            }
+            let data: opentelemetry_proto::tonic::logs::v1::LogsData =
+                serde_json::from_str(&line).expect("parse LogsData line");
+            for rl in &data.resource_logs {
+                let matches_service = rl
+                    .resource
+                    .as_ref()
+                    .and_then(|r| r.attributes.iter().find(|kv| kv.key == "service.name"))
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| v.value.as_ref())
+                    .is_some_and(|v| {
+                        matches!(
+                            v,
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)
+                                if s == service
+                        )
+                    });
+                if !matches_service {
+                    continue;
+                }
+                for sl in &rl.scope_logs {
+                    for lr in &sl.log_records {
+                        if lr.time_unix_nano != 0 {
+                            clean.push(lr.time_unix_nano);
+                        } else if lr.observed_time_unix_nano != 0 {
+                            poison.push(lr.observed_time_unix_nano);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    clean.sort_unstable();
+    poison.sort_unstable();
+    (clean, poison)
+}
+
+/// Pick a `k`-row time-window slice `[a, b)` of a service's records with
+/// CLEAN EDGES, preferring mid-corpus. `clean_ts` and `poison_ts` come
+/// sorted from [`collect_service_timestamps`]. A candidate start index
+/// `i` is valid iff:
+///
+/// - **start edge**: no earlier record shares `clean_ts[i]`, so `a =
+///   clean_ts[i]` admits exactly the window's rows;
+/// - **end edge**: the next record (if any) sits ≥ 2 ns past the last
+///   in-window one, so `b = last + 1` selects the same rows whether a
+///   system treats its range end as inclusive or exclusive;
+/// - no poison timestamp falls in `[a, b)`.
+///
+/// The window then contains exactly `k` rows on both systems. Returns
+/// `(a, b)`, or `None` if no valid window exists.
+fn pick_window_pair(clean_ts: &[u64], poison_ts: &[u64], k: usize) -> Option<(u64, u64)> {
+    if k == 0 || clean_ts.len() < k {
+        return None;
+    }
+    let valid = |i: usize| {
+        let (first, last) = (clean_ts[i], clean_ts[i + k - 1]);
+        if i > 0 && clean_ts[i - 1] == first {
+            return false;
+        }
+        let Some(b) = last.checked_add(1) else {
+            return false;
+        };
+        if i + k < clean_ts.len() && clean_ts[i + k] <= b {
+            return false;
+        }
+        let at = poison_ts.partition_point(|&t| t < first);
+        poison_ts.get(at).is_none_or(|&t| t >= b)
+    };
+    let centre = (clean_ts.len() - k) / 2;
+    let i = (0..=clean_ts.len() - k)
+        .filter(|&i| valid(i))
+        .min_by_key(|&i| (i.abs_diff(centre), i))?;
+    Some((clean_ts[i], clean_ts[i + k - 1] + 1))
 }
 
 /// The candidate `(rows, threshold, service, text)` tuples for
@@ -801,21 +900,134 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
     eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests");
 }
 
-/// The §7 calibration input: the first indicative Ourios-vs-Loki
-/// bytes-read comparison on a real corpus (`OURIOS_COMPARATIVE_CORPUS`,
-/// fetched by the `comparative-bench` dispatch workflow — the
-/// `corpus/otel-demo-v*` releases).
+/// One measured query of the indicative run: the equivalent DSL/`LogQL`
+/// question, the window both systems answer it over, and the row count
+/// both must return exactly.
+struct PairSpec {
+    label: String,
+    /// The pair's §7 margin for the reported gate (`m_l2` for the
+    /// severity pair, `f_l6` for the broad time-window slices).
+    margin: u64,
+    dsl: String,
+    logql: String,
+    /// Loki `query_range` window (nanoseconds, `[start, end)` by the
+    /// clean-edge construction).
+    start: u64,
+    end: u64,
+    expected_rows: u64,
+    /// The Ourios querier's window parameters mapping to the same
+    /// `[start, end)`: `time_window_filter` is `ts ≥ now − window ∧
+    /// ts < now`, so `now = end`, `window = end − start`.
+    now: u64,
+    window: u64,
+}
+
+/// The run's three pairs — a selectivity curve, not a point. Run #6
+/// measured ONE extreme-selectivity pair (1 row) and found storage-side
+/// advantage 5.95×: Ourios's fixed per-query footer/metadata reads
+/// dominate when the answer is a single row. The curve tests the
+/// amortization prediction — Ourios's fixed cost should wash out as the
+/// result grows while Loki's scan grows with it. The severity pair is
+/// the L2-family point; the two time-window slices (~100 and ~2000 rows
+/// on the same service) are broad scans, so their gates report under
+/// the L6 floor factor.
+fn build_pair_specs(
+    pair: &SelectivePair,
+    clean_ts: &[u64],
+    poison_ts: &[u64],
+    corpus_now: u64,
+    corpus_window: u64,
+) -> Vec<PairSpec> {
+    let margins = ourios_bench::ComparativeMargins::default();
+    let mut specs = vec![PairSpec {
+        label: format!(
+            "severity, L2 family: service={} severity>={} (text={:?})",
+            pair.service, pair.threshold, pair.text
+        ),
+        margin: margins.m_l2,
+        dsl: format!(
+            "service == \"{}\" and severity >= {} | limit 5000",
+            pair.service, pair.threshold
+        ),
+        logql: format!(
+            "{{service_name=\"{}\"}} | severity_text=\"{}\"",
+            pair.service, pair.text
+        ),
+        start: pair.min_ts,
+        end: pair.max_ts + 1,
+        expected_rows: pair.rows,
+        now: corpus_now,
+        window: corpus_window,
+    }];
+    for k in [100usize, 2000] {
+        let Some((start, end)) = pick_window_pair(clean_ts, poison_ts, k) else {
+            panic!(
+                "no clean {k}-row window on service {} ({} clean rows, {} poison)",
+                pair.service,
+                clean_ts.len(),
+                poison_ts.len(),
+            );
+        };
+        specs.push(PairSpec {
+            label: format!(
+                "time-window slice, L6 family: service={} k={k}",
+                pair.service
+            ),
+            margin: margins.f_l6,
+            dsl: format!("service == \"{}\" | limit 5000", pair.service),
+            logql: format!("{{service_name=\"{}\"}}", pair.service),
+            start,
+            end,
+            expected_rows: k as u64,
+            now: end,
+            window: end - start,
+        });
+    }
+    specs
+}
+
+/// One pair's Loki measurement: poll `query_range` until ingest has
+/// caught up to the expected row count (or fail loudly at the deadline).
+async fn loki_measure_pair(
+    http: &reqwest::Client,
+    base: &str,
+    spec: &PairSpec,
+) -> (Vec<LineKey>, u64, LokiFetchedBytes) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let (lines, bytes, fetched) =
+            loki_query_with_stats(http, base, &spec.logql, spec.start, spec.end).await;
+        if lines.len() as u64 >= spec.expected_rows {
+            break (lines, bytes, fetched);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "loki returned {} of {} expected rows for [{}] before timeout",
+            lines.len(),
+            spec.expected_rows,
+            spec.label,
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The §7 calibration input: the indicative Ourios-vs-Loki bytes-read
+/// comparison on a real corpus (`OURIOS_COMPARATIVE_CORPUS`, fetched by
+/// the `comparative-bench` dispatch workflow — the `corpus/otel-demo-v*`
+/// releases), measured across a three-point selectivity curve
+/// ([`build_pair_specs`]) over one container + one corpus replay.
 ///
-/// **Equivalence is asserted; the bytes gate is REPORTED, not asserted**
-/// — the §7 margins are provisional until the maintainer freezes them
-/// against exactly this run's numbers (RFC 0031 §7).
+/// **Equivalence is asserted per pair; the bytes gates are REPORTED,
+/// not asserted** — the §7 margins are provisional until the maintainer
+/// freezes them against exactly these numbers (RFC 0031 §7).
 ///
-/// Loki runs the stock image config plus two explicit, documented
-/// ingest-side deviations (both in LOKI'S favour — the anti-strawman
-/// direction): `-validation.reject-old-samples=false` (the frozen captures carry
-/// their original timestamps, weeks old by run time) and raised
-/// ingest-rate limits so a 2.96 GB replay isn't throttled by dev-scale
-/// defaults. The query side stays stock.
+/// Loki runs the stock image config plus explicit, documented
+/// ingest-side deviations (all in LOKI'S favour — the anti-strawman
+/// direction): `-validation.reject-old-samples=false` (the frozen
+/// captures carry their original timestamps, weeks old by run time),
+/// raised ingest-rate limits so a 2.96 GB replay isn't throttled by
+/// dev-scale defaults, and a raised internal gRPC message cap (see the
+/// flag comment). The query side stays stock.
 #[test]
 #[ignore = "dispatch-only: needs Docker + a corpus via OURIOS_COMPARATIVE_CORPUS (comparative-bench workflow)"]
 fn rfc0031_indicative_comparative_run() {
@@ -824,9 +1036,17 @@ fn rfc0031_indicative_comparative_run() {
             .expect("set OURIOS_COMPARATIVE_CORPUS to a corpus dir (the dispatch workflow does)"),
     );
 
-    // Pick the pair, then drive the (locally-proven) Ourios half.
     let pair = pick_selective_pair(&corpus_dir);
     eprintln!("pair: {pair:?}");
+    let (clean_ts, poison_ts) = collect_service_timestamps(&corpus_dir, &pair.service);
+    eprintln!(
+        "service {}: {} clean timestamps, {} zero-time (poison)",
+        pair.service,
+        clean_ts.len(),
+        poison_ts.len(),
+    );
+
+    // The (locally-proven) Ourios half, per pair.
     let bucket = tempfile::TempDir::new().expect("bucket dir");
     let built = ourios_bench::build_comparative_store(
         &corpus_dir,
@@ -835,27 +1055,37 @@ fn rfc0031_indicative_comparative_run() {
     )
     .expect("build comparative store");
     let tenant = TenantId::new(built.tenant);
-    let now = built.max_effective_time_unix_nano + 1;
-    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
-    let dsl = format!(
-        "service == \"{}\" and severity >= {} | limit 5000",
-        pair.service, pair.threshold
-    );
-    let ourios = ourios_bench::ourios_query_answer(bucket.path(), &tenant, &dsl, now, window)
-        .expect("ourios answer");
-    assert_eq!(
-        ourios.lines.len() as u64,
-        pair.rows,
-        "Ourios must return exactly the picked pair's rows",
-    );
+    let corpus_now = built.max_effective_time_unix_nano + 1;
+    let corpus_window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+    let specs = build_pair_specs(&pair, &clean_ts, &poison_ts, corpus_now, corpus_window);
+    let ourios: Vec<_> = specs
+        .iter()
+        .map(|spec| {
+            let answer = ourios_bench::ourios_query_answer(
+                bucket.path(),
+                &tenant,
+                &spec.dsl,
+                spec.now,
+                spec.window,
+            )
+            .expect("ourios answer");
+            assert_eq!(
+                answer.lines.len() as u64,
+                spec.expected_rows,
+                "Ourios must return exactly [{}]'s expected rows",
+                spec.label,
+            );
+            answer
+        })
+        .collect();
 
-    // The Loki half: container (stock + documented ingest-side flags),
-    // full-corpus OTLP replay, the equivalent LogQL.
+    // The Loki half: one container (stock + documented ingest-side
+    // flags), ONE full-corpus OTLP replay, all pairs measured against it.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (loki_lines, loki_bytes, loki_fetched) = runtime.block_on(async {
+    let loki: Vec<_> = runtime.block_on(async {
         let (_container, base, http) = start_loki(&[
             "-validation.reject-old-samples=false",
             "-distributor.ingestion-rate-limit-mb=512",
@@ -876,90 +1106,69 @@ fn rfc0031_indicative_comparative_run() {
         ])
         .await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;
-
-        let logql = format!(
-            "{{service_name=\"{}\"}} | severity_text=\"{}\"",
-            pair.service, pair.text
-        );
-        let (start, end) = (pair.min_ts, pair.max_ts + 1);
-        // Poll until ingest catches up to the expected row count.
-        let deadline = std::time::Instant::now() + Duration::from_secs(300);
-        loop {
-            let (lines, bytes, fetched) =
-                loki_query_with_stats(&http, &base, &logql, start, end).await;
-            if lines.len() as u64 >= pair.rows {
-                break (lines, bytes, fetched);
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "loki returned {} of {} expected rows before timeout",
-                lines.len(),
-                pair.rows,
-            );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut measured = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            measured.push(loki_measure_pair(&http, &base, spec).await);
         }
+        measured
     });
 
-    // Equivalence gates the measurement (RFC0031.1) — asserted.
-    let outcome = compare_lines(&ourios.lines, &loki_lines, 8);
-    assert!(
-        outcome.is_equal(),
-        "the two systems' answers must be multiset-identical: {outcome:?}",
-    );
+    // Equivalence gates every measurement (RFC0031.1) — asserted.
+    for ((spec, ours), (loki_lines, _, _)) in specs.iter().zip(&ourios).zip(&loki) {
+        let outcome = compare_lines(&ours.lines, loki_lines, 8);
+        assert!(
+            outcome.is_equal(),
+            "the two systems' answers must be multiset-identical on [{}]: {outcome:?}",
+            spec.label,
+        );
+    }
 
-    print_indicative_report(
-        &corpus_dir,
-        &pair,
-        ourios.bytes_read,
-        loki_bytes,
-        loki_fetched,
-    );
+    print_indicative_report(&corpus_dir, pair.total_records, &specs, &ourios, &loki);
 }
 
-/// The indicative run's report block. The bytes gate is REPORTED under
-/// the provisional §7 margins, and evaluated PRIMARILY on the
-/// conservative Loki figure: `totalBytesProcessed` is decompressed
-/// engine-side work, which overstates Loki's storage reads by the chunk
-/// compression ratio; the storage-side figure (compressed chunk bytes +
-/// memory-served head-chunk bytes) is the apples-to-apples counterpart
-/// of Ourios's fetched-compressed-Parquet bytes. Both ratios are printed
-/// so the §9 entry can carry the honest pair of numbers.
+/// The indicative run's report block, one section per pair. Each gate is
+/// REPORTED under the pair's provisional §7 margin, and evaluated
+/// PRIMARILY on the conservative Loki figure: `totalBytesProcessed` is
+/// decompressed engine-side work, which overstates Loki's storage reads
+/// by the chunk compression ratio; the storage-side figure (compressed
+/// chunk bytes + memory-served head-chunk bytes) is the apples-to-apples
+/// counterpart of Ourios's fetched-compressed-Parquet bytes. Both ratios
+/// are printed so the §9 entry can carry the honest pair of numbers.
 fn print_indicative_report(
     corpus_dir: &std::path::Path,
-    pair: &SelectivePair,
-    ourios_bytes: u64,
-    loki_processed: u64,
-    loki_fetched: LokiFetchedBytes,
+    total_records: u64,
+    specs: &[PairSpec],
+    ourios: &[ourios_bench::OuriosAnswer],
+    loki: &[(Vec<LineKey>, u64, LokiFetchedBytes)],
 ) {
-    let margins = ourios_bench::ComparativeMargins::default();
-    let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
-    let gate_storage = ourios_bench::bytes_must_win(ourios_bytes, loki_storage, margins.m_l2);
-    let gate_processed = ourios_bench::bytes_must_win(ourios_bytes, loki_processed, margins.m_l2);
     println!("=== RFC 0031 indicative comparative run ===");
-    println!(
-        "corpus: {} ({} records)",
-        corpus_dir.display(),
-        pair.total_records
-    );
-    println!(
-        "pair (L2 family): service={} severity>={} (text={:?}) rows={}",
-        pair.service, pair.threshold, pair.text, pair.rows
-    );
-    println!("ourios bytes_read (compressed, fetched)   = {ourios_bytes}");
-    println!(
-        "loki   storage-side bytes (conservative)  = {loki_storage} \
-         (compressed={} + head_chunk={})",
-        loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
-    );
-    println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
-    println!(
-        "gate vs storage-side (PRIMARY, margin {}): {gate_storage:?}",
-        margins.m_l2
-    );
-    println!(
-        "gate vs bytes-processed (context, margin {}): {gate_processed:?}",
-        margins.m_l2
-    );
+    println!("corpus: {} ({total_records} records)", corpus_dir.display());
+    for ((spec, ours), (_, loki_processed, loki_fetched)) in specs.iter().zip(ourios).zip(loki) {
+        let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
+        let gate_storage = ourios_bench::bytes_must_win(ours.bytes_read, loki_storage, spec.margin);
+        let gate_processed =
+            ourios_bench::bytes_must_win(ours.bytes_read, *loki_processed, spec.margin);
+        println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
+        println!("dsl: {}", spec.dsl);
+        println!(
+            "ourios bytes_read (compressed, fetched)   = {}",
+            ours.bytes_read
+        );
+        println!(
+            "loki   storage-side bytes (conservative)  = {loki_storage} \
+             (compressed={} + head_chunk={})",
+            loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
+        );
+        println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
+        println!(
+            "gate vs storage-side (PRIMARY, margin {}): {gate_storage:?}",
+            spec.margin
+        );
+        println!(
+            "gate vs bytes-processed (context, margin {}): {gate_processed:?}",
+            spec.margin
+        );
+    }
 }
 
 #[test]
@@ -1027,4 +1236,105 @@ fn pick_selective_pair_generalizes_without_error_rows() {
     );
     assert_eq!(pair.text, "WARN");
     assert_eq!(pair.rows, 1);
+}
+
+#[test]
+fn pick_window_pair_prefers_a_clean_mid_corpus_window() {
+    let ts: Vec<u64> = (0..100).map(|i| 1_000 + i * 10).collect();
+    let (a, b) = pick_window_pair(&ts, &[], 10).expect("every window is clean");
+    assert_eq!(a, 1_000 + 45 * 10, "centred start index (100−10)/2 = 45");
+    assert_eq!(b, 1_000 + 54 * 10 + 1, "b = last in-window timestamp + 1");
+    assert_eq!(ts.iter().filter(|&&t| t >= a && t < b).count(), 10);
+}
+
+#[test]
+fn pick_window_pair_edges_are_clean() {
+    // Duplicates and 1 ns gaps around the centre force the picker off the
+    // centred window; whatever it returns must satisfy both edge
+    // invariants and contain exactly k rows.
+    let ts: Vec<u64> = vec![0, 10, 20, 30, 40, 40, 41, 50, 60, 70, 80, 90];
+    let k = 3;
+    let (a, b) = pick_window_pair(&ts, &[], k).expect("clean windows exist");
+    assert_eq!(ts.iter().filter(|&&t| t >= a && t < b).count(), k);
+    assert!(
+        !ts.contains(&b),
+        "end-inclusive semantics at b must not admit an extra row"
+    );
+    let first_inside = ts.iter().position(|&t| t >= a).expect("window non-empty");
+    assert!(
+        first_inside == 0 || ts[first_inside - 1] < a,
+        "no earlier record shares the window's start timestamp"
+    );
+}
+
+#[test]
+fn pick_window_pair_avoids_poison_timestamps() {
+    let ts: Vec<u64> = (0..100).map(|i| i * 10).collect();
+    let poison = vec![455];
+    let (a, b) = pick_window_pair(&ts, &poison, 10).expect("clean windows exist off-centre");
+    assert!(
+        !(a..b).contains(&455),
+        "a zero-time row's fallback timestamp inside the window guarantees \
+         an equivalence mismatch"
+    );
+    assert_eq!(ts.iter().filter(|&&t| t >= a && t < b).count(), 10);
+}
+
+#[test]
+fn pick_window_pair_none_when_insufficient() {
+    assert_eq!(pick_window_pair(&[1, 2, 3], &[], 4), None);
+    assert_eq!(pick_window_pair(&[1, 2, 3], &[], 0), None);
+}
+
+#[test]
+fn collect_service_timestamps_reads_the_fixture() {
+    let records = comparative_fixture(1_000_000);
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+
+    let (clean, poison) = collect_service_timestamps(corpus.path(), FIXTURE_SERVICE);
+    assert_eq!(clean, vec![1_000_000, 1_001_000, 1_002_000]);
+    assert!(poison.is_empty(), "the fixture has no zero-time records");
+    let (other_clean, other_poison) = collect_service_timestamps(corpus.path(), "no-such-service");
+    assert!(other_clean.is_empty() && other_poison.is_empty());
+}
+
+/// Locally proves the window-pair query shape end to end on the fixture:
+/// the bare-service DSL parses, and the `now = end` / `window = end −
+/// start` mapping slices exactly `[start, end)` (the querier's
+/// `time_window_filter` is `ts ≥ now − window ∧ ts < now`).
+#[test]
+fn window_pair_dsl_slices_the_fixture() {
+    let records = comparative_fixture(1_000_000);
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+
+    // [1_001_000, 1_002_001) → the second and third fixture records.
+    let (start, end) = (1_001_000u64, 1_002_001u64);
+    let dsl = format!("service == \"{FIXTURE_SERVICE}\" | limit 5000");
+    let answer = ourios_bench::ourios_query_answer(bucket.path(), &tenant, &dsl, end, end - start)
+        .expect("ourios answer");
+    let mut got: Vec<u64> = answer
+        .lines
+        .iter()
+        .map(|k| k.timestamp_unix_nanos)
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![1_001_000, 1_002_000]);
 }

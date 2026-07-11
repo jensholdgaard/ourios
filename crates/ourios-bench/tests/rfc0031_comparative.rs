@@ -1405,6 +1405,235 @@ fn window_pair_dsl_slices_the_fixture() {
     assert_eq!(got, vec![1_001_000, 1_002_000]);
 }
 
+// ---------------------------------------------------------------------------
+// Promoted `service.name` parity (RFC 0022 §3.1 in the comparative store).
+//
+// Loki's stock OTLP ingest promotes `service.name` to the `service_name`
+// stream label by default, so every service-scoped LogQL query in the
+// comparison is label-indexed. Ourios holds the same ground by
+// construction: RFC 0022 §3.1 promotes `service.name` implicitly on every
+// writer constructor, so the comparative store's files carry a
+// stats-bearing `resource.service.name` column and the DSL `service ==`
+// predicate compiles to the promoted arm (RFC 0022 §3.3), not the
+// JSON-substring fallback. These tests pin that parity: a writer or
+// store-builder change that demoted the column would silently hold Ourios
+// to a harder version of the service-scoped question than Loki answers,
+// exactly the strawman RFC 0031 §2 forbids in either direction.
+// ---------------------------------------------------------------------------
+
+/// One OTLP `LogsData` line for `service`, one INFO record per
+/// `(time_unix_nano, body)` pair — the hand-rolled two-service analogue
+/// of `fixture_logs_data` (which is fixed to the single
+/// [`FIXTURE_SERVICE`] resource).
+fn service_logs_data(
+    service: &str,
+    records: &[(u64, &str)],
+) -> opentelemetry_proto::tonic::logs::v1::LogsData {
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    let log_records = records
+        .iter()
+        .map(|&(ts, body)| LogRecord {
+            time_unix_nano: ts,
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(body.to_string())),
+            }),
+            ..LogRecord::default()
+        })
+        .collect();
+    LogsData {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(service.to_string())),
+                    }),
+                    ..KeyValue::default()
+                }],
+                ..Resource::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records,
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}
+
+/// A fixed in-range instant for the two-service corpus (2026-04-02 UTC;
+/// local tests don't face Loki's reject-old-samples window, so any base
+/// works — fixed for deterministic partition paths).
+const TWO_SERVICE_BASE_NS: u64 = 1_775_127_480_000_000_000;
+const HOUR_NS: u64 = 3_600_000_000_000;
+
+/// The `(timestamp, body)` records each service of the two-service
+/// corpus carries. `svc-a` sits two hour-partitions before `svc-b`, so
+/// each service lands in its own file with service-homogeneous row-group
+/// stats — the layout a `service ==` predicate can actually prune
+/// against (a row group holding both services has min/max spanning both,
+/// and nothing to skip).
+fn two_service_records(service: &str) -> Vec<(u64, &'static str)> {
+    let (base, bodies): (u64, [&'static str; 3]) = match service {
+        "svc-a" => (
+            TWO_SERVICE_BASE_NS,
+            ["alpha one", "alpha two", "alpha three"],
+        ),
+        "svc-b" => (
+            TWO_SERVICE_BASE_NS + 2 * HOUR_NS,
+            ["beta one", "beta two", "beta three"],
+        ),
+        other => panic!("two_service_records knows svc-a and svc-b, not {other:?}"),
+    };
+    bodies
+        .into_iter()
+        .zip([0u64, 1_000, 2_000])
+        .map(|(body, off)| (base + off, body))
+        .collect()
+}
+
+/// Build the registry-bearing comparative store over the two-service
+/// corpus. Returns the live bucket dir plus the build summary.
+fn build_two_service_store() -> (tempfile::TempDir, ourios_bench::BuiltStore) {
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    let jsonl = ["svc-a", "svc-b"]
+        .map(|svc| {
+            serde_json::to_string(&service_logs_data(svc, &two_service_records(svc)))
+                .expect("serialize LogsData")
+        })
+        .join("\n");
+    std::fs::write(corpus.path().join("two-service.jsonl"), jsonl).expect("write corpus");
+
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    (bucket, built)
+}
+
+/// Every data file the comparative store publishes carries the RFC 0022
+/// promoted `resource.service.name` column, byte-for-byte the field the
+/// writer's default (implicit-`service.name`) schema declares.
+#[test]
+fn comparative_store_promotes_the_service_name_column() {
+    let (bucket, built) = build_two_service_store();
+    assert_eq!(built.rows, 6);
+    assert_eq!(built.files, 2, "one file per hour partition");
+
+    let expected_schema =
+        ourios_parquet::data_schema_with_promoted(&ourios_parquet::PromotedAttributes::default());
+    let expected_field = expected_schema
+        .field_with_name("resource.service.name")
+        .expect("default promoted schema declares the service column");
+
+    let mut checked = 0;
+    let mut stack = vec![bucket.path().join("data")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                let file = std::fs::File::open(&path).expect("open parquet file");
+                let builder =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .expect("parquet footer");
+                let field = builder
+                    .schema()
+                    .field_with_name("resource.service.name")
+                    .unwrap_or_else(|_| {
+                        panic!("{} lacks the promoted service column", path.display())
+                    });
+                assert_eq!(field, expected_field, "{}", path.display());
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 2, "both data files checked");
+}
+
+/// A `service ==` query over the two-service store answers off the
+/// promoted column: the other service's row group is pruned by its
+/// statistics, and the query reads strictly fewer bytes than the
+/// full-window scan. The JSON-substring fallback arm can do neither —
+/// this is the pruning evidence RFC 0031's service-scoped pairs rest on.
+#[test]
+fn service_predicate_prunes_on_the_promoted_column() {
+    let (bucket, built) = build_two_service_store();
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    let query = ourios_querier::dsl::parse("service == \"svc-a\" | limit 100").expect("parse DSL");
+    let querier = ourios_querier::Querier::new(bucket.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let result = runtime
+        .block_on(querier.run_query(&query, &tenant, now, window, None))
+        .expect("service query");
+    assert_eq!(result.rows, 3, "exactly the svc-a rows match");
+    assert!(
+        result.stats.row_groups_pruned >= 1,
+        "svc-b's row group must be pruned via promoted-column statistics \
+         (scanned {}, pruned {})",
+        result.stats.row_groups_scanned,
+        result.stats.row_groups_pruned,
+    );
+
+    // The same two queries through the comparative measurement channel:
+    // the service-scoped answer is the right rows AND fewer bytes than
+    // the full-window scan.
+    let service_answer = ourios_bench::ourios_query_answer(
+        bucket.path(),
+        &tenant,
+        "service == \"svc-a\" | limit 100",
+        now,
+        window,
+    )
+    .expect("service answer");
+    let expected: Vec<LineKey> = two_service_records("svc-a")
+        .into_iter()
+        .map(|(ts, body)| LineKey {
+            timestamp_unix_nanos: ts,
+            body: body.as_bytes().to_vec(),
+        })
+        .collect();
+    assert!(
+        compare_lines(&service_answer.lines, &expected, 8).is_equal(),
+        "the promoted arm must return exactly the svc-a lines",
+    );
+
+    let full_answer = ourios_bench::ourios_query_answer(
+        bucket.path(),
+        &tenant,
+        "severity >= 0 | limit 100",
+        now,
+        window,
+    )
+    .expect("full-window answer");
+    assert_eq!(
+        full_answer.lines.len(),
+        6,
+        "the full scan reads both services"
+    );
+    assert!(
+        service_answer.bytes_read < full_answer.bytes_read,
+        "service-scoped bytes_read ({}) must undercut the full scan ({})",
+        service_answer.bytes_read,
+        full_answer.bytes_read,
+    );
+}
+
 #[test]
 fn select_pair_candidates_rejects_poisoned_bands() {
     use std::collections::HashMap;

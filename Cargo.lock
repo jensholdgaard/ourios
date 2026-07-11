@@ -3260,9 +3260,12 @@ dependencies = [
  "ourios-testgen",
  "ourios-wal",
  "proptest",
+ "prost",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers-modules",
  "tokio",
  "zstd",
 ]

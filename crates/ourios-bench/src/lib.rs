@@ -44,7 +44,7 @@ mod store;
 pub use calibrate::{CALIBRATION_DIR, extract_manifest, write_manifest};
 pub use comparative::{
     AggKey, EquivalenceOutcome, LineKey, Mismatch, compare_aggregations, compare_lines,
-    ourios_query_lines,
+    ourios_query_lines, parse_loki_streams,
 };
 pub use corpus::TxtSeverity;
 pub use reference::ReferenceCorpus;

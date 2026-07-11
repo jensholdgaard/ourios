@@ -295,6 +295,66 @@ fn body_bytes(body: &ourios_querier::LogBody) -> Result<Vec<u8>, BenchError> {
     })
 }
 
+/// Parse a Loki `query_range` **streams** response into [`LineKey`]s — the
+/// Loki half of the RFC0031.1 equivalence check.
+///
+/// Loki returns matching lines under `data.result[].values[]`, each a
+/// `["<ns-timestamp-string>", "<log line>"]` pair. Each becomes a
+/// `LineKey` keyed the same way as the Ourios side (`(timestamp, body)`),
+/// so the two feed [`compare_lines`]. The timestamp is Loki's nanosecond
+/// string; the body is the log line bytes.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if the JSON doesn't parse, the
+/// `data.result` array is absent, a `values` entry isn't a two-element
+/// `[string, string]`, or the timestamp string isn't a `u64`.
+pub fn parse_loki_streams(response_json: &str) -> Result<Vec<LineKey>, BenchError> {
+    let root: serde_json::Value =
+        serde_json::from_str(response_json).map_err(|e| BenchError::Pipeline {
+            detail: format!("Loki response is not JSON: {e}"),
+        })?;
+    let result = root
+        .get("data")
+        .and_then(|d| d.get("result"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: "Loki response missing `data.result` array".to_string(),
+        })?;
+
+    let mut lines = Vec::new();
+    for stream in result {
+        let values = stream
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| BenchError::Pipeline {
+                detail: "Loki stream missing `values` array".to_string(),
+            })?;
+        for pair in values {
+            let entry =
+                pair.as_array()
+                    .filter(|a| a.len() == 2)
+                    .ok_or_else(|| BenchError::Pipeline {
+                        detail: "Loki `values` entry is not a [timestamp, line] pair".to_string(),
+                    })?;
+            let ts_str = entry[0].as_str().ok_or_else(|| BenchError::Pipeline {
+                detail: "Loki `values` timestamp is not a string".to_string(),
+            })?;
+            let timestamp_unix_nanos = ts_str.parse::<u64>().map_err(|e| BenchError::Pipeline {
+                detail: format!("Loki timestamp `{ts_str}` is not a u64: {e}"),
+            })?;
+            let body = entry[1].as_str().ok_or_else(|| BenchError::Pipeline {
+                detail: "Loki `values` log line is not a string".to_string(),
+            })?;
+            lines.push(LineKey {
+                timestamp_unix_nanos,
+                body: body.as_bytes().to_vec(),
+            });
+        }
+    }
+    Ok(lines)
+}
+
 /// A truncated, lossy preview of a body for a mismatch report — bounded
 /// so an arbitrarily large body can't blow up the stderr summary.
 fn body_preview(body: &[u8]) -> String {
@@ -387,6 +447,64 @@ mod tests {
         );
         assert!(m.examples[0].contains("ourios=2"));
         assert!(m.examples[0].contains("loki=3"));
+    }
+
+    #[test]
+    fn parse_loki_streams_keys_compatibly_with_the_ourios_side() {
+        // A synthetic Loki `query_range` streams response — three lines
+        // across two streams.
+        let response = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "streams",
+                "result": [
+                    { "stream": {"service_name": "a"}, "values": [
+                        ["1775127480000000000", "user 1 logged in"],
+                        ["1775127480000000001", "user 2 logged in"]
+                    ]},
+                    { "stream": {"service_name": "b"}, "values": [
+                        ["1775127480000000002", "user 3 logged in"]
+                    ]}
+                ]
+            }
+        }"#;
+        let loki = parse_loki_streams(response).expect("parse loki streams");
+        assert_eq!(loki.len(), 3);
+
+        // The parsed keys must be byte-for-byte what the Ourios side would
+        // produce for the same lines — otherwise the equivalence check is
+        // comparing incompatibly-keyed sets.
+        let ourios = vec![
+            LineKey {
+                timestamp_unix_nanos: 1_775_127_480_000_000_000,
+                body: b"user 1 logged in".to_vec(),
+            },
+            LineKey {
+                timestamp_unix_nanos: 1_775_127_480_000_000_001,
+                body: b"user 2 logged in".to_vec(),
+            },
+            LineKey {
+                timestamp_unix_nanos: 1_775_127_480_000_000_002,
+                body: b"user 3 logged in".to_vec(),
+            },
+        ];
+        assert!(
+            compare_lines(&ourios, &loki, 8).is_equal(),
+            "Loki-parsed lines must key-match the Ourios side",
+        );
+    }
+
+    #[test]
+    fn parse_loki_streams_rejects_malformed_responses() {
+        // Missing data.result, a non-pair value, and a non-numeric
+        // timestamp all error rather than silently drop rows.
+        assert!(parse_loki_streams(r#"{"status":"success"}"#).is_err());
+        assert!(
+            parse_loki_streams(r#"{"data":{"result":[{"values":[["1","a","extra"]]}]}}"#).is_err()
+        );
+        assert!(
+            parse_loki_streams(r#"{"data":{"result":[{"values":[["notanum","a"]]}]}}"#).is_err()
+        );
     }
 
     #[test]

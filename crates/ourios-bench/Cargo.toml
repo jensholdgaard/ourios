@@ -65,6 +65,16 @@ zstd = "0.13"
 # reference byte count) — normal dependencies are visible to
 # `tests/`, so no separate `[dev-dependencies]` mirror is needed.
 tempfile = "3"
+# RFC 0031 comparative harness. The Ourios-side L-gate extraction
+# (`comparative::ourios_query_lines`) runs the querier **in-process**: the
+# comparative harness is a lib gate that produces `docs/benchmarks.md` §9
+# numbers (like a1/c1/c2), and producing comparative numbers requires
+# querying, so the querier belongs in the lib — not just tests. A
+# current-thread tokio runtime drives the async `Querier::run`. (Both were
+# dev-only while the only in-process queries lived in the B2 criterion
+# bench, which still uses them via these regular deps.)
+ourios-querier = { path = "../ourios-querier" }
+tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 # RFC0024.2 draws calibrated records through a fixed-seed
@@ -74,12 +84,9 @@ proptest = "=1.11.0"
 # B2 latency bench (RFC 0007 §6 — supportive, non-gating evidence
 # for the RFC0007.2 thesis gate that ourios-querier proves
 # structurally). criterion gives warmup + a statistical median,
-# which is what B2's "median latency" target wants; ourios-querier
-# is the unit under test (and pulls DataFusion); a current-thread
-# tokio runtime drives its async `Querier::run`.
+# which is what B2's "median latency" target wants; ourios-querier (a
+# regular dependency above) is the unit under test.
 criterion = "=0.8.2"
-ourios-querier = { path = "../ourios-querier" }
-tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 # RFC0008.3 recovery-non-amplification bench: times `Wal::replay`
 # over N ∈ {1, 4, 16} segments. Supportive wall-clock evidence
 # (the O(N) shape) mirroring b1/b2's role; the structural side is

@@ -927,10 +927,10 @@ enum GateKind {
 }
 
 impl GateKind {
-    fn evaluate(self, ourios: u64, loki: u64, margin: u64) -> ourios_bench::BytesGateOutcome {
+    fn evaluate(self, ourios: u64, loki: u64, calibration: u64) -> ourios_bench::BytesGateOutcome {
         match self {
-            Self::MustWin => ourios_bench::bytes_must_win(ourios, loki, margin),
-            Self::Floor => ourios_bench::bytes_within_floor(ourios, loki, margin),
+            Self::MustWin => ourios_bench::bytes_must_win(ourios, loki, calibration),
+            Self::Floor => ourios_bench::bytes_within_floor(ourios, loki, calibration),
         }
     }
 

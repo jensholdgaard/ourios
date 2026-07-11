@@ -74,8 +74,9 @@ pub enum BytesGateOutcome {
     /// a zero `margin`/`factor` (a misconfigured gate), or a
     /// measurement so large the floor budget overflows.
     Invalid {
-        /// What made it meaningless: which side(s) reported zero, or
-        /// that the margin itself was zero.
+        /// What made it meaningless: which side(s) reported zero, that
+        /// the margin/factor itself was zero, or that the floor budget
+        /// overflowed.
         reason: String,
     },
 }

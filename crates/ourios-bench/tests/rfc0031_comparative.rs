@@ -700,11 +700,22 @@ async fn loki_query_with_stats(
     )
 }
 
-/// Push a whole OTLP/JSON Lines corpus into Loki, ~500 `LogsData` lines
-/// merged per request (≈2 MB of protobuf), with the 429-retrying pusher.
+/// Push a whole OTLP/JSON Lines corpus into Loki, batched by **encoded
+/// bytes** (≈3 MiB per request, under Loki's stock 4 MiB internal gRPC
+/// message cap) with a 500-`LogsData` secondary cap, via the retrying
+/// pusher. Byte-capped because count-capped batching is blind to
+/// heterogeneous batch sizes — run #2 died on a 500-batch push that
+/// encoded to 5.28 MB (503 ResourceExhausted); adapting the pusher to
+/// Loki's stock limit is the anti-strawman direction (a real OTLP
+/// exporter batches under size limits too).
 async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &std::path::Path) {
     use prost::Message as _;
     use std::io::BufRead as _;
+
+    /// Stay ~1 MiB under Loki's stock 4 MiB cap: the encoded-size
+    /// estimate below is per-`ResourceLogs` and slightly undercounts the
+    /// envelope's field framing.
+    const FLUSH_BYTES: usize = 3 * 1024 * 1024;
 
     let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
         .expect("read corpus dir")
@@ -715,7 +726,8 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
         .collect();
     paths.sort();
 
-    let mut pending = Vec::new();
+    let mut pending: Vec<opentelemetry_proto::tonic::logs::v1::ResourceLogs> = Vec::new();
+    let (mut pending_bytes, mut pending_lines) = (0usize, 0u64);
     let (mut batched, mut pushed) = (0u64, 0u64);
     for path in paths {
         let file = std::fs::File::open(&path).expect("open corpus file");
@@ -726,20 +738,33 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
             }
             let data: opentelemetry_proto::tonic::logs::v1::LogsData =
                 serde_json::from_str(&line).expect("parse LogsData line");
-            pending.extend(data.resource_logs);
-            batched += 1;
-            if batched % 500 == 0 {
+            let line_bytes: usize = data
+                .resource_logs
+                .iter()
+                .map(|rl| rl.encoded_len() + 8)
+                .sum();
+            // Flush BEFORE appending if this line would overflow the byte
+            // cap — so no push ever exceeds it (a single oversized line
+            // still goes alone; none in practice approaches 3 MiB).
+            if !pending.is_empty()
+                && (pending_bytes + line_bytes > FLUSH_BYTES || pending_lines >= 500)
+            {
                 let payload =
                     opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
                         resource_logs: std::mem::take(&mut pending),
                     }
                     .encode_to_vec();
                 push_otlp(http, base, payload).await;
+                (pending_bytes, pending_lines) = (0, 0);
                 pushed += 1;
-                if pushed % 200 == 0 {
+                if pushed % 500 == 0 {
                     eprintln!("loki ingest: {batched} LogsData batches pushed…");
                 }
             }
+            pending.extend(data.resource_logs);
+            pending_bytes += line_bytes;
+            pending_lines += 1;
+            batched += 1;
         }
     }
     if !pending.is_empty() {

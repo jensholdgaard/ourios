@@ -915,9 +915,13 @@ struct PairSpec {
     start: u64,
     end: u64,
     expected_rows: u64,
-    /// The Ourios querier's window parameters mapping to the same
-    /// `[start, end)`: `time_window_filter` is `ts ≥ now − window ∧
-    /// ts < now`, so `now = end`, `window = end − start`.
+    /// The Ourios querier's window parameters (`time_window_filter` is
+    /// `ts ≥ now − window ∧ ts < now`). For the time-window slices these
+    /// map exactly to `[start, end)` (`now = end`, `window = end −
+    /// start`); the severity pair instead uses the full-corpus
+    /// effective-time window — there both sides' windows are supersets
+    /// of every matching row and the severity predicate does the
+    /// selecting.
     now: u64,
     window: u64,
 }

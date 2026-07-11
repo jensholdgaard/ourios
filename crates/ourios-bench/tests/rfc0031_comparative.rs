@@ -470,13 +470,19 @@ fn rfc0031_11_losses_published_and_escalation() {
 // Indicative comparative run (§7 calibration input) — dispatch-only.
 // ---------------------------------------------------------------------------
 
-/// The dynamically-picked first query pair: the service whose ERROR rows
-/// form a small, exactly-equivalent result set on both systems.
+/// The dynamically-picked first query pair: a `(service, severity
+/// threshold, severity text)` whose rows form a small, exactly-equivalent
+/// result set on both systems.
 #[derive(Debug)]
-struct ErrorPair {
+struct SelectivePair {
     service: String,
-    /// Rows with `severity_number ≥ 17` — equal, by the picker's
-    /// consistency requirement, to rows with `severity_text == "ERROR"`.
+    /// The DSL threshold: the pair selects rows with
+    /// `severity_number ≥ threshold`.
+    threshold: i32,
+    /// The single `severity_text` those rows all carry (the `LogQL` side of
+    /// the pair) — the picker's text-consistency guarantee.
+    text: String,
+    /// How many rows the pair selects.
     rows: u64,
     /// Corpus record count (for the report).
     total_records: u64,
@@ -486,21 +492,27 @@ struct ErrorPair {
 }
 
 /// Scan an OTLP/JSON Lines corpus and pick the query pair for the
-/// indicative run: the service with the FEWEST `severity ≥ 17` rows in
-/// `1..=4000` (under Loki's 5000-line query cap, so the complete result
-/// fits one page) whose error rows are **text-consistent** — every
-/// `severity_number ≥ 17` row carries `severity_text == "ERROR"` and
-/// vice versa — so the DSL (`severity >= 17`) and `LogQL`
-/// (`severity_text="ERROR"`) express the same question and the
-/// equivalence check is meaningful. Ties break to the lexicographically
-/// smallest service for deterministic reruns.
-fn pick_error_pair(corpus_dir: &std::path::Path) -> ErrorPair {
+/// indicative run: a `(service, threshold T, text t)` where **every** row
+/// of the service with `severity_number ≥ T` carries the single
+/// `severity_text == t`, and their count is `1..=4000` (under Loki's
+/// 5000-line query cap, so the complete result fits one page). The
+/// consistency requirement makes DSL `severity >= T` and `LogQL`
+/// `severity_text="t"` express the same question, so the equivalence
+/// check is meaningful. Generalised from a hardcoded ERROR band because
+/// real captures vary — otel-demo v8 carries no ERROR logs at all (its
+/// failure flags surface in traces/metrics), only INFO/Information and
+/// four WARNs. Candidate thresholds are the service's **observed**
+/// severity numbers — which is complete, because a gap threshold (say 16
+/// when only 17 occurs) selects exactly the same rows as the next
+/// observed number above it, adding no new candidates. Picks the FEWEST
+/// rows; ties break to the lowest threshold then the lexicographically
+/// smallest service, for deterministic reruns.
+fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
     use std::collections::HashMap;
     use std::io::BufRead as _;
 
-    // service -> (rows where num>=17, rows where text=="ERROR", rows where
-    // the two disagree)
-    let mut per_service: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    // service -> severity_number -> severity_text -> row count
+    let mut per_service: HashMap<String, HashMap<i32, HashMap<String, u64>>> = HashMap::new();
     let (mut total, mut min_ts, mut max_ts) = (0u64, u64::MAX, 0u64);
 
     let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
@@ -538,20 +550,36 @@ fn pick_error_pair(corpus_dir: &std::path::Path) -> ErrorPair {
                     .unwrap_or_default();
                 // One entry lookup per ResourceLogs group (moving the
                 // service string in), not one clone per record — the scan
-                // walks multi-million-record corpora.
+                // walks multi-million-record corpora. Severity texts are
+                // likewise cloned only on their FIRST occurrence per
+                // (service, number): get_mut hits the existing key for the
+                // millions of repeats.
                 let entry = per_service.entry(service).or_default();
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         total += 1;
-                        if lr.time_unix_nano != 0 {
-                            min_ts = min_ts.min(lr.time_unix_nano);
-                            max_ts = max_ts.max(lr.time_unix_nano);
+                        // Zero-`time_unix_nano` records are excluded from
+                        // candidate bands even though both systems could
+                        // still return them (Ourios windows the RFC 0005
+                        // §3.2 EFFECTIVE timestamp, falling back to
+                        // observed; Loki's OTLP ingest falls back to
+                        // observed too): the two sides would answer with
+                        // DIFFERENT timestamps — Ourios's row keeps
+                        // time_unix_nano = 0, Loki stamps its stored
+                        // (observed) time — so their LineKeys can never
+                        // match and any band containing such rows is a
+                        // guaranteed equivalence mismatch.
+                        if lr.time_unix_nano == 0 {
+                            continue;
                         }
-                        let by_num = lr.severity_number >= 17;
-                        let by_text = lr.severity_text == "ERROR";
-                        entry.0 += u64::from(by_num);
-                        entry.1 += u64::from(by_text);
-                        entry.2 += u64::from(by_num != by_text);
+                        min_ts = min_ts.min(lr.time_unix_nano);
+                        max_ts = max_ts.max(lr.time_unix_nano);
+                        let texts = entry.entry(lr.severity_number).or_default();
+                        if let Some(count) = texts.get_mut(lr.severity_text.as_str()) {
+                            *count += 1;
+                        } else {
+                            texts.insert(lr.severity_text.clone(), 1);
+                        }
                     }
                 }
             }
@@ -562,29 +590,84 @@ fn pick_error_pair(corpus_dir: &std::path::Path) -> ErrorPair {
         "corpus has no record with a non-zero time_unix_nano — no query window derivable",
     );
 
-    // No-service records (empty key) are counted above — they show in the
-    // failure diagnostic — but are never candidates: an empty service can't
-    // form a valid DSL/LogQL pair (Loki labels the stream differently for
-    // a missing service.name than for an empty one).
-    let mut candidates: Vec<(&String, u64)> = per_service
-        .iter()
-        .filter(|(svc, counts)| !svc.is_empty() && counts.2 == 0 && (1..=4000).contains(&counts.0))
-        .map(|(svc, counts)| (svc, counts.0))
-        .collect();
-    candidates.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
-    let Some(&(service, rows)) = candidates.first() else {
+    let mut candidates = select_pair_candidates(&per_service);
+    candidates.sort();
+    let Some(&(rows, threshold, service, text)) = candidates.first() else {
         panic!(
-            "no text-consistent service with 1..=4000 error rows; per-service \
-             (num>=17, text==ERROR, disagreements): {per_service:#?}"
+            "no (service, severity-threshold) with a single text and 1..=4000 rows; \
+             per-service severity bands: {per_service:#?}"
         );
     };
-    ErrorPair {
+    SelectivePair {
         service: service.clone(),
+        threshold,
+        text: text.clone(),
         rows,
         total_records: total,
         min_ts,
         max_ts,
     }
+}
+
+/// The candidate `(rows, threshold, service, text)` tuples for
+/// [`pick_selective_pair`]: for every service and every DISTINCT severity
+/// number T in it (the nested map dedupes them), the rows with
+/// `number ≥ T` are a candidate iff (a) they all share ONE text t, (b)
+/// the count is `1..=4000`, and (c) — the reverse direction — NO row with
+/// text t sits below T, so `LogQL`'s text filter selects exactly the same
+/// rows as the DSL's number threshold. No-service (empty-key) records are
+/// scanned — they show in the failure diagnostic — but never form
+/// candidates (an empty service can't make a valid DSL/LogQL pair).
+fn select_pair_candidates(
+    per_service: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<i32, std::collections::HashMap<String, u64>>,
+    >,
+) -> Vec<(u64, i32, &String, &String)> {
+    // Both names are interpolated into quoted DSL and LogQL string
+    // literals; a `"` or `\` (legal in OTLP attributes) would break or
+    // change either query. Rather than implement escaping for two query
+    // languages, a pair whose names fall outside this conservative set is
+    // simply not a candidate.
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ' '))
+    };
+    let mut candidates = Vec::new();
+    for (svc, bands) in per_service {
+        if !safe(svc) {
+            continue;
+        }
+        for &threshold in bands.keys() {
+            let selected: Vec<(&String, u64)> = bands
+                .iter()
+                .filter(|&(&n, _)| n >= threshold)
+                .flat_map(|(_, texts)| texts.iter().map(|(t, c)| (t, *c)))
+                .collect();
+            let rows: u64 = selected.iter().map(|&(_, c)| c).sum();
+            let mut texts: Vec<&String> = selected.iter().map(|&(t, _)| t).collect();
+            texts.sort();
+            texts.dedup();
+            let [text] = texts.as_slice() else {
+                continue;
+            };
+            if !safe(text) || !(1..=4000).contains(&rows) {
+                continue;
+            }
+            let text_total: u64 = bands
+                .values()
+                .filter_map(|texts| texts.get(text.as_str()))
+                .sum();
+            if text_total != rows {
+                // Rows with this text exist below the threshold — the
+                // LogQL side would return more than the DSL side.
+                continue;
+            }
+            candidates.push((rows, threshold, svc, *text));
+        }
+    }
+    candidates
 }
 
 /// One `query_range` call returning both the lines and Loki's
@@ -693,7 +776,7 @@ fn rfc0031_indicative_comparative_run() {
     );
 
     // Pick the pair, then drive the (locally-proven) Ourios half.
-    let pair = pick_error_pair(&corpus_dir);
+    let pair = pick_selective_pair(&corpus_dir);
     eprintln!("pair: {pair:?}");
     let bucket = tempfile::TempDir::new().expect("bucket dir");
     let built = ourios_bench::build_comparative_store(
@@ -706,15 +789,15 @@ fn rfc0031_indicative_comparative_run() {
     let now = built.max_effective_time_unix_nano + 1;
     let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
     let dsl = format!(
-        "service == \"{}\" and severity >= 17 | limit 5000",
-        pair.service
+        "service == \"{}\" and severity >= {} | limit 5000",
+        pair.service, pair.threshold
     );
     let ourios = ourios_bench::ourios_query_answer(bucket.path(), &tenant, &dsl, now, window)
         .expect("ourios answer");
     assert_eq!(
         ourios.lines.len() as u64,
         pair.rows,
-        "Ourios must return exactly the picked service's error rows",
+        "Ourios must return exactly the picked pair's rows",
     );
 
     // The Loki half: container (stock + documented ingest-side flags),
@@ -735,8 +818,8 @@ fn rfc0031_indicative_comparative_run() {
         push_corpus_to_loki(&http, &base, &corpus_dir).await;
 
         let logql = format!(
-            "{{service_name=\"{}\"}} | severity_text=\"ERROR\"",
-            pair.service
+            "{{service_name=\"{}\"}} | severity_text=\"{}\"",
+            pair.service, pair.text
         );
         let (start, end) = (pair.min_ts, pair.max_ts + 1);
         // Poll until ingest catches up to the expected row count.
@@ -773,8 +856,8 @@ fn rfc0031_indicative_comparative_run() {
         pair.total_records
     );
     println!(
-        "pair (L2 family): service={} error_rows={}",
-        pair.service, pair.rows
+        "pair (L2 family): service={} severity>={} (text={:?}) rows={}",
+        pair.service, pair.threshold, pair.text, pair.rows
     );
     println!("ourios bytes_read      = {}", ourios.bytes_read);
     println!("loki   bytes_processed = {loki_bytes}");
@@ -782,7 +865,7 @@ fn rfc0031_indicative_comparative_run() {
 }
 
 #[test]
-fn pick_error_pair_finds_the_fixture_error_row() {
+fn pick_selective_pair_finds_the_fixture_error_row() {
     // The picker is locally provable on the shared fixture: one ERROR row,
     // text-consistent, in the comparative-fixture service.
     let records = comparative_fixture(1_000_000);
@@ -793,10 +876,57 @@ fn pick_error_pair_finds_the_fixture_error_row() {
     )
     .expect("write corpus");
 
-    let pair = pick_error_pair(corpus.path());
+    let pair = pick_selective_pair(corpus.path());
     assert_eq!(pair.service, FIXTURE_SERVICE);
+    assert_eq!(
+        pair.threshold, 17,
+        "the ERROR band is the rarest single-text band"
+    );
+    assert_eq!(pair.text, "ERROR");
     assert_eq!(pair.rows, 1, "exactly the one ERROR fixture record");
     assert_eq!(pair.total_records, 3);
     assert_eq!(pair.min_ts, 1_000_000);
     assert_eq!(pair.max_ts, 1_002_000);
+}
+
+#[test]
+fn pick_selective_pair_generalizes_without_error_rows() {
+    // The otel-demo-v8 shape in miniature: an INFO-dominated service with
+    // a rare WARN band and NO ERROR rows anywhere — the generalization
+    // path run #1 surfaced. The picker must select the WARN band.
+    let records = vec![
+        FixtureRecord {
+            time_unix_nano: 1_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "user 1 logged in",
+        },
+        FixtureRecord {
+            time_unix_nano: 2_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "user 2 logged in",
+        },
+        FixtureRecord {
+            time_unix_nano: 3_000,
+            severity_number: 13,
+            severity_text: "WARN",
+            body: "cache nearly full",
+        },
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+
+    let pair = pick_selective_pair(corpus.path());
+    assert_eq!(pair.service, FIXTURE_SERVICE);
+    assert_eq!(
+        pair.threshold, 13,
+        "the WARN band is the rarest single-text band"
+    );
+    assert_eq!(pair.text, "WARN");
+    assert_eq!(pair.rows, 1);
 }

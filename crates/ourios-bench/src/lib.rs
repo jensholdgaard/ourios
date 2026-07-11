@@ -37,6 +37,7 @@ mod calibrate;
 mod comparative;
 mod corpus;
 mod harness;
+mod lgates;
 mod reference;
 mod report;
 mod store;
@@ -49,6 +50,7 @@ pub use comparative::{
     parse_loki_streams,
 };
 pub use corpus::TxtSeverity;
+pub use lgates::{BytesGateOutcome, ComparativeMargins, bytes_must_win};
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
 pub use store::{B1Store, BuiltStore, build_b1_store, build_comparative_store, build_query_store};

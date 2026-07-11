@@ -705,7 +705,7 @@ async fn loki_query_with_stats(
 /// message cap) with a 500-`LogsData` secondary cap, via the retrying
 /// pusher. Byte-capped because count-capped batching is blind to
 /// heterogeneous batch sizes — run #2 died on a 500-batch push that
-/// encoded to 5.28 MB (503 ResourceExhausted); adapting the pusher to
+/// encoded to 5.28 MB (503 `ResourceExhausted`); adapting the pusher to
 /// Loki's stock limit is the anti-strawman direction (a real OTLP
 /// exporter batches under size limits too).
 async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &std::path::Path) {

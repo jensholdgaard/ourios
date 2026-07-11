@@ -21,8 +21,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
-    FIXTURE_SERVICE, FixtureRecord, LineKey, comparative_fixture, compare_lines, fixture_jsonl,
-    fixture_logs_data, ourios_query_lines, parse_loki_bytes_processed, parse_loki_streams,
+    FIXTURE_SERVICE, FixtureRecord, LineKey, LokiFetchedBytes, comparative_fixture, compare_lines,
+    fixture_jsonl, fixture_logs_data, ourios_query_lines, parse_loki_bytes_processed,
+    parse_loki_fetched_bytes, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
 
@@ -680,15 +681,17 @@ fn select_pair_candidates(
     candidates
 }
 
-/// One `query_range` call returning both the lines and Loki's
-/// bytes-processed measurement from the same response body.
+/// One `query_range` call returning the lines plus BOTH of Loki's byte
+/// figures from the same response body: engine-level decompressed
+/// `totalBytesProcessed`, and the storage-side compressed/head-chunk
+/// figures — so the report can carry the conservative ratio.
 async fn loki_query_with_stats(
     http: &reqwest::Client,
     base: &str,
     logql: &str,
     start: u64,
     end: u64,
-) -> (Vec<LineKey>, u64) {
+) -> (Vec<LineKey>, u64, LokiFetchedBytes) {
     let resp = http
         .get(format!("{base}/loki/api/v1/query_range"))
         .query(&[
@@ -707,6 +710,7 @@ async fn loki_query_with_stats(
     (
         parse_loki_streams(&body).expect("parse loki streams"),
         parse_loki_bytes_processed(&body).expect("parse loki bytes"),
+        parse_loki_fetched_bytes(&body).expect("parse loki fetched bytes"),
     )
 }
 
@@ -851,7 +855,7 @@ fn rfc0031_indicative_comparative_run() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (loki_lines, loki_bytes) = runtime.block_on(async {
+    let (loki_lines, loki_bytes, loki_fetched) = runtime.block_on(async {
         let (_container, base, http) = start_loki(&[
             "-validation.reject-old-samples=false",
             "-distributor.ingestion-rate-limit-mb=512",
@@ -881,9 +885,10 @@ fn rfc0031_indicative_comparative_run() {
         // Poll until ingest catches up to the expected row count.
         let deadline = std::time::Instant::now() + Duration::from_secs(300);
         loop {
-            let (lines, bytes) = loki_query_with_stats(&http, &base, &logql, start, end).await;
+            let (lines, bytes, fetched) =
+                loki_query_with_stats(&http, &base, &logql, start, end).await;
             if lines.len() as u64 >= pair.rows {
-                break (lines, bytes);
+                break (lines, bytes, fetched);
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -902,9 +907,34 @@ fn rfc0031_indicative_comparative_run() {
         "the two systems' answers must be multiset-identical: {outcome:?}",
     );
 
-    // The bytes gate — REPORTED under the provisional §7 margins.
+    print_indicative_report(
+        &corpus_dir,
+        &pair,
+        ourios.bytes_read,
+        loki_bytes,
+        loki_fetched,
+    );
+}
+
+/// The indicative run's report block. The bytes gate is REPORTED under
+/// the provisional §7 margins, and evaluated PRIMARILY on the
+/// conservative Loki figure: `totalBytesProcessed` is decompressed
+/// engine-side work, which overstates Loki's storage reads by the chunk
+/// compression ratio; the storage-side figure (compressed chunk bytes +
+/// memory-served head-chunk bytes) is the apples-to-apples counterpart
+/// of Ourios's fetched-compressed-Parquet bytes. Both ratios are printed
+/// so the §9 entry can carry the honest pair of numbers.
+fn print_indicative_report(
+    corpus_dir: &std::path::Path,
+    pair: &SelectivePair,
+    ourios_bytes: u64,
+    loki_processed: u64,
+    loki_fetched: LokiFetchedBytes,
+) {
     let margins = ourios_bench::ComparativeMargins::default();
-    let gate = ourios_bench::bytes_must_win(ourios.bytes_read, loki_bytes, margins.m_l2);
+    let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
+    let gate_storage = ourios_bench::bytes_must_win(ourios_bytes, loki_storage, margins.m_l2);
+    let gate_processed = ourios_bench::bytes_must_win(ourios_bytes, loki_processed, margins.m_l2);
     println!("=== RFC 0031 indicative comparative run ===");
     println!(
         "corpus: {} ({} records)",
@@ -915,9 +945,21 @@ fn rfc0031_indicative_comparative_run() {
         "pair (L2 family): service={} severity>={} (text={:?}) rows={}",
         pair.service, pair.threshold, pair.text, pair.rows
     );
-    println!("ourios bytes_read      = {}", ourios.bytes_read);
-    println!("loki   bytes_processed = {loki_bytes}");
-    println!("gate (provisional margin {}): {gate:?}", margins.m_l2);
+    println!("ourios bytes_read (compressed, fetched)   = {ourios_bytes}");
+    println!(
+        "loki   storage-side bytes (conservative)  = {loki_storage} \
+         (compressed={} + head_chunk={})",
+        loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
+    );
+    println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
+    println!(
+        "gate vs storage-side (PRIMARY, margin {}): {gate_storage:?}",
+        margins.m_l2
+    );
+    println!(
+        "gate vs bytes-processed (context, margin {}): {gate_processed:?}",
+        margins.m_l2
+    );
 }
 
 #[test]

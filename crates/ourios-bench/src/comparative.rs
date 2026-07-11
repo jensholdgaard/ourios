@@ -429,6 +429,75 @@ pub fn parse_loki_bytes_processed(response_json: &str) -> Result<u64, BenchError
         })
 }
 
+/// Loki's **storage-side** byte figures for one query — the
+/// apples-to-apples counterpart of [`OuriosAnswer::bytes_read`] (which
+/// counts compressed Parquet bytes fetched from storage).
+///
+/// `summary.totalBytesProcessed` counts **decompressed** bytes the query
+/// engine processed, which overstates Loki's storage reads by the chunk
+/// compression ratio. The stats tree's per-section chunk figures carry
+/// the storage-side view; both are reported so the recorded ratio is the
+/// conservative, defensible one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LokiFetchedBytes {
+    /// Sum of every `compressedBytes` in the stats tree (querier +
+    /// ingester store sections): compressed chunk bytes the query
+    /// touched — the closest analog of bytes fetched from storage.
+    pub compressed_bytes: u64,
+    /// Sum of every `headChunkBytes`: bytes served from the ingester's
+    /// in-memory (uncompressed, never-fetched) head chunks. Reported
+    /// separately — memory-served bytes are not storage reads, but
+    /// ignoring them entirely would understate Loki's data touched when
+    /// a query is served mostly from the head.
+    pub head_chunk_bytes: u64,
+}
+
+/// Parse Loki's storage-side byte figures from a `query_range` response
+/// by summing every `compressedBytes` / `headChunkBytes` field under
+/// `data.stats` — recursive, so it is resilient to which sections
+/// (querier / ingester, store / head) the figures land in across Loki
+/// versions. Zero values are legitimate here (a query served purely from
+/// head chunks has no compressed reads); a missing stats block is not.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if the response isn't JSON, is a Loki error
+/// response (surfaces Loki's `errorType` / `error`), or has no
+/// `data.stats` object at all.
+pub fn parse_loki_fetched_bytes(response_json: &str) -> Result<LokiFetchedBytes, BenchError> {
+    let root = parse_loki_root(response_json)?;
+    let stats = root
+        .get("data")
+        .and_then(|d| d.get("stats"))
+        .filter(|s| s.is_object())
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: "Loki response missing `data.stats` — refusing to record 0 storage \
+                     bytes for a query that ran"
+                .to_string(),
+        })?;
+    let mut fetched = LokiFetchedBytes {
+        compressed_bytes: 0,
+        head_chunk_bytes: 0,
+    };
+    sum_stats_fields(stats, &mut fetched);
+    Ok(fetched)
+}
+
+/// Recursively sum `compressedBytes` / `headChunkBytes` leaves under a
+/// Loki stats subtree.
+fn sum_stats_fields(node: &serde_json::Value, acc: &mut LokiFetchedBytes) {
+    let Some(map) = node.as_object() else {
+        return;
+    };
+    for (key, value) in map {
+        match (key.as_str(), value.as_u64()) {
+            ("compressedBytes", Some(n)) => acc.compressed_bytes += n,
+            ("headChunkBytes", Some(n)) => acc.head_chunk_bytes += n,
+            _ => sum_stats_fields(value, acc),
+        }
+    }
+}
+
 /// Parse a Loki response to its JSON root, surfacing a Loki **error**
 /// response (`status == "error"`) as Loki's own diagnostic — shared by
 /// [`parse_loki_streams`] and [`parse_loki_bytes_processed`] so an error
@@ -798,6 +867,41 @@ mod tests {
             parse_loki_bytes_processed(response).expect("parse bytes"),
             4096,
         );
+    }
+
+    #[test]
+    fn parse_loki_fetched_bytes_sums_across_sections() {
+        // compressedBytes/headChunkBytes are summed wherever they appear
+        // in the stats tree (querier + ingester, store + head).
+        let response = r#"{
+            "status": "success",
+            "data": {
+                "result": [],
+                "stats": {
+                    "summary": { "totalBytesProcessed": 89550249 },
+                    "querier": { "store": { "chunk": {
+                        "compressedBytes": 1000, "headChunkBytes": 10,
+                        "decompressedBytes": 8000
+                    }}},
+                    "ingester": { "store": { "chunk": {
+                        "compressedBytes": 2000, "headChunkBytes": 30
+                    }}}
+                }
+            }
+        }"#;
+        let fetched = parse_loki_fetched_bytes(response).expect("parse fetched");
+        assert_eq!(fetched.compressed_bytes, 3000);
+        assert_eq!(fetched.head_chunk_bytes, 40);
+
+        // All-head-chunk service is legitimate zeros...
+        let head_only = r#"{"data":{"result":[],"stats":{"summary":{}}}}"#;
+        let fetched = parse_loki_fetched_bytes(head_only).expect("empty stats parse");
+        assert_eq!((fetched.compressed_bytes, fetched.head_chunk_bytes), (0, 0));
+
+        // ...but a missing or non-object stats block is an error, same
+        // honesty rule as the processed-bytes parser.
+        assert!(parse_loki_fetched_bytes(r#"{"data":{"result":[]}}"#).is_err());
+        assert!(parse_loki_fetched_bytes(r#"{"data":{"result":[],"stats":null}}"#).is_err());
     }
 
     #[test]

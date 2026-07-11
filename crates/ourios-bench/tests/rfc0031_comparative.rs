@@ -509,7 +509,10 @@ struct SelectivePair {
 /// 5000-line query cap, so the complete result fits one page). The
 /// consistency requirement makes DSL `severity >= T` and `LogQL`
 /// `severity_text="t"` express the same question, so the equivalence
-/// check is meaningful. Generalised from a hardcoded ERROR band because
+/// check is meaningful. Zero-`time_unix_nano` rows are tallied
+/// separately as POISON bands and disqualify any candidate whose
+/// predicate could select them (see [`select_pair_candidates`]).
+/// Generalised from a hardcoded ERROR band because
 /// real captures vary — otel-demo v8 carries no ERROR logs at all (its
 /// failure flags surface in traces/metrics), only INFO/Information and
 /// four WARNs. Candidate thresholds are the service's **observed**
@@ -522,8 +525,8 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
     use std::collections::HashMap;
     use std::io::BufRead as _;
 
-    // service -> severity_number -> severity_text -> row count
-    let mut per_service: HashMap<String, HashMap<i32, HashMap<String, u64>>> = HashMap::new();
+    // service -> (clean bands, poison bands)
+    let mut per_service: HashMap<String, (SeverityBands, SeverityBands)> = HashMap::new();
     let (mut total, mut min_ts, mut max_ts) = (0u64, u64::MAX, 0u64);
 
     for path in corpus_jsonl_paths(corpus_dir) {
@@ -559,23 +562,25 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         total += 1;
-                        // Zero-`time_unix_nano` records are excluded from
-                        // candidate bands even though both systems could
+                        // Zero-`time_unix_nano` records go into POISON
+                        // bands, not candidate bands: both systems could
                         // still return them (Ourios windows the RFC 0005
                         // §3.2 EFFECTIVE timestamp, falling back to
                         // observed; Loki's OTLP ingest falls back to
-                        // observed too): the two sides would answer with
-                        // DIFFERENT timestamps — Ourios's row keeps
-                        // time_unix_nano = 0, Loki stamps its stored
-                        // (observed) time — so their LineKeys can never
-                        // match and any band containing such rows is a
-                        // guaranteed equivalence mismatch.
-                        if lr.time_unix_nano == 0 {
-                            continue;
-                        }
-                        min_ts = min_ts.min(lr.time_unix_nano);
-                        max_ts = max_ts.max(lr.time_unix_nano);
-                        let texts = entry.entry(lr.severity_number).or_default();
+                        // observed too), but with DIFFERENT answer
+                        // timestamps — Ourios's row keeps time_unix_nano
+                        // = 0, Loki stamps its stored (observed) time —
+                        // so their LineKeys can never match and any
+                        // candidate whose predicate could select such a
+                        // row is a guaranteed equivalence mismatch.
+                        let bands = if lr.time_unix_nano == 0 {
+                            &mut entry.1
+                        } else {
+                            min_ts = min_ts.min(lr.time_unix_nano);
+                            max_ts = max_ts.max(lr.time_unix_nano);
+                            &mut entry.0
+                        };
+                        let texts = bands.entry(lr.severity_number).or_default();
                         if let Some(count) = texts.get_mut(lr.severity_text.as_str()) {
                             *count += 1;
                         } else {
@@ -719,20 +724,26 @@ fn pick_window_pair(clean_ts: &[u64], poison_ts: &[u64], k: usize) -> Option<(u6
     Some((clean_ts[i], clean_ts[i + k - 1].checked_add(1)?))
 }
 
+/// `severity_number -> severity_text -> row count`, one map per service
+/// for clean (non-zero-time) rows and one for poison (zero-time) rows.
+type SeverityBands = std::collections::HashMap<i32, std::collections::HashMap<String, u64>>;
+
 /// The candidate `(rows, threshold, service, text)` tuples for
 /// [`pick_selective_pair`]: for every service and every DISTINCT severity
-/// number T in it (the nested map dedupes them), the rows with
-/// `number ≥ T` are a candidate iff (a) they all share ONE text t, (b)
-/// the count is `1..=4000`, and (c) — the reverse direction — NO row with
+/// number T in its clean bands (the nested map dedupes them), the rows
+/// with `number ≥ T` are a candidate iff (a) they all share ONE text t,
+/// (b) the count is `1..=4000`, (c) — the reverse direction — NO row with
 /// text t sits below T, so `LogQL`'s text filter selects exactly the same
-/// rows as the DSL's number threshold. No-service (empty-key) records are
-/// scanned — they show in the failure diagnostic — but never form
-/// candidates (an empty service can't make a valid DSL/LogQL pair).
+/// rows as the DSL's number threshold, and (d) no POISON row could be
+/// selected by EITHER side's predicate: none with `number ≥ T` (the DSL
+/// side) and none carrying text t at any number (the `LogQL` side) —
+/// the severity pair queries the full corpus window, so a selectable
+/// zero-time row is a guaranteed equivalence mismatch. No-service
+/// (empty-key) records are scanned — they show in the failure diagnostic
+/// — but never form candidates (an empty service can't make a valid
+/// DSL/LogQL pair).
 fn select_pair_candidates(
-    per_service: &std::collections::HashMap<
-        String,
-        std::collections::HashMap<i32, std::collections::HashMap<String, u64>>,
-    >,
+    per_service: &std::collections::HashMap<String, (SeverityBands, SeverityBands)>,
 ) -> Vec<(u64, i32, &String, &String)> {
     // Both names are interpolated into quoted DSL and LogQL string
     // literals; a `"` or `\` (legal in OTLP attributes) would break or
@@ -745,7 +756,7 @@ fn select_pair_candidates(
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ' '))
     };
     let mut candidates = Vec::new();
-    for (svc, bands) in per_service {
+    for (svc, (bands, poison)) in per_service {
         if !safe(svc) {
             continue;
         }
@@ -772,6 +783,12 @@ fn select_pair_candidates(
             if text_total != rows {
                 // Rows with this text exist below the threshold — the
                 // LogQL side would return more than the DSL side.
+                continue;
+            }
+            if poison
+                .iter()
+                .any(|(&n, texts)| n >= threshold || texts.contains_key(text.as_str()))
+            {
                 continue;
             }
             candidates.push((rows, threshold, svc, *text));
@@ -958,7 +975,10 @@ fn build_pair_specs(
             pair.service, pair.text
         ),
         start: pair.min_ts,
-        end: pair.max_ts + 1,
+        end: pair
+            .max_ts
+            .checked_add(1)
+            .expect("corpus max timestamp overflows the Loki window end"),
         expected_rows: pair.rows,
         now: corpus_now,
         window: corpus_window,
@@ -1059,7 +1079,10 @@ fn rfc0031_indicative_comparative_run() {
     )
     .expect("build comparative store");
     let tenant = TenantId::new(built.tenant);
-    let corpus_now = built.max_effective_time_unix_nano + 1;
+    let corpus_now = built
+        .max_effective_time_unix_nano
+        .checked_add(1)
+        .expect("corpus max effective timestamp overflows now");
     let corpus_window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
     let specs = build_pair_specs(&pair, &clean_ts, &poison_ts, corpus_now, corpus_window);
     let ourios: Vec<_> = specs
@@ -1341,4 +1364,42 @@ fn window_pair_dsl_slices_the_fixture() {
         .collect();
     got.sort_unstable();
     assert_eq!(got, vec![1_001_000, 1_002_000]);
+}
+
+#[test]
+fn select_pair_candidates_rejects_poisoned_bands() {
+    use std::collections::HashMap;
+
+    let mut bands: SeverityBands = HashMap::new();
+    bands.entry(9).or_default().insert("INFO".into(), 5);
+    bands.entry(13).or_default().insert("WARN".into(), 1);
+
+    let clean: HashMap<String, (SeverityBands, SeverityBands)> =
+        [("svc".to_string(), (bands.clone(), HashMap::new()))].into();
+    assert!(
+        select_pair_candidates(&clean)
+            .iter()
+            .any(|&(rows, threshold, _, text)| rows == 1 && threshold == 13 && text == "WARN"),
+        "without poison the WARN band is a candidate"
+    );
+
+    // A zero-time row the DSL side would select (number ≥ threshold)…
+    let mut poison_high: SeverityBands = HashMap::new();
+    poison_high.entry(17).or_default().insert("ERROR".into(), 1);
+    let poisoned: HashMap<String, (SeverityBands, SeverityBands)> =
+        [("svc".to_string(), (bands.clone(), poison_high))].into();
+    assert!(
+        select_pair_candidates(&poisoned).is_empty(),
+        "a poison row at number ≥ threshold disqualifies the candidate"
+    );
+
+    // …and one the LogQL side would select (same text, below threshold).
+    let mut poison_text: SeverityBands = HashMap::new();
+    poison_text.entry(5).or_default().insert("WARN".into(), 1);
+    let poisoned_text: HashMap<String, (SeverityBands, SeverityBands)> =
+        [("svc".to_string(), (bands, poison_text))].into();
+    assert!(
+        select_pair_candidates(&poisoned_text).is_empty(),
+        "a below-threshold poison row carrying the text disqualifies the candidate"
+    );
 }

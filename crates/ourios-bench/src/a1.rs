@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use ourios_core::audit::AuditEvent;
 use ourios_core::record::MinedRecord;
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{AuditWriter, PartitionKey, Writer};
+use ourios_parquet::{PartitionKey, Writer};
 
 use crate::A1Result;
 
@@ -156,22 +156,8 @@ impl A1Accumulator {
             let partition = audit_partition(&event)?;
             by_partition.entry(partition).or_default().push(event);
         }
-        for (partition, events) in by_partition {
-            let mut writer = AuditWriter::open(&self.bucket_root, partition).map_err(|e| {
-                crate::BenchError::Pipeline {
-                    detail: format!("audit writer open: {e}"),
-                }
-            })?;
-            writer
-                .append_events(&events)
-                .map_err(|e| crate::BenchError::Pipeline {
-                    detail: format!("audit append_events: {e}"),
-                })?;
-            writer.close().map_err(|e| crate::BenchError::Pipeline {
-                detail: format!("audit writer close: {e}"),
-            })?;
-        }
-        Ok(())
+        // The write dance is shared with the RFC 0031 comparative store.
+        crate::store::write_audit_partitions(&self.bucket_root, by_partition)
     }
 
     /// Close every data writer, measure the on-disk footprint,

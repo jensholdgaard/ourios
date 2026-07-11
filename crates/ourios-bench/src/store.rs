@@ -14,9 +14,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use ourios_core::audit::AuditEvent;
 use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
 use ourios_core::record::MinedRecord;
-use ourios_parquet::{PartitionKey, Writer};
+use ourios_parquet::{AuditWriter, PartitionKey, Writer, derive_audit_partition};
 
 use ourios_miner::cluster::NO_TEMPLATE;
 
@@ -83,12 +84,54 @@ pub fn build_query_store(
     bucket_root: &Path,
     txt_severity: corpus::TxtSeverity,
 ) -> Result<BuiltStore, BenchError> {
+    // B1/B2 read only row counts, so the audit stream isn't captured or
+    // persisted (`capture_audit = false`); the drained events are dropped.
+    let (store, _audit) = build_query_store_inner(corpus_dir, bucket_root, txt_severity, false)?;
+    Ok(store)
+}
+
+/// Like [`build_query_store`], but also **persists the miner's audit
+/// stream** into the `audit/...` partition series, so the querier can
+/// derive the read-time template registry (RFC 0017) and reconstruct
+/// cleanly-mined string bodies on the read path.
+///
+/// The RFC 0031 comparative harness needs this: its equivalence check
+/// (RFC0031.1) compares rendered *bodies*, unlike B1/B2 which read only
+/// row counts and so never persist the registry. Mirrors the A1 gate's
+/// audit-write path.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] on any corpus / mine / Parquet / audit-write
+/// failure (same surface as [`build_query_store`], plus the audit write).
+pub fn build_comparative_store(
+    corpus_dir: &Path,
+    bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
+) -> Result<BuiltStore, BenchError> {
+    let (store, audit_events) =
+        build_query_store_inner(corpus_dir, bucket_root, txt_severity, true)?;
+    write_audit_partition(bucket_root, audit_events)?;
+    Ok(store)
+}
+
+/// Shared body of [`build_query_store`] and [`build_comparative_store`]:
+/// mine the corpus into a queryable store and pick the busiest template,
+/// returning the [`BuiltStore`] plus the captured audit events (empty
+/// unless `capture_audit`).
+fn build_query_store_inner(
+    corpus_dir: &Path,
+    bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
+    capture_audit: bool,
+) -> Result<(BuiltStore, Vec<AuditEvent>), BenchError> {
     let mut counts: HashMap<u64, u64> = HashMap::new();
 
     let core = build_store(
         corpus_dir,
         bucket_root,
         txt_severity,
+        capture_audit,
         |_input, emitted, _effective| {
             *counts.entry(emitted.template_id).or_insert(0) += 1;
             Ok(())
@@ -114,7 +157,7 @@ pub fn build_query_store(
         .or_else(|| busiest(false))
         .unwrap_or((NO_TEMPLATE, 0));
 
-    Ok(BuiltStore {
+    let store = BuiltStore {
         tenant: crate::corpus::BENCH_TENANT,
         rows: core.rows,
         files: core.files,
@@ -122,7 +165,50 @@ pub fn build_query_store(
         busiest_template_rows,
         min_effective_time_unix_nano: core.min_effective_time_unix_nano,
         max_effective_time_unix_nano: core.max_effective_time_unix_nano,
-    })
+    };
+    Ok((store, core.audit_events))
+}
+
+/// Write the miner's audit-event stream into the `audit/...` partition
+/// series so the querier's `derive_template_registry` (RFC 0017) reads it
+/// back. Groups by the canonical audit partition key, then hands off to
+/// the shared writer.
+fn write_audit_partition(bucket_root: &Path, events: Vec<AuditEvent>) -> Result<(), BenchError> {
+    let mut by_partition: HashMap<PartitionKey, Vec<AuditEvent>> = HashMap::new();
+    for event in events {
+        // Borrow for the partition derive, then move the event into its
+        // per-partition vec — no clone.
+        let partition = derive_audit_partition(&event).map_err(|e| BenchError::Pipeline {
+            detail: format!("audit partition derive: {e}"),
+        })?;
+        by_partition.entry(partition).or_default().push(event);
+    }
+    write_audit_partitions(bucket_root, by_partition)
+}
+
+/// Write pre-grouped audit events, one `AuditWriter` per partition. Shared
+/// by [`build_comparative_store`] and the A1 gate — they group by their
+/// respective partition derivation, but the write dance (open / append /
+/// close, with the `audit/...` partition series) is identical.
+pub(crate) fn write_audit_partitions(
+    bucket_root: &Path,
+    by_partition: HashMap<PartitionKey, Vec<AuditEvent>>,
+) -> Result<(), BenchError> {
+    for (partition, events) in by_partition {
+        let mut writer =
+            AuditWriter::open(bucket_root, partition).map_err(|e| BenchError::Pipeline {
+                detail: format!("audit writer open: {e}"),
+            })?;
+        writer
+            .append_events(&events)
+            .map_err(|e| BenchError::Pipeline {
+                detail: format!("audit append_events: {e}"),
+            })?;
+        writer.close().map_err(|e| BenchError::Pipeline {
+            detail: format!("audit writer close: {e}"),
+        })?;
+    }
+    Ok(())
 }
 
 /// What [`build_b1_store`] produced: the [`BuiltStore`]-style span
@@ -204,6 +290,7 @@ pub fn build_b1_store(
         corpus_dir,
         bucket_root,
         txt_severity,
+        /* capture_audit */ false,
         |input, emitted, effective| {
             if let Some(text) = &emitted.severity_text {
                 *severity_rows.entry(text.clone()).or_insert(0) += 1;
@@ -359,6 +446,11 @@ struct StoreCore {
     files: u64,
     min_effective_time_unix_nano: u64,
     max_effective_time_unix_nano: u64,
+    /// The miner's audit-event stream, captured only when `build_store`
+    /// runs with `capture_audit = true` (empty otherwise). The comparative
+    /// store persists it so the querier can derive the read-time template
+    /// registry (RFC 0017) and reconstruct cleanly-mined string bodies.
+    audit_events: Vec<AuditEvent>,
 }
 
 /// The shared load → mine → write pipeline behind
@@ -373,6 +465,7 @@ fn build_store(
     corpus_dir: &Path,
     bucket_root: &Path,
     txt_severity: corpus::TxtSeverity,
+    capture_audit: bool,
     mut observe: impl FnMut(&OtlpLogRecord, &MinedRecord, u64) -> Result<(), BenchError>,
 ) -> Result<StoreCore, BenchError> {
     // A reused bucket would let the querier enumerate a prior run's
@@ -407,9 +500,9 @@ fn build_store(
     let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
 
-    harness::run_streaming(
+    let harness_result = harness::run_streaming(
         stream,
-        /* capture_audit */ false,
+        capture_audit,
         /* capture_snapshots */ false,
         |input, emitted, _snap| {
             let effective = effective_nanos(emitted)?;
@@ -448,6 +541,7 @@ fn build_store(
         files,
         min_effective_time_unix_nano,
         max_effective_time_unix_nano,
+        audit_events: harness_result.audit_events,
     })
 }
 

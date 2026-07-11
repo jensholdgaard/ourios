@@ -90,6 +90,11 @@ prost = "0.14"
 # per-attempt Vec clone would copy ~2 MB per push across thousands).
 bytes = { version = "1", default-features = false }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+# Footer-level schema assertion for the RFC 0022 promoted-service parity
+# tests: opens a comparative-store file's Parquet footer directly to
+# check the promoted column the writer declared. Same major as the
+# workspace arrow/parquet tree, so Cargo.lock pins one copy.
+parquet = { version = "58", default-features = false, features = ["arrow"] }
 # RFC0024.2 draws calibrated records through a fixed-seed
 # `TestRunner` (the strategies come from `ourios-testgen`, already a
 # regular dependency above).

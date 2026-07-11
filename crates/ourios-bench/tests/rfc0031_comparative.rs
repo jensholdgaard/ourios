@@ -722,12 +722,15 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
     use prost::Message as _;
     use std::io::BufRead as _;
 
-    /// Stay ~1 MiB under Loki's stock 4 MiB cap. The per-`ResourceLogs`
-    /// estimate (+8 bytes each for the envelope's field framing) tracks
-    /// the true encoded size closely; the headroom absorbs any residual
-    /// drift, and `push_otlp` asserts the ACTUAL encoded size as the
-    /// checked guarantee.
-    const FLUSH_BYTES: usize = 3 * 1024 * 1024;
+    /// The 4 MiB that matters is Loki's INTERNAL gRPC message, not our
+    /// HTTP body: run #3 proved Loki's OTLP→logproto translation
+    /// INFLATES the content (a ≤3 MiB push produced a 5,276,869-byte
+    /// internal message — ≥1.76×, because OTLP shares resource/scope
+    /// attributes per batch while the internal push repeats labels and
+    /// structured metadata per entry). 1.5 MB gives ≥2.6× inflation
+    /// headroom under the cap; `push_otlp` still asserts our own encoded
+    /// size as a floor guarantee.
+    const FLUSH_BYTES: usize = 1_500_000;
 
     let mut paths: Vec<_> = std::fs::read_dir(corpus_dir)
         .expect("read corpus dir")

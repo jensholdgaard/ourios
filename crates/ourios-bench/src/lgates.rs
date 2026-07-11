@@ -64,7 +64,8 @@ pub enum BytesGateOutcome {
         /// Ourios read (the headline ratio; ≥ `margin` ⇒ `pass`).
         advantage: f64,
     },
-    /// A zero byte-count made the comparison meaningless.
+    /// The comparison was meaningless: a zero byte-count on either side,
+    /// or a zero `margin` (which would pass unconditionally).
     Invalid {
         /// Which side(s) reported zero.
         reason: String,
@@ -102,9 +103,13 @@ pub fn bytes_must_win(ourios_bytes: u64, loki_bytes: u64, margin: u64) -> BytesG
             ),
         };
     }
-    // Saturating: an astronomically large ourios×margin can only make the
-    // comparison *harder* to pass, never wrap into a false pass.
-    let pass = ourios_bytes.saturating_mul(margin) <= loki_bytes;
+    // checked_mul, not saturating: saturation to u64::MAX would FALSELY
+    // pass against loki_bytes == u64::MAX. Overflow means the true product
+    // exceeds u64::MAX ≥ loki_bytes, so overflow ⇒ fail, exactly.
+    let pass = match ourios_bytes.checked_mul(margin) {
+        Some(product) => product <= loki_bytes,
+        None => false,
+    };
     #[allow(clippy::cast_precision_loss)] // reporting ratio only; the pass
     // decision above is exact integer math.
     let advantage = loki_bytes as f64 / ourios_bytes as f64;
@@ -168,10 +173,17 @@ mod tests {
 
     #[test]
     fn huge_inputs_cannot_wrap_into_a_false_pass() {
-        // ourios×margin would overflow; saturation keeps the comparison
-        // failing (u64::MAX > loki) instead of wrapping small.
+        // ourios×margin would overflow; overflow must fail regardless of
+        // how large loki is.
         let out = bytes_must_win(u64::MAX / 2, 1_000, 10);
         assert!(!out.passed(), "{out:?}");
+        // The saturation trap: with loki == u64::MAX, a saturating product
+        // (u64::MAX ≤ u64::MAX) would FALSELY pass even though the true
+        // product exceeds it — checked_mul must fail this.
+        let trap = bytes_must_win(u64::MAX / 2, u64::MAX, 10);
+        assert!(!trap.passed(), "{trap:?}");
+        // Sanity: a huge-but-non-overflowing product still decides exactly.
+        assert!(bytes_must_win(u64::MAX / 16, u64::MAX, 10).passed());
     }
 
     #[test]

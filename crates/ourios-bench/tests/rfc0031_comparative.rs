@@ -218,8 +218,16 @@ async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKe
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
-    let narrow_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}} |= `logged in`");
+    let narrow_logql = format!("{{service_name=\"{FIXTURE_SERVICE}\"}} |= \"logged in\"");
     let loki_narrow = loki_query_range(&http, &base, &narrow_logql, start, end).await;
+    // Pin the narrow result to exactly the 2 "logged in" lines: the
+    // mismatch arm asserts only inequality, so a silently-broken filter
+    // returning 0 lines would otherwise still "pass" it.
+    assert_eq!(
+        loki_narrow.len(),
+        2,
+        "the narrower filter must match exactly the two 'logged in' lines",
+    );
     (loki_all, loki_narrow)
 }
 

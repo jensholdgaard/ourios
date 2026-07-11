@@ -574,16 +574,42 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
         "corpus has no record with a non-zero time_unix_nano — no query window derivable",
     );
 
-    // For every service and every DISTINCT severity number T in it (the
-    // nested map dedupes them): the rows with number ≥ T are a candidate
-    // iff (a) they all share ONE text t, (b) the count is 1..=4000, and
-    // (c) — the reverse direction — NO row with text t sits below T, so
-    // LogQL's text filter selects exactly the same rows as the DSL's
-    // number threshold. No-service (empty-key) records are scanned — they
-    // show in the failure diagnostic — but never form candidates (an
-    // empty service can't make a valid DSL/LogQL pair).
-    let mut candidates: Vec<(u64, i32, &String, &String)> = Vec::new();
-    for (svc, bands) in &per_service {
+    let mut candidates = select_pair_candidates(&per_service);
+    candidates.sort();
+    let Some(&(rows, threshold, service, text)) = candidates.first() else {
+        panic!(
+            "no (service, severity-threshold) with a single text and 1..=4000 rows; \
+             per-service severity bands: {per_service:#?}"
+        );
+    };
+    SelectivePair {
+        service: service.clone(),
+        threshold,
+        text: text.clone(),
+        rows,
+        total_records: total,
+        min_ts,
+        max_ts,
+    }
+}
+
+/// The candidate `(rows, threshold, service, text)` tuples for
+/// [`pick_selective_pair`]: for every service and every DISTINCT severity
+/// number T in it (the nested map dedupes them), the rows with
+/// `number ≥ T` are a candidate iff (a) they all share ONE text t, (b)
+/// the count is `1..=4000`, and (c) — the reverse direction — NO row with
+/// text t sits below T, so `LogQL`'s text filter selects exactly the same
+/// rows as the DSL's number threshold. No-service (empty-key) records are
+/// scanned — they show in the failure diagnostic — but never form
+/// candidates (an empty service can't make a valid DSL/LogQL pair).
+fn select_pair_candidates(
+    per_service: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<i32, std::collections::HashMap<String, u64>>,
+    >,
+) -> Vec<(u64, i32, &String, &String)> {
+    let mut candidates = Vec::new();
+    for (svc, bands) in per_service {
         if svc.is_empty() {
             continue;
         }
@@ -612,25 +638,10 @@ fn pick_selective_pair(corpus_dir: &std::path::Path) -> SelectivePair {
                 // LogQL side would return more than the DSL side.
                 continue;
             }
-            candidates.push((rows, threshold, svc, text));
+            candidates.push((rows, threshold, svc, *text));
         }
     }
-    candidates.sort();
-    let Some(&(rows, threshold, service, text)) = candidates.first() else {
-        panic!(
-            "no (service, severity-threshold) with a single text and 1..=4000 rows; \
-             per-service severity bands: {per_service:#?}"
-        );
-    };
-    SelectivePair {
-        service: service.clone(),
-        threshold,
-        text: text.clone(),
-        rows,
-        total_records: total,
-        min_ts,
-        max_ts,
-    }
+    candidates
 }
 
 /// One `query_range` call returning both the lines and Loki's

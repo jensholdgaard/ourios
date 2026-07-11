@@ -213,8 +213,8 @@ fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
 ///
 /// [`BenchError::Pipeline`] if the DSL fails to parse, the tokio runtime
 /// can't be built, the query fails, or a returned row carries a body
-/// kind the equivalence extraction does not yet lower (see
-/// [`body_bytes`]).
+/// kind the equivalence extraction does not yet lower (a structured or
+/// absent body — the string-body case always lowers).
 pub fn ourios_query_lines(
     bucket_root: &Path,
     tenant: &TenantId,

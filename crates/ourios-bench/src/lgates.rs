@@ -60,8 +60,9 @@ pub enum BytesGateOutcome {
     Decided {
         /// `ourios_bytes × margin ≤ loki_bytes`.
         pass: bool,
-        /// `loki_bytes / ourios_bytes` — how many times fewer bytes
-        /// Ourios read (the headline ratio; ≥ `margin` ⇒ `pass`).
+        /// The headline ratio `loki_bytes / ourios_bytes`: values above
+        /// `1.0` mean Ourios read that many times fewer bytes, below
+        /// `1.0` that it read more; `≥ margin` ⇒ `pass`.
         advantage: f64,
     },
     /// The comparison was meaningless: a zero byte-count on either side,

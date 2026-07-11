@@ -67,7 +67,8 @@ pub enum BytesGateOutcome {
     /// The comparison was meaningless: a zero byte-count on either side,
     /// or a zero `margin` (which would pass unconditionally).
     Invalid {
-        /// Which side(s) reported zero.
+        /// What made it meaningless: which side(s) reported zero, or
+        /// that the margin itself was zero.
         reason: String,
     },
 }

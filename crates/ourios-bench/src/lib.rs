@@ -23,7 +23,11 @@
 //! `a1`, `c1`, `c2`, `report`. PR-I1 extracted `corpus`,
 //! `harness`, `c1`; PR-I2 added `a1`; PR-J1 added `report`
 //! (JSON half) + the CLI; PR-J2 added `c2`; PR-J3 added the
-//! §9 appender.
+//! §9 appender. Later RFCs grew the crate beyond that layout:
+//! `calibrate` + `reference` + `store` (RFC 0024 / the B1/B2 query
+//! stores), and the RFC 0031 comparative harness (`comparative` — the
+//! Loki equivalence check + measurement channel — and `lgates`, the
+//! comparative must-win gate math).
 
 #![deny(unsafe_code)]
 

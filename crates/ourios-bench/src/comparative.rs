@@ -205,16 +205,19 @@ fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
 /// RFC0031.1 equivalence check.
 ///
 /// Runs the querier **in-process** (RFC 0031 §7: no served binary). The
-/// query MUST carry a `limit` — the querier only renders rows when a
-/// limit is set; without one `QueryResult.records` is empty (count-only)
-/// and this returns no lines.
+/// query MUST carry a `limit` large enough to render **every** matching
+/// row — the querier renders rows only when a limit is set, and caps them
+/// at it. An equivalence check over a truncated (or empty, limit-less)
+/// result is meaningless, so this **enforces completeness**: it errors
+/// unless the rendered row count equals the total match count.
 ///
 /// # Errors
 ///
 /// [`BenchError::Pipeline`] if the DSL fails to parse, the tokio runtime
-/// can't be built, the query fails, or a returned row carries a body
-/// kind the equivalence extraction does not yet lower (a structured or
-/// absent body — the string-body case always lowers).
+/// can't be built, the query fails, the rendered rows don't cover every
+/// matching row (missing or too-small `limit`), or a returned row carries
+/// a body kind the equivalence extraction does not yet lower (a structured
+/// or absent body — the string-body case always lowers).
 pub fn ourios_query_lines(
     bucket_root: &Path,
     tenant: &TenantId,
@@ -238,6 +241,20 @@ pub fn ourios_query_lines(
         .map_err(|e| BenchError::Pipeline {
             detail: format!("comparative query `{dsl}`: {e}"),
         })?;
+    // Completeness guard: `records` is the rendered rows (capped at the
+    // query's limit); `rows` is the total match count. If they differ the
+    // result is truncated (or the query had no limit, so nothing rendered),
+    // and comparing an incomplete set would silently pass a false match.
+    if result.records.len() as u64 != result.rows {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "comparative query `{dsl}` matched {} rows but rendered {} — the \
+                 equivalence check needs the complete result; raise the `| limit`",
+                result.rows,
+                result.records.len(),
+            ),
+        });
+    }
     result
         .records
         .iter()
@@ -261,15 +278,21 @@ pub fn ourios_query_lines(
 /// deliberately, not collapsed — the follow-up slice that lands those
 /// gates extends [`LineKey`] to carry the body-kind discriminator.
 fn body_bytes(body: &ourios_querier::LogBody) -> Result<Vec<u8>, BenchError> {
-    match body {
-        ourios_querier::LogBody::Rendered { line, .. } => Ok(line.clone()),
-        other => Err(BenchError::Pipeline {
-            detail: format!(
-                "comparative equivalence extraction does not yet lower body kind {other:?} \
-                 (structured/absent bodies land with the OTLP-native L2/L3/L4 gates)"
-            ),
-        }),
-    }
+    use ourios_querier::LogBody;
+    // Name the body *kind*, never `Debug`-dump the content: a structured
+    // body can be large and carry sensitive payload.
+    let kind = match body {
+        LogBody::Rendered { line, .. } => return Ok(line.clone()),
+        LogBody::Structured(_) => "structured",
+        LogBody::Absent => "absent",
+        _ => "unknown",
+    };
+    Err(BenchError::Pipeline {
+        detail: format!(
+            "comparative equivalence extraction does not yet lower {kind} bodies \
+             (they land with the OTLP-native L2/L3/L4 gates)"
+        ),
+    })
 }
 
 /// A truncated, lossy preview of a body for a mismatch report — bounded
@@ -432,6 +455,13 @@ mod tests {
         assert!(
             compare_lines(&extracted, &extracted, 8).is_equal(),
             "self-equivalence must hold",
+        );
+
+        // Completeness guard: a limit-less query matches rows but renders
+        // none, so it must error rather than silently compare an empty set.
+        assert!(
+            ourios_query_lines(bucket.path(), &tenant, "severity >= 0", now, window).is_err(),
+            "a limit-less query (rows matched, none rendered) must error",
         );
     }
 

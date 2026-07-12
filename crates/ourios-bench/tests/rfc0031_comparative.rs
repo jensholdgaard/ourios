@@ -2263,12 +2263,22 @@ fn print_indicative_report(
             None => println!("loki   latency_p50                         = unmeasured"),
         }
         if let (Some(ours_p50), Some(loki_p50)) = (ours.latency_p50, *loki_latency) {
-            println!(
-                "latency ratio loki_p50/ourios_p50 = {:.2} (>1.0 = Ourios faster; \
-                 corroborating only — Ourios is timed in-process, Loki over \
-                 localhost HTTP, which favours Ourios on sub-millisecond answers)",
-                ms(loki_p50) / ms(ours_p50),
-            );
+            // A zero p50 (timer resolution coarser than the query) would
+            // print inf/NaN — say "undefined" instead; the floor gate
+            // below already treats zero as Invalid.
+            if ours_p50.is_zero() || loki_p50.is_zero() {
+                println!(
+                    "latency ratio loki_p50/ourios_p50 = undefined (a p50 of 0 — \
+                     timer resolution coarser than the query)"
+                );
+            } else {
+                println!(
+                    "latency ratio loki_p50/ourios_p50 = {:.2} (>1.0 = Ourios faster; \
+                     corroborating only — Ourios is timed in-process, Loki over \
+                     localhost HTTP, which favours Ourios on sub-millisecond answers)",
+                    ms(loki_p50) / ms(ours_p50),
+                );
+            }
             if matches!(spec.gate, GateKind::Floor) {
                 println!(
                     "latency floor gate (RFC0031.7, floor factor {}): {:?}",

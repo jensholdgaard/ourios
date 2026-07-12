@@ -1198,7 +1198,7 @@ the per-service gate makes C2 acceptance honest without masking, and
 any future masking is deferred to an upstream Collector processor or a
 dedicated RFC.
 
-### 9.13 Results — 2026-07-12 (indicative, `ci-runner`) — RFC 0031 comparative program vs Grafana Loki (runs #8–#17)
+### 9.13 Results — 2026-07-12 (indicative, `ci-runner`) — RFC 0031 comparative program vs Grafana Loki (runs #8–#18)
 
 **Purpose.** The first recorded numbers for the RFC 0031 comparative
 program — Ourios against Grafana Loki, the incumbent `CLAUDE.md` §1
@@ -1230,8 +1230,10 @@ opt-in per RFC 0031 §3.2. Bytes-read, the primary channel, is
 CPU-insensitive by construction, but nothing here is quoted as
 authoritative.
 **Runs.** `comparative-bench.yml` dispatch runs (curated by hand as
-ever — no workflow writes §9), each an equivalence-gated pass over
-the full corpus with one harness delta under test:
+ever — no workflow writes §9), each with one harness delta under
+test. Counted runs are equivalence-gated passes over the full
+corpus; the two diagnostic failures (#11/#13) are listed with
+exactly what they carry:
 
 | run | workflow run id | delta under test |
 |---|---|---|

@@ -1325,12 +1325,20 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
                 .send()
                 .await
             {
-                Ok(resp) => {
+                Ok(mut resp) => {
                     let status = resp.status();
-                    let body = resp.text().await.unwrap_or_else(|e| format!("<{e}>"));
+                    // Stream at most ~8 KiB rather than buffering a whole
+                    // (possibly huge) body just to print a snippet.
+                    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        buf.extend_from_slice(&chunk);
+                        if buf.len() >= 8192 {
+                            break;
+                        }
+                    }
                     // Truncate on a char boundary; the cap is ~4 KiB of
                     // ASCII JSON, not an exact byte count.
-                    let body = body.chars().take(4096).collect::<String>();
+                    let body: String = String::from_utf8_lossy(&buf).chars().take(4096).collect();
                     format!("HTTP {status}: {body}")
                 }
                 Err(e) => format!("transport error: {e}"),

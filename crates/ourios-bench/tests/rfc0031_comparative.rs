@@ -1199,7 +1199,13 @@ fn pick_rare_window_pair(
                 if !safe(service) || service == exclude {
                     continue;
                 }
-                let entry = per_service.entry(service.to_string()).or_default();
+                // get-then-insert (the file's established pattern) so
+                // repeat ResourceLogs never allocate a lookup key.
+                let entry = if let Some(entry) = per_service.get_mut(service) {
+                    entry
+                } else {
+                    per_service.entry(service.to_string()).or_default()
+                };
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         if lr.time_unix_nano != 0 {

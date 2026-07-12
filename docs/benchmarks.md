@@ -1249,7 +1249,10 @@ every pair: the two systems' answers, keyed
 `(timestamp_unix_nanos, body_bytes)`, were multiset-identical at
 4.9 M-record scale. Runs #11/#13 were L3-flicker diagnostics (an
 ingester-visibility artifact, fixed in #490 — see the deviations
-list) and carry no counted numbers; every other dispatched run
+list). Run #11's panic predates the report salvage and carries no
+counted numbers; run #13's L3 pair timed out but its salvaged
+report's other pairs are counted where tabulated. Every other
+dispatched run
 appears in the table, and the per-class tables below carry a row
 for every run in each quoted streak (L1: #15/#16/#17; L3:
 #14/#15/#16/#17), so the streaks audit from this entry alone.

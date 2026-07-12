@@ -1201,12 +1201,18 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
     by_volume.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     for (service, _) in by_volume {
         let (clean, poison) = collect_service_timestamps(corpus_dir, &service);
-        let k = clean.len().min(100);
-        if k < 2 {
-            continue;
-        }
-        if let Some((start, end)) = pick_window_pair(&clean, &poison, k) {
-            return Some((service, start, end, k as u64));
+        // Descending window-size ladder: the largest k may have no clean
+        // edges even when smaller ones do, and the lowest-volume service
+        // should win with ANY valid 2..=100-row window before falling
+        // through to a busier one.
+        for k in [100usize, 50, 20, 10, 5, 2] {
+            let k = k.min(clean.len());
+            if k < 2 {
+                break;
+            }
+            if let Some((start, end)) = pick_window_pair(&clean, &poison, k) {
+                return Some((service, start, end, k as u64));
+            }
         }
     }
     None

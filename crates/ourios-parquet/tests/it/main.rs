@@ -24,4 +24,5 @@ mod round_trip;
 mod row_vs_path_validation;
 mod schema_pin;
 mod sizing;
+mod trace_bloom;
 mod zstd_level;

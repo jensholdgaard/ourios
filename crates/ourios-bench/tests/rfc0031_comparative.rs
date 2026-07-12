@@ -21,8 +21,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
-    FIXTURE_SERVICE, FIXTURE_TRACE, FixtureRecord, LineKey, LokiFetchedBytes, comparative_fixture,
-    compare_lines, fixture_jsonl, fixture_logs_data, ourios_query_lines,
+    FIXTURE_SERVICE, FIXTURE_SERVICE_B, FIXTURE_TRACE, FixtureRecord, LineKey, LokiFetchedBytes,
+    comparative_fixture, compare_lines, fixture_jsonl, fixture_logs_data, ourios_query_lines,
     parse_loki_bytes_processed, parse_loki_fetched_bytes, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
@@ -85,15 +85,23 @@ fn rfc0031_1_result_set_equivalence() {
     let tenant = TenantId::new(built.tenant);
     let now = built.max_effective_time_unix_nano + 1;
     let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+    // The DSL mirrors the LogQL stream selector ({service_name=FIXTURE_
+    // SERVICE}) explicitly now that the fixture spans two services — the
+    // pair stays equivalent by construction rather than by the corpus
+    // happening to be single-service.
     let ourios_lines = ourios_query_lines(
         bucket.path(),
         &tenant,
-        "severity >= 0 | limit 1000",
+        &format!("service == \"{FIXTURE_SERVICE}\" and severity >= 0 | limit 1000"),
         now,
         window,
     )
     .expect("ourios extraction");
-    assert_eq!(ourios_lines.len(), 3, "Ourios returns every fixture line");
+    assert_eq!(
+        ourios_lines.len(),
+        3,
+        "Ourios returns every FIXTURE_SERVICE line"
+    );
 
     // ------------------------------------------------------------------
     // Loki half (async): container → OTLP push → LogQL → LineKeys.
@@ -130,7 +138,7 @@ fn rfc0031_1_result_set_equivalence() {
         window,
     )
     .expect("ourios trace extraction");
-    assert_eq!(ourios_trace.len(), 2, "both FIXTURE_TRACE lines match");
+    assert_eq!(ourios_trace.len(), 3, "all FIXTURE_TRACE lines match");
     let trace_outcome = compare_lines(&ourios_trace, &loki_trace, 8);
     assert!(
         trace_outcome.is_equal(),
@@ -318,9 +326,10 @@ async fn loki_round_trip(
     let loki_trace = loki_query_range(&http, &base, &trace_logql, start, end).await;
     assert_eq!(
         loki_trace.len(),
-        2,
-        "the trace filter must match exactly the two FIXTURE_TRACE lines \
-         (a wrong structured-metadata key would return 0)",
+        3,
+        "the trace filter must match all three FIXTURE_TRACE lines ACROSS \
+         both service streams (a wrong structured-metadata key returns 0; \
+         an accidentally-narrowed selector returns 2)",
     );
     (loki_all, loki_narrow, loki_trace)
 }
@@ -739,7 +748,7 @@ struct TraceTally {
 /// different keys — a guaranteed mismatch) and no empty-service row
 /// (the `LogQL` side's `{service_name=~".+"}` selector could not see it),
 /// with `2..=100` rows so the result is a meaningful multiset that fits
-/// one page. Preference order: multi-service traces first (the class\'s
+/// one page. Preference order: multi-service traces first (the class's
 /// structural point — Loki cannot pre-narrow a cross-service trace to
 /// one stream), then the most rows, then the lexicographically smallest
 /// id for deterministic reruns. Returns `(hex_id, rows)`.
@@ -1412,16 +1421,20 @@ fn pick_selective_pair_finds_the_fixture_error_row() {
     .expect("write corpus");
 
     let pair = pick_selective_pair(corpus.path());
-    assert_eq!(pair.service, FIXTURE_SERVICE);
+    assert_eq!(
+        pair.service, FIXTURE_SERVICE,
+        "the (1, 17) tie against FIXTURE_SERVICE_B's ERROR row breaks to \
+         the lexicographically smaller service"
+    );
     assert_eq!(
         pair.threshold, 17,
         "the ERROR band is the rarest single-text band"
     );
     assert_eq!(pair.text, "ERROR");
-    assert_eq!(pair.rows, 1, "exactly the one ERROR fixture record");
-    assert_eq!(pair.total_records, 3);
+    assert_eq!(pair.rows, 1, "exactly the one FIXTURE_SERVICE ERROR record");
+    assert_eq!(pair.total_records, 4);
     assert_eq!(pair.min_ts, 1_000_000);
-    assert_eq!(pair.max_ts, 1_002_000);
+    assert_eq!(pair.max_ts, 1_003_000, "the service-B record is the latest");
 }
 
 #[test]
@@ -1436,6 +1449,7 @@ fn pick_selective_pair_generalizes_without_error_rows() {
             severity_text: "INFO",
             body: "user 1 logged in",
             trace_id: None,
+            service: FIXTURE_SERVICE,
         },
         FixtureRecord {
             time_unix_nano: 2_000,
@@ -1443,6 +1457,7 @@ fn pick_selective_pair_generalizes_without_error_rows() {
             severity_text: "INFO",
             body: "user 2 logged in",
             trace_id: None,
+            service: FIXTURE_SERVICE,
         },
         FixtureRecord {
             time_unix_nano: 3_000,
@@ -1450,6 +1465,7 @@ fn pick_selective_pair_generalizes_without_error_rows() {
             severity_text: "WARN",
             body: "cache nearly full",
             trace_id: None,
+            service: FIXTURE_SERVICE,
         },
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
@@ -1852,7 +1868,7 @@ fn pick_trace_pair_finds_the_shared_fixture_trace() {
 
     let (hex, rows) = pick_trace_pair(corpus.path()).expect("the shared trace is eligible");
     assert_eq!(hex, FIXTURE_TRACE);
-    assert_eq!(rows, 2);
+    assert_eq!(rows, 3, "two FIXTURE_SERVICE rows + the service-B row");
 }
 
 #[test]
@@ -1867,6 +1883,7 @@ fn pick_trace_pair_rejects_zero_ts_traces() {
             severity_text: "INFO",
             body: "zero ts row",
             trace_id: Some("00112233445566778899aabbccddeeff"),
+            service: FIXTURE_SERVICE,
         },
         FixtureRecord {
             time_unix_nano: 1_000,
@@ -1874,6 +1891,7 @@ fn pick_trace_pair_rejects_zero_ts_traces() {
             severity_text: "INFO",
             body: "clean row same trace",
             trace_id: Some("00112233445566778899aabbccddeeff"),
+            service: FIXTURE_SERVICE,
         },
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
@@ -1884,4 +1902,101 @@ fn pick_trace_pair_rejects_zero_ts_traces() {
     .expect("write corpus");
 
     assert_eq!(pick_trace_pair(corpus.path()), None);
+}
+
+#[test]
+fn pick_trace_pair_prefers_multi_service_then_smallest_id() {
+    let rec = |ts, body, trace, service| FixtureRecord {
+        time_unix_nano: ts,
+        severity_number: 9,
+        severity_text: "INFO",
+        body,
+        trace_id: Some(trace),
+        service,
+    };
+
+    // A 2-row multi-service trace beats a 3-row single-service one.
+    let records = vec![
+        rec(
+            1_000,
+            "big a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            2_000,
+            "big b",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            3_000,
+            "big c",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            4_000,
+            "spans a",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            5_000,
+            "spans b",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            FIXTURE_SERVICE_B,
+        ),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+    assert_eq!(
+        pick_trace_pair(corpus.path()),
+        Some(("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(), 2)),
+        "multi-service wins over more rows"
+    );
+
+    // Otherwise-equal candidates tie-break to the lexicographically
+    // smallest id.
+    let records = vec![
+        rec(
+            1_000,
+            "tie c1",
+            "cccccccccccccccccccccccccccccccc",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            2_000,
+            "tie c2",
+            "cccccccccccccccccccccccccccccccc",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            3_000,
+            "tie a1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            FIXTURE_SERVICE,
+        ),
+        rec(
+            4_000,
+            "tie a2",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            FIXTURE_SERVICE,
+        ),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+    assert_eq!(
+        pick_trace_pair(corpus.path()),
+        Some(("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), 2)),
+        "equal candidates pick the smallest id"
+    );
 }

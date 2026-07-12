@@ -1201,8 +1201,8 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
     let mut by_volume: Vec<(String, u64)> = rows_per_service.into_iter().collect();
     // Ascending volume; deterministic name tiebreak.
     by_volume.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    for (service, rows) in by_volume {
-        if rows < 2 {
+    for (service, total_rows) in by_volume {
+        if total_rows < 2 {
             // Cannot satisfy the 2-row window floor — skip the rescan.
             continue;
         }
@@ -1210,12 +1210,17 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
         // Descending window-size ladder: the largest k may have no clean
         // edges even when smaller ones do, and the lowest-volume service
         // should win with ANY valid 2..=100-row window before falling
-        // through to a busier one.
+        // through to a busier one. Clamped duplicates are skipped.
+        let mut tried = 0usize;
         for k in [100usize, 50, 20, 10, 5, 2] {
             let k = k.min(clean.len());
             if k < 2 {
                 break;
             }
+            if k == tried {
+                continue;
+            }
+            tried = k;
             if let Some((start, end)) = pick_window_pair(&clean, &poison, k) {
                 return Some((service, start, end, k as u64));
             }

@@ -242,9 +242,16 @@ pub struct OuriosAnswer {
     /// count/pruning scan (Loki's counterpart includes delivering
     /// results, so the §3.7 anti-strawman discipline requires ours to).
     pub bytes_read: u64,
-    /// The count/pruning-scan component (`QueryStats::bytes_read`, folded
-    /// from the engine's `bytes_scanned` scan metric on the RFC 0016
-    /// path — the figure the B1/B2 gates use).
+    /// The count/pruning-scan component (`QueryStats::bytes_read`). `0`
+    /// whenever the count scan was **elided** (`QueryOptions::single_pass`):
+    /// the completeness this harness enforces — every matching row rendered,
+    /// i.e. the limit was never hit — is exactly the condition under which
+    /// the querier derives the count from the materialize pass and skips
+    /// the count scan, so the query genuinely read zero bytes for it. The
+    /// zero is the honest figure, not an accounting gap. It is non-zero on
+    /// the success path only in the exact-limit edge (matches == limit),
+    /// where the querier falls back to the count scan to prove the result
+    /// wasn't truncated.
     pub count_scan_bytes: u64,
     /// The row-materialization component: the extra scan that fetched the
     /// ≤ `limit` rendered rows (`QueryResult::materialize_bytes_read`).
@@ -260,12 +267,17 @@ pub struct OuriosAnswer {
 /// Ourios half of both the RFC0031.1 equivalence check and the
 /// RFC0031.2–.5 bytes-read gates.
 ///
-/// Runs the querier **in-process** (RFC 0031 §7: no served binary). The
-/// query MUST carry a `limit` large enough to render **every** matching
-/// row — the querier renders rows only when a limit is set, and caps them
-/// at it. An equivalence check over a truncated (or empty, limit-less)
-/// result is meaningless, so this **enforces completeness**: it errors
-/// unless the rendered row count equals the total match count.
+/// Runs the querier **in-process** (RFC 0031 §7: no served binary) with
+/// `QueryOptions::single_pass`, so the measured bytes are what one
+/// answer-delivering query actually reads: when the materialized result
+/// is complete the count scan is elided rather than re-reading the same
+/// row groups for a count already in hand (see
+/// [`OuriosAnswer::count_scan_bytes`]). The query MUST carry a `limit`
+/// large enough to render **every** matching row — the querier renders
+/// rows only when a limit is set, and caps them at it. An equivalence
+/// check over a truncated (or empty, limit-less) result is meaningless,
+/// so this **enforces completeness**: it errors unless the rendered row
+/// count equals the total match count.
 ///
 /// # Errors
 ///
@@ -293,7 +305,14 @@ pub fn ourios_query_answer(
             detail: format!("comparative tokio runtime: {e}"),
         })?;
     let result = runtime
-        .block_on(querier.run_query(&query, tenant, now_unix_nano, default_window_nanos, None))
+        .block_on(querier.run_query_with(
+            &query,
+            tenant,
+            now_unix_nano,
+            default_window_nanos,
+            None,
+            ourios_querier::QueryOptions::single_pass(),
+        ))
         .map_err(|e| BenchError::Pipeline {
             detail: format!("comparative query `{dsl}`: {e}"),
         })?;
@@ -892,9 +911,13 @@ mod tests {
         // The §3.6 measurement-fidelity amendment (2026-07-12): the figure
         // the L-gates ratio is the TOTAL bytes fetched to deliver the answer
         // — count scan + row materialization + template-registry derivation.
-        // The registry-bearing comparative store makes all three components
-        // real: rendered rows force the materialization scan, and body
-        // reconstruction forces the RFC 0017 audit-stream read.
+        // Since the single-pass amendment the harness elides the count scan
+        // whenever the result is complete (which the completeness guard
+        // requires anyway), so on this path the count-scan component is an
+        // honest 0 — the query never read those bytes. The registry-bearing
+        // comparative store makes the other two components real: rendered
+        // rows force the materialization scan, and body reconstruction
+        // forces the RFC 0017 audit-stream read.
         let records = comparative_fixture(crate::corpus::TIME_BASELINE_NS);
         let corpus = tempfile::TempDir::new().expect("corpus dir");
         std::fs::write(
@@ -925,19 +948,41 @@ mod tests {
             answer.count_scan_bytes + answer.materialize_bytes + answer.registry_bytes,
             "bytes_read is exactly the sum of its three components",
         );
-        assert!(answer.count_scan_bytes > 0, "the count scan read data");
+        assert_eq!(
+            answer.count_scan_bytes, 0,
+            "3 matches < limit 1000 ⇒ the result is complete ⇒ the count \
+             scan was elided and its component is an honest 0",
+        );
         assert!(
             answer.materialize_bytes > 0,
-            "rendering rows costs a second scan — it must be counted",
+            "rendering rows reads the data files — it must be counted",
         );
         assert!(
             answer.registry_bytes > 0,
             "body reconstruction reads the audit stream — it must be counted",
         );
+
+        // The exact-limit edge: 3 matches with `limit 3` looks truncated
+        // (returned == limit), so the querier must fall back to the count
+        // scan to prove completeness — the component is real bytes again,
+        // and the completeness guard still passes because rows == rendered.
+        let exact = ourios_query_answer(
+            bucket.path(),
+            &tenant,
+            "severity >= 0 | limit 3",
+            now,
+            window,
+        )
+        .expect("exact-limit query answer");
+        assert_eq!(exact.lines.len(), 3, "still the complete result");
         assert!(
-            answer.bytes_read > answer.count_scan_bytes,
-            "the honest total exceeds the count-scan-only figure the old \
-             channel reported",
+            exact.count_scan_bytes > 0,
+            "returned == limit ⇒ fell back to the count scan",
+        );
+        assert_eq!(
+            exact.bytes_read,
+            exact.count_scan_bytes + exact.materialize_bytes + exact.registry_bytes,
+            "the fallback path sums the same three components",
         );
     }
 

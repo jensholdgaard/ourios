@@ -28,3 +28,4 @@ mod rfc0018_severity;
 mod rfc0022_attr_columns;
 mod rfc0024_properties;
 mod rfc0025_rendering;
+mod rfc0031_single_pass;

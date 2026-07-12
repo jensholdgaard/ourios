@@ -249,7 +249,30 @@ async fn push_otlp(http: &reqwest::Client, base: &str, payload: Vec<u8>) {
         // a 429 during a sustained replay — retry them within the same
         // deadline rather than aborting the run on a blip.
         let (status, body) = match sent {
-            Ok(resp) if resp.status().is_success() => return,
+            Ok(resp) if resp.status().is_success() => {
+                // A 2xx can still carry an OTLP partialSuccess with
+                // silently-rejected records — which would unequalize the
+                // two corpora and surface later as a baffling equivalence
+                // or row-count failure. Fail HERE, loudly.
+                let body = resp.bytes().await.expect("otlp push response body");
+                if !body.is_empty() {
+                    use prost::Message as _;
+                    let decoded =
+                        opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse::decode(
+                            body.as_ref(),
+                        )
+                        .expect("otlp push response decodes");
+                    if let Some(partial) = decoded.partial_success {
+                        assert!(
+                            partial.rejected_log_records == 0,
+                            "loki silently rejected {} records: {}",
+                            partial.rejected_log_records,
+                            partial.error_message,
+                        );
+                    }
+                }
+                return;
+            }
             Ok(resp) => {
                 let status = resp.status();
                 let retryable = status.as_u16() == 429 || status.is_server_error();
@@ -1275,7 +1298,11 @@ async fn loki_measure_pair(
                 spec.label,
             ));
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // 10 s, not 2 s: an expensive pair's poll (the L3 full-corpus
+        // scan runs ~19 s of engine time) must not queue up behind
+        // itself — run #13's failing query showed 321 s of queueTime
+        // from 2 s polling, which ate the deadline in Loki's queue.
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
 
@@ -1471,6 +1498,18 @@ fn rfc0031_indicative_comparative_run() {
     let loki: Vec<_> = runtime.block_on(async {
         let (_container, base, http) = start_loki(&[
             "-validation.reject-old-samples=false",
+            // Run #11/#13 post-mortems (the #488 diagnostics): queries over
+            // the replayed corpus's WEEKS-OLD time range skip the ingesters
+            // entirely (`query_ingesters_within`, default 3h — the failing
+            // response showed `ingester.totalReached: 0`), so rows still
+            // sitting in unflushed low-volume chunks are INVISIBLE — the
+            // L3 trace pair flickered with flush timing while high-volume
+            // streams (kafka) always flushed fast enough to be seen. `0`
+            // disables the cutoff so ingesters are always consulted — the
+            // query-side twin of `reject-old-samples=false` for frozen
+            // corpora, and in Loki's favour (without it Loki's answer to
+            // an old-range query is silently incomplete).
+            "-querier.query-ingesters-within=0",
             "-distributor.ingestion-rate-limit-mb=512",
             "-distributor.ingestion-burst-size-mb=1024",
             "-ingester.per-stream-rate-limit=512MB",

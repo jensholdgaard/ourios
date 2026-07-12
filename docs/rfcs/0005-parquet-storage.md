@@ -562,12 +562,13 @@ Per-column encoding decisions, anchored to query patterns
 > an exact-id lookup has, precisely *because* near-random ids defeat
 > min/max statistics. RFC 0031 comparative run #12 (otel-demo-v8,
 > 4.9 M records) measured the cost of the original decision: a 9-row
-> trace lookup read 72.4 MB — the `trace_id` column scanned
-> corpus-wide. With blooms (run #14): 4.8 MB, a 15.2× collapse, and
-> the RFC 0031 L3 must-win passes at 21.9× storage-side / 514.6×
-> processed-bytes against the reference system. Blooms are optional
-> column metadata: no schema change, old files and old readers
-> unaffected in both directions (§3.9).
+> trace lookup read 72,935,984 bytes — the `trace_id` column scanned
+> corpus-wide. With blooms (run #14): 4,812,668 bytes, a 15.2×
+> collapse, and the RFC 0031 L3 must-win passes at 21.9× storage-side
+> / 514.6× processed-bytes against the reference system. Blooms are
+> optional Parquet column-chunk metadata, not a schema element: files
+> written without them remain readable, readers that don't consult
+> them are simply unaccelerated, and no migration exists to plan.
 
 The `body` row is the only one with bold weight: a writer that
 quietly enables dictionary encoding on `body` because Arrow's

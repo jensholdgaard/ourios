@@ -119,8 +119,50 @@ pub struct QueryStats {
     /// B1 pruned fraction is
     /// `row_groups_pruned / (row_groups_scanned + row_groups_pruned)`.
     pub row_groups_pruned: u64,
-    /// Bytes read from object storage for the query.
+    /// Bytes read from object storage by the count/pruning scan. `0` when
+    /// the scan was elided ([`QueryOptions::elide_count_scan`]) — the
+    /// materialization pass's IO stays on
+    /// [`QueryResult::materialize_bytes_read`].
     pub bytes_read: u64,
+}
+
+/// Additive execution options for [`Querier::run_query_with`]. The
+/// `Default` is byte-for-byte the [`Querier::run_query`] behavior.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct QueryOptions {
+    /// Single-pass execution for limited queries (RFC 0031 §3.6): run the
+    /// row-materialization scan **first** and, when it proves the result
+    /// complete (fewer rows returned than the `limit`, so the limit clipped
+    /// nothing), skip the count/pruning scan — `rows` is the returned row
+    /// count, and re-scanning the same row groups to count them would be
+    /// pure redundant IO. A possibly-truncated result (returned == `limit`)
+    /// falls back to the count scan, so `rows` is the full matching total
+    /// in every case. Count-only queries (no `limit`) are unaffected.
+    ///
+    /// Under elision, `stats` diverges from the two-pass shape in exactly
+    /// one field: `row_groups_scanned` / `row_groups_pruned` still carry
+    /// the count-scan values (the materialize plan prunes by the same
+    /// predicate over the same file set, and a limit that was never reached
+    /// cannot stop the scan early, so the counts are the ones the count
+    /// scan would have reported), but `stats.bytes_read` is `0` — the count
+    /// scan genuinely read nothing. The three-component sum with
+    /// [`QueryResult::materialize_bytes_read`] /
+    /// [`QueryResult::registry_bytes_read`] therefore remains the honest
+    /// total IO. Callers needing the pinned "a limited query's `stats`
+    /// equal a count-only query's" shape (RFC 0017 §3.4) keep the default.
+    pub elide_count_scan: bool,
+}
+
+impl QueryOptions {
+    /// The RFC 0031 single-pass profile: elide the count scan whenever the
+    /// materialized result is complete.
+    #[must_use]
+    pub const fn single_pass() -> Self {
+        Self {
+            elide_count_scan: true,
+        }
+    }
 }
 
 /// Result of a query: the matching-row count (`rows`) and the scan's pruning
@@ -594,7 +636,11 @@ const STORE_URL: &str = "ourios://store";
 #[derive(Default)]
 struct CollectedRecords {
     records: Vec<LogRow>,
-    materialize_bytes_read: u64,
+    /// The materialization scan's own stats: `bytes_read` feeds
+    /// [`QueryResult::materialize_bytes_read`]; the row-group counts serve
+    /// the single-pass elision, which reports them as the query's pruning
+    /// stats ([`QueryOptions::elide_count_scan`]).
+    scan: QueryStats,
     registry_bytes_read: u64,
 }
 
@@ -655,7 +701,7 @@ impl Querier {
         let tenant = request.tenant.clone();
         let window = request.time_range;
         let row_limit = request.limit;
-        self.execute(&tenant, window, row_limit, |df| {
+        self.execute(&tenant, window, row_limit, QueryOptions::default(), |df| {
             apply_request_filters(df, &request)
         })
         .await
@@ -701,6 +747,33 @@ impl Querier {
         default_window_nanos: u64,
         alias_map: Option<&ourios_core::alias::AliasMap>,
     ) -> Result<QueryResult, QueryError> {
+        self.run_query_with(
+            query,
+            tenant,
+            now_unix_nano,
+            default_window_nanos,
+            alias_map,
+            QueryOptions::default(),
+        )
+        .await
+    }
+
+    /// [`run_query`](Self::run_query) with explicit execution
+    /// [`QueryOptions`] — the additive opt-in surface;
+    /// `QueryOptions::default()` is exactly `run_query`.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_query`](Self::run_query).
+    pub async fn run_query_with(
+        &self,
+        query: &dsl::Query,
+        tenant: &TenantId,
+        now_unix_nano: u64,
+        default_window_nanos: u64,
+        alias_map: Option<&ourios_core::alias::AliasMap>,
+        options: QueryOptions,
+    ) -> Result<QueryResult, QueryError> {
         // Error precedence: stage-support and window/limit validation
         // runs before the alias-map derivation below, so those query
         // errors surface without paying the audit-tree IO (or its
@@ -737,7 +810,7 @@ impl Querier {
         // The DSL `limit` (RFC 0002) doubles as the RFC 0017 row cap; read it
         // before `plan` moves into the filter closure.
         let row_limit = plan.limit;
-        self.execute(tenant, Some(plan.window), row_limit, move |df| {
+        self.execute(tenant, Some(plan.window), row_limit, options, move |df| {
             compile::apply(df, plan)
         })
         .await
@@ -807,8 +880,11 @@ impl Querier {
         partition_window: Option<(u64, u64)>,
         // RFC 0017 §3.4 — when `Some(n)`, collect up to `n` matching rows into
         // `QueryResult.records` (rendered via the read-time registry); `None`
-        // is count-only. The count + stats are taken the same way regardless.
+        // is count-only. The count + stats are taken the same way regardless,
+        // unless `query_options` elides the count scan for a complete
+        // limited result.
         row_limit: Option<usize>,
+        query_options: QueryOptions,
         build_filter: F,
     ) -> Result<QueryResult, QueryError>
     where
@@ -878,6 +954,39 @@ impl Querier {
             return Ok(QueryResult::default());
         };
 
+        // RFC 0031 §3.6 single-pass — with `elide_count_scan`, materialise
+        // FIRST: a result that did not hit the limit is complete, so the
+        // count is the returned row count and the count scan (which would
+        // re-read the same row groups for information already in hand) is
+        // skipped. The reported pruning counts are the materialize plan's —
+        // identical to the count scan's, because both prune by the same
+        // predicate over the same file set and an unreached limit never
+        // stops the scan early — with `bytes_read = 0`: the count scan
+        // genuinely read nothing. A possibly-truncated result
+        // (returned == limit) falls through to the count scan below, so
+        // `rows` stays the full matching total.
+        let mut early = None;
+        if let Some(n) = row_limit
+            && query_options.elide_count_scan
+        {
+            let collected = self
+                .collect_records(df.clone(), n, tenant, ctx.task_ctx())
+                .await?;
+            if collected.records.len() < n {
+                return Ok(QueryResult {
+                    rows: collected.records.len() as u64,
+                    stats: QueryStats {
+                        bytes_read: 0,
+                        ..collected.scan
+                    },
+                    records: collected.records,
+                    materialize_bytes_read: collected.scan.bytes_read,
+                    registry_bytes_read: collected.registry_bytes_read,
+                });
+            }
+            early = Some(collected);
+        }
+
         // Count via an aggregate so the heavy `attributes` /
         // `params` / `body` columns are never materialised
         // (projection pushdown). We build + execute the physical
@@ -900,16 +1009,18 @@ impl Querier {
         // matching rows (the same filtered frame, capped at the limit), decode
         // them to `MinedRecord`s, and render each into a `LogRow` via the
         // read-time template registry. Heavy columns are only materialised for
-        // these (≤ limit) rows. `None` ⇒ count-only (records stays empty).
-        let collected = match row_limit {
-            Some(n) => self.collect_records(df, n, tenant, ctx.task_ctx()).await?,
-            None => CollectedRecords::default(),
+        // these (≤ limit) rows. `None` ⇒ count-only (records stays empty). A
+        // truncated single-pass run already materialised — reuse it.
+        let collected = match (early, row_limit) {
+            (Some(collected), _) => collected,
+            (None, Some(n)) => self.collect_records(df, n, tenant, ctx.task_ctx()).await?,
+            (None, None) => CollectedRecords::default(),
         };
         Ok(QueryResult {
             rows,
             stats,
             records: collected.records,
-            materialize_bytes_read: collected.materialize_bytes_read,
+            materialize_bytes_read: collected.scan.bytes_read,
             registry_bytes_read: collected.registry_bytes_read,
         })
     }
@@ -928,16 +1039,17 @@ impl Querier {
         task_ctx: Arc<datafusion::execution::TaskContext>,
     ) -> Result<CollectedRecords, QueryError> {
         let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
-        // Plan + collect by hand (rather than `DataFrame::collect`) so the
-        // materialization scan's `bytes_scanned` can be read off the retained
-        // plan. Only the bytes are folded: this scan's row-group counts stay
-        // out of `QueryStats` so the B1 pruned fraction keeps its
-        // count-scan-only meaning.
+        // Plan + collect by hand (rather than `DataFrame::collect`) so this
+        // scan's metrics can be read off the retained plan. The caller folds
+        // only the bytes into its accounting — this scan's row-group counts
+        // stay out of `QueryStats` so the B1 pruned fraction keeps its
+        // count-scan-only meaning — except under count-scan elision, where
+        // they *are* the count-scan counts (see `QueryOptions`).
         let plan = limited.create_physical_plan().await.map_err(storage_err)?;
         let batches = collect(Arc::clone(&plan), task_ctx)
             .await
             .map_err(storage_err)?;
-        let materialize_bytes_read = scan_stats(plan.as_ref()).bytes_read;
+        let scan = scan_stats(plan.as_ref());
         // The single RFC 0005 decode path (RFC 0021 §3.1 / RFC0021.4):
         // `ShapeValidation::Skip` because `render_log_body` handles every
         // record shape safely — this path renders rather than rejects
@@ -958,7 +1070,7 @@ impl Querier {
         }
         if mined.is_empty() {
             return Ok(CollectedRecords {
-                materialize_bytes_read,
+                scan,
                 ..CollectedRecords::default()
             });
         }
@@ -999,7 +1111,7 @@ impl Querier {
                 .iter()
                 .map(|record| LogRow::from_record(record, &registry))
                 .collect(),
-            materialize_bytes_read,
+            scan,
             registry_bytes_read,
         })
     }

@@ -1192,14 +1192,20 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
                     .iter()
                     .map(|sl| sl.log_records.len() as u64)
                     .sum();
-                *rows_per_service.entry(service.to_string()).or_default() += rows;
+                if rows > 0 {
+                    *rows_per_service.entry(service.to_string()).or_default() += rows;
+                }
             }
         }
     }
     let mut by_volume: Vec<(String, u64)> = rows_per_service.into_iter().collect();
     // Ascending volume; deterministic name tiebreak.
     by_volume.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    for (service, _) in by_volume {
+    for (service, rows) in by_volume {
+        if rows < 2 {
+            // Cannot satisfy the 2-row window floor — skip the rescan.
+            continue;
+        }
         let (clean, poison) = collect_service_timestamps(corpus_dir, &service);
         // Descending window-size ladder: the largest k may have no clean
         // edges even when smaller ones do, and the lowest-volume service

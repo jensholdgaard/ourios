@@ -1245,6 +1245,7 @@ the full corpus with one harness delta under test:
 | #15 | 29192897795 | + L1 template pair (#492; pre-merge, since merged) |
 | #16 | 29199815903 | + selective-resource diagnostic, first picker (produced a vacuous duplicate of the L6 `k=100` pair — the fix is what #493 merged; the run's L1/L3 pairs measured and passed, so it counts toward the streaks) |
 | #17 | 29203804795 | + selective-resource diagnostic pair, fixed picker (#493; pre-merge, since merged) |
+| #18 | 29210202343 | + latency_p50 channel (#495; pre-merge, since merged) — bytes unchanged from #17; adds the §3.6 latency numbers below |
 
 In **every** counted run, RFC0031.1 result-set equivalence held on
 every pair: the two systems' answers, keyed
@@ -1361,9 +1362,10 @@ lowest-volume service ("ad", ~34 s window), where the
 reported here: a **bytes-read floor analog** (Ourios ≤ 3× Loki,
 i.e. ratio ≥ 0.33) — the harness applies the §7 `F_L6` factor to
 this entry's bytes channels. Note the §5 gate as written
-(RFC0031.7) defines the L6 floor on **latency p50**, which this
-program has not yet measured; the bytes framing is the harness's
-reporting choice pending the §7 freeze.
+(RFC0031.7) defines the L6 floor on **latency p50** — measured in
+run #18 (see the latency section below), where the gate as written
+passes on all three window pairs; the bytes framing here remains
+the conservative reporting channel pending the §7 freeze.
 
 | run | pair | ourios bytes | loki storage-side | loki processed | storage ratio | processed ratio |
 |---|---|---|---|---|---|---|
@@ -1388,6 +1390,34 @@ roughly one row group containing **all** services, so the promoted
 `service.name` bloom has nothing to skip. The tier-changing lever
 is write-side layout (service clustering / row-group sizing —
 hazard #4 territory, an RFC-level change), not query-side tuning.
+
+**Latency (§3.6 channel, run #18 — the program's first).** Median
+of 7 warm repetitions per pair per system, measured only on
+correctness-verified pairs; Ourios timed in-process, Loki over
+localhost HTTP (negligible at these magnitudes; stated because
+latency is corroborating, not sole-gating):
+
+| pair | ourios p50 | loki p50 | ratio (>1 = Ourios faster) |
+|---|---|---|---|
+| severity (1 row) | 82.0 ms | 875.0 ms | 10.7× |
+| L3 trace (9 rows) | 74.6 ms | 24,101.9 ms | 323× |
+| L1 template (2 rows) | 75.7 ms | 23,321.5 ms | 308× |
+| window k=100 | 40.2 ms | 13.8 ms | 0.34 |
+| window k=2000 | 85.9 ms | 294.8 ms | 3.43 |
+| selective-resource k=100 | 38.8 ms | 51.2 ms | 1.32 |
+
+Two findings this channel settles. First, the young-engine latency
+risk the RFC hedged against ("a latency loss + bytes-read win =
+sound architecture, young implementation") did **not** materialize:
+Ourios answers every pair in 39–86 ms — a flat, fixed-cost-shaped
+profile — while Loki spans 13.8 ms to 24.1 s, and on the needle
+classes the wall-clock gap is interactive-vs-batch (75 ms vs 23–24
+seconds). Second, **scenario RFC0031.7 evaluated as written — on
+latency — PASSES on all three window pairs** (0.34, 3.43, 1.32,
+all ≥ 1/3 at `F_L6 = 3`), and Ourios is outright *faster* on two of
+the three; the storage-channel loss published above is real as a
+bytes statement, but the RFC's own L6 gate holds the floor. Which
+channel the frozen L6 gate uses is part of the §7 decision.
 
 **Determinism note.** For repeated measurements of the same build
 and configuration, Ourios's bytes are **byte-identical** (the store

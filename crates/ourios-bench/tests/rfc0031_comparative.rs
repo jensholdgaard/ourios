@@ -1576,28 +1576,45 @@ fn ourios_latency_p50(
 /// ([`loki_measure_pair`] succeeded), so ingest has caught up and the
 /// reps are cache-warm, mirroring the Ourios side. A failed repetition
 /// logs loudly and yields `None` rather than failing the run.
+///
+/// Reps run before the CROSS-SYSTEM equivalence assert (which needs
+/// every pair measured first), but nothing is ever REPORTED from a run
+/// where equivalence broke — the run panics before the report prints —
+/// so published latencies always come from equivalence-held runs.
 async fn loki_latency_p50(http: &reqwest::Client, base: &str, spec: &PairSpec) -> Option<Duration> {
+    // Everything allocatable is built OUTSIDE the timed region; the
+    // body is chunk-drained (not buffered) inside it — delivery is part
+    // of the measured cost, a whole-body buffer is not.
+    let url = format!("{base}/loki/api/v1/query_range");
+    let (start_s, end_s) = (spec.start.to_string(), spec.end.to_string());
     let mut samples = Vec::with_capacity(LATENCY_REPS);
     for _ in 0..LATENCY_REPS {
         let start = std::time::Instant::now();
         let sent = http
-            .get(format!("{base}/loki/api/v1/query_range"))
+            .get(&url)
             .query(&[
                 ("query", spec.logql.as_str()),
-                ("start", &spec.start.to_string()),
-                ("end", &spec.end.to_string()),
+                ("start", start_s.as_str()),
+                ("end", end_s.as_str()),
                 ("limit", "5000"),
                 ("direction", "forward"),
             ])
             .send()
             .await;
         let outcome = match sent {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 let status = resp.status();
-                match resp.bytes().await {
-                    Ok(_) if status.is_success() => Ok(()),
-                    Ok(_) => Err(format!("HTTP {status}")),
-                    Err(e) => Err(format!("body read: {e}")),
+                let drained = loop {
+                    match resp.chunk().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break Ok(()),
+                        Err(e) => break Err(format!("body read: {e}")),
+                    }
+                };
+                match drained {
+                    Ok(()) if status.is_success() => Ok(()),
+                    Ok(()) => Err(format!("HTTP {status}")),
+                    Err(detail) => Err(detail),
                 }
             }
             Err(e) => Err(format!("transport: {e}")),

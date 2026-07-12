@@ -806,6 +806,17 @@ fn writer_properties(zstd: ZstdLevel, promoted: &PromotedAttributes) -> WriterPr
     let template_id = ColumnPath::new(vec![crate::columns::TEMPLATE_ID.to_string()]);
     builder = builder.set_column_bloom_filter_enabled(template_id, true);
 
+    // Bloom filters on the trace-context ids: random 16/8-byte values
+    // defeat min/max statistics entirely, so an exact-id lookup (the
+    // RFC 0031 L3 class) degenerates to a whole-column scan without
+    // them — measured at 72.4 MB for a 9-row trace on the 4.9M-record
+    // otel-demo-v8 corpus (comparative run #12). Same §3.6 pattern as
+    // `template_id` and the promoted columns.
+    for column in [crate::columns::TRACE_ID, crate::columns::SPAN_ID] {
+        let path = ColumnPath::new(vec![column.to_string()]);
+        builder = builder.set_column_bloom_filter_enabled(path, true);
+    }
+
     // RFC 0022 §3.1: promoted attribute columns are the attribute
     // predicate-pushdown surface — bloom filter each (dictionary and
     // page-level statistics are already the global defaults). A

@@ -26,6 +26,7 @@ use ourios_bench::{
     parse_loki_bytes_processed, parse_loki_fetched_bytes, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
+use ourios_miner::tree::OwnedToken;
 
 /// `grafana/loki`, digest-pinned like the Dex image (the tag names the
 /// release a competent operator would run; the digest makes CI
@@ -875,6 +876,273 @@ fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u64)> {
         })
 }
 
+/// The dynamically-picked L1 (template-exact lookup) pair: DSL
+/// `template_id == N` — riding the writer's existing bloom filter on
+/// `template_id` — against `LogQL` `{service_name=~".+"} |= "<needle>"`.
+/// Loki has no template concept, so its honest equivalent is a line
+/// filter over every stream.
+#[derive(Debug)]
+struct TemplatePair {
+    template_id: u64,
+    /// The template's constant text: contained in every one of the
+    /// template's rows (bit-identical reconstruction, `CLAUDE.md` §3.3)
+    /// and — validated against the corpus — in NO other line, so the two
+    /// queries select identical row sets.
+    needle: String,
+    /// How many rows the pair selects (the validated count).
+    rows: u64,
+}
+
+/// A template's candidate needle: the longest run of consecutive
+/// [`OwnedToken::Fixed`] tokens joined with single spaces, kept only at
+/// ≥ 10 chars. Runs split at wildcards AND at tokens outside the safe
+/// charset ([`select_pair_candidates`]' rule — the needle lands inside a
+/// quoted `LogQL` string literal). Separators are per-ROW state, not
+/// template state, so the single-space join is an assumption about the
+/// common case; [`pick_template_pair`]'s containment validation rejects
+/// any candidate it fails for. Length ties break to the
+/// lexicographically smallest run, for deterministic reruns.
+fn template_needle(tokens: &[OwnedToken]) -> Option<String> {
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ' '))
+    };
+    let mut runs: Vec<String> = Vec::new();
+    let mut run: Vec<&str> = Vec::new();
+    for token in tokens {
+        match token {
+            OwnedToken::Fixed(s) if safe(s) => run.push(s),
+            _ => {
+                if !run.is_empty() {
+                    runs.push(run.join(" "));
+                    run.clear();
+                }
+            }
+        }
+    }
+    if !run.is_empty() {
+        runs.push(run.join(" "));
+    }
+    runs.retain(|needle| needle.len() >= 10);
+    runs.into_iter().min_by(|a, b| {
+        (std::cmp::Reverse(a.len()), a.as_str()).cmp(&(std::cmp::Reverse(b.len()), b.as_str()))
+    })
+}
+
+/// Per-needle tally from [`tally_needles`]' corpus pass.
+#[derive(Default)]
+struct NeedleTally {
+    /// Corpus lines whose string body contains the needle.
+    matches: u64,
+    /// A matching line has `time_unix_nano == 0` — the established
+    /// key-mismatch poison rule (the two systems answer with different
+    /// keys).
+    has_zero_ts: bool,
+    /// A matching line has no `service.name` — invisible to the `LogQL`
+    /// side's `{service_name=~".+"}` selector.
+    has_empty_service: bool,
+}
+
+/// One streaming corpus pass for the L1 picker: for each candidate
+/// needle, count the corpus lines whose string body CONTAINS it, and
+/// record whether any matching line is poisoned. Non-string bodies never
+/// match (a needle can only select the string-body lines whose bytes
+/// both systems return identically).
+fn tally_needles(corpus_dir: &std::path::Path, candidates: &[(u64, String)]) -> Vec<NeedleTally> {
+    use std::io::BufRead as _;
+
+    let mut tallies: Vec<NeedleTally> = candidates.iter().map(|_| NeedleTally::default()).collect();
+    for path in corpus_jsonl_paths(corpus_dir) {
+        let file = std::fs::File::open(&path).expect("open corpus file");
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.expect("read corpus line");
+            if line.trim().is_empty() {
+                continue;
+            }
+            let data: opentelemetry_proto::tonic::logs::v1::LogsData =
+                serde_json::from_str(&line).expect("parse LogsData line");
+            for rl in &data.resource_logs {
+                let service_is_empty = !rl
+                    .resource
+                    .as_ref()
+                    .and_then(|r| r.attributes.iter().find(|kv| kv.key == "service.name"))
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| v.value.as_ref())
+                    .is_some_and(|v| {
+                        matches!(
+                            v,
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)
+                                if !s.is_empty()
+                        )
+                    });
+                for sl in &rl.scope_logs {
+                    for lr in &sl.log_records {
+                        let Some(
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                                body,
+                            ),
+                        ) = lr.body.as_ref().and_then(|b| b.value.as_ref())
+                        else {
+                            continue;
+                        };
+                        for ((_, needle), tally) in candidates.iter().zip(&mut tallies) {
+                            if body.contains(needle.as_str()) {
+                                tally.matches += 1;
+                                tally.has_zero_ts |= lr.time_unix_nano == 0;
+                                tally.has_empty_service |= service_is_empty;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tallies
+}
+
+/// The L1 candidates worth validating, ordered most-selective first:
+/// needle-match count in `2..=4000` (a meaningful multiset that fits one
+/// Loki page) and no poisoned matching line. Sorted by fewest matches,
+/// then the longest needle, then the lexicographically smallest needle,
+/// then the smallest template id — deterministic reruns.
+fn eligible_template_candidates<'a>(
+    candidates: &'a [(u64, String)],
+    tallies: &[NeedleTally],
+) -> Vec<(u64, &'a str, u64)> {
+    let mut eligible: Vec<(u64, &str, u64)> = candidates
+        .iter()
+        .zip(tallies)
+        .filter(|(_, t)| !t.has_zero_ts && !t.has_empty_service && (2..=4000).contains(&t.matches))
+        .map(|((id, needle), t)| (*id, needle.as_str(), t.matches))
+        .collect();
+    eligible.sort_by(|a, b| {
+        (a.2, std::cmp::Reverse(a.1.len()), a.1, a.0).cmp(&(
+            b.2,
+            std::cmp::Reverse(b.1.len()),
+            b.1,
+            b.0,
+        ))
+    });
+    eligible
+}
+
+/// Fourth picker, for the L1 (template-exact lookup) pair — runs AFTER
+/// `build_comparative_store`, because template ids exist only
+/// post-mining. Derives the tenant's template registry via the querier
+/// (RFC 0017 §3.2), takes each template's longest constant run as its
+/// candidate needle ([`template_needle`]), and VALIDATES equivalence
+/// before selection. A candidate survives iff:
+///
+/// - the count of corpus lines containing the needle equals the
+///   template's row count (an Ourios count query, `template_id == N`,
+///   no limit) — every template row contains its constant text
+///   (bit-identical reconstruction, `CLAUDE.md` §3.3), so count-equality
+///   proves the needle selects exactly the template's rows and nothing
+///   else;
+/// - every RENDERED template row actually contains the needle — the
+///   containment direction count-equality alone cannot prove for a
+///   multi-token needle (separators are per-row state; the single-space
+///   join is only the common case);
+/// - the shared honesty rules ([`eligible_template_candidates`]):
+///   `2..=4000` rows, no zero-`time_unix_nano` and no empty-service line
+///   among the needle matches.
+///
+/// Rejections are LOUD (stderr), and so is the no-valid-template skip
+/// (the [`build_pair_specs`] `None` arm).
+fn pick_template_pair(
+    corpus_dir: &std::path::Path,
+    bucket_root: &std::path::Path,
+    tenant: &TenantId,
+    now: u64,
+    window: u64,
+) -> Option<TemplatePair> {
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+
+    let querier = ourios_querier::Querier::new(bucket_root);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let registry = runtime
+        .block_on(querier.template_registry(tenant))
+        .expect("derive template registry");
+
+    // Highest version per template id: widening only ever turns Fixed
+    // positions into Wildcards (RFC 0001 §6.2 step 5), so the latest
+    // version's constants are constant in every earlier version's rows
+    // too — and the DSL `template_id == N` selects rows of EVERY version.
+    let mut latest: HashMap<u64, (u32, Vec<OwnedToken>)> = HashMap::new();
+    for ((id, version), tokens) in registry {
+        match latest.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert((version, tokens));
+            }
+            Entry::Occupied(mut entry) => {
+                if version > entry.get().0 {
+                    entry.insert((version, tokens));
+                }
+            }
+        }
+    }
+    let mut candidates: Vec<(u64, String)> = latest
+        .into_iter()
+        .filter(|&(id, _)| id != ourios_miner::cluster::NO_TEMPLATE)
+        .filter_map(|(id, (_, tokens))| template_needle(&tokens).map(|needle| (id, needle)))
+        .collect();
+    // Deterministic tally/validation order regardless of map iteration.
+    candidates.sort_unstable();
+
+    let tallies = tally_needles(corpus_dir, &candidates);
+    for (template_id, needle, matches) in eligible_template_candidates(&candidates, &tallies) {
+        let dsl = format!("template_id == {template_id}");
+        let query = ourios_querier::dsl::parse(&dsl).expect("L1 count DSL parses");
+        let rows = runtime
+            .block_on(querier.run_query(&query, tenant, now, window, None))
+            .expect("L1 count query")
+            .rows;
+        if rows != matches {
+            eprintln!(
+                "L1 candidate template_id={template_id} needle={needle:?} rejected: \
+                 {rows} template rows vs {matches} needle-matching corpus lines",
+            );
+            continue;
+        }
+        match ourios_bench::ourios_query_answer(
+            bucket_root,
+            tenant,
+            &format!("{dsl} | limit 5000"),
+            now,
+            window,
+        ) {
+            Ok(answer) => {
+                if answer.lines.iter().all(|line| {
+                    line.body
+                        .windows(needle.len())
+                        .any(|w| w == needle.as_bytes())
+                }) {
+                    return Some(TemplatePair {
+                        template_id,
+                        needle: needle.to_string(),
+                        rows,
+                    });
+                }
+                eprintln!(
+                    "L1 candidate template_id={template_id} needle={needle:?} rejected: a \
+                     rendered row does not contain the needle (per-row separators broke \
+                     the single-space join)",
+                );
+            }
+            Err(e) => eprintln!(
+                "L1 candidate template_id={template_id} needle={needle:?} rejected: row \
+                 materialization failed ({e:?})",
+            ),
+        }
+    }
+    None
+}
+
 /// Pick a `k`-row time-window slice `[a, b)` of a service's records with
 /// CLEAN EDGES, preferring mid-corpus. `clean_ts` and `poison_ts` come
 /// sorted from [`collect_service_timestamps`]. A candidate start index
@@ -1170,12 +1438,14 @@ struct PairSpec {
 /// result grows while Loki's scan grows with it. The severity pair is
 /// the L2-family point; the two time-window slices (~100 and ~2000 rows
 /// on the same service) are broad scans, so their gates report under
-/// the L6 floor factor.
+/// the L6 floor factor. The trace pair is the L3 must-win; the template
+/// pair is the L1 must-win — the taxonomy's flagship class.
 fn build_pair_specs(
     pair: &SelectivePair,
     clean_ts: &[u64],
     poison_ts: &[u64],
     trace: Option<&(String, u64)>,
+    template: Option<&TemplatePair>,
     corpus_now: u64,
     corpus_window: u64,
 ) -> Vec<PairSpec> {
@@ -1254,6 +1524,36 @@ fn build_pair_specs(
         None => eprintln!(
             "L3 PAIR SKIPPED: no eligible trace (16-byte id, no zero-ts/empty-service rows, \
              2..=100 rows) in the corpus"
+        ),
+    }
+    // L1 must-win — the taxonomy's flagship: DSL `template_id == N` rides
+    // the writer's existing bloom filter on template_id; Loki has no
+    // template concept, so its honest equivalent is a line filter over
+    // every stream. The picker proved the two select IDENTICAL row sets
+    // (needle-count == template row count + rendered-row containment).
+    match template {
+        Some(t) => specs.push(PairSpec {
+            label: format!(
+                "template lookup, L1 family: template_id={} needle={:?}",
+                t.template_id, t.needle
+            ),
+            margin: margins.m_l1,
+            gate: GateKind::MustWin,
+            dsl: format!("template_id == {} | limit 5000", t.template_id),
+            logql: format!("{{service_name=~\".+\"}} |= \"{}\"", t.needle),
+            start: pair.min_ts,
+            end: pair
+                .max_ts
+                .checked_add(1)
+                .expect("corpus max timestamp overflows the Loki window end"),
+            expected_rows: t.rows,
+            now: corpus_now,
+            window: corpus_window,
+        }),
+        None => eprintln!(
+            "L1 PAIR SKIPPED: no template with a validated constant needle (≥ 10 safe \
+             chars, 2..=4000 rows, needle-count == template row count, no \
+             zero-ts/empty-service match) in the corpus"
         ),
     }
     specs
@@ -1412,8 +1712,9 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
 /// The §7 calibration input: the indicative Ourios-vs-Loki bytes-read
 /// comparison on a real corpus (`OURIOS_COMPARATIVE_CORPUS`, fetched by
 /// the `comparative-bench` dispatch workflow — the `corpus/otel-demo-v*`
-/// releases), measured across a three-point selectivity curve
-/// ([`build_pair_specs`]) over one container + one corpus replay.
+/// releases), measured across the [`build_pair_specs`] pair set — a
+/// selectivity curve plus the L1/L3 must-win points — over one
+/// container + one corpus replay.
 ///
 /// **Equivalence is asserted per pair; the bytes gates are REPORTED,
 /// not asserted** — the §7 margins are provisional until the maintainer
@@ -1428,6 +1729,7 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
 /// flag comment). The query side stays stock.
 #[test]
 #[ignore = "dispatch-only: needs Docker + a corpus via OURIOS_COMPARATIVE_CORPUS (comparative-bench workflow)"]
+#[allow(clippy::too_many_lines)] // one linear dispatch-run script: pick → build → measure → gate
 fn rfc0031_indicative_comparative_run() {
     let corpus_dir = std::path::PathBuf::from(
         std::env::var("OURIOS_COMPARATIVE_CORPUS")
@@ -1460,11 +1762,22 @@ fn rfc0031_indicative_comparative_run() {
         .checked_add(1)
         .expect("corpus max effective timestamp overflows now");
     let corpus_window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+    // The L1 picker runs against the BUILT store (template ids exist only
+    // post-mining), unlike the corpus-scanning pickers above.
+    let template = pick_template_pair(
+        &corpus_dir,
+        bucket.path(),
+        &tenant,
+        corpus_now,
+        corpus_window,
+    );
+    eprintln!("template pair: {template:?}");
     let specs = build_pair_specs(
         &pair,
         &clean_ts,
         &poison_ts,
         trace.as_ref(),
+        template.as_ref(),
         corpus_now,
         corpus_window,
     );
@@ -2206,5 +2519,164 @@ fn pick_trace_pair_prefers_multi_service_then_smallest_id() {
         pick_trace_pair(corpus.path()),
         Some(("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), 2)),
         "equal candidates pick the smallest id"
+    );
+}
+
+#[test]
+fn template_needle_takes_the_longest_safe_constant_run() {
+    let fixed = |s: &str| OwnedToken::Fixed(s.to_owned());
+
+    // Wildcards and unsafe tokens split runs; the longest surviving run
+    // wins, joined with single spaces.
+    let tokens = vec![
+        fixed("shutting"),
+        fixed("down"),
+        OwnedToken::Wildcard,
+        fixed("connection"),
+        fixed("established"),
+        fixed("to"),
+        fixed("peer"),
+        fixed("via:"), // unsafe ':' splits the run
+        fixed("gateway"),
+    ];
+    assert_eq!(
+        template_needle(&tokens).as_deref(),
+        Some("connection established to peer"),
+    );
+
+    // Under 10 chars → no candidate; all wildcards → no candidate.
+    assert_eq!(template_needle(&[fixed("logged"), fixed("in")]), None);
+    assert_eq!(
+        template_needle(&[OwnedToken::Wildcard, OwnedToken::Wildcard]),
+        None,
+    );
+
+    // A length tie breaks to the lexicographically smallest run.
+    let tie = vec![
+        fixed("bbbbb"),
+        fixed("bbbb"),
+        OwnedToken::Wildcard,
+        fixed("aaaaa"),
+        fixed("aaaa"),
+    ];
+    assert_eq!(template_needle(&tie).as_deref(), Some("aaaaa aaaa"));
+}
+
+#[test]
+fn eligible_template_candidates_enforce_poison_rules_and_bounds() {
+    let candidates: Vec<(u64, String)> = [
+        (1, "needle alpha"),         // clean, 3 matches
+        (2, "needle beta"),          // zero-ts poison
+        (3, "needle gamma"),         // empty-service poison
+        (4, "needle delta"),         // 1 match — under the 2-row floor
+        (5, "needle epsilon"),       // 4001 — over the one-page cap
+        (6, "short need"),           // clean, 2 matches — most selective
+        (7, "a longer needle here"), // clean, 3 matches, longer needle
+    ]
+    .into_iter()
+    .map(|(id, needle)| (id, needle.to_string()))
+    .collect();
+    let tally = |matches, has_zero_ts, has_empty_service| NeedleTally {
+        matches,
+        has_zero_ts,
+        has_empty_service,
+    };
+    let tallies = vec![
+        tally(3, false, false),
+        tally(3, true, false),
+        tally(3, false, true),
+        tally(1, false, false),
+        tally(4001, false, false),
+        tally(2, false, false),
+        tally(3, false, false),
+    ];
+
+    assert_eq!(
+        eligible_template_candidates(&candidates, &tallies),
+        vec![
+            (6, "short need", 2),           // fewest matches first
+            (7, "a longer needle here", 3), // then the longer needle
+            (1, "needle alpha", 3),
+        ],
+        "poisoned and out-of-bounds candidates drop; the rest sort \
+         most-selective first with deterministic tiebreaks",
+    );
+}
+
+#[test]
+fn pick_template_pair_finds_a_validated_needle() {
+    // Three rows of one template whose constant run is ≥ 10 safe chars
+    // ("connection established to peer" — the numbers mask to one
+    // wildcard slot) plus a second template whose longest run ("logged
+    // in", 9 chars) is under the floor: exactly one candidate, and it
+    // validates — 3 needle-matching corpus lines == 3 template rows,
+    // every rendered row contains the needle.
+    let records: Vec<(u64, &str)> = vec![
+        (1_000, "connection established to peer 10"),
+        (2_000, "connection established to peer 11"),
+        (3_000, "connection established to peer 12"),
+        (4_000, "user 4 logged in"),
+        (5_000, "user 5 logged in"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    let pair = pick_template_pair(corpus.path(), bucket.path(), &tenant, now, window)
+        .expect("the peer template validates");
+    assert_eq!(pair.needle, "connection established to peer");
+    assert_eq!(pair.rows, 3, "exactly the three peer rows");
+    assert_ne!(pair.template_id, 0, "never the NO_TEMPLATE sentinel");
+}
+
+#[test]
+fn pick_template_pair_rejects_substring_collisions() {
+    // Two rows of the peer template, plus ONE line of a DIFFERENT
+    // template (different token count) that contains the same constant
+    // text as a substring: the needle matches 3 corpus lines against 2
+    // template rows, so count-equality fails — a Loki line filter for it
+    // would return a row the DSL side never selects. The colliding
+    // template's own needle is the same string (3 matches vs 1 row), so
+    // no candidate validates and the picker returns None.
+    let records: Vec<(u64, &str)> = vec![
+        (1_000, "connection established to peer 10"),
+        (2_000, "connection established to peer 11"),
+        (3_000, "retry: connection established to peer 12 via proxy"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    assert!(
+        pick_template_pair(corpus.path(), bucket.path(), &tenant, now, window).is_none(),
+        "a needle whose corpus count exceeds the template's rows must be rejected",
     );
 }

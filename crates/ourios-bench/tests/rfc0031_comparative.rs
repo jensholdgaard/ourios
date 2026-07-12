@@ -785,8 +785,15 @@ fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u64)> {
                         _ => None,
                     })
                     .unwrap_or("");
-                let next_id = u32::try_from(service_ids.len()).expect("service count fits u32");
-                let service_id = *service_ids.entry(service.to_string()).or_insert(next_id);
+                // get-then-insert (not entry) so the millions of repeat
+                // ResourceLogs never allocate a lookup key.
+                let service_id = if let Some(&id) = service_ids.get(service) {
+                    id
+                } else {
+                    let id = u32::try_from(service_ids.len()).expect("service count fits u32");
+                    service_ids.insert(service.to_string(), id);
+                    id
+                };
                 let service_is_empty = service.is_empty();
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {

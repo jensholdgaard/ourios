@@ -1143,6 +1143,130 @@ fn pick_template_pair(
     None
 }
 
+/// The selective-resource diagnostic's service pick: the corpus's
+/// LOWEST-volume safe-named service that still yields a clean window
+/// (maintainer's positioning point, 2026-07-12: an enriched
+/// resource-scoped browse should prune via the promoted `service.name`
+/// bloom — the measured L6 windows used the HIGHEST-volume service,
+/// which is present in every row group and is the bloom's worst case
+/// by construction, so they bound the UNSCOPED-browse cost, not the
+/// enriched one). `exclude` is the service the L6 window pairs already
+/// use: falling through to it would duplicate an existing measurement,
+/// which is a vacuous diagnostic (run #16 measured exactly that before
+/// this guard existed). One corpus pass collects every service's
+/// timestamps at once — the per-service rescan cost run #16 ~70
+/// minutes. Every skipped candidate logs WHY, so the run log records
+/// the corpus's enrichment reality even when the pick falls through.
+type ServiceTimestamps = (Vec<u64>, Vec<u64>);
+
+fn pick_rare_window_pair(
+    corpus_dir: &std::path::Path,
+    exclude: &str,
+) -> Option<(String, u64, u64, u64)> {
+    use std::collections::HashMap;
+    use std::io::BufRead as _;
+
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ' '))
+    };
+    // service -> (clean ts, poison ts), both filled in ONE corpus pass.
+    let mut per_service: HashMap<String, ServiceTimestamps> = HashMap::new();
+    for path in corpus_jsonl_paths(corpus_dir) {
+        let file = std::fs::File::open(&path).expect("open corpus file");
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.expect("read corpus line");
+            if line.trim().is_empty() {
+                continue;
+            }
+            let data: opentelemetry_proto::tonic::logs::v1::LogsData =
+                serde_json::from_str(&line).expect("parse LogsData line");
+            for rl in &data.resource_logs {
+                let service = rl
+                    .resource
+                    .as_ref()
+                    .and_then(|r| r.attributes.iter().find(|kv| kv.key == "service.name"))
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| v.value.as_ref())
+                    .and_then(|v| match v {
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            s,
+                        ) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                if !safe(service) || service == exclude {
+                    continue;
+                }
+                // get-then-insert (the file's established pattern) so
+                // repeat ResourceLogs never allocate a lookup key.
+                let entry = if let Some(entry) = per_service.get_mut(service) {
+                    entry
+                } else {
+                    per_service.entry(service.to_string()).or_default()
+                };
+                for sl in &rl.scope_logs {
+                    for lr in &sl.log_records {
+                        if lr.time_unix_nano != 0 {
+                            entry.0.push(lr.time_unix_nano);
+                        } else if lr.observed_time_unix_nano != 0 {
+                            entry.1.push(lr.observed_time_unix_nano);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut by_volume: Vec<(String, ServiceTimestamps)> = per_service.into_iter().collect();
+    by_volume.sort_by(|a, b| {
+        let (av, bv) = (a.1.0.len() + a.1.1.len(), b.1.0.len() + b.1.1.len());
+        av.cmp(&bv).then_with(|| a.0.cmp(&b.0))
+    });
+    for (service, (mut clean, mut poison)) in by_volume {
+        if clean.len() < 2 {
+            eprintln!(
+                "selective-resource candidate {service}: skipped — {} clean timestamps \
+                 ({} zero-time rows); a source-timestamp-quality gap in the corpus, \
+                 not a picker gap",
+                clean.len(),
+                poison.len(),
+            );
+            continue;
+        }
+        clean.sort_unstable();
+        poison.sort_unstable();
+        // Descending window-size ladder — a deliberate SAMPLING of the
+        // 2..=100 range, not an exhaustive search: the largest k may
+        // have no clean edges even when smaller ones do, and a
+        // lower-volume service should win at any sampled size before a
+        // busier one is tried. A window valid only at an unsampled
+        // intermediate k falls through — acceptable for a diagnostic,
+        // where 99 validity passes per service buys no measurement
+        // value. Clamped duplicates are skipped.
+        let mut tried = 0usize;
+        for k in [100usize, 50, 20, 10, 5, 2] {
+            let k = k.min(clean.len());
+            if k < 2 {
+                break;
+            }
+            if k == tried {
+                continue;
+            }
+            tried = k;
+            if let Some((start, end)) = pick_window_pair(&clean, &poison, k) {
+                return Some((service, start, end, k as u64));
+            }
+        }
+        eprintln!(
+            "selective-resource candidate {service}: skipped — {} clean timestamps but \
+             no clean-edged window at any sampled k",
+            clean.len(),
+        );
+    }
+    None
+}
+
 /// Pick a `k`-row time-window slice `[a, b)` of a service's records with
 /// CLEAN EDGES, preferring mid-corpus. `clean_ts` and `poison_ts` come
 /// sorted from [`collect_service_timestamps`]. A candidate start index
@@ -1440,15 +1564,18 @@ struct PairSpec {
 /// on the same service) are broad scans, so their gates report under
 /// the L6 floor factor. The trace pair is the L3 must-win; the template
 /// pair is the L1 must-win — the taxonomy's flagship class.
-fn build_pair_specs(
-    pair: &SelectivePair,
-    clean_ts: &[u64],
-    poison_ts: &[u64],
-    trace: Option<&(String, u64)>,
-    template: Option<&TemplatePair>,
-    corpus_now: u64,
-    corpus_window: u64,
-) -> Vec<PairSpec> {
+/// Everything the pickers produced, bundled for [`build_pair_specs`].
+struct Picks<'a> {
+    pair: &'a SelectivePair,
+    clean_ts: &'a [u64],
+    poison_ts: &'a [u64],
+    trace: Option<&'a (String, u64)>,
+    template: Option<&'a TemplatePair>,
+    rare_window: Option<&'a (String, u64, u64, u64)>,
+}
+
+fn build_pair_specs(picks: &Picks<'_>, corpus_now: u64, corpus_window: u64) -> Vec<PairSpec> {
+    let (pair, clean_ts, poison_ts) = (picks.pair, picks.clean_ts, picks.poison_ts);
     let margins = ourios_bench::ComparativeMargins::default();
     let mut specs = vec![PairSpec {
         label: format!(
@@ -1499,6 +1626,22 @@ fn build_pair_specs(
             window: end - start,
         });
     }
+    specs.extend(class_pair_specs(picks, &margins, corpus_now, corpus_window));
+    specs
+}
+
+/// The L-class (L3/L1) must-win pairs plus the selective-resource
+/// diagnostic — split from [`build_pair_specs`] so each half stays
+/// readable.
+fn class_pair_specs(
+    picks: &Picks<'_>,
+    margins: &ourios_bench::ComparativeMargins,
+    corpus_now: u64,
+    corpus_window: u64,
+) -> Vec<PairSpec> {
+    let (pair, trace, template, rare_window) =
+        (picks.pair, picks.trace, picks.template, picks.rare_window);
+    let mut specs = Vec::new();
     // L3 must-win: an exact trace lookup over the full corpus window.
     // Loki cannot pre-narrow a trace to a stream (`.+` selector +
     // structured-metadata filter = a scan across every service); Ourios
@@ -1508,7 +1651,7 @@ fn build_pair_specs(
     match trace {
         Some((hex, rows)) => specs.push(PairSpec {
             label: format!("trace correlation, L3 family: trace_id={hex}"),
-            margin: ourios_bench::ComparativeMargins::default().m_l3,
+            margin: margins.m_l3,
             gate: GateKind::MustWin,
             dsl: format!("trace_id == \"{hex}\" | limit 5000"),
             logql: format!("{{service_name=~\".+\"}} | trace_id=\"{hex}\""),
@@ -1554,6 +1697,30 @@ fn build_pair_specs(
             "L1 PAIR SKIPPED: no template with a validated constant needle (≥ 10 safe \
              chars, 2..=4000 rows, needle-count == template row count, no \
              zero-ts/empty-service match) in the corpus"
+        ),
+    }
+    // Selective-resource DIAGNOSTIC (not an L-class gate): the same
+    // window-browse shape as the L6 pairs but scoped to the corpus's
+    // LOWEST-volume service, where the promoted service.name bloom can
+    // actually skip row groups — the L6 pairs use the highest-volume
+    // service, the bloom's worst case, so they bound the unscoped-browse
+    // cost while this bounds the enriched one.
+    match rare_window {
+        Some((service, start, end, rows)) => specs.push(PairSpec {
+            label: format!("selective-resource window, diagnostic: service={service} k={rows}"),
+            margin: margins.f_l6,
+            gate: GateKind::Floor,
+            dsl: format!("service == \"{service}\" | limit 5000"),
+            logql: format!("{{service_name=\"{service}\"}}"),
+            start: *start,
+            end: *end,
+            expected_rows: *rows,
+            now: *end,
+            window: *end - *start,
+        }),
+        None => eprintln!(
+            "SELECTIVE-RESOURCE PAIR SKIPPED: no low-volume service with a clean \
+             2..=100-row window in the corpus"
         ),
     }
     specs
@@ -1747,6 +1914,8 @@ fn rfc0031_indicative_comparative_run() {
     );
     let trace = pick_trace_pair(&corpus_dir);
     eprintln!("trace pair: {trace:?}");
+    let rare_window = pick_rare_window_pair(&corpus_dir, &pair.service);
+    eprintln!("selective-resource window: {rare_window:?}");
 
     // The (locally-proven) Ourios half, per pair.
     let bucket = tempfile::TempDir::new().expect("bucket dir");
@@ -1772,15 +1941,15 @@ fn rfc0031_indicative_comparative_run() {
         corpus_window,
     );
     eprintln!("template pair: {template:?}");
-    let specs = build_pair_specs(
-        &pair,
-        &clean_ts,
-        &poison_ts,
-        trace.as_ref(),
-        template.as_ref(),
-        corpus_now,
-        corpus_window,
-    );
+    let picks = Picks {
+        pair: &pair,
+        clean_ts: &clean_ts,
+        poison_ts: &poison_ts,
+        trace: trace.as_ref(),
+        template: template.as_ref(),
+        rare_window: rare_window.as_ref(),
+    };
+    let specs = build_pair_specs(&picks, corpus_now, corpus_window);
     let ourios: Vec<_> = specs
         .iter()
         .map(|spec| {
@@ -2679,4 +2848,32 @@ fn pick_template_pair_rejects_substring_collisions() {
         pick_template_pair(corpus.path(), bucket.path(), &tenant, now, window).is_none(),
         "a needle whose corpus count exceeds the template's rows must be rejected",
     );
+}
+
+#[test]
+fn pick_rare_window_pair_selects_the_low_volume_service() {
+    // Service B is rarer than FIXTURE_SERVICE (1 row vs 3) but a 1-row
+    // window fails the 2-row floor, so the picker must fall through to
+    // the next-rarest service with a clean window.
+    let records = comparative_fixture(1_000_000);
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+
+    let (service, start, end, rows) =
+        pick_rare_window_pair(corpus.path(), "not-in-corpus").expect("a clean window exists");
+    assert_eq!(
+        service, FIXTURE_SERVICE,
+        "the 1-row service B fails the 2-row floor; fall through"
+    );
+
+    // Excluding the only viable service yields a loud None, never a
+    // duplicate of an existing pair (the run #16 lesson).
+    assert_eq!(pick_rare_window_pair(corpus.path(), FIXTURE_SERVICE), None);
+    assert_eq!(rows, 3, "all three FIXTURE_SERVICE rows fit one window");
+    assert!(start < end);
+    assert!(start >= 1_000_000 && end <= 1_002_001);
 }

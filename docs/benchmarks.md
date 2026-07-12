@@ -1250,8 +1250,9 @@ every pair: the two systems' answers, keyed
 4.9 M-record scale. Runs #11/#13 were L3-flicker diagnostics (an
 ingester-visibility artifact, fixed in #490 — see the deviations
 list) and carry no counted numbers; every other dispatched run
-appears in the table, so the consecutive-pass streaks quoted below
-(L1: #15/#16/#17; L3: #14/#15/#16/#17) are auditable from it.
+appears in the table, and the per-class tables below carry a row
+for every run in each quoted streak (L1: #15/#16/#17; L3:
+#14/#15/#16/#17), so the streaks audit from this entry alone.
 
 **The metric (§3.6 as amended 2026-07-12).** The Ourios figure is
 the **total** bytes fetched from object storage per query: count
@@ -1286,6 +1287,7 @@ writer's existing bloom filter on `template_id`.
 | run | ourios bytes | loki storage-side | loki processed | storage | processed |
 |---|---|---|---|---|---|
 | #15 | 1,358,683 | 104,825,428 | 2,468,065,726 | **77.2×** | **1,816.5×** |
+| #16 | 1,358,683 | 105,191,956 | 2,469,772,352 | 77.4× | 1,817.8× |
 | #17 | 1,358,683 | 105,579,510 | 2,474,713,321 | 77.7× | 1,821.4× |
 
 Above the provisional `M_L1 = 10` on **both** channels, in every
@@ -1302,6 +1304,8 @@ query is a structured-metadata filter over **all** streams.
 |---|---|---|---|---|---|---|
 | #12 | no bloom — `trace_id` column scanned corpus-wide | 72,935,984 | 102,835,803 | 2,419,117,783 | 1.41× | 33.2× |
 | #14 | + `trace_id`/`span_id` blooms (#489) | 4,812,668 | 105,353,837 | 2,476,749,585 | **21.9×** | **514.6×** |
+| #15 | reproduction | 4,812,668 | 102,133,866 | 2,404,486,169 | 21.2× | 499.6× |
+| #16 | reproduction | 4,812,668 | 104,656,570 | 2,456,853,969 | 21.7× | 510.5× |
 | #17 | reproduction | 4,812,668 | 105,251,547 | 2,465,855,695 | 21.9× | 512.4× |
 
 Run #12 is the honest before-picture: without blooms Ourios itself

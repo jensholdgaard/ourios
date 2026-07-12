@@ -1237,10 +1237,11 @@ fn build_pair_specs(
 }
 
 /// One pair's Loki measurement: poll `query_range` until ingest has
-/// caught up to the expected row count. `Err` at the deadline — with a
-/// diagnostic dump — instead of panicking, so one pair's failure cannot
-/// destroy the other pairs' already-measured report (run #11 lost three
-/// pairs' measurements to one L3 timeout panic).
+/// caught up to the expected row count. On a deadline miss it emits a
+/// diagnostic dump (itself bounded to 90 s) and then returns `Err`
+/// instead of panicking, so one pair's failure cannot destroy the other
+/// pairs' already-measured report (run #11 lost three pairs'
+/// measurements to one L3 timeout panic).
 async fn loki_measure_pair(
     http: &reqwest::Client,
     base: &str,
@@ -1262,7 +1263,10 @@ async fn loki_measure_pair(
             .await
             .is_err()
             {
-                eprintln!("(diagnostics dump itself timed out after 90 s)");
+                eprintln!(
+                    "(diagnostics dump for [{}] itself timed out after 90 s)",
+                    spec.label,
+                );
             }
             break Err(format!(
                 "loki returned {} of {} expected rows for [{}] before timeout",

@@ -1209,7 +1209,8 @@ margins are the RFC's *proposed* values (`M_L1..M_L4 = 10`,
 gate scenarios (RFC0031.2–.11) are still red stubs, and the harness
 **reports** each pair under its provisional margin rather than
 asserting it. Every "PASS"/"fail" below is provisional pending the
-§7 freeze (a maintainer step, listed at the end).
+§7 freeze — a maintainer step; the open inputs are enumerated in
+point (4) of the closing **Assessment**.
 
 **Corpus.** `corpus/otel-demo-v8` (the §9.12 capture): 4,948,596
 log records, 2.96 GB uncompressed — the RFC 0031 §3.3 headline
@@ -1218,7 +1219,8 @@ all). Both systems ingest the identical OTLP stream; an OTLP
 `partialSuccess` in any push response fails the run, so neither
 side can silently drop lines.
 **Reference system.** `grafana/loki:3.5.3`, digest-pinned
-(`sha256:3165cecce301…`), single-binary mode, fed over its native
+(`sha256:3165cecce301ce5b9b6e3530284b080934a05cd5cafac3d3d82edcb887b45ecd`),
+single-binary mode, fed over its native
 OTLP endpoint. Flag deviations from stock are documented below —
 all ingest-replay accommodations, all in Loki's favour, per the
 §3.7 anti-strawman commitment.
@@ -1239,16 +1241,17 @@ the full corpus with one harness delta under test:
 | #12 | 29188179299 | + L3 trace pair (#487/#488) |
 | #14 | 29190408893 | + `trace_id`/`span_id` blooms (#489; pre-merge on the PR branch, since merged) |
 | #15 | 29192897795 | + L1 template pair (#492; pre-merge, since merged) |
-| #17 | 29203804795 | + selective-resource diagnostic pair (#493; pre-merge, since merged) |
+| #16 | 29199815903 | + selective-resource diagnostic, first picker (produced a vacuous duplicate of the L6 `k=100` pair — the fix is what #493 merged; the run's L1/L3 pairs measured and passed, so it counts toward the streaks) |
+| #17 | 29203804795 | + selective-resource diagnostic pair, fixed picker (#493; pre-merge, since merged) |
 
 In **every** counted run, RFC0031.1 result-set equivalence held on
 every pair: the two systems' answers, keyed
 `(timestamp_unix_nanos, body_bytes)`, were multiset-identical at
 4.9 M-record scale. Runs #11/#13 were L3-flicker diagnostics (an
 ingester-visibility artifact, fixed in #490 — see the deviations
-list) and carry no counted numbers; run numbers omitted from the
-table introduced no harness delta and are subsumed by the
-consecutive-pass counts quoted below.
+list) and carry no counted numbers; every other dispatched run
+appears in the table, so the consecutive-pass streaks quoted below
+(L1: #15/#16/#17; L3: #14/#15/#16/#17) are auditable from it.
 
 **The metric (§3.6 as amended 2026-07-12).** The Ourios figure is
 the **total** bytes fetched from object storage per query: count
@@ -1367,8 +1370,10 @@ roughly one row group containing **all** services, so the promoted
 is write-side layout (service clustering / row-group sizing —
 hazard #4 territory, an RFC-level change), not query-side tuning.
 
-**Determinism note.** Ourios's bytes are **byte-identical across
-every run** (deterministic store build), which is what lets the
+**Determinism note.** For repeated measurements of the same build
+and configuration, Ourios's bytes are **byte-identical** (the store
+build is deterministic) — differences between runs are exactly the
+harness/optimisation deltas the table names, which is what lets the
 run series read as an optimisation ledger. Loki's storage-side
 figure wobbles run to run (severity pair: 2.67–3.35 MB) with chunk
 boundaries and flush timing; ratios quoted against Loki carry that

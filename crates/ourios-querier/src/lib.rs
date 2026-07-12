@@ -1038,6 +1038,33 @@ impl Querier {
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
     ) -> Result<CollectedRecords, QueryError> {
+        // Filter pushdown ("late materialization", off by default in
+        // DataFusion 54): the scan evaluates the predicate during Parquet
+        // decode and — via the writer's offset index — fetches only the
+        // heavy-column (`body` / `params` / `attributes`) pages the selected
+        // rows live in, instead of the whole page-index-matched window of
+        // every unpruned chunk. This keeps the RFC 0031 §3.6 materialization
+        // component proportional to the result size, not the partition size
+        // (regression-pinned in `ourios-bench`'s
+        // `one_row_materialization_reads_pages_not_whole_chunks`); the
+        // session-level option reaches the directly-constructed
+        // `ParquetFormat` because `ParquetSource::try_pushdown_filters`
+        // honours table *or* session config. Scoped to this scan only: on
+        // the count scan, pushdown lets statistics-fully-matched row groups
+        // answer with **zero** bytes scanned, which would hollow out the
+        // `stats.bytes_read` figure the B1/B2 gates and the RFC 0031 honest
+        // total assert on — the count scan keeps the default.
+        let (state, logical_plan) = df.into_parts();
+        let mut config = state.config().clone();
+        {
+            let parquet = &mut config.options_mut().execution.parquet;
+            parquet.pushdown_filters = true;
+            parquet.reorder_filters = true;
+        }
+        let state = datafusion::execution::SessionStateBuilder::new_from_existing(state)
+            .with_config(config)
+            .build();
+        let df = datafusion::dataframe::DataFrame::new(state, logical_plan);
         let limited = df.limit(0, Some(limit)).map_err(storage_err)?;
         // Plan + collect by hand (rather than `DataFrame::collect`) so this
         // scan's metrics can be read off the retained plan. The caller folds

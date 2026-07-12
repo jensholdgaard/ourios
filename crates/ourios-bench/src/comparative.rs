@@ -1139,6 +1139,198 @@ mod tests {
         );
     }
 
+    /// Hour width and shape of the late-materialization corpus, shared
+    /// between the generator and the test's expected-row computation.
+    const LM_HOUR_NS: u64 = 3_600_000_000_000;
+    const LM_HOT_ROWS: u64 = 60_000;
+    const LM_FILLER_ROWS: u64 = 5_000;
+    const LM_ERROR_INDEX: u64 = 13_337;
+
+    /// The per-record pseudo-random ids (an LCG keeps the corpus
+    /// deterministic and dependency-free) whose entropy makes the heavy
+    /// columns compress poorly, the way real request logs do.
+    fn synthetic_ids(n: u64) -> (u64, u64) {
+        let a = n
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let b = a.wrapping_mul(6_364_136_223_846_793_005) >> 32;
+        (a, b)
+    }
+
+    fn synthetic_body(n: u64, error: bool) -> String {
+        let (a, b) = synthetic_ids(n);
+        let verb = if error { "failed" } else { "handled" };
+        format!("{verb} request {a:016x} for user {b:08x} path /api/v1/orders/{n}")
+    }
+
+    /// One `LogRecord` of the late-materialization corpus.
+    fn synthetic_record(
+        time_unix_nano: u64,
+        n: u64,
+        error: bool,
+    ) -> opentelemetry_proto::tonic::logs::v1::LogRecord {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::LogRecord;
+
+        let (a, b) = synthetic_ids(n);
+        let (severity_number, severity_text) = if error { (17, "ERROR") } else { (9, "INFO") };
+        let body = synthetic_body(n, error);
+        let attr = |key: &str, value: String| KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value)),
+            }),
+            ..KeyValue::default()
+        };
+        LogRecord {
+            time_unix_nano,
+            severity_number,
+            severity_text: severity_text.to_string(),
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(body)),
+            }),
+            attributes: vec![
+                attr("http.request.id", format!("{a:016x}")),
+                attr("session.id", format!("{a:016x}{b:016x}")),
+                attr("url.path", format!("/api/v1/orders/{n}/items/{b:x}")),
+                attr(
+                    "client.address",
+                    format!("10.{}.{}.{}", a % 256, b % 256, n % 256),
+                ),
+                attr(
+                    "user_agent.original",
+                    format!("Mozilla/5.0 (build {b:08x}) ourios-bench/{}", n % 97),
+                ),
+            ],
+            ..LogRecord::default()
+        }
+    }
+
+    /// The synthetic multi-hour store the late-materialization regression
+    /// measures: a hot hour of 60 000 rows holding exactly one ERROR row,
+    /// plus two 5 000-row INFO-only filler hours. Hour-aligned so the hot
+    /// hour lands in a single partition; sized past parquet-rs's 20 000-row
+    /// default page limit so each hot-hour column chunk spans several pages
+    /// (page-granular reads need >1 page per chunk to be observable).
+    fn late_materialization_corpus() -> String {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let base_ns = (crate::corpus::TIME_BASELINE_NS / LM_HOUR_NS) * LM_HOUR_NS;
+
+        let mut lines = Vec::new();
+        for (hour, rows) in [
+            (0u64, LM_HOT_ROWS),
+            (1, LM_FILLER_ROWS),
+            (2, LM_FILLER_ROWS),
+        ] {
+            let hour_base = base_ns + hour * LM_HOUR_NS;
+            let spacing = LM_HOUR_NS / (rows + 1);
+            let log_records = (0..rows)
+                .map(|i| {
+                    let error = hour == 0 && i == LM_ERROR_INDEX;
+                    synthetic_record(hour_base + i * spacing, hour * 1_000_000 + i, error)
+                })
+                .collect();
+            let logs = LogsData {
+                resource_logs: vec![ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(
+                                    FIXTURE_SERVICE.to_string(),
+                                )),
+                            }),
+                            ..KeyValue::default()
+                        }],
+                        ..Resource::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records,
+                        ..ScopeLogs::default()
+                    }],
+                    ..ResourceLogs::default()
+                }],
+            };
+            lines.push(serde_json::to_string(&logs).expect("synthetic LogsData serializes"));
+        }
+        lines.join("\n")
+    }
+
+    /// The late-materialization regression guard (RFC 0031 run #8
+    /// decomposition): rendering even ONE matching row used to re-read the
+    /// hot partition's page-index-matched window of every column chunk
+    /// whole — with filter pushdown on the querier's scans, the
+    /// materialize pass fetches only the pages the selected row needs.
+    ///
+    /// Empirical basis for the ceiling (this exact store, measured
+    /// 2026-07-12, `DataFusion` 54 / parquet 58): the pre-pushdown
+    /// whole-window materialize scan read 1 664 654 B; the page-selective
+    /// scan reads 742 036 B. The 1 MiB ceiling sits between with
+    /// comfortable margin both ways — the old behavior violates it by
+    /// ~1.6×, the new behavior clears it with ~1.4× headroom. The store is
+    /// fully deterministic (LCG corpus, fixed timestamps), so drift toward
+    /// the ceiling means a real regression in scan selectivity, not noise.
+    #[test]
+    fn one_row_materialization_reads_pages_not_whole_chunks() {
+        const MATERIALIZE_CEILING_BYTES: u64 = 1_048_576;
+
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("synthetic.jsonl"),
+            late_materialization_corpus(),
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+        let built =
+            crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+                .expect("build store");
+        assert_eq!(
+            built.rows,
+            LM_HOT_ROWS + 2 * LM_FILLER_ROWS,
+            "the whole synthetic corpus is stored",
+        );
+
+        let tenant = TenantId::new(built.tenant);
+        let now = built.max_effective_time_unix_nano + 1;
+        let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+        let answer = ourios_query_answer(
+            bucket.path(),
+            &tenant,
+            "severity >= 17 | limit 10",
+            now,
+            window,
+        )
+        .expect("query answer");
+
+        // Correctness first: pushdown must not change the answer. The one
+        // ERROR row comes back with its exact timestamp and bit-identical
+        // reconstructed body.
+        let base_ns = (crate::corpus::TIME_BASELINE_NS / LM_HOUR_NS) * LM_HOUR_NS;
+        let expected = LineKey {
+            timestamp_unix_nanos: base_ns + LM_ERROR_INDEX * (LM_HOUR_NS / (LM_HOT_ROWS + 1)),
+            body: synthetic_body(LM_ERROR_INDEX, true).into_bytes(),
+        };
+        assert_eq!(
+            answer.lines,
+            vec![expected],
+            "exactly the one ERROR row matches, rendered bit-identically",
+        );
+
+        assert!(
+            answer.materialize_bytes < MATERIALIZE_CEILING_BYTES,
+            "materializing 1 row must read pages, not the whole page-index \
+             window of every chunk: materialize={} (ceiling {}, count_scan={}, \
+             registry={})",
+            answer.materialize_bytes,
+            MATERIALIZE_CEILING_BYTES,
+            answer.count_scan_bytes,
+            answer.registry_bytes,
+        );
+    }
+
     #[test]
     fn body_preview_bounds_large_bodies() {
         // Small body is shown whole.

@@ -1321,6 +1321,9 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
                     ("start", &spec.start.to_string()),
                     ("end", &spec.end.to_string()),
                     ("limit", &limit.to_string()),
+                    // Mirror the measurement request so the dump reflects
+                    // exactly what the poll saw.
+                    ("direction", "forward"),
                 ])
                 .send()
                 .await
@@ -1350,7 +1353,7 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
          filterless sample of the same window =>\n{}\n=== end diagnostics ===",
         spec.label,
         spec.logql,
-        raw(&spec.logql, 5).await,
+        raw(&spec.logql, 5000).await,
         raw("{service_name=~\".+\"}", 3).await,
     );
 }

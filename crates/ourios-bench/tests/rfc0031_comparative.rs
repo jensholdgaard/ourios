@@ -1254,7 +1254,16 @@ async fn loki_measure_pair(
             break Ok((lines, bytes, fetched));
         }
         if std::time::Instant::now() >= deadline {
-            dump_loki_diagnostics(http, base, spec).await;
+            // Bounded so diagnostics can't extend the miss indefinitely.
+            if tokio::time::timeout(
+                Duration::from_secs(90),
+                dump_loki_diagnostics(http, base, spec),
+            )
+            .await
+            .is_err()
+            {
+                eprintln!("(diagnostics dump itself timed out after 90 s)");
+            }
             break Err(format!(
                 "loki returned {} of {} expected rows for [{}] before timeout",
                 lines.len(),
@@ -1333,10 +1342,21 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
                     // Stream at most ~8 KiB rather than buffering a whole
                     // (possibly huge) body just to print a snippet.
                     let mut buf: Vec<u8> = Vec::with_capacity(8192);
-                    while let Ok(Some(chunk)) = resp.chunk().await {
-                        buf.extend_from_slice(&chunk);
-                        if buf.len() >= 8192 {
-                            break;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                buf.extend_from_slice(&chunk);
+                                if buf.len() >= 8192 {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            // A truncated-by-error body must say so, or the
+                            // post-mortem reads as a complete response.
+                            Err(e) => {
+                                buf.extend_from_slice(format!("<body read error: {e}>").as_bytes());
+                                break;
+                            }
                         }
                     }
                     // Truncate on a char boundary; the cap is ~4 KiB of

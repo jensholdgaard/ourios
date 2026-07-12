@@ -1356,8 +1356,13 @@ storage channel.** Pairs: all lines of the highest-volume service
 in a clean k-row window (the promoted-column bloom's worst case),
 plus run #17's diagnostic — the same shape scoped to the
 lowest-volume service ("ad", ~34 s window), where the
-`service.name` bloom could in principle skip. Floor gate: Ourios
-≤ 3× Loki, i.e. ratio ≥ 0.33.
+`service.name` bloom could in principle skip. Floor gate as
+reported here: a **bytes-read floor analog** (Ourios ≤ 3× Loki,
+i.e. ratio ≥ 0.33) — the harness applies the §7 `F_L6` factor to
+this entry's bytes channels. Note the §5 gate as written
+(RFC0031.7) defines the L6 floor on **latency p50**, which this
+program has not yet measured; the bytes framing is the harness's
+reporting choice pending the §7 freeze.
 
 | run | pair | ourios bytes | loki storage-side | loki processed | storage ratio | processed ratio |
 |---|---|---|---|---|---|---|
@@ -1368,7 +1373,7 @@ lowest-volume service ("ad", ~34 s window), where the
 | #17 | "ad" k=100 (diagnostic) | 1,757,489 | 31,616 | 687,043 | 0.018 fail | **0.39 pass** |
 
 This is the honest loss the RFC's L6 disposition anticipated, and
-it is published as §5 RFC0031.6/.11 demand: on a browse-k-rows
+it is published as §5 RFC0031.11 demands: on a browse-k-rows
 query Loki reads only the tiny chunk slice its label stream + time
 index point at, while Ourios pays fixed per-query costs (the
 registry constant plus row-group-granularity materialization) that

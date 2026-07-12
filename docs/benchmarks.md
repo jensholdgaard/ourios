@@ -1286,7 +1286,7 @@ writer's existing bloom filter on `template_id`.
 | run | ourios bytes | loki storage-side | loki processed | storage | processed |
 |---|---|---|---|---|---|
 | #15 | 1,358,683 | 104,825,428 | 2,468,065,726 | **77.2×** | **1,816.5×** |
-| #17 | 1,358,683 | — | — | 77.7× | 1,821× |
+| #17 | 1,358,683 | 105,579,510 | 2,474,713,321 | 77.7× | 1,821.4× |
 
 Above the provisional `M_L1 = 10` on **both** channels, in every
 run since the pair landed (third consecutive pass at #17). The
@@ -1301,8 +1301,8 @@ query is a structured-metadata filter over **all** streams.
 | run | ourios config | ourios bytes | loki storage-side | loki processed | storage | processed |
 |---|---|---|---|---|---|---|
 | #12 | no bloom — `trace_id` column scanned corpus-wide | 72,935,984 | 102,835,803 | 2,419,117,783 | 1.41× | 33.2× |
-| #14 | + `trace_id`/`span_id` blooms (#489) | 4,812,668 | — | — | **21.9×** | **514.6×** |
-| #17 | reproduction | 4,812,668 | — | — | 21.9× | 512.4× |
+| #14 | + `trace_id`/`span_id` blooms (#489) | 4,812,668 | 105,353,837 | 2,476,749,585 | **21.9×** | **514.6×** |
+| #17 | reproduction | 4,812,668 | 105,251,547 | 2,465,855,695 | 21.9× | 512.4× |
 
 Run #12 is the honest before-picture: without blooms Ourios itself
 had to fetch the `trace_id` column corpus-wide, and the storage-side
@@ -1350,8 +1350,8 @@ lowest-volume service ("ad", ~34 s window), where the
 |---|---|---|---|---|---|---|
 | #8 | k=100 | 5,094,790 | 16,250 | 63,595 | 0.003 fail | 0.012 fail |
 | #8 | k=2000 | 9,736,285 | 72,524 | 1,809,523 | 0.007 fail | 0.186 fail |
-| #10 | k=100 | 2,257,867 | — | — | 0.007 fail | 0.028 fail |
-| #10 | k=2000 | 4,528,429 | — | — | 0.016 fail | **0.40 pass** |
+| #10 | k=100 | 2,257,867 | 16,250 | 63,595 | 0.007 fail | 0.028 fail |
+| #10 | k=2000 | 4,528,429 | 72,524 | 1,809,523 | 0.016 fail | **0.40 pass** |
 | #17 | "ad" k=100 (diagnostic) | 1,757,489 | 31,616 | 687,043 | 0.018 fail | **0.39 pass** |
 
 This is the honest loss the RFC's L6 disposition anticipated, and

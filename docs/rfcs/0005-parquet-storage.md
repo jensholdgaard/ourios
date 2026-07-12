@@ -541,7 +541,7 @@ Per-column encoding decisions, anchored to query patterns
 | `scope_version` | yes | yes | no | Bounded per deployment |
 | `attributes` | no | no | no | JSON BYTE_ARRAY, high entropy, dict would balloon |
 | `resource_attributes` | yes | no | no | Repetitive across rows of one tenant; dict pays |
-| `trace_id` | no | yes | **yes** | Near-random ids defeat min/max statistics, so dict loses but the bloom is what makes an exact-id lookup prunable at all (amendment 2026-07-12, below) |
+| `trace_id` | no | yes | **yes** | Near-random ids defeat min/max pruning, so dict loses and the page index's *column*-index half is inert — it stays enabled for the *offset* index, which page-selective reads under filter pushdown need to fetch just the matched rows' pages; the bloom is what makes the exact-id lookup prunable at all (amendment 2026-07-12, below) |
 | `span_id` | no | yes | **yes** | Same |
 | `flags` | yes | yes | no | Bounded |
 | `event_name` | yes | yes | no | Bounded |

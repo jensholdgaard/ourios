@@ -1282,6 +1282,14 @@ fn split_measurements(
     Vec<Measured>,
     Vec<String>,
 ) {
+    assert!(
+        specs.len() == ourios.len() && specs.len() == loki.len(),
+        "harness bug: {} specs vs {} ourios vs {} loki measurements — zip \
+         would silently drop the tail",
+        specs.len(),
+        ourios.len(),
+        loki.len(),
+    );
     let (mut ok_specs, mut ok_ourios, mut ok_loki, mut failures) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for ((spec, ours), result) in specs.iter().zip(ourios).zip(loki) {
@@ -1301,7 +1309,7 @@ fn split_measurements(
 /// the evidence: the raw (truncated) response body of the failing query,
 /// and a filterless sample of the same window so the entries' shape —
 /// including whether structured metadata is present at all on replayed
-/// data — is visible.
+/// data — is visible. Bodies are truncated to ~4 KiB (4096 chars).
 async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSpec) {
     let raw = |query: &str, limit: u32| {
         let query = query.to_string();
@@ -1320,7 +1328,9 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_else(|e| format!("<{e}>"));
-                    let body = body.chars().take(4000).collect::<String>();
+                    // Truncate on a char boundary; the cap is ~4 KiB of
+                    // ASCII JSON, not an exact byte count.
+                    let body = body.chars().take(4096).collect::<String>();
                     format!("HTTP {status}: {body}")
                 }
                 Err(e) => format!("transport error: {e}"),

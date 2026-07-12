@@ -731,13 +731,15 @@ fn collect_service_timestamps(corpus_dir: &std::path::Path, service: &str) -> (V
     (clean, poison)
 }
 
-/// Per-trace tally for [`pick_trace_pair`].
+/// Per-trace tally for [`pick_trace_pair`]. Allocation-free by design:
+/// v8-scale corpora carry millions of mostly-singleton traces, so the
+/// per-entry state holds an interned service id, not a `String`.
 #[derive(Default)]
 struct TraceTally {
     rows: u64,
     has_zero_ts: bool,
     has_empty_service: bool,
-    first_service: String,
+    first_service: Option<u32>,
     multi_service: bool,
 }
 
@@ -757,6 +759,9 @@ fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u64)> {
     use std::io::BufRead as _;
 
     let mut traces: HashMap<[u8; 16], TraceTally> = HashMap::new();
+    // Service names interned to u32 ids — one small map over the handful
+    // of distinct services, zero per-trace allocations.
+    let mut service_ids: HashMap<String, u32> = HashMap::new();
     for path in corpus_jsonl_paths(corpus_dir) {
         let file = std::fs::File::open(&path).expect("open corpus file");
         for line in std::io::BufReader::new(file).lines() {
@@ -780,6 +785,9 @@ fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u64)> {
                         _ => None,
                     })
                     .unwrap_or("");
+                let next_id = u32::try_from(service_ids.len()).expect("service count fits u32");
+                let service_id = *service_ids.entry(service.to_string()).or_insert(next_id);
+                let service_is_empty = service.is_empty();
                 for sl in &rl.scope_logs {
                     for lr in &sl.log_records {
                         let Ok(id) = <[u8; 16]>::try_from(lr.trace_id.as_slice()) else {
@@ -788,11 +796,11 @@ fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u64)> {
                         let tally = traces.entry(id).or_default();
                         tally.rows += 1;
                         tally.has_zero_ts |= lr.time_unix_nano == 0;
-                        tally.has_empty_service |= service.is_empty();
-                        if tally.first_service.is_empty() {
-                            tally.first_service = service.to_string();
-                        } else if tally.first_service != service {
-                            tally.multi_service = true;
+                        tally.has_empty_service |= service_is_empty;
+                        match tally.first_service {
+                            None => tally.first_service = Some(service_id),
+                            Some(first) if first != service_id => tally.multi_service = true,
+                            Some(_) => {}
                         }
                     }
                 }

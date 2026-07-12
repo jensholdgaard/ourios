@@ -323,13 +323,29 @@ async fn loki_round_trip(
     // dispatch run. The `.+` selector is deliberate — a trace spans
     // services, so the honest Loki query cannot pre-narrow to one stream.
     let trace_logql = format!("{{service_name=~\".+\"}} | trace_id=\"{FIXTURE_TRACE}\"");
-    let loki_trace = loki_query_range(&http, &base, &trace_logql, start, end).await;
+    // The readiness loop above only proves the FIXTURE_SERVICE stream is
+    // visible; the service-B stream can land later, so the L3 arm polls
+    // to its own deadline before asserting.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let loki_trace = loop {
+        let lines = loki_query_range(&http, &base, &trace_logql, start, end).await;
+        if lines.len() >= 3 {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the trace filter returned {} of 3 FIXTURE_TRACE lines before \
+             timeout (a wrong structured-metadata key returns 0; an \
+             accidentally-narrowed selector returns 2)",
+            lines.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     assert_eq!(
         loki_trace.len(),
         3,
         "the trace filter must match all three FIXTURE_TRACE lines ACROSS \
-         both service streams (a wrong structured-metadata key returns 0; \
-         an accidentally-narrowed selector returns 2)",
+         both service streams, never more",
     );
     (loki_all, loki_narrow, loki_trace)
 }

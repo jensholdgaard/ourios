@@ -269,8 +269,10 @@ async fn push_otlp(http: &reqwest::Client, base: &str, payload: Vec<u8>) {
 
 /// The Loki half of RFC0031.1: start a real Loki container, push the SAME
 /// `LogsData` value the Ourios corpus was rendered from over the native
-/// OTLP endpoint, then answer two `LogQL` queries — the fixture-equivalent
-/// one (all lines) and a deliberately narrower one (the mismatch arm).
+/// OTLP endpoint, then answer three `LogQL` queries — the
+/// fixture-equivalent one (all `FIXTURE_SERVICE` lines), a deliberately
+/// narrower one (the mismatch arm), and the cross-stream trace filter
+/// (the L3 arm).
 async fn loki_round_trip(
     records: &[FixtureRecord],
     base_ns: u64,
@@ -1136,10 +1138,10 @@ struct PairSpec {
     window: u64,
 }
 
-/// The run's three pairs — a selectivity curve, not a point. Run #6
-/// measured ONE extreme-selectivity pair (1 row) and found storage-side
-/// advantage 5.95×: Ourios's fixed per-query footer/metadata reads
-/// dominate when the answer is a single row. The curve tests the
+/// The run's pairs — a selectivity curve plus the L-class points, not a
+/// single number. Run #6 measured ONE extreme-selectivity pair (1 row)
+/// and found storage-side advantage 5.95×: Ourios's fixed per-query
+/// reads dominate when the answer is a single row. The curve tests the
 /// amortization prediction — Ourios's fixed cost should wash out as the
 /// result grows while Loki's scan grows with it. The severity pair is
 /// the L2-family point; the two time-window slices (~100 and ~2000 rows

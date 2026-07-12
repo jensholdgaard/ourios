@@ -1238,7 +1238,9 @@ the full corpus with one harness delta under test:
 | #8 | 29171354194 | honest-metric baseline (§3.6 amendment wired) |
 | #9 | 29174022848 | + single-pass count/materialize scan (#485) |
 | #10 | 29174342843 | + late materialization (#486) |
+| #11 | 29186113326 | L3 diagnostic: Loki 0-rows, pre-salvage panic — no counted numbers |
 | #12 | 29188179299 | + L3 trace pair (#487/#488) |
+| #13 | 29189430335 | L3 diagnostic recurrence (on the #489 branch): L3 timed out; the salvaged report's other pairs are counted where tabulated |
 | #14 | 29190408893 | + `trace_id`/`span_id` blooms (#489; pre-merge on the PR branch, since merged) |
 | #15 | 29192897795 | + L1 template pair (#492; pre-merge, since merged) |
 | #16 | 29199815903 | + selective-resource diagnostic, first picker (produced a vacuous duplicate of the L6 `k=100` pair — the fix is what #493 merged; the run's L1/L3 pairs measured and passed, so it counts toward the streaks) |
@@ -1249,10 +1251,8 @@ every pair: the two systems' answers, keyed
 `(timestamp_unix_nanos, body_bytes)`, were multiset-identical at
 4.9 M-record scale. Runs #11/#13 were L3-flicker diagnostics (an
 ingester-visibility artifact, fixed in #490 — see the deviations
-list). Run #11's panic predates the report salvage and carries no
-counted numbers; run #13's L3 pair timed out but its salvaged
-report's other pairs are counted where tabulated. Every other
-dispatched run
+list); their table rows above note exactly what each carries.
+Every dispatched run
 appears in the table, and the per-class tables below carry a row
 for every run in each quoted streak (L1: #15/#16/#17; L3:
 #14/#15/#16/#17), so the streaks audit from this entry alone.
@@ -1313,8 +1313,9 @@ query is a structured-metadata filter over **all** streams.
 
 Run #12 is the honest before-picture: without blooms Ourios itself
 had to fetch the `trace_id` column corpus-wide, and the storage-side
-ratio (1.41×) was nowhere near the margin. The blooms (RFC 0005
-§3.6 amendment, #491, with this as its measured evidence) collapse
+ratio (1.41×) was nowhere near the margin. The blooms (implemented
+in #489; the RFC 0005 §3.6 amendment recording them, with this as
+its measured evidence, is #491) collapse
 the fetch 15×, and the pair has now passed the provisional margin
 on both channels three runs in a row. As with L1, Loki's side is
 structural: a trace cannot be pre-narrowed to a label stream, so it

@@ -1499,6 +1499,121 @@ async fn push_corpus_to_loki(http: &reqwest::Client, base: &str, corpus_dir: &st
     eprintln!("loki ingest complete: {batched} LogsData lines in {pushed} requests");
 }
 
+/// Timed repetitions per pair per system for the §3.6 latency channel.
+/// Every repetition runs AFTER the pair's correctness measurement, so
+/// all of them — including the first — may be cache-warm on both sides:
+/// the reported figure is a **warm p50** (median, never min, so one
+/// especially-warm rep cannot masquerade as the typical cost).
+const LATENCY_REPS: usize = 7;
+
+/// Median wall time of a rep set: odd lengths take the middle sample,
+/// even lengths the mean of the two middles. `None` on an empty set.
+fn median_duration(samples: &[Duration]) -> Option<Duration> {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(sorted[mid]),
+        _ => Some((sorted[mid - 1] + sorted[mid]) / 2),
+    }
+}
+
+/// The RFC0031.7 latency floor over the measured p50s, through the
+/// shared checked gate math ([`ourios_bench::bytes_within_floor`] —
+/// its arithmetic is unit-agnostic) on **nanosecond** integers:
+/// millisecond units would truncate a sub-millisecond in-process Ourios
+/// p50 to 0 and trip the gate's zero-measurement guard.
+fn latency_floor_gate(
+    ourios: Duration,
+    loki: Duration,
+    factor: u64,
+) -> ourios_bench::BytesGateOutcome {
+    // A p50 past u64::MAX nanoseconds (~584 years) is a broken clock;
+    // saturating keeps the gate's own guards in charge of failing it.
+    let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    ourios_bench::bytes_within_floor(nanos(ourios), nanos(loki), factor)
+}
+
+/// The Ourios half of the §3.6 latency channel: [`LATENCY_REPS`] timed
+/// end-to-end repetitions of the pair's own query through
+/// [`ourios_bench::ourios_query_answer`] — the honest per-query cost
+/// (count scan + row materialization + registry derivation, fresh
+/// querier and runtime per rep), median wall time. Ourios is timed
+/// **in-process** (no HTTP layer) while Loki is timed over localhost
+/// HTTP: negligible against multi-second scans, not against
+/// sub-millisecond answers — the report carries that caveat, and
+/// latency stays corroborating, not sole-gating (RFC 0031 §2.5). A
+/// failed repetition logs loudly and yields `None` ("latency:
+/// unmeasured") rather than failing the run.
+fn ourios_latency_p50(
+    bucket_root: &std::path::Path,
+    tenant: &TenantId,
+    spec: &PairSpec,
+) -> Option<Duration> {
+    let mut samples = Vec::with_capacity(LATENCY_REPS);
+    for _ in 0..LATENCY_REPS {
+        let start = std::time::Instant::now();
+        if let Err(e) =
+            ourios_bench::ourios_query_answer(bucket_root, tenant, &spec.dsl, spec.now, spec.window)
+        {
+            eprintln!(
+                "LATENCY UNMEASURED (ourios) [{}]: a timed repetition failed: {e:?}",
+                spec.label,
+            );
+            return None;
+        }
+        samples.push(start.elapsed());
+    }
+    median_duration(&samples)
+}
+
+/// The Loki half of the §3.6 latency channel: [`LATENCY_REPS`] timed
+/// `query_range` round trips of EXACTLY the measurement query (same
+/// `LogQL`, window, limit, direction as [`loki_query_with_stats`]),
+/// median wall time, the body drained inside the timing — delivering
+/// the result is part of the cost being measured. Runs post-poll
+/// ([`loki_measure_pair`] succeeded), so ingest has caught up and the
+/// reps are cache-warm, mirroring the Ourios side. A failed repetition
+/// logs loudly and yields `None` rather than failing the run.
+async fn loki_latency_p50(http: &reqwest::Client, base: &str, spec: &PairSpec) -> Option<Duration> {
+    let mut samples = Vec::with_capacity(LATENCY_REPS);
+    for _ in 0..LATENCY_REPS {
+        let start = std::time::Instant::now();
+        let sent = http
+            .get(format!("{base}/loki/api/v1/query_range"))
+            .query(&[
+                ("query", spec.logql.as_str()),
+                ("start", &spec.start.to_string()),
+                ("end", &spec.end.to_string()),
+                ("limit", "5000"),
+                ("direction", "forward"),
+            ])
+            .send()
+            .await;
+        let outcome = match sent {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.bytes().await {
+                    Ok(_) if status.is_success() => Ok(()),
+                    Ok(_) => Err(format!("HTTP {status}")),
+                    Err(e) => Err(format!("body read: {e}")),
+                }
+            }
+            Err(e) => Err(format!("transport: {e}")),
+        };
+        if let Err(detail) = outcome {
+            eprintln!(
+                "LATENCY UNMEASURED (loki) [{}]: a timed repetition failed: {detail}",
+                spec.label,
+            );
+            return None;
+        }
+        samples.push(start.elapsed());
+    }
+    median_duration(&samples)
+}
+
 /// Which direction a pair's bytes gate asks its question in (RFC 0031
 /// §2 dispositions): the L1–L4 classes must WIN by the margin, the
 /// L6/L7 family must merely stay WITHIN the floor factor.
@@ -1775,17 +1890,28 @@ async fn loki_measure_pair(
 
 /// Split successes from failures: equivalence + report run for every
 /// measured pair BEFORE the run fails on the broken ones, so one pair's
-/// timeout cannot destroy the others' 40-minute measurements.
-type Measured = (Vec<LineKey>, u64, LokiFetchedBytes);
+/// timeout cannot destroy the others' 40-minute measurements. The
+/// trailing `Option<Duration>` is the pair's Loki `latency_p50` —
+/// `None` when the (corroborating) latency channel failed on an
+/// otherwise-good pair, reported as "unmeasured".
+type Measured = (Vec<LineKey>, u64, LokiFetchedBytes, Option<Duration>);
+
+/// One pair's Ourios measurement: the correctness answer plus the §3.6
+/// latency channel (`None` = unmeasured; latency never fails the run).
+#[derive(Clone)]
+struct OuriosMeasured {
+    answer: ourios_bench::OuriosAnswer,
+    latency_p50: Option<Duration>,
+}
 
 #[allow(clippy::type_complexity)] // one-shot plumbing tuple for the runner
 fn split_measurements(
     specs: &[PairSpec],
-    ourios: &[ourios_bench::OuriosAnswer],
+    ourios: &[OuriosMeasured],
     loki: Vec<Result<Measured, String>>,
 ) -> (
     Vec<PairSpec>,
-    Vec<ourios_bench::OuriosAnswer>,
+    Vec<OuriosMeasured>,
     Vec<Measured>,
     Vec<String>,
 ) {
@@ -1950,7 +2076,7 @@ fn rfc0031_indicative_comparative_run() {
         rare_window: rare_window.as_ref(),
     };
     let specs = build_pair_specs(&picks, corpus_now, corpus_window);
-    let ourios: Vec<_> = specs
+    let ourios: Vec<OuriosMeasured> = specs
         .iter()
         .map(|spec| {
             let answer = ourios_bench::ourios_query_answer(
@@ -1967,7 +2093,12 @@ fn rfc0031_indicative_comparative_run() {
                 "Ourios must return exactly [{}]'s expected rows",
                 spec.label,
             );
-            answer
+            // Timed reps only after the pair's Ourios correctness holds.
+            let latency_p50 = ourios_latency_p50(bucket.path(), &tenant, spec);
+            OuriosMeasured {
+                answer,
+                latency_p50,
+            }
         })
         .collect();
 
@@ -2012,7 +2143,16 @@ fn rfc0031_indicative_comparative_run() {
         push_corpus_to_loki(&http, &base, &corpus_dir).await;
         let mut measured = Vec::with_capacity(specs.len());
         for spec in &specs {
-            measured.push(loki_measure_pair(&http, &base, spec).await);
+            let result = match loki_measure_pair(&http, &base, spec).await {
+                Ok((lines, bytes, fetched)) => {
+                    // Timed reps only after the poll proved ingest caught
+                    // up — post-poll, so warm-up asymmetry is minimized.
+                    let latency_p50 = loki_latency_p50(&http, &base, spec).await;
+                    Ok((lines, bytes, fetched, latency_p50))
+                }
+                Err(detail) => Err(detail),
+            };
+            measured.push(result);
         }
         measured
     });
@@ -2020,8 +2160,8 @@ fn rfc0031_indicative_comparative_run() {
     let (ok_specs, ok_ourios, ok_loki, failures) = split_measurements(&specs, &ourios, loki);
 
     // Equivalence gates every successful measurement (RFC0031.1).
-    for ((spec, ours), (loki_lines, _, _)) in ok_specs.iter().zip(&ok_ourios).zip(&ok_loki) {
-        let outcome = compare_lines(&ours.lines, loki_lines, 8);
+    for ((spec, ours), (loki_lines, _, _, _)) in ok_specs.iter().zip(&ok_ourios).zip(&ok_loki) {
+        let outcome = compare_lines(&ours.answer.lines, loki_lines, 8);
         assert!(
             outcome.is_equal(),
             "the two systems' answers must be multiset-identical on [{}]: {outcome:?}",
@@ -2051,23 +2191,33 @@ fn rfc0031_indicative_comparative_run() {
 /// chunk bytes + memory-served head-chunk bytes) is the apples-to-apples
 /// counterpart of Ourios's fetched-compressed-Parquet bytes. Both ratios
 /// are printed so the §9 entry can carry the honest pair of numbers.
+///
+/// The latency lines carry the §3.6 corroborating channel: warm p50s
+/// (median of [`LATENCY_REPS`] post-poll reps — see the asymmetry note
+/// on [`ourios_latency_p50`]: Ourios in-process, Loki over localhost
+/// HTTP), the `loki_p50/ourios_p50` ratio in the bytes gates'
+/// above-1.0-means-Ourios-faster orientation, and — for Floor pairs — the
+/// RFC0031.7 latency floor as written (`ourios_p50 ≤ F_L6 × loki_p50`).
 fn print_indicative_report(
     corpus_dir: &std::path::Path,
     total_records: u64,
     specs: &[PairSpec],
-    ourios: &[ourios_bench::OuriosAnswer],
-    loki: &[(Vec<LineKey>, u64, LokiFetchedBytes)],
+    ourios: &[OuriosMeasured],
+    loki: &[Measured],
 ) {
     println!("=== RFC 0031 indicative comparative run ===");
     println!("corpus: {} ({total_records} records)", corpus_dir.display());
-    for ((spec, ours), (_, loki_processed, loki_fetched)) in specs.iter().zip(ourios).zip(loki) {
+    for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
+        specs.iter().zip(ourios).zip(loki)
+    {
+        let answer = &ours.answer;
         let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
         let gate_storage = spec
             .gate
-            .evaluate(ours.bytes_read, loki_storage, spec.margin);
+            .evaluate(answer.bytes_read, loki_storage, spec.margin);
         let gate_processed = spec
             .gate
-            .evaluate(ours.bytes_read, *loki_processed, spec.margin);
+            .evaluate(answer.bytes_read, *loki_processed, spec.margin);
         println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
         println!("dsl: {}", spec.dsl);
         // The Ourios figure is the honest TOTAL (§3.6 measurement-fidelity
@@ -2076,7 +2226,10 @@ fn print_indicative_report(
         println!(
             "ourios bytes_read (compressed, fetched)   = {} \
              (count_scan={} + materialize={} + registry={})",
-            ours.bytes_read, ours.count_scan_bytes, ours.materialize_bytes, ours.registry_bytes,
+            answer.bytes_read,
+            answer.count_scan_bytes,
+            answer.materialize_bytes,
+            answer.registry_bytes,
         );
         println!(
             "loki   storage-side bytes (conservative)  = {loki_storage} \
@@ -2094,6 +2247,36 @@ fn print_indicative_report(
             spec.gate.margin_label(),
             spec.margin
         );
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        match ours.latency_p50 {
+            Some(p50) => println!(
+                "ourios latency_p50 (warm, in-process)      = {:.3} ms ({LATENCY_REPS} reps)",
+                ms(p50),
+            ),
+            None => println!("ourios latency_p50                         = unmeasured"),
+        }
+        match loki_latency {
+            Some(p50) => println!(
+                "loki   latency_p50 (warm, localhost HTTP)  = {:.3} ms ({LATENCY_REPS} reps)",
+                ms(*p50),
+            ),
+            None => println!("loki   latency_p50                         = unmeasured"),
+        }
+        if let (Some(ours_p50), Some(loki_p50)) = (ours.latency_p50, *loki_latency) {
+            println!(
+                "latency ratio loki_p50/ourios_p50 = {:.2} (>1.0 = Ourios faster; \
+                 corroborating only — Ourios is timed in-process, Loki over \
+                 localhost HTTP, which favours Ourios on sub-millisecond answers)",
+                ms(loki_p50) / ms(ours_p50),
+            );
+            if matches!(spec.gate, GateKind::Floor) {
+                println!(
+                    "latency floor gate (RFC0031.7, floor factor {}): {:?}",
+                    spec.margin,
+                    latency_floor_gate(ours_p50, loki_p50, spec.margin),
+                );
+            }
+        }
     }
 }
 
@@ -2876,4 +3059,44 @@ fn pick_rare_window_pair_selects_the_low_volume_service() {
     assert_eq!(rows, 3, "all three FIXTURE_SERVICE rows fit one window");
     assert!(start < end);
     assert!(start >= 1_000_000 && end <= 1_002_001);
+}
+
+#[test]
+fn median_duration_takes_the_middle_sample() {
+    let ms = Duration::from_millis;
+
+    // The K = 7 shape: the fourth-smallest, regardless of arrival order.
+    let reps = [ms(70), ms(10), ms(50), ms(30), ms(20), ms(60), ms(40)];
+    assert_eq!(median_duration(&reps), Some(ms(40)));
+
+    assert_eq!(median_duration(&[ms(9), ms(1), ms(5)]), Some(ms(5)));
+    assert_eq!(median_duration(&[ms(7)]), Some(ms(7)));
+    assert_eq!(
+        median_duration(&[ms(4), ms(1), ms(3), ms(2)]),
+        Some(ms(2) + Duration::from_micros(500)),
+        "even lengths take the mean of the two middles"
+    );
+    assert_eq!(median_duration(&[]), None);
+}
+
+#[test]
+fn latency_floor_gate_decides_in_nanoseconds() {
+    // The RFC0031.7 rule at F_L6 = 3: pass iff ourios_p50 ≤ 3 × loki_p50.
+    let ms = Duration::from_millis;
+    assert!(latency_floor_gate(ms(300), ms(100), 3).passed());
+    assert!(!latency_floor_gate(ms(301), ms(100), 3).passed());
+
+    // Sub-millisecond p50s stay decidable — the reason the gate runs on
+    // nanosecond integers, not milliseconds.
+    let us = Duration::from_micros;
+    assert!(latency_floor_gate(us(300), us(100), 3).passed());
+    assert!(!latency_floor_gate(us(301), us(100), 3).passed());
+
+    // The shared gate's honesty guards carry over: a zero measurement is
+    // Invalid, never a pass.
+    assert!(!latency_floor_gate(Duration::ZERO, ms(100), 3).passed());
+    assert!(matches!(
+        latency_floor_gate(Duration::ZERO, ms(100), 3),
+        ourios_bench::BytesGateOutcome::Invalid { .. }
+    ));
 }

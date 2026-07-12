@@ -576,12 +576,13 @@ fn parse_loki_root(response_json: &str) -> Result<serde_json::Value, BenchError>
     Ok(root)
 }
 
-/// The trace two fixture records share — the RFC0031.1 L3
-/// (trace-correlation) equivalence arm queries for exactly these two
-/// lines on both systems.
+/// The trace three fixture records share — two in [`FIXTURE_SERVICE`],
+/// one in [`FIXTURE_SERVICE_B`], so it spans service streams — the
+/// RFC0031.1 L3 (trace-correlation) equivalence arm queries for exactly
+/// these three lines on both systems.
 pub const FIXTURE_TRACE: &str = "00112233445566778899aabbccddeeff";
 
-/// The `service.name` every comparative-fixture record carries — the
+/// The `service.name` most comparative-fixture records carry — the
 /// resource identity both systems key on (Ourios: promoted service
 /// column; Loki: the `service_name` stream label its OTLP ingest derives).
 pub const FIXTURE_SERVICE: &str = "comparative-fixture";
@@ -678,10 +679,10 @@ pub fn comparative_fixture(base_ns: u64) -> Vec<FixtureRecord> {
     .collect()
 }
 
-/// The fixture as the OTLP `LogsData` wire shape: one resource whose
-/// `service.name` is [`FIXTURE_SERVICE`], one scope, one `LogRecord` per
-/// fixture record. The Ourios corpus line and the Loki OTLP push are both
-/// derived from this one value.
+/// The fixture as the OTLP `LogsData` wire shape: one `ResourceLogs`
+/// per distinct `service.name` (in first-appearance order), one scope
+/// each, one `LogRecord` per fixture record. The Ourios corpus line and
+/// the Loki OTLP push are both derived from this one value.
 #[must_use]
 pub fn fixture_logs_data(records: &[FixtureRecord]) -> LogsData {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};

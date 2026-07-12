@@ -128,7 +128,7 @@ fn rfc0031_1_result_set_equivalence() {
 
     // L3 (trace-correlation) equivalence on the fixture: DSL
     // `trace_id == …` and the LogQL structured-metadata filter must
-    // return the same two lines — the cheap cross-system validation of
+    // return the same three lines — the cheap cross-system validation of
     // the RFC 0031 L3 pair's query shapes.
     let ourios_trace = ourios_query_lines(
         bucket.path(),
@@ -1855,9 +1855,10 @@ fn select_pair_candidates_rejects_poisoned_bands() {
 
 #[test]
 fn pick_trace_pair_finds_the_shared_fixture_trace() {
-    // Two fixture records share FIXTURE_TRACE (eligible: 2 rows, clean
-    // timestamps, named service); the third record's trace has only one
-    // row — below the 2-row floor — so exactly one candidate remains.
+    // Three fixture records share FIXTURE_TRACE across two services
+    // (eligible: 3 rows, clean timestamps, named services); the remaining
+    // record's trace has only one row — below the 2-row floor — so
+    // exactly one candidate remains.
     let records = comparative_fixture(1_000_000);
     let corpus = tempfile::TempDir::new().expect("corpus dir");
     std::fs::write(

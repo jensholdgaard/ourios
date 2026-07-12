@@ -30,7 +30,9 @@
 //!   columns (`tenant_id`, `attributes`, `resource_attributes`,
 //!   `body`, both `params` list-element leaves,
 //!   `separators.list.element`).
-//! - Bloom filter on `template_id` (B2 predicate-pushdown).
+//! - Bloom filters on `template_id` (B2 predicate-pushdown),
+//!   `trace_id` / `span_id` (RFC 0031 L3 exact-id lookup — random
+//!   ids defeat min/max statistics), and every promoted column.
 //!
 //! [`CLAUDE.md`]: ../../../../CLAUDE.md
 

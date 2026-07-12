@@ -30,7 +30,7 @@ RFC 0031 comparative run #8 — with one small object GET.
 
 ## 2. Motivation
 
-### 2.1 The deferral condition has been met, with a number
+### 2.1 The deferral condition has been met — and measured
 
 RFC 0005 §3.7.1 pinned v1 as "no persisted per-tenant artifact: the
 audit stream *is* the alias store", and deferred the cached map with
@@ -172,10 +172,17 @@ kilobyte-scale object. Content:
 template memory (per-tenant template count is capped) times the
 per-template version count; templates are token strings, not log
 data. The alias map is rare operator actions. The artifact is
-therefore kilobytes-to-low-megabytes by construction — and always
-strictly smaller than the audit stream it folds, which carries the
-same templates *plus* envelopes, samples, hashes, and full history.
-A hard size guard is left open (§7).
+therefore expected to be kilobytes-to-low-megabytes, and on any
+tenant with meaningful history substantially smaller than the audit
+stream it folds (which carries the same templates *plus* envelopes,
+samples, hashes, and full history) — but this is a measured
+expectation, not a guarantee: on a very small tenant the frontier
+list and JSON envelope can exceed the audit bytes. The publisher
+therefore **abstains** when the serialized artifact is not smaller
+than the audit bytes just folded (nothing to win) or exceeds a
+configured size ceiling; the exact ceiling is an open question
+(§7). Abstention costs nothing — the no-artifact path is today's
+behaviour.
 
 ### 3.3 Freshness — the frontier check
 
@@ -267,6 +274,19 @@ querier serializes the fold it already holds plus the frontier it
 already listed, and publishes best-effort — a publish failure is
 telemetry, never a query failure.
 
+**Both folds, one scan — never a partial artifact.** The two
+derivation call sites are asymmetric (body rendering derives only
+the registry; only `resolves_to` queries derive the alias map), so
+a naive write-through after a registry-only miss would publish an
+artifact with an empty alias fold that a later alias query would
+trust. The miss path therefore folds **both** maps from the single
+`read_all_events` capture it already paid for — the marginal cost
+is CPU over in-memory events, zero extra IO — and publication of a
+partially populated artifact is forbidden by construction.
+RFC0033.1's property test covers both folds, and RFC0033.6's
+integration arm includes a body-rendering query followed by a
+`resolves_to` query against the artifact the first one published.
+
 Rationale:
 
 - **Zero extra derivation work.** The fold and the frontier are in
@@ -324,10 +344,17 @@ minted through the semconv registry (`weaver`):
 - the artifact byte size at publish (the number RFC0033.6 gates
   on).
 
-`QueryResult::registry_bytes_read` keeps its RFC 0031 §3.6 meaning
-— total bytes fetched to obtain the registry — and on a cache hit
-that is the artifact GET's byte length, making the win directly
-visible in the comparative harness with no channel changes.
+`QueryResult::registry_bytes_read` is today documented as bytes
+fetched from the tenant's **audit stream**; a cache hit fetches the
+artifact instead, and the artifact carries the alias fold and
+frontier alongside the registry. At green this RFC therefore
+**amends the field's contract** (and RFC 0031 §3.6's wording) to
+*template-map acquisition bytes*: the total bytes fetched to obtain
+body-rendering capability, whatever the source — the audit-stream
+fold on a miss, the artifact GET on a hit. One field, one honest
+meaning, no separate channel; the comparative harness needs no code
+change, and the alternative (a separate artifact-bytes field with
+the old field pinned to audit-stream-only) is recorded in §4.
 
 ## 4. Alternatives considered
 
@@ -510,7 +537,7 @@ Mapped to `CLAUDE.md` §6.2:
   matter?
 - [ ] **Retention/GC of audit files**: no audit retention exists
   today; when it lands, deleting folded files shrinks the live set
-  and correctly staleness-misses (§RFC0033.2), but the *fresh
+  and correctly staleness-misses (RFC0033.2), but the *fresh
   re-fold loses history* — that is a property of audit retention
   itself, to be pinned by the retention RFC, not by this cache.
 - [ ] **Should the freshness LIST count into RFC 0031

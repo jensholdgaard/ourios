@@ -10,7 +10,7 @@
 use ourios_core::audit::ParamType;
 use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
-use ourios_parquet::{DEFAULT_ZSTD_LEVEL, encode_records_to_parquet};
+use ourios_parquet::{DEFAULT_ZSTD_LEVEL, columns, encode_records_to_parquet};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 const TS0: u64 = 1_775_127_480_000_000_000;
@@ -59,7 +59,7 @@ fn trace_context_columns_carry_bloom_filters() {
     let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).expect("footer");
     let rg = reader.metadata().row_group(0);
 
-    for name in ["trace_id", "span_id", "template_id"] {
+    for name in [columns::TRACE_ID, columns::SPAN_ID, columns::TEMPLATE_ID] {
         let col = (0..rg.num_columns())
             .map(|i| rg.column(i))
             .find(|c| c.column_path().string() == name)

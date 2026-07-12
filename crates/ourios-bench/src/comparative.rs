@@ -576,10 +576,22 @@ fn parse_loki_root(response_json: &str) -> Result<serde_json::Value, BenchError>
     Ok(root)
 }
 
-/// The `service.name` every comparative-fixture record carries — the
+/// The trace three fixture records share — two in [`FIXTURE_SERVICE`],
+/// one in [`FIXTURE_SERVICE_B`], so it spans service streams — the
+/// RFC0031.1 L3 (trace-correlation) equivalence arm queries for exactly
+/// these three lines on both systems.
+pub const FIXTURE_TRACE: &str = "00112233445566778899aabbccddeeff";
+
+/// The `service.name` most comparative-fixture records carry — the
 /// resource identity both systems key on (Ourios: promoted service
 /// column; Loki: the `service_name` stream label its OTLP ingest derives).
 pub const FIXTURE_SERVICE: &str = "comparative-fixture";
+
+/// The second fixture service: one [`FIXTURE_TRACE`] record lives here so
+/// the shared trace genuinely SPANS services — the L3 equivalence arm
+/// then fails if the `LogQL` side is ever accidentally narrowed to a
+/// single stream.
+pub const FIXTURE_SERVICE_B: &str = "comparative-fixture-b";
 
 /// One comparative-fixture log record: the **single source of truth** for
 /// the RFC0031.1 equivalence check. The same records are rendered as the
@@ -597,6 +609,12 @@ pub struct FixtureRecord {
     pub severity_text: &'static str,
     /// The log line (string body).
     pub body: &'static str,
+    /// Optional trace context, as 32 hex digits (the DSL's `trace_id`
+    /// literal shape). `None` leaves the wire field empty — the common
+    /// case for uninstrumented lines.
+    pub trace_id: Option<&'static str>,
+    /// The record's `service.name` (its `ResourceLogs` stream identity).
+    pub service: &'static str,
 }
 
 /// The deterministic comparative fixture, timestamped from `base_ns`.
@@ -609,62 +627,124 @@ pub struct FixtureRecord {
 pub fn comparative_fixture(base_ns: u64) -> Vec<FixtureRecord> {
     // Distinct timestamps (LineKey identity is (timestamp, body)) and a
     // severity mix so severity-filtered pairs have selective results.
+    // Three records share FIXTURE_TRACE — two in FIXTURE_SERVICE, one in
+    // FIXTURE_SERVICE_B, so the trace genuinely spans service streams
+    // (the L3 arm's structural point) — while one record carries a
+    // different trace the L3 arm must NOT return. The service-B record
+    // mirrors the ERROR band so the severity picker's deterministic
+    // service tiebreak still selects FIXTURE_SERVICE.
     [
-        (0, 9, "INFO", "user 1 logged in"),
-        (1_000, 9, "INFO", "user 2 logged in"),
-        (2_000, 17, "ERROR", "payment 7 failed"),
+        (
+            0,
+            9,
+            "INFO",
+            "user 1 logged in",
+            Some(FIXTURE_TRACE),
+            FIXTURE_SERVICE,
+        ),
+        (
+            1_000,
+            9,
+            "INFO",
+            "user 2 logged in",
+            Some("ffeeddccbbaa99887766554433221100"),
+            FIXTURE_SERVICE,
+        ),
+        (
+            2_000,
+            17,
+            "ERROR",
+            "payment 7 failed",
+            Some(FIXTURE_TRACE),
+            FIXTURE_SERVICE,
+        ),
+        (
+            3_000,
+            17,
+            "ERROR",
+            "payment 7 retried",
+            Some(FIXTURE_TRACE),
+            FIXTURE_SERVICE_B,
+        ),
     ]
     .into_iter()
-    .map(|(off, num, text, body)| FixtureRecord {
+    .map(|(off, num, text, body, trace_id, service)| FixtureRecord {
         time_unix_nano: base_ns + off,
         severity_number: num,
         severity_text: text,
         body,
+        trace_id,
+        service,
     })
     .collect()
 }
 
-/// The fixture as the OTLP `LogsData` wire shape: one resource whose
-/// `service.name` is [`FIXTURE_SERVICE`], one scope, one `LogRecord` per
-/// fixture record. The Ourios corpus line and the Loki OTLP push are both
-/// derived from this one value.
+/// The fixture as the OTLP `LogsData` wire shape: one `ResourceLogs`
+/// per distinct `service.name` (in first-appearance order), one scope
+/// each, one `LogRecord` per fixture record. The Ourios corpus line and
+/// the Loki OTLP push are both derived from this one value.
 #[must_use]
 pub fn fixture_logs_data(records: &[FixtureRecord]) -> LogsData {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
 
-    let log_records = records
-        .iter()
-        .map(|r| LogRecord {
+    // One ResourceLogs per distinct service, in first-appearance order —
+    // deterministic wire shape, and a multi-service fixture lands as the
+    // multiple streams the L3 arm exists to cross.
+    let mut by_service: Vec<(&str, Vec<LogRecord>)> = Vec::new();
+    for r in records {
+        let record = LogRecord {
             time_unix_nano: r.time_unix_nano,
             severity_number: r.severity_number,
             severity_text: r.severity_text.to_string(),
             body: Some(AnyValue {
                 value: Some(any_value::Value::StringValue(r.body.to_string())),
             }),
+            trace_id: r.trace_id.map(hex_to_bytes).unwrap_or_default(),
             ..LogRecord::default()
-        })
-        .collect();
-    LogsData {
-        resource_logs: vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: vec![KeyValue {
-                    key: "service.name".to_string(),
-                    value: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(FIXTURE_SERVICE.to_string())),
-                    }),
-                    ..KeyValue::default()
-                }],
-                ..Resource::default()
-            }),
-            scope_logs: vec![ScopeLogs {
-                log_records,
-                ..ScopeLogs::default()
-            }],
-            ..ResourceLogs::default()
-        }],
+        };
+        match by_service.iter_mut().find(|(svc, _)| *svc == r.service) {
+            Some((_, records)) => records.push(record),
+            None => by_service.push((r.service, vec![record])),
+        }
     }
+    LogsData {
+        resource_logs: by_service
+            .into_iter()
+            .map(|(service, log_records)| ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(service.to_string())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Resource::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records,
+                    ..ScopeLogs::default()
+                }],
+                ..ResourceLogs::default()
+            })
+            .collect(),
+    }
+}
+
+/// Fixture-side hex decode (exactly 32 hex digits → 16 bytes). Panics on a bad
+/// literal — fixture constants are compile-time authored, so a typo
+/// should fail the test loudly, not ship a silently-empty trace.
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    assert!(
+        hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "fixture trace_id {hex:?} is not exactly 32 hex digits",
+    );
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("checked hex digits"))
+        .collect()
 }
 
 /// The fixture rendered as one OTLP/JSON Lines corpus line — the format
@@ -879,7 +959,7 @@ mod tests {
         let built =
             crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
                 .expect("build store");
-        assert_eq!(built.rows, 3, "one stored row per fixture record");
+        assert_eq!(built.rows, 4, "one stored row per fixture record");
 
         let tenant = TenantId::new(built.tenant);
         let now = built.max_effective_time_unix_nano + 1;
@@ -941,7 +1021,7 @@ mod tests {
             window,
         )
         .expect("query answer");
-        assert_eq!(answer.lines.len(), 3, "every fixture row rendered");
+        assert_eq!(answer.lines.len(), 4, "every fixture row rendered");
 
         assert_eq!(
             answer.bytes_read,
@@ -950,7 +1030,7 @@ mod tests {
         );
         assert_eq!(
             answer.count_scan_bytes, 0,
-            "3 matches < limit 1000 ⇒ the result is complete ⇒ the count \
+            "4 matches < limit 1000 ⇒ the result is complete ⇒ the count \
              scan was elided and its component is an honest 0",
         );
         assert!(
@@ -962,19 +1042,19 @@ mod tests {
             "body reconstruction reads the audit stream — it must be counted",
         );
 
-        // The exact-limit edge: 3 matches with `limit 3` looks truncated
+        // The exact-limit edge: 4 matches with `limit 4` looks truncated
         // (returned == limit), so the querier must fall back to the count
         // scan to prove completeness — the component is real bytes again,
         // and the completeness guard still passes because rows == rendered.
         let exact = ourios_query_answer(
             bucket.path(),
             &tenant,
-            "severity >= 0 | limit 3",
+            "severity >= 0 | limit 4",
             now,
             window,
         )
         .expect("exact-limit query answer");
-        assert_eq!(exact.lines.len(), 3, "still the complete result");
+        assert_eq!(exact.lines.len(), 4, "still the complete result");
         assert!(
             exact.count_scan_bytes > 0,
             "returned == limit ⇒ fell back to the count scan",

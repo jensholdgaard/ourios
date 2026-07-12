@@ -1207,10 +1207,14 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
             continue;
         }
         let (clean, poison) = collect_service_timestamps(corpus_dir, &service);
-        // Descending window-size ladder: the largest k may have no clean
-        // edges even when smaller ones do, and the lowest-volume service
-        // should win with ANY valid 2..=100-row window before falling
-        // through to a busier one. Clamped duplicates are skipped.
+        // Descending window-size ladder — a deliberate SAMPLING of the
+        // 2..=100 range, not an exhaustive search: the largest k may
+        // have no clean edges even when smaller ones do, and a
+        // lower-volume service should win at any sampled size before a
+        // busier one is tried. A window valid only at an unsampled
+        // intermediate k falls through — acceptable for a diagnostic,
+        // where 99 validity passes per service buys no measurement
+        // value. Clamped duplicates are skipped.
         let mut tried = 0usize;
         for k in [100usize, 50, 20, 10, 5, 2] {
             let k = k.min(clean.len());

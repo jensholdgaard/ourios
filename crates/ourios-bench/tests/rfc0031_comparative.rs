@@ -1582,9 +1582,11 @@ fn ourios_latency_p50(
 /// where equivalence broke — the run panics before the report prints —
 /// so published latencies always come from equivalence-held runs.
 async fn loki_latency_p50(http: &reqwest::Client, base: &str, spec: &PairSpec) -> Option<Duration> {
-    // Everything allocatable is built OUTSIDE the timed region; the
-    // body is chunk-drained (not buffered) inside it — delivery is part
-    // of the measured cost, a whole-body buffer is not.
+    // The heavy strings (URL, window bounds) are built outside the
+    // timed region; the per-rep request builder still runs inside it —
+    // a client constructing its request is part of an honest round
+    // trip. The body is chunk-drained (not buffered) inside the timing:
+    // delivery is part of the measured cost, a whole-body buffer is not.
     let url = format!("{base}/loki/api/v1/query_range");
     let (start_s, end_s) = (spec.start.to_string(), spec.end.to_string());
     let mut samples = Vec::with_capacity(LATENCY_REPS);

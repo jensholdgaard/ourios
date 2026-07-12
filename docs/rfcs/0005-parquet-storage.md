@@ -541,8 +541,8 @@ Per-column encoding decisions, anchored to query patterns
 | `scope_version` | yes | yes | no | Bounded per deployment |
 | `attributes` | no | no | no | JSON BYTE_ARRAY, high entropy, dict would balloon |
 | `resource_attributes` | yes | no | no | Repetitive across rows of one tenant; dict pays |
-| `trace_id` | no | yes | no | High cardinality, near-random — dict and bloom both lose |
-| `span_id` | no | yes | no | Same |
+| `trace_id` | no | yes | **yes** | Near-random ids defeat min/max statistics, so dict loses but the bloom is what makes an exact-id lookup prunable at all (amendment 2026-07-12, below) |
+| `span_id` | no | yes | **yes** | Same |
 | `flags` | yes | yes | no | Bounded |
 | `event_name` | yes | yes | no | Bounded |
 | `body_kind` | yes | yes | no | Two values |
@@ -552,6 +552,22 @@ Per-column encoding decisions, anchored to query patterns
 | `confidence` | no | yes | no | Float, narrow range, page-index sufficient |
 | `lossy_flag` | n/a | yes | no | Boolean, RLE handles it |
 | `dropped_attributes_count` | yes | yes | no | Almost always zero |
+
+> **Amendment (2026-07-12): bloom filters on `trace_id` and `span_id`.**
+> This table originally said "dict and bloom both lose" for the
+> trace-context ids — right about dictionaries, measurably wrong about
+> blooms. The two judgments conflate different costs: dictionary
+> encoding loses because near-random values don't repeat, but a bloom
+> filter's value is not compression — it is the ONLY pruning mechanism
+> an exact-id lookup has, precisely *because* near-random ids defeat
+> min/max statistics. RFC 0031 comparative run #12 (otel-demo-v8,
+> 4.9 M records) measured the cost of the original decision: a 9-row
+> trace lookup read 72.4 MB — the `trace_id` column scanned
+> corpus-wide. With blooms (run #14): 4.8 MB, a 15.2× collapse, and
+> the RFC 0031 L3 must-win passes at 21.9× storage-side / 514.6×
+> processed-bytes against the reference system. Blooms are optional
+> column metadata: no schema change, old files and old readers
+> unaffected in both directions (§3.9).
 
 The `body` row is the only one with bold weight: a writer that
 quietly enables dictionary encoding on `body` because Arrow's

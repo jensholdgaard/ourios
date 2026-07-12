@@ -1320,11 +1320,11 @@ service, full corpus span, 1 row. The run series doubles as the
 read-path optimisation ledger (component split: count scan +
 materialize + registry):
 
-| run | lever | ourios bytes (count + mat + reg) | storage | processed |
-|---|---|---|---|---|
-| #8 | baseline | 4,270,091 (609,498 + 3,146,731 + 513,862) | 0.67× | 20.9× |
-| #9 | single-pass scan (#485) | 3,660,593 (0 + 3,146,731 + 513,862) | 0.86× | 26.8× |
-| #10 | late materialization (#486) | 2,549,129 (0 + 2,035,267 + 513,862) | 1.08× | 33.4× |
+| run | lever | ourios bytes (count + mat + reg) | loki storage | loki processed | storage | processed |
+|---|---|---|---|---|---|---|
+| #8 | baseline | 4,270,091 (609,498 + 3,146,731 + 513,862) | 2,880,784 | 89,184,711 | 0.67× | 20.9× |
+| #9 | single-pass scan (#485) | 3,660,593 (0 + 3,146,731 + 513,862) | 3,158,323 | 98,114,703 | 0.86× | 26.8× |
+| #10 | late materialization (#486) | 2,549,129 (0 + 2,035,267 + 513,862) | 2,751,834 | 85,261,718 | 1.08× | 33.4× |
 
 (Run #8's Loki side: 2,880,784 storage / 89,184,711 processed.)
 Across the later reproductions the storage-side ratio sits at

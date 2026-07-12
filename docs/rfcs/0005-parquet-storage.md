@@ -541,8 +541,8 @@ Per-column encoding decisions, anchored to query patterns
 | `scope_version` | yes | yes | no | Bounded per deployment |
 | `attributes` | no | no | no | JSON BYTE_ARRAY, high entropy, dict would balloon |
 | `resource_attributes` | yes | no | no | Repetitive across rows of one tenant; dict pays |
-| `trace_id` | no | yes | no | High cardinality, near-random — dict and bloom both lose |
-| `span_id` | no | yes | no | Same |
+| `trace_id` | no | yes | yes | Near-random ids defeat min/max pruning, so dict loses and the page index's *column*-index half is inert — it stays enabled for the *offset* index, which page-selective reads under filter pushdown need to fetch just the matched rows' pages; the bloom is what makes the exact-id lookup prunable at all (amendment 2026-07-12, below) |
+| `span_id` | no | yes | yes | Same |
 | `flags` | yes | yes | no | Bounded |
 | `event_name` | yes | yes | no | Bounded |
 | `body_kind` | yes | yes | no | Two values |
@@ -553,7 +553,26 @@ Per-column encoding decisions, anchored to query patterns
 | `lossy_flag` | n/a | yes | no | Boolean, RLE handles it |
 | `dropped_attributes_count` | yes | yes | no | Almost always zero |
 
-The `body` row is the only one with bold weight: a writer that
+> **Amendment (2026-07-12): bloom filters on `trace_id` and `span_id`.**
+> This table originally said "dict and bloom both lose" for the
+> trace-context ids — right about dictionaries, measurably wrong about
+> blooms. The two judgments conflate different costs: dictionary
+> encoding loses because near-random values don't repeat, but a bloom
+> filter's value is not compression — it is the ONLY pruning mechanism
+> an exact-id lookup has, precisely *because* near-random ids defeat
+> min/max statistics. RFC 0031 comparative run #12 (otel-demo-v8,
+> 4.9 M records) measured the cost of the original decision: a 9-row
+> trace lookup read 72,935,984 bytes — the `trace_id` column scanned
+> corpus-wide. With blooms (run #14): 4,812,668 bytes, a 15.2×
+> collapse, and the RFC 0031 L3 must-win passes at 21.9× storage-side
+> / 514.6× processed-bytes against the reference system. Blooms are
+> optional Parquet column-chunk metadata, not a schema element: files
+> written without them remain readable, readers that don't consult
+> them are simply unaccelerated, and no migration exists to plan.
+
+The `body` **row** is the only one bolded end to end (the lone
+bold *cells* elsewhere mark bloom decisions that carry their own
+rationale text): a writer that
 quietly enables dictionary encoding on `body` because Arrow's
 default does so violates `CLAUDE.md` §3.2 ("Drain assumes
 parameters are short, variable bits. Reality: a `params` slot

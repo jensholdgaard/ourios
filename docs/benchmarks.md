@@ -1406,11 +1406,14 @@ exactly these deviations from stock:
   consulted — without it Loki's answer to an old-range query is
   silently incomplete.
 - Raised ingestion + per-stream rate limits
-  (`-distributor.ingestion-rate-limit-mb=512`, burst 1024;
-  `-ingester.per-stream-rate-limit=512MB`, burst 1GB) — replay is
+  (`-distributor.ingestion-rate-limit-mb=512`,
+  `-distributor.ingestion-burst-size-mb=1024`,
+  `-ingester.per-stream-rate-limit=512MB`,
+  `-ingester.per-stream-rate-limit-burst=1GB`) — replay is
   far faster than the capture's real-time rate.
 - Raised internal gRPC message caps
-  (`-server.grpc-max-{recv,send}-msg-size-bytes=16777216`) — runs
+  (`-server.grpc-max-recv-msg-size-bytes=16777216`,
+  `-server.grpc-max-send-msg-size-bytes=16777216`) — runs
   #2–#4 failed on the same ~5.27 MB internal message regardless of
   our outer batch size: a single kafka-service LogsData line's
   content alone inflates past Loki's stock 4 MiB internal cap.

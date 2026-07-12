@@ -576,6 +576,11 @@ fn parse_loki_root(response_json: &str) -> Result<serde_json::Value, BenchError>
     Ok(root)
 }
 
+/// The trace two fixture records share — the RFC0031.1 L3
+/// (trace-correlation) equivalence arm queries for exactly these two
+/// lines on both systems.
+pub const FIXTURE_TRACE: &str = "00112233445566778899aabbccddeeff";
+
 /// The `service.name` every comparative-fixture record carries — the
 /// resource identity both systems key on (Ourios: promoted service
 /// column; Loki: the `service_name` stream label its OTLP ingest derives).
@@ -597,6 +602,10 @@ pub struct FixtureRecord {
     pub severity_text: &'static str,
     /// The log line (string body).
     pub body: &'static str,
+    /// Optional trace context, as 32 hex digits (the DSL's `trace_id`
+    /// literal shape). `None` leaves the wire field empty — the common
+    /// case for uninstrumented lines.
+    pub trace_id: Option<&'static str>,
 }
 
 /// The deterministic comparative fixture, timestamped from `base_ns`.
@@ -609,17 +618,27 @@ pub struct FixtureRecord {
 pub fn comparative_fixture(base_ns: u64) -> Vec<FixtureRecord> {
     // Distinct timestamps (LineKey identity is (timestamp, body)) and a
     // severity mix so severity-filtered pairs have selective results.
+    // Two records share FIXTURE_TRACE (a trace-correlation pair must
+    // return >1 line to be a meaningful multiset check), one carries a
+    // different trace — the L3 arm must NOT return it.
     [
-        (0, 9, "INFO", "user 1 logged in"),
-        (1_000, 9, "INFO", "user 2 logged in"),
-        (2_000, 17, "ERROR", "payment 7 failed"),
+        (0, 9, "INFO", "user 1 logged in", Some(FIXTURE_TRACE)),
+        (
+            1_000,
+            9,
+            "INFO",
+            "user 2 logged in",
+            Some("ffeeddccbbaa99887766554433221100"),
+        ),
+        (2_000, 17, "ERROR", "payment 7 failed", Some(FIXTURE_TRACE)),
     ]
     .into_iter()
-    .map(|(off, num, text, body)| FixtureRecord {
+    .map(|(off, num, text, body, trace_id)| FixtureRecord {
         time_unix_nano: base_ns + off,
         severity_number: num,
         severity_text: text,
         body,
+        trace_id,
     })
     .collect()
 }
@@ -643,6 +662,7 @@ pub fn fixture_logs_data(records: &[FixtureRecord]) -> LogsData {
             body: Some(AnyValue {
                 value: Some(any_value::Value::StringValue(r.body.to_string())),
             }),
+            trace_id: r.trace_id.map(hex_to_bytes).unwrap_or_default(),
             ..LogRecord::default()
         })
         .collect();
@@ -665,6 +685,20 @@ pub fn fixture_logs_data(records: &[FixtureRecord]) -> LogsData {
             ..ResourceLogs::default()
         }],
     }
+}
+
+/// Fixture-side hex decode (32 hex digits → 16 bytes). Panics on a bad
+/// literal — fixture constants are compile-time authored, so a typo
+/// should fail the test loudly, not ship a silently-empty trace.
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    assert!(
+        hex.len().is_multiple_of(2) && hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "fixture trace_id {hex:?} is not a hex string",
+    );
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("checked hex digits"))
+        .collect()
 }
 
 /// The fixture rendered as one OTLP/JSON Lines corpus line — the format

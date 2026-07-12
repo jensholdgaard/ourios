@@ -21,9 +21,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
-    FIXTURE_SERVICE, FixtureRecord, LineKey, LokiFetchedBytes, comparative_fixture, compare_lines,
-    fixture_jsonl, fixture_logs_data, ourios_query_lines, parse_loki_bytes_processed,
-    parse_loki_fetched_bytes, parse_loki_streams,
+    FIXTURE_SERVICE, FIXTURE_TRACE, FixtureRecord, LineKey, LokiFetchedBytes, comparative_fixture,
+    compare_lines, fixture_jsonl, fixture_logs_data, ourios_query_lines,
+    parse_loki_bytes_processed, parse_loki_fetched_bytes, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
 
@@ -102,7 +102,7 @@ fn rfc0031_1_result_set_equivalence() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (loki_all, loki_narrow) = runtime.block_on(loki_round_trip(&records, base_ns));
+    let (loki_all, loki_narrow, loki_trace) = runtime.block_on(loki_round_trip(&records, base_ns));
 
     // ------------------------------------------------------------------
     // The equivalence check itself (RFC0031.1): identical multisets for
@@ -116,6 +116,25 @@ fn rfc0031_1_result_set_equivalence() {
     assert!(
         !compare_lines(&ourios_lines, &loki_narrow, 8).is_equal(),
         "the deliberately-narrower LogQL must report Mismatch, not silently pass",
+    );
+
+    // L3 (trace-correlation) equivalence on the fixture: DSL
+    // `trace_id == …` and the LogQL structured-metadata filter must
+    // return the same two lines — the cheap cross-system validation of
+    // the RFC 0031 L3 pair's query shapes.
+    let ourios_trace = ourios_query_lines(
+        bucket.path(),
+        &tenant,
+        &format!("trace_id == \"{FIXTURE_TRACE}\" | limit 1000"),
+        now,
+        window,
+    )
+    .expect("ourios trace extraction");
+    assert_eq!(ourios_trace.len(), 2, "both FIXTURE_TRACE lines match");
+    let trace_outcome = compare_lines(&ourios_trace, &loki_trace, 8);
+    assert!(
+        trace_outcome.is_equal(),
+        "L3 arm — the two systems' trace answers must be multiset-identical: {trace_outcome:?}",
     );
 }
 
@@ -244,7 +263,10 @@ async fn push_otlp(http: &reqwest::Client, base: &str, payload: Vec<u8>) {
 /// `LogsData` value the Ourios corpus was rendered from over the native
 /// OTLP endpoint, then answer two `LogQL` queries — the fixture-equivalent
 /// one (all lines) and a deliberately narrower one (the mismatch arm).
-async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKey>, Vec<LineKey>) {
+async fn loki_round_trip(
+    records: &[FixtureRecord],
+    base_ns: u64,
+) -> (Vec<LineKey>, Vec<LineKey>, Vec<LineKey>) {
     use prost::Message as _;
 
     let (_container, base, http) = start_loki(&[]).await;
@@ -285,7 +307,22 @@ async fn loki_round_trip(records: &[FixtureRecord], base_ns: u64) -> (Vec<LineKe
         2,
         "the narrower filter must match exactly the two 'logged in' lines",
     );
-    (loki_all, loki_narrow)
+
+    // L3 arm: Loki's OTLP ingest lands `trace_id` in structured metadata
+    // as lowercase hex; this filter is the LogQL half of the RFC 0031 L3
+    // (trace-correlation) pair, validated here on the fixture so a wrong
+    // metadata key name fails this PR-gated job, not a 40-minute
+    // dispatch run. The `.+` selector is deliberate — a trace spans
+    // services, so the honest Loki query cannot pre-narrow to one stream.
+    let trace_logql = format!("{{service_name=~\".+\"}} | trace_id=\"{FIXTURE_TRACE}\"");
+    let loki_trace = loki_query_range(&http, &base, &trace_logql, start, end).await;
+    assert_eq!(
+        loki_trace.len(),
+        2,
+        "the trace filter must match exactly the two FIXTURE_TRACE lines \
+         (a wrong structured-metadata key would return 0)",
+    );
+    (loki_all, loki_narrow, loki_trace)
 }
 
 /// One Loki `query_range` call, parsed to [`LineKey`]s.
@@ -685,6 +722,94 @@ fn collect_service_timestamps(corpus_dir: &std::path::Path, service: &str) -> (V
     (clean, poison)
 }
 
+/// Per-trace tally for [`pick_trace_pair`].
+#[derive(Default)]
+struct TraceTally {
+    rows: u64,
+    has_zero_ts: bool,
+    has_empty_service: bool,
+    first_service: String,
+    multi_service: bool,
+}
+
+/// Third streaming pass, for the L3 (trace-correlation) pair: tally
+/// every 16-byte `trace_id` in the corpus and pick the one to query.
+/// Eligibility mirrors the other pickers' honesty rules: no
+/// zero-`time_unix_nano` row (the two systems would answer with
+/// different keys — a guaranteed mismatch) and no empty-service row
+/// (the `LogQL` side's `{service_name=~".+"}` selector could not see it),
+/// with `2..=100` rows so the result is a meaningful multiset that fits
+/// one page. Preference order: multi-service traces first (the class\'s
+/// structural point — Loki cannot pre-narrow a cross-service trace to
+/// one stream), then the most rows, then the lexicographically smallest
+/// id for deterministic reruns. Returns `(hex_id, rows)`.
+fn pick_trace_pair(corpus_dir: &std::path::Path) -> Option<(String, u64)> {
+    use std::collections::HashMap;
+    use std::io::BufRead as _;
+
+    let mut traces: HashMap<[u8; 16], TraceTally> = HashMap::new();
+    for path in corpus_jsonl_paths(corpus_dir) {
+        let file = std::fs::File::open(&path).expect("open corpus file");
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.expect("read corpus line");
+            if line.trim().is_empty() {
+                continue;
+            }
+            let data: opentelemetry_proto::tonic::logs::v1::LogsData =
+                serde_json::from_str(&line).expect("parse LogsData line");
+            for rl in &data.resource_logs {
+                let service = rl
+                    .resource
+                    .as_ref()
+                    .and_then(|r| r.attributes.iter().find(|kv| kv.key == "service.name"))
+                    .and_then(|kv| kv.value.as_ref())
+                    .and_then(|v| v.value.as_ref())
+                    .and_then(|v| match v {
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            s,
+                        ) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                for sl in &rl.scope_logs {
+                    for lr in &sl.log_records {
+                        let Ok(id) = <[u8; 16]>::try_from(lr.trace_id.as_slice()) else {
+                            continue;
+                        };
+                        let tally = traces.entry(id).or_default();
+                        tally.rows += 1;
+                        tally.has_zero_ts |= lr.time_unix_nano == 0;
+                        tally.has_empty_service |= service.is_empty();
+                        if tally.first_service.is_empty() {
+                            tally.first_service = service.to_string();
+                        } else if tally.first_service != service {
+                            tally.multi_service = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    traces
+        .into_iter()
+        .filter(|(_, t)| !t.has_zero_ts && !t.has_empty_service && (2..=100).contains(&t.rows))
+        .max_by(|(a_id, a), (b_id, b)| {
+            (a.multi_service, a.rows, std::cmp::Reverse(a_id)).cmp(&(
+                b.multi_service,
+                b.rows,
+                std::cmp::Reverse(b_id),
+            ))
+        })
+        .map(|(id, t)| {
+            use std::fmt::Write as _;
+            let hex = id.iter().fold(String::new(), |mut out, b| {
+                let _ = write!(out, "{b:02x}");
+                out
+            });
+            (hex, t.rows)
+        })
+}
+
 /// Pick a `k`-row time-window slice `[a, b)` of a service's records with
 /// CLEAN EDGES, preferring mid-corpus. `clean_ts` and `poison_ts` come
 /// sorted from [`collect_service_timestamps`]. A candidate start index
@@ -984,6 +1109,7 @@ fn build_pair_specs(
     pair: &SelectivePair,
     clean_ts: &[u64],
     poison_ts: &[u64],
+    trace: Option<&(String, u64)>,
     corpus_now: u64,
     corpus_window: u64,
 ) -> Vec<PairSpec> {
@@ -1036,6 +1162,33 @@ fn build_pair_specs(
             now: end,
             window: end - start,
         });
+    }
+    // L3 must-win: an exact trace lookup over the full corpus window.
+    // Loki cannot pre-narrow a trace to a stream (`.+` selector +
+    // structured-metadata filter = a scan across every service); Ourios
+    // compiles it to a trace_id column equality. Skipping when no
+    // eligible trace exists is LOUD (stderr + a 3-section report), never
+    // silent.
+    match trace {
+        Some((hex, rows)) => specs.push(PairSpec {
+            label: format!("trace correlation, L3 family: trace_id={hex}"),
+            margin: ourios_bench::ComparativeMargins::default().m_l3,
+            gate: GateKind::MustWin,
+            dsl: format!("trace_id == \"{hex}\" | limit 5000"),
+            logql: format!("{{service_name=~\".+\"}} | trace_id=\"{hex}\""),
+            start: pair.min_ts,
+            end: pair
+                .max_ts
+                .checked_add(1)
+                .expect("corpus max timestamp overflows the Loki window end"),
+            expected_rows: *rows,
+            now: corpus_now,
+            window: corpus_window,
+        }),
+        None => eprintln!(
+            "L3 PAIR SKIPPED: no eligible trace (16-byte id, no zero-ts/empty-service rows, \
+             2..=100 rows) in the corpus"
+        ),
     }
     specs
 }
@@ -1099,6 +1252,8 @@ fn rfc0031_indicative_comparative_run() {
         clean_ts.len(),
         poison_ts.len(),
     );
+    let trace = pick_trace_pair(&corpus_dir);
+    eprintln!("trace pair: {trace:?}");
 
     // The (locally-proven) Ourios half, per pair.
     let bucket = tempfile::TempDir::new().expect("bucket dir");
@@ -1114,7 +1269,14 @@ fn rfc0031_indicative_comparative_run() {
         .checked_add(1)
         .expect("corpus max effective timestamp overflows now");
     let corpus_window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
-    let specs = build_pair_specs(&pair, &clean_ts, &poison_ts, corpus_now, corpus_window);
+    let specs = build_pair_specs(
+        &pair,
+        &clean_ts,
+        &poison_ts,
+        trace.as_ref(),
+        corpus_now,
+        corpus_window,
+    );
     let ourios: Vec<_> = specs
         .iter()
         .map(|spec| {
@@ -1273,18 +1435,21 @@ fn pick_selective_pair_generalizes_without_error_rows() {
             severity_number: 9,
             severity_text: "INFO",
             body: "user 1 logged in",
+            trace_id: None,
         },
         FixtureRecord {
             time_unix_nano: 2_000,
             severity_number: 9,
             severity_text: "INFO",
             body: "user 2 logged in",
+            trace_id: None,
         },
         FixtureRecord {
             time_unix_nano: 3_000,
             severity_number: 13,
             severity_text: "WARN",
             body: "cache nearly full",
+            trace_id: None,
         },
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
@@ -1670,4 +1835,53 @@ fn select_pair_candidates_rejects_poisoned_bands() {
         select_pair_candidates(&poisoned_text).is_empty(),
         "a below-threshold poison row carrying the text disqualifies the candidate"
     );
+}
+
+#[test]
+fn pick_trace_pair_finds_the_shared_fixture_trace() {
+    // Two fixture records share FIXTURE_TRACE (eligible: 2 rows, clean
+    // timestamps, named service); the third record's trace has only one
+    // row — below the 2-row floor — so exactly one candidate remains.
+    let records = comparative_fixture(1_000_000);
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+
+    let (hex, rows) = pick_trace_pair(corpus.path()).expect("the shared trace is eligible");
+    assert_eq!(hex, FIXTURE_TRACE);
+    assert_eq!(rows, 2);
+}
+
+#[test]
+fn pick_trace_pair_rejects_zero_ts_traces() {
+    // A trace containing any zero-time_unix_nano row is poison (the two
+    // systems answer with different keys); with every trace poisoned or
+    // single-row, there is no candidate.
+    let records = vec![
+        FixtureRecord {
+            time_unix_nano: 0,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "zero ts row",
+            trace_id: Some("00112233445566778899aabbccddeeff"),
+        },
+        FixtureRecord {
+            time_unix_nano: 1_000,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: "clean row same trace",
+            trace_id: Some("00112233445566778899aabbccddeeff"),
+        },
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+
+    assert_eq!(pick_trace_pair(corpus.path()), None);
 }

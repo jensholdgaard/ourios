@@ -1617,7 +1617,7 @@ fn class_pair_specs(
     match trace {
         Some((hex, rows)) => specs.push(PairSpec {
             label: format!("trace correlation, L3 family: trace_id={hex}"),
-            margin: ourios_bench::ComparativeMargins::default().m_l3,
+            margin: margins.m_l3,
             gate: GateKind::MustWin,
             dsl: format!("trace_id == \"{hex}\" | limit 5000"),
             logql: format!("{{service_name=~\".+\"}} | trace_id=\"{hex}\""),

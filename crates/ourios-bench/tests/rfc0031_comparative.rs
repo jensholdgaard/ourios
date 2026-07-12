@@ -1112,6 +1112,7 @@ impl GateKind {
 /// One measured query of the indicative run: the equivalent DSL/`LogQL`
 /// question, the window both systems answer it over, and the row count
 /// both must return exactly.
+#[derive(Clone)]
 struct PairSpec {
     label: String,
     /// The pair's §7 margin for the reported gate (`m_l2` for the
@@ -1236,28 +1237,149 @@ fn build_pair_specs(
 }
 
 /// One pair's Loki measurement: poll `query_range` until ingest has
-/// caught up to the expected row count (or fail loudly at the deadline).
+/// caught up to the expected row count. On a deadline miss it emits a
+/// diagnostic dump (itself bounded to 90 s) and then returns `Err`
+/// instead of panicking, so one pair's failure cannot destroy the other
+/// pairs' already-measured report (run #11 lost three pairs'
+/// measurements to one L3 timeout panic).
 async fn loki_measure_pair(
     http: &reqwest::Client,
     base: &str,
     spec: &PairSpec,
-) -> (Vec<LineKey>, u64, LokiFetchedBytes) {
+) -> Result<(Vec<LineKey>, u64, LokiFetchedBytes), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
     loop {
         let (lines, bytes, fetched) =
             loki_query_with_stats(http, base, &spec.logql, spec.start, spec.end).await;
         if lines.len() as u64 >= spec.expected_rows {
-            break (lines, bytes, fetched);
+            break Ok((lines, bytes, fetched));
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "loki returned {} of {} expected rows for [{}] before timeout",
-            lines.len(),
-            spec.expected_rows,
-            spec.label,
-        );
+        if std::time::Instant::now() >= deadline {
+            // Bounded so diagnostics can't extend the miss indefinitely.
+            if tokio::time::timeout(
+                Duration::from_secs(90),
+                dump_loki_diagnostics(http, base, spec),
+            )
+            .await
+            .is_err()
+            {
+                eprintln!(
+                    "(diagnostics dump for [{}] itself timed out after 90 s)",
+                    spec.label,
+                );
+            }
+            break Err(format!(
+                "loki returned {} of {} expected rows for [{}] before timeout",
+                lines.len(),
+                spec.expected_rows,
+                spec.label,
+            ));
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Split successes from failures: equivalence + report run for every
+/// measured pair BEFORE the run fails on the broken ones, so one pair's
+/// timeout cannot destroy the others' 40-minute measurements.
+type Measured = (Vec<LineKey>, u64, LokiFetchedBytes);
+
+#[allow(clippy::type_complexity)] // one-shot plumbing tuple for the runner
+fn split_measurements(
+    specs: &[PairSpec],
+    ourios: &[ourios_bench::OuriosAnswer],
+    loki: Vec<Result<Measured, String>>,
+) -> (
+    Vec<PairSpec>,
+    Vec<ourios_bench::OuriosAnswer>,
+    Vec<Measured>,
+    Vec<String>,
+) {
+    assert!(
+        specs.len() == ourios.len() && specs.len() == loki.len(),
+        "harness bug: {} specs vs {} ourios vs {} loki measurements — zip \
+         would silently drop the tail",
+        specs.len(),
+        ourios.len(),
+        loki.len(),
+    );
+    let (mut ok_specs, mut ok_ourios, mut ok_loki, mut failures) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for ((spec, ours), result) in specs.iter().zip(ourios).zip(loki) {
+        match result {
+            Ok(measured) => {
+                ok_specs.push(spec.clone());
+                ok_ourios.push(ours.clone());
+                ok_loki.push(measured);
+            }
+            Err(detail) => failures.push(detail),
+        }
+    }
+    (ok_specs, ok_ourios, ok_loki, failures)
+}
+
+/// Timed-out pair post-mortem, printed to stderr so the run log carries
+/// the evidence: the raw (truncated) response body of the failing query,
+/// and a filterless sample of the same window so the entries' shape —
+/// including whether structured metadata is present at all on replayed
+/// data — is visible. Bodies are truncated to ~4 KiB (4096 chars).
+async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSpec) {
+    let raw = |query: &str, limit: u32| {
+        let query = query.to_string();
+        async move {
+            match http
+                .get(format!("{base}/loki/api/v1/query_range"))
+                .query(&[
+                    ("query", query.as_str()),
+                    ("start", &spec.start.to_string()),
+                    ("end", &spec.end.to_string()),
+                    ("limit", &limit.to_string()),
+                    // Mirror the measurement request so the dump reflects
+                    // exactly what the poll saw.
+                    ("direction", "forward"),
+                ])
+                .send()
+                .await
+            {
+                Ok(mut resp) => {
+                    let status = resp.status();
+                    // Stream at most ~8 KiB rather than buffering a whole
+                    // (possibly huge) body just to print a snippet.
+                    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                buf.extend_from_slice(&chunk);
+                                if buf.len() >= 8192 {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            // A truncated-by-error body must say so, or the
+                            // post-mortem reads as a complete response.
+                            Err(e) => {
+                                buf.extend_from_slice(format!("<body read error: {e}>").as_bytes());
+                                break;
+                            }
+                        }
+                    }
+                    // Truncate on a char boundary; the cap is ~4 KiB of
+                    // ASCII JSON, not an exact byte count.
+                    let body: String = String::from_utf8_lossy(&buf).chars().take(4096).collect();
+                    format!("HTTP {status}: {body}")
+                }
+                Err(e) => format!("transport error: {e}"),
+            }
+        }
+    };
+    eprintln!(
+        "=== diagnostics for timed-out pair [{}] ===\nfailing query {:?} =>\n{}\n\n\
+         filterless sample of the same window =>\n{}\n=== end diagnostics ===",
+        spec.label,
+        spec.logql,
+        raw(&spec.logql, 5000).await,
+        raw("{service_name=~\".+\"}", 3).await,
+    );
 }
 
 /// The §7 calibration input: the indicative Ourios-vs-Loki bytes-read
@@ -1374,8 +1496,10 @@ fn rfc0031_indicative_comparative_run() {
         measured
     });
 
-    // Equivalence gates every measurement (RFC0031.1) — asserted.
-    for ((spec, ours), (loki_lines, _, _)) in specs.iter().zip(&ourios).zip(&loki) {
+    let (ok_specs, ok_ourios, ok_loki, failures) = split_measurements(&specs, &ourios, loki);
+
+    // Equivalence gates every successful measurement (RFC0031.1).
+    for ((spec, ours), (loki_lines, _, _)) in ok_specs.iter().zip(&ok_ourios).zip(&ok_loki) {
         let outcome = compare_lines(&ours.lines, loki_lines, 8);
         assert!(
             outcome.is_equal(),
@@ -1384,7 +1508,18 @@ fn rfc0031_indicative_comparative_run() {
         );
     }
 
-    print_indicative_report(&corpus_dir, pair.total_records, &specs, &ourios, &loki);
+    print_indicative_report(
+        &corpus_dir,
+        pair.total_records,
+        &ok_specs,
+        &ok_ourios,
+        &ok_loki,
+    );
+    assert!(
+        failures.is_empty(),
+        "{} pair(s) failed to measure (report above covers the rest): {failures:?}",
+        failures.len(),
+    );
 }
 
 /// The indicative run's report block, one section per pair. Each gate is

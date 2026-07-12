@@ -1150,8 +1150,19 @@ fn pick_template_pair(
 /// bloom — the measured L6 windows used the HIGHEST-volume service,
 /// which is present in every row group and is the bloom's worst case
 /// by construction, so they bound the UNSCOPED-browse cost, not the
-/// enriched one). Returns `(service, start, end, rows)`.
-fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u64, u64)> {
+/// enriched one). `exclude` is the service the L6 window pairs already
+/// use: falling through to it would duplicate an existing measurement,
+/// which is a vacuous diagnostic (run #16 measured exactly that before
+/// this guard existed). One corpus pass collects every service's
+/// timestamps at once — the per-service rescan cost run #16 ~70
+/// minutes. Every skipped candidate logs WHY, so the run log records
+/// the corpus's enrichment reality even when the pick falls through.
+type ServiceTimestamps = (Vec<u64>, Vec<u64>);
+
+fn pick_rare_window_pair(
+    corpus_dir: &std::path::Path,
+    exclude: &str,
+) -> Option<(String, u64, u64, u64)> {
     use std::collections::HashMap;
     use std::io::BufRead as _;
 
@@ -1160,7 +1171,8 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
             && s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ' '))
     };
-    let mut rows_per_service: HashMap<String, u64> = HashMap::new();
+    // service -> (clean ts, poison ts), both filled in ONE corpus pass.
+    let mut per_service: HashMap<String, ServiceTimestamps> = HashMap::new();
     for path in corpus_jsonl_paths(corpus_dir) {
         let file = std::fs::File::open(&path).expect("open corpus file");
         for line in std::io::BufReader::new(file).lines() {
@@ -1184,29 +1196,39 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
                         _ => None,
                     })
                     .unwrap_or("");
-                if !safe(service) {
+                if !safe(service) || service == exclude {
                     continue;
                 }
-                let rows: u64 = rl
-                    .scope_logs
-                    .iter()
-                    .map(|sl| sl.log_records.len() as u64)
-                    .sum();
-                if rows > 0 {
-                    *rows_per_service.entry(service.to_string()).or_default() += rows;
+                let entry = per_service.entry(service.to_string()).or_default();
+                for sl in &rl.scope_logs {
+                    for lr in &sl.log_records {
+                        if lr.time_unix_nano != 0 {
+                            entry.0.push(lr.time_unix_nano);
+                        } else if lr.observed_time_unix_nano != 0 {
+                            entry.1.push(lr.observed_time_unix_nano);
+                        }
+                    }
                 }
             }
         }
     }
-    let mut by_volume: Vec<(String, u64)> = rows_per_service.into_iter().collect();
-    // Ascending volume; deterministic name tiebreak.
-    by_volume.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    for (service, total_rows) in by_volume {
-        if total_rows < 2 {
-            // Cannot satisfy the 2-row window floor — skip the rescan.
+    let mut by_volume: Vec<(String, ServiceTimestamps)> = per_service.into_iter().collect();
+    by_volume.sort_by(|a, b| {
+        let (av, bv) = (a.1.0.len() + a.1.1.len(), b.1.0.len() + b.1.1.len());
+        av.cmp(&bv).then_with(|| a.0.cmp(&b.0))
+    });
+    for (service, (mut clean, mut poison)) in by_volume {
+        if clean.len() < 2 {
+            eprintln!(
+                "selective-resource candidate {service}: skipped — {} clean timestamps \
+                 ({} zero-time rows); the corpus's enrichment gap, not a picker gap",
+                clean.len(),
+                poison.len(),
+            );
             continue;
         }
-        let (clean, poison) = collect_service_timestamps(corpus_dir, &service);
+        clean.sort_unstable();
+        poison.sort_unstable();
         // Descending window-size ladder — a deliberate SAMPLING of the
         // 2..=100 range, not an exhaustive search: the largest k may
         // have no clean edges even when smaller ones do, and a
@@ -1229,6 +1251,11 @@ fn pick_rare_window_pair(corpus_dir: &std::path::Path) -> Option<(String, u64, u
                 return Some((service, start, end, k as u64));
             }
         }
+        eprintln!(
+            "selective-resource candidate {service}: skipped — {} clean timestamps but \
+             no clean-edged window at any sampled k",
+            clean.len(),
+        );
     }
     None
 }
@@ -1880,7 +1907,7 @@ fn rfc0031_indicative_comparative_run() {
     );
     let trace = pick_trace_pair(&corpus_dir);
     eprintln!("trace pair: {trace:?}");
-    let rare_window = pick_rare_window_pair(&corpus_dir);
+    let rare_window = pick_rare_window_pair(&corpus_dir, &pair.service);
     eprintln!("selective-resource window: {rare_window:?}");
 
     // The (locally-proven) Ourios half, per pair.
@@ -2830,11 +2857,15 @@ fn pick_rare_window_pair_selects_the_low_volume_service() {
     .expect("write corpus");
 
     let (service, start, end, rows) =
-        pick_rare_window_pair(corpus.path()).expect("a clean window exists");
+        pick_rare_window_pair(corpus.path(), "not-in-corpus").expect("a clean window exists");
     assert_eq!(
         service, FIXTURE_SERVICE,
         "the 1-row service B fails the 2-row floor; fall through"
     );
+
+    // Excluding the only viable service yields a loud None, never a
+    // duplicate of an existing pair (the run #16 lesson).
+    assert_eq!(pick_rare_window_pair(corpus.path(), FIXTURE_SERVICE), None);
     assert_eq!(rows, 3, "all three FIXTURE_SERVICE rows fit one window");
     assert!(start < end);
     assert!(start >= 1_000_000 && end <= 1_002_001);

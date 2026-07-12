@@ -57,6 +57,7 @@
 - [RFC 0029 — OIDC bearer layer](./rfcs/0029-oidc-bearer-layer.md)
 - [RFC 0030 — TLS/mTLS on the listeners](./rfcs/0030-tls-mtls-listeners.md)
 - [RFC 0031 — Comparative evaluation vs Loki](./rfcs/0031-comparative-evaluation-loki.md)
+- [RFC 0033 — Cached template-map artifact](./rfcs/0033-cached-template-map.md)
 
 # Talks
 

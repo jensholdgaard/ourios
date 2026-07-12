@@ -1227,7 +1227,8 @@ fn pick_rare_window_pair(
         if clean.len() < 2 {
             eprintln!(
                 "selective-resource candidate {service}: skipped — {} clean timestamps \
-                 ({} zero-time rows); the corpus's enrichment gap, not a picker gap",
+                 ({} zero-time rows); a source-timestamp-quality gap in the corpus, \
+                 not a picker gap",
                 clean.len(),
                 poison.len(),
             );

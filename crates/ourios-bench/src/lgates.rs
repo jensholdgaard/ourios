@@ -11,12 +11,16 @@
 
 /// The RFC 0031 §7 calibration values, as configuration.
 ///
-/// The `Default` carries the §7 **proposed** starting points — margins
-/// `M ≥ 10` (mirroring B1's 10× framing on the honest metric) and the
-/// floor/parity factors `F_L6 = 3`, `F_L7 = 2`. They are provisional by
-/// design: §7 freezes them only after a calibration look at the first
-/// indicative run, so nothing here should be treated as accepted until
-/// `docs/rfcs/0031-comparative-evaluation-loki.md` §7 says so.
+/// Partially **frozen** by the 2026-07-13 §7 calibration decision
+/// (evidence: `docs/benchmarks.md` §9.13): `m_l1 = 10` and `m_l3 = 10`
+/// on the storage-side bytes channel, and `f_l6 = 3` on the latency
+/// channel (RFC0031.7 as written), are frozen — asserted by the
+/// dispatch run and the RFC0031.2/.4/.7 scenarios. `m_l2` is deferred
+/// with a named condition (storage-side freeze after RFC 0033; until
+/// then L2 gates on the processed channel at 10, storage
+/// informational); `m_l4` and `f_l7` stay deferred until their classes
+/// are first measured. See
+/// `docs/rfcs/0031-comparative-evaluation-loki.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComparativeMargins {
     /// L1 (template-exact lookup) must-win margin.
@@ -185,9 +189,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_carry_the_section_7_proposals() {
-        // Pinned so the provisional §7 values can't drift silently; when
-        // §7 freezes calibrated values, this test changes WITH the RFC.
+    fn defaults_carry_the_section_7_values_frozen_and_deferred() {
+        // Pinned so the §7 values can't drift silently — m_l1/m_l3/f_l6
+        // are FROZEN (2026-07-13), the rest still-deferred proposals; a
+        // §7 change lands here WITH the RFC.
         let m = ComparativeMargins::default();
         assert_eq!((m.m_l1, m.m_l2, m.m_l3, m.m_l4), (10, 10, 10, 10));
         assert_eq!((m.f_l6, m.f_l7), (3, 2));

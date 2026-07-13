@@ -425,6 +425,21 @@ fn is_tenant_relative_parquet(name: &str) -> bool {
     if name.is_empty() || name.contains('\\') || name.split('/').any(str::is_empty) {
         return false;
     }
+    // Tenant-root-relative means the audit writer's Hive layout: the
+    // first segment is `year=…` and no segment re-introduces the
+    // `tenant_id=`/`audit` prefix — a foreign-tree name can't escape
+    // (the frontier is compared, never dereferenced) but would
+    // misclassify a hostile artifact stale instead of torn.
+    let mut segments = name.split('/');
+    if !segments.next().is_some_and(|s| s.starts_with("year=")) {
+        return false;
+    }
+    if name
+        .split('/')
+        .any(|s| s.starts_with("tenant_id=") || s == "audit")
+    {
+        return false;
+    }
     let path = Path::new(name);
     let mut components = path.components();
     let all_normal = components
@@ -693,6 +708,9 @@ mod tests {
             "year=2026/a.parquet/",
             "a\\b.parquet",
             "",
+            "audit/tenant_id=other/year=2026/a.parquet",
+            "tenant_id=other/year=2026/a.parquet",
+            "month=07/a.parquet",
         ] {
             assert!(!is_tenant_relative_parquet(bad), "{bad:?} must be rejected");
         }

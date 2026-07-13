@@ -43,11 +43,17 @@ mod compile;
 mod drift;
 pub mod dsl;
 mod log_row;
+mod template_map;
 mod template_registry;
 
+pub use alias_store::derive_alias_map;
 pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
+pub use template_map::{
+    ArtifactRead, TEMPLATE_MAP_FILENAME, TEMPLATE_MAP_FORMAT_VERSION, TemplateMap,
+    derive_template_map,
+};
 pub use template_registry::{TemplateRegistry, derive_template_registry};
 
 use std::path::PathBuf;

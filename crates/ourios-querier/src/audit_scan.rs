@@ -110,6 +110,20 @@ pub(crate) fn audit_files(
     }
 }
 
+/// One captured audit scan: the events in SCAN order — (file path
+/// lexicographic, within-file row index), the order the §3.7.1
+/// timestamp sort uses as its tiebreak via stable sorting — the bytes
+/// fetched reading them, and the **frontier** — the exact audit `*.parquet`
+/// set the events came from, as store-relative keys under the tenant's audit
+/// root, sorted lexicographically (RFC 0033 §3.2 `folded_files`). Everything
+/// derived from a single listing + read pass, so the frontier can never name
+/// a set other than the one actually folded.
+pub(crate) struct CapturedScan {
+    pub(crate) events: Vec<AuditEvent>,
+    pub(crate) bytes_read: u64,
+    pub(crate) frontier: Vec<String>,
+}
+
 /// Read every [`AuditEvent`] from `tenant`'s resolved audit file set (the
 /// `None`-window full history), in the §3.7.1 fold order, applying the
 /// **row-level tenant backstop** (`CLAUDE.md` §3.7 / RFC 0005 §3.9 row-vs-path):
@@ -127,8 +141,20 @@ pub(crate) fn read_all_events(
     backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<(Vec<AuditEvent>, u64), QueryError> {
+    read_all_events_captured(backend, tenant).map(|scan| (scan.events, scan.bytes_read))
+}
+
+/// [`read_all_events`] plus the frontier it folded — see [`CapturedScan`].
+/// The RFC 0033 artifact derivation consumes this so the `folded_files` it
+/// publishes and the events it folds come from the same single scan (§3.5's
+/// no-partial rule starts here).
+pub(crate) fn read_all_events_captured(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+) -> Result<CapturedScan, QueryError> {
     let mut bytes_read: u64 = 0;
     let mut events: Vec<AuditEvent> = Vec::new();
+    let mut frontier: Vec<String> = Vec::new();
     let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
         for event in read {
             if event.tenant_id != *tenant {
@@ -147,7 +173,16 @@ pub(crate) fn read_all_events(
     };
     match backend {
         StoreRef::Local(root) => {
-            for path in &local_audit_files(root, tenant, None)? {
+            let files = local_audit_files(root, tenant, None)?;
+            // The canonical tenant root `local_audit_files` validated every
+            // file against — recomputed here (only when there are files, so
+            // an absent tree stays a valid empty scan) to relativize the
+            // frontier the same way the S3 branch's keys already are.
+            let tenant_root = match files.first() {
+                Some(_) => Some(canonical_tenant_root(root, tenant)?),
+                None => None,
+            };
+            for path in &files {
                 let len = std::fs::metadata(path)
                     .map_err(|e| QueryError::Storage {
                         detail: format!("audit file metadata {}: {e}", path.display()),
@@ -160,9 +195,14 @@ pub(crate) fn read_all_events(
                         detail: format!("audit file {}: {e}", path.display()),
                     })?;
                 push_validated(&path.display().to_string(), read)?;
+                if let Some(tenant_root) = &tenant_root {
+                    frontier.push(tenant_relative(path, tenant_root)?);
+                }
             }
         }
         StoreRef::Remote(store) => {
+            let enc = percent_encode_tenant(tenant.as_str());
+            let prefix = format!("audit/tenant_id={enc}/");
             for key in &remote_audit_files(store, tenant, None)? {
                 let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
                     detail: format!("audit file {key}: {e}"),
@@ -174,10 +214,59 @@ pub(crate) fn read_all_events(
                         detail: format!("audit file {key}: {e}"),
                     })?;
                 push_validated(key, read)?;
+                // The listing is prefix-scoped, so the strip always applies;
+                // keeping the full key on a (can't-happen) miss stays
+                // consistent for set-equality as long as both sides use
+                // this same rule.
+                frontier.push(key.strip_prefix(&prefix).unwrap_or(key).to_owned());
             }
         }
     }
-    Ok((events, bytes_read))
+    frontier.sort_unstable();
+    Ok(CapturedScan {
+        events,
+        bytes_read,
+        frontier,
+    })
+}
+
+/// The canonical `audit/tenant_id=<enc>` root under `bucket_root` — the same
+/// trust-anchored path [`local_audit_files`] validated every resolved file
+/// against, so [`tenant_relative`] can never be asked to strip a non-prefix.
+fn canonical_tenant_root(bucket_root: &Path, tenant: &TenantId) -> Result<PathBuf, QueryError> {
+    let enc = percent_encode_tenant(tenant.as_str());
+    let bucket_canonical = bucket_root
+        .canonicalize()
+        .map_err(|e| QueryError::Storage {
+            detail: format!("canonicalize {}: {e}", bucket_root.display()),
+        })?;
+    Ok(bucket_canonical
+        .join("audit")
+        .join(format!("tenant_id={enc}")))
+}
+
+/// `path` as a store-relative key under `tenant_root`, `/`-joined — the
+/// canonical frontier form shared with the S3 branch's listing keys.
+fn tenant_relative(path: &Path, tenant_root: &Path) -> Result<String, QueryError> {
+    let non_relative = || QueryError::Storage {
+        detail: format!(
+            "audit file {} is not relativizable under tenant root {}",
+            path.display(),
+            tenant_root.display(),
+        ),
+    };
+    let rel = path.strip_prefix(tenant_root).map_err(|_| non_relative())?;
+    let segments: Vec<&str> = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str().ok_or_else(non_relative),
+            _ => Err(non_relative()),
+        })
+        .collect::<Result<_, _>>()?;
+    if segments.is_empty() {
+        return Err(non_relative());
+    }
+    Ok(segments.join("/"))
 }
 
 /// Accumulate a measured byte count, failing loudly on overflow — a

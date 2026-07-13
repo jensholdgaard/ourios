@@ -37,10 +37,13 @@ use crate::{QueryError, StoreRef, audit_scan};
 /// Alias events are rare operator actions, not ingest-volume data, so
 /// the unwindowed scan is small by construction (§3.7.1); no day prune
 /// applies because the fold covers the tenant's whole alias history.
-pub(crate) fn derive_alias_map(
-    backend: StoreRef<'_>,
-    tenant: &TenantId,
-) -> Result<AliasMap, QueryError> {
+///
+/// # Errors
+///
+/// [`QueryError::Storage`] if the audit subtree cannot be listed, an audit
+/// file cannot be read, or a row claims a tenant other than the one whose
+/// partition root it lives under (the RFC 0005 §3.9 row-vs-path backstop).
+pub fn derive_alias_map(backend: StoreRef<'_>, tenant: &TenantId) -> Result<AliasMap, QueryError> {
     // The shared reader gives the §3.7.1 file/row order and the row-level
     // tenant backstop; keep only the alias events. The reader's byte
     // accounting is unused here (RFC 0031 measures the registry derivation,

@@ -423,6 +423,41 @@ impl AliasMap {
         map
     }
 
+    /// `tenant`'s equivalence classes in canonical order — sorted by the
+    /// derived representative, `min(members)` (the `BTreeSet`'s first
+    /// element). Cloned out so a caller cannot break the ≥ 2-member
+    /// invariant the projection maintains. The projection-out half of the
+    /// RFC 0033 cached-artifact serialization; [`Self::from_classes`] is
+    /// its inverse.
+    #[must_use]
+    pub fn classes(&self, tenant: &TenantId) -> Vec<BTreeSet<u64>> {
+        let mut classes = self.classes.get(tenant).cloned().unwrap_or_default();
+        classes.sort_unstable_by_key(|class| class.first().copied());
+        classes
+    }
+
+    /// Rebuild `tenant`'s projection from already-folded `classes` (the
+    /// RFC 0033 cached-artifact read path — inverse of [`Self::classes`]).
+    ///
+    /// Same tolerance as [`Self::apply`]: a class of fewer than two
+    /// members folds to nothing, and overlapping classes union — so any
+    /// input still yields a projection upholding the invariants, exactly
+    /// as a replayed event log would. Like [`Self::from_events`], a
+    /// rebuild does not increment the operator-action counters.
+    #[must_use]
+    pub fn from_classes<I>(tenant: &TenantId, classes: I) -> Self
+    where
+        I: IntoIterator<Item = BTreeSet<u64>>,
+    {
+        let mut map = Self::new();
+        for class in classes {
+            if class.len() >= 2 {
+                map.union_in(tenant, &class);
+            }
+        }
+        map
+    }
+
     /// Union `asserted` into `tenant`'s classes, merging every existing
     /// class that shares a member (union-on-overlap, order-independent).
     fn union_in(&mut self, tenant: &TenantId, asserted: &BTreeSet<u64>) {
@@ -548,6 +583,42 @@ mod tests {
         assert_eq!(map.resolves(&t, 1), expected);
         assert_eq!(map.resolves(&t, 3), expected);
         assert_eq!(map.canonical(&t, 3), 1, "canonical is min(members)");
+    }
+
+    #[test]
+    fn classes_round_trip_through_from_classes() {
+        // Arrange — two disjoint classes, asserted in non-canonical order.
+        let mut live = AliasMap::new();
+        let mut sink = InMemoryAuditSink::new();
+        let t = TenantId::new("t");
+        live.assert(&mut sink, &t, 9, vec![7], op()).unwrap();
+        live.assert(&mut sink, &t, 1, vec![3, 2], op()).unwrap();
+
+        // Act — project out, rebuild, project out again.
+        let classes = live.classes(&t);
+        let rebuilt = AliasMap::from_classes(&t, classes.clone());
+
+        // Assert — canonical (representative-sorted) order, identical
+        // classes, and resolution matches the live projection.
+        assert_eq!(
+            classes,
+            vec![
+                [1, 2, 3].into_iter().collect::<BTreeSet<u64>>(),
+                [7, 9].into_iter().collect(),
+            ],
+        );
+        assert_eq!(rebuilt.classes(&t), classes);
+        assert_eq!(rebuilt.resolves(&t, 2), live.resolves(&t, 2));
+    }
+
+    #[test]
+    fn from_classes_ignores_degenerate_classes() {
+        let t = TenantId::new("t");
+        let rebuilt = AliasMap::from_classes(&t, vec![[5].into_iter().collect(), BTreeSet::new()]);
+        assert!(
+            rebuilt.classes(&t).is_empty(),
+            "a class below two members is not an alias set",
+        );
     }
 
     #[test]

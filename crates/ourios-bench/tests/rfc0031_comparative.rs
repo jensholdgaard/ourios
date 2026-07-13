@@ -3,9 +3,12 @@
 //! One scenario per §5 acceptance criterion (RFC0031.1–.11). `.1`
 //! (result-set equivalence) is **live**: a real Loki container run,
 //! `#[ignore]`d because it needs Docker — the `loki-interop` CI job
-//! executes it via `--ignored --exact` (the dex-oidc precedent). The
-//! remaining ten are `#[ignore]`d red stubs, each discharged by its
-//! named green slice.
+//! executes it via `--ignored --exact` (the dex-oidc precedent).
+//! `.2`/`.4`/`.7`/`.11` are green under the §7 partial freeze
+//! (2026-07-13): locally-provable scenarios over the frozen gate math
+//! and the published §9.13 record, with the dispatch run asserting the
+//! same frozen gates on live measurements. The remaining six are
+//! `#[ignore]`d red stubs, each discharged by its named green slice.
 //!
 //! Placement note: the comparative harness lives in `ourios-bench`
 //! for now (extending the RFC 0006 harness) rather than a new crate,
@@ -413,24 +416,50 @@ async fn loki_query_range(
 
 /// Scenario RFC0031.2 — L1 selective template lookup wins on bytes read.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// Green under the §7 partial freeze (2026-07-13): `M_L1 = 10` on the
+/// storage-side bytes channel. Locally provable without a container —
+/// the frozen gate math decides exactly at the margin boundary in the
+/// must-win direction (above the ratio flips `pass = false`, the
+/// pillar-level-finding arm), and the §9.13-recorded L1 measurements
+/// (documented historical evidence from equivalence-verified runs
+/// #15–#17, NOT a live measurement) clear the frozen margin. The live
+/// assertion of the same gate is `rfc0031_indicative_comparative_run`;
+/// latency stays recorded there as corroborating, non-gating.
 #[test]
-#[ignore = "RFC0031.2 stub — implemented in the L-gate + bytes-read green slice"]
 fn rfc0031_2_l1_template_lookup_bytes() {
-    todo!(
-        "RFC0031.2 — on the headline OTel-Demo corpus, a template \
-         matching <0.1% of lines: ourios.bytes_read / loki.bytes_read \
-         <= 1/M_L1 (Ourios row-group bytes read per the RFC 0016 \
-         extension; Loki Summary.totalBytesProcessed). must-win: above \
-         the ratio flips l1.pass = false and surfaces a pillar-level \
-         finding (benchmarks.md §7). Cold + warm latency recorded as \
-         corroborating, non-gating"
-    );
+    let m_l1 = ourios_bench::ComparativeMargins::default().m_l1;
+    assert_eq!(m_l1, 10, "the §7-frozen L1 must-win margin");
+
+    // The must-win rule at the frozen margin: pass at and below
+    // ourios × 10 ≤ loki, fail one byte above — and a failure is a
+    // Decided { pass: false, .. }, the reportable pillar-level arm.
+    assert!(ourios_bench::bytes_must_win(100, 1_000, m_l1).passed());
+    let over = ourios_bench::bytes_must_win(101, 1_000, m_l1);
+    assert!(!over.passed(), "{over:?}");
+    assert!(matches!(
+        over,
+        ourios_bench::BytesGateOutcome::Decided { pass: false, .. }
+    ));
+
+    // §9.13 (runs #15/#16/#17): ourios 1,358,683 B vs Loki storage-side
+    // 104.8–105.6 MB — 77.2–77.7×, clearing the frozen margin with
+    // headroom in every counted run since the pair landed.
+    for loki_storage in [104_825_428, 105_191_956, 105_579_510] {
+        let outcome = ourios_bench::bytes_must_win(1_358_683, loki_storage, m_l1);
+        assert!(
+            outcome.passed(),
+            "a recorded §9.13 L1 run must clear the frozen M_L1: {outcome:?}",
+        );
+    }
 }
 
 /// Scenario RFC0031.3 — L2 attribute predicate wins on bytes read.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 #[test]
-#[ignore = "RFC0031.3 stub — implemented in the L-gate + bytes-read green slice"]
+#[ignore = "RFC0031.3 stub — M_L2 deferred by the §7 partial freeze (2026-07-13): the \
+            storage-side margin freezes after RFC 0033 (the cached template map) lands; \
+            until then the dispatch run gates L2 on the processed channel at 10"]
 fn rfc0031_3_l2_attribute_predicate_bytes() {
     todo!(
         "RFC0031.3 — headline corpus, predicate severity >= ERROR AND \
@@ -444,18 +473,35 @@ fn rfc0031_3_l2_attribute_predicate_bytes() {
 
 /// Scenario RFC0031.4 — L3 trace correlation wins on bytes read (OTLP-native).
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// Green under the §7 partial freeze (2026-07-13): `M_L3 = 10` on the
+/// storage-side bytes channel. Locally provable without a container:
+/// the frozen gate decides correctly on BOTH sides of the margin using
+/// the §9.13-recorded measurements as documented historical evidence
+/// (not a live measurement) — the pre-bloom run #12 configuration
+/// (1.41×) correctly FAILS the frozen margin, and the post-bloom runs
+/// #14–#17 (21.2–21.9×) clear it. The live assertion is
+/// `rfc0031_indicative_comparative_run`.
 #[test]
-#[ignore = "RFC0031.4 stub — implemented in the L-gate + bytes-read green slice"]
 fn rfc0031_4_l3_trace_correlation_bytes() {
-    todo!(
-        "RFC0031.4 — headline corpus, 'every log line for this \
-         trace_id', with trace_id NOT a Loki label (high-cardinality, \
-         un-labelable per §3.3): ourios.bytes_read / loki.bytes_read <= \
-         1/M_L3 (Ourios bloom-filtered promoted column; Loki \
-         label-stream scan). must-win — a query Loki's model cannot \
-         serve without a full scan, so a loss is among the strongest \
-         signals against the thesis"
-    );
+    let m_l3 = ourios_bench::ComparativeMargins::default().m_l3;
+    assert_eq!(m_l3, 10, "the §7-frozen L3 must-win margin");
+
+    // §9.13 run #12 — before the trace_id/span_id blooms Ourios fetched
+    // the trace_id column corpus-wide (72,935,984 B): the frozen gate
+    // correctly fails that configuration rather than flattering it.
+    let pre_bloom = ourios_bench::bytes_must_win(72_935_984, 102_835_803, m_l3);
+    assert!(!pre_bloom.passed(), "{pre_bloom:?}");
+
+    // §9.13 runs #14–#17 — with blooms the fetch collapses to
+    // 4,812,668 B and clears the frozen margin four runs in a row.
+    for loki_storage in [105_353_837, 102_133_866, 104_656_570, 105_251_547] {
+        let outcome = ourios_bench::bytes_must_win(4_812_668, loki_storage, m_l3);
+        assert!(
+            outcome.passed(),
+            "a recorded §9.13 L3 run must clear the frozen M_L3: {outcome:?}",
+        );
+    }
 }
 
 /// Scenario RFC0031.5 — L4 frequency aggregation wins on bytes read (OTLP-native).
@@ -492,15 +538,44 @@ fn rfc0031_6_l5_substring_needle_published() {
 
 /// Scenario RFC0031.7 — L6 broad scan stays within the floor.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// Green under the §7 partial freeze (2026-07-13): `F_L6 = 3` FROZEN on
+/// the LATENCY channel, exactly as the scenario is written
+/// (`ourios.latency_p50 ≤ F_L6 × loki.latency_p50`); the window pairs'
+/// bytes figures are reclassified to a published diagnostic (their
+/// publication is RFC0031.11's ground). Locally provable: the floor
+/// semantics at the frozen factor decide exactly at the boundary, and
+/// the §9.13 run #18 window-pair p50s (documented historical evidence,
+/// not a live measurement) all hold the floor. The live assertion —
+/// loudly non-evaluable when latency is unmeasured, never a silent
+/// pass or a spurious fail — is `rfc0031_indicative_comparative_run`.
 #[test]
-#[ignore = "RFC0031.7 stub — implemented in the L-gate + reporting green slice"]
 fn rfc0031_7_l6_broad_scan_floor() {
-    todo!(
-        "RFC0031.7 — low-selectivity wide-time-range query, RFC0031.1 \
-         holding: ourios.latency_p50 <= F_L6 * loki.latency_p50. \
-         Exceeding the floor is a tuning-RFC signal, not a pillar-level \
-         escalation"
-    );
+    let f_l6 = ourios_bench::ComparativeMargins::default().f_l6;
+    assert_eq!(f_l6, 3, "the §7-frozen L6 latency floor factor");
+
+    // The floor rule at the frozen factor: pass at ourios == 3 × loki,
+    // fail one microsecond above — a Decided fail (the tuning-RFC
+    // signal, not a pillar-level escalation), never an Invalid.
+    let us = Duration::from_micros;
+    assert!(latency_floor_gate(us(300), us(100), f_l6).passed());
+    let over = latency_floor_gate(us(301), us(100), f_l6);
+    assert!(!over.passed(), "{over:?}");
+    assert!(matches!(
+        over,
+        ourios_bench::BytesGateOutcome::Decided { pass: false, .. }
+    ));
+
+    // §9.13 run #18 (the program's first latency measurements): all
+    // three window pairs hold the frozen floor — 40.2 vs 13.8 ms,
+    // 85.9 vs 294.8 ms, 38.8 vs 51.2 ms.
+    for (ourios_p50, loki_p50) in [(40_200, 13_800), (85_900, 294_800), (38_800, 51_200)] {
+        let outcome = latency_floor_gate(us(ourios_p50), us(loki_p50), f_l6);
+        assert!(
+            outcome.passed(),
+            "a recorded §9.13 run-#18 window pair must hold the frozen F_L6: {outcome:?}",
+        );
+    }
 }
 
 /// Scenario RFC0031.8 — L7 ingest throughput parity within a stated factor.
@@ -549,20 +624,71 @@ fn rfc0031_10_loki_config_machine_checked() {
     );
 }
 
+/// The repo root, resolved from the crate dir (the `rfc0024_calibration`
+/// pattern) so the docs-presence scenario is cwd-independent.
+fn repo_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
 /// Scenario RFC0031.11 — losses published and escalation follows §7.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// Green for the locally-testable half of the commitment: the published
+/// record (`docs/benchmarks.md` §9.13) carries every class measured so
+/// far — the L1/L3 wins, L2's honest short-of-margin disposition, AND
+/// the window pairs' storage-channel loss figures (reclassified by the
+/// §7 freeze from gated floor to published diagnostic — publishing them
+/// honestly IS the commitment). A suppressed loss row is the process
+/// violation the scenario forbids, so the loss figures' presence is
+/// asserted against the committed doc. The escalation POLICY (an L1–L4
+/// bytes loss is pillar-level; a latency-only loss with a bytes win is
+/// a roadmap item) is prose in `benchmarks.md` §7 and the RFC; its
+/// enforcement teeth are `rfc0031_indicative_comparative_run`'s
+/// frozen-gate assertions.
 #[test]
-#[ignore = "RFC0031.11 stub — implemented in the reporting + escalation green slice"]
 fn rfc0031_11_losses_published_and_escalation() {
-    todo!(
-        "RFC0031.11 — every taxonomy class appears in benchmarks.md §9 \
-         (wins AND losses) with disposition, both systems' numbers, the \
-         corpus, and the hardware tag; an L1/L2/L3/L4 bytes-read loss on \
-         the headline OTel-Demo corpus is a pillar-level finding pausing \
-         further implementation pending a CLAUDE.md §2 revisit, whereas \
-         a must-win latency-only loss with a bytes-read win is a roadmap \
-         item"
-    );
+    let text = std::fs::read_to_string(repo_root().join("docs/benchmarks.md"))
+        .expect("read docs/benchmarks.md");
+    let start = text
+        .find("### 9.13 ")
+        .expect("benchmarks.md carries the §9.13 comparative calibration record");
+    let rest = &text[start..];
+    let section = rest[1..].find("\n### ").map_or(rest, |i| &rest[..=i]);
+
+    for (marker, why) in [
+        (
+            "**77.2×**",
+            "the L1 flagship win (run #15) — wins publish too",
+        ),
+        ("**21.9×**", "the L3 win (runs #14/#17)"),
+        (
+            "not a provisional 10× pass",
+            "L2's honest short-of-margin disposition",
+        ),
+        (
+            "Time-window browses (L6 floor family)",
+            "the window-browse class heading",
+        ),
+        ("0.007 fail", "the k=2000 storage-channel loss row (run #8)"),
+        (
+            "0.016 fail",
+            "the k=2000 storage-channel loss on current code (run #10)",
+        ),
+        (
+            "0.018 fail",
+            "the selective-resource diagnostic's storage loss (run #17)",
+        ),
+    ] {
+        assert!(
+            section.contains(marker),
+            "§9.13 must publish {why} ({marker:?}) — deleting a loss figure \
+             is the process violation RFC0031.11 forbids",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,11 +1775,39 @@ impl GateKind {
             Self::Floor => ourios_bench::bytes_within_floor(ourios, loki, calibration),
         }
     }
+}
 
-    fn margin_label(self) -> &'static str {
+/// The RFC 0031 taxonomy class a pair belongs to: which §7 value
+/// applies, on which channel, and whether it is FROZEN (asserted by the
+/// dispatch run) or deferred/diagnostic (reported only) — per the §7
+/// partial freeze (2026-07-13, calibrated against `benchmarks.md`
+/// §9.13).
+#[derive(Clone, Copy)]
+enum PairClass {
+    /// L1 template lookup — must-win, `M_L1 = 10` frozen on the
+    /// storage channel.
+    L1,
+    /// L2 attribute predicate — must-win; the storage-side margin is
+    /// deferred until RFC 0033 lands, so the pair gates on the
+    /// processed channel at `M_L2 = 10` with storage informational.
+    L2,
+    /// L3 trace correlation — must-win, `M_L3 = 10` frozen on the
+    /// storage channel.
+    L3,
+    /// L6-family window browse — `F_L6 = 3` frozen on the LATENCY
+    /// channel (RFC0031.7 as written); the bytes channel is a
+    /// published diagnostic, not a gate.
+    WindowFloor,
+    /// Selective-resource window — diagnostic only; nothing gates.
+    Diagnostic,
+}
+
+impl PairClass {
+    /// The bytes-gate direction the class's channels report under.
+    fn gate(self) -> GateKind {
         match self {
-            Self::MustWin => "must-win margin",
-            Self::Floor => "floor factor",
+            Self::L1 | Self::L2 | Self::L3 => GateKind::MustWin,
+            Self::WindowFloor | Self::Diagnostic => GateKind::Floor,
         }
     }
 }
@@ -1664,12 +1818,14 @@ impl GateKind {
 #[derive(Clone)]
 struct PairSpec {
     label: String,
-    /// The pair's §7 margin for the reported gate (`m_l2` for the
-    /// severity pair, `f_l6` for the broad time-window slices).
+    /// The pair's §7 calibration value (`m_l1`/`m_l2`/`m_l3` for the
+    /// must-win classes; `f_l6` for the window slices — the latency
+    /// floor factor, since the §7 freeze reclassified their bytes
+    /// channel to a diagnostic).
     margin: u64,
-    /// Direction the gate is reported under: must-win for the severity
-    /// pair, floor for the time-window slices.
-    gate: GateKind,
+    /// The taxonomy class: which channel gates, which is reported, and
+    /// whether the §7 value is frozen or deferred.
+    class: PairClass,
     dsl: String,
     logql: String,
     /// Loki `query_range` window (nanoseconds, `[start, end)` by the
@@ -1717,7 +1873,7 @@ fn build_pair_specs(picks: &Picks<'_>, corpus_now: u64, corpus_window: u64) -> V
             pair.service, pair.threshold, pair.text
         ),
         margin: margins.m_l2,
-        gate: GateKind::MustWin,
+        class: PairClass::L2,
         dsl: format!(
             "service == \"{}\" and severity >= {} | limit 5000",
             pair.service, pair.threshold
@@ -1750,7 +1906,7 @@ fn build_pair_specs(picks: &Picks<'_>, corpus_now: u64, corpus_window: u64) -> V
                 pair.service
             ),
             margin: margins.f_l6,
-            gate: GateKind::Floor,
+            class: PairClass::WindowFloor,
             dsl: format!("service == \"{}\" | limit 5000", pair.service),
             logql: format!("{{service_name=\"{}\"}}", pair.service),
             start,
@@ -1786,7 +1942,7 @@ fn class_pair_specs(
         Some((hex, rows)) => specs.push(PairSpec {
             label: format!("trace correlation, L3 family: trace_id={hex}"),
             margin: margins.m_l3,
-            gate: GateKind::MustWin,
+            class: PairClass::L3,
             dsl: format!("trace_id == \"{hex}\" | limit 5000"),
             logql: format!("{{service_name=~\".+\"}} | trace_id=\"{hex}\""),
             start: pair.min_ts,
@@ -1815,7 +1971,7 @@ fn class_pair_specs(
                 t.template_id, t.needle
             ),
             margin: margins.m_l1,
-            gate: GateKind::MustWin,
+            class: PairClass::L1,
             dsl: format!("template_id == {} | limit 5000", t.template_id),
             logql: format!("{{service_name=~\".+\"}} |= \"{}\"", t.needle),
             start: pair.min_ts,
@@ -1843,7 +1999,7 @@ fn class_pair_specs(
         Some((service, start, end, rows)) => specs.push(PairSpec {
             label: format!("selective-resource window, diagnostic: service={service} k={rows}"),
             margin: margins.f_l6,
-            gate: GateKind::Floor,
+            class: PairClass::Diagnostic,
             dsl: format!("service == \"{service}\" | limit 5000"),
             logql: format!("{{service_name=\"{service}\"}}"),
             start: *start,
@@ -1957,6 +2113,74 @@ fn split_measurements(
     (ok_specs, ok_ourios, ok_loki, failures)
 }
 
+/// The §7-frozen gate checks (partial freeze, 2026-07-13): L1/L3
+/// must-win on the storage channel at their frozen margins; L2 must-win
+/// on the processed channel (the §7 deferred-condition rule — its
+/// storage-side margin freezes after RFC 0033); the L6-family window
+/// pairs hold the RFC0031.7 latency floor **when latency was measured**
+/// — latency is `Option` by design, and an unmeasured p50 makes the
+/// frozen gate non-evaluable, which is reported LOUDLY rather than
+/// failed (a corroborating-channel hiccup must not fake a floor
+/// breach). The window pairs' bytes channel and the selective-resource
+/// pair are published diagnostics — never checked here. Returns the
+/// failures instead of panicking so the caller can assert them all at
+/// once, AFTER the report has printed.
+fn frozen_gate_failures(
+    specs: &[PairSpec],
+    ourios: &[OuriosMeasured],
+    loki: &[Measured],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
+        specs.iter().zip(ourios).zip(loki)
+    {
+        let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
+        match spec.class {
+            PairClass::L1 | PairClass::L3 => {
+                let outcome =
+                    ourios_bench::bytes_must_win(ours.answer.bytes_read, loki_storage, spec.margin);
+                if !outcome.passed() {
+                    failures.push(format!(
+                        "[{}] frozen storage-channel must-win (margin {}) failed: {outcome:?}",
+                        spec.label, spec.margin,
+                    ));
+                }
+            }
+            PairClass::L2 => {
+                let outcome = ourios_bench::bytes_must_win(
+                    ours.answer.bytes_read,
+                    *loki_processed,
+                    spec.margin,
+                );
+                if !outcome.passed() {
+                    failures.push(format!(
+                        "[{}] processed-channel must-win (margin {}, the §7 \
+                         deferred-condition rule) failed: {outcome:?}",
+                        spec.label, spec.margin,
+                    ));
+                }
+            }
+            PairClass::WindowFloor => match (ours.latency_p50, *loki_latency) {
+                (Some(ours_p50), Some(loki_p50)) => {
+                    let outcome = latency_floor_gate(ours_p50, loki_p50, spec.margin);
+                    if !outcome.passed() {
+                        failures.push(format!(
+                            "[{}] RFC0031.7 latency floor (frozen factor {}) failed: {outcome:?}",
+                            spec.label, spec.margin,
+                        ));
+                    }
+                }
+                _ => eprintln!(
+                    "RFC0031.7 not evaluable this run for [{}] (latency unmeasured)",
+                    spec.label,
+                ),
+            },
+            PairClass::Diagnostic => {}
+        }
+    }
+    failures
+}
+
 /// Timed-out pair post-mortem, printed to stderr so the run log carries
 /// the evidence: the raw (truncated) response body of the failing query,
 /// and a filterless sample of the same window so the entries' shape —
@@ -2028,9 +2252,16 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
 /// selectivity curve plus the L1/L3 must-win points — over one
 /// container + one corpus replay.
 ///
-/// **Equivalence is asserted per pair; the bytes gates are REPORTED,
-/// not asserted** — the §7 margins are provisional until the maintainer
-/// freezes them against exactly these numbers (RFC 0031 §7).
+/// **Equivalence is asserted per pair, and the §7-FROZEN gates
+/// (partial freeze, 2026-07-13) are asserted after the report prints**:
+/// L1/L3 storage-channel must-win at margin 10, L2 processed-channel
+/// must-win at 10 (the §7 deferred-condition rule — its storage-side
+/// margin freezes after RFC 0033), and the RFC0031.7 latency floor at
+/// factor 3 on the L6-family window pairs (loudly non-evaluable when
+/// latency is unmeasured, never a silent pass or a spurious fail). The
+/// window pairs' bytes channel, the L2 storage channel, and the
+/// selective-resource pair stay reported diagnostics per the §7
+/// deferrals.
 ///
 /// Loki runs the stock image config plus explicit, documented
 /// ingest-side deviations (all in LOKI'S favour — the anti-strawman
@@ -2195,6 +2426,14 @@ fn rfc0031_indicative_comparative_run() {
         &ok_ourios,
         &ok_loki,
     );
+    // The frozen gates run AFTER the report so a failed gate cannot
+    // destroy the run's evidence (the run #11 salvage lesson).
+    let gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
+    assert!(
+        gate_failures.is_empty(),
+        "{} frozen §7 gate(s) failed (the report above carries the evidence): {gate_failures:#?}",
+        gate_failures.len(),
+    );
     assert!(
         failures.is_empty(),
         "{} pair(s) failed to measure (report above covers the rest): {failures:?}",
@@ -2202,14 +2441,83 @@ fn rfc0031_indicative_comparative_run() {
     );
 }
 
-/// The indicative run's report block, one section per pair. Each gate is
-/// REPORTED under the pair's provisional §7 margin, and evaluated
-/// PRIMARILY on the conservative Loki figure: `totalBytesProcessed` is
-/// decompressed engine-side work, which overstates Loki's storage reads
-/// by the chunk compression ratio; the storage-side figure (compressed
-/// chunk bytes + memory-served head-chunk bytes) is the apples-to-apples
-/// counterpart of Ourios's fetched-compressed-Parquet bytes. Both ratios
-/// are printed so the §9 entry can carry the honest pair of numbers.
+/// One pair's bytes-channel lines, labeled per the §7 partial freeze
+/// (2026-07-13). Both Loki byte figures are evaluated for every pair —
+/// `totalBytesProcessed` is decompressed engine-side work, which
+/// overstates Loki's storage reads by the chunk compression ratio; the
+/// storage-side figure (compressed chunk bytes + memory-served
+/// head-chunk bytes) is the apples-to-apples counterpart of Ourios's
+/// fetched-compressed-Parquet bytes — but which line carries a gate
+/// verdict depends on the class: L1/L3 gate on the frozen storage
+/// channel (processed is context), L2 gates on the processed channel
+/// (storage informational until the RFC 0033 freeze), and the window
+/// pairs' bytes lines are a published diagnostic — a ratio, no verdict
+/// — since the freeze reclassified them; their gate is the RFC0031.7
+/// latency floor.
+fn print_pair_bytes_gates(
+    spec: &PairSpec,
+    ourios_bytes: u64,
+    loki_storage: u64,
+    loki_processed: u64,
+) {
+    let gate = |loki_bytes: u64| {
+        spec.class
+            .gate()
+            .evaluate(ourios_bytes, loki_bytes, spec.margin)
+    };
+    // Diagnostic bytes lines carry the gate math's advantage ratio (and
+    // its zero-measurement honesty guards) WITHOUT a pass/fail verdict:
+    // the §7 freeze reclassified the window pairs' bytes from gated
+    // floor to published diagnostic.
+    let diagnostic = |loki_bytes: u64| match gate(loki_bytes) {
+        ourios_bench::BytesGateOutcome::Decided { advantage, .. } => {
+            format!("ratio loki/ourios = {advantage:.3}")
+        }
+        outcome => format!("{outcome:?}"),
+    };
+    match spec.class {
+        PairClass::L1 | PairClass::L3 => {
+            println!(
+                "gate vs storage-side (PRIMARY — §7 FROZEN, must-win margin {}): {:?}",
+                spec.margin,
+                gate(loki_storage),
+            );
+            println!(
+                "gate vs bytes-processed (context, must-win margin {}): {:?}",
+                spec.margin,
+                gate(loki_processed),
+            );
+        }
+        PairClass::L2 => {
+            println!(
+                "gate vs bytes-processed (GATING — §7 deferred-condition rule, \
+                 must-win margin {}): {:?}",
+                spec.margin,
+                gate(loki_processed),
+            );
+            println!(
+                "gate vs storage-side (informational until the RFC 0033 freeze, \
+                 must-win margin {}): {:?}",
+                spec.margin,
+                gate(loki_storage),
+            );
+        }
+        PairClass::WindowFloor | PairClass::Diagnostic => {
+            println!(
+                "bytes vs storage-side: diagnostic (published, not gated); {}",
+                diagnostic(loki_storage),
+            );
+            println!(
+                "bytes vs bytes-processed: diagnostic (published, not gated); {}",
+                diagnostic(loki_processed),
+            );
+        }
+    }
+}
+
+/// The indicative run's report block, one section per pair, labeled per
+/// the §7 partial freeze (2026-07-13) — the bytes-channel labeling
+/// itself is [`print_pair_bytes_gates`].
 ///
 /// The latency lines carry the §3.6 corroborating channel: warm p50s
 /// (median of [`LATENCY_REPS`] post-poll reps — see the asymmetry note
@@ -2231,12 +2539,6 @@ fn print_indicative_report(
     {
         let answer = &ours.answer;
         let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
-        let gate_storage = spec
-            .gate
-            .evaluate(answer.bytes_read, loki_storage, spec.margin);
-        let gate_processed = spec
-            .gate
-            .evaluate(answer.bytes_read, *loki_processed, spec.margin);
         println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
         println!("dsl: {}", spec.dsl);
         // The Ourios figure is the honest TOTAL (§3.6 measurement-fidelity
@@ -2256,16 +2558,7 @@ fn print_indicative_report(
             loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
         );
         println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
-        println!(
-            "gate vs storage-side (PRIMARY, {} {}): {gate_storage:?}",
-            spec.gate.margin_label(),
-            spec.margin
-        );
-        println!(
-            "gate vs bytes-processed (context, {} {}): {gate_processed:?}",
-            spec.gate.margin_label(),
-            spec.margin
-        );
+        print_pair_bytes_gates(spec, answer.bytes_read, loki_storage, *loki_processed);
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         match ours.latency_p50 {
             Some(p50) => println!(
@@ -2298,12 +2591,18 @@ fn print_indicative_report(
                     ms(loki_p50) / ms(ours_p50),
                 );
             }
-            if matches!(spec.gate, GateKind::Floor) {
-                println!(
-                    "latency floor gate (RFC0031.7, floor factor {}): {:?}",
+            match spec.class {
+                PairClass::WindowFloor => println!(
+                    "latency floor gate (RFC0031.7 — §7 FROZEN, floor factor {}): {:?}",
                     spec.margin,
                     latency_floor_gate(ours_p50, loki_p50, spec.margin),
-                );
+                ),
+                PairClass::Diagnostic => println!(
+                    "latency floor (diagnostic reference, factor {}): {:?}",
+                    spec.margin,
+                    latency_floor_gate(ours_p50, loki_p50, spec.margin),
+                ),
+                PairClass::L1 | PairClass::L2 | PairClass::L3 => {}
             }
         }
     }

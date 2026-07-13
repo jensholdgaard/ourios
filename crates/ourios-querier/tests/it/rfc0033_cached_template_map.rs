@@ -137,9 +137,10 @@ fn live_audit_set(bucket: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
+        // Test oracle: an unreadable dir must fail the test loudly, not
+        // shrink the expected frontier and pass for the wrong reason.
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
         for entry in entries {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {

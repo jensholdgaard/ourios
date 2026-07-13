@@ -215,7 +215,7 @@ impl TemplateMap {
     ///
     /// [`serde_json::Error`] if serialization fails (not expected for
     /// these plain structs).
-    pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+    pub fn to_json(&self) -> Result<Vec<u8>, QueryError> {
         let mut registry: Vec<RegistryEntry> = self
             .registry
             .iter()
@@ -230,19 +230,30 @@ impl TemplateMap {
             .aliases
             .classes(&self.tenant)
             .into_iter()
-            .map(|class| AliasClass {
+            .map(|class| match class.first().copied() {
+                Some(representative) => Ok(AliasClass {
+                    representative,
+                    members: class.into_iter().collect(),
+                }),
                 // A stored class always has ≥ 2 members (the AliasMap
-                // invariant), so `first` is never absent.
-                representative: class.first().copied().unwrap_or_default(),
-                members: class.into_iter().collect(),
+                // invariant); an empty one is corruption and must fail
+                // LOUDLY rather than serialize representative 0 into a
+                // torn artifact.
+                None => Err(QueryError::Storage {
+                    detail: "alias class with no members — AliasMap invariant violation"
+                        .to_string(),
+                }),
             })
-            .collect();
+            .collect::<Result<Vec<_>, QueryError>>()?;
         serde_json::to_vec(&TemplateMapJson {
             format_version: TEMPLATE_MAP_FORMAT_VERSION,
             tenant_id: self.tenant.as_str().to_owned(),
             folded_files: self.folded_files.clone(),
             registry,
             alias_map,
+        })
+        .map_err(|e| QueryError::Storage {
+            detail: format!("template_map serialization: {e}"),
         })
     }
 
@@ -314,6 +325,18 @@ impl TemplateMap {
 /// keys, so a hostile artifact cannot name paths outside the tenant's
 /// audit subtree (`CLAUDE.md` §3.7).
 fn validate(raw: &TemplateMapJson) -> Result<(), String> {
+    // Canonical-form check on every template string: the artifact is
+    // untrusted input, and a non-canonical string (empty segments,
+    // doubled/leading/trailing spaces) that parse_template would still
+    // accept could alter matching semantics — classify it torn instead.
+    for entry in &raw.registry {
+        if format_template(&parse_template(&entry.template)) != entry.template {
+            return Err(format!(
+                "registry template for id {} v{} is not in canonical format_template form",
+                entry.template_id, entry.version,
+            ));
+        }
+    }
     for name in &raw.folded_files {
         if !is_tenant_relative_parquet(name) {
             return Err(format!(

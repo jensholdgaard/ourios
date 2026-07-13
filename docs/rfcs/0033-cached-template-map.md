@@ -106,9 +106,10 @@ in §4.
 
 A single JSON object per tenant, named **`template_map.json`**
 (**legacy v1 encoding** — key and transport encoding superseded by
-the 2026-07-13 amendment at the end of this section; the object
-*content* below is unchanged), living at the root of the tenant's
-audit subtree:
+the 2026-07-13 amendment at the end of this section; the JSON
+*structure* below is unchanged, but v2 carries `format_version: 2`
+and ships zstd-compressed at the v2 key), living at the root of the
+tenant's audit subtree:
 
 ```text
 audit/tenant_id=<percent-encoded>/template_map.json
@@ -380,13 +381,13 @@ sequenceDiagram
     participant Q as Querier
     participant FS as Object store (tenant audit subtree)
     Q->>FS: LIST audit/tenant_id=t/*.parquet → live set S
-    Q->>FS: GET template_map.json
+    Q->>FS: GET template_map.v2.json.zst
     alt hit — folded_files == S
         Q->>Q: deserialize registry + alias map (no audit GETs)
     else miss / stale / torn / unknown version
         Q->>FS: GET every audit file in S (today's fold)
         Q->>Q: fold registry + alias map (§3.7.1 order)
-        Q-->>FS: publish template_map.json @ frontier S (tmp+rename / CAS, best-effort)
+        Q-->>FS: publish template_map.v2.json.zst @ frontier S (tmp+rename / CAS, best-effort)
     end
     Q->>Q: answer the query (identical either way)
 ```

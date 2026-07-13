@@ -104,8 +104,11 @@ in §4.
 
 ### 3.2 The artifact — format and location
 
-A single JSON object per tenant, named **`template_map.json`**,
-living at the root of the tenant's audit subtree:
+A single JSON object per tenant, named **`template_map.json`**
+(**legacy v1 encoding** — key and transport encoding superseded by
+the 2026-07-13 amendment at the end of this section; the object
+*content* below is unchanged), living at the root of the tenant's
+audit subtree:
 
 ```text
 audit/tenant_id=<percent-encoded>/template_map.json
@@ -184,6 +187,101 @@ configured size ceiling; the exact ceiling is an open question
 (§7). Abstention costs nothing — the no-artifact path is today's
 behaviour.
 
+> **Amendment (2026-07-13, run #20 / §9.14): compressed artifact
+> encoding — `format_version` 2.** Comparative run #20
+> (`docs/benchmarks.md` §9.14) showed the v1 encoding losing to its
+> own guard on the headline corpus: on otel-demo-v8 the uncompressed
+> JSON of every `(template_id, version)` canonical template meets or
+> exceeds the 513,862 B *zstd-compressed Parquet* fold it must
+> undercut, so the size abstention correctly refused every publish
+> and the corpus never ran warm (RFC0033.6's corpus arm
+> undischarged, status `green → red`). The defect is transport
+> encoding, not structure; this amendment changes only how the bytes
+> ship.
+>
+> - **Encoding.** The artifact body is the §3.2 JSON object,
+>   zstd-compressed as a single frame. The JSON structure, field
+>   meanings, canonical sort orders, and validation rules above are
+>   **unchanged** — only the bytes on the wire are. The compression
+>   level is the crate default (3), an implementation constant, not
+>   configuration: the object is kilobyte-scale and written once per
+>   miss, the template-string JSON is highly redundant (the same
+>   strings zstd-compress into the 513,862 B audit Parquet *with*
+>   their full event history alongside), so the needed
+>   order-of-magnitude win does not hinge on the level; raise the
+>   constant in code if run #21 measures the ratio marginal.
+> - **Key: `template_map.v2.json.zst`**, same tenant audit root
+>   (`audit/tenant_id=<enc>/template_map.v2.json.zst`) — the version
+>   moves **into the key**. A pre-amendment reader GETs only
+>   `template_map.json`, so for it the v2 artifact is *literal
+>   absence* — genuine fresh fold, correct by §3.3's design, with
+>   honest telemetry. A post-amendment reader GETs only the v2 key.
+>   Both keys stay invisible to every audit walk by construction
+>   (local walk keeps only `extension == "parquet"` entries, S3
+>   listing filters `ends_with(".parquet")` — `audit_scan.rs`; the
+>   filter ignores any number of non-Parquet keys, so a second one
+>   changes nothing). Future encoding-affecting bumps repeat the
+>   pattern: new key, new in-body version, best-effort delete of the
+>   predecessor (§3.4 amendment).
+> - **Rejected: same key, magic-frame sniff.** The alternative keeps
+>   `template_map.json` and has readers sniff the zstd frame magic
+>   (`0xFD2FB528`) before JSON parse. It is *correct* — an old
+>   reader GETs the compressed body, fails JSON parse, classifies
+>   **Torn**, folds fresh, self-heals — but it lies twice: §3.7
+>   pins `torn` as the RFC 0008-style *corruption* signal, so a
+>   mixed-version fleet would page on healthy state for as long as
+>   one old binary keeps querying; and §3.3's `UnknownVersion`
+>   disposition — designed for exactly this evolution — is
+>   unreachable there, because the parse fails before the version
+>   probe runs. A `.json` key carrying zstd bytes also misnames the
+>   object. The one cost of the new-key route — a bounded second
+>   key during the mixed-version window, deleted best-effort — is
+>   cheaper than a permanently lying corruption signal.
+> - **`format_version: 2`, in the decompressed body.** The version
+>   names the whole artifact contract *including* the transport
+>   encoding, not just the JSON shape: `TEMPLATE_MAP_FORMAT_VERSION`
+>   becomes 2, and the probe runs on the decompressed bytes as
+>   defense-in-depth — a v1 body planted at the v2 key (or a
+>   decompressed v2 body at the v1 key) classifies `UnknownVersion`
+>   → treated as absent, harmless, per §3.3's rule.
+> - **Dispositions at the v2 key** (§3.3 table unchanged in
+>   spirit): not a zstd frame, failed decompression, or
+>   post-decompression parse/validation failure → **Torn**;
+>   decompressed `format_version` ≠ 2 → **`UnknownVersion`**;
+>   `tenant_id` mismatch → loud failure. Everything else as
+>   tabulated.
+> - **Abstention, restated (unchanged in spirit).** Publish iff the
+>   **compressed** artifact byte size is smaller than the audit
+>   bytes just folded: the comparison is between the bytes a warm
+>   GET would pay and the bytes the fold just paid — the v1 rule
+>   applied to the bytes actually shipped.
+> - **Telemetry (§3.7).** The artifact-size histogram records the
+>   **compressed** (published-object) bytes — the GET cost, which
+>   is what the instrument always measured (it records the
+>   published bytes, and those are now compressed). Lookup and
+>   publish outcome values are unchanged.
+> - **Reading rule.** References to `template_map.json` elsewhere
+>   in this RFC (§3.3–§3.5, §5, the §3.4 diagram) read as the
+>   versioned key post-amendment; the local tmp is
+>   `template_map.v2.json.zst.tmp` (extension `tmp`, ignored by the
+>   walk as before).
+> - **Dependency.** Zero new dependencies: `zstd` 0.13 is already
+>   compiled into every querier build (`parquet` 58's `zstd`
+>   feature via `ourios-parquet`, and `arrow-ipc`), and
+>   `ourios-bench` already binds the crate directly as the A1
+>   reference codec (RFC 0006 §3.4.1). Adding `zstd = "0.13"` to
+>   `ourios-querier` introduces no new transitive crate and passes
+>   the existing cargo-deny license gate unchanged.
+> - **Validation: comparative run #21, before merge.** The
+>   amendment is validated by a comparative dispatch from the
+>   implementation branch **before** it merges (the
+>   measure-before-merge workflow), and the harness MUST print each
+>   pair's publish outcome explicitly — `published` (with the
+>   compressed size), `abstained` (with the would-be size vs. the
+>   folded audit bytes), `lost_race`, or `error` — so run #20's
+>   ambiguity (abstention and publish IO failure both leaving the
+>   same "no artifact" label) cannot recur.
+
 ### 3.3 Freshness — the frontier check
 
 The audit stream is append-only, so cache validity is exactly:
@@ -225,6 +323,16 @@ uses one listing, taken once, for both the validity check and the
 fallback fold, so a file appearing mid-query affects a cached and an
 uncached query identically.
 
+> **Amendment (2026-07-13, run #20 / §9.14).** At the v2 key (§3.2
+> amendment), "torn / unparseable JSON" includes a missing zstd
+> frame or a failed decompression, and the unknown-`format_version`
+> probe runs on the *decompressed* bytes. The table's dispositions
+> and the LIST-before-GET rule are otherwise unchanged. Note the
+> version-in-key choice means a pre-amendment reader never fetches
+> a v2 artifact at all: for old binaries the encoding bump manifests
+> as literal absence — the cleanest possible realization of the
+> unknown-version-is-absent rule this table was designed around.
+
 ### 3.4 Atomic publish — the RFC 0009 §3.4 precedent
 
 The artifact is published the way the compaction manifest is
@@ -249,6 +357,23 @@ retry loop, no error. The manifest needed CAS to prevent *lost
 updates* of authoritative state; the cache needs only *atomicity of
 the object itself*, and gets CAS cheaply because the primitive
 already exists.
+
+> **Amendment (2026-07-13, run #20 / §9.14).** The publish targets
+> the v2 key (`template_map.v2.json.zst`; local tmp
+> `template_map.v2.json.zst.tmp`, same rename; same CAS ladder on
+> S3, the expectation being the v2 key's observed ETag or
+> create-if-absent), and on a successful publish best-effort
+> **deletes** the stale v1 `template_map.json` key. The delete is
+> unconditional (no CAS needed — any v1 artifact is derived and
+> discardable by definition) and never a query failure; a crash or
+> failure between publish and delete leaves both keys, which is
+> harmless: each reader population GETs only its own key and
+> verifies the frontier at every read, and the next successful v2
+> publish retries the delete implicitly. During a mixed-version
+> window an old binary's write-through may republish the v1 key (on
+> tenants where the uncompressed artifact still beats the fold);
+> correctness is unaffected — each version population maintains its
+> own cache — and hygiene converges once old binaries retire.
 
 ```mermaid
 sequenceDiagram
@@ -500,6 +625,17 @@ treated as absent, no migration) before the gate can be measured.
 The scenario stays as written; the RFC status returns to `red` until
 it passes.
 
+**Amendment pointer (2026-07-13):** the compressed encoding this
+note calls for is specified in the §3.2 amendment. The scenario text
+above needs **no change**: the "artifact object's byte size" a warm
+GET pays *is* the compressed object's size, and the ratio gate is
+encoding-agnostic. Validation is comparative run #21, dispatched
+from the implementation branch before merge (measure-before-merge),
+with the harness printing each pair's publish outcome — `published`
+(compressed size) / `abstained` (would-be size vs. folded audit
+bytes) / `lost_race` / `error` — so run #20's abstention-vs-failure
+ambiguity cannot recur.
+
 > **Scenario RFC0033.7 — Observable outcomes**
 > - **Given** a served querier with the OTel metrics pipeline
 >   (RFC 0016) active
@@ -529,6 +665,15 @@ Mapped to `CLAUDE.md` §6.2:
   is the gate, the absolute numbers are recorded.
 - **RFC0033.7** — the RFC 0016 metrics-pipeline test shape
   (in-memory exporter), plus the semconv no-diff CI gate.
+
+> **Amendment (2026-07-13).** §6 is structurally unchanged by the
+> compressed encoding: the same tests exercise the v2 artifact
+> (round-trip and torn-classification now run through the
+> compressed body; RFC0033.6's local arm asserts warm acquisition
+> bytes equal the artifact's byte size exactly, which holds
+> unchanged because the GET *is* the compressed object). The one
+> addition is run #21's harness printing publish outcomes (§3.2
+> amendment / §5.6 pointer).
 
 ## 7. Open questions
 
@@ -560,6 +705,11 @@ Mapped to `CLAUDE.md` §6.2:
 - [ ] **Drift queries (RFC 0010)** intentionally do not use the
   artifact (they need raw events, not the fold) — confirm no future
   consumer is tempted to.
+- [ ] **Legacy v1 key hygiene** (raised by the 2026-07-13
+  amendment): the v2 publish best-effort-deletes
+  `template_map.json`; once no pre-amendment binaries remain, keep
+  the delete as permanent hygiene (one cheap idempotent DELETE) or
+  drop it?
 
 ## 8. References
 
@@ -579,6 +729,12 @@ Mapped to `CLAUDE.md` §6.2:
   check reuses.
 - RFC 0023 — bounded template memory (the artifact's size-bound
   argument).
+- RFC 0006 §3.4.1 / `crates/ourios-bench` — the workspace's
+  existing `zstd` (0.13) binding, the A1 reference codec; the
+  2026-07-13 compressed-encoding amendment reuses the same crate,
+  zero new dependencies.
+- `docs/benchmarks.md` §9.14 — comparative run #20 (2026-07-13):
+  the abstention finding the compressed-encoding amendment answers.
 - `CLAUDE.md` §3.5 (schema/migration — satisfied additively), §3.6
   (object storage is the source of truth), §3.7 (per-tenant
   scoping), §6.3 (observability).

@@ -189,7 +189,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_carry_the_section_7_proposals() {
+    fn defaults_carry_the_section_7_values_frozen_and_deferred() {
         // Pinned so the §7 values can't drift silently — m_l1/m_l3/f_l6
         // are FROZEN (2026-07-13), the rest still-deferred proposals; a
         // §7 change lands here WITH the RFC.

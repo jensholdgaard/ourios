@@ -660,11 +660,10 @@ fn rfc0031_11_losses_published_and_escalation() {
     let section = rest[1..].find("\n### ").map_or(rest, |i| &rest[..=i]);
 
     for (marker, why) in [
-        (
-            "**77.2×**",
-            "the L1 flagship win (run #15) — wins publish too",
-        ),
-        ("**21.9×**", "the L3 win (runs #14/#17)"),
+        // Unformatted substrings: a bold-only doc edit must not fail
+        // this; deleting the figure itself must.
+        ("77.2×", "the L1 flagship win (run #15) — wins publish too"),
+        ("21.9×", "the L3 win (runs #14/#17)"),
         (
             "not a provisional 10× pass",
             "L2's honest short-of-margin disposition",

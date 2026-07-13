@@ -313,8 +313,11 @@ Per query, per system, the harness records:
   query. Ourios: extended from the RFC 0016 `scanned`/`pruned`
   row-group counts to the **bytes** of the row groups actually read
   (footer + read row-group byte length), emitted on the existing OTel
-  query-metrics path. Loki: `totalBytesProcessed` from the query
-  `Summary`. **Primary gate metric.** Because it counts bytes fetched
+  query-metrics path. Loki: recorded on **two channels** (definitions
+  in the 2026-07-13 amendment below): storage-side
+  (`compressedBytes + headChunkBytes`) and processed
+  (`totalBytesProcessed`); each frozen gate cites one (§7).
+  **Primary gate metric.** Because it counts bytes fetched
   from the shared object store, it is by construction insensitive to
   CPU speed and engine maturity; to keep it insensitive to local page
   cache as well, each measured query runs against a **freshly started**
@@ -346,6 +349,22 @@ Per query, per system, the harness records:
 > `QueryStats::bytes_read` keeps its count-scan-only meaning (the
 > B1/B2 gates and the RFC 0016 metrics depend on it); the two new
 > components are additive `QueryResult` fields the harness sums.
+>
+> **Channel definitions (amendment, 2026-07-13).** The Loki
+> comparator is recorded on two channels, and each frozen gate names
+> which it uses (§7): the **storage-side channel**
+> (`compressedBytes + headChunkBytes` from the query-stats tree —
+> compressed chunk bytes fetched from storage plus memory-served
+> head-chunk bytes, the latter counted so data not yet flushed is
+> not free; the conservative apples-to-apples counterpart of
+> Ourios's fetched-compressed total)
+> and the **processed channel** (`totalBytesProcessed` —
+> decompressed engine work, the measure of the scanning the §1
+> thesis eliminates). Both are always recorded; gates cite one.
+> Where a §5 scenario's shorthand reads `loki.bytes_read` (or names
+> `Summary.totalBytesProcessed` directly), the channel the frozen
+> gate cites in §7 applies: storage-side for RFC0031.2/.4, processed
+> for RFC0031.3 under the interim rule.
 
 ### 3.7 Reproducibility and anti-strawman commitment
 
@@ -599,17 +618,41 @@ not block `validated` in the "we didn't finish" sense — it is a
 
 ## 7. Open questions
 
-- [ ] **Must-win margins `M_L1`, `M_L2`, `M_L3`, `M_L4`.** What
-  bytes-read ratio counts as "decisively wins"? Proposed starting point:
-  `M ≥ 10` (Ourios reads ≤ 1/10 the bytes Loki does), mirroring B1's 10×
-  framing but on the honest metric; the two Loki-can't-index classes
-  (L3 trace, L4 aggregation) may warrant larger margins. Needs a
-  calibration pass on a first indicative run before frozen. **Maintainer
-  call.**
-- [ ] **Floor / parity factors `F_L6`, `F_L7`.** How much slower on the
-  broad scan (L6) and how much lower on ingest (L7) is tolerable before
-  it is a finding? Proposed `F_L6 = 3`, `F_L7 = 2`, pending the first
-  run.
+- [x] **Must-win margins — PARTIALLY FROZEN (2026-07-13, per the
+  `benchmarks.md` §9.13 calibration record; maintainer delegated).**
+  `M_L1 = 10` and `M_L3 = 10` are **frozen** on the storage-side
+  channel (the conservative one, §3.6 channel definitions): both classes clear it with
+  headroom (L1 77.2–77.7×, L3 21.2–21.9×) across 3–4 consecutive
+  equivalence-verified runs, and both wins are structural rather
+  than tuned. `M_L2` is **deferred with a named condition**: the
+  measured storage-side band is 1.05–1.31× — an honest parity, not a
+  10× claim — and two named levers (the RFC 0033 cached template
+  map, constant 513,862 bytes per query, and write-side sizing) are expected
+  to move it; freeze after RFC 0033 lands. Until then L2 gates on
+  the processed channel at `M = 10` (measured 32.5–39.3×),
+  with the storage-side figure recorded as informational. `M_L4` is
+  **deferred until L4 is first measured** (query shape below).
+  Rationale for the split channels is the `benchmarks.md` §9.13 assessment: the
+  storage channel is the conservative claim where we can make it,
+  and the processed channel measures the work the §1 thesis
+  eliminates.
+- [x] **Floor / parity factors — F_L6 FROZEN, F_L7 DEFERRED
+  (2026-07-13).** `F_L6 = 3` is **frozen on the latency channel, as
+  RFC0031.7 is written**: run #18 measured all three window pairs
+  inside the floor (ratios 0.34 / 3.43 / 1.32, oriented
+  `loki_p50 / ourios_p50` so > 1 means Ourios is faster; the floor
+  passes at ≥ 1/3 — Ourios outright faster on two of three). Harness
+  alignment (asserting the frozen gates instead of reporting them)
+  lands in the companion slice immediately after this amendment. The window pairs' **bytes** figures
+  are reclassified from a gated floor to a **published diagnostic**
+  (`informational` bar, `benchmarks.md` taxonomy): the storage-channel
+  loss (0.003–0.018 across the record; 0.007–0.018 on current
+  code, post-#486) is real, structural to time-partitioned chunks
+  vs columnar layout, small in absolute terms (≤ 4.5 MB), and its
+  only lever is the write-side layout fork — publishing it honestly
+  is the commitment; gating on it would gate on a number we do not
+  intend to chase. `F_L7 = 2` stays **deferred until L7 (ingest
+  parity) is first measured**.
 - [ ] **L4 aggregation query shape.** Which template + param + bucket
   width best represents the real alerting/dashboard workload on the
   OTel-Demo corpus, and how is the LogQL equivalent (pattern/`label_format`

@@ -356,6 +356,12 @@ Per query, per system, the harness records:
 > and the **processed channel** (`totalBytesProcessed` —
 > decompressed engine work, the measure of the scanning the §1
 > thesis eliminates). Both are always recorded; gates cite one.
+> This amendment **supersedes** the original §3.6 `bytes_read`
+> bullet's single-comparator wording ("Loki: `totalBytesProcessed`")
+> and the §5 scenarios' `Summary.totalBytesProcessed` shorthand:
+> where a scenario reads `loki.bytes_read`, the channel the frozen
+> gate cites in §7 applies (storage-side for RFC0031.2/.4; processed
+> for RFC0031.3 under the interim rule).
 
 ### 3.7 Reproducibility and anti-strawman commitment
 
@@ -612,7 +618,7 @@ not block `validated` in the "we didn't finish" sense — it is a
 - [x] **Must-win margins — PARTIALLY FROZEN (2026-07-13, per the
   `benchmarks.md` §9.13 calibration record; maintainer delegated).**
   `M_L1 = 10` and `M_L3 = 10` are **frozen** on the storage-side
-  bytes channel (the conservative one): both classes clear it with
+  channel (the conservative one, §3.6 channel definitions): both classes clear it with
   headroom (L1 77.2–77.7×, L3 21.2–21.9×) across 3–4 consecutive
   equivalence-verified runs, and both wins are structural rather
   than tuned. `M_L2` is **deferred with a named condition**: the
@@ -620,7 +626,7 @@ not block `validated` in the "we didn't finish" sense — it is a
   10× claim — and two named levers (the RFC 0033 cached template
   map, constant 513,862 bytes per query, and write-side sizing) are expected
   to move it; freeze after RFC 0033 lands. Until then L2 gates on
-  the processed-bytes channel at `M = 10` (measured 32.5–39.3×),
+  the processed channel at `M = 10` (measured 32.5–39.3×),
   with the storage-side figure recorded as informational. `M_L4` is
   **deferred until L4 is first measured** (query shape below).
   Rationale for the split channels is the `benchmarks.md` §9.13 assessment: the

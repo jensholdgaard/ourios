@@ -67,6 +67,7 @@ pub struct TemplateMap {
 /// read loudly ([`QueryError::Storage`]) rather than degrading to a
 /// fresh fold.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ArtifactRead {
     /// Well-formed, known version, tenant verified — usable as a cache
     /// hit once the caller's frontier check passes.
@@ -213,8 +214,10 @@ impl TemplateMap {
     ///
     /// # Errors
     ///
-    /// [`serde_json::Error`] if serialization fails (not expected for
-    /// these plain structs).
+    /// [`QueryError::Storage`] if serialization fails (not expected for
+    /// these plain structs) or an alias class violates the non-empty
+    /// invariant — corruption that must fail loudly rather than
+    /// serialize a torn artifact.
     pub fn to_json(&self) -> Result<Vec<u8>, QueryError> {
         let mut registry: Vec<RegistryEntry> = self
             .registry

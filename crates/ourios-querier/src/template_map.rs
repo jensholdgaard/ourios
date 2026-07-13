@@ -109,6 +109,7 @@ pub enum PublishOutcome {
 /// dispositions that resolve to the fresh fold, distinguished for the
 /// §3.7 lookup-outcome telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MissReason {
     /// No artifact under the tenant's audit root.
     Absent,
@@ -125,6 +126,7 @@ pub enum MissReason {
 /// variant's answer is correct — the outcome distinguishes what IO paid
 /// for it, never what was served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CacheOutcome {
     /// The artifact's frontier equals the live listing: served from the
     /// artifact, zero audit GETs.

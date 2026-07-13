@@ -43,7 +43,7 @@ use tokio::task::JoinHandle;
 use ourios_core::otlp::canonical;
 use ourios_core::tenant::TenantId;
 use ourios_miner::reconstruct::Reconstruction;
-use ourios_parquet::StoreConfig;
+use ourios_parquet::{PromotedAttributes, StoreConfig};
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
 use ourios_querier::{DriftResult, LogBody, LogRow, Querier, QueryResult, QueryStats};
@@ -82,6 +82,10 @@ pub struct QuerierConfig {
     /// Serve the RFC 0027 MCP surface at `/mcp` (`querier.mcp.enabled`;
     /// default off). The RFC 0026 gate applies to it identically.
     pub mcp_enabled: bool,
+    /// The effective RFC 0022 promoted attribute set
+    /// (`storage.promoted_attributes`) — the same set the write paths
+    /// apply; the MCP query-schema resource publishes it (RFC 0032 §3.1).
+    pub promoted: PromotedAttributes,
     /// The RFC 0026/0029 credential resolver (`is_open()` = open mode,
     /// §3.1). Otherwise every request must carry a resolvable
     /// `Authorization: Bearer` credential (→ 401) and its
@@ -235,18 +239,39 @@ pub fn router(bucket_root: PathBuf, default_window_nanos: u64) -> Router {
 }
 
 /// [`router_with_auth`] plus the RFC 0027 `/mcp` surface — the fully
-/// optioned constructor tests drive (RFC0027.1/.2).
+/// optioned constructor tests drive (RFC0027.1/.2). The query-schema
+/// resource serves the default promoted set (`service.name` only).
 pub fn router_with_mcp(
     bucket_root: PathBuf,
     default_window_nanos: u64,
     auth: AuthResolver,
     mcp_enabled: bool,
 ) -> Router {
+    router_with_mcp_promoted(
+        bucket_root,
+        default_window_nanos,
+        auth,
+        mcp_enabled,
+        &PromotedAttributes::default(),
+    )
+}
+
+/// [`router_with_mcp`] with an explicit RFC 0022 promoted set — the
+/// constructor the RFC 0032 query-schema tests drive (the resource's
+/// `promoted_attributes` section is built from this set).
+pub fn router_with_mcp_promoted(
+    bucket_root: PathBuf,
+    default_window_nanos: u64,
+    auth: AuthResolver,
+    mcp_enabled: bool,
+    promoted: &PromotedAttributes,
+) -> Router {
     router_from_querier(
         Querier::new(bucket_root),
         default_window_nanos,
         auth,
         mcp_enabled,
+        promoted,
     )
 }
 
@@ -258,7 +283,13 @@ pub fn router_with_auth(
     default_window_nanos: u64,
     auth: AuthResolver,
 ) -> Router {
-    router_from_querier(Querier::new(bucket_root), default_window_nanos, auth, false)
+    router_from_querier(
+        Querier::new(bucket_root),
+        default_window_nanos,
+        auth,
+        false,
+        &PromotedAttributes::default(),
+    )
 }
 
 /// Build the router from an already-constructed [`Querier`] — the shared core
@@ -269,6 +300,7 @@ fn router_from_querier(
     default_window_nanos: u64,
     auth: AuthResolver,
     mcp_enabled: bool,
+    promoted: &PromotedAttributes,
 ) -> Router {
     let state = QuerierState {
         querier: Arc::new(querier),
@@ -287,7 +319,13 @@ fn router_from_querier(
         // `/mcp`, behind the same RFC 0026 gate, over the same engine.
         router.nest(
             "/mcp",
-            crate::mcp::mcp_router(mcp_querier, default_window_nanos, auth, mcp_metrics),
+            crate::mcp::mcp_router(
+                mcp_querier,
+                default_window_nanos,
+                auth,
+                mcp_metrics,
+                promoted,
+            ),
         )
     } else {
         router
@@ -335,6 +373,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         config.default_window_nanos,
         config.auth,
         config.mcp_enabled,
+        &config.promoted,
     );
     let (shutdown, mut shutdown_rx) = watch::channel(());
     let http = tokio::spawn(async move {

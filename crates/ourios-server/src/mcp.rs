@@ -25,6 +25,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use ourios_core::tenant::TenantId;
 use ourios_ingester::receiver::{AuthBinding, AuthResolver};
+use ourios_parquet::PromotedAttributes;
 use ourios_querier::Querier;
 use ourios_querier::dsl::{self, Statement};
 use rmcp::handler::server::ServerHandler;
@@ -50,6 +51,9 @@ const DSL_RFC: &str = include_str!("../../../docs/rfcs/0002-query-dsl.md");
 /// The resource's URI (RFC0027.6).
 const GRAMMAR_URI: &str = "ourios://dsl-grammar";
 
+/// The query-schema / cost-model resource's URI (RFC 0032).
+const QUERY_SCHEMA_URI: &str = "ourios://query-schema";
+
 /// The §7 grammar section of the embedded RFC (heading inclusive, next
 /// top-level heading exclusive), extracted once. [`mcp_router`] touches
 /// this at role startup, so an RFC that lost its §7 heading panics
@@ -69,6 +73,83 @@ static GRAMMAR_SECTION: std::sync::LazyLock<&'static str> = std::sync::LazyLock:
 /// The `ourios.query.kind` value for the registry fold (a registry
 /// member alongside `logs`/`drift`/`rejected`).
 const QUERY_KIND_TEMPLATES: &str = "templates";
+
+/// The RFC 0032 §3.2 query-schema / cost-model document: the DSL field
+/// vocabulary (exactly the RFC 0002 §7 `field` production), the severity
+/// bands from the DSL compiler's own mapping (so the resource cannot
+/// drift from it), the deployment's effective promoted set, and the
+/// structural cost tiers. Configuration is startup-static (RFC 0020), so
+/// [`mcp_router`] builds this once per role — and it derives only from
+/// code constants and configuration: never benchmark numbers, never
+/// ingested telemetry (§3.2's structure-not-numbers rule).
+///
+/// The `bloom` mechanism entries mirror the columns the Parquet writer
+/// actually bloom-filters (`template_id`, `trace_id`/`span_id`, and every
+/// promoted column); `severity` prunes through min/max statistics, so its
+/// entry says `statistics` — claiming index-backing the writer does not
+/// provide is the drift RFC0032.4 gates against.
+fn query_schema_document(promoted: &PromotedAttributes) -> serde_json::Value {
+    use ourios_querier::dsl::ir::SeverityName;
+    let severity_names: Vec<serde_json::Value> = [
+        ("trace", SeverityName::Trace),
+        ("debug", SeverityName::Debug),
+        ("info", SeverityName::Info),
+        ("warn", SeverityName::Warn),
+        ("error", SeverityName::Error),
+        ("fatal", SeverityName::Fatal),
+    ]
+    .into_iter()
+    .map(|(name, level)| {
+        serde_json::json!({ "name": name, "floor": level.floor(), "ceil": level.ceil() })
+    })
+    .collect();
+    serde_json::json!({
+        "format_version": 1,
+        "fields": [
+            { "name": "ts",          "type": "timestamp" },
+            { "name": "observed_ts", "type": "timestamp" },
+            { "name": "severity",    "type": "integer" },
+            { "name": "body",        "type": "string" },
+            { "name": "trace_id",    "type": "hex_string" },
+            { "name": "span_id",     "type": "hex_string" },
+            { "name": "scope",       "type": "string" },
+            { "name": "flags",       "type": "integer" },
+            { "name": "service",     "type": "string" },
+            { "name": "template_id", "type": "integer" },
+            { "name": "confidence",  "type": "float" },
+            { "name": "lossy",       "type": "boolean" }
+        ],
+        "severity": {
+            "comparison": "numeric, OTel SeverityNumber 1-24",
+            "names": severity_names
+        },
+        "promoted_attributes": {
+            "resource": promoted.resource_keys(),
+            "log": promoted.log_keys()
+        },
+        "cost_model": {
+            "tiers": ["index_backed", "pruned", "scan"],
+            "classification": [
+                { "kind": "exact_equality", "fields": ["trace_id", "span_id", "template_id"],
+                  "tier": "index_backed", "mechanism": "bloom" },
+                { "kind": "ordering_or_equality", "fields": ["severity"],
+                  "tier": "index_backed", "mechanism": "statistics" },
+                { "kind": "promoted_attribute_equality",
+                  "fields": ["service", "resource.<promoted key>", "attr.<promoted key>"],
+                  "tier": "index_backed", "mechanism": "bloom" },
+                { "kind": "time_window", "fields": ["ts", "observed_ts"],
+                  "tier": "pruned", "mechanism": "statistics" },
+                { "kind": "non_promoted_attribute_predicate",
+                  "fields": ["resource.<other key>", "attr.<other key>"],
+                  "tier": "scan" },
+                { "kind": "body_substring_or_regex", "fields": ["body"],
+                  "tier": "scan" },
+                { "kind": "unscoped_browse", "fields": [],
+                  "tier": "scan" }
+            ]
+        }
+    })
+}
 
 /// The standard §3.3 warning every tool description carries: log bodies
 /// are attacker-influenceable input entering an LLM context.
@@ -113,6 +194,10 @@ pub(crate) struct OuriosMcp {
     default_window_nanos: u64,
     auth: AuthResolver,
     metrics: Arc<crate::querier::QuerierMetrics>,
+    /// The RFC 0032 resource body, serialized once at role startup (the
+    /// promoted set is startup-static, so the document is immutable for
+    /// the process lifetime, like the grammar section).
+    query_schema: Arc<str>,
 }
 
 /// Normalize a tool's `tenant` argument the way the HTTP surface treats
@@ -173,12 +258,14 @@ impl OuriosMcp {
         default_window_nanos: u64,
         auth: AuthResolver,
         metrics: Arc<crate::querier::QuerierMetrics>,
+        query_schema: Arc<str>,
     ) -> Self {
         Self {
             querier,
             default_window_nanos,
             auth,
             metrics,
+            query_schema,
         }
     }
 
@@ -361,19 +448,28 @@ impl ServerHandler for OuriosMcp {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        // One resource: the DSL grammar, served from the canonical doc
+        // Two resources: the DSL grammar, served from the canonical doc
         // (RFC0027.6) so agents learn the query language from the
-        // protocol rather than prompt engineering.
-        let mut resource = Resource::new(GRAMMAR_URI, "Ourios logs DSL grammar");
-        resource.description = Some(
+        // protocol rather than prompt engineering, and the RFC 0032
+        // query-schema / cost-model document beside it.
+        let mut grammar = Resource::new(GRAMMAR_URI, "Ourios logs DSL grammar");
+        grammar.description = Some(
             "The RFC 0002 §7 grammar for the logs DSL the query_logs tool \
              accepts, verbatim from the project documentation."
                 .to_string(),
         );
-        resource.mime_type = Some("text/markdown".to_string());
+        grammar.mime_type = Some("text/markdown".to_string());
+        let mut schema = Resource::new(QUERY_SCHEMA_URI, "Ourios query schema and cost model");
+        schema.description = Some(
+            "The queryable DSL fields, the OTel severity bands, this \
+             deployment's promoted attribute columns, and the structural \
+             query-cost tiers."
+                .to_string(),
+        );
+        schema.mime_type = Some("application/json".to_string());
         // (Exhaustive by design upstream — struct-update works here.)
         Ok(ListResourcesResult {
-            resources: vec![resource],
+            resources: vec![grammar, schema],
             ..ListResourcesResult::default()
         })
     }
@@ -383,16 +479,20 @@ impl ServerHandler for OuriosMcp {
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
-        if request.uri != GRAMMAR_URI {
-            return Err(ErrorData::resource_not_found(
+        match request.uri.as_str() {
+            GRAMMAR_URI => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                *GRAMMAR_SECTION,
+                GRAMMAR_URI,
+            )])),
+            QUERY_SCHEMA_URI => Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(self.query_schema.as_ref(), QUERY_SCHEMA_URI)
+                    .with_mime_type("application/json"),
+            ])),
+            _ => Err(ErrorData::resource_not_found(
                 format!("unknown resource: {}", request.uri),
                 None,
-            ));
+            )),
         }
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            *GRAMMAR_SECTION,
-            GRAMMAR_URI,
-        )]))
     }
 }
 
@@ -459,6 +559,7 @@ pub(crate) fn mcp_router(
     default_window_nanos: u64,
     auth: AuthResolver,
     metrics: Arc<crate::querier::QuerierMetrics>,
+    promoted: &PromotedAttributes,
 ) -> Router {
     // (`StreamableHttpServerConfig` is `#[non_exhaustive]`; mutate a
     // default.) rmcp's default allows loopback Hosts only — a
@@ -471,6 +572,9 @@ pub(crate) fn mcp_router(
     // Startup-fail the grammar extraction (RFC0027.6's loud-panic
     // contract): the role never comes up serving a malformed resource.
     let _ = *GRAMMAR_SECTION;
+    // The RFC 0032 document, once per role startup (§3.1): configuration
+    // is startup-static, so every session serves the same bytes.
+    let query_schema: Arc<str> = query_schema_document(promoted).to_string().into();
     let mut config = StreamableHttpServerConfig::default();
     if !auth.is_open() {
         config.allowed_hosts = Vec::new();
@@ -483,6 +587,7 @@ pub(crate) fn mcp_router(
                 default_window_nanos,
                 handler_auth.clone(),
                 metrics.clone(),
+                query_schema.clone(),
             ))
         },
         Arc::new(LocalSessionManager::default()),

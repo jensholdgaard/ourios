@@ -41,8 +41,8 @@ async fn mcp_handshake(router: &Router) -> String {
 }
 
 /// Read `ourios://query-schema` through the full protocol dance and
-/// parse its text contents as JSON.
-async fn read_query_schema(router: &Router) -> serde_json::Value {
+/// return the raw text body (the exact served bytes).
+async fn read_query_schema_text(router: &Router) -> String {
     let session = mcp_handshake(router).await;
     let read = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "resources/read",
@@ -51,10 +51,15 @@ async fn read_query_schema(router: &Router) -> serde_json::Value {
     let (status, body, _) = mcp_post(router.clone(), None, Some(&session), read).await;
     assert_eq!(status, StatusCode::OK, "resources/read");
     let rpc = rpc_payload(&body);
-    let text = rpc["result"]["contents"][0]["text"]
+    rpc["result"]["contents"][0]["text"]
         .as_str()
-        .expect("text contents");
-    serde_json::from_str(text).expect("the resource body is JSON")
+        .expect("text contents")
+        .to_string()
+}
+
+/// [`read_query_schema_text`], parsed as JSON.
+async fn read_query_schema(router: &Router) -> serde_json::Value {
+    serde_json::from_str(&read_query_schema_text(router).await).expect("the resource body is JSON")
 }
 
 /// An open-mode MCP router over an empty store, with `promoted` as the
@@ -365,12 +370,13 @@ fn collect_number_paths(value: &serde_json::Value, path: &str, out: &mut Vec<Str
 #[tokio::test]
 async fn rfc0032_5_tool_description_placement() {
     let bucket = tempfile::tempdir().expect("temp");
-    let router = ourios_server::querier::router_with_mcp(
-        bucket.path().to_path_buf(),
-        3_600_000_000_000,
-        ourios_ingester::receiver::AuthResolver::static_only(None),
-        true,
+    // Explicitly configured promoted keys, so the no-promoted-keys pin
+    // below exercises deployment-specific keys, not just the default.
+    let promoted = PromotedAttributes::new(
+        ["k8s.namespace.name".to_string()],
+        ["http.route".to_string()],
     );
+    let router = router_with_promoted(bucket.path(), &promoted);
     let session = mcp_handshake(&router).await;
     let list = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
@@ -412,11 +418,13 @@ async fn rfc0032_5_tool_description_placement() {
             "{}: no severity bands in descriptions: {description}",
             tool["name"],
         );
-        assert!(
-            !description.contains(SERVICE_NAME_KEY),
-            "{}: no promoted keys in descriptions: {description}",
-            tool["name"],
-        );
+        for key in [SERVICE_NAME_KEY, "k8s.namespace.name", "http.route"] {
+            assert!(
+                !description.contains(key),
+                "{}: no promoted keys in descriptions ({key}): {description}",
+                tool["name"],
+            );
+        }
     }
 }
 
@@ -440,20 +448,21 @@ async fn rfc0032_6_read_only_contract_preserved() {
     crate::rfc0016_query_endpoint::seed_two_records(populated.path());
     crate::rfc0016_query_endpoint::seed_template_audit(populated.path(), "acme");
     let populated_router = router_with_promoted(populated.path(), &promoted);
-    let populated_doc = read_query_schema(&populated_router).await;
+    let populated_text = read_query_schema_text(&populated_router).await;
 
     // …serves exactly what the same configuration over an empty store
-    // serves: no ingested-telemetry-derived content, no tenant data.
+    // serves — raw served bytes, so key order and whitespace count: no
+    // ingested-telemetry-derived content, no tenant data.
     let empty = tempfile::tempdir().expect("temp");
     let empty_router = router_with_promoted(empty.path(), &promoted);
     assert_eq!(
-        populated_doc,
-        read_query_schema(&empty_router).await,
-        "the body is independent of ingested telemetry",
+        populated_text,
+        read_query_schema_text(&empty_router).await,
+        "the body is byte-identical regardless of ingested telemetry",
     );
     assert!(
-        !populated_doc.to_string().contains("acme"),
-        "no tenant identifier leaks: {populated_doc}",
+        !populated_text.contains("acme"),
+        "no tenant identifier leaks: {populated_text}",
     );
 
     // An unknown resource URI still returns the resource-not-found

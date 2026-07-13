@@ -2099,7 +2099,10 @@ fn template_map_outcome(artifact: &std::path::Path, registry_bytes: u64) -> Stri
             "cold (audit fold, {registry_bytes} B; artifact on disk {} B)",
             meta.len(),
         ),
-        Err(_) => format!("cold (audit fold, {registry_bytes} B; no artifact published)"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("cold (audit fold, {registry_bytes} B; no artifact published)")
+        }
+        Err(e) => format!("cold (audit fold, {registry_bytes} B; artifact stat failed: {e})"),
     }
 }
 

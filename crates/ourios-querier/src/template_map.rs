@@ -82,7 +82,7 @@ pub enum ArtifactRead {
 }
 
 /// Fold `tenant`'s [`TemplateMap`] from its audit stream — **one**
-/// [`audit_scan::read_all_events_captured`] pass, both folds from the
+/// `audit_scan::read_all_events_captured` pass, both folds from the
 /// captured events (RFC 0033 §3.5: the marginal cost of the second fold
 /// is CPU over in-memory events, zero extra IO), and the frontier taken
 /// from that same scan. Also returns the **bytes fetched** deriving it
@@ -90,7 +90,7 @@ pub enum ArtifactRead {
 /// acquisition cost).
 ///
 /// Each fold is byte-for-byte the fresh derivation it caches:
-/// the registry filter + [`template_registry::fold_registry`] matches
+/// the registry filter + `template_registry::fold_registry` matches
 /// [`crate::derive_template_registry`], and the alias filter + stable
 /// timestamp sort + [`AliasMap::from_events`] matches
 /// [`crate::derive_alias_map`] (RFC0033.1 pins this by property test).

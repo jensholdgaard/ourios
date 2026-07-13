@@ -85,7 +85,7 @@ pub(crate) fn derive_template_registry_measured(
 /// [`TEMPLATE_INITIAL_VERSION`], widening / type-expansion at `new_version`,
 /// rejections contribute nothing — so distinct versions never collide and a
 /// later widening cannot clobber an earlier version's tokens.
-fn fold_registry(mut events: Vec<AuditEvent>) -> TemplateRegistry {
+pub(crate) fn fold_registry(mut events: Vec<AuditEvent>) -> TemplateRegistry {
     events.sort_by_key(|e| e.timestamp);
 
     let mut registry = TemplateRegistry::new();

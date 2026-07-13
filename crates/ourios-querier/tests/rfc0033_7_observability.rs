@@ -124,14 +124,40 @@ fn write_audit(bucket: &Path, events: &[AuditEvent]) {
 /// makes it materialise rows, RFC 0017) through the public query
 /// surface; the template-map acquisition runs inside row rendering.
 fn body_query(bucket: &Path) -> QueryResult {
+    try_body_query(bucket).expect("every §3.3 disposition answers the query, no error surfaced")
+}
+
+fn try_body_query(bucket: &Path) -> Result<QueryResult, ourios_querier::QueryError> {
     let query = ourios_querier::dsl::parse("template_id == 1 | limit 10").expect("parse");
     let querier = Querier::new(bucket);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
-    runtime
-        .block_on(querier.run_query(&query, &TenantId::new(TENANT), NOW, DEFAULT_WINDOW_NS, None))
-        .expect("every §3.3 disposition answers the query, no error surfaced")
+    runtime.block_on(querier.run_query(
+        &query,
+        &TenantId::new(TENANT),
+        NOW,
+        DEFAULT_WINDOW_NS,
+        None,
+    ))
+}
+
+/// Every file under `dir`, recursively — the audit stream is
+/// date-partitioned, so new files land in nested directories.
+fn walk_files(dir: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut files = std::collections::BTreeSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("list audit dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.insert(path);
+            }
+        }
+    }
+    files
 }
 
 fn metric_data<'a>(rms: &'a [ResourceMetrics], name: &str) -> &'a AggregatedMetrics {
@@ -210,6 +236,19 @@ fn rfc0033_7_observable_outcomes() {
     std::fs::write(&artifact, &good[..good.len() / 2]).expect("tear artifact");
     assert_eq!(body_query(bucket.path()).rows, 1);
     let size_after_torn = artifact_len();
+    // 5. A failing fold records nothing: a frontier-changing audit file
+    //    that is itself unreadable errors the query, so no outcome is
+    //    counted — a counted outcome is always one that answered.
+    let audit_dir = artifact.parent().expect("audit tenant dir").to_path_buf();
+    let before = walk_files(&audit_dir);
+    write_audit(bucket.path(), &[widened(1, 4, TS0 + 2 * HOUR_NS)]);
+    let new_audit = walk_files(&audit_dir)
+        .into_iter()
+        .find(|p| !before.contains(p))
+        .expect("act 5 wrote a new audit file");
+    let bytes = std::fs::read(&new_audit).expect("read new audit file");
+    std::fs::write(&new_audit, &bytes[..bytes.len() / 2]).expect("tear new audit file");
+    try_body_query(bucket.path()).expect_err("an unreadable audit stream must fail the query");
 
     // Assert — the exported stream carries the §3.7 instruments, every
     // driven outcome recorded once under its registry attribute value.
@@ -227,7 +266,8 @@ fn rfc0033_7_observable_outcomes() {
         .collect();
     assert_eq!(
         lookups, expected,
-        "one lookup per driven outcome, no extras"
+        "one lookup per answered outcome, no extras — act 5's failed fold \
+         counted nothing"
     );
 
     // The three publishing lookups (miss, stale, torn) each published;

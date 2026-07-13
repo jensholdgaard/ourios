@@ -321,7 +321,6 @@ pub fn load_or_derive(
             }
         }
     };
-    METRICS.record_lookup(outcome);
     let (map, fold_bytes) = fold_template_map(resolved, tenant)?;
     let acquisition_bytes =
         fold_bytes
@@ -332,6 +331,9 @@ pub fn load_or_derive(
                      artifact={fetched_bytes})"
                 ),
             })?;
+    // Recorded only after every fallible step — a counted outcome is
+    // always one that answered, mirroring the hit arm's record-at-return.
+    METRICS.record_lookup(outcome);
     map.write_through(backend, expected.as_deref(), fold_bytes);
     Ok((map, acquisition_bytes, outcome))
 }

@@ -3419,6 +3419,7 @@ version = "0.2.1"
 dependencies = [
  "axum",
  "base64",
+ "bytes",
  "clap",
  "jsonwebtoken",
  "opentelemetry",
@@ -3434,6 +3435,7 @@ dependencies = [
  "ourios-telemetry",
  "ourios-wal",
  "p256",
+ "parquet",
  "proptest",
  "prost",
  "rand 0.8.6",

@@ -110,7 +110,9 @@ pub(crate) fn audit_files(
     }
 }
 
-/// One captured audit scan: the events in the §3.7.1 fold order, the bytes
+/// One captured audit scan: the events in SCAN order — (file path
+/// lexicographic, within-file row index), the order the §3.7.1
+/// timestamp sort uses as its tiebreak via stable sorting — the bytes
 /// fetched reading them, and the **frontier** — the exact audit `*.parquet`
 /// set the events came from, as store-relative keys under the tenant's audit
 /// root, sorted lexicographically (RFC 0033 §3.2 `folded_files`). Everything

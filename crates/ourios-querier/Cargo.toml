@@ -55,6 +55,14 @@ datafusion = { version = "54", default-features = false, features = [
 # parse. No DataFusion/arrow/SQL type crosses this surface (hazard §4.6).
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# RFC 0033 §3.7 — the template-map lookup/publish instruments. API crate
+# only: they resolve through the process-global meter (RFC 0001 §6.8
+# API/SDK split — the SDK + OTLP exporter live in ourios-telemetry) and
+# are no-ops until a provider is installed.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# Generated semantic-convention name constants (`semconv/registry/` via
+# weaver) — instrument and attribute names are never hand-written.
+ourios-semconv = { path = "../ourios-semconv" }
 # RFC 0002 §6.5 — the compiler resolves `range(...)` RFC 3339 timestamp
 # bounds to `time_unix_nano`. `chrono` is already in the Arrow/DataFusion
 # dep tree (and ourios-parquet uses it for the same nanosecond timeline),
@@ -69,6 +77,11 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 [dev-dependencies]
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
 ourios-config = { path = "../ourios-config" }
+# RFC0033.7 (`tests/rfc0033_7_observability.rs`) — the in-memory metrics
+# pipeline (`init_in_memory` installs the global provider) plus the SDK's
+# exported-data types the assertions read.
+ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 # RFC0002.7 — the parse/serialise round-trip is a property test over
 # generated well-formed queries.
 proptest = "=1.11.0"

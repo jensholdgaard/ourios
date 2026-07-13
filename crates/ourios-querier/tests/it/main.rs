@@ -4,8 +4,10 @@
 //! stack, and the link count — not compilation — dominated `cargo test`
 //! wall time (RFC 0028 §1 / epic #382). Files here moved verbatim from
 //! `tests/*.rs`; test names gain only this harness's module-path prefix
-//! (RFC0028.1). No querier binary needs process isolation, so nothing is
-//! exempt (RFC0028.2).
+//! (RFC0028.1). One binary is exempt under the RFC0028.2 rule
+//! (process isolation): `tests/rfc0033_7_observability.rs` installs a
+//! process-global in-memory `MeterProvider` (the RFC 0016 metrics-test
+//! shape).
 
 mod common;
 

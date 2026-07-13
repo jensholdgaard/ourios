@@ -169,6 +169,70 @@ groups:
           the total), so the B1 pruned fraction is derived in the backend
           as `pruned / (scanned + pruned)` (RFC 0016; OTel usage/state
           convention — record raw counts, derive the ratio).
+      - id: ourios.template_map.lookup.outcome
+        type:
+          members:
+            - id: hit
+              value: "hit"
+              stability: development
+              brief: >-
+                The artifact's frontier equals the live audit listing —
+                served from the artifact, zero audit GETs.
+            - id: miss
+              value: "miss"
+              stability: development
+              brief: No artifact under the tenant's audit root; fresh fold.
+            - id: stale
+              value: "stale"
+              stability: development
+              brief: >-
+                A valid artifact at a different frontier — never served
+                (re-derive, never serve stale); fresh fold, republished
+                at the new frontier.
+            - id: torn
+              value: "torn"
+              stability: development
+              brief: >-
+                Unreadable, unparseable, or internally invalid artifact —
+                treated as absent (the corruption signal for a derived
+                artifact); the write-through self-heals the store.
+            - id: unknown_version
+              value: "unknown_version"
+              stability: development
+              brief: >-
+                A future writer's `format_version` — treated as absent
+                (forward compatibility), republished at this reader's
+                version.
+        stability: development
+        brief: >-
+          The outcome of a cached template-map lookup (RFC 0033 §3.3).
+          Every outcome answers the query correctly — the dimension
+          distinguishes what IO paid for it, never what was served.
+      - id: ourios.template_map.publish.outcome
+        type:
+          members:
+            - id: published
+              value: "published"
+              stability: development
+              brief: The writer's artifact is now the published one.
+            - id: lost_race
+              value: "lost_race"
+              stability: development
+              brief: >-
+                A concurrent writer published first (the conditional-put
+                precondition failed) — a non-error outcome; the loser
+                discards its write, no retry.
+            - id: error
+              value: "error"
+              stability: development
+              brief: >-
+                The publish failed (serialization or a non-precondition
+                store failure) — telemetry only, never a query failure.
+        stability: development
+        brief: >-
+          The outcome of a template-map artifact publish (RFC 0033
+          §3.4/§3.5). The write-through is best-effort by contract, so
+          this counter is where its failures surface.
       - id: ourios.audit_sink.flush.outcome
         type:
           members:

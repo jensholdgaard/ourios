@@ -2,21 +2,24 @@
 //!
 //! `.1` (the artifact-format + fold green slice), `.3` (the publish
 //! green slice), `.2`/`.4`/`.5` (the freshness + write-through green
-//! slice — the cached read path wired into the query surface) and `.6`
+//! slice — the cached read path wired into the query surface), `.6`
 //! (the comparative green slice — the cold-vs-warm collapse, local arm)
-//! are live; the remaining `.7` stub is `#[ignore]`d so the default run
-//! stays green while its slice lands. The `.3` S3 `If-Match` half runs
-//! in the `s3-integration` CI job (`template_map_publish_cas_on_s3`,
-//! the RFC 0013 localstack pattern).
+//! and `.7` (the observability green slice) are live. The `.3` S3
+//! `If-Match` half runs in the `s3-integration` CI job
+//! (`template_map_publish_cas_on_s3`, the RFC 0013 localstack pattern).
 //!
-//! Placement note: all seven scenarios live here because the artifact's
+//! Placement note: the scenarios live here because the artifact's
 //! machinery — the folds (`template_registry.rs` / `alias_store.rs` /
 //! `audit_scan.rs`), the freshness check, and the write-through — is
 //! querier code (RFC 0033 §3.5), matching how RFC 0031 kept its
-//! cross-cutting stubs in the one crate owning the harness. The `.6`
-//! headline-corpus measurable additionally runs through the RFC 0031
-//! comparative harness in `ourios-bench` (RFC 0033 §6), which reports
-//! each pair's cold/warm template-map acquisition.
+//! cross-cutting stubs in the one crate owning the harness. Two
+//! scenarios additionally run outside this binary: the `.6`
+//! headline-corpus measurable through the RFC 0031 comparative harness
+//! in `ourios-bench` (RFC 0033 §6), which reports each pair's cold/warm
+//! template-map acquisition, and `.7` in its own integration binary
+//! (`tests/rfc0033_7_observability.rs`) because it installs a
+//! process-global in-memory `MeterProvider` — the RFC 0016
+//! metrics-test shape.
 
 use std::path::Path;
 
@@ -876,22 +879,5 @@ fn rfc0033_6_measured_tax_collapses() {
         cold.registry_bytes_read,
         events.len(),
         warm.registry_bytes_read,
-    );
-}
-
-/// Scenario RFC0033.7 — observable outcomes.
-/// See `docs/rfcs/0033-cached-template-map.md` §5.
-#[test]
-#[ignore = "RFC0033.7 stub — implemented in the observability green slice"]
-fn rfc0033_7_observable_outcomes() {
-    todo!(
-        "RFC0033.7 — served querier with the RFC 0016 OTel metrics \
-         pipeline active; queries drive a miss, a hit, a staleness, \
-         and a torn artifact: the §3.7 lookup-outcome and \
-         publish-outcome instruments record each with the correct \
-         outcome attribute, the publish-size instrument records the \
-         artifact size, and the instrument names exist in the \
-         semconv registry (weaver-generated constants, no \
-         hand-written flat names)"
     );
 }

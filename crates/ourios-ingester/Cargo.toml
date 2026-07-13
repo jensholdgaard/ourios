@@ -126,10 +126,10 @@ oidc = ["ourios-core/oidc"]
 # RFC0030.2 HTTPS client: a real TLS handshake to the http listener
 # (the other http tests use in-process oneshot, which skips TLS).
 # rustls-tls-manual-roots so the test trusts only its rcgen CA.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "http2"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-manual-roots", "http2"] }
 # RFC 0030 test CAs / leaf certs, minted at test time — no committed
 # key material (the RFC 0029 house rule).
-rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
+rcgen = { version = "=0.14.8", default-features = false, features = ["pem", "crypto", "ring"] }
 # The RFC0026.2 served-stack arm: serve `LogsServiceServer::with_interceptor`
 # over a local socket and drive it with a real tonic client, so the
 # metadata → interceptor → extension → handler handoff is covered end to end.

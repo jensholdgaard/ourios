@@ -86,17 +86,17 @@ proptest = "=1.11.0"
 tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 # Loopback fixture issuer (discovery + JWKS + rotation) for the RFC 0029
 # §5.2/§5.6 verification-matrix and rotation tests — test-only.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 # Mints the fixture issuer's ES256 keypair at test runtime (instant P-256
 # keygen; no committed private-key fixtures for scanners to flag).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
 # Mints the RSA-family fixture key at test runtime for the same reason
 # (2048-bit — PS512 needs >1024 — generated once per test process).
 # Already in the tree via jsonwebtoken's rust_crypto backend.
-rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
-rand = "0.8"
+rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
+rand = "=0.8.6"
 # base64url (no pad) for the fixture issuer's JWK coordinates.
-base64 = "0.22"
+base64 = "=0.22.1"
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 
 [lints]

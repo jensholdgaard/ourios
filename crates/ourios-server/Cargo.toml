@@ -89,7 +89,7 @@ schemars = { version = "1.2.1", default-features = false, features = ["derive"] 
 [dev-dependencies]
 # RFC 0030 test CAs / leaf certs, minted at test time — no committed
 # key material (the RFC 0029 house rule).
-rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
+rcgen = { version = "=0.14.8", default-features = false, features = ["pem", "crypto", "ring"] }
 # RFC 0020 env-substitution resolver property tests (config::env_subst): the
 # OTel Config WG vector table + invariants (escape round-trip, non-recursion).
 proptest = "=1.11.0"
@@ -116,14 +116,14 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # RFC 0029 §5 served arms: a loopback fixture issuer (axum, already a lib
 # dep) plus ES256 minting — the same runtime-generated-key policy as the
 # ourios-core fixture (no committed private keys).
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 # The RFC0029.7 Dex arm mints real tokens (form POST to the container's
 # token endpoint) and polls readiness — same crate + TLS stack as the
 # verifier itself.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
-rand = "0.8"
-base64 = "0.22"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+rand = "=0.8.6"
+base64 = "=0.22.1"
 
 [lints]
 workspace = true

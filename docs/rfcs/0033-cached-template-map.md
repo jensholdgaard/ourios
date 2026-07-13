@@ -1,7 +1,7 @@
 ---
 rfc: 0033
 title: Cached template-map artifact
-status: green
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-12
@@ -485,6 +485,20 @@ sits inside the RFC 0031 headline metric fails the condition.
 >   corpus and baseline evolve
 > - **And** both numbers are recorded in `docs/benchmarks.md`
 >   alongside the run #8 baseline.
+
+**Run #20 note (2026-07-13, §9.14):** undischarged on the corpus.
+The dispatch shows every pair cold with **no artifact published** —
+consistent with §3.2's size abstention: the artifact is uncompressed
+JSON of every `(template_id, version)` canonical template, while the
+513,862 B it must beat is the zstd-compressed Parquet of the same
+strings, so on otel-demo-v8 the guard correctly refuses a publish
+that would make warm acquisition cost *more* bytes than the fold.
+The local-shape arm (`rfc0033_6_measured_tax_collapses`, 55.8×)
+stands; this corpus arm needs a compressed artifact encoding
+(`format_version` 2 — cheap by §3.3's own rule: unknown versions are
+treated as absent, no migration) before the gate can be measured.
+The scenario stays as written; the RFC status returns to `red` until
+it passes.
 
 > **Scenario RFC0033.7 — Observable outcomes**
 > - **Given** a served querier with the OTel metrics pipeline

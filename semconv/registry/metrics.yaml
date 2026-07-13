@@ -451,3 +451,48 @@ groups:
         requirement_level: required
       - ref: ourios.tls.reload_error
         requirement_level: required
+
+  # Cached template map (RFC 0033 §3.7): the querier's per-tenant cached
+  # fold of the audit stream. Lookup outcomes carry the corruption /
+  # forward-compat signals (`torn` / `unknown_version`); publish outcomes
+  # surface the best-effort write-through's failures.
+  - id: metric.ourios.template_map.lookups
+    type: metric
+    metric_name: ourios.template_map.lookups
+    stability: development
+    brief: >-
+      Cached template-map lookups on the querier read path (RFC 0033
+      §3.3), by outcome. Every outcome answers correctly — the attribute
+      distinguishes what IO paid for it (one attribute on one counter,
+      the error.type convention, not per-outcome counters).
+    instrument: counter
+    unit: "{lookup}"
+    attributes:
+      - ref: ourios.template_map.lookup.outcome
+        requirement_level: required
+
+  - id: metric.ourios.template_map.publishes
+    type: metric
+    metric_name: ourios.template_map.publishes
+    stability: development
+    brief: >-
+      Template-map artifact publishes (RFC 0033 §3.4/§3.5), by outcome.
+      The write-through is best-effort by contract — a lost race or a
+      publish error never fails the query, so this counter is the only
+      place they surface.
+    instrument: counter
+    unit: "{publish}"
+    attributes:
+      - ref: ourios.template_map.publish.outcome
+        requirement_level: required
+
+  - id: metric.ourios.template_map.artifact.size
+    type: metric
+    metric_name: ourios.template_map.artifact.size
+    stability: development
+    brief: >-
+      Byte size of the template-map artifact at publish — the RFC 0033
+      §3.2 size-bound expectation, and the number the RFC0033.6
+      cache-warm acquisition gate reads.
+    instrument: histogram
+    unit: "By"

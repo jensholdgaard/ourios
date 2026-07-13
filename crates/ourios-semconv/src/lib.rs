@@ -142,6 +142,15 @@ pub const OURIOS_SINK_FLUSH_RECORDS: &str = "ourios.sink.flush.records";
 /// `ourios.storage.parquet.file.size` (histogram, unit `By`).
 pub const OURIOS_STORAGE_PARQUET_FILE_SIZE: &str = "ourios.storage.parquet.file.size";
 
+/// `ourios.template_map.artifact.size` (histogram, unit `By`).
+pub const OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE: &str = "ourios.template_map.artifact.size";
+
+/// `ourios.template_map.lookups` (counter, unit `{lookup}`).
+pub const OURIOS_TEMPLATE_MAP_LOOKUPS: &str = "ourios.template_map.lookups";
+
+/// `ourios.template_map.publishes` (counter, unit `{publish}`).
+pub const OURIOS_TEMPLATE_MAP_PUBLISHES: &str = "ourios.template_map.publishes";
+
 /// `ourios.wal.append.duration` (histogram, unit `s`).
 pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
 
@@ -173,6 +182,12 @@ pub const OURIOS_SERVICE: &str = "ourios.service";
 
 /// `ourios.sink.flush.trigger` attribute key.
 pub const OURIOS_SINK_FLUSH_TRIGGER: &str = "ourios.sink.flush.trigger";
+
+/// `ourios.template_map.lookup.outcome` attribute key.
+pub const OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME: &str = "ourios.template_map.lookup.outcome";
+
+/// `ourios.template_map.publish.outcome` attribute key.
+pub const OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME: &str = "ourios.template_map.publish.outcome";
 
 /// `ourios.tenant` attribute key.
 pub const OURIOS_TENANT: &str = "ourios.tenant";

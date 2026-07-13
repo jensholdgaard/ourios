@@ -23,14 +23,23 @@
 //! JSON follows the `manifest.json` precedent
 //! (`ourios_parquet::Manifest`, RFC 0009 §3.4): small, human-
 //! inspectable, `serde`-round-tripped, validated before use.
+//!
+//! Every lookup and publish records its RFC 0033 §3.7 outcome on the
+//! `ourios.template_map.*` instruments — resolved through the
+//! process-global meter, names from the weaver-generated
+//! [`ourios_semconv`] constants.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::{KeyValue, global};
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::{AuditEvent, AuditPayload};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{format_template, parse_template};
 use ourios_parquet::percent_encode_tenant;
+use ourios_semconv as semconv;
 use serde::{Deserialize, Serialize};
 
 use crate::template_registry::TemplateRegistry;
@@ -47,6 +56,90 @@ pub const TEMPLATE_MAP_FILENAME: &str = "template_map.json";
 /// (forward compatibility, RFC 0033 §3.3) — no migration is ever
 /// required because the artifact is derived and discardable.
 pub const TEMPLATE_MAP_FORMAT_VERSION: u32 = 1;
+
+/// `ourios.template_map.lookup.outcome` attribute values (RFC 0033 §3.7):
+/// the five §3.3 lookup dispositions, folded flat onto one counter (the
+/// error.type convention — one instrument, the dimension on an
+/// attribute).
+const LOOKUP_OUTCOME_HIT: &str = "hit";
+const LOOKUP_OUTCOME_MISS: &str = "miss";
+const LOOKUP_OUTCOME_STALE: &str = "stale";
+const LOOKUP_OUTCOME_TORN: &str = "torn";
+const LOOKUP_OUTCOME_UNKNOWN_VERSION: &str = "unknown_version";
+/// `ourios.template_map.publish.outcome` attribute values (RFC 0033 §3.7).
+const PUBLISH_OUTCOME_PUBLISHED: &str = "published";
+const PUBLISH_OUTCOME_LOST_RACE: &str = "lost_race";
+const PUBLISH_OUTCOME_ERROR: &str = "error";
+
+/// The RFC 0033 §3.7 instruments: lookups by outcome, publishes by
+/// outcome, and the artifact byte size at publish. Names come from the
+/// weaver-generated [`ourios_semconv`] constants.
+struct TemplateMapMetrics {
+    lookups: Counter<u64>,
+    publishes: Counter<u64>,
+    artifact_size: Histogram<u64>,
+}
+
+/// Resolved once, on the first lookup or publish, through the
+/// process-global meter (the RFC 0001 §6.8 API/SDK split) — every binary
+/// installs its `MeterProvider` at startup, before serving a query, so
+/// the lazy init binds to the real provider; with none installed the
+/// instruments are cheap no-ops. Both counters carry a *required*
+/// outcome attribute, so neither is zero-seeded (the
+/// `CompactionMetrics` stance): each series surfaces on its first real
+/// measurement.
+static METRICS: LazyLock<TemplateMapMetrics> = LazyLock::new(|| {
+    let meter = global::meter("ourios.template_map");
+    TemplateMapMetrics {
+        lookups: meter
+            .u64_counter(semconv::OURIOS_TEMPLATE_MAP_LOOKUPS)
+            .with_unit("{lookup}")
+            .build(),
+        publishes: meter
+            .u64_counter(semconv::OURIOS_TEMPLATE_MAP_PUBLISHES)
+            .with_unit("{publish}")
+            .build(),
+        artifact_size: meter
+            .u64_histogram(semconv::OURIOS_TEMPLATE_MAP_ARTIFACT_SIZE)
+            .with_unit("By")
+            .build(),
+    }
+});
+
+impl TemplateMapMetrics {
+    fn record_lookup(&self, outcome: CacheOutcome) {
+        let value = match outcome {
+            CacheOutcome::Hit => LOOKUP_OUTCOME_HIT,
+            CacheOutcome::Miss {
+                reason: MissReason::Absent,
+            } => LOOKUP_OUTCOME_MISS,
+            CacheOutcome::Miss {
+                reason: MissReason::Torn,
+            } => LOOKUP_OUTCOME_TORN,
+            CacheOutcome::Miss {
+                reason: MissReason::UnknownVersion,
+            } => LOOKUP_OUTCOME_UNKNOWN_VERSION,
+            CacheOutcome::StaleRefreshed => LOOKUP_OUTCOME_STALE,
+        };
+        self.lookups.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_TEMPLATE_MAP_LOOKUP_OUTCOME,
+                value,
+            )],
+        );
+    }
+
+    fn record_publish(&self, outcome: &'static str) {
+        self.publishes.add(
+            1,
+            &[KeyValue::new(
+                semconv::OURIOS_TEMPLATE_MAP_PUBLISH_OUTCOME,
+                outcome,
+            )],
+        );
+    }
+}
 
 /// The per-tenant cached fold of the audit stream (RFC 0033 §3.2):
 /// both derived maps plus the exact audit-file frontier they folded.
@@ -207,6 +300,7 @@ pub fn load_or_derive(
             let len = bytes.len() as u64;
             match TemplateMap::from_json(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
+                    METRICS.record_lookup(CacheOutcome::Hit);
                     return Ok((map, len, CacheOutcome::Hit));
                 }
                 ArtifactRead::Valid(_) => (len, e_tag, CacheOutcome::StaleRefreshed),
@@ -237,6 +331,9 @@ pub fn load_or_derive(
                      artifact={fetched_bytes})"
                 ),
             })?;
+    // Recorded only after every fallible step — a counted outcome is
+    // always one that answered, mirroring the hit arm's record-at-return.
+    METRICS.record_lookup(outcome);
     map.write_through(backend, expected.as_deref(), fold_bytes);
     Ok((map, acquisition_bytes, outcome))
 }
@@ -565,8 +662,11 @@ impl TemplateMap {
         backend: StoreRef<'_>,
         expected: Option<&str>,
     ) -> Result<PublishOutcome, QueryError> {
-        let bytes = self.to_json().map_err(|e| QueryError::Storage {
-            detail: format!("serialize {TEMPLATE_MAP_FILENAME}: {e}"),
+        let bytes = self.to_json().map_err(|e| {
+            METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
+            QueryError::Storage {
+                detail: format!("serialize {TEMPLATE_MAP_FILENAME}: {e}"),
+            }
         })?;
         self.publish_bytes(backend, expected, bytes)
     }
@@ -574,12 +674,15 @@ impl TemplateMap {
     /// The RFC 0033 §3.5 write-through: publish this fresh fold
     /// best-effort after a cache miss. Never fails the caller — a
     /// serialization or backend failure and a lost race are all
-    /// telemetry-only outcomes (the §3.7 slice) — and **abstains** when
+    /// telemetry-only outcomes (the §3.7 publish-outcome counter, via
+    /// [`publish_bytes`](Self::publish_bytes)) — and **abstains** when
     /// the serialized artifact would not be smaller than
     /// `folded_audit_bytes`, the audit bytes the fold just read (§3.2:
     /// nothing to win; on a tiny or empty tenant the JSON envelope can
     /// exceed the stream it caches, and the no-artifact path is exactly
-    /// today's behaviour).
+    /// today's behaviour). An abstention records no publish outcome —
+    /// §3.7 pins the values to `published` / `lost_race` / `error`, and
+    /// a publish that never starts is none of them.
     fn write_through(
         &self,
         backend: StoreRef<'_>,
@@ -587,6 +690,7 @@ impl TemplateMap {
         folded_audit_bytes: u64,
     ) {
         let Ok(bytes) = self.to_json() else {
+            METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
             return;
         };
         if bytes.len() as u64 >= folded_audit_bytes {
@@ -594,11 +698,35 @@ impl TemplateMap {
         }
         // Best-effort by contract: Published and LostRace are both fine,
         // and an error must not fail the query answered from the fold in
-        // hand.
+        // hand (publish_bytes already recorded it).
         let _ = self.publish_bytes(backend, expected, bytes);
     }
 
+    /// Commit `bytes` per the §3.4 backend ladder, recording the §3.7
+    /// publish outcome — and, on [`PublishOutcome::Published`], the
+    /// artifact byte size (the number RFC0033.6 gates on) — for every
+    /// caller, so the write-through and a direct [`Self::publish`] count
+    /// identically.
     fn publish_bytes(
+        &self,
+        backend: StoreRef<'_>,
+        expected: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<PublishOutcome, QueryError> {
+        let size = bytes.len() as u64;
+        let result = self.publish_bytes_inner(backend, expected, bytes);
+        match &result {
+            Ok(PublishOutcome::Published) => {
+                METRICS.record_publish(PUBLISH_OUTCOME_PUBLISHED);
+                METRICS.artifact_size.record(size, &[]);
+            }
+            Ok(PublishOutcome::LostRace) => METRICS.record_publish(PUBLISH_OUTCOME_LOST_RACE),
+            Err(_) => METRICS.record_publish(PUBLISH_OUTCOME_ERROR),
+        }
+        result
+    }
+
+    fn publish_bytes_inner(
         &self,
         backend: StoreRef<'_>,
         expected: Option<&str>,

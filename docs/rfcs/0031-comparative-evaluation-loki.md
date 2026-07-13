@@ -313,8 +313,11 @@ Per query, per system, the harness records:
   query. Ourios: extended from the RFC 0016 `scanned`/`pruned`
   row-group counts to the **bytes** of the row groups actually read
   (footer + read row-group byte length), emitted on the existing OTel
-  query-metrics path. Loki: `totalBytesProcessed` from the query
-  `Summary`. **Primary gate metric.** Because it counts bytes fetched
+  query-metrics path. Loki: recorded on **two channels** (definitions
+  in the 2026-07-13 amendment below): storage-side
+  (`compressedBytes + headChunkBytes`) and processed
+  (`totalBytesProcessed`); each frozen gate cites one (§7).
+  **Primary gate metric.** Because it counts bytes fetched
   from the shared object store, it is by construction insensitive to
   CPU speed and engine maturity; to keep it insensitive to local page
   cache as well, each measured query runs against a **freshly started**
@@ -351,17 +354,17 @@ Per query, per system, the harness records:
 > comparator is recorded on two channels, and each frozen gate names
 > which it uses (§7): the **storage-side channel**
 > (`compressedBytes + headChunkBytes` from the query-stats tree —
-> bytes fetched from storage, the conservative apples-to-apples
-> counterpart of Ourios's fetched-compressed total)
+> compressed chunk bytes fetched from storage plus memory-served
+> head-chunk bytes, the latter counted so data not yet flushed is
+> not free; the conservative apples-to-apples counterpart of
+> Ourios's fetched-compressed total)
 > and the **processed channel** (`totalBytesProcessed` —
 > decompressed engine work, the measure of the scanning the §1
 > thesis eliminates). Both are always recorded; gates cite one.
-> This amendment **supersedes** the original §3.6 `bytes_read`
-> bullet's single-comparator wording ("Loki: `totalBytesProcessed`")
-> and the §5 scenarios' `Summary.totalBytesProcessed` shorthand:
-> where a scenario reads `loki.bytes_read`, the channel the frozen
-> gate cites in §7 applies (storage-side for RFC0031.2/.4; processed
-> for RFC0031.3 under the interim rule).
+> Where a §5 scenario's shorthand reads `loki.bytes_read` (or names
+> `Summary.totalBytesProcessed` directly), the channel the frozen
+> gate cites in §7 applies: storage-side for RFC0031.2/.4, processed
+> for RFC0031.3 under the interim rule.
 
 ### 3.7 Reproducibility and anti-strawman commitment
 
@@ -643,7 +646,8 @@ not block `validated` in the "we didn't finish" sense — it is a
   lands in the companion slice immediately after this amendment. The window pairs' **bytes** figures
   are reclassified from a gated floor to a **published diagnostic**
   (`informational` bar, `benchmarks.md` taxonomy): the storage-channel
-  loss (0.007–0.018) is real, structural to time-partitioned chunks
+  loss (0.003–0.018 across the record; 0.007–0.018 on current
+  code, post-#486) is real, structural to time-partitioned chunks
   vs columnar layout, small in absolute terms (≤ 4.5 MB), and its
   only lever is the write-side layout fork — publishing it honestly
   is the commitment; gating on it would gate on a number we do not

@@ -1197,3 +1197,281 @@ floor unharmed. #444 **accepted** that tradeoff on hostile infra logs:
 the per-service gate makes C2 acceptance honest without masking, and
 any future masking is deferred to an upstream Collector processor or a
 dedicated RFC.
+
+### 9.13 Results — 2026-07-12 (indicative, `ci-runner`) — RFC 0031 comparative program vs Grafana Loki (runs #8–#18)
+
+**Purpose.** The first recorded numbers for the RFC 0031 comparative
+program — Ourios against Grafana Loki, the incumbent `CLAUDE.md` §1
+defines the project against. These are the §7 **calibration inputs**
+the RFC's open questions ask for, not gate verdicts: the `L`-gate
+margins are the RFC's *proposed* values (`M_L1..M_L4 = 10`,
+`F_L6 = 3`, wired as `ComparativeMargins::default()`), the §5
+gate scenarios (RFC0031.2–.11) are still red stubs, and the harness
+**reports** each pair under its provisional margin rather than
+asserting it. Every "PASS"/"fail" below is provisional pending the
+§7 freeze — a maintainer step; the open inputs are enumerated in
+point (4) of the closing **Assessment**.
+
+**Corpus.** `corpus/otel-demo-v8` (the §9.12 capture): 4,948,596
+log records, 2.96 GB uncompressed — the RFC 0031 §3.3 headline
+corpus (real OTLP, failure flags active, kafka fragmentation and
+all). Both systems ingest the identical OTLP stream; an OTLP
+`partialSuccess` in any push response fails the run, so neither
+side can silently drop lines.
+**Reference system.** `grafana/loki:3.5.3`, digest-pinned
+(`sha256:3165cecce301ce5b9b6e3530284b080934a05cd5cafac3d3d82edcb887b45ecd`),
+single-binary mode, fed over its native
+OTLP endpoint. Flag deviations from stock are documented below —
+all ingest-replay accommodations, all in Loki's favour, per the
+§3.7 anti-strawman commitment.
+**Hardware.** `ci-runner` — **indicative, not the §1 baseline**;
+the authoritative `baseline-8vcpu-32gib` run remains a maintainer
+opt-in per RFC 0031 §3.2. Bytes-read, the primary channel, is
+CPU-insensitive by construction, but nothing here is quoted as
+authoritative.
+**Runs.** `comparative-bench.yml` dispatch runs (curated by hand as
+ever — no workflow writes §9), each with one harness delta under
+test. Counted runs are equivalence-gated passes over the full
+corpus; the two diagnostic failures (#11/#13) are listed with
+exactly what they carry:
+
+| run | workflow run id | delta under test |
+|---|---|---|
+| #8 | 29171354194 | honest-metric baseline (§3.6 amendment wired) |
+| #9 | 29174022848 | + single-pass count/materialize scan (#485) |
+| #10 | 29174342843 | + late materialization (#486) |
+| #11 | 29186113326 | L3 diagnostic: Loki 0-rows, pre-salvage panic — no counted numbers |
+| #12 | 29188179299 | + L3 trace pair (#487/#488) |
+| #13 | 29189430335 | L3 diagnostic recurrence (on the #489 branch): L3 timed out; the salvaged report's other pairs are counted where tabulated |
+| #14 | 29190408893 | + `trace_id`/`span_id` blooms (#489; pre-merge on the PR branch, since merged) |
+| #15 | 29192897795 | + L1 template pair (#492; pre-merge, since merged) |
+| #16 | 29199815903 | + selective-resource diagnostic, first picker (produced a vacuous duplicate of the L6 `k=100` pair — the fix is what #493 merged; the run's L1/L3 pairs measured and passed, so it counts toward the streaks) |
+| #17 | 29203804795 | + selective-resource diagnostic pair, fixed picker (#493; pre-merge, since merged) |
+| #18 | 29210202343 | + latency_p50 channel (#495; pre-merge, since merged) — bytes unchanged from #17; adds the §3.6 latency numbers below |
+
+In **every** counted run, RFC0031.1 result-set equivalence held on
+every pair: the two systems' answers, keyed
+`(timestamp_unix_nanos, body_bytes)`, were multiset-identical at
+4.9 M-record scale. Runs #11/#13 were L3-flicker diagnostics (an
+ingester-visibility artifact, fixed in #490 — see the deviations
+list); their table rows above note exactly what each carries.
+Every dispatched run
+appears in the table, and the per-class tables below carry a row
+for every run in each quoted streak (L1: #15/#16/#17; L3:
+#14/#15/#16/#17), so the streaks audit from this entry alone.
+
+**The metric (§3.6 as amended 2026-07-12).** The Ourios figure is
+the **total** bytes fetched from object storage per query: count
+scan + row materialization + template-registry derivation. Loki is
+reported on **two channels**: **storage-side** (query-stats
+`compressedBytes + headChunkBytes` — the conservative
+apples-to-apples counterpart of Ourios's fetched compressed-Parquet
+bytes; the harness evaluates gates primarily on this) and
+**`totalBytesProcessed`** (decompressed engine-side work, which
+overstates Loki's storage reads by the chunk compression ratio;
+reported as context). Which channel the frozen §7 gates ride is an
+open maintainer decision.
+
+**Program history — the biased ruler, retired.** Runs #5–#7
+predate the §3.6 measurement-fidelity amendment and measured the
+Ourios side as the **count scan alone** (e.g. run #7's severity
+figure of 609,498 B and its "146.9×"-style ratios), silently
+excluding the row-materialization and registry IO while Loki's
+counterpart figure includes delivering results. Those runs are
+program history only and are **not citable**; every number below is
+on the honest total.
+
+**L1 — template-exact lookup (must-win, the flagship class):
+provisional PASS, widest margins.** Pair: `template_id == 4323`
+(2 rows) vs the LogQL line-filter needle `"Updated
+connection-accept-rate max connection creation rate to"` over every
+stream — the picker proves the two select identical row sets before
+the pair counts. Loki has no template concept, so its honest
+equivalent is a substring scan of the whole corpus; Ourios rides the
+writer's existing bloom filter on `template_id`.
+
+| run | ourios bytes | loki storage-side | loki processed | storage | processed |
+|---|---|---|---|---|---|
+| #15 | 1,358,683 | 104,825,428 | 2,468,065,726 | **77.2×** | **1,816.5×** |
+| #16 | 1,358,683 | 105,191,956 | 2,469,772,352 | 77.4× | 1,817.8× |
+| #17 | 1,358,683 | 105,579,510 | 2,474,713,321 | 77.7× | 1,821.4× |
+
+Above the provisional `M_L1 = 10` on **both** channels, in every
+run since the pair landed (third consecutive pass at #17). The
+Loki side is structural: no template id → nothing to prune with.
+
+**L3 — trace correlation (must-win, OTLP-native): provisional PASS
+after blooms.** Pair: every log line for one `trace_id` (9 rows).
+`trace_id` is high-cardinality by construction, so it cannot be a
+Loki label (§3.3's machine-checked disallowlist); Loki's honest
+query is a structured-metadata filter over **all** streams.
+
+| run | ourios config | ourios bytes | loki storage-side | loki processed | storage | processed |
+|---|---|---|---|---|---|---|
+| #12 | no bloom — `trace_id` column scanned corpus-wide | 72,935,984 | 102,835,803 | 2,419,117,783 | 1.41× | 33.2× |
+| #14 | + `trace_id`/`span_id` blooms (#489) | 4,812,668 | 105,353,837 | 2,476,749,585 | **21.9×** | **514.6×** |
+| #15 | reproduction | 4,812,668 | 102,133,866 | 2,404,486,169 | 21.2× | 499.6× |
+| #16 | reproduction | 4,812,668 | 104,656,570 | 2,456,853,969 | 21.7× | 510.5× |
+| #17 | reproduction | 4,812,668 | 105,251,547 | 2,465,855,695 | 21.9× | 512.4× |
+
+Run #12 is the honest before-picture: without blooms Ourios itself
+had to fetch the `trace_id` column corpus-wide, and the storage-side
+ratio (1.41×) was nowhere near the margin. The blooms (implemented
+in #489; the RFC 0005 §3.6 amendment recording them, with this as
+its measured evidence, is #491) collapse
+the fetch 15×, and the pair has now passed the provisional margin
+on both channels three runs in a row. As with L1, Loki's side is
+structural: a trace cannot be pre-narrowed to a label stream, so it
+scans and decompresses everything in the window.
+
+**L2 — severity predicate (must-win family): parity-plus
+storage-side, ~33× processed — not a provisional 10× pass.** Pair:
+lowest-volume single-`severity_text` band on the highest-volume
+service, full corpus span, 1 row. The run series doubles as the
+read-path optimisation ledger (component split: count scan +
+materialize + registry):
+
+| run | lever | ourios bytes (count + mat + reg) | loki storage | loki processed | storage | processed |
+|---|---|---|---|---|---|---|
+| #8 | baseline | 4,270,091 (609,498 + 3,146,731 + 513,862) | 2,880,784 | 89,184,711 | 0.67× | 20.9× |
+| #9 | single-pass scan (#485) | 3,660,593 (0 + 3,146,731 + 513,862) | 3,158,323 | 98,114,703 | 0.86× | 26.8× |
+| #10 | late materialization (#486) | 2,549,129 (0 + 2,035,267 + 513,862) | 2,751,834 | 85,261,718 | 1.08× | 33.4× |
+| #12 | reproduction (no L2 delta) | 2,549,129 | 2,779,800 | 86,255,901 | 1.09× | 33.8× |
+| #13 | reproduction | 2,549,129 | 3,349,897 | 98,253,343 | 1.31× | 38.5× |
+| #14 | reproduction | 2,549,129 | 3,224,893 | 100,044,070 | 1.27× | 39.2× |
+| #15 | reproduction | 2,549,129 | 2,688,942 | 83,216,895 | 1.05× | 32.6× |
+| #16 | reproduction | 2,549,129 | 2,673,545 | 82,919,233 | 1.05× | 32.5× |
+| #17 | reproduction | 2,549,129 | 3,224,528 | 100,198,466 | 1.26× | 39.3× |
+
+(Run #8's Loki side: 2,880,784 storage / 89,184,711 processed.)
+Across the later reproductions the storage-side ratio sits at
+**1.05–1.31×** and processed at ~33–39×, the spread being entirely
+Loki-side wobble (below). Reading: on the honest metric Ourios
+went from *losing* the storage channel (0.67×) to parity-plus via
+two read-path fixes, and wins decisively on engine work — but this
+is **not** a 10× storage-side pass, and no amount of wobble makes
+it one. The remaining named levers: the constant **513,862 B**
+template-registry derivation, 20–29 % of every small-answer query's
+total (the RFC 0033 cached-template-map candidate), and write-side
+page/row-group sizing.
+
+**Time-window browses (L6 floor family): published loss on the
+storage channel.** Pairs: all lines of the highest-volume service
+in a clean k-row window (the promoted-column bloom's worst case),
+plus run #17's diagnostic — the same shape scoped to the
+lowest-volume service ("ad", ~34 s window), where the
+`service.name` bloom could in principle skip. Floor gate as
+reported here: a **bytes-read floor analog** (Ourios ≤ 3× Loki,
+i.e. ratio ≥ 0.33) — the harness applies the §7 `F_L6` factor to
+this entry's bytes channels. Note the §5 gate as written
+(RFC0031.7) defines the L6 floor on **latency p50** — measured in
+run #18 (see the latency section below), where the gate as written
+passes on all three window pairs; the bytes framing here remains
+the conservative reporting channel pending the §7 freeze.
+
+| run | pair | ourios bytes | loki storage-side | loki processed | storage ratio | processed ratio |
+|---|---|---|---|---|---|---|
+| #8 | k=100 | 5,094,790 | 16,250 | 63,595 | 0.003 fail | 0.012 fail |
+| #8 | k=2000 | 9,736,285 | 72,524 | 1,809,523 | 0.007 fail | 0.186 fail |
+| #10 | k=100 | 2,257,867 | 16,250 | 63,595 | 0.007 fail | 0.028 fail |
+| #10 | k=2000 | 4,528,429 | 72,524 | 1,809,523 | 0.016 fail | **0.40 pass** |
+| #17 | "ad" k=100 (diagnostic) | 1,757,489 | 31,616 | 687,043 | 0.018 fail | **0.39 pass** |
+
+This is the honest loss the RFC's L6 disposition anticipated, and
+it is published as §5 RFC0031.11 demands: on a browse-k-rows
+query Loki reads only the tiny chunk slice its label stream + time
+index point at, while Ourios pays fixed per-query costs (the
+registry constant plus row-group-granularity materialization) that
+dwarf a k-row answer. The #486 late-materialization fix halved the
+loss and lifted k=2000 past the processed floor; storage-side stays
+0.007–0.018 vs the 0.33 floor on current code. Run #17's
+diagnostic sharpens the *why*: scoping to a low-volume service
+improves Ourios only ~22 % and flips the processed floor to pass,
+but there is **no bloom collapse** — v8's hour partitions each hold
+roughly one row group containing **all** services, so the promoted
+`service.name` bloom has nothing to skip. The tier-changing lever
+is write-side layout (service clustering / row-group sizing —
+hazard #4 territory, an RFC-level change), not query-side tuning.
+
+**Latency (§3.6 channel, run #18 — the program's first).** Median
+of 7 warm repetitions per pair per system, measured only on
+correctness-verified pairs; Ourios timed in-process, Loki over
+localhost HTTP (negligible at these magnitudes; stated because
+latency is corroborating, not sole-gating):
+
+| pair | ourios p50 | loki p50 | ratio (>1 = Ourios faster) |
+|---|---|---|---|
+| severity (1 row) | 82.0 ms | 875.0 ms | 10.7× |
+| L3 trace (9 rows) | 74.6 ms | 24,101.9 ms | 323× |
+| L1 template (2 rows) | 75.7 ms | 23,321.5 ms | 308× |
+| window k=100 | 40.2 ms | 13.8 ms | 0.34 |
+| window k=2000 | 85.9 ms | 294.8 ms | 3.43 |
+| selective-resource k=100 | 38.8 ms | 51.2 ms | 1.32 |
+
+Two findings this channel settles. First, the young-engine latency
+risk the RFC hedged against ("a latency loss + bytes-read win =
+sound architecture, young implementation") did **not** materialize:
+Ourios answers every pair in 39–86 ms — a flat, fixed-cost-shaped
+profile — while Loki spans 13.8 ms to 24.1 s, and on the needle
+classes the wall-clock gap is interactive-vs-batch (75 ms vs 23–24
+seconds). Second, **scenario RFC0031.7 evaluated as written — on
+latency — PASSES on all three window pairs** (0.34, 3.43, 1.32,
+all ≥ 1/3 at `F_L6 = 3`), and Ourios is outright *faster* on two of
+the three; the storage-channel loss published above is real as a
+bytes statement, but the RFC's own L6 gate holds the floor. Which
+channel the frozen L6 gate uses is part of the §7 decision.
+
+**Determinism note.** For repeated measurements of the same build
+and configuration, Ourios's bytes are **byte-identical** (the store
+build is deterministic) — differences between runs are exactly the
+harness/optimisation deltas the table names, which is what lets the
+run series read as an optimisation ledger. Loki's storage-side
+figure wobbles run to run (severity pair: 2.67–3.35 MB) with chunk
+boundaries and flush timing; ratios quoted against Loki carry that
+band.
+
+**Documented Loki flag deviations (all in Loki's favour, per
+§3.7).** The committed harness starts Loki with, and comments,
+exactly these deviations from stock:
+
+- `-validation.reject-old-samples=false` — the frozen corpus is
+  weeks old; stock Loki would reject the replay outright.
+- `-querier.query-ingesters-within=0` — stock Loki (default 3 h)
+  skips ingesters for queries over weeks-old ranges, making rows
+  still in unflushed low-volume chunks **invisible** (the run
+  #11/#13 L3 flicker; diagnosed via `ingester.totalReached: 0`,
+  fixed in #490). Disabling the cutoff means ingesters are always
+  consulted — without it Loki's answer to an old-range query is
+  silently incomplete.
+- Raised ingestion + per-stream rate limits
+  (`-distributor.ingestion-rate-limit-mb=512`,
+  `-distributor.ingestion-burst-size-mb=1024`,
+  `-ingester.per-stream-rate-limit=512MB`,
+  `-ingester.per-stream-rate-limit-burst=1GB`) — replay is
+  far faster than the capture's real-time rate.
+- Raised internal gRPC message caps
+  (`-server.grpc-max-recv-msg-size-bytes=16777216`,
+  `-server.grpc-max-send-msg-size-bytes=16777216`) — runs
+  #2–#4 failed on the same ~5.27 MB internal message regardless of
+  our outer batch size: a single kafka-service LogsData line's
+  content alone inflates past Loki's stock 4 MiB internal cap.
+  Raising it (standard operator tuning) lets Loki accept the data
+  at all, preserving the identical-ingest precondition the
+  equivalence check requires.
+
+**Assessment.** (1) The two classes the thesis stakes itself on
+hardest — L1 template lookup and L3 trace correlation — pass their
+provisional must-win margins on **both** channels, reproduced
+across three consecutive runs, and in both cases Loki's cost is
+structural rather than tuning: no template concept, and no way to
+index a trace id. (2) L2 is parity-plus on storage and a ~33×
+processed win, honestly short of a 10× storage claim, with two
+named levers still on the table. (3) The window browses are a
+published storage-channel loss whose mechanism is understood
+(fixed per-query costs vs v8's one-row-group-per-hour layout);
+the lever is write-side and RFC-sized. (4) Nothing here is frozen:
+the §7 inputs — the primary metric channel (storage-side vs
+processed), the must-win margins and floor factors, and whether
+the time-window pairs reclassify from gated floor to diagnostic —
+are **open maintainer decisions**, and this entry is the
+calibration evidence for them, not their resolution.

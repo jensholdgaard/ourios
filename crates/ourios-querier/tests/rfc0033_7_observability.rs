@@ -150,18 +150,28 @@ fn outcome_counts(rms: &[ResourceMetrics], metric: &str, attr_key: &str) -> BTre
     let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric_data(rms, metric) else {
         panic!("{metric} should be a u64 sum (counter)");
     };
-    sum.data_points()
-        .map(|dp| {
-            let outcome = dp
-                .attributes()
-                .find(|kv| kv.key.as_str() == attr_key)
-                .unwrap_or_else(|| panic!("{metric} data point missing required {attr_key}"))
-                .value
-                .as_str()
-                .into_owned();
-            (outcome, dp.value())
-        })
-        .collect()
+    let mut counts = BTreeMap::new();
+    for dp in sum.data_points() {
+        let attrs: Vec<_> = dp.attributes().collect();
+        let [kv] = attrs.as_slice() else {
+            panic!(
+                "{metric} data point must carry exactly the {attr_key} attribute, \
+                 got {} attributes",
+                attrs.len(),
+            );
+        };
+        assert_eq!(
+            kv.key.as_str(),
+            attr_key,
+            "{metric} data point carries an unexpected attribute",
+        );
+        let outcome = kv.value.as_str().into_owned();
+        assert!(
+            counts.insert(outcome.clone(), dp.value()).is_none(),
+            "{metric} exported two series for {attr_key}={outcome}",
+        );
+    }
+    counts
 }
 
 /// Scenario RFC0033.7 — observable outcomes.

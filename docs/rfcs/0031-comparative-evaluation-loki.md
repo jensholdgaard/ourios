@@ -636,7 +636,7 @@ not block `validated` in the "we didn't finish" sense — it is a
   alignment (asserting the frozen gates instead of reporting them)
   lands in the companion slice immediately after this amendment. The window pairs' **bytes** figures
   are reclassified from a gated floor to a **published diagnostic**
-  (`informational` bar, benchmarks.md taxonomy): the storage-channel
+  (`informational` bar, `benchmarks.md` taxonomy): the storage-channel
   loss (0.007–0.018) is real, structural to time-partitioned chunks
   vs columnar layout, small in absolute terms (≤ 4.5 MB), and its
   only lever is the write-side layout fork — publishing it honestly

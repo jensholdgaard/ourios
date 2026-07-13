@@ -23,3 +23,4 @@ mod rfc0026_auth;
 mod rfc0027_mcp;
 mod rfc0029_oidc;
 mod rfc0030_tls;
+mod rfc0032_query_schema;

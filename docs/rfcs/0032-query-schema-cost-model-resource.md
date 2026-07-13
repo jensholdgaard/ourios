@@ -1,7 +1,7 @@
 ---
 rfc: 0032
 title: Query-schema and cost-model resource for the MCP surface (RFC 0027 amendment)
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-13

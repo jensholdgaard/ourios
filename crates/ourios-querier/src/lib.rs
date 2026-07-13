@@ -51,7 +51,7 @@ pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_map::{
-    ArtifactRead, TEMPLATE_MAP_FILENAME, TEMPLATE_MAP_FORMAT_VERSION, TemplateMap,
+    ArtifactRead, PublishOutcome, TEMPLATE_MAP_FILENAME, TEMPLATE_MAP_FORMAT_VERSION, TemplateMap,
     derive_template_map,
 };
 pub use template_registry::{TemplateRegistry, derive_template_registry};

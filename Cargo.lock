@@ -3401,6 +3401,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+ "testcontainers-modules",
  "tokio",
 ]
 

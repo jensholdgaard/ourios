@@ -84,17 +84,17 @@ tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 # and the tokio dev-features give the container half an async runtime
 # (the Ourios half stays sync — `ourios_query_lines` owns its runtime).
 testcontainers-modules = "=0.15.0"
-reqwest = { version = "0.12", default-features = false }
-prost = "0.14"
+reqwest = { version = "=0.12.28", default-features = false }
+prost = "=0.14.4"
 # Refcounted request bodies for the corpus replay's retrying pusher (a
 # per-attempt Vec clone would copy ~2 MB per push across thousands).
-bytes = { version = "1", default-features = false }
+bytes = { version = "=1.12.1", default-features = false }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 # Footer-level schema assertion for the RFC 0022 promoted-service parity
 # tests: opens a comparative-store file's Parquet footer directly to
 # check the promoted column the writer declared. Same major as the
 # workspace arrow/parquet tree, so Cargo.lock pins one copy.
-parquet = { version = "58", default-features = false, features = ["arrow"] }
+parquet = { version = "=58.3.0", default-features = false, features = ["arrow"] }
 # RFC0024.2 draws calibrated records through a fixed-seed
 # `TestRunner` (the strategies come from `ourios-testgen`, already a
 # regular dependency above).

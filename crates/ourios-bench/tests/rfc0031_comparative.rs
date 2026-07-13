@@ -1663,8 +1663,10 @@ fn latency_floor_gate(
 /// The Ourios half of the §3.6 latency channel: [`LATENCY_REPS`] timed
 /// end-to-end repetitions of the pair's own query through
 /// [`ourios_bench::ourios_query_answer`] — the honest per-query cost
-/// (count scan + row materialization + registry derivation, fresh
-/// querier and runtime per rep), median wall time. Ourios is timed
+/// (count scan + row materialization + template-map acquisition, fresh
+/// querier and runtime per rep; once the RFC 0033 write-through has
+/// published, the acquisition is one warm artifact GET — the production
+/// steady state), median wall time. Ourios is timed
 /// **in-process** (no HTTP layer) while Loki is timed over localhost
 /// HTTP: negligible against multi-second scans, not against
 /// sub-millisecond answers — the report carries that caveat, and
@@ -2076,6 +2078,29 @@ type Measured = (Vec<LineKey>, u64, LokiFetchedBytes, Option<Duration>);
 struct OuriosMeasured {
     answer: ourios_bench::OuriosAnswer,
     latency_p50: Option<Duration>,
+    /// The RFC 0033 template-map acquisition outcome behind
+    /// `answer.registry_bytes` — cold audit fold vs warm artifact GET —
+    /// classified at measurement time ([`template_map_outcome`]).
+    template_map: String,
+}
+
+/// Classify one measurement's registry component (RFC 0033 / RFC0033.6):
+/// a warm hit's acquisition equals the published artifact's byte size
+/// exactly (the only registry-path GET is the artifact); anything else
+/// is the cold audit fold, whose write-through publishes for the next
+/// query. Read at measurement time, right after the query, so the size
+/// compared is the artifact that query saw (or just published).
+fn template_map_outcome(artifact: &std::path::Path, registry_bytes: u64) -> String {
+    match std::fs::metadata(artifact) {
+        Ok(meta) if meta.len() == registry_bytes => {
+            format!("warm (one artifact GET, {registry_bytes} B)")
+        }
+        Ok(meta) => format!(
+            "cold (audit fold, {registry_bytes} B; artifact on disk {} B)",
+            meta.len(),
+        ),
+        Err(_) => format!("cold (audit fold, {registry_bytes} B; no artifact published)"),
+    }
 }
 
 #[allow(clippy::type_complexity)] // one-shot plumbing tuple for the runner
@@ -2292,7 +2317,15 @@ fn rfc0031_indicative_comparative_run() {
     let rare_window = pick_rare_window_pair(&corpus_dir, &pair.service);
     eprintln!("selective-resource window: {rare_window:?}");
 
-    // The (locally-proven) Ourios half, per pair.
+    // The (locally-proven) Ourios half, per pair. The RFC 0033
+    // template-map artifact persists in the bucket across pairs BY
+    // DESIGN — production reality: caches persist. The first
+    // row-rendering query after the store build folds the audit stream
+    // cold and write-through-publishes; every later query's registry
+    // component is one small artifact GET (the L1 picker's rendering
+    // validation query may itself be the publisher, so even the first
+    // measured pair can be warm). Each pair's outcome is classified at
+    // measurement time and printed in the report block.
     let bucket = tempfile::TempDir::new().expect("bucket dir");
     let built = ourios_bench::build_comparative_store(
         &corpus_dir,
@@ -2325,6 +2358,14 @@ fn rfc0031_indicative_comparative_run() {
         rare_window: rare_window.as_ref(),
     };
     let specs = build_pair_specs(&picks, corpus_now, corpus_window);
+    let artifact_path = bucket
+        .path()
+        .join("audit")
+        .join(format!(
+            "tenant_id={}",
+            ourios_parquet::percent_encode_tenant(built.tenant),
+        ))
+        .join(ourios_querier::TEMPLATE_MAP_FILENAME);
     let ourios: Vec<OuriosMeasured> = specs
         .iter()
         .map(|spec| {
@@ -2342,11 +2383,17 @@ fn rfc0031_indicative_comparative_run() {
                 "Ourios must return exactly [{}]'s expected rows",
                 spec.label,
             );
+            let template_map = template_map_outcome(&artifact_path, answer.registry_bytes);
+            eprintln!(
+                "[{}] template-map acquisition (RFC 0033): {template_map}",
+                spec.label,
+            );
             // Timed reps only after the pair's Ourios correctness holds.
             let latency_p50 = ourios_latency_p50(bucket.path(), &tenant, spec);
             OuriosMeasured {
                 answer,
                 latency_p50,
+                template_map,
             }
         })
         .collect();
@@ -2550,6 +2597,13 @@ fn print_indicative_report(
             answer.count_scan_bytes,
             answer.materialize_bytes,
             answer.registry_bytes,
+        );
+        // The registry component's RFC 0033 acquisition outcome
+        // (RFC0033.6's channel): the artifact persists across pairs by
+        // design, so the cold audit fold is paid at most once per run.
+        println!(
+            "ourios template-map acquisition (RFC 0033) = {}",
+            ours.template_map
         );
         println!(
             "loki   storage-side bytes (conservative)  = {loki_storage} \

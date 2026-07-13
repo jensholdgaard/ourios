@@ -673,7 +673,7 @@ Mapped to `CLAUDE.md` §6.2:
 > bytes equal the artifact's byte size exactly, which holds
 > unchanged because the GET *is* the compressed object). The one
 > addition is run #21's harness printing publish outcomes (§3.2
-> amendment / §5.6 pointer).
+> amendment / the Scenario RFC0033.6 run-#20 note's pointer).
 
 ## 7. Open questions
 

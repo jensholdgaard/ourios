@@ -13,18 +13,22 @@
 //! rule at the type level: a [`TemplateMap`] cannot be constructed
 //! outside this module with only one fold populated, so a
 //! registry-at-frontier-F1 / alias-map-at-F2 split is unrepresentable.
-//! Publication (tmp+rename / CAS, §3.4) and the freshness check (§3.3)
-//! are the follow-up slices; this module owns only the format, the
-//! derivation, and the read dispositions.
+//! [`TemplateMap::publish`] commits the artifact atomically (tmp+rename
+//! locally, conditional put on the store — §3.4, the RFC 0009 manifest
+//! precedent); the freshness check (§3.3) and the write-through are the
+//! follow-up slices.
 //!
 //! JSON follows the `manifest.json` precedent
 //! (`ourios_parquet::Manifest`, RFC 0009 §3.4): small, human-
 //! inspectable, `serde`-round-tripped, validated before use.
 
+use std::path::Path;
+
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::{AuditEvent, AuditPayload};
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::{format_template, parse_template};
+use ourios_parquet::percent_encode_tenant;
 use serde::{Deserialize, Serialize};
 
 use crate::template_registry::TemplateRegistry;
@@ -80,6 +84,23 @@ pub enum ArtifactRead {
     /// compatibility) — distinct from [`Self::Torn`] because it is not
     /// corruption and carries its own §3.7 outcome.
     UnknownVersion { format_version: u32 },
+}
+
+/// Outcome of a [`TemplateMap::publish`] (RFC 0033 §3.4). A lost race
+/// is a **non-error** outcome, unlike the manifest's authoritative
+/// generation swap: every writer publishes a correct fold of *some*
+/// frontier and the reader verifies the frontier independently at every
+/// read (§3.3), so the loser discards its write and moves on — no retry
+/// loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// This writer's artifact is now the published one.
+    Published,
+    /// A concurrent writer published first (the create /
+    /// compare-and-swap precondition failed). Whatever it published is
+    /// a correct fold; a stale one is detected and rewritten on the
+    /// next query.
+    LostRace,
 }
 
 /// Fold `tenant`'s [`TemplateMap`] from its audit stream — **one**
@@ -319,6 +340,78 @@ impl TemplateMap {
             aliases,
         }))
     }
+
+    /// Publish this artifact to `audit/tenant_id=<enc>/template_map.json`
+    /// (RFC 0033 §3.2) following the RFC 0009 §3.4 manifest precedent,
+    /// adapted to a derived, discardable object:
+    ///
+    /// - [`StoreRef::Local`]: write `template_map.json.tmp` in the
+    ///   tenant's audit dir and `rename` it into place — the rename is
+    ///   the only visibility point, so a reader observes the prior
+    ///   artifact (or its absence) or the new one, never a partial
+    ///   write; a crash leaves a stray `.tmp` no reader opens. Like
+    ///   `Manifest::write_atomic` this is atomic but not crash-durable
+    ///   (no fsync): losing the artifact in a crash costs one
+    ///   re-derivation. `expected` cannot be enforced on the filesystem
+    ///   (no conditional rename), so this branch is last-writer-wins —
+    ///   safe because any published artifact is a correct fold of some
+    ///   frontier, verified at every read (§3.3/§3.4).
+    /// - [`StoreRef::Remote`]: single-object conditional put (the
+    ///   `Manifest::publish_cas` shape). `expected` is the `ETag`
+    ///   observed when the artifact was last read, or `None` when it
+    ///   was observed absent (create-if-absent). A failed precondition
+    ///   is [`PublishOutcome::LostRace`], never an error.
+    ///
+    /// Publish failure is surfaceable but non-fatal by contract (§3.5):
+    /// the write-through caller records it as telemetry and answers its
+    /// query from the fold it already holds.
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::Storage`] if serialization fails or on a
+    /// non-precondition filesystem/backend failure.
+    pub fn publish(
+        &self,
+        backend: StoreRef<'_>,
+        expected: Option<&str>,
+    ) -> Result<PublishOutcome, QueryError> {
+        let bytes = self.to_json().map_err(|e| QueryError::Storage {
+            detail: format!("serialize {TEMPLATE_MAP_FILENAME}: {e}"),
+        })?;
+        let enc = percent_encode_tenant(self.tenant.as_str());
+        match backend {
+            StoreRef::Local(root) => {
+                let io_err = |op: &str, p: &Path, e: &std::io::Error| QueryError::Storage {
+                    detail: format!("{op} {}: {e}", p.display()),
+                };
+                let dir = root.join("audit").join(format!("tenant_id={enc}"));
+                std::fs::create_dir_all(&dir).map_err(|e| io_err("create_dir_all", &dir, &e))?;
+                let tmp = dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp"));
+                std::fs::write(&tmp, &bytes).map_err(|e| io_err("write", &tmp, &e))?;
+                let target = dir.join(TEMPLATE_MAP_FILENAME);
+                std::fs::rename(&tmp, &target).map_err(|e| QueryError::Storage {
+                    detail: format!("rename {} -> {}: {e}", tmp.display(), target.display()),
+                })?;
+                Ok(PublishOutcome::Published)
+            }
+            StoreRef::Remote(store) => {
+                let key = format!("audit/tenant_id={enc}/{TEMPLATE_MAP_FILENAME}");
+                let result = match expected {
+                    None => store.put_if_absent_blocking(&key, bytes),
+                    Some(e_tag) => store.put_if_match_blocking(&key, bytes, e_tag),
+                };
+                match result {
+                    Ok(()) => Ok(PublishOutcome::Published),
+                    Err(e) if e.is_precondition() || e.is_already_exists() => {
+                        Ok(PublishOutcome::LostRace)
+                    }
+                    Err(e) => Err(QueryError::Storage {
+                        detail: format!("publish {key}: {e}"),
+                    }),
+                }
+            }
+        }
+    }
 }
 
 /// Validate the canonical form [`TemplateMap::to_json`] writes; any
@@ -417,7 +510,7 @@ fn validate(raw: &TemplateMapJson) -> Result<(), String> {
 /// carry their `year=…/month=…/day=…` partition dirs, otherwise the
 /// same stance as the manifest's `is_partition_local_parquet`.
 fn is_tenant_relative_parquet(name: &str) -> bool {
-    use std::path::{Component, Path};
+    use std::path::Component;
     // Path::components() normalizes away empty segments, so a doubled
     // slash would slip past the component check and misclassify a
     // malformed artifact Valid (failing only later, at frontier
@@ -657,6 +750,96 @@ mod tests {
                 "{label} must classify as torn, got {read:?}",
             );
         }
+    }
+
+    /// A second artifact distinguishable from [`sample`] (one more
+    /// frontier entry), for asserting which of two publishes a reader
+    /// observes.
+    fn sample_at_wider_frontier() -> TemplateMap {
+        let mut map = sample();
+        map.folded_files
+            .push("year=2026/month=07/day=13/c.parquet".to_string());
+        map
+    }
+
+    #[test]
+    fn publish_local_commits_atomically_and_reads_back() {
+        // Arrange
+        let bucket = tempfile::tempdir().expect("temp");
+        let map = sample();
+
+        // Act
+        let outcome = map
+            .publish(crate::StoreRef::Local(bucket.path()), None)
+            .expect("publish");
+
+        // Assert — committed under the tenant's audit root, no `.tmp`
+        // left behind, and the bytes read back Valid.
+        assert_eq!(outcome, PublishOutcome::Published);
+        let dir = bucket.path().join("audit").join("tenant_id=acme");
+        assert!(!dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp")).exists());
+        let bytes = std::fs::read(dir.join(TEMPLATE_MAP_FILENAME)).expect("read");
+        let restored = expect_valid(TemplateMap::from_json(&bytes, &tenant()));
+        assert_eq!(restored.folded_files(), map.folded_files());
+        assert_eq!(restored.registry(), map.registry());
+    }
+
+    #[test]
+    fn publish_local_republish_overwrites() {
+        // The local branch is last-writer-wins (no filesystem CAS) —
+        // safe because any published artifact is a correct fold of some
+        // frontier, verified at every read (RFC 0033 §3.4).
+        let bucket = tempfile::tempdir().expect("temp");
+        let backend = crate::StoreRef::Local(bucket.path());
+        let first = sample();
+        let second = sample_at_wider_frontier();
+        first.publish(backend, None).expect("first publish");
+
+        let outcome = second.publish(backend, None).expect("second publish");
+
+        assert_eq!(outcome, PublishOutcome::Published);
+        let bytes = std::fs::read(
+            bucket
+                .path()
+                .join("audit")
+                .join("tenant_id=acme")
+                .join(TEMPLATE_MAP_FILENAME),
+        )
+        .expect("read");
+        let restored = expect_valid(TemplateMap::from_json(&bytes, &tenant()));
+        assert_eq!(restored.folded_files(), second.folded_files());
+    }
+
+    #[test]
+    fn publish_store_create_if_absent_and_lost_race() {
+        // The store branch through the `Store` seam. `LocalFileSystem`
+        // supports the create-if-absent half of the conditional put, so
+        // the None-expectation ladder — create wins, a concurrent
+        // create loses harmlessly — runs without an S3 backend (the
+        // `If-Match` swap half is the localstack integration arm).
+        let root = tempfile::tempdir().expect("temp");
+        let store = ourios_parquet::Store::local(root.path()).expect("store");
+        let backend = crate::StoreRef::Remote(&store);
+        let winner = sample();
+        let loser = sample_at_wider_frontier();
+
+        assert_eq!(
+            winner.publish(backend, None).expect("create"),
+            PublishOutcome::Published,
+        );
+        // The concurrent writer also observed absence; its stale
+        // expectation loses the race as an outcome, not an error.
+        assert_eq!(
+            loser.publish(backend, None).expect("lost race is Ok"),
+            PublishOutcome::LostRace,
+        );
+
+        // The store still holds the winner's valid, readable artifact.
+        let bytes = store
+            .get_blocking(&format!("audit/tenant_id=acme/{TEMPLATE_MAP_FILENAME}"))
+            .expect("get");
+        let held = expect_valid(TemplateMap::from_json(&bytes, &tenant()));
+        assert_eq!(held.folded_files(), winner.folded_files());
     }
 
     #[test]

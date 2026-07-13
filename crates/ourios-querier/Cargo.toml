@@ -78,9 +78,14 @@ proptest = "=1.11.0"
 ourios-testgen = { path = "../ourios-testgen" }
 # Async runtime for the execution integration tests; the writer
 # (ourios-parquet, a normal dep) lays down fixture Parquet, and
-# tempfile gives each test a scratch bucket.
-tokio = { version = "=1.52.3", features = ["rt", "macros"] }
+# tempfile gives each test a scratch bucket. `rt-multi-thread` for the
+# `#[tokio::test(flavor = "multi_thread")]` localstack publish arm.
+tokio = { version = "=1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "=3.27.0"
+# RFC 0033 §3.4 S3 publish arm (`template_map_publish_cas_on_s3`):
+# LocalStack via testcontainers, the same harness as ourios-parquet's
+# RFC 0013 CAS tests — `#[ignore]`d, run by the `s3-integration` CI job.
+testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # RFC0007.4 (forward-compatible reads) needs Parquet files whose
 # schema differs from the current one — an extra column (future
 # writer) or a missing OPTIONAL column (old writer). The

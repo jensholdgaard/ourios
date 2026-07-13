@@ -120,6 +120,13 @@ jobs:
           rfc0013_object_store::store_delete_blocking_removes_on_s3
           rfc0013_object_store::compact_partition_consolidates_on_s3_via_cas
           rfc0013_object_store::parquet_audit_sink_persists_to_s3
+      # RFC 0033 §3.4 S3 publish arm: the template-map artifact's
+      # conditional-put ladder (create / lost create / If-Match swap /
+      # lost swap) against the same LocalStack.
+      - run: >
+          cargo test -p ourios-querier --test it --
+          --ignored --exact
+          rfc0033_cached_template_map::template_map_publish_cas_on_s3
       # RFC 0019 server-level §5 scenarios (.2/.3/.4/.5): spawn the
       # `ourios-server` binary configured for the S3 backend against the same
       # LocalStack, driven over HTTP. `--exact` (RFC0019.1/.6/.7 are non-ignored

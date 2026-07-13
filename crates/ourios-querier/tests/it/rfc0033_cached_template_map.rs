@@ -1,8 +1,11 @@
 //! RFC 0033 §5 — the cached template-map artifact, all seven scenarios.
 //!
-//! `.1` is live (the artifact-format + fold green slice); the
-//! remaining stubs are `#[ignore]`d so the default run stays green
-//! while their slices land, each naming the slice that discharges it.
+//! `.1` (the artifact-format + fold green slice) and `.3` (the publish
+//! green slice) are live; the remaining stubs are `#[ignore]`d so the
+//! default run stays green while their slices land, each naming the
+//! slice that discharges it. The `.3` S3 `If-Match` half runs in the
+//! `s3-integration` CI job (`template_map_publish_cas_on_s3`, the
+//! RFC 0013 localstack pattern).
 //!
 //! Placement note: all seven stubs live here because the artifact's
 //! machinery — the folds (`template_registry.rs` / `alias_store.rs` /
@@ -15,13 +18,16 @@
 
 use std::path::Path;
 
-use crate::common::{DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, at, simple, write_all, write_audit};
+use crate::common::{
+    DEFAULT_WINDOW_NS, HOUR_NS, NOW, TS0, at, simple, widened, write_all, write_audit,
+};
 use ourios_core::alias::ActorId;
 use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange, hash_triggering_line};
 use ourios_core::tenant::TenantId;
+use ourios_parquet::Store;
 use ourios_querier::{
-    ArtifactRead, Querier, StoreRef, TemplateMap, derive_alias_map, derive_template_map,
-    derive_template_registry,
+    ArtifactRead, PublishOutcome, Querier, StoreRef, TEMPLATE_MAP_FILENAME, TemplateMap,
+    derive_alias_map, derive_template_map, derive_template_registry,
 };
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -268,21 +274,244 @@ fn rfc0033_2_staleness_detected_never_served() {
     );
 }
 
+/// The scenario's "next query": `resolves_to(1)` through the public
+/// query surface. Returns the matching-row count; the `expect` is the
+/// no-error-surfaced arm of RFC0033.3.
+fn next_query_rows(bucket: &Path, tenant: &TenantId) -> u64 {
+    let query = ourios_querier::dsl::parse("resolves_to(1)").expect("parse");
+    let querier = Querier::new(bucket);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    runtime
+        .block_on(querier.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, None))
+        .expect("the query must succeed, publish debris notwithstanding")
+        .rows
+}
+
 /// Scenario RFC0033.3 — crash/tear safety around the publish.
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
+///
+/// Crash simulation follows the house precedent for interrupted
+/// atomic commits (`execution.rs`'s uncommitted `*.parquet.tmp`, the
+/// RFC 0009 orphan stance): the dying writer got its bytes into the
+/// `.tmp` and never reached the rename, so the test writes the `.tmp`
+/// and does not rename. The tear is a real publish then an in-place
+/// truncation of the committed name. The CAS loss runs through the
+/// `Store` seam's create-if-absent half here (both writers observed
+/// absence); the `If-Match` half is `template_map_publish_cas_on_s3`.
 #[test]
-#[ignore = "RFC0033.3 stub — implemented in the publish green slice"]
 fn rfc0033_3_crash_tear_safety() {
-    todo!(
-        "RFC0033.3 — publish interrupted mid-write (stray \
-         template_map.json.tmp, truncated/corrupt template_map.json, \
-         S3 CAS loss to a concurrent writer): next query ignores the \
-         .tmp, treats a torn artifact as absent (fresh fold, correct \
-         answer, no error surfaced), a CAS loss discards the losing \
-         write without failing its query; the torn case emits the \
-         §3.7 torn outcome and the fresh fold's write-through \
-         overwrites the torn artifact (self-heal)"
+    let bucket = TempDir::new().expect("temp dir");
+    write_audit(bucket.path(), &[widened(TENANT, 1, 1, TS0)]);
+    write_all(bucket.path(), &[simple(TENANT, 1, TS0 + 1)]);
+    let tenant = TenantId::new(TENANT);
+    let backend = StoreRef::Local(bucket.path());
+    let tenant_dir = bucket
+        .path()
+        .join("audit")
+        .join(format!("tenant_id={TENANT}"));
+    let artifact = tenant_dir.join(TEMPLATE_MAP_FILENAME);
+    let tmp = tenant_dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp"));
+
+    // The undisturbed baseline: the fold and the query answer every
+    // corrupted read below must still produce.
+    let (map, _) = derive_template_map(backend, &tenant).expect("derive");
+    let baseline_rows = next_query_rows(bucket.path(), &tenant);
+    assert_eq!(
+        map.publish(backend, None).expect("publish"),
+        PublishOutcome::Published,
     );
+    assert!(artifact.exists(), "the rename committed the final name");
+    assert!(!tmp.exists(), "a completed publish leaves no .tmp");
+
+    // A stray `.tmp` from a crashed publish: the read path opens only
+    // `template_map.json`, so the committed artifact still reads back
+    // Valid, the audit walk's frontier is unchanged, and the next
+    // query succeeds with the correct answer.
+    std::fs::write(&tmp, br#"{"format_version":1,"partial"#).expect("plant stray tmp");
+    let read = TemplateMap::from_json(&std::fs::read(&artifact).expect("read artifact"), &tenant)
+        .expect("read");
+    let ArtifactRead::Valid(committed) = read else {
+        panic!("the committed artifact must stay Valid under a stray .tmp, got {read:?}");
+    };
+    assert_eq!(committed.registry(), map.registry());
+    let (refold, _) = derive_template_map(backend, &tenant).expect("fold under a stray tmp");
+    assert_eq!(
+        refold.folded_files(),
+        map.folded_files(),
+        "the stray .tmp must be invisible to the audit walk",
+    );
+    assert_eq!(next_query_rows(bucket.path(), &tenant), baseline_rows);
+
+    // Torn JSON at the final name (a real publish, then the object
+    // truncated in place): treated as absent — the §3.7 `torn` outcome
+    // — while the fresh fold still answers the query correctly, no
+    // error surfaced.
+    let good_bytes = std::fs::read(&artifact).expect("read artifact");
+    std::fs::write(&artifact, &good_bytes[..good_bytes.len() / 2]).expect("tear artifact");
+    let torn = TemplateMap::from_json(&std::fs::read(&artifact).expect("read torn"), &tenant)
+        .expect("torn is a disposition, not an error");
+    assert!(matches!(torn, ArtifactRead::Torn { .. }), "got {torn:?}");
+    let (healed, _) = derive_template_map(backend, &tenant).expect("fold under a torn artifact");
+    assert_eq!(healed.registry(), map.registry());
+    assert_eq!(next_query_rows(bucket.path(), &tenant), baseline_rows);
+
+    // ...and that fresh fold's write-through overwrites the torn
+    // artifact: the store self-heals.
+    assert_eq!(
+        healed.publish(backend, None).expect("republish"),
+        PublishOutcome::Published,
+    );
+    let read = TemplateMap::from_json(&std::fs::read(&artifact).expect("read healed"), &tenant)
+        .expect("read");
+    assert!(
+        matches!(read, ArtifactRead::Valid(_)),
+        "the store must self-heal to a Valid artifact, got {read:?}",
+    );
+
+    // A CAS loss to a concurrent writer, through the Store seam: both
+    // writers derived a correct fold and observed absence; the loser's
+    // stale expectation comes back LostRace — an outcome, not an error,
+    // so its query is never failed — and the store holds the winner's
+    // valid, readable artifact.
+    write_audit(bucket.path(), &[widened(TENANT, 1, 2, TS0 + HOUR_NS)]);
+    let (wider, _) = derive_template_map(backend, &tenant).expect("derive at the wider frontier");
+    assert!(
+        wider.folded_files().len() > map.folded_files().len(),
+        "the two writers' folds must be distinguishable",
+    );
+    let cas_root = TempDir::new().expect("cas temp dir");
+    let store = Store::local(cas_root.path()).expect("store");
+    let remote = StoreRef::Remote(&store);
+    assert_eq!(
+        map.publish(remote, None).expect("winner"),
+        PublishOutcome::Published,
+    );
+    assert_eq!(
+        wider.publish(remote, None).expect("a lost race must be Ok"),
+        PublishOutcome::LostRace,
+    );
+    let held = store
+        .get_blocking(&format!("audit/tenant_id={TENANT}/{TEMPLATE_MAP_FILENAME}"))
+        .expect("get the published artifact");
+    let ArtifactRead::Valid(held) = TemplateMap::from_json(&held, &tenant).expect("read") else {
+        panic!("the store must hold a valid readable artifact after a lost race");
+    };
+    assert_eq!(held.folded_files(), map.folded_files());
+}
+
+/// The RFC0033.3 S3 arm on a real S3 backend (`LocalStack`): the full
+/// conditional-put ladder — create-if-absent wins, a concurrent create
+/// loses, an `If-Match` swap at the observed `ETag` wins, the now-stale
+/// `ETag` loses — with every lost race a non-error outcome and the
+/// object valid and readable throughout (RFC 0033 §3.4, the
+/// `Manifest::publish_cas` precedent). Run by the `s3-integration` CI
+/// job by exact name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "RFC0033.3 S3 arm; run via the `s3-integration` CI job (needs Docker + AWS_* env)"]
+async fn template_map_publish_cas_on_s3() {
+    use testcontainers_modules::localstack::LocalStack;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::core::ExecCommand;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    // Two correct folds at different frontiers, derived from a local
+    // audit fixture (the publish target is the store under test, not
+    // the fold source).
+    let bucket = TempDir::new().expect("temp dir");
+    let tenant = TenantId::new(TENANT);
+    write_audit(bucket.path(), &[widened(TENANT, 1, 1, TS0)]);
+    let (map_a, _) =
+        derive_template_map(StoreRef::Local(bucket.path()), &tenant).expect("derive a");
+    write_audit(bucket.path(), &[widened(TENANT, 1, 2, TS0 + HOUR_NS)]);
+    let (map_b, _) =
+        derive_template_map(StoreRef::Local(bucket.path()), &tenant).expect("derive b");
+
+    // The RFC 0013 localstack harness pattern: start LocalStack, create
+    // the bucket with the image's own `awslocal`, point `Store::s3` at
+    // it via the endpoint override (credentials from the CI job's
+    // `AWS_*` env — LocalStack accepts any).
+    let container = LocalStack::default()
+        .with_env_var("SERVICES", "s3")
+        .start()
+        .await
+        .expect("start localstack");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(4566)
+        .await
+        .expect("container port");
+    let mut mb = container
+        .exec(ExecCommand::new([
+            "awslocal".to_string(),
+            "s3".to_string(),
+            "mb".to_string(),
+            "s3://ourios-it-templatemap".to_string(),
+        ]))
+        .await
+        .expect("exec awslocal s3 mb");
+    // Drain both streams before reading the exit code — testcontainers
+    // reports `exit_code()` as `None` until the output is consumed.
+    let stdout =
+        String::from_utf8_lossy(&mb.stdout_to_vec().await.expect("mb stdout")).into_owned();
+    let stderr =
+        String::from_utf8_lossy(&mb.stderr_to_vec().await.expect("mb stderr")).into_owned();
+    let code = mb.exit_code().await.expect("mb exit code");
+    assert_eq!(
+        code,
+        Some(0),
+        "awslocal s3 mb failed (code {code:?}): stdout={stdout:?} stderr={stderr:?}",
+    );
+    let s3 = Store::s3(
+        ourios_parquet::S3Config::new("ourios-it-templatemap")
+            .with_endpoint(format!("http://{host}:{port}"))
+            .with_region("us-east-1"),
+    )
+    .expect("build s3 store");
+    let remote = StoreRef::Remote(&s3);
+    let key = format!("audit/tenant_id={TENANT}/{TEMPLATE_MAP_FILENAME}");
+
+    // Create-if-absent wins; a concurrent create (stale absence) loses
+    // harmlessly and the store still holds A.
+    assert_eq!(
+        map_a.publish(remote, None).expect("create"),
+        PublishOutcome::Published,
+    );
+    assert_eq!(
+        map_b.publish(remote, None).expect("a lost create is Ok"),
+        PublishOutcome::LostRace,
+    );
+    let (bytes, e_tag) = s3
+        .get_with_etag_blocking_opt(&key)
+        .expect("get")
+        .expect("artifact present");
+    let e_tag = e_tag.expect("s3 exposes an ETag");
+    let ArtifactRead::Valid(held) = TemplateMap::from_json(&bytes, &tenant).expect("read") else {
+        panic!("the artifact must read back Valid after a lost create");
+    };
+    assert_eq!(held.folded_files(), map_a.folded_files());
+
+    // An `If-Match` swap at the observed `ETag` wins; the now-stale
+    // `ETag` loses harmlessly, and the object stays valid throughout.
+    assert_eq!(
+        map_b.publish(remote, Some(&e_tag)).expect("swap"),
+        PublishOutcome::Published,
+    );
+    assert_eq!(
+        map_a
+            .publish(remote, Some(&e_tag))
+            .expect("a lost swap is Ok"),
+        PublishOutcome::LostRace,
+    );
+    let (bytes, _) = s3
+        .get_with_etag_blocking_opt(&key)
+        .expect("get")
+        .expect("artifact present");
+    let ArtifactRead::Valid(held) = TemplateMap::from_json(&bytes, &tenant).expect("read") else {
+        panic!("the artifact must read back Valid after a lost swap");
+    };
+    assert_eq!(held.folded_files(), map_b.folded_files());
 }
 
 /// Scenario RFC0033.4 — additive and advisory (back-compat).

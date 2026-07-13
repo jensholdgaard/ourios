@@ -2592,7 +2592,8 @@ fn print_indicative_report(
         println!("dsl: {}", spec.dsl);
         // The Ourios figure is the honest TOTAL (§3.6 measurement-fidelity
         // amendment, 2026-07-12): count scan + row materialization +
-        // template-registry derivation — the gates below ratio against it.
+        // template-map acquisition (RFC 0033: cold audit fold or warm
+        // artifact GET) — the gates below ratio against it.
         println!(
             "ourios bytes_read (compressed, fetched)   = {} \
              (count_scan={} + materialize={} + registry={})",

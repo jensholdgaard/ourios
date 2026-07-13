@@ -256,8 +256,9 @@ pub struct OuriosAnswer {
     /// The row-materialization component: the extra scan that fetched the
     /// ≤ `limit` rendered rows (`QueryResult::materialize_bytes_read`).
     pub materialize_bytes: u64,
-    /// The template-registry component: the RFC 0017 §3.2 audit-stream
-    /// derivation that reconstructs string bodies
+    /// The template-map acquisition component (RFC 0033): the bytes that
+    /// obtained the registry that reconstructs string bodies — a cold
+    /// audit fold or a warm artifact GET
     /// (`QueryResult::registry_bytes_read`).
     pub registry_bytes: u64,
 }
@@ -990,7 +991,7 @@ mod tests {
     fn honest_total_bytes_breaks_down_additively() {
         // The §3.6 measurement-fidelity amendment (2026-07-12): the figure
         // the L-gates ratio is the TOTAL bytes fetched to deliver the answer
-        // — count scan + row materialization + template-registry derivation.
+        // — count scan + row materialization + template-map acquisition.
         // Since the single-pass amendment the harness elides the count scan
         // whenever the result is complete (which the completeness guard
         // requires anyway), so on this path the count-scan component is an

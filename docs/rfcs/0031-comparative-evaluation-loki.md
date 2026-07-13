@@ -317,7 +317,10 @@ Per query, per system, the harness records:
   in the 2026-07-13 amendment below): storage-side
   (`compressedBytes + headChunkBytes`) and processed
   (`totalBytesProcessed`); each frozen gate cites one (§7).
-  **Primary gate metric.** Because it counts bytes fetched
+  **Primary gate metric** — with the rationale applying to Ourios's
+  figure and Loki's storage-side channel; the processed
+  channel measures decompressed engine work, not fetched bytes.
+  Because the storage-side comparison counts bytes fetched
   from the shared object store, it is by construction insensitive to
   CPU speed and engine maturity; to keep it insensitive to local page
   cache as well, each measured query runs against a **freshly started**
@@ -362,9 +365,10 @@ Per query, per system, the harness records:
 > decompressed engine work, the measure of the scanning the §1
 > thesis eliminates). Both are always recorded; gates cite one.
 > Where a §5 scenario's shorthand reads `loki.bytes_read` (or names
-> `Summary.totalBytesProcessed` directly), the channel the frozen
-> gate cites in §7 applies: storage-side for RFC0031.2/.4, processed
-> for RFC0031.3 under the interim rule.
+> `Summary.totalBytesProcessed` directly — **legacy wording**, kept
+> for scenario stability, not a redefinition of that key), interpret
+> it as the channel the frozen gate cites in §7: storage-side for
+> RFC0031.2/.4, processed for RFC0031.3 under the interim rule.
 
 ### 3.7 Reproducibility and anti-strawman commitment
 
@@ -618,8 +622,10 @@ not block `validated` in the "we didn't finish" sense — it is a
 
 ## 7. Open questions
 
-- [x] **Must-win margins — PARTIALLY FROZEN (2026-07-13, per the
-  `benchmarks.md` §9.13 calibration record; maintainer delegated).**
+- [x] **Must-win margins — PARTIALLY FROZEN (2026-07-13, informed by the
+  `benchmarks.md` §9.13 calibration record — whose channel choice was
+  still open at its writing; this amendment resolves it. Maintainer
+  delegated).**
   `M_L1 = 10` and `M_L3 = 10` are **frozen** on the storage-side
   channel (the conservative one, §3.6 channel definitions): both classes clear it with
   headroom (L1 77.2–77.7×, L3 21.2–21.9×) across 3–4 consecutive

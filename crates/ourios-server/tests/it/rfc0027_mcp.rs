@@ -12,7 +12,8 @@ use tower::ServiceExt as _;
 /// request stands alone; the server's session id from `initialize` is
 /// echoed back when `session` is given). Returns status + body text
 /// (SSE or JSON) + any `mcp-session-id` response header.
-async fn mcp_post(
+/// Shared with the RFC 0032 suite (the same harness shape, §6).
+pub(crate) async fn mcp_post(
     router: Router,
     bearer: Option<&str>,
     session: Option<&str>,
@@ -88,7 +89,8 @@ async fn mcp_tool_call(
 
 /// The first non-empty SSE `data:` payload (rmcp sends an empty priming
 /// event first), or the body itself for plain-JSON responses.
-fn rpc_payload(body: &str) -> serde_json::Value {
+/// Shared with the RFC 0032 suite (the same harness shape, §6).
+pub(crate) fn rpc_payload(body: &str) -> serde_json::Value {
     let json_line = body
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -474,7 +476,10 @@ async fn rfc0027_6_grammar_resource() {
     let (status, _, _) = mcp_post(router.clone(), None, Some(&session), initialized).await;
     assert!(status.is_success(), "initialized: {status}");
 
-    // resources/list advertises exactly the grammar.
+    // resources/list advertises the grammar. (RFC 0032 amends the
+    // surface with the query-schema resource beside it; the exactly-two
+    // count is RFC0032.1's assertion — this scenario pins the grammar's
+    // presence and byte-identity.)
     let list = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}
     });
@@ -482,13 +487,14 @@ async fn rfc0027_6_grammar_resource() {
     assert_eq!(status, StatusCode::OK);
     let rpc = rpc_payload(&body);
     let resources = rpc["result"]["resources"].as_array().expect("resources");
-    assert_eq!(resources.len(), 1, "one resource: {rpc}");
-    let uri = resources[0]["uri"].as_str().expect("uri");
-    assert_eq!(uri, "ourios://dsl-grammar");
+    let grammar = resources
+        .iter()
+        .find(|r| r["uri"] == "ourios://dsl-grammar")
+        .expect("grammar resource advertised");
+    let uri = grammar["uri"].as_str().expect("uri");
     assert_eq!(
-        resources[0]["mimeType"], "text/markdown",
-        "advertised as markdown: {}",
-        resources[0],
+        grammar["mimeType"], "text/markdown",
+        "advertised as markdown: {grammar}",
     );
 
     // resources/read serves text byte-identical to the RFC 0002 §7

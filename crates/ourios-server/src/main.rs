@@ -706,6 +706,35 @@ async fn auth_resolver(
     }
 }
 
+/// Start the querier role if enabled (RFC 0016), over the same store the
+/// receiver writes and the compactor sweeps. Reports the bound address on
+/// stdout (an operator — or a test binding `:0` — learns the actual port).
+async fn start_querier(
+    config: &ServerConfig,
+    resolver: Option<ourios_ingester::receiver::AuthResolver>,
+) -> Result<Option<ourios_server::querier::QuerierHandle>, String> {
+    let Some(params) = &config.querier else {
+        return Ok(None);
+    };
+    let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
+        http_addr: params.http_addr,
+        http_tls: params.http_tls.clone(),
+        // The querier engine is Store-capable (RFC 0019 slice 2a), so it
+        // reads whichever backend config resolved (local or S3).
+        store: config.store.clone(),
+        auth: resolver.expect("resolver built for enabled roles"),
+        default_window_nanos: params.default_window_nanos,
+        mcp_enabled: params.mcp_enabled,
+        // The same effective set the write paths apply — the MCP
+        // query-schema resource publishes it (RFC 0032 §3.1).
+        promoted: config.promoted.clone(),
+    })
+    .await?;
+    println!("querier HTTP listening on {}", handle.http_addr);
+    std::io::stdout().flush().ok();
+    Ok(Some(handle))
+}
+
 /// Resolve the configuration (file or env, RFC 0020 §3.2) and pre-create
 /// a local store root (`Store::local` canonicalises it and errors on a
 /// missing dir; an S3 backend needs no such step — mirrors the querier
@@ -784,28 +813,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    // Start the querier role if enabled (RFC 0016), over the same store the
-    // receiver writes and the compactor sweeps. Report the bound address on
-    // stdout (an operator — or a test binding `:0` — learns the actual port).
-    let querier = match &config.querier {
-        Some(params) => {
-            let handle = ourios_server::querier::serve(ourios_server::querier::QuerierConfig {
-                http_addr: params.http_addr,
-                http_tls: params.http_tls.clone(),
-                // The querier engine is Store-capable (RFC 0019 slice 2a), so it
-                // reads whichever backend config resolved (local or S3).
-                store: config.store.clone(),
-                auth: resolver.clone().expect("resolver built for enabled roles"),
-                default_window_nanos: params.default_window_nanos,
-                mcp_enabled: params.mcp_enabled,
-            })
-            .await?;
-            println!("querier HTTP listening on {}", handle.http_addr);
-            std::io::stdout().flush().ok();
-            Some(handle)
-        }
-        None => None,
-    };
+    let querier = start_querier(&config, resolver.clone()).await?;
 
     // The compactor sweeps the resolved store (local or S3, RFC 0019 slice 2b),
     // opened in the preflight above so a store failure never leaks a live role,

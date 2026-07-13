@@ -62,6 +62,7 @@ async fn rfc0030_3_querier_and_mcp_over_tls() {
         mcp_enabled: true,
         auth: AuthResolver::static_only(Some(std::sync::Arc::new(tokens))),
         default_window_nanos: 3600 * 1_000_000_000,
+        promoted: ourios_parquet::PromotedAttributes::default(),
     })
     .await
     .expect("querier serves");

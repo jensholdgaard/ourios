@@ -350,10 +350,10 @@ Per query, per system, the harness records:
 > **Channel definitions (amendment, 2026-07-13).** The Loki
 > comparator is recorded on two channels, and each frozen gate names
 > which it uses (§7): the **storage-side channel**
-> (`querier.store.chunk.compressedBytes` + `headChunkBytes` from the
-> query-stats tree — bytes fetched from storage, the conservative
-> apples-to-apples counterpart of Ourios's fetched-compressed total)
-> and the **processed channel** (`Summary.totalBytesProcessed` —
+> (`compressedBytes + headChunkBytes` from the query-stats tree —
+> bytes fetched from storage, the conservative apples-to-apples
+> counterpart of Ourios's fetched-compressed total)
+> and the **processed channel** (`totalBytesProcessed` —
 > decompressed engine work, the measure of the scanning the §1
 > thesis eliminates). Both are always recorded; gates cite one.
 
@@ -618,7 +618,7 @@ not block `validated` in the "we didn't finish" sense — it is a
   than tuned. `M_L2` is **deferred with a named condition**: the
   measured storage-side band is 1.05–1.31× — an honest parity, not a
   10× claim — and two named levers (the RFC 0033 cached template
-  map, constant 513,862 B/query, and write-side sizing) are expected
+  map, constant 513,862 bytes per query, and write-side sizing) are expected
   to move it; freeze after RFC 0033 lands. Until then L2 gates on
   the processed-bytes channel at `M = 10` (measured 32.5–39.3×),
   with the storage-side figure recorded as informational. `M_L4` is

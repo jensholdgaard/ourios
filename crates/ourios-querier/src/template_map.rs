@@ -389,7 +389,9 @@ impl TemplateMap {
                 let tmp = dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp"));
                 std::fs::write(&tmp, &bytes).map_err(|e| io_err("write", &tmp, &e))?;
                 let target = dir.join(TEMPLATE_MAP_FILENAME);
-                std::fs::rename(&tmp, &target).map_err(|e| io_err("rename", &tmp, &e))?;
+                std::fs::rename(&tmp, &target).map_err(|e| QueryError::Storage {
+                    detail: format!("rename {} -> {}: {e}", tmp.display(), target.display()),
+                })?;
                 Ok(PublishOutcome::Published)
             }
             StoreRef::Remote(store) => {

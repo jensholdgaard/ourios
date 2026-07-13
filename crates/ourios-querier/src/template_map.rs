@@ -418,12 +418,19 @@ fn validate(raw: &TemplateMapJson) -> Result<(), String> {
 /// same stance as the manifest's `is_partition_local_parquet`.
 fn is_tenant_relative_parquet(name: &str) -> bool {
     use std::path::{Component, Path};
+    // Path::components() normalizes away empty segments, so a doubled
+    // slash would slip past the component check and misclassify a
+    // malformed artifact Valid (failing only later, at frontier
+    // equality) — reject non-canonical separators explicitly first.
+    if name.is_empty() || name.contains('\\') || name.split('/').any(str::is_empty) {
+        return false;
+    }
     let path = Path::new(name);
     let mut components = path.components();
     let all_normal = components
         .by_ref()
         .all(|c| matches!(c, Component::Normal(_)));
-    all_normal && !name.is_empty() && path.extension().is_some_and(|ext| ext == "parquet")
+    all_normal && path.extension().is_some_and(|ext| ext == "parquet")
 }
 
 #[cfg(test)]
@@ -676,5 +683,19 @@ mod tests {
             TemplateMap::from_json(&bytes, &tenant()),
             Ok(ArtifactRead::Valid(_))
         ));
+    }
+
+    #[test]
+    fn non_canonical_frontier_paths_rejected() {
+        for bad in [
+            "year=2026//month=07/a.parquet",
+            "/year=2026/a.parquet",
+            "year=2026/a.parquet/",
+            "a\\b.parquet",
+            "",
+        ] {
+            assert!(!is_tenant_relative_parquet(bad), "{bad:?} must be rejected");
+        }
+        assert!(is_tenant_relative_parquet("year=2026/month=07/a.parquet"));
     }
 }

@@ -326,11 +326,18 @@ impl TemplateMap {
 /// audit subtree (`CLAUDE.md` §3.7).
 fn validate(raw: &TemplateMapJson) -> Result<(), String> {
     // Canonical-form check on every template string: the artifact is
-    // untrusted input, and a non-canonical string (empty segments,
-    // doubled/leading/trailing spaces) that parse_template would still
-    // accept could alter matching semantics — classify it torn instead.
+    // untrusted input. parse_template/format_template round-trip alone
+    // is NOT sufficient — empty segments (leading/trailing/doubled
+    // spaces) parse to Fixed("") and round-trip unchanged — so enforce
+    // what mine-time tokenization actually guarantees: a non-empty
+    // string splits into non-empty, whitespace-free tokens.
     for entry in &raw.registry {
-        if format_template(&parse_template(&entry.template)) != entry.template {
+        let canonical = entry.template.is_empty()
+            || entry
+                .template
+                .split(' ')
+                .all(|tok| !tok.is_empty() && !tok.chars().any(char::is_whitespace));
+        if !canonical {
             return Err(format!(
                 "registry template for id {} v{} is not in canonical format_template form",
                 entry.template_id, entry.version,
@@ -638,5 +645,33 @@ mod tests {
         let bytes = serde_json::to_vec(&json).expect("serialize");
         let read = TemplateMap::from_json(&bytes, &tenant()).expect("read");
         assert!(matches!(read, ArtifactRead::Torn { .. }), "got {read:?}");
+    }
+
+    #[test]
+    fn non_canonical_templates_classify_torn() {
+        // Empty segments round-trip through parse/format unchanged, so
+        // the validator must reject them explicitly.
+        for bad in [" a", "a ", "a  b", "a\tb", " "] {
+            let mut json: TemplateMapJson =
+                serde_json::from_slice(&sample().to_json().expect("serialize")).expect("parse");
+            json.registry[0].template = bad.to_string();
+            let bytes = serde_json::to_vec(&json).expect("serialize");
+            assert!(
+                matches!(
+                    TemplateMap::from_json(&bytes, &tenant()),
+                    Ok(ArtifactRead::Torn { .. })
+                ),
+                "template {bad:?} must classify torn",
+            );
+        }
+        // The empty template (zero-token) stays valid — it is canonical.
+        let mut json: TemplateMapJson =
+            serde_json::from_slice(&sample().to_json().expect("serialize")).expect("parse");
+        json.registry[0].template = String::new();
+        let bytes = serde_json::to_vec(&json).expect("serialize");
+        assert!(matches!(
+            TemplateMap::from_json(&bytes, &tenant()),
+            Ok(ArtifactRead::Valid(_))
+        ));
     }
 }

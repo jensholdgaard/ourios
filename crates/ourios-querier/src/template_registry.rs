@@ -1,12 +1,14 @@
 //! v1 reader-side template-registry derivation (RFC 0017 §3.2).
 //!
-//! There is **no persisted per-tenant template-registry artifact** in v1
-//! (the cached map is the deferred RFC 0005 §3.7.1 / manifest-fork
-//! optimisation): the audit stream *is* the registry, and the querier
-//! derives the requesting tenant's `(template_id, template_version) →
-//! tokens` map at query time by folding the tenant's `template_created` /
-//! `template_widened` / `template_type_expanded` events (RFC 0001 §6.4,
-//! RFC 0017 §3.1) off the RFC 0005 §3.7 audit Parquet stream.
+//! The audit stream *is* the registry: the querier derives the requesting
+//! tenant's `(template_id, template_version) → tokens` map at query time
+//! by folding the tenant's `template_created` / `template_widened` /
+//! `template_type_expanded` events (RFC 0001 §6.4, RFC 0017 §3.1) off the
+//! RFC 0005 §3.7 audit Parquet stream. The RFC 0033 cached template map
+//! (`template_map.json`, discharging the RFC 0005 §3.7.1 deferral)
+//! accelerates this derivation at the query call sites; this fold remains
+//! the source-of-truth derivation and the fallback for every non-hit
+//! disposition.
 //!
 //! This mirrors [`crate::alias_store::derive_alias_map`] exactly — the same
 //! shared [`crate::audit_scan`] walk and the same total, deterministic fold

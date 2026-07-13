@@ -51,8 +51,8 @@ pub use audit_scan::StoreRef;
 pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_map::{
-    ArtifactRead, PublishOutcome, TEMPLATE_MAP_FILENAME, TEMPLATE_MAP_FORMAT_VERSION, TemplateMap,
-    derive_template_map,
+    ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME,
+    TEMPLATE_MAP_FORMAT_VERSION, TemplateMap, derive_template_map, load_or_derive,
 };
 pub use template_registry::{TemplateRegistry, derive_template_registry};
 
@@ -197,10 +197,16 @@ pub struct QueryResult {
     /// metrics depend on that semantics) — a caller wanting the honest
     /// total IO for one query sums the three components.
     pub materialize_bytes_read: u64,
-    /// Bytes fetched from the tenant's audit stream deriving the read-time
-    /// template registry that rendered the returned `records` (RFC 0017
-    /// §3.2 / RFC 0031 §3.6). `0` when no rows were rendered. Same additive
-    /// contract as `materialize_bytes_read`.
+    /// **Template-map acquisition bytes** (RFC 0033 §3.6, amending the
+    /// pre-0033 audit-stream-only meaning): the total bytes fetched to
+    /// obtain the body-rendering capability behind the returned `records`,
+    /// whatever the source — the audit-stream fold on a cache miss
+    /// (byte-for-byte the pre-0033 RFC 0017 §3.2 registry derivation) or
+    /// the `template_map.json` artifact GET on a cache hit. One
+    /// per-query acquisition serves both the registry and, for
+    /// `resolves_to` queries, the alias map. `0` when no rows were
+    /// rendered. Same additive contract as `materialize_bytes_read`
+    /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
 }
 
@@ -650,6 +656,18 @@ struct CollectedRecords {
     registry_bytes_read: u64,
 }
 
+/// One per-query template-map acquisition (RFC 0033): the artifact-or-fold
+/// [`TemplateMap`] plus the bytes fetched acquiring it
+/// ([`QueryResult::registry_bytes_read`]). Acquired at most once per query
+/// — at compile time when the DSL uses `resolves_to` (the alias fold),
+/// otherwise lazily by [`Querier::collect_records`] when there are rows to
+/// render — so the alias map and the registry can never come from
+/// different frontiers within one query (§3.1's one-artifact rationale).
+struct AcquiredTemplateMap {
+    map: TemplateMap,
+    acquisition_bytes: u64,
+}
+
 impl Querier {
     /// Create a querier reading the RFC 0005 store under the **local**
     /// `bucket_root` (the same root the `ourios-parquet` writer writes
@@ -707,9 +725,14 @@ impl Querier {
         let tenant = request.tenant.clone();
         let window = request.time_range;
         let row_limit = request.limit;
-        self.execute(&tenant, window, row_limit, QueryOptions::default(), |df| {
-            apply_request_filters(df, &request)
-        })
+        self.execute(
+            &tenant,
+            window,
+            row_limit,
+            QueryOptions::default(),
+            None,
+            |df| apply_request_filters(df, &request),
+        )
         .await
     }
 
@@ -727,9 +750,11 @@ impl Querier {
     /// unbounded scan).
     ///
     /// `alias_map` selects where the RFC 0001 §6.7 alias projection comes
-    /// from. `None` — the production default — derives the requesting
-    /// tenant's map from its audit stream at compile time per RFC 0005
-    /// §3.7.1 (the audit stream is the alias store in v1; the scan is
+    /// from. `None` — the production default — resolves the requesting
+    /// tenant's map at compile time per RFC 0005 §3.7.1 through the
+    /// RFC 0033 cached template map (the audit stream stays the source of
+    /// truth: an artifact hit reflects exactly the fresh fold, and every
+    /// non-hit disposition *is* the fresh fold; the acquisition is
     /// skipped entirely when the query has no `resolves_to`).
     /// `Some(map)` injects a caller-held projection instead — the
     /// test/operator override, bypassing storage. Either way,
@@ -788,22 +813,34 @@ impl Querier {
         // pure validation internally — one source of truth, negligible
         // cost.
         compile::validate(query, now_unix_nano, default_window_nanos)?;
+        let mut acquired: Option<AcquiredTemplateMap> = None;
         let derived;
         let map = match alias_map {
             Some(map) => map,
             None if compile::uses_resolves_to(&query.predicate) => {
-                // Offload the blocking audit derivation (S3 `get_blocking` /
-                // the local `std::fs` reads) off the runtime worker, mirroring
-                // `run_drift` — the derivation is deeply sync, so clone the
-                // cheap backend handle into the blocking task.
-                derived = self
+                // The alias fold comes from the cached template map
+                // (RFC 0033): artifact hit or fresh fold + write-through.
+                // Offload the blocking IO (S3 GETs / the local `std::fs`
+                // reads) off the runtime worker, mirroring `run_drift` —
+                // the derivation is deeply sync, so clone the cheap
+                // backend handle into the blocking task. The acquired map
+                // is handed down to the row-rendering pass, so the alias
+                // map and the registry share one acquisition (and one
+                // frontier) per query.
+                let (template_map, acquisition_bytes, _outcome) = self
                     .spawn_blocking_audit({
                         let backend = self.backend.clone();
                         let tenant = tenant.clone();
-                        move || alias_store::derive_alias_map(backend.store_ref(), &tenant)
+                        move || template_map::load_or_derive(backend.store_ref(), &tenant)
                     })
                     .await?;
-                &derived
+                acquired
+                    .insert(AcquiredTemplateMap {
+                        map: template_map,
+                        acquisition_bytes,
+                    })
+                    .map
+                    .alias_map()
             }
             // No `resolves_to` ⇒ the map is never consulted; an empty
             // projection avoids the audit-tree scan.
@@ -816,9 +853,14 @@ impl Querier {
         // The DSL `limit` (RFC 0002) doubles as the RFC 0017 row cap; read it
         // before `plan` moves into the filter closure.
         let row_limit = plan.limit;
-        self.execute(tenant, Some(plan.window), row_limit, options, move |df| {
-            compile::apply(df, plan)
-        })
+        self.execute(
+            tenant,
+            Some(plan.window),
+            row_limit,
+            options,
+            acquired,
+            move |df| compile::apply(df, plan),
+        )
         .await
     }
 
@@ -891,6 +933,11 @@ impl Querier {
         // limited result.
         row_limit: Option<usize>,
         query_options: QueryOptions,
+        // A template map already acquired at query-compile time (the
+        // `resolves_to` alias fold, RFC 0033) — handed to the row-rendering
+        // pass so one acquisition serves both folds. `None` ⇒ rendering
+        // acquires lazily.
+        mut acquired: Option<AcquiredTemplateMap>,
         build_filter: F,
     ) -> Result<QueryResult, QueryError>
     where
@@ -976,7 +1023,7 @@ impl Querier {
             && query_options.elide_count_scan
         {
             let collected = self
-                .collect_records(df.clone(), n, tenant, ctx.task_ctx())
+                .collect_records(df.clone(), n, tenant, ctx.task_ctx(), acquired.take())
                 .await?;
             if collected.records.len() < n {
                 return Ok(QueryResult {
@@ -1019,7 +1066,10 @@ impl Querier {
         // truncated single-pass run already materialised — reuse it.
         let collected = match (early, row_limit) {
             (Some(collected), _) => collected,
-            (None, Some(n)) => self.collect_records(df, n, tenant, ctx.task_ctx()).await?,
+            (None, Some(n)) => {
+                self.collect_records(df, n, tenant, ctx.task_ctx(), acquired.take())
+                    .await?
+            }
             (None, None) => CollectedRecords::default(),
         };
         Ok(QueryResult {
@@ -1033,16 +1083,20 @@ impl Querier {
 
     /// Materialise up to `limit` matching rows from the filtered `df`, decode
     /// them, and render each into a [`LogRow`] (RFC 0017 §3.3). The template
-    /// registry is derived once (from the tenant's audit stream) only when
-    /// there are rows to render. Returns the rows plus this pass's own IO
-    /// accounting (RFC 0031 §3.6), kept out of [`QueryStats`] so the
-    /// count-scan figures B1/B2 assert on stay exactly the count scan.
+    /// map is acquired once — reusing `acquired` when the query-compile
+    /// alias fold already paid for it, otherwise through the RFC 0033
+    /// cached read path (artifact hit, or fresh fold + write-through) —
+    /// and only when there are rows to render. Returns the rows plus this
+    /// pass's own IO accounting (RFC 0031 §3.6), kept out of
+    /// [`QueryStats`] so the count-scan figures B1/B2 assert on stay
+    /// exactly the count scan.
     async fn collect_records(
         &self,
         df: datafusion::dataframe::DataFrame,
         limit: usize,
         tenant: &TenantId,
         task_ctx: Arc<datafusion::execution::TaskContext>,
+        acquired: Option<AcquiredTemplateMap>,
     ) -> Result<CollectedRecords, QueryError> {
         // Filter pushdown ("late materialization", off by default in
         // DataFusion 54): the scan evaluates the predicate during Parquet
@@ -1125,27 +1179,36 @@ impl Querier {
                 });
             }
         }
-        // The single registry derivation, measured (RFC 0031 §3.6) — the
-        // same blocking-pool offload as [`Self::template_registry`].
-        let (registry, registry_bytes_read) = self
-            .spawn_blocking_audit({
-                let backend = self.backend.clone();
-                let tenant = tenant.clone();
-                move || {
-                    template_registry::derive_template_registry_measured(
-                        backend.store_ref(),
-                        &tenant,
-                    )
-                }
-            })
-            .await?;
+        // The single per-query template-map acquisition, measured
+        // (RFC 0031 §3.6 / RFC 0033): reuse the compile-time alias fold's
+        // map when the query already acquired one, else resolve through
+        // the cached read path — the same blocking-pool offload as
+        // [`Self::template_registry`].
+        let AcquiredTemplateMap {
+            map,
+            acquisition_bytes,
+        } = if let Some(acquired) = acquired {
+            acquired
+        } else {
+            let (map, acquisition_bytes, _outcome) = self
+                .spawn_blocking_audit({
+                    let backend = self.backend.clone();
+                    let tenant = tenant.clone();
+                    move || template_map::load_or_derive(backend.store_ref(), &tenant)
+                })
+                .await?;
+            AcquiredTemplateMap {
+                map,
+                acquisition_bytes,
+            }
+        };
         Ok(CollectedRecords {
             records: mined
                 .iter()
-                .map(|record| LogRow::from_record(record, &registry))
+                .map(|record| LogRow::from_record(record, map.registry()))
                 .collect(),
             scan,
-            registry_bytes_read,
+            registry_bytes_read: acquisition_bytes,
         })
     }
 

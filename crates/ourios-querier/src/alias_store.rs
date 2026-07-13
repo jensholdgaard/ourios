@@ -16,9 +16,10 @@
 //! The derived map reflects exactly the alias events durably flushed
 //! to the audit stream at scan time — the RFC 0001 §6.7
 //! eventual-consistency stance, with the staleness window being
-//! audit-flush visibility. A future materialized per-tenant cache
-//! (the RFC 0009 §3.4 manifest fork) would accelerate, not change,
-//! this derivation.
+//! audit-flush visibility. The RFC 0033 cached template map
+//! accelerates this derivation at the query call sites (an
+//! exactly-fresh artifact skips the scan); this fold remains the
+//! semantics owner and the fallback for every non-hit disposition.
 
 use ourios_core::alias::AliasMap;
 use ourios_core::audit::AuditPayload;

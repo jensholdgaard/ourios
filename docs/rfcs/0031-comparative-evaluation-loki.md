@@ -346,6 +346,16 @@ Per query, per system, the harness records:
 > `QueryStats::bytes_read` keeps its count-scan-only meaning (the
 > B1/B2 gates and the RFC 0016 metrics depend on it); the two new
 > components are additive `QueryResult` fields the harness sums.
+>
+> **Channel definitions (amendment, 2026-07-13).** The Loki
+> comparator is recorded on two channels, and each frozen gate names
+> which it uses (§7): the **storage-side channel**
+> (`querier.store.chunk.compressedBytes` + `headChunkBytes` from the
+> query-stats tree — bytes fetched from storage, the conservative
+> apples-to-apples counterpart of Ourios's fetched-compressed total)
+> and the **processed channel** (`Summary.totalBytesProcessed` —
+> decompressed engine work, the measure of the scanning the §1
+> thesis eliminates). Both are always recorded; gates cite one.
 
 ### 3.7 Reproducibility and anti-strawman commitment
 
@@ -600,7 +610,7 @@ not block `validated` in the "we didn't finish" sense — it is a
 ## 7. Open questions
 
 - [x] **Must-win margins — PARTIALLY FROZEN (2026-07-13, per the
-  §9.13 calibration record; maintainer delegated).**
+  `benchmarks.md` §9.13 calibration record; maintainer delegated).**
   `M_L1 = 10` and `M_L3 = 10` are **frozen** on the storage-side
   bytes channel (the conservative one): both classes clear it with
   headroom (L1 77.2–77.7×, L3 21.2–21.9×) across 3–4 consecutive
@@ -613,15 +623,18 @@ not block `validated` in the "we didn't finish" sense — it is a
   the processed-bytes channel at `M = 10` (measured 32.5–39.3×),
   with the storage-side figure recorded as informational. `M_L4` is
   **deferred until L4 is first measured** (query shape below).
-  Rationale for the split channels is the §9.13 assessment: the
+  Rationale for the split channels is the `benchmarks.md` §9.13 assessment: the
   storage channel is the conservative claim where we can make it,
   and the processed channel measures the work the §1 thesis
   eliminates.
 - [x] **Floor / parity factors — F_L6 FROZEN, F_L7 DEFERRED
   (2026-07-13).** `F_L6 = 3` is **frozen on the latency channel, as
   RFC0031.7 is written**: run #18 measured all three window pairs
-  inside the floor (ratios 0.34 / 3.43 / 1.32 against the 1/3 bound,
-  Ourios outright faster on two). The window pairs' **bytes** figures
+  inside the floor (ratios 0.34 / 3.43 / 1.32, oriented
+  `loki_p50 / ourios_p50` so > 1 means Ourios is faster; the floor
+  passes at ≥ 1/3 — Ourios outright faster on two of three). Harness
+  alignment (asserting the frozen gates instead of reporting them)
+  lands in the companion slice immediately after this amendment. The window pairs' **bytes** figures
   are reclassified from a gated floor to a **published diagnostic**
   (`informational` bar, benchmarks.md taxonomy): the storage-channel
   loss (0.007–0.018) is real, structural to time-partitioned chunks

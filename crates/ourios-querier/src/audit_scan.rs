@@ -124,6 +124,160 @@ pub(crate) struct CapturedScan {
     pub(crate) frontier: Vec<String>,
 }
 
+/// A resolved audit file set **plus** its frontier, from **one** listing —
+/// the RFC 0033 §3.3 ordering requirement (LIST-before-GET-is-compared)
+/// made structural: the freshness comparison and the fallback fold consume
+/// this same listing, so a file appearing mid-query affects a cached and an
+/// uncached query identically. The remote variant carries its [`Store`]
+/// borrow, so a resolved set can never be read against the wrong backend.
+pub(crate) enum ResolvedAuditSet<'a> {
+    Local {
+        /// Absolute, canonical local file paths (lexicographically sorted,
+        /// unique — [`local_audit_files`]'s output).
+        paths: Vec<PathBuf>,
+        frontier: Vec<String>,
+    },
+    Remote {
+        store: &'a Store,
+        /// Store-relative object keys (lexicographically sorted, unique).
+        keys: Vec<String>,
+        frontier: Vec<String>,
+    },
+}
+
+/// Resolve `tenant`'s live audit `*.parquet` set together with its frontier
+/// — the single LIST both the RFC 0033 §3.3 freshness check and the fold
+/// consume. A tenant with no audit files is an empty set, not an error.
+pub(crate) fn resolve_audit_set<'a>(
+    backend: StoreRef<'a>,
+    tenant: &TenantId,
+) -> Result<ResolvedAuditSet<'a>, QueryError> {
+    match backend {
+        StoreRef::Local(root) => {
+            let paths = local_audit_files(root, tenant, None)?;
+            // The canonical tenant root every file was validated against —
+            // recomputed only when there are files, so an absent tree stays
+            // a valid empty scan — relativizes the frontier the same way
+            // the S3 branch's keys already are.
+            let mut frontier = Vec::with_capacity(paths.len());
+            if !paths.is_empty() {
+                let tenant_root = canonical_tenant_root(root, tenant)?;
+                for path in &paths {
+                    frontier.push(tenant_relative(path, &tenant_root)?);
+                }
+            }
+            frontier.sort_unstable();
+            Ok(ResolvedAuditSet::Local { paths, frontier })
+        }
+        StoreRef::Remote(store) => {
+            let enc = percent_encode_tenant(tenant.as_str());
+            let prefix = format!("audit/tenant_id={enc}/");
+            let keys = remote_audit_files(store, tenant, None)?;
+            // The listing is prefix-scoped, so the strip always applies;
+            // keeping the full key on a (can't-happen) miss stays
+            // consistent for set-equality as long as both sides use this
+            // same rule.
+            let mut frontier: Vec<String> = keys
+                .iter()
+                .map(|key| key.strip_prefix(&prefix).unwrap_or(key).to_owned())
+                .collect();
+            frontier.sort_unstable();
+            Ok(ResolvedAuditSet::Remote {
+                store,
+                keys,
+                frontier,
+            })
+        }
+    }
+}
+
+impl ResolvedAuditSet<'_> {
+    /// The frontier: the resolved audit `*.parquet` set as tenant-root-
+    /// relative keys, sorted lexicographically — the right-hand side of the
+    /// RFC 0033 §3.3 set-equality freshness check.
+    pub(crate) fn frontier(&self) -> &[String] {
+        match self {
+            Self::Local { frontier, .. } | Self::Remote { frontier, .. } => frontier,
+        }
+    }
+
+    /// Read every [`AuditEvent`] from this resolved set, in the §3.7.1 fold
+    /// order, applying the **row-level tenant backstop** (`CLAUDE.md` §3.7 /
+    /// RFC 0005 §3.9 row-vs-path): the listing/walk is already
+    /// tenant-scoped, so a row claiming another tenant is a corrupt or
+    /// foreign file — fail loudly rather than fold (or silently drop) it. A
+    /// local file is read with [`AuditReader::open_file`], an S3 key via
+    /// [`Store::get_blocking`] → [`AuditReader::open_bytes`].
+    ///
+    /// Also returns (in the [`CapturedScan`]) the **bytes fetched** reading
+    /// the set (RFC 0031 §3.6). The remote branch pays a full-object GET
+    /// per key, so the local branch counts each file's length to keep the
+    /// two backends' figures equal for identical data.
+    pub(crate) fn read_events(self, tenant: &TenantId) -> Result<CapturedScan, QueryError> {
+        let mut bytes_read: u64 = 0;
+        let mut events: Vec<AuditEvent> = Vec::new();
+        let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
+            for event in read {
+                if event.tenant_id != *tenant {
+                    return Err(QueryError::Storage {
+                        detail: format!(
+                            "audit file {label} carries a row for tenant {} under tenant {}'s \
+                             partition root",
+                            event.tenant_id.as_str(),
+                            tenant.as_str(),
+                        ),
+                    });
+                }
+                events.push(event);
+            }
+            Ok(())
+        };
+        let frontier = match self {
+            Self::Local { paths, frontier } => {
+                for path in &paths {
+                    let len = std::fs::metadata(path)
+                        .map_err(|e| QueryError::Storage {
+                            detail: format!("audit file metadata {}: {e}", path.display()),
+                        })?
+                        .len();
+                    bytes_read = add_measured(bytes_read, len)?;
+                    let read = AuditReader::open_file(path)
+                        .and_then(AuditReader::read_all)
+                        .map_err(|e| QueryError::Storage {
+                            detail: format!("audit file {}: {e}", path.display()),
+                        })?;
+                    push_validated(&path.display().to_string(), read)?;
+                }
+                frontier
+            }
+            Self::Remote {
+                store,
+                keys,
+                frontier,
+            } => {
+                for key in &keys {
+                    let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
+                        detail: format!("audit file {key}: {e}"),
+                    })?;
+                    bytes_read = add_measured(bytes_read, bytes.len() as u64)?;
+                    let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
+                        .and_then(AuditReader::read_all)
+                        .map_err(|e| QueryError::Storage {
+                            detail: format!("audit file {key}: {e}"),
+                        })?;
+                    push_validated(key, read)?;
+                }
+                frontier
+            }
+        };
+        Ok(CapturedScan {
+            events,
+            bytes_read,
+            frontier,
+        })
+    }
+}
+
 /// Read every [`AuditEvent`] from `tenant`'s resolved audit file set (the
 /// `None`-window full history), in the §3.7.1 fold order, applying the
 /// **row-level tenant backstop** (`CLAUDE.md` §3.7 / RFC 0005 §3.9 row-vs-path):
@@ -152,82 +306,7 @@ pub(crate) fn read_all_events_captured(
     backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<CapturedScan, QueryError> {
-    let mut bytes_read: u64 = 0;
-    let mut events: Vec<AuditEvent> = Vec::new();
-    let mut frontier: Vec<String> = Vec::new();
-    let mut push_validated = |label: &str, read: Vec<AuditEvent>| -> Result<(), QueryError> {
-        for event in read {
-            if event.tenant_id != *tenant {
-                return Err(QueryError::Storage {
-                    detail: format!(
-                        "audit file {label} carries a row for tenant {} under tenant {}'s \
-                         partition root",
-                        event.tenant_id.as_str(),
-                        tenant.as_str(),
-                    ),
-                });
-            }
-            events.push(event);
-        }
-        Ok(())
-    };
-    match backend {
-        StoreRef::Local(root) => {
-            let files = local_audit_files(root, tenant, None)?;
-            // The canonical tenant root `local_audit_files` validated every
-            // file against — recomputed here (only when there are files, so
-            // an absent tree stays a valid empty scan) to relativize the
-            // frontier the same way the S3 branch's keys already are.
-            let tenant_root = match files.first() {
-                Some(_) => Some(canonical_tenant_root(root, tenant)?),
-                None => None,
-            };
-            for path in &files {
-                let len = std::fs::metadata(path)
-                    .map_err(|e| QueryError::Storage {
-                        detail: format!("audit file metadata {}: {e}", path.display()),
-                    })?
-                    .len();
-                bytes_read = add_measured(bytes_read, len)?;
-                let read = AuditReader::open_file(path)
-                    .and_then(AuditReader::read_all)
-                    .map_err(|e| QueryError::Storage {
-                        detail: format!("audit file {}: {e}", path.display()),
-                    })?;
-                push_validated(&path.display().to_string(), read)?;
-                if let Some(tenant_root) = &tenant_root {
-                    frontier.push(tenant_relative(path, tenant_root)?);
-                }
-            }
-        }
-        StoreRef::Remote(store) => {
-            let enc = percent_encode_tenant(tenant.as_str());
-            let prefix = format!("audit/tenant_id={enc}/");
-            for key in &remote_audit_files(store, tenant, None)? {
-                let bytes = store.get_blocking(key).map_err(|e| QueryError::Storage {
-                    detail: format!("audit file {key}: {e}"),
-                })?;
-                bytes_read = add_measured(bytes_read, bytes.len() as u64)?;
-                let read = AuditReader::open_bytes(bytes::Bytes::from(bytes))
-                    .and_then(AuditReader::read_all)
-                    .map_err(|e| QueryError::Storage {
-                        detail: format!("audit file {key}: {e}"),
-                    })?;
-                push_validated(key, read)?;
-                // The listing is prefix-scoped, so the strip always applies;
-                // keeping the full key on a (can't-happen) miss stays
-                // consistent for set-equality as long as both sides use
-                // this same rule.
-                frontier.push(key.strip_prefix(&prefix).unwrap_or(key).to_owned());
-            }
-        }
-    }
-    frontier.sort_unstable();
-    Ok(CapturedScan {
-        events,
-        bytes_read,
-        frontier,
-    })
+    resolve_audit_set(backend, tenant)?.read_events(tenant)
 }
 
 /// The canonical `audit/tenant_id=<enc>` root under `bucket_root` — the same

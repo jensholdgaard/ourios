@@ -1,11 +1,12 @@
 //! RFC 0033 §5 — the cached template-map artifact, all seven scenarios.
 //!
-//! `.1` (the artifact-format + fold green slice) and `.3` (the publish
-//! green slice) are live; the remaining stubs are `#[ignore]`d so the
-//! default run stays green while their slices land, each naming the
-//! slice that discharges it. The `.3` S3 `If-Match` half runs in the
-//! `s3-integration` CI job (`template_map_publish_cas_on_s3`, the
-//! RFC 0013 localstack pattern).
+//! `.1` (the artifact-format + fold green slice), `.3` (the publish
+//! green slice) and `.2`/`.4`/`.5` (the freshness + write-through green
+//! slice — the cached read path wired into the query surface) are live;
+//! the remaining stubs are `#[ignore]`d so the default run stays green
+//! while their slices land, each naming the slice that discharges it.
+//! The `.3` S3 `If-Match` half runs in the `s3-integration` CI job
+//! (`template_map_publish_cas_on_s3`, the RFC 0013 localstack pattern).
 //!
 //! Placement note: all seven stubs live here because the artifact's
 //! machinery — the folds (`template_registry.rs` / `alias_store.rs` /
@@ -26,8 +27,9 @@ use ourios_core::audit::{AuditEvent, AuditPayload, TemplateChange, hash_triggeri
 use ourios_core::tenant::TenantId;
 use ourios_parquet::Store;
 use ourios_querier::{
-    ArtifactRead, PublishOutcome, Querier, StoreRef, TEMPLATE_MAP_FILENAME, TemplateMap,
-    derive_alias_map, derive_template_map, derive_template_registry,
+    ArtifactRead, CacheOutcome, PublishOutcome, Querier, QueryError, QueryResult, StoreRef,
+    TEMPLATE_MAP_FILENAME, TemplateMap, derive_alias_map, derive_template_map,
+    derive_template_registry, load_or_derive,
 };
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -135,11 +137,17 @@ fn arb_history() -> impl Strategy<Value = Vec<AuditEvent>> {
     )
 }
 
+/// A tenant's audit root under `bucket` (plain tenant names only — no
+/// percent-encoding needed for these fixtures).
+fn audit_root(bucket: &Path, tenant: &str) -> std::path::PathBuf {
+    bucket.join("audit").join(format!("tenant_id={tenant}"))
+}
+
 /// The tenant's live audit `*.parquet` set as tenant-root-relative,
 /// `/`-joined, sorted keys — an independent walk the artifact's
 /// `folded_files` frontier must match exactly.
-fn live_audit_set(bucket: &Path) -> Vec<String> {
-    let root = bucket.join("audit").join(format!("tenant_id={TENANT}"));
+fn live_audit_set(bucket: &Path, tenant: &str) -> Vec<String> {
+    let root = audit_root(bucket, tenant);
     let mut out = Vec::new();
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
@@ -222,7 +230,7 @@ proptest! {
 
         // The frontier is exactly the audit file set that was folded,
         // in canonical (tenant-root-relative, sorted) form.
-        let live_set = live_audit_set(bucket.path());
+        let live_set = live_audit_set(bucket.path(), TENANT);
         prop_assert_eq!(cached.folded_files(), live_set.as_slice());
 
         // The query answer through either path is identical: probe an
@@ -258,33 +266,138 @@ proptest! {
     }
 }
 
+/// An `alias_asserted` audit event — the freshness probe: whether a
+/// `resolves_to` answer reflects it is exactly whether the fold that
+/// answered the query saw the audit file it landed in.
+fn alias_asserted(
+    tenant: &str,
+    representative_id: u64,
+    member_ids: Vec<u64>,
+    ts_ns: u64,
+) -> AuditEvent {
+    AuditEvent {
+        tenant_id: TenantId::new(tenant),
+        timestamp: at(ts_ns),
+        payload: AuditPayload::AliasAsserted {
+            representative_id,
+            member_ids,
+            actor: ActorId::new("op-it").expect("non-empty actor"),
+            reason: String::new(),
+        },
+    }
+}
+
 /// Scenario RFC0033.2 — staleness is detected and never served.
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
+///
+/// The freshness probe is the query *answer*: `resolves_to(1)` counts 1
+/// row until the alias assertion `{1, 2}` is folded and 3 rows after, so
+/// a stale artifact served would be visible as a wrong count — no cache
+/// internals needed to detect it.
 #[test]
-#[ignore = "RFC0033.2 stub — implemented in the freshness + write-through green slice"]
 fn rfc0033_2_staleness_detected_never_served() {
-    todo!(
-        "RFC0033.2 — artifact published at frontier S, then new audit \
-         files appear: the frontier check fails, the artifact is \
-         bypassed, the answer equals the no-cache fold over the live \
-         set incl. the new files; the querier republishes at the new \
-         frontier and a subsequent unchanged-store query is a hit; \
-         same when files DISAPPEAR from the live set (set equality, \
-         not subset)"
+    let bucket = TempDir::new().expect("temp dir");
+    let tenant = TenantId::new(TENANT);
+    let backend = StoreRef::Local(bucket.path());
+    write_audit(
+        bucket.path(),
+        &[widened(TENANT, 1, 1, TS0), widened(TENANT, 2, 1, TS0 + 1)],
     );
+    write_all(
+        bucket.path(),
+        &[
+            simple(TENANT, 1, TS0 + 10),
+            simple(TENANT, 2, TS0 + 11),
+            simple(TENANT, 2, TS0 + 12),
+        ],
+    );
+
+    // The first query misses (no artifact), folds fresh, and its
+    // write-through publishes at frontier S.
+    assert_eq!(next_query_rows(bucket.path(), &tenant), 1);
+    let artifact = audit_root(bucket.path(), TENANT).join(TEMPLATE_MAP_FILENAME);
+    assert!(artifact.exists(), "the miss write-through published at S");
+    let frontier_s = live_audit_set(bucket.path(), TENANT);
+
+    // New audit files appear after the publish: the operator asserts the
+    // alias class {1, 2}.
+    write_audit(
+        bucket.path(),
+        &[alias_asserted(TENANT, 1, vec![2], TS0 + HOUR_NS)],
+    );
+    let live_wide = live_audit_set(bucket.path(), TENANT);
+    assert!(
+        live_wide.len() > frontier_s.len(),
+        "the assertion landed in a new audit file",
+    );
+
+    // The frontier check fails, the artifact is bypassed, and the answer
+    // equals the no-cache fold over the live set — including the new
+    // file's alias event (an artifact served stale would still say 1).
+    assert_eq!(next_query_rows(bucket.path(), &tenant), 3);
+
+    // ...and the querier republished at the new frontier, both folds.
+    let bytes = std::fs::read(&artifact).expect("read artifact");
+    let read = TemplateMap::from_json(&bytes, &tenant).expect("read");
+    let ArtifactRead::Valid(republished) = read else {
+        panic!("the republished artifact must be Valid, got {read:?}");
+    };
+    assert_eq!(republished.folded_files(), live_wide.as_slice());
+    assert_eq!(
+        republished.alias_map().classes(&tenant),
+        vec![std::collections::BTreeSet::from([1u64, 2])],
+    );
+
+    // A subsequent unchanged-store lookup is a cache hit: the acquisition
+    // is exactly the artifact GET (frontier equal — zero audit GETs).
+    let (held, acquisition_bytes, outcome) = load_or_derive(backend, &tenant).expect("lookup");
+    assert_eq!(outcome, CacheOutcome::Hit);
+    assert_eq!(
+        acquisition_bytes,
+        std::fs::metadata(&artifact).expect("stat artifact").len(),
+        "a hit's acquisition bytes are the artifact GET's bytes",
+    );
+    assert_eq!(held.folded_files(), live_wide.as_slice());
+
+    // The removal direction: frontier validity is SET equality, not
+    // subset. Delete the alias event's audit file — the artifact (now a
+    // superset frontier) must be detected stale and the fold over the
+    // shrunken live set must answer.
+    for rel in live_wide.iter().filter(|k| !frontier_s.contains(k)) {
+        std::fs::remove_file(audit_root(bucket.path(), TENANT).join(rel))
+            .expect("remove the appended audit file");
+    }
+    assert_eq!(live_audit_set(bucket.path(), TENANT), frontier_s);
+    assert_eq!(
+        next_query_rows(bucket.path(), &tenant),
+        1,
+        "files disappeared ⇒ stale ⇒ the fold over the live set answers",
+    );
+    let bytes = std::fs::read(&artifact).expect("read artifact");
+    let read = TemplateMap::from_json(&bytes, &tenant).expect("read");
+    let ArtifactRead::Valid(reshrunk) = read else {
+        panic!("the shrink republish must be Valid, got {read:?}");
+    };
+    assert_eq!(reshrunk.folded_files(), frontier_s.as_slice());
+    assert!(reshrunk.alias_map().classes(&tenant).is_empty());
+}
+
+/// `resolves_to(1)` through the public query surface — the shared
+/// "next query" of RFC0033.2/.3/.5.
+fn resolves_query(bucket: &Path, tenant: &TenantId) -> Result<QueryResult, QueryError> {
+    let query = ourios_querier::dsl::parse("resolves_to(1)").expect("parse");
+    let querier = Querier::new(bucket);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(querier.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, None))
 }
 
 /// The scenario's "next query": `resolves_to(1)` through the public
 /// query surface. Returns the matching-row count; the `expect` is the
 /// no-error-surfaced arm of RFC0033.3.
 fn next_query_rows(bucket: &Path, tenant: &TenantId) -> u64 {
-    let query = ourios_querier::dsl::parse("resolves_to(1)").expect("parse");
-    let querier = Querier::new(bucket);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    runtime
-        .block_on(querier.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, None))
+    resolves_query(bucket, tenant)
         .expect("the query must succeed, publish debris notwithstanding")
         .rows
 }
@@ -514,35 +627,172 @@ async fn template_map_publish_cas_on_s3() {
     assert_eq!(held.folded_files(), map_b.folded_files());
 }
 
+/// A body-rendering query (`severity >= 0 | limit 10`) through the
+/// public query surface — the RFC0033.4 probe.
+fn body_query(bucket: &Path, tenant: &TenantId) -> QueryResult {
+    let query = ourios_querier::dsl::parse("severity >= 0 | limit 10").expect("parse");
+    let querier = Querier::new(bucket);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    runtime
+        .block_on(querier.run_query(&query, tenant, NOW, DEFAULT_WINDOW_NS, None))
+        .expect("body-rendering query")
+}
+
 /// Scenario RFC0033.4 — additive and advisory (back-compat).
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
+///
+/// The pre-RFC behaviour is byte-precise on the local backend: the fold
+/// counts each audit `*.parquet` file's length, so "reads the audit
+/// stream exactly as today" is `registry_bytes_read == the summed file
+/// sizes on disk` — the figure the pre-0033 registry derivation
+/// reported.
 #[test]
-#[ignore = "RFC0033.4 stub — implemented in the freshness + write-through green slice"]
 fn rfc0033_4_additive_and_advisory() {
-    todo!(
-        "RFC0033.4 — store with no artifact: a body-rendering query's \
-         result is identical to the pre-RFC binary's and the fold \
-         reads the audit stream exactly as today; deleting the \
-         artifact between two queries changes neither answer; the \
-         artifact's presence changes nothing a *.parquet scan sees \
-         (audit walk/listing returns the same file set with and \
-         without it)"
+    let bucket = TempDir::new().expect("temp dir");
+    let tenant = TenantId::new(TENANT);
+    write_audit(bucket.path(), &[widened(TENANT, 1, 1, TS0)]);
+    write_all(
+        bucket.path(),
+        &[simple(TENANT, 1, TS0 + 1), simple(TENANT, 1, TS0 + 2)],
     );
+    let live_before = live_audit_set(bucket.path(), TENANT);
+    let audit_bytes: u64 = live_before
+        .iter()
+        .map(|rel| {
+            std::fs::metadata(audit_root(bucket.path(), TENANT).join(rel))
+                .expect("stat audit file")
+                .len()
+        })
+        .sum();
+
+    // Store with no artifact (old data): the result is the pre-RFC
+    // binary's — every row rendered from the audit-stream fold, and the
+    // fold reads the audit stream exactly as today, byte for byte.
+    let first = body_query(bucket.path(), &tenant);
+    assert_eq!(first.rows, 2);
+    assert_eq!(first.records.len(), 2);
+    assert_eq!(
+        first.registry_bytes_read, audit_bytes,
+        "no artifact ⇒ the acquisition is exactly today's audit-stream fold",
+    );
+
+    // The miss write-through published — and the artifact's presence
+    // changes nothing a `*.parquet` scan sees: the audit walk returns
+    // the same file set as without it.
+    let artifact = audit_root(bucket.path(), TENANT).join(TEMPLATE_MAP_FILENAME);
+    assert!(artifact.exists(), "the miss write-through published");
+    assert_eq!(live_audit_set(bucket.path(), TENANT), live_before);
+
+    // Artifact present: identical answer (the cache is advisory), the
+    // acquisition now one small GET.
+    let second = body_query(bucket.path(), &tenant);
+    assert_eq!(second.rows, first.rows);
+    assert_eq!(second.records, first.records);
+    assert_eq!(
+        second.registry_bytes_read,
+        std::fs::metadata(&artifact).expect("stat artifact").len(),
+        "a hit's acquisition is exactly the artifact GET",
+    );
+
+    // Deleting the artifact between two queries changes neither query's
+    // answer — the only cost is re-derivation (the acquisition returns
+    // to today's fold figure).
+    std::fs::remove_file(&artifact).expect("delete artifact");
+    let third = body_query(bucket.path(), &tenant);
+    assert_eq!(third.rows, first.rows);
+    assert_eq!(third.records, first.records);
+    assert_eq!(third.registry_bytes_read, audit_bytes);
 }
 
 /// Scenario RFC0033.5 — tenant isolation.
 /// See `docs/rfcs/0033-cached-template-map.md` §5.
 #[test]
-#[ignore = "RFC0033.5 stub — implemented in the freshness + write-through green slice"]
 fn rfc0033_5_tenant_isolation() {
-    todo!(
-        "RFC0033.5 — two tenants with distinct histories and published \
-         artifacts: each cache hit serves only that tenant's registry \
-         and alias map (paths under tenant_id=<enc>); an artifact \
-         whose body tenant_id differs from the tenant of the path it \
-         was fetched from fails the query loudly (the row-vs-path \
-         stance), never silently serving or ignoring foreign data"
+    let bucket = TempDir::new().expect("temp dir");
+    let backend = StoreRef::Local(bucket.path());
+    let alpha = TenantId::new("alpha");
+    let beta = TenantId::new("beta");
+    // Distinct histories: alpha has one template and no aliases; beta has
+    // two templates and the alias class {1, 2} — the same probe query
+    // answers differently per tenant, so a cross-read would be visible.
+    write_audit(bucket.path(), &[widened("alpha", 1, 1, TS0)]);
+    write_audit(
+        bucket.path(),
+        &[
+            widened("beta", 1, 1, TS0),
+            widened("beta", 2, 1, TS0 + 1),
+            alias_asserted("beta", 1, vec![2], TS0 + 2),
+        ],
     );
+    write_all(
+        bucket.path(),
+        &[
+            simple("alpha", 1, TS0 + 10),
+            simple("beta", 1, TS0 + 10),
+            simple("beta", 2, TS0 + 11),
+        ],
+    );
+
+    // Each tenant's first query warms its own artifact, under its own
+    // `tenant_id=<enc>` audit root — and answers only from its own fold:
+    // alpha resolves 1 → {1} (1 row); beta resolves 1 → {1, 2} (2 rows).
+    assert_eq!(next_query_rows(bucket.path(), &alpha), 1);
+    assert_eq!(next_query_rows(bucket.path(), &beta), 2);
+    let alpha_artifact = audit_root(bucket.path(), "alpha").join(TEMPLATE_MAP_FILENAME);
+    let beta_artifact = audit_root(bucket.path(), "beta").join(TEMPLATE_MAP_FILENAME);
+    assert!(alpha_artifact.exists(), "alpha's write-through published");
+    assert!(beta_artifact.exists(), "beta's write-through published");
+
+    // Each cache hit serves only that tenant's registry and alias map.
+    let (alpha_map, _, outcome) = load_or_derive(backend, &alpha).expect("alpha lookup");
+    assert_eq!(outcome, CacheOutcome::Hit);
+    assert_eq!(
+        alpha_map.registry(),
+        &derive_template_registry(backend, &alpha).expect("alpha registry"),
+    );
+    assert!(alpha_map.alias_map().classes(&alpha).is_empty());
+    let (beta_map, _, outcome) = load_or_derive(backend, &beta).expect("beta lookup");
+    assert_eq!(outcome, CacheOutcome::Hit);
+    assert_eq!(
+        beta_map.registry(),
+        &derive_template_registry(backend, &beta).expect("beta registry"),
+    );
+    assert_eq!(
+        beta_map.alias_map().classes(&beta),
+        vec![std::collections::BTreeSet::from([1u64, 2])],
+    );
+    assert_eq!(
+        alpha_map.folded_files(),
+        live_audit_set(bucket.path(), "alpha").as_slice()
+    );
+    assert_eq!(
+        beta_map.folded_files(),
+        live_audit_set(bucket.path(), "beta").as_slice()
+    );
+
+    // The queries stay isolated cache-warm too.
+    assert_eq!(next_query_rows(bucket.path(), &alpha), 1);
+    assert_eq!(next_query_rows(bucket.path(), &beta), 2);
+
+    // An artifact whose body `tenant_id` differs from the tenant of the
+    // path it was fetched from fails the query LOUDLY — end to end
+    // through the public surface — never silently serving or ignoring
+    // foreign data (the row-vs-path stance).
+    std::fs::copy(&beta_artifact, &alpha_artifact).expect("plant beta's artifact under alpha");
+    let err = resolves_query(bucket.path(), &alpha)
+        .expect_err("a foreign artifact under alpha's root must fail alpha's query");
+    assert!(
+        matches!(err, QueryError::Storage { .. }),
+        "expected Storage, got {err:?}",
+    );
+    assert!(
+        format!("{err:?}").contains("claims tenant beta under tenant alpha"),
+        "the failure must name the row-vs-path mismatch: {err:?}",
+    );
+    // Beta is untouched by alpha's corruption.
+    assert_eq!(next_query_rows(bucket.path(), &beta), 2);
 }
 
 /// Scenario RFC0033.6 — the measured tax collapses (RFC 0031 channel).

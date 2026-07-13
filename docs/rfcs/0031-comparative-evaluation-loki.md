@@ -353,6 +353,17 @@ Per query, per system, the harness records:
 > B1/B2 gates and the RFC 0016 metrics depend on it); the two new
 > components are additive `QueryResult` fields the harness sums.
 >
+> **Template-map acquisition (amendment, 2026-07-13, RFC 0033).**
+> Since RFC 0033's cached template-map artifact, the third component
+> is the **template-map acquisition bytes**: the total bytes fetched
+> to obtain body-rendering capability, whatever the source — the
+> audit-stream fold on a cache miss (byte-for-byte the registry
+> derivation described above) or the `template_map.json` artifact GET
+> on a cache hit. `QueryResult::registry_bytes_read` keeps its name
+> and its additive place in the three-component sum; only the source
+> of the bytes changes. One field, one honest meaning — the harness
+> needs no code change.
+>
 > **Channel definitions (amendment, 2026-07-13).** The Loki
 > comparator is recorded on two channels, and each frozen gate names
 > which it uses (§7): the **storage-side channel**

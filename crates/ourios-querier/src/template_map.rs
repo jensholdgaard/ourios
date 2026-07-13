@@ -15,8 +15,10 @@
 //! registry-at-frontier-F1 / alias-map-at-F2 split is unrepresentable.
 //! [`TemplateMap::publish`] commits the artifact atomically (tmp+rename
 //! locally, conditional put on the store — §3.4, the RFC 0009 manifest
-//! precedent); the freshness check (§3.3) and the write-through are the
-//! follow-up slices.
+//! precedent). [`load_or_derive`] is the cached read path the query
+//! layer consumes: one listing, the §3.3 frontier check, fallback to
+//! the fresh fold on every non-hit disposition, and the §3.5
+//! best-effort write-through.
 //!
 //! JSON follows the `manifest.json` precedent
 //! (`ourios_parquet::Manifest`, RFC 0009 §3.4): small, human-
@@ -103,18 +105,190 @@ pub enum PublishOutcome {
     LostRace,
 }
 
+/// Why a [`load_or_derive`] lookup missed — the RFC 0033 §3.3
+/// dispositions that resolve to the fresh fold, distinguished for the
+/// §3.7 lookup-outcome telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissReason {
+    /// No artifact under the tenant's audit root.
+    Absent,
+    /// Torn: unreadable, unparseable, or internally invalid artifact —
+    /// treated as absent, overwritten by the write-through (the store
+    /// self-heals).
+    Torn,
+    /// A future writer's `format_version` — treated as absent (forward
+    /// compatibility), republished at this reader's version.
+    UnknownVersion,
+}
+
+/// Outcome of one [`load_or_derive`] lookup (RFC 0033 §3.3/§3.7). Every
+/// variant's answer is correct — the outcome distinguishes what IO paid
+/// for it, never what was served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// The artifact's frontier equals the live listing: served from the
+    /// artifact, zero audit GETs.
+    Hit,
+    /// No usable artifact (§3.3 dispositions): fresh fold,
+    /// write-through.
+    Miss {
+        /// The disposition that voided the artifact.
+        reason: MissReason,
+    },
+    /// A valid artifact at a different frontier — never served (§3.3:
+    /// re-derive, never serve stale): fresh fold over the live listing,
+    /// write-through republish at the new frontier.
+    StaleRefreshed,
+}
+
+/// The cached read path (RFC 0033 §3.3/§3.5): resolve `tenant`'s
+/// [`TemplateMap`] through the published artifact when it is exactly
+/// fresh, and by the fresh fold — today's behaviour, then a best-effort
+/// write-through publish — on **every** other disposition.
+///
+/// IO per outcome (the freshness LIST is never byte-counted, matching
+/// both backends' existing accounting):
+///
+/// - [`CacheOutcome::Hit`] — one LIST (the live frontier) + one GET
+///   (the artifact); **zero** audit GETs. Acquisition bytes = the
+///   artifact GET's bytes.
+/// - [`CacheOutcome::Miss`] — one LIST + one artifact GET that found
+///   nothing usable + the full audit fold over that same listing + one
+///   best-effort publish. Acquisition bytes = the fold's audit bytes,
+///   plus the failed GET's bytes if it returned any (torn / unknown
+///   version).
+/// - [`CacheOutcome::StaleRefreshed`] — as a miss, with the stale
+///   artifact's GET bytes counted (they were fetched and discarded).
+///
+/// The listing is taken **once**, before the artifact GET is compared,
+/// and the fallback fold consumes that same listing (§3.3's
+/// LIST-before-GET-is-compared rule), so a file appearing mid-query
+/// affects a cached and an uncached query identically.
+///
+/// The write-through publishes the fold it already holds at the frontier
+/// it already listed — both folds, never a partial artifact (§3.5) —
+/// with the CAS expectation observed by this read (the artifact's `ETag`,
+/// or create-if-absent). A publish failure or lost race is never a query
+/// failure; it abstains entirely when the serialized artifact would not
+/// be smaller than the audit bytes just folded (§3.2 — nothing to win,
+/// and the no-artifact path is today's behaviour).
+///
+/// # Errors
+///
+/// [`QueryError::Storage`] as [`derive_template_map`], and when a
+/// fetched artifact's body `tenant_id` differs from `tenant` (the
+/// row-vs-path stance — a loud failure, not a fresh-fold fallback).
+pub fn load_or_derive(
+    backend: StoreRef<'_>,
+    tenant: &TenantId,
+) -> Result<(TemplateMap, u64, CacheOutcome), QueryError> {
+    let resolved = audit_scan::resolve_audit_set(backend, tenant)?;
+    let (fetched_bytes, expected, outcome) = match fetch_artifact(backend, tenant) {
+        FetchedArtifact::Absent => (
+            0,
+            None,
+            CacheOutcome::Miss {
+                reason: MissReason::Absent,
+            },
+        ),
+        FetchedArtifact::Unreadable => (
+            0,
+            None,
+            CacheOutcome::Miss {
+                reason: MissReason::Torn,
+            },
+        ),
+        FetchedArtifact::Present { bytes, e_tag } => {
+            let len = bytes.len() as u64;
+            match TemplateMap::from_json(&bytes, tenant)? {
+                ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
+                    return Ok((map, len, CacheOutcome::Hit));
+                }
+                ArtifactRead::Valid(_) => (len, e_tag, CacheOutcome::StaleRefreshed),
+                ArtifactRead::Torn { .. } => (
+                    len,
+                    e_tag,
+                    CacheOutcome::Miss {
+                        reason: MissReason::Torn,
+                    },
+                ),
+                ArtifactRead::UnknownVersion { .. } => (
+                    len,
+                    e_tag,
+                    CacheOutcome::Miss {
+                        reason: MissReason::UnknownVersion,
+                    },
+                ),
+            }
+        }
+    };
+    let (map, fold_bytes) = fold_template_map(resolved, tenant)?;
+    let acquisition_bytes =
+        fold_bytes
+            .checked_add(fetched_bytes)
+            .ok_or_else(|| QueryError::Storage {
+                detail: format!(
+                    "template-map acquisition bytes overflow u64 (fold={fold_bytes}, \
+                     artifact={fetched_bytes})"
+                ),
+            })?;
+    map.write_through(backend, expected.as_deref(), fold_bytes);
+    Ok((map, acquisition_bytes, outcome))
+}
+
+/// One GET of `tenant`'s artifact, classified. Infallible by design: a
+/// failed (non-not-found) GET is `Unreadable` — RFC 0033 §1 pins that an
+/// unreadable artifact is *bypassed* (the fresh fold is always a correct
+/// answer), never a query failure the audit fold wouldn't itself hit.
+enum FetchedArtifact {
+    Absent,
+    Unreadable,
+    Present {
+        bytes: Vec<u8>,
+        /// The `ETag` observed (S3 backend) — the CAS expectation a
+        /// write-through publish carries. `None` on the local backend
+        /// (its publish is last-writer-wins, §3.4).
+        e_tag: Option<String>,
+    },
+}
+
+fn fetch_artifact(backend: StoreRef<'_>, tenant: &TenantId) -> FetchedArtifact {
+    let enc = percent_encode_tenant(tenant.as_str());
+    match backend {
+        StoreRef::Local(root) => {
+            let path = root
+                .join("audit")
+                .join(format!("tenant_id={enc}"))
+                .join(TEMPLATE_MAP_FILENAME);
+            match std::fs::read(&path) {
+                Ok(bytes) => FetchedArtifact::Present { bytes, e_tag: None },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => FetchedArtifact::Absent,
+                Err(_) => FetchedArtifact::Unreadable,
+            }
+        }
+        StoreRef::Remote(store) => {
+            let key = format!("audit/tenant_id={enc}/{TEMPLATE_MAP_FILENAME}");
+            match store.get_with_etag_blocking_opt(&key) {
+                Ok(Some((bytes, e_tag))) => FetchedArtifact::Present { bytes, e_tag },
+                Ok(None) => FetchedArtifact::Absent,
+                Err(_) => FetchedArtifact::Unreadable,
+            }
+        }
+    }
+}
+
 /// Fold `tenant`'s [`TemplateMap`] from its audit stream — **one**
-/// `audit_scan::read_all_events_captured` pass, both folds from the
-/// captured events (RFC 0033 §3.5: the marginal cost of the second fold
-/// is CPU over in-memory events, zero extra IO), and the frontier taken
-/// from that same scan. Also returns the **bytes fetched** deriving it
-/// (RFC 0031 §3.6 — on a cache miss this is exactly what template-map
-/// acquisition cost).
+/// `audit_scan` listing + read pass, both folds from the captured events
+/// (RFC 0033 §3.5: the marginal cost of the second fold is CPU over
+/// in-memory events, zero extra IO), and the frontier taken from that
+/// same scan. Also returns the **bytes fetched** deriving it (RFC 0031
+/// §3.6 — on a cache miss this is exactly what template-map acquisition
+/// cost).
 ///
 /// Each fold is byte-for-byte the fresh derivation it caches:
-/// the registry filter + `template_registry::fold_registry` matches
+/// the registry filter + `fold_registry` matches
 /// [`crate::derive_template_registry`], and the alias filter + stable
-/// timestamp sort + [`AliasMap::from_events`] matches
+/// timestamp sort + `AliasMap::from_events` matches
 /// [`crate::derive_alias_map`] (RFC0033.1 pins this by property test).
 ///
 /// # Errors
@@ -127,7 +301,18 @@ pub fn derive_template_map(
     backend: StoreRef<'_>,
     tenant: &TenantId,
 ) -> Result<(TemplateMap, u64), QueryError> {
-    let scan = audit_scan::read_all_events_captured(backend, tenant)?;
+    fold_template_map(audit_scan::resolve_audit_set(backend, tenant)?, tenant)
+}
+
+/// [`derive_template_map`] from a pre-resolved audit set — the fallback
+/// arm of [`load_or_derive`], which must fold the **same** listing its
+/// freshness comparison used (RFC 0033 §3.3: one listing, taken once,
+/// for both).
+fn fold_template_map(
+    resolved: audit_scan::ResolvedAuditSet<'_>,
+    tenant: &TenantId,
+) -> Result<(TemplateMap, u64), QueryError> {
+    let scan = resolved.read_events(tenant)?;
 
     let mut alias_events: Vec<&AuditEvent> = scan
         .events
@@ -378,6 +563,42 @@ impl TemplateMap {
         let bytes = self.to_json().map_err(|e| QueryError::Storage {
             detail: format!("serialize {TEMPLATE_MAP_FILENAME}: {e}"),
         })?;
+        self.publish_bytes(backend, expected, bytes)
+    }
+
+    /// The RFC 0033 §3.5 write-through: publish this fresh fold
+    /// best-effort after a cache miss. Never fails the caller — a
+    /// serialization or backend failure and a lost race are all
+    /// telemetry-only outcomes (the §3.7 slice) — and **abstains** when
+    /// the serialized artifact would not be smaller than
+    /// `folded_audit_bytes`, the audit bytes the fold just read (§3.2:
+    /// nothing to win; on a tiny or empty tenant the JSON envelope can
+    /// exceed the stream it caches, and the no-artifact path is exactly
+    /// today's behaviour).
+    fn write_through(
+        &self,
+        backend: StoreRef<'_>,
+        expected: Option<&str>,
+        folded_audit_bytes: u64,
+    ) {
+        let Ok(bytes) = self.to_json() else {
+            return;
+        };
+        if bytes.len() as u64 >= folded_audit_bytes {
+            return;
+        }
+        // Best-effort by contract: Published and LostRace are both fine,
+        // and an error must not fail the query answered from the fold in
+        // hand.
+        let _ = self.publish_bytes(backend, expected, bytes);
+    }
+
+    fn publish_bytes(
+        &self,
+        backend: StoreRef<'_>,
+        expected: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<PublishOutcome, QueryError> {
         let enc = percent_encode_tenant(self.tenant.as_str());
         match backend {
             StoreRef::Local(root) => {

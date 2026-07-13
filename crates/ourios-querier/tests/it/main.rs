@@ -29,3 +29,4 @@ mod rfc0022_attr_columns;
 mod rfc0024_properties;
 mod rfc0025_rendering;
 mod rfc0031_single_pass;
+mod rfc0033_cached_template_map;

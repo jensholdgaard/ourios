@@ -84,7 +84,7 @@ tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
 # and the tokio dev-features give the container half an async runtime
 # (the Ourios half stays sync — `ourios_query_lines` owns its runtime).
 testcontainers-modules = "=0.15.0"
-reqwest = { version = "=0.12.28", default-features = false }
+reqwest = { version = "=0.13.4", default-features = false }
 prost = "=0.14.4"
 # Refcounted request bodies for the corpus replay's retrying pusher (a
 # per-attempt Vec clone would copy ~2 MB per push across thousands).

@@ -64,7 +64,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 # startup, on rotation, and on kid misses — never per request).
 # Already in the dep tree via `object_store`'s S3 backend, same
 # rustls stack — no new cargo-deny surface.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-tls"], optional = true }
 # Derive for the discovery-document subset the verifier reads.
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 # Async runtime types for the JWKS cache (`RwLock`) and the verifier's
@@ -89,12 +89,12 @@ tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-m
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 # Mints the fixture issuer's ES256 keypair at test runtime (instant P-256
 # keygen; no committed private-key fixtures for scanners to flag).
-p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
 # Mints the RSA-family fixture key at test runtime for the same reason
 # (2048-bit — PS512 needs >1024 — generated once per test process).
 # Already in the tree via jsonwebtoken's rust_crypto backend.
 rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
-rand = "=0.8.6"
+rand = "=0.10.2"
 # base64url (no pad) for the fixture issuer's JWK coordinates.
 base64 = "=0.22.1"
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }

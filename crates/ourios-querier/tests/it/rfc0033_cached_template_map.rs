@@ -781,16 +781,15 @@ fn rfc0033_5_tenant_isolation() {
     // through the public surface — never silently serving or ignoring
     // foreign data (the row-vs-path stance).
     std::fs::copy(&beta_artifact, &alpha_artifact).expect("plant beta's artifact under alpha");
-    let err = resolves_query(bucket.path(), &alpha)
-        .expect_err("a foreign artifact under alpha's root must fail alpha's query");
-    assert!(
-        matches!(err, QueryError::Storage { .. }),
-        "expected Storage, got {err:?}",
-    );
-    assert!(
-        format!("{err:?}").contains("claims tenant beta under tenant alpha"),
-        "the failure must name the row-vs-path mismatch: {err:?}",
-    );
+    match resolves_query(bucket.path(), &alpha)
+        .expect_err("a foreign artifact under alpha's root must fail alpha's query")
+    {
+        QueryError::Storage { detail } => assert!(
+            detail.contains("claims tenant beta under tenant alpha"),
+            "the failure must name the row-vs-path mismatch: {detail}",
+        ),
+        other => panic!("expected Storage, got {other:?}"),
+    }
     // Beta is untouched by alpha's corruption.
     assert_eq!(next_query_rows(bucket.path(), &beta), 2);
 }

@@ -114,8 +114,11 @@ pub enum MissReason {
     /// No artifact under the tenant's audit root.
     Absent,
     /// Torn: unreadable, unparseable, or internally invalid artifact —
-    /// treated as absent, overwritten by the write-through (the store
-    /// self-heals).
+    /// treated as absent. A parsed-but-invalid artifact is overwritten
+    /// by the write-through at its observed `ETag` (the store
+    /// self-heals); a failed GET observes no `ETag`, so on the remote
+    /// backend its publish is create-only and the heal waits for a
+    /// readable fetch — the fold answers the query either way.
     Torn,
     /// A future writer's `format_version` — treated as absent (forward
     /// compatibility), republished at this reader's version.

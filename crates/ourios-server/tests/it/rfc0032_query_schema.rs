@@ -1,21 +1,22 @@
 //! RFC 0032 §5 — the query-schema / cost-model resource, all six
 //! scenarios.
 //!
-//! `.1`/`.2` are green (the resource + config-threading slice); the
-//! remaining stubs are `#[ignore]`d, each naming the green slice that
-//! discharges it.
-//!
-//! Placement note: all six scenarios live here, in the RFC 0027
-//! in-process MCP harness area (`rfc0027_mcp.rs`'s router +
-//! JSON-RPC-over-`/mcp` shape, RFC 0032 §6), matching the RFC 0033 red
-//! precedent of one file per RFC for §5→stub traceability. The
-//! `.3`/`.4` green work is unit tests beside the resource builder in
-//! `mcp.rs` (RFC 0032 §6); their stubs stay here so the §5 map is one
-//! file.
+//! All six are green. Placement note: the §5 map lives here, in the
+//! RFC 0027 in-process MCP harness area (`rfc0027_mcp.rs`'s router +
+//! JSON-RPC-over-`/mcp` shape, RFC 0032 §6), matching the RFC 0033
+//! precedent of one file per RFC for §5 traceability. The anti-drift
+//! substance of `.3`/`.4` is unit tests beside the resource builder in
+//! `mcp.rs` (RFC 0032 §6 — asserted against `SeverityName::floor`/`ceil`
+//! and the bloom set harvested from a real writer footer); the `.3`/`.4`
+//! arms here assert the same scenarios through the served surface.
+
+use std::collections::BTreeSet;
 
 use axum::Router;
 use axum::http::StatusCode;
-use ourios_parquet::PromotedAttributes;
+use ourios_parquet::promoted::{ATTR_PREFIX, RESOURCE_PREFIX};
+use ourios_parquet::{PromotedAttributes, SERVICE_NAME_KEY, columns};
+use ourios_querier::dsl::ir::SeverityName;
 
 use crate::rfc0027_mcp::{mcp_post, rpc_payload};
 
@@ -40,8 +41,8 @@ async fn mcp_handshake(router: &Router) -> String {
 }
 
 /// Read `ourios://query-schema` through the full protocol dance and
-/// parse its text contents as JSON.
-async fn read_query_schema(router: &Router) -> serde_json::Value {
+/// return the raw text body (the exact served bytes).
+async fn read_query_schema_text(router: &Router) -> String {
     let session = mcp_handshake(router).await;
     let read = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "resources/read",
@@ -50,10 +51,15 @@ async fn read_query_schema(router: &Router) -> serde_json::Value {
     let (status, body, _) = mcp_post(router.clone(), None, Some(&session), read).await;
     assert_eq!(status, StatusCode::OK, "resources/read");
     let rpc = rpc_payload(&body);
-    let text = rpc["result"]["contents"][0]["text"]
+    rpc["result"]["contents"][0]["text"]
         .as_str()
-        .expect("text contents");
-    serde_json::from_str(text).expect("the resource body is JSON")
+        .expect("text contents")
+        .to_string()
+}
+
+/// [`read_query_schema_text`], parsed as JSON.
+async fn read_query_schema(router: &Router) -> serde_json::Value {
+    serde_json::from_str(&read_query_schema_text(router).await).expect("the resource body is JSON")
 }
 
 /// An open-mode MCP router over an empty store, with `promoted` as the
@@ -193,65 +199,288 @@ async fn rfc0032_2_content_matches_running_config() {
     assert_ne!(doc, default_doc);
 }
 
-/// Scenario RFC0032.3 — severity scale correctness.
+/// Scenario RFC0032.3 — severity scale correctness, through the served
+/// surface: each band in the served body equals the DSL compiler's own
+/// `SeverityName::floor`/`ceil` — the functions, never repeated
+/// literals. (The unit test beside the builder in `mcp.rs` is the
+/// primary §6 mapping; this arm pins the same contract end to end.)
 /// See `docs/rfcs/0032-query-schema-cost-model-resource.md` §5.
-#[test]
-#[ignore = "RFC0032.3 stub — implemented in the document-correctness green slice (unit tests beside the mcp.rs builder)"]
-fn rfc0032_3_severity_scale_correctness() {
-    todo!(
-        "RFC0032.3 — the severity.names entries equal the DSL's \
-         SeverityName mapping: for each of the six names, floor \
-         equals SeverityName::floor and ceil equals \
-         SeverityName::ceil, asserted against the ourios-querier \
-         functions, not repeated literals, so the resource cannot \
-         drift from the compiler"
-    );
+#[tokio::test]
+async fn rfc0032_3_severity_scale_correctness() {
+    let bucket = tempfile::tempdir().expect("temp");
+    let router = router_with_promoted(bucket.path(), &PromotedAttributes::default());
+    let doc = read_query_schema(&router).await;
+    let names = doc["severity"]["names"].as_array().expect("severity.names");
+    let expected = [
+        ("trace", SeverityName::Trace),
+        ("debug", SeverityName::Debug),
+        ("info", SeverityName::Info),
+        ("warn", SeverityName::Warn),
+        ("error", SeverityName::Error),
+        ("fatal", SeverityName::Fatal),
+    ];
+    assert_eq!(names.len(), expected.len(), "the six names: {doc}");
+    for (name, level) in expected {
+        let entry = names
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present: {doc}"));
+        assert_eq!(entry["floor"], level.floor(), "{name} floor");
+        assert_eq!(entry["ceil"], level.ceil(), "{name} ceil");
+    }
 }
 
-/// Scenario RFC0032.4 — cost-tier classification stability.
+/// Scenario RFC0032.4 — cost-tier classification stability, through the
+/// served surface: the bloom-mechanism kinds, placeholders expanded over
+/// the document's own promoted section, cover exactly the DSL fields
+/// backed by the §3.2 bloom set derived from `PromotedAttributes::
+/// column_names` and the writer's column constants; severity says
+/// statistics, never bloom; structure, never numbers. (The unit test
+/// beside the builder harvests the same set from a real writer footer —
+/// the two derivations pin each other.)
 /// See `docs/rfcs/0032-query-schema-cost-model-resource.md` §5.
-#[test]
-#[ignore = "RFC0032.4 stub — implemented in the document-correctness green slice (unit tests beside the mcp.rs builder)"]
-fn rfc0032_4_cost_tier_classification_stability() {
-    todo!(
-        "RFC0032.4 — every cost_model.classification entry with \
-         mechanism \"bloom\" names only columns the writer actually \
-         bloom-filters: the expected set derives from the writer's \
-         properties for the configured PromotedAttributes \
-         (template_id, trace_id, span_id, and every \
-         PromotedAttributes::column_names column) and the resource's \
-         index-backed equality kinds cover exactly the DSL fields \
-         backed by that set; severity's entry carries mechanism \
-         \"statistics\", never \"bloom\"; no classification entry \
-         carries a numeric cost value"
+#[tokio::test]
+async fn rfc0032_4_cost_tier_classification_stability() {
+    let promoted = PromotedAttributes::new(
+        ["k8s.namespace.name".to_string()],
+        ["http.route".to_string()],
     );
+    let bucket = tempfile::tempdir().expect("temp");
+    let router = router_with_promoted(bucket.path(), &promoted);
+    let doc = read_query_schema(&router).await;
+
+    // The bloom-backed column set for this deployment, derived from the
+    // configured value and the writer's column constants.
+    let derived: BTreeSet<String> = [columns::TEMPLATE_ID, columns::TRACE_ID, columns::SPAN_ID]
+        .into_iter()
+        .map(str::to_string)
+        .chain(promoted.column_names())
+        .collect();
+
+    // Expand the served document's bloom-mechanism kinds over its own
+    // promoted_attributes section, mapping each DSL field onto its
+    // storage column.
+    let classification = doc["cost_model"]["classification"]
+        .as_array()
+        .expect("classification");
+    let keys = |section: &str| -> Vec<String> {
+        doc["promoted_attributes"][section]
+            .as_array()
+            .expect("promoted key array")
+            .iter()
+            .map(|k| k.as_str().expect("key").to_string())
+            .collect()
+    };
+    let mut backed = BTreeSet::new();
+    for entry in classification {
+        if entry["mechanism"] != "bloom" {
+            continue;
+        }
+        assert_eq!(
+            entry["tier"], "index_backed",
+            "bloom implies index-backed: {entry}",
+        );
+        for field in entry["fields"].as_array().expect("fields") {
+            match field.as_str().expect("field") {
+                "template_id" => {
+                    backed.insert(columns::TEMPLATE_ID.to_string());
+                }
+                "trace_id" => {
+                    backed.insert(columns::TRACE_ID.to_string());
+                }
+                "span_id" => {
+                    backed.insert(columns::SPAN_ID.to_string());
+                }
+                "service" => {
+                    backed.insert(format!("{RESOURCE_PREFIX}{SERVICE_NAME_KEY}"));
+                }
+                "resource.<promoted key>" => backed.extend(
+                    keys("resource")
+                        .into_iter()
+                        .map(|k| format!("{RESOURCE_PREFIX}{k}")),
+                ),
+                "attr.<promoted key>" => {
+                    backed.extend(keys("log").into_iter().map(|k| format!("{ATTR_PREFIX}{k}")));
+                }
+                other => panic!("a bloom entry names an unknown field: {other}"),
+            }
+        }
+    }
+    assert_eq!(
+        backed, derived,
+        "index-backed equality covers exactly the bloom-backed fields: {doc}",
+    );
+
+    // Severity prunes through min/max statistics, never bloom.
+    let severity = classification
+        .iter()
+        .find(|e| {
+            e["fields"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|v| v == "severity"))
+        })
+        .expect("a severity classification entry");
+    assert_eq!(severity["mechanism"], "statistics", "{severity}");
+
+    // Structure, never numbers: the only numeric leaves in the whole
+    // document are the format_version and the severity bands.
+    let mut numeric = Vec::new();
+    collect_number_paths(&doc, "", &mut numeric);
+    for path in numeric {
+        let in_band = path
+            .strip_suffix(".floor")
+            .or_else(|| path.strip_suffix(".ceil"))
+            .is_some_and(|entry| entry.starts_with("severity.names["));
+        assert!(
+            path == "format_version" || in_band,
+            "numeric leaf outside the severity scale: {path}",
+        );
+    }
 }
 
-/// Scenario RFC0032.5 — tool-description placement.
-/// See `docs/rfcs/0032-query-schema-cost-model-resource.md` §5.
-#[test]
-#[ignore = "RFC0032.5 stub — implemented in the tool-descriptions + read-only green slice"]
-fn rfc0032_5_tool_description_placement() {
-    todo!(
-        "RFC0032.5 — tools/list: each of query_logs, list_templates, \
-         and template_drift carries exactly one advisory sentence \
-         naming ourios://query-schema, and no tool description \
-         enumerates tiers, severity bands, or promoted keys (the \
-         full tiering lives only in the resource)"
-    );
+/// Record the dotted path of every JSON number in `value`.
+fn collect_number_paths(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Number(_) => out.push(path.to_string()),
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                collect_number_paths(item, &format!("{path}[{i}]"), out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                collect_number_paths(item, &child, out);
+            }
+        }
+        _ => {}
+    }
 }
 
-/// Scenario RFC0032.6 — read-only contract preserved.
+/// Scenario RFC0032.5 — tool-description placement: each of the three
+/// RFC 0027 tools carries exactly one advisory sentence naming
+/// `ourios://query-schema`, and no description enumerates tiers,
+/// severity bands, or promoted keys — the full tiering lives only in
+/// the machine-readable resource (§3.3, the #465 placement rule).
 /// See `docs/rfcs/0032-query-schema-cost-model-resource.md` §5.
-#[test]
-#[ignore = "RFC0032.6 stub — implemented in the tool-descriptions + read-only green slice"]
-fn rfc0032_6_read_only_contract_preserved() {
-    todo!(
-        "RFC0032.6 — with the amendment applied, the RFC 0027 §5 \
-         suite passes verbatim (same tools, same outputs, grammar \
-         resource byte-identical); reading ourios://query-schema \
-         performs no query, touches no tenant data, and its body \
-         contains no ingested-telemetry-derived content; an unknown \
-         resource URI still returns the resource-not-found error"
+#[tokio::test]
+async fn rfc0032_5_tool_description_placement() {
+    let bucket = tempfile::tempdir().expect("temp");
+    // Explicitly configured promoted keys, so the no-promoted-keys pin
+    // below exercises deployment-specific keys, not just the default.
+    let promoted = PromotedAttributes::new(
+        ["k8s.namespace.name".to_string()],
+        ["http.route".to_string()],
+    );
+    let router = router_with_promoted(bucket.path(), &promoted);
+    let session = mcp_handshake(&router).await;
+    let list = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    });
+    let (status, body, _) = mcp_post(router.clone(), None, Some(&session), list).await;
+    assert_eq!(status, StatusCode::OK);
+    let rpc = rpc_payload(&body);
+    let tools = rpc["result"]["tools"].as_array().expect("tools array");
+    let mut names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["list_templates", "query_logs", "template_drift"]);
+    for tool in tools {
+        // Doc-comment sourced descriptions carry line breaks; normalize
+        // before the phrase checks.
+        let description = tool["description"]
+            .as_str()
+            .expect("description")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            description.matches(QUERY_SCHEMA_URI).count(),
+            1,
+            "{}: exactly one advisory sentence names the resource: {description}",
+            tool["name"],
+        );
+        for needle in ["index_backed", "pruned", "scan"] {
+            assert!(
+                !description.contains(needle),
+                "{}: tier vocabulary stays out of descriptions ({needle}): {description}",
+                tool["name"],
+            );
+        }
+        assert!(
+            !description.chars().any(|c| c.is_ascii_digit()),
+            "{}: no severity bands in descriptions: {description}",
+            tool["name"],
+        );
+        for key in [SERVICE_NAME_KEY, "k8s.namespace.name", "http.route"] {
+            assert!(
+                !description.contains(key),
+                "{}: no promoted keys in descriptions ({key}): {description}",
+                tool["name"],
+            );
+        }
+    }
+}
+
+/// Scenario RFC0032.6 — read-only contract preserved. The suite half is
+/// the RFC 0027 §5 tests running unmodified in this same binary
+/// (`rfc0027_mcp.rs` — same tools, same outputs, grammar byte-identity
+/// and mime assertions intact); this arm pins the remaining clauses:
+/// the resource body derives from configuration alone (a populated and
+/// an empty store serve identical bytes — reading it performs no query
+/// and touches no tenant data), and an unknown URI still errors.
+/// See `docs/rfcs/0032-query-schema-cost-model-resource.md` §5.
+#[tokio::test]
+async fn rfc0032_6_read_only_contract_preserved() {
+    let promoted = PromotedAttributes::new(
+        ["k8s.namespace.name".to_string()],
+        std::iter::empty::<String>(),
+    );
+
+    // A store holding ingested tenant data and a template-audit stream…
+    let populated = tempfile::tempdir().expect("temp");
+    crate::rfc0016_query_endpoint::seed_two_records(populated.path());
+    crate::rfc0016_query_endpoint::seed_template_audit(populated.path(), "acme");
+    let populated_router = router_with_promoted(populated.path(), &promoted);
+    let populated_text = read_query_schema_text(&populated_router).await;
+
+    // …serves exactly what the same configuration over an empty store
+    // serves — raw served bytes, so key order and whitespace count: no
+    // ingested-telemetry-derived content, no tenant data.
+    let empty = tempfile::tempdir().expect("temp");
+    let empty_router = router_with_promoted(empty.path(), &promoted);
+    assert_eq!(
+        populated_text,
+        read_query_schema_text(&empty_router).await,
+        "the body is byte-identical regardless of ingested telemetry",
+    );
+    assert!(
+        !populated_text.contains("acme"),
+        "no tenant identifier leaks: {populated_text}",
+    );
+
+    // An unknown resource URI still returns the resource-not-found
+    // error (JSON-RPC -32002), never some other resource's content.
+    let session = mcp_handshake(&populated_router).await;
+    let read = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+        "params": {"uri": "ourios://no-such-resource"}
+    });
+    let (status, body, _) = mcp_post(populated_router.clone(), None, Some(&session), read).await;
+    assert_eq!(status, StatusCode::OK, "resources/read (unknown URI)");
+    let rpc = rpc_payload(&body);
+    assert_eq!(rpc["error"]["code"], -32002, "resource-not-found: {rpc}");
+    assert!(
+        rpc["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("unknown resource"),
+        "{rpc}",
     );
 }

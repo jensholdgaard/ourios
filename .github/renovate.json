@@ -60,6 +60,26 @@
     },
     {
       "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "reqwest"
+      ],
+      "allowedVersions": "<0.13.0",
+      "description": "Hold reqwest at 0.12.x. reqwest 0.13 drops the rustls-tls-manual-roots feature ourios-ingester's OTLP exporter path uses, and object_store 0.12/0.13 still require reqwest ^0.12, so a standalone bump fails resolution (Renovate PR #505's plan failure). Lift together with the DataFusion 55 upgrade (RFC 0021 phase 2, #295) - the same pattern as the arrow and object_store holds above."
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "p256"
+      ],
+      "allowedVersions": "<0.14.0",
+      "description": "Hold p256 at 0.13.x. jsonwebtoken pins the RustCrypto 0.13-era stack (elliptic-curve/ecdsa/pkcs8), and p256 0.14 moves to the split rand-core/pkcs8 APIs (OsRng relocation, to_pkcs8_pem removal) that broke Renovate PR #505's clippy. Lift when jsonwebtoken ships a RustCrypto-0.14-era release; run cargo tree -i p256 first."
+    },
+    {
+      "matchManagers": [
         "helm-values"
       ],
       "pinDigests": false,

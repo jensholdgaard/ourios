@@ -1,7 +1,7 @@
 ---
 rfc: 0032
 title: Query-schema and cost-model resource for the MCP surface (RFC 0027 amendment)
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-13
@@ -204,7 +204,8 @@ pointer, one source of truth.
 
 No Parquet schema change, no DSL change, no new tool, no new crate,
 no change to any RFC 0027 tool's arguments or output. The RFC 0027 §5
-suite must pass verbatim after this lands (RFC0032.6).
+suite must pass after this lands, with only the §3.1 two-resource
+amendment applied (RFC0032.6 pins the exact contract).
 
 ## 4. Alternatives considered
 
@@ -288,12 +289,15 @@ Scenario ids `RFC0032.<m>`, referenced from test code.
 > the resource).
 
 > **Scenario RFC0032.6 — read-only contract preserved.** Given the
-> amendment applied, Then the RFC 0027 §5 suite passes verbatim
-> (same tools, same outputs, grammar resource byte-identical), And
-> reading `ourios://query-schema` performs no query, touches no
-> tenant data, and its body contains no ingested-telemetry-derived
-> content; And an unknown resource URI still returns the
-> resource-not-found error.
+> amendment applied, Then the RFC 0027 §5 suite passes with the §3.1
+> two-resource amendment applied (same tools, same outputs, grammar
+> byte-identity and mime assertions intact — the one relocated
+> assertion is `rfc0027_6_grammar_resource`'s exactly-one-resource
+> count, which moved to RFC0032.1's exactly-two; the grammar test now
+> locates the grammar among the advertised resources), And reading
+> `ourios://query-schema` performs no query, touches no tenant data,
+> and its body contains no ingested-telemetry-derived content; And an
+> unknown resource URI still returns the resource-not-found error.
 
 ## 6. Testing strategy
 

@@ -456,19 +456,87 @@ fn rfc0031_2_l1_template_lookup_bytes() {
 
 /// Scenario RFC0031.3 — L2 attribute predicate wins on bytes read.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// Green under the §7 `M_L2` unfreeze (2026-07-14, the named condition
+/// met: RFC 0033's v2 artifact merged and measured warm at 187,904 B in
+/// run #21, §9.15): `M_L2 = 10` on the processed channel as primary,
+/// plus the 1.1× storage-side floor (`m_l2_storage_floor_tenths = 11`).
+/// Locally provable without a container — both frozen gates decide
+/// exactly at their boundaries in the must-win direction, and the
+/// recorded measurements (documented historical evidence from
+/// equivalence-verified runs, NOT a live measurement) decide correctly
+/// on both sides: the post-artifact honest total (§9.13 run #10's
+/// components with §9.15's warm registry: 0 + 2,035,267 + 187,904 =
+/// 2,223,171 B) clears both channels against every §9.13 reproduction
+/// row, while the pre-RFC-0033 total (2,549,129 B) correctly FAILS the
+/// storage floor on the weakest recorded Loki row — the floor is not
+/// vacuous. The live assertion of the same gates is
+/// `rfc0031_indicative_comparative_run`.
 #[test]
-#[ignore = "RFC0031.3 stub — M_L2 deferred by the §7 partial freeze (2026-07-13): the \
-            storage-side margin freezes after RFC 0033 (the cached template map) lands; \
-            until then the dispatch run gates L2 on the processed channel at 10"]
 fn rfc0031_3_l2_attribute_predicate_bytes() {
-    todo!(
-        "RFC0031.3 — headline corpus, predicate severity >= ERROR AND \
-         service.name = X over a bounded window, expressed equivalently \
-         in both DSLs (RFC0031.1 holding): ourios.bytes_read / \
-         loki.bytes_read <= 1/M_L2, same pillar-level escalation on \
-         failure (resource-context pruning via promoted columns, \
-         RFC 0022)"
+    let margins = ourios_bench::ComparativeMargins::default();
+    assert_eq!(
+        margins.m_l2, 10,
+        "the §7-frozen L2 processed-channel margin"
     );
+    assert_eq!(
+        margins.m_l2_storage_floor_tenths, 11,
+        "the §7-frozen L2 storage-side floor (1.1×, in tenths)"
+    );
+
+    // The processed must-win rule at the frozen margin: pass at and
+    // below ourios × 10 ≤ loki, fail one byte above — a Decided fail,
+    // the reportable pillar-level arm.
+    assert!(ourios_bench::bytes_must_win(100, 1_000, margins.m_l2).passed());
+    let over = ourios_bench::bytes_must_win(101, 1_000, margins.m_l2);
+    assert!(!over.passed(), "{over:?}");
+    assert!(matches!(
+        over,
+        ourios_bench::BytesGateOutcome::Decided { pass: false, .. }
+    ));
+    // The storage floor in tenths: pass at ourios × 11 == loki × 10,
+    // fail one byte above.
+    let tenths = margins.m_l2_storage_floor_tenths;
+    assert!(ourios_bench::bytes_must_win_tenths(1_000, 1_100, tenths).passed());
+    let over = ourios_bench::bytes_must_win_tenths(1_001, 1_100, tenths);
+    assert!(!over.passed(), "{over:?}");
+    assert!(matches!(
+        over,
+        ourios_bench::BytesGateOutcome::Decided { pass: false, .. }
+    ));
+
+    // §9.13 (runs #10–#17 reproductions) with §9.15's warm registry
+    // applied: the post-artifact total clears the processed margin
+    // (37.3–45.1×) and the storage floor (1.20–1.51×) on every
+    // recorded (storage, processed) row.
+    let post_artifact = 2_223_171;
+    for (loki_storage, loki_processed) in [
+        (2_751_834, 85_261_718),
+        (2_779_800, 86_255_901),
+        (3_349_897, 98_253_343),
+        (3_224_893, 100_044_070),
+        (2_688_942, 83_216_895),
+        (2_673_545, 82_919_233),
+        (3_224_528, 100_198_466),
+    ] {
+        let processed = ourios_bench::bytes_must_win(post_artifact, loki_processed, margins.m_l2);
+        assert!(
+            processed.passed(),
+            "a recorded §9.13 L2 run must clear the frozen processed M_L2: {processed:?}",
+        );
+        let storage = ourios_bench::bytes_must_win_tenths(post_artifact, loki_storage, tenths);
+        assert!(
+            storage.passed(),
+            "a recorded §9.13 L2 run must clear the frozen storage floor: {storage:?}",
+        );
+    }
+
+    // The pre-RFC-0033 total (2,549,129 B — the 513,862 B cold fold in
+    // every query) fails the storage floor against run #16's Loki row
+    // (1.05×): the frozen gate correctly refuses the configuration the
+    // unfreeze condition existed to fix.
+    let pre_artifact = ourios_bench::bytes_must_win_tenths(2_549_129, 2_673_545, tenths);
+    assert!(!pre_artifact.passed(), "{pre_artifact:?}");
 }
 
 /// Scenario RFC0031.4 — L3 trace correlation wins on bytes read (OTLP-native).
@@ -1782,15 +1850,16 @@ impl GateKind {
 /// applies, on which channel, and whether it is FROZEN (asserted by the
 /// dispatch run) or deferred/diagnostic (reported only) — per the §7
 /// partial freeze (2026-07-13, calibrated against `benchmarks.md`
-/// §9.13).
+/// §9.13) and the `M_L2` unfreeze (2026-07-14, §9.15).
 #[derive(Clone, Copy)]
 enum PairClass {
     /// L1 template lookup — must-win, `M_L1 = 10` frozen on the
     /// storage channel.
     L1,
-    /// L2 attribute predicate — must-win; the storage-side margin is
-    /// deferred until RFC 0033 lands, so the pair gates on the
-    /// processed channel at `M_L2 = 10` with storage informational.
+    /// L2 attribute predicate — must-win, `M_L2 = 10` frozen on the
+    /// processed channel (primary) plus a frozen 1.1× storage-side
+    /// floor (the 2026-07-14 unfreeze: RFC 0033's artifact moved the
+    /// storage channel past parity).
     L2,
     /// L3 trace correlation — must-win, `M_L3 = 10` frozen on the
     /// storage channel.
@@ -2187,6 +2256,50 @@ fn reproduce_publish_decision(bucket: &std::path::Path, tenant: &TenantId) -> St
     }
 }
 
+/// The RFC0033.6 corpus acquisition gate (§5.6 as amended 2026-07-14,
+/// the run #21 record): when any measured pair ran warm, the warm
+/// artifact GET must cost at most half the cold audit fold —
+/// `warm × 2 ≤ fold`, integer-exact. The fold figure comes from a cold
+/// pair's measurement when the run has one; the healthy steady state is
+/// all-warm (run #21), so the caller refolds once via
+/// `derive_template_map` — off the timed path, after every pair's reps,
+/// exactly like the publish-outcome resolution. No warm pair means the
+/// gate has nothing to decide (run #20's all-cold shape is RFC 0033's
+/// own red, not this gate's); a failed refold makes it non-evaluable,
+/// reported LOUDLY rather than failed, mirroring the RFC0031.7
+/// unmeasured-latency stance. Returns the failure in the
+/// `frozen_gate_failures` message shape so the caller asserts them
+/// together, AFTER the report has printed.
+fn template_map_acquisition_failure(
+    warm_artifact: Option<u64>,
+    cold_fold: Option<u64>,
+    refold: impl FnOnce() -> Result<u64, String>,
+) -> Option<String> {
+    let warm = warm_artifact?;
+    let fold = match cold_fold.map_or_else(refold, Ok) {
+        Ok(fold) => fold,
+        Err(e) => {
+            eprintln!("RFC0033.6 not evaluable this run (refold failed: {e})");
+            return None;
+        }
+    };
+    if warm == 0 || fold == 0 {
+        // The lgates honesty rule: a zero measurement must not decide a
+        // gate — least of all fake a pass.
+        return Some(format!(
+            "[template map] RFC0033.6 corpus acquisition gate invalid: zero byte-count \
+             (warm={warm}, fold={fold})"
+        ));
+    }
+    let pass = warm.checked_mul(2).is_some_and(|double| double <= fold);
+    (!pass).then(|| {
+        format!(
+            "[template map] RFC0033.6 corpus acquisition gate (warm ≤ fold/2) failed: \
+             warm artifact GET {warm} B vs cold audit fold {fold} B"
+        )
+    })
+}
+
 #[allow(clippy::type_complexity)] // one-shot plumbing tuple for the runner
 fn split_measurements(
     specs: &[PairSpec],
@@ -2221,10 +2334,10 @@ fn split_measurements(
     (ok_specs, ok_ourios, ok_loki, failures)
 }
 
-/// The §7-frozen gate checks (partial freeze, 2026-07-13): L1/L3
-/// must-win on the storage channel at their frozen margins; L2 must-win
-/// on the processed channel (the §7 deferred-condition rule — its
-/// storage-side margin freezes after RFC 0033); the L6-family window
+/// The §7-frozen gate checks (partial freeze 2026-07-13; `M_L2` unfrozen
+/// and frozen 2026-07-14): L1/L3 must-win on the storage channel at
+/// their frozen margins; L2 must-win on the processed channel (primary)
+/// AND hold the frozen 1.1× storage-side floor; the L6-family window
 /// pairs hold the RFC0031.7 latency floor **when latency was measured**
 /// — latency is `Option` by design, and an unmeasured p50 makes the
 /// frozen gate non-evaluable, which is reported LOUDLY rather than
@@ -2262,9 +2375,21 @@ fn frozen_gate_failures(
                 );
                 if !outcome.passed() {
                     failures.push(format!(
-                        "[{}] processed-channel must-win (margin {}, the §7 \
-                         deferred-condition rule) failed: {outcome:?}",
+                        "[{}] frozen processed-channel must-win (margin {}) failed: {outcome:?}",
                         spec.label, spec.margin,
+                    ));
+                }
+                let tenths = ourios_bench::ComparativeMargins::default().m_l2_storage_floor_tenths;
+                let outcome = ourios_bench::bytes_must_win_tenths(
+                    ours.answer.bytes_read,
+                    loki_storage,
+                    tenths,
+                );
+                if !outcome.passed() {
+                    failures.push(format!(
+                        "[{}] frozen storage-channel floor (must-win at {tenths}/10) \
+                         failed: {outcome:?}",
+                        spec.label,
                     ));
                 }
             }
@@ -2361,13 +2486,16 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
 /// container + one corpus replay.
 ///
 /// **Equivalence is asserted per pair, and the §7-FROZEN gates
-/// (partial freeze, 2026-07-13) are asserted after the report prints**:
+/// (partial freeze 2026-07-13; `M_L2` unfrozen and frozen 2026-07-14)
+/// are asserted after the report prints**:
 /// L1/L3 storage-channel must-win at margin 10, L2 processed-channel
-/// must-win at 10 (the §7 deferred-condition rule — its storage-side
-/// margin freezes after RFC 0033), and the RFC0031.7 latency floor at
+/// must-win at 10 plus the 1.1× storage-side floor (11/10,
+/// integer-exact), the RFC0031.7 latency floor at
 /// factor 3 on the L6-family window pairs (loudly non-evaluable when
-/// latency is unmeasured, never a silent pass or a spurious fail). The
-/// window pairs' bytes channel, the L2 storage channel, and the
+/// latency is unmeasured, never a silent pass or a spurious fail), and
+/// the RFC0033.6 corpus acquisition gate (warm artifact GET ≤ half the
+/// cold audit fold, whenever any pair ran warm). The
+/// window pairs' bytes channel and the
 /// selective-resource pair stay reported diagnostics per the §7
 /// deferrals.
 ///
@@ -2484,6 +2612,24 @@ fn rfc0031_indicative_comparative_run() {
         .iter()
         .any(|(_, _, probe)| matches!(probe, TemplateMapProbe::ColdAbsent { .. }))
         .then(|| reproduce_publish_decision(bucket.path(), &tenant));
+    // The RFC0033.6 corpus acquisition gate's inputs, harvested before
+    // the probes collapse into report labels: any warm pair's artifact
+    // GET size, and — when a pair ran cold — the fold it measured.
+    let warm_artifact = measured.iter().find_map(|(_, _, probe)| match probe {
+        TemplateMapProbe::Warm { artifact_bytes } => Some(*artifact_bytes),
+        _ => None,
+    });
+    let cold_fold = measured.iter().find_map(|(_, _, probe)| match probe {
+        TemplateMapProbe::ColdPublished { registry_bytes, .. }
+        | TemplateMapProbe::ColdAbsent { registry_bytes }
+        | TemplateMapProbe::ColdUnreadable { registry_bytes, .. } => Some(*registry_bytes),
+        TemplateMapProbe::Warm { .. } => None,
+    });
+    let acquisition_failure = template_map_acquisition_failure(warm_artifact, cold_fold, || {
+        ourios_querier::derive_template_map(ourios_querier::StoreRef::Local(bucket.path()), &tenant)
+            .map(|(_, fold_bytes)| fold_bytes)
+            .map_err(|e| e.to_string())
+    });
     let ourios: Vec<OuriosMeasured> = specs
         .iter()
         .zip(measured)
@@ -2577,10 +2723,12 @@ fn rfc0031_indicative_comparative_run() {
     );
     // The frozen gates run AFTER the report so a failed gate cannot
     // destroy the run's evidence (the run #11 salvage lesson).
-    let gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
+    let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
+    gate_failures.extend(acquisition_failure);
     assert!(
         gate_failures.is_empty(),
-        "{} frozen §7 gate(s) failed (the report above carries the evidence): {gate_failures:#?}",
+        "{} asserting gate(s) failed — frozen §7 plus the RFC0033.6 corpus acquisition \
+         gate (the report above carries the evidence): {gate_failures:#?}",
         gate_failures.len(),
     );
     assert!(
@@ -2591,7 +2739,8 @@ fn rfc0031_indicative_comparative_run() {
 }
 
 /// One pair's bytes-channel lines, labeled per the §7 partial freeze
-/// (2026-07-13). Both Loki byte figures are evaluated for every pair —
+/// (2026-07-13) and the `M_L2` unfreeze (2026-07-14). Both Loki byte
+/// figures are evaluated for every pair —
 /// `totalBytesProcessed` is decompressed engine-side work, which
 /// overstates Loki's storage reads by the chunk compression ratio; the
 /// storage-side figure (compressed chunk bytes + memory-served
@@ -2599,7 +2748,7 @@ fn rfc0031_indicative_comparative_run() {
 /// fetched-compressed-Parquet bytes — but which line carries a gate
 /// verdict depends on the class: L1/L3 gate on the frozen storage
 /// channel (processed is context), L2 gates on the processed channel
-/// (storage informational until the RFC 0033 freeze), and the window
+/// (primary) plus the frozen 1.1× storage-side floor, and the window
 /// pairs' bytes lines are a published diagnostic — a ratio, no verdict
 /// — since the freeze reclassified them; their gate is the RFC0031.7
 /// latency floor.
@@ -2639,16 +2788,14 @@ fn print_pair_bytes_gates(
         }
         PairClass::L2 => {
             println!(
-                "gate vs bytes-processed (GATING — §7 deferred-condition rule, \
-                 must-win margin {}): {:?}",
+                "gate vs bytes-processed (PRIMARY — §7 FROZEN, must-win margin {}): {:?}",
                 spec.margin,
                 gate(loki_processed),
             );
+            let tenths = ourios_bench::ComparativeMargins::default().m_l2_storage_floor_tenths;
             println!(
-                "gate vs storage-side (informational until the RFC 0033 freeze, \
-                 must-win margin {}): {:?}",
-                spec.margin,
-                gate(loki_storage),
+                "gate vs storage-side (§7 FROZEN floor, must-win at {tenths}/10): {:?}",
+                ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths),
             );
         }
         PairClass::WindowFloor | PairClass::Diagnostic => {
@@ -3587,4 +3734,48 @@ fn latency_floor_gate_decides_in_nanoseconds() {
         latency_floor_gate(Duration::ZERO, ms(100), 3),
         ourios_bench::BytesGateOutcome::Invalid { .. }
     ));
+}
+
+#[test]
+fn template_map_acquisition_gate_decides_warm_against_the_fold() {
+    let no_refold = || -> Result<u64, String> { panic!("a measured cold fold must be used") };
+
+    // No warm pair: nothing to decide (run #20's all-cold shape is
+    // RFC 0033's own red, not this gate's) — and no refold is spent.
+    assert_eq!(
+        template_map_acquisition_failure(None, Some(513_862), no_refold),
+        None,
+    );
+
+    // Warm with a cold pair's measured fold: pass at exactly warm × 2 ==
+    // fold, fail one byte above — the ≤ 1/2 rule of the amended §5.6.
+    assert_eq!(
+        template_map_acquisition_failure(Some(250_000), Some(500_000), no_refold),
+        None,
+    );
+    let over = template_map_acquisition_failure(Some(250_001), Some(500_000), no_refold);
+    assert!(
+        over.as_deref().is_some_and(|f| f.contains("RFC0033.6")),
+        "{over:?}",
+    );
+
+    // The all-warm steady state (run #21) refolds once: the §9.15
+    // record (187,904 B warm vs the 513,862 B fold, ≈ 1/2.73) passes.
+    assert_eq!(
+        template_map_acquisition_failure(Some(187_904), None, || Ok(513_862)),
+        None,
+    );
+    assert!(template_map_acquisition_failure(Some(300_000), None, || Ok(513_862)).is_some());
+
+    // A failed refold is non-evaluable — loud, never a spurious fail
+    // (the RFC0031.7 unmeasured-latency stance).
+    assert_eq!(
+        template_map_acquisition_failure(Some(187_904), None, || Err("boom".to_string())),
+        None,
+    );
+
+    // The lgates honesty rule: a zero measurement must not decide the
+    // gate — least of all a 0-byte "warm" GET faking a pass.
+    assert!(template_map_acquisition_failure(Some(0), Some(513_862), no_refold).is_some());
+    assert!(template_map_acquisition_failure(Some(187_904), Some(0), no_refold).is_some());
 }

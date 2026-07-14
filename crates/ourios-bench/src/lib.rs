@@ -54,7 +54,9 @@ pub use comparative::{
     ourios_query_lines, parse_loki_bytes_processed, parse_loki_fetched_bytes, parse_loki_streams,
 };
 pub use corpus::TxtSeverity;
-pub use lgates::{BytesGateOutcome, ComparativeMargins, bytes_must_win, bytes_within_floor};
+pub use lgates::{
+    BytesGateOutcome, ComparativeMargins, bytes_must_win, bytes_must_win_tenths, bytes_within_floor,
+};
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
 pub use store::{B1Store, BuiltStore, build_b1_store, build_comparative_store, build_query_store};

@@ -15,18 +15,27 @@
 /// (evidence: `docs/benchmarks.md` §9.13): `m_l1 = 10` and `m_l3 = 10`
 /// on the storage-side bytes channel, and `f_l6 = 3` on the latency
 /// channel (RFC0031.7 as written), are frozen — asserted by the
-/// dispatch run and the RFC0031.2/.4/.7 scenarios. `m_l2` is deferred
-/// with a named condition (storage-side freeze after RFC 0033; until
-/// then L2 gates on the processed channel at 10, storage
-/// informational); `m_l4` and `f_l7` stay deferred until their classes
-/// are first measured. See
+/// dispatch run and the RFC0031.2/.4/.7 scenarios. `m_l2` was deferred
+/// with a named condition and **frozen 2026-07-14** when the condition
+/// (RFC 0033's cached template map landing and being measured — run
+/// #21, `docs/benchmarks.md` §9.15) was met: `m_l2 = 10` on the
+/// processed channel as primary, plus `m_l2_storage_floor_tenths = 11`
+/// — a 1.1× storage-side floor asserted alongside via
+/// [`bytes_must_win_tenths`] — asserted by the dispatch run and
+/// scenario RFC0031.3. `m_l4` and `f_l7` stay deferred until their
+/// classes are first measured. See
 /// `docs/rfcs/0031-comparative-evaluation-loki.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComparativeMargins {
     /// L1 (template-exact lookup) must-win margin.
     pub m_l1: u64,
-    /// L2 (attribute predicate) must-win margin.
+    /// L2 (attribute predicate) must-win margin, processed channel.
     pub m_l2: u64,
+    /// L2 storage-side floor in tenths (11 = a 1.1× must-win), decided
+    /// exactly as `ourios × tenths ≤ loki × 10`
+    /// ([`bytes_must_win_tenths`]). Tenths keep the sub-integer §7
+    /// value in the same integer-exact domain as the other gates.
+    pub m_l2_storage_floor_tenths: u64,
     /// L3 (trace correlation) must-win margin.
     pub m_l3: u64,
     /// L4 (frequency aggregation) must-win margin.
@@ -42,6 +51,7 @@ impl Default for ComparativeMargins {
         Self {
             m_l1: 10,
             m_l2: 10,
+            m_l2_storage_floor_tenths: 11,
             m_l3: 10,
             m_l4: 10,
             f_l6: 3,
@@ -129,6 +139,56 @@ pub fn bytes_must_win(ourios_bytes: u64, loki_bytes: u64, margin: u64) -> BytesG
     BytesGateOutcome::Decided { pass, advantage }
 }
 
+/// [`bytes_must_win`] for sub-integer margins expressed in tenths
+/// (the §7 L2 storage-side floor, `m_l2_storage_floor_tenths = 11` ⇒
+/// 1.1×): pass iff `ourios × margin_tenths ≤ loki × 10`, exact in the
+/// integer domain — no float in the pass decision.
+///
+/// Same honesty guards, split across the two products: an
+/// `ourios × margin_tenths` overflow means the true product exceeds
+/// anything `loki × 10` could be ⇒ fail (the must-win stance), while a
+/// `loki × 10` overflow means an exabyte-scale Loki figure — a broken
+/// measurement, [`Invalid`](BytesGateOutcome::Invalid) rather than a
+/// pass on garbage (the floor stance).
+#[must_use]
+pub fn bytes_must_win_tenths(
+    ourios_bytes: u64,
+    loki_bytes: u64,
+    margin_tenths: u64,
+) -> BytesGateOutcome {
+    if margin_tenths == 0 {
+        return BytesGateOutcome::Invalid {
+            reason: "margin_tenths is 0 — a must-win gate with no margin passes everything, \
+                     which demonstrates nothing"
+                .to_string(),
+        };
+    }
+    if ourios_bytes == 0 || loki_bytes == 0 {
+        return BytesGateOutcome::Invalid {
+            reason: format!(
+                "zero byte-count (ourios={ourios_bytes}, loki={loki_bytes}) — a must-win \
+                 gate needs both measurements non-zero to demonstrate anything"
+            ),
+        };
+    }
+    let Some(budget) = loki_bytes.checked_mul(10) else {
+        return BytesGateOutcome::Invalid {
+            reason: format!(
+                "loki_bytes × 10 overflows u64 (loki={loki_bytes}) — a bound past \
+                 u64::MAX is a broken measurement, not a pass"
+            ),
+        };
+    };
+    let pass = match ourios_bytes.checked_mul(margin_tenths) {
+        Some(product) => product <= budget,
+        None => false,
+    };
+    #[allow(clippy::cast_precision_loss)] // reporting ratio only; the pass
+    // decision above is exact integer math.
+    let advantage = loki_bytes as f64 / ourios_bytes as f64;
+    BytesGateOutcome::Decided { pass, advantage }
+}
+
 /// Evaluate one bytes-read **floor** gate (RFC 0031 §2's L6/L7
 /// dispositions, scenarios RFC0031.7–.8, factors `F_L6`/`F_L7` from §7):
 /// Ourios is allowed to be *worse* than Loki here, but only within the
@@ -191,10 +251,13 @@ mod tests {
     #[test]
     fn defaults_carry_the_section_7_values_frozen_and_deferred() {
         // Pinned so the §7 values can't drift silently — m_l1/m_l3/f_l6
-        // are FROZEN (2026-07-13), the rest still-deferred proposals; a
+        // are FROZEN (2026-07-13) and m_l2 (processed primary + the
+        // 1.1× storage floor in tenths) FROZEN (2026-07-14, the RFC 0033
+        // unfreeze condition met); m_l4/f_l7 stay deferred proposals; a
         // §7 change lands here WITH the RFC.
         let m = ComparativeMargins::default();
         assert_eq!((m.m_l1, m.m_l2, m.m_l3, m.m_l4), (10, 10, 10, 10));
+        assert_eq!(m.m_l2_storage_floor_tenths, 11);
         assert_eq!((m.f_l6, m.f_l7), (3, 2));
     }
 
@@ -262,6 +325,62 @@ mod tests {
         let m = ComparativeMargins::default();
         assert!(bytes_must_win(100, 1_000, m.m_l1).passed());
         assert!(!bytes_must_win(100, 1_000, 20).passed());
+    }
+
+    #[test]
+    fn tenths_passes_at_and_below_the_boundary_fails_above() {
+        // Exactly at the boundary: 1000 × 11 == 1100 × 10 ⇒ pass.
+        let at = bytes_must_win_tenths(1_000, 1_100, 11);
+        assert!(at.passed(), "{at:?}");
+        // One byte over: a decided (reportable) fail with its ratio.
+        let BytesGateOutcome::Decided { pass, advantage } = bytes_must_win_tenths(1_001, 1_100, 11)
+        else {
+            panic!("expected decided");
+        };
+        assert!(!pass);
+        assert!(advantage < 1.1, "{advantage}");
+        // Tenths of 10 is exactly the margin-1 must-win rule.
+        assert!(bytes_must_win_tenths(1_000, 1_000, 10).passed());
+        assert!(!bytes_must_win_tenths(1_001, 1_000, 10).passed());
+    }
+
+    #[test]
+    fn tenths_honesty_guards_match_the_integer_gates() {
+        // Zero on either side, or a zero margin, is Invalid — never a
+        // pass, never a silent fail.
+        for outcome in [
+            bytes_must_win_tenths(0, 1_000, 11),
+            bytes_must_win_tenths(100, 0, 11),
+            bytes_must_win_tenths(100, 1_000, 0),
+        ] {
+            assert!(!outcome.passed());
+            assert!(matches!(outcome, BytesGateOutcome::Invalid { .. }));
+        }
+        // ourios × tenths overflow ⇒ fail (must-win stance): the true
+        // product exceeds any u64 bound.
+        let over = bytes_must_win_tenths(u64::MAX / 2, 1_000, 11);
+        assert!(!over.passed(), "{over:?}");
+        assert!(matches!(
+            over,
+            BytesGateOutcome::Decided { pass: false, .. }
+        ));
+        // loki × 10 overflow ⇒ Invalid (floor stance): a bound past
+        // u64::MAX is a broken measurement, not a pass.
+        let trap = bytes_must_win_tenths(100, u64::MAX / 2, 11);
+        assert!(!trap.passed(), "{trap:?}");
+        assert!(matches!(trap, BytesGateOutcome::Invalid { .. }));
+    }
+
+    #[test]
+    fn tenths_floor_flows_into_the_decision() {
+        // The §6 calibration-wiring pin for the L2 storage floor: the
+        // §9.13/§9.15-derived post-artifact L2 total (2,223,171 B)
+        // clears the frozen 1.1× floor against the weakest recorded
+        // Loki storage row (run #16, 2,673,545 B ⇒ 1.20×), and the same
+        // measurements decide differently under a stricter floor.
+        let m = ComparativeMargins::default();
+        assert!(bytes_must_win_tenths(2_223_171, 2_673_545, m.m_l2_storage_floor_tenths).passed());
+        assert!(!bytes_must_win_tenths(2_223_171, 2_673_545, 13).passed());
     }
 
     #[test]

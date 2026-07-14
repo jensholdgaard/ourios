@@ -653,6 +653,45 @@ not block `validated` in the "we didn't finish" sense — it is a
   storage channel is the conservative claim where we can make it,
   and the processed channel measures the work the §1 thesis
   eliminates.
+- [x] **M_L2 — UNFROZEN AND FROZEN (2026-07-14, per the named
+  condition above; maintainer delegated as with the 2026-07-13
+  freeze).** The condition is met: RFC 0033's v2 compressed template
+  map merged (#522) and comparative run #21 measured every pair warm
+  at **187,904 B** template-map acquisition against the **513,862 B**
+  audit fold it replaces (`benchmarks.md` §9.15) — a ~326 KB cut off
+  every body-rendering query's honest total. Frozen values, per
+  channel:
+  - **Processed channel (primary): `M_L2 = 10`.** Measured
+    32.5–39.3× across the counted §9.13 runs (#10–#17) on the
+    pre-artifact total, and 37.3–45.1× recomputed on the
+    post-artifact total; like `F_L6`, the freeze sits well below the
+    weakest measurement. This is the channel the §9.13 assessment
+    named as measuring the work the §1 thesis eliminates — Loki
+    decompresses the corpus slice to answer the predicate; Ourios
+    never fetches those bytes.
+  - **Storage-side channel: a floor of 1.1×** (integer-exact as
+    `ourios × 11 ≤ loki_storage × 10`; carried as
+    `m_l2_storage_floor_tenths = 11`). Derived from the record, not
+    remeasured: applying §9.15's warm acquisition to the §9.13
+    run-record components gives the post-artifact honest total
+    2,223,171 B (count 0 + materialize 2,035,267 + registry 187,904),
+    and the §9.13 reproduction rows' Loki storage band
+    (2,673,545–3,349,897 B) then computes to **1.20–1.51×**. The
+    1.1 floor sits below the weakest computed point with margin for
+    Loki's documented chunk-boundary wobble, and the pre-artifact
+    total (2,549,129 B, 1.05× on the weakest row) correctly fails it
+    — the floor is not vacuous. This is deliberately a **parity-plus
+    floor, not a 10× claim**: the deferral's second named lever
+    (write-side sizing) remains the only route past the 2.04 MB/row
+    page-granularity residual, and the honest storage-side story
+    stays published per RFC0031.11.
+
+  With this freeze, scenario **RFC0031.3** asserts (the stub's
+  `#[ignore]` is lifted) and the dispatch run gates the L2 family
+  pair on **both** channels. The run #21 acquisition measurement also
+  turns RFC 0033's amended §5.6 corpus gate (`warm ≤ fold/2`, dated
+  2026-07-14 in that RFC) into a dispatch-run assertion whenever a
+  warm pair exists. `M_L4` and `F_L7` deferrals are untouched.
 - [x] **Floor / parity factors — F_L6 FROZEN, F_L7 DEFERRED
   (2026-07-13).** `F_L6 = 3` is **frozen on the latency channel, as
   RFC0031.7 is written**: run #18 measured all three window pairs

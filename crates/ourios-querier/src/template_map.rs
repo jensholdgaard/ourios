@@ -76,6 +76,32 @@ pub const TEMPLATE_MAP_FORMAT_VERSION: u32 = 2;
 /// run #21 measures the ratio marginal).
 const ARTIFACT_ZSTD_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
 
+/// Ceiling on the decompressed JSON body, enforced symmetrically: the
+/// reader stops a crafted zstd bomb from allocating past it (oversize
+/// classifies `Torn` — the artifact is untrusted input), and the
+/// publish side refuses to serialize a larger body, so a legitimate
+/// artifact can never trip the reader's bound and cause a
+/// torn/republish churn loop. 64 MiB is far above any observed
+/// registry (otel-demo-v8's whole fold is ~0.5 MB compressed Parquet).
+const ARTIFACT_MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Decompress one artifact frame, refusing to allocate beyond
+/// [`ARTIFACT_MAX_DECOMPRESSED_BYTES`].
+fn decode_bounded(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut json = Vec::new();
+    let decoder = zstd::Decoder::new(bytes)?;
+    decoder
+        .take(ARTIFACT_MAX_DECOMPRESSED_BYTES + 1)
+        .read_to_end(&mut json)?;
+    if json.len() as u64 > ARTIFACT_MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::other(format!(
+            "decompressed body exceeds the {ARTIFACT_MAX_DECOMPRESSED_BYTES}-byte bound",
+        )));
+    }
+    Ok(json)
+}
+
 /// `ourios.template_map.lookup.outcome` attribute values (RFC 0033 §3.7):
 /// the five §3.3 lookup dispositions, folded flat onto one counter (the
 /// error.type convention — one instrument, the dimension on an
@@ -554,6 +580,15 @@ impl TemplateMap {
     /// fails.
     pub fn to_artifact_bytes(&self) -> Result<Vec<u8>, QueryError> {
         let json = self.to_json()?;
+        if json.len() as u64 > ARTIFACT_MAX_DECOMPRESSED_BYTES {
+            return Err(QueryError::Storage {
+                detail: format!(
+                    "{TEMPLATE_MAP_FILENAME} body would be {} bytes, past the \
+                     {ARTIFACT_MAX_DECOMPRESSED_BYTES}-byte reader bound",
+                    json.len(),
+                ),
+            });
+        }
         zstd::encode_all(json.as_slice(), ARTIFACT_ZSTD_LEVEL).map_err(|e| QueryError::Storage {
             detail: format!("compress {TEMPLATE_MAP_FILENAME}: {e}"),
         })
@@ -634,7 +669,7 @@ impl TemplateMap {
         tenant: &TenantId,
     ) -> Result<ArtifactRead, QueryError> {
         let torn = |detail: String| Ok(ArtifactRead::Torn { detail });
-        let json = match zstd::decode_all(bytes) {
+        let json = match decode_bounded(bytes) {
             Ok(json) => json,
             Err(e) => return torn(format!("decompress {TEMPLATE_MAP_FILENAME}: {e}")),
         };
@@ -1104,6 +1139,29 @@ mod tests {
                 matches!(read, ArtifactRead::Torn { .. }),
                 "{bytes:?} must classify as torn",
             );
+        }
+    }
+
+    #[test]
+    fn decompression_bomb_classifies_torn_within_the_bound() {
+        // The artifact is untrusted input: a crafted frame whose tiny
+        // compressed body expands past the reader bound must classify
+        // torn without ever allocating the full expansion.
+        let expansion = usize::try_from(ARTIFACT_MAX_DECOMPRESSED_BYTES + 1024).expect("test host");
+        let bomb = compress(&vec![0u8; expansion]);
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "the bomb must be small compressed ({} bytes) for the test to mean anything",
+            bomb.len(),
+        );
+        let read =
+            TemplateMap::from_artifact_bytes(&bomb, &tenant()).expect("oversize is not an error");
+        match read {
+            ArtifactRead::Torn { detail } => assert!(
+                detail.contains("bound"),
+                "the torn detail names the bound: {detail}",
+            ),
+            other => panic!("expected Torn, got {other:?}"),
         }
     }
 

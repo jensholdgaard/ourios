@@ -52,7 +52,8 @@ pub use drift::{DriftResult, DriftRow};
 pub use log_row::{LogBody, LogRow, render_log_body};
 pub use template_map::{
     ArtifactRead, CacheOutcome, MissReason, PublishOutcome, TEMPLATE_MAP_FILENAME,
-    TEMPLATE_MAP_FORMAT_VERSION, TemplateMap, derive_template_map, load_or_derive,
+    TEMPLATE_MAP_FORMAT_VERSION, TEMPLATE_MAP_V1_FILENAME, TemplateMap, derive_template_map,
+    load_or_derive,
 };
 pub use template_registry::{TemplateRegistry, derive_template_registry};
 
@@ -202,7 +203,7 @@ pub struct QueryResult {
     /// obtain the body-rendering capability behind the returned `records`,
     /// whatever the source — the audit-stream fold on a cache miss
     /// (byte-for-byte the pre-0033 RFC 0017 §3.2 registry derivation) or
-    /// the `template_map.json` artifact GET on a cache hit. One
+    /// the `template_map.v2.json.zst` artifact GET on a cache hit. One
     /// per-query acquisition serves both the registry and, for
     /// `resolves_to` queries, the alias map. `0` when no rows were
     /// rendered. Same additive contract as `materialize_bytes_read`

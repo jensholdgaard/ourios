@@ -2078,31 +2078,112 @@ type Measured = (Vec<LineKey>, u64, LokiFetchedBytes, Option<Duration>);
 struct OuriosMeasured {
     answer: ourios_bench::OuriosAnswer,
     latency_p50: Option<Duration>,
-    /// The RFC 0033 template-map acquisition outcome behind
-    /// `answer.registry_bytes` — cold audit fold vs warm artifact GET —
-    /// classified at measurement time ([`template_map_outcome`]).
+    /// The RFC 0033 template-map acquisition + publish-outcome label
+    /// behind `answer.registry_bytes` — cold audit fold vs warm
+    /// artifact GET, with the publish outcome the §3.2 amendment
+    /// requires printed explicitly ([`TemplateMapProbe`]).
     template_map: String,
 }
 
-/// Classify one measurement's registry component (RFC 0033 / RFC0033.6):
-/// a warm hit's acquisition equals the published artifact's byte size
-/// exactly (the only registry-path GET is the artifact); anything else
-/// is the cold audit fold, whose write-through publishes for the next
-/// query. Read at measurement time, right after the query, so the size
-/// compared is the artifact that query saw (or just published).
-fn template_map_outcome(artifact: &std::path::Path, registry_bytes: u64) -> String {
-    match std::fs::metadata(artifact) {
-        Ok(meta) if meta.len() == registry_bytes => {
-            format!("warm (one artifact GET, {registry_bytes} B)")
+/// One pair's artifact observation, taken right after its query (the
+/// state changes across pairs — the first cold miss publishes for the
+/// rest): a warm hit's acquisition equals the published artifact's byte
+/// size exactly (the only registry-path GET is the artifact); anything
+/// else is the cold audit fold. The absent arm's publish outcome —
+/// `abstained` vs `error`, run #20's ambiguity — is resolved once,
+/// after every pair's timed measurement
+/// ([`reproduce_publish_decision`]). `lost_race` cannot occur here: the
+/// harness is the store's only writer, so it is never printed.
+enum TemplateMapProbe {
+    Warm {
+        artifact_bytes: u64,
+    },
+    ColdPublished {
+        registry_bytes: u64,
+        artifact_bytes: u64,
+    },
+    ColdAbsent {
+        registry_bytes: u64,
+    },
+    ColdUnreadable {
+        registry_bytes: u64,
+        detail: String,
+    },
+}
+
+impl TemplateMapProbe {
+    fn observe(artifact: &std::path::Path, registry_bytes: u64) -> Self {
+        match std::fs::metadata(artifact) {
+            Ok(meta) if meta.len() == registry_bytes => Self::Warm {
+                artifact_bytes: registry_bytes,
+            },
+            Ok(meta) => Self::ColdPublished {
+                registry_bytes,
+                artifact_bytes: meta.len(),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Self::ColdAbsent { registry_bytes }
+            }
+            Err(e) => Self::ColdUnreadable {
+                registry_bytes,
+                detail: e.to_string(),
+            },
         }
-        Ok(meta) => format!(
-            "cold (audit fold, {registry_bytes} B; artifact on disk {} B)",
-            meta.len(),
+    }
+
+    /// The report label; `absent_outcome` is the once-computed
+    /// [`reproduce_publish_decision`] string (present iff any pair
+    /// observed absence).
+    fn label(&self, absent_outcome: Option<&str>) -> String {
+        match self {
+            Self::Warm { artifact_bytes } => {
+                format!("warm (one artifact GET, {artifact_bytes} B compressed)")
+            }
+            Self::ColdPublished {
+                registry_bytes,
+                artifact_bytes,
+            } => format!(
+                "cold (audit fold, {registry_bytes} B; published — artifact \
+                 {artifact_bytes} B compressed)"
+            ),
+            Self::ColdAbsent { registry_bytes } => format!(
+                "cold (audit fold, {registry_bytes} B; {})",
+                absent_outcome.expect("an absent probe resolves its publish outcome"),
+            ),
+            Self::ColdUnreadable {
+                registry_bytes,
+                detail,
+            } => format!("cold (audit fold, {registry_bytes} B; artifact stat failed: {detail})"),
+        }
+    }
+}
+
+/// Resolve run #20's abstained-vs-error ambiguity for a store left with
+/// no artifact (RFC 0033 §3.2 amendment: the harness MUST print each
+/// pair's publish outcome): reproduce the §3.5 publish decision — one
+/// fold + serialize + compress, the exact bytes the write-through would
+/// have published — against the folded audit bytes. Off the measured
+/// path by construction: called once, after every pair's timed
+/// measurement, and only labels.
+fn reproduce_publish_decision(bucket: &std::path::Path, tenant: &TenantId) -> String {
+    let (map, fold_bytes) = match ourios_querier::derive_template_map(
+        ourios_querier::StoreRef::Local(bucket),
+        tenant,
+    ) {
+        Ok(derived) => derived,
+        Err(e) => return format!("publish outcome unresolvable — refold failed: {e}"),
+    };
+    match map.to_artifact_bytes() {
+        Ok(bytes) if (bytes.len() as u64) < fold_bytes => format!(
+            "publish error — would-be artifact {} B compressed < folded audit \
+             {fold_bytes} B, yet nothing on the store",
+            bytes.len(),
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            format!("cold (audit fold, {registry_bytes} B; no artifact published)")
-        }
-        Err(e) => format!("cold (audit fold, {registry_bytes} B; artifact stat failed: {e})"),
+        Ok(bytes) => format!(
+            "abstained — would-be artifact {} B compressed >= folded audit {fold_bytes} B",
+            bytes.len(),
+        ),
+        Err(e) => format!("publish error — serialization failed: {e}"),
     }
 }
 
@@ -2369,7 +2450,11 @@ fn rfc0031_indicative_comparative_run() {
             ourios_parquet::percent_encode_tenant(built.tenant),
         ))
         .join(ourios_querier::TEMPLATE_MAP_FILENAME);
-    let ourios: Vec<OuriosMeasured> = specs
+    let measured: Vec<(
+        ourios_bench::OuriosAnswer,
+        Option<Duration>,
+        TemplateMapProbe,
+    )> = specs
         .iter()
         .map(|spec| {
             let answer = ourios_bench::ourios_query_answer(
@@ -2386,13 +2471,28 @@ fn rfc0031_indicative_comparative_run() {
                 "Ourios must return exactly [{}]'s expected rows",
                 spec.label,
             );
-            let template_map = template_map_outcome(&artifact_path, answer.registry_bytes);
+            let probe = TemplateMapProbe::observe(&artifact_path, answer.registry_bytes);
+            // Timed reps only after the pair's Ourios correctness holds.
+            let latency_p50 = ourios_latency_p50(bucket.path(), &tenant, spec);
+            (answer, latency_p50, probe)
+        })
+        .collect();
+    // Publish-outcome labels resolve AFTER every timed measurement (§3.2
+    // amendment): reproducing the abstention decision costs a fold +
+    // compress, so it runs once, off the measured path, and only labels.
+    let absent_outcome = measured
+        .iter()
+        .any(|(_, _, probe)| matches!(probe, TemplateMapProbe::ColdAbsent { .. }))
+        .then(|| reproduce_publish_decision(bucket.path(), &tenant));
+    let ourios: Vec<OuriosMeasured> = specs
+        .iter()
+        .zip(measured)
+        .map(|(spec, (answer, latency_p50, probe))| {
+            let template_map = probe.label(absent_outcome.as_deref());
             eprintln!(
                 "[{}] template-map acquisition (RFC 0033): {template_map}",
                 spec.label,
             );
-            // Timed reps only after the pair's Ourios correctness holds.
-            let latency_p50 = ourios_latency_p50(bucket.path(), &tenant, spec);
             OuriosMeasured {
                 answer,
                 latency_p50,
@@ -2602,9 +2702,12 @@ fn print_indicative_report(
             answer.materialize_bytes,
             answer.registry_bytes,
         );
-        // The registry component's RFC 0033 acquisition outcome
-        // (RFC0033.6's channel): the artifact persists across pairs by
-        // design, so the cold audit fold is paid at most once per run.
+        // The registry component's RFC 0033 acquisition + publish
+        // outcome (RFC0033.6's channel, §3.2 amendment): the artifact
+        // persists across pairs by design, so a successful publish makes
+        // the cold audit fold a once-per-run cost — while an abstention
+        // (printed with its would-be size vs the folded bytes) leaves
+        // every pair cold, run #20's finding.
         println!(
             "ourios template-map acquisition (RFC 0033) = {}",
             ours.template_map

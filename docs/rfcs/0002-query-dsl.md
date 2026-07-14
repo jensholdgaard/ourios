@@ -17,7 +17,7 @@ superseded-by: —
 > audience analysis in §3.6 (primary: Perses dashboard authors; future:
 > MCP agents). This RFC is now **`green`** — all 11 §5 acceptance
 > criteria (RFC0002.1–.11) have passing tests
-> (`crates/ourios-querier/tests/rfc0002_dsl.rs`), landed across PRs
+> (`crates/ourios-querier/tests/it/rfc0002_dsl.rs`), landed across PRs
 > #143 (this spec) and #144–#154 (the red gate + implementation): the
 > Branch-B parser + structured surface → one IR, the
 > IR→DataFusion compile, YAML-embeddability + the structured JSON Schema,

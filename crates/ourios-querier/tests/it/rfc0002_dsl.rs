@@ -1,13 +1,12 @@
 //! RFC 0002 — Query DSL acceptance criteria (RFC0002.1–.16).
 //!
-//! Red gate (`specified → red`): `#[ignore]`'d `todo!()` stubs
-//! until the DSL parser + compiler land in front of the (already
-//! implemented) RFC 0007 execution layer. Per `docs/verification.md` §3
-//! the scenarios become ignored stubs first, implementations second; each
-//! carries the §2.2 doc-comment form so the spec↔test mapping is
-//! greppable. RFC0002.1–.11 are green; RFC0002.12–.16 (the 2026-07-15
+//! RFC0002.1–.11 are green (the DSL parser + compiler in front of the
+//! RFC 0007 execution layer). RFC0002.12–.16 (the 2026-07-15
 //! aggregation-execution amendment, RFC 0031 L4) are the current red
-//! stubs at the bottom of this file.
+//! gate: `#[ignore]`'d `todo!()` stubs at the bottom of this file, per
+//! `docs/verification.md` §3 — scenarios become ignored stubs first,
+//! implementations second; each carries the §2.2 doc-comment form so
+//! the spec↔test mapping is greppable.
 
 /// Proptest strategies that generate **well-formed** [`Query`] IR — shapes the
 /// §7 grammar admits and the canonical serialiser renders losslessly — for the

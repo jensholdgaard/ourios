@@ -60,6 +60,16 @@
     },
     {
       "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "reqwest"
+      ],
+      "allowedVersions": "<0.13.0",
+      "description": "Hold reqwest at 0.12.x. reqwest 0.13 drops the rustls-tls-manual-roots feature ourios-ingester's OTLP exporter path uses, and object_store 0.12/0.13 still require reqwest ^0.12, so a standalone bump fails resolution (Renovate PR #505's plan failure). Lift together with the DataFusion 55 upgrade (RFC 0021 phase 2, #295) - the same pattern as the arrow and object_store holds above."
+    },
+    {
+      "matchManagers": [
         "helm-values"
       ],
       "pinDigests": false,

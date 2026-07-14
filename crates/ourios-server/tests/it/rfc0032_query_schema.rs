@@ -472,7 +472,8 @@ async fn rfc0032_6_read_only_contract_preserved() {
         "jsonrpc": "2.0", "id": 3, "method": "resources/read",
         "params": {"uri": "ourios://no-such-resource"}
     });
-    let (_, body, _) = mcp_post(populated_router.clone(), None, Some(&session), read).await;
+    let (status, body, _) = mcp_post(populated_router.clone(), None, Some(&session), read).await;
+    assert_eq!(status, StatusCode::OK, "resources/read (unknown URI)");
     let rpc = rpc_payload(&body);
     assert_eq!(rpc["error"]["code"], -32002, "resource-not-found: {rpc}");
     assert!(

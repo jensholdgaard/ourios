@@ -134,8 +134,9 @@ One binary, three roles — **receiver**, **querier**, and the background
 **compactor**. Two orderings are load-bearing: a batch is fsync'd to the
 WAL **before** it is acknowledged and before the miner touches it
 (WAL-before-ack, [`CLAUDE.md`](CLAUDE.md) §3.4), and object storage is
-the source of truth — local disk is only WAL and cache (§3.6). All
-storage seams run against S3-compatible object storage
+the source of truth — in the S3-backed topology local disk holds only
+the WAL and caches (§3.6). All storage seams run against S3-compatible
+object storage
 ([RFC 0013](docs/rfcs/0013-object-storage.md),
 [RFC 0019](docs/rfcs/0019-storage-backend-selection.md)); the local
 filesystem remains the zero-dependency development backend, and the WAL

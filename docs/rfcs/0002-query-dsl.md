@@ -682,7 +682,10 @@ those two are the only Ourios extensions, both surface-independent.
 > **Amendment 2026-07-15.** The §6.3 group terms lower **inside** the
 > existing `count` / aggregations row: `param(n)` compiles to a
 > list-element extraction over the `params` column and `bucket(width)`
-> to a fixed-width truncation of the effective-time column, both as
+> to floor division of the effective-time column by the width (the
+> half-open window `[k*w, (k+1)*w)` — floor, not toward-zero
+> truncation, so the definition stays unambiguous for any signed
+> timestamp representation), both as
 > grouping *expressions* within the `Aggregate` node. No new logical
 > node — the "only `render` and `resolves_to`" statement above is
 > unchanged.
@@ -886,6 +889,8 @@ Alternatives that would replace the whole design, not just one branch.
   https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html
 - Perses (CNCF dashboards-as-code): https://perses.dev/
 - Apache DataFusion logical-plan documentation.
+- RFC 0031 §2.3/§3.4–§3.6/§5 (the comparative L4 class and the
+  equivalence + honest-bytes contracts the 2026-07-15 amendment serves);
 - RFC 0001 §6.1/§6.3/§6.7 (the columns + template/drift primitives);
   RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4 hazard 6
   (no-leakage hazard) and `CLAUDE.md` §3.7 (multi-tenancy).

@@ -70,6 +70,16 @@
     },
     {
       "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "p256"
+      ],
+      "allowedVersions": "<0.14.0",
+      "description": "Hold p256 at 0.13.x. jsonwebtoken pins the RustCrypto 0.13-era stack (elliptic-curve/ecdsa/pkcs8), and p256 0.14 moves to the split rand-core/pkcs8 APIs (OsRng relocation, to_pkcs8_pem removal) that broke Renovate PR #505's clippy. Lift when jsonwebtoken ships a RustCrypto-0.14-era release; run cargo tree -i p256 first."
+    },
+    {
+      "matchManagers": [
         "helm-values"
       ],
       "pinDigests": false,

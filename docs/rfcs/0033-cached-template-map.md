@@ -1,7 +1,7 @@
 ---
 rfc: 0033
 title: Cached template-map artifact
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-12

@@ -1557,3 +1557,25 @@ race (the run #12-era flicker), resurfacing on the shared runner
 despite the #490 flag fixes. All other pairs measured; the report
 and every RFC 0033 number printed before the panic. A rerun for a
 clean L3 pair is queued as run #22.
+
+### 9.16 Results — 2026-07-14 (indicative, `ci-runner`) — runs #22 and #23: the v2 artifact asserting, M_L2 unfrozen
+
+Two dispatches after the RFC 0033 v2 merge (#522):
+
+- **Run #22** (29352282162, from `main`): exit 0 — the clean-record
+  run. All then-frozen gates passed, the L3 pair measured cleanly
+  (run #21's Loki-side flake did not recur), and every pair ran warm
+  on the compressed artifact.
+- **Run #23** (29353634499, from the `M_L2`-unfreeze branch): exit 0 —
+  the first run with the full assertion set live. L2 processed
+  (PRIMARY, frozen 10) **43.97×**; L2 storage-side floor (frozen
+  11/10) **1.49×**; L1 storage 108.3× and L3 storage 24.9× against
+  their frozen 10s; latency floors held; and the RFC 0033 §5.6
+  acquisition gate asserted **warm = 187,905 B compressed on every
+  pair** against the 513,862 B fold (ratio ≈ 1/2.73, gate ≤ 1/2).
+
+With #528 merged, §7's measurable gates (M_L1, M_L2, M_L3, F_L6) are
+all enforcing on every comparative dispatch; M_L4/F_L7 stay deferred
+until measured. RFC 0033's §5 is fully discharged: the corpus arm
+passed as measured (#21), and passed again as an asserting gate
+(#23) — the status flips red → green with this record.

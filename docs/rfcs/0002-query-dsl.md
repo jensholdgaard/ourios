@@ -27,6 +27,13 @@ superseded-by: —
 > maintainer flip) follow the §9 validation.
 > Hazard 6 (`CLAUDE.md` §4 — no DataFusion/SQL leakage) constrains the
 > whole design.
+> **Amendment 2026-07-15 (RFC 0031 L4):** §6.3/§7 gain the `param(n)`
+> and `bucket(width)` aggregation group terms (grammar **v1.1**, a §6.6
+> minor version) and §5 gains **RFC0002.12–.16** (aggregation
+> execution). The `green` above refers to RFC0002.1–.11; the new
+> scenarios enter **red** (`#[ignore]`'d stubs, the
+> `docs/verification.md` §3 two-loop) via the next PR and are
+> discharged by the implementing slices.
 
 ## 1. Summary
 
@@ -287,6 +294,84 @@ surface? Perses+OTel query conventions?) are folded into §9.
   - **Then** well-formed requests pass and compile; malformed ones are
     rejected by the schema before reaching the planner.
 
+> **Amendment 2026-07-15 — aggregation execution criteria (RFC 0031
+> L4).** RFC0002.12–.16 below are added together with the §6.3
+> `param(n)` / `bucket(width)` group terms; they specify lifting the
+> querier's explicit aggregation-stage rejection (today
+> `ourios-querier` `compile::validate` rejects `count`/`agg_fn` stages
+> as "not yet supported") for the `count` family. Per the
+> `docs/verification.md` §3 two-loop they enter **red** via the next
+> PR (`#[ignore]`'d stubs) and turn green in the implementing slices;
+> the status note's `green` refers to RFC0002.1–.11. Execution of the
+> `sum`/`min`/`max`/`avg` stages remains a later obligation — their
+> stages keep the explicit rejection until a future amendment adds
+> their criteria.
+
+- **RFC0002.12 — `count [by …]` executes end-to-end and matches a naive oracle `[§6.5]`**
+  - **Given** a populated tenant store and a query
+    `<predicate> | range(…) | count by <field, …>` over ordinary §7
+    fields (e.g. `template_id`, `service`) — and the bare `count`
+    (no `by`)
+  - **When** the querier executes it
+  - **Then** the result is the `group_key → count` map (bare `count`:
+    the single total) and equals a naive oracle computed outside the
+    query path by filtering and counting the same rows — and the
+    `count` stage is no longer rejected by `compile::validate`.
+
+- **RFC0002.13 — `count by param(n), bucket(w)` yields the L4 grouped-count map `[§6.3 amendment; RFC0031.5]`**
+  - **Given** a predicate that pins exactly one `template_id`
+    (§6.3 amendment pinning rule) and the stage
+    `count by param(0), bucket(5m)` over rows of that template
+  - **When** the querier executes it
+  - **Then** the result is the `(bucket, group_key) → count` map —
+    buckets the half-open epoch-aligned windows
+    `[k·w, (k+1)·w)` over the effective timestamp (§6.2 amendment
+    2026-06-11), group keys the stored string form of params slot
+    `0` — equal to a naive oracle, and shape-identical to the map
+    RFC 0031 §3.5 / RFC0031.1 compares for L4 equivalence.
+
+- **RFC0002.14 — `param(n)` misuse is a specific compile-time error `[§6.3 amendment]`**
+  - **Given** (i) `service == "api" | count by param(0)` (no
+    `template_id` pin), (ii)
+    `template_id == 4 or template_id == 7 | count by param(0)` (a
+    disjunction pins nothing), (iii)
+    `resolves_to(4) | count by param(0)` (an alias *set*, not a pin),
+    and (iv) `param(0)` outside a `by`-list (as a predicate path or a
+    `project` field)
+  - **When** each is parsed/compiled
+  - **Then** each fails with a specific, leak-free error (RFC0002.8):
+    (i)–(iii) at compile time, citing the single-template pinning
+    rule; (iv) at parse time — `group_term` is grammatically confined
+    to `by`-lists (§7 v1.1) — citing the grammar. No query reaches
+    execution.
+
+- **RFC0002.15 — short/NULL params rows are excluded and tallied `[§6.3 amendment]`**
+  - **Given** rows of the pinned template whose `params` list is
+    shorter than `n + 1` (or whose slot `n` value is NULL) alongside
+    rows carrying slot `n`
+  - **When** `count by param(n), …` executes
+  - **Then** the short/NULL rows contribute to **no** group (no
+    synthetic absent bucket), the returned groups equal the naive
+    oracle over the remaining rows, and the number of excluded rows
+    is reported per query (a `QueryStats` field, surfaced on the
+    RFC 0016 query-metrics path) so the exclusion is observable, not
+    silent.
+
+- **RFC0002.16 — the aggregation path's honest bytes total is the group-column scan alone `[RFC 0031 §3.6]`**
+  - **Given** an L4-shaped query (`template_id == N | range(…) |
+    count by param(n), bucket(w)`) executing with the RFC 0031 §3.6
+    honest-total accounting
+  - **When** the harness sums the per-query components
+  - **Then** the total is the count-scan component only: within the
+    surviving (unpruned) row groups, the column chunks read are those
+    of the predicate + group-term columns — `template_id`, the
+    effective-time column, and `params` iff a `param(n)` term is
+    present — and never `body`/`separators`; the row-materialization
+    component is zero (an aggregation returns the map, not rows) and
+    the template-map-acquisition component
+    (`registry_bytes_read`) is zero (nothing is rendered). This is
+    the pruning claim RFC0031.5 divides against Loki.
+
 ## 6. Design
 
 ### 6.1 Predicate sublanguage (Branch B)
@@ -420,6 +505,94 @@ per RFC 0001 §6.7 drift is an audit-stream property, not a column in the
 RFC 0005 data files, so it needs an audit-stream query path — a future
 capability, not a row predicate in this grammar.
 
+> **Amendment 2026-07-15 — aggregation group terms `param(n)` and
+> `bucket(width)` (RFC 0031 L4).** RFC 0031 §3.4 fixes a must-win
+> query class **L4** — count of one template over time, grouped by an
+> extracted param — and scenario RFC0031.5 names the Ourios surface it
+> measures: *"columnar `GROUP BY` on `template_id` + a typed param
+> column"*. The DSL had no way to say that; this amendment adds it,
+> discharging the §9 `params[N]` open item on its positional half. Two
+> **group terms** join the `by`-list of the `count` and `agg_fn`
+> stages (grammar delta in the §7 amendment). They are *not* general
+> fields: `project`, predicates, and `sort` do not admit them — the
+> §7 v1.1 `group_term` production confines them grammatically, so use
+> outside a `by`-list is a parse error (RFC0002.14).
+>
+> - **`param(n)`** — the template's parameter slot `n`, zero-based,
+>   addressing the positional RFC 0005 §3.2 `params` list
+>   (`List<Struct{type_tag, value}>`; RFC 0001 §6.1). Valid **only**
+>   when the query's predicate **pins exactly one `template_id`**:
+>   params are positional *per template*, so grouping across templates
+>   by position aggregates unrelated values — meaningless, and
+>   rejected at compile time (RFC0002.14), never silently computed.
+>   The pinning rule is syntactic and decidable on the
+>   associative-normalised IR: the predicate must carry, at its top
+>   conjunctive level, at least one `template_id == <N>` comparison,
+>   and all such comparisons must name the same `N`. A
+>   `template_id == N` under `or`/`not` pins nothing.
+>   `resolves_to(n)` does **not** pin: it expands to an alias *set*,
+>   and drift aliases do not guarantee positional param alignment
+>   across the class — cross-alias positional grouping is exactly the
+>   meaningless case. (Named parameters via the template schema, the
+>   still-open §9 half, are the future route to alias-safe grouping.)
+>
+>   **Value semantics.** The group key is the param's **original
+>   string form** — the stored `value` bytes of slot `n` as UTF-8
+>   (`ourios_core::record::Param.value`). The stored `type_tag` is
+>   recorded metadata, **not a type promotion**: `param(n)` never
+>   parses, coerces, or numerically compares the value, so a slot that
+>   captured `"500"` groups as the string `"500"`. A param that
+>   overflowed the RFC 0001 §6.5 byte limit groups by its stored
+>   marker form — consistently "the string form on disk". Typed
+>   (promoted) grouping is future work, not this amendment.
+>
+>   **Short/NULL disposition.** A row whose `params` list is shorter
+>   than `n + 1`, or whose slot-`n` value is NULL, is **excluded**
+>   from the aggregation — it contributes to no group, and there is no
+>   synthetic "absent" bucket. Rationale: (1) *equivalence* — LogQL
+>   extraction (the RFC0031.1 comparator) produces no sample for a
+>   line the pattern does not match, so an absent-bucket key on the
+>   Ourios side would make the RFC 0031 §3.5 `(bucket, group_key) →
+>   count` maps structurally unequal for reasons that are artifacts of
+>   our sentinel, not of the data; (2) no sentinel key can be chosen
+>   that cannot collide with a real param value (params are arbitrary
+>   strings); (3) within one pinned `template_id`, a short params list
+>   is the anomaly path (version arity drift), and presenting an
+>   anomaly as a data value would be a quiet lie. The exclusion is
+>   **not silent**: the per-query excluded-row count is reported
+>   (RFC0002.15).
+>
+> - **`bucket(width)`** — fixed-width time bucketing usable in the
+>   same `by`-list (e.g. `count by param(0), bucket(5m)`), and freely
+>   without `param(n)` (e.g. `count by service, bucket(1h)` — no
+>   pinning requirement of its own). `width` is the existing §7
+>   `duration` lexical form (`30s`, `5m`, `1h`, `1d`, `1w`); it must
+>   be positive (`bucket(0s)` is a compile-time error). It buckets the
+>   **effective timestamp** — the same derived
+>   `effective_time_unix_nano` column `range(...)` filters (§6.2
+>   amendment 2026-06-11; RFC 0005 §3.2 derivation, including the
+>   §3.9 old-file default) — into half-open, epoch-aligned UTC windows
+>   `[k·width, (k+1)·width)` in nanoseconds since the Unix epoch. The
+>   epoch is UTC-midnight-aligned, so `bucket(1d)` windows are UTC
+>   calendar days; `bucket(1w)` windows are epoch-aligned 7-day spans
+>   (starting Thursdays), **not** ISO calendar weeks. The bucket key
+>   in the result map is the window start (serialised RFC 3339 UTC).
+>   A `by`-list admits **at most one** `bucket(...)` term and at most
+>   one `param(n)` per `n`; duplicates are a compile-time error.
+>   (The RFC 0031 harness pins the LogQL `step`/`start` to the same
+>   epoch-aligned boundaries so the two systems' bucket keys
+>   coincide — a harness obligation, noted here for RFC0031.1.)
+>
+> On the **structured surface** (§6.4) the group terms are the stage
+> `by`-array elements `{ "param": <n> }` (non-negative integer) and
+> `{ "bucket": "<duration>" }` (the §7 duration lexical string); the
+> RFC0002.2 one-IR invariant extends to them, and the published JSON
+> Schema gains both forms additively (§6.6 amendment). In the IR the
+> `by`-list element widens from a plain field to a group term
+> (`Field::Param(u32)`-style positional variant + a bucket term) — the
+> exact Rust modelling is the implementing slice's choice; this RFC
+> constrains the surfaces and the semantics.
+
 ### 6.4 Two front-ends, one core
 
 ```mermaid
@@ -506,6 +679,17 @@ Every construct compiles to a DataFusion `LogicalPlan`:
 All but `render` and `resolves_to` are DataFusion's built-in algebra;
 those two are the only Ourios extensions, both surface-independent.
 
+> **Amendment 2026-07-15.** The §6.3 group terms lower **inside** the
+> existing `count` / aggregations row: `param(n)` compiles to a
+> list-element extraction over the `params` column and `bucket(width)`
+> to floor division of the effective-time column by the width (the
+> half-open window `[k*w, (k+1)*w)` — floor, not toward-zero
+> truncation, so the definition stays unambiguous for any signed
+> timestamp representation), both as
+> grouping *expressions* within the `Aggregate` node. No new logical
+> node — the "only `render` and `resolves_to`" statement above is
+> unchanged.
+
 ### 6.6 Stability and versioning
 
 The grammar (§7) is owned and versioned by this RFC. Additions (new
@@ -515,6 +699,18 @@ amending RFC + a deprecation window, and — because the Perses/MCP
 audiences persist queries (git-versioned dashboards, cached agent schemas)
 — ship with a documented migration. There is no external spec to shadow,
 so major versions are deliberate, not inherited.
+
+> **Amendment 2026-07-15.** The §6.3 group terms are an addition (new
+> first-class grammar surface, no behavioural change to any existing
+> query), i.e. a **minor version** under this section: grammar
+> **v1.1**, v1.0 being the surface green as RFC0002.1–.11. The
+> grammar carries no in-code version constant today, so this amendment
+> record *is* the version record. The published structured schema's
+> `$id` major (`…/structured-query/v1.json`) is unchanged — the
+> additions are backward-compatible (`by` arrays accept two new object
+> forms). Extending `structured_query.schema.json` + its snapshot
+> test, and the parser-side grammar snapshot (§8), are obligations of
+> the implementing slice.
 
 ## 7. Grammar specification (owned by this RFC)
 
@@ -575,6 +771,29 @@ integer      = digit , { digit } ;
    these double quotes need no YAML-level escaping *)
 ```
 
+> **Amendment 2026-07-15 — grammar v1.1 (aggregation group terms).**
+> The EBNF above is **v1.0**, the surface shipped green as
+> RFC0002.1–.11. v1.1 replaces the two aggregation stages' `field_list`
+> with a `group_list` and adds two productions:
+>
+> ```ebnf
+> stage        = (* v1.0 alternatives unchanged, except: *)
+>                "count" , [ "by" , group_list ]
+>              | agg_fn , "(" , path , ")" , [ "by" , group_list ] ;
+> group_list   = group_term , { "," , group_term } ;
+> group_term   = field
+>              | "param" , "(" , integer , ")"
+>              | "bucket" , "(" , duration , ")" ;
+> ```
+>
+> `field_list` remains as-is for `project`; `duration` and `integer`
+> are the existing productions. Semantics — the single-template
+> pinning rule for `param(n)`, string-form group keys, the
+> excluded-short-rows disposition, epoch-aligned half-open buckets
+> over the effective timestamp — are the §6.3 amendment's. The
+> canonical machine-readable grammar and its snapshot update with the
+> implementing slice (§6.6 amendment).
+
 ## 8. Testing strategy
 
 Mapping to `CLAUDE.md` §6.2 and `docs/verification.md` §3 (red→green
@@ -621,8 +840,15 @@ two-loop: `#[ignore]`'d stubs first, implementations second).
 - [ ] `--sql` advanced-mode escape hatch — gated + sandboxed, or never?
       (Currently: never; reconsider under a separate RFC.)
 - [ ] Custom user functions — out for v1 (sandboxing is its own project).
-- [ ] `params[N]` positional access vs named parameters via the template
-      schema.
+- [x] ~~`params[N]` positional access vs named parameters via the
+      template schema.~~ *Resolved in part (amendment 2026-07-15):*
+      positional access is specified as the `param(n)` group term
+      (§6.3 amendment; grammar v1.1, §7 amendment) — aggregation-only
+      (`by`-lists), single-`template_id`-pinned, string-form group
+      keys, scenarios RFC0002.12–.16. **Named parameters via the
+      template schema stay open** — they are the future route to
+      alias-safe (cross-version) grouping, which `param(n)`
+      deliberately forbids.
 - [ ] In-path query cost estimator ("this will scan 400 GB") before run.
 - [ ] Pagination / streaming surface for large result sets (mirrors
       RFC 0007 §8).
@@ -663,6 +889,8 @@ Alternatives that would replace the whole design, not just one branch.
   https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html
 - Perses (CNCF dashboards-as-code): https://perses.dev/
 - Apache DataFusion logical-plan documentation.
+- RFC 0031 §2.3/§3.4–§3.6/§5 (the comparative L4 class and the
+  equivalence + honest-bytes contracts the 2026-07-15 amendment serves);
 - RFC 0001 §6.1/§6.3/§6.7 (the columns + template/drift primitives);
   RFC 0007 (the execution layer this DSL targets); `CLAUDE.md` §4 hazard 6
   (no-leakage hazard) and `CLAUDE.md` §3.7 (multi-tenancy).

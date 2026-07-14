@@ -218,9 +218,10 @@ OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
 ./ourios-server
 ```
 
-Point any OpenTelemetry SDK or Collector at the OTLP ports (Ourios
-speaks OTLP and nothing else; the tenant derives from `service.name`),
-then query with the logs DSL:
+Point any OpenTelemetry SDK or Collector at the OTLP ports — Ourios
+speaks OTLP and nothing else, and the tenant derives from the resource's
+`service.name` (so logs sent with `service.name=checkout` land in tenant
+`checkout`). Then query that same tenant with the logs DSL:
 
 ```sh
 curl -s http://localhost:4319/v1/query \
@@ -239,7 +240,8 @@ leaves localhost.
 
 ## Agents: the MCP surface
 
-The querier serves the Model Context Protocol at `/mcp`
+The querier can serve the Model Context Protocol at `/mcp` — opt-in via
+`querier.mcp.enabled` / `OURIOS_QUERIER_MCP_ENABLED=1`, off by default
 ([RFC 0027](docs/rfcs/0027-mcp-query-surface.md)): the `query_logs`,
 `list_templates`, and `template_drift` tools, plus the
 `ourios://dsl-grammar` resource and the `ourios://query-schema`
@@ -282,7 +284,7 @@ stand:
 
 ## Repository layout
 
-```
+```text
 crates/      # Rust workspace: ourios-{core,config,miner,wal,parquet,
              #   ingester,querier,server,telemetry,semconv,testgen,bench}
 deploy/helm/ # the Helm chart

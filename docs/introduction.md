@@ -44,7 +44,7 @@ on-disk schema can still move: treat everything as pre-1.0.
 - **[Benchmarks](./benchmarks.md)** — the thesis gates, stated so they
   could falsify the project, and every measurement against them with
   run IDs and caveats; plus the [roadmap](./roadmap.md).
-- **[RFCs](./rfcs/index.html)** — every subsystem is specified before it
+- **[RFCs](./rfcs/)** — every subsystem is specified before it
   is built. Each RFC pins `Given / When / Then` acceptance scenarios
   and climbs a maturity ladder
   (`drafted → specified → red → green → validated → accepted`); the

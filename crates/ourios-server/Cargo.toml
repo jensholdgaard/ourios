@@ -128,7 +128,7 @@ bytes = { version = "=1.12.1", default-features = false }
 # verifier itself.
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "pem", "arithmetic"] }
-rand = "=0.8.6"
+rand = "=0.8.7"
 base64 = "=0.22.1"
 
 [lints]

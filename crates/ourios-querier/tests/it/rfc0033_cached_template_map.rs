@@ -893,7 +893,7 @@ fn rfc0033_6_measured_tax_collapses() {
             .expect("read published artifact")
             .as_slice(),
     )
-    .expect("the published artifact is one zstd frame")
+    .expect("the published artifact decompresses as zstd")
     .len();
     eprintln!(
         "rfc0033.6 local arm: cold={} B (audit fold, {} files), warm={} B \

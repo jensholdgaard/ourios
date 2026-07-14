@@ -218,8 +218,9 @@ OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
 ./ourios-server
 ```
 
-Point any OpenTelemetry SDK or Collector at the OTLP ports — Ourios
-speaks OTLP and nothing else, and the tenant derives from the resource's
+Point any OpenTelemetry SDK or Collector at the OTLP ports — on the
+ingest side Ourios speaks OTLP and nothing else (queries use the plain
+HTTP API below), and the tenant derives from the resource's
 `service.name` (so logs sent with `service.name=checkout` land in tenant
 `checkout`). Then query that same tenant with the logs DSL:
 

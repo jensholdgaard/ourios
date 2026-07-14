@@ -117,6 +117,12 @@ testcontainers-modules = { version = "=0.15.0", features = ["localstack"] }
 # dep) plus ES256 minting — the same runtime-generated-key policy as the
 # ourios-core fixture (no committed private keys).
 jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+# RFC0032.4: harvest the writer's actual bloom-filtered column set from a
+# real Parquet footer, so the MCP cost-model resource is pinned to the
+# writer rather than to repeated literals. Already in the tree via
+# ourios-parquet — no new compilation unit versions.
+parquet = { version = "=58.3.0", default-features = false, features = ["arrow", "zstd"] }
+bytes = { version = "=1.12.1", default-features = false }
 # The RFC0029.7 Dex arm mints real tokens (form POST to the container's
 # token endpoint) and polls readiness — same crate + TLS stack as the
 # verifier itself.

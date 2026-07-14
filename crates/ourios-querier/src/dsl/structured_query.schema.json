@@ -72,6 +72,26 @@
         }
       ]
     },
+    "group_term": {
+      "description": "A by-array element of the aggregation stages (§6.3 amendment 2026-07-15): a field, {\"param\": n} (the pinned template's parameter slot n, zero-based), or {\"bucket\": \"<duration>\"} (fixed-width time bucketing; the §7 duration lexical string).",
+      "oneOf": [
+        { "$ref": "#/$defs/field" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["param"],
+          "properties": { "param": { "type": "integer", "minimum": 0 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bucket"],
+          "properties": {
+            "bucket": { "type": "string", "pattern": "^[0-9]+[smhdw]$" }
+          }
+        }
+      ]
+    },
     "cmp_op": {
       "type": "string",
       "enum": ["==", "!=", "<", "<=", ">", ">=", "=~", "!~"]
@@ -227,7 +247,7 @@
           "properties": {
             "by": {
               "type": "array",
-              "items": { "$ref": "#/$defs/field" }
+              "items": { "$ref": "#/$defs/group_term" }
             }
           }
         }
@@ -245,7 +265,7 @@
         "avg": { "$ref": "#/$defs/field" },
         "by": {
           "type": "array",
-          "items": { "$ref": "#/$defs/field" }
+          "items": { "$ref": "#/$defs/group_term" }
         }
       },
       "oneOf": [

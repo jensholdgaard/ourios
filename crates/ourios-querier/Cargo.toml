@@ -45,10 +45,14 @@ percent-encoding = { version = "2", default-features = false, features = ["alloc
 # `starts_with` / `ends_with`) and the `=~` / `!~` regex operators
 # (RFC 0002 §6.1); with default features off they would not be in the
 # session registry and planning those predicates would fail.
+# `nested_expressions` registers the list functions the §6.3 `param(n)`
+# group term lowers through (`array_element` over the RFC 0005 `params`
+# list column).
 datafusion = { version = "54", default-features = false, features = [
     "parquet",
     "string_expressions",
     "regex_expressions",
+    "nested_expressions",
 ] }
 # RFC 0002 structured (JSON) query surface (§6.4) — deserialised into the
 # shared DSL IR. serde derive for the surface types, serde_json for the

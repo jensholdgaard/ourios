@@ -46,7 +46,9 @@ use ourios_miner::reconstruct::Reconstruction;
 use ourios_parquet::{PromotedAttributes, StoreConfig};
 use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
-use ourios_querier::{DriftResult, LogBody, LogRow, Querier, QueryResult, QueryStats};
+use ourios_querier::{
+    AggregateGroup, DriftResult, LogBody, LogRow, Querier, QueryResult, QueryStats,
+};
 use ourios_semconv as semconv;
 
 /// The `X-Ourios-Tenant` request header (RFC 0016 §3.3) — kept out of the DSL
@@ -613,6 +615,9 @@ struct StatsDto {
     row_groups_scanned: u64,
     row_groups_pruned: u64,
     bytes_read: u64,
+    /// Rows an aggregation excluded for a NULL group key (RFC0002.15 —
+    /// short/NULL `param(n)` slots); `0` for non-aggregation queries.
+    rows_excluded: u64,
 }
 
 impl From<&QueryStats> for StatsDto {
@@ -621,6 +626,7 @@ impl From<&QueryStats> for StatsDto {
             row_groups_scanned: s.row_groups_scanned,
             row_groups_pruned: s.row_groups_pruned,
             bytes_read: s.bytes_read,
+            rows_excluded: s.rows_excluded,
         }
     }
 }
@@ -632,6 +638,26 @@ pub(crate) struct LogQueryResponse {
     stats: StatsDto,
     /// The returned rows, ≤ the effective limit.
     records: Vec<LogRowDto>,
+    /// The executed aggregation's grouped-count map (RFC 0002 amendment
+    /// 2026-07-15) — present iff the query carried a `count [by …]` stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aggregate: Option<Vec<AggregateGroupDto>>,
+}
+
+#[derive(Serialize)]
+struct AggregateGroupDto {
+    /// One entry per `by` term in query order; empty for a bare `count`.
+    key: Vec<String>,
+    count: u64,
+}
+
+impl From<&AggregateGroup> for AggregateGroupDto {
+    fn from(g: &AggregateGroup) -> Self {
+        Self {
+            key: g.key.clone(),
+            count: g.count,
+        }
+    }
 }
 
 impl From<&QueryResult> for LogQueryResponse {
@@ -640,6 +666,10 @@ impl From<&QueryResult> for LogQueryResponse {
             rows: r.rows,
             stats: StatsDto::from(&r.stats),
             records: r.records.iter().map(LogRowDto::from).collect(),
+            aggregate: r
+                .aggregate
+                .as_ref()
+                .map(|groups| groups.iter().map(AggregateGroupDto::from).collect()),
         }
     }
 }

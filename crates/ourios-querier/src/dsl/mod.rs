@@ -36,7 +36,8 @@ pub fn structured_query_schema() -> &'static str {
 }
 
 pub(crate) use parse::{
-    parse_severity_name_pub, parse_time_pub, require_string_operand, validate_sort_key,
+    parse_duration_lexeme_pub, parse_severity_name_pub, parse_time_pub, require_string_operand,
+    validate_sort_key,
 };
 
 /// An error from parsing the logs DSL (either front-end). Hand-rolled (no

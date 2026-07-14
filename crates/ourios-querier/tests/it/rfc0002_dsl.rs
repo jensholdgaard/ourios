@@ -20,8 +20,8 @@
 #[cfg(test)]
 mod wellformed {
     use ourios_querier::dsl::ir::{
-        AggFn, Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue, Stage,
-        Time, Value,
+        AggFn, Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityName, SeverityValue,
+        Stage, Time, Value,
     };
     use proptest::prelude::*;
 
@@ -242,11 +242,22 @@ mod wellformed {
         ]
     }
 
+    /// A §7 v1.1 `group_term` for the aggregation `by`-lists: a bare field,
+    /// `param(n)`, or `bucket(duration)` (the pinning / duplicate rules are
+    /// compile-time, not parse-time, so any mix round-trips).
+    fn group_term() -> impl Strategy<Value = GroupTerm> {
+        prop_oneof![
+            bare_field().prop_map(GroupTerm::Field),
+            (0u32..=8).prop_map(GroupTerm::Param),
+            duration_lexeme().prop_map(GroupTerm::Bucket),
+        ]
+    }
+
     fn stage() -> impl Strategy<Value = Stage> {
         let field_list = prop::collection::vec(bare_field(), 1..=3);
         prop_oneof![
             (time(), time()).prop_map(|(a, b)| Stage::Range(a, b)),
-            prop::collection::vec(bare_field(), 0..=3).prop_map(|by| Stage::Count { by }),
+            prop::collection::vec(group_term(), 0..=3).prop_map(|by| Stage::Count { by }),
             (
                 prop_oneof![
                     Just(AggFn::Sum),
@@ -255,7 +266,7 @@ mod wellformed {
                     Just(AggFn::Avg)
                 ],
                 path_field(),
-                prop::collection::vec(bare_field(), 0..=3),
+                prop::collection::vec(group_term(), 0..=3),
             )
                 .prop_map(|(func, path, by)| Stage::Agg { func, path, by }),
             (sort_key(), any::<bool>()).prop_map(|(key, desc)| Stage::Sort { key, desc }),
@@ -839,9 +850,10 @@ async fn rfc0002_6_unsupported_stage_rejected() {
     let q = Querier::new(bucket.path());
     let tenant = TenantId::new("a");
 
-    // `range` + `limit` stay supported; the rest must error, not no-op.
+    // `range` + `limit` stay supported, and — per the 2026-07-15 amendment
+    // (RFC0002.12) — `count` now executes rather than erroring (its own
+    // acceptance test below); the rest must error, not no-op.
     let cases: &[(&str, &str)] = &[
-        ("body == \"x\" | count", "count"),
         ("body == \"x\" | sum(confidence)", "aggregation"),
         ("body == \"x\" | sort ts", "sort"),
         ("body == \"x\" | project body", "project"),
@@ -1390,6 +1402,9 @@ fn assert_well_formed_requests_pass(validator: &jsonschema::Validator) {
             {"render":{}}
         ]}"#,
         r#"{"predicate":{"const":true},"stages":[{"render":null}]}"#,
+        r#"{"predicate":{"field":"template_id","op":"==","value":4},"stages":[
+            {"count":{"by":[{"param":0},{"bucket":"5m"},"service"]}}
+        ]}"#,
     ];
     for req in valid {
         let instance: serde_json::Value =
@@ -1458,6 +1473,18 @@ fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
             "unknown stage kind",
         ),
         (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":-1}]}}]}"#,
+            "negative param slot",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"bucket":"5"}]}}]}"#,
+            "non-duration bucket width",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":0,"x":1}]}}]}"#,
+            "extra group-term key",
+        ),
+        (
             r#"{"predicate":{"field":"severity","op":"=~","value":"error"}}"#,
             "regex operator on severity",
         ),
@@ -1496,37 +1523,161 @@ fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
     }
 }
 
+/// Run a DSL query against `bucket` as tenant `a` with the shared fixture
+/// window — the aggregation scenarios' common driver.
+async fn run_dsl(bucket: &std::path::Path, dsl: &str) -> ourios_querier::QueryResult {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW};
+    let query = ourios_querier::dsl::parse(dsl).expect("parse DSL");
+    ourios_querier::Querier::new(bucket)
+        .run_query(
+            &query,
+            &ourios_core::tenant::TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&crate::common::no_aliases()),
+        )
+        .await
+        .expect("run_query")
+}
+
+/// The executed aggregation map as `key → count`, for oracle comparison.
+fn group_map(result: &ourios_querier::QueryResult) -> std::collections::BTreeMap<Vec<String>, u64> {
+    result
+        .aggregate
+        .as_ref()
+        .expect("an aggregation query returns the grouped-count map")
+        .iter()
+        .map(|g| (g.key.clone(), g.count))
+        .collect()
+}
+
 /// Scenario RFC0002.12 — `count [by …]` executes end-to-end and matches a
 /// naive oracle. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
 /// 2026-07-15).
-#[test]
-#[ignore = "RFC0002.12 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_12_count_by_matches_naive_oracle() {
-    todo!(
-        "RFC0002.12 — populated tenant store; `<predicate> | range(…) | \
-         count by <field, …>` over ordinary §7 fields (template_id, \
-         service) and the bare `count`: the result is the \
-         group_key → count map (bare count: the single total), equals \
-         a naive oracle that filters + counts the same rows outside \
-         the query path, and compile::validate no longer rejects the \
-         count stage"
+#[tokio::test]
+async fn rfc0002_12_count_by_matches_naive_oracle() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec, write_all};
+
+    // Arrange — a mixed corpus over two services and three templates, plus
+    // a foreign tenant that must never leak into the map (§3.7).
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let recs = [
+        rec("a", 1, TS0, 9, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 1, 17, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 2, 9, "web", "lib.cart", None, None),
+        rec("a", 2, TS0 + 3, 9, "api", "lib.cart", None, None),
+        rec("a", 3, TS0 + 4, 9, "web", "lib.cart", None, None),
+    ];
+    write_all(bucket.path(), &recs);
+    write_all(
+        bucket.path(),
+        &[rec("b", 1, TS0 + 5, 9, "api", "lib.cart", None, None)],
     );
+
+    // Naive oracle — filter and count the same rows outside the query path.
+    let service_of = |r: &ourios_core::record::MinedRecord| {
+        r.resource_attributes
+            .iter()
+            .find(|kv| kv.key == "service.name")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match v.value.as_ref() {
+                Some(ourios_core::otlp::any_value::Value::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("fixture rows carry service.name")
+    };
+    let mut by_template: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for r in recs.iter().filter(|r| service_of(r) == "api") {
+        *by_template
+            .entry(vec![r.template_id.to_string()])
+            .or_default() += 1;
+    }
+    let mut by_service: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for r in recs.iter().filter(|r| r.template_id == 1) {
+        *by_service.entry(vec![service_of(r)]).or_default() += 1;
+    }
+
+    // Act / Assert — `count by <field>` over ordinary §7 fields. The count
+    // stage executing at all is RFC0002.12's "no longer rejected by
+    // compile::validate".
+    let counted = run_dsl(bucket.path(), "service == \"api\" | count by template_id").await;
+    assert_eq!(group_map(&counted), by_template, "template_id grouping");
+    assert_eq!(counted.rows, 3, "rows stays the total matching-row count");
+    assert!(counted.records.is_empty(), "an aggregation returns no rows");
+
+    let by_svc = run_dsl(bucket.path(), "template_id == 1 | count by service").await;
+    assert_eq!(group_map(&by_svc), by_service, "service grouping");
+
+    // The bare `count`: the single total, as one empty-keyed group.
+    let bare = run_dsl(bucket.path(), "service == \"api\" | count").await;
+    assert_eq!(group_map(&bare), BTreeMap::from([(vec![], 3)]));
+    assert_eq!(bare.rows, 3);
 }
 
 /// Scenario RFC0002.13 — `count by param(n), bucket(w)` yields the L4
 /// grouped-count map. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
 /// 2026-07-15; RFC0031.5).
-#[test]
-#[ignore = "RFC0002.13 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_13_count_by_param_bucket_grouped_map() {
-    todo!(
-        "RFC0002.13 — predicate pinning exactly one template_id (§6.3 \
-         pinning rule) with `count by param(0), bucket(5m)`: the \
-         result is the (bucket, group_key) → count map — buckets the \
-         half-open epoch-aligned windows [k·w, (k+1)·w) over the \
-         effective timestamp, group keys the stored string form of \
-         params slot 0 — equal to a naive oracle and shape-identical \
-         to the RFC 0031 §3.5 / RFC0031.1 L4-equivalence map"
+#[tokio::test]
+async fn rfc0002_13_count_by_param_bucket_grouped_map() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec_with_params, write_all};
+
+    const SECOND_NS: u64 = 1_000_000_000;
+    const WIDTH_NS: u64 = 300 * SECOND_NS; // 5m
+
+    // Arrange — template-1 rows spread across two 5-minute windows, plus a
+    // template-2 row in the same window that a pinned query must not count.
+    let rows: &[(&str, u64)] = &[
+        ("u1", TS0),
+        ("u2", TS0 + 100 * SECOND_NS),
+        ("u1", TS0 + 150 * SECOND_NS),
+        ("u1", TS0 + 400 * SECOND_NS),
+    ];
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let mut recs: Vec<_> = rows
+        .iter()
+        .map(|(p, ts)| rec_with_params("a", 1, *ts, &[p]))
+        .collect();
+    recs.push(rec_with_params("a", 2, TS0, &["zz"]));
+    write_all(bucket.path(), &recs);
+
+    // Naive oracle — the (group_key, bucket) → count map, buckets computed
+    // as the epoch-aligned half-open windows [k·w, (k+1)·w) over the
+    // effective timestamp, keys serialised RFC 3339 UTC (window start).
+    let bucket_key = |ts: u64| {
+        let start = ts / WIDTH_NS * WIDTH_NS;
+        chrono::DateTime::from_timestamp_nanos(i64::try_from(start).expect("fixture ns"))
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    };
+    let mut oracle: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for (p, ts) in rows {
+        *oracle
+            .entry(vec![(*p).to_string(), bucket_key(*ts)])
+            .or_default() += 1;
+    }
+
+    // Act — the L4 shape: a predicate pinning exactly one template_id.
+    let result = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) \
+         | count by param(0), bucket(5m)",
+    )
+    .await;
+
+    // Assert — the (bucket, group_key) → count map, shape-identical to the
+    // RFC 0031 §3.5 L4-equivalence map (key entries in by-list order).
+    assert_eq!(group_map(&result), oracle);
+    assert_eq!(result.rows, 4, "the pinned template's matching rows");
+    assert_eq!(result.stats.rows_excluded, 0, "every row carries slot 0");
+    // Pin one bucket key's exact serialisation: TS0 is 2026-04-02T10:58:00Z,
+    // so its 5m window starts 10:55:00Z.
+    assert!(
+        group_map(&result).contains_key(&vec!["u1".to_string(), "2026-04-02T10:55:00Z".into()]),
+        "epoch-aligned RFC 3339 UTC bucket key; got {:?}",
+        result.aggregate,
     );
 }
 
@@ -1551,37 +1702,113 @@ fn rfc0002_14_param_misuse_specific_error() {
 
 /// Scenario RFC0002.15 — short/NULL params rows are excluded and tallied.
 /// See `docs/rfcs/0002-query-dsl.md` §5 (amendment 2026-07-15).
-#[test]
-#[ignore = "RFC0002.15 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_15_short_params_excluded_and_tallied() {
-    todo!(
-        "RFC0002.15 — pinned-template rows whose params list is shorter \
-         than n + 1 (or whose slot n is NULL) alongside rows carrying \
-         slot n; `count by param(n), …`: the short/NULL rows \
-         contribute to no group (no synthetic absent bucket), the \
-         returned groups equal the naive oracle over the remaining \
-         rows, and the excluded-row count is reported per query (a \
-         QueryStats field on the RFC 0016 query-metrics path) so the \
-         exclusion is observable, not silent"
+#[tokio::test]
+async fn rfc0002_15_short_params_excluded_and_tallied() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec_with_params, write_all};
+
+    // Arrange — pinned-template rows carrying slot 1 alongside rows whose
+    // params list is shorter than n + 1.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_params("a", 1, TS0, &["a", "x"]),
+            rec_with_params("a", 1, TS0 + 1, &["b", "y"]),
+            rec_with_params("a", 1, TS0 + 2, &["c", "x"]),
+            rec_with_params("a", 1, TS0 + 3, &["c"]), // short: no slot 1
+            rec_with_params("a", 1, TS0 + 4, &[]),    // short: empty list
+        ],
     );
+
+    // Act
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by param(1)").await;
+
+    // Assert — the short rows contribute to no group (no synthetic absent
+    // bucket: the groups equal the naive oracle over the remaining rows
+    // exactly), and the exclusion is tallied per query on `QueryStats` —
+    // the field the RFC 0016 query path surfaces — so it is observable,
+    // not silent.
+    let oracle = BTreeMap::from([(vec!["x".to_string()], 2), (vec!["y".to_string()], 1)]);
+    assert_eq!(group_map(&result), oracle);
+    assert_eq!(result.stats.rows_excluded, 2, "both short rows tallied");
+    assert_eq!(result.rows, 5, "rows stays the total matching-row count");
 }
 
 /// Scenario RFC0002.16 — the aggregation path's honest bytes total is the
 /// group-column scan alone. See `docs/rfcs/0002-query-dsl.md` §5
 /// (amendment 2026-07-15; RFC 0031 §3.6).
-#[test]
-#[ignore = "RFC0002.16 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_16_honest_bytes_is_group_column_scan_only() {
-    todo!(
-        "RFC0002.16 — an L4-shaped query (`template_id == N | range(…) \
-         | count by param(n), bucket(w)`) under RFC 0031 §3.6 \
-         honest-total accounting: the total is the count-scan \
-         component only — within surviving row groups, the column \
-         chunks read are the predicate + group-term columns \
-         (template_id, the effective-time column, params iff a \
-         param(n) term is present), never body/separators; the \
-         row-materialization component is zero (a map is returned, \
-         not rows) and registry_bytes_read is zero (nothing is \
-         rendered)"
+#[tokio::test]
+async fn rfc0002_16_honest_bytes_is_group_column_scan_only() {
+    use crate::common::{TS0, rec_with_params, write_all};
+    use ourios_core::record::MinedRecord;
+
+    // Arrange — rows whose retained `body` dominates the file: if the
+    // aggregation scan touched the body/separators chunks, its byte figure
+    // could not stay far below the materialization pass's.
+    let fat_body = |seed: u64| -> String {
+        use std::fmt::Write as _;
+        // Simple xorshift so the bodies stay incompressible-ish; hex-encoded.
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut s = String::with_capacity(8 * 1024);
+        while s.len() < 8 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let _ = write!(s, "{x:016x}");
+        }
+        s
+    };
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let recs: Vec<MinedRecord> = (0..64)
+        .map(|i| MinedRecord {
+            body: Some(fat_body(i)),
+            ..rec_with_params("a", 1, TS0 + i, &[if i % 2 == 0 { "u1" } else { "u2" }])
+        })
+        .collect();
+    write_all(bucket.path(), &recs);
+
+    // Act — the L4 shape under the RFC 0031 §3.6 honest-total accounting,
+    // and (for the body-exclusion comparison) a materializing query over
+    // the same rows, whose pass must fetch every fat body page.
+    let agg = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) \
+         | count by param(0), bucket(5m)",
+    )
+    .await;
+    let rendered = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) | limit 100",
+    )
+    .await;
+
+    // Assert — the honest total is the count-scan component only: zero row
+    // materialization (a map is returned, not rows) and zero template-map
+    // acquisition (nothing is rendered).
+    assert_eq!(agg.rows, 64);
+    assert!(agg.aggregate.is_some());
+    assert_eq!(agg.materialize_bytes_read, 0, "no rows are materialized");
+    assert_eq!(agg.registry_bytes_read, 0, "nothing is rendered");
+    assert!(agg.stats.bytes_read > 0, "the group-column scan reads data");
+    let honest_total = agg.stats.bytes_read + agg.materialize_bytes_read + agg.registry_bytes_read;
+    assert_eq!(honest_total, agg.stats.bytes_read);
+
+    // The count scan reads the predicate + group-term columns only —
+    // never `body`/`separators`. Proxy: the materializing pass over the
+    // same rows pays for every fat body page; the aggregation's whole scan
+    // must stay far below it.
+    assert_eq!(
+        rendered.records.len(),
+        64,
+        "the comparison rendered all rows"
+    );
+    assert!(
+        agg.stats.bytes_read * 2 < rendered.materialize_bytes_read,
+        "the aggregation scan ({} B) must stay far below the body-page \
+         materialization ({} B) — it must never read body/separators",
+        agg.stats.bytes_read,
+        rendered.materialize_bytes_read,
     );
 }

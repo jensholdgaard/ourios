@@ -246,18 +246,36 @@ pub enum Call {
     ResolvesTo(u64),
 }
 
+/// A `by`-list element of the aggregation stages (§7 v1.1 `group_term`,
+/// amendment 2026-07-15). Grammatically confined to `by`-lists: `project`,
+/// predicates, and `sort` admit only plain fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupTerm {
+    /// A bare §7 `field`.
+    Field(Field),
+    /// `param(n)` — parameter slot `n` (zero-based) of the single
+    /// `template_id` the predicate pins (§6.3 amendment). The group key is
+    /// the slot's stored string form; short/NULL rows are excluded and
+    /// tallied.
+    Param(u32),
+    /// `bucket(width)` — fixed-width bucketing of the effective timestamp
+    /// into half-open, epoch-aligned UTC windows `[k·width, (k+1)·width)`.
+    /// Carries the validated §7 `duration` lexeme (`5m`, `1h`, …).
+    Bucket(String),
+}
+
 /// A pipe stage (§7 `stage`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
     /// `range(from, to)`.
     Range(Time, Time),
-    /// `count [by field, …]`.
-    Count { by: Vec<Field> },
-    /// `sum|min|max|avg(path) [by field, …]`.
+    /// `count [by group_term, …]`.
+    Count { by: Vec<GroupTerm> },
+    /// `sum|min|max|avg(path) [by group_term, …]`.
     Agg {
         func: AggFn,
         path: Field,
-        by: Vec<Field>,
+        by: Vec<GroupTerm>,
     },
     /// `sort <field-or-aggregate> [asc|desc]`.
     Sort { key: String, desc: bool },

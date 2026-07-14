@@ -274,11 +274,12 @@ async fn invalid_query_fails_before_alias_derivation() {
     std::fs::create_dir_all(&audit).expect("audit dir");
     std::fs::write(audit.join("tenant_id=T"), b"not a directory").expect("poison");
 
-    // Act / Assert — `count` parses but is not yet executable; the
-    // compile error must win over the broken audit tree's Storage
-    // error, proving validation runs before derivation.
-    let query = ourios_querier::dsl::parse(&format!("resolves_to({A}) | count by template_id"))
-        .expect("parse");
+    // Act / Assert — `render` parses but is not yet executable (`count`
+    // formerly played this role, until the RFC 0002 amendment 2026-07-15
+    // made it executable); the compile error must win over the broken
+    // audit tree's Storage error, proving validation runs before
+    // derivation.
+    let query = ourios_querier::dsl::parse(&format!("resolves_to({A}) | render")).expect("parse");
     let err = Querier::new(bucket.path())
         .run_query(&query, &TenantId::new("T"), NOW, DEFAULT_WINDOW_NS, None)
         .await

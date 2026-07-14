@@ -204,7 +204,8 @@ code that turns them green. Statuses live in each RFC's frontmatter —
 
 Grab a [signed release](https://github.com/jensholdgaard/ourios/releases/latest)
 (or `cargo build --release -p ourios-server`) and run one process with
-the receiver and querier roles on localhost:
+the receiver and querier roles on localhost (background compaction also
+runs by default; `OURIOS_COMPACTION_ENABLED=0` turns it off):
 
 ```sh
 mkdir -p /tmp/ourios/data /tmp/ourios/wal

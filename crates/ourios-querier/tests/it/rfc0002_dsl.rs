@@ -1,6 +1,6 @@
 //! RFC 0002 — Query DSL acceptance criteria (RFC0002.1–.16).
 //!
-//! Red gate (`specified → red`): `#[ignore]`'d `unimplemented!()` stubs
+//! Red gate (`specified → red`): `#[ignore]`'d `todo!()` stubs
 //! until the DSL parser + compiler land in front of the (already
 //! implemented) RFC 0007 execution layer. Per `docs/verification.md` §3
 //! the scenarios become ignored stubs first, implementations second; each

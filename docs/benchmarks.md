@@ -1475,3 +1475,54 @@ processed), the must-win margins and floor factors, and whether
 the time-window pairs reclassify from gated floor to diagnostic —
 are **open maintainer decisions**, and this entry is the
 calibration evidence for them, not their resolution.
+
+### 9.14 Results — 2026-07-13 (indicative, `ci-runner`) — comparative run #20: frozen gates on `main`, RFC 0033 acquisition
+
+First dispatch on `main` after the §7 partial freeze **and** after the
+RFC 0033 cached template map merged (#511–#513). Job: run #20
+(29255000054), exit 0.
+
+**Frozen gates.** All asserting gates pass on `main` — `M_L1`/`M_L3`
+storage margins and the `F_L6` latency floors held; equivalence held
+on every pair. The dispatch is functioning as the regression gate the
+freeze intended (run #19 proved it on the branch; this run proves it
+on `main`).
+
+**RFC 0033 acquisition (the run's purpose).** Every pair reports:
+
+```
+template-map acquisition (RFC 0033): cold (audit fold, 513862 B; no artifact published)
+```
+
+- The registry component is **byte-identical to run #8's baseline**
+  (513,862 B constant per body-rendering query): the cache regressed
+  nothing, exactly as the advisory design promised.
+- But the write-through **never published** on this corpus, so no
+  pair ever ran warm and the RFC0033.6 corpus gate
+  (`warm/cold ≤ 1/10`) could not be measured.
+- The explanation consistent with the run's outputs is §3.2's size
+  abstention: the artifact is *uncompressed JSON* carrying every
+  `(template_id, version)` canonical template string, while the
+  513,862 B it must undercut is *zstd-compressed Parquet* of the
+  same strings (plus their event history). On v8's template set the
+  JSON evidently meets or exceeds the fold, and the guard refuses a
+  publish that would make warm acquisition cost more bytes than the
+  fold it replaces. (A publish IO failure would leave the same
+  "no artifact" label; the §3.7 publish-outcome telemetry
+  distinguishes the two in a served process, but the bench harness
+  does not export metrics — the amendment run should print the
+  outcome explicitly.)
+
+**Consequences recorded.**
+
+1. RFC 0033 status reverted `green → red` (this PR): RFC0033.6's
+   corpus arm is undischarged. The local-shape arm (55.8× on the
+   64-event fixture) stands.
+2. `M_L2` stays frozen-deferred — §7's unfreeze condition (the
+   RFC 0033 warm measurement on the headline corpus) was not met.
+3. The lever is an artifact encoding amendment (`format_version` 2,
+   compressed body). The same template strings zstd-compress into
+   the 513,862 B audit Parquet *with* full event history alongside,
+   so a compressed artifact is expected to land well below the fold
+   size — to be measured, not assumed. Abstention semantics stay:
+   publish only when the artifact beats the fold.

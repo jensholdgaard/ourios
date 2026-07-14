@@ -215,7 +215,7 @@ OURIOS_RECEIVER_GRPC_ADDR=127.0.0.1:4317 \
 OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:4318 \
 OURIOS_QUERIER_ENABLED=1 \
 OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
-./ourios-server
+./ourios-server   # ./target/release/ourios-server if built from source
 ```
 
 Point any OpenTelemetry SDK or Collector at the OTLP ports — on the

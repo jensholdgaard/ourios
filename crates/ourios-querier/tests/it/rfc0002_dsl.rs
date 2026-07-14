@@ -1,11 +1,12 @@
-//! RFC 0002 — Query DSL acceptance criteria (RFC0002.1–.11).
+//! RFC 0002 — Query DSL acceptance criteria (RFC0002.1–.16).
 //!
-//! Red gate (`specified → red`): `#[ignore]`'d `unimplemented!()` stubs
-//! until the DSL parser + compiler land in front of the (already
-//! implemented) RFC 0007 execution layer. Per `docs/verification.md` §3
-//! the scenarios become ignored stubs first, implementations second; each
-//! carries the §2.2 doc-comment form so the spec↔test mapping is
-//! greppable.
+//! RFC0002.1–.11 are green (the DSL parser + compiler in front of the
+//! RFC 0007 execution layer). RFC0002.12–.16 (the 2026-07-15
+//! aggregation-execution amendment, RFC 0031 L4) are the current red
+//! gate: `#[ignore]`'d `todo!()` stubs at the bottom of this file, per
+//! `docs/verification.md` §3 — scenarios become ignored stubs first,
+//! implementations second; each carries the §2.2 doc-comment form so
+//! the spec↔test mapping is greppable.
 
 /// Proptest strategies that generate **well-formed** [`Query`] IR — shapes the
 /// §7 grammar admits and the canonical serialiser renders losslessly — for the
@@ -1493,4 +1494,94 @@ fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
             "{what}: schema must reject {req} before the planner",
         );
     }
+}
+
+/// Scenario RFC0002.12 — `count [by …]` executes end-to-end and matches a
+/// naive oracle. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
+/// 2026-07-15).
+#[test]
+#[ignore = "RFC0002.12 stub — implemented in the aggregation-execution green slice"]
+fn rfc0002_12_count_by_matches_naive_oracle() {
+    todo!(
+        "RFC0002.12 — populated tenant store; `<predicate> | range(…) | \
+         count by <field, …>` over ordinary §7 fields (template_id, \
+         service) and the bare `count`: the result is the \
+         group_key → count map (bare count: the single total), equals \
+         a naive oracle that filters + counts the same rows outside \
+         the query path, and compile::validate no longer rejects the \
+         count stage"
+    );
+}
+
+/// Scenario RFC0002.13 — `count by param(n), bucket(w)` yields the L4
+/// grouped-count map. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
+/// 2026-07-15; RFC0031.5).
+#[test]
+#[ignore = "RFC0002.13 stub — implemented in the aggregation-execution green slice"]
+fn rfc0002_13_count_by_param_bucket_grouped_map() {
+    todo!(
+        "RFC0002.13 — predicate pinning exactly one template_id (§6.3 \
+         pinning rule) with `count by param(0), bucket(5m)`: the \
+         result is the (bucket, group_key) → count map — buckets the \
+         half-open epoch-aligned windows [k·w, (k+1)·w) over the \
+         effective timestamp, group keys the stored string form of \
+         params slot 0 — equal to a naive oracle and shape-identical \
+         to the RFC 0031 §3.5 / RFC0031.1 L4-equivalence map"
+    );
+}
+
+/// Scenario RFC0002.14 — `param(n)` misuse is a specific compile-time
+/// error. See `docs/rfcs/0002-query-dsl.md` §5 (amendment 2026-07-15).
+#[test]
+#[ignore = "RFC0002.14 stub — implemented in the grammar/compile-validation green slice"]
+fn rfc0002_14_param_misuse_specific_error() {
+    todo!(
+        "RFC0002.14 — (i) `service == \"api\" | count by param(0)` (no \
+         template_id pin), (ii) `template_id == 4 or template_id == 7 \
+         | count by param(0)` (a disjunction pins nothing), (iii) \
+         `resolves_to(4) | count by param(0)` (an alias set, not a \
+         pin), (iv) `param(0)` outside a by-list (predicate path or \
+         project field): each fails with a specific, leak-free error \
+         (RFC0002.8) — (i)–(iii) at compile time citing the \
+         single-template pinning rule, (iv) at parse time citing the \
+         §7 v1.1 grammar (group_term is confined to by-lists); no \
+         query reaches execution"
+    );
+}
+
+/// Scenario RFC0002.15 — short/NULL params rows are excluded and tallied.
+/// See `docs/rfcs/0002-query-dsl.md` §5 (amendment 2026-07-15).
+#[test]
+#[ignore = "RFC0002.15 stub — implemented in the aggregation-execution green slice"]
+fn rfc0002_15_short_params_excluded_and_tallied() {
+    todo!(
+        "RFC0002.15 — pinned-template rows whose params list is shorter \
+         than n + 1 (or whose slot n is NULL) alongside rows carrying \
+         slot n; `count by param(n), …`: the short/NULL rows \
+         contribute to no group (no synthetic absent bucket), the \
+         returned groups equal the naive oracle over the remaining \
+         rows, and the excluded-row count is reported per query (a \
+         QueryStats field on the RFC 0016 query-metrics path) so the \
+         exclusion is observable, not silent"
+    );
+}
+
+/// Scenario RFC0002.16 — the aggregation path's honest bytes total is the
+/// group-column scan alone. See `docs/rfcs/0002-query-dsl.md` §5
+/// (amendment 2026-07-15; RFC 0031 §3.6).
+#[test]
+#[ignore = "RFC0002.16 stub — implemented in the aggregation-execution green slice"]
+fn rfc0002_16_honest_bytes_is_group_column_scan_only() {
+    todo!(
+        "RFC0002.16 — an L4-shaped query (`template_id == N | range(…) \
+         | count by param(n), bucket(w)`) under RFC 0031 §3.6 \
+         honest-total accounting: the total is the count-scan \
+         component only — within surviving row groups, the column \
+         chunks read are the predicate + group-term columns \
+         (template_id, the effective-time column, params iff a \
+         param(n) term is present), never body/separators; the \
+         row-materialization component is zero (a map is returned, \
+         not rows) and registry_bytes_read is zero (nothing is \
+         rendered)"
+    );
 }

@@ -17,7 +17,7 @@ superseded-by: —
 > audience analysis in §3.6 (primary: Perses dashboard authors; future:
 > MCP agents). This RFC is now **`green`** — all 11 §5 acceptance
 > criteria (RFC0002.1–.11) have passing tests
-> (`crates/ourios-querier/tests/rfc0002_dsl.rs`), landed across PRs
+> (`crates/ourios-querier/tests/it/rfc0002_dsl.rs`), landed across PRs
 > #143 (this spec) and #144–#154 (the red gate + implementation): the
 > Branch-B parser + structured surface → one IR, the
 > IR→DataFusion compile, YAML-embeddability + the structured JSON Schema,
@@ -31,8 +31,9 @@ superseded-by: —
 > and `bucket(width)` aggregation group terms (grammar **v1.1**, a §6.6
 > minor version) and §5 gains **RFC0002.12–.16** (aggregation
 > execution). The `green` above refers to RFC0002.1–.11; the new
-> scenarios enter **red** (`#[ignore]`'d stubs, the
-> `docs/verification.md` §3 two-loop) via the next PR and are
+> scenarios are **red** (`#[ignore]`'d stubs, the
+> `docs/verification.md` §3 two-loop, landed in
+> `crates/ourios-querier/tests/it/rfc0002_dsl.rs`) and are
 > discharged by the implementing slices.
 
 ## 1. Summary
@@ -300,8 +301,9 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > querier's explicit aggregation-stage rejection (today
 > `ourios-querier` `compile::validate` rejects `count`/`agg_fn` stages
 > as "not yet supported") for the `count` family. Per the
-> `docs/verification.md` §3 two-loop they enter **red** via the next
-> PR (`#[ignore]`'d stubs) and turn green in the implementing slices;
+> `docs/verification.md` §3 two-loop they are **red** (`#[ignore]`'d
+> stubs in `crates/ourios-querier/tests/it/rfc0002_dsl.rs`) and turn
+> green in the implementing slices;
 > the status note's `green` refers to RFC0002.1–.11. Execution of the
 > `sum`/`min`/`max`/`avg` stages remains a later obligation — their
 > stages keep the explicit rejection until a future amendment adds

@@ -210,12 +210,13 @@ proptest! {
         let tenant = TenantId::new(TENANT);
         let backend = StoreRef::Local(bucket.path());
 
-        // One scan, both folds — then through the artifact bytes.
+        // One scan, both folds — then through the artifact bytes (the
+        // v2 zstd frame — the exact published-object encoding).
         let (derived, _bytes_read) =
             derive_template_map(backend, &tenant).expect("derive template map");
-        let json = derived.to_json().expect("serialize");
+        let bytes = derived.to_artifact_bytes().expect("serialize");
         let ArtifactRead::Valid(cached) =
-            TemplateMap::from_json(&json, &tenant).expect("read artifact")
+            TemplateMap::from_artifact_bytes(&bytes, &tenant).expect("read artifact")
         else {
             panic!("a just-serialized artifact must read back Valid");
         };
@@ -342,7 +343,7 @@ fn rfc0033_2_staleness_detected_never_served() {
 
     // ...and the querier republished at the new frontier, both folds.
     let bytes = std::fs::read(&artifact).expect("read artifact");
-    let read = TemplateMap::from_json(&bytes, &tenant).expect("read");
+    let read = TemplateMap::from_artifact_bytes(&bytes, &tenant).expect("read");
     let ArtifactRead::Valid(republished) = read else {
         panic!("the republished artifact must be Valid, got {read:?}");
     };
@@ -378,7 +379,7 @@ fn rfc0033_2_staleness_detected_never_served() {
         "files disappeared ⇒ stale ⇒ the fold over the live set answers",
     );
     let bytes = std::fs::read(&artifact).expect("read artifact");
-    let read = TemplateMap::from_json(&bytes, &tenant).expect("read");
+    let read = TemplateMap::from_artifact_bytes(&bytes, &tenant).expect("read");
     let ArtifactRead::Valid(reshrunk) = read else {
         panic!("the shrink republish must be Valid, got {read:?}");
     };
@@ -443,12 +444,15 @@ fn rfc0033_3_crash_tear_safety() {
     assert!(!tmp.exists(), "a completed publish leaves no .tmp");
 
     // A stray `.tmp` from a crashed publish: the read path opens only
-    // `template_map.json`, so the committed artifact still reads back
-    // Valid, the audit walk's frontier is unchanged, and the next
-    // query succeeds with the correct answer.
+    // the v2 key (`template_map.v2.json.zst`), so the committed
+    // artifact still reads back Valid, the audit walk's frontier is
+    // unchanged, and the next query succeeds with the correct answer.
     std::fs::write(&tmp, br#"{"format_version":1,"partial"#).expect("plant stray tmp");
-    let read = TemplateMap::from_json(&std::fs::read(&artifact).expect("read artifact"), &tenant)
-        .expect("read");
+    let read = TemplateMap::from_artifact_bytes(
+        &std::fs::read(&artifact).expect("read artifact"),
+        &tenant,
+    )
+    .expect("read");
     let ArtifactRead::Valid(committed) = read else {
         panic!("the committed artifact must stay Valid under a stray .tmp, got {read:?}");
     };
@@ -461,14 +465,16 @@ fn rfc0033_3_crash_tear_safety() {
     );
     assert_eq!(next_query_rows(bucket.path(), &tenant), baseline_rows);
 
-    // Torn JSON at the final name (a real publish, then the object
-    // truncated in place): treated as absent — the §3.7 `torn` outcome
-    // — while the fresh fold still answers the query correctly, no
-    // error surfaced.
+    // A torn artifact at the final name (a real publish, then the
+    // compressed object truncated in place — a broken zstd frame, the
+    // §3.3 amendment's decompression-failure arm): treated as absent —
+    // the §3.7 `torn` outcome — while the fresh fold still answers the
+    // query correctly, no error surfaced.
     let good_bytes = std::fs::read(&artifact).expect("read artifact");
     std::fs::write(&artifact, &good_bytes[..good_bytes.len() / 2]).expect("tear artifact");
-    let torn = TemplateMap::from_json(&std::fs::read(&artifact).expect("read torn"), &tenant)
-        .expect("torn is a disposition, not an error");
+    let torn =
+        TemplateMap::from_artifact_bytes(&std::fs::read(&artifact).expect("read torn"), &tenant)
+            .expect("torn is a disposition, not an error");
     assert!(matches!(torn, ArtifactRead::Torn { .. }), "got {torn:?}");
     let (healed, _) = derive_template_map(backend, &tenant).expect("fold under a torn artifact");
     assert_eq!(healed.registry(), map.registry());
@@ -480,8 +486,9 @@ fn rfc0033_3_crash_tear_safety() {
         healed.publish(backend, None).expect("republish"),
         PublishOutcome::Published,
     );
-    let read = TemplateMap::from_json(&std::fs::read(&artifact).expect("read healed"), &tenant)
-        .expect("read");
+    let read =
+        TemplateMap::from_artifact_bytes(&std::fs::read(&artifact).expect("read healed"), &tenant)
+            .expect("read");
     assert!(
         matches!(read, ArtifactRead::Valid(_)),
         "the store must self-heal to a Valid artifact, got {read:?}",
@@ -512,7 +519,8 @@ fn rfc0033_3_crash_tear_safety() {
     let held = store
         .get_blocking(&format!("audit/tenant_id={TENANT}/{TEMPLATE_MAP_FILENAME}"))
         .expect("get the published artifact");
-    let ArtifactRead::Valid(held) = TemplateMap::from_json(&held, &tenant).expect("read") else {
+    let ArtifactRead::Valid(held) = TemplateMap::from_artifact_bytes(&held, &tenant).expect("read")
+    else {
         panic!("the store must hold a valid readable artifact after a lost race");
     };
     assert_eq!(held.folded_files(), map.folded_files());
@@ -604,7 +612,9 @@ async fn template_map_publish_cas_on_s3() {
         .expect("get")
         .expect("artifact present");
     let e_tag = e_tag.expect("s3 exposes an ETag");
-    let ArtifactRead::Valid(held) = TemplateMap::from_json(&bytes, &tenant).expect("read") else {
+    let ArtifactRead::Valid(held) =
+        TemplateMap::from_artifact_bytes(&bytes, &tenant).expect("read")
+    else {
         panic!("the artifact must read back Valid after a lost create");
     };
     assert_eq!(held.folded_files(), map_a.folded_files());
@@ -625,7 +635,9 @@ async fn template_map_publish_cas_on_s3() {
         .get_with_etag_blocking_opt(&key)
         .expect("get")
         .expect("artifact present");
-    let ArtifactRead::Valid(held) = TemplateMap::from_json(&bytes, &tenant).expect("read") else {
+    let ArtifactRead::Valid(held) =
+        TemplateMap::from_artifact_bytes(&bytes, &tenant).expect("read")
+    else {
         panic!("the artifact must read back Valid after a lost swap");
     };
     assert_eq!(held.folded_files(), map_b.folded_files());
@@ -874,8 +886,18 @@ fn rfc0033_6_measured_tax_collapses() {
         warm.registry_bytes_read,
         cold.registry_bytes_read,
     );
+    // The §3.2 amendment's lever, recorded: the artifact ships as one
+    // zstd frame, so the warm GET pays the compressed bytes.
+    let decompressed = zstd::decode_all(
+        std::fs::read(&artifact)
+            .expect("read published artifact")
+            .as_slice(),
+    )
+    .expect("the published artifact is one zstd frame")
+    .len();
     eprintln!(
-        "rfc0033.6 local arm: cold={} B (audit fold, {} files), warm={} B (artifact GET)",
+        "rfc0033.6 local arm: cold={} B (audit fold, {} files), warm={} B \
+         (artifact GET, compressed; {decompressed} B JSON decompressed)",
         cold.registry_bytes_read,
         events.len(),
         warm.registry_bytes_read,

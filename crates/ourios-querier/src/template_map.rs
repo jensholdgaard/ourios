@@ -1,12 +1,14 @@
 //! The RFC 0033 cached template-map artifact — format and derivation.
 //!
-//! One JSON object per tenant (`template_map.json`, RFC 0033 §3.2)
-//! carrying **both** folds of the tenant's audit stream — the RFC 0017
-//! §3.2 template registry and the RFC 0005 §3.7.1 alias map — plus the
-//! `folded_files` frontier they were folded from. The audit stream
-//! remains the source of truth; this artifact is a derived, discardable
-//! acceleration, and every doubtful read resolves by folding the stream
-//! (§3.3's dispositions, [`ArtifactRead`]).
+//! One JSON object per tenant, shipped as a single zstd frame
+//! (`template_map.v2.json.zst`, RFC 0033 §3.2 + the 2026-07-13
+//! compressed-encoding amendment), carrying **both** folds of the
+//! tenant's audit stream — the RFC 0017 §3.2 template registry and the
+//! RFC 0005 §3.7.1 alias map — plus the `folded_files` frontier they
+//! were folded from. The audit stream remains the source of truth; this
+//! artifact is a derived, discardable acceleration, and every doubtful
+//! read resolves by folding the stream (§3.3's dispositions,
+//! [`ArtifactRead`]).
 //!
 //! [`derive_template_map`] performs **one** [`crate::audit_scan`] pass
 //! and folds both maps from that single capture — §3.5's no-partial
@@ -45,17 +47,34 @@ use serde::{Deserialize, Serialize};
 use crate::template_registry::TemplateRegistry;
 use crate::{QueryError, StoreRef, audit_scan, template_registry};
 
-/// Canonical artifact filename at the root of a tenant's audit subtree
-/// (`audit/tenant_id=<enc>/template_map.json`, RFC 0033 §3.2). Not a
-/// `*.parquet` name, so every existing audit walk/listing ignores it by
-/// construction.
-pub const TEMPLATE_MAP_FILENAME: &str = "template_map.json";
+/// Canonical artifact key at the root of a tenant's audit subtree
+/// (`audit/tenant_id=<enc>/template_map.v2.json.zst`, RFC 0033 §3.2
+/// amendment 2026-07-13): the encoding version lives in the key, so a
+/// pre-amendment reader sees literal absence — the cleanest realization
+/// of the unknown-version-is-absent rule. Not a `*.parquet` name, so
+/// every existing audit walk/listing ignores it by construction.
+pub const TEMPLATE_MAP_FILENAME: &str = "template_map.v2.json.zst";
 
-/// The `format_version` this reader writes and understands. A reader
-/// encountering any other version treats the artifact as absent
-/// (forward compatibility, RFC 0033 §3.3) — no migration is ever
-/// required because the artifact is derived and discardable.
-pub const TEMPLATE_MAP_FORMAT_VERSION: u32 = 1;
+/// The superseded v1 key (uncompressed JSON, `format_version` 1).
+/// Post-amendment readers never GET it; a successful v2 publish
+/// best-effort deletes it (§3.4 amendment — unconditional, any v1
+/// artifact is derived and discardable, and a failed delete is
+/// swallowed like every other best-effort publish IO).
+pub const TEMPLATE_MAP_V1_FILENAME: &str = "template_map.json";
+
+/// The `format_version` this reader writes and understands — it names
+/// the whole artifact contract *including* the zstd transport encoding
+/// (§3.2 amendment). A reader encountering any other version treats the
+/// artifact as absent (forward compatibility, RFC 0033 §3.3) — no
+/// migration is ever required because the artifact is derived and
+/// discardable.
+pub const TEMPLATE_MAP_FORMAT_VERSION: u32 = 2;
+
+/// The artifact frame's zstd level — the crate default (3), an
+/// implementation constant, not configuration (§3.2 amendment: the
+/// object is kilobyte-scale and written once per miss; raise here if
+/// run #21 measures the ratio marginal).
+const ARTIFACT_ZSTD_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
 
 /// `ourios.template_map.lookup.outcome` attribute values (RFC 0033 §3.7):
 /// the five §3.3 lookup dispositions, folded flat onto one counter (the
@@ -146,8 +165,9 @@ impl TemplateMapMetrics {
 ///
 /// Fields are private and the only constructors are
 /// [`derive_template_map`] (one scan, both folds) and
-/// [`TemplateMap::from_json`] (a validated read of a published
-/// artifact) — so a partially populated artifact (§3.5) cannot exist.
+/// [`TemplateMap::from_artifact_bytes`] (a validated read of a
+/// published artifact) — so a partially populated artifact (§3.5)
+/// cannot exist.
 #[derive(Debug)]
 pub struct TemplateMap {
     tenant: TenantId,
@@ -159,9 +179,9 @@ pub struct TemplateMap {
     aliases: AliasMap,
 }
 
-/// Outcome of reading `template_map.json` bytes — the RFC 0033 §3.3
-/// dispositions that are decidable from the bytes alone. Absence and
-/// staleness are the caller's to decide (it owns the GET and the
+/// Outcome of reading `template_map.v2.json.zst` bytes — the RFC 0033
+/// §3.3 dispositions that are decidable from the bytes alone. Absence
+/// and staleness are the caller's to decide (it owns the GET and the
 /// listing); a tenant mismatch is not a variant because it fails the
 /// read loudly ([`QueryError::Storage`]) rather than degrading to a
 /// fresh fold.
@@ -171,11 +191,14 @@ pub enum ArtifactRead {
     /// Well-formed, known version, tenant verified — usable as a cache
     /// hit once the caller's frontier check passes.
     Valid(TemplateMap),
-    /// Torn: unparseable JSON or internally invalid content. Treated as
+    /// Torn: not a zstd frame / failed decompression (§3.3 amendment),
+    /// unparseable JSON, or internally invalid content. Treated as
     /// absent (fresh fold; write-through overwrites, so the store
     /// self-heals); `detail` feeds the §3.7 `torn` telemetry outcome.
     Torn { detail: String },
-    /// A future writer's `format_version`. Treated as absent (forward
+    /// A different writer's `format_version`, probed on the
+    /// *decompressed* bytes (§3.2 amendment — defense-in-depth behind
+    /// the version-in-key rule). Treated as absent (forward
     /// compatibility) — distinct from [`Self::Torn`] because it is not
     /// corruption and carries its own §3.7 outcome.
     UnknownVersion { format_version: u32 },
@@ -267,9 +290,9 @@ pub enum CacheOutcome {
 /// it already listed — both folds, never a partial artifact (§3.5) —
 /// with the CAS expectation observed by this read (the artifact's `ETag`,
 /// or create-if-absent). A publish failure or lost race is never a query
-/// failure; it abstains entirely when the serialized artifact would not
-/// be smaller than the audit bytes just folded (§3.2 — nothing to win,
-/// and the no-artifact path is today's behaviour).
+/// failure; it abstains entirely when the **compressed** artifact would
+/// not be smaller than the audit bytes just folded (§3.2 amendment —
+/// nothing to win, and the no-artifact path is today's behaviour).
 ///
 /// # Errors
 ///
@@ -298,7 +321,7 @@ pub fn load_or_derive(
         ),
         FetchedArtifact::Present { bytes, e_tag } => {
             let len = bytes.len() as u64;
-            match TemplateMap::from_json(&bytes, tenant)? {
+            match TemplateMap::from_artifact_bytes(&bytes, tenant)? {
                 ArtifactRead::Valid(map) if map.folded_files() == resolved.frontier() => {
                     METRICS.record_lookup(CacheOutcome::Hit);
                     return Ok((map, len, CacheOutcome::Hit));
@@ -448,7 +471,9 @@ fn fold_template_map(
     ))
 }
 
-/// The artifact's wire shape (RFC 0033 §3.2). Kept separate from
+/// The artifact's JSON body — the decompressed content of the zstd
+/// frame (RFC 0033 §3.2; the amendment changed only the transport
+/// encoding, this shape is unchanged). Kept separate from
 /// [`TemplateMap`] so the semantic type never holds unvalidated
 /// content and the wire field names are pinned independently of the
 /// in-memory representation.
@@ -515,9 +540,28 @@ impl TemplateMap {
         &self.aliases
     }
 
-    /// Serialize to the canonical JSON bytes [`Self::from_json`]
-    /// parses: registry entries sorted by `(template_id, version)`,
-    /// alias classes sorted by representative, members sorted — so two
+    /// The published-object bytes: the canonical JSON body
+    /// zstd-compressed as a single frame at the crate-default level
+    /// (§3.2 amendment — an implementation constant, not
+    /// configuration). This is exactly what a warm GET pays, what the
+    /// §3.5 abstention compares against the folded audit bytes, and
+    /// what the §3.7 `artifact.size` histogram records.
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::Storage`] if JSON serialization fails, an alias
+    /// class violates the non-empty invariant, or the zstd encode
+    /// fails.
+    pub fn to_artifact_bytes(&self) -> Result<Vec<u8>, QueryError> {
+        let json = self.to_json()?;
+        zstd::encode_all(json.as_slice(), ARTIFACT_ZSTD_LEVEL).map_err(|e| QueryError::Storage {
+            detail: format!("compress {TEMPLATE_MAP_FILENAME}: {e}"),
+        })
+    }
+
+    /// Serialize to the canonical JSON body the artifact frame carries:
+    /// registry entries sorted by `(template_id, version)`, alias
+    /// classes sorted by representative, members sorted — so two
     /// derivations of the same fold serialize identically.
     ///
     /// # Errors
@@ -526,7 +570,7 @@ impl TemplateMap {
     /// these plain structs) or an alias class violates the non-empty
     /// invariant — corruption that must fail loudly rather than
     /// serialize a torn artifact.
-    pub fn to_json(&self) -> Result<Vec<u8>, QueryError> {
+    fn to_json(&self) -> Result<Vec<u8>, QueryError> {
         let mut registry: Vec<RegistryEntry> = self
             .registry
             .iter()
@@ -569,10 +613,13 @@ impl TemplateMap {
     }
 
     /// Parse and validate artifact `bytes` fetched from `tenant`'s
-    /// audit root, applying the RFC 0033 §3.3 dispositions: torn or
-    /// internally invalid content and unknown `format_version` come
-    /// back as their [`ArtifactRead`] variants (callers treat both as
-    /// absent — the fresh fold is always a correct answer).
+    /// audit root, applying the RFC 0033 §3.3 dispositions (as amended
+    /// 2026-07-13): a missing zstd frame or failed decompression is
+    /// torn, the `format_version` probe runs on the decompressed bytes,
+    /// and torn / internally invalid content and unknown
+    /// `format_version` come back as their [`ArtifactRead`] variants
+    /// (callers treat both as absent — the fresh fold is always a
+    /// correct answer).
     ///
     /// # Errors
     ///
@@ -582,8 +629,16 @@ impl TemplateMap {
     /// loudly per the RFC 0005 §3.9 row-vs-path stance (exactly as
     /// the audit scan fails a foreign row, never serving or silently
     /// ignoring it).
-    pub fn from_json(bytes: &[u8], tenant: &TenantId) -> Result<ArtifactRead, QueryError> {
+    pub fn from_artifact_bytes(
+        bytes: &[u8],
+        tenant: &TenantId,
+    ) -> Result<ArtifactRead, QueryError> {
         let torn = |detail: String| Ok(ArtifactRead::Torn { detail });
+        let json = match zstd::decode_all(bytes) {
+            Ok(json) => json,
+            Err(e) => return torn(format!("decompress {TEMPLATE_MAP_FILENAME}: {e}")),
+        };
+        let bytes = json.as_slice();
         let probe: VersionProbe = match serde_json::from_slice(bytes) {
             Ok(probe) => probe,
             Err(e) => return torn(format!("parse {TEMPLATE_MAP_FILENAME}: {e}")),
@@ -628,13 +683,14 @@ impl TemplateMap {
         }))
     }
 
-    /// Publish this artifact to `audit/tenant_id=<enc>/template_map.json`
-    /// (RFC 0033 §3.2) following the RFC 0009 §3.4 manifest precedent,
+    /// Publish this artifact to
+    /// `audit/tenant_id=<enc>/template_map.v2.json.zst` (RFC 0033 §3.2
+    /// amendment) following the RFC 0009 §3.4 manifest precedent,
     /// adapted to a derived, discardable object:
     ///
-    /// - [`StoreRef::Local`]: write `template_map.json.tmp` in the
-    ///   tenant's audit dir and `rename` it into place — the rename is
-    ///   the only visibility point, so a reader observes the prior
+    /// - [`StoreRef::Local`]: write `template_map.v2.json.zst.tmp` in
+    ///   the tenant's audit dir and `rename` it into place — the rename
+    ///   is the only visibility point, so a reader observes the prior
     ///   artifact (or its absence) or the new one, never a partial
     ///   write; a crash leaves a stray `.tmp` no reader opens. Like
     ///   `Manifest::write_atomic` this is atomic but not crash-durable
@@ -649,20 +705,27 @@ impl TemplateMap {
     ///   was observed absent (create-if-absent). A failed precondition
     ///   is [`PublishOutcome::LostRace`], never an error.
     ///
+    /// A successful publish then best-effort **deletes** the stale v1
+    /// key ([`TEMPLATE_MAP_V1_FILENAME`], §3.4 amendment) —
+    /// unconditional, never a query failure; a crash or failure between
+    /// publish and delete leaves both keys, which is harmless (each
+    /// reader population GETs only its own key), and the next
+    /// successful publish retries the delete implicitly.
+    ///
     /// Publish failure is surfaceable but non-fatal by contract (§3.5):
     /// the write-through caller records it as telemetry and answers its
     /// query from the fold it already holds.
     ///
     /// # Errors
     ///
-    /// [`QueryError::Storage`] if serialization fails or on a
-    /// non-precondition filesystem/backend failure.
+    /// [`QueryError::Storage`] if serialization/compression fails or on
+    /// a non-precondition filesystem/backend failure.
     pub fn publish(
         &self,
         backend: StoreRef<'_>,
         expected: Option<&str>,
     ) -> Result<PublishOutcome, QueryError> {
-        let bytes = self.to_json().map_err(|e| {
+        let bytes = self.to_artifact_bytes().map_err(|e| {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
             QueryError::Storage {
                 detail: format!("serialize {TEMPLATE_MAP_FILENAME}: {e}"),
@@ -676,20 +739,22 @@ impl TemplateMap {
     /// serialization or backend failure and a lost race are all
     /// telemetry-only outcomes (the §3.7 publish-outcome counter, via
     /// [`publish_bytes`](Self::publish_bytes)) — and **abstains** when
-    /// the serialized artifact would not be smaller than
-    /// `folded_audit_bytes`, the audit bytes the fold just read (§3.2:
-    /// nothing to win; on a tiny or empty tenant the JSON envelope can
-    /// exceed the stream it caches, and the no-artifact path is exactly
-    /// today's behaviour). An abstention records no publish outcome —
-    /// §3.7 pins the values to `published` / `lost_race` / `error`, and
-    /// a publish that never starts is none of them.
+    /// the **compressed** artifact would not be smaller than
+    /// `folded_audit_bytes`, the audit bytes the fold just read (§3.2
+    /// amendment: the comparison is between the bytes a warm GET would
+    /// pay and the bytes the fold just paid; on a tiny or empty tenant
+    /// even the compressed envelope can exceed the stream it caches,
+    /// and the no-artifact path is exactly today's behaviour). An
+    /// abstention records no publish outcome — §3.7 pins the values to
+    /// `published` / `lost_race` / `error`, and a publish that never
+    /// starts is none of them.
     fn write_through(
         &self,
         backend: StoreRef<'_>,
         expected: Option<&str>,
         folded_audit_bytes: u64,
     ) {
-        let Ok(bytes) = self.to_json() else {
+        let Ok(bytes) = self.to_artifact_bytes() else {
             METRICS.record_publish(PUBLISH_OUTCOME_ERROR);
             return;
         };
@@ -704,9 +769,10 @@ impl TemplateMap {
 
     /// Commit `bytes` per the §3.4 backend ladder, recording the §3.7
     /// publish outcome — and, on [`PublishOutcome::Published`], the
-    /// artifact byte size (the number RFC0033.6 gates on) — for every
-    /// caller, so the write-through and a direct [`Self::publish`] count
-    /// identically.
+    /// artifact byte size (compressed: the published-object bytes a
+    /// warm GET pays, the number RFC0033.6 gates on) — for every
+    /// caller, so the write-through and a direct [`Self::publish`]
+    /// count identically.
     fn publish_bytes(
         &self,
         backend: StoreRef<'_>,
@@ -746,6 +812,10 @@ impl TemplateMap {
                 std::fs::rename(&tmp, &target).map_err(|e| QueryError::Storage {
                     detail: format!("rename {} -> {}: {e}", tmp.display(), target.display()),
                 })?;
+                // §3.4 amendment: best-effort unconditional delete of the
+                // stale v1 key — failure is harmless (both keys may
+                // coexist; the next publish retries implicitly).
+                let _ = std::fs::remove_file(dir.join(TEMPLATE_MAP_V1_FILENAME));
                 Ok(PublishOutcome::Published)
             }
             StoreRef::Remote(store) => {
@@ -755,7 +825,15 @@ impl TemplateMap {
                     Some(e_tag) => store.put_if_match_blocking(&key, bytes, e_tag),
                 };
                 match result {
-                    Ok(()) => Ok(PublishOutcome::Published),
+                    Ok(()) => {
+                        // §3.4 amendment: best-effort unconditional delete
+                        // of the stale v1 key (no CAS — any v1 artifact is
+                        // derived and discardable); failure is harmless.
+                        let _ = store.delete_blocking(&format!(
+                            "audit/tenant_id={enc}/{TEMPLATE_MAP_V1_FILENAME}"
+                        ));
+                        Ok(PublishOutcome::Published)
+                    }
                     Err(e) if e.is_precondition() || e.is_already_exists() => {
                         Ok(PublishOutcome::LostRace)
                     }
@@ -947,14 +1025,21 @@ mod tests {
         }
     }
 
+    /// Compress a mutated JSON body into the v2 transport frame, so the
+    /// torn/invalid fixtures exercise the same decompress-then-parse
+    /// path a real GET takes.
+    fn compress(json: &[u8]) -> Vec<u8> {
+        zstd::encode_all(json, ARTIFACT_ZSTD_LEVEL).expect("compress fixture")
+    }
+
     #[test]
-    fn round_trips_through_json() {
+    fn round_trips_through_artifact_bytes() {
         // Arrange
         let map = sample();
 
         // Act
-        let restored = expect_valid(TemplateMap::from_json(
-            &map.to_json().expect("serialize"),
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(
+            &map.to_artifact_bytes().expect("serialize"),
             &tenant(),
         ));
 
@@ -999,8 +1084,22 @@ mod tests {
 
     #[test]
     fn torn_bytes_are_treated_as_absent() {
-        for bytes in [&b"not json"[..], &b"{\"format_version\":"[..], &[][..]] {
-            let read = TemplateMap::from_json(bytes, &tenant()).expect("torn is not an error");
+        // Non-frames (a v1-style plain-JSON body planted at the v2 key
+        // included — the §3.3 amendment's "not a zstd frame" arm), a
+        // truncated frame, and frames of unparseable JSON all classify
+        // torn, never an error.
+        let good = sample().to_artifact_bytes().expect("serialize");
+        let bad_json = compress(b"not json");
+        let truncated_json = compress(b"{\"format_version\":");
+        for bytes in [
+            &b"not a zstd frame"[..],
+            &br#"{"format_version":1,"tenant_id":"acme"}"#[..],
+            &good[..good.len() / 2],
+            &bad_json[..],
+            &truncated_json[..],
+        ] {
+            let read =
+                TemplateMap::from_artifact_bytes(bytes, &tenant()).expect("torn is not an error");
             assert!(
                 matches!(read, ArtifactRead::Torn { .. }),
                 "{bytes:?} must classify as torn",
@@ -1010,14 +1109,24 @@ mod tests {
 
     #[test]
     fn unknown_format_version_is_treated_as_absent() {
-        // A future writer's artifact: bump the version and change the
-        // rest of the shape entirely — still UnknownVersion, not Torn.
-        let future = br#"{"format_version": 2, "something_else": true}"#;
-        let read = TemplateMap::from_json(future, &tenant()).expect("unknown version is no error");
-        assert!(
-            matches!(read, ArtifactRead::UnknownVersion { format_version: 2 }),
-            "got {read:?}",
-        );
+        // The probe runs on the decompressed bytes (§3.2 amendment):
+        // a future writer's body — the version bumped and the rest of
+        // the shape changed entirely — and a v1 body shipped in the v2
+        // transport both classify UnknownVersion, not Torn.
+        for (json, version) in [
+            (&br#"{"format_version": 3, "something_else": true}"#[..], 3),
+            (&br#"{"format_version": 1, "tenant_id": "acme"}"#[..], 1),
+        ] {
+            let read = TemplateMap::from_artifact_bytes(&compress(json), &tenant())
+                .expect("unknown version is no error");
+            assert!(
+                matches!(
+                    read,
+                    ArtifactRead::UnknownVersion { format_version } if format_version == version
+                ),
+                "got {read:?}",
+            );
+        }
     }
 
     #[test]
@@ -1025,8 +1134,8 @@ mod tests {
         // The row-vs-path stance (RFC 0005 §3.9): a well-formed artifact
         // claiming another tenant under this tenant's root is a corrupt
         // or foreign object — an error, never absent-and-refolded.
-        let bytes = sample().to_json().expect("serialize");
-        let err = TemplateMap::from_json(&bytes, &TenantId::new("intruder"))
+        let bytes = sample().to_artifact_bytes().expect("serialize");
+        let err = TemplateMap::from_artifact_bytes(&bytes, &TenantId::new("intruder"))
             .expect_err("foreign artifact must fail the read");
         match err {
             QueryError::Storage { detail } => assert!(
@@ -1046,7 +1155,7 @@ mod tests {
             "year=2026/month=07/day=11/a.parquet",
         ]);
         let bytes = serde_json::to_vec(&json).expect("serialize");
-        let read = TemplateMap::from_json(&bytes, &tenant()).expect("read");
+        let read = TemplateMap::from_artifact_bytes(&compress(&bytes), &tenant()).expect("read");
         assert!(matches!(read, ArtifactRead::Torn { .. }), "got {read:?}");
     }
 
@@ -1063,7 +1172,8 @@ mod tests {
                 serde_json::from_slice(&sample().to_json().expect("serialize")).expect("parse");
             json["folded_files"] = serde_json::json!([entry]);
             let bytes = serde_json::to_vec(&json).expect("serialize");
-            let read = TemplateMap::from_json(&bytes, &tenant()).expect("read");
+            let read =
+                TemplateMap::from_artifact_bytes(&compress(&bytes), &tenant()).expect("read");
             assert!(
                 matches!(read, ArtifactRead::Torn { .. }),
                 "{entry:?} must classify as torn, got {read:?}",
@@ -1098,7 +1208,8 @@ mod tests {
                 serde_json::from_slice(&sample().to_json().expect("serialize")).expect("parse");
             json["alias_map"] = classes;
             let bytes = serde_json::to_vec(&json).expect("serialize");
-            let read = TemplateMap::from_json(&bytes, &tenant()).expect("read");
+            let read =
+                TemplateMap::from_artifact_bytes(&compress(&bytes), &tenant()).expect("read");
             assert!(
                 matches!(read, ArtifactRead::Torn { .. }),
                 "{label} must classify as torn, got {read:?}",
@@ -1133,7 +1244,7 @@ mod tests {
         let dir = bucket.path().join("audit").join("tenant_id=acme");
         assert!(!dir.join(format!("{TEMPLATE_MAP_FILENAME}.tmp")).exists());
         let bytes = std::fs::read(dir.join(TEMPLATE_MAP_FILENAME)).expect("read");
-        let restored = expect_valid(TemplateMap::from_json(&bytes, &tenant()));
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(&bytes, &tenant()));
         assert_eq!(restored.folded_files(), map.folded_files());
         assert_eq!(restored.registry(), map.registry());
     }
@@ -1160,8 +1271,54 @@ mod tests {
                 .join(TEMPLATE_MAP_FILENAME),
         )
         .expect("read");
-        let restored = expect_valid(TemplateMap::from_json(&bytes, &tenant()));
+        let restored = expect_valid(TemplateMap::from_artifact_bytes(&bytes, &tenant()));
         assert_eq!(restored.folded_files(), second.folded_files());
+    }
+
+    #[test]
+    fn publish_deletes_stale_v1_key() {
+        // §3.4 amendment: a successful v2 publish best-effort-deletes
+        // the superseded v1 key on both backends — and its absence
+        // (nothing to delete) never fails a publish.
+        let map = sample();
+
+        let bucket = tempfile::tempdir().expect("temp");
+        let dir = bucket.path().join("audit").join("tenant_id=acme");
+        std::fs::create_dir_all(&dir).expect("create audit dir");
+        std::fs::write(
+            dir.join(TEMPLATE_MAP_V1_FILENAME),
+            br#"{"format_version":1}"#,
+        )
+        .expect("plant stale v1 artifact");
+        assert_eq!(
+            map.publish(crate::StoreRef::Local(bucket.path()), None)
+                .expect("publish"),
+            PublishOutcome::Published,
+        );
+        assert!(dir.join(TEMPLATE_MAP_FILENAME).exists());
+        assert!(
+            !dir.join(TEMPLATE_MAP_V1_FILENAME).exists(),
+            "the stale v1 key must be deleted after a v2 publish",
+        );
+
+        let root = tempfile::tempdir().expect("temp");
+        let store = ourios_parquet::Store::local(root.path()).expect("store");
+        let v1_key = format!("audit/tenant_id=acme/{TEMPLATE_MAP_V1_FILENAME}");
+        store
+            .put_blocking(&v1_key, br#"{"format_version":1}"#.to_vec())
+            .expect("plant stale v1 artifact");
+        assert_eq!(
+            map.publish(crate::StoreRef::Remote(&store), None)
+                .expect("publish"),
+            PublishOutcome::Published,
+        );
+        assert!(
+            store
+                .get_blocking_opt(&v1_key)
+                .expect("probe v1 key")
+                .is_none(),
+            "the stale v1 key must be deleted after a v2 publish",
+        );
     }
 
     #[test]
@@ -1192,7 +1349,7 @@ mod tests {
         let bytes = store
             .get_blocking(&format!("audit/tenant_id=acme/{TEMPLATE_MAP_FILENAME}"))
             .expect("get");
-        let held = expect_valid(TemplateMap::from_json(&bytes, &tenant()));
+        let held = expect_valid(TemplateMap::from_artifact_bytes(&bytes, &tenant()));
         assert_eq!(held.folded_files(), winner.folded_files());
     }
 
@@ -1205,7 +1362,7 @@ mod tests {
             { "template_id": 7, "version": 1, "template": "user <*> <*>" },
         ]);
         let bytes = serde_json::to_vec(&json).expect("serialize");
-        let read = TemplateMap::from_json(&bytes, &tenant()).expect("read");
+        let read = TemplateMap::from_artifact_bytes(&compress(&bytes), &tenant()).expect("read");
         assert!(matches!(read, ArtifactRead::Torn { .. }), "got {read:?}");
     }
 
@@ -1220,7 +1377,7 @@ mod tests {
             let bytes = serde_json::to_vec(&json).expect("serialize");
             assert!(
                 matches!(
-                    TemplateMap::from_json(&bytes, &tenant()),
+                    TemplateMap::from_artifact_bytes(&compress(&bytes), &tenant()),
                     Ok(ArtifactRead::Torn { .. })
                 ),
                 "template {bad:?} must classify torn",
@@ -1232,7 +1389,7 @@ mod tests {
         json.registry[0].template = String::new();
         let bytes = serde_json::to_vec(&json).expect("serialize");
         assert!(matches!(
-            TemplateMap::from_json(&bytes, &tenant()),
+            TemplateMap::from_artifact_bytes(&compress(&bytes), &tenant()),
             Ok(ArtifactRead::Valid(_))
         ));
     }

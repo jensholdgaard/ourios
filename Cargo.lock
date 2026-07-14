@@ -3407,6 +3407,7 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

@@ -73,6 +73,13 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # on the async query path. `rt` is the blocking-pool half only; the runtime itself
 # is the caller's (the server / `#[tokio::test]`).
 tokio = { version = "1", default-features = false, features = ["rt"] }
+# RFC 0033 §3.2 (2026-07-13 amendment) — the template-map artifact ships
+# as one zstd frame. `zstd` is the ergonomic safe wrapper over
+# `zstd-safe`; both bind the same bundled C library and `parquet`'s
+# `zstd` feature already pulls it into the tree (via ourios-parquet, and
+# ourios-bench binds it directly as the A1 reference codec), so this
+# adds no new transitive crate and the version is pinned by `Cargo.lock`.
+zstd = "0.13"
 
 [dev-dependencies]
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).

@@ -1526,3 +1526,34 @@ template-map acquisition (RFC 0033): cold (audit fold, 513862 B; no artifact pub
    so a compressed artifact is expected to land well below the fold
    size — to be measured, not assumed. Abstention semantics stay:
    publish only when the artifact beats the fold.
+
+### 9.15 Results — 2026-07-14 (indicative, `ci-runner`) — comparative run #21: the v2 compressed artifact publishes and runs warm
+
+Dispatched from the RFC 0033 v2 implementation branch (PR #522, the
+measure-before-merge step). Run 29343438434.
+
+**The RFC 0033 answer.** The zstd artifact **published** on the
+corpus (no abstention — the run #20 ambiguity is resolved by the new
+per-pair outcome labels), and **every measured pair ran warm**:
+
+```
+template-map acquisition (RFC 0033): warm (one artifact GET, 187904 B compressed)
+```
+
+- warm = **187,904 B** (the compressed artifact, GET cost) vs
+  cold = **513,862 B** (the audit fold, byte-identical to run #8) —
+  **warm/cold ≈ 1/2.73**, a ~326 KB cut off every body-rendering
+  query's honest total.
+- The original RFC0033.6 ratio gate (`≤ 1/10`) does **not** pass on
+  this corpus: the artifact is O(live template state), the fold is
+  O(audit history), and otel-demo-v8 is young — the amended gate
+  (`≤ 1/2`, dated 2026-07-14 in the RFC) asserts the real margin and
+  ages upward. See the §5.6 amendment for the full argument.
+
+**The test failure is not an Ourios finding.** The run exited 1 on
+one pair: `loki returned 0 of 9 expected rows for [trace
+correlation, L3] before timeout` — the Loki-side low-volume-chunk
+race (the run #12-era flicker), resurfacing on the shared runner
+despite the #490 flag fixes. All other pairs measured; the report
+and every RFC 0033 number printed before the panic. A rerun for a
+clean L3 pair is queued as run #22.

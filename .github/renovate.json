@@ -80,6 +80,16 @@
     },
     {
       "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "rand"
+      ],
+      "allowedVersions": "<0.9.0",
+      "description": "Hold rand at 0.8.x. The test ES256 key minting feeds p256 0.13's rand_core 0.6 traits, and rand 0.9+ removes rand::rngs::OsRng (the exact break in Renovate PR #505's third regeneration). Lifts together with the p256 hold above when jsonwebtoken moves to the RustCrypto 0.14-era stack."
+    },
+    {
+      "matchManagers": [
         "helm-values"
       ],
       "pinDigests": false,

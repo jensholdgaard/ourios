@@ -652,28 +652,15 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
     // here without wiring the container-based measurement loop, per this
     // slice's scope.
     let margins = ourios_bench::ComparativeMargins::default();
-    let spec = PairSpec {
-        label: format!(
-            "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
-            pair.template_id, pair.param, pair.bucket_width,
-        ),
-        margin: margins.m_l4,
-        class: PairClass::L4,
-        dsl: format!(
-            "template_id == {} | count by param({}), bucket({})",
-            pair.template_id, pair.param, pair.bucket_width,
-        ),
-        logql: format!(
-            "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
-             | regexp \"{}\" [{}]))",
-            pair.needle, pair.capture_regex, pair.bucket_width,
-        ),
-        start: built.min_effective_time_unix_nano,
-        end: built.max_effective_time_unix_nano + 1,
-        expected_rows: pair.groups.values().sum(),
+    let spec = l4_pair_spec(
+        &pair,
+        built.min_effective_time_unix_nano,
+        built.max_effective_time_unix_nano,
         now,
         window,
-    };
+        &margins,
+    )
+    .expect("the fixture's capture_regex carries no backtick");
     assert!(
         matches!(spec.class.gate(), GateKind::MustWin),
         "L4 is a must-win class (RFC 0031 §3.4), same disposition as L1/L2/L3",
@@ -1667,6 +1654,59 @@ fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
         ));
     }
     None
+}
+
+/// Build the L4 `PairSpec` from a picked [`FrequencyPair`]. The `regexp`
+/// argument is backtick-delimited (a `LogQL`/Go raw string literal): the
+/// pattern already carries Go RE2 escapes (`\s+`, `\S+`, and any
+/// `regex_escape`d metacharacter) from [`param_capture_regex`], and a
+/// double-quoted `LogQL` string literal would try to interpret those same
+/// backslashes as *its own* escape sequences — `\s` is not a valid one,
+/// so Loki's parser rejects the query with "invalid char escape" before
+/// the pattern ever reaches the regex engine. Returns `None` (loudly
+/// logged) if `capture_regex` itself contains a backtick — the fixed
+/// corpus token would prematurely close the raw string, and `regex_escape`
+/// does not escape backticks (they are not an RE2 metacharacter).
+fn l4_pair_spec(
+    pair: &FrequencyPair,
+    min_effective_time_unix_nano: u64,
+    max_effective_time_unix_nano: u64,
+    now: u64,
+    window: u64,
+    margins: &ourios_bench::ComparativeMargins,
+) -> Option<PairSpec> {
+    if pair.capture_regex.contains('`') {
+        eprintln!(
+            "L4 pair template_id={} param({}): rejected — capture_regex contains a \
+             backtick, which would break the LogQL raw-string delimiter: {:?}",
+            pair.template_id, pair.param, pair.capture_regex,
+        );
+        return None;
+    }
+    Some(PairSpec {
+        label: format!(
+            "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
+            pair.template_id, pair.param, pair.bucket_width,
+        ),
+        margin: margins.m_l4,
+        class: PairClass::L4,
+        dsl: format!(
+            "template_id == {} | count by param({}), bucket({})",
+            pair.template_id, pair.param, pair.bucket_width,
+        ),
+        logql: format!(
+            "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
+             | regexp `{}` [{}]))",
+            pair.needle, pair.capture_regex, pair.bucket_width,
+        ),
+        start: min_effective_time_unix_nano,
+        end: max_effective_time_unix_nano
+            .checked_add(1)
+            .expect("corpus max timestamp overflows the Loki window end"),
+        expected_rows: pair.groups.values().sum(),
+        now,
+        window,
+    })
 }
 
 fn pick_frequency_pair(
@@ -3139,39 +3179,23 @@ fn rfc0031_indicative_comparative_run() {
     // the state rather than model it).
     let frequency = pick_frequency_pair(bucket.path(), &tenant, corpus_now, corpus_window);
     eprintln!("frequency pair: {frequency:?}");
-    let l4_spec = frequency.as_ref().map(|pair| {
-        let margins = ourios_bench::ComparativeMargins::default();
-        PairSpec {
-            label: format!(
-                "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
-                pair.template_id, pair.param, pair.bucket_width,
-            ),
-            margin: margins.m_l4,
-            class: PairClass::L4,
-            dsl: format!(
-                "template_id == {} | count by param({}), bucket({})",
-                pair.template_id, pair.param, pair.bucket_width,
-            ),
-            logql: format!(
-                "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
-                 | regexp \"{}\" [{}]))",
-                pair.needle, pair.capture_regex, pair.bucket_width,
-            ),
-            start: built.min_effective_time_unix_nano,
-            end: built
-                .max_effective_time_unix_nano
-                .checked_add(1)
-                .expect("corpus max timestamp overflows the Loki window end"),
-            expected_rows: pair.groups.values().sum(),
-            now: corpus_now,
-            window: corpus_window,
-        }
+    let margins = ourios_bench::ComparativeMargins::default();
+    let l4_spec = frequency.as_ref().and_then(|pair| {
+        l4_pair_spec(
+            pair,
+            built.min_effective_time_unix_nano,
+            built.max_effective_time_unix_nano,
+            corpus_now,
+            corpus_window,
+            &margins,
+        )
     });
     if l4_spec.is_none() {
         eprintln!(
             "L4 PAIR SKIPPED: no template/param slot in the corpus cleared \
              pick_frequency_pair's bounds (moderate cardinality {L4_CARDINALITY:?}, \
-             >= {L4_MIN_ROWS} rows, a validated needle + capture regex)"
+             >= {L4_MIN_ROWS} rows, a validated needle + capture regex, no backtick \
+             in the capture regex)"
         );
     }
     let picks = Picks {
@@ -4598,6 +4622,73 @@ fn pick_frequency_pair_rejects_below_the_row_floor() {
     assert!(
         pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
         "3 rows is below L4_MIN_ROWS — the picker must reject loudly, not fall through",
+    );
+}
+
+fn synthetic_frequency_pair(capture_regex: &str) -> FrequencyPair {
+    FrequencyPair {
+        template_id: 1,
+        param: 0,
+        needle: "connection established to peer".to_string(),
+        capture_regex: capture_regex.to_string(),
+        bucket_width: "1s".to_string(),
+        groups: HashMap::from([(
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "10".to_string(),
+            },
+            1,
+        )]),
+        bytes_read: 1,
+    }
+}
+
+#[test]
+fn l4_pair_spec_uses_a_backtick_delimited_regexp_argument() {
+    // The bug this guards: a double-quoted LogQL string literal
+    // interprets `capture_regex`'s own Go RE2 escapes (`\s+`) as ITS
+    // OWN escape sequences, and `\s` is not a valid one — Loki's
+    // parser rejects the query with "invalid char escape" before the
+    // pattern reaches the regex engine (the exact failure the first L4
+    // dispatch hit). Backticks pass the pattern through literally.
+    let pair = synthetic_frequency_pair(r"peer\s+(?P<value>\S+)");
+    let margins = ourios_bench::ComparativeMargins::default();
+    let spec = l4_pair_spec(
+        &pair,
+        0,
+        1_000_000_000,
+        2_000_000_000,
+        2_000_000_000,
+        &margins,
+    )
+    .expect("a plain capture_regex carries no backtick");
+    assert!(
+        spec.logql.contains(r"regexp `peer\s+(?P<value>\S+)`"),
+        "the regexp argument must be backtick-delimited: {}",
+        spec.logql,
+    );
+}
+
+#[test]
+fn l4_pair_spec_rejects_a_capture_regex_containing_a_backtick() {
+    // A backtick in the pattern (from an unescaped fixed-token
+    // neighbour — `regex_escape` does not escape backticks, since they
+    // are not an RE2 metacharacter) would prematurely close the
+    // backtick-delimited raw string. Reject loudly rather than emit a
+    // malformed query.
+    let pair = synthetic_frequency_pair("peer`s\\s+(?P<value>\\S+)");
+    let margins = ourios_bench::ComparativeMargins::default();
+    assert!(
+        l4_pair_spec(
+            &pair,
+            0,
+            1_000_000_000,
+            2_000_000_000,
+            2_000_000_000,
+            &margins
+        )
+        .is_none(),
+        "a capture_regex containing a backtick must be rejected, not emitted",
     );
 }
 

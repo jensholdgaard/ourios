@@ -1378,6 +1378,7 @@ fn rfc0002_11_structured_surface_schema_validation() {
 
     assert_well_formed_requests_pass(&validator);
     assert_malformed_requests_rejected(&validator);
+    assert_malformed_group_terms_rejected(&validator);
 }
 
 /// Well-formed requests must PASS the schema and then parse to an IR (RFC0002.2).
@@ -1473,18 +1474,6 @@ fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
             "unknown stage kind",
         ),
         (
-            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":-1}]}}]}"#,
-            "negative param slot",
-        ),
-        (
-            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"bucket":"5"}]}}]}"#,
-            "non-duration bucket width",
-        ),
-        (
-            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":0,"x":1}]}}]}"#,
-            "extra group-term key",
-        ),
-        (
             r#"{"predicate":{"field":"severity","op":"=~","value":"error"}}"#,
             "regex operator on severity",
         ),
@@ -1511,6 +1500,46 @@ fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
         (
             r#"{"predicate":{"const":true},"stages":[{"sort":{"key":"attr.http.status_code"}}]}"#,
             "non-identifier sort key",
+        ),
+    ];
+    for (req, what) in invalid {
+        let instance: serde_json::Value =
+            serde_json::from_str(req).expect("malformed-but-still-JSON request");
+        assert!(
+            !validator.is_valid(&instance),
+            "{what}: schema must reject {req} before the planner",
+        );
+    }
+}
+
+/// The `count`/`by`-list-specific malformed cases (§6.3 amendment): split out
+/// of [`assert_malformed_requests_rejected`] to keep it under the
+/// `clippy::too_many_lines` budget.
+fn assert_malformed_group_terms_rejected(validator: &jsonschema::Validator) {
+    let invalid: &[(&str, &str)] = &[
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":-1}]}}]}"#,
+            "negative param slot",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"bucket":"5"}]}}]}"#,
+            "non-duration bucket width",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":0,"x":1}]}}]}"#,
+            "extra group-term key",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"resource":"k8s.pod.name"}]}}]}"#,
+            "resource path in a by-list (string DSL group_term is bare-field-only)",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"attr":"http.status_code"}]}}]}"#,
+            "attr path in a by-list (string DSL group_term is bare-field-only)",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":4294967296}]}}]}"#,
+            "param slot past u32::MAX",
         ),
     ];
     for (req, what) in invalid {

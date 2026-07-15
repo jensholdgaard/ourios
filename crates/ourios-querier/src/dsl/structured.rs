@@ -467,7 +467,19 @@ impl RawGroupTerm {
             Self::Bucket(RawBucketTerm { bucket }) => {
                 Ok(GroupTerm::Bucket(parse_duration_lexeme_pub(&bucket)?))
             }
-            Self::Field(field) => Ok(GroupTerm::Field(field.into_ir()?)),
+            // The string DSL's `group_term = field` production (§7 v1.1)
+            // only accepts a bare top-level field — `resource.`/`attr.`
+            // paths are rejected there (see `parse_field`'s error message).
+            // A `{resource|attr}` object here would let the structured
+            // surface express a `by`-list the string grammar cannot, so it
+            // is rejected at the same boundary rather than reaching the
+            // planner (RFC0002.2).
+            Self::Field(RawField::Object(_)) => Err(DslError::new(
+                "a by-list field must be a bare field name (resource./attr. paths \
+                 are not allowed here)"
+                    .to_string(),
+            )),
+            Self::Field(field @ RawField::Name(_)) => Ok(GroupTerm::Field(field.into_ir()?)),
         }
     }
 }
@@ -810,6 +822,28 @@ mod tests {
             r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":0,"x":1}]}}]}"#,
         ] {
             assert!(parse_structured(req).is_err(), "must reject {req}");
+        }
+    }
+
+    #[test]
+    fn rejects_resource_and_attr_group_terms() {
+        // The string DSL's `group_term = field` production (§7 v1.1) is
+        // bare-field-only; a structured `{resource|attr}` by-element would
+        // let this surface express a query the string grammar cannot
+        // (RFC0002.2), so it is rejected here rather than reaching the
+        // planner.
+        for req in [
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"resource":"k8s.pod.name"}]}}]}"#,
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"attr":"http.status_code"}]}}]}"#,
+            r#"{"predicate":{"const":true},"stages":[{"avg":"confidence","by":[{"attr":"k"}]}]}"#,
+        ] {
+            let err = parse_structured(req).unwrap_err();
+            assert!(
+                err.message().contains("bare field"),
+                "{}: {}",
+                req,
+                err.message()
+            );
         }
     }
 

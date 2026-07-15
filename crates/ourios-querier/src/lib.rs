@@ -1325,11 +1325,13 @@ impl Querier {
 
     /// Execute a validated `count [by …]` stage over the filtered frame
     /// (RFC 0002 §6.5 amendment 2026-07-15): one grouped-count scan whose
-    /// column reads are the predicate + group-term columns only — never
-    /// `body`/`separators` — with zero row materialization and zero
-    /// template-map acquisition (nothing is rendered), the RFC0002.16
-    /// honest-bytes shape. `rows` stays the total matching-row count
-    /// (included + excluded), derived from the same scan.
+    /// column reads are the user's predicate/window filters + the
+    /// row-level tenant backstop (§3.7) + the group-term columns only —
+    /// never `body`/`separators` — with zero row materialization and
+    /// zero template-map acquisition (nothing is rendered), the
+    /// RFC0002.16 honest-bytes shape. `rows` stays the total
+    /// matching-row count (included + excluded), derived from the same
+    /// scan.
     async fn execute_aggregate(
         &self,
         df: datafusion::dataframe::DataFrame,

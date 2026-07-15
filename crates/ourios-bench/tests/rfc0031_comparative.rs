@@ -2076,6 +2076,49 @@ async fn loki_query_with_stats(
     )
 }
 
+/// One Loki **metric** `query_range` call — the L4 matrix counterpart of
+/// [`loki_query_with_stats`]: `step` is pinned to the bucket width so
+/// every evaluation instant is `t = bucket_start + width`
+/// ([`parse_loki_matrix`]'s bucket-alignment convention), and the same
+/// bytes-processed / fetched-bytes figures are read from the identical
+/// stats block the line-returning pairs use.
+async fn loki_query_matrix(
+    http: &reqwest::Client,
+    base: &str,
+    logql: &str,
+    start_ns: u64,
+    end_ns: u64,
+    bucket_width_ns: u64,
+    label_name: &str,
+) -> L4Measured {
+    // `bucket_width_seconds` — the only producer of a bucket width this
+    // harness ever queries with — guarantees a whole-second width, so
+    // this truncation is exact, not a precision loss.
+    let step_s = (bucket_width_ns / 1_000_000_000).to_string();
+    let resp = http
+        .get(format!("{base}/loki/api/v1/query_range"))
+        .query(&[
+            ("query", logql),
+            ("start", &start_ns.to_string()),
+            ("end", &end_ns.to_string()),
+            ("step", &step_s),
+        ])
+        .send()
+        .await
+        .expect("query_range (matrix)");
+    let status = resp.status();
+    let body = resp.text().await.expect("query_range (matrix) body");
+    assert!(
+        status.is_success(),
+        "loki query_range (matrix) returned {status}: {body}",
+    );
+    (
+        parse_loki_matrix(&body, label_name, bucket_width_ns).expect("parse loki matrix"),
+        parse_loki_bytes_processed(&body).expect("parse loki bytes"),
+        parse_loki_fetched_bytes(&body).expect("parse loki fetched bytes"),
+    )
+}
+
 /// Push a whole OTLP/JSON Lines corpus into Loki, batched by **encoded
 /// bytes** ([`FLUSH_BYTES`] per request — sized for Loki's stock 4 MiB
 /// internal gRPC cap *after* its OTLP→logproto inflation, see the
@@ -2608,6 +2651,45 @@ async fn loki_measure_pair(
     }
 }
 
+/// The L4 pair's Loki measurement: poll the matrix `query_range` until
+/// ingest has caught up to the expected total row count — the
+/// aggregation counterpart of [`loki_measure_pair`]. Returns `Err`
+/// instead of panicking on a deadline miss, so an L4 failure cannot
+/// destroy the already-measured/printed evidence for the other pairs
+/// (same run #11 salvage lesson; L4 is measured and reported last, see
+/// `rfc0031_indicative_comparative_run`).
+async fn loki_measure_frequency_pair(
+    http: &reqwest::Client,
+    base: &str,
+    spec: &PairSpec,
+    bucket_width_ns: u64,
+) -> Result<L4Measured, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let (groups, bytes, fetched) = loki_query_matrix(
+            http,
+            base,
+            &spec.logql,
+            spec.start,
+            spec.end,
+            bucket_width_ns,
+            "value",
+        )
+        .await;
+        let total: u64 = groups.values().sum();
+        if total >= spec.expected_rows {
+            break Ok((groups, bytes, fetched));
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err(format!(
+                "loki returned {total} of {} expected rows for [{}] before timeout",
+                spec.expected_rows, spec.label,
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 /// Split successes from failures: equivalence + report run for every
 /// measured pair BEFORE the run fails on the broken ones, so one pair's
 /// timeout cannot destroy the others' 40-minute measurements. The
@@ -2615,6 +2697,12 @@ async fn loki_measure_pair(
 /// `None` when the (corroborating) latency channel failed on an
 /// otherwise-good pair, reported as "unmeasured".
 type Measured = (Vec<LineKey>, u64, LokiFetchedBytes, Option<Duration>);
+
+/// The L4 pair's Loki measurement — the aggregation counterpart of
+/// [`Measured`]: a `(bucket, group) -> count` map rather than a
+/// [`LineKey`] multiset, with no latency channel this slice wires (see
+/// [`run_l4_pair`]'s doc).
+type L4Measured = (HashMap<AggKey, u64>, u64, LokiFetchedBytes);
 
 /// One pair's Ourios measurement: the correctness answer plus the §3.6
 /// latency channel (`None` = unmeasured; latency never fails the run).
@@ -3041,6 +3129,51 @@ fn rfc0031_indicative_comparative_run() {
         corpus_window,
     );
     eprintln!("template pair: {template:?}");
+    // L4 (RFC 0031 §3.4/§3.5): picked the same way as L1's template pair
+    // (post-store-build — group cardinality only exists once templates
+    // are mined), but kept OUT of `Picks`/`specs` — purely additive to
+    // the pair list, not woven into the line-returning classes' shared
+    // machinery (see `run_l4_pair`'s doc for why: an aggregation's
+    // `(bucket, group) -> count` map is not a `LineKey` multiset, and
+    // forcing it through `OuriosAnswer`/`compare_lines` would misrepresent
+    // the state rather than model it).
+    let frequency = pick_frequency_pair(bucket.path(), &tenant, corpus_now, corpus_window);
+    eprintln!("frequency pair: {frequency:?}");
+    let l4_spec = frequency.as_ref().map(|pair| {
+        let margins = ourios_bench::ComparativeMargins::default();
+        PairSpec {
+            label: format!(
+                "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
+                pair.template_id, pair.param, pair.bucket_width,
+            ),
+            margin: margins.m_l4,
+            class: PairClass::L4,
+            dsl: format!(
+                "template_id == {} | count by param({}), bucket({})",
+                pair.template_id, pair.param, pair.bucket_width,
+            ),
+            logql: format!(
+                "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
+                 | regexp \"{}\" [{}]))",
+                pair.needle, pair.capture_regex, pair.bucket_width,
+            ),
+            start: built.min_effective_time_unix_nano,
+            end: built
+                .max_effective_time_unix_nano
+                .checked_add(1)
+                .expect("corpus max timestamp overflows the Loki window end"),
+            expected_rows: pair.groups.values().sum(),
+            now: corpus_now,
+            window: corpus_window,
+        }
+    });
+    if l4_spec.is_none() {
+        eprintln!(
+            "L4 PAIR SKIPPED: no template/param slot in the corpus cleared \
+             pick_frequency_pair's bounds (moderate cardinality {L4_CARDINALITY:?}, \
+             >= {L4_MIN_ROWS} rows, a validated needle + capture regex)"
+        );
+    }
     let picks = Picks {
         pair: &pair,
         clean_ts: &clean_ts,
@@ -3133,7 +3266,7 @@ fn rfc0031_indicative_comparative_run() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let loki: Vec<_> = runtime.block_on(async {
+    let (loki, l4_loki): (Vec<_>, Option<Result<L4Measured, String>>) = runtime.block_on(async {
         let (_container, base, http) = start_loki(&[
             "-validation.reject-old-samples=false",
             // Run #11/#13 post-mortems (the #488 diagnostics): queries over
@@ -3179,7 +3312,19 @@ fn rfc0031_indicative_comparative_run() {
             };
             measured.push(result);
         }
-        measured
+        // L4, same container + corpus replay as the pairs above (one
+        // Loki instance for the whole run) — but measured on its own
+        // matrix query, not folded into the `for spec in &specs` loop.
+        let l4 = match (&frequency, &l4_spec) {
+            (Some(pair), Some(spec)) => {
+                let bucket_width_ns = bucket_width_seconds(&pair.bucket_width)
+                    .checked_mul(1_000_000_000)
+                    .expect("bucket width fits u64 nanoseconds");
+                Some(loki_measure_frequency_pair(&http, &base, spec, bucket_width_ns).await)
+            }
+            _ => None,
+        };
+        (measured, l4)
     });
 
     let (ok_specs, ok_ourios, ok_loki, failures) = split_measurements(&specs, &ourios, loki);
@@ -3216,6 +3361,24 @@ fn rfc0031_indicative_comparative_run() {
         "{} pair(s) failed to measure (report above covers the rest): {failures:?}",
         failures.len(),
     );
+
+    // L4 (RFC 0031 §3.4/§3.5) is purely additive to the pair list above:
+    // measured, equivalence-checked, and reported LAST, after the
+    // L1–L3/L6 evidence has already printed and their frozen gates have
+    // already asserted, so an L4-only failure cannot destroy that
+    // evidence. A missing candidate (the picker found nothing eligible)
+    // is a real, loud finding, not a silently-skipped step — it was
+    // already reported above, at pick time.
+    match (&l4_spec, l4_loki) {
+        (Some(spec), Some(result)) => run_l4_pair(bucket.path(), &tenant, spec, result),
+        (None, _) => {}
+        (Some(spec), None) => unreachable!(
+            "l4_spec is Some iff frequency is Some, which is exactly the condition the \
+             async block used to decide whether to measure the Loki half — [{}] has a spec \
+             but no Loki measurement (harness bug)",
+            spec.label,
+        ),
+    }
 }
 
 /// One pair's bytes-channel lines, labeled per the §7 partial freeze
@@ -3306,6 +3469,78 @@ fn print_pair_bytes_gates(
             );
         }
     }
+}
+
+/// The L4 pair's report block — the aggregation counterpart of
+/// [`print_indicative_report`]'s per-pair section. An aggregation renders
+/// no lines and acquires no template map (RFC 0002 §6.5: the aggregate
+/// path's `materialize_bytes_read`/`registry_bytes_read` are structurally
+/// zero, see [`ourios_bench::OuriosAggregateAnswer`]), so there is no
+/// count-scan/materialize/registry breakdown to print, and this slice
+/// does not wire an L4 latency channel (§7 DEFERRED already covers the
+/// bytes verdict; latency is corroborating-only everywhere else too, so
+/// this is a scope boundary, not a gap). Reuses [`print_pair_bytes_gates`]
+/// for the shared bytes-channel labeling.
+fn print_l4_report(
+    spec: &PairSpec,
+    ourios_bytes: u64,
+    loki_fetched: &LokiFetchedBytes,
+    loki_processed: u64,
+) {
+    let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
+    println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
+    println!("dsl: {}", spec.dsl);
+    println!("logql: {}", spec.logql);
+    println!("ourios bytes_read (grouped-count scan, compressed, fetched) = {ourios_bytes}");
+    println!(
+        "loki   storage-side bytes (conservative)  = {loki_storage} \
+         (compressed={} + head_chunk={})",
+        loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
+    );
+    println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
+    print_pair_bytes_gates(spec, ourios_bytes, loki_storage, loki_processed);
+}
+
+/// Measure, equivalence-check, and report the L4 pair — the aggregation
+/// counterpart of the line-returning pairs' report loop, kept separate
+/// (see `rfc0031_indicative_comparative_run`'s call-site comment) rather
+/// than folded into `OuriosMeasured`/`Measured`, which are built around
+/// `LineKey` multisets. `l4_loki` is the Loki-side matrix measurement
+/// already gathered inside the same container session the other pairs
+/// share (the dispatch run's async block). Called LAST, after the
+/// L1–L3/L6 evidence has printed and their frozen gates have asserted,
+/// so an L4-only failure cannot destroy that evidence (the same run #11
+/// salvage lesson `loki_measure_pair`'s error-return, rather than panic,
+/// already follows). Equivalence is never optional (RFC0031.1 applies to
+/// every class, must-win or not); `M_L4` itself stays §7-DEFERRED —
+/// [`print_l4_report`] prints both bytes channels' ratio with no verdict,
+/// exactly like the fixture-level proof
+/// (`rfc0031_5_l4_frequency_aggregation_bytes`).
+fn run_l4_pair(
+    bucket_root: &std::path::Path,
+    tenant: &TenantId,
+    spec: &PairSpec,
+    l4_loki: Result<L4Measured, String>,
+) {
+    let ourios_answer =
+        ourios_aggregate_answer(bucket_root, tenant, &spec.dsl, spec.now, spec.window)
+            .expect("l4 ourios aggregate answer");
+    let (loki_groups, loki_processed, loki_fetched) = match l4_loki {
+        Ok(measured) => measured,
+        Err(detail) => panic!("L4 pair [{}] failed to measure: {detail}", spec.label),
+    };
+    let outcome = compare_aggregations(&ourios_answer.groups, &loki_groups, 8);
+    assert!(
+        outcome.is_equal(),
+        "RFC0031.5 — the two systems' grouped-count maps must be identical on [{}]: {outcome:?}",
+        spec.label,
+    );
+    print_l4_report(
+        spec,
+        ourios_answer.bytes_read,
+        &loki_fetched,
+        loki_processed,
+    );
 }
 
 /// The indicative run's report block, one section per pair, labeled per

@@ -480,6 +480,22 @@ pub fn ourios_aggregate_answer(
             group.count,
         );
     }
+    // RFC 0002 §6.5's honest-bytes contract for the aggregation path:
+    // no row is ever rendered, so materialization and template-map
+    // acquisition must both be zero. Asserted rather than assumed — a
+    // regression here would otherwise silently underreport `bytes_read`
+    // (which already omits both components) and make every L4
+    // diagnostic/gate quietly wrong instead of failing loudly.
+    if result.materialize_bytes_read != 0 || result.registry_bytes_read != 0 {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "comparative aggregate query `{dsl}` violated the RFC 0002 §6.5 honest-bytes \
+                 contract: materialize_bytes_read={}, registry_bytes_read={} (both must be \
+                 zero — no row is rendered by a count aggregation)",
+                result.materialize_bytes_read, result.registry_bytes_read,
+            ),
+        });
+    }
     Ok(OuriosAggregateAnswer {
         groups,
         bytes_read: result.stats.bytes_read,

@@ -1562,7 +1562,10 @@ fn regex_escape(s: &str) -> String {
 /// are not template state — the same known limitation [`template_needle`]
 /// documents) and unambiguous whenever at least one neighbour is fixed.
 /// Returns `None` if `target_param` is not a wildcard position in
-/// `tokens`.
+/// `tokens`, **or** if neither neighbour is a fixed token — an
+/// unanchored `(?P<value>\S+)` would match any token and silently feed
+/// wrong equivalence input to `compare_aggregations`, so the caller must
+/// reject the candidate instead of measuring it.
 fn param_capture_regex(tokens: &[OwnedToken], target_param: u32) -> Option<String> {
     let mut wildcard_idx = 0u32;
     let pos = tokens.iter().position(|t| {
@@ -1578,13 +1581,18 @@ fn param_capture_regex(tokens: &[OwnedToken], target_param: u32) -> Option<Strin
         Some(OwnedToken::Fixed(s)) => Some(s.as_str()),
         _ => None,
     };
+    let prev = pos.checked_sub(1).and_then(fixed_at);
+    let next = fixed_at(pos + 1);
+    if prev.is_none() && next.is_none() {
+        return None;
+    }
     let mut pattern = String::new();
-    if let Some(prev) = pos.checked_sub(1).and_then(fixed_at) {
+    if let Some(prev) = prev {
         pattern.push_str(&regex_escape(prev));
         pattern.push_str(r"\s+");
     }
     pattern.push_str(r"(?P<value>\S+)");
-    if let Some(next) = fixed_at(pos + 1) {
+    if let Some(next) = next {
         pattern.push_str(r"\s+");
         pattern.push_str(&regex_escape(next));
     }
@@ -1719,8 +1727,9 @@ fn pick_frequency_pair(
             };
             let Some(capture_regex) = param_capture_regex(tokens, param) else {
                 eprintln!(
-                    "L4 candidate template_id={id} param({param}): rejected — the param \
-                     position was not found among the template's wildcards (harness bug)",
+                    "L4 candidate template_id={id} param({param}): rejected — no fixed \
+                     neighbour token to anchor the Loki capture regex on (an unanchored \
+                     pattern would match any token)",
                 );
                 continue;
             };
@@ -4244,6 +4253,21 @@ fn param_capture_regex_anchors_on_the_nearest_fixed_neighbours() {
         None,
     );
     assert_eq!(param_capture_regex(&[OwnedToken::Wildcard], 1), None);
+
+    // Unanchored: neither neighbour is fixed — a single wildcard with no
+    // surrounding tokens, and two adjacent wildcards where the target's
+    // neighbour on both sides is itself a wildcard. An unanchored
+    // `(?P<value>\S+)` would match any token, so both must reject rather
+    // than return a pattern a caller could unknowingly measure with.
+    assert_eq!(param_capture_regex(&[OwnedToken::Wildcard], 0), None);
+    assert_eq!(
+        param_capture_regex(&[OwnedToken::Wildcard, OwnedToken::Wildcard], 0),
+        None,
+    );
+    assert_eq!(
+        param_capture_regex(&[OwnedToken::Wildcard, OwnedToken::Wildcard], 1),
+        None,
+    );
 }
 
 #[test]

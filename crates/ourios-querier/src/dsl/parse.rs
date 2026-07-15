@@ -6,8 +6,8 @@
 
 use super::DslError;
 use super::ir::{
-    AggFn, Call, CmpOp, DriftQuery, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue,
-    Stage, Statement, Time, Value,
+    AggFn, Call, CmpOp, DriftQuery, Field, GroupTerm, OrdOp, Predicate, Query, SeverityName,
+    SeverityValue, Stage, Statement, Time, Value,
 };
 
 /// Parse a β-surface query string into a [`Statement`] — a log query or a
@@ -984,12 +984,64 @@ impl<'a> Parser<'a> {
         Ok(Stage::Agg { func, path, by })
     }
 
-    /// `[ "by" , field_list ]`.
-    fn parse_optional_by(&mut self) -> Result<Vec<Field>, DslError> {
+    /// `[ "by" , group_list ]` (§7 v1.1).
+    fn parse_optional_by(&mut self) -> Result<Vec<GroupTerm>, DslError> {
         if self.eat_keyword("by") {
-            self.parse_field_list()
+            self.parse_group_list()
         } else {
             Ok(Vec::new())
+        }
+    }
+
+    /// `group_list = group_term , { "," , group_term }` (§7 v1.1).
+    fn parse_group_list(&mut self) -> Result<Vec<GroupTerm>, DslError> {
+        let mut terms = vec![self.parse_group_term()?];
+        while self.eat(&Tok::Comma) {
+            terms.push(self.parse_group_term()?);
+        }
+        Ok(terms)
+    }
+
+    /// `group_term = field | "param" "(" integer ")" | "bucket" "(" duration ")"`
+    /// (§7 v1.1). `param`/`bucket` are recognised only as calls (ident + `(`),
+    /// so a field list keeps rejecting them elsewhere — the group terms are
+    /// grammatically confined to `by`-lists (§6.3 amendment / RFC0002.14).
+    fn parse_group_term(&mut self) -> Result<GroupTerm, DslError> {
+        match self.peek() {
+            Some(Tok::Ident(s)) if s == "param" && self.is_call() => {
+                self.pos += 1;
+                self.expect(&Tok::LParen, "'(' after param")?;
+                let n = match self.next() {
+                    Some(Tok::Number(n)) => n.clone(),
+                    other => {
+                        return Err(DslError::new(format!(
+                            "param(...) takes a non-negative integer slot, found {}",
+                            describe(other)
+                        )));
+                    }
+                };
+                let n = n.parse::<u32>().map_err(|_| {
+                    DslError::new(format!("param slot {n:?} is not a non-negative integer"))
+                })?;
+                self.expect(&Tok::RParen, "')' to close param(...)")?;
+                Ok(GroupTerm::Param(n))
+            }
+            Some(Tok::Ident(s)) if s == "bucket" && self.is_call() => {
+                self.pos += 1;
+                self.expect(&Tok::LParen, "'(' after bucket")?;
+                let width = match self.next() {
+                    Some(Tok::Duration(d)) => d.clone(),
+                    other => {
+                        return Err(DslError::new(format!(
+                            "bucket(...) takes a duration width like 5m, found {}",
+                            describe(other)
+                        )));
+                    }
+                };
+                self.expect(&Tok::RParen, "')' to close bucket(...)")?;
+                Ok(GroupTerm::Bucket(width))
+            }
+            _ => Ok(GroupTerm::Field(self.parse_field()?)),
         }
     }
 
@@ -1158,6 +1210,19 @@ pub(crate) fn parse_time_pub(s: &str) -> Result<Time, DslError> {
     Ok(time)
 }
 
+/// Validate a standalone §7 `duration` lexeme (a structured-surface
+/// `{"bucket": "<duration>"}` width) against the string-DSL lexer, so the two
+/// surfaces admit exactly the same widths (RFC0002.2). Rejects trailing input.
+pub(crate) fn parse_duration_lexeme_pub(s: &str) -> Result<String, DslError> {
+    let tokens = tokenize(s)?;
+    match tokens.as_slice() {
+        [Tok::Duration(d)] => Ok(d.clone()),
+        _ => Err(DslError::new(format!(
+            "{s:?} is not a duration like 30s, 5m, 1h, 1d, or 1w"
+        ))),
+    }
+}
+
 /// Case-insensitive severity-name lookup, shared with the structured surface.
 pub(crate) fn parse_severity_name_pub(name: &str) -> Option<SeverityName> {
     parse_severity_name(name)
@@ -1226,7 +1291,7 @@ fn describe(tok: Option<&Tok>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::ir::{Field, Predicate, Stage, Value};
+    use crate::dsl::ir::{Field, GroupTerm, Predicate, Stage, Value};
 
     #[test]
     fn parses_match_all_and_match_none() {
@@ -1361,6 +1426,53 @@ mod tests {
         assert_eq!(q.stages.len(), 4);
         assert!(matches!(q.stages[0], Stage::Range(_, _)));
         assert!(matches!(q.stages[3], Stage::Limit(10)));
+    }
+
+    #[test]
+    fn parses_group_terms_in_by_lists() {
+        // §7 v1.1 `group_term`: field | param(n) | bucket(duration).
+        let q = parse("template_id == 4 | count by param(0), bucket(5m), service").unwrap();
+        assert_eq!(
+            q.stages,
+            vec![Stage::Count {
+                by: vec![
+                    GroupTerm::Param(0),
+                    GroupTerm::Bucket("5m".into()),
+                    GroupTerm::Field(Field::Service),
+                ],
+            }],
+        );
+        // The aggregates' by-list takes the same production.
+        let agg = parse("template_id == 4 | avg(confidence) by bucket(1h)").unwrap();
+        assert!(matches!(
+            &agg.stages[0],
+            Stage::Agg { by, .. } if by == &[GroupTerm::Bucket("1h".into())]
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_group_terms() {
+        // Non-integer / negative param slot; non-duration bucket width.
+        assert!(parse("template_id == 4 | count by param(1.5)").is_err());
+        assert!(parse("template_id == 4 | count by param(-1)").is_err());
+        assert!(parse("template_id == 4 | count by param(x)").is_err());
+        assert!(parse("template_id == 4 | count by bucket(5)").is_err());
+        assert!(parse("template_id == 4 | count by bucket(\"5m\")").is_err());
+        // group_term is confined to by-lists (§7 v1.1): param/bucket are not
+        // fields, so predicates and project reject them at parse time.
+        assert!(parse("param(0) == 1").is_err());
+        assert!(parse("true | project param(0)").is_err());
+        assert!(parse("true | sort param(0)").is_err());
+    }
+
+    #[test]
+    fn parse_duration_lexeme_pub_matches_the_lexer() {
+        assert_eq!(parse_duration_lexeme_pub("5m").unwrap(), "5m");
+        assert_eq!(parse_duration_lexeme_pub("30s").unwrap(), "30s");
+        assert!(parse_duration_lexeme_pub("5").is_err());
+        assert!(parse_duration_lexeme_pub("5x").is_err());
+        assert!(parse_duration_lexeme_pub("5m extra").is_err());
+        assert!(parse_duration_lexeme_pub("-5m").is_err());
     }
 
     #[test]

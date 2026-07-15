@@ -17,10 +17,12 @@ use serde::Deserialize;
 
 use super::DslError;
 use super::ir::{
-    AggFn, Call, CmpOp, DriftQuery, Field, OrdOp, Predicate, Query, SeverityValue, Stage,
-    Statement, Time, Value,
+    AggFn, Call, CmpOp, DriftQuery, Field, GroupTerm, OrdOp, Predicate, Query, SeverityValue,
+    Stage, Statement, Time, Value,
 };
-use super::{parse_severity_name_pub, require_string_operand, validate_sort_key};
+use super::{
+    parse_duration_lexeme_pub, parse_severity_name_pub, require_string_operand, validate_sort_key,
+};
 
 /// Parse a structured (JSON) statement — a log query (`{"predicate":…}`) or a
 /// RFC 0010 `drift` query (`{"drift":{"from":…,"to":…}}`) — into a
@@ -428,7 +430,62 @@ struct RawRange {
 #[serde(deny_unknown_fields)]
 struct RawCount {
     #[serde(default)]
-    by: Vec<RawField>,
+    by: Vec<RawGroupTerm>,
+}
+
+/// A structured `by`-array element (§6.4 / §6.3 amendment 2026-07-15): a
+/// field, `{"param": n}`, or `{"bucket": "<duration>"}`. The `param`/`bucket`
+/// objects deny unknown keys, so they never collide with the
+/// `{resource|attr}` field objects and a stray extra key is rejected.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawGroupTerm {
+    Param(RawParamTerm),
+    Bucket(RawBucketTerm),
+    Field(RawField),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawParamTerm {
+    param: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBucketTerm {
+    bucket: String,
+}
+
+impl RawGroupTerm {
+    fn into_ir(self) -> Result<GroupTerm, DslError> {
+        match self {
+            Self::Param(RawParamTerm { param }) => Ok(GroupTerm::Param(param)),
+            // The width is the §7 `duration` lexical string, validated by the
+            // string-DSL lexer so both surfaces admit the same widths
+            // (RFC0002.2).
+            Self::Bucket(RawBucketTerm { bucket }) => {
+                Ok(GroupTerm::Bucket(parse_duration_lexeme_pub(&bucket)?))
+            }
+            // The string DSL's `group_term = field` production (§7 v1.1)
+            // only accepts a bare top-level field — `resource.`/`attr.`
+            // paths are rejected there (see `parse_field`'s error message).
+            // A `{resource|attr}` object here would let the structured
+            // surface express a `by`-list the string grammar cannot, so it
+            // is rejected at the same boundary rather than reaching the
+            // planner (RFC0002.2).
+            Self::Field(RawField::Object(_)) => Err(DslError::new(
+                "a by-list field must be a bare field name (resource./attr. paths \
+                 are not allowed here)"
+                    .to_string(),
+            )),
+            Self::Field(field @ RawField::Name(_)) => Ok(GroupTerm::Field(field.into_ir()?)),
+        }
+    }
+}
+
+fn group_terms_to_ir(terms: Vec<RawGroupTerm>) -> Result<Vec<GroupTerm>, DslError> {
+    terms.into_iter().map(RawGroupTerm::into_ir).collect()
 }
 
 #[derive(Deserialize)]
@@ -487,7 +544,7 @@ impl RawStage {
                 }
                 let c: RawCount = from_stage_body(body, "count")?;
                 Ok(Stage::Count {
-                    by: fields_to_ir(c.by)?,
+                    by: group_terms_to_ir(c.by)?,
                 })
             }
             "sort" => {
@@ -547,9 +604,10 @@ fn agg_into_ir(
     let by = match by_value {
         None => Vec::new(),
         Some(v) => {
-            let fields: Vec<RawField> = serde_json::from_value(v)
-                .map_err(|e| DslError::new(format!("aggregate `by` is not a field list: {e}")))?;
-            fields_to_ir(fields)?
+            let terms: Vec<RawGroupTerm> = serde_json::from_value(v).map_err(|e| {
+                DslError::new(format!("aggregate `by` is not a group-term list: {e}"))
+            })?;
+            group_terms_to_ir(terms)?
         }
     };
     Ok(Stage::Agg {
@@ -737,6 +795,55 @@ mod tests {
         match q.predicate {
             Predicate::And(terms) => assert_eq!(terms.len(), 3),
             other => panic!("expected flat And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_terms_match_the_string_surface() {
+        // §6.3 amendment — the structured `{"param": n}` / `{"bucket": "5m"}`
+        // by-elements produce the same IR as the string DSL (RFC0002.2).
+        let structured = parse_structured(
+            r#"{"predicate":{"field":"template_id","op":"==","value":4},
+                "stages":[{"count":{"by":[{"param":0},{"bucket":"5m"},"service"]}}]}"#,
+        )
+        .unwrap();
+        let string =
+            crate::dsl::parse("template_id == 4 | count by param(0), bucket(5m), service").unwrap();
+        assert_eq!(structured, string);
+    }
+
+    #[test]
+    fn rejects_malformed_group_terms() {
+        // A negative param slot, a non-duration bucket width, and a stray
+        // extra key on a group-term object all fail before the planner.
+        for req in [
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":-1}]}}]}"#,
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"bucket":"5"}]}}]}"#,
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":0,"x":1}]}}]}"#,
+        ] {
+            assert!(parse_structured(req).is_err(), "must reject {req}");
+        }
+    }
+
+    #[test]
+    fn rejects_resource_and_attr_group_terms() {
+        // The string DSL's `group_term = field` production (§7 v1.1) is
+        // bare-field-only; a structured `{resource|attr}` by-element would
+        // let this surface express a query the string grammar cannot
+        // (RFC0002.2), so it is rejected here rather than reaching the
+        // planner.
+        for req in [
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"resource":"k8s.pod.name"}]}}]}"#,
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"attr":"http.status_code"}]}}]}"#,
+            r#"{"predicate":{"const":true},"stages":[{"avg":"confidence","by":[{"attr":"k"}]}]}"#,
+        ] {
+            let err = parse_structured(req).unwrap_err();
+            assert!(
+                err.message().contains("bare field"),
+                "{}: {}",
+                req,
+                err.message()
+            );
         }
     }
 

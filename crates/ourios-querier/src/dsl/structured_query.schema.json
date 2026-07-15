@@ -72,6 +72,47 @@
         }
       ]
     },
+    "bare_field": {
+      "description": "A bare top-level field name, no {resource|attr} path — the string DSL's `group_term = field` production (§7 v1.1) admits only this form in a by-list.",
+      "type": "string",
+      "enum": [
+        "body",
+        "severity",
+        "ts",
+        "observed_ts",
+        "trace_id",
+        "span_id",
+        "scope",
+        "event_name",
+        "flags",
+        "service",
+        "template_id",
+        "confidence",
+        "lossy"
+      ]
+    },
+    "group_term": {
+      "description": "A by-array element of the aggregation stages (§6.3 amendment 2026-07-15): a bare field, {\"param\": n} (the pinned template's parameter slot n, zero-based), or {\"bucket\": \"<duration>\"} (fixed-width time bucketing; the §7 duration lexical string). Unlike a comparison field, a by-list field cannot be a {resource|attr} path — the string DSL's group_term grammar has no such form.",
+      "oneOf": [
+        { "$ref": "#/$defs/bare_field" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["param"],
+          "properties": {
+            "param": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bucket"],
+          "properties": {
+            "bucket": { "type": "string", "pattern": "^[0-9]+[smhdw]$" }
+          }
+        }
+      ]
+    },
     "cmp_op": {
       "type": "string",
       "enum": ["==", "!=", "<", "<=", ">", ">=", "=~", "!~"]
@@ -227,7 +268,7 @@
           "properties": {
             "by": {
               "type": "array",
-              "items": { "$ref": "#/$defs/field" }
+              "items": { "$ref": "#/$defs/group_term" }
             }
           }
         }
@@ -245,7 +286,7 @@
         "avg": { "$ref": "#/$defs/field" },
         "by": {
           "type": "array",
-          "items": { "$ref": "#/$defs/field" }
+          "items": { "$ref": "#/$defs/group_term" }
         }
       },
       "oneOf": [

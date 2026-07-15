@@ -118,7 +118,11 @@ pub struct QueryRequest {
 /// (RFC0007.1) can assert pushdown actually skipped data rather
 /// than scanning it. Plain integers — no `DataFusion`/arrow types
 /// cross this boundary (hazard §4.6).
+///
+/// Marked `#[non_exhaustive]` so further additive fields (like
+/// `rows_excluded`, RFC0002.15) stay non-breaking.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct QueryStats {
     /// Row groups `DataFusion` read.
     pub row_groups_scanned: u64,
@@ -131,6 +135,15 @@ pub struct QueryStats {
     /// materialization pass's IO stays on
     /// [`QueryResult::materialize_bytes_read`].
     pub bytes_read: u64,
+    /// Rows excluded from an executed aggregation because a group key was
+    /// NULL — either `param(n)` on a `params` list shorter than `n + 1` /
+    /// a NULL slot, or an `OPTIONAL` field group term (e.g. `bucket`'s
+    /// underlying timestamp, `trace_id`) absent on the row (RFC 0002
+    /// §6.3 amendment 2026-07-15 / RFC0002.15). Such rows contribute to
+    /// no group and there is no synthetic "absent" bucket; this tally
+    /// keeps the exclusion observable, not silent. Always `0` for a
+    /// non-aggregation query.
+    pub rows_excluded: u64,
 }
 
 /// Additive execution options for [`Querier::run_query_with`]. The
@@ -198,6 +211,15 @@ pub struct QueryResult {
     /// metrics depend on that semantics) — a caller wanting the honest
     /// total IO for one query sums the three components.
     pub materialize_bytes_read: u64,
+    /// The executed aggregation's grouped-count map (RFC 0002 §6.5
+    /// amendment 2026-07-15) — `Some` iff the query carried a `count [by …]`
+    /// stage. Each group's `key` holds one entry per `by` term in query
+    /// order (a bare `count` is one group with an empty key); groups are
+    /// sorted by key so the output is deterministic. This is the
+    /// `(bucket, group_key) → count` map RFC 0031 §3.5 compares for L4
+    /// equivalence; the plain-string shape keeps it engine-free (§4.6) and
+    /// directly serializable on the RFC 0016 endpoint.
+    pub aggregate: Option<Vec<AggregateGroup>>,
     /// **Template-map acquisition bytes** (RFC 0033 §3.6, amending the
     /// pre-0033 audit-stream-only meaning): the total bytes fetched to
     /// obtain the body-rendering capability behind the returned `records`,
@@ -209,6 +231,24 @@ pub struct QueryResult {
     /// rendered. Same additive contract as `materialize_bytes_read`
     /// (RFC 0031 §3.6).
     pub registry_bytes_read: u64,
+}
+
+/// One group of an executed `count [by …]` stage (RFC 0002 §6.3/§6.5
+/// amendment 2026-07-15). Plain owned strings — no `datafusion`/`arrow`
+/// type crosses this boundary (hazard §4.6).
+///
+/// Marked `#[non_exhaustive]` so further additive fields stay
+/// non-breaking, matching `QueryResult`/`QueryStats`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AggregateGroup {
+    /// The group-key values, one per `by` term in query order: a field or
+    /// `param(n)` as its stored string form, `bucket(width)` as the RFC 3339
+    /// UTC start of the half-open window `[k·width, (k+1)·width)`. Empty for
+    /// a bare `count`.
+    pub key: Vec<String>,
+    /// The number of matching rows in this group.
+    pub count: u64,
 }
 
 /// Errors from [`Querier::run`]. Ourios-owned — no
@@ -437,6 +477,173 @@ fn count_value(batches: &[RecordBatch]) -> Result<u64, QueryError> {
     u64::try_from(col.value(0)).map_err(|_| bad("negative count".to_string()))
 }
 
+/// The empty result for a query that provably scans nothing, shaped for its
+/// stage set: a plain query is all-zero; an aggregation query carries the
+/// map the engine would produce over an empty scan — no groups when
+/// grouped, the single zero-count total for a bare `count`.
+fn empty_result(aggregate: Option<&compile::Aggregate>) -> QueryResult {
+    let aggregate = aggregate.map(|agg| {
+        if agg.by.is_empty() {
+            vec![AggregateGroup {
+                key: Vec::new(),
+                count: 0,
+            }]
+        } else {
+            Vec::new()
+        }
+    });
+    QueryResult {
+        aggregate,
+        ..QueryResult::default()
+    }
+}
+
+/// [`decode_aggregate`]'s output: the group map, the total matching-row
+/// count (included + excluded — the same total a plain count would report),
+/// and the excluded-row tally (RFC0002.15).
+struct DecodedAggregate {
+    groups: Vec<AggregateGroup>,
+    rows: u64,
+    excluded: u64,
+}
+
+/// Decode the grouped-count batches into [`AggregateGroup`]s: the key
+/// columns are `group_0..group_{n-1}` ([`compile::group_column_name`]), the
+/// count column [`compile::COUNT_COLUMN`]. A row whose key carries a NULL
+/// (a short/NULL `param(n)` slot, an absent OPTIONAL field column)
+/// contributes to no group and lands in the excluded tally instead — the
+/// §6.3 amendment disposition, with no synthetic "absent" key. Groups are
+/// sorted by key for a deterministic result.
+fn decode_aggregate(
+    batches: &[RecordBatch],
+    n_terms: usize,
+) -> Result<DecodedAggregate, QueryError> {
+    let bad = |detail: String| QueryError::Storage {
+        detail: format!("count aggregate: {detail}"),
+    };
+    let mut groups = Vec::new();
+    let mut rows: u64 = 0;
+    let mut excluded: u64 = 0;
+    for batch in batches {
+        let counts = batch
+            .column_by_name(compile::COUNT_COLUMN)
+            .ok_or_else(|| bad("result is missing the count column".to_string()))?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| bad("count column is not Int64".to_string()))?;
+        let key_columns = (0..n_terms)
+            .map(|i| {
+                let name = compile::group_column_name(i);
+                batch
+                    .column_by_name(&name)
+                    .ok_or_else(|| bad(format!("result is missing group column `{name}`")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in 0..batch.num_rows() {
+            if counts.is_null(row) {
+                return Err(bad("count is null".to_string()));
+            }
+            let count =
+                u64::try_from(counts.value(row)).map_err(|_| bad("negative count".to_string()))?;
+            rows = rows
+                .checked_add(count)
+                .ok_or_else(|| bad("total row count overflows u64".to_string()))?;
+            // `None` for any cell ⇒ the whole key is NULL-bearing ⇒ the
+            // row's count lands in the excluded tally, not in a group.
+            let key = key_columns
+                .iter()
+                .map(|column| group_key_string(column.as_ref(), row))
+                .collect::<Result<Option<Vec<String>>, QueryError>>()?;
+            match key {
+                Some(key) => groups.push(AggregateGroup { key, count }),
+                None => {
+                    excluded = excluded
+                        .checked_add(count)
+                        .ok_or_else(|| bad("excluded row count overflows u64".to_string()))?;
+                }
+            }
+        }
+    }
+    groups.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(DecodedAggregate {
+        groups,
+        rows,
+        excluded,
+    })
+}
+
+/// Render one group-key cell as its result-map string form (RFC 0002 §6.3
+/// amendment): `None` for NULL (the excluded disposition), the stored
+/// UTF-8 bytes for the `params` extraction, RFC 3339 UTC for timestamps
+/// (the `bucket(…)` window start), hex for the fixed-size id columns, and
+/// the natural rendering for the scalar column types. The type set is
+/// exactly what [`compile::group_exprs`] can emit; anything else is a plan
+/// contract drift, surfaced rather than guessed at.
+fn group_key_string(array: &dyn Array, row: usize) -> Result<Option<String>, QueryError> {
+    use datafusion::arrow::array::{
+        BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
+        Float64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+        TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
+    };
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let bad = || QueryError::Storage {
+        detail: format!(
+            "count aggregate: group column has unsupported type {:?}",
+            array.data_type(),
+        ),
+    };
+    let cell = |s: String| Ok(Some(s));
+    macro_rules! typed {
+        ($ty:ty) => {
+            array.as_any().downcast_ref::<$ty>().ok_or_else(bad)?
+        };
+    }
+    match array.data_type() {
+        DataType::Null => Ok(None),
+        DataType::Utf8 => cell(typed!(StringArray).value(row).to_string()),
+        DataType::LargeUtf8 => cell(typed!(LargeStringArray).value(row).to_string()),
+        DataType::Utf8View => cell(typed!(StringViewArray).value(row).to_string()),
+        // The stored string form (§6.3): params are written from UTF-8
+        // strings, so lossy decoding is exact for Ourios-written rows and
+        // never fails on a foreign/degraded file.
+        DataType::Binary => {
+            cell(String::from_utf8_lossy(typed!(BinaryArray).value(row)).into_owned())
+        }
+        DataType::LargeBinary => {
+            cell(String::from_utf8_lossy(typed!(LargeBinaryArray).value(row)).into_owned())
+        }
+        DataType::BinaryView => {
+            cell(String::from_utf8_lossy(typed!(BinaryViewArray).value(row)).into_owned())
+        }
+        DataType::FixedSizeBinary(_) => {
+            use std::fmt::Write as _;
+            let mut hex = String::new();
+            for byte in typed!(FixedSizeBinaryArray).value(row) {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            cell(hex)
+        }
+        DataType::Boolean => cell(typed!(BooleanArray).value(row).to_string()),
+        DataType::UInt8 => cell(typed!(UInt8Array).value(row).to_string()),
+        DataType::UInt32 => cell(typed!(UInt32Array).value(row).to_string()),
+        DataType::UInt64 => cell(typed!(UInt64Array).value(row).to_string()),
+        DataType::Int64 => cell(typed!(Int64Array).value(row).to_string()),
+        DataType::Float32 => cell(typed!(Float32Array).value(row).to_string()),
+        DataType::Float64 => cell(typed!(Float64Array).value(row).to_string()),
+        // RFC 3339 UTC — the §6.3 bucket-key serialisation (subseconds
+        // rendered only when present).
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => cell(
+            chrono::DateTime::from_timestamp_nanos(typed!(TimestampNanosecondArray).value(row))
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        ),
+        _ => Err(bad()),
+    }
+}
+
 /// Walk the executed physical plan and accumulate the scan
 /// pruning / IO metrics into a [`QueryStats`]. Recursive — the
 /// Parquet scan is a leaf under the aggregate.
@@ -657,6 +864,29 @@ struct CollectedRecords {
     registry_bytes_read: u64,
 }
 
+/// How [`Querier::execute`] terminates the filtered scan (RFC 0002 §6.5):
+/// count + optional row materialization, or one grouped-count aggregation
+/// returning the map. An enum so an aggregation carrying a row limit /
+/// elision option is unrepresentable — the map is the whole result.
+enum Terminal {
+    /// Count + up-to-`limit` rendered rows (RFC 0017 §3.4).
+    Rows {
+        limit: Option<usize>,
+        options: QueryOptions,
+    },
+    /// A validated `count [by …]` stage (RFC 0002 amendment 2026-07-15).
+    Aggregate(compile::Aggregate),
+}
+
+impl Terminal {
+    fn aggregate(&self) -> Option<&compile::Aggregate> {
+        match self {
+            Self::Aggregate(agg) => Some(agg),
+            Self::Rows { .. } => None,
+        }
+    }
+}
+
 /// One per-query template-map acquisition (RFC 0033): the artifact-or-fold
 /// [`TemplateMap`] plus the bytes fetched acquiring it
 /// ([`QueryResult::registry_bytes_read`]). Acquired at most once per query
@@ -729,8 +959,10 @@ impl Querier {
         self.execute(
             &tenant,
             window,
-            row_limit,
-            QueryOptions::default(),
+            Terminal::Rows {
+                limit: row_limit,
+                options: QueryOptions::default(),
+            },
             None,
             |df| apply_request_filters(df, &request),
         )
@@ -852,16 +1084,20 @@ impl Querier {
         };
         let plan = compile::compile(query, tenant, now_unix_nano, default_window_nanos, map)?;
         // The DSL `limit` (RFC 0002) doubles as the RFC 0017 row cap; read it
-        // before `plan` moves into the filter closure.
-        let row_limit = plan.limit;
-        self.execute(
-            tenant,
-            Some(plan.window),
-            row_limit,
-            options,
-            acquired,
-            move |df| compile::apply(df, plan),
-        )
+        // — and the aggregation stage — before `plan` moves into the filter
+        // closure. An aggregation query terminates in the grouped-count scan:
+        // the map is the whole result, so the row cap and the count-scan
+        // elision option have nothing to apply to.
+        let terminal = match plan.aggregate.clone() {
+            Some(aggregate) => Terminal::Aggregate(aggregate),
+            None => Terminal::Rows {
+                limit: plan.limit,
+                options,
+            },
+        };
+        self.execute(tenant, Some(plan.window), terminal, acquired, move |df| {
+            compile::apply(df, plan)
+        })
         .await
     }
 
@@ -927,13 +1163,12 @@ impl Querier {
         &self,
         tenant: &TenantId,
         partition_window: Option<(u64, u64)>,
-        // RFC 0017 §3.4 — when `Some(n)`, collect up to `n` matching rows into
-        // `QueryResult.records` (rendered via the read-time registry); `None`
-        // is count-only. The count + stats are taken the same way regardless,
-        // unless `query_options` elides the count scan for a complete
-        // limited result.
-        row_limit: Option<usize>,
-        query_options: QueryOptions,
+        // How the filtered scan terminates: `Terminal::Rows` counts and —
+        // when it carries a limit — collects up to that many rows into
+        // `QueryResult.records` (RFC 0017 §3.4), with the count-scan
+        // elision per its `options`; `Terminal::Aggregate` runs the
+        // grouped-count scan and returns the map (RFC 0002 §6.5 amendment).
+        terminal: Terminal,
         // A template map already acquired at query-compile time (the
         // `resolves_to` alias fold, RFC 0033) — handed to the row-rendering
         // pass so one acquisition serves both folds. `None` ⇒ rendering
@@ -963,7 +1198,7 @@ impl Querier {
         // otherwise error and wrongly fail the query.
         let urls = self.resolve_data_urls(&ctx, &data_prefix, partition_window)?;
         if urls.is_empty() {
-            return Ok(QueryResult::default());
+            return Ok(empty_result(terminal.aggregate()));
         }
 
         // DataFusion's default `Utf8View` / `BinaryView` representations are
@@ -1005,7 +1240,19 @@ impl Querier {
         let base = ctx.table("logs").await.map_err(storage_err)?;
         // A provably-empty filter (absent OPTIONAL column) ⇒ no scan.
         let Some(df) = build_filter(base)? else {
-            return Ok(QueryResult::default());
+            return Ok(empty_result(terminal.aggregate()));
+        };
+
+        // An aggregation query terminates in its own grouped-count scan
+        // (RFC 0002 §6.5 amendment): the map is the result, so the
+        // count/materialize passes below never run for it.
+        let (row_limit, query_options) = match terminal {
+            Terminal::Aggregate(agg) => {
+                return self
+                    .execute_aggregate(df, &agg, tenant, ctx.task_ctx())
+                    .await;
+            }
+            Terminal::Rows { limit, options } => (limit, options),
         };
 
         // RFC 0031 §3.6 single-pass — with `elide_count_scan`, materialise
@@ -1034,6 +1281,7 @@ impl Querier {
                         ..collected.scan
                     },
                     records: collected.records,
+                    aggregate: None,
                     materialize_bytes_read: collected.scan.bytes_read,
                     registry_bytes_read: collected.registry_bytes_read,
                 });
@@ -1077,8 +1325,63 @@ impl Querier {
             rows,
             stats,
             records: collected.records,
+            aggregate: None,
             materialize_bytes_read: collected.scan.bytes_read,
             registry_bytes_read: collected.registry_bytes_read,
+        })
+    }
+
+    /// Execute a validated `count [by …]` stage over the filtered frame
+    /// (RFC 0002 §6.5 amendment 2026-07-15): one grouped-count scan whose
+    /// column reads are the user's predicate/window filters + the
+    /// row-level tenant backstop (§3.7) + the group-term columns only —
+    /// never `body`/`separators` — with zero row materialization and
+    /// zero template-map acquisition (nothing is rendered), the
+    /// RFC0002.16 honest-bytes shape. `rows` stays the total
+    /// matching-row count (included + excluded), derived from the same
+    /// scan.
+    async fn execute_aggregate(
+        &self,
+        df: datafusion::dataframe::DataFrame,
+        agg: &compile::Aggregate,
+        tenant: &TenantId,
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> Result<QueryResult, QueryError> {
+        // Row-level tenant backstop (`CLAUDE.md` §3.7), mirroring the drift
+        // aggregation: the scan is scoped to the tenant's partition prefix,
+        // but an aggregation returns group *values* and has no per-row
+        // check like `collect_records`' — a misplaced row under the prefix
+        // must neither skew the counts nor leak a foreign param value into
+        // a group key.
+        let df = df
+            .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
+            .map_err(storage_err)?;
+        let group_exprs = compile::group_exprs(&agg.by, &df)?;
+        let aggregated = df
+            .aggregate(
+                group_exprs,
+                vec![count(lit(1_i64)).alias(compile::COUNT_COLUMN)],
+            )
+            .map_err(storage_err)?;
+        let plan = aggregated
+            .create_physical_plan()
+            .await
+            .map_err(storage_err)?;
+        let batches = collect(Arc::clone(&plan), task_ctx)
+            .await
+            .map_err(storage_err)?;
+        let scan = scan_stats(plan.as_ref());
+        let decoded = decode_aggregate(&batches, agg.by.len())?;
+        Ok(QueryResult {
+            rows: decoded.rows,
+            stats: QueryStats {
+                rows_excluded: decoded.excluded,
+                ..scan
+            },
+            records: Vec::new(),
+            aggregate: Some(decoded.groups),
+            materialize_bytes_read: 0,
+            registry_bytes_read: 0,
         })
     }
 

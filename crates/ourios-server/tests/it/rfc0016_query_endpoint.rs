@@ -358,3 +358,48 @@ async fn rfc0016_oversize_body_is_rejected() {
 //
 // RFC0016.6 (pruning observable + OTel query metrics) installs a process-global
 // in-memory meter, so it lives in its own `rfc0016_6_query_metrics` binary.
+
+/// Regression for RFC0002 amendment 2026-07-15 / RFC0016 — the HTTP
+/// endpoint's §7 default/cap `limit` injection must be skipped for a
+/// `count [by …]` query. `compile::validate` rejects a `count` stage
+/// combined with `limit`, so unconditionally injecting one (as the §7
+/// row-query default did before this fix) made every aggregation query
+/// a clean `400`, not a served answer.
+#[tokio::test]
+async fn rfc0016_count_by_query_is_served_not_limit_rejected() {
+    let bucket = tempfile::tempdir().unwrap();
+    write_records(bucket.path(), &[mined("acme", 1), mined("acme", 1)]);
+
+    let (status, json) = post(
+        bucket.path(),
+        Some("acme"),
+        "text/plain",
+        "template_id == 1 | count by template_id",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an aggregation query is served: {json}"
+    );
+    assert!(
+        json["aggregate"].is_array(),
+        "the grouped-count map is present: {json}",
+    );
+
+    // A plain row query on the same store still gets the §7 default limit —
+    // proving the skip is scoped to aggregation queries, not a global no-op.
+    let (row_status, row_json) = post(
+        bucket.path(),
+        Some("acme"),
+        "text/plain",
+        "template_id == 1",
+    )
+    .await;
+    assert_eq!(row_status, StatusCode::OK);
+    assert!(
+        row_json["aggregate"].is_null(),
+        "a plain row query carries no aggregate field: {row_json}",
+    );
+}

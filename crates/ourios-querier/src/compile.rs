@@ -57,17 +57,19 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use datafusion::common::Column;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::dataframe::DataFrame;
-use datafusion::functions::expr_fn::{regexp_like, starts_with};
-use datafusion::logical_expr::{Expr, not};
+use datafusion::functions::expr_fn::{coalesce, get_field, regexp_like, starts_with};
+use datafusion::functions_nested::expr_fn::array_element;
+use datafusion::logical_expr::{Expr, cast, not};
 use datafusion::prelude::{col, lit};
 
 use ourios_core::alias::AliasMap;
 use ourios_core::tenant::TenantId;
 
 use crate::dsl::ir::{
-    Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
+    Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
 };
 use crate::{QueryError, has_column, time_bound_scalar};
 use ourios_parquet::{columns, promoted};
@@ -87,6 +89,35 @@ pub(crate) struct Plan {
     predicate: Predicate,
     alias_classes: BTreeMap<u64, BTreeSet<u64>>,
     pub(crate) limit: Option<usize>,
+    pub(crate) aggregate: Option<Aggregate>,
+}
+
+/// A validated `count [by …]` stage (RFC 0002 §6.3/§6.5 amendment
+/// 2026-07-15): the group terms, already checked against the pinning rule,
+/// the positive-bucket-width rule, and the duplicate-term rules. Only the
+/// `count` family executes in this slice; `sum`/`min`/`max`/`avg` keep
+/// their explicit rejection.
+#[derive(Debug, Clone)]
+pub(crate) struct Aggregate {
+    pub(crate) by: Vec<GroupTerm>,
+}
+
+/// The alias each grouping expression carries in the aggregation plan
+/// (`group_0`, `group_1`, …, one per `by` term in query order) — the result
+/// decoder addresses the key columns by these names.
+pub(crate) fn group_column_name(i: usize) -> String {
+    format!("group_{i}")
+}
+
+/// The alias of the aggregation plan's count column.
+pub(crate) const COUNT_COLUMN: &str = "n";
+
+/// [`validate`]'s output: the resolved window and limit (as before) plus the
+/// validated aggregation stage, if any.
+pub(crate) struct Validated {
+    pub(crate) window: (u64, u64),
+    pub(crate) limit: Option<usize>,
+    pub(crate) aggregate: Option<Aggregate>,
 }
 
 /// Nanoseconds per duration unit (RFC 0002 §7 `duration`: `s`/`m`/`h`/`d`/`w`).
@@ -106,16 +137,27 @@ pub(crate) fn validate(
     query: &Query,
     now_unix_nano: u64,
     default_window_nanos: u64,
-) -> Result<((u64, u64), Option<usize>), QueryError> {
-    // This slice executes only the `range` (time window) and `limit` stages.
-    // The aggregation / sort / projection / render stages parse into a valid
-    // IR but are not yet wired to execution; reject them explicitly so a
-    // query asking for one fails fast rather than silently returning a plain
-    // filtered row set (RFC0002 — full pipeline execution is a later slice).
+) -> Result<Validated, QueryError> {
+    // This slice executes the `range` (time window), `limit`, and — per the
+    // RFC 0002 amendment 2026-07-15 (RFC0002.12) — `count [by …]` stages.
+    // The remaining aggregation / sort / projection / render stages parse
+    // into a valid IR but are not yet wired to execution; reject them
+    // explicitly so a query asking for one fails fast rather than silently
+    // returning a plain filtered row set.
+    let mut aggregate = None;
     for stage in &query.stages {
         let unsupported = match stage {
             Stage::Range(..) | Stage::Limit(_) => None,
-            Stage::Count { .. } => Some("count"),
+            Stage::Count { .. } if aggregate.is_some() => {
+                return Err(QueryError::InvalidQuery {
+                    detail: "a query takes at most one `count` stage".to_string(),
+                });
+            }
+            Stage::Count { by } => {
+                validate_group_terms(by, &query.predicate)?;
+                aggregate = Some(Aggregate { by: by.clone() });
+                None
+            }
             Stage::Agg { .. } => Some("aggregation"),
             Stage::Sort { .. } => Some("sort"),
             Stage::Project(_) => Some("project"),
@@ -138,7 +180,107 @@ pub(crate) fn validate(
         })?),
         None => None,
     };
-    Ok((window, limit))
+    // `Terminal::Aggregate` executes its own grouped-count scan and never
+    // consults `plan.limit` (the aggregation *is* the result — group-limiting
+    // semantics are not implemented), so a `count [by …] | limit n` pipeline
+    // would silently drop the `limit` instead of applying it. Reject the
+    // combination rather than execute the wrong query.
+    if limit.is_some() && aggregate.is_some() {
+        return Err(QueryError::InvalidQuery {
+            detail: "a query with a `count` stage does not support `limit`; \
+                     group-limiting semantics are not implemented yet"
+                .to_string(),
+        });
+    }
+    Ok(Validated {
+        window,
+        limit,
+        aggregate,
+    })
+}
+
+/// Validate a `by`-list against the §6.3 amendment rules: `param(n)` only
+/// under a single-template pin, positive bucket widths, at most one
+/// `bucket(…)`, and at most one `param(n)` per `n`.
+fn validate_group_terms(by: &[GroupTerm], predicate: &Predicate) -> Result<(), QueryError> {
+    let mut params = BTreeSet::new();
+    let mut has_bucket = false;
+    for term in by {
+        match term {
+            GroupTerm::Param(n) if pinned_template_id(predicate).is_none() => {
+                // Params are positional *per template*, so grouping across
+                // templates by position aggregates unrelated values (§6.3
+                // amendment) — rejected, never silently computed.
+                return Err(QueryError::InvalidQuery {
+                    detail: format!(
+                        "param({n}) requires the predicate to pin exactly one template: \
+                         a top-level `template_id == <id>` conjunct, with every such \
+                         comparison naming the same id (params are positional per \
+                         template)"
+                    ),
+                });
+            }
+            GroupTerm::Param(n) => {
+                if !params.insert(*n) {
+                    return Err(QueryError::InvalidQuery {
+                        detail: format!("param({n}) appears more than once in the `by` list"),
+                    });
+                }
+            }
+            GroupTerm::Bucket(_) if has_bucket => {
+                return Err(QueryError::InvalidQuery {
+                    detail: "a `by` list takes at most one bucket(...) term".to_string(),
+                });
+            }
+            GroupTerm::Bucket(width) => {
+                let nanos = duration_nanos(width)?;
+                if nanos == 0 {
+                    return Err(QueryError::InvalidQuery {
+                        detail: format!("bucket({width}) width must be positive"),
+                    });
+                }
+                // The execution lowering casts the width to `i64` (§6.5
+                // floor-division), so a width beyond `i64::MAX` nanoseconds
+                // must fail here — one compile-time contract, not a second
+                // error path surfacing later during planning.
+                if i64::try_from(nanos).is_err() {
+                    return Err(QueryError::InvalidQuery {
+                        detail: format!("bucket({width}) width exceeds i64 nanoseconds"),
+                    });
+                }
+                has_bucket = true;
+            }
+            GroupTerm::Field(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The §6.3 amendment pinning rule, decidable on the associative-normalised
+/// IR: the predicate must carry, at its top conjunctive level, at least one
+/// `template_id == <N>` comparison, and all such comparisons must name the
+/// same `N`. A comparison under `or`/`not` pins nothing, and `resolves_to`
+/// does **not** pin (it expands to an alias *set* with no positional param
+/// alignment across the class).
+fn pinned_template_id(predicate: &Predicate) -> Option<u64> {
+    fn pin_of(p: &Predicate) -> Option<u64> {
+        match p {
+            Predicate::Comparison {
+                field: Field::TemplateId,
+                op: CmpOp::Ord(OrdOp::Eq),
+                value: Value::Int(n),
+            } => u64::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+    let pins: Vec<u64> = match predicate {
+        Predicate::And(terms) => terms.iter().filter_map(pin_of).collect(),
+        leaf => pin_of(leaf).into_iter().collect(),
+    };
+    match pins.split_first() {
+        Some((first, rest)) if rest.iter().all(|n| n == first) => Some(*first),
+        _ => None,
+    }
 }
 
 pub(crate) fn compile(
@@ -148,7 +290,11 @@ pub(crate) fn compile(
     default_window_nanos: u64,
     alias_map: &AliasMap,
 ) -> Result<Plan, QueryError> {
-    let (window, limit) = validate(query, now_unix_nano, default_window_nanos)?;
+    let Validated {
+        window,
+        limit,
+        aggregate,
+    } = validate(query, now_unix_nano, default_window_nanos)?;
     // Eagerly resolve every `resolves_to(n)` against the tenant's alias map
     // so the deferred predicate compilation in `apply` is tenant-agnostic.
     let mut alias_classes = BTreeMap::new();
@@ -159,6 +305,7 @@ pub(crate) fn compile(
         predicate: query.predicate.clone(),
         alias_classes,
         limit,
+        aggregate,
     })
 }
 
@@ -221,6 +368,11 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
         // `Querier::execute` via the `row_limit` it reads from `plan.limit`
         // (RFC 0017 §3.4). Applying it here would wrongly cap the count too.
         limit: _,
+        // The aggregation stage is executed by `Querier::execute` on the
+        // frame this returns (§6.5 amendment: the group terms lower inside
+        // the `Aggregate` node, over the same filtered scan); the caller
+        // reads it off the plan before handing the plan here.
+        aggregate: _,
     } = plan;
     // The window filters the *effective* timestamp (RFC 0002 §6.2 amendment
     // 2026-06-11), with the RFC 0005 §3.9 fallback for pre-amendment files;
@@ -239,6 +391,123 @@ pub(crate) fn apply(df: DataFrame, plan: Plan) -> Result<Option<DataFrame>, Quer
     }
 
     Ok(Some(df))
+}
+
+/// Lower a validated `by`-list to the `Aggregate` node's grouping
+/// expressions (§6.5 amendment 2026-07-15), one per term in query order,
+/// aliased `group_0`, `group_1`, … ([`group_column_name`]). Deferred to
+/// execution (like the predicate) because the lowering consults the scanned
+/// union schema: the promoted `service` column, the effective-time column,
+/// and the absent-OPTIONAL-column guard.
+///
+/// - A **field** lowers to its RFC 0005 column ([`column_of`]); `service`
+///   to the RFC 0022 promoted `resource.service.name` column. An absent
+///   OPTIONAL column lowers to a typed NULL literal — the column reads
+///   all-NULL (RFC0007.4), so every row's key is NULL, i.e. excluded and
+///   tallied rather than invented.
+/// - **`param(n)`** lowers to a list-element extraction over the `params`
+///   column: element `n` (`array_element` is 1-based) of the
+///   `List<Struct{type_tag, value}>`, then the struct's `value` — the
+///   stored string bytes (§6.3: the group key is the stored string form,
+///   never a type promotion). A short list or NULL slot yields NULL — the
+///   excluded disposition.
+/// - **`bucket(width)`** lowers to floor division of the effective
+///   timestamp by the width: the §6.2 `effective_time_unix_nano` column
+///   with the §3.9 `time_unix_nano` fallback (`coalesce`), cast to whole
+///   nanoseconds, floored to the window start `k·width`, and cast back to a
+///   UTC timestamp. Stored timestamps are non-negative, so integer division
+///   *is* the §6.5 floor division.
+pub(crate) fn group_exprs(by: &[GroupTerm], df: &DataFrame) -> Result<Vec<Expr>, QueryError> {
+    by.iter()
+        .enumerate()
+        .map(|(i, term)| {
+            let expr = match term {
+                GroupTerm::Field(field) => field_group_expr(field, df)?,
+                GroupTerm::Param(n) => get_field(
+                    array_element(col(columns::PARAMS), lit(i64::from(*n) + 1)),
+                    "value",
+                ),
+                GroupTerm::Bucket(width) => bucket_expr(width, df)?,
+            };
+            Ok(expr.alias(group_column_name(i)))
+        })
+        .collect()
+}
+
+fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
+    match field {
+        Field::Service => {
+            let name =
+                promoted_column_name(columns::RESOURCE_ATTRIBUTES, promoted::SERVICE_NAME_KEY);
+            if has_column(df, &name) {
+                Ok(Expr::Column(Column::new_unqualified(name)))
+            } else {
+                Ok(lit(ScalarValue::Utf8(None)))
+            }
+        }
+        // §7 confines `by`-list fields to the bare set, so these are only
+        // reachable from a hand-built IR — reject rather than group over the
+        // JSON-encoded attribute columns.
+        Field::Resource(_) | Field::Attr(_) => Err(QueryError::InvalidQuery {
+            detail: "grouping by resource/attr attributes is not supported in this query surface"
+                .to_string(),
+        }),
+        _ => {
+            let (column, optional) = column_of(field);
+            if optional && !has_column(df, column) {
+                Ok(lit(null_scalar_for(field)))
+            } else {
+                Ok(col(column))
+            }
+        }
+    }
+}
+
+/// The typed NULL an absent `OPTIONAL` group-by column stands in for, so
+/// the aggregate plan's output schema does not depend on which columns
+/// happen to be present in the scanned union schema (every `optional`
+/// arm of [`column_of`] must have a case here — the module doc's field
+/// table §6.2 is the source of truth for these types).
+fn null_scalar_for(field: &Field) -> ScalarValue {
+    match field {
+        Field::Body => ScalarValue::Binary(None),
+        Field::ObservedTs => ScalarValue::TimestampNanosecond(None, Some("UTC".into())),
+        Field::TraceId => ScalarValue::FixedSizeBinary(16, None),
+        Field::SpanId => ScalarValue::FixedSizeBinary(8, None),
+        Field::Scope | Field::EventName => ScalarValue::Utf8(None),
+        // `column_of` never marks these `optional` (Service/Resource/Attr
+        // are intercepted earlier, before this function is reached), so
+        // this arm is unreachable from every real call site — kept only
+        // for match exhaustiveness over `Field`.
+        Field::Severity
+        | Field::Ts
+        | Field::Flags
+        | Field::TemplateId
+        | Field::Confidence
+        | Field::Lossy
+        | Field::Service
+        | Field::Resource(_)
+        | Field::Attr(_) => {
+            unreachable!("{field:?} is never an OPTIONAL group-by column")
+        }
+    }
+}
+
+fn bucket_expr(width: &str, df: &DataFrame) -> Result<Expr, QueryError> {
+    let w = i64::try_from(duration_nanos(width)?).map_err(|_| QueryError::InvalidQuery {
+        detail: format!("bucket({width}) width exceeds i64 nanoseconds"),
+    })?;
+    let ts = col(columns::TIME_UNIX_NANO);
+    let effective = if has_column(df, columns::EFFECTIVE_TIME_UNIX_NANO) {
+        coalesce(vec![col(columns::EFFECTIVE_TIME_UNIX_NANO), ts])
+    } else {
+        ts
+    };
+    let ns = cast(effective, DataType::Int64);
+    Ok(cast(
+        ns / lit(w) * lit(w),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+    ))
 }
 
 /// The result of compiling a predicate against a known schema.
@@ -837,6 +1106,37 @@ mod tests {
     }
 
     #[test]
+    fn bucket_width_beyond_i64_nanoseconds_is_rejected_at_validation() {
+        // Arrange — a width that fits `u64` (`duration_nanos` succeeds) but
+        // exceeds `i64::MAX` nanoseconds, the type `bucket_expr`'s execution
+        // lowering casts into (§6.5 floor-division): 20,000 weeks ≈
+        // 12.096e18 ns, past i64::MAX ≈ 9.223e18 ns.
+        let width = "20000w";
+        let i64_max_ns = u64::try_from(i64::MAX).expect("i64::MAX is non-negative");
+        assert!(
+            duration_nanos(width).unwrap() > i64_max_ns,
+            "the fixture width must actually exceed i64::MAX ns",
+        );
+
+        // Act
+        let err = validate_group_terms(
+            &[GroupTerm::Bucket(width.to_string())],
+            &Predicate::Bool(true),
+        )
+        .expect_err("an i64-overflowing bucket width must fail validation");
+
+        // Assert — rejected here, at the same compile-time gate as every
+        // other `by`-list rule, not later during `bucket_expr`'s own cast.
+        let QueryError::InvalidQuery { detail } = err else {
+            panic!("expected InvalidQuery, got {err:?}");
+        };
+        assert!(
+            detail.contains("i64"),
+            "the error names the i64 bound: {detail}",
+        );
+    }
+
+    #[test]
     fn resolve_window_defaults_to_lookback_when_no_range() {
         // Arrange — no range stage.
         let now = 1_000 * NS_PER_SECOND;
@@ -887,6 +1187,40 @@ mod tests {
     }
 
     #[test]
+    fn pinned_template_id_follows_the_amendment_rule() {
+        let pin = |q: &str| pinned_template_id(&crate::dsl::parse(q).unwrap().predicate);
+        assert_eq!(pin("template_id == 4"), Some(4));
+        assert_eq!(pin("template_id == 4 and service == \"api\""), Some(4));
+        assert_eq!(pin("template_id == 4 and template_id == 4"), Some(4));
+        // A disjunction / negation pins nothing; conflicting top-level ids
+        // pin nothing; `resolves_to` is an alias *set*, not a pin.
+        assert_eq!(pin("template_id == 4 or template_id == 7"), None);
+        assert_eq!(pin("not template_id == 4"), None);
+        assert_eq!(pin("template_id == 4 and template_id == 7"), None);
+        assert_eq!(pin("resolves_to(4)"), None);
+        assert_eq!(pin("service == \"api\""), None);
+    }
+
+    #[test]
+    fn validate_enforces_group_term_rules() {
+        let v = |q: &str| {
+            validate(
+                &crate::dsl::parse(q).unwrap(),
+                1_000 * NS_PER_SECOND,
+                NS_PER_SECOND,
+            )
+        };
+        assert!(v("template_id == 4 | count by param(0), bucket(5m)").is_ok());
+        // `bucket` alone has no pinning requirement of its own.
+        assert!(v("true | count by bucket(5m)").is_ok());
+        assert!(v("service == \"api\" | count by param(0)").is_err());
+        assert!(v("template_id == 4 | count by bucket(0s)").is_err());
+        assert!(v("template_id == 4 | count by bucket(5m), bucket(1h)").is_err());
+        assert!(v("template_id == 4 | count by param(0), param(0)").is_err());
+        assert!(v("true | count | count").is_err());
+    }
+
+    #[test]
     fn attr_fragment_matches_canonical_json() {
         // The needle the compiler builds for `service == "api"` must be a
         // substring of the canonical JSON the writer stores — this is the
@@ -896,5 +1230,174 @@ mod tests {
         let fragment = "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"api\"}}";
         let stored = "[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"api\"}}]";
         assert!(stored.contains(fragment));
+    }
+
+    #[test]
+    fn validate_rejects_limit_alongside_count() {
+        // A `count [by …] | limit n` pipeline would silently drop the
+        // `limit` — `Terminal::Aggregate` never consults `plan.limit`
+        // (group-limiting semantics are not implemented) — so `validate`
+        // must reject the combination rather than execute the wrong query.
+        let v = |q: &str| {
+            validate(
+                &crate::dsl::parse(q).unwrap(),
+                1_000 * NS_PER_SECOND,
+                NS_PER_SECOND,
+            )
+        };
+        assert!(v("true | count by service | limit 10").is_err());
+        assert!(v("true | count | limit 10").is_err());
+        // `limit` alone, or `count` alone, are each still fine.
+        assert!(v("true | limit 10").is_ok());
+        assert!(v("true | count by service").is_ok());
+    }
+
+    /// Property tests (CLAUDE.md §6.2) for the §6.3 amendment's planner
+    /// invariants: pin detection ([`pinned_template_id`]) and the `by`-list
+    /// rules ([`validate_group_terms`], reached here through the real
+    /// [`validate`] entry point). Each generated case is checked against an
+    /// independently-computed reference decision — ground truth tracked
+    /// alongside generation, not derived by calling the code under test —
+    /// so the properties supplement (not replace) the hand-picked examples
+    /// above.
+    mod planner_invariants {
+        use std::collections::BTreeSet;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// A top-level `and`-term together with the pin candidate it
+        /// contributes, if any: a bare `template_id == n` comparison pins;
+        /// wrapping it in `or`, `not`, or `resolves_to` does not (§6.3
+        /// amendment).
+        fn pin_term() -> impl Strategy<Value = (Predicate, Option<i64>)> {
+            let id = 0i64..4;
+            prop_oneof![
+                id.clone().prop_map(|n| (
+                    Predicate::Comparison {
+                        field: Field::TemplateId,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Int(n),
+                    },
+                    Some(n),
+                )),
+                Just((
+                    Predicate::Comparison {
+                        field: Field::Service,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Str("svc".to_string()),
+                    },
+                    None,
+                )),
+                id.clone().prop_map(|n| (
+                    Predicate::Or(vec![
+                        Predicate::Comparison {
+                            field: Field::TemplateId,
+                            op: CmpOp::Ord(OrdOp::Eq),
+                            value: Value::Int(n),
+                        },
+                        Predicate::Bool(true),
+                    ]),
+                    None,
+                )),
+                id.clone().prop_map(|n| (
+                    Predicate::Not(Box::new(Predicate::Comparison {
+                        field: Field::TemplateId,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Int(n),
+                    })),
+                    None,
+                )),
+                id.prop_map(|n| (
+                    #[allow(clippy::cast_sign_loss)] // `id` is 0..4, always non-negative
+                    Predicate::Call(Call::ResolvesTo(n as u64)),
+                    None,
+                )),
+            ]
+        }
+
+        /// A `by`-list element: a bare field (never a pin/param concern), a
+        /// `param(n)` from a small pool (biases toward duplicate `n`), or a
+        /// `bucket(...)` from a pool that includes a zero-width lexeme (the
+        /// only non-positive width the grammar can represent — a signed
+        /// literal is not a valid `bucket(...)` argument).
+        fn group_term() -> impl Strategy<Value = GroupTerm> {
+            prop_oneof![
+                Just(GroupTerm::Field(Field::Service)),
+                Just(GroupTerm::Field(Field::Body)),
+                (0u32..3).prop_map(GroupTerm::Param),
+                prop_oneof![
+                    Just("0s".to_string()),
+                    Just("5m".to_string()),
+                    Just("1h".to_string()),
+                ]
+                .prop_map(GroupTerm::Bucket),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn validate_matches_the_naive_oracle(
+                terms in prop::collection::vec(pin_term(), 1..4),
+                by in prop::collection::vec(group_term(), 0..5),
+            ) {
+                // Ground truth for the pin: all pin-candidate terms present
+                // must name the same id (empty ⇒ no pin), independent of
+                // `pinned_template_id`'s own traversal.
+                let pins: Vec<i64> = terms.iter().filter_map(|(_, p)| *p).collect();
+                let expected_pin = match pins.split_first() {
+                    Some((first, rest)) if rest.iter().all(|n| n == first) => Some(*first),
+                    _ => None,
+                };
+                let predicate = if terms.len() == 1 {
+                    terms[0].0.clone()
+                } else {
+                    Predicate::And(terms.iter().map(|(p, _)| p.clone()).collect())
+                };
+                prop_assert_eq!(
+                    pinned_template_id(&predicate),
+                    expected_pin.map(|n| u64::try_from(n).expect("pin pool is non-negative")),
+                    "pinned_template_id disagreed with the naive oracle on {:?}",
+                    predicate,
+                );
+
+                // Ground truth for the `by`-list: at most one `param(n)` per
+                // `n` and only under a pin, at most one `bucket(...)`, and
+                // every present bucket width positive.
+                let mut seen_params = BTreeSet::new();
+                let mut seen_bucket = false;
+                let mut expected_ok = true;
+                for term in &by {
+                    match term {
+                        GroupTerm::Param(n) => {
+                            if expected_pin.is_none() || !seen_params.insert(*n) {
+                                expected_ok = false;
+                            }
+                        }
+                        GroupTerm::Bucket(width) => {
+                            if seen_bucket || duration_nanos(width).unwrap_or(0) == 0 {
+                                expected_ok = false;
+                            }
+                            seen_bucket = true;
+                        }
+                        GroupTerm::Field(_) => {}
+                    }
+                }
+
+                let query = Query {
+                    predicate,
+                    stages: vec![Stage::Count { by: by.clone() }],
+                };
+                let got_ok = validate(&query, 1_000 * NS_PER_SECOND, NS_PER_SECOND).is_ok();
+                prop_assert_eq!(
+                    got_ok,
+                    expected_ok,
+                    "validate() disagreed with the naive oracle: pin={:?} by={:?}",
+                    expected_pin,
+                    by,
+                );
+            }
+        }
     }
 }

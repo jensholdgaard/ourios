@@ -20,8 +20,8 @@
 #[cfg(test)]
 mod wellformed {
     use ourios_querier::dsl::ir::{
-        AggFn, Call, CmpOp, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue, Stage,
-        Time, Value,
+        AggFn, Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityName, SeverityValue,
+        Stage, Time, Value,
     };
     use proptest::prelude::*;
 
@@ -55,6 +55,7 @@ mod wellformed {
             Just(Field::TraceId),
             Just(Field::SpanId),
             Just(Field::Scope),
+            Just(Field::EventName),
             Just(Field::Flags),
             Just(Field::Service),
             Just(Field::TemplateId),
@@ -242,11 +243,22 @@ mod wellformed {
         ]
     }
 
+    /// A §7 v1.1 `group_term` for the aggregation `by`-lists: a bare field,
+    /// `param(n)`, or `bucket(duration)` (the pinning / duplicate rules are
+    /// compile-time, not parse-time, so any mix round-trips).
+    fn group_term() -> impl Strategy<Value = GroupTerm> {
+        prop_oneof![
+            bare_field().prop_map(GroupTerm::Field),
+            (0u32..=8).prop_map(GroupTerm::Param),
+            duration_lexeme().prop_map(GroupTerm::Bucket),
+        ]
+    }
+
     fn stage() -> impl Strategy<Value = Stage> {
         let field_list = prop::collection::vec(bare_field(), 1..=3);
         prop_oneof![
             (time(), time()).prop_map(|(a, b)| Stage::Range(a, b)),
-            prop::collection::vec(bare_field(), 0..=3).prop_map(|by| Stage::Count { by }),
+            prop::collection::vec(group_term(), 0..=3).prop_map(|by| Stage::Count { by }),
             (
                 prop_oneof![
                     Just(AggFn::Sum),
@@ -255,7 +267,7 @@ mod wellformed {
                     Just(AggFn::Avg)
                 ],
                 path_field(),
-                prop::collection::vec(bare_field(), 0..=3),
+                prop::collection::vec(group_term(), 0..=3),
             )
                 .prop_map(|(func, path, by)| Stage::Agg { func, path, by }),
             (sort_key(), any::<bool>()).prop_map(|(key, desc)| Stage::Sort { key, desc }),
@@ -839,9 +851,10 @@ async fn rfc0002_6_unsupported_stage_rejected() {
     let q = Querier::new(bucket.path());
     let tenant = TenantId::new("a");
 
-    // `range` + `limit` stay supported; the rest must error, not no-op.
+    // `range` + `limit` stay supported, and — per the 2026-07-15 amendment
+    // (RFC0002.12) — `count` now executes rather than erroring (its own
+    // acceptance test below); the rest must error, not no-op.
     let cases: &[(&str, &str)] = &[
-        ("body == \"x\" | count", "count"),
         ("body == \"x\" | sum(confidence)", "aggregation"),
         ("body == \"x\" | sort ts", "sort"),
         ("body == \"x\" | project body", "project"),
@@ -1366,6 +1379,7 @@ fn rfc0002_11_structured_surface_schema_validation() {
 
     assert_well_formed_requests_pass(&validator);
     assert_malformed_requests_rejected(&validator);
+    assert_malformed_group_terms_rejected(&validator);
 }
 
 /// Well-formed requests must PASS the schema and then parse to an IR (RFC0002.2).
@@ -1390,6 +1404,9 @@ fn assert_well_formed_requests_pass(validator: &jsonschema::Validator) {
             {"render":{}}
         ]}"#,
         r#"{"predicate":{"const":true},"stages":[{"render":null}]}"#,
+        r#"{"predicate":{"field":"template_id","op":"==","value":4},"stages":[
+            {"count":{"by":[{"param":0},{"bucket":"5m"},"service"]}}
+        ]}"#,
     ];
     for req in valid {
         let instance: serde_json::Value =
@@ -1496,37 +1513,267 @@ fn assert_malformed_requests_rejected(validator: &jsonschema::Validator) {
     }
 }
 
+/// The `count`/`by`-list-specific malformed cases (§6.3 amendment): split out
+/// of [`assert_malformed_requests_rejected`] to keep it under the
+/// `clippy::too_many_lines` budget.
+fn assert_malformed_group_terms_rejected(validator: &jsonschema::Validator) {
+    let invalid: &[(&str, &str)] = &[
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":-1}]}}]}"#,
+            "negative param slot",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"bucket":"5"}]}}]}"#,
+            "non-duration bucket width",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":0,"x":1}]}}]}"#,
+            "extra group-term key",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"resource":"k8s.pod.name"}]}}]}"#,
+            "resource path in a by-list (string DSL group_term is bare-field-only)",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"attr":"http.status_code"}]}}]}"#,
+            "attr path in a by-list (string DSL group_term is bare-field-only)",
+        ),
+        (
+            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"param":4294967296}]}}]}"#,
+            "param slot past u32::MAX",
+        ),
+    ];
+    for (req, what) in invalid {
+        let instance: serde_json::Value =
+            serde_json::from_str(req).expect("malformed-but-still-JSON request");
+        assert!(
+            !validator.is_valid(&instance),
+            "{what}: schema must reject {req} before the planner",
+        );
+    }
+}
+
+/// Run a DSL query against `bucket` as tenant `a` with the shared fixture
+/// window — the aggregation scenarios' common driver.
+async fn run_dsl(bucket: &std::path::Path, dsl: &str) -> ourios_querier::QueryResult {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW};
+    let query = ourios_querier::dsl::parse(dsl).expect("parse DSL");
+    ourios_querier::Querier::new(bucket)
+        .run_query(
+            &query,
+            &ourios_core::tenant::TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&crate::common::no_aliases()),
+        )
+        .await
+        .expect("run_query")
+}
+
+/// The executed aggregation map as `key → count`, for oracle comparison.
+fn group_map(result: &ourios_querier::QueryResult) -> std::collections::BTreeMap<Vec<String>, u64> {
+    result
+        .aggregate
+        .as_ref()
+        .expect("an aggregation query returns the grouped-count map")
+        .iter()
+        .map(|g| (g.key.clone(), g.count))
+        .collect()
+}
+
 /// Scenario RFC0002.12 — `count [by …]` executes end-to-end and matches a
 /// naive oracle. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
 /// 2026-07-15).
-#[test]
-#[ignore = "RFC0002.12 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_12_count_by_matches_naive_oracle() {
-    todo!(
-        "RFC0002.12 — populated tenant store; `<predicate> | range(…) | \
-         count by <field, …>` over ordinary §7 fields (template_id, \
-         service) and the bare `count`: the result is the \
-         group_key → count map (bare count: the single total), equals \
-         a naive oracle that filters + counts the same rows outside \
-         the query path, and compile::validate no longer rejects the \
-         count stage"
+#[tokio::test]
+async fn rfc0002_12_count_by_matches_naive_oracle() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec, write_all};
+
+    // Arrange — a mixed corpus over two services and three templates, plus
+    // a foreign tenant that must never leak into the map (§3.7).
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let recs = [
+        rec("a", 1, TS0, 9, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 1, 17, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 2, 9, "web", "lib.cart", None, None),
+        rec("a", 2, TS0 + 3, 9, "api", "lib.cart", None, None),
+        rec("a", 3, TS0 + 4, 9, "web", "lib.cart", None, None),
+    ];
+    write_all(bucket.path(), &recs);
+    write_all(
+        bucket.path(),
+        &[rec("b", 1, TS0 + 5, 9, "api", "lib.cart", None, None)],
     );
+
+    // Naive oracle — filter and count the same rows outside the query path.
+    let service_of = |r: &ourios_core::record::MinedRecord| {
+        r.resource_attributes
+            .iter()
+            .find(|kv| kv.key == "service.name")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match v.value.as_ref() {
+                Some(ourios_core::otlp::any_value::Value::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("fixture rows carry service.name")
+    };
+    let mut by_template: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for r in recs.iter().filter(|r| service_of(r) == "api") {
+        *by_template
+            .entry(vec![r.template_id.to_string()])
+            .or_default() += 1;
+    }
+    let mut by_service: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for r in recs.iter().filter(|r| r.template_id == 1) {
+        *by_service.entry(vec![service_of(r)]).or_default() += 1;
+    }
+
+    // Act / Assert — `count by <field>` over ordinary §7 fields. The count
+    // stage executing at all is RFC0002.12's "no longer rejected by
+    // compile::validate".
+    let counted = run_dsl(bucket.path(), "service == \"api\" | count by template_id").await;
+    assert_eq!(group_map(&counted), by_template, "template_id grouping");
+    assert_eq!(counted.rows, 3, "rows stays the total matching-row count");
+    assert!(counted.records.is_empty(), "an aggregation returns no rows");
+
+    let by_svc = run_dsl(bucket.path(), "template_id == 1 | count by service").await;
+    assert_eq!(group_map(&by_svc), by_service, "service grouping");
+
+    // The bare `count`: the single total, as one empty-keyed group.
+    let bare = run_dsl(bucket.path(), "service == \"api\" | count").await;
+    assert_eq!(group_map(&bare), BTreeMap::from([(vec![], 3)]));
+    assert_eq!(bare.rows, 3);
+}
+
+/// Regression for RFC0002.12 — the row-level tenant backstop in
+/// `execute_aggregate` (`CLAUDE.md` §3.7), not merely directory-level
+/// partitioning, excludes a foreign-tenant row.
+///
+/// `write_all` places every record under *its own* tenant's partition
+/// (`PartitionKey::derive`), so a genuinely foreign-tenant fixture (as in
+/// [`rfc0002_12_count_by_matches_naive_oracle`] above) never reaches
+/// tenant "a"'s scan and exercises only the directory scoping. This test
+/// plants a tenant "b" row *inside* tenant "a"'s partition directory — the
+/// shape a partitioning bug or on-disk corruption would produce, since
+/// `Writer::append_records` enforces the RFC 0005 §3.9 row-vs-path
+/// contract and refuses a mismatched `tenant_id` at write time — and
+/// asserts the aggregation's `tenant_id == tenant` filter, not just
+/// partitioning, keeps the misplaced row out of both the group map and the
+/// count.
+#[tokio::test]
+async fn rfc0002_12_aggregation_tenant_backstop_excludes_misplaced_row() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec, write_all};
+    use ourios_parquet::{PartitionKey, Writer};
+
+    // Arrange — two legitimate tenant "a" rows, written normally.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let a_recs = [
+        rec("a", 1, TS0, 9, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 1, 9, "api", "lib.cart", None, None),
+    ];
+    write_all(bucket.path(), &a_recs);
+
+    // A tenant "b" row, written through the real (validating) writer into
+    // its own partition — `append_records` would reject it outright if
+    // opened under tenant "a"'s partition, so the only way to plant it is
+    // to write it honestly, then relocate the finished file.
+    let b_rec = rec("b", 1, TS0, 9, "api", "lib.cart", None, None);
+    let b_partition = PartitionKey::derive(&b_rec).expect("derive partition");
+    let mut w = Writer::open(bucket.path(), b_partition.clone()).expect("open writer");
+    w.append_records(std::slice::from_ref(&b_rec))
+        .expect("append");
+    let written = w.close().expect("close");
+
+    // Relocate the file into tenant "a"'s directory for the same time
+    // bucket — the row's stored `tenant_id` now disagrees with the
+    // directory it lives under.
+    let a_partition = PartitionKey {
+        tenant_id: "a".to_string(),
+        ..b_partition
+    };
+    let a_dir = a_partition.data_path(bucket.path());
+    std::fs::create_dir_all(&a_dir).expect("create tenant a dir");
+    let dest = a_dir.join(written.path.file_name().expect("file name"));
+    std::fs::rename(&written.path, &dest).expect("relocate misplaced file");
+
+    // Act — an aggregation query as tenant "a".
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by service").await;
+
+    // Assert — only the 2 legitimate tenant "a" rows are counted; the
+    // misplaced tenant "b" row neither skews the count nor leaks into a
+    // group.
+    assert_eq!(
+        group_map(&result),
+        BTreeMap::from([(vec!["api".to_string()], 2)]),
+    );
+    assert_eq!(result.rows, 2, "the misplaced row must not skew the count");
 }
 
 /// Scenario RFC0002.13 — `count by param(n), bucket(w)` yields the L4
 /// grouped-count map. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
 /// 2026-07-15; RFC0031.5).
-#[test]
-#[ignore = "RFC0002.13 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_13_count_by_param_bucket_grouped_map() {
-    todo!(
-        "RFC0002.13 — predicate pinning exactly one template_id (§6.3 \
-         pinning rule) with `count by param(0), bucket(5m)`: the \
-         result is the (bucket, group_key) → count map — buckets the \
-         half-open epoch-aligned windows [k·w, (k+1)·w) over the \
-         effective timestamp, group keys the stored string form of \
-         params slot 0 — equal to a naive oracle and shape-identical \
-         to the RFC 0031 §3.5 / RFC0031.1 L4-equivalence map"
+#[tokio::test]
+async fn rfc0002_13_count_by_param_bucket_grouped_map() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec_with_params, write_all};
+
+    const SECOND_NS: u64 = 1_000_000_000;
+    const WIDTH_NS: u64 = 300 * SECOND_NS; // 5m
+
+    // Arrange — template-1 rows spread across two 5-minute windows, plus a
+    // template-2 row in the same window that a pinned query must not count.
+    let rows: &[(&str, u64)] = &[
+        ("u1", TS0),
+        ("u2", TS0 + 100 * SECOND_NS),
+        ("u1", TS0 + 150 * SECOND_NS),
+        ("u1", TS0 + 400 * SECOND_NS),
+    ];
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let mut recs: Vec<_> = rows
+        .iter()
+        .map(|(p, ts)| rec_with_params("a", 1, *ts, &[p]))
+        .collect();
+    recs.push(rec_with_params("a", 2, TS0, &["zz"]));
+    write_all(bucket.path(), &recs);
+
+    // Naive oracle — the (group_key, bucket) → count map, buckets computed
+    // as the epoch-aligned half-open windows [k·w, (k+1)·w) over the
+    // effective timestamp, keys serialised RFC 3339 UTC (window start).
+    let bucket_key = |ts: u64| {
+        let start = ts / WIDTH_NS * WIDTH_NS;
+        chrono::DateTime::from_timestamp_nanos(i64::try_from(start).expect("fixture ns"))
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    };
+    let mut oracle: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for (p, ts) in rows {
+        *oracle
+            .entry(vec![(*p).to_string(), bucket_key(*ts)])
+            .or_default() += 1;
+    }
+
+    // Act — the L4 shape: a predicate pinning exactly one template_id.
+    let result = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) \
+         | count by param(0), bucket(5m)",
+    )
+    .await;
+
+    // Assert — the (bucket, group_key) → count map, shape-identical to the
+    // RFC 0031 §3.5 L4-equivalence map (key entries in by-list order).
+    assert_eq!(group_map(&result), oracle);
+    assert_eq!(result.rows, 4, "the pinned template's matching rows");
+    assert_eq!(result.stats.rows_excluded, 0, "every row carries slot 0");
+    // Pin one bucket key's exact serialisation: TS0 is 2026-04-02T10:58:00Z,
+    // so its 5m window starts 10:55:00Z.
+    assert!(
+        group_map(&result).contains_key(&vec!["u1".to_string(), "2026-04-02T10:55:00Z".into()]),
+        "epoch-aligned RFC 3339 UTC bucket key; got {:?}",
+        result.aggregate,
     );
 }
 
@@ -1551,37 +1798,282 @@ fn rfc0002_14_param_misuse_specific_error() {
 
 /// Scenario RFC0002.15 — short/NULL params rows are excluded and tallied.
 /// See `docs/rfcs/0002-query-dsl.md` §5 (amendment 2026-07-15).
-#[test]
-#[ignore = "RFC0002.15 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_15_short_params_excluded_and_tallied() {
-    todo!(
-        "RFC0002.15 — pinned-template rows whose params list is shorter \
-         than n + 1 (or whose slot n is NULL) alongside rows carrying \
-         slot n; `count by param(n), …`: the short/NULL rows \
-         contribute to no group (no synthetic absent bucket), the \
-         returned groups equal the naive oracle over the remaining \
-         rows, and the excluded-row count is reported per query (a \
-         QueryStats field on the RFC 0016 query-metrics path) so the \
-         exclusion is observable, not silent"
+#[tokio::test]
+async fn rfc0002_15_short_params_excluded_and_tallied() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec_with_params, write_all};
+
+    // Arrange — pinned-template rows carrying slot 1 alongside rows whose
+    // params list is shorter than n + 1.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_params("a", 1, TS0, &["a", "x"]),
+            rec_with_params("a", 1, TS0 + 1, &["b", "y"]),
+            rec_with_params("a", 1, TS0 + 2, &["c", "x"]),
+            rec_with_params("a", 1, TS0 + 3, &["c"]), // short: no slot 1
+            rec_with_params("a", 1, TS0 + 4, &[]),    // short: empty list
+        ],
     );
+
+    // Act
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by param(1)").await;
+
+    // Assert — the short rows contribute to no group (no synthetic absent
+    // bucket: the groups equal the naive oracle over the remaining rows
+    // exactly), and the exclusion is tallied per query on `QueryStats` —
+    // the field the RFC 0016 query path surfaces — so it is observable,
+    // not silent.
+    let oracle = BTreeMap::from([(vec!["x".to_string()], 2), (vec!["y".to_string()], 1)]);
+    assert_eq!(group_map(&result), oracle);
+    assert_eq!(result.stats.rows_excluded, 2, "both short rows tallied");
+    assert_eq!(result.rows, 5, "rows stays the total matching-row count");
+}
+
+/// Regression for RFC0002.15 — a params-list element that is *present* but
+/// whose own `value` decodes as Parquet-level NULL, distinct from a list
+/// shorter than `n + 1` (the case above). `Param.value` is a plain
+/// (non-`Option`) Rust `String`, so the `ourios-parquet` writer can never
+/// itself produce this shape — but the column is declared nullable at the
+/// schema level (RFC 0005 §3.2 `params_element.value`), so a corrupted or
+/// non-Rust-writer file legitimately can. Built with the raw arrow writer
+/// (mirroring `forward_compat.rs`'s schema-drift fixtures) so the disposition
+/// is proven on the actual code path, not assumed from the short-list case.
+#[tokio::test]
+async fn rfc0002_15_present_but_null_param_slot_excluded_and_tallied() {
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow_array::{Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StructArray};
+    use arrow_schema::DataType;
+    use parquet::arrow::ArrowWriter;
+
+    use crate::common::{TS0, rec_with_params, write_all};
+    use ourios_parquet::{PartitionKey, columns, mined_records_to_batch};
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+
+    // Two ordinary pinned-template rows with a real slot 1, written normally.
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_params("a", 1, TS0, &["a", "x"]),
+            rec_with_params("a", 1, TS0 + 1, &["b", "x"]),
+        ],
+    );
+
+    // A third row whose params list HAS a slot 1 — unlike the short lists
+    // above — but whose stored `value` at that slot is NULL. Start from a
+    // normally-shaped batch and replace only the `value` child array so
+    // every other column (including `type_tag`) stays exactly what a real
+    // writer produces.
+    let null_slot_rec = rec_with_params("a", 1, TS0 + 2, &["c", "y"]);
+    let base = mined_records_to_batch(std::slice::from_ref(&null_slot_rec)).expect("base batch");
+    let params_col = base.column_by_name(columns::PARAMS).expect("params column");
+    let list = params_col
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("params is a ListArray");
+    let struct_arr = list
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("list values is a StructArray");
+    let type_tag_col = struct_arr
+        .column_by_name("type_tag")
+        .expect("type_tag")
+        .clone();
+    // Slot 0 ("c") keeps its real value; slot 1 ("y") becomes NULL.
+    let new_value: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"c".as_slice()), None]));
+    let new_struct = StructArray::try_new(
+        struct_arr.fields().clone(),
+        vec![type_tag_col, new_value],
+        None,
+    )
+    .expect("rebuilt struct array");
+    let DataType::List(list_field) = params_col.data_type() else {
+        panic!("params column must be a List");
+    };
+    let new_list = ListArray::try_new(
+        list_field.clone(),
+        list.offsets().clone(),
+        Arc::new(new_struct),
+        list.nulls().cloned(),
+    )
+    .expect("rebuilt list array");
+    // Sanity: the list genuinely has 2 elements (slot 1 exists) — this is
+    // the present-but-NULL shape, not a length-1 short list.
+    assert_eq!(new_list.value_length(0), 2, "list must carry slot 1");
+    let params_idx = base
+        .schema()
+        .index_of(columns::PARAMS)
+        .expect("params index");
+    let mut cols: Vec<ArrayRef> = base.columns().to_vec();
+    cols[params_idx] = Arc::new(new_list);
+    let batch = RecordBatch::try_new(base.schema(), cols).expect("batch with null param slot");
+
+    let dir = PartitionKey::derive(&null_slot_rec)
+        .expect("derive partition")
+        .data_path(bucket.path());
+    std::fs::create_dir_all(&dir).expect("mkdir partition");
+    let file = File::create(dir.join("null-slot.parquet")).expect("create parquet");
+    let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    w.write(&batch).expect("write batch");
+    w.close().expect("close writer");
+
+    // Act
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by param(1)").await;
+
+    // Assert — same disposition as a short list: the present-but-NULL slot
+    // contributes to no group and is tallied, not silently coerced or
+    // grouped under a synthetic key.
+    let oracle = BTreeMap::from([(vec!["x".to_string()], 2)]);
+    assert_eq!(group_map(&result), oracle);
+    assert_eq!(
+        result.stats.rows_excluded, 1,
+        "the present-but-NULL slot is tallied"
+    );
+    assert_eq!(result.rows, 3, "rows stays the total matching-row count");
+}
+
+/// Regression for RFC0002.15/§6.3 — grouping by a **fixed-column** field
+/// (`trace_id`, `FixedSizeBinary(16)`) that is entirely absent from the
+/// tenant's file set (an old writer that predates the column, the
+/// `rfc0007_4_severity_filter_on_column_absent_everywhere_is_empty`
+/// shape). The absent-column NULL substitute must carry `trace_id`'s own
+/// Arrow type — not a generic `Utf8` placeholder — so the aggregate
+/// plan's output schema does not depend on which optional columns happen
+/// to be present; proves the path executes and every row is excluded
+/// (not misdecoded or panicking on a type mismatch).
+#[tokio::test]
+async fn rfc0002_16_group_by_absent_fixed_column_excluded_and_tallied() {
+    use std::fs::File;
+
+    use ourios_parquet::{PartitionKey, columns, mined_records_to_batch};
+    use parquet::arrow::ArrowWriter;
+
+    use crate::common::{TS0, rec};
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let rows = [
+        rec("a", 1, TS0, 9, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 1, 9, "api", "lib.cart", None, None),
+    ];
+    let base = mined_records_to_batch(&rows).expect("base batch");
+    let keep: Vec<usize> = base
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name() != columns::TRACE_ID)
+        .map(|(i, _)| i)
+        .collect();
+    let batch = base.project(&keep).expect("batch without trace_id");
+    assert!(
+        batch.schema().index_of(columns::TRACE_ID).is_err(),
+        "trace_id must be entirely absent from this file's schema",
+    );
+
+    let dir = PartitionKey::derive(&rows[0])
+        .expect("derive partition")
+        .data_path(bucket.path());
+    std::fs::create_dir_all(&dir).expect("mkdir partition");
+    let file = File::create(dir.join("no-trace-id.parquet")).expect("create parquet");
+    let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    w.write(&batch).expect("write batch");
+    w.close().expect("close writer");
+
+    // Act
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by trace_id").await;
+
+    // Assert — an absent OPTIONAL column reads as NULL for every row, so
+    // both rows land in the excluded tally and no group is produced;
+    // the query answers cleanly rather than erroring on a type mismatch
+    // between the substituted literal and `trace_id`'s real Arrow type.
+    assert!(
+        group_map(&result).is_empty(),
+        "an entirely absent column produces no group",
+    );
+    assert_eq!(result.stats.rows_excluded, 2, "both rows tallied excluded");
+    assert_eq!(result.rows, 2, "rows stays the total matching-row count");
 }
 
 /// Scenario RFC0002.16 — the aggregation path's honest bytes total is the
 /// group-column scan alone. See `docs/rfcs/0002-query-dsl.md` §5
 /// (amendment 2026-07-15; RFC 0031 §3.6).
-#[test]
-#[ignore = "RFC0002.16 stub — implemented in the aggregation-execution green slice"]
-fn rfc0002_16_honest_bytes_is_group_column_scan_only() {
-    todo!(
-        "RFC0002.16 — an L4-shaped query (`template_id == N | range(…) \
-         | count by param(n), bucket(w)`) under RFC 0031 §3.6 \
-         honest-total accounting: the total is the count-scan \
-         component only — within surviving row groups, the column \
-         chunks read are the predicate + group-term columns \
-         (template_id, the effective-time column, params iff a \
-         param(n) term is present), never body/separators; the \
-         row-materialization component is zero (a map is returned, \
-         not rows) and registry_bytes_read is zero (nothing is \
-         rendered)"
+#[tokio::test]
+async fn rfc0002_16_honest_bytes_is_group_column_scan_only() {
+    use crate::common::{TS0, rec_with_params, write_all};
+    use ourios_core::record::MinedRecord;
+
+    // Arrange — rows whose retained `body` dominates the file: if the
+    // aggregation scan touched the body/separators chunks, its byte figure
+    // could not stay far below the materialization pass's.
+    let fat_body = |seed: u64| -> String {
+        use std::fmt::Write as _;
+        // Simple xorshift so the bodies stay incompressible-ish; hex-encoded.
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut s = String::with_capacity(8 * 1024);
+        while s.len() < 8 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let _ = write!(s, "{x:016x}");
+        }
+        s
+    };
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let recs: Vec<MinedRecord> = (0..64)
+        .map(|i| MinedRecord {
+            body: Some(fat_body(i)),
+            ..rec_with_params("a", 1, TS0 + i, &[if i % 2 == 0 { "u1" } else { "u2" }])
+        })
+        .collect();
+    write_all(bucket.path(), &recs);
+
+    // Act — the L4 shape under the RFC 0031 §3.6 honest-total accounting,
+    // and (for the body-exclusion comparison) a materializing query over
+    // the same rows, whose pass must fetch every fat body page.
+    let agg = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) \
+         | count by param(0), bucket(5m)",
+    )
+    .await;
+    let rendered = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) | limit 100",
+    )
+    .await;
+
+    // Assert — the honest total is the count-scan component only: zero row
+    // materialization (a map is returned, not rows) and zero template-map
+    // acquisition (nothing is rendered).
+    assert_eq!(agg.rows, 64);
+    assert!(agg.aggregate.is_some());
+    assert_eq!(agg.materialize_bytes_read, 0, "no rows are materialized");
+    assert_eq!(agg.registry_bytes_read, 0, "nothing is rendered");
+    assert!(agg.stats.bytes_read > 0, "the group-column scan reads data");
+    let honest_total = agg.stats.bytes_read + agg.materialize_bytes_read + agg.registry_bytes_read;
+    assert_eq!(honest_total, agg.stats.bytes_read);
+
+    // The count scan reads the predicate + group-term columns only —
+    // never `body`/`separators`. Proxy: the materializing pass over the
+    // same rows pays for every fat body page; the aggregation's whole scan
+    // must stay far below it.
+    assert_eq!(
+        rendered.records.len(),
+        64,
+        "the comparison rendered all rows"
+    );
+    assert!(
+        agg.stats.bytes_read * 2 < rendered.materialize_bytes_read,
+        "the aggregation scan ({} B) must stay far below the body-page \
+         materialization ({} B) — it must never read body/separators",
+        agg.stats.bytes_read,
+        rendered.materialize_bytes_read,
     );
 }

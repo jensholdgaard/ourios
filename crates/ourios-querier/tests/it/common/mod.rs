@@ -86,6 +86,25 @@ pub fn simple(tenant: &str, template_id: u64, ts_ns: u64) -> MinedRecord {
     rec(tenant, template_id, ts_ns, 9, "api", "lib.cart", None, None)
 }
 
+/// A [`simple`] record with an explicit positional `params` list (RFC 0005
+/// §3.2), for the §6.3 `param(n)` group-term scenarios — including short
+/// lists (RFC0002.15's excluded rows).
+pub fn rec_with_params(tenant: &str, template_id: u64, ts_ns: u64, params: &[&str]) -> MinedRecord {
+    MinedRecord {
+        params: params
+            .iter()
+            .map(|v| Param {
+                type_tag: ParamType::Str,
+                value: (*v).to_string(),
+            })
+            .collect(),
+        // The writer's three-zone invariant: a string-bodied record carries
+        // `params.len() + 1` separators.
+        separators: vec![String::new(); params.len() + 1],
+        ..simple(tenant, template_id, ts_ns)
+    }
+}
+
 /// A record with explicit resource attributes (overriding the default
 /// single `service.name`), so a test can give one row a key and another
 /// row none.

@@ -9,8 +9,8 @@
 use std::fmt::Write as _;
 
 use super::ir::{
-    AggFn, Call, CmpOp, DriftQuery, Field, OrdOp, Predicate, Query, SeverityName, SeverityValue,
-    Stage, Statement, Time, Value,
+    AggFn, Call, CmpOp, DriftQuery, Field, GroupTerm, OrdOp, Predicate, Query, SeverityName,
+    SeverityValue, Stage, Statement, Time, Value,
 };
 
 /// Serialise a [`Statement`] (a log query or a RFC 0010 `drift` query) to its
@@ -254,10 +254,23 @@ fn write_stage(out: &mut String, stage: &Stage) {
     }
 }
 
-fn write_by(out: &mut String, by: &[Field]) {
+fn write_by(out: &mut String, by: &[GroupTerm]) {
     if !by.is_empty() {
         out.push_str(" by ");
-        write_field_list(out, by);
+        for (i, term) in by.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            match term {
+                GroupTerm::Field(f) => write_field(out, f),
+                GroupTerm::Param(n) => {
+                    let _ = write!(out, "param({n})");
+                }
+                GroupTerm::Bucket(width) => {
+                    let _ = write!(out, "bucket({width})");
+                }
+            }
+        }
     }
 }
 
@@ -371,6 +384,8 @@ mod tests {
         "not (service == \"api\" or service == \"web\")",
         "true | range(-1h, now) | limit 100",
         "service == \"x\" | count by template_id, service | sort count desc | limit 10",
+        "template_id == 4 | range(-1h, now) | count by param(0), bucket(5m)",
+        "template_id == 4 | count by service, bucket(1d)",
         "true | avg(confidence) by service | project body, ts | render",
         "ts >= 2026-01-02T03:04:05Z",
         "attr.dur == 30s",

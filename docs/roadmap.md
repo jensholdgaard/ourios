@@ -4,14 +4,15 @@
 > a merged PR materially changes the *current state* in §3.
 > Last updated: **2026-07-15** — a month of post-MVP shipping work
 > landed since the prior entry below; §3's RFC ladder now covers
-> RFC 0001 through RFC 0033 and §5's deferred-capabilities table is
-> rewritten because six of its seven rows have since shipped: WAL
-> (RFC 0008 `accepted`), the OTLP wire endpoints (RFC 0003 `green`),
-> the query DSL (RFC 0002 `green`), auth + tenant binding (RFC 0026
-> `accepted`), the `ourios-server` binary + Helm chart (shipped,
-> kind-validated), and object storage on S3 (RFC 0013 `green`, RFC
-> 0019 `accepted`). Only the Perses datasource plugin is still
-> deferred. Current work is RFC 0031 (comparative evaluation against
+> RFC 0001 through RFC 0033 and §5's deferred-capabilities table
+> (eight rows) is rewritten: six have shipped outright (the WAL, the
+> OTLP wire endpoints, the snapshot mechanism, the §6.8 telemetry
+> surface, the query DSL, and the `ourios-server` binary + Helm
+> chart), multi-tenancy-at-runtime is partially landed (auth +
+> tenant binding shipped via RFC 0026 `accepted`; rate-limit/
+> eviction/lifecycle orchestration is still open), and the Perses
+> datasource plugin remains fully deferred. Current work is RFC 0031
+> (comparative evaluation against
 > Grafana Loki) — a post-MVP thesis-strengthening effort, not a new
 > MVP gate — with the `L1`/`L3`/`L6` classes frozen and gate-enforcing
 > per its §7 and the last must-win class (`L4`, frequency aggregation)
@@ -132,6 +133,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0009 | Background compaction | **`validated`** — §5 RFC0009.1–.6 pass; RFC0009.7 D2/D3/B2-post measured authoritatively on `baseline-8vcpu-32gib` (§9.7: D3 in 256 MiB–2 GiB band, D2 166.8 MiB/s, B2-post ≈6.1×) |
 | 0010 | Audit-stream / drift queries | **`green`** — all 8 §5 scenarios pass (`crates/ourios-querier/tests/drift.rs`); discharges RFC 0001 H5.3; §9 items are `accepted`-gating; general audit aggregation deferred (§3.2) |
 | 0011 | A1 re-scope | **`accepted`** |
+| 0012 | meta: CLAUDE.md §2 pillar-#2 wording | **`accepted`** |
 | 0013 | Object storage (S3-compatible) | `green` — S3 backend + conditional-PUT publish + consumer migration all landed |
 | 0014 | Ingest write path: record sink and flush policy | `green` |
 | 0015 | Fuzzing harness: cargo-fuzz + ClusterFuzzLite CI | `green` |
@@ -321,9 +323,10 @@ or it doesn't.
 Each item is a real production concern. The reason it was deferred
 *for MVP* is *"answering 'does the thesis hold?' doesn't require
 it,"* not *"we don't think it matters."* As of this entry, six of
-the seven original rows have shipped as part of the post-MVP
-shipping milestone (§3); the table below records what shipped and
-what's still genuinely open.
+the eight original rows have shipped outright, one (multi-tenancy
+at runtime) is partially landed, and one (Perses) is still fully
+deferred, as part of the post-MVP shipping milestone (§3); the
+table below records what shipped and what's still genuinely open.
 
 | Capability | Why deferred for MVP | Status |
 |---|---|---|
@@ -336,18 +339,19 @@ what's still genuinely open.
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
 | **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
 
-**Note on OTLP scope.** The pre-amendment roadmap listed
-"OTLP receiver (gRPC + HTTP)" as a single post-MVP item.
+**Note on OTLP scope (historical).** The pre-amendment roadmap
+listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.
 PR #20 + #21 split that scope: the **OTLP record shape**
 (`OtlpLogRecord` consumption, the canonical JSON encoding,
-the OTLP-aligned Parquet schema) is in MVP — it's a
-prerequisite for thesis-gate **C2**'s validity, because the
+the OTLP-aligned Parquet schema) was in MVP from the start — it's
+a prerequisite for thesis-gate **C2**'s validity, because the
 template-count convergence the corpus measures has to be over
-records that look like real OTel traffic, not over
-flat-text caricatures of it. Only the **wire endpoints** —
-the actual gRPC/HTTP listeners that decode OTLP off the
-network — remain post-MVP, and that's the row in the table
-above.
+records that look like real OTel traffic, not over flat-text
+caricatures of it. Only the **wire endpoints** — the actual
+gRPC/HTTP listeners that decode OTLP off the network — were
+deferred past MVP, and that's the row in the table above; RFC 0003
+(`green`) has since landed them, so nothing in this note is
+still-open scope.
 
 ---
 

@@ -55,6 +55,7 @@ mod wellformed {
             Just(Field::TraceId),
             Just(Field::SpanId),
             Just(Field::Scope),
+            Just(Field::EventName),
             Just(Field::Flags),
             Just(Field::Service),
             Just(Field::TemplateId),
@@ -1645,6 +1646,72 @@ async fn rfc0002_12_count_by_matches_naive_oracle() {
     assert_eq!(bare.rows, 3);
 }
 
+/// Regression for RFC0002.12 — the row-level tenant backstop in
+/// `execute_aggregate` (`CLAUDE.md` §3.7), not merely directory-level
+/// partitioning, excludes a foreign-tenant row.
+///
+/// `write_all` places every record under *its own* tenant's partition
+/// (`PartitionKey::derive`), so a genuinely foreign-tenant fixture (as in
+/// [`rfc0002_12_count_by_matches_naive_oracle`] above) never reaches
+/// tenant "a"'s scan and exercises only the directory scoping. This test
+/// plants a tenant "b" row *inside* tenant "a"'s partition directory — the
+/// shape a partitioning bug or on-disk corruption would produce, since
+/// `Writer::append_records` enforces the RFC 0005 §3.9 row-vs-path
+/// contract and refuses a mismatched `tenant_id` at write time — and
+/// asserts the aggregation's `tenant_id == tenant` filter, not just
+/// partitioning, keeps the misplaced row out of both the group map and the
+/// count.
+#[tokio::test]
+async fn rfc0002_12_aggregation_tenant_backstop_excludes_misplaced_row() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, rec, write_all};
+    use ourios_parquet::{PartitionKey, Writer};
+
+    // Arrange — two legitimate tenant "a" rows, written normally.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let a_recs = [
+        rec("a", 1, TS0, 9, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 1, 9, "api", "lib.cart", None, None),
+    ];
+    write_all(bucket.path(), &a_recs);
+
+    // A tenant "b" row, written through the real (validating) writer into
+    // its own partition — `append_records` would reject it outright if
+    // opened under tenant "a"'s partition, so the only way to plant it is
+    // to write it honestly, then relocate the finished file.
+    let b_rec = rec("b", 1, TS0, 9, "api", "lib.cart", None, None);
+    let b_partition = PartitionKey::derive(&b_rec).expect("derive partition");
+    let mut w = Writer::open(bucket.path(), b_partition.clone()).expect("open writer");
+    w.append_records(std::slice::from_ref(&b_rec))
+        .expect("append");
+    let written = w.close().expect("close");
+
+    // Relocate the file into tenant "a"'s directory for the same time
+    // bucket — the row's stored `tenant_id` now disagrees with the
+    // directory it lives under.
+    let a_partition = PartitionKey {
+        tenant_id: "a".to_string(),
+        ..b_partition
+    };
+    let a_dir = a_partition.data_path(bucket.path());
+    std::fs::create_dir_all(&a_dir).expect("create tenant a dir");
+    let dest = a_dir.join(written.path.file_name().expect("file name"));
+    std::fs::rename(&written.path, &dest).expect("relocate misplaced file");
+
+    // Act — an aggregation query as tenant "a".
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by service").await;
+
+    // Assert — only the 2 legitimate tenant "a" rows are counted; the
+    // misplaced tenant "b" row neither skews the count nor leaks into a
+    // group.
+    assert_eq!(
+        group_map(&result),
+        BTreeMap::from([(vec!["api".to_string()], 2)]),
+    );
+    assert_eq!(result.rows, 2, "the misplaced row must not skew the count");
+}
+
 /// Scenario RFC0002.13 — `count by param(n), bucket(w)` yields the L4
 /// grouped-count map. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
 /// 2026-07-15; RFC0031.5).
@@ -1763,6 +1830,113 @@ async fn rfc0002_15_short_params_excluded_and_tallied() {
     assert_eq!(group_map(&result), oracle);
     assert_eq!(result.stats.rows_excluded, 2, "both short rows tallied");
     assert_eq!(result.rows, 5, "rows stays the total matching-row count");
+}
+
+/// Regression for RFC0002.15 — a params-list element that is *present* but
+/// whose own `value` decodes as Parquet-level NULL, distinct from a list
+/// shorter than `n + 1` (the case above). `Param.value` is a plain
+/// (non-`Option`) Rust `String`, so the `ourios-parquet` writer can never
+/// itself produce this shape — but the column is declared nullable at the
+/// schema level (RFC 0005 §3.2 `params_element.value`), so a corrupted or
+/// non-Rust-writer file legitimately can. Built with the raw arrow writer
+/// (mirroring `forward_compat.rs`'s schema-drift fixtures) so the disposition
+/// is proven on the actual code path, not assumed from the short-list case.
+#[tokio::test]
+async fn rfc0002_15_present_but_null_param_slot_excluded_and_tallied() {
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow_array::{Array, ArrayRef, BinaryArray, ListArray, RecordBatch, StructArray};
+    use arrow_schema::DataType;
+    use parquet::arrow::ArrowWriter;
+
+    use crate::common::{TS0, rec_with_params, write_all};
+    use ourios_parquet::{PartitionKey, columns, mined_records_to_batch};
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+
+    // Two ordinary pinned-template rows with a real slot 1, written normally.
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_params("a", 1, TS0, &["a", "x"]),
+            rec_with_params("a", 1, TS0 + 1, &["b", "x"]),
+        ],
+    );
+
+    // A third row whose params list HAS a slot 1 — unlike the short lists
+    // above — but whose stored `value` at that slot is NULL. Start from a
+    // normally-shaped batch and replace only the `value` child array so
+    // every other column (including `type_tag`) stays exactly what a real
+    // writer produces.
+    let null_slot_rec = rec_with_params("a", 1, TS0 + 2, &["c", "y"]);
+    let base = mined_records_to_batch(std::slice::from_ref(&null_slot_rec)).expect("base batch");
+    let params_col = base.column_by_name(columns::PARAMS).expect("params column");
+    let list = params_col
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("params is a ListArray");
+    let struct_arr = list
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("list values is a StructArray");
+    let type_tag_col = struct_arr
+        .column_by_name("type_tag")
+        .expect("type_tag")
+        .clone();
+    // Slot 0 ("c") keeps its real value; slot 1 ("y") becomes NULL.
+    let new_value: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"c".as_slice()), None]));
+    let new_struct = StructArray::try_new(
+        struct_arr.fields().clone(),
+        vec![type_tag_col, new_value],
+        None,
+    )
+    .expect("rebuilt struct array");
+    let DataType::List(list_field) = params_col.data_type() else {
+        panic!("params column must be a List");
+    };
+    let new_list = ListArray::try_new(
+        list_field.clone(),
+        list.offsets().clone(),
+        Arc::new(new_struct),
+        list.nulls().cloned(),
+    )
+    .expect("rebuilt list array");
+    // Sanity: the list genuinely has 2 elements (slot 1 exists) — this is
+    // the present-but-NULL shape, not a length-1 short list.
+    assert_eq!(new_list.value_length(0), 2, "list must carry slot 1");
+    let params_idx = base
+        .schema()
+        .index_of(columns::PARAMS)
+        .expect("params index");
+    let mut cols: Vec<ArrayRef> = base.columns().to_vec();
+    cols[params_idx] = Arc::new(new_list);
+    let batch = RecordBatch::try_new(base.schema(), cols).expect("batch with null param slot");
+
+    let dir = PartitionKey::derive(&null_slot_rec)
+        .expect("derive partition")
+        .data_path(bucket.path());
+    std::fs::create_dir_all(&dir).expect("mkdir partition");
+    let file = File::create(dir.join("null-slot.parquet")).expect("create parquet");
+    let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    w.write(&batch).expect("write batch");
+    w.close().expect("close writer");
+
+    // Act
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by param(1)").await;
+
+    // Assert — same disposition as a short list: the present-but-NULL slot
+    // contributes to no group and is tallied, not silently coerced or
+    // grouped under a synthetic key.
+    let oracle = BTreeMap::from([(vec!["x".to_string()], 2)]);
+    assert_eq!(group_map(&result), oracle);
+    assert_eq!(
+        result.stats.rows_excluded, 1,
+        "the present-but-NULL slot is tallied"
+    );
+    assert_eq!(result.rows, 3, "rows stays the total matching-row count");
 }
 
 /// Scenario RFC0002.16 — the aggregation path's honest bytes total is the

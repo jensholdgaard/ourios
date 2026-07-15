@@ -21,12 +21,14 @@
 //! expression of the pruning thesis. Latency is corroborating, not
 //! sole-gating. See `docs/rfcs/0031-comparative-evaluation-loki.md`.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
-    FIXTURE_SERVICE, FIXTURE_SERVICE_B, FIXTURE_TRACE, FixtureRecord, LineKey, LokiFetchedBytes,
-    comparative_fixture, compare_lines, fixture_jsonl, fixture_logs_data, ourios_query_lines,
-    parse_loki_bytes_processed, parse_loki_fetched_bytes, parse_loki_streams,
+    AggKey, FIXTURE_SERVICE, FIXTURE_SERVICE_B, FIXTURE_TRACE, FixtureRecord, LineKey,
+    LokiFetchedBytes, comparative_fixture, compare_aggregations, compare_lines, fixture_jsonl,
+    fixture_logs_data, ourios_aggregate_answer, ourios_query_lines, parse_loki_bytes_processed,
+    parse_loki_fetched_bytes, parse_loki_matrix, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
 use ourios_miner::tree::OwnedToken;
@@ -574,17 +576,155 @@ fn rfc0031_4_l3_trace_correlation_bytes() {
 
 /// Scenario RFC0031.5 — L4 frequency aggregation wins on bytes read (OTLP-native).
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
+///
+/// `M_L4` stays **§7-DEFERRED** ("deferred until L4 is first measured") —
+/// unlike RFC0031.2/.4 (`M_L1`/`M_L3` frozen on the storage channel) or
+/// RFC0031.7 (`F_L6` frozen on the latency channel), there is no recorded
+/// measurement to pin a gate against yet, so this slice cannot pin a
+/// frozen-value bound the way those scenarios do. What it pins instead —
+/// the un-stub for this slice — is the **equivalence machinery** and the
+/// **`PairSpec` shape** an L4 pair takes: the picker
+/// ([`pick_frequency_pair`]), the Ourios aggregation extraction
+/// (`ourios_bench::ourios_aggregate_answer`), the Loki matrix parser
+/// (`ourios_bench::parse_loki_matrix`, including its bucket-alignment
+/// convention), and the `(bucket, group_key) -> count` equivalence check
+/// (`ourios_bench::compare_aggregations`) — all wired correctly on the
+/// deterministic fixture. No container: the Loki side is a HAND-BUILT
+/// matrix response over the SAME grouped counts the Ourios side measured
+/// (mirroring how `pick_template_pair_finds_a_validated_needle` validates
+/// the L1 picker against the Ourios engine alone, with the live
+/// cross-system round trip left to the dispatch run). The bytes figure is
+/// PRINTED, never asserted, per the deferral.
 #[test]
-#[ignore = "RFC0031.5 stub — implemented in the L-gate + bytes-read green slice"]
 fn rfc0031_5_l4_frequency_aggregation_bytes() {
-    todo!(
-        "RFC0031.5 — headline corpus, count of one template over time \
-         grouped by an extracted param (Ourios: columnar GROUP BY on \
-         template_id + a typed param column; Loki: count_over_time with \
-         a LogQL pattern/label_format extraction over scanned chunks), \
-         RFC0031.1 grouped-count-map equivalence holding: \
-         ourios.bytes_read / loki.bytes_read <= 1/M_L4. must-win — the \
-         query the template + typed-params pillar exists to serve"
+    // Two values ("10"/"11") of one template ("connection established to
+    // peer <id>" — the same ≥10-char constant run
+    // `pick_template_pair_finds_a_validated_needle` already validates),
+    // spread over four one-second buckets so the picker's cardinality
+    // (2..=50) and row-floor bounds are exercised, not merely satisfied
+    // trivially.
+    let records: Vec<(u64, &str)> = vec![
+        (100_000_000, "connection established to peer 10"),
+        (500_000_000, "connection established to peer 10"),
+        (900_000_000, "connection established to peer 11"),
+        (2_100_000_000, "connection established to peer 10"),
+        (2_500_000_000, "connection established to peer 11"),
+        (3_000_000_000, "connection established to peer 11"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    let pair = pick_frequency_pair(bucket.path(), &tenant, now, window)
+        .expect("the peer template's trailing id validates as an L4 candidate");
+    assert_eq!(pair.param, 0, "the template's only wildcard");
+    assert_eq!(
+        pair.bucket_width, "1s",
+        "the ~2.9s fixture span floors to the 1s minimum bucket width",
+    );
+    assert_eq!(pair.needle, "connection established to peer");
+    assert_eq!(pair.capture_regex, "peer\\s+(?P<value>\\S+)");
+    let distinct: std::collections::HashSet<&String> =
+        pair.groups.keys().map(|k| &k.group_key).collect();
+    assert_eq!(distinct.len(), 2, "exactly the two picked id values");
+    assert_eq!(pair.groups.values().sum::<u64>(), 6, "all six rows counted");
+    assert!(
+        pair.bytes_read > 0,
+        "the grouped-count scan reads real bytes from storage",
+    );
+
+    // The `PairSpec` shape the dispatch run would fill in with a live
+    // Loki round trip (RFC 0031 §3.4: L4 is a must-win class) — pinned
+    // here without wiring the container-based measurement loop, per this
+    // slice's scope.
+    let margins = ourios_bench::ComparativeMargins::default();
+    let spec = PairSpec {
+        label: format!(
+            "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
+            pair.template_id, pair.param, pair.bucket_width,
+        ),
+        margin: margins.m_l4,
+        class: PairClass::L4,
+        dsl: format!(
+            "template_id == {} | count by param({}), bucket({})",
+            pair.template_id, pair.param, pair.bucket_width,
+        ),
+        logql: format!(
+            "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
+             | regexp \"{}\" [{}]))",
+            pair.needle, pair.capture_regex, pair.bucket_width,
+        ),
+        start: built.min_effective_time_unix_nano,
+        end: built.max_effective_time_unix_nano + 1,
+        expected_rows: pair.groups.values().sum(),
+        now,
+        window,
+    };
+    assert!(
+        matches!(spec.class.gate(), GateKind::MustWin),
+        "L4 is a must-win class (RFC 0031 §3.4), same disposition as L1/L2/L3",
+    );
+    assert_eq!(
+        spec.margin, 10,
+        "m_l4's current (§7-deferred) default value"
+    );
+
+    // The Ourios half, run for real through the exact `spec.dsl` (no
+    // container needed) — and proved to match the picker's own
+    // measurement.
+    let ourios = ourios_aggregate_answer(bucket.path(), &tenant, &spec.dsl, spec.now, spec.window)
+        .expect("l4 aggregate answer");
+    assert_eq!(ourios.groups, pair.groups);
+
+    // The Loki half: a HAND-BUILT matrix response over the SAME grouped
+    // counts (no container — the live cross-system round trip is the
+    // dispatch run's job), proving `parse_loki_matrix`'s bucket-alignment
+    // convention (eval instant t = (k+1)*w, decoded bucket start = t - w)
+    // decodes to EXACTLY the Ourios map.
+    let width_ns = bucket_width_seconds(&pair.bucket_width)
+        .checked_mul(1_000_000_000)
+        .expect("bucket width fits u64 nanoseconds");
+    let loki_json = synthetic_loki_matrix(&pair.groups, width_ns);
+    let loki_groups =
+        parse_loki_matrix(&loki_json, "value", width_ns).expect("parse synthetic loki matrix");
+
+    let outcome = compare_aggregations(&ourios.groups, &loki_groups, 8);
+    assert!(
+        outcome.is_equal(),
+        "RFC0031.5 — the two systems' grouped-count maps must be identical: {outcome:?}",
+    );
+
+    // The mismatch arm (RFC0031.1's L4 half): dropping one cell from the
+    // Loki side must report Mismatch, not silently pass — mirrors
+    // RFC0031.1's `loki_narrow` assertion for the line-returning classes.
+    let mut short = loki_groups.clone();
+    let any_key = short.keys().next().cloned().expect("non-empty map");
+    short.remove(&any_key);
+    assert!(
+        !compare_aggregations(&ourios.groups, &short, 8).is_equal(),
+        "a dropped aggregation cell must report Mismatch, not silently pass",
+    );
+
+    // PRINTED, never asserted — M_L4 stays §7-deferred until the dispatch
+    // run's first live measurement.
+    println!(
+        "RFC0031.5 [{}] ourios bytes_read (grouped-count scan) = {} — M_L4 DEFERRED \
+         (RFC 0031 §7): reported, not asserted, until first measured",
+        spec.label, ourios.bytes_read,
     );
 }
 
@@ -1336,6 +1476,337 @@ fn pick_template_pair(
     None
 }
 
+// ---------------------------------------------------------------------------
+// L4 (frequency-aggregation) pair — the fourth post-store-build picker.
+// ---------------------------------------------------------------------------
+
+/// The lowest floor on total matching rows a [`pick_frequency_pair`]
+/// candidate must clear — enough for the grouped-count map to be a
+/// meaningful multi-cell answer, not a trivially-passing edge case.
+const L4_MIN_ROWS: u64 = 4;
+
+/// The distinct-param-value cardinality band a [`pick_frequency_pair`]
+/// candidate must fall within: `2` (a single value is not a grouping
+/// question) through `50` (moderate cardinality — a low-cardinality
+/// `GROUP BY` an operator would actually run, per the RFC 0031 §2.3 L4
+/// motivation; this is also what naturally rejects a per-line-unique slot
+/// like kafka's, without a special case for it).
+const L4_CARDINALITY: std::ops::RangeInclusive<usize> = 2..=50;
+
+/// Choose a `bucket(width)` for the L4 pair from a query's time span: the
+/// largest whole DSL duration unit (`w`/`d`/`h`/`m`/`s`) that divides the
+/// span into roughly [`L4_TARGET_BUCKETS`] windows, floored at the DSL's
+/// finest unit (`1s`) so a short capture window still splits into more
+/// than one bucket. RFC 0031 §7 leaves "which bucket width" open pending
+/// v8-scale tuning at dispatch time; this is a documented, deterministic
+/// default, not a frozen value.
+fn pick_bucket_width(span_ns: u64) -> String {
+    const L4_TARGET_BUCKETS: u64 = 4;
+    const MIN_BUCKET_NS: u64 = 1_000_000_000;
+    const UNITS: [(&str, u64); 5] = [
+        ("w", 7 * 86_400 * 1_000_000_000),
+        ("d", 86_400 * 1_000_000_000),
+        ("h", 3_600 * 1_000_000_000),
+        ("m", 60 * 1_000_000_000),
+        ("s", 1_000_000_000),
+    ];
+    let target = (span_ns / L4_TARGET_BUCKETS).max(MIN_BUCKET_NS);
+    for (suffix, unit_ns) in UNITS {
+        if target >= unit_ns {
+            return format!("{}{suffix}", target / unit_ns);
+        }
+    }
+    unreachable!("target is floored at MIN_BUCKET_NS, the \"s\" unit's own width")
+}
+
+/// Convert a `bucket(width)` lexeme this harness emits (`pick_bucket_width`'s
+/// output — `s`/`m`/`h`/`d`/`w`, never sub-second) to whole seconds, the
+/// unit Loki's `query_range` `start`/`end`/`step` parameters take.
+fn bucket_width_seconds(width: &str) -> u64 {
+    let (digits, unit) = width.split_at(width.len() - 1);
+    let n: u64 = digits
+        .parse()
+        .unwrap_or_else(|e| panic!("bucket width {width:?} digits: {e}"));
+    let per_unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 7 * 86_400,
+        other => panic!("bucket width {width:?} has unknown unit {other:?}"),
+    };
+    n * per_unit
+}
+
+/// Escape Go RE2 metacharacters (Loki's `regexp` stage dialect) in a
+/// literal template constant.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '+' | '?' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Build a Loki `regexp` pattern (Go RE2 syntax) capturing one template
+/// parameter as the named group `value` — the RFC 0031 §5 L4 "`LogQL`
+/// pattern/regexp extraction" (§2.3). Anchors on the wildcard's immediate
+/// fixed-token neighbours, not the whole line: a narrower pattern is more
+/// robust to separator variance elsewhere in the line (per-row separators
+/// are not template state — the same known limitation [`template_needle`]
+/// documents) and unambiguous whenever at least one neighbour is fixed.
+/// Returns `None` if `target_param` is not a wildcard position in
+/// `tokens`, **or** if neither neighbour is a fixed token — an
+/// unanchored `(?P<value>\S+)` would match any token and silently feed
+/// wrong equivalence input to `compare_aggregations`, so the caller must
+/// reject the candidate instead of measuring it.
+fn param_capture_regex(tokens: &[OwnedToken], target_param: u32) -> Option<String> {
+    let mut wildcard_idx = 0u32;
+    let pos = tokens.iter().position(|t| {
+        if matches!(t, OwnedToken::Wildcard) {
+            let is_target = wildcard_idx == target_param;
+            wildcard_idx += 1;
+            is_target
+        } else {
+            false
+        }
+    })?;
+    let fixed_at = |i: usize| match tokens.get(i) {
+        Some(OwnedToken::Fixed(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let prev = pos.checked_sub(1).and_then(fixed_at);
+    let next = fixed_at(pos + 1);
+    if prev.is_none() && next.is_none() {
+        return None;
+    }
+    let mut pattern = String::new();
+    if let Some(prev) = prev {
+        pattern.push_str(&regex_escape(prev));
+        pattern.push_str(r"\s+");
+    }
+    pattern.push_str(r"(?P<value>\S+)");
+    if let Some(next) = next {
+        pattern.push_str(r"\s+");
+        pattern.push_str(&regex_escape(next));
+    }
+    Some(pattern)
+}
+
+/// The dynamically-picked L4 (frequency-aggregation) pair: a
+/// `(template_id, param position, bucket width)` whose grouped-count map
+/// is a moderate-cardinality, multi-row answer.
+#[derive(Debug)]
+struct FrequencyPair {
+    template_id: u64,
+    /// The wildcard position within the template extracted as the group
+    /// key (`param(n)`, 0-based over wildcards only).
+    param: u32,
+    /// The template's constant needle for the Loki `|=` stream-selector
+    /// pre-filter ([`template_needle`] — the same machinery the L1 pair
+    /// uses).
+    needle: String,
+    /// The Loki `regexp` pattern extracting `param` as the named group
+    /// `value` ([`param_capture_regex`]).
+    capture_regex: String,
+    /// The `bucket(width)` lexeme ([`pick_bucket_width`]).
+    bucket_width: String,
+    /// The validated grouped-count map (from the real Ourios aggregate
+    /// query — the picker's own selection criterion).
+    groups: HashMap<AggKey, u64>,
+    /// The grouped-count scan's bytes read (RFC 0031 §3.6).
+    bytes_read: u64,
+}
+
+/// Fourth picker (post-store-build, like [`pick_template_pair`]): a
+/// per-template, per-param-slot cardinality tally over the corpus,
+/// choosing the first `(template_id, param position)` whose grouped-count
+/// map (at a bucket width derived from the query's own time span,
+/// [`pick_bucket_width`]) has [`L4_CARDINALITY`] distinct group values and
+/// at least [`L4_MIN_ROWS`] total matching rows — moderate cardinality,
+/// enough rows to be a meaningful multiset, and (naturally, via the
+/// cardinality bound) never a per-line-unique slot like kafka's. Iterates
+/// templates by ascending id and, within a template, param slots by
+/// ascending index — a deterministic pick. Every rejected candidate logs
+/// its reason to stderr (the run-#16 "no silent fallthrough" lesson); a
+/// candidate that fails the SAME query bounds check but has no usable
+/// needle or capture regex is rejected too, loudly.
+/// Whether an aggregate candidate's grouped-count map meets the L4
+/// picker's shape floors — moderate cardinality ([`L4_CARDINALITY`]),
+/// enough total rows ([`L4_MIN_ROWS`]), and at least 2 distinct bucket
+/// starts (otherwise the candidate never exercises the bucket
+/// dimension of the `(bucket, group_key) → count` equivalence shape,
+/// leaving [`parse_loki_matrix`]'s bucket-alignment convention
+/// untested on this corpus). Returns the rejection reason, or `None`
+/// if the candidate passes every floor.
+fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
+    let distinct_values: std::collections::HashSet<&String> =
+        groups.keys().map(|k| &k.group_key).collect();
+    if !L4_CARDINALITY.contains(&distinct_values.len()) {
+        return Some(format!(
+            "{} distinct param values (need {L4_CARDINALITY:?})",
+            distinct_values.len(),
+        ));
+    }
+    let total_rows: u64 = groups.values().sum();
+    if total_rows < L4_MIN_ROWS {
+        return Some(format!("{total_rows} rows (need >= {L4_MIN_ROWS})"));
+    }
+    let distinct_buckets: std::collections::HashSet<u64> =
+        groups.keys().map(|k| k.bucket_start_unix_nanos).collect();
+    if distinct_buckets.len() < 2 {
+        return Some(format!(
+            "all rows land in {} bucket window(s) (need >= 2, to exercise the bucket dimension)",
+            distinct_buckets.len(),
+        ));
+    }
+    None
+}
+
+fn pick_frequency_pair(
+    bucket_root: &std::path::Path,
+    tenant: &TenantId,
+    now: u64,
+    window: u64,
+) -> Option<FrequencyPair> {
+    use std::collections::HashMap as StdHashMap;
+    use std::collections::hash_map::Entry;
+
+    let querier = ourios_querier::Querier::new(bucket_root);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let registry = runtime
+        .block_on(querier.template_registry(tenant))
+        .expect("derive template registry");
+
+    // Highest version per template id — mirrors `pick_template_pair`'s
+    // rationale: widening only ever turns Fixed positions into Wildcards,
+    // so the latest version's wildcard positions are wildcards in every
+    // earlier version's rows too.
+    let mut latest: StdHashMap<u64, (u32, Vec<OwnedToken>)> = StdHashMap::new();
+    for ((id, version), tokens) in registry {
+        match latest.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert((version, tokens));
+            }
+            Entry::Occupied(mut entry) => {
+                if version > entry.get().0 {
+                    entry.insert((version, tokens));
+                }
+            }
+        }
+    }
+    let mut ids: Vec<u64> = latest
+        .keys()
+        .copied()
+        .filter(|&id| id != ourios_miner::cluster::NO_TEMPLATE)
+        .collect();
+    ids.sort_unstable();
+
+    let bucket_width = pick_bucket_width(window);
+
+    for id in ids {
+        let tokens = &latest[&id].1;
+        let wildcard_count = tokens
+            .iter()
+            .filter(|t| matches!(t, OwnedToken::Wildcard))
+            .count();
+        for param in 0..u32::try_from(wildcard_count).expect("wildcard count fits u32") {
+            let dsl =
+                format!("template_id == {id} | count by param({param}), bucket({bucket_width})");
+            let answer = match ourios_aggregate_answer(bucket_root, tenant, &dsl, now, window) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!(
+                        "L4 candidate template_id={id} param({param}): aggregate query \
+                         failed: {e:?}",
+                    );
+                    continue;
+                }
+            };
+            if let Some(reason) = frequency_shape_rejection(&answer.groups) {
+                eprintln!("L4 candidate template_id={id} param({param}): rejected — {reason}");
+                continue;
+            }
+            let Some(needle) = template_needle(tokens) else {
+                eprintln!(
+                    "L4 candidate template_id={id} param({param}): rejected — no ≥10-char \
+                     constant needle for the Loki stream-selector filter",
+                );
+                continue;
+            };
+            let Some(capture_regex) = param_capture_regex(tokens, param) else {
+                eprintln!(
+                    "L4 candidate template_id={id} param({param}): rejected — no fixed \
+                     neighbour token to anchor the Loki capture regex on (an unanchored \
+                     pattern would match any token)",
+                );
+                continue;
+            };
+            return Some(FrequencyPair {
+                template_id: id,
+                param,
+                needle,
+                capture_regex,
+                bucket_width,
+                groups: answer.groups,
+                bytes_read: answer.bytes_read,
+            });
+        }
+    }
+    None
+}
+
+/// Render a synthetic Loki matrix `query_range` response over the SAME
+/// grouped counts an [`ourios_aggregate_answer`] call measured — the
+/// no-container proof that [`parse_loki_matrix`]'s bucket-alignment
+/// convention (evaluation instant `t = (k+1)*width`, decoded bucket start
+/// `t - width`) round-trips exactly. Samples are grouped by
+/// [`AggKey::group_key`] under the `value` metric label and sorted by
+/// timestamp ascending within each series (cosmetic — `parse_loki_matrix`
+/// does not require sample order).
+fn synthetic_loki_matrix(groups: &HashMap<AggKey, u64>, bucket_width_ns: u64) -> String {
+    let mut by_label: std::collections::BTreeMap<String, Vec<(u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for (key, &count) in groups {
+        let t_ns = key
+            .bucket_start_unix_nanos
+            .checked_add(bucket_width_ns)
+            .expect("bucket end fits u64 nanoseconds");
+        by_label
+            .entry(key.group_key.clone())
+            .or_default()
+            .push((t_ns, count));
+    }
+    let result: Vec<serde_json::Value> = by_label
+        .into_iter()
+        .map(|(label, mut samples)| {
+            samples.sort_unstable_by_key(|&(t, _)| t);
+            let values: Vec<serde_json::Value> = samples
+                .into_iter()
+                .map(|(t_ns, count)| {
+                    let seconds = t_ns / 1_000_000_000;
+                    serde_json::json!([seconds, count.to_string()])
+                })
+                .collect();
+            serde_json::json!({ "metric": { "value": label }, "values": values })
+        })
+        .collect();
+    serde_json::json!({
+        "status": "success",
+        "data": { "resultType": "matrix", "result": result },
+    })
+    .to_string()
+}
+
 /// The selective-resource diagnostic's service pick: the corpus's
 /// LOWEST-volume safe-named service that still yields a clean window
 /// (maintainer's positioning point, 2026-07-12: an enriched
@@ -1864,6 +2335,10 @@ enum PairClass {
     /// L3 trace correlation — must-win, `M_L3 = 10` frozen on the
     /// storage channel.
     L3,
+    /// L4 frequency aggregation — must-win (RFC 0031 §3.4), but `M_L4`
+    /// stays §7-DEFERRED until first measured: both bytes channels are
+    /// PRINTED, never asserted (`frozen_gate_failures` skips this class).
+    L4,
     /// L6-family window browse — `F_L6 = 3` frozen on the LATENCY
     /// channel (RFC0031.7 as written); the bytes channel is a
     /// published diagnostic, not a gate.
@@ -1876,7 +2351,7 @@ impl PairClass {
     /// The bytes-gate direction the class's channels report under.
     fn gate(self) -> GateKind {
         match self {
-            Self::L1 | Self::L2 | Self::L3 => GateKind::MustWin,
+            Self::L1 | Self::L2 | Self::L3 | Self::L4 => GateKind::MustWin,
             Self::WindowFloor | Self::Diagnostic => GateKind::Floor,
         }
     }
@@ -2343,9 +2818,12 @@ fn split_measurements(
 /// frozen gate non-evaluable, which is reported LOUDLY rather than
 /// failed (a corroborating-channel hiccup must not fake a floor
 /// breach). The window pairs' bytes channel and the selective-resource
-/// pair are published diagnostics — never checked here. Returns the
-/// failures instead of panicking so the caller can assert them all at
-/// once, AFTER the report has printed.
+/// pair are published diagnostics — never checked here. L4 is a
+/// must-win class (§3.4) but `M_L4` stays §7-DEFERRED, so it is excluded
+/// here too — its bytes are `print_pair_bytes_gates`' job, reported not
+/// asserted, until the maintainer freezes a margin against a first
+/// measurement. Returns the failures instead of panicking so the caller
+/// can assert them all at once, AFTER the report has printed.
 fn frozen_gate_failures(
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
@@ -2408,7 +2886,9 @@ fn frozen_gate_failures(
                     spec.label,
                 ),
             },
-            PairClass::Diagnostic => {}
+            // M_L4 is §7-deferred — reported by `print_pair_bytes_gates`,
+            // never asserted here.
+            PairClass::L4 | PairClass::Diagnostic => {}
         }
     }
     failures
@@ -2748,7 +3228,8 @@ fn rfc0031_indicative_comparative_run() {
 /// fetched-compressed-Parquet bytes — but which line carries a gate
 /// verdict depends on the class: L1/L3 gate on the frozen storage
 /// channel (processed is context), L2 gates on the processed channel
-/// (primary) plus the frozen 1.1× storage-side floor, and the window
+/// (primary) plus the frozen 1.1× storage-side floor, L4 prints both
+/// channels' ratio with no verdict (`M_L4` §7-deferred), and the window
 /// pairs' bytes lines are a published diagnostic — a ratio, no verdict
 /// — since the freeze reclassified them; their gate is the RFC0031.7
 /// latency floor.
@@ -2796,6 +3277,22 @@ fn print_pair_bytes_gates(
             println!(
                 "gate vs storage-side (§7 FROZEN floor, must-win at {tenths}/10): {:?}",
                 ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths),
+            );
+        }
+        // L4 is must-win-shaped (RFC 0031 §3.4), but `M_L4` stays
+        // §7-DEFERRED until first measured (§7): both channels print the
+        // gate math's ratio for the record, never a pass/fail verdict —
+        // `frozen_gate_failures` never evaluates this class.
+        PairClass::L4 => {
+            println!(
+                "gate vs storage-side (must-win margin {}, §7 DEFERRED — reported only): {}",
+                spec.margin,
+                diagnostic(loki_storage),
+            );
+            println!(
+                "gate vs bytes-processed (must-win margin {}, §7 DEFERRED — reported only): {}",
+                spec.margin,
+                diagnostic(loki_processed),
             );
         }
         PairClass::WindowFloor | PairClass::Diagnostic => {
@@ -2909,7 +3406,7 @@ fn print_indicative_report(
                     spec.margin,
                     latency_floor_gate(ours_p50, loki_p50, spec.margin),
                 ),
-                PairClass::L1 | PairClass::L2 | PairClass::L3 => {}
+                PairClass::L1 | PairClass::L2 | PairClass::L3 | PairClass::L4 => {}
             }
         }
     }
@@ -3665,6 +4162,281 @@ fn pick_template_pair_rejects_substring_collisions() {
     assert!(
         pick_template_pair(corpus.path(), bucket.path(), &tenant, now, window).is_none(),
         "a needle whose corpus count exceeds the template's rows must be rejected",
+    );
+}
+
+#[test]
+fn pick_bucket_width_targets_four_buckets_floored_at_one_second() {
+    assert_eq!(pick_bucket_width(4_000_000_000), "1s", "4s span / 4 = 1s");
+    assert_eq!(
+        pick_bucket_width(400_000_000),
+        "1s",
+        "a sub-second span floors to the DSL's finest unit",
+    );
+    assert_eq!(
+        pick_bucket_width(4 * 60_000_000_000),
+        "1m",
+        "4m span / 4 = 1m"
+    );
+    assert_eq!(
+        pick_bucket_width(4 * 3_600_000_000_000),
+        "1h",
+        "4h span / 4 = 1h"
+    );
+    assert_eq!(
+        pick_bucket_width(4 * 86_400_000_000_000),
+        "1d",
+        "4d span / 4 = 1d"
+    );
+    assert_eq!(
+        pick_bucket_width(4 * 7 * 86_400_000_000_000),
+        "1w",
+        "4w span / 4 = 1w",
+    );
+    assert_eq!(
+        pick_bucket_width(9 * 60_000_000_000),
+        "2m",
+        "9m / 4 = 2.25m, floored to 2m",
+    );
+}
+
+#[test]
+fn bucket_width_seconds_converts_every_dsl_unit() {
+    assert_eq!(bucket_width_seconds("30s"), 30);
+    assert_eq!(bucket_width_seconds("2m"), 120);
+    assert_eq!(bucket_width_seconds("1h"), 3_600);
+    assert_eq!(bucket_width_seconds("1d"), 86_400);
+    assert_eq!(bucket_width_seconds("1w"), 7 * 86_400);
+}
+
+#[test]
+fn regex_escape_escapes_go_re2_metacharacters() {
+    assert_eq!(regex_escape("peer"), "peer");
+    assert_eq!(regex_escape("a.b*c"), r"a\.b\*c");
+    assert_eq!(regex_escape(r"[x](y)"), r"\[x\]\(y\)");
+}
+
+#[test]
+fn param_capture_regex_anchors_on_the_nearest_fixed_neighbours() {
+    let fixed = |s: &str| OwnedToken::Fixed(s.to_owned());
+
+    // A single trailing wildcard: only a prefix neighbour exists.
+    let tokens = vec![
+        fixed("connection"),
+        fixed("established"),
+        fixed("to"),
+        fixed("peer"),
+        OwnedToken::Wildcard,
+    ];
+    assert_eq!(
+        param_capture_regex(&tokens, 0).as_deref(),
+        Some(r"peer\s+(?P<value>\S+)"),
+    );
+
+    // A wildcard with fixed neighbours on both sides.
+    let tokens = vec![
+        fixed("user"),
+        OwnedToken::Wildcard,
+        fixed("logged"),
+        fixed("in"),
+    ];
+    assert_eq!(
+        param_capture_regex(&tokens, 0).as_deref(),
+        Some(r"user\s+(?P<value>\S+)\s+logged"),
+    );
+
+    // The SECOND wildcard, disambiguated from the first by index.
+    let tokens = vec![
+        fixed("from"),
+        OwnedToken::Wildcard,
+        fixed("to"),
+        OwnedToken::Wildcard,
+        fixed("bytes"),
+    ];
+    assert_eq!(
+        param_capture_regex(&tokens, 1).as_deref(),
+        Some(r"to\s+(?P<value>\S+)\s+bytes"),
+    );
+
+    // A metacharacter neighbour is escaped.
+    let tokens = vec![fixed("count."), OwnedToken::Wildcard];
+    assert_eq!(
+        param_capture_regex(&tokens, 0).as_deref(),
+        Some(r"count\.\s+(?P<value>\S+)"),
+    );
+
+    // Out of range: no such wildcard position.
+    assert_eq!(
+        param_capture_regex(&[fixed("no"), fixed("wildcards")], 0),
+        None,
+    );
+    assert_eq!(param_capture_regex(&[OwnedToken::Wildcard], 1), None);
+
+    // Unanchored: neither neighbour is fixed — a single wildcard with no
+    // surrounding tokens, and two adjacent wildcards where the target's
+    // neighbour on both sides is itself a wildcard. An unanchored
+    // `(?P<value>\S+)` would match any token, so both must reject rather
+    // than return a pattern a caller could unknowingly measure with.
+    assert_eq!(param_capture_regex(&[OwnedToken::Wildcard], 0), None);
+    assert_eq!(
+        param_capture_regex(&[OwnedToken::Wildcard, OwnedToken::Wildcard], 0),
+        None,
+    );
+    assert_eq!(
+        param_capture_regex(&[OwnedToken::Wildcard, OwnedToken::Wildcard], 1),
+        None,
+    );
+}
+
+#[test]
+fn pick_frequency_pair_finds_a_moderate_cardinality_group() {
+    // Two ids ("10"/"11") of the peer template, spread over four
+    // one-second buckets — cardinality 2 (within 2..=50) and 6 total
+    // rows (above the L4_MIN_ROWS floor).
+    let records: Vec<(u64, &str)> = vec![
+        (100_000_000, "connection established to peer 10"),
+        (500_000_000, "connection established to peer 10"),
+        (900_000_000, "connection established to peer 11"),
+        (2_100_000_000, "connection established to peer 10"),
+        (2_500_000_000, "connection established to peer 11"),
+        (3_000_000_000, "connection established to peer 11"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    let pair = pick_frequency_pair(bucket.path(), &tenant, now, window)
+        .expect("the peer template's trailing id validates");
+    assert_eq!(pair.param, 0);
+    assert_eq!(pair.bucket_width, "1s");
+    assert_eq!(pair.needle, "connection established to peer");
+    assert_eq!(pair.capture_regex, r"peer\s+(?P<value>\S+)");
+    assert_eq!(pair.groups.values().sum::<u64>(), 6);
+    assert!(pair.bytes_read > 0);
+}
+
+#[test]
+fn pick_frequency_pair_rejects_below_the_row_floor() {
+    // Three rows, each a DISTINCT trailing id (cardinality 3, inside the
+    // 2..=50 band) but under L4_MIN_ROWS (4): the same generalised bound
+    // that rejects kafka's per-line-unique slots at scale — small enough
+    // here to pin the row floor explicitly. No other template exists to
+    // fall through to, so the picker returns None loudly rather than
+    // silently degrading to a weaker candidate.
+    let records: Vec<(u64, &str)> = vec![
+        (1_000, "connection established to peer 10"),
+        (2_000, "connection established to peer 11"),
+        (3_000, "connection established to peer 12"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    assert!(
+        pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
+        "3 rows is below L4_MIN_ROWS — the picker must reject loudly, not fall through",
+    );
+}
+
+#[test]
+fn pick_frequency_pair_rejects_a_single_bucket_window() {
+    // Cardinality 2 and 4 rows both clear their respective floors, but
+    // every timestamp falls inside the same 1s bucket window — the
+    // candidate never exercises the bucket dimension of the (bucket,
+    // group_key) → count equivalence shape, so the picker must reject
+    // it rather than measure an L4 pair that leaves bucket alignment
+    // untested.
+    let records: Vec<(u64, &str)> = vec![
+        (100_000_000, "connection established to peer 10"),
+        (300_000_000, "connection established to peer 10"),
+        (500_000_000, "connection established to peer 11"),
+        (700_000_000, "connection established to peer 11"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    assert!(
+        pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
+        "all rows land in one bucket window — the picker must reject loudly, not fall through",
+    );
+}
+
+#[test]
+fn pick_frequency_pair_rejects_a_single_value_slot() {
+    // Every row carries the SAME trailing id — cardinality 1, below the
+    // L4 grouping floor of 2 (a single value is not a grouping question):
+    // enough rows to clear L4_MIN_ROWS, isolating the cardinality bound
+    // from the row-floor rejection the previous test pins.
+    let records: Vec<(u64, &str)> = vec![
+        (100_000_000, "connection established to peer 10"),
+        (500_000_000, "connection established to peer 10"),
+        (900_000_000, "connection established to peer 10"),
+        (2_100_000_000, "connection established to peer 10"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    assert!(
+        pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
+        "cardinality 1 is below the L4 grouping floor — reject, don't fall through",
     );
 }
 

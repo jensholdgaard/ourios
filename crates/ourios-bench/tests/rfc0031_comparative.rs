@@ -1472,6 +1472,18 @@ fn pick_template_pair(
 /// meaningful multi-cell answer, not a trivially-passing edge case.
 const L4_MIN_ROWS: u64 = 4;
 
+/// The highest ceiling on total matching rows a [`pick_frequency_pair`]
+/// candidate may have — a smaller candidate proves the same
+/// `(bucket, group_key) → count` equivalence just as validly as a
+/// larger one, and [`loki_measure_frequency_pair`]'s poll shares the
+/// same 300 s deadline every other class's [`loki_measure_pair`] uses.
+/// A ~971K-row candidate (a service's dominant, near-catch-all
+/// template) genuinely could not finish ingesting/processing within
+/// that window on a real dispatch — 100K rows leaves comfortable
+/// margin at the observed ~2.7K rows/s Loki throughput (~37 s of the
+/// 300 s budget) while still being a large, meaningful multiset.
+const L4_MAX_ROWS: u64 = 100_000;
+
 /// The distinct-param-value cardinality band a [`pick_frequency_pair`]
 /// candidate must fall within: `2` (a single value is not a grouping
 /// question) through `50` (moderate cardinality — a low-cardinality
@@ -1625,13 +1637,17 @@ struct FrequencyPair {
 /// candidate that fails the SAME query bounds check but has no usable
 /// needle or capture regex is rejected too, loudly.
 /// Whether an aggregate candidate's grouped-count map meets the L4
-/// picker's shape floors — moderate cardinality ([`L4_CARDINALITY`]),
-/// enough total rows ([`L4_MIN_ROWS`]), and at least 2 distinct bucket
-/// starts (otherwise the candidate never exercises the bucket
-/// dimension of the `(bucket, group_key) → count` equivalence shape,
-/// leaving [`parse_loki_matrix`]'s bucket-alignment convention
-/// untested on this corpus). Returns the rejection reason, or `None`
-/// if the candidate passes every floor.
+/// picker's shape floors/ceiling — moderate cardinality
+/// ([`L4_CARDINALITY`]), a row-count band (at least [`L4_MIN_ROWS`],
+/// at most [`L4_MAX_ROWS`] — too many rows makes
+/// [`loki_measure_frequency_pair`]'s poll unable to finish within its
+/// shared 300 s deadline before Loki has ingested/processed them
+/// all), and at least 2 distinct bucket starts (otherwise the
+/// candidate never exercises the bucket dimension of the `(bucket,
+/// group_key) → count` equivalence shape, leaving
+/// [`parse_loki_matrix`]'s bucket-alignment convention untested on
+/// this corpus). Returns the rejection reason, or `None` if the
+/// candidate passes every bound.
 fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
     let distinct_values: std::collections::HashSet<&String> =
         groups.keys().map(|k| &k.group_key).collect();
@@ -1644,6 +1660,12 @@ fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
     let total_rows: u64 = groups.values().sum();
     if total_rows < L4_MIN_ROWS {
         return Some(format!("{total_rows} rows (need >= {L4_MIN_ROWS})"));
+    }
+    if total_rows > L4_MAX_ROWS {
+        return Some(format!(
+            "{total_rows} rows (need <= {L4_MAX_ROWS}, so the Loki poll can finish within \
+             its shared 300s deadline)"
+        ));
     }
     let distinct_buckets: std::collections::HashSet<u64> =
         groups.keys().map(|k| k.bucket_start_unix_nanos).collect();
@@ -4646,6 +4668,54 @@ fn pick_frequency_pair_rejects_below_the_row_floor() {
     assert!(
         pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
         "3 rows is below L4_MIN_ROWS — the picker must reject loudly, not fall through",
+    );
+}
+
+#[test]
+fn frequency_shape_rejection_enforces_the_row_ceiling() {
+    // A ~971K-row candidate (a service's dominant, near-catch-all
+    // template) is exactly the run #3 dispatch finding: cardinality 2
+    // and 2 bucket windows both clear their floors, but the total row
+    // count made the Loki poll unable to finish within its shared
+    // 300s deadline. Two groups summing past L4_MAX_ROWS reproduces
+    // the shape without building a 100K+-row real corpus fixture.
+    let groups = HashMap::from([
+        (
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "a".to_string(),
+            },
+            L4_MAX_ROWS / 2 + 1,
+        ),
+        (
+            AggKey {
+                bucket_start_unix_nanos: 1_000_000_000,
+                group_key: "b".to_string(),
+            },
+            L4_MAX_ROWS / 2 + 1,
+        ),
+    ]);
+    let rejection =
+        frequency_shape_rejection(&groups).expect("a candidate past L4_MAX_ROWS must be rejected");
+    assert!(
+        rejection.contains(&L4_MAX_ROWS.to_string()),
+        "the rejection reason must name the ceiling: {rejection}",
+    );
+
+    // One row under the ceiling passes (isolating the ceiling from the
+    // other floors: still cardinality 2, still 2 bucket windows).
+    let mut under_ceiling = groups;
+    let cell = under_ceiling
+        .get_mut(&AggKey {
+            bucket_start_unix_nanos: 0,
+            group_key: "a".to_string(),
+        })
+        .expect("cell exists");
+    *cell -= 2;
+    assert_eq!(
+        frequency_shape_rejection(&under_ceiling),
+        None,
+        "exactly at the ceiling must pass",
     );
 }
 

@@ -826,6 +826,9 @@ impl<'a> Parser<'a> {
         match name.as_str() {
             "resource" => Ok(Field::Resource(self.parse_key_tail()?)),
             "attr" => Ok(Field::Attr(self.parse_key_tail()?)),
+            term @ ("param" | "bucket") if matches!(self.peek(), Some(Tok::LParen)) => {
+                Err(group_term_outside_by(term))
+            }
             "severity" if allow_severity => Ok(Field::Severity),
             "severity" => Err(DslError::new(
                 "severity may only be used in a severity comparison \
@@ -1068,6 +1071,9 @@ impl<'a> Parser<'a> {
         };
         match name.as_str() {
             "severity" => Ok(Field::Severity),
+            term @ ("param" | "bucket") if matches!(self.peek(), Some(Tok::LParen)) => {
+                Err(group_term_outside_by(term))
+            }
             other => bare_field(other).ok_or_else(|| {
                 DslError::new(format!(
                     "unknown field {other:?} in a field list; expected a bare top-level \
@@ -1122,6 +1128,17 @@ impl<'a> Parser<'a> {
         let fields = self.parse_field_list()?;
         Ok(Stage::Project(fields))
     }
+}
+
+/// `param(…)`/`bucket(…)` are group terms, grammatically confined to
+/// `by`-lists by the §7 v1.1 `group_term` production. Used as a field or
+/// path they are rejected citing that grammar rule, not reported as an
+/// unknown field (RFC0002.14).
+fn group_term_outside_by(name: &str) -> DslError {
+    DslError::new(format!(
+        "{name}(...) is a group term, valid only in the `by` list of an \
+         aggregation stage (grammar §7 v1.1 group_term), not as a field or path"
+    ))
 }
 
 /// Reject a non-string first operand to a string function

@@ -3351,7 +3351,7 @@ fn rfc0031_indicative_comparative_run() {
         (measured, l4)
     });
 
-    let (ok_specs, ok_ourios, ok_loki, failures) = split_measurements(&specs, &ourios, loki);
+    let (ok_specs, ok_ourios, ok_loki, mut failures) = split_measurements(&specs, &ourios, loki);
 
     // Equivalence gates every successful measurement (RFC0031.1).
     for ((spec, ours), (loki_lines, _, _, _)) in ok_specs.iter().zip(&ok_ourios).zip(&ok_loki) {
@@ -3370,6 +3370,30 @@ fn rfc0031_indicative_comparative_run() {
         &ok_ourios,
         &ok_loki,
     );
+
+    // L4 (RFC 0031 §3.4/§3.5) is purely additive to the pair list above,
+    // measured and reported right after it — BEFORE the gate/failure
+    // assertions below, not after: an L1–L3/L6 measurement failure (a
+    // flake, e.g. the documented Loki low-volume-chunk race) must not
+    // prevent L4 from ever being attempted or reported. A failed L4
+    // measurement joins the SAME `failures` list those classes use, so
+    // it still fails the run — just without silently starving L4 of a
+    // chance to run at all. A missing candidate (the picker found
+    // nothing eligible) is a real, loud finding, not a silently-skipped
+    // step — it was already reported above, at pick time.
+    match (&l4_spec, l4_loki) {
+        (Some(spec), Some(result)) => {
+            run_l4_pair(bucket.path(), &tenant, spec, result, &mut failures);
+        }
+        (None, _) => {}
+        (Some(spec), None) => unreachable!(
+            "l4_spec is Some iff frequency is Some, which is exactly the condition the \
+             async block used to decide whether to measure the Loki half — [{}] has a spec \
+             but no Loki measurement (harness bug)",
+            spec.label,
+        ),
+    }
+
     // The frozen gates run AFTER the report so a failed gate cannot
     // destroy the run's evidence (the run #11 salvage lesson).
     let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
@@ -3382,27 +3406,10 @@ fn rfc0031_indicative_comparative_run() {
     );
     assert!(
         failures.is_empty(),
-        "{} pair(s) failed to measure (report above covers the rest): {failures:?}",
+        "{} pair(s) failed to measure (report above covers the rest, L4 included): \
+         {failures:?}",
         failures.len(),
     );
-
-    // L4 (RFC 0031 §3.4/§3.5) is purely additive to the pair list above:
-    // measured, equivalence-checked, and reported LAST, after the
-    // L1–L3/L6 evidence has already printed and their frozen gates have
-    // already asserted, so an L4-only failure cannot destroy that
-    // evidence. A missing candidate (the picker found nothing eligible)
-    // is a real, loud finding, not a silently-skipped step — it was
-    // already reported above, at pick time.
-    match (&l4_spec, l4_loki) {
-        (Some(spec), Some(result)) => run_l4_pair(bucket.path(), &tenant, spec, result),
-        (None, _) => {}
-        (Some(spec), None) => unreachable!(
-            "l4_spec is Some iff frequency is Some, which is exactly the condition the \
-             async block used to decide whether to measure the Loki half — [{}] has a spec \
-             but no Loki measurement (harness bug)",
-            spec.label,
-        ),
-    }
 }
 
 /// One pair's bytes-channel lines, labeled per the §7 partial freeze
@@ -3540,19 +3547,36 @@ fn print_l4_report(
 /// [`print_l4_report`] prints both bytes channels' ratio with no verdict,
 /// exactly like the fixture-level proof
 /// (`rfc0031_5_l4_frequency_aggregation_bytes`).
+/// Measure, equivalence-check, and report the L4 pair. A Loki-side
+/// measurement failure (timeout/flake — the SAME failure mode
+/// [`split_measurements`] salvages for L1–L3/L6) is pushed onto
+/// `failures` and the pair is skipped, exactly like a flaky L1–L3/L6
+/// pair never reaching `ok_specs`. A genuine equivalence MISMATCH
+/// (both sides measured, but disagree) still hard-panics immediately
+/// — RFC0031.1 equivalence is never optional, matching the L1–L3/L6
+/// `compare_lines` assertion this mirrors — the failure modes are
+/// deliberately not symmetric: a flake is salvageable, a mismatch is
+/// not.
 fn run_l4_pair(
     bucket_root: &std::path::Path,
     tenant: &TenantId,
     spec: &PairSpec,
     l4_loki: Result<L4Measured, String>,
+    failures: &mut Vec<String>,
 ) {
+    let (loki_groups, loki_processed, loki_fetched) = match l4_loki {
+        Ok(measured) => measured,
+        Err(detail) => {
+            failures.push(format!(
+                "L4 pair [{}] failed to measure: {detail}",
+                spec.label
+            ));
+            return;
+        }
+    };
     let ourios_answer =
         ourios_aggregate_answer(bucket_root, tenant, &spec.dsl, spec.now, spec.window)
             .expect("l4 ourios aggregate answer");
-    let (loki_groups, loki_processed, loki_fetched) = match l4_loki {
-        Ok(measured) => measured,
-        Err(detail) => panic!("L4 pair [{}] failed to measure: {detail}", spec.label),
-    };
     let outcome = compare_aggregations(&ourios_answer.groups, &loki_groups, 8);
     assert!(
         outcome.is_equal(),

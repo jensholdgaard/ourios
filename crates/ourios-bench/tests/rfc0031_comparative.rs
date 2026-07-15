@@ -2720,13 +2720,25 @@ async fn loki_measure_pair(
 /// destroy the already-measured/printed evidence for the other pairs
 /// (same run #11 salvage lesson; L4 is measured and reported last, see
 /// `rfc0031_indicative_comparative_run`).
+///
+/// Deadline is longer than [`loki_measure_pair`]'s 300 s: runs #4 and
+/// #6 both plateaued at 93-96% of the expected row count at 300 s, with
+/// the shortfall varying run to run (not a fixed cache echo — #6 ruled
+/// that out by disabling `-querier.cache-results` and still seeing the
+/// same shape). L4's `LogQL` runs a `| regexp` capture over every
+/// candidate line before grouping and counting, a genuinely heavier
+/// per-line cost than the plain stream/count queries every other class
+/// uses — variable completion time, not a bug, so the fix is headroom,
+/// not a config flag. The CI job has no `timeout-minutes` (the 360 min
+/// GitHub Actions default applies) and the whole run has taken
+/// ~95-100 min so far, so 900 s of poll budget here is well inside it.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
     spec: &PairSpec,
     bucket_width_ns: u64,
 ) -> Result<L4Measured, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let deadline = std::time::Instant::now() + Duration::from_secs(900);
     loop {
         let (groups, bytes, fetched) = loki_query_matrix(
             http,

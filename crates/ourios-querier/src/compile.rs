@@ -233,9 +233,19 @@ fn validate_group_terms(by: &[GroupTerm], predicate: &Predicate) -> Result<(), Q
                 });
             }
             GroupTerm::Bucket(width) => {
-                if duration_nanos(width)? == 0 {
+                let nanos = duration_nanos(width)?;
+                if nanos == 0 {
                     return Err(QueryError::InvalidQuery {
                         detail: format!("bucket({width}) width must be positive"),
+                    });
+                }
+                // The execution lowering casts the width to `i64` (§6.5
+                // floor-division), so a width beyond `i64::MAX` nanoseconds
+                // must fail here — one compile-time contract, not a second
+                // error path surfacing later during planning.
+                if i64::try_from(nanos).is_err() {
+                    return Err(QueryError::InvalidQuery {
+                        detail: format!("bucket({width}) width exceeds i64 nanoseconds"),
                     });
                 }
                 has_bucket = true;
@@ -1093,6 +1103,37 @@ mod tests {
         assert_eq!(duration_nanos("1h").unwrap(), 3_600 * NS_PER_SECOND);
         assert_eq!(duration_nanos("1d").unwrap(), 86_400 * NS_PER_SECOND);
         assert_eq!(duration_nanos("1w").unwrap(), 7 * 86_400 * NS_PER_SECOND);
+    }
+
+    #[test]
+    fn bucket_width_beyond_i64_nanoseconds_is_rejected_at_validation() {
+        // Arrange — a width that fits `u64` (`duration_nanos` succeeds) but
+        // exceeds `i64::MAX` nanoseconds, the type `bucket_expr`'s execution
+        // lowering casts into (§6.5 floor-division): 20,000 weeks ≈
+        // 12.096e18 ns, past i64::MAX ≈ 9.223e18 ns.
+        let width = "20000w";
+        let i64_max_ns = u64::try_from(i64::MAX).expect("i64::MAX is non-negative");
+        assert!(
+            duration_nanos(width).unwrap() > i64_max_ns,
+            "the fixture width must actually exceed i64::MAX ns",
+        );
+
+        // Act
+        let err = validate_group_terms(
+            &[GroupTerm::Bucket(width.to_string())],
+            &Predicate::Bool(true),
+        )
+        .expect_err("an i64-overflowing bucket width must fail validation");
+
+        // Assert — rejected here, at the same compile-time gate as every
+        // other `by`-list rule, not later during `bucket_expr`'s own cast.
+        let QueryError::InvalidQuery { detail } = err else {
+            panic!("expected InvalidQuery, got {err:?}");
+        };
+        assert!(
+            detail.contains("i64"),
+            "the error names the i64 bound: {detail}",
+        );
     }
 
     #[test]

@@ -236,7 +236,11 @@ pub struct QueryResult {
 /// One group of an executed `count [by …]` stage (RFC 0002 §6.3/§6.5
 /// amendment 2026-07-15). Plain owned strings — no `datafusion`/`arrow`
 /// type crosses this boundary (hazard §4.6).
+///
+/// Marked `#[non_exhaustive]` so further additive fields stay
+/// non-breaking, matching `QueryResult`/`QueryStats`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AggregateGroup {
     /// The group-key values, one per `by` term in query order: a field or
     /// `param(n)` as its stored string form, `bucket(width)` as the RFC 3339

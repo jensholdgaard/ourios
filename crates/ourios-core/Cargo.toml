@@ -94,7 +94,7 @@ p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pk
 # (2048-bit — PS512 needs >1024 — generated once per test process).
 # Already in the tree via jsonwebtoken's rust_crypto backend.
 rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
-rand = "=0.8.6"
+rand = "=0.8.7"
 # base64url (no pad) for the fixture issuer's JWK coordinates.
 base64 = "=0.22.1"
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }

@@ -552,7 +552,11 @@ fn decode_aggregate(
                 .collect::<Result<Option<Vec<String>>, QueryError>>()?;
             match key {
                 Some(key) => groups.push(AggregateGroup { key, count }),
-                None => excluded += count,
+                None => {
+                    excluded = excluded
+                        .checked_add(count)
+                        .ok_or_else(|| bad("excluded row count overflows u64".to_string()))?;
+                }
             }
         }
     }

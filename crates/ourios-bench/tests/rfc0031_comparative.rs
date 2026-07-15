@@ -1637,6 +1637,38 @@ struct FrequencyPair {
 /// its reason to stderr (the run-#16 "no silent fallthrough" lesson); a
 /// candidate that fails the SAME query bounds check but has no usable
 /// needle or capture regex is rejected too, loudly.
+/// Whether an aggregate candidate's grouped-count map meets the L4
+/// picker's shape floors — moderate cardinality ([`L4_CARDINALITY`]),
+/// enough total rows ([`L4_MIN_ROWS`]), and at least 2 distinct bucket
+/// starts (otherwise the candidate never exercises the bucket
+/// dimension of the `(bucket, group_key) → count` equivalence shape,
+/// leaving [`parse_loki_matrix`]'s bucket-alignment convention
+/// untested on this corpus). Returns the rejection reason, or `None`
+/// if the candidate passes every floor.
+fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
+    let distinct_values: std::collections::HashSet<&String> =
+        groups.keys().map(|k| &k.group_key).collect();
+    if !L4_CARDINALITY.contains(&distinct_values.len()) {
+        return Some(format!(
+            "{} distinct param values (need {L4_CARDINALITY:?})",
+            distinct_values.len(),
+        ));
+    }
+    let total_rows: u64 = groups.values().sum();
+    if total_rows < L4_MIN_ROWS {
+        return Some(format!("{total_rows} rows (need >= {L4_MIN_ROWS})"));
+    }
+    let distinct_buckets: std::collections::HashSet<u64> =
+        groups.keys().map(|k| k.bucket_start_unix_nanos).collect();
+    if distinct_buckets.len() < 2 {
+        return Some(format!(
+            "all rows land in {} bucket window(s) (need >= 2, to exercise the bucket dimension)",
+            distinct_buckets.len(),
+        ));
+    }
+    None
+}
+
 fn pick_frequency_pair(
     bucket_root: &std::path::Path,
     tenant: &TenantId,
@@ -1700,22 +1732,8 @@ fn pick_frequency_pair(
                     continue;
                 }
             };
-            let distinct: std::collections::HashSet<&String> =
-                answer.groups.keys().map(|k| &k.group_key).collect();
-            if !L4_CARDINALITY.contains(&distinct.len()) {
-                eprintln!(
-                    "L4 candidate template_id={id} param({param}): rejected — {} distinct \
-                     param values (need {L4_CARDINALITY:?})",
-                    distinct.len(),
-                );
-                continue;
-            }
-            let total_rows: u64 = answer.groups.values().sum();
-            if total_rows < L4_MIN_ROWS {
-                eprintln!(
-                    "L4 candidate template_id={id} param({param}): rejected — {total_rows} \
-                     rows (need >= {L4_MIN_ROWS})",
-                );
+            if let Some(reason) = frequency_shape_rejection(&answer.groups) {
+                eprintln!("L4 candidate template_id={id} param({param}): rejected — {reason}");
                 continue;
             }
             let Some(needle) = template_needle(tokens) else {
@@ -4345,6 +4363,44 @@ fn pick_frequency_pair_rejects_below_the_row_floor() {
     assert!(
         pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
         "3 rows is below L4_MIN_ROWS — the picker must reject loudly, not fall through",
+    );
+}
+
+#[test]
+fn pick_frequency_pair_rejects_a_single_bucket_window() {
+    // Cardinality 2 and 4 rows both clear their respective floors, but
+    // every timestamp falls inside the same 1s bucket window — the
+    // candidate never exercises the bucket dimension of the (bucket,
+    // group_key) → count equivalence shape, so the picker must reject
+    // it rather than measure an L4 pair that leaves bucket alignment
+    // untested.
+    let records: Vec<(u64, &str)> = vec![
+        (100_000_000, "connection established to peer 10"),
+        (300_000_000, "connection established to peer 10"),
+        (500_000_000, "connection established to peer 11"),
+        (700_000_000, "connection established to peer 11"),
+    ];
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        serde_json::to_string(&service_logs_data(FIXTURE_SERVICE, &records))
+            .expect("serialize LogsData"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+    assert!(
+        pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
+        "all rows land in one bucket window — the picker must reject loudly, not fall through",
     );
 }
 

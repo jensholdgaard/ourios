@@ -180,6 +180,18 @@ pub(crate) fn validate(
         })?),
         None => None,
     };
+    // `Terminal::Aggregate` executes its own grouped-count scan and never
+    // consults `plan.limit` (the aggregation *is* the result — group-limiting
+    // semantics are not implemented), so a `count [by …] | limit n` pipeline
+    // would silently drop the `limit` instead of applying it. Reject the
+    // combination rather than execute the wrong query.
+    if limit.is_some() && aggregate.is_some() {
+        return Err(QueryError::InvalidQuery {
+            detail: "a query with a `count` stage does not support `limit`; \
+                     group-limiting semantics are not implemented yet"
+                .to_string(),
+        });
+    }
     Ok(Validated {
         window,
         limit,
@@ -1147,5 +1159,174 @@ mod tests {
         let fragment = "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"api\"}}";
         let stored = "[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"api\"}}]";
         assert!(stored.contains(fragment));
+    }
+
+    #[test]
+    fn validate_rejects_limit_alongside_count() {
+        // A `count [by …] | limit n` pipeline would silently drop the
+        // `limit` — `Terminal::Aggregate` never consults `plan.limit`
+        // (group-limiting semantics are not implemented) — so `validate`
+        // must reject the combination rather than execute the wrong query.
+        let v = |q: &str| {
+            validate(
+                &crate::dsl::parse(q).unwrap(),
+                1_000 * NS_PER_SECOND,
+                NS_PER_SECOND,
+            )
+        };
+        assert!(v("true | count by service | limit 10").is_err());
+        assert!(v("true | count | limit 10").is_err());
+        // `limit` alone, or `count` alone, are each still fine.
+        assert!(v("true | limit 10").is_ok());
+        assert!(v("true | count by service").is_ok());
+    }
+
+    /// Property tests (CLAUDE.md §6.2) for the §6.3 amendment's planner
+    /// invariants: pin detection ([`pinned_template_id`]) and the `by`-list
+    /// rules ([`validate_group_terms`], reached here through the real
+    /// [`validate`] entry point). Each generated case is checked against an
+    /// independently-computed reference decision — ground truth tracked
+    /// alongside generation, not derived by calling the code under test —
+    /// so the properties supplement (not replace) the hand-picked examples
+    /// above.
+    mod planner_invariants {
+        use std::collections::BTreeSet;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// A top-level `and`-term together with the pin candidate it
+        /// contributes, if any: a bare `template_id == n` comparison pins;
+        /// wrapping it in `or`, `not`, or `resolves_to` does not (§6.3
+        /// amendment).
+        fn pin_term() -> impl Strategy<Value = (Predicate, Option<i64>)> {
+            let id = 0i64..4;
+            prop_oneof![
+                id.clone().prop_map(|n| (
+                    Predicate::Comparison {
+                        field: Field::TemplateId,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Int(n),
+                    },
+                    Some(n),
+                )),
+                Just((
+                    Predicate::Comparison {
+                        field: Field::Service,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Str("svc".to_string()),
+                    },
+                    None,
+                )),
+                id.clone().prop_map(|n| (
+                    Predicate::Or(vec![
+                        Predicate::Comparison {
+                            field: Field::TemplateId,
+                            op: CmpOp::Ord(OrdOp::Eq),
+                            value: Value::Int(n),
+                        },
+                        Predicate::Bool(true),
+                    ]),
+                    None,
+                )),
+                id.clone().prop_map(|n| (
+                    Predicate::Not(Box::new(Predicate::Comparison {
+                        field: Field::TemplateId,
+                        op: CmpOp::Ord(OrdOp::Eq),
+                        value: Value::Int(n),
+                    })),
+                    None,
+                )),
+                id.prop_map(|n| (
+                    #[allow(clippy::cast_sign_loss)] // `id` is 0..4, always non-negative
+                    Predicate::Call(Call::ResolvesTo(n as u64)),
+                    None,
+                )),
+            ]
+        }
+
+        /// A `by`-list element: a bare field (never a pin/param concern), a
+        /// `param(n)` from a small pool (biases toward duplicate `n`), or a
+        /// `bucket(...)` from a pool that includes a zero-width lexeme (the
+        /// only non-positive width the grammar can represent — a signed
+        /// literal is not a valid `bucket(...)` argument).
+        fn group_term() -> impl Strategy<Value = GroupTerm> {
+            prop_oneof![
+                Just(GroupTerm::Field(Field::Service)),
+                Just(GroupTerm::Field(Field::Body)),
+                (0u32..3).prop_map(GroupTerm::Param),
+                prop_oneof![
+                    Just("0s".to_string()),
+                    Just("5m".to_string()),
+                    Just("1h".to_string()),
+                ]
+                .prop_map(GroupTerm::Bucket),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn validate_matches_the_naive_oracle(
+                terms in prop::collection::vec(pin_term(), 1..4),
+                by in prop::collection::vec(group_term(), 0..5),
+            ) {
+                // Ground truth for the pin: all pin-candidate terms present
+                // must name the same id (empty ⇒ no pin), independent of
+                // `pinned_template_id`'s own traversal.
+                let pins: Vec<i64> = terms.iter().filter_map(|(_, p)| *p).collect();
+                let expected_pin = match pins.split_first() {
+                    Some((first, rest)) if rest.iter().all(|n| n == first) => Some(*first),
+                    _ => None,
+                };
+                let predicate = if terms.len() == 1 {
+                    terms[0].0.clone()
+                } else {
+                    Predicate::And(terms.iter().map(|(p, _)| p.clone()).collect())
+                };
+                prop_assert_eq!(
+                    pinned_template_id(&predicate),
+                    expected_pin.map(|n| u64::try_from(n).expect("pin pool is non-negative")),
+                    "pinned_template_id disagreed with the naive oracle on {:?}",
+                    predicate,
+                );
+
+                // Ground truth for the `by`-list: at most one `param(n)` per
+                // `n` and only under a pin, at most one `bucket(...)`, and
+                // every present bucket width positive.
+                let mut seen_params = BTreeSet::new();
+                let mut seen_bucket = false;
+                let mut expected_ok = true;
+                for term in &by {
+                    match term {
+                        GroupTerm::Param(n) => {
+                            if expected_pin.is_none() || !seen_params.insert(*n) {
+                                expected_ok = false;
+                            }
+                        }
+                        GroupTerm::Bucket(width) => {
+                            if seen_bucket || duration_nanos(width).unwrap_or(0) == 0 {
+                                expected_ok = false;
+                            }
+                            seen_bucket = true;
+                        }
+                        GroupTerm::Field(_) => {}
+                    }
+                }
+
+                let query = Query {
+                    predicate,
+                    stages: vec![Stage::Count { by: by.clone() }],
+                };
+                let got_ok = validate(&query, 1_000 * NS_PER_SECOND, NS_PER_SECOND).is_ok();
+                prop_assert_eq!(
+                    got_ok,
+                    expected_ok,
+                    "validate() disagreed with the naive oracle: pin={:?} by={:?}",
+                    expected_pin,
+                    by,
+                );
+            }
+        }
     }
 }

@@ -1,12 +1,10 @@
 //! RFC 0002 — Query DSL acceptance criteria (RFC0002.1–.16).
 //!
 //! RFC0002.1–.11 are green (the DSL parser + compiler in front of the
-//! RFC 0007 execution layer). RFC0002.12–.16 (the 2026-07-15
-//! aggregation-execution amendment, RFC 0031 L4) are the current red
-//! gate: `#[ignore]`'d `todo!()` stubs at the bottom of this file, per
-//! `docs/verification.md` §3 — scenarios become ignored stubs first,
-//! implementations second; each carries the §2.2 doc-comment form so
-//! the spec↔test mapping is greppable.
+//! RFC 0007 execution layer), and so are RFC0002.12–.16 (the 2026-07-15
+//! aggregation-execution amendment, RFC 0031 L4). Each scenario carries
+//! the `docs/verification.md` §2.2 doc-comment form so the spec↔test
+//! mapping is greppable.
 
 /// Proptest strategies that generate **well-formed** [`Query`] IR — shapes the
 /// §7 grammar admits and the canonical serialiser renders losslessly — for the
@@ -1779,21 +1777,122 @@ async fn rfc0002_13_count_by_param_bucket_grouped_map() {
 
 /// Scenario RFC0002.14 — `param(n)` misuse is a specific compile-time
 /// error. See `docs/rfcs/0002-query-dsl.md` §5 (amendment 2026-07-15).
-#[test]
-#[ignore = "RFC0002.14 stub — implemented in the grammar/compile-validation green slice"]
-fn rfc0002_14_param_misuse_specific_error() {
-    todo!(
-        "RFC0002.14 — (i) `service == \"api\" | count by param(0)` (no \
-         template_id pin), (ii) `template_id == 4 or template_id == 7 \
-         | count by param(0)` (a disjunction pins nothing), (iii) \
-         `resolves_to(4) | count by param(0)` (an alias set, not a \
-         pin), (iv) `param(0)` outside a by-list (predicate path or \
-         project field): each fails with a specific, leak-free error \
-         (RFC0002.8) — (i)–(iii) at compile time citing the \
-         single-template pinning rule, (iv) at parse time citing the \
-         §7 v1.1 grammar (group_term is confined to by-lists); no \
-         query reaches execution"
+#[tokio::test]
+async fn rfc0002_14_param_misuse_specific_error() {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, TS0, rec_with_params, write_all};
+    use ourios_core::tenant::TenantId;
+    use ourios_querier::{Querier, QueryError};
+
+    // Engine/SQL tokens that must never surface (RFC0002.8 / RFC0002.3).
+    const LEAK_TOKENS: &[&str] = &[
+        "datafusion",
+        "arrow",
+        "sql",
+        "logicalplan",
+        "logical plan",
+        "recordbatch",
+    ];
+    let assert_leak_free = |what: &str, msg: &str| {
+        let lower = msg.to_ascii_lowercase();
+        for token in LEAK_TOKENS {
+            assert!(
+                !lower.contains(token),
+                "error for {what} leaked engine token {token:?}: {msg:?}",
+            );
+        }
+    };
+
+    // Arrange — rows that WOULD match every predicate below if the query
+    // executed, so a rejection cannot be mistaken for an empty result.
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all(
+        bucket.path(),
+        &[
+            rec_with_params("a", 4, TS0, &["u1"]),
+            rec_with_params("a", 7, TS0 + 1, &["u2"]),
+        ],
     );
+    let q = Querier::new(bucket.path());
+    let tenant = TenantId::new("a");
+
+    // (i)–(iii) — compile-time: the query PARSES (the misuse is semantic,
+    // not grammatical) and compile rejects it citing the single-template
+    // pinning rule; the error is Ourios-owned, so nothing executed.
+    let compile_cases: &[(&str, &str)] = &[
+        // (i) no template_id pin at all.
+        ("service == \"api\" | count by param(0)", "no pin"),
+        // (ii) a disjunction pins nothing …
+        (
+            "template_id == 4 or template_id == 7 | count by param(0)",
+            "a disjunction",
+        ),
+        // … and neither does a pin buried under `not`.
+        ("not template_id == 4 | count by param(0)", "a negated pin"),
+        // (iii) `resolves_to` expands to an alias *set*, not a pin.
+        ("resolves_to(4) | count by param(0)", "an alias set"),
+    ];
+    for (text, what) in compile_cases {
+        let query =
+            ourios_querier::dsl::parse(text).expect("(i)-(iii) are compile-time, not parse-time");
+        let err = q
+            .run_query(
+                &query,
+                &tenant,
+                NOW,
+                DEFAULT_WINDOW_NS,
+                Some(&crate::common::no_aliases()),
+            )
+            .await
+            .expect_err(&format!("{what} ({text:?}) must be rejected at compile"));
+        assert!(
+            matches!(err, QueryError::InvalidQuery { .. }),
+            "{what} ({text:?}) must be the compile-time rejection class, got {err:?}",
+        );
+        // The message names the offending term and cites the pinning rule.
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        for fragment in ["param(0)", "pin", "template"] {
+            assert!(
+                lower.contains(fragment),
+                "error for {what} ({text:?}) should cite {fragment:?}: {msg:?}",
+            );
+        }
+        assert_leak_free(what, &msg);
+    }
+
+    // (iv) — parse-time: `group_term` is grammatically confined to
+    // `by`-lists (§7 v1.1), so `param(n)` — and `bucket(w)`, confined by the
+    // same production — never yields a query object at all outside one. The
+    // error cites the grammar, not an "unknown field".
+    let parse_cases: &[(&str, &str, &str)] = &[
+        ("param(0) == \"u1\"", "a predicate path", "param"),
+        ("true | project param(0)", "a project field", "param"),
+        ("bucket(5m) == 1", "a bucket predicate path", "bucket"),
+        (
+            "true | project bucket(5m)",
+            "a bucket project field",
+            "bucket",
+        ),
+        (
+            "matches(param(0), \"u.\")",
+            "a string-function path",
+            "param",
+        ),
+        ("true | sum(param(0))", "an aggregate path", "param"),
+    ];
+    for (text, what, term) in parse_cases {
+        let err = ourios_querier::dsl::parse(text)
+            .expect_err(&format!("{what} ({text:?}) must be rejected at parse"));
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        for fragment in [*term, "group_term", "by"] {
+            assert!(
+                lower.contains(fragment),
+                "error for {what} ({text:?}) should cite {fragment:?}: {msg:?}",
+            );
+        }
+        assert_leak_free(what, &msg);
+    }
 }
 
 /// Scenario RFC0002.15 — short/NULL params rows are excluded and tallied.

@@ -3355,7 +3355,13 @@ fn rfc0031_indicative_comparative_run() {
             // the same way, so they self-heal across polls — only the
             // metric path needed this. Disabling caching for the run is
             // in Loki's favour: it costs Loki latency, not correctness.
-            "-query-range.cache-results=false",
+            // Run #5 proved `-query-range.cache-results` isn't a real
+            // flag ("flag provided but not defined" — the container
+            // never reached /ready); the boolean actually lives on
+            // `queryrangebase.Config.CacheResults`, registered under
+            // the `querier.` flag prefix, not `query-range.` (verified
+            // against the pinned v3.5.3 source, `roundtrip.go`).
+            "-querier.cache-results=false",
         ])
         .await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;

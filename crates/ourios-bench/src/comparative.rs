@@ -392,6 +392,264 @@ fn body_bytes(body: &ourios_querier::LogBody) -> Result<Vec<u8>, BenchError> {
     })
 }
 
+/// The Ourios side of an L4 (frequency-aggregation) comparative pair (RFC
+/// 0031 §3.4/§3.5): the executed `count by param(n), bucket(w)` stage's
+/// grouped-count map, keyed the way [`compare_aggregations`] expects, plus
+/// the bytes read to answer it.
+#[derive(Debug, Clone)]
+pub struct OuriosAggregateAnswer {
+    /// `(bucket, group_key) -> count`, per RFC0031.1's L4 equivalence shape.
+    pub groups: HashMap<AggKey, u64>,
+    /// Bytes read from storage to answer the aggregation. An aggregation
+    /// renders no rows and acquires no template map — RFC 0002 §6.5's
+    /// "zero row materialization and zero template-map acquisition"
+    /// contract holds `materialize_bytes_read`/`registry_bytes_read` at
+    /// `0` on this path — so the grouped-count scan
+    /// (`QueryStats::bytes_read`) is already the honest total.
+    pub bytes_read: u64,
+}
+
+/// Run a `count by param(n), bucket(w)` logs-DSL query against the Ourios
+/// store and return its grouped-count map plus bytes read — the Ourios
+/// half of the RFC0031.5 (L4) comparative pair.
+///
+/// Assumes this harness's own `by`-list convention (`count by param(N),
+/// bucket(W)`, in exactly that order — the comparative-harness callers
+/// never emit any other shape): the zeroth key cell is the extracted
+/// param (the group), the first is the bucket window start.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if the DSL fails to parse, the tokio runtime
+/// can't be built, the query fails, the query did not compile to an
+/// aggregation (`QueryResult::aggregate` is `None` — the `dsl` argument
+/// must carry a `count by …` stage), or a group key does not carry
+/// exactly the `(param, bucket)` two cells this harness's convention
+/// requires.
+pub fn ourios_aggregate_answer(
+    bucket_root: &Path,
+    tenant: &TenantId,
+    dsl: &str,
+    now_unix_nano: u64,
+    default_window_nanos: u64,
+) -> Result<OuriosAggregateAnswer, BenchError> {
+    let query = ourios_querier::dsl::parse(dsl).map_err(|e| BenchError::Pipeline {
+        detail: format!("comparative aggregate DSL parse `{dsl}`: {e}"),
+    })?;
+    let querier = ourios_querier::Querier::new(bucket_root);
+    // A current-thread runtime is enough: `run_query` offloads its own
+    // blocking IO, and the comparative harness drives one query at a time.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("comparative tokio runtime: {e}"),
+        })?;
+    let result = runtime
+        .block_on(querier.run_query(&query, tenant, now_unix_nano, default_window_nanos, None))
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("comparative aggregate query `{dsl}`: {e}"),
+        })?;
+    let raw_groups = result.aggregate.ok_or_else(|| BenchError::Pipeline {
+        detail: format!(
+            "comparative aggregate query `{dsl}` did not compile to an aggregation \
+             (QueryResult::aggregate is None) — the dsl must carry a `count by …` stage"
+        ),
+    })?;
+    let mut groups = HashMap::with_capacity(raw_groups.len());
+    for group in raw_groups {
+        let cell_count = group.key.len();
+        let [group_key, bucket]: [String; 2] =
+            group.key.try_into().map_err(|_| BenchError::Pipeline {
+                detail: format!(
+                    "comparative aggregate query `{dsl}` produced a {cell_count}-cell group \
+                     key — this harness's convention is exactly `param(n), bucket(w)` (2 cells)"
+                ),
+            })?;
+        let bucket_start_unix_nanos =
+            rfc3339_to_unix_nanos(&bucket).map_err(|detail| BenchError::Pipeline {
+                detail: format!("comparative aggregate query `{dsl}` bucket key: {detail}"),
+            })?;
+        // Groups decode from `decode_aggregate`'s already-deduplicated,
+        // sorted-by-key output (one group per distinct key), so no key
+        // collides with another here.
+        groups.insert(
+            AggKey {
+                bucket_start_unix_nanos,
+                group_key,
+            },
+            group.count,
+        );
+    }
+    Ok(OuriosAggregateAnswer {
+        groups,
+        bytes_read: result.stats.bytes_read,
+    })
+}
+
+/// Parse an RFC 3339 UTC instant — the `bucket(width)` group-key rendering
+/// (`ourios-querier`'s `group_key_string` `Timestamp` arm) — to Unix
+/// nanoseconds.
+fn rfc3339_to_unix_nanos(s: &str) -> Result<u64, String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| format!("bucket key {s:?} is not a resolvable RFC 3339 instant: {e}"))?;
+    let ns = dt
+        .timestamp_nanos_opt()
+        .ok_or_else(|| format!("bucket key {s:?} is out of the representable range"))?;
+    u64::try_from(ns).map_err(|_| format!("bucket key {s:?} predates the epoch"))
+}
+
+/// Parse a Loki `query_range` **matrix** response (a metric query: `sum by
+/// (<label>) (count_over_time(...))`) into the `(bucket, group_key) ->
+/// count` map [`compare_aggregations`] expects — the Loki half of the
+/// RFC0031.5 (L4) equivalence check.
+///
+/// Loki (Prometheus-compatible) returns `data.result[]` entries shaped
+/// `{"metric": {"<label>": "<value>"}, "values": [[<unix-seconds>,
+/// "<count>"], ...]}`. **Bucket alignment** (RFC 0031 §7's L4 open
+/// question): each sample at evaluation instant `t` is
+/// `count_over_time(range[w])`'s count over the half-open window `(t-w,
+/// t]`. Querying with `start`/`step` pinned so every evaluation instant is
+/// `t = (k+1)·w` for a desired Ourios bucket `k` makes that window exactly
+/// the `bucket(w)` window `[k·w, (k+1)·w)` — so a sample's decoded bucket
+/// **start**, matching [`AggKey::bucket_start_unix_nanos`], is `t - w`
+/// (`bucket_width_ns`). Choosing that `start`/`step` is the caller's job
+/// (the harness's pair builder); this function only decodes under the
+/// convention, it does not choose them.
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] if the response isn't JSON; is a Loki error
+/// response; is not `resultType: "matrix"`; is missing `data.result`; a
+/// result entry is missing its `<label>` metric or its `values` array; a
+/// sample isn't a `[number, string]` pair; a sample's timestamp is not a
+/// non-negative whole-second instant (this harness never emits a
+/// sub-second bucket width, so a fractional-second sample means a
+/// misaligned query, not lost precision); a sample's timestamp is before
+/// `bucket_width_ns` (would underflow the bucket start); a sample's count
+/// string doesn't parse to a `u64`; or two samples land in the same
+/// `(bucket, group_key)` cell and their counts would overflow `u64`
+/// summed together.
+pub fn parse_loki_matrix(
+    response_json: &str,
+    label_name: &str,
+    bucket_width_ns: u64,
+) -> Result<HashMap<AggKey, u64>, BenchError> {
+    let root = parse_loki_root(response_json)?;
+    let result_type = root
+        .get("data")
+        .and_then(|d| d.get("resultType"))
+        .and_then(serde_json::Value::as_str);
+    if result_type != Some("matrix") {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "Loki response resultType is {result_type:?}, not \"matrix\" — an L4 \
+                 metric query must return a matrix"
+            ),
+        });
+    }
+    let result = root
+        .get("data")
+        .and_then(|d| d.get("result"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: "Loki response missing `data.result` array".to_string(),
+        })?;
+
+    let mut groups: HashMap<AggKey, u64> = HashMap::new();
+    for (ri, series) in result.iter().enumerate() {
+        let group_key = series
+            .get("metric")
+            .and_then(|m| m.get(label_name))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| BenchError::Pipeline {
+                detail: format!("Loki matrix result {ri} metric is missing label `{label_name}`"),
+            })?
+            .to_string();
+        let values = series
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| BenchError::Pipeline {
+                detail: format!("Loki matrix result {ri} missing `values` array"),
+            })?;
+        for (vi, pair) in values.iter().enumerate() {
+            let (bucket_start_unix_nanos, count) =
+                decode_matrix_sample(pair, bucket_width_ns, ri, vi)?;
+            let key = AggKey {
+                bucket_start_unix_nanos,
+                group_key: group_key.clone(),
+            };
+            let existing = groups.entry(key).or_insert(0);
+            *existing = existing
+                .checked_add(count)
+                .ok_or_else(|| BenchError::Pipeline {
+                    detail: format!(
+                        "Loki matrix result {ri} value {vi}: summing count {count} into an \
+                     existing cell overflows u64"
+                    ),
+                })?;
+        }
+    }
+    Ok(groups)
+}
+
+/// Decode one `[<unix-seconds>, "<count>"]` matrix sample to `(bucket
+/// start, count)`, per [`parse_loki_matrix`]'s bucket-alignment
+/// convention. `ri`/`vi` (result/value index) are for error messages
+/// only.
+fn decode_matrix_sample(
+    sample: &serde_json::Value,
+    bucket_width_ns: u64,
+    ri: usize,
+    vi: usize,
+) -> Result<(u64, u64), BenchError> {
+    let entry = sample
+        .as_array()
+        .filter(|a| a.len() == 2)
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: format!("Loki matrix result {ri} value {vi} is not a [timestamp, count] pair"),
+        })?;
+    let t_seconds = entry[0].as_f64().ok_or_else(|| BenchError::Pipeline {
+        detail: format!("Loki matrix result {ri} value {vi} timestamp is not a number"),
+    })?;
+    if !t_seconds.is_finite() || t_seconds < 0.0 || t_seconds.fract() != 0.0 {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "Loki matrix result {ri} value {vi} timestamp {t_seconds} is not a \
+                 non-negative whole-second instant — this harness never queries a \
+                 sub-second bucket width, so a fractional sample means a misaligned \
+                 query, not a precision loss"
+            ),
+        });
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // Checked above: finite, non-negative, integral — an exact conversion
+    // (unix seconds are far under f64's 2^53 exact-integer range).
+    let seconds = t_seconds as u64;
+    let t_ns = seconds
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| BenchError::Pipeline {
+            detail: format!(
+                "Loki matrix result {ri} value {vi} timestamp {t_seconds}s overflows \
+                 u64 nanoseconds"
+            ),
+        })?;
+    let bucket_start_unix_nanos =
+        t_ns.checked_sub(bucket_width_ns)
+            .ok_or_else(|| BenchError::Pipeline {
+                detail: format!(
+                    "Loki matrix result {ri} value {vi} timestamp {t_seconds}s is before \
+                     the bucket width ({bucket_width_ns} ns) — cannot compute a bucket start"
+                ),
+            })?;
+    let count_str = entry[1].as_str().ok_or_else(|| BenchError::Pipeline {
+        detail: format!("Loki matrix result {ri} value {vi} count is not a string"),
+    })?;
+    let count: u64 = count_str.parse().map_err(|e| BenchError::Pipeline {
+        detail: format!("Loki matrix result {ri} value {vi} count `{count_str}` is not a u64: {e}"),
+    })?;
+    Ok((bucket_start_unix_nanos, count))
+}
+
 /// Parse a Loki `query_range` **streams** response into [`LineKey`]s — the
 /// Loki half of the RFC0031.1 equivalence check.
 ///
@@ -1432,5 +1690,203 @@ mod tests {
             bucket_start_unix_nanos: bucket,
             group_key: group.to_string(),
         }
+    }
+
+    #[test]
+    fn rfc3339_to_unix_nanos_parses_and_rejects() {
+        assert_eq!(
+            rfc3339_to_unix_nanos("1970-01-01T00:00:01Z").unwrap(),
+            1_000_000_000,
+        );
+        assert_eq!(rfc3339_to_unix_nanos("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert!(rfc3339_to_unix_nanos("not a timestamp").is_err());
+    }
+
+    #[test]
+    fn ourios_aggregate_answer_decodes_the_group_map() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        // One template ("connection established to peer <id>" — the same
+        // ≥10-char constant run the L1 picker validates elsewhere), two
+        // distinct trailing ids across two 1-second buckets:
+        // TIME_BASELINE_NS lands exactly on a whole-second boundary, so
+        // the expected bucket starts are hand-computable.
+        let base_ns = crate::corpus::TIME_BASELINE_NS;
+        let record = |offset_ns: u64, body: &str| LogRecord {
+            time_unix_nano: base_ns + offset_ns,
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(body.to_string())),
+            }),
+            ..LogRecord::default()
+        };
+        let logs = LogsData {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(FIXTURE_SERVICE.to_string())),
+                        }),
+                        ..KeyValue::default()
+                    }],
+                    ..Resource::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![
+                        record(0, "connection established to peer 10"),
+                        record(1_000_000_000, "connection established to peer 10"),
+                        record(1_000_000_000, "connection established to peer 11"),
+                    ],
+                    ..ScopeLogs::default()
+                }],
+                ..ResourceLogs::default()
+            }],
+        };
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("agg.jsonl"),
+            serde_json::to_string(&logs).expect("serialize LogsData"),
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+        let built =
+            crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+                .expect("build store");
+        let tenant = TenantId::new(built.tenant);
+        let now = built.max_effective_time_unix_nano + 1;
+        let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+        let querier = ourios_querier::Querier::new(bucket.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let registry = runtime
+            .block_on(querier.template_registry(&tenant))
+            .expect("derive template registry");
+        let template_id = registry
+            .keys()
+            .map(|&(id, _)| id)
+            .find(|&id| id != ourios_miner::cluster::NO_TEMPLATE)
+            .expect("exactly one mined template");
+
+        let dsl = format!("template_id == {template_id} | count by param(0), bucket(1s)");
+        let answer = ourios_aggregate_answer(bucket.path(), &tenant, &dsl, now, window)
+            .expect("aggregate answer");
+
+        assert_eq!(
+            answer.groups,
+            HashMap::from([
+                (agg(base_ns, "10"), 1),
+                (agg(base_ns + 1_000_000_000, "10"), 1),
+                (agg(base_ns + 1_000_000_000, "11"), 1),
+            ]),
+        );
+        assert!(
+            answer.bytes_read > 0,
+            "the grouped-count scan reads real bytes from storage",
+        );
+    }
+
+    #[test]
+    fn ourios_aggregate_answer_rejects_a_non_aggregating_dsl() {
+        let records = comparative_fixture(crate::corpus::TIME_BASELINE_NS);
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        std::fs::write(
+            corpus.path().join("fixture.jsonl"),
+            fixture_jsonl(&records).expect("fixture jsonl"),
+        )
+        .expect("write corpus");
+        let bucket = tempfile::TempDir::new().expect("bucket dir");
+        let built =
+            crate::build_comparative_store(corpus.path(), bucket.path(), crate::TxtSeverity::Fixed)
+                .expect("build store");
+        let tenant = TenantId::new(built.tenant);
+        let now = built.max_effective_time_unix_nano + 1;
+        let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+
+        assert!(
+            ourios_aggregate_answer(
+                bucket.path(),
+                &tenant,
+                "severity >= 0 | limit 10",
+                now,
+                window
+            )
+            .is_err(),
+            "a query with no `count by …` stage must not silently report an empty aggregate",
+        );
+    }
+
+    #[test]
+    fn parse_loki_matrix_decodes_bucket_aligned_samples() {
+        // Bucket alignment (RFC 0031 §7's L4 open question): a 1s bucket
+        // width, evaluated at t = (k+1)·w for k = 0 and k = 2, decodes
+        // to bucket starts 0 and 2_000_000_000 — exactly `t - w`.
+        let response = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [
+                    { "metric": {"value": "10"}, "values": [[1, "1"], [3, "1"]] },
+                    { "metric": {"value": "11"}, "values": [[1, "2"]] }
+                ]
+            }
+        }"#;
+        let groups = parse_loki_matrix(response, "value", 1_000_000_000).expect("parse matrix");
+        assert_eq!(
+            groups,
+            HashMap::from([
+                (agg(0, "10"), 1),
+                (agg(2_000_000_000, "10"), 1),
+                (agg(0, "11"), 2),
+            ]),
+        );
+    }
+
+    #[test]
+    fn parse_loki_matrix_rejects_non_matrix_result_types() {
+        let response = r#"{"status":"success","data":{"resultType":"streams","result":[]}}"#;
+        assert!(parse_loki_matrix(response, "value", 1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn parse_loki_matrix_rejects_a_missing_label() {
+        let response = r#"{"status":"success","data":{"resultType":"matrix",
+            "result":[{"metric":{},"values":[[1,"1"]]}]}}"#;
+        assert!(parse_loki_matrix(response, "value", 1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn parse_loki_matrix_rejects_sub_second_and_pre_width_samples() {
+        // A fractional-second sample means a misaligned query (this
+        // harness never emits a sub-second bucket width), not lost
+        // precision — refuse rather than truncate.
+        let fractional = r#"{"status":"success","data":{"resultType":"matrix",
+            "result":[{"metric":{"value":"10"},"values":[[1.5,"1"]]}]}}"#;
+        assert!(parse_loki_matrix(fractional, "value", 1_000_000_000).is_err());
+
+        // t = 0 with a 1s bucket width underflows the bucket start.
+        let too_early = r#"{"status":"success","data":{"resultType":"matrix",
+            "result":[{"metric":{"value":"10"},"values":[[0,"1"]]}]}}"#;
+        assert!(parse_loki_matrix(too_early, "value", 1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn parse_loki_matrix_surfaces_a_loki_error_response() {
+        let err = parse_loki_matrix(
+            r#"{"status":"error","errorType":"parse error","error":"unexpected token"}"#,
+            "value",
+            1_000_000_000,
+        )
+        .expect_err("a Loki error response must error");
+        let BenchError::Pipeline { detail } = err else {
+            panic!("expected a pipeline error");
+        };
+        assert!(detail.contains("unexpected token"), "{detail}");
     }
 }

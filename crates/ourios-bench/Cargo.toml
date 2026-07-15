@@ -75,6 +75,10 @@ tempfile = "3"
 # bench, which still uses them via these regular deps.)
 ourios-querier = { path = "../ourios-querier" }
 tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
+# RFC 0031 L4 (frequency-aggregation) pair: decodes the querier's RFC 3339
+# `bucket(width)` group-key rendering back to Unix nanoseconds for the
+# `AggKey` comparison against Loki. Same version `ourios-querier` pins.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # RFC0031.1 Loki container integration (CI-only, like the dex-oidc job):

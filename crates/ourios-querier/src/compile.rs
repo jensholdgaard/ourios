@@ -445,10 +445,40 @@ fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
         _ => {
             let (column, optional) = column_of(field);
             if optional && !has_column(df, column) {
-                Ok(lit(ScalarValue::Utf8(None)))
+                Ok(lit(null_scalar_for(field)))
             } else {
                 Ok(col(column))
             }
+        }
+    }
+}
+
+/// The typed NULL an absent `OPTIONAL` group-by column stands in for, so
+/// the aggregate plan's output schema does not depend on which columns
+/// happen to be present in the scanned union schema (every `optional`
+/// arm of [`column_of`] must have a case here — the module doc's field
+/// table §6.2 is the source of truth for these types).
+fn null_scalar_for(field: &Field) -> ScalarValue {
+    match field {
+        Field::Body => ScalarValue::Binary(None),
+        Field::ObservedTs => ScalarValue::TimestampNanosecond(None, Some("UTC".into())),
+        Field::TraceId => ScalarValue::FixedSizeBinary(16, None),
+        Field::SpanId => ScalarValue::FixedSizeBinary(8, None),
+        Field::Scope | Field::EventName => ScalarValue::Utf8(None),
+        // `column_of` never marks these `optional` (Service/Resource/Attr
+        // are intercepted earlier, before this function is reached), so
+        // this arm is unreachable from every real call site — kept only
+        // for match exhaustiveness over `Field`.
+        Field::Severity
+        | Field::Ts
+        | Field::Flags
+        | Field::TemplateId
+        | Field::Confidence
+        | Field::Lossy
+        | Field::Service
+        | Field::Resource(_)
+        | Field::Attr(_) => {
+            unreachable!("{field:?} is never an OPTIONAL group-by column")
         }
     }
 }

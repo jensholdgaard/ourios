@@ -1939,6 +1939,68 @@ async fn rfc0002_15_present_but_null_param_slot_excluded_and_tallied() {
     assert_eq!(result.rows, 3, "rows stays the total matching-row count");
 }
 
+/// Regression for RFC0002.15/§6.3 — grouping by a **fixed-column** field
+/// (`trace_id`, `FixedSizeBinary(16)`) that is entirely absent from the
+/// tenant's file set (an old writer that predates the column, the
+/// `rfc0007_4_severity_filter_on_column_absent_everywhere_is_empty`
+/// shape). The absent-column NULL substitute must carry `trace_id`'s own
+/// Arrow type — not a generic `Utf8` placeholder — so the aggregate
+/// plan's output schema does not depend on which optional columns happen
+/// to be present; proves the path executes and every row is excluded
+/// (not misdecoded or panicking on a type mismatch).
+#[tokio::test]
+async fn rfc0002_16_group_by_absent_fixed_column_excluded_and_tallied() {
+    use std::fs::File;
+
+    use ourios_parquet::{PartitionKey, columns, mined_records_to_batch};
+    use parquet::arrow::ArrowWriter;
+
+    use crate::common::{TS0, rec};
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let rows = [
+        rec("a", 1, TS0, 9, "api", "lib.cart", None, None),
+        rec("a", 1, TS0 + 1, 9, "api", "lib.cart", None, None),
+    ];
+    let base = mined_records_to_batch(&rows).expect("base batch");
+    let keep: Vec<usize> = base
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name() != columns::TRACE_ID)
+        .map(|(i, _)| i)
+        .collect();
+    let batch = base.project(&keep).expect("batch without trace_id");
+    assert!(
+        batch.schema().index_of(columns::TRACE_ID).is_err(),
+        "trace_id must be entirely absent from this file's schema",
+    );
+
+    let dir = PartitionKey::derive(&rows[0])
+        .expect("derive partition")
+        .data_path(bucket.path());
+    std::fs::create_dir_all(&dir).expect("mkdir partition");
+    let file = File::create(dir.join("no-trace-id.parquet")).expect("create parquet");
+    let mut w = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    w.write(&batch).expect("write batch");
+    w.close().expect("close writer");
+
+    // Act
+    let result = run_dsl(bucket.path(), "template_id == 1 | count by trace_id").await;
+
+    // Assert — an absent OPTIONAL column reads as NULL for every row, so
+    // both rows land in the excluded tally and no group is produced;
+    // the query answers cleanly rather than erroring on a type mismatch
+    // between the substituted literal and `trace_id`'s real Arrow type.
+    assert!(
+        group_map(&result).is_empty(),
+        "an entirely absent column produces no group",
+    );
+    assert_eq!(result.stats.rows_excluded, 2, "both rows tallied excluded");
+    assert_eq!(result.rows, 2, "rows stays the total matching-row count");
+}
+
 /// Scenario RFC0002.16 — the aggregation path's honest bytes total is the
 /// group-column scan alone. See `docs/rfcs/0002-query-dsl.md` §5
 /// (amendment 2026-07-15; RFC 0031 §3.6).

@@ -118,7 +118,11 @@ pub struct QueryRequest {
 /// (RFC0007.1) can assert pushdown actually skipped data rather
 /// than scanning it. Plain integers — no `DataFusion`/arrow types
 /// cross this boundary (hazard §4.6).
+///
+/// Marked `#[non_exhaustive]` so further additive fields (like
+/// `rows_excluded`, RFC0002.15) stay non-breaking.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct QueryStats {
     /// Row groups `DataFusion` read.
     pub row_groups_scanned: u64,
@@ -132,11 +136,13 @@ pub struct QueryStats {
     /// [`QueryResult::materialize_bytes_read`].
     pub bytes_read: u64,
     /// Rows excluded from an executed aggregation because a group key was
-    /// NULL — for `param(n)`, a `params` list shorter than `n + 1` or a NULL
-    /// slot (RFC 0002 §6.3 amendment 2026-07-15 / RFC0002.15). Such rows
-    /// contribute to no group and there is no synthetic "absent" bucket;
-    /// this tally keeps the exclusion observable, not silent. Always `0`
-    /// for a non-aggregation query.
+    /// NULL — either `param(n)` on a `params` list shorter than `n + 1` /
+    /// a NULL slot, or an `OPTIONAL` field group term (e.g. `bucket`'s
+    /// underlying timestamp, `trace_id`) absent on the row (RFC 0002
+    /// §6.3 amendment 2026-07-15 / RFC0002.15). Such rows contribute to
+    /// no group and there is no synthetic "absent" bucket; this tally
+    /// keeps the exclusion observable, not silent. Always `0` for a
+    /// non-aggregation query.
     pub rows_excluded: u64,
 }
 

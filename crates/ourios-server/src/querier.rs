@@ -616,7 +616,8 @@ struct StatsDto {
     row_groups_pruned: u64,
     bytes_read: u64,
     /// Rows an aggregation excluded for a NULL group key (RFC0002.15 —
-    /// short/NULL `param(n)` slots); `0` for non-aggregation queries.
+    /// short/NULL `param(n)` slots, or an absent `OPTIONAL` field group
+    /// term); `0` for non-aggregation queries.
     rows_excluded: u64,
 }
 

@@ -3342,6 +3342,20 @@ fn rfc0031_indicative_comparative_run() {
             // per dskit's server registry (grpc_server_max_*_msg_size).
             "-server.grpc-max-recv-msg-size-bytes=16777216",
             "-server.grpc-max-send-msg-size-bytes=16777216",
+            // Run #4's L4 near-miss (11,053/11,523 rows, plateaued across
+            // every 10s poll instead of climbing toward completeness):
+            // the bundled `local-config.yaml`'s embedded results cache
+            // covers `query_range`'s metric/matrix path (L4's
+            // `loki_query_matrix`), keyed by the query+start+end+step
+            // tuple — which `loki_measure_frequency_pair` re-polls
+            // unchanged. The first (still-incomplete) response gets
+            // cached and every retry echoes it back verbatim instead of
+            // re-querying storage/ingesters. Plain log queries
+            // (`loki_query_range`, used by L1-L3/L6) aren't extent-cached
+            // the same way, so they self-heal across polls — only the
+            // metric path needed this. Disabling caching for the run is
+            // in Loki's favour: it costs Loki latency, not correctness.
+            "-query-range.cache-results=false",
         ])
         .await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;

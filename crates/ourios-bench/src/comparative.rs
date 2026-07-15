@@ -660,9 +660,38 @@ fn decode_matrix_sample(
     let count_str = entry[1].as_str().ok_or_else(|| BenchError::Pipeline {
         detail: format!("Loki matrix result {ri} value {vi} count is not a string"),
     })?;
-    let count: u64 = count_str.parse().map_err(|e| BenchError::Pipeline {
-        detail: format!("Loki matrix result {ri} value {vi} count `{count_str}` is not a u64: {e}"),
+    // Prometheus/Loki matrix sample values are always a stringified
+    // float ("1", "1.0", "1e+00" are all legal encodings of an integer
+    // count), so a strict `u64::from_str` would reject valid responses.
+    // Parse as `f64`, then apply the same finite/non-negative/integral
+    // guard the timestamp above uses.
+    let count_f64: f64 = count_str.parse().map_err(|e| BenchError::Pipeline {
+        detail: format!(
+            "Loki matrix result {ri} value {vi} count `{count_str}` is not a number: {e}"
+        ),
     })?;
+    if !count_f64.is_finite() || count_f64 < 0.0 || count_f64.fract() != 0.0 {
+        return Err(BenchError::Pipeline {
+            detail: format!(
+                "Loki matrix result {ri} value {vi} count {count_f64} is not a \
+                 non-negative whole number — `count_over_time` never produces a \
+                 fractional sample"
+            ),
+        });
+    }
+    #[allow(clippy::cast_precision_loss)] // an upper-bound probe, not a value conversion:
+    // `u64::MAX as f64` rounds up to 2^64, which is exactly the property
+    // this comparison needs (anything at or past it cannot fit in u64).
+    let u64_max_f64 = u64::MAX as f64;
+    if count_f64 > u64_max_f64 {
+        return Err(BenchError::Pipeline {
+            detail: format!("Loki matrix result {ri} value {vi} count {count_f64} overflows u64"),
+        });
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // Checked above: finite, non-negative, integral, and within u64's
+    // range — an exact conversion.
+    let count = count_f64 as u64;
     Ok((bucket_start_unix_nanos, count))
 }
 
@@ -1862,6 +1891,36 @@ mod tests {
                 (agg(0, "11"), 2),
             ]),
         );
+    }
+
+    #[test]
+    fn parse_loki_matrix_decodes_float_and_scientific_notation_counts() {
+        // Prometheus/Loki matrix sample values are always a stringified
+        // float — "1", "1.0", and "1e+00" are all legal encodings of the
+        // same integer count, and different backends/serializers emit
+        // different forms.
+        let response = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [
+                    { "metric": {"value": "a"}, "values": [[1, "1.0"]] },
+                    { "metric": {"value": "b"}, "values": [[1, "1e+00"]] }
+                ]
+            }
+        }"#;
+        let groups = parse_loki_matrix(response, "value", 1_000_000_000).expect("parse matrix");
+        assert_eq!(groups, HashMap::from([(agg(0, "a"), 1), (agg(0, "b"), 1)]));
+    }
+
+    #[test]
+    fn parse_loki_matrix_rejects_a_fractional_count() {
+        // `count_over_time` never produces a fractional sample — a
+        // non-integral count means a misparsed or unexpected query type,
+        // not a value to silently truncate.
+        let response = r#"{"status":"success","data":{"resultType":"matrix",
+            "result":[{"metric":{"value":"10"},"values":[[1,"1.5"]]}]}}"#;
+        assert!(parse_loki_matrix(response, "value", 1_000_000_000).is_err());
     }
 
     #[test]

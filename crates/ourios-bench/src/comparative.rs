@@ -679,11 +679,17 @@ fn decode_matrix_sample(
             ),
         });
     }
-    #[allow(clippy::cast_precision_loss)] // an upper-bound probe, not a value conversion:
-    // `u64::MAX as f64` rounds up to 2^64, which is exactly the property
-    // this comparison needs (anything at or past it cannot fit in u64).
-    let u64_max_f64 = u64::MAX as f64;
-    if count_f64 > u64_max_f64 {
+    // `u64::MAX` (2^64 - 1) is not exactly representable in `f64` — it
+    // rounds *up* to 2^64 — so comparing against `u64::MAX as f64` with
+    // `>` would let a count exactly at 2^64 through, and the cast below
+    // saturates float-to-int on overflow (Rust's defined `as` behavior)
+    // rather than erroring, silently corrupting the decoded count to
+    // `u64::MAX`. `2f64.powi(64)` is exact (a power of two), and any
+    // integral `f64` strictly less than it is provably `<= u64::MAX`
+    // (the largest representable `f64` below 2^64 is 2^64 - 2048, well
+    // inside range) — so `>=` against that exact bound is the correct,
+    // gap-free check.
+    if count_f64 >= 2f64.powi(64) {
         return Err(BenchError::Pipeline {
             detail: format!("Loki matrix result {ri} value {vi} count {count_f64} overflows u64"),
         });
@@ -1921,6 +1927,24 @@ mod tests {
         let response = r#"{"status":"success","data":{"resultType":"matrix",
             "result":[{"metric":{"value":"10"},"values":[[1,"1.5"]]}]}}"#;
         assert!(parse_loki_matrix(response, "value", 1_000_000_000).is_err());
+    }
+
+    #[test]
+    fn parse_loki_matrix_rejects_a_count_exactly_at_2_pow_64() {
+        // `u64::MAX` rounds UP to 2^64 when cast to `f64` (it is not
+        // exactly representable), so a boundary check written as
+        // `count_f64 > u64::MAX as f64` would let a count of exactly
+        // 2^64 through — and the float-to-int cast saturates rather
+        // than erroring, silently corrupting the decoded count to
+        // `u64::MAX`. This value must be rejected, not silently mapped.
+        let response = r#"{"status":"success","data":{"resultType":"matrix",
+            "result":[{"metric":{"value":"10"},"values":[[1,"18446744073709551616"]]}]}}"#;
+        let err = parse_loki_matrix(response, "value", 1_000_000_000)
+            .expect_err("a count at exactly 2^64 must be rejected, not saturated to u64::MAX");
+        let BenchError::Pipeline { detail } = err else {
+            panic!("expected a pipeline error");
+        };
+        assert!(detail.contains("overflows u64"), "{detail}");
     }
 
     #[test]

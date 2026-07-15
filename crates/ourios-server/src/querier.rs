@@ -472,7 +472,19 @@ async fn handle_query(
     let started = Instant::now();
     match statement {
         Statement::Logs(mut query) => {
-            apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
+            // `count [by …]` and `limit` are mutually exclusive
+            // (`compile::validate` rejects the combination, RFC 0002
+            // amendment 2026-07-15) — an aggregation query answers with
+            // its grouped-count map, not a capped row set, so the §7
+            // default/cap limit is meaningless for it and must not be
+            // injected.
+            let is_aggregation = query
+                .stages
+                .iter()
+                .any(|s| matches!(s, Stage::Count { .. }));
+            if !is_aggregation {
+                apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
+            }
             let result = state
                 .querier
                 .run_query(&query, &tenant, now, state.default_window_nanos, None)

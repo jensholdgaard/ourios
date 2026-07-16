@@ -600,16 +600,18 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
     // Two values ("10"/"11") of one template ("connection established to
     // peer <id>" — the same ≥10-char constant run
     // `pick_template_pair_finds_a_validated_needle` already validates),
-    // spread over four one-second buckets so the picker's cardinality
+    // spread over five 12-minute buckets so the picker's cardinality
     // (2..=50) and row-floor bounds are exercised, not merely satisfied
-    // trivially.
+    // trivially. 1000x the original sub-3s timestamps (~300s average
+    // spacing) so this candidate also clears L4_MIN_AVG_INTERVAL_SECONDS
+    // — see `pick_frequency_pair_finds_a_moderate_cardinality_group`.
     let records: Vec<(u64, &str)> = vec![
-        (100_000_000, "connection established to peer 10"),
-        (500_000_000, "connection established to peer 10"),
-        (900_000_000, "connection established to peer 11"),
-        (2_100_000_000, "connection established to peer 10"),
-        (2_500_000_000, "connection established to peer 11"),
-        (3_000_000_000, "connection established to peer 11"),
+        (100_000_000_000, "connection established to peer 10"),
+        (500_000_000_000, "connection established to peer 10"),
+        (900_000_000_000, "connection established to peer 11"),
+        (2_100_000_000_000, "connection established to peer 10"),
+        (2_500_000_000_000, "connection established to peer 11"),
+        (3_000_000_000_000, "connection established to peer 11"),
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
     std::fs::write(
@@ -633,8 +635,8 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
         .expect("the peer template's trailing id validates as an L4 candidate");
     assert_eq!(pair.param, 0, "the template's only wildcard");
     assert_eq!(
-        pair.bucket_width, "1s",
-        "the ~2.9s fixture span floors to the 1s minimum bucket width",
+        pair.bucket_width, "12m",
+        "the ~2900s fixture span targets a 12-minute bucket width",
     );
     assert_eq!(pair.needle, "connection established to peer");
     assert_eq!(pair.capture_regex, "peer\\s+(?P<value>\\S+)");
@@ -1492,6 +1494,29 @@ const L4_MAX_ROWS: u64 = 100_000;
 /// like kafka's, without a special case for it).
 const L4_CARDINALITY: std::ops::RangeInclusive<usize> = 2..=50;
 
+/// The floor on a candidate's average inter-arrival interval
+/// (`bucket_width_seconds / (total_rows / distinct_buckets)`) a
+/// [`pick_frequency_pair`] candidate must clear. Loki's ingester
+/// silently drops a log entry that collides with another on
+/// `(timestamp, body)` within the same stream — a drop invisible to the
+/// OTLP push response's `partial_success` (`push_otlp` already asserts
+/// that field is clean, so this loss was never a rejected-record signal
+/// to catch there). A real dispatch (RFC 0031 L4 workstream, runs
+/// #6-#12) picked kafka's `template_id=16` "Wrote producer snapshot"
+/// needle — a ~15 s average cadence — and measured a stable ~93-97%
+/// completeness ceiling against Loki regardless of poll deadline,
+/// results caching, `-validation.max-entries-limit`, or bucket-aligned
+/// query windows: every fix narrowed or changed the number without
+/// closing the gap, and a plain unaggregated line-filter count over the
+/// same window came back just as short — proof the loss happens at
+/// Loki's ingest time, not in any query this harness constructs. The
+/// exact collision mechanics (why a ~15 s cadence collides and how much
+/// margin is enough) aren't fully characterized, so this floor is
+/// deliberately generous — 100 s, comfortably above the observed-bad
+/// 15 s and with real headroom below the two candidates a corpus
+/// exploration run found clear of it (60 s and ~144 s cadences).
+const L4_MIN_AVG_INTERVAL_SECONDS: f64 = 100.0;
+
 /// Choose a `bucket(width)` for the L4 pair from a query's time span: the
 /// largest whole DSL duration unit (`w`/`d`/`h`/`m`/`s`) that divides the
 /// span into roughly [`L4_TARGET_BUCKETS`] windows, floored at the DSL's
@@ -1648,7 +1673,10 @@ struct FrequencyPair {
 /// [`parse_loki_matrix`]'s bucket-alignment convention untested on
 /// this corpus). Returns the rejection reason, or `None` if the
 /// candidate passes every bound.
-fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
+fn frequency_shape_rejection(
+    groups: &HashMap<AggKey, u64>,
+    bucket_width_seconds: u64,
+) -> Option<String> {
     let distinct_values: std::collections::HashSet<&String> =
         groups.keys().map(|k| &k.group_key).collect();
     if !L4_CARDINALITY.contains(&distinct_values.len()) {
@@ -1673,6 +1701,22 @@ fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
         return Some(format!(
             "all rows land in {} bucket window(s) (need >= 2, to exercise the bucket dimension)",
             distinct_buckets.len(),
+        ));
+    }
+    // Row/bucket counts and a bucket width in seconds never approach
+    // f64's 2^53 exact-integer range in practice — this is an
+    // approximate picker heuristic, not a value stored or compared bit
+    // for bit.
+    #[allow(clippy::cast_precision_loss)]
+    let avg_rows_per_bucket = total_rows as f64 / distinct_buckets.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let avg_interval_s = bucket_width_seconds as f64 / avg_rows_per_bucket;
+    if avg_interval_s < L4_MIN_AVG_INTERVAL_SECONDS {
+        return Some(format!(
+            "~{avg_interval_s:.1}s average inter-arrival interval (need >= \
+             {L4_MIN_AVG_INTERVAL_SECONDS}s — a shorter cadence risks Loki's own \
+             same-timestamp/same-body ingest-time dedup, a real Loki behavior invisible \
+             to the OTLP push response and unfixable from the query side)"
         ));
     }
     None
@@ -1819,7 +1863,9 @@ fn pick_frequency_pair(
                     continue;
                 }
             };
-            if let Some(reason) = frequency_shape_rejection(&answer.groups) {
+            if let Some(reason) =
+                frequency_shape_rejection(&answer.groups, bucket_width_seconds(&bucket_width))
+            {
                 eprintln!("L4 candidate template_id={id} param({param}): rejected — {reason}");
                 continue;
             }
@@ -4749,16 +4795,21 @@ fn param_capture_regex_anchors_on_the_nearest_fixed_neighbours() {
 
 #[test]
 fn pick_frequency_pair_finds_a_moderate_cardinality_group() {
-    // Two ids ("10"/"11") of the peer template, spread over four
-    // one-second buckets — cardinality 2 (within 2..=50) and 6 total
-    // rows (above the L4_MIN_ROWS floor).
+    // Two ids ("10"/"11") of the peer template, spread over five
+    // 12-minute buckets — cardinality 2 (within 2..=50), 6 total rows
+    // (above the L4_MIN_ROWS floor), and 1000x the original sub-3s
+    // timestamps (~300s average spacing) so this candidate also clears
+    // L4_MIN_AVG_INTERVAL_SECONDS: a tight synthetic timeline is
+    // convenient for a unit test but is exactly the shape (bursty,
+    // same-timestamp-prone) the RFC 0031 L4 workstream (runs #6-#12)
+    // found Loki silently drops rows for at ingest.
     let records: Vec<(u64, &str)> = vec![
-        (100_000_000, "connection established to peer 10"),
-        (500_000_000, "connection established to peer 10"),
-        (900_000_000, "connection established to peer 11"),
-        (2_100_000_000, "connection established to peer 10"),
-        (2_500_000_000, "connection established to peer 11"),
-        (3_000_000_000, "connection established to peer 11"),
+        (100_000_000_000, "connection established to peer 10"),
+        (500_000_000_000, "connection established to peer 10"),
+        (900_000_000_000, "connection established to peer 11"),
+        (2_100_000_000_000, "connection established to peer 10"),
+        (2_500_000_000_000, "connection established to peer 11"),
+        (3_000_000_000_000, "connection established to peer 11"),
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
     std::fs::write(
@@ -4781,7 +4832,7 @@ fn pick_frequency_pair_finds_a_moderate_cardinality_group() {
     let pair = pick_frequency_pair(bucket.path(), &tenant, now, window)
         .expect("the peer template's trailing id validates");
     assert_eq!(pair.param, 0);
-    assert_eq!(pair.bucket_width, "1s");
+    assert_eq!(pair.bucket_width, "12m");
     assert_eq!(pair.needle, "connection established to peer");
     assert_eq!(pair.capture_regex, r"peer\s+(?P<value>\S+)");
     assert_eq!(pair.groups.values().sum::<u64>(), 6);
@@ -4825,6 +4876,14 @@ fn pick_frequency_pair_rejects_below_the_row_floor() {
     );
 }
 
+// A wide bucket width so `frequency_shape_rejection_enforces_the_row_ceiling`'s
+// ~50K-rows-per-bucket density clears [`L4_MIN_AVG_INTERVAL_SECONDS`]
+// too — that fixture's two-bucket, 1-second-apart `AggKey`s are
+// synthetic (isolating the row ceiling from the other floors), not a
+// real bucket width, so this value is chosen only to keep the
+// frequency floor from interfering.
+const WIDE_BUCKET_SECONDS: u64 = 10_000_000;
+
 #[test]
 fn frequency_shape_rejection_enforces_the_row_ceiling() {
     // A ~971K-row candidate (a service's dominant, near-catch-all
@@ -4849,8 +4908,8 @@ fn frequency_shape_rejection_enforces_the_row_ceiling() {
             L4_MAX_ROWS / 2 + 1,
         ),
     ]);
-    let rejection =
-        frequency_shape_rejection(&groups).expect("a candidate past L4_MAX_ROWS must be rejected");
+    let rejection = frequency_shape_rejection(&groups, WIDE_BUCKET_SECONDS)
+        .expect("a candidate past L4_MAX_ROWS must be rejected");
     assert!(
         rejection.contains(&L4_MAX_ROWS.to_string()),
         "the rejection reason must name the ceiling: {rejection}",
@@ -4867,9 +4926,68 @@ fn frequency_shape_rejection_enforces_the_row_ceiling() {
         .expect("cell exists");
     *cell -= 2;
     assert_eq!(
-        frequency_shape_rejection(&under_ceiling),
+        frequency_shape_rejection(&under_ceiling, WIDE_BUCKET_SECONDS),
         None,
         "exactly at the ceiling must pass",
+    );
+}
+
+#[test]
+fn frequency_shape_rejection_enforces_the_average_interval_floor() {
+    // RFC 0031 L4 workstream, runs #6-#12: kafka's `template_id=16`
+    // needle averaged a ~15s inter-arrival cadence and measured a
+    // stable ~93-97% completeness ceiling against Loki, independent of
+    // every query-side fix tried — the shortfall was proven ingest-side
+    // (a plain unaggregated line count came back just as short) and
+    // matches Loki's documented same-timestamp/same-body ingester dedup.
+    // 100 rows over a 1h bucket, 2 distinct values, 2 buckets: cardinality
+    // and bucket-diversity both clear, but ~72s average spacing (below
+    // L4_MIN_AVG_INTERVAL_SECONDS) must still reject.
+    let dense = HashMap::from([
+        (
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "a".to_string(),
+            },
+            50,
+        ),
+        (
+            AggKey {
+                bucket_start_unix_nanos: 3_600_000_000_000,
+                group_key: "b".to_string(),
+            },
+            50,
+        ),
+    ]);
+    let rejection =
+        frequency_shape_rejection(&dense, 3_600).expect("a ~72s average cadence must be rejected");
+    assert!(
+        rejection.contains("average inter-arrival interval"),
+        "the rejection reason must name the interval floor: {rejection}",
+    );
+
+    // Same shape, a fifth of the volume: ~360s average spacing clears
+    // the floor, isolating it from cardinality/ceiling/bucket-diversity.
+    let sparse = HashMap::from([
+        (
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "a".to_string(),
+            },
+            10,
+        ),
+        (
+            AggKey {
+                bucket_start_unix_nanos: 3_600_000_000_000,
+                group_key: "b".to_string(),
+            },
+            10,
+        ),
+    ]);
+    assert_eq!(
+        frequency_shape_rejection(&sparse, 3_600),
+        None,
+        "a ~360s average cadence must pass",
     );
 }
 

@@ -1705,6 +1705,33 @@ fn l4_pair_spec(
         );
         return None;
     }
+    // Loki's `query_range` evaluates a fixed step-grid starting exactly
+    // at `start` (`start, start+step, start+2*step, ..., end`), each
+    // instant's `[bucket_width]` range-vector lookback covering the
+    // PRECEDING window. Ourios's own buckets (RFC 0002's `bucket(width)`)
+    // are epoch-aligned (`floor(ts/width)*width`), not aligned to
+    // whatever `min_effective_time_unix_nano` happens to be. Runs
+    // #6-#10 all converged L4 to a stable ~93-97% regardless of poll
+    // deadline (ruling out a timing race) even after the entries-limit
+    // fix (run #8) closed part of the gap — consistent with a
+    // structural, not transient, shortfall: unless `start`/`end` are
+    // themselves bucket-boundary multiples, `(end - start) % width` is
+    // generically nonzero, leaving a fractional sliver at the tail of
+    // the range that the step-grid never evaluates a window over at
+    // all, independent of how long Loki is given to ingest. Snapping
+    // `start` down and `end` up to the nearest bucket boundary costs
+    // nothing (no data exists outside `[min, max]` to inflate the
+    // count) and guarantees full coverage.
+    let bucket_width_ns = bucket_width_seconds(&pair.bucket_width)
+        .checked_mul(1_000_000_000)
+        .expect("bucket width fits u64 nanoseconds");
+    let start = (min_effective_time_unix_nano / bucket_width_ns) * bucket_width_ns;
+    let end = max_effective_time_unix_nano
+        .checked_add(1)
+        .expect("corpus max timestamp overflows the Loki window end")
+        .div_ceil(bucket_width_ns)
+        .checked_mul(bucket_width_ns)
+        .expect("bucket-aligned window end overflows u64 nanoseconds");
     Some(PairSpec {
         label: format!(
             "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
@@ -1721,10 +1748,8 @@ fn l4_pair_spec(
              | regexp `{}` [{}]))",
             pair.needle, pair.capture_regex, pair.bucket_width,
         ),
-        start: min_effective_time_unix_nano,
-        end: max_effective_time_unix_nano
-            .checked_add(1)
-            .expect("corpus max timestamp overflows the Loki window end"),
+        start,
+        end,
         expected_rows: pair.groups.values().sum(),
         now,
         window,

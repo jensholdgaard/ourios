@@ -2808,12 +2808,15 @@ async fn loki_measure_pair(
 /// exact `(timestamp, body)` collision entirely — every one of the
 /// 1197 matching records has a unique timestamp AND unique body, so
 /// Loki's documented dedup rule cannot be the mechanism here (or,
-/// evidently, for the prior candidate either). On a deadline miss this
-/// now also dumps Loki's OWN container stdout/stderr — the ingester
-/// logs WARN-level lines for rate limits, out-of-order rejections, and
-/// stream-limit drops, and none of that is visible from the query side
-/// or the OTLP push response's `partial_success`, which `push_otlp`
-/// already confirms is clean on every push.
+/// evidently, for the prior candidate either). Run #14 added a
+/// `level=warn`/`level=error` scan of Loki's own container stderr and
+/// came back with zero matches — whatever is happening, Loki doesn't
+/// consider it log-worthy, ruling out rate limiting, out-of-order
+/// rejection, and stream-limit drops (all of which log at WARN). A
+/// deadline miss now also scrapes `/metrics` for
+/// `loki_discarded_samples_total`/`loki_discarded_bytes_total` — Loki's
+/// own dedicated counters for silent/expected discards, incremented
+/// even when nothing is logged, labeled by `reason`.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
@@ -2853,29 +2856,23 @@ async fn loki_measure_frequency_pair(
                 );
             }
             // Loki's own logs, not just its HTTP answers: the ingester
-            // logs WARN-level lines for rate limiting, out-of-order
-            // rejection, and stream-limit drops — none of which surface
-            // in a query response or the OTLP push's partial_success.
+            // logs at level=warn/level=error for rate limiting,
+            // out-of-order rejection, and stream-limit drops — none of
+            // which surface in a query response or the OTLP push's
+            // partial_success. Matched on the `level=` FIELD, not a
+            // bare substring: run #14 showed a naive "contains warn"
+            // filter drowning in false positives from query text like
+            // `severity_text="WARN"` inside `level=info` lines.
             match container.stderr_to_vec().await {
                 Ok(stderr) => {
                     let text = String::from_utf8_lossy(&stderr);
                     let relevant: Vec<&str> = text
                         .lines()
-                        .filter(|l| {
-                            let lower = l.to_lowercase();
-                            lower.contains("warn")
-                                || lower.contains("error")
-                                || lower.contains("drop")
-                                || lower.contains("reject")
-                                || lower.contains("out of order")
-                                || lower.contains("out-of-order")
-                                || lower.contains("rate limit")
-                                || lower.contains("stream limit")
-                        })
+                        .filter(|l| l.contains("level=warn") || l.contains("level=error"))
                         .collect();
                     eprintln!(
-                        "loki container stderr for [{}] — {} matching line(s) out of {} \
-                         total (filtered to warn/error/drop/reject/rate-limit/stream-limit):",
+                        "loki container stderr for [{}] — {} level=warn/error line(s) out \
+                         of {} total:",
                         spec.label,
                         relevant.len(),
                         text.lines().count(),
@@ -2889,6 +2886,7 @@ async fn loki_measure_frequency_pair(
                     spec.label,
                 ),
             }
+            dump_loki_discard_metrics(http, base, spec).await;
             // Decisive ingest-vs-query split: a PLAIN line-filter count
             // (no `count_over_time`, no `| regexp`) over the same
             // needle + window tells us whether the shortfall is Loki
@@ -3334,6 +3332,53 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
         raw(&spec.logql, 5000).await,
         raw("{service_name=~\".+\"}", 3).await,
     );
+}
+
+/// Loki's OWN accounting for silent/expected drops: the distributor
+/// increments `loki_discarded_samples_total` (labeled by `reason` —
+/// `rate_limited`, `out_of_order`, `too_many_streams`, `line_too_long`,
+/// ...) even when nothing is logged, since a single discarded sample
+/// isn't always WARN-worthy on its own ([`loki_measure_frequency_pair`]'s
+/// `level=warn`/`level=error` stderr scan came back clean on run #14).
+/// This is Loki's dedicated answer to "how much did you drop and why."
+async fn dump_loki_discard_metrics(http: &reqwest::Client, base: &str, spec: &PairSpec) {
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        http.get(format!("{base}/metrics")).send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => match resp.text().await {
+            Ok(body) => {
+                let discard_lines: Vec<&str> = body
+                    .lines()
+                    .filter(|l| {
+                        !l.starts_with('#')
+                            && (l.starts_with("loki_discarded_samples_total")
+                                || l.starts_with("loki_discarded_bytes_total"))
+                    })
+                    .collect();
+                eprintln!(
+                    "loki /metrics discarded-samples counters for [{}] — {} \
+                     non-zero-eligible series:",
+                    spec.label,
+                    discard_lines.len(),
+                );
+                for line in &discard_lines {
+                    eprintln!("  {line}");
+                }
+            }
+            Err(e) => eprintln!(
+                "(couldn't read loki /metrics body for [{}]: {e})",
+                spec.label
+            ),
+        },
+        Ok(Err(e)) => eprintln!("(loki /metrics request failed for [{}]: {e})", spec.label),
+        Err(_) => eprintln!(
+            "(loki /metrics request for [{}] itself timed out after 30 s)",
+            spec.label,
+        ),
+    }
 }
 
 /// The §7 calibration input: the indicative Ourios-vs-Loki bytes-read

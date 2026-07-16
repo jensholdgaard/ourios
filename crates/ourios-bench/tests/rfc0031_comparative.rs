@@ -2746,15 +2746,16 @@ async fn loki_measure_pair(
 /// (same run #11 salvage lesson; L4 is measured and reported last, see
 /// `rfc0031_indicative_comparative_run`).
 ///
-/// Deadline matches [`loki_measure_pair`]'s 300 s — run #9 proved
-/// widening it to 600 s changes nothing (96.5% vs run #8's 97.1% at
-/// 300 s, statistically the same), so the remaining shortfall after
-/// `-validation.max-entries-limit` is a second stable cap, not settle
-/// time. Reused [`dump_loki_diagnostics`] (built for the streams path,
-/// but `spec.logql` and its `stats` block are query-shape-agnostic) on
-/// a deadline miss so the next run's failure carries real evidence
-/// (`totalChunksRef` vs `totalChunksDownloaded`, any `warnings`) instead
-/// of another guess.
+/// Deadline matches [`loki_measure_pair`]'s 300 s — widening it to
+/// 600/900 s (runs #7/#9) changed nothing, and bucket-aligning the
+/// query window (run #11) narrowed but didn't close the gap either.
+/// Six straight dispatches (#6-#11) all converged to a stable ~93-97%
+/// regardless of which query-side knob moved, so a deadline miss now
+/// also runs a plain, unaggregated line-filter count (bypassing
+/// `count_over_time`/`regexp` entirely) alongside [`dump_loki_diagnostics`]
+/// — decisive evidence for whether the shortfall is Loki never storing
+/// the missing lines at ingest, or specific to the aggregation path,
+/// instead of another guess.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
@@ -2790,6 +2791,41 @@ async fn loki_measure_frequency_pair(
                     spec.label,
                 );
             }
+            // Decisive ingest-vs-query split: a PLAIN line-filter count
+            // (no `count_over_time`, no `| regexp`) over the same
+            // needle + window tells us whether the shortfall is Loki
+            // never having stored the missing lines at all, or an
+            // artifact specific to the metric-aggregation path. Every
+            // prior fix (cache, entries-limit, bucket alignment) has
+            // moved the number without closing the gap — six straight
+            // dispatches at a stable ~93-97%, so guessing another
+            // query-side knob isn't warranted without this evidence.
+            if let Some(needle) = l4_needle_from_logql(&spec.logql) {
+                match tokio::time::timeout(
+                    Duration::from_secs(60),
+                    loki_query_range_uncapped(
+                        http,
+                        base,
+                        &format!(r#"{{service_name=~".+"}} |= "{needle}""#),
+                        spec.start,
+                        spec.end,
+                        spec.expected_rows,
+                    ),
+                )
+                .await
+                {
+                    Ok(count) => eprintln!(
+                        "plain line-filter count for [{}]: {count} of {} expected \
+                         (bypasses count_over_time/regexp entirely — a \
+                         shortfall here means Loki never stored those lines)",
+                        spec.label, spec.expected_rows,
+                    ),
+                    Err(_) => eprintln!(
+                        "(plain line-filter count for [{}] itself timed out after 60 s)",
+                        spec.label,
+                    ),
+                }
+            }
             break Err(format!(
                 "loki returned {total} of {} expected rows for [{}] before timeout",
                 spec.expected_rows, spec.label,
@@ -2797,6 +2833,53 @@ async fn loki_measure_frequency_pair(
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
+}
+
+/// Pull the bare `|= "..."` needle back out of an L4 [`PairSpec`]'s
+/// `logql` (built by [`l4_pair_spec`]) for the plain-count diagnostic —
+/// parsing rather than threading a new parameter through, since this is
+/// diagnostic-only code and a parse miss should just skip the probe, not
+/// fail the run.
+fn l4_needle_from_logql(logql: &str) -> Option<&str> {
+    let after = logql.split_once("|= \"")?.1;
+    let (needle, _) = after.split_once('"')?;
+    Some(needle)
+}
+
+/// Diagnostic-only: a plain streams count, unlike [`loki_query_range`],
+/// whose `limit=5000` is deliberately tuned to the equivalence pairs'
+/// (≤4000-row) expectations and would silently under-report an L4 pair
+/// whose `expected_rows` exceeds it. `limit` is set to `expected_rows`
+/// rounded up with headroom, not a fixed constant, so the probe can
+/// never itself be the reason the count looks short.
+async fn loki_query_range_uncapped(
+    http: &reqwest::Client,
+    base: &str,
+    logql: &str,
+    start: u64,
+    end: u64,
+    expected_rows: u64,
+) -> u64 {
+    let limit = expected_rows.saturating_mul(2).max(5000);
+    let resp = http
+        .get(format!("{base}/loki/api/v1/query_range"))
+        .query(&[
+            ("query", logql),
+            ("start", &start.to_string()),
+            ("end", &end.to_string()),
+            ("limit", &limit.to_string()),
+            ("direction", "forward"),
+        ])
+        .send()
+        .await
+        .expect("query_range");
+    let status = resp.status();
+    let body = resp.text().await.expect("query_range body");
+    assert!(
+        status.is_success(),
+        "loki query_range (uncapped diagnostic) returned {status}: {body}",
+    );
+    parse_loki_streams(&body).expect("parse loki streams").len() as u64
 }
 
 /// Split successes from failures: equivalence + report run for every

@@ -2720,13 +2720,22 @@ async fn loki_measure_pair(
 /// destroy the already-measured/printed evidence for the other pairs
 /// (same run #11 salvage lesson; L4 is measured and reported last, see
 /// `rfc0031_indicative_comparative_run`).
+///
+/// Deadline is longer than [`loki_measure_pair`]'s 300 s. Before
+/// `-validation.max-entries-limit` was raised, widening this deadline
+/// alone (run #7, 900 s) made no measurable difference — proof the
+/// shortfall was a hard per-query cap, not a timing race. With that cap
+/// raised (run #8), completeness jumped from a ~93% plateau to 97.1%,
+/// which now behaves like genuine ingest settle time rather than a
+/// fixed ceiling — worth confirming with real headroom before
+/// concluding a third factor is still capping it.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
     spec: &PairSpec,
     bucket_width_ns: u64,
 ) -> Result<L4Measured, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
     loop {
         let (groups, bytes, fetched) = loki_query_matrix(
             http,

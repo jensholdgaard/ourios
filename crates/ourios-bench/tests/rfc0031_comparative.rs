@@ -2720,25 +2720,13 @@ async fn loki_measure_pair(
 /// destroy the already-measured/printed evidence for the other pairs
 /// (same run #11 salvage lesson; L4 is measured and reported last, see
 /// `rfc0031_indicative_comparative_run`).
-///
-/// Deadline is longer than [`loki_measure_pair`]'s 300 s: runs #4 and
-/// #6 both plateaued at 93-96% of the expected row count at 300 s, with
-/// the shortfall varying run to run (not a fixed cache echo — #6 ruled
-/// that out by disabling `-querier.cache-results` and still seeing the
-/// same shape). L4's `LogQL` runs a `| regexp` capture over every
-/// candidate line before grouping and counting, a genuinely heavier
-/// per-line cost than the plain stream/count queries every other class
-/// uses — variable completion time, not a bug, so the fix is headroom,
-/// not a config flag. The CI job has no `timeout-minutes` (the 360 min
-/// GitHub Actions default applies) and the whole run has taken
-/// ~95-100 min so far, so 900 s of poll budget here is well inside it.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
     spec: &PairSpec,
     bucket_width_ns: u64,
 ) -> Result<L4Measured, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(900);
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     loop {
         let (groups, bytes, fetched) = loki_query_matrix(
             http,
@@ -3354,26 +3342,30 @@ fn rfc0031_indicative_comparative_run() {
             // per dskit's server registry (grpc_server_max_*_msg_size).
             "-server.grpc-max-recv-msg-size-bytes=16777216",
             "-server.grpc-max-send-msg-size-bytes=16777216",
-            // Run #4's L4 near-miss (11,053/11,523 rows, plateaued across
-            // every 10s poll instead of climbing toward completeness):
-            // the bundled `local-config.yaml`'s embedded results cache
-            // covers `query_range`'s metric/matrix path (L4's
-            // `loki_query_matrix`), keyed by the query+start+end+step
-            // tuple — which `loki_measure_frequency_pair` re-polls
-            // unchanged. The first (still-incomplete) response gets
-            // cached and every retry echoes it back verbatim instead of
-            // re-querying storage/ingesters. Plain log queries
-            // (`loki_query_range`, used by L1-L3/L6) aren't extent-cached
-            // the same way, so they self-heal across polls — only the
-            // metric path needed this. Disabling caching for the run is
-            // in Loki's favour: it costs Loki latency, not correctness.
-            // Run #5 proved `-query-range.cache-results` isn't a real
-            // flag ("flag provided but not defined" — the container
-            // never reached /ready); the boolean actually lives on
-            // `queryrangebase.Config.CacheResults`, registered under
-            // the `querier.` flag prefix, not `query-range.` (verified
-            // against the pinned v3.5.3 source, `roundtrip.go`).
+            // `loki_measure_frequency_pair` polls the SAME query+step
+            // repeatedly waiting for completeness; disable query_range
+            // results caching so every poll re-queries fresh data rather
+            // than risking a stale cached answer (flag lives under the
+            // `querier.` prefix on `queryrangebase.Config.CacheResults`,
+            // verified against the pinned v3.5.3 source).
             "-querier.cache-results=false",
+            // L4's near-miss completeness plateau (runs #4/#6/#7 all
+            // converged around 93-96% of expected rows, independent of
+            // poll deadline — ruling out a slow-ingest race) is Loki's
+            // default `-validation.max-entries-limit` (5000): the
+            // `count_over_time(... | regexp ...)` aggregation still has
+            // to scan every raw kafka log line in-window before the
+            // line filter narrows it down, and kafka's overall volume in
+            // some query-frontend splits exceeds 5000 lines, silently
+            // truncating the scan before it reaches every matching line.
+            // Confirmed by pulling the frozen otel-demo-v8 corpus and
+            // checking every line matching the L4 needle against the
+            // capture regex directly: all match — the shortfall isn't a
+            // regex/content mismatch, it's lines never being scanned.
+            // Raised well past the corpus's noisiest single template's
+            // volume (~971K rows) — in Loki's favour, cost is memory,
+            // not correctness.
+            "-validation.max-entries-limit=2000000",
         ])
         .await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;

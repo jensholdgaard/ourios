@@ -2802,9 +2802,24 @@ async fn loki_measure_pair(
 /// — decisive evidence for whether the shortfall is Loki never storing
 /// the missing lines at ingest, or specific to the aggregation path,
 /// instead of another guess.
+///
+/// Run #13 (a lower-frequency candidate, `L4_MIN_AVG_INTERVAL_SECONDS`)
+/// still fell short (1144/1197), and a corpus-side check ruled out
+/// exact `(timestamp, body)` collision entirely — every one of the
+/// 1197 matching records has a unique timestamp AND unique body, so
+/// Loki's documented dedup rule cannot be the mechanism here (or,
+/// evidently, for the prior candidate either). On a deadline miss this
+/// now also dumps Loki's OWN container stdout/stderr — the ingester
+/// logs WARN-level lines for rate limits, out-of-order rejections, and
+/// stream-limit drops, and none of that is visible from the query side
+/// or the OTLP push response's `partial_success`, which `push_otlp`
+/// already confirms is clean on every push.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
+    container: &testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::testcontainers::GenericImage,
+    >,
     spec: &PairSpec,
     bucket_width_ns: u64,
 ) -> Result<L4Measured, String> {
@@ -2836,6 +2851,43 @@ async fn loki_measure_frequency_pair(
                     "(diagnostics dump for [{}] itself timed out after 90 s)",
                     spec.label,
                 );
+            }
+            // Loki's own logs, not just its HTTP answers: the ingester
+            // logs WARN-level lines for rate limiting, out-of-order
+            // rejection, and stream-limit drops — none of which surface
+            // in a query response or the OTLP push's partial_success.
+            match container.stderr_to_vec().await {
+                Ok(stderr) => {
+                    let text = String::from_utf8_lossy(&stderr);
+                    let relevant: Vec<&str> = text
+                        .lines()
+                        .filter(|l| {
+                            let lower = l.to_lowercase();
+                            lower.contains("warn")
+                                || lower.contains("error")
+                                || lower.contains("drop")
+                                || lower.contains("reject")
+                                || lower.contains("out of order")
+                                || lower.contains("out-of-order")
+                                || lower.contains("rate limit")
+                                || lower.contains("stream limit")
+                        })
+                        .collect();
+                    eprintln!(
+                        "loki container stderr for [{}] — {} matching line(s) out of {} \
+                         total (filtered to warn/error/drop/reject/rate-limit/stream-limit):",
+                        spec.label,
+                        relevant.len(),
+                        text.lines().count(),
+                    );
+                    for line in relevant.iter().rev().take(200).rev() {
+                        eprintln!("  {line}");
+                    }
+                }
+                Err(e) => eprintln!(
+                    "(couldn't read loki container stderr for [{}]: {e})",
+                    spec.label,
+                ),
             }
             // Decisive ingest-vs-query split: a PLAIN line-filter count
             // (no `count_over_time`, no `| regexp`) over the same
@@ -3489,7 +3541,7 @@ fn rfc0031_indicative_comparative_run() {
         .build()
         .expect("tokio runtime");
     let (loki, l4_loki): (Vec<_>, Option<Result<L4Measured, String>>) = runtime.block_on(async {
-        let (_container, base, http) = start_loki(&[
+        let (container, base, http) = start_loki(&[
             "-validation.reject-old-samples=false",
             // Run #11/#13 post-mortems (the #488 diagnostics): queries over
             // the replayed corpus's WEEKS-OLD time range skip the ingesters
@@ -3566,7 +3618,10 @@ fn rfc0031_indicative_comparative_run() {
                 let bucket_width_ns = bucket_width_seconds(&pair.bucket_width)
                     .checked_mul(1_000_000_000)
                     .expect("bucket width fits u64 nanoseconds");
-                Some(loki_measure_frequency_pair(&http, &base, spec, bucket_width_ns).await)
+                Some(
+                    loki_measure_frequency_pair(&http, &base, &container, spec, bucket_width_ns)
+                        .await,
+                )
             }
             _ => None,
         };

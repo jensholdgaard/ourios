@@ -2721,21 +2721,22 @@ async fn loki_measure_pair(
 /// (same run #11 salvage lesson; L4 is measured and reported last, see
 /// `rfc0031_indicative_comparative_run`).
 ///
-/// Deadline is longer than [`loki_measure_pair`]'s 300 s. Before
-/// `-validation.max-entries-limit` was raised, widening this deadline
-/// alone (run #7, 900 s) made no measurable difference — proof the
-/// shortfall was a hard per-query cap, not a timing race. With that cap
-/// raised (run #8), completeness jumped from a ~93% plateau to 97.1%,
-/// which now behaves like genuine ingest settle time rather than a
-/// fixed ceiling — worth confirming with real headroom before
-/// concluding a third factor is still capping it.
+/// Deadline matches [`loki_measure_pair`]'s 300 s — run #9 proved
+/// widening it to 600 s changes nothing (96.5% vs run #8's 97.1% at
+/// 300 s, statistically the same), so the remaining shortfall after
+/// `-validation.max-entries-limit` is a second stable cap, not settle
+/// time. Reused [`dump_loki_diagnostics`] (built for the streams path,
+/// but `spec.logql` and its `stats` block are query-shape-agnostic) on
+/// a deadline miss so the next run's failure carries real evidence
+/// (`totalChunksRef` vs `totalChunksDownloaded`, any `warnings`) instead
+/// of another guess.
 async fn loki_measure_frequency_pair(
     http: &reqwest::Client,
     base: &str,
     spec: &PairSpec,
     bucket_width_ns: u64,
 ) -> Result<L4Measured, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     loop {
         let (groups, bytes, fetched) = loki_query_matrix(
             http,
@@ -2752,6 +2753,18 @@ async fn loki_measure_frequency_pair(
             break Ok((groups, bytes, fetched));
         }
         if std::time::Instant::now() >= deadline {
+            if tokio::time::timeout(
+                Duration::from_secs(90),
+                dump_loki_diagnostics(http, base, spec),
+            )
+            .await
+            .is_err()
+            {
+                eprintln!(
+                    "(diagnostics dump for [{}] itself timed out after 90 s)",
+                    spec.label,
+                );
+            }
             break Err(format!(
                 "loki returned {total} of {} expected rows for [{}] before timeout",
                 spec.expected_rows, spec.label,

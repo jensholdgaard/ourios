@@ -254,19 +254,18 @@ fn aggregate_by_group_key<S: std::hash::BuildHasher>(
 /// for. `margin` must be a finite fraction in `[0, 1]` — asserted, since
 /// this is a public helper other callers could pass a bad value to.
 ///
-/// The `ourios_key_total == 1` special case exists because a pure
+/// The `ourios_key_total <= 1` special case exists because a pure
 /// percentage margin has no meaningful middle ground at `n = 1` (0% or
 /// 100%, nothing in between could ever land inside a normal margin):
 /// run #19 found a real `group_key` with exactly 1 total Ourios row,
 /// where Loki captured 0 — fully consistent with the already-
 /// characterized ~4-8% aggregate loss rate (a lone occurrence has a
 /// real, non-negligible chance of being the one that's lost). Every
-/// OTHER total uses `floor`, not `ceil` with a floor-at-1: an earlier
-/// version used `ceil(...).max(1)`, which review caught loosening the
-/// margin for every small-but-not-1 total too (`o=2` at a 90% margin:
-/// `ceil(2*0.1)=1` tolerance means losing 1 of 2 is 50% completeness,
-/// nowhere near 90%). `floor` guarantees the tolerance never rounds up
-/// past what the margin actually allows.
+/// OTHER total is held directly to `loki_total >= ourios_total *
+/// margin`; two earlier subtract-and-round tolerance designs
+/// (`ceil(o*(1-margin)).max(1)`, then plain `floor`) each had a real
+/// rounding defect — see the function body's comment for both
+/// counterexamples.
 ///
 /// The check is **per-`group_key`, not just the grand total**: checking
 /// only the sum across every cell would let Loki over-count one
@@ -302,6 +301,11 @@ pub fn compare_aggregations_within_margin<
     margin: f64,
     examples_cap: usize,
 ) -> EquivalenceOutcome {
+    assert!(
+        (0.0..=1.0).contains(&margin) && !margin.is_nan(),
+        "margin must be a fraction in [0, 1], got {margin}"
+    );
+
     let phantom = phantom_cells(ourios, loki);
     if !phantom.is_empty() {
         let summary = format!(
@@ -348,11 +352,6 @@ pub fn compare_aggregations_within_margin<
             .collect();
         return EquivalenceOutcome::Mismatch(Mismatch { summary, examples });
     }
-
-    assert!(
-        (0.0..=1.0).contains(&margin) && !margin.is_nan(),
-        "margin must be a fraction in [0, 1], got {margin}"
-    );
 
     // A pure percentage margin breaks down for a low-cardinality key: run
     // #19 found a real group_key with exactly 1 total Ourios row, where

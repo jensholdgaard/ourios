@@ -3631,11 +3631,13 @@ fn rfc0031_indicative_comparative_run() {
     });
     if l4_spec.is_none() {
         eprintln!(
-            "L4 PAIR SKIPPED: no template/param slot in the corpus cleared \
-             pick_frequency_pair's bounds (moderate cardinality {L4_CARDINALITY:?}, \
-             {L4_MIN_ROWS}..={L4_MAX_ROWS} rows, >= {L4_MIN_AVG_INTERVAL_SECONDS}s average \
-             inter-arrival interval, a validated needle + capture regex, no backtick in the \
-             capture regex)"
+            "L4 PAIR MISSING (this WILL fail the dispatch — L4 is must-win): either no \
+             template/param slot cleared pick_frequency_pair's bounds (moderate cardinality \
+             {L4_CARDINALITY:?}, {L4_MIN_ROWS}..={L4_MAX_ROWS} rows, >= \
+             {L4_MIN_AVG_INTERVAL_SECONDS}s average inter-arrival interval, a validated \
+             needle + capture regex), or the picked candidate's capture regex contained a \
+             backtick l4_pair_spec can't embed in LogQL's raw-string delimiter — the \
+             rejection lines above say which"
         );
     }
     let picks = Picks {
@@ -3856,9 +3858,11 @@ fn rfc0031_indicative_comparative_run() {
             run_l4_pair(bucket.path(), &tenant, spec, result, &mut failures);
         }
         (None, _) => failures.push(
-            "L4: no template/param slot in the corpus cleared pick_frequency_pair's bounds \
-             (see the L4 PAIR SKIPPED diagnostic above) — L4 is a must-win class and cannot \
-             be silently skipped"
+            "L4: no viable frequency pair — either no template/param slot cleared \
+             pick_frequency_pair's bounds, or the picked candidate's capture regex \
+             contained a backtick l4_pair_spec can't embed in LogQL (see the L4 PAIR \
+             MISSING diagnostic above for which) — L4 is a must-win class and cannot be \
+             silently skipped"
                 .to_string(),
         ),
         (Some(spec), None) => unreachable!(

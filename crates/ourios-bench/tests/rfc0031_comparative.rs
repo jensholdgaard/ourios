@@ -2300,6 +2300,13 @@ async fn loki_query_with_stats(
 /// multiple of `1_000_000_000` ([`bucket_width_seconds`] never produces
 /// a sub-second width), so any multiple of it is automatically
 /// whole-second-aligned too.
+///
+/// Returns `Err` on any transport/HTTP/parse failure rather than
+/// panicking: this is called from [`loki_measure_frequency_pair`]'s poll
+/// loop, which runs LAST in the same async block that holds every other
+/// pair's already-collected measurement — a panic on a transient blip
+/// would unwind and lose all of it. The poll loop retries an `Err` until
+/// its deadline, same as an incomplete answer.
 async fn loki_query_matrix(
     http: &reqwest::Client,
     base: &str,
@@ -2308,7 +2315,7 @@ async fn loki_query_matrix(
     end_ns: u64,
     bucket_width_ns: u64,
     label_name: &str,
-) -> L4Measured {
+) -> Result<L4Measured, String> {
     // `bucket_width_seconds` — the only producer of a bucket width this
     // harness ever queries with — guarantees a whole-second width, so
     // this truncation is exact, not a precision loss.
@@ -2323,18 +2330,23 @@ async fn loki_query_matrix(
         ])
         .send()
         .await
-        .expect("query_range (matrix)");
+        .map_err(|e| format!("query_range (matrix) transport error: {e}"))?;
     let status = resp.status();
-    let body = resp.text().await.expect("query_range (matrix) body");
-    assert!(
-        status.is_success(),
-        "loki query_range (matrix) returned {status}: {body}",
-    );
-    (
-        parse_loki_matrix(&body, label_name, bucket_width_ns).expect("parse loki matrix"),
-        parse_loki_bytes_processed(&body).expect("parse loki bytes"),
-        parse_loki_fetched_bytes(&body).expect("parse loki fetched bytes"),
-    )
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("query_range (matrix) body read error: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "loki query_range (matrix) returned {status}: {body}"
+        ));
+    }
+    Ok((
+        parse_loki_matrix(&body, label_name, bucket_width_ns)
+            .map_err(|e| format!("parse loki matrix: {e}"))?,
+        parse_loki_bytes_processed(&body).map_err(|e| format!("parse loki bytes: {e}"))?,
+        parse_loki_fetched_bytes(&body).map_err(|e| format!("parse loki fetched bytes: {e}"))?,
+    ))
 }
 
 /// Push a whole OTLP/JSON Lines corpus into Loki, batched by **encoded
@@ -2913,7 +2925,7 @@ async fn loki_measure_frequency_pair(
 ) -> Result<L4Measured, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
     loop {
-        let (groups, bytes, fetched) = loki_query_matrix(
+        let (groups, bytes, fetched) = match loki_query_matrix(
             http,
             base,
             &spec.logql,
@@ -2922,7 +2934,29 @@ async fn loki_measure_frequency_pair(
             bucket_width_ns,
             "value",
         )
-        .await;
+        .await
+        {
+            Ok(measured) => measured,
+            // A transient blip (transport error, a 5xx, a torn body) is
+            // retried until the deadline, same as an incomplete answer —
+            // panicking here would unwind the async block holding every
+            // other pair's already-collected measurement.
+            Err(detail) => {
+                if std::time::Instant::now() >= deadline {
+                    break Err(format!(
+                        "loki matrix query for [{}] still failing at its poll deadline: \
+                         {detail}",
+                        spec.label,
+                    ));
+                }
+                eprintln!(
+                    "loki matrix query for [{}] failed (retrying until deadline): {detail}",
+                    spec.label,
+                );
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
         let total: u64 = groups.values().sum();
         if total >= spec.expected_rows {
             break Ok((groups, bytes, fetched));
@@ -2949,66 +2983,7 @@ async fn loki_measure_frequency_pair(
             // of timeout budget) are worth paying for here, unlike the
             // common case above where they'd just be noise on an
             // already-accepted result.
-            if tokio::time::timeout(
-                Duration::from_secs(90),
-                dump_loki_diagnostics(http, base, spec),
-            )
-            .await
-            .is_err()
-            {
-                eprintln!(
-                    "(diagnostics dump for [{}] itself timed out after 90 s)",
-                    spec.label,
-                );
-            }
-            dump_loki_container_warnings(container, spec).await;
-            dump_loki_discard_metrics(http, base, spec).await;
-            // Decisive metric-vs-plain-query split — NOT ingest-vs-query:
-            // this plain line-filter count (no `count_over_time`, no
-            // `| regexp`) still goes through `query_range`, so a
-            // shortfall here doesn't prove Loki never STORED the missing
-            // lines — that would require checking the ingester/store
-            // directly, which this harness doesn't do. What it DOES
-            // prove: whether the shortfall is specific to the metric-
-            // aggregation machinery, or affects a plain streams query
-            // too (in which case it's the same wide-time-range query
-            // incompleteness RFC 0031 §7 ultimately characterizes, not
-            // an artifact of `count_over_time`/`regexp`). Every prior
-            // fix (cache, entries-limit, bucket alignment) moved the
-            // number without closing the gap — six straight dispatches
-            // at a stable ~93-97%, so guessing another query-side knob
-            // isn't warranted without this evidence.
-            if let Some(needle) = l4_needle_from_logql(&spec.logql) {
-                match tokio::time::timeout(
-                    Duration::from_secs(60),
-                    loki_query_range_uncapped(
-                        http,
-                        base,
-                        &format!(r#"{{service_name=~".+"}} |= "{needle}""#),
-                        spec.start,
-                        spec.end,
-                        spec.expected_rows,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(count)) => eprintln!(
-                        "plain line-filter count for [{}]: {count} of {} expected \
-                         (bypasses count_over_time/regexp entirely — a shortfall here means \
-                         the loss isn't specific to the metric-aggregation path; it's still \
-                         a query_range call, so this doesn't prove ingest-side loss)",
-                        spec.label, spec.expected_rows,
-                    ),
-                    Ok(Err(detail)) => eprintln!(
-                        "(plain line-filter count for [{}] itself failed: {detail})",
-                        spec.label,
-                    ),
-                    Err(_) => eprintln!(
-                        "(plain line-filter count for [{}] itself timed out after 60 s)",
-                        spec.label,
-                    ),
-                }
-            }
+            dump_l4_shortfall_diagnostics(http, base, container, spec).await;
             break Err(format!(
                 "loki returned {total} of {} expected rows for [{}] before timeout — below \
                  the {:.0}% completeness margin",
@@ -3018,6 +2993,80 @@ async fn loki_measure_frequency_pair(
             ));
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+/// The full L4 shortfall post-mortem, run only when a poll deadline
+/// passed AND completeness fell below [`L4_COMPLETENESS_MARGIN`] (i.e.
+/// the run is about to fail): the general timed-out-pair diagnostics,
+/// Loki's own container `level=warn`/`level=error` lines, its
+/// discarded-samples counters, and the plain line-filter count.
+///
+/// That last probe is the decisive metric-vs-plain-query split — NOT
+/// ingest-vs-query: a plain line-filter count (no `count_over_time`, no
+/// `| regexp`) still goes through `query_range`, so a shortfall here
+/// doesn't prove Loki never STORED the missing lines (that would require
+/// checking the ingester/store directly, which this harness doesn't do).
+/// What it DOES prove: whether the shortfall is specific to the
+/// metric-aggregation machinery, or affects a plain streams query too
+/// (in which case it's the same wide-time-range query incompleteness
+/// RFC 0031 §7 ultimately characterizes, not an artifact of
+/// `count_over_time`/`regexp`). Every prior fix (cache, entries-limit,
+/// bucket alignment) moved the number without closing the gap — six
+/// straight dispatches at a stable ~93-97%, so guessing another
+/// query-side knob isn't warranted without this evidence.
+async fn dump_l4_shortfall_diagnostics(
+    http: &reqwest::Client,
+    base: &str,
+    container: &testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::testcontainers::GenericImage,
+    >,
+    spec: &PairSpec,
+) {
+    if tokio::time::timeout(
+        Duration::from_secs(90),
+        dump_loki_diagnostics(http, base, spec),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!(
+            "(diagnostics dump for [{}] itself timed out after 90 s)",
+            spec.label,
+        );
+    }
+    dump_loki_container_warnings(container, spec).await;
+    dump_loki_discard_metrics(http, base, spec).await;
+    if let Some(needle) = l4_needle_from_logql(&spec.logql) {
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            loki_query_range_uncapped(
+                http,
+                base,
+                &format!(r#"{{service_name=~".+"}} |= "{needle}""#),
+                spec.start,
+                spec.end,
+                spec.expected_rows,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(count)) => eprintln!(
+                "plain line-filter count for [{}]: {count} of {} expected \
+                 (bypasses count_over_time/regexp entirely — a shortfall here means \
+                 the loss isn't specific to the metric-aggregation path; it's still \
+                 a query_range call, so this doesn't prove ingest-side loss)",
+                spec.label, spec.expected_rows,
+            ),
+            Ok(Err(detail)) => eprintln!(
+                "(plain line-filter count for [{}] itself failed: {detail})",
+                spec.label,
+            ),
+            Err(_) => eprintln!(
+                "(plain line-filter count for [{}] itself timed out after 60 s)",
+                spec.label,
+            ),
+        }
     }
 }
 

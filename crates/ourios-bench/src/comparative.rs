@@ -244,7 +244,9 @@ fn aggregate_by_group_key<S: std::hash::BuildHasher>(
 /// `loki_key_total >= ourios_key_total * margin` (an epsilon-guarded
 /// multiplication, not a subtracted-and-rounded row tolerance — see the
 /// function body for why), except `ourios_key_total <= 1` special-cased
-/// to always pass — but never tolerates a **phantom cell** (a
+/// to always pass when `margin < 1.0` (at `margin = 1.0` — exact
+/// completeness — the exemption does not apply) — but never tolerates a
+/// **phantom cell** (a
 /// `(bucket, group_key)` Loki reports that Ourios's own answer doesn't
 /// contain at all) or any
 /// `group_key` where Loki's **total across all buckets** exceeds
@@ -359,7 +361,11 @@ pub fn compare_aggregations_within_margin<
     // middle ground) for n=1, yet fully consistent with the
     // already-characterized ~4-8% aggregate loss rate (a lone occurrence
     // has a real, non-negligible chance of being the one that's lost). A
-    // `o <= 1` key is therefore never held to the margin at all.
+    // `o <= 1` key is therefore never held to the margin — UNLESS the
+    // caller asked for `margin = 1.0`, which is a request for exact
+    // completeness: exempting n=1 there would make "exact" silently
+    // non-strict for cardinality-1 keys, so the exemption only applies
+    // to a genuinely fractional margin.
     //
     // Every other key is checked directly against `l >= o * margin`
     // rather than converting the margin to a subtracted-and-rounded row
@@ -386,7 +392,8 @@ pub fn compare_aggregations_within_margin<
         .filter_map(|(&key, &o)| {
             let l = loki_by_key.get(key).copied().unwrap_or(0);
             let completeness = if o == 0 { 1.0 } else { l as f64 / o as f64 };
-            let below_margin = o > 1 && (l as f64) + MARGIN_EPSILON < (o as f64) * margin;
+            let exempt = o <= 1 && margin < 1.0;
+            let below_margin = !exempt && (l as f64) + MARGIN_EPSILON < (o as f64) * margin;
             below_margin.then_some((key, o, l, completeness))
         })
         .collect();
@@ -1526,15 +1533,32 @@ mod tests {
 
     #[test]
     fn margin_comparison_still_rejects_a_large_key_losing_more_than_its_tolerance() {
-        // The absolute-tolerance formula must still catch a real
-        // shortfall on a large key, not just skip checking it: 100 total
-        // rows, tolerance = ceil(100 * 0.10) = 10, so losing 20 must
-        // still reject.
+        // The cardinality-1 exemption must not leak generosity onto
+        // larger keys: 100 total rows at a 90% margin, so 80 captured
+        // (80%) must still reject.
         let mut o = HashMap::new();
         o.insert(agg(0, "svcA"), 100);
         let mut l = HashMap::new();
         l.insert(agg(0, "svcA"), 80);
         assert!(!compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
+    }
+
+    #[test]
+    fn margin_comparison_at_exact_margin_holds_cardinality_one_keys_strictly() {
+        // `margin = 1.0` is a request for exact completeness — the
+        // cardinality-1 exemption must not apply there, or "exact"
+        // silently tolerates losing any n=1 key's only row.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "0"), 1);
+        let l: HashMap<AggKey, u64> = HashMap::new();
+        assert!(
+            !compare_aggregations_within_margin(&o, &l, 1.0, 8).is_equal(),
+            "margin=1.0 must reject 0-of-1 on a cardinality-1 key",
+        );
+        // And a fully-captured answer still passes at margin = 1.0.
+        let mut exact = HashMap::new();
+        exact.insert(agg(0, "0"), 1);
+        assert!(compare_aggregations_within_margin(&o, &exact, 1.0, 8).is_equal());
     }
 
     #[test]

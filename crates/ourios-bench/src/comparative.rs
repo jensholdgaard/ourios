@@ -196,24 +196,28 @@ pub fn compare_aggregations<S1: std::hash::BuildHasher, S2: std::hash::BuildHash
 /// documented completeness-margin decision): unlike [`compare_aggregations`]'s
 /// exact-match requirement (which the RFC0031.5 fixture-level test still
 /// holds Ourios and a synthetic Loki answer to), this tolerates Loki
-/// UNDER-counting — up to `margin`, in aggregate — but never tolerates a
-/// **phantom cell** (a `(bucket, group_key)` Loki reports that Ourios's
-/// own answer doesn't contain at all) or Loki's **total** exceeding
-/// Ourios's total. Those two remain a hard [`EquivalenceOutcome::Mismatch`],
-/// since they'd indicate a genuine correctness problem in the harness's
-/// query construction, not the characterized loss this margin exists
-/// for.
+/// UNDER-counting — up to `margin`, per `group_key` — but never tolerates
+/// a **phantom cell** (a `(bucket, group_key)` Loki reports that Ourios's
+/// own answer doesn't contain at all) or any `group_key` where Loki's
+/// **total across all buckets** exceeds Ourios's. Those two remain a
+/// hard [`EquivalenceOutcome::Mismatch`], since they'd indicate a
+/// genuine correctness problem in the harness's query construction, not
+/// the characterized loss this margin exists for.
 ///
-/// Run #17 is why this checks the TOTAL rather than every individual
-/// cell: a single cell landed 1 row over Ourios's count (114 vs 113)
-/// while the overall total (1153/1197) stayed a solid under-count —
-/// consistent with the same step-grid boundary imprecision already
-/// characterized (RFC 0031 §7's L4 entry), not fabrication. A per-cell
-/// "Loki must never exceed Ourios" rule was too strict for that kind of
-/// noise; a phantom-key check still catches the failure mode that
-/// actually indicates a bug (Loki answering a *different* query than
-/// intended — wrong regex, wrong bucket math — would show up as keys
-/// Ourios never produced at all).
+/// The check is **per-`group_key`, not just the grand total**: checking
+/// only the sum across every cell would let Loki over-count one
+/// `group_key` while under-counting another by the same amount and
+/// still read as 100% complete overall — silently hiding exactly the
+/// kind of cross-key misattribution (wrong regex capture, wrong param
+/// extraction) a real bug would produce. Aggregating within each
+/// `group_key` first (summing across its buckets) still tolerates run
+/// #17's actual observed noise, though: a single cell landed 1 row over
+/// Ourios's count for that cell (114 vs 113) while the *same
+/// `group_key`'s* total across all its buckets stayed a solid
+/// under-count — consistent with the already-characterized step-grid
+/// boundary imprecision (a record landing in an adjacent bucket for the
+/// SAME key), which a per-key check doesn't even see, since it never
+/// looks at bucket boundaries within a key.
 ///
 /// The margin is not a general weakening of RFC0031.1 ("equivalence is
 /// never optional") — it is scoped narrowly to a documented, external,
@@ -257,36 +261,74 @@ pub fn compare_aggregations_within_margin<
         return EquivalenceOutcome::Mismatch(Mismatch { summary, examples });
     }
 
-    let ourios_total: u64 = ourios.values().sum();
-    let loki_total: u64 = loki.values().sum();
-    if loki_total > ourios_total {
-        return EquivalenceOutcome::Mismatch(Mismatch {
-            summary: format!(
-                "loki's total ({loki_total}) exceeds ourios's total ({ourios_total}) — \
-                 the characterized loss is an under-count, so a net over-count isn't \
-                 tolerated regardless of margin"
-            ),
-            examples: Vec::new(),
-        });
+    let mut ourios_by_key: HashMap<&str, u64> = HashMap::new();
+    for (k, &v) in ourios {
+        *ourios_by_key.entry(k.group_key.as_str()).or_insert(0) += v;
     }
+    let mut loki_by_key: HashMap<&str, u64> = HashMap::new();
+    for (k, &v) in loki {
+        *loki_by_key.entry(k.group_key.as_str()).or_insert(0) += v;
+    }
+
+    let mut over: Vec<(&str, u64, u64)> = ourios_by_key
+        .iter()
+        .filter_map(|(&key, &o)| {
+            let l = loki_by_key.get(key).copied().unwrap_or(0);
+            (l > o).then_some((key, o, l))
+        })
+        .collect();
+    if !over.is_empty() {
+        over.sort_unstable_by_key(|(key, _, _)| *key);
+        let summary = format!(
+            "{} group_key(s) where Loki's total across all buckets exceeds Ourios's — \
+             never tolerated, regardless of margin (a per-key overcount can't be \
+             explained by the characterized inter-bucket boundary jitter, since that \
+             never changes a key's own total)",
+            over.len(),
+        );
+        let examples = over
+            .iter()
+            .take(examples_cap)
+            .map(|(key, o, l)| format!("group={key:?} ourios_total={o} loki_total={l}"))
+            .collect();
+        return EquivalenceOutcome::Mismatch(Mismatch { summary, examples });
+    }
+
     #[allow(clippy::cast_precision_loss)]
-    let completeness = if ourios_total == 0 {
-        1.0
-    } else {
-        loki_total as f64 / ourios_total as f64
-    };
-    if completeness >= margin {
+    // Group totals are bounded aggregation counts (u64), nowhere near f64's 2^53 exact-integer range.
+    let mut short: Vec<(&str, u64, u64, f64)> = ourios_by_key
+        .iter()
+        .filter_map(|(&key, &o)| {
+            let l = loki_by_key.get(key).copied().unwrap_or(0);
+            let completeness = l as f64 / o as f64;
+            (completeness < margin).then_some((key, o, l, completeness))
+        })
+        .collect();
+    if short.is_empty() {
         return EquivalenceOutcome::Equal;
     }
-    EquivalenceOutcome::Mismatch(Mismatch {
-        summary: format!(
-            "loki captured {loki_total} of {ourios_total} rows ({:.1}%), below the \
-             {:.0}% completeness margin",
-            completeness * 100.0,
-            margin * 100.0,
-        ),
-        examples: Vec::new(),
-    })
+    short.sort_by(|a, b| a.3.total_cmp(&b.3));
+    let summary = format!(
+        "{} group_key(s) below the {:.0}% completeness margin (worst: {:?} captured \
+         {}/{} = {:.1}%)",
+        short.len(),
+        margin * 100.0,
+        short[0].0,
+        short[0].2,
+        short[0].1,
+        short[0].3 * 100.0,
+    );
+    let examples = short
+        .iter()
+        .take(examples_cap)
+        .map(|(key, o, l, c)| {
+            format!(
+                "group={key:?} ourios_total={o} loki_total={l} ({:.1}%)",
+                c * 100.0
+            )
+        })
+        .collect();
+    EquivalenceOutcome::Mismatch(Mismatch { summary, examples })
 }
 
 /// Count occurrences of each key — the multiset the comparison walks.
@@ -1277,15 +1319,15 @@ mod tests {
 
     #[test]
     fn margin_comparison_tolerates_undercount_within_margin() {
-        // RFC 0031 §7's completeness-margin decision (2026-07-17): 90
-        // of 100 total ourios rows is 90% captured — exactly at a 0.90
-        // margin, so this must pass.
+        // RFC 0031 §7's completeness-margin decision (2026-07-17): each
+        // group_key independently at or above a 0.90 margin (svcA
+        // 91.7%, svcB exactly 90.0%) must pass.
         let mut o = HashMap::new();
         o.insert(agg(0, "svcA"), 60);
         o.insert(agg(0, "svcB"), 40);
         let mut l = HashMap::new();
         l.insert(agg(0, "svcA"), 55);
-        l.insert(agg(0, "svcB"), 35);
+        l.insert(agg(0, "svcB"), 36);
         assert!(compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
     }
 
@@ -1303,31 +1345,27 @@ mod tests {
     }
 
     #[test]
-    fn margin_comparison_never_tolerates_a_net_overcount() {
-        // Loki's TOTAL exceeding Ourios's total is never tolerated, no
-        // matter how loose the margin — the characterized loss is an
-        // under-count, so more overall than truly exists would
-        // indicate a genuine correctness bug, not the characterized
-        // completeness loss.
+    fn margin_comparison_never_tolerates_a_per_key_overcount() {
+        // A group_key's total (across all its buckets) exceeding
+        // Ourios's is never tolerated, no matter how loose the margin —
+        // it can't be explained by the characterized inter-bucket
+        // jitter (which never changes a key's own total), so it would
+        // indicate a genuine correctness bug.
         let mut o = HashMap::new();
         o.insert(agg(0, "svcA"), 10);
         let mut l = HashMap::new();
         l.insert(agg(0, "svcA"), 11);
         let EquivalenceOutcome::Mismatch(m) = compare_aggregations_within_margin(&o, &l, 0.10, 8)
         else {
-            panic!("expected a net-overcount mismatch even at a near-vacuous margin");
+            panic!("expected a per-key overcount mismatch even at a near-vacuous margin");
         };
-        assert!(
-            m.summary.contains("exceeds ourios's total"),
-            "{}",
-            m.summary
-        );
+        assert!(m.summary.contains("exceeds Ourios's"), "{}", m.summary);
     }
 
     #[test]
     fn margin_comparison_never_tolerates_a_phantom_cell() {
         // A (bucket, group_key) Loki reports that doesn't exist in
-        // Ourios's own answer at all — same reasoning as a net
+        // Ourios's own answer at all — same reasoning as a per-key
         // overcount: it indicates a genuine query-construction bug
         // (wrong regex, wrong bucket math), not the characterized loss.
         let o: HashMap<AggKey, u64> = HashMap::new();
@@ -1341,19 +1379,45 @@ mod tests {
     }
 
     #[test]
-    fn margin_comparison_tolerates_a_single_cell_over_when_the_total_still_undercounts() {
-        // Run #17's exact shape: one cell (bucket=0, "electPreferred")
-        // landed 1 row over Ourios's count, consistent with Loki's
-        // step-grid boundary imprecision (a record landing in an
-        // adjacent bucket) rather than fabrication — the aggregate
-        // total is still a solid under-count, so this must be Equal.
+    fn margin_comparison_tolerates_inter_bucket_jitter_within_the_same_key() {
+        // Run #17's exact shape, generalized: one cell (bucket=0,
+        // "electPreferred") landed 1 row over Ourios's count for that
+        // cell, consistent with Loki's step-grid boundary imprecision
+        // (a record landing in an adjacent bucket) rather than
+        // fabrication. Spread across two buckets for the SAME key so
+        // the per-key check (which sums across buckets first) actually
+        // exercises the tolerance: electPreferred's own total (257)
+        // still comes in under Ourios's (254), so this must be Equal.
         let mut o = HashMap::new();
         o.insert(agg(0, "electPreferred"), 113);
-        o.insert(agg(0, "electUnclean"), 114);
+        o.insert(agg(1, "electPreferred"), 144);
         let mut l = HashMap::new();
-        l.insert(agg(0, "electPreferred"), 114); // 1 over Ourios's cell.
-        l.insert(agg(0, "electUnclean"), 100); // Enough under to keep the total down.
+        l.insert(agg(0, "electPreferred"), 114); // 1 over this cell...
+        l.insert(agg(1, "electPreferred"), 140); // ...but the key's own total still undercounts.
         assert!(compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
+    }
+
+    #[test]
+    fn margin_comparison_rejects_cross_key_redistribution_even_at_100_percent_total() {
+        // The gap a pure grand-total check misses (flagged in PR #536
+        // review): Ourios {A: 100, B: 100} vs Loki {A: 190, B: 10} sums
+        // to 200/200 — a "complete" grand total — but silently hides A
+        // being fabricated to compensate for B being nearly lost
+        // entirely. A's per-key overcount (190 > 100) must reject this
+        // outright, before completeness is even considered.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "A"), 100);
+        o.insert(agg(0, "B"), 100);
+        let mut l = HashMap::new();
+        l.insert(agg(0, "A"), 190);
+        l.insert(agg(0, "B"), 10);
+        let EquivalenceOutcome::Mismatch(m) = compare_aggregations_within_margin(&o, &l, 0.90, 8)
+        else {
+            panic!(
+                "expected cross-key redistribution to be rejected despite a complete grand total"
+            );
+        };
+        assert!(m.summary.contains("exceeds Ourios's"), "{}", m.summary);
     }
 
     #[test]

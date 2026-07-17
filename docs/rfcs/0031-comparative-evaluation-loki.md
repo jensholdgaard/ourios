@@ -465,10 +465,11 @@ record. It references RFC 0006's harness rather than editing it.
 >   so duplicates are not silently collapsed); for the L4 aggregation
 >   class it asserts the `(bucket, group_key) → count` maps are
 >   identical **within the `L4_COMPLETENESS_MARGIN` documented in §7**
->   (2026-07-17) — a phantom cell (one Loki reports that Ourios's own
->   answer doesn't contain at all) or Loki's total exceeding Ourios's
->   total is never tolerated regardless of margin; only Loki
->   under-counting, in aggregate, up to the margin is tolerated
+>   (2026-07-17), checked per `group_key` — a phantom cell (one Loki
+>   reports that Ourios's own answer doesn't contain at all) or any
+>   `group_key` whose total across all its buckets exceeds Ourios's is
+>   never tolerated regardless of margin; only Loki under-counting a
+>   `group_key`'s own total, up to the margin, is tolerated
 > - **And** if the answers differ beyond what's tolerated, the harness
 >   records no `L`-metric for that class, writes the symmetric-difference
 >   (or count-delta) summary and up to N example keys to stderr, and
@@ -717,13 +718,19 @@ not block `validated` in the "we didn't finish" sense — it is a
 - [x] **L4 aggregation query shape — DECIDED, and RFC0031.1 equivalence
   amended with a documented completeness margin (2026-07-17; maintainer
   delegated).** The picker chooses `(template_id, param, bucket_width)`
-  dynamically per corpus (`pick_frequency_pair`), preferring the
-  lowest-frequency viable candidate (`L4_MIN_AVG_INTERVAL_SECONDS`,
-  below) — on the frozen `otel-demo-v8` corpus this lands on
-  `template_id=60` ("Periodic task \<type\> generated"), `param(0)`,
-  `bucket(12h)`. The LogQL equivalent is `sum by (value)
+  dynamically per corpus (`pick_frequency_pair`): the first candidate,
+  in ascending `(template_id, param)` order, that clears every shape
+  floor including `L4_MIN_AVG_INTERVAL_SECONDS` (below) — first-fit,
+  not an exhaustive search for the single lowest-frequency candidate in
+  the whole corpus (a real ranking pass over every template would cost
+  a `ourios_aggregate_answer` query per candidate against a corpus with
+  tens of thousands of templates; deliberately not built given
+  first-fit has now found a working, validated candidate three real
+  dispatches running). On the frozen `otel-demo-v8` corpus this lands
+  on `template_id=60` ("Periodic task \<type\> generated"), `param(0)`,
+  `bucket(12h)`. The LogQL equivalent is ``sum by (value)
   (count_over_time({service_name=~".+"} |= "\<needle\>" | regexp
-  \`\<pattern\>\` [\<width\>]))`, with `start`/`end` epoch-aligned to
+  \`\<pattern\>\` [\<width\>]))``, with `start`/`end` epoch-aligned to
   `bucket_width` — Loki's `query_range` step-grid starts exactly at
   `start`, but Ourios's own `bucket(width)` semantics are epoch-aligned
   (`floor(ts/width)*width`); snapping the query window to a bucket
@@ -773,31 +780,54 @@ not block `validated` in the "we didn't finish" sense — it is a
 
   **Decision:** `L4_COMPLETENESS_MARGIN = 0.90` (harness constant,
   `crates/ourios-bench/tests/rfc0031_comparative.rs`) — Loki must
-  capture at least 90% of a candidate's expected rows, in aggregate,
-  for the dispatch to accept the answer. This is real headroom (~2.3×)
-  over the observed 3.9-4.4% loss band (runs #13/#14/#16:
-  95.6%/95.8%/96.1% complete), not tuned to the exact number. The
-  margin is narrowly scoped, not a general weakening of RFC0031.1
-  ("equivalence is never optional"): `compare_aggregations_within_margin`
-  still hard-fails, at any margin, on a phantom cell (one Loki reports
-  that Ourios's own answer doesn't contain at all) or Loki's TOTAL
-  exceeding Ourios's total — the two signals that would actually
-  indicate a query-construction or Ourios-side bug. Only aggregate
-  under-counting, up to the margin, is tolerated. **Run #17** (the
-  first real dispatch under this margin) validated the design and
-  refined it in the same pass: the poll-completion check passed cleanly
-  (1153/1197, 96.3%), but the equivalence check itself then hard-failed
-  on a single cell landing 1 row *over* Ourios's count for that cell
-  (114 vs 113) while the aggregate total stayed a solid under-count —
-  consistent with the same step-grid boundary imprecision already
-  characterized above, not fabrication. The original design checked
-  "Loki `>` Ourios" per cell, which was too strict for that kind of
-  noise; refined the same day to check for phantom cells and a
-  total-level overcount instead, which still catches a genuine wrong
-  regex or wrong bucket-math bug (that would produce cells Ourios never
-  produced at all) while tolerating the boundary noise the margin
-  exists for. `M_L4` stays **deferred** — this decision unblocks a
-  measurement, it does not freeze the bytes-read margin.
+  capture at least 90% of a candidate's expected rows, **per
+  `group_key`**, for the dispatch to accept the answer. This is real
+  headroom (~2.3×) over the observed 3.9-4.4% loss band (runs
+  #13/#14/#16: 95.6%/95.8%/96.1% complete), not tuned to the exact
+  number. The margin is narrowly scoped, not a general weakening of
+  RFC0031.1 ("equivalence is never optional"):
+  `compare_aggregations_within_margin` still hard-fails, at any margin,
+  on a phantom cell (a `(bucket, group_key)` Loki reports that Ourios's
+  own answer doesn't contain at all) or any `group_key` whose total
+  across all its buckets exceeds Ourios's — the signals that would
+  actually indicate a query-construction or Ourios-side bug. Only
+  aggregate under-counting, up to the margin, is tolerated, and the
+  check is per-key rather than a single grand total specifically so a
+  Loki over-count on one key can't silently compensate for an
+  under-count on another and still read as "complete."
+
+  The design went through two real rounds of hardening after this
+  decision was first written:
+  - **Run #17** (the first real dispatch under the margin) validated
+    it and immediately found a gap: the poll-completion check passed
+    cleanly (1153/1197, 96.3%), but the equivalence check then
+    hard-failed on a single cell landing 1 row *over* Ourios's count
+    for that cell (114 vs 113) while the aggregate total stayed a
+    solid under-count — consistent with the same step-grid boundary
+    imprecision already characterized above, not fabrication. The
+    original design checked "Loki `>` Ourios" on every individual
+    `(bucket, group_key)` cell, too strict for that kind of noise.
+  - **PR #536 code review** (same day) caught that the run #17 fix —
+    checking only the grand total — opened a different gap: Ourios
+    `{A: 100, B: 100}` vs Loki `{A: 190, B: 10}` sums to a "complete"
+    200/200 while silently hiding `A` being fabricated to compensate
+    for `B` being nearly lost. Refined to aggregate `ourios`/`loki` by
+    `group_key` first (summing each key across every bucket it
+    appears in), then apply the phantom/overcount/margin checks
+    per-key: this still tolerates run #17's exact shape (one bucket's
+    +1 doesn't change `electPreferred`'s *own* total across its
+    buckets) while rejecting the cross-key redistribution a pure
+    grand-total check missed. Both shapes are now regression tests
+    (`margin_comparison_tolerates_inter_bucket_jitter_within_the_same_key`,
+    `margin_comparison_rejects_cross_key_redistribution_even_at_100_percent_total`).
+  - **Run #18**, with the per-key design, is L4's first fully clean
+    measurement: `template_id=60` ("Periodic task"), `param(0)`,
+    `bucket(12h)`, 1197 rows, equivalence held. Storage-side
+    `loki/ourios = 3.73×`, processed-channel `87.1×` — both reported
+    only, per the deferral below.
+
+  `M_L4` stays **deferred** — this decision unblocks a measurement, it
+  does not freeze the bytes-read margin.
 - [x] **Headline corpus — DECIDED: OTel-Demo.** Ourios is an OTLP-native
   backend, so the honest headline is real OTLP logs — the workload the
   project claims to do best — not the favourable well-templated HDFS_v1.

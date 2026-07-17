@@ -1760,9 +1760,10 @@ fn frequency_shape_rejection(
     if avg_interval_s < L4_MIN_AVG_INTERVAL_SECONDS {
         return Some(format!(
             "~{avg_interval_s:.1}s average inter-arrival interval (need >= \
-             {L4_MIN_AVG_INTERVAL_SECONDS}s — a shorter cadence risks Loki's own \
-             same-timestamp/same-body ingest-time dedup, a real Loki behavior invisible \
-             to the OTLP push response and unfixable from the query side)"
+             {L4_MIN_AVG_INTERVAL_SECONDS}s — a shorter cadence correlates with Loki's \
+             uncharacterized wide-time-range completeness shortfall; exact \
+             (timestamp, body) collision was checked and ruled out directly, see \
+             L4_COMPLETENESS_MARGIN's documentation)"
         ));
     }
     None
@@ -2938,6 +2939,9 @@ async fn loki_measure_frequency_pair(
                     ),
                 }
             }
+            // `expected_rows` is a real corpus row count, non-zero (the
+            // picker's L4_MIN_ROWS floor) and capped at L4_MAX_ROWS —
+            // nowhere near f64's 2^53 exact-integer range.
             #[allow(clippy::cast_precision_loss)]
             let completeness = total as f64 / spec.expected_rows as f64;
             if completeness >= L4_COMPLETENESS_MARGIN {
@@ -3771,13 +3775,21 @@ fn rfc0031_indicative_comparative_run() {
     // measurement joins the SAME `failures` list those classes use, so
     // it still fails the run — just without silently starving L4 of a
     // chance to run at all. A missing candidate (the picker found
-    // nothing eligible) is a real, loud finding, not a silently-skipped
-    // step — it was already reported above, at pick time.
+    // nothing eligible) is ALSO pushed into `failures` — L4 is a
+    // must-win class (RFC 0031 §3.4), so a corpus that never produces a
+    // viable candidate must fail the dispatch, not silently pass with
+    // zero L4 evidence (the eprintln above is a diagnostic breadcrumb,
+    // not a substitute for actually failing the gate).
     match (&l4_spec, l4_loki) {
         (Some(spec), Some(result)) => {
             run_l4_pair(bucket.path(), &tenant, spec, result, &mut failures);
         }
-        (None, _) => {}
+        (None, _) => failures.push(
+            "L4: no template/param slot in the corpus cleared pick_frequency_pair's bounds \
+             (see the L4 PAIR SKIPPED diagnostic above) — L4 is a must-win class and cannot \
+             be silently skipped"
+                .to_string(),
+        ),
         (Some(spec), None) => unreachable!(
             "l4_spec is Some iff frequency is Some, which is exactly the condition the \
              async block used to decide whether to measure the Loki half — [{}] has a spec \
@@ -5122,11 +5134,14 @@ fn frequency_shape_rejection_enforces_the_average_interval_floor() {
     // needle averaged a ~15s inter-arrival cadence and measured a
     // stable ~93-97% completeness ceiling against Loki, independent of
     // every query-side fix tried — the shortfall was proven ingest-side
-    // (a plain unaggregated line count came back just as short) and
-    // matches Loki's documented same-timestamp/same-body ingester dedup.
-    // 100 rows over a 1h bucket, 2 distinct values, 2 buckets: cardinality
-    // and bucket-diversity both clear, but ~72s average spacing (below
-    // L4_MIN_AVG_INTERVAL_SECONDS) must still reject.
+    // (a plain unaggregated line count came back just as short), but a
+    // later corpus-side check ruled out exact (timestamp, body)
+    // collision entirely (see L4_COMPLETENESS_MARGIN's documentation);
+    // the mechanism correlates with cadence but is otherwise
+    // uncharacterized. 100 rows over a 1h bucket, 2 distinct values, 2
+    // buckets: cardinality and bucket-diversity both clear, but ~72s
+    // average spacing (below L4_MIN_AVG_INTERVAL_SECONDS) must still
+    // reject.
     let dense = HashMap::from([
         (
             AggKey {

@@ -192,6 +192,83 @@ pub fn compare_aggregations<S1: std::hash::BuildHasher, S2: std::hash::BuildHash
     EquivalenceOutcome::Mismatch(Mismatch { summary, examples })
 }
 
+/// The L4 class's real-dispatch equivalence check (RFC 0031 §7's
+/// documented completeness-margin decision): unlike [`compare_aggregations`]'s
+/// exact-match requirement (which the RFC0031.5 fixture-level test still
+/// holds Ourios and a synthetic Loki answer to), this tolerates Loki
+/// UNDER-counting a cell — up to `margin`, in aggregate — but never
+/// tolerates Loki OVER-counting a cell or reporting one absent from
+/// Ourios's own answer. Those two remain a hard [`EquivalenceOutcome::Mismatch`],
+/// since they would indicate a genuine correctness problem in the
+/// harness's query construction, not the characterized loss this margin
+/// exists for.
+///
+/// The margin is not a general weakening of RFC0031.1 ("equivalence is
+/// never optional") — it is scoped narrowly to a documented, external,
+/// currently-unfixable Loki characteristic (see the constant's own
+/// documentation at its call site), not anything under Ourios's control.
+#[must_use]
+pub fn compare_aggregations_within_margin<
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+>(
+    ourios: &HashMap<AggKey, u64, S1>,
+    loki: &HashMap<AggKey, u64, S2>,
+    margin: f64,
+    examples_cap: usize,
+) -> EquivalenceOutcome {
+    let mut over_or_phantom: Vec<(&AggKey, u64, u64)> = loki
+        .iter()
+        .filter_map(|(k, &l)| {
+            let o = ourios.get(k).copied().unwrap_or(0);
+            (l > o).then_some((k, o, l))
+        })
+        .collect();
+    if !over_or_phantom.is_empty() {
+        over_or_phantom.sort_by(|a, b| {
+            (a.0.bucket_start_unix_nanos, &a.0.group_key)
+                .cmp(&(b.0.bucket_start_unix_nanos, &b.0.group_key))
+        });
+        let summary = format!(
+            "{} cell(s) where Loki reports MORE than Ourios (or a cell absent \
+             from Ourios's own answer) — never tolerated, regardless of margin",
+            over_or_phantom.len(),
+        );
+        let examples = over_or_phantom
+            .iter()
+            .take(examples_cap)
+            .map(|(k, o, l)| {
+                format!(
+                    "bucket={} group={:?} ourios={o} loki={l}",
+                    k.bucket_start_unix_nanos, k.group_key,
+                )
+            })
+            .collect();
+        return EquivalenceOutcome::Mismatch(Mismatch { summary, examples });
+    }
+
+    let ourios_total: u64 = ourios.values().sum();
+    let loki_total: u64 = loki.values().sum();
+    #[allow(clippy::cast_precision_loss)]
+    let completeness = if ourios_total == 0 {
+        1.0
+    } else {
+        loki_total as f64 / ourios_total as f64
+    };
+    if completeness >= margin {
+        return EquivalenceOutcome::Equal;
+    }
+    EquivalenceOutcome::Mismatch(Mismatch {
+        summary: format!(
+            "loki captured {loki_total} of {ourios_total} rows ({:.1}%), below the \
+             {:.0}% completeness margin",
+            completeness * 100.0,
+            margin * 100.0,
+        ),
+        examples: Vec::new(),
+    })
+}
+
 /// Count occurrences of each key — the multiset the comparison walks.
 fn tally(lines: &[LineKey]) -> HashMap<&LineKey, u64> {
     let mut counts: HashMap<&LineKey, u64> = HashMap::with_capacity(lines.len());
@@ -1176,6 +1253,64 @@ mod tests {
         );
         assert!(m.examples[0].contains("ourios=2"));
         assert!(m.examples[0].contains("loki=3"));
+    }
+
+    #[test]
+    fn margin_comparison_tolerates_undercount_within_margin() {
+        // RFC 0031 §7's completeness-margin decision (2026-07-17): 90
+        // of 100 total ourios rows is 90% captured — exactly at a 0.90
+        // margin, so this must pass.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "svcA"), 60);
+        o.insert(agg(0, "svcB"), 40);
+        let mut l = HashMap::new();
+        l.insert(agg(0, "svcA"), 55);
+        l.insert(agg(0, "svcB"), 35);
+        assert!(compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
+    }
+
+    #[test]
+    fn margin_comparison_rejects_undercount_beyond_margin() {
+        let mut o = HashMap::new();
+        o.insert(agg(0, "svcA"), 100);
+        let mut l = HashMap::new();
+        l.insert(agg(0, "svcA"), 80); // 80% captured, below a 0.90 margin.
+        let EquivalenceOutcome::Mismatch(m) = compare_aggregations_within_margin(&o, &l, 0.90, 8)
+        else {
+            panic!("expected a margin mismatch");
+        };
+        assert!(m.summary.contains("80.0%"), "{}", m.summary);
+    }
+
+    #[test]
+    fn margin_comparison_never_tolerates_overcount() {
+        // Loki reporting MORE than Ourios for a cell is never
+        // tolerated, no matter how loose the margin — it would
+        // indicate a genuine correctness bug, not the characterized
+        // completeness loss.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "svcA"), 10);
+        let mut l = HashMap::new();
+        l.insert(agg(0, "svcA"), 11);
+        let EquivalenceOutcome::Mismatch(m) = compare_aggregations_within_margin(&o, &l, 0.10, 8)
+        else {
+            panic!("expected an overcount mismatch even at a near-vacuous margin");
+        };
+        assert!(m.summary.contains("MORE than Ourios"), "{}", m.summary);
+    }
+
+    #[test]
+    fn margin_comparison_never_tolerates_a_phantom_cell() {
+        // A (bucket, group_key) Loki reports that doesn't exist in
+        // Ourios's own answer at all — same reasoning as overcount.
+        let o: HashMap<AggKey, u64> = HashMap::new();
+        let mut l = HashMap::new();
+        l.insert(agg(0, "svcA"), 1);
+        let EquivalenceOutcome::Mismatch(m) = compare_aggregations_within_margin(&o, &l, 0.10, 8)
+        else {
+            panic!("expected a phantom-cell mismatch even at a near-vacuous margin");
+        };
+        assert!(m.summary.contains("absent from Ourios"), "{}", m.summary);
     }
 
     #[test]

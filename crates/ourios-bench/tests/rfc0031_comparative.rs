@@ -26,8 +26,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
     AggKey, FIXTURE_SERVICE, FIXTURE_SERVICE_B, FIXTURE_TRACE, FixtureRecord, LineKey,
-    LokiFetchedBytes, comparative_fixture, compare_aggregations, compare_lines, fixture_jsonl,
-    fixture_logs_data, ourios_aggregate_answer, ourios_query_lines, parse_loki_bytes_processed,
+    LokiFetchedBytes, comparative_fixture, compare_aggregations,
+    compare_aggregations_within_margin, compare_lines, fixture_jsonl, fixture_logs_data,
+    ourios_aggregate_answer, ourios_query_lines, parse_loki_bytes_processed,
     parse_loki_fetched_bytes, parse_loki_matrix, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
@@ -1496,26 +1497,65 @@ const L4_CARDINALITY: std::ops::RangeInclusive<usize> = 2..=50;
 
 /// The floor on a candidate's average inter-arrival interval
 /// (`bucket_width_seconds / (total_rows / distinct_buckets)`) a
-/// [`pick_frequency_pair`] candidate must clear. Loki's ingester
-/// silently drops a log entry that collides with another on
-/// `(timestamp, body)` within the same stream — a drop invisible to the
-/// OTLP push response's `partial_success` (`push_otlp` already asserts
-/// that field is clean, so this loss was never a rejected-record signal
-/// to catch there). A real dispatch (RFC 0031 L4 workstream, runs
-/// #6-#12) picked kafka's `template_id=16` "Wrote producer snapshot"
-/// needle — a ~15 s average cadence — and measured a stable ~93-97%
-/// completeness ceiling against Loki regardless of poll deadline,
-/// results caching, `-validation.max-entries-limit`, or bucket-aligned
-/// query windows: every fix narrowed or changed the number without
-/// closing the gap, and a plain unaggregated line-filter count over the
-/// same window came back just as short — proof the loss happens at
-/// Loki's ingest time, not in any query this harness constructs. The
-/// exact collision mechanics (why a ~15 s cadence collides and how much
-/// margin is enough) aren't fully characterized, so this floor is
-/// deliberately generous — 100 s, comfortably above the observed-bad
-/// 15 s and with real headroom below the two candidates a corpus
-/// exploration run found clear of it (60 s and ~144 s cadences).
+/// [`pick_frequency_pair`] candidate must clear. A real dispatch (RFC
+/// 0031 L4 workstream, runs #6-#12) picked kafka's `template_id=16`
+/// "Wrote producer snapshot" needle — a ~15 s average cadence — and
+/// measured a stable ~93-97% completeness ceiling against Loki
+/// regardless of poll deadline, results caching,
+/// `-validation.max-entries-limit`, or bucket-aligned query windows.
+/// Loki's documented same-`(timestamp, body)` ingester dedup was the
+/// leading theory, but runs #13+ disproved it directly: a corpus-side
+/// check found ZERO exact `(timestamp, body)` collisions for either
+/// candidate template's matching records. The true mechanism is still
+/// uncharacterized (it matches an open, unresolved upstream Loki issue
+/// — silent small-percentage loss on wide-time-range queries, no
+/// maintainer-identified root cause; see [`L4_COMPLETENESS_MARGIN`]),
+/// but empirically, lower frequency DOES help: switching from the ~15 s
+/// candidate to a ~144 s one cut the loss from ~17.5% to ~4%. This
+/// floor is deliberately generous — 100 s, comfortably above the
+/// observed-bad 15 s and with real headroom below the two candidates a
+/// corpus exploration run found clear of it (60 s and ~144 s cadences).
 const L4_MIN_AVG_INTERVAL_SECONDS: f64 = 100.0;
+
+/// The minimum fraction of a picked L4 candidate's `expected_rows` Loki
+/// must return before the harness accepts its answer as equivalent
+/// (RFC 0031 §7's completeness-margin decision, dated 2026-07-17).
+///
+/// Even after [`L4_MIN_AVG_INTERVAL_SECONDS`] cut the loss from ~17.5%
+/// to ~4% (runs #13/#14/#16: 95.6%/95.8%/96.1% complete), a real
+/// dispatch NEVER reached exact completeness for any L4 candidate
+/// tried. Runs #13-#16 exhausted every mechanism checkable from this
+/// side: a plain unaggregated line-filter count came back exactly as
+/// short as the aggregation path (ruling out anything query-shape
+/// specific); a corpus-side check found zero exact `(timestamp, body)`
+/// collisions (ruling out Loki's documented dedup rule); the two kafka
+/// service-instance periods (a genuine mid-corpus container restart)
+/// are cleanly sequential with no interleaving; `push_corpus_to_loki`
+/// was read end to end with no drop path found; Loki's own container
+/// stderr carries zero `level=warn`/`level=error` lines (bar one
+/// harmless startup "empty ring" transient); and Loki's own
+/// `loki_discarded_samples_total`/`loki_discarded_bytes_total`
+/// Prometheus counters — its dedicated accounting for silent/expected
+/// discards — never appear in `/metrics` at all, meaning zero discards
+/// of ANY kind were recorded for ANY reason.
+///
+/// This matches a known, OPEN, unresolved upstream Loki issue
+/// (grafana/loki#10658 and related): wide-time-range queries silently
+/// missing a small, consistent percentage of lines, with no error, no
+/// discard accounting, and no maintainer-identified root cause as of
+/// this writing. It is not a defect in Ourios, this harness's query
+/// construction, or the corpus — it is a documented, external,
+/// currently-unfixable characteristic of the comparison partner.
+///
+/// 90% (tolerating up to 10% loss) is chosen with real headroom over
+/// the observed 3.9-4.4% band (roughly 2.3x), not tuned to the exact
+/// number — a margin this loose stays meaningful because
+/// [`compare_aggregations_within_margin`] still hard-fails on the
+/// invariant that WOULD indicate a genuine Ourios-side or query-side
+/// bug: Loki reporting MORE than Ourios for any cell, or a cell Loki
+/// has that Ourios's own answer doesn't. Only under-counting, in
+/// aggregate, up to this margin, is tolerated.
+const L4_COMPLETENESS_MARGIN: f64 = 0.90;
 
 /// Choose a `bucket(width)` for the L4 pair from a query's time span: the
 /// largest whole DSL duration unit (`w`/`d`/`h`/`m`/`s`) that divides the
@@ -2855,37 +2895,7 @@ async fn loki_measure_frequency_pair(
                     spec.label,
                 );
             }
-            // Loki's own logs, not just its HTTP answers: the ingester
-            // logs at level=warn/level=error for rate limiting,
-            // out-of-order rejection, and stream-limit drops — none of
-            // which surface in a query response or the OTLP push's
-            // partial_success. Matched on the `level=` FIELD, not a
-            // bare substring: run #14 showed a naive "contains warn"
-            // filter drowning in false positives from query text like
-            // `severity_text="WARN"` inside `level=info` lines.
-            match container.stderr_to_vec().await {
-                Ok(stderr) => {
-                    let text = String::from_utf8_lossy(&stderr);
-                    let relevant: Vec<&str> = text
-                        .lines()
-                        .filter(|l| l.contains("level=warn") || l.contains("level=error"))
-                        .collect();
-                    eprintln!(
-                        "loki container stderr for [{}] — {} level=warn/error line(s) out \
-                         of {} total:",
-                        spec.label,
-                        relevant.len(),
-                        text.lines().count(),
-                    );
-                    for line in relevant.iter().rev().take(200).rev() {
-                        eprintln!("  {line}");
-                    }
-                }
-                Err(e) => eprintln!(
-                    "(couldn't read loki container stderr for [{}]: {e})",
-                    spec.label,
-                ),
-            }
+            dump_loki_container_warnings(container, spec).await;
             dump_loki_discard_metrics(http, base, spec).await;
             // Decisive ingest-vs-query split: a PLAIN line-filter count
             // (no `count_over_time`, no `| regexp`) over the same
@@ -2922,9 +2932,25 @@ async fn loki_measure_frequency_pair(
                     ),
                 }
             }
+            #[allow(clippy::cast_precision_loss)]
+            let completeness = total as f64 / spec.expected_rows as f64;
+            if completeness >= L4_COMPLETENESS_MARGIN {
+                eprintln!(
+                    "loki returned {total} of {} expected rows for [{}] — short of exact but \
+                     within the {:.0}% completeness margin (RFC 0031 §7, 2026-07-17); \
+                     accepting",
+                    spec.expected_rows,
+                    spec.label,
+                    L4_COMPLETENESS_MARGIN * 100.0,
+                );
+                break Ok((groups, bytes, fetched));
+            }
             break Err(format!(
-                "loki returned {total} of {} expected rows for [{}] before timeout",
-                spec.expected_rows, spec.label,
+                "loki returned {total} of {} expected rows for [{}] before timeout — below \
+                 the {:.0}% completeness margin",
+                spec.expected_rows,
+                spec.label,
+                L4_COMPLETENESS_MARGIN * 100.0,
             ));
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -3334,13 +3360,51 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
     );
 }
 
+/// Loki's own logs, not just its HTTP answers: the ingester logs at
+/// `level=warn`/`level=error` for rate limiting, out-of-order
+/// rejection, and stream-limit drops — none of which surface in a
+/// query response or the OTLP push's `partial_success`. Matched on the
+/// `level=` FIELD, not a bare substring: run #14 showed a naive
+/// "contains warn" filter drowning in false positives from query text
+/// like `severity_text="WARN"` inside `level=info` lines.
+async fn dump_loki_container_warnings(
+    container: &testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::testcontainers::GenericImage,
+    >,
+    spec: &PairSpec,
+) {
+    match container.stderr_to_vec().await {
+        Ok(stderr) => {
+            let text = String::from_utf8_lossy(&stderr);
+            let relevant: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("level=warn") || l.contains("level=error"))
+                .collect();
+            eprintln!(
+                "loki container stderr for [{}] — {} level=warn/error line(s) out of {} \
+                 total:",
+                spec.label,
+                relevant.len(),
+                text.lines().count(),
+            );
+            for line in relevant.iter().rev().take(200).rev() {
+                eprintln!("  {line}");
+            }
+        }
+        Err(e) => eprintln!(
+            "(couldn't read loki container stderr for [{}]: {e})",
+            spec.label
+        ),
+    }
+}
+
 /// Loki's OWN accounting for silent/expected drops: the distributor
 /// increments `loki_discarded_samples_total` (labeled by `reason` —
 /// `rate_limited`, `out_of_order`, `too_many_streams`, `line_too_long`,
 /// ...) even when nothing is logged, since a single discarded sample
-/// isn't always WARN-worthy on its own ([`loki_measure_frequency_pair`]'s
-/// `level=warn`/`level=error` stderr scan came back clean on run #14).
-/// This is Loki's dedicated answer to "how much did you drop and why."
+/// isn't always WARN-worthy on its own ([`dump_loki_container_warnings`]
+/// came back clean on run #14). This is Loki's dedicated answer to
+/// "how much did you drop and why."
 async fn dump_loki_discard_metrics(http: &reqwest::Client, base: &str, spec: &PairSpec) {
     match tokio::time::timeout(
         Duration::from_secs(30),
@@ -3899,10 +3963,24 @@ fn run_l4_pair(
     let ourios_answer =
         ourios_aggregate_answer(bucket_root, tenant, &spec.dsl, spec.now, spec.window)
             .expect("l4 ourios aggregate answer");
-    let outcome = compare_aggregations(&ourios_answer.groups, &loki_groups, 8);
+    // RFC 0031 §7's completeness-margin decision (2026-07-17): exact
+    // per-cell equality (`compare_aggregations`) is what the RFC0031.5
+    // fixture-level test still holds a synthetic Loki answer to, but a
+    // real dispatch's real Loki never reaches it — see
+    // `L4_COMPLETENESS_MARGIN`'s documentation for the full evidence
+    // trail. Loki reporting MORE than Ourios for any cell, or a cell
+    // absent from Ourios's own answer, still hard-fails here.
+    let outcome = compare_aggregations_within_margin(
+        &ourios_answer.groups,
+        &loki_groups,
+        L4_COMPLETENESS_MARGIN,
+        8,
+    );
     assert!(
         outcome.is_equal(),
-        "RFC0031.5 — the two systems' grouped-count maps must be identical on [{}]: {outcome:?}",
+        "RFC0031.5 — the two systems' grouped-count maps must be equivalent within the \
+         {:.0}% completeness margin on [{}]: {outcome:?}",
+        L4_COMPLETENESS_MARGIN * 100.0,
         spec.label,
     );
     print_l4_report(

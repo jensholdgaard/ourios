@@ -196,13 +196,26 @@ pub fn compare_aggregations<S1: std::hash::BuildHasher, S2: std::hash::BuildHash
 /// documented completeness-margin decision): unlike [`compare_aggregations`]'s
 /// exact-match requirement (which the RFC0031.5 fixture-level test still
 /// holds Ourios and a synthetic Loki answer to), this tolerates Loki
-/// UNDER-counting — up to `margin`, per `group_key` — but never tolerates
-/// a **phantom cell** (a `(bucket, group_key)` Loki reports that Ourios's
-/// own answer doesn't contain at all) or any `group_key` where Loki's
-/// **total across all buckets** exceeds Ourios's. Those two remain a
-/// hard [`EquivalenceOutcome::Mismatch`], since they'd indicate a
-/// genuine correctness problem in the harness's query construction, not
-/// the characterized loss this margin exists for.
+/// UNDER-counting — up to `margin`, per `group_key`, converted to an
+/// ABSOLUTE row tolerance floored at 1 (`ceil(ourios_key_total *
+/// (1 - margin)).max(1)`) — but never tolerates a **phantom cell** (a
+/// `(bucket, group_key)` Loki reports that Ourios's own answer doesn't
+/// contain at all) or any `group_key` where Loki's **total across all
+/// buckets** exceeds Ourios's. Those two remain a hard
+/// [`EquivalenceOutcome::Mismatch`], since they'd indicate a genuine
+/// correctness problem in the harness's query construction, not the
+/// characterized loss this margin exists for.
+///
+/// The floor-at-1 absolute tolerance (not a pure percentage) is why:
+/// run #19 found a real `group_key` with exactly 1 total Ourios row,
+/// where Loki captured 0 — an inherently binary outcome for `n = 1`
+/// (0% or 100%, no percentage in between can ever land inside a normal
+/// margin), yet losing one isolated occurrence is fully consistent with
+/// the already-characterized ~4-8% aggregate loss rate. A pure ratio
+/// check has no way to express "this specific miss is fine" at a
+/// denominator of 1; converting to an absolute tolerance that scales
+/// with the key's own size (and never rounds below 1) fixes the small
+/// end while still catching a real shortfall on a large key.
 ///
 /// The check is **per-`group_key`, not just the grand total**: checking
 /// only the sum across every cell would let Loki over-count one
@@ -294,14 +307,33 @@ pub fn compare_aggregations_within_margin<
         return EquivalenceOutcome::Mismatch(Mismatch { summary, examples });
     }
 
+    // A pure percentage margin breaks down for a low-cardinality key: run
+    // #19 found a real group_key with exactly 1 total Ourios row, where
+    // Loki captured 0 — an inherently binary outcome (0% or 100%, no
+    // middle ground) for n=1, yet fully consistent with the
+    // already-characterized ~4-8% aggregate loss rate (a lone occurrence
+    // has a real, non-negligible chance of being the one that's lost).
+    // Converting the margin to an ABSOLUTE row tolerance per key, floored
+    // at 1, fixes this: a cardinality-1 key can lose its only row without
+    // being flagged, while a large key (say 574 rows) still gets a
+    // tolerance that scales with the margin (~58 rows at 90%) — smooth
+    // behavior at both ends, and it still requires an EXPLANATION (the
+    // characterized loss) proportional to how much data existed, not a
+    // fixed percentage that's meaningless at small denominators.
     #[allow(clippy::cast_precision_loss)]
     // Group totals are bounded aggregation counts (u64), nowhere near f64's 2^53 exact-integer range.
     let mut short: Vec<(&str, u64, u64, f64)> = ourios_by_key
         .iter()
         .filter_map(|(&key, &o)| {
             let l = loki_by_key.get(key).copied().unwrap_or(0);
+            // `.max(1.0)` before the cast keeps the result non-negative,
+            // and a bounded group total times a margin in [0, 1] stays
+            // nowhere near u64::MAX — no truncation in practice.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let tolerance = ((o as f64) * (1.0 - margin)).ceil().max(1.0) as u64;
+            let shortfall = o.saturating_sub(l);
             let completeness = l as f64 / o as f64;
-            (completeness < margin).then_some((key, o, l, completeness))
+            (shortfall > tolerance).then_some((key, o, l, completeness))
         })
         .collect();
     if short.is_empty() {
@@ -1418,6 +1450,37 @@ mod tests {
             );
         };
         assert!(m.summary.contains("exceeds Ourios's"), "{}", m.summary);
+    }
+
+    #[test]
+    fn margin_comparison_tolerates_losing_a_cardinality_one_keys_only_row() {
+        // Run #19's exact shape: a real group_key with exactly 1 total
+        // Ourios row, where Loki captured 0 (0%). A pure percentage
+        // margin has no meaningful middle ground at n=1 — it's binary —
+        // but a single lost occurrence is fully consistent with the
+        // already-characterized ~4-8% aggregate loss rate. The other
+        // (dominant, high-cardinality) key stays comfortably within
+        // margin, isolating this from the grand-total/other-key checks.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "0"), 1);
+        o.insert(agg(0, "electPreferred"), 574);
+        let mut l = HashMap::new();
+        // No entry for "0" at all: Loki captured zero of Ourios's one row.
+        l.insert(agg(0, "electPreferred"), 550);
+        assert!(compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
+    }
+
+    #[test]
+    fn margin_comparison_still_rejects_a_large_key_losing_more_than_its_tolerance() {
+        // The absolute-tolerance formula must still catch a real
+        // shortfall on a large key, not just skip checking it: 100 total
+        // rows, tolerance = ceil(100 * 0.10) = 10, so losing 20 must
+        // still reject.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "svcA"), 100);
+        let mut l = HashMap::new();
+        l.insert(agg(0, "svcA"), 80);
+        assert!(!compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
     }
 
     #[test]

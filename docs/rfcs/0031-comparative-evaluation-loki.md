@@ -825,6 +825,22 @@ not block `validated` in the "we didn't finish" sense — it is a
     `bucket(12h)`, 1197 rows, equivalence held. Storage-side
     `loki/ourios = 3.73×`, processed-channel `87.1×` — both reported
     only, per the deferral below.
+  - **PR #536 code review, round 2** (same day, after run #18): a
+    per-`group_key` PERCENTAGE margin breaks down at low cardinality.
+    **Run #19** (dispatched to confirm the round-1 review fixes) found
+    it directly: a real `group_key` with exactly 1 total Ourios row,
+    where Loki captured 0 — 0%, below any normal margin, but for
+    `n = 1` there is no percentage between 0% and 100% a margin could
+    land on; losing one isolated occurrence is exactly the kind of
+    event the already-characterized ~4-8% aggregate loss rate predicts.
+    Converted the per-key check from a pure ratio to an absolute row
+    tolerance, floored at 1: `ceil(ourios_key_total * (1 - margin))
+    .max(1)`. This tolerates a cardinality-1 key losing its only row
+    while still catching a real shortfall on a large key (100 rows,
+    tolerance 10, losing 20 still rejects) — regression tests for both
+    ends
+    (`margin_comparison_tolerates_losing_a_cardinality_one_keys_only_row`,
+    `margin_comparison_still_rejects_a_large_key_losing_more_than_its_tolerance`).
 
   `M_L4` stays **deferred** — this decision unblocks a measurement, it
   does not freeze the bytes-read margin.

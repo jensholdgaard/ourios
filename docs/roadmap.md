@@ -2,7 +2,24 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-06-15** — RFC 0013 (object storage, S3-compatible)
+> Last updated: **2026-07-15** — a month of post-MVP shipping work
+> landed since the prior entry below; §3's RFC ladder now covers
+> RFC 0001 through RFC 0033 and §5's deferred-capabilities table
+> (eight rows) is rewritten: six have shipped outright (the WAL, the
+> OTLP wire endpoints, the snapshot mechanism, the §6.8 telemetry
+> surface, the query DSL, and the `ourios-server` binary + Helm
+> chart), multi-tenancy-at-runtime is partially landed (auth +
+> tenant binding shipped via RFC 0026 `accepted`; rate-limit/
+> eviction/lifecycle orchestration is still open), and the Perses
+> datasource plugin remains fully deferred. Current work is RFC 0031
+> (comparative evaluation against
+> Grafana Loki) — a post-MVP thesis-strengthening effort, not a new
+> MVP gate — with the `L1`/`L3`/`L6` classes frozen and gate-enforcing
+> per its §7 and the last must-win class (`L4`, frequency aggregation)
+> mid-dispatch. Phases 1–3 in §4 are all complete; that section is
+> historical narrative only from this point forward.
+>
+> Prior entry — 2026-06-15: RFC 0013 (object storage, S3-compatible)
 > drafted → `specified` → `red` (first shipping-milestone spine; `store`
 > module skeleton + §5 stubs landed); RFC 0009 (background
 > compaction) flipped to `validated` (RFC0009.7 D2/D3/B2-post measured on
@@ -83,7 +100,7 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-06-15)
+## 3. Current state (as of 2026-07-15)
 
 **The thesis is proven on representative corpora.** All four gating
 thesis-gates pass authoritatively on the `benchmarks.md` §1 baseline
@@ -116,7 +133,28 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0009 | Background compaction | **`validated`** — §5 RFC0009.1–.6 pass; RFC0009.7 D2/D3/B2-post measured authoritatively on `baseline-8vcpu-32gib` (§9.7: D3 in 256 MiB–2 GiB band, D2 166.8 MiB/s, B2-post ≈6.1×) |
 | 0010 | Audit-stream / drift queries | **`green`** — all 8 §5 scenarios pass (`crates/ourios-querier/tests/drift.rs`); discharges RFC 0001 H5.3; §9 items are `accepted`-gating; general audit aggregation deferred (§3.2) |
 | 0011 | A1 re-scope | **`accepted`** |
-| 0013 | Object storage (S3-compatible) | `red` — first shipping-milestone spine; `store` module skeleton in `ourios-parquet` (`object_store` direct dep, `local()` wired) + 8 `#[ignore]`d §5 stubs; crate-shape resolved (module, not a crate). `green` = S3 backend + conditional-PUT publish + consumer migration |
+| 0012 | meta: CLAUDE.md §2 pillar-#2 wording | **`accepted`** |
+| 0013 | Object storage (S3-compatible) | `green` — S3 backend + conditional-PUT publish + consumer migration all landed |
+| 0014 | Ingest write path: record sink and flush policy | `green` |
+| 0015 | Fuzzing harness: cargo-fuzz + ClusterFuzzLite CI | `green` |
+| 0016 | Query-serving endpoint: HTTP query API over the logs DSL | `green` |
+| 0017 | Read-time template registry & query-row rendering | `green` |
+| 0018 | OTLP log-spec compliance amendments | `green` |
+| 0019 | Storage-backend selection (local vs S3) | **`accepted`** |
+| 0020 | Server configuration file (YAML + env-var substitution) | `green` |
+| 0021 | Coordinated DataFusion / Arrow upgrade | `green` — phase 1; phase 2 gated on upstream (DataFusion 55) |
+| 0022 | Queryable attribute columns (RFC 0005 amendment) | `green` |
+| 0023 | Bounded template memory (RFC 0001 amendment) | `green` |
+| 0024 | OTLP-envelope property testing (RFC 0006 amendment) | `green` |
+| 0025 | Absent-body representation (RFC 0005 amendment) | `green` |
+| 0026 | Authentication and tenant binding (ingest + query) | **`accepted`** |
+| 0027 | MCP query surface (agent-facing read tools) | **`accepted`** |
+| 0028 | Build-feedback program (test-harness + workspace decomposition) | `green` |
+| 0029 | OIDC bearer layer (issuer-agnostic, Dex-validated) | `green` |
+| 0030 | TLS/mTLS on the data-plane listeners | `green` |
+| 0031 | Comparative evaluation against Grafana Loki | in progress — `L1`/`L3` (storage + latency) and `L6` (latency) frozen and gate-enforcing per §7; `L2` unfrozen via RFC 0033; `L4` (frequency aggregation) is the last must-win, mid-dispatch. The file's own frontmatter still reads `red`; pending an update at close-out |
+| 0032 | Query-schema and cost-model resource for the MCP surface | `green` |
+| 0033 | Cached template-map artifact | `green` |
 
 **Crates — all ten product crates are implemented** (`ourios-core`,
 `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`, `-server`,
@@ -140,23 +178,38 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
   the RFC 0009 compaction runner.
 - **`ourios-querier`** — RFC 0007 `validated` / RFC 0002 `green`: the logs
   DSL over DataFusion with predicate + partition (time-window) pruning,
-  alias resolution, and the RFC 0010 drift query.
+  alias resolution, the RFC 0010 drift query, `param(n)`/`bucket(width)`
+  aggregation (RFC 0002's L4 amendment), and the RFC 0032 query-schema +
+  cost-model MCP resource.
 - **`ourios-bench`** — RFC 0006 `green`: drives the A1/B1/B2/C1/C2
-  measurements over OTLP-Demo + LogHub corpora and records results to
-  `benchmarks.md` §9.
+  measurements over OTLP-Demo + LogHub corpora, records results to
+  `benchmarks.md` §9, and (RFC 0031) runs the comparative dispatch
+  against a real Loki container.
 - **`ourios-core`** / **`-semconv`** / **`-telemetry`** / **`-server`** —
   shared types + tenancy + record/audit shapes; the weaver-generated OTel
-  name constants; the OTel metrics/export surface; the two-role binary.
+  name constants; the OTel metrics/export surface (RFC 0018); the
+  two-role binary, now with TLS/mTLS (RFC 0030), an OIDC bearer layer
+  (RFC 0029), and the S3-native Helm chart, deploy-validated on kind.
 
 The full `cargo test --all-features` suite is green in CI — the `cargo
 test` job gates every PR on the exact head; the coverage job runs
 alongside it but is informational (`continue-on-error`), not gating.
 
-**What remains** is post-MVP shipping shape (§5 — Helm chart, the
-production deployment surface) and the items tracked in the RFCs'
-§7/§9 open-questions (e.g. RFC 0009's full D2 sustained-ingest soak +
-a measured D1, and the S3 atomic-swap primitive). RFC 0005 (`green`)
-and RFC 0009 (`validated`) are no longer open.
+**What remains** is no longer "reach MVP" — that bar cleared a month
+before this entry (§3's gate table is unchanged and still authoritative)
+and the shipping milestone that followed (WAL, wire endpoints, DSL,
+auth, S3, Helm — the whole §5 table below except Perses) is
+substantially done. What's actually open:
+
+- **RFC 0031's `L4` class** (frequency aggregation vs Loki) — the last
+  unmeasured must-win in the comparative program; a dispatch is in
+  flight as of this entry.
+- **The Perses datasource plugin** — deliberately deferred (§5), not
+  started.
+- Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.
+  RFC 0009's full D2 sustained-ingest soak and a measured D1, RFC
+  0021's phase 2 gated on upstream DataFusion 55, RFC 0028's musl
+  cargo-dist re-add) — none block anything downstream.
 
 ---
 
@@ -267,33 +320,38 @@ or it doesn't.
 
 ## 5. Deliberately out of MVP
 
-Each item is a real production concern. The reason it's deferred
-is *"answering 'does the thesis hold?' doesn't require it,"* not
-*"we don't think it matters."*
+Each item is a real production concern. The reason it was deferred
+*for MVP* is *"answering 'does the thesis hold?' doesn't require
+it,"* not *"we don't think it matters."* As of this entry, six of
+the eight original rows have shipped outright, one (multi-tenancy
+at runtime) is partially landed, and one (Perses) is still fully
+deferred, as part of the post-MVP shipping milestone (§3); the
+table below records what shipped and what's still genuinely open.
 
-| Capability | Why deferred for MVP | When it lands |
+| Capability | Why deferred for MVP | Status |
 |---|---|---|
-| **Write-ahead log** (`ourios-wal`) | Corpus replay is bounded and reproducible; durability is irrelevant for thesis-proving | First post-MVP shipping PR series — required before any non-corpus traffic |
-| **OTLP wire endpoints** (gRPC + HTTP listeners) | Bench reads OTLP from disk, not the network — see Phase 3. The wire-decode layer (`tonic`, `axum`, `opentelemetry-proto`) is independent of the record shape and adds no signal to thesis gates | First post-MVP shipping PR series — paired with WAL since both gate non-corpus ingest. RFC 0003 (forthcoming) specifies the wire-decode design |
-| **Snapshot mechanism** (RFC 0001 §6.9) | Corpus runs from cold start; replay budget moot | After WAL — snapshots are an optimisation on top of WAL replay |
-| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | After Phase 1 finishes — the metrics depend on the miner's hot path being final. Implementation note (maintainer direction, 2026-05-19, **updated 2026-06-03**): instrument through the **OpenTelemetry metrics API** (meters create the instruments) and export the resulting metrics through the OTel SDK's **OTLP metric exporter** (push), *not* the legacy `prometheus` client crate and *not* a `/metrics` scrape endpoint — any Prometheus compatibility is a downstream collector concern, keeping the project one metric-model end-to-end. The RFC 0001 §6.8 architecture amendment (2026-06-03) reframes the export model and terminology; the dotted-semconv name redesign (joining `semconv/registry/`, RFC 0009 §3.6) is a tracked follow-up |
-| **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | Post-MVP — RFC 0002 already drafted but not specified |
-| **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | Post-MVP, tied to operator-console RFC (see RFC 0001 §9 *"Multi-tenancy and operational lifecycle"*) |
-| **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | Post-MVP, sequencing TBD |
-| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* RFC 0002 stabilises the query API; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line. Splitting the concern: the plugin is an additive RFC against a stable query API; the CRDs/operator path is a charter change, not an RFC. Discussion captured 2026-05-18 (Grok prompt → maintainer review) | Plugin: after RFC 0002 lands, as `RFC 0010 — Perses datasource plugin`, scoped to plugin-only and living in a separate repo. CRDs/operator: requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
+| **Write-ahead log** (`ourios-wal`) | Corpus replay is bounded and reproducible; durability is irrelevant for thesis-proving | **Landed** — RFC 0008 `accepted`: append/sync, real-SIGKILL crash recovery, snapshot-restore, group-commit batched fsync |
+| **OTLP wire endpoints** (gRPC + HTTP listeners) | Bench reads OTLP from disk, not the network — see Phase 3 | **Landed** — RFC 0003 `green`: gRPC + HTTP receivers, WAL-before-ack, per-`ResourceLogs` tenant derivation |
+| **Snapshot mechanism** (RFC 0001 §6.9) | Corpus runs from cold start; replay budget moot | **Landed** — part of RFC 0008 (`accepted`), v2 restore format |
+| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0018 `green`); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). Traces deliberately deferred |
+| **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `green`, including the `param(n)`/`bucket(width)` aggregation amendment |
+| **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding shipped (RFC 0026 `accepted`); rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9) |
+| **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
+| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
 
-**Note on OTLP scope.** The pre-amendment roadmap listed
-"OTLP receiver (gRPC + HTTP)" as a single post-MVP item.
+**Note on OTLP scope (historical).** The pre-amendment roadmap
+listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.
 PR #20 + #21 split that scope: the **OTLP record shape**
 (`OtlpLogRecord` consumption, the canonical JSON encoding,
-the OTLP-aligned Parquet schema) is in MVP — it's a
-prerequisite for thesis-gate **C2**'s validity, because the
+the OTLP-aligned Parquet schema) was in MVP from the start — it's
+a prerequisite for thesis-gate **C2**'s validity, because the
 template-count convergence the corpus measures has to be over
-records that look like real OTel traffic, not over
-flat-text caricatures of it. Only the **wire endpoints** —
-the actual gRPC/HTTP listeners that decode OTLP off the
-network — remain post-MVP, and that's the row in the table
-above.
+records that look like real OTel traffic, not over flat-text
+caricatures of it. Only the **wire endpoints** — the actual
+gRPC/HTTP listeners that decode OTLP off the network — were
+deferred past MVP, and that's the row in the table above; RFC 0003
+(`green`) has since landed them, so nothing in this note is
+still-open scope.
 
 ---
 

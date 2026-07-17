@@ -84,7 +84,7 @@ H3, `CLAUDE.md` §3.4.
 
 **Hazard.** A named failure mode that, if not actively mitigated,
 silently corrupts data or destroys the project's value
-proposition. The seven current hazards are catalogued in
+proposition. The eight current hazards are catalogued in
 `docs/hazards.md`. New hazards are added via a `meta:` RFC.
 
 **Ingester.** The Ourios role that receives OTLP over gRPC/HTTP,

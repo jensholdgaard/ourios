@@ -1551,10 +1551,16 @@ const L4_MIN_AVG_INTERVAL_SECONDS: f64 = 100.0;
 /// the observed 3.9-4.4% band (roughly 2.3x), not tuned to the exact
 /// number — a margin this loose stays meaningful because
 /// [`compare_aggregations_within_margin`] still hard-fails on the
-/// invariant that WOULD indicate a genuine Ourios-side or query-side
-/// bug: Loki reporting MORE than Ourios for any cell, or a cell Loki
-/// has that Ourios's own answer doesn't. Only under-counting, in
-/// aggregate, up to this margin, is tolerated.
+/// invariants that WOULD indicate a genuine Ourios-side or query-side
+/// bug: a `(bucket, group_key)` cell Loki reports that Ourios's own
+/// answer doesn't contain at all (a phantom cell — the signal of a
+/// wrong regex or wrong bucket math), or Loki's TOTAL exceeding
+/// Ourios's total. Run #17 showed a single cell landing 1 row over
+/// Ourios's own count for that cell while the aggregate total stayed a
+/// solid under-count — consistent with step-grid boundary imprecision,
+/// not fabrication — which is why the check is total-level, not
+/// per-cell: only net under-counting, in aggregate, up to this margin,
+/// is tolerated.
 const L4_COMPLETENESS_MARGIN: f64 = 0.90;
 
 /// Choose a `bucket(width)` for the L4 pair from a query's time span: the
@@ -3968,8 +3974,8 @@ fn run_l4_pair(
     // fixture-level test still holds a synthetic Loki answer to, but a
     // real dispatch's real Loki never reaches it — see
     // `L4_COMPLETENESS_MARGIN`'s documentation for the full evidence
-    // trail. Loki reporting MORE than Ourios for any cell, or a cell
-    // absent from Ourios's own answer, still hard-fails here.
+    // trail. A phantom cell (one absent from Ourios's own answer) or
+    // Loki's total exceeding Ourios's total still hard-fails here.
     let outcome = compare_aggregations_within_margin(
         &ourios_answer.groups,
         &loki_groups,

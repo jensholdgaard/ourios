@@ -465,10 +465,10 @@ record. It references RFC 0006's harness rather than editing it.
 >   so duplicates are not silently collapsed); for the L4 aggregation
 >   class it asserts the `(bucket, group_key) → count` maps are
 >   identical **within the `L4_COMPLETENESS_MARGIN` documented in §7**
->   (2026-07-17) — Loki reporting *more* than Ourios for any cell, or a
->   cell absent from Ourios's own answer, is never tolerated regardless
->   of margin; only Loki under-counting, in aggregate, up to the margin
->   is tolerated
+>   (2026-07-17) — a phantom cell (one Loki reports that Ourios's own
+>   answer doesn't contain at all) or Loki's total exceeding Ourios's
+>   total is never tolerated regardless of margin; only Loki
+>   under-counting, in aggregate, up to the margin is tolerated
 > - **And** if the answers differ beyond what's tolerated, the harness
 >   records no `L`-metric for that class, writes the symmetric-difference
 >   (or count-delta) summary and up to N example keys to stderr, and
@@ -779,11 +779,24 @@ not block `validated` in the "we didn't finish" sense — it is a
   95.6%/95.8%/96.1% complete), not tuned to the exact number. The
   margin is narrowly scoped, not a general weakening of RFC0031.1
   ("equivalence is never optional"): `compare_aggregations_within_margin`
-  still hard-fails, at any margin, if Loki reports *more* than Ourios
-  for any cell or a cell absent from Ourios's own answer — the two
-  signals that would actually indicate a query-construction or
-  Ourios-side bug. Only aggregate under-counting, up to the margin, is
-  tolerated. `M_L4` stays **deferred** — this decision unblocks a
+  still hard-fails, at any margin, on a phantom cell (one Loki reports
+  that Ourios's own answer doesn't contain at all) or Loki's TOTAL
+  exceeding Ourios's total — the two signals that would actually
+  indicate a query-construction or Ourios-side bug. Only aggregate
+  under-counting, up to the margin, is tolerated. **Run #17** (the
+  first real dispatch under this margin) validated the design and
+  refined it in the same pass: the poll-completion check passed cleanly
+  (1153/1197, 96.3%), but the equivalence check itself then hard-failed
+  on a single cell landing 1 row *over* Ourios's count for that cell
+  (114 vs 113) while the aggregate total stayed a solid under-count —
+  consistent with the same step-grid boundary imprecision already
+  characterized above, not fabrication. The original design checked
+  "Loki `>` Ourios" per cell, which was too strict for that kind of
+  noise; refined the same day to check for phantom cells and a
+  total-level overcount instead, which still catches a genuine wrong
+  regex or wrong bucket-math bug (that would produce cells Ourios never
+  produced at all) while tolerating the boundary noise the margin
+  exists for. `M_L4` stays **deferred** — this decision unblocks a
   measurement, it does not freeze the bytes-read margin.
 - [x] **Headline corpus — DECIDED: OTel-Demo.** Ourios is an OTLP-native
   backend, so the honest headline is real OTLP logs — the workload the

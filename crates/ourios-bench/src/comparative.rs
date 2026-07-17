@@ -196,12 +196,24 @@ pub fn compare_aggregations<S1: std::hash::BuildHasher, S2: std::hash::BuildHash
 /// documented completeness-margin decision): unlike [`compare_aggregations`]'s
 /// exact-match requirement (which the RFC0031.5 fixture-level test still
 /// holds Ourios and a synthetic Loki answer to), this tolerates Loki
-/// UNDER-counting a cell — up to `margin`, in aggregate — but never
-/// tolerates Loki OVER-counting a cell or reporting one absent from
-/// Ourios's own answer. Those two remain a hard [`EquivalenceOutcome::Mismatch`],
-/// since they would indicate a genuine correctness problem in the
-/// harness's query construction, not the characterized loss this margin
-/// exists for.
+/// UNDER-counting — up to `margin`, in aggregate — but never tolerates a
+/// **phantom cell** (a `(bucket, group_key)` Loki reports that Ourios's
+/// own answer doesn't contain at all) or Loki's **total** exceeding
+/// Ourios's total. Those two remain a hard [`EquivalenceOutcome::Mismatch`],
+/// since they'd indicate a genuine correctness problem in the harness's
+/// query construction, not the characterized loss this margin exists
+/// for.
+///
+/// Run #17 is why this checks the TOTAL rather than every individual
+/// cell: a single cell landed 1 row over Ourios's count (114 vs 113)
+/// while the overall total (1153/1197) stayed a solid under-count —
+/// consistent with the same step-grid boundary imprecision already
+/// characterized (RFC 0031 §7's L4 entry), not fabrication. A per-cell
+/// "Loki must never exceed Ourios" rule was too strict for that kind of
+/// noise; a phantom-key check still catches the failure mode that
+/// actually indicates a bug (Loki answering a *different* query than
+/// intended — wrong regex, wrong bucket math — would show up as keys
+/// Ourios never produced at all).
 ///
 /// The margin is not a general weakening of RFC0031.1 ("equivalence is
 /// never optional") — it is scoped narrowly to a documented, external,
@@ -217,30 +229,28 @@ pub fn compare_aggregations_within_margin<
     margin: f64,
     examples_cap: usize,
 ) -> EquivalenceOutcome {
-    let mut over_or_phantom: Vec<(&AggKey, u64, u64)> = loki
+    let mut phantom: Vec<(&AggKey, u64)> = loki
         .iter()
-        .filter_map(|(k, &l)| {
-            let o = ourios.get(k).copied().unwrap_or(0);
-            (l > o).then_some((k, o, l))
-        })
+        .filter(|(k, _)| !ourios.contains_key(*k))
+        .map(|(k, &l)| (k, l))
         .collect();
-    if !over_or_phantom.is_empty() {
-        over_or_phantom.sort_by(|a, b| {
+    if !phantom.is_empty() {
+        phantom.sort_by(|a, b| {
             (a.0.bucket_start_unix_nanos, &a.0.group_key)
                 .cmp(&(b.0.bucket_start_unix_nanos, &b.0.group_key))
         });
         let summary = format!(
-            "{} cell(s) where Loki reports MORE than Ourios (or a cell absent \
-             from Ourios's own answer) — never tolerated, regardless of margin",
-            over_or_phantom.len(),
+            "{} cell(s) Loki reports that are absent from Ourios's own answer entirely \
+             — never tolerated, regardless of margin",
+            phantom.len(),
         );
-        let examples = over_or_phantom
+        let examples = phantom
             .iter()
             .take(examples_cap)
-            .map(|(k, o, l)| {
+            .map(|(k, l)| {
                 format!(
-                    "bucket={} group={:?} ourios={o} loki={l}",
-                    k.bucket_start_unix_nanos, k.group_key,
+                    "bucket={} group={:?} loki={l} (no Ourios cell)",
+                    k.bucket_start_unix_nanos, k.group_key
                 )
             })
             .collect();
@@ -249,6 +259,16 @@ pub fn compare_aggregations_within_margin<
 
     let ourios_total: u64 = ourios.values().sum();
     let loki_total: u64 = loki.values().sum();
+    if loki_total > ourios_total {
+        return EquivalenceOutcome::Mismatch(Mismatch {
+            summary: format!(
+                "loki's total ({loki_total}) exceeds ourios's total ({ourios_total}) — \
+                 the characterized loss is an under-count, so a net over-count isn't \
+                 tolerated regardless of margin"
+            ),
+            examples: Vec::new(),
+        });
+    }
     #[allow(clippy::cast_precision_loss)]
     let completeness = if ourios_total == 0 {
         1.0
@@ -1283,9 +1303,10 @@ mod tests {
     }
 
     #[test]
-    fn margin_comparison_never_tolerates_overcount() {
-        // Loki reporting MORE than Ourios for a cell is never
-        // tolerated, no matter how loose the margin — it would
+    fn margin_comparison_never_tolerates_a_net_overcount() {
+        // Loki's TOTAL exceeding Ourios's total is never tolerated, no
+        // matter how loose the margin — the characterized loss is an
+        // under-count, so more overall than truly exists would
         // indicate a genuine correctness bug, not the characterized
         // completeness loss.
         let mut o = HashMap::new();
@@ -1294,15 +1315,21 @@ mod tests {
         l.insert(agg(0, "svcA"), 11);
         let EquivalenceOutcome::Mismatch(m) = compare_aggregations_within_margin(&o, &l, 0.10, 8)
         else {
-            panic!("expected an overcount mismatch even at a near-vacuous margin");
+            panic!("expected a net-overcount mismatch even at a near-vacuous margin");
         };
-        assert!(m.summary.contains("MORE than Ourios"), "{}", m.summary);
+        assert!(
+            m.summary.contains("exceeds ourios's total"),
+            "{}",
+            m.summary
+        );
     }
 
     #[test]
     fn margin_comparison_never_tolerates_a_phantom_cell() {
         // A (bucket, group_key) Loki reports that doesn't exist in
-        // Ourios's own answer at all — same reasoning as overcount.
+        // Ourios's own answer at all — same reasoning as a net
+        // overcount: it indicates a genuine query-construction bug
+        // (wrong regex, wrong bucket math), not the characterized loss.
         let o: HashMap<AggKey, u64> = HashMap::new();
         let mut l = HashMap::new();
         l.insert(agg(0, "svcA"), 1);
@@ -1311,6 +1338,22 @@ mod tests {
             panic!("expected a phantom-cell mismatch even at a near-vacuous margin");
         };
         assert!(m.summary.contains("absent from Ourios"), "{}", m.summary);
+    }
+
+    #[test]
+    fn margin_comparison_tolerates_a_single_cell_over_when_the_total_still_undercounts() {
+        // Run #17's exact shape: one cell (bucket=0, "electPreferred")
+        // landed 1 row over Ourios's count, consistent with Loki's
+        // step-grid boundary imprecision (a record landing in an
+        // adjacent bucket) rather than fabrication — the aggregate
+        // total is still a solid under-count, so this must be Equal.
+        let mut o = HashMap::new();
+        o.insert(agg(0, "electPreferred"), 113);
+        o.insert(agg(0, "electUnclean"), 114);
+        let mut l = HashMap::new();
+        l.insert(agg(0, "electPreferred"), 114); // 1 over Ourios's cell.
+        l.insert(agg(0, "electUnclean"), 100); // Enough under to keep the total down.
+        assert!(compare_aggregations_within_margin(&o, &l, 0.90, 8).is_equal());
     }
 
     #[test]

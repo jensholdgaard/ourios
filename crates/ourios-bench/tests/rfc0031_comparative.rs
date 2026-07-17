@@ -26,8 +26,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ourios_bench::{
     AggKey, FIXTURE_SERVICE, FIXTURE_SERVICE_B, FIXTURE_TRACE, FixtureRecord, LineKey,
-    LokiFetchedBytes, comparative_fixture, compare_aggregations, compare_lines, fixture_jsonl,
-    fixture_logs_data, ourios_aggregate_answer, ourios_query_lines, parse_loki_bytes_processed,
+    LokiFetchedBytes, comparative_fixture, compare_aggregations,
+    compare_aggregations_within_margin, compare_lines, fixture_jsonl, fixture_logs_data,
+    ourios_aggregate_answer, ourios_query_lines, parse_loki_bytes_processed,
     parse_loki_fetched_bytes, parse_loki_matrix, parse_loki_streams,
 };
 use ourios_core::tenant::TenantId;
@@ -600,16 +601,19 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
     // Two values ("10"/"11") of one template ("connection established to
     // peer <id>" — the same ≥10-char constant run
     // `pick_template_pair_finds_a_validated_needle` already validates),
-    // spread over four one-second buckets so the picker's cardinality
+    // spread over five 12-minute buckets so the picker's cardinality
     // (2..=50) and row-floor bounds are exercised, not merely satisfied
-    // trivially.
+    // trivially. 1000x the original sub-3s timestamps (~580s average
+    // spacing over the 100s-3000s span) so this candidate also clears
+    // L4_MIN_AVG_INTERVAL_SECONDS — see
+    // `pick_frequency_pair_finds_a_moderate_cardinality_group`.
     let records: Vec<(u64, &str)> = vec![
-        (100_000_000, "connection established to peer 10"),
-        (500_000_000, "connection established to peer 10"),
-        (900_000_000, "connection established to peer 11"),
-        (2_100_000_000, "connection established to peer 10"),
-        (2_500_000_000, "connection established to peer 11"),
-        (3_000_000_000, "connection established to peer 11"),
+        (100_000_000_000, "connection established to peer 10"),
+        (500_000_000_000, "connection established to peer 10"),
+        (900_000_000_000, "connection established to peer 11"),
+        (2_100_000_000_000, "connection established to peer 10"),
+        (2_500_000_000_000, "connection established to peer 11"),
+        (3_000_000_000_000, "connection established to peer 11"),
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
     std::fs::write(
@@ -633,8 +637,8 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
         .expect("the peer template's trailing id validates as an L4 candidate");
     assert_eq!(pair.param, 0, "the template's only wildcard");
     assert_eq!(
-        pair.bucket_width, "1s",
-        "the ~2.9s fixture span floors to the 1s minimum bucket width",
+        pair.bucket_width, "12m",
+        "the ~2900s fixture span targets a 12-minute bucket width",
     );
     assert_eq!(pair.needle, "connection established to peer");
     assert_eq!(pair.capture_regex, "peer\\s+(?P<value>\\S+)");
@@ -652,28 +656,15 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
     // here without wiring the container-based measurement loop, per this
     // slice's scope.
     let margins = ourios_bench::ComparativeMargins::default();
-    let spec = PairSpec {
-        label: format!(
-            "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
-            pair.template_id, pair.param, pair.bucket_width,
-        ),
-        margin: margins.m_l4,
-        class: PairClass::L4,
-        dsl: format!(
-            "template_id == {} | count by param({}), bucket({})",
-            pair.template_id, pair.param, pair.bucket_width,
-        ),
-        logql: format!(
-            "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
-             | regexp \"{}\" [{}]))",
-            pair.needle, pair.capture_regex, pair.bucket_width,
-        ),
-        start: built.min_effective_time_unix_nano,
-        end: built.max_effective_time_unix_nano + 1,
-        expected_rows: pair.groups.values().sum(),
+    let spec = l4_pair_spec(
+        &pair,
+        built.min_effective_time_unix_nano,
+        built.max_effective_time_unix_nano,
         now,
         window,
-    };
+        &margins,
+    )
+    .expect("the fixture's capture_regex carries no backtick");
     assert!(
         matches!(spec.class.gate(), GateKind::MustWin),
         "L4 is a must-win class (RFC 0031 §3.4), same disposition as L1/L2/L3",
@@ -1485,6 +1476,18 @@ fn pick_template_pair(
 /// meaningful multi-cell answer, not a trivially-passing edge case.
 const L4_MIN_ROWS: u64 = 4;
 
+/// The highest ceiling on total matching rows a [`pick_frequency_pair`]
+/// candidate may have — a smaller candidate proves the same
+/// `(bucket, group_key) → count` equivalence just as validly as a
+/// larger one, and [`loki_measure_frequency_pair`]'s poll shares the
+/// same 300 s deadline every other class's [`loki_measure_pair`] uses.
+/// A ~971K-row candidate (a service's dominant, near-catch-all
+/// template) genuinely could not finish ingesting/processing within
+/// that window on a real dispatch — 100K rows leaves comfortable
+/// margin at the observed ~2.7K rows/s Loki throughput (~37 s of the
+/// 300 s budget) while still being a large, meaningful multiset.
+const L4_MAX_ROWS: u64 = 100_000;
+
 /// The distinct-param-value cardinality band a [`pick_frequency_pair`]
 /// candidate must fall within: `2` (a single value is not a grouping
 /// question) through `50` (moderate cardinality — a low-cardinality
@@ -1492,6 +1495,82 @@ const L4_MIN_ROWS: u64 = 4;
 /// motivation; this is also what naturally rejects a per-line-unique slot
 /// like kafka's, without a special case for it).
 const L4_CARDINALITY: std::ops::RangeInclusive<usize> = 2..=50;
+
+/// The floor on a candidate's average inter-arrival interval
+/// (`bucket_width_seconds / (total_rows / distinct_buckets)`) a
+/// [`pick_frequency_pair`] candidate must clear. A real dispatch (RFC
+/// 0031 L4 workstream, runs #6-#12) picked kafka's `template_id=16`
+/// "Wrote producer snapshot" needle — a ~15 s average cadence — and
+/// measured a stable ~93-97% completeness ceiling against Loki
+/// regardless of poll deadline, results caching,
+/// `-validation.max-entries-limit`, or bucket-aligned query windows.
+/// Loki's documented same-`(timestamp, body)` ingester dedup was the
+/// leading theory, but runs #13+ disproved it directly: a corpus-side
+/// check found ZERO exact `(timestamp, body)` collisions for either
+/// candidate template's matching records. The true mechanism is still
+/// uncharacterized (it matches an open, unresolved upstream Loki issue
+/// — silent small-percentage loss on wide-time-range queries, no
+/// maintainer-identified root cause; see [`L4_COMPLETENESS_MARGIN`]),
+/// but empirically, lower frequency DOES help: switching from the ~15 s
+/// candidate to a ~144 s one cut the loss from ~17.5% to ~4%. This
+/// floor is deliberately generous — 100 s, comfortably above the
+/// observed-bad 15 s and with real headroom below the two candidates a
+/// corpus exploration run found clear of it (60 s and ~144 s cadences).
+const L4_MIN_AVG_INTERVAL_SECONDS: f64 = 100.0;
+
+/// The minimum fraction of a picked L4 candidate's `expected_rows` Loki
+/// must return before the harness accepts its answer as equivalent
+/// (RFC 0031 §7's completeness-margin decision, dated 2026-07-17).
+///
+/// Even after [`L4_MIN_AVG_INTERVAL_SECONDS`] cut the loss from ~17.5%
+/// to ~4% (runs #13/#14/#16: 95.6%/95.8%/96.1% complete), a real
+/// dispatch NEVER reached exact completeness for any L4 candidate
+/// tried. Runs #13-#16 exhausted every mechanism checkable from this
+/// side: a plain unaggregated line-filter count came back exactly as
+/// short as the aggregation path (ruling out anything query-shape
+/// specific); a corpus-side check found zero exact `(timestamp, body)`
+/// collisions (ruling out Loki's documented dedup rule); the two kafka
+/// service-instance periods (a genuine mid-corpus container restart)
+/// are cleanly sequential with no interleaving; `push_corpus_to_loki`
+/// was read end to end with no drop path found; Loki's own container
+/// stderr carries zero `level=warn`/`level=error` lines (bar one
+/// harmless startup "empty ring" transient); and Loki's own
+/// `loki_discarded_samples_total`/`loki_discarded_bytes_total`
+/// Prometheus counters — its dedicated accounting for silent/expected
+/// discards — never appear in `/metrics` at all, meaning zero discards
+/// of ANY kind were recorded for ANY reason.
+///
+/// This matches a known, OPEN, unresolved upstream Loki issue
+/// (grafana/loki#10658 and related): wide-time-range queries silently
+/// missing a small, consistent percentage of lines, with no error, no
+/// discard accounting, and no maintainer-identified root cause as of
+/// this writing. It is not a defect in Ourios, this harness's query
+/// construction, or the corpus — it is a documented, external,
+/// currently-unfixable characteristic of the comparison partner.
+///
+/// 90% (tolerating up to 10% loss) is chosen with real headroom over
+/// the observed 3.9-4.4% band (roughly 2.3x), not tuned to the exact
+/// number — a margin this loose stays meaningful because
+/// [`compare_aggregations_within_margin`] still hard-fails on the
+/// invariants that WOULD indicate a genuine Ourios-side or query-side
+/// bug: a `(bucket, group_key)` cell Loki reports that Ourios's own
+/// answer doesn't contain at all (a phantom cell — the signal of a
+/// wrong regex or wrong bucket math), or any `group_key` where Loki's
+/// total across all its buckets exceeds Ourios's. The check went
+/// through two rounds of PR #536 review hardening after this margin was
+/// first written: run #17 showed a single cell landing 1 row over
+/// Ourios's own count while the SAME key's total across its own buckets
+/// stayed a solid under-count (step-grid boundary imprecision, not
+/// fabrication), which a naive per-cell check flagged too strictly —
+/// fixed to check per-`group_key`, not per-cell or a single grand
+/// total (a pure grand-total check would let an overcount on one key
+/// silently compensate for another key's loss). Run #19 then found a
+/// cardinality-1 key that legitimately lost its only row — a pure
+/// percentage margin can't express that at `n = 1` — fixed by
+/// converting the per-key tolerance to an absolute row count, floored
+/// at 1 only for `n = 1`. See [`compare_aggregations_within_margin`]'s
+/// own documentation for the full, current design.
+const L4_COMPLETENESS_MARGIN: f64 = 0.90;
 
 /// Choose a `bucket(width)` for the L4 pair from a query's time span: the
 /// largest whole DSL duration unit (`w`/`d`/`h`/`m`/`s`) that divides the
@@ -1638,14 +1717,21 @@ struct FrequencyPair {
 /// candidate that fails the SAME query bounds check but has no usable
 /// needle or capture regex is rejected too, loudly.
 /// Whether an aggregate candidate's grouped-count map meets the L4
-/// picker's shape floors — moderate cardinality ([`L4_CARDINALITY`]),
-/// enough total rows ([`L4_MIN_ROWS`]), and at least 2 distinct bucket
-/// starts (otherwise the candidate never exercises the bucket
-/// dimension of the `(bucket, group_key) → count` equivalence shape,
-/// leaving [`parse_loki_matrix`]'s bucket-alignment convention
-/// untested on this corpus). Returns the rejection reason, or `None`
-/// if the candidate passes every floor.
-fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
+/// picker's shape floors/ceiling — moderate cardinality
+/// ([`L4_CARDINALITY`]), a row-count band (at least [`L4_MIN_ROWS`],
+/// at most [`L4_MAX_ROWS`] — too many rows makes
+/// [`loki_measure_frequency_pair`]'s poll unable to finish within its
+/// shared 300 s deadline before Loki has ingested/processed them
+/// all), and at least 2 distinct bucket starts (otherwise the
+/// candidate never exercises the bucket dimension of the `(bucket,
+/// group_key) → count` equivalence shape, leaving
+/// [`parse_loki_matrix`]'s bucket-alignment convention untested on
+/// this corpus). Returns the rejection reason, or `None` if the
+/// candidate passes every bound.
+fn frequency_shape_rejection(
+    groups: &HashMap<AggKey, u64>,
+    bucket_width_seconds: u64,
+) -> Option<String> {
     let distinct_values: std::collections::HashSet<&String> =
         groups.keys().map(|k| &k.group_key).collect();
     if !L4_CARDINALITY.contains(&distinct_values.len()) {
@@ -1658,6 +1744,12 @@ fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
     if total_rows < L4_MIN_ROWS {
         return Some(format!("{total_rows} rows (need >= {L4_MIN_ROWS})"));
     }
+    if total_rows > L4_MAX_ROWS {
+        return Some(format!(
+            "{total_rows} rows (need <= {L4_MAX_ROWS}, so the Loki poll can finish within \
+             its shared 300s deadline)"
+        ));
+    }
     let distinct_buckets: std::collections::HashSet<u64> =
         groups.keys().map(|k| k.bucket_start_unix_nanos).collect();
     if distinct_buckets.len() < 2 {
@@ -1666,7 +1758,119 @@ fn frequency_shape_rejection(groups: &HashMap<AggKey, u64>) -> Option<String> {
             distinct_buckets.len(),
         ));
     }
+    // Row/bucket counts and a bucket width in seconds never approach
+    // f64's 2^53 exact-integer range in practice — this is an
+    // approximate picker heuristic, not a value stored or compared bit
+    // for bit.
+    #[allow(clippy::cast_precision_loss)]
+    let avg_rows_per_bucket = total_rows as f64 / distinct_buckets.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let avg_interval_s = bucket_width_seconds as f64 / avg_rows_per_bucket;
+    if avg_interval_s < L4_MIN_AVG_INTERVAL_SECONDS {
+        return Some(format!(
+            "~{avg_interval_s:.1}s average inter-arrival interval (need >= \
+             {L4_MIN_AVG_INTERVAL_SECONDS}s — a shorter cadence correlates with Loki's \
+             uncharacterized wide-time-range completeness shortfall; exact \
+             (timestamp, body) collision was checked and ruled out directly, see \
+             L4_COMPLETENESS_MARGIN's documentation)"
+        ));
+    }
     None
+}
+
+/// Build the L4 `PairSpec` from a picked [`FrequencyPair`]. The `regexp`
+/// argument is backtick-delimited (a `LogQL`/Go raw string literal): the
+/// pattern already carries Go RE2 escapes (`\s+`, `\S+`, and any
+/// `regex_escape`d metacharacter) from [`param_capture_regex`], and a
+/// double-quoted `LogQL` string literal would try to interpret those same
+/// backslashes as *its own* escape sequences — `\s` is not a valid one,
+/// so Loki's parser rejects the query with "invalid char escape" before
+/// the pattern ever reaches the regex engine. Returns `None` (loudly
+/// logged) if `capture_regex` itself contains a backtick — the fixed
+/// corpus token would prematurely close the raw string, and `regex_escape`
+/// does not escape backticks (they are not an RE2 metacharacter).
+fn l4_pair_spec(
+    pair: &FrequencyPair,
+    min_effective_time_unix_nano: u64,
+    max_effective_time_unix_nano: u64,
+    now: u64,
+    window: u64,
+    margins: &ourios_bench::ComparativeMargins,
+) -> Option<PairSpec> {
+    if pair.capture_regex.contains('`') {
+        eprintln!(
+            "L4 pair template_id={} param({}): rejected — capture_regex contains a \
+             backtick, which would break the LogQL raw-string delimiter: {:?}",
+            pair.template_id, pair.param, pair.capture_regex,
+        );
+        return None;
+    }
+    // Loki's `query_range` evaluates a fixed step-grid starting exactly
+    // at `start` (`start, start+step, start+2*step, ..., end`), each
+    // instant's `[bucket_width]` range-vector lookback covering the
+    // PRECEDING window. Ourios's own buckets (RFC 0002's `bucket(width)`)
+    // are epoch-aligned (`floor(ts/width)*width`), not aligned to
+    // whatever `min_effective_time_unix_nano` happens to be. Runs
+    // #6-#10 all converged L4 to a stable ~93-97% regardless of poll
+    // deadline (ruling out a timing race) even after the entries-limit
+    // fix (run #8) closed part of the gap — consistent with a
+    // structural, not transient, shortfall: unless `start`/`end` are
+    // themselves bucket-boundary multiples, `(end - start) % width` is
+    // generically nonzero, leaving a fractional sliver at the tail of
+    // the range that the step-grid never evaluates a window over at
+    // all, independent of how long Loki is given to ingest. Snapping
+    // `start` down and `end` up to the nearest bucket boundary costs
+    // nothing (no data exists outside `[min, max]` to inflate the
+    // count) and guarantees full coverage.
+    //
+    // Reviewed concern: doesn't the step-grid's first evaluated instant
+    // (`t = start`) waste a step on `parse_loki_matrix`'s `bucket_start =
+    // t - width` decoding, losing the first real bucket? No — at
+    // `t = start`, `count_over_time`'s lookback window `(start - width,
+    // start]` covers only time strictly before `start`, where no corpus
+    // data exists by construction (that's the whole point of the
+    // bucket-aligned `start`). That instant decodes to an empty,
+    // zero-count bucket that's simply never present in Loki's response
+    // (Prometheus range-vector queries omit empty series/samples), so
+    // it's silently and correctly dropped. The first REAL bucket,
+    // `[start, start + width)`, is covered by the *next* evaluated
+    // instant, `t = start + width`, whose window `(start, start +
+    // width]` decodes to `bucket_start = start` — exactly right.
+    // Every subsequent instant follows the same pattern, so all `N` real
+    // buckets in `[start, end)` are covered by the `N` evaluated
+    // instants after the wasted first one, not lost to it.
+    let bucket_width_ns = bucket_width_seconds(&pair.bucket_width)
+        .checked_mul(1_000_000_000)
+        .expect("bucket width fits u64 nanoseconds");
+    let start = (min_effective_time_unix_nano / bucket_width_ns) * bucket_width_ns;
+    let end = max_effective_time_unix_nano
+        .checked_add(1)
+        .expect("corpus max timestamp overflows the Loki window end")
+        .div_ceil(bucket_width_ns)
+        .checked_mul(bucket_width_ns)
+        .expect("bucket-aligned window end overflows u64 nanoseconds");
+    Some(PairSpec {
+        label: format!(
+            "frequency aggregation, L4 family: template_id={} param({}) bucket({})",
+            pair.template_id, pair.param, pair.bucket_width,
+        ),
+        margin: margins.m_l4,
+        class: PairClass::L4,
+        dsl: format!(
+            "template_id == {} | count by param({}), bucket({})",
+            pair.template_id, pair.param, pair.bucket_width,
+        ),
+        logql: format!(
+            "sum by (value) (count_over_time({{service_name=~\".+\"}} |= \"{}\" \
+             | regexp `{}` [{}]))",
+            pair.needle, pair.capture_regex, pair.bucket_width,
+        ),
+        start,
+        end,
+        expected_rows: pair.groups.values().sum(),
+        now,
+        window,
+    })
 }
 
 fn pick_frequency_pair(
@@ -1732,7 +1936,9 @@ fn pick_frequency_pair(
                     continue;
                 }
             };
-            if let Some(reason) = frequency_shape_rejection(&answer.groups) {
+            if let Some(reason) =
+                frequency_shape_rejection(&answer.groups, bucket_width_seconds(&bucket_width))
+            {
                 eprintln!("L4 candidate template_id={id} param({param}): rejected — {reason}");
                 continue;
             }
@@ -2074,6 +2280,73 @@ async fn loki_query_with_stats(
         parse_loki_bytes_processed(&body).expect("parse loki bytes"),
         parse_loki_fetched_bytes(&body).expect("parse loki fetched bytes"),
     )
+}
+
+/// One Loki **metric** `query_range` call — the L4 matrix counterpart of
+/// [`loki_query_with_stats`]: `step` is pinned to the bucket width so
+/// every evaluation instant is `t = bucket_start + width`
+/// ([`parse_loki_matrix`]'s bucket-alignment convention), and the same
+/// bytes-processed / fetched-bytes figures are read from the identical
+/// stats block the line-returning pairs use.
+///
+/// **Precondition:** `start_ns` must already be whole-second AND
+/// `bucket_width_ns`-aligned, or the response's evaluation instants land
+/// off the second grid and [`parse_loki_matrix`] rejects them as
+/// fractional-second samples. This function does not align `start_ns`
+/// itself — [`l4_pair_spec`] (this function's only caller, via
+/// [`loki_measure_frequency_pair`]) guarantees it by construction:
+/// `start = (min_effective_time_unix_nano / bucket_width_ns) *
+/// bucket_width_ns`, and `bucket_width_ns` is itself always a whole
+/// multiple of `1_000_000_000` ([`bucket_width_seconds`] never produces
+/// a sub-second width), so any multiple of it is automatically
+/// whole-second-aligned too.
+///
+/// Returns `Err` on any transport/HTTP/parse failure rather than
+/// panicking: this is called from [`loki_measure_frequency_pair`]'s poll
+/// loop, which runs LAST in the same async block that holds every other
+/// pair's already-collected measurement — a panic on a transient blip
+/// would unwind and lose all of it. The poll loop retries an `Err` until
+/// its deadline, same as an incomplete answer.
+async fn loki_query_matrix(
+    http: &reqwest::Client,
+    base: &str,
+    logql: &str,
+    start_ns: u64,
+    end_ns: u64,
+    bucket_width_ns: u64,
+    label_name: &str,
+) -> Result<L4Measured, String> {
+    // `bucket_width_seconds` — the only producer of a bucket width this
+    // harness ever queries with — guarantees a whole-second width, so
+    // this truncation is exact, not a precision loss.
+    let step_s = (bucket_width_ns / 1_000_000_000).to_string();
+    let resp = http
+        .get(format!("{base}/loki/api/v1/query_range"))
+        .query(&[
+            ("query", logql),
+            ("start", &start_ns.to_string()),
+            ("end", &end_ns.to_string()),
+            ("step", &step_s),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("query_range (matrix) transport error: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("query_range (matrix) body read error: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "loki query_range (matrix) returned {status}: {body}"
+        ));
+    }
+    Ok((
+        parse_loki_matrix(&body, label_name, bucket_width_ns)
+            .map_err(|e| format!("parse loki matrix: {e}"))?,
+        parse_loki_bytes_processed(&body).map_err(|e| format!("parse loki bytes: {e}"))?,
+        parse_loki_fetched_bytes(&body).map_err(|e| format!("parse loki fetched bytes: {e}"))?,
+    ))
 }
 
 /// Push a whole OTLP/JSON Lines corpus into Loki, batched by **encoded
@@ -2608,6 +2881,258 @@ async fn loki_measure_pair(
     }
 }
 
+/// The L4 pair's Loki measurement: poll the matrix `query_range` until
+/// ingest has caught up to the expected total row count — the
+/// aggregation counterpart of [`loki_measure_pair`]. Returns `Err`
+/// instead of panicking on a deadline miss, so an L4 failure cannot
+/// destroy the already-measured/printed evidence for the other pairs
+/// (same run #11 salvage lesson; L4 is measured and reported last, see
+/// `rfc0031_indicative_comparative_run`).
+///
+/// Deadline matches [`loki_measure_pair`]'s 300 s — widening it to
+/// 600/900 s (runs #7/#9) changed nothing, and bucket-aligning the
+/// query window (run #11) narrowed but didn't close the gap either.
+/// Six straight dispatches (#6-#11) all converged to a stable ~93-97%
+/// regardless of which query-side knob moved, so a deadline miss now
+/// also runs a plain, unaggregated line-filter count (bypassing
+/// `count_over_time`/`regexp` entirely) alongside [`dump_loki_diagnostics`]
+/// — decisive evidence for whether the shortfall is Loki never storing
+/// the missing lines at ingest, or specific to the aggregation path,
+/// instead of another guess.
+///
+/// Run #13 (a lower-frequency candidate, `L4_MIN_AVG_INTERVAL_SECONDS`)
+/// still fell short (1144/1197), and a corpus-side check ruled out
+/// exact `(timestamp, body)` collision entirely — every one of the
+/// 1197 matching records has a unique timestamp AND unique body, so
+/// Loki's documented dedup rule cannot be the mechanism here (or,
+/// evidently, for the prior candidate either). Run #14 added a
+/// `level=warn`/`level=error` scan of Loki's own container stderr and
+/// came back with zero matches — whatever is happening, Loki doesn't
+/// consider it log-worthy, ruling out rate limiting, out-of-order
+/// rejection, and stream-limit drops (all of which log at WARN). A
+/// deadline miss now also scrapes `/metrics` for
+/// `loki_discarded_samples_total`/`loki_discarded_bytes_total` — Loki's
+/// own dedicated counters for silent/expected discards, incremented
+/// even when nothing is logged, labeled by `reason`.
+async fn loki_measure_frequency_pair(
+    http: &reqwest::Client,
+    base: &str,
+    container: &testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::testcontainers::GenericImage,
+    >,
+    spec: &PairSpec,
+    bucket_width_ns: u64,
+) -> Result<L4Measured, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let (groups, bytes, fetched) = match loki_query_matrix(
+            http,
+            base,
+            &spec.logql,
+            spec.start,
+            spec.end,
+            bucket_width_ns,
+            "value",
+        )
+        .await
+        {
+            Ok(measured) => measured,
+            // A transient blip (transport error, a 5xx, a torn body) is
+            // retried until the deadline, same as an incomplete answer —
+            // panicking here would unwind the async block holding every
+            // other pair's already-collected measurement.
+            Err(detail) => {
+                if std::time::Instant::now() >= deadline {
+                    break Err(format!(
+                        "loki matrix query for [{}] still failing at its poll deadline: \
+                         {detail}",
+                        spec.label,
+                    ));
+                }
+                eprintln!(
+                    "loki matrix query for [{}] failed (retrying until deadline): {detail}",
+                    spec.label,
+                );
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        let total: u64 = groups.values().sum();
+        if total >= spec.expected_rows {
+            break Ok((groups, bytes, fetched));
+        }
+        if std::time::Instant::now() >= deadline {
+            // `expected_rows` is a real corpus row count, non-zero (the
+            // picker's L4_MIN_ROWS floor) and capped at L4_MAX_ROWS —
+            // nowhere near f64's 2^53 exact-integer range.
+            #[allow(clippy::cast_precision_loss)]
+            let completeness = total as f64 / spec.expected_rows as f64;
+            if completeness >= L4_COMPLETENESS_MARGIN {
+                eprintln!(
+                    "loki returned {total} of {} expected rows for [{}] — short of exact but \
+                     within the {:.0}% completeness margin (RFC 0031 §7, 2026-07-17); \
+                     accepting",
+                    spec.expected_rows,
+                    spec.label,
+                    L4_COMPLETENESS_MARGIN * 100.0,
+                );
+                break Ok((groups, bytes, fetched));
+            }
+            // Below the margin — this run will fail, so the expensive
+            // diagnostics (each its own HTTP round trip, up to 90s+60s
+            // of timeout budget) are worth paying for here, unlike the
+            // common case above where they'd just be noise on an
+            // already-accepted result.
+            dump_l4_shortfall_diagnostics(http, base, container, spec).await;
+            break Err(format!(
+                "loki returned {total} of {} expected rows for [{}] before timeout — below \
+                 the {:.0}% completeness margin",
+                spec.expected_rows,
+                spec.label,
+                L4_COMPLETENESS_MARGIN * 100.0,
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+/// The full L4 shortfall post-mortem, run only when a poll deadline
+/// passed AND completeness fell below [`L4_COMPLETENESS_MARGIN`] (i.e.
+/// the run is about to fail): the general timed-out-pair diagnostics,
+/// Loki's own container `level=warn`/`level=error` lines, its
+/// discarded-samples counters, and the plain line-filter count.
+///
+/// That last probe is the decisive metric-vs-plain-query split — NOT
+/// ingest-vs-query: a plain line-filter count (no `count_over_time`, no
+/// `| regexp`) still goes through `query_range`, so a shortfall here
+/// doesn't prove Loki never STORED the missing lines (that would require
+/// checking the ingester/store directly, which this harness doesn't do).
+/// What it DOES prove: whether the shortfall is specific to the
+/// metric-aggregation machinery, or affects a plain streams query too
+/// (in which case it's the same wide-time-range query incompleteness
+/// RFC 0031 §7 ultimately characterizes, not an artifact of
+/// `count_over_time`/`regexp`). Every prior fix (cache, entries-limit,
+/// bucket alignment) moved the number without closing the gap — six
+/// straight dispatches at a stable ~93-97%, so guessing another
+/// query-side knob isn't warranted without this evidence.
+async fn dump_l4_shortfall_diagnostics(
+    http: &reqwest::Client,
+    base: &str,
+    container: &testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::testcontainers::GenericImage,
+    >,
+    spec: &PairSpec,
+) {
+    if tokio::time::timeout(
+        Duration::from_secs(90),
+        dump_loki_diagnostics(http, base, spec),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!(
+            "(diagnostics dump for [{}] itself timed out after 90 s)",
+            spec.label,
+        );
+    }
+    dump_loki_container_warnings(container, spec).await;
+    dump_loki_discard_metrics(http, base, spec).await;
+    if let Some(needle) = l4_needle_from_logql(&spec.logql) {
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            loki_query_range_uncapped(
+                http,
+                base,
+                &format!(r#"{{service_name=~".+"}} |= "{needle}""#),
+                spec.start,
+                spec.end,
+                spec.expected_rows,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(count)) => eprintln!(
+                "plain line-filter count for [{}]: {count} of {} expected \
+                 (bypasses count_over_time/regexp entirely — a shortfall here means \
+                 the loss isn't specific to the metric-aggregation path; it's still \
+                 a query_range call, so this doesn't prove ingest-side loss)",
+                spec.label, spec.expected_rows,
+            ),
+            Ok(Err(detail)) => eprintln!(
+                "(plain line-filter count for [{}] itself failed: {detail})",
+                spec.label,
+            ),
+            Err(_) => eprintln!(
+                "(plain line-filter count for [{}] itself timed out after 60 s)",
+                spec.label,
+            ),
+        }
+    }
+}
+
+/// Pull the bare `|= "..."` needle back out of an L4 [`PairSpec`]'s
+/// `logql` (built by [`l4_pair_spec`]) for the plain-count diagnostic —
+/// parsing rather than threading a new parameter through, since this is
+/// diagnostic-only code and a parse miss should just skip the probe, not
+/// fail the run.
+fn l4_needle_from_logql(logql: &str) -> Option<&str> {
+    let after = logql.split_once("|= \"")?.1;
+    let (needle, _) = after.split_once('"')?;
+    Some(needle)
+}
+
+/// Diagnostic-only: a plain streams count, unlike [`loki_query_range`],
+/// whose `limit=5000` is deliberately tuned to the equivalence pairs'
+/// (≤4000-row) expectations and would silently under-report an L4 pair
+/// whose `expected_rows` exceeds it. `limit` is set to `expected_rows`
+/// rounded up with headroom, not a fixed constant, so the probe can
+/// never itself be the reason the count looks short.
+///
+/// Returns `Err` rather than panicking on any failure (unlike
+/// [`loki_query_range`]'s and [`loki_query_with_stats`]'s `expect`-based
+/// style): this runs on the deadline-miss path of an already-flaky L4
+/// candidate, inside the same `runtime.block_on` that gathers L1–L3/L6's
+/// evidence — a `panic!`/`expect!`/`assert!` here would unwind the whole
+/// async block, losing that evidence too, defeating the "print before
+/// assert" salvage design this diagnostic path exists alongside
+/// ([`dump_loki_diagnostics`] and its siblings are already panic-free for
+/// the same reason).
+async fn loki_query_range_uncapped(
+    http: &reqwest::Client,
+    base: &str,
+    logql: &str,
+    start: u64,
+    end: u64,
+    expected_rows: u64,
+) -> Result<u64, String> {
+    let limit = expected_rows.saturating_mul(2).max(5000);
+    let resp = http
+        .get(format!("{base}/loki/api/v1/query_range"))
+        .query(&[
+            ("query", logql),
+            ("start", &start.to_string()),
+            ("end", &end.to_string()),
+            ("limit", &limit.to_string()),
+            ("direction", "forward"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("query_range (uncapped diagnostic) transport error: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("query_range (uncapped diagnostic) body read error: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "loki query_range (uncapped diagnostic) returned {status}: {body}"
+        ));
+    }
+    parse_loki_streams(&body)
+        .map(|lines| lines.len() as u64)
+        .map_err(|e| format!("parse loki streams (uncapped diagnostic): {e}"))
+}
+
 /// Split successes from failures: equivalence + report run for every
 /// measured pair BEFORE the run fails on the broken ones, so one pair's
 /// timeout cannot destroy the others' 40-minute measurements. The
@@ -2615,6 +3140,12 @@ async fn loki_measure_pair(
 /// `None` when the (corroborating) latency channel failed on an
 /// otherwise-good pair, reported as "unmeasured".
 type Measured = (Vec<LineKey>, u64, LokiFetchedBytes, Option<Duration>);
+
+/// The L4 pair's Loki measurement — the aggregation counterpart of
+/// [`Measured`]: a `(bucket, group) -> count` map rather than a
+/// [`LineKey`] multiset, with no latency channel this slice wires (see
+/// [`run_l4_pair`]'s doc).
+type L4Measured = (HashMap<AggKey, u64>, u64, LokiFetchedBytes);
 
 /// One pair's Ourios measurement: the correctness answer plus the §3.6
 /// latency channel (`None` = unmeasured; latency never fails the run).
@@ -2958,6 +3489,91 @@ async fn dump_loki_diagnostics(http: &reqwest::Client, base: &str, spec: &PairSp
     );
 }
 
+/// Loki's own logs, not just its HTTP answers: the ingester logs at
+/// `level=warn`/`level=error` for rate limiting, out-of-order
+/// rejection, and stream-limit drops — none of which surface in a
+/// query response or the OTLP push's `partial_success`. Matched on the
+/// `level=` FIELD, not a bare substring: run #14 showed a naive
+/// "contains warn" filter drowning in false positives from query text
+/// like `severity_text="WARN"` inside `level=info` lines.
+async fn dump_loki_container_warnings(
+    container: &testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::testcontainers::GenericImage,
+    >,
+    spec: &PairSpec,
+) {
+    match container.stderr_to_vec().await {
+        Ok(stderr) => {
+            let text = String::from_utf8_lossy(&stderr);
+            let relevant: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("level=warn") || l.contains("level=error"))
+                .collect();
+            eprintln!(
+                "loki container stderr for [{}] — {} level=warn/error line(s) out of {} \
+                 total:",
+                spec.label,
+                relevant.len(),
+                text.lines().count(),
+            );
+            for line in relevant.iter().rev().take(200).rev() {
+                eprintln!("  {line}");
+            }
+        }
+        Err(e) => eprintln!(
+            "(couldn't read loki container stderr for [{}]: {e})",
+            spec.label
+        ),
+    }
+}
+
+/// Loki's OWN accounting for silent/expected drops: the distributor
+/// increments `loki_discarded_samples_total` (labeled by `reason` —
+/// `rate_limited`, `out_of_order`, `too_many_streams`, `line_too_long`,
+/// ...) even when nothing is logged, since a single discarded sample
+/// isn't always WARN-worthy on its own ([`dump_loki_container_warnings`]
+/// came back clean on run #14). This is Loki's dedicated answer to
+/// "how much did you drop and why."
+async fn dump_loki_discard_metrics(http: &reqwest::Client, base: &str, spec: &PairSpec) {
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        http.get(format!("{base}/metrics")).send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => match resp.text().await {
+            Ok(body) => {
+                let discard_lines: Vec<&str> = body
+                    .lines()
+                    .filter(|l| {
+                        !l.starts_with('#')
+                            && (l.starts_with("loki_discarded_samples_total")
+                                || l.starts_with("loki_discarded_bytes_total"))
+                    })
+                    .collect();
+                eprintln!(
+                    "loki /metrics discarded-samples counters for [{}] — {} \
+                     non-zero-eligible series:",
+                    spec.label,
+                    discard_lines.len(),
+                );
+                for line in &discard_lines {
+                    eprintln!("  {line}");
+                }
+            }
+            Err(e) => eprintln!(
+                "(couldn't read loki /metrics body for [{}]: {e})",
+                spec.label
+            ),
+        },
+        Ok(Err(e)) => eprintln!("(loki /metrics request failed for [{}]: {e})", spec.label),
+        Err(_) => eprintln!(
+            "(loki /metrics request for [{}] itself timed out after 30 s)",
+            spec.label,
+        ),
+    }
+}
+
 /// The §7 calibration input: the indicative Ourios-vs-Loki bytes-read
 /// comparison on a real corpus (`OURIOS_COMPARATIVE_CORPUS`, fetched by
 /// the `comparative-bench` dispatch workflow — the `corpus/otel-demo-v*`
@@ -3041,6 +3657,38 @@ fn rfc0031_indicative_comparative_run() {
         corpus_window,
     );
     eprintln!("template pair: {template:?}");
+    // L4 (RFC 0031 §3.4/§3.5): picked the same way as L1's template pair
+    // (post-store-build — group cardinality only exists once templates
+    // are mined), but kept OUT of `Picks`/`specs` — purely additive to
+    // the pair list, not woven into the line-returning classes' shared
+    // machinery (see `run_l4_pair`'s doc for why: an aggregation's
+    // `(bucket, group) -> count` map is not a `LineKey` multiset, and
+    // forcing it through `OuriosAnswer`/`compare_lines` would misrepresent
+    // the state rather than model it).
+    let frequency = pick_frequency_pair(bucket.path(), &tenant, corpus_now, corpus_window);
+    eprintln!("frequency pair: {frequency:?}");
+    let margins = ourios_bench::ComparativeMargins::default();
+    let l4_spec = frequency.as_ref().and_then(|pair| {
+        l4_pair_spec(
+            pair,
+            built.min_effective_time_unix_nano,
+            built.max_effective_time_unix_nano,
+            corpus_now,
+            corpus_window,
+            &margins,
+        )
+    });
+    if l4_spec.is_none() {
+        eprintln!(
+            "L4 PAIR MISSING (this WILL fail the dispatch — L4 is must-win): either no \
+             template/param slot cleared pick_frequency_pair's bounds (moderate cardinality \
+             {L4_CARDINALITY:?}, {L4_MIN_ROWS}..={L4_MAX_ROWS} rows, >= \
+             {L4_MIN_AVG_INTERVAL_SECONDS}s average inter-arrival interval, a validated \
+             needle + capture regex), or the picked candidate's capture regex contained a \
+             backtick l4_pair_spec can't embed in LogQL's raw-string delimiter — the \
+             rejection lines above say which"
+        );
+    }
     let picks = Picks {
         pair: &pair,
         clean_ts: &clean_ts,
@@ -3133,8 +3781,8 @@ fn rfc0031_indicative_comparative_run() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let loki: Vec<_> = runtime.block_on(async {
-        let (_container, base, http) = start_loki(&[
+    let (loki, l4_loki): (Vec<_>, Option<Result<L4Measured, String>>) = runtime.block_on(async {
+        let (container, base, http) = start_loki(&[
             "-validation.reject-old-samples=false",
             // Run #11/#13 post-mortems (the #488 diagnostics): queries over
             // the replayed corpus's WEEKS-OLD time range skip the ingesters
@@ -3163,6 +3811,30 @@ fn rfc0031_indicative_comparative_run() {
             // per dskit's server registry (grpc_server_max_*_msg_size).
             "-server.grpc-max-recv-msg-size-bytes=16777216",
             "-server.grpc-max-send-msg-size-bytes=16777216",
+            // `loki_measure_frequency_pair` polls the SAME query+step
+            // repeatedly waiting for completeness; disable query_range
+            // results caching so every poll re-queries fresh data rather
+            // than risking a stale cached answer (flag lives under the
+            // `querier.` prefix on `queryrangebase.Config.CacheResults`,
+            // verified against the pinned v3.5.3 source).
+            "-querier.cache-results=false",
+            // L4's near-miss completeness plateau (runs #4/#6/#7 all
+            // converged around 93-96% of expected rows, independent of
+            // poll deadline — ruling out a slow-ingest race) is Loki's
+            // default `-validation.max-entries-limit` (5000): the
+            // `count_over_time(... | regexp ...)` aggregation still has
+            // to scan every raw kafka log line in-window before the
+            // line filter narrows it down, and kafka's overall volume in
+            // some query-frontend splits exceeds 5000 lines, silently
+            // truncating the scan before it reaches every matching line.
+            // Confirmed by pulling the frozen otel-demo-v8 corpus and
+            // checking every line matching the L4 needle against the
+            // capture regex directly: all match — the shortfall isn't a
+            // regex/content mismatch, it's lines never being scanned.
+            // Raised well past the corpus's noisiest single template's
+            // volume (~971K rows) — in Loki's favour, cost is memory,
+            // not correctness.
+            "-validation.max-entries-limit=2000000",
         ])
         .await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;
@@ -3179,10 +3851,25 @@ fn rfc0031_indicative_comparative_run() {
             };
             measured.push(result);
         }
-        measured
+        // L4, same container + corpus replay as the pairs above (one
+        // Loki instance for the whole run) — but measured on its own
+        // matrix query, not folded into the `for spec in &specs` loop.
+        let l4 = match (&frequency, &l4_spec) {
+            (Some(pair), Some(spec)) => {
+                let bucket_width_ns = bucket_width_seconds(&pair.bucket_width)
+                    .checked_mul(1_000_000_000)
+                    .expect("bucket width fits u64 nanoseconds");
+                Some(
+                    loki_measure_frequency_pair(&http, &base, &container, spec, bucket_width_ns)
+                        .await,
+                )
+            }
+            _ => None,
+        };
+        (measured, l4)
     });
 
-    let (ok_specs, ok_ourios, ok_loki, failures) = split_measurements(&specs, &ourios, loki);
+    let (ok_specs, ok_ourios, ok_loki, mut failures) = split_measurements(&specs, &ourios, loki);
 
     // Equivalence gates every successful measurement (RFC0031.1).
     for ((spec, ours), (loki_lines, _, _, _)) in ok_specs.iter().zip(&ok_ourios).zip(&ok_loki) {
@@ -3201,6 +3888,42 @@ fn rfc0031_indicative_comparative_run() {
         &ok_ourios,
         &ok_loki,
     );
+
+    // L4 (RFC 0031 §3.4/§3.5) is purely additive to the pair list above,
+    // measured and reported right after it — BEFORE the gate/failure
+    // assertions below, not after: an L1–L3/L6 measurement failure (a
+    // flake, e.g. the documented Loki low-volume-chunk race) must not
+    // prevent L4 from ever being attempted or reported. A failed L4
+    // measurement joins the SAME `failures` list those classes use, so
+    // it still fails the run — just without silently starving L4 of a
+    // chance to run at all. A missing candidate (the picker found
+    // nothing eligible) is ALSO pushed into `failures` — L4 is a
+    // must-win class (RFC 0031 §3.4), so a corpus that never produces a
+    // viable candidate must fail the dispatch, not silently pass with
+    // zero L4 evidence (the eprintln above is a diagnostic breadcrumb,
+    // not a substitute for actually failing the gate).
+    match (&l4_spec, l4_loki) {
+        (Some(spec), Some(result)) => {
+            run_l4_pair(bucket.path(), &tenant, spec, result, &mut failures);
+        }
+        (None, _) => failures.push(
+            "L4: no viable frequency pair — either no template/param slot cleared \
+             pick_frequency_pair's bounds, or the picked candidate's capture regex \
+             contained a backtick l4_pair_spec can't embed in LogQL (see the L4 PAIR \
+             MISSING diagnostic above for which) — L4 is a must-win class and cannot be \
+             silently skipped"
+                .to_string(),
+        ),
+        (Some(spec), None) => unreachable!(
+            "l4_spec.is_some() implies l4_loki.is_some(): the async block's own match \
+             (`(Some(pair), Some(spec)) => measure`) only skips measuring when EITHER is \
+             None, and l4_spec.is_some() already implies frequency.is_some() (it's derived \
+             via frequency.as_ref().and_then(l4_pair_spec)) — [{}] has a spec but no Loki \
+             measurement (harness bug)",
+            spec.label,
+        ),
+    }
+
     // The frozen gates run AFTER the report so a failed gate cannot
     // destroy the run's evidence (the run #11 salvage lesson).
     let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
@@ -3213,7 +3936,8 @@ fn rfc0031_indicative_comparative_run() {
     );
     assert!(
         failures.is_empty(),
-        "{} pair(s) failed to measure (report above covers the rest): {failures:?}",
+        "{} pair(s) failed to measure (report above covers the rest, L4 included): \
+         {failures:?}",
         failures.len(),
     );
 }
@@ -3306,6 +4030,112 @@ fn print_pair_bytes_gates(
             );
         }
     }
+}
+
+/// The L4 pair's report block — the aggregation counterpart of
+/// [`print_indicative_report`]'s per-pair section. An aggregation renders
+/// no lines and acquires no template map (RFC 0002 §6.5: the aggregate
+/// path's `materialize_bytes_read`/`registry_bytes_read` are structurally
+/// zero, see [`ourios_bench::OuriosAggregateAnswer`]), so there is no
+/// count-scan/materialize/registry breakdown to print, and this slice
+/// does not wire an L4 latency channel (§7 DEFERRED already covers the
+/// bytes verdict; latency is corroborating-only everywhere else too, so
+/// this is a scope boundary, not a gap). Reuses [`print_pair_bytes_gates`]
+/// for the shared bytes-channel labeling.
+fn print_l4_report(
+    spec: &PairSpec,
+    ourios_bytes: u64,
+    loki_fetched: &LokiFetchedBytes,
+    loki_processed: u64,
+) {
+    let loki_storage = loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes;
+    println!("--- pair [{}] rows={} ---", spec.label, spec.expected_rows);
+    println!("dsl: {}", spec.dsl);
+    println!("logql: {}", spec.logql);
+    println!("ourios bytes_read (grouped-count scan, compressed, fetched) = {ourios_bytes}");
+    println!(
+        "loki   storage-side bytes (conservative)  = {loki_storage} \
+         (compressed={} + head_chunk={})",
+        loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
+    );
+    println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
+    print_pair_bytes_gates(spec, ourios_bytes, loki_storage, loki_processed);
+}
+
+/// Measure, equivalence-check, and report the L4 pair — the aggregation
+/// counterpart of the line-returning pairs' report loop, kept separate
+/// (see `rfc0031_indicative_comparative_run`'s call-site comment) rather
+/// than folded into `OuriosMeasured`/`Measured`, which are built around
+/// `LineKey` multisets. `l4_loki` is the Loki-side matrix measurement
+/// already gathered inside the same container session the other pairs
+/// share (the dispatch run's async block).
+///
+/// Called right after L1–L3/L6's evidence has PRINTED, but — unlike
+/// those classes — BEFORE their frozen §7 gates are asserted (the call
+/// site's own comment has the full reasoning): printing first means an
+/// earlier pair's failure can never destroy already-printed evidence,
+/// and running L4 before the frozen-gate assertions means an L4
+/// failure can't prevent those gates from at least having their
+/// evidence printed, even though — because this function can panic —
+/// it does mean the frozen gates might not get a chance to formally
+/// assert in the same run. A Loki-side MEASUREMENT failure
+/// (timeout/flake — the SAME failure mode `split_measurements` salvages
+/// for L1–L3/L6) is pushed onto `failures` and the pair is skipped,
+/// exactly like a flaky L1–L3/L6 pair never reaching `ok_specs`. A
+/// genuine equivalence MISMATCH (both sides measured, but disagree
+/// beyond `L4_COMPLETENESS_MARGIN`) still hard-panics immediately —
+/// RFC0031.1 equivalence is never optional, matching the L1–L3/L6
+/// `compare_lines` assertion this mirrors — the failure modes are
+/// deliberately not symmetric: a flake is salvageable, a mismatch is
+/// not. `M_L4` itself stays §7-DEFERRED — [`print_l4_report`] prints
+/// both bytes channels' ratio with no verdict, exactly like the
+/// fixture-level proof (`rfc0031_5_l4_frequency_aggregation_bytes`).
+fn run_l4_pair(
+    bucket_root: &std::path::Path,
+    tenant: &TenantId,
+    spec: &PairSpec,
+    l4_loki: Result<L4Measured, String>,
+    failures: &mut Vec<String>,
+) {
+    let (loki_groups, loki_processed, loki_fetched) = match l4_loki {
+        Ok(measured) => measured,
+        Err(detail) => {
+            failures.push(format!(
+                "L4 pair [{}] failed to measure: {detail}",
+                spec.label
+            ));
+            return;
+        }
+    };
+    let ourios_answer =
+        ourios_aggregate_answer(bucket_root, tenant, &spec.dsl, spec.now, spec.window)
+            .expect("l4 ourios aggregate answer");
+    // RFC 0031 §7's completeness-margin decision (2026-07-17): exact
+    // per-cell equality (`compare_aggregations`) is what the RFC0031.5
+    // fixture-level test still holds a synthetic Loki answer to, but a
+    // real dispatch's real Loki never reaches it — see
+    // `L4_COMPLETENESS_MARGIN`'s documentation for the full evidence
+    // trail. A phantom cell (one absent from Ourios's own answer) or
+    // Loki's total exceeding Ourios's total still hard-fails here.
+    let outcome = compare_aggregations_within_margin(
+        &ourios_answer.groups,
+        &loki_groups,
+        L4_COMPLETENESS_MARGIN,
+        8,
+    );
+    assert!(
+        outcome.is_equal(),
+        "RFC0031.5 — the two systems' grouped-count maps must be equivalent within the \
+         {:.0}% completeness margin on [{}]: {outcome:?}",
+        L4_COMPLETENESS_MARGIN * 100.0,
+        spec.label,
+    );
+    print_l4_report(
+        spec,
+        ourios_answer.bytes_read,
+        &loki_fetched,
+        loki_processed,
+    );
 }
 
 /// The indicative run's report block, one section per pair, labeled per
@@ -4290,16 +5120,24 @@ fn param_capture_regex_anchors_on_the_nearest_fixed_neighbours() {
 
 #[test]
 fn pick_frequency_pair_finds_a_moderate_cardinality_group() {
-    // Two ids ("10"/"11") of the peer template, spread over four
-    // one-second buckets — cardinality 2 (within 2..=50) and 6 total
-    // rows (above the L4_MIN_ROWS floor).
+    // Two ids ("10"/"11") of the peer template, spread over five
+    // 12-minute buckets — cardinality 2 (within 2..=50), 6 total rows
+    // (above the L4_MIN_ROWS floor), and 1000x the original sub-3s
+    // timestamps (~580s average spacing over the 100s-3000s span) so
+    // this candidate also clears L4_MIN_AVG_INTERVAL_SECONDS: a tight
+    // synthetic timeline is convenient for a unit test but is exactly
+    // the bursty shape a short average inter-arrival interval rejects
+    // — a lower-frequency candidate is what the RFC 0031 L4 workstream
+    // (runs #6-#12) found measures more completely against Loki, though
+    // the exact mechanism is uncharacterized (NOT ingest-side dedup,
+    // ruled out directly — see `L4_COMPLETENESS_MARGIN`'s documentation).
     let records: Vec<(u64, &str)> = vec![
-        (100_000_000, "connection established to peer 10"),
-        (500_000_000, "connection established to peer 10"),
-        (900_000_000, "connection established to peer 11"),
-        (2_100_000_000, "connection established to peer 10"),
-        (2_500_000_000, "connection established to peer 11"),
-        (3_000_000_000, "connection established to peer 11"),
+        (100_000_000_000, "connection established to peer 10"),
+        (500_000_000_000, "connection established to peer 10"),
+        (900_000_000_000, "connection established to peer 11"),
+        (2_100_000_000_000, "connection established to peer 10"),
+        (2_500_000_000_000, "connection established to peer 11"),
+        (3_000_000_000_000, "connection established to peer 11"),
     ];
     let corpus = tempfile::TempDir::new().expect("corpus dir");
     std::fs::write(
@@ -4322,7 +5160,7 @@ fn pick_frequency_pair_finds_a_moderate_cardinality_group() {
     let pair = pick_frequency_pair(bucket.path(), &tenant, now, window)
         .expect("the peer template's trailing id validates");
     assert_eq!(pair.param, 0);
-    assert_eq!(pair.bucket_width, "1s");
+    assert_eq!(pair.bucket_width, "12m");
     assert_eq!(pair.needle, "connection established to peer");
     assert_eq!(pair.capture_regex, r"peer\s+(?P<value>\S+)");
     assert_eq!(pair.groups.values().sum::<u64>(), 6);
@@ -4363,6 +5201,194 @@ fn pick_frequency_pair_rejects_below_the_row_floor() {
     assert!(
         pick_frequency_pair(bucket.path(), &tenant, now, window).is_none(),
         "3 rows is below L4_MIN_ROWS — the picker must reject loudly, not fall through",
+    );
+}
+
+// A wide bucket width so `frequency_shape_rejection_enforces_the_row_ceiling`'s
+// ~50K-rows-per-bucket density clears [`L4_MIN_AVG_INTERVAL_SECONDS`]
+// too — that fixture's two-bucket, 1-second-apart `AggKey`s are
+// synthetic (isolating the row ceiling from the other floors), not a
+// real bucket width, so this value is chosen only to keep the
+// frequency floor from interfering.
+const WIDE_BUCKET_SECONDS: u64 = 10_000_000;
+
+#[test]
+fn frequency_shape_rejection_enforces_the_row_ceiling() {
+    // A ~971K-row candidate (a service's dominant, near-catch-all
+    // template) is exactly the run #3 dispatch finding: cardinality 2
+    // and 2 bucket windows both clear their floors, but the total row
+    // count made the Loki poll unable to finish within its shared
+    // 300s deadline. Two groups summing past L4_MAX_ROWS reproduces
+    // the shape without building a 100K+-row real corpus fixture.
+    let groups = HashMap::from([
+        (
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "a".to_string(),
+            },
+            L4_MAX_ROWS / 2 + 1,
+        ),
+        (
+            AggKey {
+                bucket_start_unix_nanos: 1_000_000_000,
+                group_key: "b".to_string(),
+            },
+            L4_MAX_ROWS / 2 + 1,
+        ),
+    ]);
+    let rejection = frequency_shape_rejection(&groups, WIDE_BUCKET_SECONDS)
+        .expect("a candidate past L4_MAX_ROWS must be rejected");
+    assert!(
+        rejection.contains(&L4_MAX_ROWS.to_string()),
+        "the rejection reason must name the ceiling: {rejection}",
+    );
+
+    // Exactly at the ceiling passes (isolating the ceiling from the
+    // other floors: still cardinality 2, still 2 bucket windows).
+    let mut under_ceiling = groups;
+    let cell = under_ceiling
+        .get_mut(&AggKey {
+            bucket_start_unix_nanos: 0,
+            group_key: "a".to_string(),
+        })
+        .expect("cell exists");
+    *cell -= 2;
+    assert_eq!(
+        frequency_shape_rejection(&under_ceiling, WIDE_BUCKET_SECONDS),
+        None,
+        "exactly at the ceiling must pass",
+    );
+}
+
+#[test]
+fn frequency_shape_rejection_enforces_the_average_interval_floor() {
+    // RFC 0031 L4 workstream, runs #6-#12: kafka's `template_id=16`
+    // needle averaged a ~15s inter-arrival cadence and measured a
+    // stable ~93-97% completeness ceiling against Loki, independent of
+    // every query-side fix tried — a plain unaggregated line count came
+    // back just as short, ruling out anything specific to the metric-
+    // aggregation path (NOT proof of ingest-side loss specifically: the
+    // plain count is still a query_range call, so it can't distinguish
+    // "never stored" from "this wide-time-range query came back
+    // incomplete" — see L4_COMPLETENESS_MARGIN's documentation, which
+    // settles on the latter). A later corpus-side check ruled out exact
+    // (timestamp, body) collision entirely; the mechanism correlates
+    // with cadence but is otherwise uncharacterized. 100 rows over a 1h
+    // bucket, 2 distinct values, 2 buckets: cardinality and bucket-
+    // diversity both clear, but ~72s average spacing (below
+    // L4_MIN_AVG_INTERVAL_SECONDS) must still reject.
+    let dense = HashMap::from([
+        (
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "a".to_string(),
+            },
+            50,
+        ),
+        (
+            AggKey {
+                bucket_start_unix_nanos: 3_600_000_000_000,
+                group_key: "b".to_string(),
+            },
+            50,
+        ),
+    ]);
+    let rejection =
+        frequency_shape_rejection(&dense, 3_600).expect("a ~72s average cadence must be rejected");
+    assert!(
+        rejection.contains("average inter-arrival interval"),
+        "the rejection reason must name the interval floor: {rejection}",
+    );
+
+    // Same shape, a fifth of the volume: ~360s average spacing clears
+    // the floor, isolating it from cardinality/ceiling/bucket-diversity.
+    let sparse = HashMap::from([
+        (
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "a".to_string(),
+            },
+            10,
+        ),
+        (
+            AggKey {
+                bucket_start_unix_nanos: 3_600_000_000_000,
+                group_key: "b".to_string(),
+            },
+            10,
+        ),
+    ]);
+    assert_eq!(
+        frequency_shape_rejection(&sparse, 3_600),
+        None,
+        "a ~360s average cadence must pass",
+    );
+}
+
+fn synthetic_frequency_pair(capture_regex: &str) -> FrequencyPair {
+    FrequencyPair {
+        template_id: 1,
+        param: 0,
+        needle: "connection established to peer".to_string(),
+        capture_regex: capture_regex.to_string(),
+        bucket_width: "1s".to_string(),
+        groups: HashMap::from([(
+            AggKey {
+                bucket_start_unix_nanos: 0,
+                group_key: "10".to_string(),
+            },
+            1,
+        )]),
+        bytes_read: 1,
+    }
+}
+
+#[test]
+fn l4_pair_spec_uses_a_backtick_delimited_regexp_argument() {
+    // The bug this guards: a double-quoted LogQL string literal
+    // interprets `capture_regex`'s own Go RE2 escapes (`\s+`) as ITS
+    // OWN escape sequences, and `\s` is not a valid one — Loki's
+    // parser rejects the query with "invalid char escape" before the
+    // pattern reaches the regex engine (the exact failure the first L4
+    // dispatch hit). Backticks pass the pattern through literally.
+    let pair = synthetic_frequency_pair(r"peer\s+(?P<value>\S+)");
+    let margins = ourios_bench::ComparativeMargins::default();
+    let spec = l4_pair_spec(
+        &pair,
+        0,
+        1_000_000_000,
+        2_000_000_000,
+        2_000_000_000,
+        &margins,
+    )
+    .expect("a plain capture_regex carries no backtick");
+    assert!(
+        spec.logql.contains(r"regexp `peer\s+(?P<value>\S+)`"),
+        "the regexp argument must be backtick-delimited: {}",
+        spec.logql,
+    );
+}
+
+#[test]
+fn l4_pair_spec_rejects_a_capture_regex_containing_a_backtick() {
+    // A backtick in the pattern (from an unescaped fixed-token
+    // neighbour — `regex_escape` does not escape backticks, since they
+    // are not an RE2 metacharacter) would prematurely close the
+    // backtick-delimited raw string. Reject loudly rather than emit a
+    // malformed query.
+    let pair = synthetic_frequency_pair("peer`s\\s+(?P<value>\\S+)");
+    let margins = ourios_bench::ComparativeMargins::default();
+    assert!(
+        l4_pair_spec(
+            &pair,
+            0,
+            1_000_000_000,
+            2_000_000_000,
+            2_000_000_000,
+            &margins
+        )
+        .is_none(),
+        "a capture_regex containing a backtick must be rejected, not emitted",
     );
 }
 

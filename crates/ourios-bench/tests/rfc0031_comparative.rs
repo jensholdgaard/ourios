@@ -1554,13 +1554,21 @@ const L4_MIN_AVG_INTERVAL_SECONDS: f64 = 100.0;
 /// invariants that WOULD indicate a genuine Ourios-side or query-side
 /// bug: a `(bucket, group_key)` cell Loki reports that Ourios's own
 /// answer doesn't contain at all (a phantom cell — the signal of a
-/// wrong regex or wrong bucket math), or Loki's TOTAL exceeding
-/// Ourios's total. Run #17 showed a single cell landing 1 row over
-/// Ourios's own count for that cell while the aggregate total stayed a
-/// solid under-count — consistent with step-grid boundary imprecision,
-/// not fabrication — which is why the check is total-level, not
-/// per-cell: only net under-counting, in aggregate, up to this margin,
-/// is tolerated.
+/// wrong regex or wrong bucket math), or any `group_key` where Loki's
+/// total across all its buckets exceeds Ourios's. The check went
+/// through two rounds of PR #536 review hardening after this margin was
+/// first written: run #17 showed a single cell landing 1 row over
+/// Ourios's own count while the SAME key's total across its own buckets
+/// stayed a solid under-count (step-grid boundary imprecision, not
+/// fabrication), which a naive per-cell check flagged too strictly —
+/// fixed to check per-`group_key`, not per-cell or a single grand
+/// total (a pure grand-total check would let an overcount on one key
+/// silently compensate for another key's loss). Run #19 then found a
+/// cardinality-1 key that legitimately lost its only row — a pure
+/// percentage margin can't express that at `n = 1` — fixed by
+/// converting the per-key tolerance to an absolute row count, floored
+/// at 1 only for `n = 1`. See [`compare_aggregations_within_margin`]'s
+/// own documentation for the full, current design.
 const L4_COMPLETENESS_MARGIN: f64 = 0.90;
 
 /// Choose a `bucket(width)` for the L4 pair from a query's time span: the
@@ -1813,6 +1821,23 @@ fn l4_pair_spec(
     // `start` down and `end` up to the nearest bucket boundary costs
     // nothing (no data exists outside `[min, max]` to inflate the
     // count) and guarantees full coverage.
+    //
+    // Reviewed concern: doesn't the step-grid's first evaluated instant
+    // (`t = start`) waste a step on `parse_loki_matrix`'s `bucket_start =
+    // t - width` decoding, losing the first real bucket? No — at
+    // `t = start`, `count_over_time`'s lookback window `(start - width,
+    // start]` covers only time strictly before `start`, where no corpus
+    // data exists by construction (that's the whole point of the
+    // bucket-aligned `start`). That instant decodes to an empty,
+    // zero-count bucket that's simply never present in Loki's response
+    // (Prometheus range-vector queries omit empty series/samples), so
+    // it's silently and correctly dropped. The first REAL bucket,
+    // `[start, start + width)`, is covered by the *next* evaluated
+    // instant, `t = start + width`, whose window `(start, start +
+    // width]` decodes to `bucket_start = start` — exactly right.
+    // Every subsequent instant follows the same pattern, so all `N` real
+    // buckets in `[start, end)` are covered by the `N` evaluated
+    // instants after the wasted first one, not lost to it.
     let bucket_width_ns = bucket_width_seconds(&pair.bucket_width)
         .checked_mul(1_000_000_000)
         .expect("bucket width fits u64 nanoseconds");
@@ -2904,15 +2929,21 @@ async fn loki_measure_frequency_pair(
             }
             dump_loki_container_warnings(container, spec).await;
             dump_loki_discard_metrics(http, base, spec).await;
-            // Decisive ingest-vs-query split: a PLAIN line-filter count
-            // (no `count_over_time`, no `| regexp`) over the same
-            // needle + window tells us whether the shortfall is Loki
-            // never having stored the missing lines at all, or an
-            // artifact specific to the metric-aggregation path. Every
-            // prior fix (cache, entries-limit, bucket alignment) has
-            // moved the number without closing the gap — six straight
-            // dispatches at a stable ~93-97%, so guessing another
-            // query-side knob isn't warranted without this evidence.
+            // Decisive metric-vs-plain-query split — NOT ingest-vs-query:
+            // this plain line-filter count (no `count_over_time`, no
+            // `| regexp`) still goes through `query_range`, so a
+            // shortfall here doesn't prove Loki never STORED the missing
+            // lines — that would require checking the ingester/store
+            // directly, which this harness doesn't do. What it DOES
+            // prove: whether the shortfall is specific to the metric-
+            // aggregation machinery, or affects a plain streams query
+            // too (in which case it's the same wide-time-range query
+            // incompleteness RFC 0031 §7 ultimately characterizes, not
+            // an artifact of `count_over_time`/`regexp`). Every prior
+            // fix (cache, entries-limit, bucket alignment) moved the
+            // number without closing the gap — six straight dispatches
+            // at a stable ~93-97%, so guessing another query-side knob
+            // isn't warranted without this evidence.
             if let Some(needle) = l4_needle_from_logql(&spec.logql) {
                 match tokio::time::timeout(
                     Duration::from_secs(60),
@@ -2929,8 +2960,9 @@ async fn loki_measure_frequency_pair(
                 {
                     Ok(count) => eprintln!(
                         "plain line-filter count for [{}]: {count} of {} expected \
-                         (bypasses count_over_time/regexp entirely — a \
-                         shortfall here means Loki never stored those lines)",
+                         (bypasses count_over_time/regexp entirely — a shortfall here means \
+                         the loss isn't specific to the metric-aggregation path; it's still \
+                         a query_range call, so this doesn't prove ingest-side loss)",
                         spec.label, spec.expected_rows,
                     ),
                     Err(_) => eprintln!(
@@ -3563,8 +3595,9 @@ fn rfc0031_indicative_comparative_run() {
         eprintln!(
             "L4 PAIR SKIPPED: no template/param slot in the corpus cleared \
              pick_frequency_pair's bounds (moderate cardinality {L4_CARDINALITY:?}, \
-             >= {L4_MIN_ROWS} rows, a validated needle + capture regex, no backtick \
-             in the capture regex)"
+             {L4_MIN_ROWS}..={L4_MAX_ROWS} rows, >= {L4_MIN_AVG_INTERVAL_SECONDS}s average \
+             inter-arrival interval, a validated needle + capture regex, no backtick in the \
+             capture regex)"
         );
     }
     let picks = Picks {
@@ -3942,25 +3975,28 @@ fn print_l4_report(
 /// than folded into `OuriosMeasured`/`Measured`, which are built around
 /// `LineKey` multisets. `l4_loki` is the Loki-side matrix measurement
 /// already gathered inside the same container session the other pairs
-/// share (the dispatch run's async block). Called LAST, after the
-/// L1–L3/L6 evidence has printed and their frozen gates have asserted,
-/// so an L4-only failure cannot destroy that evidence (the same run #11
-/// salvage lesson `loki_measure_pair`'s error-return, rather than panic,
-/// already follows). Equivalence is never optional (RFC0031.1 applies to
-/// every class, must-win or not); `M_L4` itself stays §7-DEFERRED —
-/// [`print_l4_report`] prints both bytes channels' ratio with no verdict,
-/// exactly like the fixture-level proof
-/// (`rfc0031_5_l4_frequency_aggregation_bytes`).
-/// Measure, equivalence-check, and report the L4 pair. A Loki-side
-/// measurement failure (timeout/flake — the SAME failure mode
-/// [`split_measurements`] salvages for L1–L3/L6) is pushed onto
-/// `failures` and the pair is skipped, exactly like a flaky L1–L3/L6
-/// pair never reaching `ok_specs`. A genuine equivalence MISMATCH
-/// (both sides measured, but disagree) still hard-panics immediately
-/// — RFC0031.1 equivalence is never optional, matching the L1–L3/L6
+/// share (the dispatch run's async block).
+///
+/// Called right after L1–L3/L6's evidence has PRINTED, but — unlike
+/// those classes — BEFORE their frozen §7 gates are asserted (the call
+/// site's own comment has the full reasoning): printing first means an
+/// earlier pair's failure can never destroy already-printed evidence,
+/// and running L4 before the frozen-gate assertions means an L4
+/// failure can't prevent those gates from at least having their
+/// evidence printed, even though — because this function can panic —
+/// it does mean the frozen gates might not get a chance to formally
+/// assert in the same run. A Loki-side MEASUREMENT failure
+/// (timeout/flake — the SAME failure mode `split_measurements` salvages
+/// for L1–L3/L6) is pushed onto `failures` and the pair is skipped,
+/// exactly like a flaky L1–L3/L6 pair never reaching `ok_specs`. A
+/// genuine equivalence MISMATCH (both sides measured, but disagree
+/// beyond `L4_COMPLETENESS_MARGIN`) still hard-panics immediately —
+/// RFC0031.1 equivalence is never optional, matching the L1–L3/L6
 /// `compare_lines` assertion this mirrors — the failure modes are
 /// deliberately not symmetric: a flake is salvageable, a mismatch is
-/// not.
+/// not. `M_L4` itself stays §7-DEFERRED — [`print_l4_report`] prints
+/// both bytes channels' ratio with no verdict, exactly like the
+/// fixture-level proof (`rfc0031_5_l4_frequency_aggregation_bytes`).
 fn run_l4_pair(
     bucket_root: &std::path::Path,
     tenant: &TenantId,
@@ -5133,15 +5169,18 @@ fn frequency_shape_rejection_enforces_the_average_interval_floor() {
     // RFC 0031 L4 workstream, runs #6-#12: kafka's `template_id=16`
     // needle averaged a ~15s inter-arrival cadence and measured a
     // stable ~93-97% completeness ceiling against Loki, independent of
-    // every query-side fix tried — the shortfall was proven ingest-side
-    // (a plain unaggregated line count came back just as short), but a
-    // later corpus-side check ruled out exact (timestamp, body)
-    // collision entirely (see L4_COMPLETENESS_MARGIN's documentation);
-    // the mechanism correlates with cadence but is otherwise
-    // uncharacterized. 100 rows over a 1h bucket, 2 distinct values, 2
-    // buckets: cardinality and bucket-diversity both clear, but ~72s
-    // average spacing (below L4_MIN_AVG_INTERVAL_SECONDS) must still
-    // reject.
+    // every query-side fix tried — a plain unaggregated line count came
+    // back just as short, ruling out anything specific to the metric-
+    // aggregation path (NOT proof of ingest-side loss specifically: the
+    // plain count is still a query_range call, so it can't distinguish
+    // "never stored" from "this wide-time-range query came back
+    // incomplete" — see L4_COMPLETENESS_MARGIN's documentation, which
+    // settles on the latter). A later corpus-side check ruled out exact
+    // (timestamp, body) collision entirely; the mechanism correlates
+    // with cadence but is otherwise uncharacterized. 100 rows over a 1h
+    // bucket, 2 distinct values, 2 buckets: cardinality and bucket-
+    // diversity both clear, but ~72s average spacing (below
+    // L4_MIN_AVG_INTERVAL_SECONDS) must still reject.
     let dense = HashMap::from([
         (
             AggKey {

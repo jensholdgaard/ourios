@@ -527,6 +527,12 @@ record. It references RFC 0006's harness rather than editing it.
 > - **And** the class disposition is `must-win` with the same
 >   pillar-level escalation as RFC0031.2 on failure — this is the query
 >   the template + typed-params pillar exists to serve (§2.3)
+>
+> **Not currently asserted:** `M_L4` is deferred (§7) — no frozen value
+> exists yet, so the harness measures and reports `ourios.bytes_read /
+> loki.bytes_read` for L4 without gating a run's pass/fail on it. This
+> scenario states the target contract L4 must eventually clear to reach
+> `must-win` in practice, not a predicate the harness currently enforces.
 
 > **Scenario RFC0031.6 — L5 substring needle is measured and published, loss permitted**
 > - **Given** an L5 query for a literal not captured by a template or a
@@ -729,11 +735,16 @@ not block `validated` in the "we didn't finish" sense — it is a
   dispatches running). On the frozen `otel-demo-v8` corpus this lands
   on `template_id=60` ("Periodic task \<type\> generated"), `param(0)`,
   `bucket(12h)`. The LogQL equivalent is ``sum by (value)
-  (count_over_time({service_name=~".+"} |= "\<needle\>" | regexp
-  \`\<pattern\>\` [\<width\>]))``, with `start`/`end` epoch-aligned to
-  `bucket_width` — Loki's `query_range` step-grid starts exactly at
-  `start`, but Ourios's own `bucket(width)` semantics are epoch-aligned
-  (`floor(ts/width)*width`); snapping the query window to a bucket
+  (count_over_time({service_name=~".+"} |= "<needle>" | regexp
+  `<pattern>` [<width>]))``, with `start`/`end` epoch-aligned to
+  `bucket_width` — Loki's `query_range` step-grid evaluates the range
+  vector at each instant `t` in `[start, end)`, covering `(t - width,
+  t]`; the instant at exactly `start` therefore decodes to an empty
+  phantom bucket (nothing in the corpus precedes `start` by
+  construction) that gets silently dropped, while every real bucket is
+  still fully covered by the remaining evaluated instants — Ourios's own
+  `bucket(width)` semantics are epoch-aligned (`floor(ts/width)*width`)
+  and line up with the same grid. Snapping the query window to a bucket
   boundary (run #11) closed part of the gap this entry's margin covers
   the rest of.
 
@@ -841,6 +852,27 @@ not block `validated` in the "we didn't finish" sense — it is a
     ends
     (`margin_comparison_tolerates_losing_a_cardinality_one_keys_only_row`,
     `margin_comparison_still_rejects_a_large_key_losing_more_than_its_tolerance`).
+  - **PR #536 code review, round 3** (same day, after run #19): the
+    `ceil(...).max(1)` formula itself was miscalibrated — Copilot found
+    (independently, twice) that it loosens the margin for every
+    small-but-not-1 total, not just `n = 1` (`o = 2` at a 90% margin:
+    `ceil(2 * 0.1) = 1` tolerance permits losing 1 of 2, i.e. 50%
+    completeness, nowhere near 90%). Switched the non-`n=1` case to
+    `floor`, which cannot round up past what the margin allows — but
+    local verification (`cargo test -p ourios-bench --lib`) immediately
+    caught a *different*, self-introduced bug in that fix:
+    `floor(40.0 * (1.0 - 0.9))` truncates to `3`, not the exact `4`,
+    because `1.0 - 0.9` is not exactly representable in `f64`
+    (`0.09999999999999998`) — silently tightening the tolerance at any
+    boundary case where completeness lands exactly on the margin
+    (`margin_comparison_tolerates_undercount_within_margin`'s svcB case,
+    36/40 = exactly 90%, started failing). Replaced the
+    subtract-then-round tolerance entirely with a direct,
+    epsilon-guarded comparison — `loki_key_total >= ourios_key_total *
+    margin` — which avoids that class of rounding error by construction
+    (multiplication accumulates far less relative error here than
+    subtracting two close floats and rounding the remainder). All prior
+    regression tests plus this boundary case now pass together.
 
   `M_L4` stays **deferred** — this decision unblocks a measurement, it
   does not freeze the bytes-read margin.

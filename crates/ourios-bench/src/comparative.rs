@@ -202,6 +202,20 @@ const MARGIN_EPSILON: f64 = 1e-9;
 /// Cells Loki reports that are absent from Ourios's own answer entirely —
 /// always a hard mismatch for [`compare_aggregations_within_margin`],
 /// never subject to its margin. Sorted for deterministic examples.
+///
+/// Deliberately CELL-level (`(bucket, group_key)`), not key-level, even
+/// though the margin checks aggregate per key: a systematic bucket-decode
+/// error (every cell shifted by one width — exactly the class of bug the
+/// run #11 alignment fix addressed) leaves every per-key total intact, so
+/// this is the only check that can catch it. The cost is a theoretical
+/// false positive: a record whose timestamp lands EXACTLY on a bucket
+/// boundary is assigned to adjacent buckets by the two systems'
+/// conventions, and if Ourios has no other row for that key in the
+/// neighbouring bucket, Loki's cell reads as phantom. That requires a
+/// nanosecond-exact boundary hit — never observed across every real
+/// dispatch — and if it ever fires, the mismatch report shows it plainly
+/// (a ±1 cell adjacent to the key's existing cells); revisit with that
+/// evidence rather than pre-weakening the bucket-math guard.
 fn phantom_cells<'a, S1, S2>(
     ourios: &HashMap<AggKey, u64, S1>,
     loki: &'a HashMap<AggKey, u64, S2>,

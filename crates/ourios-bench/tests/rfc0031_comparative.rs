@@ -2628,6 +2628,20 @@ impl PairClass {
             Self::WindowFloor | Self::Diagnostic => GateKind::Floor,
         }
     }
+
+    /// The class's stable name in the results artifact
+    /// ([`comparative_results_json`]) — part of that JSON's schema, so
+    /// renaming a variant must not silently rename the recorded series.
+    fn artifact_name(self) -> &'static str {
+        match self {
+            Self::L1 => "L1",
+            Self::L2 => "L2",
+            Self::L3 => "L3",
+            Self::L4 => "L4",
+            Self::WindowFloor => "window-floor",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
 }
 
 /// One measured query of the indicative run: the equivalent DSL/`LogQL`
@@ -3307,6 +3321,207 @@ fn template_map_acquisition_failure(
 }
 
 #[allow(clippy::type_complexity)] // one-shot plumbing tuple for the runner
+/// The dispatch's machine-readable per-pair record (issue #538 item 3):
+/// each pair's `expected_rows` vs the rows Loki actually returned, plus
+/// both bytes channels — so run-over-run completeness is a queryable
+/// series instead of a log line, and a slide toward
+/// [`L4_COMPLETENESS_MARGIN`] (or an L3-style routing flicker) shows up
+/// as a trend across artifacts rather than as a surprise failure.
+///
+/// Built from the RAW measurement results, before `split_measurements`,
+/// equivalence, or any gate asserts — a failing run records its numbers
+/// too, and failed runs are exactly the points a trend needs. A pair
+/// whose Loki side failed to measure carries its failure string in
+/// place of numbers. `schema` names this shape; additive changes only
+/// (bump the suffix on anything breaking).
+fn comparative_results_json(
+    specs: &[PairSpec],
+    ourios: &[OuriosMeasured],
+    loki: &[Result<Measured, String>],
+    l4_spec: Option<&PairSpec>,
+    l4_loki: Option<&Result<L4Measured, String>>,
+    l4_ourios_bytes: Option<u64>,
+    total_records: u64,
+) -> serde_json::Value {
+    #[allow(clippy::cast_precision_loss)]
+    // Row counts are far below f64's 2^53 exact-integer range.
+    let completeness = |returned: u64, expected: u64| {
+        if expected == 0 {
+            1.0
+        } else {
+            returned as f64 / expected as f64
+        }
+    };
+    let latency_ms = |d: &Option<Duration>| d.map(|d| serde_json::json!(d.as_secs_f64() * 1_000.0));
+    let pairs: Vec<serde_json::Value> = specs
+        .iter()
+        .zip(ourios)
+        .zip(loki)
+        .map(|((spec, ours), result)| match result {
+            Ok((lines, processed, fetched, loki_latency)) => serde_json::json!({
+                "label": spec.label,
+                "class": spec.class.artifact_name(),
+                "expected_rows": spec.expected_rows,
+                "loki_rows": lines.len(),
+                "completeness": completeness(lines.len() as u64, spec.expected_rows),
+                "ourios_bytes_read": ours.answer.bytes_read,
+                "loki_storage_bytes": fetched.compressed_bytes + fetched.head_chunk_bytes,
+                "loki_processed_bytes": processed,
+                "ourios_latency_p50_ms": latency_ms(&ours.latency_p50),
+                "loki_latency_p50_ms": latency_ms(loki_latency),
+            }),
+            Err(detail) => serde_json::json!({
+                "label": spec.label,
+                "class": spec.class.artifact_name(),
+                "expected_rows": spec.expected_rows,
+                "failure": detail,
+            }),
+        })
+        .collect();
+    let l4 = match (l4_spec, l4_loki) {
+        (Some(spec), Some(Ok((groups, processed, fetched)))) => {
+            let returned: u64 = groups.values().sum();
+            serde_json::json!({
+                "label": spec.label,
+                "class": spec.class.artifact_name(),
+                "expected_rows": spec.expected_rows,
+                "loki_rows": returned,
+                "completeness": completeness(returned, spec.expected_rows),
+                "ourios_bytes_read": l4_ourios_bytes,
+                "loki_storage_bytes": fetched.compressed_bytes + fetched.head_chunk_bytes,
+                "loki_processed_bytes": processed,
+            })
+        }
+        (Some(spec), Some(Err(detail))) => serde_json::json!({
+            "label": spec.label,
+            "class": spec.class.artifact_name(),
+            "expected_rows": spec.expected_rows,
+            "failure": detail,
+        }),
+        _ => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "schema": "ourios-comparative-results/v1",
+        "total_records": total_records,
+        "pairs": pairs,
+        "l4": l4,
+    })
+}
+
+#[test]
+fn comparative_results_json_records_every_pair_and_the_failure_shapes() {
+    let spec = |label: &str, class: PairClass, expected: u64| PairSpec {
+        label: label.to_string(),
+        margin: 10,
+        class,
+        dsl: String::new(),
+        logql: String::new(),
+        start: 0,
+        end: 1,
+        expected_rows: expected,
+        now: 1,
+        window: 1,
+    };
+    let ours = OuriosMeasured {
+        answer: ourios_bench::OuriosAnswer {
+            lines: Vec::new(),
+            bytes_read: 1_000,
+            count_scan_bytes: 0,
+            materialize_bytes: 900,
+            registry_bytes: 100,
+        },
+        latency_p50: Some(Duration::from_millis(50)),
+        template_map: String::new(),
+    };
+    let specs = vec![
+        spec("good", PairClass::L1, 4),
+        spec("flaky", PairClass::L3, 9),
+    ];
+    let line = ourios_bench::LineKey {
+        timestamp_unix_nanos: 1,
+        body: b"x".to_vec(),
+    };
+    let loki: Vec<Result<Measured, String>> = vec![
+        Ok((
+            vec![line.clone(), line.clone(), line],
+            2_000_000,
+            LokiFetchedBytes {
+                compressed_bytes: 40_000,
+                head_chunk_bytes: 2_000,
+            },
+            None,
+        )),
+        Err("loki returned 0 of 9 expected rows".to_string()),
+    ];
+    let l4_spec = spec("freq", PairClass::L4, 1_197);
+    let l4_loki: Result<L4Measured, String> = Ok((
+        HashMap::from([
+            (
+                ourios_bench::AggKey {
+                    bucket_start_unix_nanos: 0,
+                    group_key: "a".to_string(),
+                },
+                1_000,
+            ),
+            (
+                ourios_bench::AggKey {
+                    bucket_start_unix_nanos: 1,
+                    group_key: "b".to_string(),
+                },
+                149,
+            ),
+        ]),
+        3_000_000,
+        LokiFetchedBytes {
+            compressed_bytes: 170_000_000,
+            head_chunk_bytes: 0,
+        },
+    ));
+
+    let json = comparative_results_json(
+        &specs,
+        &[ours.clone(), ours],
+        &loki,
+        Some(&l4_spec),
+        Some(&l4_loki),
+        Some(47_995_205),
+        4_900_000,
+    );
+
+    assert_eq!(json["schema"], "ourios-comparative-results/v1");
+    assert_eq!(json["total_records"], 4_900_000);
+    let good = &json["pairs"][0];
+    assert_eq!(good["class"], "L1");
+    assert_eq!(good["loki_rows"], 3);
+    assert!((good["completeness"].as_f64().unwrap() - 0.75).abs() < 1e-12);
+    assert_eq!(good["loki_storage_bytes"], 42_000);
+    assert_eq!(good["ourios_latency_p50_ms"], 50.0);
+    assert!(good["loki_latency_p50_ms"].is_null());
+    let flaky = &json["pairs"][1];
+    assert_eq!(flaky["class"], "L3");
+    assert_eq!(flaky["expected_rows"], 9);
+    assert!(
+        flaky["failure"]
+            .as_str()
+            .unwrap()
+            .contains("0 of 9 expected"),
+        "a failed pair must carry its failure string: {flaky}",
+    );
+    assert!(flaky.get("loki_rows").is_none());
+    let l4 = &json["l4"];
+    assert_eq!(l4["loki_rows"], 1_149);
+    assert!((l4["completeness"].as_f64().unwrap() - 1_149.0 / 1_197.0).abs() < 1e-12);
+    assert_eq!(l4["ourios_bytes_read"], 47_995_205);
+}
+
+#[test]
+fn comparative_results_json_with_no_l4_candidate_records_null_not_absence() {
+    let json = comparative_results_json(&[], &[], &[], None, None, None, 1);
+    assert_eq!(json["schema"], "ourios-comparative-results/v1");
+    assert!(json["l4"].is_null());
+    assert_eq!(json["pairs"].as_array().unwrap().len(), 0);
+}
+
 fn split_measurements(
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
@@ -3868,6 +4083,27 @@ fn rfc0031_indicative_comparative_run() {
         };
         (measured, l4)
     });
+
+    // The machine-readable per-pair record (issue #538 item 3) writes
+    // FIRST — before split/equivalence/gates can panic — so every run,
+    // passing or failing, leaves a queryable completeness artifact.
+    if let Ok(path) = std::env::var("OURIOS_COMPARATIVE_RESULTS") {
+        let results = comparative_results_json(
+            &specs,
+            &ourios,
+            &loki,
+            l4_spec.as_ref(),
+            l4_loki.as_ref(),
+            frequency.as_ref().map(|pair| pair.bytes_read),
+            pair.total_records,
+        );
+        let rendered = serde_json::to_string_pretty(&results).expect("results serialize");
+        match std::fs::write(&path, rendered) {
+            Ok(()) => eprintln!("comparative results artifact written to {path}"),
+            // Diagnostic-only output must never fail the run.
+            Err(e) => eprintln!("(couldn't write the results artifact to {path}: {e})"),
+        }
+    }
 
     let (ok_specs, ok_ourios, ok_loki, mut failures) = split_measurements(&specs, &ourios, loki);
 

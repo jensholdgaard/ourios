@@ -201,11 +201,18 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: >
-          cargo test -p ourios-bench --test rfc0031_comparative --
-          --ignored --exact
-          rfc0031_1_result_set_equivalence
-          rfc0031_backdated_wide_range_interop
+      # Module-qualified names (the #499 split moved these into
+      # `interop`); a bare name here would match NOTHING and still exit
+      # 0 — the trailing grep turns that silent no-op into a hard fail
+      # (pipefail keeps a real test failure fatal through the tee).
+      - run: |
+          set -euo pipefail
+          cargo test -p ourios-bench --test rfc0031_comparative -- \
+            --ignored --exact \
+            interop::rfc0031_1_result_set_equivalence \
+            interop::rfc0031_backdated_wide_range_interop \
+            2>&1 | tee loki-interop.log
+          grep -q "test result: ok. 2 passed" loki-interop.log
 
   book:
     name: mdbook build

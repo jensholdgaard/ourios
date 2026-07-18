@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7fc4369e1a65e7e0292e11603cd21a62741e6b39483f227551b3161a36953b4a # shrinks to ourios = {AggKey { bucket_start_unix_nanos: 0, group_key: "svc0" }: 1}, cut = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc d56c565b436037138b408fbe71242a6373b1edccc4722bc22616bc465c1af7d9 # shrinks to ourios = {AggKey { bucket_start_unix_nanos: 0, group_key: "svc0" }: 1}, margin = 0.0, unknown_key = true
+cc ab301b522ac9eeb57063299b918c4a30965a8730e6432b54cdd2389ad076d6b5 # shrinks to ourios = {AggKey { bucket_start_unix_nanos: 0, group_key: "svc0" }: 1}, margin = 0.55, extra = 380

@@ -1605,12 +1605,12 @@ full five-iteration comparator design trail lives there.
 The measured pair (picker floors `L4_MAX_ROWS = 100_000`,
 `L4_MIN_AVG_INTERVAL_SECONDS = 100` — lower-frequency candidates
 measure more completely; mechanism uncharacterized, NOT dedup):
-`template_id=60` ("Periodic task \<type\> generated"), `param(0)`,
+`template_id=60` (`Periodic task <type> generated`), `param(0)`,
 `bucket(12h)`, 1,197 expected rows, group cardinality 4.
 
 | run (workflow id) | completeness | storage-side (loki/ourios) | processed (loki/ourios) |
 |---|---|---|---|
-| #18-era first clean pass | equivalence held | 3.73× | 87.1× |
+| 29573249312 (2026-07-17, first clean pass) | equivalence held | 3.73× | 87.1× |
 | 29598833238 (2026-07-17) | 1164/1197 = 97.2% | 3.72× | 86.8× |
 | 29608796312 (2026-07-17) | 1141/1197 = 95.3% | — (run failed on the unrelated L3 flicker; L4 itself passed) | — |
 | 29614831613 (2026-07-17) | 1149/1197 = 96.0% | 3.69× | 86.6× |
@@ -1620,8 +1620,10 @@ metric). Four consecutive equivalence-verified measurements in a
 3.69–3.73× / 86.6–87.1× band: the shape mirrors L2 pre-freeze — a
 strong processed-channel win with storage closer to parity. **`M_L4`
 stays §7-deferred** (both channels reported, nothing asserted); the
-proposed freeze shape on #498 is the L2 precedent (processed must-win
-at 10×, storage informational).
+proposed freeze shape on #498 is the L2 precedent — processed-channel
+must-win at 10× **plus a storage-side floor** (L2's is frozen at 1.1×;
+L4's measured 3.69–3.73× storage band would clear a similar floor with
+real headroom).
 
 Follow-on hardening, so the 2 h dispatch confirms rather than
 discovers (#538/#499, closed via #539–#542): a mutation-tested

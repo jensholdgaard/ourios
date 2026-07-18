@@ -42,7 +42,13 @@ on:
         default: '90'
         required: false
       locust_users:
-        description: Concurrent load-generator users (HTTP, browser traffic off — drives corpus volume)
+        description: >-
+          Concurrent load-generator users (HTTP, browser traffic off —
+          drives corpus volume). Era-neutral despite the name: exported
+          as both LOCUST_USERS (demo ≤ 2.2.0, Locust) and
+          LOAD_GENERATOR_VUS (demo main/2.3+, k6) — each stack reads its
+          own and ignores the other. The input keeps its original name
+          so reproduction dispatches of older corpora stay copy-paste.
         default: '40'
         required: false
       failure_flags:
@@ -96,21 +102,17 @@ jobs:
       # writes `logs.jsonl` here, so the corpus lands straight on
       # the runner filesystem.
       OURIOS_CAPTURE_DIR: ${{ github.workspace }}/captured
-      # Concurrent load-generator users. The base compose's
-      # load-generator has a bare `LOCUST_USERS` passthrough, so
-      # setting it here (shell env) overrides the demo .env default
-      # of 5 for every `docker compose` call. With browser traffic
-      # off (compose override) these are cheap HTTP users, so a
-      # higher count scales corpus volume — more records with
-      # varied params per template — without inflating template
-      # count or needing a multi-hour window.
+      # Concurrent load-generator users, exported for BOTH demo eras
+      # from the one input: `LOCUST_USERS` is the ≤ 2.2.0 (Locust)
+      # passthrough, `LOAD_GENERATOR_VUS` the main/2.3+ (k6) one —
+      # each era's compose reads its own knob and passes the other
+      # into a container that ignores it. With browser traffic off
+      # (compose override) these are cheap HTTP users, so a higher
+      # count scales corpus volume — more records with varied params
+      # per template — without inflating template count or needing a
+      # multi-hour window.
       LOCUST_USERS: ${{ inputs.locust_users }}
-      # `COMPOSE_FILE` (colon-separated on Linux) layers our
-      # override onto the demo's base compose for every
-      # `docker compose` call without repeating `-f`. The base
-      # path is relative (resolved from the `demo` working-dir);
-      # the override is absolute so it's project-dir-independent.
-      COMPOSE_FILE: docker-compose.yml:${{ github.workspace }}/.github/otel-demo-capture-compose-override.yml
+      LOAD_GENERATOR_VUS: ${{ inputs.locust_users }}
     steps:
       - name: Checkout ourios (for the collector overlay)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -122,6 +124,29 @@ jobs:
           set -euxo pipefail
           git clone --depth 1 --branch "$DEMO_REF" \
             https://github.com/open-telemetry/opentelemetry-demo demo
+
+      # `COMPOSE_FILE` (colon-separated on Linux) layers our override
+      # onto the demo's base compose for every `docker compose` call
+      # without repeating `-f`. The base file's NAME is era-dependent —
+      # `docker-compose.yml` through demo 2.2.0, `compose.yaml` on
+      # main/2.3+ — so it is detected from the clone rather than
+      # hardcoded (a stale hardcode fails `compose config` loudly, but
+      # only after a runner spin-up). The base path is relative
+      # (resolved from the `demo` working-dir); the override is
+      # absolute so it's project-dir-independent.
+      - name: Resolve the demo's base compose file
+        run: |
+          set -euxo pipefail
+          if [ -f demo/compose.yaml ]; then
+            base="compose.yaml"
+          elif [ -f demo/docker-compose.yml ]; then
+            base="docker-compose.yml"
+          else
+            echo "::error::neither compose.yaml nor docker-compose.yml in the demo clone"
+            exit 1
+          fi
+          echo "COMPOSE_FILE=${base}:${GITHUB_WORKSPACE}/.github/otel-demo-capture-compose-override.yml" \
+            >> "$GITHUB_ENV"
 
       - name: Inject the file/corpus collector overlay
         run: |

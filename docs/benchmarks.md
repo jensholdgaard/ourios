@@ -1579,3 +1579,55 @@ all enforcing on every comparative dispatch; M_L4/F_L7 stay deferred
 until measured. RFC 0033's §5 is fully discharged: the corpus arm
 passed as measured (#21), and passed again as an asserting gate
 (#23) — the status flips red → green with this record.
+
+### 9.17 Results — 2026-07-17→18 (indicative, `ci-runner`) — L4 frequency aggregation measured (PR #536 arc)
+
+The last unmeasured must-win class. The L4 workstream's own dispatch
+sequence (~23 real `comparative-bench` runs across the arc — a
+numbering distinct from §9.16's) fixed three genuine harness bugs
+early (`LogQL` escaping, a control-flow ordering bug, a missing picker
+row ceiling), then spent the balance of the runs on a persistent
+completeness shortfall that no harness-side fix closed: **Loki never
+returned 100% of any L4 candidate's expected rows on this corpus.**
+Every mechanism checkable from the harness side was ruled out
+directly — exact `(timestamp, body)` ingester dedup (corpus analysis
+found zero collisions), push-path drops (`partial_success` asserted
+clean on every push), Loki's own `warn`/`error` logs (silent), and its
+`loki_discarded_samples_total` accounting (zero, of any kind). The
+residual matches open upstream
+[grafana/loki#10658](https://github.com/grafana/loki/issues/10658)
+(wide-time-range queries silently missing a small percentage of lines,
+no maintainer-identified root cause). RFC 0031 §7 records the
+resulting amendment: `L4_COMPLETENESS_MARGIN = 0.90`, checked per
+`group_key` with phantom-cell and per-key-overcount hard-fails — the
+full five-iteration comparator design trail lives there.
+
+The measured pair (picker floors `L4_MAX_ROWS = 100_000`,
+`L4_MIN_AVG_INTERVAL_SECONDS = 100` — lower-frequency candidates
+measure more completely; mechanism uncharacterized, NOT dedup):
+`template_id=60` ("Periodic task \<type\> generated"), `param(0)`,
+`bucket(12h)`, 1,197 expected rows, group cardinality 4.
+
+| run (workflow id) | completeness | storage-side (loki/ourios) | processed (loki/ourios) |
+|---|---|---|---|
+| #18-era first clean pass | equivalence held | 3.73× | 87.1× |
+| 29598833238 (2026-07-17) | 1164/1197 = 97.2% | 3.72× | 86.8× |
+| 29608796312 (2026-07-17) | 1141/1197 = 95.3% | — (run failed on the unrelated L3 flicker; L4 itself passed) | — |
+| 29614831613 (2026-07-17) | 1149/1197 = 96.0% | 3.69× | 86.6× |
+
+Ourios's side is constant at 47,995,205 B total (the honest §3.6
+metric). Four consecutive equivalence-verified measurements in a
+3.69–3.73× / 86.6–87.1× band: the shape mirrors L2 pre-freeze — a
+strong processed-channel win with storage closer to parity. **`M_L4`
+stays §7-deferred** (both channels reported, nothing asserted); the
+proposed freeze shape on #498 is the L2 precedent (processed must-win
+at 10×, storage informational).
+
+Follow-on hardening, so the 2 h dispatch confirms rather than
+discovers (#538/#499, closed via #539–#542): a mutation-tested
+property suite over the margin comparator, per-pair completeness
+recorded as a machine-readable artifact on every dispatch, a backdated
+wide-time-range arm in the per-PR `loki-interop` job running the
+dispatch's exact Loki flags (one shared constant — config drift
+between the 1-minute test and the 2 h run is now unrepresentable), and
+a dispatch class filter for targeted re-runs.

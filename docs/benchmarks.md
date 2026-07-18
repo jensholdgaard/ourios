@@ -1654,9 +1654,12 @@ true }`:
 | L2 storage floor (11/10) | 1.41× |
 | L1 storage (PRIMARY, must-win 10) | 102.10× |
 | L3 storage (PRIMARY, must-win 10) | 23.36× |
+| L6 latency floors (factor 3, both window pairs) | 0.52× / 3.94× |
 
 L4 completeness this run: 1151/1197 = 96.2% — inside the §7 margin
-and the §9.17 band (95.3–97.5%). With this run the dispatch asserts
+and the §9.17 band (95.3–97.5%). (Latency-floor advantages are
+oriented loki_p50/ourios_p50 — above 1 means Ourios faster; the floor
+passes at ≥ 1/3.) With this run the dispatch asserts
 every §7 value except `F_L7` (deferred until L7 is first measured):
 an L4 band degradation below either frozen value now fails the run
 instead of printing a smaller ratio.

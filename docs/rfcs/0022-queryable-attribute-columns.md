@@ -23,7 +23,7 @@ superseded-by: —
 > measured tree). §9.9 named the authoritative rerun as the outstanding
 > `green → validated` step; §9.11 completed it the next day — this note
 > records the flip the evidence already supported. Maintainer flip to
-> `accepted` per `docs/rfcs/README.md` §"maturity stages" remains open.
+> `accepted` per `docs/rfcs/README.md` §Lifecycle remains open.
 
 ## 1. Summary
 

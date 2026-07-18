@@ -16,6 +16,14 @@ on:
         required: false
         default: corpus/otel-demo-v8
         type: string
+      classes:
+        description: >-
+          Comma-separated taxonomy classes to measure (L1, L2, L3, L4,
+          window-floor, diagnostic) — a targeted re-run skips the other
+          classes' measurement polls. "all" measures everything.
+        required: false
+        default: all
+        type: string
 
 permissions:
   contents: read
@@ -67,6 +75,10 @@ jobs:
           # (issue #538 item 3): written before the harness's
           # equivalence/gate asserts, so failing runs record too.
           OURIOS_COMPARATIVE_RESULTS: ${{ github.workspace }}/comparative-results.json
+          # Class filter (issue #538 item 4): `env:` not `${{ }}`
+          # splicing — dispatcher-controlled input (template-injection
+          # rule); the harness validates the names and panics on typos.
+          OURIOS_COMPARATIVE_CLASSES: ${{ inputs.classes }}
         # Release mode: the run mines ~3 GB through the real miner +
         # Parquet writer (bench.yml pins release for the same reason).
         # `tee` keeps the full log while the summary step greps the

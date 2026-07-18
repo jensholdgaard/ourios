@@ -2428,7 +2428,7 @@ mod tests {
         /// those mutations — verified by mutation-testing this suite.
         fn agg_map() -> impl Strategy<Value = HashMap<AggKey, u64>> {
             let count = prop_oneof![1..4u64, 1..500u64];
-            proptest::collection::btree_map((0..6u64, 0..6u8), count, 1..12).prop_map(|cells| {
+            proptest::collection::btree_map((0..6u64, 0..6u8), count, 1..=12).prop_map(|cells| {
                 cells
                     .into_iter()
                     .map(|((bucket, key), count)| {
@@ -2440,22 +2440,36 @@ mod tests {
 
         /// The per-key minimum Loki total the margin admits: `0` for an
         /// exempt cardinality-≤1 key (fractional margin only), else the
-        /// smallest integer at or above `o * margin`. `ceil` may round
-        /// an inexact product up past the true bound — that only makes
-        /// the constructed answer MORE complete, never less, so the
-        /// acceptance property stays sound.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        // The product is a bounded count scaled by a fraction in [0, 1]; ceil never
-        // rounds negative and never exceeds `o`, which is already a valid u64.
+        /// smallest integer clearing the comparator's OWN epsilon
+        /// predicate (`l + MARGIN_EPSILON >= o * margin`, in the same
+        /// f64 arithmetic). A plain `ceil` of the product is NOT that
+        /// boundary: `380.0 * 0.55` computes to `209.00000000000003`
+        /// in f64, whose ceil claims a minimum of 210 — but the true
+        /// bound is exactly 209, which the comparator (correctly, via
+        /// its epsilon) accepts, so a rejection property built on the
+        /// ceil would construct 209 expecting rejection and spuriously
+        /// fail. Walking down from the ceil with the comparator's
+        /// predicate makes `min` admitted and `min - 1` rejected by
+        /// construction — the exact boundary both properties need.
         fn min_admitted_total(o: u64, margin: f64) -> u64 {
+            if o <= 1 && margin < 1.0 {
+                return 0;
+            }
             #[allow(clippy::cast_precision_loss)]
             // Counts are far below f64's 2^53 exact-integer range.
-            let bound = ((o as f64) * margin).ceil() as u64;
-            if o <= 1 && margin < 1.0 {
-                0
-            } else {
-                bound.min(o)
+            let clears = |l: u64| (l as f64) + MARGIN_EPSILON >= (o as f64) * margin;
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            // The product is a bounded count scaled by a fraction in [0, 1]; ceil never
+            // rounds negative and never exceeds `o`, which is already a valid u64.
+            let mut min = (((o as f64) * margin).ceil() as u64).min(o);
+            while min > 0 && clears(min - 1) {
+                min -= 1;
             }
+            min
         }
 
         /// Reduce `map` so each `group_key`'s total drops to exactly
@@ -2520,27 +2534,28 @@ mod tests {
 
             /// One row past the admitted minimum on any single key with
             /// a real (n ≥ 2) total rejects, no matter how complete
-            /// every other key is.
+            /// every other key is — every OTHER key stays at its full
+            /// total, so a grand-total-only comparator would often
+            /// accept this shape (the other keys' surplus absorbing the
+            /// victim's shortfall); only a genuinely per-key check
+            /// rejects it every time.
             #[test]
             fn one_row_below_the_margin_on_one_key_rejects(
                 ourios in agg_map(),
                 margin in fractional_margin_grid(),
                 extra in 4..500u64,
             ) {
-                // Force at least one key with a total big enough that
-                // `min - 1` is a genuine shortfall below the margin.
+                // A dedicated victim key ("victim", distinct from the
+                // generator's svc* pool) whose total is big enough that
+                // `min - 1` is a genuine shortfall below the margin
+                // (o >= 4 and margin >= 0.5 make ceil(o * margin) >= 2).
                 let mut ourios = ourios;
                 let victim = agg(0, "victim");
                 ourios.insert(victim.clone(), extra);
-                let loki = undercount_per_key(&ourios, |o| {
-                    let min = min_admitted_total(o, margin);
-                    if min == 0 { 0 } else { min - 1 }
-                });
-                // Only assert when the victim's reduction is a real
-                // shortfall (min > 0 always holds here: o >= 4 and
-                // margin >= 0.5 make ceil(o * margin) >= 2).
-                let victim_total = aggregate_by_group_key(&ourios)["victim"];
-                prop_assert!(min_admitted_total(victim_total, margin) > 0);
+                let min = min_admitted_total(extra, margin);
+                prop_assert!(min > 0);
+                let mut loki = ourios.clone();
+                loki.insert(victim, min - 1);
                 prop_assert!(
                     !compare_aggregations_within_margin(&ourios, &loki, margin, 8).is_equal()
                 );
@@ -2608,23 +2623,25 @@ mod tests {
                 prop_assert_eq!(strict.is_equal(), exact.is_equal());
             }
 
-            /// Mismatch examples never exceed the requested cap.
+            /// Mismatch examples never exceed the requested cap. An
+            /// empty Loki answer at `margin = 1.0` guarantees the
+            /// shortfall path fires (the n ≤ 1 exemption doesn't apply
+            /// at exact, and the generator never emits an empty map),
+            /// so this can't pass vacuously via an `Equal` outcome.
             #[test]
             fn mismatch_examples_respect_the_cap(
                 ourios in agg_map(),
                 cap in 1..5usize,
             ) {
                 let loki: HashMap<AggKey, u64> = HashMap::new();
-                // Empty Loki answer: every key with o > 1 is short at a
-                // 0.95 margin, so multi-key maps exercise the cap.
-                match compare_aggregations_within_margin(&ourios, &loki, 0.95, cap) {
-                    EquivalenceOutcome::Equal => {
-                        // All keys were cardinality-1 (exempt) — nothing to cap.
-                    }
-                    EquivalenceOutcome::Mismatch(m) => {
-                        prop_assert!(m.examples.len() <= cap, "{:?}", m.examples);
-                    }
-                }
+                let EquivalenceOutcome::Mismatch(m) =
+                    compare_aggregations_within_margin(&ourios, &loki, 1.0, cap)
+                else {
+                    return Err(TestCaseError::fail(
+                        "an empty Loki answer at margin = 1.0 must mismatch",
+                    ));
+                };
+                prop_assert!(m.examples.len() <= cap, "{:?}", m.examples);
             }
         }
     }

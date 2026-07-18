@@ -1636,3 +1636,30 @@ wide-time-range arm in the per-PR `loki-interop` job running the
 dispatch's exact Loki flags (one shared constant — config drift
 between the 1-minute test and the 2 h run is now unrepresentable), and
 a dispatch class filter for targeted re-runs.
+
+### 9.18 Results — 2026-07-18 (indicative, `ci-runner`) — the `M_L4` freeze's first asserting run
+
+Workflow run 29659514874, dispatched from the freeze branch (PR #548)
+with the L4 gates **enforcing** for the first time — `M_L4 = 10` on
+the processed channel (primary) plus the 1.1× storage-side floor
+(`m_l4_storage_floor_tenths = 11`), the L2 shape per the §7 decision
+(maintainer, 2026-07-18). Exit 0; every frozen gate `Decided { pass:
+true }`:
+
+| gate | verdict |
+|---|---|
+| L4 processed (PRIMARY, must-win 10) | **86.60×** |
+| L4 storage floor (11/10) | **3.70×** |
+| L2 processed (PRIMARY, must-win 10) | 43.73× |
+| L2 storage floor (11/10) | 1.41× |
+| L1 storage (PRIMARY, must-win 10) | 102.10× |
+| L3 storage (PRIMARY, must-win 10) | 23.36× |
+| L6 latency floors (factor 3, both window pairs) | 0.52× / 3.94× |
+
+L4 completeness this run: 1151/1197 = 96.2% — inside the §7 margin
+and the §9.17 band (95.3–97.5%). (Latency-floor advantages are
+oriented loki_p50/ourios_p50 — above 1 means Ourios faster; the floor
+passes at ≥ 1/3.) With this run the dispatch asserts
+every §7 value except `F_L7` (deferred until L7 is first measured):
+an L4 band degradation below either frozen value now fails the run
+instead of printing a smaller ratio.

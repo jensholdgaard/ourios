@@ -210,9 +210,11 @@ pub(crate) enum PairClass {
     /// L3 trace correlation — must-win, `M_L3 = 10` frozen on the
     /// storage channel.
     L3,
-    /// L4 frequency aggregation — must-win (RFC 0031 §3.4), but `M_L4`
-    /// stays §7-DEFERRED until first measured: both bytes channels are
-    /// PRINTED, never asserted (`frozen_gate_failures` skips this class).
+    /// L4 frequency aggregation — must-win, `M_L4 = 10` frozen
+    /// 2026-07-18 on the processed channel (primary) plus the 1.1×
+    /// storage-side floor (the L2 shape; evidence `benchmarks.md`
+    /// §9.17). Asserted via [`l4_gate_failures`] — the measurement
+    /// lives outside `frozen_gate_failures`'s line-pair walk.
     L4,
     /// L6-family window browse — `F_L6 = 3` frozen on the LATENCY
     /// channel (RFC0031.7 as written); the bytes channel is a
@@ -1019,16 +1021,16 @@ pub(crate) fn split_measurements(
 /// frozen gate non-evaluable, which is reported LOUDLY rather than
 /// failed (a corroborating-channel hiccup must not fake a floor
 /// breach). The window pairs' bytes channel and the selective-resource
-/// pair are published diagnostics — never checked here. L4 is a
-/// must-win class (§3.4) but `M_L4` stays §7-DEFERRED, so it is excluded
-/// here too — its bytes are `print_pair_bytes_gates`' job, reported not
-/// asserted, until the maintainer freezes a margin against a first
-/// measurement. Returns the failures instead of panicking so the caller
+/// pair are published diagnostics — never checked here. L4's frozen
+/// gates (2026-07-18, the L2 shape) live in [`l4_gate_failures`]
+/// instead — its measurement sits outside the line-pair `specs` walk.
+/// Returns the failures instead of panicking so the caller
 /// can assert them all at once, AFTER the report has printed.
 pub(crate) fn frozen_gate_failures(
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
     loki: &[Measured],
+    margins: &ourios_bench::ComparativeMargins,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
@@ -1058,7 +1060,7 @@ pub(crate) fn frozen_gate_failures(
                         spec.label, spec.margin,
                     ));
                 }
-                let tenths = ourios_bench::ComparativeMargins::default().m_l2_storage_floor_tenths;
+                let tenths = margins.m_l2_storage_floor_tenths;
                 let outcome = ourios_bench::bytes_must_win_tenths(
                     ours.answer.bytes_read,
                     loki_storage,
@@ -1087,10 +1089,45 @@ pub(crate) fn frozen_gate_failures(
                     spec.label,
                 ),
             },
-            // M_L4 is §7-deferred — reported by `print_pair_bytes_gates`,
-            // never asserted here.
+            // L4 is measured outside the line-pair machinery — its
+            // frozen gates are [`l4_gate_failures`]'s job, asserted at
+            // the same point as this function's.
             PairClass::L4 | PairClass::Diagnostic => {}
         }
+    }
+    failures
+}
+
+/// The §7-frozen L4 gates (frozen 2026-07-18, evidence `benchmarks.md`
+/// §9.17 — the same split-channel shape as L2): the processed channel
+/// is PRIMARY at the must-win margin, plus the 1.1× storage-side floor.
+/// The L4 counterpart of [`frozen_gate_failures`]'s L2 arm, separate
+/// because L4's measurement lives outside the line-pair `specs` walk
+/// (an aggregation's answer is a grouped-count map, not a `LineKey`
+/// multiset). Returns failures for the caller to assert alongside the
+/// other frozen gates, after every report has printed.
+pub(crate) fn l4_gate_failures(
+    spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
+    ourios_bytes: u64,
+    loki_storage: u64,
+    loki_processed: u64,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let outcome = ourios_bench::bytes_must_win(ourios_bytes, loki_processed, spec.margin);
+    if !outcome.passed() {
+        failures.push(format!(
+            "[{}] frozen processed-channel must-win (margin {}) failed: {outcome:?}",
+            spec.label, spec.margin,
+        ));
+    }
+    let tenths = margins.m_l4_storage_floor_tenths;
+    let outcome = ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths);
+    if !outcome.passed() {
+        failures.push(format!(
+            "[{}] frozen storage-channel floor (must-win at {tenths}/10) failed: {outcome:?}",
+            spec.label,
+        ));
     }
     failures
 }

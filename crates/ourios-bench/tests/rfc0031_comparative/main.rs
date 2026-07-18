@@ -208,11 +208,13 @@ fn rfc0031_4_l3_trace_correlation_bytes() {
 /// Scenario RFC0031.5 — L4 frequency aggregation wins on bytes read (OTLP-native).
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 ///
-/// `M_L4` stays **§7-DEFERRED** ("deferred until L4 is first measured") —
-/// unlike RFC0031.2/.4 (`M_L1`/`M_L3` frozen on the storage channel) or
-/// RFC0031.7 (`F_L6` frozen on the latency channel), there is no recorded
-/// measurement to pin a gate against yet, so this slice cannot pin a
-/// frozen-value bound the way those scenarios do. What it pins instead —
+/// Green under the §7 `M_L4` freeze (2026-07-18, first measured —
+/// `benchmarks.md` §9.17's four-run band): `M_L4 = 10` on the processed
+/// channel as primary, plus the 1.1× storage-side floor
+/// (`m_l4_storage_floor_tenths = 11`) — the same split-channel shape as
+/// L2, pinned here the way RFC0031.3 pins its gates (frozen values,
+/// boundary math, recorded measurements clearing both channels). What
+/// this slice ALSO pins, from before the freeze —
 /// the un-stub for this slice — is the **equivalence machinery** and the
 /// **`PairSpec` shape** an L4 pair takes: the picker
 /// ([`pick_frequency_pair`]), the Ourios aggregation extraction
@@ -299,10 +301,7 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
         matches!(spec.class.gate(), GateKind::MustWin),
         "L4 is a must-win class (RFC 0031 §3.4), same disposition as L1/L2/L3",
     );
-    assert_eq!(
-        spec.margin, 10,
-        "m_l4's current (§7-deferred) default value"
-    );
+    assert_eq!(spec.margin, 10, "the §7-frozen M_L4 (2026-07-18)");
 
     // The Ourios half, run for real through the exact `spec.dsl` (no
     // container needed) — and proved to match the picker's own
@@ -340,13 +339,64 @@ fn rfc0031_5_l4_frequency_aggregation_bytes() {
         "a dropped aggregation cell must report Mismatch, not silently pass",
     );
 
-    // PRINTED, never asserted — M_L4 stays §7-deferred until the dispatch
-    // run's first live measurement.
     println!(
-        "RFC0031.5 [{}] ourios bytes_read (grouped-count scan) = {} — M_L4 DEFERRED \
-         (RFC 0031 §7): reported, not asserted, until first measured",
+        "RFC0031.5 [{}] ourios bytes_read (grouped-count scan) = {} — M_L4 FROZEN \
+         (RFC 0031 §7, 2026-07-18): processed PRIMARY at 10x + 1.1x storage floor",
         spec.label, ourios.bytes_read,
     );
+}
+
+/// The RFC0031.5 frozen-gate arm (split from the fixture-level
+/// equivalence proof above for size): the §7 `M_L4` freeze
+/// (2026-07-18, evidence §9.17 — the L2 shape), pinned the way
+/// RFC0031.2/.3 pin theirs — frozen values, boundary math in the
+/// must-win direction, recorded measurements clearing both channels.
+#[test]
+fn rfc0031_5_l4_frozen_gates() {
+    // The §7-frozen L4 gates (frozen 2026-07-18, evidence §9.17 — the
+    // L2 shape): processed-channel must-win at M_L4 = 10 as PRIMARY,
+    // plus the 1.1× storage-side floor. Pinned here like RFC0031.2/.3
+    // pin theirs: the frozen values, the boundary math in the must-win
+    // direction, and the recorded measurements clearing both channels.
+    let margins = ourios_bench::ComparativeMargins::default();
+    assert_eq!(
+        margins.m_l4, 10,
+        "the §7-frozen L4 processed-channel margin"
+    );
+    assert_eq!(
+        margins.m_l4_storage_floor_tenths, 11,
+        "the §7-frozen L4 storage-side floor (1.1×, in tenths)"
+    );
+    assert!(ourios_bench::bytes_must_win(100, 1_000, margins.m_l4).passed());
+    let over = ourios_bench::bytes_must_win(101, 1_000, margins.m_l4);
+    assert!(!over.passed(), "{over:?}");
+    let tenths = margins.m_l4_storage_floor_tenths;
+    assert!(ourios_bench::bytes_must_win_tenths(1_000, 1_100, tenths).passed());
+    let over = ourios_bench::bytes_must_win_tenths(1_001, 1_100, tenths);
+    assert!(!over.passed(), "{over:?}");
+
+    // §9.17 (runs at the measured pair's constant ourios total,
+    // 47,995,205 B): the two runs with exact recorded Loki bytes clear
+    // the processed margin (86.8–87.1×) and the storage floor
+    // (3.72–3.73×) — documented historical evidence from
+    // equivalence-verified runs, NOT a live measurement; the live
+    // assertion is `rfc0031_indicative_comparative_run`'s
+    // `l4_gate_failures`.
+    for (loki_storage, loki_processed) in [
+        (178_970_792_u64, 4_180_502_067_u64),
+        (178_359_628, 4_165_782_796),
+    ] {
+        let processed = ourios_bench::bytes_must_win(47_995_205, loki_processed, margins.m_l4);
+        assert!(
+            processed.passed(),
+            "a recorded §9.17 L4 run must clear the frozen processed M_L4: {processed:?}",
+        );
+        let storage = ourios_bench::bytes_must_win_tenths(47_995_205, loki_storage, tenths);
+        assert!(
+            storage.passed(),
+            "a recorded §9.17 L4 run must clear the frozen storage floor: {storage:?}",
+        );
+    }
 }
 
 /// Scenario RFC0031.6 — L5 substring needle measured + published, loss permitted.
@@ -813,6 +863,7 @@ fn rfc0031_indicative_comparative_run() {
 
     print_indicative_report(
         &corpus_dir,
+        &margins,
         pair.total_records,
         &ok_specs,
         &ok_ourios,
@@ -832,21 +883,29 @@ fn rfc0031_indicative_comparative_run() {
     // viable candidate must fail the dispatch, not silently pass with
     // zero L4 evidence (the eprintln above is a diagnostic breadcrumb,
     // not a substitute for actually failing the gate).
-    match (&l4_spec, l4_loki) {
-        (Some(spec), Some(result)) => {
-            run_l4_pair(bucket.path(), &tenant, spec, result, &mut failures);
-        }
+    let l4_frozen_gate_failures = match (&l4_spec, l4_loki) {
+        (Some(spec), Some(result)) => run_l4_pair(
+            bucket.path(),
+            &tenant,
+            spec,
+            &margins,
+            result,
+            &mut failures,
+        ),
         // A filtered-out L4 is a requested skip, not a must-win failure
         // — the class filter's whole point is a targeted partial run.
-        (None, _) if !l4_requested => {}
-        (None, _) => failures.push(
-            "L4: no viable frequency pair — either no template/param slot cleared \
-             pick_frequency_pair's bounds, or the picked candidate's capture regex \
-             contained a backtick l4_pair_spec can't embed in LogQL (see the L4 PAIR \
-             MISSING diagnostic above for which) — L4 is a must-win class and cannot be \
-             silently skipped"
-                .to_string(),
-        ),
+        (None, _) if !l4_requested => Vec::new(),
+        (None, _) => {
+            failures.push(
+                "L4: no viable frequency pair — either no template/param slot cleared \
+                 pick_frequency_pair's bounds, or the picked candidate's capture regex \
+                 contained a backtick l4_pair_spec can't embed in LogQL (see the L4 PAIR \
+                 MISSING diagnostic above for which) — L4 is a must-win class and cannot be \
+                 silently skipped"
+                    .to_string(),
+            );
+            Vec::new()
+        }
         (Some(spec), None) => unreachable!(
             "l4_spec.is_some() implies l4_loki.is_some(): the async block's own match \
              (`(Some(pair), Some(spec)) => measure`) only skips measuring when EITHER is \
@@ -855,11 +914,12 @@ fn rfc0031_indicative_comparative_run() {
              measurement (harness bug)",
             spec.label,
         ),
-    }
+    };
 
     // The frozen gates run AFTER the report so a failed gate cannot
     // destroy the run's evidence (the run #11 salvage lesson).
-    let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
+    let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki, &margins);
+    gate_failures.extend(l4_frozen_gate_failures);
     gate_failures.extend(acquisition_failure);
     assert!(
         gate_failures.is_empty(),
@@ -884,14 +944,15 @@ fn rfc0031_indicative_comparative_run() {
 /// head-chunk bytes) is the apples-to-apples counterpart of Ourios's
 /// fetched-compressed-Parquet bytes — but which line carries a gate
 /// verdict depends on the class: L1/L3 gate on the frozen storage
-/// channel (processed is context), L2 gates on the processed channel
-/// (primary) plus the frozen 1.1× storage-side floor, L4 prints both
-/// channels' ratio with no verdict (`M_L4` §7-deferred), and the window
+/// channel (processed is context), L2 and L4 gate on the processed
+/// channel (primary) plus their frozen 1.1× storage-side floors (L4
+/// frozen 2026-07-18 on the L2 shape), and the window
 /// pairs' bytes lines are a published diagnostic — a ratio, no verdict
 /// — since the freeze reclassified them; their gate is the RFC0031.7
 /// latency floor.
 fn print_pair_bytes_gates(
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     ourios_bytes: u64,
     loki_storage: u64,
     loki_processed: u64,
@@ -930,26 +991,26 @@ fn print_pair_bytes_gates(
                 spec.margin,
                 gate(loki_processed),
             );
-            let tenths = ourios_bench::ComparativeMargins::default().m_l2_storage_floor_tenths;
+            let tenths = margins.m_l2_storage_floor_tenths;
             println!(
                 "gate vs storage-side (§7 FROZEN floor, must-win at {tenths}/10): {:?}",
                 ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths),
             );
         }
-        // L4 is must-win-shaped (RFC 0031 §3.4), but `M_L4` stays
-        // §7-DEFERRED until first measured (§7): both channels print the
-        // gate math's ratio for the record, never a pass/fail verdict —
-        // `frozen_gate_failures` never evaluates this class.
+        // L4: frozen 2026-07-18 on the L2 shape (§7, evidence §9.17) —
+        // processed channel PRIMARY at the must-win margin, plus the
+        // 1.1× storage-side floor. Printed here; asserted by
+        // `l4_gate_failures` alongside the other frozen gates.
         PairClass::L4 => {
             println!(
-                "gate vs storage-side (must-win margin {}, §7 DEFERRED — reported only): {}",
+                "gate vs bytes-processed (PRIMARY — §7 FROZEN, must-win margin {}): {:?}",
                 spec.margin,
-                diagnostic(loki_storage),
+                gate(loki_processed),
             );
+            let tenths = margins.m_l4_storage_floor_tenths;
             println!(
-                "gate vs bytes-processed (must-win margin {}, §7 DEFERRED — reported only): {}",
-                spec.margin,
-                diagnostic(loki_processed),
+                "gate vs storage-side (§7 FROZEN floor, must-win at {tenths}/10): {:?}",
+                ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths),
             );
         }
         PairClass::WindowFloor | PairClass::Diagnostic => {
@@ -971,12 +1032,13 @@ fn print_pair_bytes_gates(
 /// path's `materialize_bytes_read`/`registry_bytes_read` are structurally
 /// zero, see [`ourios_bench::OuriosAggregateAnswer`]), so there is no
 /// count-scan/materialize/registry breakdown to print, and this slice
-/// does not wire an L4 latency channel (§7 DEFERRED already covers the
-/// bytes verdict; latency is corroborating-only everywhere else too, so
+/// does not wire an L4 latency channel (the frozen bytes gates carry
+/// the verdict; latency is corroborating-only everywhere else too, so
 /// this is a scope boundary, not a gap). Reuses [`print_pair_bytes_gates`]
 /// for the shared bytes-channel labeling.
 fn print_l4_report(
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     ourios_bytes: u64,
     loki_fetched: &LokiFetchedBytes,
     loki_processed: u64,
@@ -992,7 +1054,7 @@ fn print_l4_report(
         loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
     );
     println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
-    print_pair_bytes_gates(spec, ourios_bytes, loki_storage, loki_processed);
+    print_pair_bytes_gates(spec, margins, ourios_bytes, loki_storage, loki_processed);
 }
 
 /// Measure, equivalence-check, and report the L4 pair — the aggregation
@@ -1020,16 +1082,18 @@ fn print_l4_report(
 /// RFC0031.1 equivalence is never optional, matching the L1–L3/L6
 /// `compare_lines` assertion this mirrors — the failure modes are
 /// deliberately not symmetric: a flake is salvageable, a mismatch is
-/// not. `M_L4` itself stays §7-DEFERRED — [`print_l4_report`] prints
-/// both bytes channels' ratio with no verdict, exactly like the
-/// fixture-level proof (`rfc0031_5_l4_frequency_aggregation_bytes`).
+/// not. `M_L4` is §7-FROZEN (2026-07-18): [`print_l4_report`] prints
+/// both channels' gate verdicts, and the returned gate failures are
+/// asserted by the caller alongside [`frozen_gate_failures`]'s — after
+/// every report has printed, per the same salvage design.
 fn run_l4_pair(
     bucket_root: &std::path::Path,
     tenant: &TenantId,
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     l4_loki: Result<L4Measured, String>,
     failures: &mut Vec<String>,
-) {
+) -> Vec<String> {
     let (loki_groups, loki_processed, loki_fetched) = match l4_loki {
         Ok(measured) => measured,
         Err(detail) => {
@@ -1037,7 +1101,7 @@ fn run_l4_pair(
                 "L4 pair [{}] failed to measure: {detail}",
                 spec.label
             ));
-            return;
+            return Vec::new();
         }
     };
     let ourios_answer =
@@ -1065,10 +1129,18 @@ fn run_l4_pair(
     );
     print_l4_report(
         spec,
+        margins,
         ourios_answer.bytes_read,
         &loki_fetched,
         loki_processed,
     );
+    l4_gate_failures(
+        spec,
+        margins,
+        ourios_answer.bytes_read,
+        loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes,
+        loki_processed,
+    )
 }
 
 /// The indicative run's report block, one section per pair, labeled per
@@ -1083,6 +1155,7 @@ fn run_l4_pair(
 /// RFC0031.7 latency floor as written (`ourios_p50 ≤ F_L6 × loki_p50`).
 fn print_indicative_report(
     corpus_dir: &std::path::Path,
+    margins: &ourios_bench::ComparativeMargins,
     total_records: u64,
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
@@ -1125,7 +1198,13 @@ fn print_indicative_report(
             loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
         );
         println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
-        print_pair_bytes_gates(spec, answer.bytes_read, loki_storage, *loki_processed);
+        print_pair_bytes_gates(
+            spec,
+            margins,
+            answer.bytes_read,
+            loki_storage,
+            *loki_processed,
+        );
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         match ours.latency_p50 {
             Some(p50) => println!(

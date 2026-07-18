@@ -2385,4 +2385,247 @@ mod tests {
         };
         assert!(detail.contains("unexpected token"), "{detail}");
     }
+
+    /// Property tests for [`compare_aggregations_within_margin`]'s
+    /// invariants (CLAUDE.md §6.2: the comparator is an invariant-bearing
+    /// piece, so it gets property tests; issue #538 item 1). Every
+    /// example-based margin test above pins a specific historical shape
+    /// (runs #17/#19, the review counterexamples); these properties pin
+    /// the *rules* those shapes are instances of, so the next formula
+    /// change gets caught in milliseconds instead of a 2 h dispatch.
+    mod margin_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A bucket width for synthetic maps (12 h in nanoseconds, the
+        /// shape real L4 pairs use — the comparator itself never reads
+        /// the width, only distinct bucket-start values).
+        const WIDTH: u64 = 43_200_000_000_000;
+
+        /// Margins from a coarse 1/20 grid. Properties that must
+        /// construct a count strictly below `o * margin` rely on the
+        /// fractional part of `o * margin` being either zero or at
+        /// least ~0.05 — far above `MARGIN_EPSILON` — which a coarse
+        /// grid guarantees and an arbitrary `f64` margin would not.
+        fn margin_grid() -> impl Strategy<Value = f64> {
+            (0..=20u32).prop_map(|k| f64::from(k) / 20.0)
+        }
+
+        /// Strict-interior margins (0.5..=0.95) for properties that
+        /// need both a real tolerance band and a real rejection band.
+        fn fractional_margin_grid() -> impl Strategy<Value = f64> {
+            (10..=19u32).prop_map(|k| f64::from(k) / 20.0)
+        }
+
+        /// Random aggregation answers: up to 12 cells over 6 bucket
+        /// starts × 6 group keys (small pools force multi-bucket keys).
+        /// Counts are deliberately biased toward tiny values (half the
+        /// draws land in 1..4): the comparator's hardest edge cases live
+        /// at cardinality-1 keys and single-digit totals (run #19, the
+        /// `o = 2` review counterexample, the `margin = 1.0` exemption
+        /// gate), and a uniform 1..500 draw makes a count of exactly 1
+        /// so rare the properties lose their teeth against exactly
+        /// those mutations — verified by mutation-testing this suite.
+        fn agg_map() -> impl Strategy<Value = HashMap<AggKey, u64>> {
+            let count = prop_oneof![1..4u64, 1..500u64];
+            proptest::collection::btree_map((0..6u64, 0..6u8), count, 1..12).prop_map(|cells| {
+                cells
+                    .into_iter()
+                    .map(|((bucket, key), count)| {
+                        (agg(bucket * WIDTH, &format!("svc{key}")), count)
+                    })
+                    .collect()
+            })
+        }
+
+        /// The per-key minimum Loki total the margin admits: `0` for an
+        /// exempt cardinality-≤1 key (fractional margin only), else the
+        /// smallest integer at or above `o * margin`. `ceil` may round
+        /// an inexact product up past the true bound — that only makes
+        /// the constructed answer MORE complete, never less, so the
+        /// acceptance property stays sound.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // The product is a bounded count scaled by a fraction in [0, 1]; ceil never
+        // rounds negative and never exceeds `o`, which is already a valid u64.
+        fn min_admitted_total(o: u64, margin: f64) -> u64 {
+            #[allow(clippy::cast_precision_loss)]
+            // Counts are far below f64's 2^53 exact-integer range.
+            let bound = ((o as f64) * margin).ceil() as u64;
+            if o <= 1 && margin < 1.0 {
+                0
+            } else {
+                bound.min(o)
+            }
+        }
+
+        /// Reduce `map` so each `group_key`'s total drops to exactly
+        /// `target(key_total)`, removing rows greedily across the key's
+        /// own cells (never adding cells, so no phantoms) and dropping
+        /// cells that reach zero (a real Loki matrix omits empty cells).
+        fn undercount_per_key(
+            map: &HashMap<AggKey, u64>,
+            target: impl Fn(u64) -> u64,
+        ) -> HashMap<AggKey, u64> {
+            let totals = aggregate_by_group_key(map);
+            let mut remaining: HashMap<String, u64> = totals
+                .iter()
+                .map(|(&key, &o)| (key.to_string(), o - target(o)))
+                .collect();
+            let mut cells: Vec<(&AggKey, u64)> = map.iter().map(|(k, &v)| (k, v)).collect();
+            cells.sort_by_key(|(k, _)| (k.bucket_start_unix_nanos, k.group_key.clone()));
+            let mut out = HashMap::new();
+            for (k, v) in cells {
+                let to_remove = remaining
+                    .get_mut(&k.group_key)
+                    .expect("every cell's key has a total");
+                let removed = v.min(*to_remove);
+                *to_remove -= removed;
+                if v - removed > 0 {
+                    out.insert(k.clone(), v - removed);
+                }
+            }
+            out
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: ourios_testgen::proptest_cases(64),
+                ..ProptestConfig::default()
+            })]
+
+            /// Identical answers are equivalent at every valid margin.
+            #[test]
+            fn identical_answers_are_equal_at_any_margin(
+                ourios in agg_map(),
+                margin in margin_grid(),
+            ) {
+                prop_assert!(
+                    compare_aggregations_within_margin(&ourios, &ourios, margin, 8).is_equal()
+                );
+            }
+
+            /// The WORST undercount the margin admits — every key
+            /// reduced to its minimum admitted total — is accepted.
+            /// Anything the margin promises to tolerate, it tolerates.
+            #[test]
+            fn maximal_within_margin_undercount_is_accepted(
+                ourios in agg_map(),
+                margin in margin_grid(),
+            ) {
+                let loki = undercount_per_key(&ourios, |o| min_admitted_total(o, margin));
+                prop_assert!(
+                    compare_aggregations_within_margin(&ourios, &loki, margin, 8).is_equal()
+                );
+            }
+
+            /// One row past the admitted minimum on any single key with
+            /// a real (n ≥ 2) total rejects, no matter how complete
+            /// every other key is.
+            #[test]
+            fn one_row_below_the_margin_on_one_key_rejects(
+                ourios in agg_map(),
+                margin in fractional_margin_grid(),
+                extra in 4..500u64,
+            ) {
+                // Force at least one key with a total big enough that
+                // `min - 1` is a genuine shortfall below the margin.
+                let mut ourios = ourios;
+                let victim = agg(0, "victim");
+                ourios.insert(victim.clone(), extra);
+                let loki = undercount_per_key(&ourios, |o| {
+                    let min = min_admitted_total(o, margin);
+                    if min == 0 { 0 } else { min - 1 }
+                });
+                // Only assert when the victim's reduction is a real
+                // shortfall (min > 0 always holds here: o >= 4 and
+                // margin >= 0.5 make ceil(o * margin) >= 2).
+                let victim_total = aggregate_by_group_key(&ourios)["victim"];
+                prop_assert!(min_admitted_total(victim_total, margin) > 0);
+                prop_assert!(
+                    !compare_aggregations_within_margin(&ourios, &loki, margin, 8).is_equal()
+                );
+            }
+
+            /// A per-key overcount is never tolerated, at any margin:
+            /// boundary jitter redistributes rows WITHIN a key, it can
+            /// never raise the key's own cross-bucket total.
+            #[test]
+            fn per_key_overcount_always_rejects(
+                ourios in agg_map(),
+                margin in margin_grid(),
+                delta in 1..100u64,
+            ) {
+                let mut loki = ourios.clone();
+                let inflated = loki.keys().next().expect("maps are non-empty").clone();
+                *loki.get_mut(&inflated).expect("cell exists") += delta;
+                prop_assert!(
+                    !compare_aggregations_within_margin(&ourios, &loki, margin, 8).is_equal()
+                );
+            }
+
+            /// A phantom cell — any `(bucket, group_key)` Loki reports
+            /// that Ourios's answer doesn't contain — is never
+            /// tolerated, at any margin, whether its group_key is
+            /// entirely unknown or known-but-in-a-foreign-bucket.
+            #[test]
+            fn phantom_cells_always_reject(
+                ourios in agg_map(),
+                margin in margin_grid(),
+                unknown_key in proptest::bool::ANY,
+            ) {
+                let mut loki = ourios.clone();
+                let phantom = if unknown_key {
+                    agg(0, "never-mined")
+                } else {
+                    let known = ourios.keys().next().expect("maps are non-empty");
+                    agg(99 * WIDTH, &known.group_key)
+                };
+                prop_assume!(!ourios.contains_key(&phantom));
+                loki.insert(phantom, 1);
+                prop_assert!(
+                    !compare_aggregations_within_margin(&ourios, &loki, margin, 8).is_equal()
+                );
+            }
+
+            /// `margin = 1.0` is exact: over cell-wise undercounts
+            /// (each Loki cell ≤ its Ourios cell, no phantoms) it
+            /// agrees with [`compare_aggregations`], including on
+            /// cardinality-1 keys — the n ≤ 1 exemption must not apply.
+            #[test]
+            fn margin_one_agrees_with_the_exact_comparator_on_undercounts(
+                ourios in agg_map(),
+                cut in proptest::collection::vec(0..4u64, 12),
+            ) {
+                let mut loki = HashMap::new();
+                for (i, (k, &v)) in ourios.iter().enumerate() {
+                    let kept = v.saturating_sub(cut[i % cut.len()]);
+                    if kept > 0 {
+                        loki.insert(k.clone(), kept);
+                    }
+                }
+                let strict = compare_aggregations_within_margin(&ourios, &loki, 1.0, 8);
+                let exact = compare_aggregations(&ourios, &loki, 8);
+                prop_assert_eq!(strict.is_equal(), exact.is_equal());
+            }
+
+            /// Mismatch examples never exceed the requested cap.
+            #[test]
+            fn mismatch_examples_respect_the_cap(
+                ourios in agg_map(),
+                cap in 1..5usize,
+            ) {
+                let loki: HashMap<AggKey, u64> = HashMap::new();
+                // Empty Loki answer: every key with o > 1 is short at a
+                // 0.95 margin, so multi-key maps exercise the cap.
+                match compare_aggregations_within_margin(&ourios, &loki, 0.95, cap) {
+                    EquivalenceOutcome::Equal => {
+                        // All keys were cardinality-1 (exempt) — nothing to cap.
+                    }
+                    EquivalenceOutcome::Mismatch(m) => {
+                        prop_assert!(m.examples.len() <= cap, "{:?}", m.examples);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -63,6 +63,10 @@ jobs:
       - name: Run the indicative comparative test (release)
         env:
           OURIOS_COMPARATIVE_CORPUS: ${{ steps.fetch.outputs.corpus_dir }}
+          # Machine-readable per-pair completeness + bytes record
+          # (issue #538 item 3): written before the harness's
+          # equivalence/gate asserts, so failing runs record too.
+          OURIOS_COMPARATIVE_RESULTS: ${{ github.workspace }}/comparative-results.json
         # Release mode: the run mines ~3 GB through the real miner +
         # Parquet writer (bench.yml pins release for the same reason).
         # `tee` keeps the full log while the summary step greps the
@@ -73,6 +77,19 @@ jobs:
             --ignored --exact rfc0031_indicative_comparative_run --nocapture \
             2>&1 | tee comparative-run.log
 
+      # The artifact is the run-over-run trend series (completeness per
+      # pair vs the L4 margin, both bytes channels): fetch across runs
+      # with `gh api .../actions/artifacts` to see movement before it
+      # becomes a failure. `always()` — failed runs are exactly the
+      # points a trend needs.
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: comparative-results-${{ github.run_number }}
+          path: comparative-results.json
+          if-no-files-found: warn
+
       - name: Write job summary
         if: always()
         run: |
@@ -82,4 +99,18 @@ jobs:
             grep -A60 '=== RFC 0031 indicative comparative run ===' comparative-run.log \
               || echo "(no report block — see the run log)"
             echo '```'
+            if [ -f comparative-results.json ]; then
+              echo ""
+              echo "### Per-pair completeness (returned/expected)"
+              echo ""
+              echo "| pair | class | expected | returned | completeness |"
+              echo "|---|---|---|---|---|"
+              jq -r '
+                (.pairs[], (.l4 | select(. != null))) |
+                if has("failure")
+                then "| \(.label) | \(.class) | \(.expected_rows) | — | FAILED: \(.failure) |"
+                else "| \(.label) | \(.class) | \(.expected_rows) | \(.loki_rows) | \(.completeness * 100 | round / 100) |"
+                end
+              ' comparative-results.json
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

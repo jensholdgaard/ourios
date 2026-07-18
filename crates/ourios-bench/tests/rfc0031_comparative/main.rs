@@ -863,6 +863,7 @@ fn rfc0031_indicative_comparative_run() {
 
     print_indicative_report(
         &corpus_dir,
+        &margins,
         pair.total_records,
         &ok_specs,
         &ok_ourios,
@@ -951,6 +952,7 @@ fn rfc0031_indicative_comparative_run() {
 /// latency floor.
 fn print_pair_bytes_gates(
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     ourios_bytes: u64,
     loki_storage: u64,
     loki_processed: u64,
@@ -989,7 +991,7 @@ fn print_pair_bytes_gates(
                 spec.margin,
                 gate(loki_processed),
             );
-            let tenths = ourios_bench::ComparativeMargins::default().m_l2_storage_floor_tenths;
+            let tenths = margins.m_l2_storage_floor_tenths;
             println!(
                 "gate vs storage-side (§7 FROZEN floor, must-win at {tenths}/10): {:?}",
                 ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths),
@@ -1005,7 +1007,7 @@ fn print_pair_bytes_gates(
                 spec.margin,
                 gate(loki_processed),
             );
-            let tenths = ourios_bench::ComparativeMargins::default().m_l4_storage_floor_tenths;
+            let tenths = margins.m_l4_storage_floor_tenths;
             println!(
                 "gate vs storage-side (§7 FROZEN floor, must-win at {tenths}/10): {:?}",
                 ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths),
@@ -1036,6 +1038,7 @@ fn print_pair_bytes_gates(
 /// for the shared bytes-channel labeling.
 fn print_l4_report(
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     ourios_bytes: u64,
     loki_fetched: &LokiFetchedBytes,
     loki_processed: u64,
@@ -1051,7 +1054,7 @@ fn print_l4_report(
         loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
     );
     println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
-    print_pair_bytes_gates(spec, ourios_bytes, loki_storage, loki_processed);
+    print_pair_bytes_gates(spec, margins, ourios_bytes, loki_storage, loki_processed);
 }
 
 /// Measure, equivalence-check, and report the L4 pair — the aggregation
@@ -1126,6 +1129,7 @@ fn run_l4_pair(
     );
     print_l4_report(
         spec,
+        margins,
         ourios_answer.bytes_read,
         &loki_fetched,
         loki_processed,
@@ -1151,6 +1155,7 @@ fn run_l4_pair(
 /// RFC0031.7 latency floor as written (`ourios_p50 ≤ F_L6 × loki_p50`).
 fn print_indicative_report(
     corpus_dir: &std::path::Path,
+    margins: &ourios_bench::ComparativeMargins,
     total_records: u64,
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
@@ -1193,7 +1198,13 @@ fn print_indicative_report(
             loki_fetched.compressed_bytes, loki_fetched.head_chunk_bytes,
         );
         println!("loki   totalBytesProcessed (decompressed) = {loki_processed}");
-        print_pair_bytes_gates(spec, answer.bytes_read, loki_storage, *loki_processed);
+        print_pair_bytes_gates(
+            spec,
+            margins,
+            answer.bytes_read,
+            loki_storage,
+            *loki_processed,
+        );
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         match ours.latency_p50 {
             Some(p50) => println!(

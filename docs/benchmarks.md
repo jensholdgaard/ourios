@@ -1626,8 +1626,11 @@ L4's measured 3.69–3.73× storage band would clear a similar floor with
 real headroom).
 
 Follow-on hardening, so the 2 h dispatch confirms rather than
-discovers (#538/#499, closed via #539–#542): a mutation-tested
-property suite over the margin comparator, per-pair completeness
+discovers (#538/#499, closed via #539–#542): a `proptest` property
+suite over the margin comparator (its properties were verified by
+manually re-introducing the three historical comparator bugs and
+confirming each is caught — the evidence trail is PR #539's record,
+not a standing mutation-testing harness), per-pair completeness
 recorded as a machine-readable artifact on every dispatch, a backdated
 wide-time-range arm in the per-PR `loki-interop` job running the
 dispatch's exact Loki flags (one shared constant — config drift

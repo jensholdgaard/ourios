@@ -883,9 +883,14 @@ fn rfc0031_indicative_comparative_run() {
     // zero L4 evidence (the eprintln above is a diagnostic breadcrumb,
     // not a substitute for actually failing the gate).
     let l4_frozen_gate_failures = match (&l4_spec, l4_loki) {
-        (Some(spec), Some(result)) => {
-            run_l4_pair(bucket.path(), &tenant, spec, result, &mut failures)
-        }
+        (Some(spec), Some(result)) => run_l4_pair(
+            bucket.path(),
+            &tenant,
+            spec,
+            &margins,
+            result,
+            &mut failures,
+        ),
         // A filtered-out L4 is a requested skip, not a must-win failure
         // — the class filter's whole point is a targeted partial run.
         (None, _) if !l4_requested => Vec::new(),
@@ -912,7 +917,7 @@ fn rfc0031_indicative_comparative_run() {
 
     // The frozen gates run AFTER the report so a failed gate cannot
     // destroy the run's evidence (the run #11 salvage lesson).
-    let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki);
+    let mut gate_failures = frozen_gate_failures(&ok_specs, &ok_ourios, &ok_loki, &margins);
     gate_failures.extend(l4_frozen_gate_failures);
     gate_failures.extend(acquisition_failure);
     assert!(
@@ -1082,6 +1087,7 @@ fn run_l4_pair(
     bucket_root: &std::path::Path,
     tenant: &TenantId,
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     l4_loki: Result<L4Measured, String>,
     failures: &mut Vec<String>,
 ) -> Vec<String> {
@@ -1126,6 +1132,7 @@ fn run_l4_pair(
     );
     l4_gate_failures(
         spec,
+        margins,
         ourios_answer.bytes_read,
         loki_fetched.compressed_bytes + loki_fetched.head_chunk_bytes,
         loki_processed,

@@ -1030,6 +1030,7 @@ pub(crate) fn frozen_gate_failures(
     specs: &[PairSpec],
     ourios: &[OuriosMeasured],
     loki: &[Measured],
+    margins: &ourios_bench::ComparativeMargins,
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for ((spec, ours), (_, loki_processed, loki_fetched, loki_latency)) in
@@ -1059,7 +1060,7 @@ pub(crate) fn frozen_gate_failures(
                         spec.label, spec.margin,
                     ));
                 }
-                let tenths = ourios_bench::ComparativeMargins::default().m_l2_storage_floor_tenths;
+                let tenths = margins.m_l2_storage_floor_tenths;
                 let outcome = ourios_bench::bytes_must_win_tenths(
                     ours.answer.bytes_read,
                     loki_storage,
@@ -1107,6 +1108,7 @@ pub(crate) fn frozen_gate_failures(
 /// other frozen gates, after every report has printed.
 pub(crate) fn l4_gate_failures(
     spec: &PairSpec,
+    margins: &ourios_bench::ComparativeMargins,
     ourios_bytes: u64,
     loki_storage: u64,
     loki_processed: u64,
@@ -1119,7 +1121,7 @@ pub(crate) fn l4_gate_failures(
             spec.label, spec.margin,
         ));
     }
-    let tenths = ourios_bench::ComparativeMargins::default().m_l4_storage_floor_tenths;
+    let tenths = margins.m_l4_storage_floor_tenths;
     let outcome = ourios_bench::bytes_must_win_tenths(ourios_bytes, loki_storage, tenths);
     if !outcome.passed() {
         failures.push(format!(

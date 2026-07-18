@@ -30,7 +30,11 @@
 /// dispatch run and scenario RFC0031.5. `f_l7` stays deferred until L7
 /// is first measured. See
 /// `docs/rfcs/0031-comparative-evaluation-loki.md` §7.
+/// Marked `#[non_exhaustive]` so future §7 freezes can add margin
+/// fields without a breaking change — construct via [`Default`] and
+/// override fields, never a struct literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ComparativeMargins {
     /// L1 (template-exact lookup) must-win margin.
     pub m_l1: u64,

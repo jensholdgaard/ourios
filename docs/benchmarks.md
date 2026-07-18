@@ -1608,16 +1608,16 @@ measure more completely; mechanism uncharacterized, NOT dedup):
 `template_id=60` (`Periodic task <type> generated`), `param(0)`,
 `bucket(12h)`, 1,197 expected rows, group cardinality 4.
 
-| run (workflow id) | completeness | storage-side (loki/ourios) | processed (loki/ourios) |
+| run (workflow ID) | completeness | storage-side (loki/ourios) | processed (loki/ourios) |
 |---|---|---|---|
 | 29573249312 (2026-07-17, first clean pass) | 1167/1197 = 97.5% | 3.73× | 87.1× |
 | 29598833238 (2026-07-17) | 1164/1197 = 97.2% | 3.72× | 86.8× |
-| 29608796312 (2026-07-17) | 1141/1197 = 95.3% | — (run failed on the unrelated L3 flicker; L4 itself passed) | — |
+| 29608796312 (2026-07-17) | 1141/1197 = 95.3% | 3.70× | 86.5× (run failed on the unrelated L3 flicker; L4 itself passed and its report printed) |
 | 29614831613 (2026-07-17) | 1149/1197 = 96.0% | 3.69× | 86.6× |
 
 Ourios's side is constant at 47,995,205 B total (the honest §3.6
 metric). Four consecutive equivalence-verified measurements in a
-3.69–3.73× / 86.6–87.1× band: the shape mirrors L2 pre-freeze — a
+3.69–3.73× / 86.5–87.1× band: the shape mirrors L2 pre-freeze — a
 strong processed-channel win with storage closer to parity. **`M_L4`
 stays §7-deferred** (both channels reported, nothing asserted); the
 proposed freeze shape on #498 is the L2 precedent — processed-channel

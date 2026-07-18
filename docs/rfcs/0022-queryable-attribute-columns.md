@@ -16,7 +16,8 @@ superseded-by: —
 > `benchmarks.md` §9.9 (indicative `ci-runner`, git `6e3301b` — the
 > `green` merge itself: B1 34.8× vs the ≥ 10× bar, B2 flat few-ms
 > windowed latencies, pruning counters pinned structurally in
-> `rfc0022_attr_columns.rs`), and `benchmarks.md` §9.11 (authoritative
+> `crates/ourios-querier/tests/it/rfc0022_attr_columns.rs`), and
+> `benchmarks.md` §9.11 (authoritative
 > `baseline-8vcpu-32gib`, git `19e0886`, a descendant of `6e3301b` —
 > the first ≥ 10 GiB B1/B2 readings, both **PASS (authoritative)** with
 > the promoted-column write path and two-arm predicate compile in the

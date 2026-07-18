@@ -1,7 +1,7 @@
 ---
 rfc: 0022
 title: Queryable attribute columns (RFC 0005 amendment)
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-03
@@ -10,6 +10,22 @@ superseded-by: —
 ---
 
 # RFC 0022 — Queryable attribute columns (RFC 0005 amendment)
+
+> **Status note.** **`validated`** (2026-07-18) — the RFC0022.5
+> no-regression contract holds on both rungs of the bench ladder:
+> `benchmarks.md` §9.9 (indicative `ci-runner`, git `6e3301b` — the
+> `green` merge itself: B1 34.8× vs the ≥ 10× bar, B2 flat few-ms
+> windowed latencies, pruning counters pinned structurally in
+> `crates/ourios-querier/tests/it/rfc0022_attr_columns.rs`), and
+> `benchmarks.md` §9.11 (authoritative
+> `baseline-8vcpu-32gib`, git `19e0886`, a descendant of `6e3301b` —
+> the first ≥ 10 GiB B1/B2 readings, both **PASS (authoritative)** with
+> the promoted-column write path and two-arm predicate compile in the
+> measured tree). §9.9 named the authoritative rerun as the outstanding
+> `green → validated` step; §9.11 completed it the next day — this note
+> records the flip the evidence already supported. The next rung —
+> `validated → accepted` — is the maintainer's, per the
+> `docs/rfcs/README.md` lifecycle ladder.
 
 ## 1. Summary
 

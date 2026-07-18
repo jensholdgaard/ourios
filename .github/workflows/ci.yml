@@ -185,9 +185,11 @@ jobs:
   # RFC0031.1 (comparative evaluation vs Loki): the shared OTLP fixture is
   # ingested by BOTH systems — Ourios in-process, Loki as a real container —
   # queried equivalently (logs DSL / LogQL), and the answers must be
-  # multiset-identical. Needs Docker, so the test is #[ignore]d and this job
-  # runs it explicitly (the dex-oidc / collector-interop pattern). A required
-  # check (in `ci-success`'s `needs`).
+  # multiset-identical. Needs Docker, so the tests are #[ignore]d and this
+  # job runs them explicitly (the dex-oidc / collector-interop pattern). A
+  # required check (in `ci-success`'s `needs`). The backdated arm (#538
+  # item 2) exercises the days-old wide-time-range query-routing regime the
+  # frozen-corpus dispatch runs in, on the dispatch's exact Loki flags.
   loki-interop:
     name: loki interop (testcontainers)
     runs-on: ubuntu-latest
@@ -203,6 +205,7 @@ jobs:
           cargo test -p ourios-bench --test rfc0031_comparative --
           --ignored --exact
           rfc0031_1_result_set_equivalence
+          rfc0031_backdated_wide_range_interop
 
   book:
     name: mdbook build

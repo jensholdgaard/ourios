@@ -22,8 +22,9 @@ superseded-by: —
 > the promoted-column write path and two-arm predicate compile in the
 > measured tree). §9.9 named the authoritative rerun as the outstanding
 > `green → validated` step; §9.11 completed it the next day — this note
-> records the flip the evidence already supported. Maintainer flip to
-> `accepted` per `docs/rfcs/README.md` §Lifecycle remains open.
+> records the flip the evidence already supported. The next rung —
+> `validated → accepted` — is the maintainer's, per the
+> `docs/rfcs/README.md` lifecycle ladder.
 
 ## 1. Summary
 

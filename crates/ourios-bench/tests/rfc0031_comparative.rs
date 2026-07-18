@@ -41,6 +41,68 @@ const LOKI_IMAGE: &str = "grafana/loki";
 const LOKI_TAG: &str =
     "3.5.3@sha256:3165cecce301ce5b9b6e3530284b080934a05cd5cafac3d3d82edcb887b45ecd";
 
+/// The dispatch run's Loki flags — every documented deviation from the
+/// stock single-binary config, each one a run-history lesson. ONE
+/// constant shared by the dispatch (`rfc0031_indicative_comparative_run`)
+/// and the per-PR backdated interop test
+/// (`rfc0031_backdated_wide_range_interop`), so the config the cheap
+/// CI test pins is BY CONSTRUCTION the config the expensive run uses —
+/// drift between them is unrepresentable (issue #538 item 2).
+const LOKI_DISPATCH_FLAGS: &[&str] = &[
+    "-validation.reject-old-samples=false",
+    // Run #11/#13 post-mortems (the #488 diagnostics): queries over
+    // the replayed corpus's WEEKS-OLD time range skip the ingesters
+    // entirely (`query_ingesters_within`, default 3h — the failing
+    // response showed `ingester.totalReached: 0`), so rows still
+    // sitting in unflushed low-volume chunks are INVISIBLE — the
+    // L3 trace pair flickered with flush timing while high-volume
+    // streams (kafka) always flushed fast enough to be seen. `0`
+    // disables the cutoff so ingesters are always consulted — the
+    // query-side twin of `reject-old-samples=false` for frozen
+    // corpora, and in Loki's favour (without it Loki's answer to
+    // an old-range query is silently incomplete).
+    "-querier.query-ingesters-within=0",
+    "-distributor.ingestion-rate-limit-mb=512",
+    "-distributor.ingestion-burst-size-mb=1024",
+    "-ingester.per-stream-rate-limit=512MB",
+    "-ingester.per-stream-rate-limit-burst=1GB",
+    // Runs #2–#4 all failed on the SAME ~5.27 MB internal message
+    // regardless of our batch size (3 MiB → 1.5 MB outer), proving
+    // a single `kafka`-service LogsData line's content alone
+    // inflates past the stock 4 MiB internal gRPC cap. Raising the
+    // cap (standard operator tuning, in Loki's favour — it lets
+    // Loki accept the data at all) preserves the identical-ingest
+    // precondition the equivalence check requires; skipping the
+    // line would silently unequalize the two corpora. Flag names
+    // per dskit's server registry (grpc_server_max_*_msg_size).
+    "-server.grpc-max-recv-msg-size-bytes=16777216",
+    "-server.grpc-max-send-msg-size-bytes=16777216",
+    // `loki_measure_frequency_pair` polls the SAME query+step
+    // repeatedly waiting for completeness; disable query_range
+    // results caching so every poll re-queries fresh data rather
+    // than risking a stale cached answer (flag lives under the
+    // `querier.` prefix on `queryrangebase.Config.CacheResults`,
+    // verified against the pinned v3.5.3 source).
+    "-querier.cache-results=false",
+    // L4's near-miss completeness plateau (runs #4/#6/#7 all
+    // converged around 93-96% of expected rows, independent of
+    // poll deadline — ruling out a slow-ingest race) is Loki's
+    // default `-validation.max-entries-limit` (5000): the
+    // `count_over_time(... | regexp ...)` aggregation still has
+    // to scan every raw kafka log line in-window before the
+    // line filter narrows it down, and kafka's overall volume in
+    // some query-frontend splits exceeds 5000 lines, silently
+    // truncating the scan before it reaches every matching line.
+    // Confirmed by pulling the frozen otel-demo-v8 corpus and
+    // checking every line matching the L4 needle against the
+    // capture regex directly: all match — the shortfall isn't a
+    // regex/content mismatch, it's lines never being scanned.
+    // Raised well past the corpus's noisiest single template's
+    // volume (~971K rows) — in Loki's favour, cost is memory,
+    // not correctness.
+    "-validation.max-entries-limit=2000000",
+];
+
 /// Scenario RFC0031.1 — result-set equivalence gates every comparison.
 /// See `docs/rfcs/0031-comparative-evaluation-loki.md` §5.
 ///
@@ -380,6 +442,214 @@ async fn loki_round_trip(
          both service streams, never more",
     );
     (loki_all, loki_narrow, loki_trace)
+}
+
+/// The backdated wide-time-range fixture (issue #538 item 2): nine
+/// records, 12 h apart, spanning ~4 days — every timestamp far beyond
+/// Loki's default 3 h `query_ingesters_within` cutoff and its default
+/// `reject_old_samples` window, i.e. the exact ingester-vs-store query
+/// routing regime the frozen-corpus dispatch lives in (and where the
+/// L3 0-of-N flicker and the L4 completeness loss were found). One
+/// service; all records share [`FIXTURE_TRACE`] (the L3-shaped arm);
+/// bodies alternate two `peer` values of one template (the L4-shaped
+/// arm: cardinality 2, ≥ 4 rows, multiple 12 h buckets, and a
+/// per-bucket cadence far above `L4_MIN_AVG_INTERVAL_SECONDS`).
+fn backdated_wide_range_fixture(base_ns: u64) -> Vec<FixtureRecord> {
+    const TWELVE_HOURS_NS: u64 = 12 * 3600 * 1_000_000_000;
+    (0..9u64)
+        .map(|i| FixtureRecord {
+            time_unix_nano: base_ns + i * TWELVE_HOURS_NS,
+            severity_number: 9,
+            severity_text: "INFO",
+            body: if i % 2 == 0 {
+                "connection established to peer 10"
+            } else {
+                "connection established to peer 11"
+            },
+            trace_id: Some(FIXTURE_TRACE),
+            service: FIXTURE_SERVICE,
+        })
+        .collect()
+}
+
+/// Issue #538 item 2 — the backdated wide-time-range arm of the Loki
+/// interop job. The plain RFC0031.1 test stamps its fixture ~30 s ago,
+/// so it never exercises the query-routing regime the real dispatch
+/// runs in: a frozen corpus whose entire time range is days old, where
+/// Loki's ingester-vs-store routing decides whether unflushed rows are
+/// visible at all. That regime is where both characterized dispatch
+/// failure modes live — the L3 trace pair's 0-of-N flicker (runs
+/// #20/#22: `query_ingesters_within` routing) and the L4 wide-range
+/// completeness loss. This test pins, per-PR and in ~1 minute, that
+/// the EXACT dispatch Loki config ([`LOKI_DISPATCH_FLAGS`], shared by
+/// construction) returns complete, equivalent answers for both shapes
+/// over a backdated multi-day range:
+///
+/// - an L3-shaped trace-correlation query (9 rows, one trace, ~4-day
+///   window) polled to completeness — a plateau below 9 is the routing
+///   flake reproduced at fixture scale;
+/// - an L4-shaped `count_over_time` matrix query, exact-equivalent to
+///   Ourios's grouped counts (`compare_aggregations`, no margin — at
+///   fixture scale completeness has never been observed to fall short,
+///   so exact is the honest assertion; if the corpus-scale loss ever
+///   reproduces down here, this failing IS the discovery).
+#[test]
+#[ignore = "RFC 0031 / #538 item 2 — needs Docker (real Loki container); run by the loki-interop CI job via --ignored"]
+fn rfc0031_backdated_wide_range_interop() {
+    let now_ns = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("nanos fit u64");
+    // End the span ~1 h ago so every record is stale relative to `now`,
+    // start it ~4 days + 1 h ago.
+    let base_ns = now_ns.saturating_sub(4 * 24 * 3600 * 1_000_000_000 + 3600 * 1_000_000_000);
+    let records = backdated_wide_range_fixture(base_ns);
+
+    // Ourios half: fixture → store → the two query shapes.
+    let corpus = tempfile::TempDir::new().expect("corpus dir");
+    std::fs::write(
+        corpus.path().join("fixture.jsonl"),
+        fixture_jsonl(&records).expect("fixture jsonl"),
+    )
+    .expect("write corpus");
+    let bucket = tempfile::TempDir::new().expect("bucket dir");
+    let built = ourios_bench::build_comparative_store(
+        corpus.path(),
+        bucket.path(),
+        ourios_bench::TxtSeverity::Fixed,
+    )
+    .expect("build comparative store");
+    let tenant = TenantId::new(built.tenant);
+    let now = built.max_effective_time_unix_nano + 1;
+    let window = built.max_effective_time_unix_nano - built.min_effective_time_unix_nano + 2;
+    let ourios_trace = ourios_query_lines(
+        bucket.path(),
+        &tenant,
+        &format!("trace_id == \"{FIXTURE_TRACE}\" | limit 1000"),
+        now,
+        window,
+    )
+    .expect("ourios trace extraction");
+    assert_eq!(ourios_trace.len(), 9, "Ourios returns every fixture line");
+    let frequency = pick_frequency_pair(bucket.path(), &tenant, now, window)
+        .expect("the peer template must yield an L4 candidate on this fixture");
+    let margins = ourios_bench::ComparativeMargins::default();
+    let l4_spec = l4_pair_spec(
+        &frequency,
+        built.min_effective_time_unix_nano,
+        built.max_effective_time_unix_nano,
+        now,
+        window,
+        &margins,
+    )
+    .expect("the L4 pair spec must build (no backtick in the capture regex)");
+    let bucket_width_ns = bucket_width_seconds(&frequency.bucket_width)
+        .checked_mul(1_000_000_000)
+        .expect("bucket width fits u64 nanoseconds");
+
+    // Loki half: the DISPATCH config, a backdated push, both shapes
+    // polled to completeness.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (loki_trace, loki_groups) = runtime.block_on(backdated_loki_answers(
+        &records,
+        base_ns,
+        now_ns,
+        &l4_spec,
+        bucket_width_ns,
+        frequency.groups.values().sum(),
+    ));
+
+    let trace_outcome = compare_lines(&ourios_trace, &loki_trace, 8);
+    assert!(
+        trace_outcome.is_equal(),
+        "backdated L3 arm — the two systems' trace answers must be \
+         multiset-identical: {trace_outcome:?}",
+    );
+    let agg_outcome = ourios_bench::compare_aggregations(&frequency.groups, &loki_groups, 8);
+    assert!(
+        agg_outcome.is_equal(),
+        "backdated L4 arm — the grouped counts must be EXACTLY equal at \
+         fixture scale (no completeness margin down here): {agg_outcome:?}",
+    );
+}
+
+/// The Loki half of [`rfc0031_backdated_wide_range_interop`]: the
+/// DISPATCH config ([`LOKI_DISPATCH_FLAGS`]), one backdated OTLP push,
+/// then both query shapes polled to completeness — the trace filter to
+/// all 9 rows, the L4 matrix to `expected` rows. A plateau below either
+/// target is the corresponding dispatch failure mode reproduced at
+/// fixture scale.
+async fn backdated_loki_answers(
+    records: &[FixtureRecord],
+    base_ns: u64,
+    now_ns: u64,
+    l4_spec: &PairSpec,
+    bucket_width_ns: u64,
+    expected: u64,
+) -> (Vec<LineKey>, HashMap<AggKey, u64>) {
+    use prost::Message as _;
+    let (_container, base, http) = start_loki(LOKI_DISPATCH_FLAGS).await;
+    let payload = opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest {
+        resource_logs: fixture_logs_data(records).resource_logs,
+    }
+    .encode_to_vec();
+    push_otlp(&http, &base, payload).await;
+
+    let trace_logql = format!("{{service_name=~\".+\"}} | trace_id=\"{FIXTURE_TRACE}\"");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let loki_trace = loop {
+        let lines = loki_query_range(&http, &base, &trace_logql, base_ns, now_ns).await;
+        if lines.len() >= 9 {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backdated trace query plateaued at {} of 9 rows — the \
+             ingester-vs-store routing flake reproduced at fixture scale \
+             (or LOKI_DISPATCH_FLAGS' routing config regressed)",
+            lines.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let loki_groups = loop {
+        match loki_query_matrix(
+            &http,
+            &base,
+            &l4_spec.logql,
+            l4_spec.start,
+            l4_spec.end,
+            bucket_width_ns,
+            "value",
+        )
+        .await
+        {
+            Ok((groups, _, _)) if groups.values().sum::<u64>() >= expected => break groups,
+            Ok((groups, _, _)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "backdated matrix query plateaued at {} of {expected} rows — \
+                     the wide-range completeness loss reproduced at fixture scale",
+                    groups.values().sum::<u64>(),
+                );
+            }
+            Err(detail) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "backdated matrix query kept failing: {detail}",
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    (loki_trace, loki_groups)
 }
 
 /// One Loki `query_range` call, parsed to [`LineKey`]s.
@@ -3997,61 +4267,7 @@ fn rfc0031_indicative_comparative_run() {
         .build()
         .expect("tokio runtime");
     let (loki, l4_loki): (Vec<_>, Option<Result<L4Measured, String>>) = runtime.block_on(async {
-        let (container, base, http) = start_loki(&[
-            "-validation.reject-old-samples=false",
-            // Run #11/#13 post-mortems (the #488 diagnostics): queries over
-            // the replayed corpus's WEEKS-OLD time range skip the ingesters
-            // entirely (`query_ingesters_within`, default 3h — the failing
-            // response showed `ingester.totalReached: 0`), so rows still
-            // sitting in unflushed low-volume chunks are INVISIBLE — the
-            // L3 trace pair flickered with flush timing while high-volume
-            // streams (kafka) always flushed fast enough to be seen. `0`
-            // disables the cutoff so ingesters are always consulted — the
-            // query-side twin of `reject-old-samples=false` for frozen
-            // corpora, and in Loki's favour (without it Loki's answer to
-            // an old-range query is silently incomplete).
-            "-querier.query-ingesters-within=0",
-            "-distributor.ingestion-rate-limit-mb=512",
-            "-distributor.ingestion-burst-size-mb=1024",
-            "-ingester.per-stream-rate-limit=512MB",
-            "-ingester.per-stream-rate-limit-burst=1GB",
-            // Runs #2–#4 all failed on the SAME ~5.27 MB internal message
-            // regardless of our batch size (3 MiB → 1.5 MB outer), proving
-            // a single `kafka`-service LogsData line's content alone
-            // inflates past the stock 4 MiB internal gRPC cap. Raising the
-            // cap (standard operator tuning, in Loki's favour — it lets
-            // Loki accept the data at all) preserves the identical-ingest
-            // precondition the equivalence check requires; skipping the
-            // line would silently unequalize the two corpora. Flag names
-            // per dskit's server registry (grpc_server_max_*_msg_size).
-            "-server.grpc-max-recv-msg-size-bytes=16777216",
-            "-server.grpc-max-send-msg-size-bytes=16777216",
-            // `loki_measure_frequency_pair` polls the SAME query+step
-            // repeatedly waiting for completeness; disable query_range
-            // results caching so every poll re-queries fresh data rather
-            // than risking a stale cached answer (flag lives under the
-            // `querier.` prefix on `queryrangebase.Config.CacheResults`,
-            // verified against the pinned v3.5.3 source).
-            "-querier.cache-results=false",
-            // L4's near-miss completeness plateau (runs #4/#6/#7 all
-            // converged around 93-96% of expected rows, independent of
-            // poll deadline — ruling out a slow-ingest race) is Loki's
-            // default `-validation.max-entries-limit` (5000): the
-            // `count_over_time(... | regexp ...)` aggregation still has
-            // to scan every raw kafka log line in-window before the
-            // line filter narrows it down, and kafka's overall volume in
-            // some query-frontend splits exceeds 5000 lines, silently
-            // truncating the scan before it reaches every matching line.
-            // Confirmed by pulling the frozen otel-demo-v8 corpus and
-            // checking every line matching the L4 needle against the
-            // capture regex directly: all match — the shortfall isn't a
-            // regex/content mismatch, it's lines never being scanned.
-            // Raised well past the corpus's noisiest single template's
-            // volume (~971K rows) — in Loki's favour, cost is memory,
-            // not correctness.
-            "-validation.max-entries-limit=2000000",
-        ])
-        .await;
+        let (container, base, http) = start_loki(LOKI_DISPATCH_FLAGS).await;
         push_corpus_to_loki(&http, &base, &corpus_dir).await;
         let mut measured = Vec::with_capacity(specs.len());
         for spec in &specs {

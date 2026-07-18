@@ -257,13 +257,20 @@ pub(crate) async fn loki_query_range(
 /// figures from the same response body: engine-level decompressed
 /// `totalBytesProcessed`, and the storage-side compressed/head-chunk
 /// figures — so the report can carry the conservative ratio.
+/// Returns `Err` on any transport/HTTP/parse failure rather than
+/// panicking: this runs inside [`loki_measure_pair`]'s poll loop, in
+/// the same async block that accumulates every pair's measurement — a
+/// panic on a transient blip would unwind and lose all of it (the same
+/// salvage rule [`loki_query_matrix`] and `loki_query_range_uncapped`
+/// already follow). The poll loop retries an `Err` until its deadline,
+/// same as an incomplete answer.
 pub(crate) async fn loki_query_with_stats(
     http: &reqwest::Client,
     base: &str,
     logql: &str,
     start: u64,
     end: u64,
-) -> (Vec<LineKey>, u64, LokiFetchedBytes) {
+) -> Result<(Vec<LineKey>, u64, LokiFetchedBytes), String> {
     let resp = http
         .get(format!("{base}/loki/api/v1/query_range"))
         .query(&[
@@ -275,15 +282,20 @@ pub(crate) async fn loki_query_with_stats(
         ])
         .send()
         .await
-        .expect("query_range");
+        .map_err(|e| format!("query_range transport error: {e}"))?;
     let status = resp.status();
-    let body = resp.text().await.expect("query_range body");
-    assert!(status.is_success(), "loki query_range {status}: {body}");
-    (
-        parse_loki_streams(&body).expect("parse loki streams"),
-        parse_loki_bytes_processed(&body).expect("parse loki bytes"),
-        parse_loki_fetched_bytes(&body).expect("parse loki fetched bytes"),
-    )
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("query_range body read error: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("loki query_range {status}: {body}"));
+    }
+    Ok((
+        parse_loki_streams(&body).map_err(|e| format!("parse loki streams: {e}"))?,
+        parse_loki_bytes_processed(&body).map_err(|e| format!("parse loki bytes: {e}"))?,
+        parse_loki_fetched_bytes(&body).map_err(|e| format!("parse loki fetched bytes: {e}"))?,
+    ))
 }
 
 /// One Loki **metric** `query_range` call — the L4 matrix counterpart of
@@ -527,7 +539,27 @@ pub(crate) async fn loki_measure_pair(
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
     loop {
         let (lines, bytes, fetched) =
-            loki_query_with_stats(http, base, &spec.logql, spec.start, spec.end).await;
+            match loki_query_with_stats(http, base, &spec.logql, spec.start, spec.end).await {
+                Ok(measured) => measured,
+                // A transient blip (transport error, a 5xx, a torn
+                // body) retries until the deadline, same as an
+                // incomplete answer — panicking here would unwind the
+                // async block holding every pair's measurements.
+                Err(detail) => {
+                    if std::time::Instant::now() >= deadline {
+                        break Err(format!(
+                            "loki query for [{}] still failing at its poll deadline: {detail}",
+                            spec.label,
+                        ));
+                    }
+                    eprintln!(
+                        "loki query for [{}] failed (retrying until deadline): {detail}",
+                        spec.label,
+                    );
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
         if lines.len() as u64 >= spec.expected_rows {
             break Ok((lines, bytes, fetched));
         }

@@ -22,8 +22,13 @@
 /// processed channel as primary, plus `m_l2_storage_floor_tenths = 11`
 /// — a 1.1× storage-side floor asserted alongside via
 /// [`bytes_must_win_tenths`] — asserted by the dispatch run and
-/// scenario RFC0031.3. `m_l4` and `f_l7` stay deferred until their
-/// classes are first measured. See
+/// scenario RFC0031.3. `m_l4` was deferred until L4 was first measured
+/// and **frozen 2026-07-18** on the same shape as L2 once it was
+/// (`docs/benchmarks.md` §9.17: a four-run 3.69–3.73× storage /
+/// 86.5–87.1× processed band): `m_l4 = 10` on the processed channel as
+/// primary, plus `m_l4_storage_floor_tenths = 11` — asserted by the
+/// dispatch run and scenario RFC0031.5. `f_l7` stays deferred until L7
+/// is first measured. See
 /// `docs/rfcs/0031-comparative-evaluation-loki.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComparativeMargins {
@@ -38,8 +43,15 @@ pub struct ComparativeMargins {
     pub m_l2_storage_floor_tenths: u64,
     /// L3 (trace correlation) must-win margin.
     pub m_l3: u64,
-    /// L4 (frequency aggregation) must-win margin.
+    /// L4 (frequency aggregation) must-win margin, processed channel.
     pub m_l4: u64,
+    /// L4 storage-side floor in tenths (11 = a 1.1× must-win), decided
+    /// exactly as `ourios × tenths ≤ loki × 10`
+    /// ([`bytes_must_win_tenths`]) — the same split-channel shape as
+    /// L2, frozen from the same kind of evidence (a strong processed
+    /// win with storage nearer parity; L4's measured 3.69–3.73×
+    /// storage band clears this floor with ~3.4× headroom).
+    pub m_l4_storage_floor_tenths: u64,
     /// L6 broad-scan latency floor factor.
     pub f_l6: u64,
     /// L7 ingest-throughput parity factor.
@@ -54,6 +66,7 @@ impl Default for ComparativeMargins {
             m_l2_storage_floor_tenths: 11,
             m_l3: 10,
             m_l4: 10,
+            m_l4_storage_floor_tenths: 11,
             f_l6: 3,
             f_l7: 2,
         }
@@ -253,11 +266,13 @@ mod tests {
         // Pinned so the §7 values can't drift silently — m_l1/m_l3/f_l6
         // are FROZEN (2026-07-13) and m_l2 (processed primary + the
         // 1.1× storage floor in tenths) FROZEN (2026-07-14, the RFC 0033
-        // unfreeze condition met); m_l4/f_l7 stay deferred proposals; a
-        // §7 change lands here WITH the RFC.
+        // unfreeze condition met), m_l4 + its storage floor frozen
+        // 2026-07-18 (first measured, §9.17); f_l7 stays a deferred
+        // proposal; a §7 change lands here WITH the RFC.
         let m = ComparativeMargins::default();
         assert_eq!((m.m_l1, m.m_l2, m.m_l3, m.m_l4), (10, 10, 10, 10));
         assert_eq!(m.m_l2_storage_floor_tenths, 11);
+        assert_eq!(m.m_l4_storage_floor_tenths, 11);
         assert_eq!((m.f_l6, m.f_l7), (3, 2));
     }
 

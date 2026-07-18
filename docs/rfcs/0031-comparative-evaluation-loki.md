@@ -528,11 +528,15 @@ record. It references RFC 0006's harness rather than editing it.
 >   pillar-level escalation as RFC0031.2 on failure — this is the query
 >   the template + typed-params pillar exists to serve (§2.3)
 >
-> **Not currently asserted:** `M_L4` is deferred (§7) — no frozen value
-> exists yet, so the harness measures and reports `ourios.bytes_read /
-> loki.bytes_read` for L4 without gating a run's pass/fail on it. This
-> scenario states the target contract L4 must eventually clear to reach
-> `must-win` in practice, not a predicate the harness currently enforces.
+> **Asserted since the 2026-07-18 `M_L4` freeze** (below, §7): the
+> dispatch run gates the L4 pair on the processed channel at
+> `M_L4 = 10` (primary) plus the 1.1× storage-side floor
+> (`m_l4_storage_floor_tenths = 11`) via `l4_gate_failures`, and
+> scenario RFC0031.5 pins the frozen values and boundary math
+> (`rfc0031_5_l4_frozen_gates`). The storage-side must-win at the full
+> margin stated above remains aspirational (measured 3.69–3.73× vs the
+> 10× this Then-clause names) — the freeze records the honest
+> split-channel claim, the same shape as L2's.
 
 > **Scenario RFC0031.6 — L5 substring needle is measured and published, loss permitted**
 > - **Given** an L5 query for a literal not captured by a template or a
@@ -659,8 +663,10 @@ not block `validated` in the "we didn't finish" sense — it is a
   map, constant 513,862 bytes per query, and write-side sizing) are expected
   to move it; freeze after RFC 0033 lands. Until then L2 gates on
   the processed channel at `M = 10` (measured 32.5–39.3×),
-  with the storage-side figure recorded as informational. `M_L4` is
-  **deferred until L4 is first measured** (query shape below).
+  with the storage-side figure recorded as informational. `M_L4` was
+  **deferred until L4 was first measured** (query shape below) and
+  **frozen 2026-07-18** once it was — see the freeze record at the end
+  of the L4 entry below.
   Rationale for the split channels is the `benchmarks.md` §9.13 assessment: the
   storage channel is the conservative claim where we can make it,
   and the processed channel measures the work the §1 thesis
@@ -874,8 +880,27 @@ not block `validated` in the "we didn't finish" sense — it is a
     subtracting two close floats and rounding the remainder). All prior
     regression tests plus this boundary case now pass together.
 
-  `M_L4` stays **deferred** — this decision unblocks a measurement, it
-  does not freeze the bytes-read margin.
+  **`M_L4` FROZEN (2026-07-18, maintainer decision).** With the
+  measurement stable — four consecutive equivalence-verified runs
+  (`benchmarks.md` §9.17) in a 3.69–3.73× storage / 86.5–87.1×
+  processed band on the frozen corpus — the margin freezes on the
+  same split-channel shape as `M_L2`, from the same kind of evidence
+  (a strong processed win with storage nearer parity):
+
+  - `M_L4 = 10` on the **processed channel as primary** (measured
+    86.5–87.1× — ~8.7× headroom), and
+  - a **1.1× storage-side floor** (`m_l4_storage_floor_tenths = 11`,
+    decided as `ourios × 11 ≤ loki × 10`; measured 3.69–3.73× —
+    ~3.4× headroom),
+
+  both asserted by the dispatch run (`l4_gate_failures`, alongside
+  the other frozen §7 gates after every report has printed) and
+  pinned by scenario RFC0031.5 (`rfc0031_5_l4_frozen_gates`:
+  frozen values, boundary math, the §9.17-recorded measurements
+  clearing both channels). The completeness margin above is
+  unchanged — it conditions what counts as an equivalent answer;
+  this freezes what the bytes must then show. `F_L7` remains the
+  only deferred §7 value (until L7 is first measured).
 - [x] **Headline corpus — DECIDED: OTel-Demo.** Ourios is an OTLP-native
   backend, so the honest headline is real OTLP logs — the workload the
   project claims to do best — not the favourable well-templated HDFS_v1.

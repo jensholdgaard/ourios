@@ -286,23 +286,29 @@ impl ClassFilter {
         if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
             return Self(PairClass::ALL.to_vec());
         }
-        let classes = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|token| {
-                PairClass::ALL
-                    .into_iter()
-                    .find(|c| c.artifact_name() == token)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "OURIOS_COMPARATIVE_CLASSES: unknown class {token:?} (valid: {}, \
-                             or \"all\")",
-                            PairClass::ALL.map(PairClass::artifact_name).join(", "),
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
+        let mut classes: Vec<PairClass> = Vec::new();
+        for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let class = PairClass::ALL
+                .into_iter()
+                .find(|c| c.artifact_name() == token)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "OURIOS_COMPARATIVE_CLASSES: unknown class {token:?} (valid: {}, \
+                         or \"all\")",
+                        PairClass::ALL.map(PairClass::artifact_name).join(", "),
+                    )
+                });
+            // First-seen dedup: `L1,L1` is one class, and a list naming
+            // every class (with or without repeats) is a FULL run —
+            // `artifact_value` keys off the count, so duplicates must
+            // not make a full run read as partial.
+            if !classes
+                .iter()
+                .any(|c| c.artifact_name() == class.artifact_name())
+            {
+                classes.push(class);
+            }
+        }
         assert!(
             !classes.is_empty(),
             "OURIOS_COMPARATIVE_CLASSES parsed to an empty set — a run that measures \
@@ -339,7 +345,7 @@ impl ClassFilter {
 /// One measured query of the indicative run: the equivalent DSL/`LogQL`
 /// question, the window both systems answer it over, and the row count
 /// both must return exactly.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PairSpec {
     pub(crate) label: String,
     /// The pair's §7 calibration value (`m_l1`/`m_l2`/`m_l3` for the
@@ -390,61 +396,78 @@ pub(crate) struct Picks<'a> {
 
 pub(crate) fn build_pair_specs(
     picks: &Picks<'_>,
+    class_filter: &ClassFilter,
     corpus_now: u64,
     corpus_window: u64,
 ) -> Vec<PairSpec> {
     let (pair, clean_ts, poison_ts) = (picks.pair, picks.clean_ts, picks.poison_ts);
     let margins = ourios_bench::ComparativeMargins::default();
-    let mut specs = vec![PairSpec {
-        label: format!(
-            "severity, L2 family: service={} severity>={} (text={:?})",
-            pair.service, pair.threshold, pair.text
-        ),
-        margin: margins.m_l2,
-        class: PairClass::L2,
-        dsl: format!(
-            "service == \"{}\" and severity >= {} | limit 5000",
-            pair.service, pair.threshold
-        ),
-        logql: format!(
-            "{{service_name=\"{}\"}} | severity_text=\"{}\"",
-            pair.service, pair.text
-        ),
-        start: pair.min_ts,
-        end: pair
-            .max_ts
-            .checked_add(1)
-            .expect("corpus max timestamp overflows the Loki window end"),
-        expected_rows: pair.rows,
-        now: corpus_now,
-        window: corpus_window,
-    }];
-    for k in [100usize, 2000] {
-        let Some((start, end)) = pick_window_pair(clean_ts, poison_ts, k) else {
-            panic!(
-                "no clean {k}-row window on service {} ({} clean rows, {} poison)",
-                pair.service,
-                clean_ts.len(),
-                poison_ts.len(),
-            );
-        };
+    // The filter applies DURING construction, not as a post-hoc retain:
+    // an excluded class must impose no preconditions — the L6 window
+    // loop below hard-panics when no clean window exists, and a
+    // `classes=L1` dispatch must not die on a precondition of a class
+    // it never asked to measure.
+    let mut specs = Vec::new();
+    if class_filter.includes(PairClass::L2) {
         specs.push(PairSpec {
             label: format!(
-                "time-window slice, L6 family: service={} k={k}",
-                pair.service
+                "severity, L2 family: service={} severity>={} (text={:?})",
+                pair.service, pair.threshold, pair.text
             ),
-            margin: margins.f_l6,
-            class: PairClass::WindowFloor,
-            dsl: format!("service == \"{}\" | limit 5000", pair.service),
-            logql: format!("{{service_name=\"{}\"}}", pair.service),
-            start,
-            end,
-            expected_rows: k as u64,
-            now: end,
-            window: end - start,
+            margin: margins.m_l2,
+            class: PairClass::L2,
+            dsl: format!(
+                "service == \"{}\" and severity >= {} | limit 5000",
+                pair.service, pair.threshold
+            ),
+            logql: format!(
+                "{{service_name=\"{}\"}} | severity_text=\"{}\"",
+                pair.service, pair.text
+            ),
+            start: pair.min_ts,
+            end: pair
+                .max_ts
+                .checked_add(1)
+                .expect("corpus max timestamp overflows the Loki window end"),
+            expected_rows: pair.rows,
+            now: corpus_now,
+            window: corpus_window,
         });
     }
-    specs.extend(class_pair_specs(picks, &margins, corpus_now, corpus_window));
+    if class_filter.includes(PairClass::WindowFloor) {
+        for k in [100usize, 2000] {
+            let Some((start, end)) = pick_window_pair(clean_ts, poison_ts, k) else {
+                panic!(
+                    "no clean {k}-row window on service {} ({} clean rows, {} poison)",
+                    pair.service,
+                    clean_ts.len(),
+                    poison_ts.len(),
+                );
+            };
+            specs.push(PairSpec {
+                label: format!(
+                    "time-window slice, L6 family: service={} k={k}",
+                    pair.service
+                ),
+                margin: margins.f_l6,
+                class: PairClass::WindowFloor,
+                dsl: format!("service == \"{}\" | limit 5000", pair.service),
+                logql: format!("{{service_name=\"{}\"}}", pair.service),
+                start,
+                end,
+                expected_rows: k as u64,
+                now: end,
+                window: end - start,
+            });
+        }
+    }
+    specs.extend(class_pair_specs(
+        picks,
+        class_filter,
+        &margins,
+        corpus_now,
+        corpus_window,
+    ));
     specs
 }
 
@@ -453,6 +476,7 @@ pub(crate) fn build_pair_specs(
 /// readable.
 pub(crate) fn class_pair_specs(
     picks: &Picks<'_>,
+    class_filter: &ClassFilter,
     margins: &ourios_bench::ComparativeMargins,
     corpus_now: u64,
     corpus_window: u64,
@@ -466,56 +490,64 @@ pub(crate) fn class_pair_specs(
     // compiles it to a trace_id column equality. Skipping when no
     // eligible trace exists is LOUD (stderr + a 3-section report), never
     // silent.
-    match trace {
-        Some((hex, rows)) => specs.push(PairSpec {
-            label: format!("trace correlation, L3 family: trace_id={hex}"),
-            margin: margins.m_l3,
-            class: PairClass::L3,
-            dsl: format!("trace_id == \"{hex}\" | limit 5000"),
-            logql: format!("{{service_name=~\".+\"}} | trace_id=\"{hex}\""),
-            start: pair.min_ts,
-            end: pair
-                .max_ts
-                .checked_add(1)
-                .expect("corpus max timestamp overflows the Loki window end"),
-            expected_rows: *rows,
-            now: corpus_now,
-            window: corpus_window,
-        }),
-        None => eprintln!(
-            "L3 PAIR SKIPPED: no eligible trace (16-byte id, no zero-ts/empty-service rows, \
+    if class_filter.includes(PairClass::L3) {
+        match trace {
+            Some((hex, rows)) => specs.push(PairSpec {
+                label: format!("trace correlation, L3 family: trace_id={hex}"),
+                margin: margins.m_l3,
+                class: PairClass::L3,
+                dsl: format!("trace_id == \"{hex}\" | limit 5000"),
+                logql: format!("{{service_name=~\".+\"}} | trace_id=\"{hex}\""),
+                start: pair.min_ts,
+                end: pair
+                    .max_ts
+                    .checked_add(1)
+                    .expect("corpus max timestamp overflows the Loki window end"),
+                expected_rows: *rows,
+                now: corpus_now,
+                window: corpus_window,
+            }),
+            None => eprintln!(
+                "L3 PAIR SKIPPED: no eligible trace (16-byte id, no zero-ts/empty-service rows, \
              2..=100 rows) in the corpus"
-        ),
+            ),
+        }
+    } else {
+        eprintln!("L3 PAIR SKIPPED by OURIOS_COMPARATIVE_CLASSES");
     }
     // L1 must-win — the taxonomy's flagship: DSL `template_id == N` rides
     // the writer's existing bloom filter on template_id; Loki has no
     // template concept, so its honest equivalent is a line filter over
     // every stream. The picker proved the two select IDENTICAL row sets
     // (needle-count == template row count + rendered-row containment).
-    match template {
-        Some(t) => specs.push(PairSpec {
-            label: format!(
-                "template lookup, L1 family: template_id={} needle={:?}",
-                t.template_id, t.needle
-            ),
-            margin: margins.m_l1,
-            class: PairClass::L1,
-            dsl: format!("template_id == {} | limit 5000", t.template_id),
-            logql: format!("{{service_name=~\".+\"}} |= \"{}\"", t.needle),
-            start: pair.min_ts,
-            end: pair
-                .max_ts
-                .checked_add(1)
-                .expect("corpus max timestamp overflows the Loki window end"),
-            expected_rows: t.rows,
-            now: corpus_now,
-            window: corpus_window,
-        }),
-        None => eprintln!(
-            "L1 PAIR SKIPPED: no template with a validated constant needle (≥ 10 safe \
+    if class_filter.includes(PairClass::L1) {
+        match template {
+            Some(t) => specs.push(PairSpec {
+                label: format!(
+                    "template lookup, L1 family: template_id={} needle={:?}",
+                    t.template_id, t.needle
+                ),
+                margin: margins.m_l1,
+                class: PairClass::L1,
+                dsl: format!("template_id == {} | limit 5000", t.template_id),
+                logql: format!("{{service_name=~\".+\"}} |= \"{}\"", t.needle),
+                start: pair.min_ts,
+                end: pair
+                    .max_ts
+                    .checked_add(1)
+                    .expect("corpus max timestamp overflows the Loki window end"),
+                expected_rows: t.rows,
+                now: corpus_now,
+                window: corpus_window,
+            }),
+            None => eprintln!(
+                "L1 PAIR SKIPPED: no template with a validated constant needle (≥ 10 safe \
              chars, 2..=4000 rows, needle-count == template row count, no \
              zero-ts/empty-service match) in the corpus"
-        ),
+            ),
+        }
+    } else {
+        eprintln!("L1 PAIR SKIPPED by OURIOS_COMPARATIVE_CLASSES");
     }
     // Selective-resource DIAGNOSTIC (not an L-class gate): the same
     // window-browse shape as the L6 pairs but scoped to the corpus's
@@ -523,23 +555,27 @@ pub(crate) fn class_pair_specs(
     // actually skip row groups — the L6 pairs use the highest-volume
     // service, the bloom's worst case, so they bound the unscoped-browse
     // cost while this bounds the enriched one.
-    match rare_window {
-        Some((service, start, end, rows)) => specs.push(PairSpec {
-            label: format!("selective-resource window, diagnostic: service={service} k={rows}"),
-            margin: margins.f_l6,
-            class: PairClass::Diagnostic,
-            dsl: format!("service == \"{service}\" | limit 5000"),
-            logql: format!("{{service_name=\"{service}\"}}"),
-            start: *start,
-            end: *end,
-            expected_rows: *rows,
-            now: *end,
-            window: *end - *start,
-        }),
-        None => eprintln!(
-            "SELECTIVE-RESOURCE PAIR SKIPPED: no low-volume service with a clean \
+    if class_filter.includes(PairClass::Diagnostic) {
+        match rare_window {
+            Some((service, start, end, rows)) => specs.push(PairSpec {
+                label: format!("selective-resource window, diagnostic: service={service} k={rows}"),
+                margin: margins.f_l6,
+                class: PairClass::Diagnostic,
+                dsl: format!("service == \"{service}\" | limit 5000"),
+                logql: format!("{{service_name=\"{service}\"}}"),
+                start: *start,
+                end: *end,
+                expected_rows: *rows,
+                now: *end,
+                window: *end - *start,
+            }),
+            None => eprintln!(
+                "SELECTIVE-RESOURCE PAIR SKIPPED: no low-volume service with a clean \
              2..=100-row window in the corpus"
-        ),
+            ),
+        }
+    } else {
+        eprintln!("SELECTIVE-RESOURCE (diagnostic) PAIR SKIPPED by OURIOS_COMPARATIVE_CLASSES");
     }
     specs
 }
@@ -1239,4 +1275,43 @@ fn class_filter_parses_all_and_subsets() {
 #[should_panic(expected = "unknown class \"L9\"")]
 fn class_filter_rejects_an_unknown_class_loudly() {
     let _ = ClassFilter::parse("L1,L9");
+}
+
+#[test]
+fn class_filter_excluded_classes_impose_no_preconditions() {
+    // The review finding this pins: a `classes=L2` dispatch must not die
+    // on the L6 window loop's no-clean-window panic — an empty timestamp
+    // set would panic that loop if the filter applied after construction
+    // instead of during it.
+    let pair = SelectivePair {
+        service: "svc".to_string(),
+        threshold: 17,
+        text: "ERROR".to_string(),
+        rows: 3,
+        total_records: 10,
+        min_ts: 1,
+        max_ts: 9,
+    };
+    let picks = Picks {
+        pair: &pair,
+        clean_ts: &[], // would panic the window loop if it ran
+        poison_ts: &[],
+        trace: None,
+        template: None,
+        rare_window: None,
+    };
+    let specs = build_pair_specs(&picks, &ClassFilter::parse("L2"), 10, 10);
+    assert_eq!(specs.len(), 1, "exactly the requested L2 spec: {specs:?}");
+    assert!(matches!(specs[0].class, PairClass::L2));
+
+    // And the inverse: excluding L2 with windows requested still hits
+    // the window precondition — the filter skips classes, it does not
+    // soften a REQUESTED class's requirements.
+    let result = std::panic::catch_unwind(|| {
+        build_pair_specs(&picks, &ClassFilter::parse("window-floor"), 10, 10)
+    });
+    assert!(
+        result.is_err(),
+        "a requested window class must still enforce its clean-window precondition",
+    );
 }

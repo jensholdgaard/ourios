@@ -647,13 +647,14 @@ fn rfc0031_indicative_comparative_run() {
         template: template.as_ref(),
         rare_window: rare_window.as_ref(),
     };
-    let mut specs = build_pair_specs(&picks, corpus_now, corpus_window);
-    let before = specs.len();
-    specs.retain(|spec| class_filter.includes(spec.class));
-    if specs.len() < before {
+    // The filter applies INSIDE build_pair_specs (during construction,
+    // not a post-hoc retain): an excluded class must impose no
+    // preconditions — notably the L6 window loop's no-clean-window
+    // panic must not kill a dispatch that never asked for windows.
+    let specs = build_pair_specs(&picks, &class_filter, corpus_now, corpus_window);
+    if class_filter.artifact_value().is_some() {
         eprintln!(
-            "class filter {:?}: measuring {} of {before} line-returning pairs",
-            class_filter,
+            "class filter {class_filter:?}: measuring {} line-returning pair(s)",
             specs.len(),
         );
     }

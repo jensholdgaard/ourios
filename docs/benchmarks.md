@@ -1580,7 +1580,7 @@ until measured. RFC 0033's §5 is fully discharged: the corpus arm
 passed as measured (#21), and passed again as an asserting gate
 (#23) — the status flips red → green with this record.
 
-### 9.17 Results — 2026-07-17→18 (indicative, `ci-runner`) — L4 frequency aggregation measured (PR #536 arc)
+### 9.17 Results — 2026-07-17 (indicative, `ci-runner`) — L4 frequency aggregation measured (PR #536 arc)
 
 The last unmeasured must-win class. The L4 workstream's own dispatch
 sequence (~23 real `comparative-bench` runs across the arc — a
@@ -1610,7 +1610,7 @@ measure more completely; mechanism uncharacterized, NOT dedup):
 
 | run (workflow id) | completeness | storage-side (loki/ourios) | processed (loki/ourios) |
 |---|---|---|---|
-| 29573249312 (2026-07-17, first clean pass) | equivalence held | 3.73× | 87.1× |
+| 29573249312 (2026-07-17, first clean pass) | 1167/1197 = 97.5% | 3.73× | 87.1× |
 | 29598833238 (2026-07-17) | 1164/1197 = 97.2% | 3.72× | 86.8× |
 | 29608796312 (2026-07-17) | 1141/1197 = 95.3% | — (run failed on the unrelated L3 flicker; L4 itself passed) | — |
 | 29614831613 (2026-07-17) | 1149/1197 = 96.0% | 3.69× | 86.6× |

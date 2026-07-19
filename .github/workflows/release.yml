@@ -135,12 +135,43 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      # The dist-generated form is `curl https://sh.rustup.rs | sh`;
+      # replaced with a pinned download → verify → execute of the
+      # versioned rustup-init (the #366 dist-installer pattern —
+      # sh.rustup.rs is unversioned and can't be hash-pinned). Bump the
+      # version and both hashes together from
+      # static.rust-lang.org/rustup/archive/<v>/<triple>/rustup-init.sha256.
+      # Currently dormant: no dist container config while musl is
+      # deferred, so `matrix.container` is always null.
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
+        shell: bash
         run: |
+          set -euo pipefail
           if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            rustup_version=1.29.0
+            case "$(uname -m)" in
+              x86_64)
+                triple=x86_64-unknown-linux-gnu
+                sha=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
+                ;;
+              aarch64)
+                triple=aarch64-unknown-linux-gnu
+                sha=9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792
+                ;;
+              *)
+                echo "unsupported container arch: $(uname -m)" >&2
+                exit 1
+                ;;
+            esac
+            rustup_init="$(mktemp "$RUNNER_TEMP/rustup-init-XXXXXX")"
+            trap 'rm -f "$rustup_init"' EXIT
+            curl --proto '=https' --tlsv1.2 -LsSf -o "$rustup_init" \
+              "https://static.rust-lang.org/rustup/archive/${rustup_version}/${triple}/rustup-init"
+            echo "${sha}  $rustup_init" | sha256sum -c -
+            chmod +x "$rustup_init"
+            "$rustup_init" -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - name: Install dist
         # `matrix.install_dist.run` is the dist-plan-generated `curl | sh`;

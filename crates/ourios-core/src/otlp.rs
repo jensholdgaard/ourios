@@ -956,6 +956,117 @@ impl Default for TenantId {
     }
 }
 
+/// Lenient OTLP/JSON parsing: a workaround for `opentelemetry-proto`'s
+/// `with-serde` deserialiser rejecting proto3-JSON's two valid
+/// encodings of an **unset** `AnyValue` — `{}` (a message with no
+/// fields set; the `OTel` Collector's file exporter emits it for
+/// empty-body event records) and `null` (what `with-serde`'s own
+/// serialiser emits for `value: None`) — with "Invalid data for
+/// Value, no known keys found". Tracked upstream; until the fix
+/// ships, both OTLP/JSON entry points (the receiver's
+/// `application/json` transport and the bench corpus loader) parse
+/// through here.
+///
+/// Semantics: the direct parse runs first, so the hot path is
+/// untouched for the overwhelmingly common valid input. On failure,
+/// unset-`AnyValue` encodings at the two `Option`-typed positions —
+/// `LogRecord.body` and `KeyValue.value` (including inside
+/// `kvlistValue`) — are rewritten to an **absent field** and the
+/// parse retried once.
+///
+/// **Bounded fidelity concession, by design**: the faithful decode of
+/// a present-but-unset `AnyValue` is `Some(AnyValue { value: None })`
+/// (what prost produces from the protobuf transport, per the RFC 0018
+/// preserve-don't-correct rule) — but the broken upstream deserialiser
+/// leaves NO encoding that reaches that state, so this shim accepts
+/// the closest expressible reading: absent (`None`). What is conceded
+/// is exactly the presence bit of an EMPTY value, nothing else; for
+/// bodies even that is invisible ([`Body::from_any_value`] collapses
+/// both states identically). The interim contract — including the
+/// signal that flips when the upstream fix restores full fidelity —
+/// is pinned by the cross-transport equivalence test in
+/// `ourios-ingester` (`rfc0003_6_unset_any_value_decodes_equivalently_across_transports`).
+/// An unset `AnyValue` **inside `arrayValue`** has no absent encoding
+/// (position matters) and stays a parse error — matching the
+/// pre-existing behaviour, resolved only by the upstream fix.
+pub mod lenient_json {
+    use serde::de::DeserializeOwned;
+
+    /// [`serde_json::from_slice`] with the unset-`AnyValue` retry.
+    ///
+    /// # Errors
+    ///
+    /// The retry's parse error when normalisation changed the
+    /// document, the original parse error otherwise.
+    pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, serde_json::Error> {
+        from_slice_flagged(bytes).map(|(v, _)| v)
+    }
+
+    /// [`from_slice`], also reporting WHICH path parsed: `true` means
+    /// the direct parse failed and the lenient retry succeeded — the
+    /// observability hook (`CLAUDE.md` §6.3) that lets the receiver
+    /// count lenient decodes (`ourios.ingest.json.lenient` on the
+    /// batches counter) so operators see upstream-rejected-but-valid
+    /// payloads arriving, and so the shim's dormancy is visible once
+    /// the upstream fix ships.
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`from_slice`]'s.
+    pub fn from_slice_flagged<T: DeserializeOwned>(
+        bytes: &[u8],
+    ) -> Result<(T, bool), serde_json::Error> {
+        match serde_json::from_slice(bytes) {
+            Ok(v) => Ok((v, false)),
+            Err(first) => {
+                let Ok(mut tree) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                    return Err(first);
+                };
+                if !strip_unset_any_values(&mut tree) {
+                    return Err(first);
+                }
+                serde_json::from_value(tree).map(|v| (v, true))
+            }
+        }
+    }
+
+    /// Remove `"body"` / `"value"` keys whose value encodes an unset
+    /// `AnyValue` (`{}` or `null`), recursively. Returns whether the
+    /// tree changed. The two key names are unambiguous in the OTLP/JSON
+    /// log tree: user data only ever appears as the *values of* `key` /
+    /// `value` / `body` fields, never as sibling object keys, so no
+    /// user-controlled content can be misread as one of these
+    /// positions.
+    fn strip_unset_any_values(tree: &mut serde_json::Value) -> bool {
+        let mut changed = false;
+        match tree {
+            serde_json::Value::Object(map) => {
+                for slot in ["body", "value"] {
+                    let is_unset = match map.get(slot) {
+                        Some(serde_json::Value::Null) => true,
+                        Some(serde_json::Value::Object(inner)) => inner.is_empty(),
+                        _ => false,
+                    };
+                    if is_unset {
+                        map.remove(slot);
+                        changed = true;
+                    }
+                }
+                for v in map.values_mut() {
+                    changed |= strip_unset_any_values(v);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    changed |= strip_unset_any_values(v);
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,5 +1196,78 @@ mod tests {
         assert_eq!(r.flags, 0);
         assert_eq!(r.event_name, None);
         assert_eq!(r.body, None);
+    }
+
+    /// The exact record shape the OTel-Demo (`main`, post-2.2.0) file
+    /// exporter emits for an empty-body event — the input that
+    /// motivated [`lenient_json`] (ourios#549). Kept byte-faithful to
+    /// the captured corpus line.
+    const DEMO_EMPTY_BODY_EVENT: &str = r#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"shipping"}}]},"scopeLogs":[{"scope":{"name":"shipping::shipping_service"},"logRecords":[{"observedTimeUnixNano":"1784401032379902551","severityNumber":9,"severityText":"INFO","body":{},"attributes":[{"key":"feature_flag_key","value":{"stringValue":"intlShippingSlowdown"}}],"eventName":"shipping.feature_flag.evaluated"}]}]}]}"#;
+
+    #[test]
+    fn lenient_json_accepts_the_demo_empty_body_event() {
+        use opentelemetry_proto::tonic::logs::v1::LogsData;
+        // Future-proof against the upstream fix landing: today the
+        // direct parse rejects this and only the lenient retry accepts
+        // (the ingester's RFC0003.6 equivalence test pins that state as
+        // the designated flip signal); once upstream is fixed the direct
+        // parse succeeds with Some(AnyValue { value: None }). Either
+        // way the body must be absent-or-unset — the one downstream
+        // state Body::from_any_value maps both to.
+        let parsed: LogsData =
+            lenient_json::from_slice(DEMO_EMPTY_BODY_EVENT.as_bytes()).expect("lenient parse");
+        let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
+        assert!(
+            record
+                .body
+                .as_ref()
+                .and_then(|b| b.value.as_ref())
+                .is_none()
+        );
+        assert_eq!(record.event_name, "shipping.feature_flag.evaluated");
+        assert_eq!(record.attributes.len(), 1, "attributes survive untouched");
+    }
+
+    #[test]
+    fn lenient_json_accepts_both_unset_encodings_in_both_positions() {
+        use opentelemetry_proto::tonic::logs::v1::LogsData;
+        // Both spellings of the unset state (`null` and `{}` —
+        // proto3-JSON's empty-message encoding) at both Option-typed
+        // positions (`body`, `KeyValue.value`); the sibling test above
+        // covers `"body": {}` on the real demo record.
+        let doc = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"logRecords":[{"body":null,"attributes":[{"key":"a","value":{}},{"key":"b","value":null}]}]}]}]}"#;
+        let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("lenient parse");
+        let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
+        // Absent-or-unset (not strictly absent): once upstream accepts
+        // these encodings directly, `{}` parses to present-but-unset.
+        let unset = |v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>| {
+            v.as_ref().and_then(|av| av.value.as_ref()).is_none()
+        };
+        assert!(unset(&record.body));
+        assert!(unset(&record.attributes[0].value));
+        assert!(unset(&record.attributes[1].value));
+    }
+
+    #[test]
+    fn lenient_json_does_not_loosen_unknown_key_rejection() {
+        use opentelemetry_proto::tonic::logs::v1::LogsData;
+        // An AnyValue object with keys — just no KNOWN key — stays an
+        // error: the retry only rewrites genuinely EMPTY encodings, it
+        // must not paper over malformed values.
+        let doc =
+            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":1}}]}]}]}"#;
+        assert!(lenient_json::from_slice::<LogsData>(doc.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn lenient_json_leaves_valid_input_on_the_direct_path() {
+        use opentelemetry_proto::tonic::logs::v1::LogsData;
+        let doc = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"hello"}}]}]}]}"#;
+        let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("parse");
+        let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
+        assert!(matches!(
+            record.body.as_ref().and_then(|b| b.value.as_ref()),
+            Some(AvValue::StringValue(s)) if s == "hello"
+        ));
     }
 }

@@ -162,6 +162,9 @@ pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outco
 /// `ourios.compaction.result` attribute key.
 pub const OURIOS_COMPACTION_RESULT: &str = "ourios.compaction.result";
 
+/// `ourios.ingest.json.lenient` attribute key.
+pub const OURIOS_INGEST_JSON_LENIENT: &str = "ourios.ingest.json.lenient";
+
 /// `ourios.io.direction` attribute key.
 pub const OURIOS_IO_DIRECTION: &str = "ourios.io.direction";
 

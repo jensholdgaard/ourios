@@ -299,13 +299,27 @@ impl IngestMetrics {
     /// out-of-range ones with `error.type = severity_out_of_range`
     /// (RFC 0018 §3.5) — one counter, reason on a low-cardinality attribute,
     /// not a bespoke metric.
+    /// `lenient_json` marks a batch whose OTLP/JSON payload only parsed
+    /// via the lenient unset-`AnyValue` retry (ourios#549): recorded as
+    /// the registry's `ourios.ingest.json.lenient` attribute on the
+    /// batches counter — the same one-instrument-plus-attribute shape as
+    /// `error.type`, and the operator/dormancy signal for the interim
+    /// upstream workaround.
     pub fn record_batch(
         &self,
         record_count: usize,
         severity_out_of_range: usize,
+        lenient_json: bool,
         elapsed: Duration,
     ) {
-        self.batches.add(1, &[]);
+        if lenient_json {
+            self.batches.add(
+                1,
+                &[KeyValue::new(semconv::OURIOS_INGEST_JSON_LENIENT, true)],
+            );
+        } else {
+            self.batches.add(1, &[]);
+        }
         let in_range = record_count.saturating_sub(severity_out_of_range);
         if in_range > 0 {
             self.records.add(to_u64(in_range), &[]);

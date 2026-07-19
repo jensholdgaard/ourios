@@ -122,12 +122,20 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
         None => return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(),
     };
     let decoded = match format {
-        WireFormat::Protobuf => decode_protobuf(&raw),
+        WireFormat::Protobuf => decode_protobuf(&raw).map(|request| (request, false)),
         WireFormat::Json => decode_json(&raw),
     };
-    let Ok(request) = decoded else {
+    let Ok((request, lenient_json)) = decoded else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if lenient_json {
+        // Rare by construction (spec-valid payloads upstream with-serde
+        // rejects — ourios#549); debug so a client emitting them at
+        // volume can't turn the log stream into the bottleneck. The
+        // countable signal is `ourios.ingest.json.lenient` on the
+        // batches counter.
+        tracing::debug!("OTLP/JSON payload parsed via the lenient unset-AnyValue retry");
+    }
 
     // WAL-before-ack ingest. The fsync is batched by the group-commit
     // coordinator (RFC0008.8), which offloads its blocking `sync`, so the
@@ -135,7 +143,12 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     // pipeline/miner is contained as a 500 (the handler promises not to
     // panic) rather than aborting the connection.
     let pipeline = state.pipeline.clone();
-    match tokio::spawn(async move { pipeline.ingest_bound(request, binding.as_ref()).await }).await
+    match tokio::spawn(async move {
+        pipeline
+            .ingest_bound(request, binding.as_ref(), lenient_json)
+            .await
+    })
+    .await
     {
         Ok(Ok(_)) => success_response(format),
         Ok(Err(e)) => ingest_error_status(&e).into_response(),

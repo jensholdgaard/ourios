@@ -66,14 +66,18 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 # rustls stack — no new cargo-deny surface.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 # Derive for the discovery-document subset the verifier reads.
-serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+# Non-optional since the lenient OTLP/JSON module needs the
+# `DeserializeOwned` bound; already unconditionally in the tree via
+# `serde_json`, so this adds no crate weight. The `derive` feature
+# stays behind `oidc` (the only user of derived impls).
+serde = { version = "1", default-features = false }
 # Async runtime types for the JWKS cache (`RwLock`) and the verifier's
 # refresh path. Runtime-free feature set; the binary provides the runtime.
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 
 [features]
 # The RFC 0029 OIDC bearer layer (verifier + JWKS cache).
-oidc = ["dep:jsonwebtoken", "dep:reqwest", "dep:serde", "dep:tokio"]
+oidc = ["dep:jsonwebtoken", "dep:reqwest", "serde/derive", "dep:tokio"]
 
 [dev-dependencies]
 # `init_in_memory` collects the alias counters' exported metric stream

@@ -68,10 +68,23 @@ pub fn decode_protobuf(bytes: &[u8]) -> Result<ExportLogsServiceRequest, DecodeE
 /// accepted as number or string, base64 bytes, lowerCamelCase keys —
 /// are handled by the proto types' `with-serde` deserialiser.
 ///
+/// Parses through [`ourios_core::otlp::lenient_json`]: the upstream
+/// `with-serde` deserialiser rejects proto3-JSON's valid encodings of
+/// an UNSET `AnyValue` (`{}` / `null` — real exporters emit them for
+/// empty-body events), which would 400 a spec-compliant client
+/// (ourios#549). The lenient path is a failed-parse retry only; valid
+/// input never leaves `serde_json`'s direct path.
+///
+/// The returned `bool` is `true` when only the lenient retry parsed
+/// the payload — threaded to the `ourios.ingest.json.lenient`
+/// attribute on `ourios.ingest.batches` (`CLAUDE.md` §6.3: the
+/// operator signal for upstream-rejected-but-valid payloads, and the
+/// shim-dormancy signal once the upstream fix ships).
+///
 /// # Errors
 ///
 /// Returns [`DecodeError::Json`] if `bytes` is not well-formed OTLP/JSON
 /// for an `ExportLogsServiceRequest`.
-pub fn decode_json(bytes: &[u8]) -> Result<ExportLogsServiceRequest, DecodeError> {
-    serde_json::from_slice(bytes).map_err(DecodeError::Json)
+pub fn decode_json(bytes: &[u8]) -> Result<(ExportLogsServiceRequest, bool), DecodeError> {
+    ourios_core::otlp::lenient_json::from_slice_flagged(bytes).map_err(DecodeError::Json)
 }

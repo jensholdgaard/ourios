@@ -145,7 +145,7 @@ async fn rfc0018_6_out_of_range_severity_preserved() {
     // counter via error.type (OTel "recording errors on metrics" convention).
     let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test-rfc0018-6");
     let ingest = IngestMetrics::new();
-    ingest.record_batch(4, 2, Duration::from_millis(1));
+    ingest.record_batch(4, 2, false, Duration::from_millis(1));
     guard.force_flush().expect("force_flush");
     let rms = exporter.get_finished_metrics().expect("metrics exported");
 
@@ -159,4 +159,42 @@ async fn rfc0018_6_out_of_range_severity_preserved() {
         2,
         "out-of-range records tagged error.type = severity_out_of_range",
     );
+
+    // A lenient-JSON batch (ourios#549) lands on the batches counter
+    // with the registry's `ourios.ingest.json.lenient` attribute — one
+    // instrument, path on an attribute, the same shape as error.type.
+    let (guard, exporter) = ourios_telemetry::init_in_memory("ourios-test-rfc0018-6b");
+    let ingest = IngestMetrics::new();
+    ingest.record_batch(1, 0, true, Duration::from_millis(1));
+    ingest.record_batch(1, 0, false, Duration::from_millis(1));
+    guard.force_flush().expect("force_flush");
+    let rms = exporter.get_finished_metrics().expect("metrics exported");
+    let batches = rms
+        .iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|m| m.name() == semconv::OURIOS_INGEST_BATCHES)
+        .map(opentelemetry_sdk::metrics::data::Metric::data)
+        .expect("ourios.ingest.batches exported");
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = batches else {
+        panic!("ourios.ingest.batches should be a u64 sum");
+    };
+    let lenient_total: u64 = sum
+        .data_points()
+        .filter(|dp| {
+            dp.attributes()
+                .any(|kv| kv.key.as_str() == semconv::OURIOS_INGEST_JSON_LENIENT)
+        })
+        .map(SumDataPoint::value)
+        .sum();
+    let direct_total: u64 = sum
+        .data_points()
+        .filter(|dp| {
+            !dp.attributes()
+                .any(|kv| kv.key.as_str() == semconv::OURIOS_INGEST_JSON_LENIENT)
+        })
+        .map(SumDataPoint::value)
+        .sum();
+    assert_eq!(lenient_total, 1, "the lenient batch carries the attribute");
+    assert_eq!(direct_total, 1, "the direct batch stays attribute-free");
 }

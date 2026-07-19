@@ -271,6 +271,9 @@ groups:
     brief: OTLP batches accepted by the ingest pipeline.
     instrument: counter
     unit: "{batch}"
+    attributes:
+      - ref: ourios.ingest.json.lenient
+        requirement_level: recommended
 
   - id: metric.ourios.wal.append.duration
     type: metric

@@ -98,6 +98,7 @@ async fn rfc0026_7_rejection_telemetry_and_audit() {
         .ingest_bound(
             request(vec![resource_logs("tenant-b", &["intruding line"])]),
             Some(&binding),
+            false,
         )
         .await
         .expect_err("out-of-set");

@@ -1,0 +1,14 @@
+# Codecov is informational, matching the CI coverage job's stance
+# (CLAUDE.md §6.2: coverage is not a number to game): no status check
+# may gate a PR on a percentage. Uploads currently come from pushes to
+# main only (the coverage job is main-only by a deliberate CI-cost
+# decision), so there is no PR diff coverage; these settings also keep
+# any future PR uploads non-gating.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true

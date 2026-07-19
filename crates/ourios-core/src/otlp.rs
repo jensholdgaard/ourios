@@ -1205,15 +1205,18 @@ mod tests {
     }
 
     #[test]
-    fn lenient_json_accepts_null_bodies_and_null_attribute_values() {
+    fn lenient_json_accepts_both_unset_encodings_in_both_positions() {
         use opentelemetry_proto::tonic::logs::v1::LogsData;
-        // `null` is what with-serde's own serializer emits for an unset
-        // AnyValue — its deserializer must not choke on its own output.
-        let doc = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"logRecords":[{"body":null,"attributes":[{"key":"k","value":{}}]}]}]}]}"#;
+        // Both spellings of the unset state (`null` and `{}` —
+        // proto3-JSON's empty-message encoding) at both Option-typed
+        // positions (`body`, `KeyValue.value`); the sibling test above
+        // covers `"body": {}` on the real demo record.
+        let doc = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"logRecords":[{"body":null,"attributes":[{"key":"a","value":{}},{"key":"b","value":null}]}]}]}]}"#;
         let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("lenient parse");
         let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
         assert!(record.body.is_none());
         assert!(record.attributes[0].value.is_none());
+        assert!(record.attributes[1].value.is_none());
     }
 
     #[test]

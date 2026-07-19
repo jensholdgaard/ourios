@@ -418,8 +418,11 @@ mod tests {
 
         let emitted = MinedRecord {
             tenant_id: TenantId::new("bench-tenant"),
-            template_id: 42,
-            template_version: 1,
+            // The miner's real absent-body shape: no template is
+            // allocated (`cluster.rs` emits `NO_TEMPLATE` = 0), so the
+            // fixture matches an emittable record, not an invented one.
+            template_id: ourios_miner::cluster::NO_TEMPLATE,
+            template_version: 0,
             severity_number: 9,
             severity_text: None,
             scope_name: None,

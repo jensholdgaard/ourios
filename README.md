@@ -1,7 +1,6 @@
 # Ourios
 
 [![CI](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml/badge.svg)](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjensholdgaard%2Fourios%2Fbadges%2Fcoverage.json)](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jensholdgaard/ourios/branch/main/graph/badge.svg)](https://codecov.io/gh/jensholdgaard/ourios)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jensholdgaard/ourios/badge)](https://scorecard.dev/viewer/?uri=github.com/jensholdgaard/ourios)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13499/badge)](https://www.bestpractices.dev/projects/13499)

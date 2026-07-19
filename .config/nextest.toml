@@ -1,0 +1,6 @@
+# The `ci` profile is what .github/workflows/ci.yml runs. Its only
+# deviation from default is the JUnit report, which the workflow
+# uploads to Codecov Test Analytics (run times, failure rates, flake
+# detection). Local `cargo nextest run` is unaffected.
+[profile.ci.junit]
+path = "junit.xml"

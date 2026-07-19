@@ -488,9 +488,15 @@ fn jsonl_line_records(
     line_no: usize,
     tenant: &TenantId,
 ) -> Result<Vec<OtlpLogRecord>, BenchError> {
-    let logs_data: LogsData = serde_json::from_str(raw).map_err(|e| BenchError::Corpus {
-        detail: format!("parse OTLP/JSON at {}:{}: {e}", path.display(), line_no),
-    })?;
+    // Lenient per ourios#549: real captures (OTel-Demo main's
+    // empty-body events) carry unset-AnyValue encodings upstream
+    // with-serde rejects; valid lines stay on the direct path.
+    let logs_data: LogsData =
+        ourios_core::otlp::lenient_json::from_slice(raw.as_bytes()).map_err(|e| {
+            BenchError::Corpus {
+                detail: format!("parse OTLP/JSON at {}:{}: {e}", path.display(), line_no),
+            }
+        })?;
     let mut records = Vec::new();
     for rl in logs_data.resource_logs {
         // Resource attributes are copied onto every record

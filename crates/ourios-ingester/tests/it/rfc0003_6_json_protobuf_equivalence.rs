@@ -231,3 +231,93 @@ fn rfc0003_6_decoder_ignores_unknown_fields() {
         7,
     );
 }
+
+/// Scenario RFC0003.6 follow-on (ourios#549) — an UNSET `AnyValue` is
+/// spec-valid OTLP/JSON (`{}` per proto3-JSON's empty-message
+/// encoding; real exporters emit it for empty-body events, and
+/// `with-serde`'s own serializer emits `null` for the same state) and
+/// must decode to the SAME materialized record the protobuf transport
+/// produces for a wire-present-but-unset `AnyValue`.
+///
+/// This is the empirical-finding layer this file's header promises:
+/// upstream `with-serde` rejects both encodings ("Invalid data for
+/// Value, no known keys found"), so `decode_json` parses through
+/// `ourios_core::otlp::lenient_json`. On the JSON path the unset value
+/// re-parses as the ABSENT field (`None`) where protobuf yields
+/// `Some(AnyValue { value: None })` — this test pins that the
+/// difference is invisible at the [`Body`]/downstream level, which is
+/// the level Ourios stores.
+#[test]
+fn rfc0003_6_unset_any_value_decodes_equivalently_across_transports() {
+    use ourios_core::otlp::Body;
+
+    // Protobuf: body PRESENT but unset (an empty AnyValue message on
+    // the wire), one attribute with an unset value.
+    let record = LogRecord {
+        severity_number: 9,
+        body: Some(AnyValue { value: None }),
+        attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+            key: "feature_flag_key".to_owned(),
+            value: Some(AnyValue { value: None }),
+            ..Default::default()
+        }],
+        event_name: "shipping.feature_flag.evaluated".to_owned(),
+        ..Default::default()
+    };
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![record],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let from_protobuf = decode_protobuf(&request.encode_to_vec()).expect("protobuf decodes");
+
+    // JSON: the demo-corpus shape — `"body": {}`, `"value": {}`.
+    let json = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9,"body":{},"attributes":[{"key":"feature_flag_key","value":{}}],"eventName":"shipping.feature_flag.evaluated"}]}]}]}"#;
+    let from_json = decode_json(json).expect("spec-valid unset AnyValue must decode");
+
+    let pb_rec = &from_protobuf.resource_logs[0].scope_logs[0].log_records[0];
+    let js_rec = &from_json.resource_logs[0].scope_logs[0].log_records[0];
+
+    // The raw decode differs BY DESIGN (Some(empty) vs None) …
+    assert_eq!(pb_rec.body, Some(AnyValue { value: None }));
+    assert_eq!(js_rec.body, None);
+    // … and collapses to the identical stored state at the Body level:
+    assert_eq!(
+        pb_rec.body.clone().and_then(Body::from_any_value),
+        js_rec.body.clone().and_then(Body::from_any_value),
+        "unset body must be storage-equivalent across transports",
+    );
+    // Attribute values: the INTERIM contract, pinned exactly. The
+    // protobuf transport preserves the wire's present-but-unset value
+    // (`Some(AnyValue { value: None })` — the RFC 0018 fidelity rule,
+    // and the canonical codec round-trips it, see
+    // `attributes_with_absent_and_empty_values_round_trip`). The JSON
+    // transport CANNOT currently deliver that state — upstream
+    // `with-serde` rejects its only encodings (`{}` / `null`,
+    // ourios#549) — so the lenient shim's strip-to-absent is a
+    // BOUNDED, DOCUMENTED fidelity concession: the presence bit of an
+    // EMPTY value is downgraded, nothing else. When the upstream fix
+    // ships, the direct parse succeeds, the shim goes dormant, and the
+    // JSON path regains Some(empty) — flipping the assert below is the
+    // signal that full fidelity is restored.
+    assert_eq!(pb_rec.attributes[0].value, Some(AnyValue { value: None }));
+    assert_eq!(js_rec.attributes[0].value, None, "interim: see ourios#549");
+    // Both states store and read back faithfully through the canonical
+    // codec — each transport's delivered form survives its own round
+    // trip (no silent convergence, no read failure on either form).
+    let canon = ourios_core::otlp::canonical::encode_attributes;
+    let decode = ourios_core::otlp::canonical::decode_attributes;
+    for rec in [pb_rec, js_rec] {
+        let stored = canon(&rec.attributes).expect("canonical encode");
+        let read = decode(&stored).expect("stored attributes must decode");
+        assert_eq!(
+            read, rec.attributes,
+            "canonical round trip preserves the form"
+        );
+    }
+    assert_eq!(pb_rec.event_name, js_rec.event_name);
+}

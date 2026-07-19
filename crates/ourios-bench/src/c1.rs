@@ -91,6 +91,18 @@ impl C1Accumulator {
         if matches!(emitted.body_kind, BodyKind::Structured) {
             return;
         }
+        // Absent-body records are excluded for the same reason with a
+        // simpler proof: no body arrived on the wire, so no template
+        // was allocated and no Drain pipeline ran (`BodyKind::Absent`'s
+        // contract) — there are no bytes to reconstruct byte-for-byte.
+        // Real corpora contain these at scale now: the OTel-Demo
+        // (post-2.2.0) emits body-less event records
+        // (`eventName` + attributes, `body` unset — ourios#549 has the
+        // capture evidence), and counting them in the denominator made
+        // C1 fail on rows that carry no reconstruction obligation.
+        if matches!(emitted.body_kind, BodyKind::Absent) {
+            return;
+        }
         // Non-lossy, string body. §3.4.2 says we count this
         // record in the denominator regardless of whether the
         // snapshot lookup succeeds; an absent snapshot for a
@@ -390,6 +402,61 @@ mod tests {
         // still counts the record, so the lossy ratio's
         // denominator stays honest, but the structured record
         // doesn't appear in `lossy_count`.
+        assert!(c1.lossy_flag_ratio.abs() < f64::EPSILON);
+    }
+
+    /// The absent-body twin of the structured exclusion: a record with
+    /// no wire body (the OTel-Demo post-2.2.0 event shape, ourios#549)
+    /// carries no reconstruction obligation and must not land in C1's
+    /// denominator — before this exclusion, three such rows failed the
+    /// gate on the first real capture containing them.
+    #[test]
+    fn absent_body_record_is_excluded_from_denominator() {
+        use ourios_core::otlp::OtlpLogRecord;
+        use ourios_core::record::{BodyKind, MinedRecord};
+        use ourios_core::tenant::TenantId;
+
+        let emitted = MinedRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            template_id: 42,
+            template_version: 1,
+            severity_number: 9,
+            severity_text: None,
+            scope_name: None,
+            scope_version: None,
+            scope_attributes: Vec::new(),
+            resource_schema_url: None,
+            scope_schema_url: None,
+            time_unix_nano: 0,
+            observed_time_unix_nano: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            resource_attributes: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            event_name: Some("shipping.feature_flag.evaluated".to_string()),
+            body_kind: BodyKind::Absent,
+            params: Vec::new(),
+            separators: Vec::new(),
+            body: None,
+            confidence: 1.0,
+            lossy_flag: false,
+        };
+        let input = OtlpLogRecord {
+            tenant_id: TenantId::new("bench-tenant"),
+            ..Default::default()
+        };
+
+        let mut acc = C1Accumulator::new();
+        acc.record(&input, &emitted, None);
+        let c1 = acc.finalize();
+
+        assert_eq!(
+            c1.non_lossy_total, 0,
+            "absent-body records are excluded from the denominator",
+        );
+        assert!(c1.pass, "an absent-body record alone must not fail C1");
         assert!(c1.lossy_flag_ratio.abs() < f64::EPSILON);
     }
 }

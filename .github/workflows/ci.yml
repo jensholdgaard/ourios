@@ -14,8 +14,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Least-privilege default for the whole workflow; jobs that need more
-# (coverage publishes the badge branch) escalate at the job level.
+# Least-privilege default for the whole workflow.
 permissions:
   contents: read
 
@@ -80,8 +79,25 @@ jobs:
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --all-features --no-fail-fast
+      - run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
       - run: cargo test --workspace --all-features --doc
+      # Codecov Test Analytics (informational, like the coverage job):
+      # nextest's JUnit report (the `ci` profile in .config/nextest.toml)
+      # feeds run times / failure rates / flake detection. `!cancelled()`
+      # so failing runs still upload — failure data is the point — and
+      # `continue-on-error` keeps an uploader outage from failing this
+      # required job. Same action + pin as the coverage upload
+      # (`test-results-action` is deprecated in its favor); doctests are
+      # not in nextest's model and stay out of the report.
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          report_type: test_results
+          files: target/nextest/ci/junit.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   # RFC 0013 S3 integration tests (RFC0013.1/.3/.4/.7): spin LocalStack
   # (S3-compatible, Apache-2.0) via testcontainers and drive `Store::s3` at it
@@ -445,10 +461,6 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     continue-on-error: true
-    permissions:
-      # The badge-publish step below writes coverage.json to the
-      # `badges` branch via the contents API; everything else is read.
-      contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Free runner disk space
@@ -476,45 +488,17 @@ jobs:
           if-no-files-found: error
       # Codecov upload (informational, matching this job's stance and
       # codecov.yml's informational statuses): the same lcov lands on
-      # codecov.io for the trend view + badge. Main-only like the rest
-      # of this job — the deliberate no-PR-coverage-runs decision above
-      # stands, so there is no PR diff coverage; lifting that means
-      # removing this job's main-only `if`, a separate cost decision.
-      # `fail_ci_if_error: false` — an uploader outage must not fail
-      # even this informational job's step list.
+      # codecov.io for the trend view + the README badge. Main-only
+      # like the rest of this job — the deliberate no-PR-coverage-runs
+      # decision above stands, so there is no PR diff coverage; lifting
+      # that means removing this job's main-only `if`, a separate cost
+      # decision. `fail_ci_if_error: false` — an uploader outage must
+      # not fail even this informational job's step list.
       - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
-      # Self-hosted README coverage badge: a shields.io endpoint JSON
-      # on the `badges` branch, refreshed on every push to main. The
-      # artifact above stays the full report and the percentage stays
-      # non-gating (CLAUDE.md §6.2 — not a number to game); Codecov
-      # (above) is the external mirror of the same data. The job-level
-      # `if` already restricts the whole job to main, so no step guard
-      # here.
-      - name: Publish coverage badge
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          pct=$(cargo llvm-cov report --json --summary-only \
-            | jq -r '.data[0].totals.lines.percent * 10 | round / 10')
-          color=$(awk -v p="$pct" 'BEGIN{print (p>=80)?"brightgreen":(p>=60)?"yellow":"orange"}')
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' \
-            "$pct" "$color" > coverage.json
-          # Ensure the badges branch exists (first run only), then
-          # upsert via the contents API (sha required for updates).
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref=refs/heads/badges -f sha="$GITHUB_SHA" 2>/dev/null || true
-          sha=$(gh api "repos/${GITHUB_REPOSITORY}/contents/coverage.json?ref=badges" \
-            --jq .sha 2>/dev/null || true)
-          gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/coverage.json" \
-            -f message="coverage badge: ${pct}%" -f branch=badges \
-            -f content="$(base64 -w0 coverage.json)" \
-            ${sha:+-f sha=$sha} >/dev/null
-          echo "badge published: ${pct}%"
 
   # Aggregate result so branch-protection rules need only require
   # a single check. Skipped Cargo jobs (pre-first-crate) pass through.

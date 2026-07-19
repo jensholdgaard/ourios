@@ -220,7 +220,7 @@ impl IngestPipeline {
     ///
     /// As [`Self::ingest_bound`], minus the binding rejection.
     pub async fn ingest(&self, request: ExportLogsServiceRequest) -> Result<usize, ReceiveError> {
-        self.ingest_bound(request, None).await
+        self.ingest_bound(request, None, false).await
     }
 
     /// Ingest one decoded export per the §6.5 sequence: enforce the
@@ -250,6 +250,7 @@ impl IngestPipeline {
         &self,
         request: ExportLogsServiceRequest,
         binding: Option<&super::auth::AuthBinding>,
+        lenient_json: bool,
     ) -> Result<usize, ReceiveError> {
         // RFC 0026 §3.2: authz precedes every other ingest step — a denied
         // batch does no encode, fan-out, or WAL work. §3.4: the denial counts on
@@ -364,8 +365,12 @@ impl IngestPipeline {
                     .iter()
                     .filter(|r| super::materialize::severity_is_out_of_range(r.severity_number))
                     .count();
-                self.metrics
-                    .record_batch(records.len(), severity_out_of_range, append_elapsed);
+                self.metrics.record_batch(
+                    records.len(),
+                    severity_out_of_range,
+                    lenient_json,
+                    append_elapsed,
+                );
                 Ok(records.len())
             }
             // Sync failed: the frame is not durable and not acked; it

@@ -125,6 +125,18 @@ groups:
                 hard ceiling (RFC0014.4) — indicates memory backpressure.
         stability: development
         brief: Why the record sink flushed a partition (RFC 0014 §3.2).
+      - id: ourios.ingest.json.lenient
+        type: boolean
+        stability: development
+        brief: >-
+          Whether the batch's OTLP/JSON payload only parsed via the
+          lenient unset-`AnyValue` retry (`ourios_core::otlp::lenient_json`,
+          the interim workaround for opentelemetry-rust#3598). Absent or
+          `false` on the direct-parse path; protobuf-transport batches
+          never carry it. A sustained non-zero rate is the operator
+          signal that spec-valid-but-upstream-rejected payloads (empty
+          `AnyValue` encodings) are arriving, and the attribute goes
+          away with the upstream fix.
       - id: ourios.query.kind
         type:
           members:

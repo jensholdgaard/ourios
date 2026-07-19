@@ -64,7 +64,7 @@ fn rfc0003_6_json_and_protobuf_decode_to_the_same_request() {
         let from_protobuf = decode_protobuf(&req.encode_to_vec())
             .expect("protobuf payload decodes");
         let json = serde_json::to_vec(&req).expect("serialise OTLP/JSON");
-        let from_json = decode_json(&json).expect("OTLP/JSON payload decodes");
+        let (from_json, _) = decode_json(&json).expect("OTLP/JSON payload decodes");
         // Equivalence at the decoded-request (AnyValue) level. Shared
         // `with-serde` codec, so this is the necessary-not-sufficient
         // layer; the spec asserts below carry the rest.
@@ -113,7 +113,7 @@ fn roundtrip_double_via_otlp_json(x: f64) -> f64 {
         }],
     };
     let json = serde_json::to_vec(&req).expect("serialise OTLP/JSON");
-    let back = decode_json(&json).expect("OTLP/JSON decodes");
+    let (back, _) = decode_json(&json).expect("OTLP/JSON decodes");
     match back.resource_logs[0].scope_logs[0].log_records[0]
         .body
         .as_ref()
@@ -187,7 +187,11 @@ fn rfc0003_6_decoder_accepts_compliant_otlp_json() {
         "spanId":"0102030405060708",
         "body":{"stringValue":"hello"}
     }]}]}]}"#;
-    let req = decode_json(compliant).expect("compliant OTLP/JSON decodes");
+    let (req, lenient) = decode_json(compliant).expect("compliant OTLP/JSON decodes");
+    assert!(
+        !lenient,
+        "a fully-valid payload stays on the direct parse path"
+    );
     let rec = &req.resource_logs[0].scope_logs[0].log_records[0];
 
     assert_eq!(rec.time_unix_nano, 1_700_000_000_000_000_000);
@@ -210,7 +214,7 @@ fn rfc0003_6_decoder_accepts_64bit_int_as_number_or_string() {
     let numeric = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{
         "timeUnixNano":1700000000000000000
     }]}]}]}"#;
-    let req = decode_json(numeric).expect("a 64-bit int as a JSON number is accepted");
+    let (req, _) = decode_json(numeric).expect("a 64-bit int as a JSON number is accepted");
     assert_eq!(
         req.resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
         1_700_000_000_000_000_000,
@@ -225,7 +229,7 @@ fn rfc0003_6_decoder_ignores_unknown_fields() {
         "timeUnixNano":"7",
         "thisFieldIsNotInTheSchema":{"nested":[1,2,3]}
     }]}]}]}"#;
-    let req = decode_json(unknown).expect("unknown fields are ignored, not rejected");
+    let (req, _) = decode_json(unknown).expect("unknown fields are ignored, not rejected");
     assert_eq!(
         req.resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
         7,
@@ -277,7 +281,12 @@ fn rfc0003_6_unset_any_value_decodes_equivalently_across_transports() {
 
     // JSON: the demo-corpus shape — `"body": {}`, `"value": {}`.
     let json = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9,"body":{},"attributes":[{"key":"feature_flag_key","value":{}}],"eventName":"shipping.feature_flag.evaluated"}]}]}]}"#;
-    let from_json = decode_json(json).expect("spec-valid unset AnyValue must decode");
+    let (from_json, lenient) = decode_json(json).expect("spec-valid unset AnyValue must decode");
+    assert!(
+        lenient,
+        "the unset encodings only parse via the lenient retry today — this flip is \
+         ALSO an upstream-fix signal (direct parse succeeding makes this false)",
+    );
 
     let pb_rec = &from_protobuf.resource_logs[0].scope_logs[0].log_records[0];
     let js_rec = &from_json.resource_logs[0].scope_logs[0].log_records[0];

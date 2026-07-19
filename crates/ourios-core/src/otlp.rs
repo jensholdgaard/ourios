@@ -999,8 +999,25 @@ pub mod lenient_json {
     /// The retry's parse error when normalisation changed the
     /// document, the original parse error otherwise.
     pub fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, serde_json::Error> {
+        from_slice_flagged(bytes).map(|(v, _)| v)
+    }
+
+    /// [`from_slice`], also reporting WHICH path parsed: `true` means
+    /// the direct parse failed and the lenient retry succeeded — the
+    /// observability hook (`CLAUDE.md` §6.3) that lets the receiver
+    /// count lenient decodes (`ourios.ingest.json.lenient` on the
+    /// batches counter) so operators see upstream-rejected-but-valid
+    /// payloads arriving, and so the shim's dormancy is visible once
+    /// the upstream fix ships.
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`from_slice`]'s.
+    pub fn from_slice_flagged<T: DeserializeOwned>(
+        bytes: &[u8],
+    ) -> Result<(T, bool), serde_json::Error> {
         match serde_json::from_slice(bytes) {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok((v, false)),
             Err(first) => {
                 let Ok(mut tree) = serde_json::from_slice::<serde_json::Value>(bytes) else {
                     return Err(first);
@@ -1008,7 +1025,7 @@ pub mod lenient_json {
                 if !strip_unset_any_values(&mut tree) {
                     return Err(first);
                 }
-                serde_json::from_value(tree)
+                serde_json::from_value(tree).map(|v| (v, true))
             }
         }
     }
@@ -1190,16 +1207,23 @@ mod tests {
     #[test]
     fn lenient_json_accepts_the_demo_empty_body_event() {
         use opentelemetry_proto::tonic::logs::v1::LogsData;
-        // The direct parse rejects it (the upstream with-serde bug this
-        // module works around) …
-        assert!(serde_json::from_str::<LogsData>(DEMO_EMPTY_BODY_EVENT).is_err());
-        // … the lenient parse accepts it, with the body ABSENT — the
-        // same downstream state prost's Some(AnyValue { value: None })
-        // reaches through Body::from_any_value.
+        // Future-proof against the upstream fix landing: today the
+        // direct parse rejects this and only the lenient retry accepts
+        // (the ingester's RFC0003.6 equivalence test pins that state as
+        // the designated flip signal); once upstream is fixed the direct
+        // parse succeeds with Some(AnyValue { value: None }). Either
+        // way the body must be absent-or-unset — the one downstream
+        // state Body::from_any_value maps both to.
         let parsed: LogsData =
             lenient_json::from_slice(DEMO_EMPTY_BODY_EVENT.as_bytes()).expect("lenient parse");
         let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
-        assert!(record.body.is_none());
+        assert!(
+            record
+                .body
+                .as_ref()
+                .and_then(|b| b.value.as_ref())
+                .is_none()
+        );
         assert_eq!(record.event_name, "shipping.feature_flag.evaluated");
         assert_eq!(record.attributes.len(), 1, "attributes survive untouched");
     }
@@ -1214,9 +1238,14 @@ mod tests {
         let doc = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"logRecords":[{"body":null,"attributes":[{"key":"a","value":{}},{"key":"b","value":null}]}]}]}]}"#;
         let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("lenient parse");
         let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
-        assert!(record.body.is_none());
-        assert!(record.attributes[0].value.is_none());
-        assert!(record.attributes[1].value.is_none());
+        // Absent-or-unset (not strictly absent): once upstream accepts
+        // these encodings directly, `{}` parses to present-but-unset.
+        let unset = |v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>| {
+            v.as_ref().and_then(|av| av.value.as_ref()).is_none()
+        };
+        assert!(unset(&record.body));
+        assert!(unset(&record.attributes[0].value));
+        assert!(unset(&record.attributes[1].value));
     }
 
     #[test]

@@ -207,6 +207,7 @@ async fn rfc0026_3_ingest_tenant_binding() {
                 resource_logs("tenant-b", &["b line"]),
             ]),
             Some(&bound),
+            false,
         )
         .await
         .expect("in-set batch acks");
@@ -222,6 +223,7 @@ async fn rfc0026_3_ingest_tenant_binding() {
                 resource_logs("tenant-c", &["intruding line"]),
             ]),
             Some(&bound),
+            false,
         )
         .await
         .expect_err("out-of-set batch is denied");
@@ -288,6 +290,7 @@ async fn rfc0026_5_wildcard_binding_ingest() {
             .ingest_bound(
                 request(vec![resource_logs(service, &["a line"])]),
                 Some(&bound),
+                false,
             )
             .await
             .unwrap_or_else(|e| panic!("wildcard ingests to {service}: {e}"));

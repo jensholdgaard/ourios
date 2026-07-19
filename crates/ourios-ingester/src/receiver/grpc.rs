@@ -164,8 +164,10 @@ impl LogsService for LogsReceiver {
         // contract. `ingest` is async now (it awaits the batched fsync),
         // so this is `spawn`, not `spawn_blocking`.
         let pipeline = self.pipeline.clone();
-        match tokio::spawn(async move { pipeline.ingest_bound(export, binding.as_ref()).await })
-            .await
+        match tokio::spawn(
+            async move { pipeline.ingest_bound(export, binding.as_ref(), false).await },
+        )
+        .await
         {
             Ok(Ok(_)) => Ok(Response::new(ExportLogsServiceResponse::default())),
             Ok(Err(e)) => Err(ingest_error_status(&e)),

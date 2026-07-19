@@ -62,6 +62,26 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+The ServiceAccount a role's pods run as. Pass (dict "root" $ "role"
+"receiver"|"querier"|"compactor"): the role's own serviceAccount when
+configured (create=true renders it; name alone binds an existing one),
+falling back to the shared serviceAccount otherwise. Role-scoped accounts
+are the least-privilege seam — with IRSA, each carries its own
+eks.amazonaws.com/role-arn (README "Per-role IAM").
+*/}}
+{{- define "ourios.roleServiceAccountName" -}}
+{{- $ := .root -}}
+{{- $sa := (index $.Values .role).serviceAccount | default dict -}}
+{{- if $sa.create -}}
+{{- default (printf "%s-%s" (include "ourios.fullname" $) .role | trunc 63 | trimSuffix "-") $sa.name }}
+{{- else if $sa.name -}}
+{{- $sa.name }}
+{{- else -}}
+{{- include "ourios.serviceAccountName" $ }}
+{{- end }}
+{{- end }}
+
+{{/*
 The image reference (repository:tag). The tag defaults to `latest` (a
 publishable floating tag) rather than the chart appVersion — appVersion tracks
 the unreleased crate version (0.0.0), for which no image is ever pushed. Pin a
@@ -206,12 +226,20 @@ web-identity credentials — so configuring both is rejected.
 */}}
 {{- define "ourios.s3CredentialsEnvFrom" -}}
 {{- if eq .Values.storage.backend "s3" }}
-{{- $roleArn := index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn" }}
-{{- if and $roleArn (not .Values.serviceAccount.create) }}
+{{- $anyArn := index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn" }}
+{{- if and $anyArn (not .Values.serviceAccount.create) }}
 {{- fail "serviceAccount.annotations \"eks.amazonaws.com/role-arn\" (IRSA) requires serviceAccount.create=true so the chart applies it; with create=false the chart renders no ServiceAccount and the annotation has no effect. Either set serviceAccount.create=true, or annotate your existing ServiceAccount out-of-band and remove it here." }}
 {{- end }}
-{{- if and .Values.storage.s3.existingSecret $roleArn }}
-{{- fail "storage.s3.existingSecret and IRSA (serviceAccount.annotations \"eks.amazonaws.com/role-arn\") are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one credential mode." }}
+{{- range $role := list "receiver" "querier" "compactor" }}
+{{- $sa := (index $.Values $role).serviceAccount | default dict }}
+{{- $roleArn := index ($sa.annotations | default dict) "eks.amazonaws.com/role-arn" }}
+{{- if and $roleArn (not $sa.create) }}
+{{- fail (printf "%s.serviceAccount.annotations \"eks.amazonaws.com/role-arn\" (IRSA) requires %s.serviceAccount.create=true so the chart applies it; with create=false the annotation has no effect. Either set create=true, or annotate the existing ServiceAccount out-of-band and remove it here." $role $role) }}
+{{- end }}
+{{- $anyArn = or $anyArn $roleArn }}
+{{- end }}
+{{- if and .Values.storage.s3.existingSecret $anyArn }}
+{{- fail "storage.s3.existingSecret and IRSA (an \"eks.amazonaws.com/role-arn\" annotation on the shared or a per-role serviceAccount) are mutually exclusive: static keys would shadow the web-identity credentials. Set exactly one credential mode." }}
 {{- end }}
 {{- with .Values.storage.s3.existingSecret }}
 envFrom:

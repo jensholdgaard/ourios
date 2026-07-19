@@ -40,7 +40,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "ourios.serviceAccountName" . }}
+      serviceAccountName: {{ include "ourios.roleServiceAccountName" (dict "root" $ "role" "querier") }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
       {{- with .Values.podSecurityContext }}
       securityContext:

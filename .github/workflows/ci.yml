@@ -474,12 +474,26 @@ jobs:
             lcov.info
             coverage-html
           if-no-files-found: error
+      # Codecov upload (informational, matching this job's stance and
+      # codecov.yml's informational statuses): the same lcov lands on
+      # codecov.io for the trend view + badge. Main-only like the rest
+      # of this job — the deliberate no-PR-coverage-runs decision above
+      # stands, so there is no PR diff coverage; lifting that means
+      # removing this job's main-only `if`, a separate cost decision.
+      # `fail_ci_if_error: false` — an uploader outage must not fail
+      # even this informational job's step list.
+      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
       # Self-hosted README coverage badge: a shields.io endpoint JSON
-      # on the `badges` branch, refreshed on every push to main. No
-      # external coverage service is wired; the artifact above stays
-      # the full report and the percentage stays non-gating
-      # (CLAUDE.md §6.2 — not a number to game). The job-level `if`
-      # already restricts the whole job to main, so no step guard here.
+      # on the `badges` branch, refreshed on every push to main. The
+      # artifact above stays the full report and the percentage stays
+      # non-gating (CLAUDE.md §6.2 — not a number to game); Codecov
+      # (above) is the external mirror of the same data. The job-level
+      # `if` already restricts the whole job to main, so no step guard
+      # here.
       - name: Publish coverage badge
         env:
           GH_TOKEN: ${{ github.token }}

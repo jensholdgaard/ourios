@@ -856,7 +856,9 @@ hardware-independent and also pinned in `ourios-parquet`'s
 wall-clock figures are the baseline-hardware stamp for RFC 0009's
 `validated`. The full sustained-ingest soak (D2's "backlog returns to
 zero in a one-hour window at D1's rate") and D1 itself remain unrun —
-the throughput here is the RFC0009.7 D2 measure, not that soak.
+the throughput here is the RFC0009.7 D2 measure, not that soak —
+which §9.19 later ran (D2 soak PASS; D1's per-core bar is the open
+reading).
 
 ### 9.8 Results — 2026-06-18 (authoritative, `baseline-8vcpu-32gib`) — ingest write-path + recovery (criterion) and real-corpus A1 / C1 / C2 + B1 / B2
 
@@ -1663,3 +1665,40 @@ passes at ≥ 1/3.) With this run the dispatch asserts
 every §7 value except `F_L7` (deferred until L7 is first measured):
 an L4 band degradation below either frozen value now fails the run
 instead of printing a smaller ratio.
+
+### 9.19 Results — 2026-07-20 (indicative, `ci-runner`) — first D1/D2 sustained-ingest soak (#558)
+
+**Purpose.** The first run of the RFC 0009 D1/D2 soak harness
+(#558, `ourios-bench soak` + `soak-bench.yml`): the full in-process
+pipeline — `IngestPipeline` group commit (100 ms WAL batch window) →
+seal → sweep → compact — under one hour of paced synthetic OTLP load.
+Record timestamps ride a ×60 synthetic clock and the same synthetic
+"now" feeds the sweeps, so hour-sealing exercises continuously; D1's
+ack latencies are wall-clock. Workflow run **29717165102**; the JSON
+report is the run's artifact. Hardware: `ci-runner` (4 vCPU) —
+**indicative, not the §1 baseline**.
+
+**Numbers** (release build, defaults: target 100,000 lines/s, batch
+1,000, 4 workers, 10 s sampling):
+
+| measure | value | bar | verdict |
+|---|---|---|---|
+| sustained rate | 99,995 lines/s for 3,600.1 s (359,997,000 lines acked, 0 failed batches) | — | target held |
+| ack p50 / p95 / p99 / max | 103.05 / 157.27 / **172.68** / 227.94 ms | p99 ≤ 200 ms | **latency bar PASS** |
+| per-core rate | 24,999 lines/s/core (4 workers) | ≥ 100,000 /core | **D1 FAIL as normalized** |
+| D2 backlog | max **1** partition, 60 compactions over 185 samples, final 0 (returned to zero) | bounded, drains in-window | **D2 PASS** |
+| WAL at last sample | 397 segments, 53,146,830,018 B | — | disk note for longer soaks |
+
+**Reading.** D2 is a clean pass: compaction kept pace with a full
+hour at target with a backlog that never exceeded one partition.
+D1 splits: the *machine* sustained the 100k lines/s target with ack
+p99 inside the bar, but normalized per core (÷4 workers on 4 vCPU)
+it lands at ~25k lines/s/core against the ≥ 100k/core bar. Open
+reading for the maintainer: whether the bar means single-core-scaled
+throughput (then this is a real 4× efficiency gap to close) or
+per-node throughput on baseline hardware (then the authoritative
+`baseline-8vcpu-32gib` run decides). The commit path's fsync overlap
+needs ≥ 2 threads, so a literal 1-worker measurement under-credits by
+construction. Either way the harness now measures instead of
+guessing, and the number is honest: no bar was reworded to fit the
+result.

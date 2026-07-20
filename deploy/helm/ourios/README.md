@@ -200,8 +200,12 @@ helm install ourios ./ourios \
   --set querier.serviceAccount.create=true \
   --set querier.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/ourios-querier \
   --set compactor.serviceAccount.create=true \
-  --set compactor.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/ourios-compactor
+  --set compactor.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/ourios-compactor \
+  --set serviceAccount.create=false
 ```
+
+(The last flag skips the shared ServiceAccount — with all three roles on
+their own accounts it would be rendered but unused.)
 
 Because IRSA credentials come from STS, they are **short-lived and rotated
 automatically** — no static key exists to leak or forget to rotate. Each IAM
@@ -288,6 +292,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `serviceAccount.annotations` | `{}` | AWS EKS IRSA `eks.amazonaws.com/role-arn` goes here (alternative to `storage.s3.existingSecret`). One identity for all roles — prefer the per-role split. |
 | `<role>.serviceAccount.create` | `false` | Role-scoped ServiceAccount for `receiver`/`querier`/`compactor` — the least-privilege IAM seam ("Per-role IAM" above). `false` falls back to the shared `serviceAccount`. |
 | `<role>.serviceAccount.annotations` | `{}` | The role's own IRSA `role-arn` (querier read-only, receiver no-delete, compactor sole delete-holder). |
+| `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<release>-ourios-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
 | `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |
 | `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |
 

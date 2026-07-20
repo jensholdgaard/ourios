@@ -51,6 +51,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+The three workload roles. The single source for every template that
+ranges over roles — add/remove roles here only.
+*/}}
+{{- define "ourios.roles" -}}receiver querier compactor{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "ourios.serviceAccountName" -}}
@@ -230,7 +236,7 @@ web-identity credentials — so configuring both is rejected.
 {{- if and $anyArn (not .Values.serviceAccount.create) }}
 {{- fail "serviceAccount.annotations \"eks.amazonaws.com/role-arn\" (IRSA) requires serviceAccount.create=true so the chart applies it; with create=false the chart renders no ServiceAccount and the annotation has no effect. Either set serviceAccount.create=true, or annotate your existing ServiceAccount out-of-band and remove it here." }}
 {{- end }}
-{{- range $role := list "receiver" "querier" "compactor" }}
+{{- range $role := splitList " " (include "ourios.roles" $) }}
 {{- $sa := (index $.Values $role).serviceAccount | default dict }}
 {{- $roleArn := index ($sa.annotations | default dict) "eks.amazonaws.com/role-arn" }}
 {{- if and $roleArn (not $sa.create) }}

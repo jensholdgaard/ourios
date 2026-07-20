@@ -32,8 +32,9 @@
 //! bound on the §D1 WAL-commit latency, and exactly what an OTLP client
 //! observes.
 
+use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -348,7 +349,7 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
     };
     let policy = CompactionPolicy::default();
     let stats = Arc::new(LoadStats::default());
-    let stop = Arc::new(AtomicBool::new(false));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let sampler_task = tokio::spawn(run_sampler(SamplerCtx {
         store: store.clone(),
         sink: sink.clone(),
@@ -356,7 +357,7 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
         clock: clock.clone(),
         policy,
         every: Duration::from_secs(config.sample_every_secs),
-        stop: Arc::clone(&stop),
+        stop: stop_rx,
     }));
 
     run_load(&pipeline, &clock, config, &stats, pace).await;
@@ -364,7 +365,8 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
     // drain sweep below are measurement overhead, not load.
     let load_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
 
-    stop.store(true, Ordering::Relaxed);
+    // A send error just means the sampler already exited.
+    let _ = stop_tx.send(true);
     // A sampler panic loses the timeseries but not the run; report with
     // no samples (d2 then fails loudly on the missing final backlog).
     let mut samples: Vec<BacklogSample> = sampler_task.await.unwrap_or_default();
@@ -904,7 +906,9 @@ pub fn build_batch(
             for (slot, segment) in template.segments.iter().enumerate() {
                 if slot > 0 {
                     let param = splitmix64(&mut rng_state) % 1_000_000;
-                    body.push_str(&param.to_string());
+                    // Infallible for String, and no per-param allocation
+                    // in this hot loop (one write per record slot).
+                    let _ = write!(body, "{param}");
                 }
                 body.push_str(segment);
             }
@@ -965,7 +969,7 @@ struct SamplerCtx {
     clock: SyntheticClock,
     policy: CompactionPolicy,
     every: Duration,
-    stop: Arc<AtomicBool>,
+    stop: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Sample + sweep on an aligned wall cadence until stopped: ticks are
@@ -974,14 +978,21 @@ struct SamplerCtx {
 /// blocking work. A sample that overruns its period delays the next
 /// tick by a full `every` (`MissedTickBehavior::Delay`) rather than
 /// bursting — and each sweep completes before the next tick is awaited,
-/// so sweeps never overlap.
-async fn run_sampler(ctx: SamplerCtx) -> Vec<BacklogSample> {
+/// so sweeps never overlap. Shutdown is prompt: the stop signal races
+/// the tick, so the sampler never idles out a tick period (up to a full
+/// `every`) just to notice it should exit.
+async fn run_sampler(mut ctx: SamplerCtx) -> Vec<BacklogSample> {
     let mut samples = Vec::new();
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + ctx.every, ctx.every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
-        if ctx.stop.load(Ordering::Relaxed) {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            // The only value ever sent is `true`, and a dropped sender
+            // equally means the run is over — exit on either.
+            _ = ctx.stop.changed() => break,
+        }
+        if *ctx.stop.borrow() {
             break;
         }
         let store = ctx.store.clone();

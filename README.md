@@ -84,6 +84,56 @@ logs that other backends ignore:
   logged in" to "user authenticated" shows up here — at the time of the
   change, not three weeks later when your alert stops firing.
 
+## Workload fit: when to choose Ourios — and when not
+
+Ourios is not "better than Loki" (or anything else); it is built for a
+specific workload shape, and the honest comparison
+([RFC 0031](docs/rfcs/0031-comparative-evaluation-loki.md); every
+benchmark query pair — the same question posed to both systems — is
+machine-checked before it counts: row-level answers must be
+multiset-identical, and the aggregation pair is checked within a
+documented completeness margin for the reference system's own
+under-counting) is evidence of fit, not a ranking.
+
+**Choose Ourios when this is your workload:**
+
+- Your logs arrive as **OTLP** (a Collector already in front) and you
+  want them stored with exact OTLP fidelity — every field back out,
+  bit-identical bodies.
+- Your bread-and-butter queries are **selective**: needles by template,
+  trace-ID correlation, severity outliers, counts by template — the
+  shapes that prune to a handful of row groups instead of scanning.
+- You care about **predictable** query cost over long retention. The
+  measured profile is flat: 39–86 ms across every latency-measured
+  comparative pair at 4.9 M records — needles, severity, and window
+  browses alike — where the grep-architecture reference spans 13.8 ms
+  to 24.1 s depending on how much it must scan (dataset, environment,
+  and the pair definitions:
+  [`docs/benchmarks.md` §9.13](docs/benchmarks.md)). Flatness, not any
+  single ratio, is the headline: cost tracks the *result*, not the
+  corpus.
+- You want **one binary** on object storage: no index tier, no
+  distributor/ingester/querier fleet, no separate compactor service.
+
+**Choose something else when:**
+
+- **Arbitrary substring hunts over recent data are the daily shape.**
+  A label + time index (Loki's design) is genuinely better at "the most
+  recent few thousand rows matching this string, fast" — our
+  time-window browse is a documented storage-bytes loss
+  ([`docs/benchmarks.md` §9.13](docs/benchmarks.md)), and we publish it
+  rather than argue with it.
+- **You live in the Grafana ecosystem** and its integrations are the
+  point.
+- **You need years of operational hardening today.** Ourios is
+  pre-release; the incumbents have production miles we simply do not.
+
+One honesty note on the numbers: the comparison measured the
+architecture's antithesis (grep-shaped storage). Against columnar
+engines closer to our own design — ClickHouse-family,
+VictoriaLogs-style — the margins would be thinner; that comparison is a
+possible future RFC, and until it runs we claim nothing about it.
+
 ## Non-goals
 
 - Metrics and traces. OTLP logs only. Traces are linked by `trace_id`

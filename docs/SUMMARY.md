@@ -59,6 +59,7 @@
 - [RFC 0031 — Comparative evaluation vs Loki](./rfcs/0031-comparative-evaluation-loki.md)
 - [RFC 0032 — Query-schema and cost-model resource](./rfcs/0032-query-schema-cost-model-resource.md)
 - [RFC 0033 — Cached template-map artifact](./rfcs/0033-cached-template-map.md)
+- [RFC 0034 — D1 re-scope](./rfcs/0034-d1-rescope.md)
 - [RFC 0035 — Ingest concurrency](./rfcs/0035-ingest-concurrency.md)
 
 # Talks

@@ -14,7 +14,7 @@
 # so Renovate bumps tag + digest). musl-tools provides the native musl-gcc each
 # architecture leg needs — the CI legs run on native runners, so this is
 # a native musl build, not a cross-compile.
-FROM rust:1.97-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
+FROM rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 # ca-certificates is installed explicitly rather than assumed from the
 # base image — the scratch runtime stage COPYs the bundle out of here.
 RUN apt-get update \

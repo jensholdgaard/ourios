@@ -82,11 +82,17 @@ directly, on the axis the architecture scales on after RFC 0035.
 ## 3. Proposed design
 
 1. **D1's must-win**: sustained **≥ 100 000 lines/s per node** on
-   `baseline-8vcpu-32gib`, multi-tenant load (`soak --tenants N`,
-   N ≥ cores) through one shared WAL/commit stream, WAL fsync batched at
-   100 ms, **with p99 ingest-ack ≤ 200 ms at that sustained rate**
-   (below saturation — queue-bound latencies at over-offered load do not
-   count against the bar, per §9.20's reading). Judged on the §9 series;
+   `baseline-8vcpu-32gib`, multi-tenant load (`soak --tenants N` with
+   **N = cores**, i.e. 8 on the baseline class) through one shared
+   WAL/commit stream, WAL fsync batched at 100 ms, **with p99
+   ingest-ack ≤ 200 ms at that sustained rate**. "Below saturation" is
+   observable, not asserted: the run offers exactly the bar rate
+   (100 000 lines/s) and must **achieve ≥ 99% of offered** — a
+   saturated pipeline cannot keep pace with the paced load, so
+   achieved ≈ offered *is* the below-saturation proof, and the p99 is
+   measured over that same run (queue-bound latencies at over-offered
+   load are a different regime, per §9.20's reading, and do not
+   count). Judged on the §9 series;
    first evidence: §9.22's 132,289 lines/s (RFC 0035 Design A
    prototype). The bar **asserts only once RFC 0035's production
    implementation is `green`** — the prototype number is the calibration
@@ -135,11 +141,13 @@ directly, on the axis the architecture scales on after RFC 0035.
 > **Scenario RFC0034.2 — the bar asserts on baseline hardware once
 > RFC 0035 is green.**
 > - **Given** RFC 0035's production implementation at `green` and a
->   `soak --tenants N` (N ≥ cores) run on `baseline-8vcpu-32gib`
-> - **When** the one-hour sustained soak runs at ≥ 100k lines/s offered
-> - **Then** achieved ≥ 100 000 lines/s with 0 failed batches, p99 ack
->   ≤ 200 ms at that rate, D2 PASS — recorded in the §9 series as the
->   asserting run.
+>   `soak --tenants 8` run on `baseline-8vcpu-32gib` (N = cores,
+>   deterministic)
+> - **When** the one-hour soak offers exactly 100 000 lines/s
+> - **Then** achieved ≥ 99% of offered (the observable
+>   below-saturation condition) with 0 failed batches, p99 ack
+>   ≤ 200 ms over that run, D2 PASS — recorded in the §9 series as
+>   the asserting run.
 
 > **Scenario RFC0034.3 — the diagnostics stay visible.**
 > - **Given** any soak run
@@ -163,8 +171,10 @@ per-core fields, #567/#570) and pinned by its existing report tests.
 - [ ] Whether the asserting run (RFC0034.2) doubles as RFC 0035's
   RFC0035.4 measurement (same instrument, same hardware) — one run,
   two records, or kept separate for independence.
-- [ ] N for the asserting run: `N = cores` (the §9.22 shape) or the
-  knee of a tenant curve — decide from the RFC 0035 `green` run.
+- [x] N for the asserting run: settled at **N = cores** (8 on the
+  baseline class, the §9.22 shape) for determinism; a tenant-scaling
+  curve remains a worthwhile *diagnostic* exploration but never moves
+  the gate's N.
 - [ ] `benchmarks.md` § D1's prose retains the old per-core target as
   the diagnostic's reference line (RFC 0011 did this for A1) — confirm
   exact wording at enactment.

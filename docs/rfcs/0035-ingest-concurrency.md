@@ -196,11 +196,23 @@ ordered-vs-concurrent phases behind the same public contract.
   id, e.g. `(tenant_ordinal, per_tenant_seq)`, **not** a naive per-tenant
   `u64` — which the code explicitly warns collides, `cluster.rs:120–122`).
   This reaches the full per-core ceiling (the ~341k independent-lane
-  approximation, §9.20). **Deferred because** changing `template_id`'s
-  representation is an on-disk Parquet **schema change** (§3.5 migration
-  plan required — historical files, reader forward-compat) that ripples
-  into the query surface (`template_id == N`), the audit stream, and the
-  snapshot format. That is a large, separate commitment; Design A should
+  approximation, §9.20). **Two shapes exist, with very different costs:**
+  a *compound* id (`(tenant, seq)` as separate fields) is an on-disk
+  Parquet **schema change** (§3.5 migration plan required — historical
+  files, reader forward-compat) rippling into the query surface
+  (`template_id == N`), the audit stream, and the snapshot format. The
+  cheaper named variant is **bit-partitioning the existing `u64`**
+  (`tenant_ordinal << K | per_tenant_seq`): still a `u64` — no Parquet
+  schema change, dictionary/bloom behaviour unaffected (they exploit
+  repetition, not density), the DSL untouched — applied forward-only
+  (old files keep old ids, defined as ever by the audit stream). Its
+  own unexamined edges are real, though: the tenant-ordinal map is
+  **new global state** needing a durable, replay-stable recovery story;
+  the K-bit split imposes tenant/template cardinality caps that must be
+  justified; and snapshots/high-water marks become per-tenant either
+  way. **Deferred because** even the cheap shape is an id-allocation
+  redesign on the silent-corruption-risk path, and its design is not
+  settled enough to implement without its own RFC round. That is a large, separate commitment; Design A should
   ship and be measured first, and B revisited only if A's measured
   ceiling (§6) leaves the D1 must-win unmet. Per-tenant snapshot
   high-water marks (or a rotation drain-barrier) would also be required
@@ -334,6 +346,11 @@ before implementation proceeds.
   measurement) at `red` — it decides whether Design A alone clears the D1
   must-win or whether Design B (§4) must be escalated before
   implementation proceeds.
+- [ ] **If Design B is ever escalated (§4):** settle bit-partitioned
+  `u64` vs compound id first — the former may avoid the §3.5 migration
+  entirely, but needs a durable tenant-ordinal map design and K-bit
+  cardinality-cap justification. Its own RFC; recorded here so the
+  cheaper shape isn't forgotten.
 - [ ] **The encode-drain-and-flush barrier mechanism (§3.1)** — a
   per-`seq` completion watch the rotation/shutdown drain awaits, or
   per-partition encode-completion offsets the writer folds into the

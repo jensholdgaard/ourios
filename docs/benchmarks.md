@@ -1764,8 +1764,10 @@ the evidence, not the verdict.
 **Purpose.** The §9.20 tenant-parallel figure (≈ 341k lines/s) was a
 multi-process *approximation* flagged as such; #567's in-process
 `--tenants N` mode (merged #570) is the honest instrument. Ad-hoc VM
-runs at `9ad3158`-era code, JSONs retained by the maintainer
-(`scratch/soak-mt-2026-07-20/`, `scratch/soak-prof-2026-07-20/`).
+runs at `9ad3158`-era code; the per-run JSONs and the profile
+artifacts are retained by the maintainer outside the repository
+(the gitignored local `scratch/` tree), as with every ad-hoc VM
+record in this series.
 
 **Finding 1 — node capacity is FLAT across tenants.** 10-minute
 saturating soaks, 8 workers, one shared WAL/commit stream:
@@ -1776,7 +1778,8 @@ precisely because separate processes had separate commit streams.
 **Finding 2 — the ceiling is software serialization, not hardware.**
 Profile at saturation (flamegraph + per-thread pidstat): **1.2 of 8
 cores busy — ~85% idle**; no thread above ~33%. Root cause
-(`pipeline.rs:314–354` at that commit): the global WAL-seq gate + the
+(`crates/ourios-ingester/src/receiver/pipeline.rs:314–354` at that
+commit): the global WAL-seq gate + the
 global miner mutex serialize all tenants, with the miner match AND the
 sink emit (including size-triggered Parquet encode + store put — I/O)
 inside the single-file section. Issue #571; design → **RFC 0035**
@@ -1789,7 +1792,8 @@ inside the single-file section. Issue #571; design → **RFC 0035**
 `987b781` — ordered mining under the gate, sink emit + triggered
 publish moved to a bounded concurrent pool, crude quiesce barrier).
 Same VM, back-to-back 10-minute saturating soaks (8 tenants, offered
-800k, 8 workers). Artifacts: `scratch/soak-ab-2026-07-20/`.
+800k, 8 workers). Artifacts retained by the maintainer outside the
+repository (gitignored local `scratch/` tree).
 
 | arm | node capacity | ack p50 / p99 (at saturation) | D2 |
 |---|---|---|---|

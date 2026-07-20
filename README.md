@@ -90,8 +90,10 @@ Ourios is not "better than Loki" (or anything else); it is built for a
 specific workload shape, and the honest comparison
 ([RFC 0031](docs/rfcs/0031-comparative-evaluation-loki.md); every
 benchmark query pair — the same question posed to both systems — is
-machine-checked for result-set equivalence before it counts) is
-evidence of fit, not a ranking.
+machine-checked before it counts: row-level answers must be
+multiset-identical, and the aggregation pair is checked within a
+documented completeness margin for the reference system's own
+under-counting) is evidence of fit, not a ranking.
 
 **Choose Ourios when this is your workload:**
 

@@ -141,7 +141,7 @@ record the mark claims is safe. Design A therefore adds an explicit
 any `wal_high_water` advance) must **quiesce the encode pool up to the
 rotation offset** — every `MinedRecord` with `seq ≤ mark` has completed
 its `RecordSink` emit — before the high-water is stamped. Because the
-barrier is keyed to WAL rotation (segments are 128 MiB — RFC 0009 sizing)
+barrier is keyed to WAL rotation (WAL segments default to 128 MiB — RFC 0008)
 and shutdown, not to every batch, its amortised cost is negligible while
 the between-rotation steady state runs fully concurrent. The barrier's
 mechanism (a per-seq completion watch the drain awaits, or per-partition

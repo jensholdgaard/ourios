@@ -1724,9 +1724,9 @@ clock):
 | 800,000 lines/s | 85,911 lines/s | 5,972 / 6,319 ms | max 1 partition, drained — PASS |
 
 The identical ~86k plateau at every offered rate, with ack latency
-pinned at ~6 s, is a saturated pipeline: at saturation the in-flight
-bound sets the *latency* (512 batches × 1,000 lines ÷ 86k lines/s
-≈ 6 s) while the plateau itself is the pipeline's *service rate* —
+pinned at ~6 s, is a saturated pipeline: at saturation the harness's
+in-flight bound (a 512-batch semaphore in the load loop, #558) sets
+the *latency* (512 batches × 1,000 lines ÷ 86k lines/s ≈ 6 s) while the plateau itself is the pipeline's *service rate* —
 raising the permit count would lengthen the queue, not the
 throughput, because the per-tenant miner hand-off is in-order and
 sequential by design (`CLAUDE.md` §3.7 per-tenant trees; the

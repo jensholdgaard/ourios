@@ -211,9 +211,9 @@ ordered-vs-concurrent phases behind the same public contract.
   the K-bit split imposes tenant/template cardinality caps that must be
   justified; and snapshots/high-water marks become per-tenant either
   way. **Deferred because** even the cheap shape is an id-allocation
-  redesign on the silent-corruption-risk path, and its design is not
-  settled enough to implement without its own RFC round. That is a large, separate commitment; Design A should
-  ship and be measured first, and B revisited only if A's measured
+  redesign on the silent-corruption-risk path, not settled enough to
+  implement without its own RFC round — a separate commitment. Design A
+  ships and is measured first; B is revisited only if A's measured
   ceiling (§6) leaves the D1 must-win unmet. Per-tenant snapshot
   high-water marks (or a rotation drain-barrier) would also be required
   (`recovery.rs:199–203` stamps one global mark on every tenant today).

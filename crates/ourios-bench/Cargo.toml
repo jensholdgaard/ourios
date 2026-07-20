@@ -74,7 +74,19 @@ tempfile = "3"
 # dev-only while the only in-process queries lived in the B2 criterion
 # bench, which still uses them via these regular deps.)
 ourios-querier = { path = "../ourios-querier" }
-tokio = { version = "=1.52.3", default-features = false, features = ["rt"] }
+# The RFC 0009 D1/D2 soak harness (`soak`) needs the multi-thread
+# runtime: the group-commit coordinator offloads its fsync via
+# `spawn_blocking`, which a current-thread runtime would serialize
+# behind the load loop. `time` paces the load, `sync` bounds in-flight
+# batches (Semaphore).
+tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync"] }
+# The soak harness drives the real ingest path in-process: WAL →
+# group-commit coordinator → `IngestPipeline` → record sink, with the
+# compactor's `run_sweep` driven manually on the synthetic cadence.
+# Regular (not dev) deps since the `soak` subcommand ships in the bin;
+# the criterion benches use them through these same lines.
+ourios-wal = { path = "../ourios-wal" }
+ourios-ingester = { path = "../ourios-ingester" }
 # RFC 0031 L4 (frequency-aggregation) pair: decodes the querier's RFC 3339
 # `bucket(width)` group-key rendering back to Unix nanoseconds for the
 # `AggKey` comparison against Loki. Same version `ourios-querier` pins.
@@ -109,15 +121,6 @@ proptest = "=1.11.0"
 # which is what B2's "median latency" target wants; ourios-querier (a
 # regular dependency above) is the unit under test.
 criterion = "=0.8.2"
-# RFC0008.3 recovery-non-amplification bench: times `Wal::replay`
-# over N ∈ {1, 4, 16} segments. Supportive wall-clock evidence
-# (the O(N) shape) mirroring b1/b2's role; the structural side is
-# pinned by `ourios-wal`'s `rfc0008_3_*` integration tests.
-ourios-wal = { path = "../ourios-wal" }
-# Ingest write-path bench (CLAUDE.md §6.2 hot paths): drives the RFC 0014
-# `ParquetRecordSink` for the WAL → Parquet half; the WAL half uses
-# `ourios-wal` directly.
-ourios-ingester = { path = "../ourios-ingester" }
 
 [[bench]]
 name = "b1"

@@ -15,9 +15,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ourios_bench::{
-    BenchConfig, BenchError, GateSet, TxtSeverity, run, update_status_section, write_results_json,
+    BenchConfig, BenchError, GateSet, SoakConfig, SoakReport, TxtSeverity, run, run_soak,
+    update_status_section, write_results_json,
 };
 
 /// The §9 Results doc the `--update-benchmarks-md` path
@@ -34,12 +35,18 @@ const BASELINE_HARDWARE_TAG: &str = "baseline-8vcpu-32gib (8 vCPU / 32 GiB / gp3
 #[derive(Parser, Debug)]
 #[command(
     name = "ourios-bench",
-    about = "RFC 0006 thesis-gate bench harness (A1 compression / C1 reconstruction / C2 convergence)"
+    about = "RFC 0006 thesis-gate bench harness (A1 compression / C1 reconstruction / C2 convergence)",
+    // Subcommands (`soak`) carry their own flag surface; without this,
+    // clap would still demand the gate run's --hardware-kind.
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
 )]
 // Each bool is an independent operator flag; a state enum would fight
 // clap's derive, not clarify it.
 #[allow(clippy::struct_excessive_bools)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Directory of corpus files to load (recursive). Walker
     /// dispatches on extension: `*.txt` (plain-text per RFC
     /// 0006 §3.3) and `*.jsonl` / `*.json` (OTLP/JSON Lines
@@ -101,6 +108,67 @@ struct Cli {
     /// Manifest output path override.
     #[arg(long, requires = "calibrate")]
     calibration_out: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// RFC 0009 D1/D2 sustained-ingest soak: drive the real ingest path
+    /// in-process at a paced rate and sample the compaction backlog
+    /// under a synthetic (compressed) clock.
+    Soak(SoakArgs),
+}
+
+/// Flags mirroring [`SoakConfig`]; defaults match its `Default`.
+#[derive(Args, Debug)]
+struct SoakArgs {
+    /// Load duration in wall seconds.
+    #[arg(long, default_value_t = 3600)]
+    duration_secs: u64,
+    /// Target ingest rate for the whole process, in lines per second.
+    #[arg(long, default_value_t = 100_000)]
+    target_lines_per_sec: u64,
+    /// Log records per OTLP export batch.
+    #[arg(long, default_value_t = 1000)]
+    batch_size: usize,
+    /// Synthetic seconds per wall second (60 ⇒ one wall-minute of load
+    /// is one synthetic hour of record time — see the soak module doc).
+    #[arg(long, default_value_t = 60)]
+    time_compression: u64,
+    /// Wall seconds between backlog samples / compaction sweeps.
+    #[arg(long, default_value_t = 10)]
+    sample_every_secs: u64,
+    /// Record-sink flush threshold in bytes (small on purpose: the soak
+    /// must produce the multi-file partitions compaction consolidates).
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    sink_target_bytes: usize,
+    /// Seed for the deterministic batch generator.
+    #[arg(long, default_value_t = 0xD1D2_50AC)]
+    seed: u64,
+    /// Tokio worker threads (default: host parallelism) — also the
+    /// divisor for the D1 per-core rate.
+    #[arg(long)]
+    worker_threads: Option<usize>,
+    /// Where the JSON soak report lands.
+    #[arg(long, default_value = "soak-report.json")]
+    out: PathBuf,
+}
+
+impl SoakArgs {
+    fn into_config(self) -> (SoakConfig, PathBuf) {
+        let config = SoakConfig {
+            duration_secs: self.duration_secs,
+            target_lines_per_sec: self.target_lines_per_sec,
+            batch_size: self.batch_size,
+            time_compression: self.time_compression,
+            sample_every_secs: self.sample_every_secs,
+            sink_target_bytes: self.sink_target_bytes,
+            seed: self.seed,
+            worker_threads: self
+                .worker_threads
+                .unwrap_or_else(ourios_bench::default_worker_threads),
+        };
+        (config, self.out)
+    }
 }
 
 /// clap value parser for `--corpus-tag`: one normal path component
@@ -167,12 +235,81 @@ impl Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Command::Soak(args)) = cli.command {
+        return match run_soak_command(args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("ourios-bench: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match run_bench(cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("ourios-bench: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// The `soak` subcommand: run the D1/D2 soak, write the JSON report,
+/// print the human summary. Like A1/C2, the D1/D2 verdicts are
+/// *reported*, not process failures — whether an indicative run's miss
+/// pauses anything is the §7 escalation rule's human judgment.
+fn run_soak_command(args: SoakArgs) -> Result<ExitCode, String> {
+    let (config, out) = args.into_config();
+    let report = run_soak(&config).map_err(|e| e.to_string())?;
+    let json =
+        serde_json::to_string_pretty(&report).map_err(|e| format!("serialize soak report: {e}"))?;
+    std::fs::write(&out, json).map_err(|e| format!("write {}: {e}", out.display()))?;
+    eprintln!("ourios-bench: soak report written to {}", out.display());
+    print_soak_summary(&report);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One-line-per-gate soak summary, mirroring [`print_summary`]'s shape.
+fn print_soak_summary(report: &SoakReport) {
+    println!(
+        "soak — {:.1}s wall at target {} lines/s (batch {}, {} worker(s), ×{} synthetic time)",
+        report.wall_secs,
+        report.config.target_lines_per_sec,
+        report.config.batch_size,
+        report.config.worker_threads,
+        report.config.time_compression,
+    );
+    println!(
+        "  D1 ingest: {:.0} lines/s ({:.0}/core; bar ≥ {}/core) · ack p50 {:.2} p95 {:.2} \
+         p99 {:.2} max {:.2} ms (bar p99 ≤ {} ms) — {}",
+        report.achieved_lines_per_sec,
+        report.d1.per_core_lines_per_sec,
+        report.d1.bar_lines_per_sec_per_core,
+        report.latency.p50_ms,
+        report.latency.p95_ms,
+        report.d1.p99_ack_ms,
+        report.latency.max_ms,
+        report.d1.bar_p99_ack_ms,
+        if report.d1.pass { "PASS" } else { "FAIL" },
+    );
+    println!(
+        "  D2 backlog: max {} partition(s), final {} (returned to zero: {}) · {} compacted \
+         over {} sample(s) — {}",
+        report.d2.max_backlog_partitions,
+        report.d2.final_backlog_partitions,
+        report.d2.returned_to_zero_after_max,
+        report.total_partitions_compacted,
+        report.samples.len(),
+        if report.d2.pass { "PASS" } else { "FAIL" },
+    );
+    println!(
+        "  batches: {} acked, {} failed · {} line(s) acked",
+        report.batches_acked, report.batches_failed, report.lines_acked,
+    );
+    if let Some(last) = report.samples.last() {
+        println!(
+            "  WAL at last sample: {} segment(s), {} byte(s) on disk",
+            last.wal_segments, last.wal_disk_bytes,
+        );
     }
 }
 
@@ -440,6 +577,48 @@ mod tests {
             explicit.hardware_kind.as_deref(),
             Some("baseline-8vcpu-32gib")
         );
+    }
+
+    /// The `soak` subcommand parses without the gate run's required
+    /// flags (`subcommand_negates_reqs`), and its flags land in
+    /// [`SoakConfig`] with the documented defaults.
+    #[test]
+    fn soak_subcommand_parses_without_gate_flags() {
+        let cli = Cli::try_parse_from(["ourios-bench", "soak"])
+            .expect("bare soak parses without --hardware-kind");
+        let Some(Command::Soak(args)) = cli.command else {
+            panic!("expected the soak subcommand");
+        };
+        let (config, out) = args.into_config();
+        assert_eq!(config.duration_secs, 3600);
+        assert_eq!(config.target_lines_per_sec, 100_000);
+        assert_eq!(config.batch_size, 1000);
+        assert_eq!(config.time_compression, 60);
+        assert_eq!(config.sample_every_secs, 10);
+        assert!(config.worker_threads > 0);
+        assert_eq!(out, PathBuf::from("soak-report.json"));
+
+        let cli = Cli::try_parse_from([
+            "ourios-bench",
+            "soak",
+            "--duration-secs",
+            "5",
+            "--target-lines-per-sec",
+            "20000",
+            "--worker-threads",
+            "2",
+            "--out",
+            "x.json",
+        ])
+        .expect("flagged soak parses");
+        let Some(Command::Soak(args)) = cli.command else {
+            panic!("expected the soak subcommand");
+        };
+        let (config, out) = args.into_config();
+        assert_eq!(config.duration_secs, 5);
+        assert_eq!(config.target_lines_per_sec, 20_000);
+        assert_eq!(config.worker_threads, 2);
+        assert_eq!(out, PathBuf::from("x.json"));
     }
 
     /// RFC0006.6 — `--gates` scopes the measurement; omitting

@@ -185,6 +185,11 @@ pub struct MinerCluster {
     // single record `emit_record` would hand the record sink into
     // `Captured` for the caller to encode off the gate.
     mined_capture: MinedCapture,
+    // Records salvaged out of the capture slot on a panic inside
+    // [`Self::ingest_mined`] (forwarded to the record sink instead of
+    // being dropped with the unwind). Expected to stay 0; a non-zero
+    // value means a panic fired between capture and return.
+    mined_capture_salvages: AtomicU64,
 }
 
 /// State of the one-record capture slot backing
@@ -293,6 +298,7 @@ impl MinerCluster {
             clock: Box::new(SystemClock::new()),
             metrics: MinerMetrics::new(),
             mined_capture: MinedCapture::Off,
+            mined_capture_salvages: AtomicU64::new(0),
         }
     }
 
@@ -1214,14 +1220,54 @@ impl MinerCluster {
     /// `ingest` emits exactly one record); it is surfaced rather than
     /// `expect`ed so a panic path that left the slot armed cannot take
     /// the miner down a second time.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises any panic from the underlying [`Self::ingest`] — but
+    /// only after settling the capture slot (reset, and any captured
+    /// record forwarded to the record sink), so an unwind can neither
+    /// leave a stale `Captured` to be discarded by the next call nor
+    /// silently drop an already-acknowledged record.
     pub fn ingest_mined(&mut self, record: &OtlpLogRecord) -> (u64, Option<MinedRecord>) {
         self.mined_capture = MinedCapture::Armed;
-        let template_id = self.ingest(record);
-        let mined = match std::mem::replace(&mut self.mined_capture, MinedCapture::Off) {
+        // An RAII guard cannot settle the slot (it would need `&mut self`
+        // concurrently with the `ingest` borrow), so catch-unwind
+        // provides the same drop-time guarantee explicitly.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ingest(record))) {
+            Ok(template_id) => (template_id, self.take_mined_capture()),
+            Err(panic) => {
+                self.salvage_mined_capture();
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    /// Take + reset the capture slot.
+    fn take_mined_capture(&mut self) -> Option<MinedRecord> {
+        match std::mem::replace(&mut self.mined_capture, MinedCapture::Off) {
             MinedCapture::Captured(rec) => Some(*rec),
             MinedCapture::Off | MinedCapture::Armed => None,
-        };
-        (template_id, mined)
+        }
+    }
+
+    /// The unwind half of [`Self::ingest_mined`]: reset the slot and
+    /// forward a record captured before the panic to the record sink.
+    /// The caller's batch is already WAL-durable (acked or about to
+    /// be), so dropping a captured record with the unwind would lose it
+    /// until a restart's replay — forward it now, and count the salvage
+    /// so the (expected-never) path is observable.
+    fn salvage_mined_capture(&mut self) {
+        if let Some(rec) = self.take_mined_capture() {
+            self.mined_capture_salvages.fetch_add(1, Ordering::Relaxed);
+            self.record_sink.emit(rec);
+        }
+    }
+
+    /// Records forwarded to the sink by the panic-unwind salvage in
+    /// [`Self::ingest_mined`]. Expected 0 in a healthy process.
+    #[must_use]
+    pub fn mined_capture_salvages_total(&self) -> u64 {
+        self.mined_capture_salvages.load(Ordering::Relaxed)
     }
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.
@@ -4629,6 +4675,81 @@ mod tests {
             via_ingest.snapshot_state(&t),
             via_mined.snapshot_state(&t),
             "per-tenant state identical across the two entry points",
+        );
+    }
+
+    /// An audit sink that panics on its first `Created` event, once —
+    /// the injectable mid-`ingest` panic (audit runs in the ordered
+    /// phase, before the record emit).
+    struct PanicOnceAuditSink {
+        fired: bool,
+    }
+
+    impl AuditSink for PanicOnceAuditSink {
+        fn emit(&mut self, _event: AuditEvent) {
+            if !self.fired {
+                self.fired = true;
+                panic!("injected audit-sink panic");
+            }
+        }
+    }
+
+    /// RFC 0035 review F2 — a panic inside `ingest_mined` must leave the
+    /// capture slot clean: the next call captures normally instead of
+    /// silently losing its record to a stale slot state.
+    #[test]
+    fn rfc0035_f2_capture_slot_is_clean_after_a_panic() {
+        let records = SharedRecordSink::new();
+        let mut cluster = MinerCluster::with_audit_sink(
+            MinerConfig::default(),
+            Box::new(PanicOnceAuditSink { fired: false }),
+        )
+        .with_record_sink(Box::new(records.clone()));
+        let t = TenantId::new("tenant-x");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.ingest_mined(&string_record(&t, "user 1 logged in"))
+        }));
+        assert!(panicked.is_err(), "the injected audit panic propagates");
+        // The panic fired before the record emit (audit precedes it), so
+        // nothing was captured and nothing is salvaged.
+        assert_eq!(cluster.mined_capture_salvages_total(), 0);
+
+        let (_, mined) = cluster.ingest_mined(&string_record(&t, "user 2 logged in"));
+        assert!(
+            mined.is_some(),
+            "the slot was reset across the unwind — the next batch item is \
+             captured, not swallowed by a stale Armed/Captured state",
+        );
+        assert!(
+            records.drain().is_empty(),
+            "capture still diverts away from the miner's own sink",
+        );
+    }
+
+    /// RFC 0035 review F2 — the unwind settle forwards a record captured
+    /// before the panic to the real sink (and counts it) instead of
+    /// dropping an acknowledged record until restart replay.
+    #[test]
+    fn rfc0035_f2_salvage_forwards_a_captured_record_to_the_sink() {
+        let records = SharedRecordSink::new();
+        let mut cluster =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(records.clone()));
+        let t = TenantId::new("tenant-x");
+
+        // Stage the state a panic-after-capture leaves behind (the tail
+        // of `ingest` past the emit is not injectable from outside).
+        let (_, mined) = cluster.ingest_mined(&string_record(&t, "user 1 logged in"));
+        cluster.mined_capture = MinedCapture::Captured(Box::new(mined.expect("captured")));
+
+        cluster.salvage_mined_capture();
+
+        assert_eq!(cluster.mined_capture_salvages_total(), 1);
+        let salvaged = records.drain();
+        assert_eq!(salvaged.len(), 1, "the captured record reached the sink");
+        assert!(
+            matches!(cluster.mined_capture, MinedCapture::Off),
+            "the slot is reset after the salvage",
         );
     }
 }

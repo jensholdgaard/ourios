@@ -408,14 +408,30 @@ impl IngestPipeline {
                         self.quiesce_encodes();
                         self.fire_rotation_hook(&miner, prev);
                     }
-                    if self.encode_pool.is_some() {
+                    if let Some(pool) = &self.encode_pool {
                         // Ordered phase (RFC 0035 §3.1): id assignment +
                         // audit under the gate; the sink emit is deferred
                         // to the concurrent pool below.
                         let mut out = Vec::with_capacity(records.len());
-                        for record in &records {
-                            let (_, rec) = miner.ingest_mined(record);
-                            out.extend(rec);
+                        // The whole batch is already WAL-durable, so a
+                        // miner panic mid-batch must not drop the records
+                        // mined before it — pre-split they had been
+                        // emitted inline as they were mined; deferring
+                        // the emit must not widen that failure into
+                        // whole-batch loss-until-restart-replay. Submit
+                        // what was mined, then let the panic continue
+                        // (the gate guard still releases, and `ingest`'s
+                        // caller still fails the request).
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                for record in &records {
+                                    let (_, rec) = miner.ingest_mined(record);
+                                    out.extend(rec);
+                                }
+                            }));
+                        if let Err(panic) = outcome {
+                            pool.submit(out);
+                            std::panic::resume_unwind(panic);
                         }
                         out
                     } else {

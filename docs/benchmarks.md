@@ -1758,3 +1758,52 @@ multi-tenant must-win + per-tenant ceiling as recorded diagnostic,
 the RFC 0011 must-win/diagnostic precedent) is a pending maintainer
 decision; until it lands, D1 stays FAIL-as-written and this record is
 the evidence, not the verdict.
+
+### 9.21 Results — 2026-07-20 (authoritative, `baseline-8vcpu-32gib`) — in-process multi-tenant ceiling + the serialization profile
+
+**Purpose.** The §9.20 tenant-parallel figure (≈ 341k lines/s) was a
+multi-process *approximation* flagged as such; #567's in-process
+`--tenants N` mode (merged #570) is the honest instrument. Ad-hoc VM
+runs at `9ad3158`-era code, JSONs retained by the maintainer
+(`scratch/soak-mt-2026-07-20/`, `scratch/soak-prof-2026-07-20/`).
+
+**Finding 1 — node capacity is FLAT across tenants.** 10-minute
+saturating soaks, 8 workers, one shared WAL/commit stream:
+1 tenant ≈ 86.0k, 8 tenants 85.8–86.2k (three offered rates), 16
+tenants 87.3k lines/s. The multi-process 341k was ~4× optimistic
+precisely because separate processes had separate commit streams.
+
+**Finding 2 — the ceiling is software serialization, not hardware.**
+Profile at saturation (flamegraph + per-thread pidstat): **1.2 of 8
+cores busy — ~85% idle**; no thread above ~33%. Root cause
+(`pipeline.rs:314–354` at that commit): the global WAL-seq gate + the
+global miner mutex serialize all tenants, with the miner match AND the
+sink emit (including size-triggered Parquet encode + store put — I/O)
+inside the single-file section. Issue #571; design → **RFC 0035**
+(`specified`). D2 passed at full saturation in every run.
+
+### 9.22 Results — 2026-07-20 (authoritative, `baseline-8vcpu-32gib`) — RFC 0035 Design A prototype A/B
+
+**Purpose.** The RFC 0035 §6 pre-implementation measurement: `main`
+(`9ad3158` lineage) vs the Design A prototype (`rfc0035-prototype`
+`987b781` — ordered mining under the gate, sink emit + triggered
+publish moved to a bounded concurrent pool, crude quiesce barrier).
+Same VM, back-to-back 10-minute saturating soaks (8 tenants, offered
+800k, 8 workers). Artifacts: `scratch/soak-ab-2026-07-20/`.
+
+| arm | node capacity | ack p50 / p99 (at saturation) | D2 |
+|---|---|---|---|
+| BEFORE (main) | 82,100 lines/s | 6,183 / 7,023 ms | PASS |
+| AFTER (prototype) | **132,289 lines/s** | 3,830 / 4,629 ms | PASS |
+
+**Design A multiple on the baseline class: 1.61×** (implied residual
+serial fraction ≈ 0.62 — the ordered miner phase + WAL group commit).
+Honest note: this is *below* the M-series indicative 1.82× — the
+prediction that the baseline multiple would land higher was wrong; the
+EPYC's slower single-thread makes the still-serial ordered phase
+relatively costlier. Saturation ack latencies are queue-bound in both
+arms (the in-flight bound), per §9.20's reading — the p99 bar applies
+at sustained rates below capacity. **This 132k lines/s/node figure is
+the §6 input to RFC 0035's target and to the RFC 0034 D1
+recalibration**; whether Design B (§4) is ever escalated is judged
+against the recalibrated bar, not the old per-core one.

@@ -213,7 +213,8 @@ role's trust policy federates to its ServiceAccount
 (`system:serviceaccount:<namespace>:<release>-ourios-<role>`); `eksctl create
 iamserviceaccount` or the Terraform `iam-role-for-service-accounts` module wires
 this in one step. The permission policy per role (swap the `Action` list per the
-table; scope to `storage.s3.prefix` if set):
+table; the example shows the `storage.s3.prefix`-scoped form — with no
+prefix, drop the `Condition` and use `<bucket>/*` on the object arn):
 
 ```json
 {
@@ -222,16 +223,21 @@ table; scope to `storage.s3.prefix` if set):
     {
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::<bucket>/*"
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/*"
     },
     {
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::<bucket>"
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": { "StringLike": { "s3:prefix": "<prefix>/*" } }
     }
   ]
 }
 ```
+
+(Without the `s3:prefix` condition, `ListBucket` on the bucket arn allows
+listing **every** key in the bucket — object access would be scoped but
+listing would not.)
 
 Two hardening notes:
 

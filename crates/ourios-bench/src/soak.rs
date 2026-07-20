@@ -501,7 +501,7 @@ fn build_report(
     };
     let per_core = achieved / as_f64(to_u64(config.worker_threads));
     // `tenants` is validated > 0, so this divisor is never zero.
-    let per_tenant = achieved / as_f64(to_u64(config.tenants.max(1)));
+    let per_tenant = achieved / as_f64(to_u64(config.tenants));
     let backlog_series: Vec<usize> = samples.iter().map(|s| s.backlog_partitions).collect();
     let total_compacted = samples.iter().map(|s| s.partitions_compacted).sum();
 
@@ -991,7 +991,13 @@ pub fn build_batch(
     batch_size: usize,
     ts_unix_nanos: u64,
 ) -> ExportLogsServiceRequest {
-    build_batch_for(seed, batch_idx, batch_size, ts_unix_nanos, TENANT)
+    build_batch_for(
+        seed,
+        batch_idx,
+        batch_size,
+        ts_unix_nanos,
+        TENANT.to_string(),
+    )
 }
 
 /// Build the batch for `batch_idx` under round-robin fan-out over
@@ -1011,20 +1017,24 @@ pub fn build_batch_for_tenants(
         // The single-tenant fast path *is* `build_batch`, so the baseline
         // batch stays byte-for-byte identical.
         Cow::Borrowed(_) => build_batch(seed, batch_idx, batch_size, ts_unix_nanos),
-        Cow::Owned(name) => build_batch_for(seed, batch_idx, batch_size, ts_unix_nanos, &name),
+        // The name is already owned (a per-batch `format!`); move it in so
+        // the hot loop allocates the tenant string exactly once.
+        Cow::Owned(name) => build_batch_for(seed, batch_idx, batch_size, ts_unix_nanos, name),
     }
 }
 
 /// Shared body of the batch builders: the record payload is a pure
 /// function of `(seed, batch_idx, batch_size, ts)`; `service_name` only
-/// stamps the tenant.
+/// stamps the tenant. Takes the name **by value** and moves it into the
+/// `ResourceLogs`, so a caller that already owns it (the multi-tenant hot
+/// loop's per-batch `format!`) does not re-allocate it.
 #[must_use]
 fn build_batch_for(
     seed: u64,
     batch_idx: u64,
     batch_size: usize,
     ts_unix_nanos: u64,
-    service_name: &str,
+    service_name: String,
 ) -> ExportLogsServiceRequest {
     let mut rng_state = seed ^ batch_idx.wrapping_mul(0xA076_1D64_78BD_642F);
     let log_records = (0..batch_size)
@@ -1058,7 +1068,7 @@ fn build_batch_for(
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
                     value: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(service_name.to_string())),
+                        value: Some(any_value::Value::StringValue(service_name)),
                     }),
                     ..KeyValue::default()
                 }],
@@ -1222,7 +1232,11 @@ fn backlog(
         .iter()
         .fold((0, 0, 0), |(parts, bytes, errs), tenant| {
             let (p, b, e) = backlog_for_tenant(store, tenant, now, policy);
-            (parts + p, bytes.saturating_add(b), errs.saturating_add(e))
+            (
+                parts.saturating_add(p),
+                bytes.saturating_add(b),
+                errs.saturating_add(e),
+            )
         })
 }
 

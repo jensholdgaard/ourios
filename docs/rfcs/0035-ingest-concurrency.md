@@ -18,7 +18,10 @@ superseded-by: —
 > (Design A) relaxes that serialization by moving the order-*insensitive*
 > Parquet encode **off** the global commit gate, while keeping the
 > order-*sensitive* template-id assignment globally ordered — so it
-> changes **no on-disk byte**. (The fully-per-tenant alternative, Design
+> makes **no on-disk schema, format, or migration change** (row order
+> within a partition may differ, but schema, `template_id` values, and
+> query results do not — §5 RFC0035.5). (The fully-per-tenant alternative,
+> Design
 > B, would relax mining itself but requires an on-disk migration; it is
 > considered and deferred, §4.) It touches the project's highest-risk
 > invariants — WAL durability (`CLAUDE.md` §3.4), miner determinism
@@ -205,7 +208,9 @@ ordered-vs-concurrent phases behind the same public contract.
 - **Per-tenant miner lock only, keep the global gate.** Insufficient —
   the global `ingest_gate` still serialises; and unsafe — per-tenant
   mining into the shared counter reorders id assignment (§2.3).
-- **Do nothing; recast D1 down to ~86k (RFC 0034 option B).** Rejected as
+- **Do nothing; recast D1 down to ~86k** (the do-nothing arm of the
+  forthcoming D1 re-scope, **RFC 0034** — held pending this RFC's
+  measurement, not yet in-tree). Rejected as
   the primary path (this RFC exists because ~86k is a software artifact,
   not a ceiling — recasting would enshrine it, the §6.2 "don't weaken the
   spec to match the code" trap). RFC 0034 remains, sequenced *after* this
@@ -356,8 +361,10 @@ before implementation proceeds.
 - `docs/benchmarks.md` §9.20 / §9.21 — the ~86k ceiling, 85%-idle
   profile, and the ~341k independent-lane approximation (Design B's
   ceiling); §1 `baseline-8vcpu-32gib`.
-- **RFC 0034** (held draft) — D1 re-scope, sequenced *after* this RFC:
-  recalibrate the D1 bar against Design A's measured number.
+- **RFC 0034** — D1 re-scope, sequenced *after* this RFC (recalibrate the
+  D1 bar against Design A's measured number). **Forthcoming: held as a
+  local draft pending this RFC's measurement, not yet in-tree** — a
+  forward-reference by number, not a document to read yet.
 - **RFC 0001** (`accepted`) — the template miner: §6.1 template-id
   semantics, §3.7.2 cross-tenant uniqueness, §3.5.3 snapshot-restore,
   §6.4 audit-sink barrier — the invariants this RFC must preserve.

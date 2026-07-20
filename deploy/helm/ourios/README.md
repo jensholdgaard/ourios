@@ -188,8 +188,9 @@ the stale v1 key). Under the read-only policy above this publish simply fails �
 the cache never populates, so every query re-pays the audit fold. To keep the
 cache warm without widening the read path, grant the querier `PutObject` +
 `DeleteObject` scoped to the one cache key it writes:
-`arn:aws:s3:::<bucket>/[<prefix>/]audit/tenant_id=*/template_map*` — the
-querier still cannot touch data objects.
+`arn:aws:s3:::<bucket>/audit/tenant_id=*/template_map*` (with a
+`storage.s3.prefix`, `arn:aws:s3:::<bucket>/<prefix>/audit/tenant_id=*/template_map*`)
+— the querier still cannot touch data objects.
 
 Each role opts into its own ServiceAccount (falling back to the shared
 `serviceAccount` otherwise), carrying its own IRSA role:

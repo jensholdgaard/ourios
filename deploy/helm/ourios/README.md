@@ -210,7 +210,9 @@ their own accounts it would be rendered but unused.)
 Because IRSA credentials come from STS, they are **short-lived and rotated
 automatically** — no static key exists to leak or forget to rotate. Each IAM
 role's trust policy federates to its ServiceAccount
-(`system:serviceaccount:<namespace>:<release>-ourios-<role>`); `eksctl create
+(`system:serviceaccount:<namespace>:<fullname>-<role>` — check the
+rendered name with `helm template`, since the chart's fullname collapses
+to the release name when it already contains "ourios"); `eksctl create
 iamserviceaccount` or the Terraform `iam-role-for-service-accounts` module wires
 this in one step. The permission policy per role (swap the `Action` list per the
 table; the example shows the `storage.s3.prefix`-scoped form — with no
@@ -298,7 +300,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `serviceAccount.annotations` | `{}` | AWS EKS IRSA `eks.amazonaws.com/role-arn` goes here (alternative to `storage.s3.existingSecret`). One identity for all roles — prefer the per-role split. |
 | `<role>.serviceAccount.create` | `false` | Role-scoped ServiceAccount for `receiver`/`querier`/`compactor` — the least-privilege IAM seam ("Per-role IAM" above). `false` falls back to the shared `serviceAccount`. |
 | `<role>.serviceAccount.annotations` | `{}` | The role's own IRSA `role-arn` (querier read-only, receiver no-delete, compactor sole delete-holder). |
-| `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<release>-ourios-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
+| `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<fullname>-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
 | `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |
 | `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |
 

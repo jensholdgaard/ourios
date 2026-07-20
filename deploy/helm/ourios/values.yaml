@@ -108,7 +108,7 @@ receiver:
   # create=false (default) uses the shared serviceAccount below. With IRSA,
   # annotate with this role's eks.amazonaws.com/role-arn — for the receiver
   # that role needs Get/List/Put but NOT s3:DeleteObject. `name`:
-  # create=true + empty name renders `<release>-ourios-receiver`;
+  # create=true + empty name renders `<fullname>-receiver`;
   # create=true + name overrides that; create=false + name binds an
   # EXISTING ServiceAccount of that name (managed out-of-band).
   serviceAccount:

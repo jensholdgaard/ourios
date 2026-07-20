@@ -79,7 +79,10 @@ eks.amazonaws.com/role-arn (README "Per-role IAM").
 {{- $ := .root -}}
 {{- $sa := (index $.Values .role).serviceAccount | default dict -}}
 {{- if $sa.create -}}
-{{- default (printf "%s-%s" (include "ourios.fullname" $) .role | trunc 63 | trimSuffix "-") $sa.name }}
+{{- /* Truncate the base, not the joined name — a 63-char fullname must
+never swallow the role suffix, or all three roles collide on one SA. */ -}}
+{{- $base := include "ourios.fullname" $ | trunc (int (sub 62 (len .role))) | trimSuffix "-" -}}
+{{- default (printf "%s-%s" $base .role) $sa.name }}
 {{- else if $sa.name -}}
 {{- $sa.name }}
 {{- else -}}

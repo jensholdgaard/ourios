@@ -87,7 +87,7 @@ ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
 # Property test for the canonical encoding's exact finite-f64
 # round-trip (#130).
 proptest = "=1.11.0"
-tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 # Loopback fixture issuer (discovery + JWKS + rotation) for the RFC 0029
 # §5.2/§5.6 verification-matrix and rotation tests — test-only.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json"] }

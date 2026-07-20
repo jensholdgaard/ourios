@@ -153,7 +153,7 @@ opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = 
 # The metrics test collects via the in-memory reader's periodic-export
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.
-tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "time", "macros", "test-util"] }
 
 [lints]
 workspace = true

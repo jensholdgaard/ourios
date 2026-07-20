@@ -167,6 +167,9 @@ impl AuthResolver {
     ///
     /// [`Unauthenticated`] on a missing, malformed, or unknown credential
     /// — including a JWT that fails verification.
+    // Without `oidc` the only .await disappears, but the signature must
+    // stay async across feature configs — callers await it either way.
+    #[cfg_attr(not(feature = "oidc"), allow(clippy::unused_async))]
     pub async fn authenticate(
         &self,
         authorization: Option<&str>,

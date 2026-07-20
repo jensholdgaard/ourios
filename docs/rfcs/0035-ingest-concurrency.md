@@ -139,10 +139,18 @@ when the WAL rotates. The snapshot's global `wal_high_water`
 (`recovery.rs:199–205`) asserts frames ≤ mark are durably captured, so
 advancing it while an encode ≤ mark is unfinished would let a crash lose a
 record the mark claims is safe. Design A therefore adds an explicit
-**encode-drain barrier**: the rotation hook (and shutdown snapshot, and
-any `wal_high_water` advance) must **quiesce the encode pool up to the
-rotation offset** — every `MinedRecord` with `seq ≤ mark` has completed
-its `RecordSink` emit — before the high-water is stamped. Because the
+**encode-drain-and-flush barrier**: the rotation hook (and shutdown
+snapshot, and any `wal_high_water` advance) must **quiesce the encode
+pool up to the rotation offset _and durably flush the sink's buffered
+partitions for those records_** — every `MinedRecord` with `seq ≤ mark`
+has both completed its `RecordSink` emit **and** been flushed to durable
+object storage — before the high-water is stamped. The flush half is
+load-bearing: `RecordSink::emit` leaves records in an in-memory partition
+buffer (today written by rotation-time `flush_all`), and recovery replays
+the WAL only *above* the high-water — so a record below the mark whose
+Parquet was buffered-but-not-flushed would be lost on a crash. The
+barrier thus preserves the existing "flush covers everything the
+high-water claims durable" contract rather than weakening it. Because the
 barrier is keyed to WAL rotation (WAL segments default to 128 MiB — RFC 0008)
 and shutdown, not to every batch, its amortised cost is negligible while
 the between-rotation steady state runs fully concurrent. The barrier's
@@ -227,12 +235,14 @@ ordered-vs-concurrent phases behind the same public contract.
 >   the process is then killed, and it restores from the snapshot plus
 >   tail replay
 > - **Then** the high-water was stamped only after the encode pool
->   quiesced to the mark (no record ≤ mark unencoded), so restore + tail
->   == full rebuild per tenant with **no record loss at the mark**, and
->   the rotation hook still observes the pre-rotation high-water with no
->   batch above the mark applied — the full `rfc0001_3_5_*` and
+>   quiesced to the mark **and the sink durably flushed those partitions**
+>   (no record ≤ mark unencoded *or* buffered-but-unflushed), so restore
+>   + tail == full rebuild per tenant with **no record loss at the mark**,
+>   and the rotation hook still observes the pre-rotation high-water with
+>   no batch above the mark applied — the full `rfc0001_3_5_*` and
 >   `rfc0008_10_*` suites pass unchanged, extended by a barrier test that
->   fails if the high-water can outrun an unfinished encode.
+>   fails if the high-water can outrun an unfinished encode **or an
+>   unflushed buffer**.
 
 > **Scenario RFC0035.3 — WAL-before-ack and durability are untouched.**
 > - **Given** Design A
@@ -257,6 +267,11 @@ ordered-vs-concurrent phases behind the same public contract.
 >   `template_id == N` queries run
 > - **Then** the Parquet schema, `template_id` values, and query results
 >   are identical — Design A introduces no migration.
+> - **And** byte-for-byte file identity is explicitly **not** claimed:
+>   concurrent encode may reorder rows within a partition, so the
+>   guarantee is *schema + semantic + query-result* stability (what "no
+>   migration" requires), not identical bytes. Any test must assert
+>   set/multiset equality of decoded rows, never file-hash equality.
 
 ## 6. Testing strategy
 
@@ -292,11 +307,12 @@ kept green.
   utilisation; recorded in the `docs/benchmarks.md` §9 series. This is
   the number that fills the pre-implementation measurement below and sets
   RFC 0034's recalibrated bar.
-- **RFC0035.5 (no on-disk/query change)** — **golden-file + query
+- **RFC0035.5 (no on-disk/query change)** — **decoded-row + query
   differential.** Read Parquet written before and after the change and
-  assert schema + `template_id` values identical; run `template_id == N`
-  queries and assert identical result sets. Design A must be a no-op on
-  disk.
+  assert schema + `template_id` values identical and decoded rows equal
+  as a multiset (never a file hash — row order may differ); run
+  `template_id == N` queries and assert identical result sets. Design A
+  must be a semantic no-op on disk.
 
 **Pre-implementation measurement (fills RFC0035.4's target).** Design A's
 achievable multiple is `1 / serial_fraction` after moving encode off the
@@ -313,11 +329,13 @@ before implementation proceeds.
   measurement) at `red` — it decides whether Design A alone clears the D1
   must-win or whether Design B (§4) must be escalated before
   implementation proceeds.
-- [ ] **The encode-drain barrier mechanism (§3.1)** — a per-`seq`
-  completion watch the rotation/shutdown drain awaits, or per-partition
-  encode-completion offsets the writer folds into the high-water. That
-  the barrier must exist is settled (RFC0035.2); which mechanism, and its
-  cost at rotation, is open.
+- [ ] **The encode-drain-and-flush barrier mechanism (§3.1)** — a
+  per-`seq` completion watch the rotation/shutdown drain awaits, or
+  per-partition encode-completion offsets the writer folds into the
+  high-water, plus the durable-flush step that must cover every partition
+  holding a record ≤ mark. That the barrier (drain **and** flush) must
+  exist is settled (RFC0035.2); which mechanism, and its cost at
+  rotation, is open.
 - [ ] Confirm no test/invariant depends on intra-file Parquet **row
   order**, and make per-partition `RecordSink` buffering concurrency-safe
   (or shard it per tenant/partition).

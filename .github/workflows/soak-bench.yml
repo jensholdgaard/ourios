@@ -1,0 +1,108 @@
+name: Soak bench (D1/D2)
+
+# RFC 0009 D1/D2 sustained-ingest soak (`ourios-bench soak`,
+# `docs/benchmarks.md` §D1/§D2): the real ingest path in-process — OTLP →
+# group-commit WAL fsync (100 ms window) → miner → Parquet sink — at a
+# paced rate, with compaction sweeps driven on a synthetic (compressed)
+# clock so the seal→sweep→compact cycle runs without waiting real hours.
+# `workflow_dispatch`-only: an hour-long paced load is far too heavy for
+# the per-PR loop, and the ci-runner wall-clock is indicative,
+# non-authoritative — the §1 baseline (`baseline-8vcpu-32gib`) carries
+# the authoritative D1/D2 numbers.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Load duration in wall seconds"
+        required: false
+        default: "3600"
+      rate_lines_per_sec:
+        description: "Target ingest rate (lines/s, whole process)"
+        required: false
+        default: "100000"
+      time_compression:
+        description: "Synthetic seconds per wall second (60 = one wall-minute per synthetic hour)"
+        required: false
+        default: "60"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  soak-bench:
+    name: D1/D2 sustained-ingest soak
+    runs-on: ubuntu-latest
+    # The load duration plus build time; a dispatch asking for the full
+    # hour still finishes with room to spare.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build ourios-bench (release)
+        run: cargo build -p ourios-bench --release --bin ourios-bench
+
+      - name: Run D1/D2 soak
+        env:
+          DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          RATE_LINES_PER_SEC: ${{ inputs.rate_lines_per_sec }}
+          TIME_COMPRESSION: ${{ inputs.time_compression }}
+        run: |
+          set -euo pipefail
+          target/release/ourios-bench soak \
+            --duration-secs "$DURATION_SECONDS" \
+            --target-lines-per-sec "$RATE_LINES_PER_SEC" \
+            --time-compression "$TIME_COMPRESSION" \
+            --out soak-report.json 2>&1 | tee soak-bench.log
+
+      - name: Write job summary (D1/D2)
+        if: always()
+        run: |
+          {
+            echo '## ourios soak bench — D1/D2'
+            echo
+            echo '**Hardware: `ci-runner` (indicative — non-authoritative pending `baseline-8vcpu-32gib`).**'
+            echo
+            if [ -f soak-report.json ]; then
+              echo '| gate | measured | bar | verdict |'
+              echo '| --- | --- | --- | --- |'
+              jq -r '
+                def verdict: if . then "PASS" else "FAIL" end;
+                "| D1 throughput | \(.per_core_lines_per_sec | round) lines/s/core (\(.achieved_lines_per_sec | round) total / \(.config.worker_threads) workers) | ≥ \(.d1.bar_lines_per_sec_per_core) lines/s/core | \(.d1.pass | verdict) |",
+                "| D1 ack latency | p99 \(.d1.p99_ack_ms) ms (p50 \(.latency.p50_ms) / max \(.latency.max_ms)) | p99 ≤ \(.d1.bar_p99_ack_ms) ms | \(.d1.pass | verdict) |",
+                "| D2 backlog | max \(.d2.max_backlog_partitions) partition(s), final \(.d2.final_backlog_partitions), returned to zero: \(.d2.returned_to_zero_after_max) | bounded, drains to 0 | \(.d2.pass | verdict) |"
+              ' soak-report.json
+              echo
+              echo 'Run shape:'
+              echo '```'
+              jq -r '"wall \(.load_wall_secs)s load / \(.total_wall_secs)s total · \(.lines_acked) lines acked (\(.batches_acked) batches, \(.batches_failed) failed) · \(.total_partitions_compacted) partitions compacted over \(.samples | length) samples · latency basis \(.latency_samples_stored)/\(.latency_samples_total) samples"' soak-report.json
+              echo '```'
+            else
+              echo '_No soak-report.json — the run failed before producing it._'
+            fi
+            echo
+            echo '> **Indicative only.** A hosted runner is not the `docs/benchmarks.md` §1'
+            echo '> baseline; the authoritative D1/D2 numbers come from `baseline-8vcpu-32gib`.'
+            echo '> The synthetic clock compresses record time so the seal→sweep→compact'
+            echo '> path runs for real; D1 throughput/latency are measured in wall-clock.'
+            echo '> Runs the maintainer selects are recorded by hand in docs/benchmarks.md §9.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: soak-bench
+          path: |
+            soak-report.json
+            soak-bench.log
+          if-no-files-found: warn

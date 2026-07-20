@@ -27,7 +27,8 @@
 //! `calibrate` + `reference` + `store` (RFC 0024 / the B1/B2 query
 //! stores), and the RFC 0031 comparative harness (`comparative` — the
 //! Loki equivalence check + measurement channel — and `lgates`, the
-//! comparative must-win / floor gate math).
+//! comparative must-win / floor gate math), plus the RFC 0009 D1/D2
+//! sustained-ingest soak harness (`soak`).
 
 #![deny(unsafe_code)]
 
@@ -44,6 +45,7 @@ mod harness;
 mod lgates;
 mod reference;
 mod report;
+mod soak;
 mod store;
 
 pub use calibrate::{CALIBRATION_DIR, extract_manifest, write_manifest};
@@ -61,6 +63,10 @@ pub use lgates::{
 };
 pub use reference::ReferenceCorpus;
 pub use report::{update_status_section, write_results_json};
+pub use soak::{
+    BacklogSample, D1Verdict, D2Verdict, LatencySummary, SoakConfig, SoakError, SoakReport,
+    default_worker_threads, run_soak,
+};
 pub use store::{B1Store, BuiltStore, build_b1_store, build_comparative_store, build_query_store};
 
 /// Configuration for one bench invocation.

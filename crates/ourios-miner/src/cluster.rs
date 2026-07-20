@@ -177,6 +177,20 @@ pub struct MinerCluster {
     // no-op when no meter provider is installed). The two are kept
     // in lockstep at the same emission sites.
     metrics: MinerMetrics,
+    // PROTOTYPE (RFC 0035 red): capture slot for [`Self::ingest_mined`].
+    // `Armed` diverts the single record `emit_record` would hand the
+    // record sink into `Captured` instead; everything else about
+    // `ingest` (id assignment, audit events, metrics) is untouched.
+    mined_capture: MinedCapture,
+}
+
+/// PROTOTYPE (RFC 0035 red): state of the one-record capture slot
+/// backing [`MinerCluster::ingest_mined`]. Boxed so the enum stays
+/// small on the `Off`/`Armed` paths.
+enum MinedCapture {
+    Off,
+    Armed,
+    Captured(Box<MinedRecord>),
 }
 
 /// Per-tenant template store.
@@ -275,6 +289,7 @@ impl MinerCluster {
             params_overflow_total: AtomicU64::new(0),
             clock: Box::new(SystemClock::new()),
             metrics: MinerMetrics::new(),
+            mined_capture: MinedCapture::Off,
         }
     }
 
@@ -600,6 +615,12 @@ impl MinerCluster {
     fn emit_record(&mut self, record: MinedRecord, service: Option<&str>) {
         self.metrics
             .record_line(&record.tenant_id, service, f64::from(record.confidence));
+        // PROTOTYPE (RFC 0035 red): an armed capture slot diverts the
+        // record to `ingest_mined`'s caller instead of the sink.
+        if matches!(self.mined_capture, MinedCapture::Armed) {
+            self.mined_capture = MinedCapture::Captured(Box::new(record));
+            return;
+        }
         self.record_sink.emit(record);
     }
 }
@@ -1174,6 +1195,29 @@ impl MinerCluster {
         let count = u64::try_from(self.template_count(&record.tenant_id)).unwrap_or(u64::MAX);
         self.metrics.set_template_count(&record.tenant_id, count);
         template_id
+    }
+
+    /// PROTOTYPE (RFC 0035 red): the ordered-phase half of
+    /// [`Self::ingest`]. Runs the identical Drain match, template-id
+    /// assignment, audit emission (template created / widened /
+    /// type-expanded stay in this ordered phase — they are
+    /// id-assignment events, RFC 0035 §3.1), counters, and metrics,
+    /// but the one [`MinedRecord`] `ingest` would hand the record sink
+    /// is **returned to the caller** instead — so the order-insensitive
+    /// sink emit can run on a concurrent pool off the global gate.
+    ///
+    /// `None` for the mined record is unreachable in practice (every
+    /// `ingest` emits exactly one record); it is surfaced rather than
+    /// `expect`ed so a panic path that left the slot armed cannot take
+    /// the miner down a second time.
+    pub fn ingest_mined(&mut self, record: &OtlpLogRecord) -> (u64, Option<MinedRecord>) {
+        self.mined_capture = MinedCapture::Armed;
+        let template_id = self.ingest(record);
+        let mined = match std::mem::replace(&mut self.mined_capture, MinedCapture::Off) {
+            MinedCapture::Captured(rec) => Some(*rec),
+            MinedCapture::Off | MinedCapture::Armed => None,
+        };
+        (template_id, mined)
     }
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.

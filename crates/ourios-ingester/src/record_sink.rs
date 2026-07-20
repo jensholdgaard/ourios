@@ -567,6 +567,66 @@ impl ParquetRecordSink {
     pub fn store(&self) -> Store {
         self.store.clone()
     }
+
+    /// PROTOTYPE (RFC 0035 red): the under-lock half of
+    /// [`SharedParquetSink::emit_concurrent`] — buffer append + trigger
+    /// checks only. The caller derived the partition key and byte
+    /// estimate off-lock, and any partitions this returns are taken out
+    /// of the buffer for the caller to encode + publish **off-lock**
+    /// (via [`SharedParquetSink::publish_owned`]) — unlike [`RecordSink::emit`],
+    /// which encodes under the sink lock on the size / ceiling triggers.
+    fn append_off_lock(
+        &mut self,
+        key: PartitionKey,
+        est: usize,
+        record: MinedRecord,
+    ) -> Vec<(PartitionKey, Vec<MinedRecord>)> {
+        let mut taken = Vec::new();
+        // Ceiling (RFC0014.4), off-lock form: take the largest partition
+        // out for the caller to publish instead of flushing inline. The
+        // byte accounting drops at take time, so the loop terminates once
+        // the buffers are drained even if the off-lock publish later
+        // fails (a failure requeues and the ceiling is transiently
+        // exceeded — same posture as `emit`).
+        while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes {
+            if !self.inline_publish_allowed() {
+                break;
+            }
+            let Some(largest) = self
+                .buffers
+                .iter()
+                .filter(|(_, b)| !b.records.is_empty())
+                .max_by_key(|(_, b)| b.est_bytes)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            taken.extend(self.take_partitions(vec![largest]));
+        }
+
+        let buf = self
+            .buffers
+            .entry(key.clone())
+            .or_insert_with(|| PartitionBuffer {
+                records: Vec::new(),
+                est_bytes: 0,
+                oldest: Instant::now(),
+            });
+        buf.records.push(record);
+        buf.est_bytes = buf.est_bytes.saturating_add(est);
+        let over_target = buf.est_bytes >= self.config.target_bytes;
+        self.total_bytes = self.total_bytes.saturating_add(est);
+        self.metrics
+            .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
+
+        // Size trigger (RFC0014.1), audit-ordered exactly like `emit`
+        // (issue #302 fix #2): the partition is taken only after the
+        // barrier confirms the audit sink is durable.
+        if over_target && self.inline_publish_allowed() {
+            taken.extend(self.take_partitions(vec![key]));
+        }
+        taken
+    }
 }
 
 /// Encode + put one partition's records to the data store, holding **no sink
@@ -736,6 +796,30 @@ impl SharedParquetSink {
             self.lock().requeue(requeue);
         }
         all_published
+    }
+
+    /// PROTOTYPE (RFC 0035 red): the concurrent-phase emit. Safe to call
+    /// from many pool workers at once: the partition key and byte
+    /// estimate are derived outside the sink lock, the buffer append is
+    /// a short locked section, and any size / ceiling-triggered
+    /// partitions are encoded + published **off the lock** via
+    /// [`Self::publish_owned`] (which settles counters, quarantines
+    /// poison records, and requeues on transient failure) — so one
+    /// worker's Parquet encode never blocks the others' appends.
+    pub fn emit_concurrent(&self, record: MinedRecord) {
+        let Ok(key) = PartitionKey::derive(&record) else {
+            let mut sink = self.lock();
+            sink.derive_errors += 1;
+            sink.metrics.record_derive_error();
+            return;
+        };
+        let est = estimate_bytes(&record);
+        let taken = self.lock().append_off_lock(key, est, record);
+        if !taken.is_empty() {
+            // PROTOTYPE: ceiling-taken partitions are labelled "size"
+            // too; the per-trigger metric split is production polish.
+            let _ = self.publish_owned(taken, "size");
+        }
     }
 }
 

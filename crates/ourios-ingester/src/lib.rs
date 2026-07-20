@@ -34,6 +34,7 @@
 
 pub mod audit_sink;
 pub mod compactor;
+pub mod encode_pool;
 pub mod metrics;
 pub mod publish;
 pub mod receiver;

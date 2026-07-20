@@ -130,6 +130,13 @@ pub struct IngestPipeline {
     /// rejection counts (`error.type` on the batches counter), recorded
     /// on the pre-WAL denial paths.
     metrics: IngestMetrics,
+    /// PROTOTYPE (RFC 0035 red): when present, the ordered phase under
+    /// the gate runs `MinerCluster::ingest_mined` (id assignment + audit
+    /// only) and hands each batch's mined records to this pool for the
+    /// concurrent sink emit. `None` (the default, and every existing
+    /// test) keeps today's fully-synchronous `miner.ingest` path
+    /// byte-for-byte.
+    encode_pool: Option<crate::encode_pool::EncodePool>,
     /// RFC 0026 §3.4: the sink for `ingest_denied` audit events. Behind a
     /// mutex — denials are the cold path.
     ///
@@ -156,8 +163,31 @@ impl IngestPipeline {
             rule,
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
+            encode_pool: None,
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
+        }
+    }
+
+    /// PROTOTYPE (RFC 0035 red): enable the ordered/concurrent ingest
+    /// split — the gated section runs only Drain match + template-id
+    /// assignment (+ audit), and the Parquet-sink emit runs on `pool`.
+    /// The pool's sink must be the same sink the miner was built with,
+    /// so the no-pool fallback and flush triggers see one buffer.
+    #[must_use]
+    pub fn with_encode_pool(mut self, pool: crate::encode_pool::EncodePool) -> Self {
+        self.encode_pool = Some(pool);
+        self
+    }
+
+    /// PROTOTYPE (RFC 0035 red): drain the concurrent encode pool —
+    /// blocks until every submitted record has reached the record sink.
+    /// Callers must run this before any flush/snapshot that claims to
+    /// cover previously-acked records (shutdown, end-of-load
+    /// measurement). A no-op without a pool.
+    pub fn quiesce_encodes(&self) {
+        if let Some(pool) = &self.encode_pool {
+            pool.quiesce();
         }
     }
 
@@ -341,16 +371,45 @@ impl IngestPipeline {
                 // `before` is exactly the preceding seq's offset and no
                 // higher seq has ingested yet.
                 let before = *self.lock_last_durable();
-                {
+                let mined = {
                     let mut miner = self.lock_miner();
                     if let Some(prev) = before
                         && prev.segment != now.segment
                     {
+                        // PROTOTYPE: crude global quiesce before the
+                        // rotation snapshot observes the mark — every
+                        // in-flight encode is for a frame ≤ prev (lower
+                        // seqs submitted before releasing the gate), so
+                        // draining the whole pool over-covers the mark;
+                        // production needs the RFC 0035 §3.1
+                        // drain-and-flush barrier keyed to the mark.
+                        self.quiesce_encodes();
                         self.fire_rotation_hook(&miner, prev);
                     }
-                    for record in &records {
-                        miner.ingest(record);
+                    if self.encode_pool.is_some() {
+                        // RFC 0035 §3.1 ordered phase: id assignment +
+                        // audit under the gate; the sink emit is
+                        // deferred to the concurrent pool below.
+                        let mut out = Vec::with_capacity(records.len());
+                        for record in &records {
+                            let (_, rec) = miner.ingest_mined(record);
+                            out.extend(rec);
+                        }
+                        out
+                    } else {
+                        for record in &records {
+                            miner.ingest(record);
+                        }
+                        Vec::new()
                     }
+                };
+                if let Some(pool) = &self.encode_pool {
+                    // Still under the ingest gate (`_gate` drops at
+                    // return): every frame ≤ this seq has submitted its
+                    // encodes before any later seq reaches the rotation
+                    // check above, which is what makes the crude
+                    // whole-pool quiesce cover the mark.
+                    pool.submit(mined);
                 }
                 // Only successful commits advance the durable mark, so the
                 // snapshot high-water never passes a failed sync — its tail

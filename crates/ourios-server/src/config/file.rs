@@ -237,6 +237,10 @@ pub struct ReceiverSection {
     pub http_tls: TlsSection,
     #[serde(deserialize_with = "scalar_opt")]
     pub wal_root: Option<String>,
+    /// RFC 0035 §3.1 — worker count for the concurrent encode pool
+    /// (`receiver.encode_workers`; default: the host's available cores).
+    #[serde(deserialize_with = "scalar_opt")]
+    pub encode_workers: Option<String>,
 }
 
 /// One `*_tls` block (RFC 0030 §3.1). Raw string leaves — the §3.1
@@ -573,7 +577,8 @@ impl ReceiverSection {
         self.grpc_tls.substitute(lookup)?;
         substitute(&mut self.http_addr, lookup)?;
         self.http_tls.substitute(lookup)?;
-        substitute(&mut self.wal_root, lookup)
+        substitute(&mut self.wal_root, lookup)?;
+        substitute(&mut self.encode_workers, lookup)
     }
 }
 

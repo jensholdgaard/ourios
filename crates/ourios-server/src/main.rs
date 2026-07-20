@@ -121,6 +121,10 @@ struct ReceiverParams {
     http_addr: SocketAddr,
     http_tls: Option<TlsSettings>,
     wal_root: PathBuf,
+    /// RFC 0035 §3.1 — worker count for the concurrent encode pool
+    /// (`receiver.encode_workers` / `OURIOS_RECEIVER_ENCODE_WORKERS`;
+    /// default: the host's available cores, validated ≥ 1).
+    encode_workers: usize,
 }
 
 /// Resolve [`ServerConfig`] from the environment:
@@ -144,6 +148,8 @@ struct ReceiverParams {
 ///   default [`DEFAULT_GRPC_ADDR`] / [`DEFAULT_HTTP_ADDR`]).
 /// - `OURIOS_WAL_ROOT` (required when the receiver is enabled) — the
 ///   write-ahead-log root (always local, RFC 0019 §3.1).
+/// - `OURIOS_RECEIVER_ENCODE_WORKERS` (optional, ≥ 1; default: available
+///   cores) — the RFC 0035 §3.1 concurrent-encode pool size.
 fn config_from_env() -> Result<ServerConfig, String> {
     let store = build_store_config(
         std::env::var("OURIOS_STORAGE_BACKEND").ok().as_deref(),
@@ -175,6 +181,9 @@ fn config_from_env() -> Result<ServerConfig, String> {
         std::env::var("OURIOS_RECEIVER_GRPC_ADDR").ok().as_deref(),
         std::env::var("OURIOS_RECEIVER_HTTP_ADDR").ok().as_deref(),
         std::env::var_os("OURIOS_WAL_ROOT").map(PathBuf::from),
+        std::env::var("OURIOS_RECEIVER_ENCODE_WORKERS")
+            .ok()
+            .as_deref(),
     )?;
     config.querier = build_querier_config(
         std::env::var("OURIOS_QUERIER_ENABLED").ok().as_deref(),
@@ -263,6 +272,7 @@ fn server_config_from_file(file: &FileConfig) -> Result<ServerConfig, String> {
         file.receiver.grpc_addr.as_deref(),
         file.receiver.http_addr.as_deref(),
         file.receiver.wal_root.as_deref().map(PathBuf::from),
+        file.receiver.encode_workers.as_deref(),
     )?;
     if let Some(receiver) = config.receiver.as_mut() {
         receiver.grpc_tls = tls_settings("receiver.grpc_tls", &file.receiver.grpc_tls)?;
@@ -423,6 +433,7 @@ fn build_receiver_config(
     grpc_raw: Option<&str>,
     http_raw: Option<&str>,
     wal_root: Option<PathBuf>,
+    encode_workers_raw: Option<&str>,
 ) -> Result<Option<ReceiverParams>, String> {
     if !matches!(enabled_raw, Some("1" | "true" | "yes")) {
         return Ok(None);
@@ -432,13 +443,30 @@ fn build_receiver_config(
     let wal_root = wal_root
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or("OURIOS_WAL_ROOT must be set when the receiver role is enabled")?;
+    let encode_workers = parse_encode_workers(encode_workers_raw)?;
     Ok(Some(ReceiverParams {
         grpc_addr,
         grpc_tls: None,
         http_addr,
         http_tls: None,
         wal_root,
+        encode_workers,
     }))
+}
+
+/// Parse the RFC 0035 encode-pool worker count: ≥ 1 when set, else the
+/// host's available cores (min 1 — `available_parallelism` can fail in
+/// constrained environments, and the pool needs at least one worker).
+fn parse_encode_workers(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get));
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!(
+            "OURIOS_RECEIVER_ENCODE_WORKERS must be an integer ≥ 1, got {raw:?}"
+        )),
+    }
 }
 
 /// Parse a socket address, falling back to `default` when unset.
@@ -803,6 +831,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 store: store.clone(),
                 promoted: config.promoted.clone(),
                 auth: resolver.clone().expect("resolver built for enabled roles"),
+                encode_workers: params.encode_workers,
             })
             .await?;
             println!("receiver gRPC listening on {}", handle.grpc_addr);
@@ -952,6 +981,7 @@ compaction:
             None,
             None,
             Some(PathBuf::from("/var/lib/ourios/wal")),
+            None,
         )
         .expect("receiver");
         expected.querier = build_querier_config(Some("true"), None, None, None).expect("querier");
@@ -1533,7 +1563,8 @@ auth:
         // Arrange / Act / Assert — unset or a falsey value disables the role.
         for raw in [None, Some("0"), Some("false"), Some("nope")] {
             assert_eq!(
-                build_receiver_config(raw, None, None, Some(PathBuf::from("/wal"))).expect("ok"),
+                build_receiver_config(raw, None, None, Some(PathBuf::from("/wal")), None)
+                    .expect("ok"),
                 None,
                 "receiver disabled for enabled_raw = {raw:?}",
             );
@@ -1543,9 +1574,10 @@ auth:
     #[test]
     fn build_receiver_config_enabled_defaults_the_addresses() {
         // Arrange / Act
-        let params = build_receiver_config(Some("1"), None, None, Some(PathBuf::from("/wal")))
-            .expect("ok")
-            .expect("enabled");
+        let params =
+            build_receiver_config(Some("1"), None, None, Some(PathBuf::from("/wal")), None)
+                .expect("ok")
+                .expect("enabled");
 
         // Assert
         assert_eq!(params.grpc_addr, DEFAULT_GRPC_ADDR.parse().unwrap());
@@ -1561,6 +1593,7 @@ auth:
             Some("127.0.0.1:1"),
             Some("127.0.0.1:2"),
             Some(PathBuf::from("/wal")),
+            None,
         )
         .expect("ok")
         .expect("enabled");
@@ -1575,13 +1608,49 @@ auth:
         // Arrange / Act / Assert — the WAL root is mandatory (and must be
         // non-empty) once the receiver role is on.
         assert!(
-            build_receiver_config(Some("1"), None, None, None).is_err(),
+            build_receiver_config(Some("1"), None, None, None, None).is_err(),
             "a missing WAL root is rejected",
         );
         assert!(
-            build_receiver_config(Some("1"), None, None, Some(PathBuf::from(""))).is_err(),
+            build_receiver_config(Some("1"), None, None, Some(PathBuf::from("")), None).is_err(),
             "an empty WAL root is rejected",
         );
+    }
+
+    #[test]
+    fn build_receiver_config_encode_workers_defaults_and_validates() {
+        // RFC 0035: unset → available cores (≥ 1); explicit values parse;
+        // zero / junk are startup errors.
+        let params =
+            build_receiver_config(Some("1"), None, None, Some(PathBuf::from("/wal")), None)
+                .expect("ok")
+                .expect("enabled");
+        assert!(params.encode_workers >= 1, "the default is at least one");
+
+        let params = build_receiver_config(
+            Some("1"),
+            None,
+            None,
+            Some(PathBuf::from("/wal")),
+            Some("3"),
+        )
+        .expect("ok")
+        .expect("enabled");
+        assert_eq!(params.encode_workers, 3);
+
+        for bad in ["0", "-1", "many"] {
+            assert!(
+                build_receiver_config(
+                    Some("1"),
+                    None,
+                    None,
+                    Some(PathBuf::from("/wal")),
+                    Some(bad),
+                )
+                .is_err(),
+                "encode_workers = {bad:?} is rejected",
+            );
+        }
     }
 
     #[test]
@@ -1592,7 +1661,8 @@ auth:
                 Some("1"),
                 Some("not-an-addr"),
                 None,
-                Some(PathBuf::from("/wal"))
+                Some(PathBuf::from("/wal")),
+                None,
             )
             .is_err(),
             "a malformed bind address is rejected",

@@ -45,6 +45,7 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_config::MinerConfig;
 use ourios_ingester::compactor::run_sweep;
+use ourios_ingester::encode_pool::EncodePool;
 use ourios_ingester::receiver::pipeline::{Journal, ReceiveError};
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
@@ -367,11 +368,13 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
         },
     ));
     let miner = MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
-    let pipeline = Arc::new(IngestPipeline::new(
-        coordinator,
-        miner,
-        TenantRule::service_name(),
-    ));
+    // The production ingest shape (RFC 0035 §3.1): id assignment under
+    // the gate, the sink emit on the concurrent encode pool — so the
+    // harness measures what the server role runs.
+    let pipeline = Arc::new(
+        IngestPipeline::new(coordinator, miner, TenantRule::service_name())
+            .with_encode_pool(EncodePool::new(&sink, config.worker_threads)),
+    );
 
     let clock = SyntheticClock {
         started: Instant::now(),
@@ -400,6 +403,18 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // The D1 rate denominator stops here — the sampler join and the
     // drain sweep below are measurement overhead, not load.
     let load_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
+
+    // RFC 0035 §3.1: drain the encode pool before the final sample +
+    // drain sweep, so every acked record has reached the sink (and the
+    // D2 backlog counts it) before flush_all runs. The bounded queue
+    // keeps this residue to a few batches per core.
+    let quiesce_pipeline = Arc::clone(&pipeline);
+    if tokio::task::spawn_blocking(move || quiesce_pipeline.quiesce_encodes())
+        .await
+        .is_err()
+    {
+        return Err(SoakError::Setup("encode-pool quiesce panicked".into()));
+    }
 
     // A send error just means the sampler already exited.
     let _ = stop_tx.send(true);

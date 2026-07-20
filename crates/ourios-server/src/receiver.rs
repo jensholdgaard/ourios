@@ -228,6 +228,10 @@ pub struct ReceiverConfig {
     /// handler authenticate before decode, and the pipeline binds each
     /// batch to the resolved tenant set before the WAL append (§3.2).
     pub auth: AuthResolver,
+    /// RFC 0035 §3.1 — worker count for the concurrent encode pool
+    /// (`receiver.encode_workers`; the config layer validates ≥ 1 and
+    /// defaults to the host's available cores).
+    pub encode_workers: usize,
 }
 
 /// A running receiver role: the **resolved** bound addresses (so a `:0`
@@ -296,6 +300,12 @@ impl ReceiverHandle {
         // the no-loss invariant (see `serve`).
         let last_durable = self.pipeline.last_durable();
         tokio::task::block_in_place(|| {
+            // RFC 0035 §3.1 barrier at the shutdown cadence point: the
+            // listeners are stopped (every acked batch has submitted its
+            // encodes), so draining the pool before the flush + snapshot
+            // guarantees no record ≤ the stamped high-water is still
+            // in-flight or buffered-but-unflushed.
+            self.pipeline.quiesce_encodes();
             self.pipeline.with_miner(|miner| {
                 flush_then_snapshot(
                     &self.sink,
@@ -471,6 +481,15 @@ pub async fn serve(config: ReceiverConfig) -> Result<ReceiverHandle, String> {
                 sink.clone(),
                 audit_sink.clone(),
                 snapshots_root.clone(),
+            ))
+            // RFC 0035 §3.1: Parquet encoding runs on the pool, off the
+            // global commit gate; the pool emits into the same shared
+            // sink the miner holds, so the rotation hook's flush_all
+            // covers it. The pipeline drains the pool before every
+            // rotation snapshot; shutdown drains it below.
+            .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(
+                &sink,
+                config.encode_workers,
             )),
     );
 
@@ -823,6 +842,7 @@ mod tests {
             store,
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
+            encode_workers: 2,
         })
         .await
         .expect("serve");
@@ -853,6 +873,7 @@ mod tests {
             store,
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
+            encode_workers: 2,
         })
         .await
         .expect("serve");
@@ -982,6 +1003,7 @@ mod tests {
             store,
             promoted: PromotedAttributes::default(),
             auth: AuthResolver::static_only(None),
+            encode_workers: 2,
         })
         .await
         .expect("serve");

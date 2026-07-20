@@ -68,11 +68,14 @@ async fn main() {
     ));
 
     let coordinator = CommitCoordinator::new(Box::new(wal), window, segment_size_bytes);
+    // The production ingest shape (RFC 0035): the sink emit runs on the
+    // concurrent encode pool, so the crash window covers the pooled path.
     let pipeline = IngestPipeline::new(
         coordinator,
         MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone())),
         TenantRule::service_name(),
-    );
+    )
+    .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2));
 
     let request = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
@@ -104,6 +107,10 @@ async fn main() {
     // Append + fsync the batch (durable) — the receiver would now ack.
     let ingested = pipeline.ingest(request).await.expect("fixture: ingest");
     assert_eq!(ingested, 2, "fixture ingested two records");
+
+    // Drain the encode pool so the acked records have reached the buffer
+    // before the assertions (the ack itself never waits on the encode).
+    pipeline.quiesce_encodes();
 
     // The acknowledged records are durable in the WAL and sitting in the
     // volatile buffer, but NOT flushed: the store must still be empty.

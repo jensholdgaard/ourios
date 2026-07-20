@@ -45,6 +45,8 @@ receiver:
   http_addr: 0.0.0.0:4318
   # The WAL stays on local disk by design, S3 or not (RFC 0019).
   wal_root: /var/lib/ourios/wal
+  # RFC 0035: concurrent Parquet-encode workers (default: all cores).
+  encode_workers: 4
 
 querier:
   enabled: true
@@ -77,6 +79,7 @@ auth:
 | `OURIOS_S3_ACCESS_KEY_ID` / `OURIOS_S3_SECRET_ACCESS_KEY` / `OURIOS_S3_SESSION_TOKEN` | S3 credentials |
 | `OURIOS_RECEIVER_ENABLED` / `OURIOS_RECEIVER_GRPC_ADDR` / `OURIOS_RECEIVER_HTTP_ADDR` | receiver role |
 | `OURIOS_WAL_ROOT` | WAL directory (receiver) |
+| `OURIOS_RECEIVER_ENCODE_WORKERS` | concurrent encode pool size (RFC 0035; default: all cores) |
 | `OURIOS_QUERIER_ENABLED` / `OURIOS_QUERIER_HTTP_ADDR` / `OURIOS_QUERIER_DEFAULT_WINDOW_SECS` | querier role |
 | `OURIOS_QUERIER_MCP_ENABLED` | the `/mcp` agent surface (RFC 0027) |
 | `OURIOS_COMPACTION_ENABLED` / `OURIOS_COMPACTION_INTERVAL_SECS` | background compactor |

@@ -1,7 +1,7 @@
 ---
 rfc: 0035
-title: Ingest concurrency — relax the global miner serialization to per-tenant
-status: drafted
+title: Ingest concurrency — take the Parquet encode off the global commit gate
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-20
@@ -14,14 +14,21 @@ superseded-by: —
 > **How to read this document.** A profile (`docs/benchmarks.md` §9.20/§9.21;
 > issue #571) showed the ingest hot path saturates ≈ 86k lines/s while
 > using only ~1.2 of 8 cores — an ~85%-idle machine held back by a
-> **global** serialization, not by compute. This RFC relaxes that
-> serialization. It touches the project's highest-risk invariants — WAL
-> durability (§3.4), miner determinism (§3.5.3), tenancy (§3.7) — so it
-> is design-first and change-nothing until `specified`→`red`→`green`.
-> §§1–4 are the contract; §5 the acceptance criteria; §7 the open
-> questions that gate `specified`. It changes **no on-disk byte** in its
-> recommended form (Design A); the full-scaling alternative (Design B)
-> would, and is deferred for that reason.
+> **global** serialization, not by compute. This RFC's recommended form
+> (Design A) relaxes that serialization by moving the order-*insensitive*
+> Parquet encode **off** the global commit gate, while keeping the
+> order-*sensitive* template-id assignment globally ordered — so it
+> changes **no on-disk byte**. (The fully-per-tenant alternative, Design
+> B, would relax mining itself but requires an on-disk migration; it is
+> considered and deferred, §4.) It touches the project's highest-risk
+> invariants — WAL durability (§3.4), miner determinism (§3.5.3),
+> tenancy (§3.7) — so it is design-first and changes nothing until
+> `red`→`green`. Per `docs/rfcs/README.md`, §§1–4 are the design
+> contract, §5 the acceptance criteria and §6 the testing strategy — all
+> written, which places this RFC at **`specified`**; this PR's review
+> confirms the criteria are testable, after which `red` (failing stubs)
+> begins. §7 lists what a prototype must still resolve before
+> implementation lands.
 
 ## 1. Summary
 
@@ -113,12 +120,34 @@ Split `MinerCluster::ingest` into an **ordered, cheap** phase and a
 
 **Why determinism is preserved (unchanged, not re-argued):** template-id
 assignment — the *only* order-sensitive step — stays globally ordered
-under the gate. Ids keep their exact values; the live tree still equals a
-WAL-order replay; snapshots (which capture the **trees**, updated in the
-ordered phase) stay coherent, so the rotation barrier the global gate
-provides for free is preserved (`pipeline.rs:343–354`). No `template_id`
-representation changes → **no Parquet schema change, no §3.5 migration,
-no query-surface change.**
+under the gate. Ids keep their exact values; the live **tree** still
+equals a WAL-order replay; the snapshot captures the trees, updated in
+the ordered phase, so template state is coherent at any point. No
+`template_id` representation changes → **no Parquet schema change, no §3.5
+migration, no query-surface change.**
+
+**The rotation / snapshot encode barrier (a required addition, not
+free).** Today the global gate makes "all frames ≤ mark are fully
+processed" true for free at a rotation (`pipeline.rs:343–354`): nothing
+above the mark has run, and everything at or below it has finished —
+*including its Parquet emit*, because emit runs inside the gated section.
+Design A breaks that second half: after the ordered phase releases the
+gate, a record's **encode may still be in flight** in the concurrent pool
+when the WAL rotates. The snapshot's global `wal_high_water`
+(`recovery.rs:199–205`) asserts frames ≤ mark are durably captured, so
+advancing it while an encode ≤ mark is unfinished would let a crash lose a
+record the mark claims is safe. Design A therefore adds an explicit
+**encode-drain barrier**: the rotation hook (and shutdown snapshot, and
+any `wal_high_water` advance) must **quiesce the encode pool up to the
+rotation offset** — every `MinedRecord` with `seq ≤ mark` has completed
+its `RecordSink` emit — before the high-water is stamped. Because the
+barrier is keyed to WAL rotation (segments are 128 MiB — RFC 0009 sizing)
+and shutdown, not to every batch, its amortised cost is negligible while
+the between-rotation steady state runs fully concurrent. The barrier's
+mechanism (a per-seq completion watch the drain awaits, or per-partition
+encode-completion offsets the writer folds into the high-water) is an §7
+open question; that it MUST exist is not. This is the one place Design A's
+"no free lunch" shows, and RFC0035.2 tests it directly.
 
 **What must be verified (Design A's real risks, §7):**
 - **Parquet row-order independence.** Concurrent encode may buffer a
@@ -188,14 +217,20 @@ ordered-vs-concurrent phases behind the same public contract.
 >   current one is single-tenant and would not catch cross-tenant
 >   reordering).
 
-> **Scenario RFC0035.2 — snapshot/restore + rotation stay coherent.**
-> - **Given** Design A and a WAL rotation under concurrent ingest
-> - **When** the rotation snapshot fires and the process later restores
->   from it plus tail replay
-> - **Then** restore + tail == full rebuild (per tenant), and the rotation
->   hook still observes the pre-rotation high-water with no batch above
->   the mark applied — the full `rfc0001_3_5_*` and `rfc0008_10_*` suites
->   pass unchanged.
+> **Scenario RFC0035.2 — snapshot/restore + rotation stay coherent under
+> in-flight encodes (the encode-drain barrier, §3.1).**
+> - **Given** Design A and a WAL rotation that fires while encodes for
+>   `seq ≤ mark` are still in flight in the concurrent pool
+> - **When** the rotation (or shutdown) snapshot stamps `wal_high_water`,
+>   the process is then killed, and it restores from the snapshot plus
+>   tail replay
+> - **Then** the high-water was stamped only after the encode pool
+>   quiesced to the mark (no record ≤ mark unencoded), so restore + tail
+>   == full rebuild per tenant with **no record loss at the mark**, and
+>   the rotation hook still observes the pre-rotation high-water with no
+>   batch above the mark applied — the full `rfc0001_3_5_*` and
+>   `rfc0008_10_*` suites pass unchanged, extended by a barrier test that
+>   fails if the high-water can outrun an unfinished encode.
 
 > **Scenario RFC0035.3 — WAL-before-ack and durability are untouched.**
 > - **Given** Design A
@@ -221,21 +256,66 @@ ordered-vs-concurrent phases behind the same public contract.
 > - **Then** the Parquet schema, `template_id` values, and query results
 >   are identical — Design A introduces no migration.
 
-## 6. Measurements
+## 6. Testing strategy
 
-> **To be filled from a prototype + baseline run.** Design A's achievable
-> multiple is `1 / serial_fraction` after moving encode off the gate; the
-> serial fraction is measured by prototyping the ordered/concurrent split
-> and re-running the §9.21 profile (per-thread CPU + throughput) on
-> `baseline-8vcpu-32gib`. This number sets both RFC0035.4's target and
-> RFC 0034's recalibrated D1 bar. The pre-RFC baseline is ~86k at 1.2/8
-> cores (§9.21).
+Mapped to `CLAUDE.md` §6.2. The load-bearing property is *equivalence to
+the WAL-order serial baseline*, so most scenarios are differential tests
+against a serial control, plus the existing determinism/durability suites
+kept green.
+
+- **RFC0035.1 (determinism)** — **differential + property (`proptest`).**
+  A new **multi-tenant** concurrent-ingest test extends
+  `rfc0008_8_concurrent_ingest_preserves_wal_order_at_the_miner` (today
+  single-tenant): drive N tenants' records concurrently, assert every
+  tenant's `snapshot_state` equals a serial control that replayed the same
+  WAL frames in strict global order. A `proptest` generator over
+  interleavings + template mixes makes the "any interleaving ⇒ same ids"
+  claim adversarial, not example-based.
+- **RFC0035.2 (rotation/snapshot barrier)** — **fault-injection + the
+  existing recovery suites.** A barrier test injects an in-flight encode
+  for `seq ≤ mark` at rotation, then asserts `wal_high_water` is not
+  stamped until the pool quiesces to the mark (the test **fails** if the
+  high-water can outrun an unfinished encode — mutation-checked by
+  reverting the barrier). The full `rfc0001_3_5_*` (snapshot-restore) and
+  `rfc0008_10_*` (rotation cadence) suites run unchanged, plus the
+  crash-recovery test (SIGKILL mid-batch) from CLAUDE.md §6.2.
+- **RFC0035.3 (WAL-before-ack)** — **existing suites unchanged.**
+  `rfc0003_15_concurrent_exports_are_each_durable` and
+  `rfc0008_8_batched_fsync` gate that durability and group-commit timing
+  are untouched; they must pass without edit (a change here is a
+  contract change, not a refactor — CLAUDE.md §6.2).
+- **RFC0035.4 (throughput)** — **`criterion` + the `soak --tenants N`
+  harness on `baseline-8vcpu-32gib`.** The ingest write-path bench and a
+  saturating multi-tenant soak measure the achieved multiple and core
+  utilisation; recorded in the `docs/benchmarks.md` §9 series. This is
+  the number that fills the pre-implementation measurement below and sets
+  RFC 0034's recalibrated bar.
+- **RFC0035.5 (no on-disk/query change)** — **golden-file + query
+  differential.** Read Parquet written before and after the change and
+  assert schema + `template_id` values identical; run `template_id == N`
+  queries and assert identical result sets. Design A must be a no-op on
+  disk.
+
+**Pre-implementation measurement (fills RFC0035.4's target).** Design A's
+achievable multiple is `1 / serial_fraction` after moving encode off the
+gate. The serial fraction is measured by prototyping the ordered/concurrent
+split and re-running the §9.21 profile (per-thread CPU + throughput) on
+`baseline-8vcpu-32gib`; the pre-RFC baseline is ~86k at 1.2/8 cores. This
+measurement is the `red`-stage gate: if the prototype's serial fraction
+shows Design A cannot clear the D1 must-win, Design B (§4) is escalated
+before implementation proceeds.
 
 ## 7. Open questions
 
 - [ ] **Prototype the split and measure the serial fraction** (the §6
-  number) before `specified` — it decides whether Design A alone clears
-  the D1 must-win or whether Design B is eventually needed.
+  measurement) at `red` — it decides whether Design A alone clears the D1
+  must-win or whether Design B (§4) must be escalated before
+  implementation proceeds.
+- [ ] **The encode-drain barrier mechanism (§3.1)** — a per-`seq`
+  completion watch the rotation/shutdown drain awaits, or per-partition
+  encode-completion offsets the writer folds into the high-water. That
+  the barrier must exist is settled (RFC0035.2); which mechanism, and its
+  cost at rotation, is open.
 - [ ] Confirm no test/invariant depends on intra-file Parquet **row
   order**, and make per-partition `RecordSink` buffering concurrency-safe
   (or shard it per tenant/partition).
@@ -256,7 +336,7 @@ ordered-vs-concurrent phases behind the same public contract.
 - `docs/benchmarks.md` §9.20 / §9.21 — the ~86k ceiling, 85%-idle
   profile, and the ~341k independent-lane approximation (Design B's
   ceiling); §1 `baseline-8vcpu-32gib`.
-- **RFC 0034** (`drafted`) — D1 re-scope, sequenced *after* this RFC:
+- **RFC 0034** (held draft) — D1 re-scope, sequenced *after* this RFC:
   recalibrate the D1 bar against Design A's measured number.
 - **RFC 0001** (`accepted`) — the template miner: §6.1 template-id
   semantics, §3.7.2 cross-tenant uniqueness, §3.5.3 snapshot-restore,

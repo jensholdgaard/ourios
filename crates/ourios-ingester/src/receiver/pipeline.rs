@@ -411,8 +411,27 @@ impl IngestPipeline {
                         // replay above the (previous) high-water re-mines
                         // (the §6.9 posture: the WAL is the durability of
                         // record; a snapshot is a rebuildable cache).
-                        self.quiesce_encodes();
-                        self.fire_rotation_hook(&miner, prev);
+                        //
+                        // The drain can wait out seconds of queued
+                        // encodes and the hook does blocking store I/O,
+                        // all on a runtime worker — `block_in_place`
+                        // lets the runtime relocate other tasks off
+                        // this worker meanwhile. Flavor-guarded:
+                        // `block_in_place` panics on a current-thread
+                        // runtime (the crash fixtures run one; they
+                        // never rotate, but a panic here would turn a
+                        // rotation into an outage).
+                        let drain_and_hook = || {
+                            self.quiesce_encodes();
+                            self.fire_rotation_hook(&miner, prev);
+                        };
+                        if tokio::runtime::Handle::current().runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread
+                        {
+                            tokio::task::block_in_place(drain_and_hook);
+                        } else {
+                            drain_and_hook();
+                        }
                     }
                     if let Some(pool) = &self.encode_pool {
                         // Ordered phase (RFC 0035 §3.1): id assignment +

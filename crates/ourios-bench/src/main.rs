@@ -148,6 +148,10 @@ struct SoakArgs {
     /// divisor for the D1 per-core rate.
     #[arg(long)]
     worker_threads: Option<usize>,
+    /// Concurrent-encode pool size (default: host parallelism) —
+    /// mirrors the server's `receiver.encode_workers` (RFC 0035).
+    #[arg(long)]
+    encode_workers: Option<usize>,
     /// Distinct tenants driven through the one shared WAL / commit stream
     /// / store (round-robin per batch). `1` is the single-tenant
     /// baseline; `N > 1` measures honest node capacity across N tenants
@@ -171,6 +175,9 @@ impl SoakArgs {
             seed: self.seed,
             worker_threads: self
                 .worker_threads
+                .unwrap_or_else(ourios_bench::default_worker_threads),
+            encode_workers: self
+                .encode_workers
                 .unwrap_or_else(ourios_bench::default_worker_threads),
             tenants: self.tenants,
         };
@@ -610,6 +617,7 @@ mod tests {
         assert_eq!(config.time_compression, 60);
         assert_eq!(config.sample_every_secs, 10);
         assert!(config.worker_threads > 0);
+        assert!(config.encode_workers > 0);
         assert_eq!(config.tenants, 1, "single-tenant baseline by default");
         assert_eq!(out, PathBuf::from("soak-report.json"));
 
@@ -622,6 +630,8 @@ mod tests {
             "20000",
             "--worker-threads",
             "2",
+            "--encode-workers",
+            "3",
             "--tenants",
             "4",
             "--out",
@@ -635,6 +645,7 @@ mod tests {
         assert_eq!(config.duration_secs, 5);
         assert_eq!(config.target_lines_per_sec, 20_000);
         assert_eq!(config.worker_threads, 2);
+        assert_eq!(config.encode_workers, 3);
         assert_eq!(config.tenants, 4);
         assert_eq!(out, PathBuf::from("x.json"));
     }

@@ -80,7 +80,7 @@ ourios-querier = { path = "../ourios-querier" }
 # behind the load loop. `time` paces the load, `sync` bounds in-flight
 # batches (Semaphore) + carries the sampler stop signal (watch), and
 # `macros` gives the sampler's tick-vs-stop `select!`.
-tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
 # The soak harness drives the real ingest path in-process: WAL →
 # group-commit coordinator → `IngestPipeline` → record sink, with the
 # compactor's `run_sweep` driven manually on the synthetic cadence.
@@ -106,7 +106,7 @@ prost = "=0.14.4"
 # Refcounted request bodies for the corpus replay's retrying pusher (a
 # per-attempt Vec clone would copy ~2 MB per push across thousands).
 bytes = { version = "=1.12.1", default-features = false }
-tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 # Footer-level schema assertion for the RFC 0022 promoted-service parity
 # tests: opens a comparative-store file's Parquet footer directly to
 # check the promoted column the writer declared. Same major as the

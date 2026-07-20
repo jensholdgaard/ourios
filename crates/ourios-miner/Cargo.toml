@@ -43,7 +43,7 @@ ourios-testgen = { path = "../ourios-testgen" }
 # H2.2 telemetry tests — same pattern as the alias + compaction
 # metrics tests.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-tokio = { version = "=1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
 # Property test for the canonical template encode/decode invariant
 # (`tree::format_template` ↔ `tree::parse_template`), per CLAUDE.md §6.2

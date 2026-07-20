@@ -177,6 +177,23 @@ pub struct MinerCluster {
     // no-op when no meter provider is installed). The two are kept
     // in lockstep at the same emission sites.
     metrics: MinerMetrics,
+    // Capture slot for [`Self::ingest_mined`] (RFC 0035 §3.1). The
+    // ordered phase must run *exactly* `ingest`'s id assignment, audit
+    // emission, counters, and metrics — forking that path would let the
+    // two halves drift apart and silently break §3.5.3 determinism — so
+    // instead of a parallel implementation, an `Armed` slot diverts the
+    // single record `emit_record` would hand the record sink into
+    // `Captured` for the caller to encode off the gate.
+    mined_capture: MinedCapture,
+}
+
+/// State of the one-record capture slot backing
+/// [`MinerCluster::ingest_mined`]. Boxed so the enum stays small on the
+/// `Off`/`Armed` paths.
+enum MinedCapture {
+    Off,
+    Armed,
+    Captured(Box<MinedRecord>),
 }
 
 /// Per-tenant template store.
@@ -275,6 +292,7 @@ impl MinerCluster {
             params_overflow_total: AtomicU64::new(0),
             clock: Box::new(SystemClock::new()),
             metrics: MinerMetrics::new(),
+            mined_capture: MinedCapture::Off,
         }
     }
 
@@ -600,6 +618,13 @@ impl MinerCluster {
     fn emit_record(&mut self, record: MinedRecord, service: Option<&str>) {
         self.metrics
             .record_line(&record.tenant_id, service, f64::from(record.confidence));
+        // An armed capture slot diverts the record to `ingest_mined`'s
+        // caller instead of the sink (RFC 0035 §3.1) — after the metrics
+        // above, so the two ingest entry points observe identically.
+        if matches!(self.mined_capture, MinedCapture::Armed) {
+            self.mined_capture = MinedCapture::Captured(Box::new(record));
+            return;
+        }
         self.record_sink.emit(record);
     }
 }
@@ -1174,6 +1199,29 @@ impl MinerCluster {
         let count = u64::try_from(self.template_count(&record.tenant_id)).unwrap_or(u64::MAX);
         self.metrics.set_template_count(&record.tenant_id, count);
         template_id
+    }
+
+    /// The ordered-phase half of [`Self::ingest`] (RFC 0035 §3.1). Runs
+    /// the identical Drain match, template-id assignment, audit emission
+    /// (template created / widened / type-expanded stay in this ordered
+    /// phase — they are id-assignment events, RFC 0001 §6.4), counters,
+    /// and metrics, but the one [`MinedRecord`] `ingest` would hand the
+    /// record sink is **returned to the caller** instead — so the
+    /// order-insensitive Parquet encode can run on a concurrent pool off
+    /// the global gate.
+    ///
+    /// `None` for the mined record is unreachable in practice (every
+    /// `ingest` emits exactly one record); it is surfaced rather than
+    /// `expect`ed so a panic path that left the slot armed cannot take
+    /// the miner down a second time.
+    pub fn ingest_mined(&mut self, record: &OtlpLogRecord) -> (u64, Option<MinedRecord>) {
+        self.mined_capture = MinedCapture::Armed;
+        let template_id = self.ingest(record);
+        let mined = match std::mem::replace(&mut self.mined_capture, MinedCapture::Off) {
+            MinedCapture::Captured(rec) => Some(*rec),
+            MinedCapture::Off | MinedCapture::Armed => None,
+        };
+        (template_id, mined)
     }
 
     /// `Body::String` path — RFC §6.2 steps 1–5 with widening.
@@ -4520,5 +4568,67 @@ mod tests {
         // No assertion beyond "the call succeeded" — the contract
         // is no public observable side effect.
         assert_eq!(cluster.template_count(&t), 1);
+    }
+
+    /// RFC 0035 §3.1 — `ingest_mined` is `ingest` with the sink emit
+    /// diverted to the caller: identical template-id assignment, audit
+    /// stream, and per-tenant state, and the returned record is
+    /// field-identical to what `ingest` hands the record sink.
+    #[test]
+    fn rfc0035_ingest_mined_matches_ingest_except_the_sink_emit() {
+        use ourios_core::clock::TestClock;
+
+        let records = SharedRecordSink::new();
+        let audit = SharedAuditSink::new();
+        let mut via_ingest =
+            MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+                .with_record_sink(Box::new(records.clone()))
+                .with_clock(Box::new(TestClock::epoch()));
+        let mined_audit = SharedAuditSink::new();
+        let mined_records = SharedRecordSink::new();
+        let mut via_mined =
+            MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(mined_audit.clone()))
+                .with_record_sink(Box::new(mined_records.clone()))
+                .with_clock(Box::new(TestClock::epoch()));
+        let t = TenantId::new("tenant-x");
+
+        // A mix that exercises fresh-leaf, attach, widening, structured,
+        // and parse-failure paths through both entry points.
+        let inputs = [
+            string_record(&t, "user 42 logged in"),
+            string_record(&t, "user 43 logged in"),
+            string_record(&t, "user alpha logged in"),
+            string_record(&t, ""),
+            structured_record(&t, 9, Some("lib.auth")),
+        ];
+        let mut captured = Vec::new();
+        for input in &inputs {
+            let id = via_ingest.ingest(input);
+            let (mined_id, mined) = via_mined.ingest_mined(input);
+            assert_eq!(id, mined_id, "identical template-id assignment");
+            captured.push(mined.expect(
+                "every ingest emits exactly one record, so every ingest_mined captures exactly one",
+            ));
+        }
+
+        assert!(
+            mined_records.drain().is_empty(),
+            "the capture slot diverts the record away from the miner's own sink",
+        );
+        assert_eq!(
+            records.drain(),
+            captured,
+            "the captured record equals what ingest hands the sink",
+        );
+        assert_eq!(
+            audit.drain(),
+            mined_audit.drain(),
+            "audit emission stays in the ordered phase, identical on both paths",
+        );
+        assert_eq!(
+            via_ingest.snapshot_state(&t),
+            via_mined.snapshot_state(&t),
+            "per-tenant state identical across the two entry points",
+        );
     }
 }

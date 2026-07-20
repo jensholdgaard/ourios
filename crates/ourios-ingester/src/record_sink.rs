@@ -567,6 +567,73 @@ impl ParquetRecordSink {
     pub fn store(&self) -> Store {
         self.store.clone()
     }
+
+    /// The under-lock half of [`SharedParquetSink::emit_concurrent`]
+    /// (RFC 0035 §3.1): buffer append + trigger checks only. The caller
+    /// derived the partition key and byte estimate off-lock, and any
+    /// partitions this returns — `(ceiling-taken, size-taken)` — are taken
+    /// out of the buffer for the caller to encode + publish **off-lock**
+    /// (via [`SharedParquetSink::publish_owned`]). Unlike [`RecordSink::emit`],
+    /// which encodes under the sink lock on the size / ceiling triggers,
+    /// this keeps the locked section to a memory move so concurrent pool
+    /// workers never serialize on one worker's Parquet encode.
+    #[allow(clippy::type_complexity)] // the two trigger classes of one drain, not a nameable domain type
+    fn append_off_lock(
+        &mut self,
+        key: PartitionKey,
+        est: usize,
+        record: MinedRecord,
+    ) -> (
+        Vec<(PartitionKey, Vec<MinedRecord>)>,
+        Vec<(PartitionKey, Vec<MinedRecord>)>,
+    ) {
+        // Ceiling (RFC0014.4), off-lock form: take the largest partition
+        // out for the caller to publish instead of flushing inline. The
+        // byte accounting drops at take time, so the loop terminates once
+        // the buffers are drained even if the off-lock publish later
+        // fails (a failure requeues and the ceiling is transiently
+        // exceeded — same posture as `emit`).
+        let mut ceiling_taken = Vec::new();
+        while self.total_bytes.saturating_add(est) > self.config.ceiling_bytes {
+            if !self.inline_publish_allowed() {
+                break;
+            }
+            let Some(largest) = self
+                .buffers
+                .iter()
+                .filter(|(_, b)| !b.records.is_empty())
+                .max_by_key(|(_, b)| b.est_bytes)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            ceiling_taken.extend(self.take_partitions(vec![largest]));
+        }
+
+        let buf = self
+            .buffers
+            .entry(key.clone())
+            .or_insert_with(|| PartitionBuffer {
+                records: Vec::new(),
+                est_bytes: 0,
+                oldest: Instant::now(),
+            });
+        buf.records.push(record);
+        buf.est_bytes = buf.est_bytes.saturating_add(est);
+        let over_target = buf.est_bytes >= self.config.target_bytes;
+        self.total_bytes = self.total_bytes.saturating_add(est);
+        self.metrics
+            .add_buffered(i64::try_from(est).unwrap_or(i64::MAX));
+
+        // Size trigger (RFC0014.1), audit-ordered exactly like `emit`
+        // (issue #302 fix #2): the partition is taken only after the
+        // barrier confirms the audit sink is durable.
+        let mut size_taken = Vec::new();
+        if over_target && self.inline_publish_allowed() {
+            size_taken = self.take_partitions(vec![key]);
+        }
+        (ceiling_taken, size_taken)
+    }
 }
 
 /// Encode + put one partition's records to the data store, holding **no sink
@@ -736,6 +803,31 @@ impl SharedParquetSink {
             self.lock().requeue(requeue);
         }
         all_published
+    }
+
+    /// The concurrent-phase emit (RFC 0035 §3.1). Safe to call from many
+    /// encode-pool workers at once: the partition key and byte estimate
+    /// are derived outside the sink lock, the buffer append is a short
+    /// locked section ([`ParquetRecordSink::append_off_lock`]), and any
+    /// size / ceiling-triggered partitions are encoded + published **off
+    /// the lock** via [`Self::publish_owned`] (which settles counters,
+    /// quarantines poison records, and requeues on transient failure) —
+    /// so one worker's Parquet encode never blocks the others' appends.
+    pub fn emit_concurrent(&self, record: MinedRecord) {
+        let Ok(key) = PartitionKey::derive(&record) else {
+            let mut sink = self.lock();
+            sink.derive_errors += 1;
+            sink.metrics.record_derive_error();
+            return;
+        };
+        let est = estimate_bytes(&record);
+        let (ceiling_taken, size_taken) = self.lock().append_off_lock(key, est, record);
+        if !ceiling_taken.is_empty() {
+            let _ = self.publish_owned(ceiling_taken, "ceiling");
+        }
+        if !size_taken.is_empty() {
+            let _ = self.publish_owned(size_taken, "size");
+        }
     }
 }
 
@@ -1024,6 +1116,52 @@ mod tests {
         );
         assert_eq!(
             records.buffered_records(),
+            1,
+            "the record is retained (the WAL is the durability of record)",
+        );
+    }
+
+    // --- RFC 0035 §3.1: the concurrent-phase emit. ---
+
+    #[test]
+    fn emit_concurrent_size_trigger_publishes_off_lock() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let sink = SharedParquetSink::new(ParquetRecordSink::new(store, size_trigger_config()));
+
+        for _ in 0..4 {
+            sink.emit_concurrent(rec("tenant-a"));
+        }
+
+        assert_eq!(sink.buffered_records(), 0, "every emit crossed the target");
+        assert_eq!(sink.flushes(), 4, "one size-triggered publish per emit");
+    }
+
+    #[test]
+    fn emit_concurrent_respects_the_audit_barrier() {
+        // The concurrent path must uphold the same issue #302 ordering as
+        // `emit`: no partition is published before the audit sink is
+        // durable. A failing barrier retains the record.
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let data_root = tmp.path().join("data");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let sink = SharedParquetSink::new(
+            ParquetRecordSink::new(
+                Store::local(&data_root).expect("data store"),
+                size_trigger_config(),
+            )
+            .with_audit_barrier(Box::new(|| false)),
+        );
+
+        sink.emit_concurrent(rec("tenant-a"));
+
+        assert_eq!(
+            sink.flushes(),
+            0,
+            "the size trigger is skipped while the audit sink isn't durable",
+        );
+        assert_eq!(
+            sink.buffered_records(),
             1,
             "the record is retained (the WAL is the durability of record)",
         );

@@ -25,6 +25,10 @@ on:
         description: "Synthetic seconds per wall second (60 = one wall-minute per synthetic hour)"
         required: false
         default: "60"
+      tenants:
+        description: "Distinct tenants through the one shared commit stream (1 = single-tenant baseline; N>1 = honest node capacity, issue #567)"
+        required: false
+        default: "1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,12 +61,14 @@ jobs:
           DURATION_SECONDS: ${{ inputs.duration_seconds }}
           RATE_LINES_PER_SEC: ${{ inputs.rate_lines_per_sec }}
           TIME_COMPRESSION: ${{ inputs.time_compression }}
+          TENANTS: ${{ inputs.tenants }}
         run: |
           set -euo pipefail
           target/release/ourios-bench soak \
             --duration-secs "$DURATION_SECONDS" \
             --target-lines-per-sec "$RATE_LINES_PER_SEC" \
             --time-compression "$TIME_COMPRESSION" \
+            --tenants "$TENANTS" \
             --out soak-report.json 2>&1 | tee soak-bench.log
 
       - name: Write job summary (D1/D2)
@@ -78,6 +84,7 @@ jobs:
               echo '| --- | --- | --- | --- |'
               jq -r '
                 def verdict: if . then "PASS" else "FAIL" end;
+                "| node capacity (#567) | \(.aggregate_lines_per_sec | round) lines/s aggregate over \(.tenants) tenant(s) (\(.per_tenant_lines_per_sec | round)/tenant mean) | honest single-node ceiling | — |",
                 "| D1 throughput | \(.per_core_lines_per_sec | round) lines/s/core (\(.achieved_lines_per_sec | round) total / \(.config.worker_threads) workers) | ≥ \(.d1.bar_lines_per_sec_per_core) lines/s/core | \(.d1.pass | verdict) |",
                 "| D1 ack latency | p99 \(.d1.p99_ack_ms) ms (p50 \(.latency.p50_ms) / max \(.latency.max_ms)) | p99 ≤ \(.d1.bar_p99_ack_ms) ms | \(.d1.pass | verdict) |",
                 "| D2 backlog | max \(.d2.max_backlog_partitions) partition(s), final \(.d2.final_backlog_partitions), returned to zero: \(.d2.returned_to_zero_after_max) | bounded, drains to 0 | \(.d2.pass | verdict) |"
@@ -85,7 +92,7 @@ jobs:
               echo
               echo 'Run shape:'
               echo '```'
-              jq -r '"wall \(.load_wall_secs)s load / \(.total_wall_secs)s total · \(.lines_acked) lines acked (\(.batches_acked) batches, \(.batches_failed) failed) · \(.total_partitions_compacted) partitions compacted over \(.samples | length) samples · latency basis \(.latency_samples_stored)/\(.latency_samples_total) samples"' soak-report.json
+              jq -r '"wall \(.load_wall_secs)s load / \(.total_wall_secs)s total · \(.tenants) tenant(s) · \(.lines_acked) lines acked (\(.batches_acked) batches, \(.batches_failed) failed) · \(.total_partitions_compacted) partitions compacted over \(.samples | length) samples · latency basis \(.latency_samples_stored)/\(.latency_samples_total) samples"' soak-report.json
               echo '```'
             else
               echo '_No soak-report.json — the run failed before producing it._'

@@ -21,8 +21,9 @@ superseded-by: —
 > changes **no on-disk byte**. (The fully-per-tenant alternative, Design
 > B, would relax mining itself but requires an on-disk migration; it is
 > considered and deferred, §4.) It touches the project's highest-risk
-> invariants — WAL durability (§3.4), miner determinism (§3.5.3),
-> tenancy (§3.7) — so it is design-first and changes nothing until
+> invariants — WAL durability (`CLAUDE.md` §3.4), miner determinism
+> (RFC 0001 §3.5.3), tenancy (`CLAUDE.md` §3.7) — so it is design-first
+> and changes nothing until
 > `red`→`green`. Per `docs/rfcs/README.md`, §§1–4 are the design
 > contract, §5 the acceptance criteria and §6 the testing strategy — all
 > written, which places this RFC at **`specified`**; this PR's review
@@ -91,7 +92,8 @@ template-id shared across tenants* (pinned by
 `invariant_3_7_2_same_template_two_tenants_distinct_template_ids`). This
 is the pivot: relaxing hand-off order to per-tenant would let records
 reach that shared counter in a different interleaving than global
-WAL-order replay, changing assigned id *values* → §3.5.3 divergence.
+WAL-order replay, changing assigned id *values* → RFC 0001 §3.5.3
+snapshot-restore divergence.
 **So per-tenant *mining* is unsafe as long as the id-space is a shared
 counter touched in-line.** The two designs differ precisely in how they
 resolve this.
@@ -326,9 +328,9 @@ before implementation proceeds.
 - [ ] Worker-pool sizing and whether encode runs on the tokio blocking
   pool or a dedicated rayon-style pool (CPU-bound work off the async
   runtime).
-- [ ] `CLAUDE.md` §3.4/§3.5.3/§3.7 are *preserved* by Design A, so no
-  `meta:` RFC — confirm at sign-off. (Design B *would* touch §3.5 —
-  a separate RFC if pursued.)
+- [ ] `CLAUDE.md` §3.4 / §3.7 and RFC 0001 §3.5.3 are *preserved* by
+  Design A, so no `meta:` RFC — confirm at sign-off. (Design B *would*
+  touch `CLAUDE.md` §3.5 — a separate RFC if pursued.)
 
 ## 8. References
 
@@ -348,5 +350,6 @@ before implementation proceeds.
   `recovery.rs:199–205 / 259–282` (global high-water; strict-order
   replay).
 - `CLAUDE.md` §3.4 (WAL-before-ack), §3.5 (schema-change migration — why
-  Design B is deferred), §3.5.3 (snapshot determinism), §3.7 (per-tenant
-  trees — why the constraint is per-tenant, not global).
+  Design B is deferred), §3.7 (per-tenant trees — why the constraint is
+  per-tenant, not global). Snapshot determinism is RFC 0001 §3.5.3
+  (above), not a `CLAUDE.md` section.

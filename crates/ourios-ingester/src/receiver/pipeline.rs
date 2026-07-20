@@ -395,12 +395,18 @@ impl IngestPipeline {
                         // The flush half is the hook's own `flush_all` +
                         // its snapshot-only-if-fully-drained gate (the
                         // server's `flush_then_snapshot`): after this
-                        // drain the sink buffers hold exactly the frames
-                        // ≤ prev, `flush_all` takes every partition, and
-                        // the high-water is stamped only when both sinks
-                        // fully drained — so a record the mark claims
-                        // durable is either in the store or the mark was
-                        // never written. A crash at any point before the
+                        // drain, every record ≤ prev has completed its
+                        // emit, so any of them still *buffered* is in the
+                        // sink for `flush_all` to take, and the
+                        // high-water is stamped only when both sinks
+                        // fully drained. What this pool barrier does NOT
+                        // cover is a record ≤ prev that an age-sweep
+                        // drained out of the buffers and is writing
+                        // off-lock while the hook runs — it is neither
+                        // buffered nor yet durable, and a crash after the
+                        // stamp but before its `write_ordered` completes
+                        // loses it (pre-existing window, tracked as
+                        // issue #578). A crash at any point before the
                         // stamp loses only buffered Parquet, which WAL
                         // replay above the (previous) high-water re-mines
                         // (the §6.9 posture: the WAL is the durability of

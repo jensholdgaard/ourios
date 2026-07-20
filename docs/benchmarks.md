@@ -1678,14 +1678,15 @@ ack latencies are wall-clock. Workflow run **29717165102**; the JSON
 report is the run's artifact. Hardware: `ci-runner` (4 vCPU) —
 **indicative, not the §1 baseline**.
 
-**Numbers** (release build, defaults: target 100,000 lines/s, batch
+**Numbers** (release build, defaults: **total** offered load
+100,000 lines/s — the paced target, not D1's per-core bar — batch
 1,000, 4 workers, 10 s sampling):
 
 | measure | value | bar | verdict |
 |---|---|---|---|
 | sustained rate | 359,997,000 lines acked in 3,600.1 s, 0 failed batches (harness-computed 99,995 lines/s over its unrounded load wall) | — | target held |
 | ack p50 / p95 / p99 / max | 103.05 / 157.27 / **172.68** / 227.94 ms | p99 ≤ 200 ms | **latency bar PASS** |
-| per-core rate | 24,999 lines/s/core (4 workers) | ≥ 100,000 /core | **D1 FAIL as normalized** |
+| per-core rate | 24,999 lines/s/core (4 workers) | ≥ 100 000 lines/s/core (§D1) | **D1 FAIL as normalized** |
 | D2 backlog | max **1** partition, 60 compactions over 185 samples, final 0 (returned to zero) | bounded, drains in-window | **D2 PASS** |
 | WAL at last sample | 397 segments, 53,146,830,018 B | — | disk note for longer soaks |
 

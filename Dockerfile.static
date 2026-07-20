@@ -62,7 +62,7 @@ ENTRYPOINT ["/usr/local/bin/ourios-server"]
 # distroless ref has no explicit tag (implicit :latest), so Renovate updates
 # only the digest. Last stage = the default target,
 # so a plain `docker build -f Dockerfile.static` yields this variant.
-FROM gcr.io/distroless/static-debian12@sha256:22fd79fd75eab2372585b44517f8a094349938919dc613aafc37e4bdc9967c82 AS runtime-static
+FROM gcr.io/distroless/static-debian12@sha256:61b7ccecebc7c474a531717de80a94709d20547cdcdaf740c25876f2a8e38b44 AS runtime-static
 COPY --from=builder /ourios-server /usr/local/bin/ourios-server
 # OTLP ingest: 4317 = gRPC, 4318 = HTTP (RFC 0003). 4319 is reserved for
 # the future query endpoint (RFC 0016) and is intentionally not exposed

@@ -855,10 +855,10 @@ hardware-independent and also pinned in `ourios-parquet`'s
 `rfc0009_1_*` / `compaction_conserves_every_row` tests; these
 wall-clock figures are the baseline-hardware stamp for RFC 0009's
 `validated`. The full sustained-ingest soak (D2's "backlog returns to
-zero in a one-hour window at D1's rate") and D1 itself remain unrun —
-the throughput here is the RFC0009.7 D2 measure, not that soak —
-which §9.19 later ran (D2 soak PASS; D1's per-core bar is the open
-reading).
+zero in a one-hour window at D1's rate") and D1 itself remained unrun
+until §9.19 (2026-07-20: D2 soak PASS; D1's per-core bar is the open
+reading) — the throughput here is the RFC0009.7 D2 measure, not that
+soak.
 
 ### 9.8 Results — 2026-06-18 (authoritative, `baseline-8vcpu-32gib`) — ingest write-path + recovery (criterion) and real-corpus A1 / C1 / C2 + B1 / B2
 
@@ -1683,7 +1683,7 @@ report is the run's artifact. Hardware: `ci-runner` (4 vCPU) —
 
 | measure | value | bar | verdict |
 |---|---|---|---|
-| sustained rate | 99,995 lines/s for 3,600.1 s (359,997,000 lines acked, 0 failed batches) | — | target held |
+| sustained rate | 359,997,000 lines acked in 3,600.1 s, 0 failed batches (harness-computed 99,995 lines/s over its unrounded load wall) | — | target held |
 | ack p50 / p95 / p99 / max | 103.05 / 157.27 / **172.68** / 227.94 ms | p99 ≤ 200 ms | **latency bar PASS** |
 | per-core rate | 24,999 lines/s/core (4 workers) | ≥ 100,000 /core | **D1 FAIL as normalized** |
 | D2 backlog | max **1** partition, 60 compactions over 185 samples, final 0 (returned to zero) | bounded, drains in-window | **D2 PASS** |

@@ -1070,4 +1070,140 @@ mod tests {
             "every ingested clean line round-trips out of the store rendered from its template",
         );
     }
+
+    // --- RFC0035.2 flush half, through the REAL `flush_then_snapshot`
+    // path (`rotation_snapshot_hook`): a buffered-but-unflushed record
+    // ≤ the mark either flushes before the stamp, or the stamp is
+    // skipped. The ingester-side barrier test covers the drain half +
+    // inline-published records; these two arms pin the buffered case
+    // against the production hook. ---
+
+    /// A pooled pipeline over a real 1 s-age WAL whose rotation hook is
+    /// the production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    fn rotating_pooled_pipeline(
+        wal_root: &Path,
+        store: Store,
+        snapshots_root: &Path,
+    ) -> (SharedPipeline, SharedParquetSink) {
+        let wal = Wal::open(WalConfig {
+            segment_age_secs: 1,
+            ..test_wal_config(wal_root)
+        })
+        .expect("open WAL");
+        let (sink, audit_sink) = build_write_sinks(store, PromotedAttributes::default());
+        let miner =
+            MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit_sink.clone()))
+                .with_record_sink(Box::new(sink.clone()));
+        let coordinator =
+            CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let pipeline = Arc::new(
+            IngestPipeline::new(coordinator, miner, TenantRule::service_name())
+                .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
+                .with_rotation_hook(rotation_snapshot_hook(
+                    sink.clone(),
+                    audit_sink,
+                    snapshots_root.to_path_buf(),
+                )),
+        );
+        (pipeline, sink)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rfc0035_2_rotation_flushes_buffered_records_before_stamping() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).expect("store root");
+        let snapshots_root = tmp.path().join("snapshots");
+        let (pipeline, sink) = rotating_pooled_pipeline(
+            &tmp.path().join("wal"),
+            Store::local(&store_root).expect("local store"),
+            &snapshots_root,
+        );
+
+        // Batch A buffers (the production 256 MiB size target never
+        // fires for two records) — encoded but NOT flushed.
+        pipeline
+            .ingest(export_request(
+                "checkout",
+                &["user 1 logged in", "user 2 logged in"],
+            ))
+            .await
+            .expect("batch A acks");
+        let rotation_point = pipeline.last_durable().expect("durable after batch A");
+        pipeline.quiesce_encodes();
+        assert_eq!(sink.buffered_records(), 2, "batch A is buffered, unflushed");
+
+        // Rotation: the hook must flush the buffered records ≤ mark
+        // before it stamps the snapshot.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        pipeline
+            .ingest(export_request("checkout", &["payment 9 settled"]))
+            .await
+            .expect("batch B acks");
+        pipeline.quiesce_encodes();
+
+        assert_eq!(
+            sink.buffered_records(),
+            1,
+            "only batch B's record remains buffered — the hook's flush_all \
+             drained batch A before the stamp",
+        );
+        assert!(
+            !data_parquet_files(&store_root.join("data")).is_empty(),
+            "batch A's records are durably in the store",
+        );
+        let artefacts =
+            ourios_ingester::snapshot_store::load_all(&snapshots_root).expect("load snapshots");
+        assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
+        let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
+        let mark = state.wal_high_water.expect("stamped with a horizon");
+        assert_eq!(mark.segment, rotation_point.segment.to_string());
+        assert_eq!(mark.byte, rotation_point.byte);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rfc0035_2_rotation_skips_the_stamp_when_the_flush_cannot_drain() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        std::fs::create_dir_all(&store_root).expect("store root");
+        let snapshots_root = tmp.path().join("snapshots");
+        let (pipeline, sink) = rotating_pooled_pipeline(
+            &tmp.path().join("wal"),
+            Store::local(&store_root).expect("local store"),
+            &snapshots_root,
+        );
+
+        pipeline
+            .ingest(export_request("checkout", &["user 1 logged in"]))
+            .await
+            .expect("batch A acks");
+        pipeline.quiesce_encodes();
+        assert_eq!(sink.buffered_records(), 1, "batch A is buffered, unflushed");
+
+        // Sabotage the store: the hook's flush cannot drain, so the
+        // snapshot must be skipped — stamping would advance the horizon
+        // past a buffered-but-unflushed record ≤ the mark.
+        std::fs::remove_dir_all(&store_root).expect("remove store dir");
+        std::fs::write(&store_root, b"not a directory").expect("sabotage store");
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        pipeline
+            .ingest(export_request("checkout", &["payment 9 settled"]))
+            .await
+            .expect("batch B still acks — the hook is best-effort");
+        pipeline.quiesce_encodes();
+
+        assert_eq!(
+            sink.buffered_records(),
+            2,
+            "the un-flushable records are retained (the WAL is the durability of record)",
+        );
+        let snapshot_written = std::fs::read_dir(&snapshots_root)
+            .ok()
+            .is_some_and(|mut d| d.next().is_some());
+        assert!(
+            !snapshot_written,
+            "the stamp is skipped while a record ≤ the mark is buffered-but-unflushed",
+        );
+    }
 }

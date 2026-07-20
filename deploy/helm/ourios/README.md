@@ -170,14 +170,16 @@ cleanly:
 | Role      | S3 actions                                            | Holds delete? |
 | --------- | ----------------------------------------------------- | ------------- |
 | querier   | `GetObject`, `ListBucket` (see cache note)            | no            |
-| receiver  | `GetObject`, `PutObject`, `ListBucket`                | no            |
+| receiver  | `PutObject` only                                      | no            |
 | compactor | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`| **only one**  |
 
-The receiver writes data/audit objects and swaps manifests (a conditional
-`PutObject`) but deletes nothing; the querier only reads; reclaiming compacted
-inputs is the compactor's job alone. With this split, a compromised querier can
-read but not destroy, and *nothing* except the singleton compactor can delete
-data.
+The receiver only *writes* data/audit objects — its production path never
+issues a read, list, or delete against the store. Manifest swaps (conditional
+`PutObject`) belong to the compaction path, and reclaiming compacted inputs is
+the compactor's job alone; the querier only reads. With this split, a
+compromised receiver can pollute but neither read nor destroy history, a
+compromised querier can read but not destroy, and *nothing* except the
+singleton compactor can delete data.
 
 **Querier cache note (RFC 0033):** after a cache miss the querier attempts a
 *best-effort* write-through of its template-map cache artifact (and cleanup of

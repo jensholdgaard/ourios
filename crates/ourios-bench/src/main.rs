@@ -148,6 +148,12 @@ struct SoakArgs {
     /// divisor for the D1 per-core rate.
     #[arg(long)]
     worker_threads: Option<usize>,
+    /// Distinct tenants driven through the one shared WAL / commit stream
+    /// / store (round-robin per batch). `1` is the single-tenant
+    /// baseline; `N > 1` measures honest node capacity across N tenants
+    /// (RFC 0009 D1, issue #567).
+    #[arg(long, default_value_t = 1)]
+    tenants: usize,
     /// Where the JSON soak report lands.
     #[arg(long, default_value = "soak-report.json")]
     out: PathBuf,
@@ -166,6 +172,7 @@ impl SoakArgs {
             worker_threads: self
                 .worker_threads
                 .unwrap_or_else(ourios_bench::default_worker_threads),
+            tenants: self.tenants,
         };
         (config, self.out)
     }
@@ -279,6 +286,11 @@ fn print_soak_summary(report: &SoakReport) {
         report.config.batch_size,
         report.config.worker_threads,
         report.config.time_compression,
+    );
+    println!(
+        "  node capacity: {:.0} lines/s aggregate over {} tenant(s) ({:.0}/tenant mean) — the \
+         #567 shared-commit-stream number",
+        report.aggregate_lines_per_sec, report.tenants, report.per_tenant_lines_per_sec,
     );
     println!(
         "  D1 ingest: {:.0} lines/s ({:.0}/core; bar ≥ {}/core) · ack p50 {:.2} p95 {:.2} \
@@ -598,6 +610,7 @@ mod tests {
         assert_eq!(config.time_compression, 60);
         assert_eq!(config.sample_every_secs, 10);
         assert!(config.worker_threads > 0);
+        assert_eq!(config.tenants, 1, "single-tenant baseline by default");
         assert_eq!(out, PathBuf::from("soak-report.json"));
 
         let cli = Cli::try_parse_from([
@@ -609,6 +622,8 @@ mod tests {
             "20000",
             "--worker-threads",
             "2",
+            "--tenants",
+            "4",
             "--out",
             "x.json",
         ])
@@ -620,6 +635,7 @@ mod tests {
         assert_eq!(config.duration_secs, 5);
         assert_eq!(config.target_lines_per_sec, 20_000);
         assert_eq!(config.worker_threads, 2);
+        assert_eq!(config.tenants, 4);
         assert_eq!(out, PathBuf::from("x.json"));
     }
 

@@ -32,6 +32,7 @@
 //! bound on the §D1 WAL-commit latency, and exactly what an OTLP client
 //! observes.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,8 +60,11 @@ pub const D1_LINES_PER_SEC_PER_CORE: u64 = 100_000;
 /// §D1 latency bar: p99 ingest-ack latency in milliseconds.
 pub const D1_P99_ACK_MS: u64 = 200;
 
-/// The single soak tenant (derived from `service.name` by the production
-/// [`TenantRule`], so the batches exercise the real fan-out).
+/// The soak tenant (derived from `service.name` by the production
+/// [`TenantRule`], so the batches exercise the real fan-out). With
+/// `--tenants N > 1` the load fans out over `"{TENANT}-{i}"` for
+/// `i in 0..N` (see [`tenant_name`]); N == 1 keeps the bare `TENANT` so
+/// the single-tenant §9.19/§9.20 numbers stay byte-for-byte comparable.
 const TENANT: &str = "soak";
 /// 2026-01-01T00:00:00Z — the synthetic timeline's fixed origin, so
 /// partition keys are deterministic across runs.
@@ -100,6 +104,13 @@ pub struct SoakConfig {
     /// Tokio worker threads for the load runtime — also the divisor for
     /// the §D1 per-core rate.
     pub worker_threads: usize,
+    /// Distinct tenants fed through the one shared WAL / commit stream /
+    /// store, round-robin per batch. `1` (the default) is the
+    /// single-tenant baseline, byte-for-byte the pre-#567 behaviour;
+    /// `N > 1` measures honest node capacity — N template trees under one
+    /// commit stream — instead of the multi-process approximation
+    /// (`docs/benchmarks.md` §9.20).
+    pub tenants: usize,
 }
 
 impl Default for SoakConfig {
@@ -113,6 +124,7 @@ impl Default for SoakConfig {
             sink_target_bytes: 4 * 1024 * 1024,
             seed: 0xD1D2_50AC,
             worker_threads: default_worker_threads(),
+            tenants: 1,
         }
     }
 }
@@ -199,6 +211,19 @@ pub struct SoakReport {
     pub batches_acked: u64,
     pub batches_failed: u64,
     pub achieved_lines_per_sec: f64,
+    /// Distinct tenants driven through the one shared commit stream this
+    /// run (mirrors [`SoakConfig::tenants`]; surfaced at the top level so
+    /// the results file names the node-capacity dimension directly).
+    pub tenants: usize,
+    /// The whole-node achieved rate — identical to
+    /// `achieved_lines_per_sec`, named explicitly because it is the #567
+    /// headline: honest single-node capacity across all tenants sharing
+    /// one WAL / commit stream / store.
+    pub aggregate_lines_per_sec: f64,
+    /// Mean achieved rate per tenant (`aggregate_lines_per_sec /
+    /// tenants`). Round-robin fan-out makes the tenants symmetric, so the
+    /// mean is each tenant's share; the aggregate is their sum.
+    pub per_tenant_lines_per_sec: f64,
     /// `achieved_lines_per_sec / worker_threads` — the §D1 per-core rate.
     pub per_core_lines_per_sec: f64,
     pub latency: LatencySummary,
@@ -265,7 +290,11 @@ pub fn run_soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
         .enable_time()
         .build()
         .map_err(SoakError::Runtime)?;
-    runtime.block_on(soak(config))
+    let dir =
+        tempfile::tempdir().map_err(|e| SoakError::Setup(format!("create soak tempdir: {e}")))?;
+    // `dir` (the WAL + store fixture) is dropped only after `block_on`
+    // returns, so the fixture outlives the whole run.
+    runtime.block_on(soak(config, dir.path()))
 }
 
 fn validate(config: &SoakConfig) -> Result<(), SoakError> {
@@ -290,17 +319,18 @@ fn validate(config: &SoakConfig) -> Result<(), SoakError> {
     if config.worker_threads == 0 {
         return Err(SoakError::Config("worker_threads must be > 0"));
     }
+    if config.tenants == 0 {
+        return Err(SoakError::Config("tenants must be > 0"));
+    }
     Ok(())
 }
 
-async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
+async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError> {
     let Some(pace) = batch_interval(config.target_lines_per_sec, config.batch_size) else {
         return Err(SoakError::Config("target rate and batch size must be > 0"));
     };
-    let dir =
-        tempfile::tempdir().map_err(|e| SoakError::Setup(format!("create soak tempdir: {e}")))?;
-    let wal_root = dir.path().join("wal");
-    let store_root = dir.path().join("store");
+    let wal_root = root.join("wal");
+    let store_root = root.join("store");
     for path in [&wal_root, &store_root] {
         std::fs::create_dir_all(path)
             .map_err(|e| SoakError::Setup(format!("create {}: {e}", path.display())))?;
@@ -348,6 +378,11 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
         compression: config.time_compression,
     };
     let policy = CompactionPolicy::default();
+    // The active tenant set — one shared store, but the backlog/drain
+    // measurement enumerates each tenant's partition tree (§9.20's honest
+    // node-capacity view). `Arc<[String]>` so the sampler and each
+    // spawn_blocking closure clone the handle, not the strings.
+    let tenants: Arc<[String]> = Arc::from(tenant_set(config.tenants));
     let stats = Arc::new(LoadStats::default());
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let sampler_task = tokio::spawn(run_sampler(SamplerCtx {
@@ -358,6 +393,7 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
         policy,
         every: Duration::from_secs(config.sample_every_secs),
         stop: stop_rx,
+        tenants: Arc::clone(&tenants),
     }));
 
     run_load(&pipeline, &clock, config, &stats, pace).await;
@@ -371,34 +407,8 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
     // no samples (d2 then fails loudly on the missing final backlog).
     let mut samples: Vec<BacklogSample> = sampler_task.await.unwrap_or_default();
 
-    // Final drain: advance the synthetic clock past the last partition's
-    // hour end + grace so *every* partition seals, then sweep. This
-    // verifies compaction can fully clear the backlog the run produced;
-    // the mid-run samples carry the steady-state D2 evidence.
-    let drain_now = clock
-        .now_unix_nanos()
-        .saturating_add(HOUR_NANOS)
-        .saturating_add(policy.grace_nanos)
-        .saturating_add(1);
-    let drain_wall = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
-    let (drain_sample, final_backlog) = {
-        let store = store.clone();
-        let sink = sink.clone();
-        let wal = Arc::clone(&wal);
-        match tokio::task::spawn_blocking(move || {
-            let sample = blocking_sample(&store, &sink, &wal, &policy, drain_wall, drain_now);
-            // An error listing here means the final backlog is unknown —
-            // fail the D2 verdict loudly rather than claim a drained run.
-            let final_backlog =
-                plan_candidates(&store, TENANT, drain_now, &policy).map_or(usize::MAX, |c| c.len());
-            (sample, final_backlog)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => (error_sample(drain_wall, drain_now), usize::MAX),
-        }
-    };
+    let (drain_sample, final_backlog) =
+        final_drain(&store, &sink, &wal, &tenants, &clock, &policy).await;
     samples.push(drain_sample);
     let total_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
 
@@ -410,6 +420,53 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
         samples,
         final_backlog,
     ))
+}
+
+/// Final drain: advance the synthetic clock past the last partition's
+/// hour end + grace so *every* partition seals, then take one last
+/// sample + sweep and total the still-pending candidates across all
+/// tenants. This verifies compaction can fully clear the backlog the run
+/// produced; the mid-run samples carry the steady-state D2 evidence.
+///
+/// An error listing any tenant means the final backlog is unknown — the
+/// per-tenant sum saturates to `usize::MAX` so the D2 verdict fails
+/// loudly rather than claim a drained run.
+async fn final_drain(
+    store: &Store,
+    sink: &SharedParquetSink,
+    wal: &Arc<Mutex<Wal>>,
+    tenants: &Arc<[String]>,
+    clock: &SyntheticClock,
+    policy: &CompactionPolicy,
+) -> (BacklogSample, usize) {
+    let drain_now = clock
+        .now_unix_nanos()
+        .saturating_add(HOUR_NANOS)
+        .saturating_add(policy.grace_nanos)
+        .saturating_add(1);
+    let drain_wall = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
+    let store = store.clone();
+    let sink = sink.clone();
+    let wal = Arc::clone(wal);
+    let tenants = Arc::clone(tenants);
+    let policy = *policy;
+    match tokio::task::spawn_blocking(move || {
+        let sample = blocking_sample(
+            &store, &sink, &wal, &policy, &tenants, drain_wall, drain_now,
+        );
+        let final_backlog = tenants
+            .iter()
+            .map(|tenant| {
+                plan_candidates(&store, tenant, drain_now, &policy).map_or(usize::MAX, |c| c.len())
+            })
+            .fold(0usize, usize::saturating_add);
+        (sample, final_backlog)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => (error_sample(drain_wall, drain_now), usize::MAX),
+    }
 }
 
 fn build_report(
@@ -443,6 +500,8 @@ fn build_report(
         0.0
     };
     let per_core = achieved / as_f64(to_u64(config.worker_threads));
+    // `tenants` is validated > 0, so this divisor is never zero.
+    let per_tenant = achieved / as_f64(to_u64(config.tenants.max(1)));
     let backlog_series: Vec<usize> = samples.iter().map(|s| s.backlog_partitions).collect();
     let total_compacted = samples.iter().map(|s| s.partitions_compacted).sum();
 
@@ -455,6 +514,9 @@ fn build_report(
         batches_acked: stats.batches_acked.load(Ordering::Relaxed),
         batches_failed: stats.batches_failed.load(Ordering::Relaxed),
         achieved_lines_per_sec: achieved,
+        tenants: config.tenants,
+        aggregate_lines_per_sec: achieved,
+        per_tenant_lines_per_sec: per_tenant,
         per_core_lines_per_sec: per_core,
         latency,
         latency_samples_total,
@@ -626,11 +688,12 @@ async fn run_load(
         };
         let pipeline = Arc::clone(pipeline);
         let stats = Arc::clone(stats);
-        let batch = build_batch(
+        let batch = build_batch_for_tenants(
             config.seed,
             batch_idx,
             config.batch_size,
             clock.now_unix_nanos(),
+            config.tenants,
         );
         tokio::spawn(async move {
             let started = Instant::now();
@@ -887,15 +950,81 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Build one deterministic OTLP export: `batch_size` records over the
-/// fixed template mix, params drawn from a per-batch seed, timestamps
-/// on the synthetic timeline (1 µs apart within the batch).
+/// The `service.name` (⇒ tenant, via [`TenantRule::service_name`]) for
+/// batch `batch_idx` under round-robin fan-out over `tenants` tenants.
+///
+/// `tenants <= 1` returns the bare [`TENANT`] borrowed — the
+/// single-tenant fast path, so the baseline batch is byte-for-byte
+/// unchanged. `tenants > 1` cycles `"{TENANT}-{batch_idx % tenants}"`, so
+/// each tenant receives every `tenants`-th batch: N distinct template
+/// trees, one shared commit stream.
+#[must_use]
+fn tenant_name(batch_idx: u64, tenants: usize) -> Cow<'static, str> {
+    if tenants <= 1 {
+        Cow::Borrowed(TENANT)
+    } else {
+        Cow::Owned(format!("{TENANT}-{}", batch_idx % to_u64(tenants)))
+    }
+}
+
+/// The active tenant ids for a run, matching [`tenant_name`]'s outputs:
+/// `[TENANT]` for the single-tenant baseline, else `"{TENANT}-{i}"` for
+/// `i in 0..tenants`. The measurement side (backlog / drain) enumerates
+/// this set; the load side derives the same ids per batch.
+#[must_use]
+fn tenant_set(tenants: usize) -> Vec<String> {
+    if tenants <= 1 {
+        vec![TENANT.to_string()]
+    } else {
+        (0..tenants).map(|i| format!("{TENANT}-{i}")).collect()
+    }
+}
+
+/// Build one deterministic OTLP export for the bare single [`TENANT`]:
+/// `batch_size` records over the fixed template mix, params drawn from a
+/// per-batch seed, timestamps on the synthetic timeline (1 µs apart
+/// within the batch).
 #[must_use]
 pub fn build_batch(
     seed: u64,
     batch_idx: u64,
     batch_size: usize,
     ts_unix_nanos: u64,
+) -> ExportLogsServiceRequest {
+    build_batch_for(seed, batch_idx, batch_size, ts_unix_nanos, TENANT)
+}
+
+/// Build the batch for `batch_idx` under round-robin fan-out over
+/// `tenants` tenants (see [`tenant_name`]): identical record payload to
+/// [`build_batch`], only the `service.name` differs — so N tenants share
+/// one deterministic template mix but land in N distinct per-tenant
+/// trees. `tenants == 1` is byte-for-byte [`build_batch`].
+#[must_use]
+pub fn build_batch_for_tenants(
+    seed: u64,
+    batch_idx: u64,
+    batch_size: usize,
+    ts_unix_nanos: u64,
+    tenants: usize,
+) -> ExportLogsServiceRequest {
+    match tenant_name(batch_idx, tenants) {
+        // The single-tenant fast path *is* `build_batch`, so the baseline
+        // batch stays byte-for-byte identical.
+        Cow::Borrowed(_) => build_batch(seed, batch_idx, batch_size, ts_unix_nanos),
+        Cow::Owned(name) => build_batch_for(seed, batch_idx, batch_size, ts_unix_nanos, &name),
+    }
+}
+
+/// Shared body of the batch builders: the record payload is a pure
+/// function of `(seed, batch_idx, batch_size, ts)`; `service_name` only
+/// stamps the tenant.
+#[must_use]
+fn build_batch_for(
+    seed: u64,
+    batch_idx: u64,
+    batch_size: usize,
+    ts_unix_nanos: u64,
+    service_name: &str,
 ) -> ExportLogsServiceRequest {
     let mut rng_state = seed ^ batch_idx.wrapping_mul(0xA076_1D64_78BD_642F);
     let log_records = (0..batch_size)
@@ -929,7 +1058,7 @@ pub fn build_batch(
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
                     value: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(TENANT.to_string())),
+                        value: Some(any_value::Value::StringValue(service_name.to_string())),
                     }),
                     ..KeyValue::default()
                 }],
@@ -970,6 +1099,7 @@ struct SamplerCtx {
     policy: CompactionPolicy,
     every: Duration,
     stop: tokio::sync::watch::Receiver<bool>,
+    tenants: Arc<[String]>,
 }
 
 /// Sample + sweep on an aligned wall cadence until stopped: ticks are
@@ -999,10 +1129,19 @@ async fn run_sampler(mut ctx: SamplerCtx) -> Vec<BacklogSample> {
         let sink = ctx.sink.clone();
         let wal = Arc::clone(&ctx.wal);
         let policy = ctx.policy;
+        let tenants = Arc::clone(&ctx.tenants);
         let wall_secs = as_f64(saturating_u64(ctx.clock.started.elapsed().as_millis())) / 1_000.0;
         let synthetic_now = ctx.clock.now_unix_nanos();
         let sample = match tokio::task::spawn_blocking(move || {
-            blocking_sample(&store, &sink, &wal, &policy, wall_secs, synthetic_now)
+            blocking_sample(
+                &store,
+                &sink,
+                &wal,
+                &policy,
+                &tenants,
+                wall_secs,
+                synthetic_now,
+            )
         })
         .await
         {
@@ -1022,11 +1161,13 @@ fn blocking_sample(
     sink: &SharedParquetSink,
     wal: &Arc<Mutex<Wal>>,
     policy: &CompactionPolicy,
+    tenants: &[String],
     wall_secs: f64,
     synthetic_now: u64,
 ) -> BacklogSample {
     sink.flush_all();
-    let (backlog_partitions, backlog_bytes, mut errors) = backlog(store, synthetic_now, policy);
+    let (backlog_partitions, backlog_bytes, mut errors) =
+        backlog(store, tenants, synthetic_now, policy);
     let partitions_compacted = if let Ok(report) = run_sweep(store, synthetic_now, policy) {
         errors += report.errors.len();
         report.partitions_compacted
@@ -1065,16 +1206,41 @@ fn error_sample(wall_secs: f64, synthetic_now: u64) -> BacklogSample {
     }
 }
 
-/// The candidate backlog as of `now`: sealed candidate partitions and
-/// the summed size of their Parquet files (derived from the store
-/// listing — the backlog has no stored byte counter).
+/// The candidate backlog as of `now`, aggregated across every active
+/// tenant: total sealed candidate partitions, the summed size of their
+/// Parquet files, and the error count. One tenant-wide listing per tenant
+/// (see [`backlog_for_tenant`]) — N tenants ⇒ N listings, not N per
+/// partition — so the per-sample list cost stays bounded at one call per
+/// tenant regardless of backlog depth.
+fn backlog(
+    store: &Store,
+    tenants: &[String],
+    now: u64,
+    policy: &CompactionPolicy,
+) -> (usize, u64, usize) {
+    tenants
+        .iter()
+        .fold((0, 0, 0), |(parts, bytes, errs), tenant| {
+            let (p, b, e) = backlog_for_tenant(store, tenant, now, policy);
+            (parts + p, bytes.saturating_add(b), errs.saturating_add(e))
+        })
+}
+
+/// One tenant's candidate backlog as of `now`: sealed candidate
+/// partitions and the summed size of their Parquet files (derived from
+/// the store listing — the backlog has no stored byte counter).
 ///
 /// One tenant-wide listing per call, matched against the candidates'
 /// partition prefixes — not one listing per candidate. On a non-local
 /// store every listing is a remote call, so the per-sample list cost
 /// must stay bounded regardless of backlog depth.
-fn backlog(store: &Store, now: u64, policy: &CompactionPolicy) -> (usize, u64, usize) {
-    let Ok(candidates) = plan_candidates(store, TENANT, now, policy) else {
+fn backlog_for_tenant(
+    store: &Store,
+    tenant: &str,
+    now: u64,
+    policy: &CompactionPolicy,
+) -> (usize, u64, usize) {
+    let Ok(candidates) = plan_candidates(store, tenant, now, policy) else {
         return (0, 0, 1);
     };
     if candidates.is_empty() {
@@ -1084,7 +1250,7 @@ fn backlog(store: &Store, now: u64, policy: &CompactionPolicy) -> (usize, u64, u
         .iter()
         .map(|key| format!("{}/", partition_prefix(key)))
         .collect();
-    let tenant_prefix = format!("data/tenant_id={}", percent_encode_tenant(TENANT));
+    let tenant_prefix = format!("data/tenant_id={}", percent_encode_tenant(tenant));
     match store.list_with_sizes_blocking(Some(&tenant_prefix)) {
         Ok(entries) => {
             let bytes = entries
@@ -1267,6 +1433,7 @@ mod tests {
             sink_target_bytes: 4 * 1024 * 1024,
             seed: 7,
             worker_threads: 2,
+            tenants: 1,
         };
         let report = run_soak(&config).expect("deadline soak runs");
         let batches = report.batches_acked + report.batches_failed;
@@ -1275,6 +1442,66 @@ mod tests {
             "3 ticks fit before the 1 s deadline, got {batches}",
         );
         assert!(report.lines_acked <= 300);
+    }
+
+    fn service_name_of(req: &ExportLogsServiceRequest) -> String {
+        req.resource_logs[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "service.name")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match &v.value {
+                Some(any_value::Value::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("service.name string")
+    }
+
+    /// `--tenants N > 1` round-robins `service.name` across batches while
+    /// leaving the record payload a pure function of `(seed, batch_idx)`;
+    /// `N == 1` stays byte-for-byte the single-tenant baseline.
+    #[test]
+    fn build_batch_cycles_tenants_and_keeps_the_single_tenant_baseline() {
+        // N == 1: bare TENANT, and byte-identical to `build_batch`.
+        assert_eq!(tenant_name(3, 1), Cow::Borrowed(TENANT));
+        let single = build_batch_for_tenants(1, 3, 10, BASE_UNIX_NANOS, 1);
+        assert_eq!(service_name_of(&single), TENANT);
+        assert_eq!(
+            single,
+            build_batch(1, 3, 10, BASE_UNIX_NANOS),
+            "the single-tenant path is byte-for-byte build_batch",
+        );
+
+        // N > 1: service.name cycles soak-0..soak-3 by batch index.
+        let names: Vec<String> = (0..9)
+            .map(|i| service_name_of(&build_batch_for_tenants(1, i, 10, BASE_UNIX_NANOS, 4)))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "soak-0", "soak-1", "soak-2", "soak-3", "soak-0", "soak-1", "soak-2", "soak-3",
+                "soak-0",
+            ],
+        );
+
+        // The active tenant set the measurement enumerates matches the
+        // ids the load side stamps.
+        assert_eq!(tenant_set(1), vec![TENANT.to_string()]);
+        assert_eq!(tenant_set(4), vec!["soak-0", "soak-1", "soak-2", "soak-3"],);
+
+        // Only service.name differs between the baseline and the tagged
+        // batch for the same index — the template trees are the same mix,
+        // just scoped per tenant.
+        let bare = build_batch(1, 1, 10, BASE_UNIX_NANOS);
+        let tagged = build_batch_for_tenants(1, 1, 10, BASE_UNIX_NANOS, 4);
+        assert_eq!(service_name_of(&tagged), "soak-1");
+        assert_eq!(
+            bare.resource_logs[0].scope_logs, tagged.resource_logs[0].scope_logs,
+            "record payload is tenant-independent",
+        );
     }
 
     #[test]
@@ -1323,6 +1550,10 @@ mod tests {
                 worker_threads: 0,
                 ..ok.clone()
             },
+            SoakConfig {
+                tenants: 0,
+                ..ok.clone()
+            },
         ] {
             assert!(matches!(validate(&broken), Err(SoakError::Config(_))));
         }
@@ -1348,6 +1579,7 @@ mod tests {
             sink_target_bytes: 64 * 1024,
             seed: 42,
             worker_threads: 4,
+            tenants: 1,
         };
         let report = run_soak(&config).expect("smoke soak runs");
 
@@ -1401,5 +1633,97 @@ mod tests {
         // The report is the workflow artifact — it must serialize.
         let json = serde_json::to_string(&report).expect("report serializes");
         assert!(json.contains("\"d1\""));
+    }
+
+    /// Multi-tenant smoke soak (#567): four tenants fan out through the
+    /// one shared WAL / commit stream / store. Asserts (a) all four land
+    /// distinct partition prefixes, (b) the backlog aggregates across
+    /// tenants and the final drain clears it, (c) the aggregate rate is
+    /// the sum of the per-tenant means, and (d) the report names four
+    /// tenants. Calls [`soak`] on an inspectable dir (rather than
+    /// [`run_soak`]'s internal tempdir) so the per-tenant partition trees
+    /// can be observed directly.
+    #[test]
+    fn multi_tenant_smoke_soak_fans_out_over_one_commit_stream() {
+        let config = SoakConfig {
+            duration_secs: 4,
+            target_lines_per_sec: 8_000,
+            batch_size: 100,
+            // As in the single-tenant smoke: 1 wall second = 2000
+            // synthetic seconds, so hour partitions seal every ~2.25 s.
+            time_compression: 2_000,
+            sample_every_secs: 1,
+            sink_target_bytes: 64 * 1024,
+            seed: 42,
+            worker_threads: 4,
+            tenants: 4,
+        };
+        validate(&config).expect("config is valid");
+        let dir = tempfile::tempdir().expect("soak tempdir");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(config.worker_threads)
+            .enable_time()
+            .build()
+            .expect("soak runtime");
+        let report = runtime
+            .block_on(soak(&config, dir.path()))
+            .expect("multi-tenant smoke soak runs");
+
+        // (d) the report names four tenants.
+        assert_eq!(report.tenants, 4);
+        assert!(report.lines_acked > 0, "load was ingested and acked");
+        assert_eq!(report.batches_failed, 0, "no batch failed to commit");
+
+        // (c) the aggregate node rate is the sum of the per-tenant means.
+        assert!(report.per_tenant_lines_per_sec > 0.0);
+        assert!(
+            (report.aggregate_lines_per_sec - report.per_tenant_lines_per_sec * 4.0).abs() < 1.0,
+            "aggregate {} ≈ 4 × per-tenant mean {}",
+            report.aggregate_lines_per_sec,
+            report.per_tenant_lines_per_sec,
+        );
+        assert_eq!(
+            report.aggregate_lines_per_sec.to_bits(),
+            report.achieved_lines_per_sec.to_bits(),
+            "the aggregate is the whole-node achieved rate",
+        );
+
+        // (a) all four tenants produced a distinct partition prefix in
+        // the one shared store.
+        let mut tenant_dirs: Vec<String> = std::fs::read_dir(dir.path().join("store").join("data"))
+            .expect("store data dir exists")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("tenant_id="))
+            .collect();
+        tenant_dirs.sort();
+        assert_eq!(
+            tenant_dirs,
+            vec![
+                "tenant_id=soak-0",
+                "tenant_id=soak-1",
+                "tenant_id=soak-2",
+                "tenant_id=soak-3",
+            ],
+            "each of the four tenants landed a distinct partition prefix",
+        );
+
+        // (b) the backlog aggregates across tenants and drains to zero.
+        assert!(
+            report.samples.iter().any(|s| s.backlog_partitions > 0),
+            "some sample observed sealed candidates across tenants: {:?}",
+            report.samples,
+        );
+        assert_eq!(
+            report.samples.iter().map(|s| s.errors).sum::<usize>(),
+            0,
+            "no sweep/listing errors across the tenant enumeration: {:?}",
+            report.samples,
+        );
+        assert_eq!(
+            report.d2.final_backlog_partitions, 0,
+            "the final drain cleared every tenant's backlog",
+        );
+        assert!(report.d2.pass, "the multi-tenant backlog is bounded");
     }
 }

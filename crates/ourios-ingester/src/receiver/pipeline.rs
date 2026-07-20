@@ -130,6 +130,15 @@ pub struct IngestPipeline {
     /// rejection counts (`error.type` on the batches counter), recorded
     /// on the pre-WAL denial paths.
     metrics: IngestMetrics,
+    /// RFC 0035 §3.1: the concurrent encode pool. When present (every
+    /// production wiring — the server role, the soak, the Parquet-sink
+    /// integration tests), the gated section runs
+    /// `MinerCluster::ingest_mined` (id assignment + audit only) and
+    /// hands each batch's mined records to the pool for the sink emit.
+    /// `None` — pipelines whose miner has no [`crate::record_sink::SharedParquetSink`]
+    /// to hand a pool (spy/no-op-sink test pipelines) — keeps the fully
+    /// synchronous `miner.ingest` path.
+    encode_pool: Option<crate::encode_pool::EncodePool>,
     /// RFC 0026 §3.4: the sink for `ingest_denied` audit events. Behind a
     /// mutex — denials are the cold path.
     ///
@@ -156,8 +165,34 @@ impl IngestPipeline {
             rule,
             last_durable: Mutex::new(None),
             rotation_hook: Mutex::new(None),
+            encode_pool: None,
             metrics: IngestMetrics::new(),
             denial_audit: Mutex::new(None),
+        }
+    }
+
+    /// Enable the RFC 0035 §3.1 ordered/concurrent ingest split: the
+    /// gated section runs only Drain match + template-id assignment
+    /// (+ audit), and the Parquet-sink emit runs on `pool`. The pool's
+    /// sink must be the same sink the miner was built with, so the
+    /// no-pool fallback, the flush triggers, and the rotation/shutdown
+    /// drains all see one buffer.
+    #[must_use]
+    pub fn with_encode_pool(mut self, pool: crate::encode_pool::EncodePool) -> Self {
+        self.encode_pool = Some(pool);
+        self
+    }
+
+    /// Drain the concurrent encode pool — blocks until every submitted
+    /// record has reached the record sink. The drain half of the §3.1
+    /// encode-drain-and-flush barrier: callers MUST run this before any
+    /// flush/snapshot that claims to cover previously-acked records
+    /// (the rotation path runs it internally; the server's shutdown and
+    /// the soak's end-of-load measurement call it here). A no-op
+    /// without a pool.
+    pub fn quiesce_encodes(&self) {
+        if let Some(pool) = &self.encode_pool {
+            pool.quiesce();
         }
     }
 
@@ -341,16 +376,64 @@ impl IngestPipeline {
                 // `before` is exactly the preceding seq's offset and no
                 // higher seq has ingested yet.
                 let before = *self.lock_last_durable();
-                {
+                let mined = {
                     let mut miner = self.lock_miner();
                     if let Some(prev) = before
                         && prev.segment != now.segment
                     {
+                        // RFC 0035 §3.1 encode-drain-and-flush barrier,
+                        // drain half. The rotation hook stamps
+                        // `wal_high_water = prev`, which asserts every
+                        // frame ≤ prev is durably captured — so no encode
+                        // for a frame ≤ prev may still be in flight when
+                        // it runs. Draining the *whole* pool over-covers
+                        // that mark soundly: submission happens under
+                        // this same in-order gate (below), so every
+                        // frame < this seq has already submitted its
+                        // encodes, no frame ≥ this seq has, and thus
+                        // every in-flight encode is for a frame ≤ prev.
+                        // The flush half is the hook's own `flush_all` +
+                        // its snapshot-only-if-fully-drained gate (the
+                        // server's `flush_then_snapshot`): after this
+                        // drain the sink buffers hold exactly the frames
+                        // ≤ prev, `flush_all` takes every partition, and
+                        // the high-water is stamped only when both sinks
+                        // fully drained — so a record the mark claims
+                        // durable is either in the store or the mark was
+                        // never written. A crash at any point before the
+                        // stamp loses only buffered Parquet, which WAL
+                        // replay above the (previous) high-water re-mines
+                        // (the §6.9 posture: the WAL is the durability of
+                        // record; a snapshot is a rebuildable cache).
+                        self.quiesce_encodes();
                         self.fire_rotation_hook(&miner, prev);
                     }
-                    for record in &records {
-                        miner.ingest(record);
+                    if self.encode_pool.is_some() {
+                        // Ordered phase (RFC 0035 §3.1): id assignment +
+                        // audit under the gate; the sink emit is deferred
+                        // to the concurrent pool below.
+                        let mut out = Vec::with_capacity(records.len());
+                        for record in &records {
+                            let (_, rec) = miner.ingest_mined(record);
+                            out.extend(rec);
+                        }
+                        out
+                    } else {
+                        for record in &records {
+                            miner.ingest(record);
+                        }
+                        Vec::new()
                     }
+                };
+                if let Some(pool) = &self.encode_pool {
+                    // Still under the ingest gate (`_gate` drops at
+                    // return): every frame ≤ this seq submits its encodes
+                    // before any later seq reaches the rotation check
+                    // above — the ordering that makes the whole-pool
+                    // drain cover the mark. A full queue blocks here
+                    // (bounded backpressure) on a runtime worker, like
+                    // the hook's own blocking store I/O on this path.
+                    pool.submit(mined);
                 }
                 // Only successful commits advance the durable mark, so the
                 // snapshot high-water never passes a failed sync — its tail

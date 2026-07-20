@@ -99,7 +99,7 @@ proptest = "=1.11.0"
 tempfile = "=3.27.0"
 prost = { version = "=0.14.4", default-features = false, features = ["std"] }
 tonic = { version = "=0.14.6", default-features = false, features = ["transport", "channel", "gzip", "tls-ring"] }
-tokio = { version = "=1.52.3", default-features = false, features = ["io-util", "time", "process"] }
+tokio = { version = "=1.53.0", default-features = false, features = ["io-util", "time", "process"] }
 # Drive the querier `Router` in-process (`ServiceExt::oneshot`) for the
 # RFC 0016 handler tests — no socket, no HTTP client (the ingester's pattern).
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }

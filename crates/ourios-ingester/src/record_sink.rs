@@ -808,7 +808,7 @@ impl SharedParquetSink {
     /// The concurrent-phase emit (RFC 0035 §3.1). Safe to call from many
     /// encode-pool workers at once: the partition key and byte estimate
     /// are derived outside the sink lock, the buffer append is a short
-    /// locked section ([`ParquetRecordSink::append_off_lock`]), and any
+    /// locked section (`ParquetRecordSink::append_off_lock`), and any
     /// size / ceiling-triggered partitions are encoded + published **off
     /// the lock** via [`Self::publish_owned`] (which settles counters,
     /// quarantines poison records, and requeues on transient failure) —

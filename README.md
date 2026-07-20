@@ -88,9 +88,10 @@ logs that other backends ignore:
 
 Ourios is not "better than Loki" (or anything else); it is built for a
 specific workload shape, and the honest comparison
-([RFC 0031](docs/rfcs/0031-comparative-evaluation-loki.md), every
-counted pair machine-checked for result-set equivalence) is evidence of
-fit, not a ranking.
+([RFC 0031](docs/rfcs/0031-comparative-evaluation-loki.md); every
+benchmark query pair — the same question posed to both systems — is
+machine-checked for result-set equivalence before it counts) is
+evidence of fit, not a ranking.
 
 **Choose Ourios when this is your workload:**
 
@@ -104,7 +105,9 @@ fit, not a ranking.
   measured profile is flat: 39–86 ms across every latency-measured
   comparative pair at 4.9 M records — needles, severity, and window
   browses alike — where the grep-architecture reference spans 13.8 ms
-  to 24.1 s depending on how much it must scan. Flatness, not any
+  to 24.1 s depending on how much it must scan (dataset, environment,
+  and the pair definitions:
+  [`docs/benchmarks.md` §9.13](docs/benchmarks.md)). Flatness, not any
   single ratio, is the headline: cost tracks the *result*, not the
   corpus.
 - You want **one binary** on object storage: no index tier, no
@@ -113,10 +116,11 @@ fit, not a ranking.
 **Choose something else when:**
 
 - **Arbitrary substring hunts over recent data are the daily shape.**
-  A label + time index (Loki's design) is genuinely better at "the last
-  k rows matching this string, fast" — our time-window browse is a
-  documented storage-bytes loss (§9.13), and we publish it rather than
-  argue with it.
+  A label + time index (Loki's design) is genuinely better at "the most
+  recent few thousand rows matching this string, fast" — our
+  time-window browse is a documented storage-bytes loss
+  ([`docs/benchmarks.md` §9.13](docs/benchmarks.md)), and we publish it
+  rather than argue with it.
 - **You live in the Grafana ecosystem** and its integrations are the
   point.
 - **You need years of operational hardening today.** Ourios is

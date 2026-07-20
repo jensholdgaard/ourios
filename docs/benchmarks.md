@@ -1704,14 +1704,14 @@ construction. Either way the harness now measures instead of
 guessing, and the number is honest: no bar was reworded to fit the
 result.
 
-### 9.20 Results — 2026-07-20 (authoritative-class hardware) — D1 capacity probes: the single-tenant ceiling
+### 9.20 Results — 2026-07-20 (authoritative, `baseline-8vcpu-32gib`) — D1 capacity probes: the single-tenant ceiling
 
 **Purpose.** §9.19 left D1's per-core bar as an open reading and noted
 the run had *paced* at the target rather than probing capacity. These
 are the first capacity probes, on the §1 baseline class (8 dedicated
-vCPU / 32 GiB), maintainer-opted per RFC 0031 §3.2's paid-run rule.
-Ad-hoc VM run (not a workflow dispatch): `ourios-bench soak` at commit
-0979d14, release build; per-probe JSON reports retained by the
+vCPU / 32 GiB) — baseline runs are maintainer opt-in per RFC 0031
+§3.2, and this one was. Ad-hoc VM run (not a workflow dispatch):
+`ourios-bench soak` at `0979d14`, release build; per-probe JSON reports retained by the
 maintainer alongside this record's source run log.
 
 **Ladder** (10-minute probes, 8 workers, one tenant, ×60 synthetic
@@ -1724,12 +1724,18 @@ clock):
 | 800,000 lines/s | 85,911 lines/s | 5,972 / 6,319 ms | max 1 partition, drained — PASS |
 
 The identical ~86k plateau at every offered rate, with ack latency
-pinned at ~6 s, is the signature of a saturated pipeline behind the
-harness's 512-batch in-flight bound (512 × 1,000 lines ÷ 6 s ≈ 85k):
-**the single-tenant ingest ceiling on this class is ≈ 86k lines/s**,
-and cores cannot raise it — the per-tenant miner is sequential by
-design (`CLAUDE.md` §3.7 per-tenant trees; the least-common-mechanism
-choice's deliberate flip side).
+pinned at ~6 s, is a saturated pipeline: at saturation the in-flight
+bound sets the *latency* (512 batches × 1,000 lines ÷ 86k lines/s
+≈ 6 s) while the plateau itself is the pipeline's *service rate* —
+raising the permit count would lengthen the queue, not the
+throughput, because the per-tenant miner hand-off is in-order and
+sequential by design (`CLAUDE.md` §3.7 per-tenant trees; the
+least-common-mechanism choice's deliberate flip side). Stated
+carefully: **≈ 86k lines/s is the observed single-tenant ceiling
+under this probe configuration** (batch 1,000, 8 workers, this
+corpus shape), consistent with the sequential-miner explanation; a
+different batch size or record mix could move the number some, but
+not onto a cores axis.
 
 **Tenant-parallel check** (8 concurrent single-tenant soak processes,
 2 workers each, 5 minutes at offered 100k each — an *approximation*:
@@ -1742,9 +1748,11 @@ core count.
 merely uncalibrated — for single-tenant load it measures a dimension
 the architecture deliberately does not scale on. D1's falsifier
 ("a meaningful share of production traffic per node") is a per-node,
-multi-tenant statement: measured here at ≈ 341k lines/s/node
-(≈ 29 B lines/day) on the approximation, with the honest in-process
-`--tenants N` measurement tracked in #567. D2, by contrast, passed
+multi-tenant statement: *approximated* here at ≈ 341k lines/s
+(≈ 29 B lines/day) — a multi-process stand-in, **not yet a per-node
+measurement** (separate WALs/stores neither share a commit stream
+nor contend on one store); the honest in-process `--tenants N`
+measurement is tracked in #567. D2, by contrast, passed
 at full saturation on every probe. The bar recalibration (per-node
 multi-tenant must-win + per-tenant ceiling as recorded diagnostic,
 the RFC 0011 must-win/diagnostic precedent) is a pending maintainer

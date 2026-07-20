@@ -137,7 +137,7 @@ release version:
     # individual files: a `git tag` failure after the commit would otherwise
     # leave the working tree inconsistent with an advanced HEAD.
     start_sha="$(git rev-parse HEAD)"
-    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v$version" >/dev/null 2>&1 || true; rm -f Cargo.toml.bak' ERR
+    trap 'git reset --hard "$start_sha" >/dev/null 2>&1 || true; git tag -d "v$version" >/dev/null 2>&1 || true; rm -f Cargo.toml.bak deploy/helm/ourios/Chart.yaml.bak' ERR
     # The anchored edit is precise (only the workspace version matches). sed needs
     # a backup suffix to edit in place portably. Keep the edit and the cleanup as
     # separate statements: in `sed ... && rm`, a sed failure is the non-final
@@ -146,6 +146,29 @@ release version:
     # trap also drops a stray .bak); this rm just clears it on the success path.
     sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml
     rm -f Cargo.toml.bak
+    # The Helm chart tracks the release too. `appVersion` is the app the chart
+    # deploys, so it moves to the release version. The chart's OWN `version` is
+    # patch-bumped: chart *feature* changes already bump it in their own PRs, so
+    # at release time its only remaining delta is the new appVersion pointer —
+    # a patch-level change. This bump is mandatory, not cosmetic: chart versions
+    # are immutable in a Helm repo, so a new appVersion (a different default
+    # image) under an unchanged chart version would republish different content
+    # at the same version. Mirrors the v0.2.1 precedent (chore(release) 7a9d97e).
+    chart_yaml="deploy/helm/ourios/Chart.yaml"
+    chart_ver="$(sed -nE 's/^version: (.*)/\1/p' "$chart_yaml" | head -1)"
+    # Plain X.Y.Z only. The first arm rejects any character outside [0-9.] —
+    # so a pre-release/build suffix (`0.4.0-alpha`, `0.4.0+meta`) fails loudly
+    # rather than feeding awk a non-numeric patch field; the second enforces the
+    # three-segment shape.
+    case "$chart_ver" in
+        *[!0-9.]*) echo "error: chart version '$chart_ver' is not plain X.Y.Z (has a suffix); bump $chart_yaml by hand"; exit 1;;
+        [0-9]*.[0-9]*.[0-9]*) : ;;
+        *) echo "error: chart version '$chart_ver' is not plain X.Y.Z; bump $chart_yaml by hand"; exit 1;;
+    esac
+    chart_next="$(echo "$chart_ver" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')"
+    sed -i.bak -E "s/^version: .*/version: $chart_next/" "$chart_yaml"
+    sed -i.bak -E "s/^appVersion: .*/appVersion: \"$version\"/" "$chart_yaml"
+    rm -f "$chart_yaml.bak"
     # Sync Cargo.lock to the new workspace-crate versions AND validate the
     # version: cargo parses `version = "..."` with its own SemVer parser, so a
     # malformed arg (leading `v`, leading zeroes, non-numeric) fails here — we
@@ -156,7 +179,7 @@ release version:
     # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
     # commit — cargo-dist reads it for the GitHub Release body (release.yml).
     git-cliff --tag "v$version" --output CHANGELOG.md
-    git add Cargo.toml Cargo.lock CHANGELOG.md
+    git add Cargo.toml Cargo.lock CHANGELOG.md "$chart_yaml"
     git commit -m "chore(release): v$version"
     git tag -a "v$version" -m "v$version"
     # Success: disarm the rollback trap.

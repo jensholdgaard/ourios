@@ -2,6 +2,171 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.3.0] - 2026-07-20
+
+### Added
+
+- RFC 0009 D1/D2 sustained-ingest soak harness (#558) (0979d14)
+- Per-role ServiceAccounts — least-privilege IAM seam (IRSA) (#556) (780114e)
+- Rfc 0031 §7 — freeze M_L4 on the L2 shape (#548) (0a0c0ca)
+- RFC 0031 — record per-pair completeness as a results artifact (#540) (fe82f42)
+- RFC 0031 L4 — wire into the live dispatch loop (#536) (0706b7b)
+- RFC 0031 L4 harness — aggregation pair, matrix parser, param picker (#534) (44c292e)
+- Rfc 0002 green — l4 validation error contract (.14) (#535) (2b46313)
+- RFC 0002 green — count-by execution with param(n) and bucket(w) (#533) (b089313)
+- Rfc 0031 §7 — m_l2 unfrozen and asserting per rfc 0033 (run #21) (#528) (7faec23)
+- RFC 0033 v2 — zstd artifact at the v2 key, publish-outcome labels (#522) (02d622e)
+- RFC 0032 green (correctness + descriptions) — .3/.4/.5/.6 (#519) (77ae4b4)
+- Rfc 0032 green (resource) — query-schema resource + config threading, .1/.2 (#518) (e1ef0e2)
+- RFC 0033 green (observability) — lookup-outcome telemetry, .7 (#513) (707950d)
+- RFC 0033 green (comparative) — cold-vs-warm acquisition, .6 (#512) (c43d5cb)
+- RFC 0033 green (freshness) — cached read path + write-through, .2/.4/.5 (#511) (8fd8e1d)
+- RFC 0033 green (publish) — atomic template_map publish, CAS + tear safety (#510) (3aefac6)
+- RFC 0033 green (artifact) — template_map format + one-scan dual fold (#509) (a63f04d)
+- RFC 0031 — frozen gates asserted; scenarios .2/.4/.7/.11 green (#506) (01303e4)
+- RFC 0031 — latency_p50 channel (RFC0031.7 becomes measurable) (#495) (13087bd)
+- RFC 0031 — selective-resource window diagnostic pair (#493) (844d413)
+- Rfc 0031 — l1 template-lookup pair (second must-win candidate) (#492) (fddd68d)
+- RFC 0005 §3.6 — bloom filters on trace_id and span_id (#489) (44296d2)
+- RFC 0031 — L3 trace-correlation pair (first must-win class beyond L2) (#487) (aeb52b7)
+- RFC 0031 — honest total-bytes accounting (count + materialize + registry) (#482) (afb1fb3)
+- RFC 0031 — floor-direction gate for L6/L7 reporting (#481) (cf79b3d)
+- RFC 0031 — three-point selectivity curve in the indicative run (#480) (5190021)
+- RFC 0031 — storage-side Loki bytes (conservative metric) (#479) (b05fc86)
+- RFC 0031 — indicative comparative run + dispatch workflow (#474) (2ce2c6a)
+- RFC 0031 — L-gate must-win math + §7 margins as config (#473) (a9c2137)
+- Rfc 0031 — bytes-read measurement channel (§3.6) (#472) (d535099)
+- RFC 0031 — Loki container integration, RFC0031.1 green (#471) (b26fb7b)
+- RFC 0031 — Loki query-response parser (RFC0031.1) (#470) (2e0c918)
+- RFC 0031 — registry-bearing comparative store (RFC0031.1) (#469) (05ea638)
+- RFC 0031 — Ourios-side query extraction (RFC0031.1) (#468) (99929b2)
+- RFC 0031 — result-set equivalence comparator (RFC0031.1 core) (#467) (b6a1c8d)
+- Harvest miner §3.1 counters into the results (#446) (#458) (7059e85)
+- Rfc 0030 green (served .8) — served end-to-end over TLS (#454) (788d84d)
+- Redefine C2 gate as per-service (#444) (#451) (b257c9a)
+- Rfc 0030 green (querier) — TLS on the querier + MCP surface (#450) (1bfb7f3)
+- Rfc 0030 green (reload) — hot cert reload without restart (#449) (0ad6856)
+- Rfc 0030 green (acceptor) — gRPC + HTTP listeners over TLS (#447) (ff71eb1)
+- Per-service C2 decomposition + v8 B2 pricing (#444) (#445) (abd9108)
+
+### Build
+
+- Bump Helm chart appVersion in the release recipe (#569) (a4a290d)
+
+### CI
+
+- Pin the container rustup install by hash (#553) (918769b)
+- Retire self-hosted coverage badge; wire codecov test analytics (#552) (77771b8)
+- Upload lcov to codecov (informational) (#551) (9fafedd)
+- Era-adaptive corpus capture — k6 knobs beside locust (#547) (6dd83a2)
+
+### Changed
+
+- RFC 0031 — split the comparative harness + dispatch class filter (#542) (9ec0111)
+
+### Chore
+
+- Update rust:1.97-bookworm docker digest to 77fac8b (#565) (ead1f27)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to a427e73 (#561) (3c05cb6)
+- Update gcr.io/distroless/static-debian12 docker digest to 61b7cce (#560) (15140f4)
+- Update gcr.io/distroless/cc-debian12 docker digest to 7ee09f3 (#559) (e7c4198)
+- Update cargo (minor/patch) (#566) (5242ab2)
+- Update github-actions (#562) (7236154)
+- Update cargo (minor/patch) (#505) (891efe4)
+- Hold rand at 0.8.x — rides the p256/rustcrypto 0.14 lift (#530) (445510a)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 90232e3 (#503) (64dde51)
+- Hold p256 at 0.13.x until jsonwebtoken moves to rustcrypto 0.14 (#525) (14a8f86)
+- Hold reqwest at 0.12.x until datafusion 55 (rfc 0021 phase 2) (#524) (fcb9335)
+- Update taiki-e/install-action digest to 43aecc8 (#500) (b314b02)
+- Update gcr.io/oss-fuzz-base/base-builder-rust docker digest to 6a1d899 (#497) (3e22246)
+- Pin dependencies (#496) (27940f9)
+- Update oss-fuzz base-builder-rust digest (#463) (6f20eae)
+- Refresh production image base layers (rust 1.97, distroless digests) (#462) (df37cec)
+- Update jsonschema to 0.47.0 (#461) (575a8f7)
+- Update cargo (in-range patch/minor) — bytes, rmcp (#460) (82894d8)
+- Update github-actions (codeql-action, taiki-e/install-action) (#459) (ce85b4a)
+- Update sigstore/cosign-installer to v4.1.2, pin cosign v2.5.2 (#216) (#457) (ac80275)
+- Replace abandoned serde_yaml with serde_yaml_ng (#216) (#456) (098f0cd)
+
+### Documentation
+
+- §9.20 — baseline-class D1 capacity probes (single-tenant ceiling) (#568) (9bc6879)
+- §9.19 — first D1/D2 soak record (#564) (f3918cf)
+- Workload-fit positioning — when to choose Ourios, and when not (#557) (a313031)
+- Add URLs to bestpractices reporting justifications (#554) (86d9f32)
+- Rfc 0022 green -> validated on the §9.9 + §9.11 evidence (#545) (f0d5fea)
+- §9.17 — L4 frequency-aggregation measurement record (#544) (20b3b9f)
+- Refresh glossary hazard count + roadmap.md to 2026-07-15 (#537) (c30986a)
+- RFC 0002 amendment — param(n), bucket(width), aggregation execution criteria (#531) (35c201b)
+- Rfc 0033 green — corpus arm measured (#21) and asserting (#23), §9.16 (#529) (f0965d5)
+- Rework both front doors — README and the book introduction (#527) (d79634b)
+- Rfc 0033 §5.6 amendment — corpus ratio gate 1/10 → 1/2 per run #21, §9.15 record (#526) (544c1f0)
+- Rfc 0032 green — all six §5 scenarios discharged (#523) (a925d70)
+- RFC 0033 §3.2 amendment — compressed artifact encoding (run #20 answer) (#521) (ae5cebd)
+- Rfc 0033 green→red — run #20: .6 corpus arm undischarged, §9.14 record (#520) (1fdbd27)
+- Rfc 0032 specified — §5 criteria declared complete (#516) (74b8ca3)
+- Rfc 0032 drafted — query-schema + cost-model resource for the mcp surface (#515) (7c949d1)
+- Rfc 0033 green — all seven §5 scenarios discharged (#514) (ff67d03)
+- Rfc 0033 drafted → specified (#507) (f653617)
+- Rfc 0031 §3.6/§7 — precision follow-up to the freeze merge (#504) (ceb8817)
+- RFC 0031 §7 — partial calibration freeze (M_L1/M_L3 @10 storage, F_L6 @3 latency) (#502) (fc31a8d)
+- RFC 0031 §9.13 comparative entry draft (runs #8–#18) — maintainer-gated fold-in (#494) (b6a139b)
+- RFC 0005 §3.6 amendment — blooms on trace-context ids, with measured evidence (#491) (30525c8)
+- RFC 0033 drafted — cached template-map artifact (#484) (136b9d1)
+- RFC 0031 — comparative evaluation vs Loki (specified) (#464) (a71cbe1)
+- Accept RFC 0019 — storage-backend selection (#455) (3d889a1)
+- Reconcile §9.12 with the resolved #444 decision (#452) (19886b9)
+- §9.12 — otel-demo v8 capture gates (C1 PASS, C2 FAIL) + calibration manifest (#443) (a99a496)
+
+### Fixed
+
+- Silence unused_async on authenticate without oidc (#563) (50339e9)
+- Accept proto3-JSON unset AnyValue on the OTLP/JSON paths (#550) (07c75c1)
+- Rfc 0031 — query ingesters regardless of range age (l3 flicker diagnosed) (#490) (93bb4a3)
+- RFC 0031 — salvage per-pair reports + L3 timeout diagnostics (#488) (6e91c0e)
+- RFC 0031 — raise Loki's internal gRPC cap (single-line inflation) (#478) (6604b0c)
+- RFC 0031 — 1.5 MB flush cap (Loki inflates OTLP internally) (#477) (e6a4352)
+- RFC 0031 — byte-capped Loki push batching (run #2 finding) (#476) (045e40e)
+- RFC 0031 — generalize the pair picker (v8 has no ERROR logs) (#475) (01069ad)
+
+### Performance
+
+- Late materialization — page-selective reads on the materialize scan (#486) (b608176)
+- Rfc 0031 — elide the count scan when materialization is complete (#485) (e44e978)
+
+### Tests
+
+- RFC 0031 — backdated wide-range Loki interop arm (#541) (f9b6afe)
+- RFC 0031 L4 — property tests for the margin comparator (#539) (9ca8feb)
+- Red — L4 amendment stubs land (RFC0002.12–.16) (#532) (d8512b0)
+- Red — all six §5 stubs land, status specified→red (#517) (a58f422)
+- Red — all seven §5 stubs land, status specified→red (#508) (b49758e)
+- RFC 0031 — pin promoted service.name column + pruning behavior (#483) (818395d)
+- Red — §5 stubs land, status specified→red (#466) (2daf0bf)
+- Real OTel Collector → Ourios over TLS + OIDC (#453) (8390da1)
+- Rfc 0030 green (mTLS) — RFC0030.4 require-and-verify (#448) (eadc78a)
+
+## [corpus/otel-demo-v8] - 2026-07-09
+
+### Added
+
+- Rfc 0030 green (config) — *_tls blocks, preflight, plaintext warning (#442) (8b7c5de)
+- Static-musl variants on distroless/static + scratch (#263) (#439) (938e186)
+
+### CI
+
+- Dispatchable chart-publish workflow (#438) (3d42f06)
+
+### Documentation
+
+- Rfc 0030 specified — tls/mtls on the data-plane listeners (#440) (dc64aff)
+- Show the topology diagram on artifact hub (#437) (0bf0805)
+- Artifact hub badge (#436) (470ef7a)
+
+### Tests
+
+- Red — all nine §5 stubs land, status specified→red (#441) (425b96c)
+
 ## [0.2.1] - 2026-07-08
 
 ### Fixed

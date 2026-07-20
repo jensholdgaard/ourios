@@ -316,6 +316,47 @@ pub fn shared_wal_pipeline(root: &Path) -> SharedPipeline {
     Arc::new(open_pipeline(root))
 }
 
+use ourios_ingester::encode_pool::EncodePool;
+use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
+use ourios_parquet::Store;
+use std::time::Duration as StdDuration;
+
+/// A never-flush [`FlushConfig`]: no size/age/ceiling trigger fires, so
+/// emitted records stay observable in the buffer.
+pub fn never_flush() -> FlushConfig {
+    FlushConfig {
+        target_bytes: usize::MAX,
+        max_buffer_age: StdDuration::from_secs(86_400),
+        ceiling_bytes: usize::MAX,
+    }
+}
+
+/// The RFC 0035 production ingest shape over a *real* `Wal` at `root`:
+/// the miner emits into a shared Parquet sink on a local store at
+/// `store_root`, and the pipeline runs the ordered/concurrent split with
+/// an encode pool of `workers` threads over that same sink. Returns the
+/// sink handle for quiesce-then-inspect assertions.
+pub fn pooled_wal_pipeline(
+    root: &Path,
+    store_root: &Path,
+    workers: usize,
+) -> (SharedPipeline, SharedParquetSink) {
+    std::fs::create_dir_all(store_root).expect("create store root");
+    let wal = Wal::open(wal_config(root)).expect("open WAL");
+    let sink = SharedParquetSink::new(ParquetRecordSink::new(
+        Store::local(store_root).expect("local store"),
+        never_flush(),
+    ));
+    let miner = MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+    let pipeline = IngestPipeline::new(
+        coordinator(Box::new(wal)),
+        miner,
+        TenantRule::service_name(),
+    )
+    .with_encode_pool(EncodePool::new(&sink, workers));
+    (Arc::new(pipeline), sink)
+}
+
 /// [`capturing_pipeline`] with an RFC 0026 denial audit sink attached.
 pub fn capturing_pipeline_with_denial_audit(
     sink: Box<dyn ourios_core::audit::AuditSink + Send>,

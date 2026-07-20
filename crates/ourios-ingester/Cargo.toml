@@ -145,6 +145,9 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # Proptest strategy over the OTLP proto value space for the
 # wire-decode equivalence scenarios (RFC0003.5/.6 per §8).
 proptest = "=1.11.0"
+# `proptest_cases` (the PROPTEST_CASES override convention) for the
+# RFC0035.1 interleaving property.
+ourios-testgen = { path = "../ourios-testgen" }
 # Stand up an in-memory MeterProvider to assert the compaction metric
 # stream; `testing` exposes `init_in_memory`.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }

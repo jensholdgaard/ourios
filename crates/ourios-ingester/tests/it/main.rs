@@ -42,3 +42,6 @@ mod rfc0022_promoted_threading;
 mod rfc0023_overflow_roundtrip;
 mod rfc0026_auth;
 mod rfc0030_tls;
+mod rfc0035_1_concurrent_determinism;
+mod rfc0035_2_encode_barrier;
+mod rfc0035_5_on_disk_equivalence;

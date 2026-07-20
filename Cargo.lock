@@ -3344,6 +3344,7 @@ dependencies = [
  "ourios-parquet",
  "ourios-semconv",
  "ourios-telemetry",
+ "ourios-testgen",
  "ourios-wal",
  "parquet",
  "proptest",

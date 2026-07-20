@@ -47,7 +47,9 @@ use ourios_ingester::receiver::pipeline::{Journal, ReceiveError};
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
-use ourios_parquet::{CompactionPolicy, PartitionKey, Store, plan_candidates};
+use ourios_parquet::{
+    CompactionPolicy, PartitionKey, Store, percent_encode_tenant, plan_candidates,
+};
 use ourios_wal::{Wal, WalConfig, WalOffset};
 use serde::Serialize;
 
@@ -173,8 +175,12 @@ pub struct D2Verdict {
     pub max_backlog_partitions: usize,
     /// Candidates still pending after the final drain sweep.
     pub final_backlog_partitions: usize,
-    /// The backlog series hit zero at least once after its maximum
-    /// (trivially true when it never rose above zero).
+    /// The backlog drained after its maximum: either the sample series
+    /// itself hit zero at least once after the max, **or** the post-load
+    /// drain sweep brought the final backlog to zero — the drain sweep
+    /// reaching zero is itself the return-to-zero evidence, observed at
+    /// the end of the run rather than mid-series. Trivially true when
+    /// the backlog never rose above zero.
     pub returned_to_zero_after_max: bool,
 }
 
@@ -183,8 +189,11 @@ pub struct D2Verdict {
 pub struct SoakReport {
     pub config: SoakConfig,
     /// Wall seconds from first batch to last ack (includes the drain of
-    /// in-flight batches).
-    pub wall_secs: f64,
+    /// in-flight batches) — the rate denominator for the §D1 numbers.
+    pub load_wall_secs: f64,
+    /// Wall seconds for the whole run, including the sampler join and
+    /// the final drain sweep; every sample's `wall_secs` is ≤ this.
+    pub total_wall_secs: f64,
     pub lines_acked: u64,
     pub batches_acked: u64,
     pub batches_failed: u64,
@@ -192,6 +201,12 @@ pub struct SoakReport {
     /// `achieved_lines_per_sec / worker_threads` — the §D1 per-core rate.
     pub per_core_lines_per_sec: f64,
     pub latency: LatencySummary,
+    /// Ack observations offered to the recorder (one per acked batch).
+    pub latency_samples_total: u64,
+    /// Observations retained as the percentile basis after the bounded
+    /// recorder's decimation (a systematic 1-in-2^k sample once the
+    /// stored cap is hit, so percentiles stay valid at bounded memory).
+    pub latency_samples_stored: usize,
     pub samples: Vec<BacklogSample>,
     pub total_partitions_compacted: usize,
     pub d1: D1Verdict,
@@ -345,7 +360,9 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
     }));
 
     run_load(&pipeline, &clock, config, &stats, pace).await;
-    let wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
+    // The D1 rate denominator stops here — the sampler join and the
+    // drain sweep below are measurement overhead, not load.
+    let load_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
 
     stop.store(true, Ordering::Relaxed);
     // A sampler panic loses the timeseries but not the run; report with
@@ -381,10 +398,12 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
         }
     };
     samples.push(drain_sample);
+    let total_wall_secs = as_f64(saturating_u64(clock.started.elapsed().as_millis())) / 1_000.0;
 
     Ok(build_report(
         config,
-        wall_secs,
+        load_wall_secs,
+        total_wall_secs,
         &stats,
         samples,
         final_backlog,
@@ -393,27 +412,31 @@ async fn soak(config: &SoakConfig) -> Result<SoakReport, SoakError> {
 
 fn build_report(
     config: &SoakConfig,
-    wall_secs: f64,
+    load_wall_secs: f64,
+    total_wall_secs: f64,
     stats: &LoadStats,
     samples: Vec<BacklogSample>,
     final_backlog: usize,
 ) -> SoakReport {
-    let mut latencies = stats
-        .latencies_us
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let (mut latencies, latency_samples_total) = {
+        let mut recorder = stats
+            .latencies_us
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (std::mem::take(&mut recorder.samples), recorder.total)
+    };
     latencies.sort_unstable();
+    let latency_samples_stored = latencies.len();
     let latency = LatencySummary {
         p50_ms: us_to_ms(percentile_us(&latencies, 50, 100)),
         p95_ms: us_to_ms(percentile_us(&latencies, 95, 100)),
         p99_ms: us_to_ms(percentile_us(&latencies, 99, 100)),
         max_ms: us_to_ms(latencies.last().copied().unwrap_or(0)),
     };
-    drop(latencies);
 
     let lines_acked = stats.lines_acked.load(Ordering::Relaxed);
-    let achieved = if wall_secs > 0.0 {
-        as_f64(lines_acked) / wall_secs
+    let achieved = if load_wall_secs > 0.0 {
+        as_f64(lines_acked) / load_wall_secs
     } else {
         0.0
     };
@@ -424,13 +447,16 @@ fn build_report(
     let p99_ms = latency.p99_ms;
     SoakReport {
         config: config.clone(),
-        wall_secs,
+        load_wall_secs,
+        total_wall_secs,
         lines_acked,
         batches_acked: stats.batches_acked.load(Ordering::Relaxed),
         batches_failed: stats.batches_failed.load(Ordering::Relaxed),
         achieved_lines_per_sec: achieved,
         per_core_lines_per_sec: per_core,
         latency,
+        latency_samples_total,
+        latency_samples_stored,
         samples,
         total_partitions_compacted: total_compacted,
         d1: d1_verdict(per_core, p99_ms),
@@ -452,7 +478,9 @@ pub fn d1_verdict(per_core_lines_per_sec: f64, p99_ack_ms: f64) -> D1Verdict {
 }
 
 /// The §D2 verdict over the per-sample backlog series and the
-/// post-drain-sweep final backlog.
+/// post-drain-sweep final backlog. A `final_backlog` of zero counts as
+/// the return-to-zero evidence even when no mid-series sample caught
+/// the backlog at zero (see [`D2Verdict::returned_to_zero_after_max`]).
 #[must_use]
 pub fn d2_verdict(backlog_series: &[usize], final_backlog: usize) -> D2Verdict {
     let max = backlog_series.iter().copied().max().unwrap_or(0);
@@ -502,9 +530,67 @@ pub fn percentile_us(sorted: &[u64], num: usize, den: usize) -> u64 {
 // Load generation
 // ----------------------------------------------------------------------
 
+/// Cap on stored ack-latency samples (2^22 × 8 B = 32 MiB). Unbounded
+/// storage would reach hundreds of millions of entries over an hour at
+/// 100k lines/s with a small batch size.
+const LATENCY_SAMPLE_CAP: usize = 1 << 22;
+
+/// Bounded ack-latency recorder: stores every observation until the cap,
+/// then decimates by two. The retained set is always the *systematic*
+/// 1-in-2^`shift` sample of the observation stream (an observation is
+/// kept iff its index ≡ 0 mod 2^`shift`), a property halving preserves —
+/// so percentiles over the retained set stay valid estimates of the full
+/// stream at bounded memory.
+struct LatencyRecorder {
+    samples: Vec<u64>,
+    /// log2 of the decimation stride: observation `i` is retained iff
+    /// `i % (1 << shift) == 0`.
+    shift: u32,
+    /// Observations offered, retained or not.
+    total: u64,
+    cap: usize,
+}
+
+impl Default for LatencyRecorder {
+    fn default() -> Self {
+        Self::with_cap(LATENCY_SAMPLE_CAP)
+    }
+}
+
+impl LatencyRecorder {
+    /// A cap below 2 could never halve; clamp so `record` always makes
+    /// progress.
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            samples: Vec::new(),
+            shift: 0,
+            total: 0,
+            cap: cap.max(2),
+        }
+    }
+
+    fn record(&mut self, value_us: u64) {
+        let index = self.total;
+        self.total += 1;
+        let stride = 1u64.checked_shl(self.shift).unwrap_or(u64::MAX);
+        if !index.is_multiple_of(stride) {
+            return;
+        }
+        self.samples.push(value_us);
+        if self.samples.len() >= self.cap {
+            // Keep every other retained sample: retained observation
+            // indices go from multiples of 2^shift to multiples of
+            // 2^(shift+1), matching the go-forward stride.
+            let halved: Vec<u64> = self.samples.iter().copied().step_by(2).collect();
+            self.samples = halved;
+            self.shift += 1;
+        }
+    }
+}
+
 #[derive(Default)]
 struct LoadStats {
-    latencies_us: Mutex<Vec<u64>>,
+    latencies_us: Mutex<LatencyRecorder>,
     lines_acked: AtomicU64,
     batches_acked: AtomicU64,
     batches_failed: AtomicU64,
@@ -519,10 +605,20 @@ async fn run_load(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut ticker = tokio::time::interval(pace);
+    // A stall must not burst back-to-back catch-up batches (default
+    // `Burst`) — that breaks the paced-load assumption and inflates
+    // in-flight depth; `Delay` keeps a full pace gap, as the sampler does.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline = clock.started + Duration::from_secs(config.duration_secs);
     let mut batch_idx = 0u64;
-    while Instant::now() < deadline {
+    loop {
         ticker.tick().await;
+        // Deadline check *after* the tick: a tick landing past the
+        // deadline must not schedule one extra batch, or the last batch
+        // would fall outside the wall/rate accounting window.
+        if Instant::now() >= deadline {
+            break;
+        }
         let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
             break; // Closed semaphore: cannot happen while we hold it.
         };
@@ -547,7 +643,7 @@ async fn run_load(
                         .latencies_us
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .push(elapsed_us);
+                        .record(elapsed_us);
                 }
                 Err(_) => {
                     stats.batches_failed.fetch_add(1, Ordering::Relaxed);
@@ -872,13 +968,19 @@ struct SamplerCtx {
     stop: Arc<AtomicBool>,
 }
 
-/// Sample + sweep on a fixed wall cadence until stopped. Sequential by
-/// construction: each sweep completes before the next tick is awaited,
+/// Sample + sweep on an aligned wall cadence until stopped: ticks are
+/// scheduled every `every` from the sampler's start (first at
+/// `start + every`), so the period does not stretch by each sample's
+/// blocking work. A sample that overruns its period delays the next
+/// tick by a full `every` (`MissedTickBehavior::Delay`) rather than
+/// bursting — and each sweep completes before the next tick is awaited,
 /// so sweeps never overlap.
 async fn run_sampler(ctx: SamplerCtx) -> Vec<BacklogSample> {
     let mut samples = Vec::new();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + ctx.every, ctx.every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::time::sleep(ctx.every).await;
+        ticker.tick().await;
         if ctx.stop.load(Ordering::Relaxed) {
             break;
         }
@@ -955,28 +1057,36 @@ fn error_sample(wall_secs: f64, synthetic_now: u64) -> BacklogSample {
 /// The candidate backlog as of `now`: sealed candidate partitions and
 /// the summed size of their Parquet files (derived from the store
 /// listing — the backlog has no stored byte counter).
+///
+/// One tenant-wide listing per call, matched against the candidates'
+/// partition prefixes — not one listing per candidate. On a non-local
+/// store every listing is a remote call, so the per-sample list cost
+/// must stay bounded regardless of backlog depth.
 fn backlog(store: &Store, now: u64, policy: &CompactionPolicy) -> (usize, u64, usize) {
-    match plan_candidates(store, TENANT, now, policy) {
-        Ok(candidates) => {
-            let mut bytes = 0u64;
-            let mut errors = 0usize;
-            for key in &candidates {
-                match store.list_with_sizes_blocking(Some(&partition_prefix(key))) {
-                    Ok(entries) => {
-                        bytes = bytes.saturating_add(
-                            entries
-                                .iter()
-                                .filter(|(key, _)| key.ends_with(".parquet"))
-                                .map(|(_, size)| *size)
-                                .sum(),
-                        );
-                    }
-                    Err(_) => errors += 1,
-                }
-            }
-            (candidates.len(), bytes, errors)
+    let Ok(candidates) = plan_candidates(store, TENANT, now, policy) else {
+        return (0, 0, 1);
+    };
+    if candidates.is_empty() {
+        return (0, 0, 0);
+    }
+    let prefixes: Vec<String> = candidates
+        .iter()
+        .map(|key| format!("{}/", partition_prefix(key)))
+        .collect();
+    let tenant_prefix = format!("data/tenant_id={}", percent_encode_tenant(TENANT));
+    match store.list_with_sizes_blocking(Some(&tenant_prefix)) {
+        Ok(entries) => {
+            let bytes = entries
+                .iter()
+                .filter(|(key, _)| {
+                    key.ends_with(".parquet")
+                        && prefixes.iter().any(|p| key.starts_with(p.as_str()))
+                })
+                .map(|(_, size)| *size)
+                .fold(0u64, u64::saturating_add);
+            (candidates.len(), bytes, 0)
         }
-        Err(_) => (0, 0, 1),
+        Err(_) => (candidates.len(), 0, 1),
     }
 }
 
@@ -1099,6 +1209,61 @@ mod tests {
         let v = d2_verdict(&[0, 3, 0, 1], 0);
         assert_eq!(v.max_backlog_partitions, 3);
         assert!(v.returned_to_zero_after_max);
+        // The drain sweep reaching zero is itself the return-to-zero
+        // evidence: the mid-series never hits zero after its max here.
+        let drained_only = d2_verdict(&[1, 2, 2], 0);
+        assert!(drained_only.returned_to_zero_after_max);
+        assert!(
+            !d2_verdict(&[1, 2, 2], 1).returned_to_zero_after_max,
+            "without the drain reaching zero, this series never returned",
+        );
+    }
+
+    /// The bounded recorder keeps a systematic 1-in-2^k sample: with
+    /// cap 8 over observations 0..32, three halvings leave exactly the
+    /// multiples of 8, and `total` still counts every observation.
+    #[test]
+    fn latency_recorder_decimates_to_a_systematic_sample() {
+        let mut recorder = LatencyRecorder::with_cap(8);
+        for i in 0..32u64 {
+            recorder.record(i);
+        }
+        assert_eq!(recorder.total, 32);
+        assert_eq!(recorder.samples, vec![0, 8, 16, 24]);
+
+        // Below the cap nothing is dropped.
+        let mut small = LatencyRecorder::with_cap(8);
+        for i in 0..5u64 {
+            small.record(i);
+        }
+        assert_eq!(small.total, 5);
+        assert_eq!(small.samples, vec![0, 1, 2, 3, 4]);
+        assert_eq!(small.shift, 0);
+    }
+
+    /// A tick landing past the deadline must not schedule one extra
+    /// batch: with a 400 ms pace and a 1 s deadline only the ticks at
+    /// ~0/400/800 ms may send (3 batches); the tick at ~1200 ms breaks
+    /// first. Delayed ticks under load can only reduce the count.
+    #[test]
+    fn load_loop_schedules_no_batch_past_the_deadline() {
+        let config = SoakConfig {
+            duration_secs: 1,
+            target_lines_per_sec: 250,
+            batch_size: 100, // pace = 100 / 250 = 400 ms
+            time_compression: 1,
+            sample_every_secs: 1,
+            sink_target_bytes: 4 * 1024 * 1024,
+            seed: 7,
+            worker_threads: 2,
+        };
+        let report = run_soak(&config).expect("deadline soak runs");
+        let batches = report.batches_acked + report.batches_failed;
+        assert!(
+            (1..=3).contains(&batches),
+            "3 ticks fit before the 1 s deadline, got {batches}",
+        );
+        assert!(report.lines_acked <= 300);
     }
 
     #[test]
@@ -1179,9 +1344,34 @@ mod tests {
         assert_eq!(report.batches_failed, 0, "no batch failed to commit");
         assert!(report.latency.p99_ms > 0.0, "latencies were recorded");
         assert!(report.achieved_lines_per_sec > 0.0);
+        assert_eq!(
+            report.latency_samples_total, report.batches_acked,
+            "one latency observation per acked batch",
+        );
+        assert!(report.latency_samples_stored <= saturating_usize(report.latency_samples_total));
+        assert!(
+            report.total_wall_secs >= report.load_wall_secs,
+            "total wall covers the sampler join + drain sweep",
+        );
+        for sample in &report.samples {
+            assert!(
+                sample.wall_secs <= report.total_wall_secs,
+                "no sample timestamp past the run's total wall: {sample:?}",
+            );
+        }
         assert!(
             report.samples.iter().any(|s| s.backlog_partitions > 0),
             "some sample observed a sealed candidate partition: {:?}",
+            report.samples,
+        );
+        assert!(
+            report
+                .samples
+                .iter()
+                .filter(|s| s.backlog_partitions > 0)
+                .all(|s| s.backlog_bytes > 0),
+            "candidate partitions carry bytes (the tenant-wide listing \
+             matched their prefixes): {:?}",
             report.samples,
         );
         assert!(

@@ -271,8 +271,10 @@ fn run_soak_command(args: SoakArgs) -> Result<ExitCode, String> {
 /// One-line-per-gate soak summary, mirroring [`print_summary`]'s shape.
 fn print_soak_summary(report: &SoakReport) {
     println!(
-        "soak — {:.1}s wall at target {} lines/s (batch {}, {} worker(s), ×{} synthetic time)",
-        report.wall_secs,
+        "soak — {:.1}s load / {:.1}s total wall at target {} lines/s (batch {}, {} worker(s), \
+         ×{} synthetic time)",
+        report.load_wall_secs,
+        report.total_wall_secs,
         report.config.target_lines_per_sec,
         report.config.batch_size,
         report.config.worker_threads,

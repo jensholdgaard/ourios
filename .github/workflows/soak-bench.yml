@@ -85,7 +85,7 @@ jobs:
               echo
               echo 'Run shape:'
               echo '```'
-              jq -r '"wall \(.wall_secs)s · \(.lines_acked) lines acked (\(.batches_acked) batches, \(.batches_failed) failed) · \(.total_partitions_compacted) partitions compacted over \(.samples | length) samples"' soak-report.json
+              jq -r '"wall \(.load_wall_secs)s load / \(.total_wall_secs)s total · \(.lines_acked) lines acked (\(.batches_acked) batches, \(.batches_failed) failed) · \(.total_partitions_compacted) partitions compacted over \(.samples | length) samples · latency basis \(.latency_samples_stored)/\(.latency_samples_total) samples"' soak-report.json
               echo '```'
             else
               echo '_No soak-report.json — the run failed before producing it._'

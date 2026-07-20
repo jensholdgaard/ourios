@@ -218,7 +218,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       - id: attest
         name: Attest
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-path: "${{ steps.attest-paths.outputs.paths }}"
       # Also ship the attestation bundle as a release *asset*
@@ -337,7 +337,7 @@ jobs:
       # build-provenance predicate as the local step.
       - id: attest-global
         name: Attest global artifacts
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-path: |
             ${{ steps.cargo-dist.outputs.paths }}

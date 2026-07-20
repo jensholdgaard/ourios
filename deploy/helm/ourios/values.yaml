@@ -103,6 +103,19 @@ receiver:
     storageClassName: ""
     accessModes:
       - ReadWriteOnce
+  # Optional role-scoped ServiceAccount (least-privilege object-store access:
+  # give each role its own IAM identity — see "Per-role IAM" in the README).
+  # create=false (default) uses the shared serviceAccount below. With IRSA,
+  # annotate with this role's eks.amazonaws.com/role-arn — the receiver's
+  # role needs s3:PutObject ONLY (its production path never reads, lists,
+  # or deletes). `name`:
+  # create=true + empty name renders `<fullname>-receiver`;
+  # create=true + name overrides that; create=false + name binds an
+  # EXISTING ServiceAccount of that name (managed out-of-band).
+  serviceAccount:
+    create: false
+    annotations: {}
+    name: ""
   resources: {}
   podAnnotations: {}
   podLabels: {}
@@ -117,6 +130,12 @@ querier:
   # Default look-back for a query with no range(...) stage, in seconds
   # (OURIOS_QUERIER_DEFAULT_WINDOW_SECS; RFC 0016 §7). Must be non-zero.
   defaultWindowSecs: 3600
+  # Optional role-scoped ServiceAccount (see receiver.serviceAccount). The
+  # querier's IAM role is read-only: Get/List, no writes, no deletes.
+  serviceAccount:
+    create: false
+    annotations: {}
+    name: ""
   resources: {}
   podAnnotations: {}
   podLabels: {}
@@ -129,6 +148,12 @@ compactor:
   enabled: true
   # Sweep cadence (OURIOS_COMPACTION_INTERVAL_SECS), used only by this compactor.
   intervalSecs: 300
+  # Optional role-scoped ServiceAccount (see receiver.serviceAccount). The
+  # compactor is the only role whose IAM role holds s3:DeleteObject.
+  serviceAccount:
+    create: false
+    annotations: {}
+    name: ""
   resources: {}
   podAnnotations: {}
   podLabels: {}
@@ -147,12 +172,16 @@ extraEnv: []
   # - name: OTEL_EXPORTER_OTLP_PROTOCOL
   #   value: http/protobuf
 
+# The shared ServiceAccount, used by every role that does not define its own
+# role-scoped one (receiver/querier/compactor .serviceAccount, above).
 serviceAccount:
   create: true
   automount: true
   # IRSA (AWS EKS-specific credential mode): set
   #   eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
-  # as an alternative to storage.s3.existingSecret (mutually exclusive).
+  # as an alternative to storage.s3.existingSecret (mutually exclusive). A
+  # role-arn here grants ONE identity to all three roles; prefer the per-role
+  # ServiceAccounts for the least-privilege split (README "Per-role IAM").
   annotations: {}
   name: ""
 

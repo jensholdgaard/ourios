@@ -1,7 +1,7 @@
 ---
 rfc: 0034
 title: D1 re-scope — ingest throughput is a per-node capacity on baseline hardware, not a per-core rate
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-20
@@ -23,7 +23,13 @@ superseded-by: —
 > a global serialization), which spawned RFC 0035 (ingest concurrency)
 > first. This RFC now recalibrates D1 against RFC 0035 Design A's
 > measured capacity (§9.22). It amends only the `benchmarks.md` § D1
-> block and §7 gate table; no code, no on-disk byte.
+> block and §7 gate table; no code, no on-disk byte. Per
+> `docs/rfcs/README.md`, **`specified`** means the §5 acceptance
+> criteria are written and review has confirmed them testable in
+> principle — the #575 review round did exactly that (tightening
+> RFC0034.2 to an observable below-saturation condition and a
+> deterministic N); RFC0034.2's assertion additionally waits on
+> RFC 0035 reaching `green`.
 
 ## 1. Summary
 

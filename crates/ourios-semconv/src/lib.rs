@@ -69,6 +69,9 @@ pub const OURIOS_COMPACTION_SWEEPS: &str = "ourios.compaction.sweeps";
 /// `ourios.ingest.batches` (counter, unit `{batch}`).
 pub const OURIOS_INGEST_BATCHES: &str = "ourios.ingest.batches";
 
+/// `ourios.ingest.encode.queue_depth` (updowncounter, unit `{batch}`).
+pub const OURIOS_INGEST_ENCODE_QUEUE_DEPTH: &str = "ourios.ingest.encode.queue_depth";
+
 /// `ourios.ingest.records` (counter, unit `{record}`).
 pub const OURIOS_INGEST_RECORDS: &str = "ourios.ingest.records";
 

@@ -275,6 +275,18 @@ groups:
       - ref: ourios.ingest.json.lenient
         requirement_level: recommended
 
+  - id: metric.ourios.ingest.encode.queue_depth
+    type: metric
+    metric_name: ourios.ingest.encode.queue_depth
+    stability: development
+    brief: >-
+      Encode batches submitted to the concurrent encode pool and not yet
+      emitted to the record sink (RFC 0035 §3.1). The pool's queue is
+      bounded, so a persistently high depth means encode-bound
+      backpressure is reaching the ingest gate.
+    instrument: updowncounter
+    unit: "{batch}"
+
   - id: metric.ourios.wal.append.duration
     type: metric
     metric_name: ourios.wal.append.duration

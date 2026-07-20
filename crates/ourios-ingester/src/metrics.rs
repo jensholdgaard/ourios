@@ -365,6 +365,48 @@ impl Default for IngestMetrics {
     }
 }
 
+/// Encode-pool instruments (RFC 0035 §6.3): the concurrent encode
+/// queue's current depth. Built once per pool on the global
+/// `ourios.ingest` meter; recording is a no-op when no provider is
+/// installed (RFC 0001 §6.8 API/SDK split).
+#[derive(Debug)]
+pub struct EncodePoolMetrics {
+    queue_depth: UpDownCounter<i64>,
+}
+
+impl EncodePoolMetrics {
+    /// Build the pool instruments with their registry units.
+    #[must_use]
+    pub fn new() -> Self {
+        let meter = global::meter("ourios.ingest");
+        let queue_depth = meter
+            .i64_up_down_counter(semconv::OURIOS_INGEST_ENCODE_QUEUE_DEPTH)
+            .with_unit("{batch}")
+            .build();
+        // Seed so the gauge is visible before the first submitted batch
+        // (collect-on-read).
+        queue_depth.add(0, &[]);
+        Self { queue_depth }
+    }
+
+    /// A batch entered the encode queue.
+    pub fn batch_submitted(&self) {
+        self.queue_depth.add(1, &[]);
+    }
+
+    /// A batch left the queue (fully emitted to the record sink, or
+    /// undone because the pool was already shutting down).
+    pub fn batch_completed(&self) {
+        self.queue_depth.add(-1, &[]);
+    }
+}
+
+impl Default for EncodePoolMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Record-sink instruments (RFC 0014 §6.3): flush throughput + latency by
 /// trigger, flush/derive errors, and current buffer occupancy. Built once
 /// per sink on the global `ourios.sink` meter.

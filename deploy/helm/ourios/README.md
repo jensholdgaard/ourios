@@ -160,6 +160,108 @@ For a **non-AWS provider**, also set `storage.s3.endpoint` to its S3 endpoint UR
 `storage.s3.region` to the provider's region (or a placeholder like `us-east-1`
 if it has none).
 
+## Per-role IAM (least privilege)
+
+A single credential shared by all three workloads holds the union of their
+privileges — a compromised querier could then delete data it never needed to
+touch. The roles' object-store needs are strictly narrower, and they split
+cleanly:
+
+| Role      | S3 actions                                            | Holds delete? |
+| --------- | ----------------------------------------------------- | ------------- |
+| querier   | `GetObject`, `ListBucket` (see cache note)            | no            |
+| receiver  | `PutObject` only                                      | no            |
+| compactor | `GetObject`, `PutObject`, `DeleteObject`, `ListBucket`| **only one**  |
+
+The receiver only *writes* data/audit objects — its production path never
+issues a read, list, or delete against the store. Manifest swaps (conditional
+`PutObject`) belong to the compaction path, and reclaiming compacted inputs is
+the compactor's job alone; the querier only reads. With this split, a
+compromised receiver can pollute but neither read nor destroy history, a
+compromised querier can read but not destroy, and *nothing* except the
+singleton compactor can delete data.
+
+**Querier cache note (RFC 0033):** after a cache miss the querier attempts a
+*best-effort* write-through of its template-map cache artifact (and cleanup of
+the stale v1 key). Under the read-only policy above this publish simply fails —
+**by contract that never fails a query** (it is a telemetry-only outcome), but
+the cache never populates, so every query re-pays the audit fold. To keep the
+cache warm without widening the read path, grant the querier `PutObject` +
+`DeleteObject` scoped to the one cache key it writes:
+`arn:aws:s3:::<bucket>/audit/tenant_id=*/template_map*` (with a
+`storage.s3.prefix`, `arn:aws:s3:::<bucket>/<prefix>/audit/tenant_id=*/template_map*`)
+— the querier still cannot touch data objects.
+
+Each role opts into its own ServiceAccount (falling back to the shared
+`serviceAccount` otherwise), carrying its own IRSA role:
+
+```sh
+helm install ourios ./ourios \
+  --set storage.backend=s3 --set storage.s3.bucket=<bucket> \
+  --set receiver.serviceAccount.create=true \
+  --set receiver.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/ourios-receiver \
+  --set querier.serviceAccount.create=true \
+  --set querier.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/ourios-querier \
+  --set compactor.serviceAccount.create=true \
+  --set compactor.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::<acct>:role/ourios-compactor \
+  --set serviceAccount.create=false
+```
+
+(The last flag skips the shared ServiceAccount — with all three roles on
+their own accounts it would be rendered but unused.)
+
+Because IRSA credentials come from STS, they are **short-lived and rotated
+automatically** — no static key exists to leak or forget to rotate. Each IAM
+role's trust policy federates to its ServiceAccount
+(`system:serviceaccount:<namespace>:<fullname>-<role>` — check the
+rendered name with `helm template`, since the chart's fullname collapses
+to the release name when it already contains "ourios"); `eksctl create
+iamserviceaccount` or the Terraform `iam-role-for-service-accounts` module wires
+this in one step. The permission policy per role (swap the `Action` list per the
+table; the example shows the `storage.s3.prefix`-scoped form — with no
+prefix, drop the `Condition` and use `<bucket>/*` on the object arn):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<bucket>/<prefix>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": { "StringLike": { "s3:prefix": "<prefix>/*" } }
+    }
+  ]
+}
+```
+
+(Without the `s3:prefix` condition, `ListBucket` on the bucket arn allows
+listing **every** key in the bucket — object access would be scoped but
+listing would not.)
+
+Two hardening notes:
+
+- **Second control on deletes**: S3 versioning (or object lock) on the bucket
+  makes the compactor's `DeleteObject` reversible — destructive action then
+  requires defeating two independent mechanisms, not one.
+- **Non-AWS providers**: the same split works anywhere the provider offers
+  scoped credentials (MinIO policies, Ceph users, R2 API tokens) — issue three
+  static credentials with the table's permissions and give each role its own
+  `Secret` out-of-band. The chart's `storage.s3.existingSecret` currently wires
+  one shared Secret; per-role static Secrets need per-role values files or
+  out-of-band env injection.
+
+For mTLS identity rotation (SPIRE, cert-manager): the binary hot-reloads its TLS
+listener certificates (RFC 0030), so a sidecar like `spiffe-helper` writing
+rotating certs to a shared volume integrates without restarts. TLS listener
+config is delivered via the RFC 0020 config file out-of-band today — chart-level
+TLS values are not yet exposed.
+
 ## Compactor topology
 
 The `ourios-server` binary runs the compaction role by default. To avoid every
@@ -198,7 +300,10 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `querier.defaultWindowSecs` | `3600` | Default look-back for a query with no `range(...)`. |
 | `compactor.enabled` | `true` | Dedicated singleton compactor Deployment. Setting `false` **fails render** (the only sweeper — hazard #4). |
 | `compactor.intervalSecs` | `300` | Compaction sweep cadence (used only by the dedicated compactor). |
-| `serviceAccount.annotations` | `{}` | AWS EKS IRSA `eks.amazonaws.com/role-arn` goes here (alternative to `storage.s3.existingSecret`). |
+| `serviceAccount.annotations` | `{}` | AWS EKS IRSA `eks.amazonaws.com/role-arn` goes here (alternative to `storage.s3.existingSecret`). One identity for all roles — prefer the per-role split. |
+| `<role>.serviceAccount.create` | `false` | Role-scoped ServiceAccount for `receiver`/`querier`/`compactor` — the least-privilege IAM seam ("Per-role IAM" above). `false` falls back to the shared `serviceAccount`. |
+| `<role>.serviceAccount.annotations` | `{}` | The role's own IRSA `role-arn` (querier read-only, receiver no-delete, compactor sole delete-holder). |
+| `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<fullname>-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
 | `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |
 | `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |
 

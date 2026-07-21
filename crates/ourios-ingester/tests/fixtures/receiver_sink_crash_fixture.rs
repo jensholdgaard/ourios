@@ -7,14 +7,20 @@
 //! [`ParquetRecordSink`] so the acknowledged records sit in the in-memory
 //! flush buffer at crash time.
 //!
-//! Usage: `receiver_sink_crash_fixture <wal_root> <bucket_root>`. Builds an
-//! `IngestPipeline` over a real `Wal` whose miner emits into a sink (a
-//! never-flush [`FlushConfig`], so nothing reaches the store), ingests one
-//! known batch (append + fsync = acknowledged), asserts the batch is buffered
-//! but **un-flushed** (the store is still empty), prints `READY`, and parks.
-//! The parent kills it after `READY` — the volatile buffer dies with the
-//! process; only the WAL is durable, so recovery must reconstruct the batch
-//! from it (RFC0014.5 / `CLAUDE.md` §3.4).
+//! Usage: `receiver_sink_crash_fixture <wal_root> <bucket_root> [window]`.
+//! Builds an `IngestPipeline` over a real `Wal` whose miner emits into a sink
+//! (nothing reaches the store), ingests one known batch (append + fsync =
+//! acknowledged), asserts the batch is **un-flushed** (the store is still
+//! empty), prints `READY`, and parks. The parent kills it after `READY`;
+//! only the WAL is durable, so recovery must reconstruct the batch from it
+//! (RFC0014.5 / `CLAUDE.md` §3.4).
+//!
+//! `window` selects where the acked records sit at crash time:
+//! - `buffer` (default): in the in-memory flush buffer (RFC0014.5).
+//! - `sweep`: drained **out** of the buffers by the age sweep's atomic
+//!   drain, with the off-lock `write_ordered` (the slow S3 PUT) still in
+//!   flight — the issue #578 window, where the records' only copies are
+//!   this process's memory and the WAL.
 
 use std::io::Write;
 use std::time::Duration;
@@ -25,6 +31,8 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ourios_config::MinerConfig;
+use ourios_ingester::audit_sink::{BufferingAuditSink, SharedParquetAuditSink};
+use ourios_ingester::publish::PublishCoordinator;
 use ourios_ingester::receiver::{CommitCoordinator, IngestPipeline, TenantRule};
 use ourios_ingester::record_sink::{FlushConfig, ParquetRecordSink, SharedParquetSink};
 use ourios_miner::cluster::MinerCluster;
@@ -42,6 +50,7 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let wal_root = args.next().expect("fixture: missing <wal_root> arg");
     let bucket_root = args.next().expect("fixture: missing <bucket_root> arg");
+    let crash_window = args.next().unwrap_or_else(|| "buffer".to_owned());
 
     let config = WalConfig {
         root: wal_root.into(),
@@ -55,14 +64,20 @@ async fn main() {
     let segment_size_bytes = config.segment_size_bytes;
     let wal = Wal::open(config).expect("fixture: Wal::open");
 
-    // Never-flush config: no size/age/ceiling trigger fires, so the batch
-    // stays in the in-memory buffer and nothing reaches the store.
+    // No size/age/ceiling trigger fires on emit, so the batch stays in the
+    // in-memory buffer and nothing reaches the store. The `sweep` window uses
+    // a zero buffer age so the age sweep's `drain_aged` takes the partition.
     let store = Store::local(&bucket_root).expect("fixture: Store::local");
+    let max_buffer_age = match crash_window.as_str() {
+        "buffer" => Duration::from_secs(86_400),
+        "sweep" => Duration::ZERO,
+        other => panic!("fixture: unknown window {other:?}"),
+    };
     let sink = SharedParquetSink::new(ParquetRecordSink::new(
-        store,
+        store.clone(),
         FlushConfig {
             target_bytes: usize::MAX,
-            max_buffer_age: Duration::from_secs(86_400),
+            max_buffer_age,
             ceiling_bytes: usize::MAX,
         },
     ));
@@ -120,8 +135,30 @@ async fn main() {
         "fixture: the acked records are buffered, not yet in the store",
     );
 
+    // The issue #578 window: run the age sweep's first half — the atomic
+    // drain under the miner lock — and hold the drained snapshot without
+    // ever starting its off-lock `write_ordered`, as if the store PUT hung.
+    // The records are now out of the buffers too; their only copies are this
+    // process's memory (killed below) and the WAL.
+    let _in_flight = match crash_window.as_str() {
+        "sweep" => {
+            let audit = SharedParquetAuditSink::new(BufferingAuditSink::new(store, 1024));
+            let coordinator = PublishCoordinator::new(sink.clone(), audit);
+            let drained = pipeline.with_miner(|_miner| coordinator.drain_aged());
+            assert!(!drained.is_empty(), "fixture: the sweep drained the batch");
+            assert_eq!(
+                sink.buffered_records(),
+                0,
+                "fixture: the acked records left the buffers — in flight",
+            );
+            Some(drained)
+        }
+        _ => None,
+    };
+
     // Signal durability, then park so the parent kills us *after* the fsync
-    // but before any flush — the crash-with-a-non-empty-buffer window.
+    // but before any flush — the crash-with-a-non-empty-buffer (or
+    // crash-mid-sweep-publish) window.
     let mut stdout = std::io::stdout();
     writeln!(stdout, "READY").expect("fixture: write READY");
     stdout.flush().expect("fixture: flush READY");

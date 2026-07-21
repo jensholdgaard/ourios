@@ -1201,6 +1201,145 @@ mod tests {
         assert_eq!(mark.byte, rotation_point.byte);
     }
 
+    /// A pooled pipeline over a real 1 s-age WAL, an **age-zero** record
+    /// sink (so `drain_aged` takes every partition — the sweep's view of an
+    /// aged one, without waiting out a real age), an audit sink, and the
+    /// production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    fn sweep_race_pipeline(
+        wal_root: &Path,
+        store_root: &Path,
+        audit_root: &Path,
+        snapshots_root: &Path,
+    ) -> (SharedPipeline, SharedParquetSink, SharedParquetAuditSink) {
+        let wal = Wal::open(WalConfig {
+            segment_age_secs: 1,
+            ..test_wal_config(wal_root)
+        })
+        .expect("open WAL");
+        std::fs::create_dir_all(store_root).expect("store root");
+        let sink = SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(store_root).expect("local store"),
+            FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::ZERO,
+                ceiling_bytes: usize::MAX,
+            },
+        ));
+        let audit = audit_sink(audit_root);
+        let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+            .with_record_sink(Box::new(sink.clone()));
+        let coordinator =
+            CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let pipeline = Arc::new(
+            IngestPipeline::new(coordinator, miner, TenantRule::service_name())
+                .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
+                .with_rotation_hook(rotation_snapshot_hook(
+                    sink.clone(),
+                    audit.clone(),
+                    snapshots_root.to_path_buf(),
+                )),
+        );
+        (pipeline, sink, audit)
+    }
+
+    /// Issue #578 — the publish half of the RFC0035.2 barrier: a rotation
+    /// firing while the age sweep's off-lock `write_ordered` is in flight
+    /// must not stamp `wal_high_water` until that publish settles. The
+    /// in-flight publish is the sweep's own two steps run by hand with the
+    /// gap held open — the atomic drain under the miner lock, then (held
+    /// back by the test) the off-lock ordered write — the exact window a
+    /// slow S3 PUT opens. Mutation check: reverting the `quiesce_publishes`
+    /// in `flush_then_snapshot` makes the rotation stamp during the window
+    /// and the mid-window assertion fail deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rfc0035_2_rotation_stamp_waits_for_the_sweeps_in_flight_publish() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        let snapshots_root = tmp.path().join("snapshots");
+        let (pipeline, sink, audit) = sweep_race_pipeline(
+            &tmp.path().join("wal"),
+            &store_root,
+            &tmp.path().join("audit"),
+            &snapshots_root,
+        );
+
+        // Batch A: acked, encoded, buffered (no trigger flushes it).
+        pipeline
+            .ingest(export_request(
+                "checkout",
+                &["user 1 logged in", "user 2 logged in"],
+            ))
+            .await
+            .expect("batch A acks");
+        let rotation_point = pipeline.last_durable().expect("durable after batch A");
+        pipeline.quiesce_encodes();
+        assert_eq!(sink.buffered_records(), 2, "batch A is buffered");
+
+        // Sweep half 1: the atomic drain under the miner lock. Batch A's
+        // records now exist only in `drained` and the WAL — the #578 window.
+        let coordinator = PublishCoordinator::new(sink.clone(), audit.clone());
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let sweep_pipeline = pipeline.clone();
+        let sweep = std::thread::spawn(move || {
+            let drained = sweep_pipeline.with_miner(|_miner| coordinator.drain_aged());
+            assert!(!drained.is_empty(), "the sweep drained batch A");
+            drained_tx.send(()).expect("signal drained");
+            release_rx.recv().expect("hold the write in flight");
+            assert!(
+                coordinator.write_ordered(drained, "age"),
+                "the held-back publish lands",
+            );
+        });
+        drained_rx.recv().expect("sweep drained");
+        assert_eq!(
+            sink.buffered_records(),
+            0,
+            "batch A left the buffers — in flight, durable nowhere but the WAL",
+        );
+
+        // The rotation races the in-flight publish: batch B lands in a new
+        // segment and fires the production hook on the ingest path.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let rotate_pipeline = pipeline.clone();
+        let rotation = tokio::spawn(async move {
+            rotate_pipeline
+                .ingest(export_request("checkout", &["payment 9 settled"]))
+                .await
+                .expect("batch B acks")
+        });
+
+        // Mid-window: the hook must be waiting in `quiesce_publishes`, not
+        // stamping. Without the barrier the rotation completes within the
+        // ~100 ms commit window, far inside this 800 ms observation point.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let snapshot_written = std::fs::read_dir(&snapshots_root)
+            .ok()
+            .is_some_and(|mut d| d.next().is_some());
+        assert!(
+            !snapshot_written,
+            "the stamp waits while the sweep's publish is in flight (issue #578)",
+        );
+
+        release_tx.send(()).expect("release the publish");
+        sweep.join().expect("sweep thread");
+        assert_eq!(rotation.await.expect("rotation task"), 1, "batch B acked");
+
+        // The stamp landed only after the publish settled: batch A is
+        // durably in the store and the snapshot carries the rotation mark.
+        assert!(
+            !data_parquet_files(&store_root.join("data")).is_empty(),
+            "batch A's records are durably in the store",
+        );
+        let artefacts =
+            ourios_ingester::snapshot_store::load_all(&snapshots_root).expect("load snapshots");
+        assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
+        let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
+        let mark = state.wal_high_water.expect("stamped with a horizon");
+        assert_eq!(mark.segment, rotation_point.segment.to_string());
+        assert_eq!(mark.byte, rotation_point.byte);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rfc0035_2_rotation_skips_the_stamp_when_the_flush_cannot_drain() {
         let tmp = tempfile::TempDir::new().expect("temp");

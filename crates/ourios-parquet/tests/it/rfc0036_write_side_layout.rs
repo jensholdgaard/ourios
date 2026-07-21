@@ -446,12 +446,28 @@ fn live_manifest_files(store: &Store, part: &PartitionKey) -> Vec<String> {
 /// Count committed `*.parquet` objects physically present under the
 /// partition prefix (what the H4 small-file detector counts).
 fn on_disk_parquet_count(store: &Store, part: &PartitionKey) -> usize {
+    // Mirror production `live_file_keys`: count only committed `.parquet`
+    // objects that are *immediate* children of the partition prefix.
+    // `Store::list*` walks the whole subtree, but a partition's files live
+    // directly under its prefix — a nested/sidecar object is not a
+    // partition file and must not inflate the H4 small-file count.
+    let prefix = partition_prefix(part);
     store
-        .list_blocking(Some(&partition_prefix(part)))
+        .list_blocking(Some(&prefix))
         .expect("list")
         .into_iter()
-        .filter(|k| k.ends_with(".parquet"))
+        .filter(|k| k.ends_with(".parquet") && is_immediate_child(k, &prefix))
         .count()
+}
+
+/// True when `key` is an immediate child object of `prefix`
+/// (`<prefix>/<name>` with no further `/`), tolerant of a trailing slash
+/// on `prefix`. Mirrors `compaction::is_immediate_child`.
+fn is_immediate_child(key: &str, prefix: &str) -> bool {
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    key.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
 /// Scenario RFC0036.3 — compaction properties preserved (D2 / D3 / memory).

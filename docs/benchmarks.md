@@ -1905,9 +1905,10 @@ pair and **passed every gate it printed** — L2 39.51× processed /
 1.275× storage floor, L1 97.56× storage, L4 84.93× processed /
 3.59× storage floor, both L6 latency floors — but **failed overall**:
 the L3 pair hit the known transient Loki-visibility flicker (`loki
-returned 0 of 9 expected rows … before timeout`), the same class the
-#490 flag fixes addressed and runs #11/#13/#21 hit before, so the
-harness hard-failed the run rather than salvage it. The decision
+returned 0 of 9 expected rows … before timeout`) — the class
+addressed by the #490 flag fixes, previously hit in runs
+#11/#13/#21 — so the harness hard-failed the run rather than
+salvage it. The decision
 rule applied: one deliberate, configuration-identical retry; had the
 flicker recurred, the next step would have been engineering, not
 rerolling. It did not recur. **Run 2 (5,556 s) is the counted
@@ -1919,7 +1920,8 @@ completeness 1147/1197 = 95.8% — inside the §7 0.90 margin and the
 §9.17 band (95.3–97.5%).
 
 **Run 2 — the counted numbers** (honest §3.6 totals; Loki bytes per
-channel; latency oriented loki_p50/ourios_p50, > 1 = Ourios faster):
+channel; latency oriented loki_p50/ourios_p50, where > 1 = Ourios
+faster):
 
 | pair | ourios bytes | loki storage / processed | gate verdicts | latency |
 |---|---|---|---|---|

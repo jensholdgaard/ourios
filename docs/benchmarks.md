@@ -309,8 +309,10 @@ the above matters.
 
 > **Recast per-node (RFC 0034; enacted 2026-07-21).** D1's original
 > metric was `lines/second/core` — an axis the architecture
-> deliberately serializes twice (per-tenant miner order, `CLAUDE.md`
-> §3.7; single durable WAL stream, §3.4) and one that contradicted
+> deliberately serializes twice (sequential per-tenant mining — the
+> `CLAUDE.md` §3.7-scoped trees assign ids first-seen, which must
+> match WAL-order replay, RFC 0001 §3.5.3; and the single durable WAL
+> stream, §3.4) and one that contradicted
 > D1's own per-node falsifier (§9.19–§9.21). The must-win below is
 > **per-node on the §1 baseline class**; the old per-core target and
 > the per-tenant single-stream ceiling are retained as recorded

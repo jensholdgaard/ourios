@@ -133,8 +133,9 @@ directly, on the axis the architecture scales on after RFC 0035.
 ## 4. Alternatives considered
 
 - **Keep the per-core bar.** Rejected: it demands scaling on an axis the
-  architecture deliberately serializes twice (per-tenant miner order,
-  §3.7; single durable WAL stream, §3.4). A permanently-red gate whose
+  architecture deliberately serializes twice (sequential per-tenant
+  mining — §3.7-scoped trees with first-seen ids that must match
+  WAL-order replay, RFC 0001 §3.5.3; single durable WAL stream, §3.4). A permanently-red gate whose
   redness is unrelated to quality trains readers to ignore gates.
 - **Recast as per-node *multi-tenant scaling* (the refuted first
   draft).** Rejected by measurement: §9.21 showed node capacity flat

@@ -1,7 +1,7 @@
 ---
 rfc: 0031
 title: Comparative evaluation against Grafana Loki
-status: red
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-11
@@ -10,6 +10,19 @@ superseded-by: —
 ---
 
 # RFC 0031 — Comparative evaluation against Grafana Loki
+
+> **Status note.** **`validated`** (2026-07-21). The §7 gate set is
+> frozen and CI-enforcing (`green` via the asserting ci-runner series,
+> §9.13–§9.18), and the first fully authoritative comparative run on
+> `baseline-8vcpu-32gib` (§9.24, PR #583) passed all 11 frozen gate
+> decisions: L1 **97.82×** / L3 **22.52×** (storage-primary), L2
+> **38.37×** / L4 **85.14×** (processed-primary) with storage floors
+> 1.239× / 3.60×, and both L6 latency floors (0.370 / 4.341).
+> Needle-query latency ratios compress on dedicated hardware (90.44× /
+> 77.99× vs the indicative 308–323×) — the §9.13 caveat, now measured.
+> Losses are published per §5: L6 *storage* is a recorded diagnostic,
+> not a win. The program ledger closed in #498; the only deferred
+> M_L4 item is F_L7 (#548). `accepted` is a maintainer flip.
 
 ## 1. Summary
 

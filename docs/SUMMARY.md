@@ -61,6 +61,7 @@
 - [RFC 0033 — Cached template-map artifact](./rfcs/0033-cached-template-map.md)
 - [RFC 0034 — D1 re-scope](./rfcs/0034-d1-rescope.md)
 - [RFC 0035 — Ingest concurrency](./rfcs/0035-ingest-concurrency.md)
+- [RFC 0036 — Write-side layout](./rfcs/0036-write-side-layout.md)
 
 # Talks
 

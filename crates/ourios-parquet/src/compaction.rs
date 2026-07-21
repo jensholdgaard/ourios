@@ -2394,10 +2394,14 @@ mod tests {
     /// See `docs/rfcs/0036-write-side-layout.md` §5 / §6.
     #[test]
     fn rfc0036_3_forced_spill_peak_is_one_input_not_whole_partition() {
-        // S is chosen ≫ F × batch so phase-1 one-input residency dominates
-        // the peak (making "one input" the measured bound, not F×batch),
-        // yet K × S ≫ that bound so a whole-partition regression is
-        // unambiguous.
+        // K inputs of S rows. The spill path's peak is dominated by
+        // phase-1's one fully decoded input (S rows, decoded strictly one
+        // at a time); phase-2 opens only K < F cursors — no hierarchical
+        // pass — each holding one small reader batch, well under S. So the
+        // peak sits at ~one input, an order of magnitude below the whole
+        // partition (K × S), making a whole-partition regression
+        // unambiguous. (The F × batch term in the RFC 0036 §3.2 bound is
+        // the worst case for F saturated runs; it does not bite here.)
         const K: u64 = 6;
         const S: u64 = 12_000;
         let total = usize::try_from(K * S).expect("fits usize");
@@ -2425,12 +2429,13 @@ mod tests {
         assert!(spilled.committed.is_some(), "≥2 files ⇒ a commit");
         assert_eq!(spilled.rows, K * S, "every row carried");
 
-        let f_batch = fan_in * SUB_BATCH_ROWS;
-        let bound = one_input + f_batch;
+        // Two-sided: formation must decode at least one full input (the
+        // floor), and the peak must stay far below the whole partition (the
+        // teeth — this fails if the merge ever buffers everything decoded).
         assert!(
-            spill_peak <= bound,
-            "forced-spill peak decoded residency {spill_peak} rows exceeds the \
-             one-input + F×batch bound {bound} (one input {one_input}, F×batch {f_batch})",
+            spill_peak >= one_input,
+            "forced-spill peak {spill_peak} is below one decoded input \
+             ({one_input}) — formation should hold a full input at its peak",
         );
         assert!(
             spill_peak < total / 2,

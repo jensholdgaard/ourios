@@ -243,17 +243,22 @@ bound for each path.
 ### 3.3 Compacted row-group threshold
 
 Compacted output rotates row groups at a **separate, smaller
-uncompressed threshold** — proposal **32 MiB**, a new
+threshold** — proposal **32 MiB**, a new
 `COMPACTED_ROW_GROUP_FLUSH_BYTES` alongside `ROW_GROUP_FLUSH_BYTES`
-(which ingest-side files keep at 128 MiB). Illustration at §9.7's
-D3 scale: the 456.7 MiB single-file hour becomes on the order of
-**~14 row groups** instead of a handful (rotation is on
-uncompressed bytes, so the exact count depends on the corpus's
-compression ratio); on v8's ~one-row-group hours, several. Combined
-with the §3.1 sort, each row group's `service.name` min/max spans
-one service (or a boundary pair) and its time min/max is tight
-*within* that service — so plain footer statistics prune, without
-even needing the bloom.
+(which ingest-side files keep at 128 MiB). Rotation fires on
+`ArrowWriter::in_progress_size`, the writer's estimate of the
+buffered row-group bytes (dominated by already-encoded page data,
+not raw uncompressed input), so on-disk row-group size tracks the
+threshold closely. Illustration at §9.7's D3 scale: the 456.7 MiB
+single-file hour (on disk) becomes on the order of **~14 row
+groups** (≈ 456.7 / 32) instead of a handful; on v8's
+~one-row-group hours, several. Combined with the §3.1 sort, each
+row group's `service.name` min/max spans one service — or a
+boundary pair, or (for a service smaller than one row group, wedged
+between two others) that service plus its two neighbours — while its
+time min/max stays tight *within* a service. A query for any single
+service scans only the group(s) whose min/max contains it and prunes
+the rest on plain footer statistics, without even needing the bloom.
 
 **This amends hazard H4's row-group band.** `docs/hazards.md` H4
 targets "row-group size 128 MB – 1 GB"; this RFC deliberately drops

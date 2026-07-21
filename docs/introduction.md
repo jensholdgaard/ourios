@@ -1,6 +1,10 @@
 # Ourios
 
-> *οὔριος* — the fair wind that fills a ship's sail.
+<img src="img/brand/ourios-mark.svg" alt="The Ourios mark: log lines streaming into a sail" width="140" style="display:block;margin:0 auto 1em;" />
+
+> *οὔριος* — the fair wind that fills a ship's sail. The mark is the
+> thesis as a glyph: the sail, and the same shape mirrored as log
+> lines — the data is the wind.
 
 Ourios is a log storage and query backend built on Apache Parquet, a
 Drain-derived online template miner, and Apache DataFusion. The thesis:

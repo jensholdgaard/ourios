@@ -675,12 +675,15 @@ fn sorting_declared_per_row_group(bytes: &[u8]) -> Vec<bool> {
 /// See `docs/rfcs/0036-write-side-layout.md` §5.
 ///
 /// The load-bearing in-repo half: a pre-RFC-0036-shape file (the plain
-/// ingest-side `Writer`, which declares no `sorting_columns` and rotates
-/// row groups at the 128 MiB ingest threshold — byte-for-byte the
-/// read-path shape of an old compacted file) and a post-RFC compacted
-/// file (which declares `sorting_columns` on every row group) decode
-/// through the **same** [`Reader`] to the **same** row multiset. That is
-/// the no-migration proof: §3.4's `sorting_columns` is pure footer
+/// ingest-side `Writer`, which declares no `sorting_columns`) and a
+/// post-RFC compacted file (which declares `sorting_columns` on every
+/// row group) decode through the **same** [`Reader`] to the **same**
+/// row multiset. The read-path-relevant difference between the two
+/// shapes is exactly the sort declaration, which this test asserts is
+/// present on one and absent on the other; row-group *sizing* is not
+/// exercised here (that is RFC0036.1/.3) — this pins that the reader is
+/// inert to the declaration. That is the no-migration proof: §3.4's
+/// `sorting_columns` is pure footer
 /// metadata with no schema change (`CLAUDE.md` §3.5), so the reader —
 /// which is driven entirely by the column schema and never consults the
 /// sort declaration — is inert to its presence or absence. Old files read
@@ -717,10 +720,13 @@ fn rfc0036_5_no_read_path_or_schema_regression() {
     let old_store = Store::local(old_bucket.path()).expect("old store");
     let (_, old_key) = write_input(&old_store, &part, &all_rows);
     let old_bytes = old_store.get_blocking(&old_key).expect("get old file");
+    let old_declared = sorting_declared_per_row_group(&old_bytes);
     assert!(
-        sorting_declared_per_row_group(&old_bytes)
-            .iter()
-            .all(|d| !d),
+        !old_declared.is_empty(),
+        "the pre-RFC file has ≥ 1 row group"
+    );
+    assert!(
+        old_declared.iter().all(|d| !d),
         "pre-RFC-0036 file declares no sorting_columns on any row group",
     );
     let old_rows = Reader::open_partition_bytes(Bytes::from(old_bytes), part.clone(), &old_key)
@@ -741,10 +747,13 @@ fn rfc0036_5_no_read_path_or_schema_regression() {
         .committed
         .expect("≥2 inputs ⇒ a commit");
     let new_bytes = consolidated_bytes(&new_store, &part, &committed.file);
+    let new_declared = sorting_declared_per_row_group(&new_bytes);
     assert!(
-        sorting_declared_per_row_group(&new_bytes)
-            .iter()
-            .all(|d| *d),
+        !new_declared.is_empty(),
+        "the compacted file has ≥ 1 row group"
+    );
+    assert!(
+        new_declared.iter().all(|d| *d),
         "post-RFC-0036 compacted file declares sorting_columns on every row group",
     );
     let new_rows =

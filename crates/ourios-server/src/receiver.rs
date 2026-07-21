@@ -181,17 +181,22 @@ fn flush_then_snapshot(
     cadence: &str,
 ) -> bool {
     // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
-    // caller stamps `wal_high_water` from here while holding the pipeline's
-    // miner lock, and the stamp asserts every acked record at or below the
-    // mark is durably captured. At this point those records fall into three
-    // disjoint classes, and the quiesce order — encodes, then publishes,
-    // then flush, then stamp — covers each:
+    // caller stamps `wal_high_water` from here with exclusive access to
+    // `miner` — the rotation hook and shutdown hold the pipeline's miner
+    // lock; the post-recovery call in `serve` runs before the pipeline
+    // (and its mutex) exists, so exclusivity is by construction. The stamp
+    // asserts every acked record at or below the mark is durably captured.
+    // At this point those records fall into three disjoint classes, and
+    // the quiesce order — encodes, then publishes, then flush, then stamp
+    // — covers each:
     //
-    //  1. **In-flight encodes**: the caller quiesced the encode pool first
-    //     (the rotation branch in `pipeline.rs`, `ReceiverHandle::shutdown`).
-    //     Submission is ingest-gate-ordered, so every frame ≤ mark has
-    //     finished its sink emit by then — its records are now buffered or
-    //     already published.
+    //  1. **In-flight encodes**: when an encode pool exists the caller
+    //     quiesced it first (the rotation branch in `pipeline.rs`,
+    //     `ReceiverHandle::shutdown`); the post-recovery call runs before
+    //     any pool is configured, so this class is empty there. Submission
+    //     is ingest-gate-ordered, so every frame ≤ mark has finished its
+    //     sink emit by then — its records are now buffered or already
+    //     published.
     //  2. **Drained-in-flight publishes**: records the age sweep took *out*
     //     of the buffers whose off-lock `write_ordered` has not settled are
     //     exactly the coordinator's in-flight set — each drain acquires a

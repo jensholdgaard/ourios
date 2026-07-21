@@ -266,10 +266,23 @@ property is what lets the run series read as an optimisation
 ledger). The §3.1 key is a **total order** over the partition's
 rows: lexicographic service value + timestamp + the
 (sorted-basename input ordinal, row ordinal) tie-break leave no two
-rows unordered, so the merged row sequence — and therefore the
-output file's bytes — is a pure function of the input files'
-contents and names, independent of listing order, thread timing, or
-run count. RFC0036.4 pins this with a rebuild test.
+rows unordered, so the merged **row sequence** is a pure function
+of the input files' contents and names. Row order alone does not
+imply byte identity, though — page and row-group boundaries,
+dictionary state, and footer contents must also be deterministic.
+They are, by the same writer-level invariants today's §9.13
+property already rests on: fixed sub-batching (`SUB_BATCH_ROWS`),
+a fixed row-group threshold evaluated on the same deterministic
+`in_progress_size` accounting, fixed writer properties (codec
+level, dictionary/statistics/bloom settings), and no
+time-or-randomness-dependent metadata. Deterministic rows fed
+through a deterministic serializer yield deterministic bytes —
+the identical argument that makes today's unsorted builds
+byte-identical, with the sort adding only a deterministic
+permutation and (for spilled runs) deterministic run boundaries
+from fixed spill thresholds. RFC0036.4 pins the end-to-end claim
+with a byte-identity rebuild test, which subsumes the row-order
+property.
 
 ### 3.6 What stays exactly as-is
 
@@ -348,9 +361,12 @@ published diagnostic.
 > - **When** the L6-shape query (one service, k-row time window)
 >   runs
 > - **Then** the row groups scanned (the RFC 0016 scanned/pruned
->   counts) are ≤ ceil(answer-span / threshold) + 2 — a few small
->   row groups, derived from the ~14-row-group §3.3 structure, not
->   the whole hour
+>   counts) are ≤ ceil(B_sw / T) + 2, where **B_sw** is the queried
+>   service's bytes within the window (measurable from the compacted
+>   file's footer: the sorted layout places one service's window in
+>   contiguous row groups) and **T** is the configured row-group
+>   threshold — i.e. the groups that *hold the answer* plus at most
+>   two boundary groups, not the whole hour
 > - **And** the before/after materialization bytes (total minus
 >   the registry acquisition) are measured on the same corpus and
 >   published in the §9 series as the storage-channel diagnostic —

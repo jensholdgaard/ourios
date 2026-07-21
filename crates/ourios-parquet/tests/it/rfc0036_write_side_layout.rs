@@ -492,7 +492,7 @@ fn rfc0036_3_compaction_properties_preserved() {
     let mut part: Option<PartitionKey> = None;
     let mut id: u64 = 0;
     let mut expected_rows = 0usize;
-    for f in 0..FILES {
+    for _ in 0..FILES {
         let recs: Vec<MinedRecord> = (0..ROWS_PER_FILE)
             .map(|i| {
                 id += 1;
@@ -507,7 +507,6 @@ fn rfc0036_3_compaction_properties_preserved() {
             .clone();
         write_input(&store, &p, &recs);
         expected_rows += recs.len();
-        let _ = f;
     }
     let part = part.expect("at least one file");
 

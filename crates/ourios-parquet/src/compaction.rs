@@ -416,8 +416,17 @@ mod residency {
     }
 
     /// `n` decoded rows left residency (spilled and dropped, or emitted).
+    /// Underflow means the instrumentation's add/sub calls are unbalanced
+    /// — a bug in the gauge the RFC0036.3 bound relies on — so panic
+    /// rather than saturate and silently under-report the peak.
     pub(super) fn sub(n: usize) {
-        CURRENT.with(|c| c.set(c.get().saturating_sub(n)));
+        CURRENT.with(|c| {
+            let now = c
+                .get()
+                .checked_sub(n)
+                .expect("residency gauge underflow: unbalanced add/sub");
+            c.set(now);
+        });
     }
 }
 

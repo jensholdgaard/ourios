@@ -12,8 +12,8 @@
 > The D1 arc shipped alongside: RFC 0034 (`specified`, enacted)
 > recast D1 as a per-node bar, and RFC 0035 (`green`) split ingest
 > into an ordered mining phase and a concurrent encode/publish phase
-> to clear it — the §9.23 asserting soak holds an offered 100 k
-> lines/s per node (99.92 % achieved, p99 153.63 ms) on the baseline
+> to clear it — the §9.23 asserting soak holds an offered 100k
+> lines/s per node (99.92% achieved, p99 153.63 ms) on the baseline
 > hardware. RFC 0036 (`specified`) opens the next arc: write-side
 > layout (compaction-time service/time sort), the remaining storage
 > lever against hazard #4.

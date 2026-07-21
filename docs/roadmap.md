@@ -2,7 +2,23 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-07-15** — a month of post-MVP shipping work
+> Last updated: **2026-07-21** — the comparative program closed and
+> the ingest-capacity arc landed; §3's ladder now covers RFC 0001
+> through RFC 0036. RFC 0031's first fully authoritative comparative
+> run (`baseline-8vcpu-32gib`, `benchmarks.md` §9.24) passed all 11
+> frozen gate decisions — L1 97.82× / L3 22.52× storage-primary, L2
+> 38.37× / L4 85.14× processed-primary, both L6 latency floors — and
+> the RFC flipped to `validated` (`accepted` is a maintainer flip).
+> The D1 arc shipped alongside: RFC 0034 (`specified`, enacted)
+> recast D1 as a per-node bar, and RFC 0035 (`green`) split ingest
+> into an ordered mining phase and a concurrent encode/publish phase
+> to clear it — the §9.23 asserting soak holds an offered 100k
+> lines/s per node (99.92% achieved, p99 153.63 ms) on the baseline
+> hardware. RFC 0036 (`specified`) opens the next arc: write-side
+> layout (compaction-time service/time sort), the remaining storage
+> lever against hazard #4.
+>
+> Prior entry — 2026-07-15: a month of post-MVP shipping work
 > landed since the prior entry below; §3's RFC ladder now covers
 > RFC 0001 through RFC 0033 and §5's deferred-capabilities table
 > (eight rows) is rewritten: six have shipped outright (the WAL, the
@@ -100,7 +116,7 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-07-15)
+## 3. Current state (as of 2026-07-21)
 
 **The thesis is proven on representative corpora.** All four gating
 thesis-gates pass authoritatively on the `benchmarks.md` §1 baseline
@@ -152,9 +168,12 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0028 | Build-feedback program (test-harness + workspace decomposition) | `green` |
 | 0029 | OIDC bearer layer (issuer-agnostic, Dex-validated) | `green` |
 | 0030 | TLS/mTLS on the data-plane listeners | `green` |
-| 0031 | Comparative evaluation against Grafana Loki | in progress — `L1`/`L3` (storage + latency) and `L6` (latency) frozen and gate-enforcing per §7; `L2` unfrozen via RFC 0033; `L4` (frequency aggregation) is the last must-win, mid-dispatch. The file's own frontmatter still reads `red`; pending an update at close-out |
+| 0031 | Comparative evaluation against Grafana Loki | **`validated`** — all four must-win classes measured, §7 gates frozen and CI-enforcing; the first fully authoritative run (`benchmarks.md` §9.24, `baseline-8vcpu-32gib`) passed all 11 frozen gate decisions; losses published per §5 (L6 *storage* is a recorded diagnostic, not a win) |
 | 0032 | Query-schema and cost-model resource for the MCP surface | `green` |
 | 0033 | Cached template-map artifact | `green` |
+| 0034 | D1 re-scope: per-node ingest-throughput bar | `specified` — enacted: RFC0034.1–.3 satisfied by the §9.20–§9.23 measurement series; `accepted` is a maintainer flip |
+| 0035 | Ingest concurrency (ordered mining, concurrent encode/publish) | `green` — §9.22 A/B plus the §9.23 asserting soak; the #578 sweep-publish durability window closed alongside |
+| 0036 | Write-side layout (compaction-time service/time sort) | `specified` — awaiting maintainer design review before `red` |
 
 **Crates — all ten product crates are implemented** (`ourios-core`,
 `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`, `-server`,
@@ -175,7 +194,8 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 - **`ourios-ingester`** — RFC 0003 `green`: the OTLP gRPC + HTTP receiver
   with WAL-before-ack, per-`ResourceLogs` tenant derivation, the windowed
   group-commit coordinator, and the startup recovery driver; also hosts
-  the RFC 0009 compaction runner.
+  the RFC 0009 compaction runner and the RFC 0035 two-phase pipeline
+  (ordered mining, concurrent encode/publish).
 - **`ourios-querier`** — RFC 0007 `validated` / RFC 0002 `green`: the logs
   DSL over DataFusion with predicate + partition (time-window) pruning,
   alias resolution, the RFC 0010 drift query, `param(n)`/`bucket(width)`
@@ -201,15 +221,16 @@ and the shipping milestone that followed (WAL, wire endpoints, DSL,
 auth, S3, Helm — the whole §5 table below except Perses) is
 substantially done. What's actually open:
 
-- **RFC 0031's `L4` class** (frequency aggregation vs Loki) — the last
-  unmeasured must-win in the comparative program; a dispatch is in
-  flight as of this entry.
+- **RFC 0036 implementation** — write-side layout (`specified`);
+  maintainer design review gates `red`. The remaining storage lever
+  against hazard #4's small-file/row-group bands.
 - **The Perses datasource plugin** — deliberately deferred (§5), not
-  started.
+  started. Its stated prerequisite (RFC 0031 close-out) is now met.
 - Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.
-  RFC 0009's full D2 sustained-ingest soak and a measured D1, RFC
-  0021's phase 2 gated on upstream DataFusion 55, RFC 0028's musl
-  cargo-dist re-add) — none block anything downstream.
+  the recurring D1/D2 soak cadence now that the harness has shipped
+  (§9.19/§9.23), RFC 0021's phase 2 gated on upstream DataFusion 55,
+  RFC 0028's musl cargo-dist re-add, RFC 0031's deferred F_L7) —
+  none block anything downstream.
 
 ---
 

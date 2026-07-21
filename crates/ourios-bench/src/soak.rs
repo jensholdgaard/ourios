@@ -105,6 +105,10 @@ pub struct SoakConfig {
     /// Tokio worker threads for the load runtime — also the divisor for
     /// the §D1 per-core rate.
     pub worker_threads: usize,
+    /// RFC 0035 §3.1 concurrent-encode pool size, mirroring the server's
+    /// `receiver.encode_workers` knob (its own axis: the encode pool is
+    /// OS threads, not part of the tokio load runtime).
+    pub encode_workers: usize,
     /// Distinct tenants fed through the one shared WAL / commit stream /
     /// store, round-robin per batch. `1` (the default) is the
     /// single-tenant baseline, byte-for-byte the pre-#567 behaviour;
@@ -125,6 +129,7 @@ impl Default for SoakConfig {
             sink_target_bytes: 4 * 1024 * 1024,
             seed: 0xD1D2_50AC,
             worker_threads: default_worker_threads(),
+            encode_workers: default_worker_threads(),
             tenants: 1,
         }
     }
@@ -320,6 +325,9 @@ fn validate(config: &SoakConfig) -> Result<(), SoakError> {
     if config.worker_threads == 0 {
         return Err(SoakError::Config("worker_threads must be > 0"));
     }
+    if config.encode_workers == 0 {
+        return Err(SoakError::Config("encode_workers must be > 0"));
+    }
     if config.tenants == 0 {
         return Err(SoakError::Config("tenants must be > 0"));
     }
@@ -373,7 +381,7 @@ async fn soak(config: &SoakConfig, root: &Path) -> Result<SoakReport, SoakError>
     // harness measures what the server role runs.
     let pipeline = Arc::new(
         IngestPipeline::new(coordinator, miner, TenantRule::service_name())
-            .with_encode_pool(EncodePool::new(&sink, config.worker_threads)),
+            .with_encode_pool(EncodePool::new(&sink, config.encode_workers)),
     );
 
     let clock = SyntheticClock {
@@ -1462,6 +1470,7 @@ mod tests {
             sink_target_bytes: 4 * 1024 * 1024,
             seed: 7,
             worker_threads: 2,
+            encode_workers: 2,
             tenants: 1,
         };
         let report = run_soak(&config).expect("deadline soak runs");
@@ -1580,6 +1589,10 @@ mod tests {
                 ..ok.clone()
             },
             SoakConfig {
+                encode_workers: 0,
+                ..ok.clone()
+            },
+            SoakConfig {
                 tenants: 0,
                 ..ok.clone()
             },
@@ -1608,6 +1621,7 @@ mod tests {
             sink_target_bytes: 64 * 1024,
             seed: 42,
             worker_threads: 4,
+            encode_workers: 4,
             tenants: 1,
         };
         let report = run_soak(&config).expect("smoke soak runs");
@@ -1685,6 +1699,7 @@ mod tests {
             sink_target_bytes: 64 * 1024,
             seed: 42,
             worker_threads: 4,
+            encode_workers: 4,
             tenants: 4,
         };
         validate(&config).expect("config is valid");

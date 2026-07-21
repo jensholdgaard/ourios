@@ -395,27 +395,68 @@ impl IngestPipeline {
                         // The flush half is the hook's own `flush_all` +
                         // its snapshot-only-if-fully-drained gate (the
                         // server's `flush_then_snapshot`): after this
-                        // drain the sink buffers hold exactly the frames
-                        // ≤ prev, `flush_all` takes every partition, and
-                        // the high-water is stamped only when both sinks
-                        // fully drained — so a record the mark claims
-                        // durable is either in the store or the mark was
-                        // never written. A crash at any point before the
+                        // drain, every record ≤ prev has completed its
+                        // emit, so any of them still *buffered* is in the
+                        // sink for `flush_all` to take, and the
+                        // high-water is stamped only when both sinks
+                        // fully drained. What this pool barrier does NOT
+                        // cover is a record ≤ prev that an age-sweep
+                        // drained out of the buffers and is writing
+                        // off-lock while the hook runs — it is neither
+                        // buffered nor yet durable, and a crash after the
+                        // stamp but before its `write_ordered` completes
+                        // loses it (pre-existing window, tracked as
+                        // issue #578). A crash at any point before the
                         // stamp loses only buffered Parquet, which WAL
                         // replay above the (previous) high-water re-mines
                         // (the §6.9 posture: the WAL is the durability of
                         // record; a snapshot is a rebuildable cache).
-                        self.quiesce_encodes();
-                        self.fire_rotation_hook(&miner, prev);
+                        //
+                        // The drain can wait out seconds of queued
+                        // encodes and the hook does blocking store I/O,
+                        // all on a runtime worker — `block_in_place`
+                        // lets the runtime relocate other tasks off
+                        // this worker meanwhile. Flavor-guarded:
+                        // `block_in_place` panics on a current-thread
+                        // runtime (the crash fixtures run one; they
+                        // never rotate, but a panic here would turn a
+                        // rotation into an outage).
+                        let drain_and_hook = || {
+                            self.quiesce_encodes();
+                            self.fire_rotation_hook(&miner, prev);
+                        };
+                        if tokio::runtime::Handle::current().runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread
+                        {
+                            tokio::task::block_in_place(drain_and_hook);
+                        } else {
+                            drain_and_hook();
+                        }
                     }
-                    if self.encode_pool.is_some() {
+                    if let Some(pool) = &self.encode_pool {
                         // Ordered phase (RFC 0035 §3.1): id assignment +
                         // audit under the gate; the sink emit is deferred
                         // to the concurrent pool below.
                         let mut out = Vec::with_capacity(records.len());
-                        for record in &records {
-                            let (_, rec) = miner.ingest_mined(record);
-                            out.extend(rec);
+                        // The whole batch is already WAL-durable, so a
+                        // miner panic mid-batch must not drop the records
+                        // mined before it — pre-split they had been
+                        // emitted inline as they were mined; deferring
+                        // the emit must not widen that failure into
+                        // whole-batch loss-until-restart-replay. Submit
+                        // what was mined, then let the panic continue
+                        // (the gate guard still releases, and `ingest`'s
+                        // caller still fails the request).
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                for record in &records {
+                                    let (_, rec) = miner.ingest_mined(record);
+                                    out.extend(rec);
+                                }
+                            }));
+                        if let Err(panic) = outcome {
+                            pool.submit(out);
+                            std::panic::resume_unwind(panic);
                         }
                         out
                     } else {
@@ -769,6 +810,31 @@ mod tests {
         // Batch 3: same segment — no further firing.
         pipeline.ingest(request()).await.expect("batch 3");
         assert_eq!(calls.lock().expect("lock").len(), 1);
+    }
+
+    /// The rotation branch on a `current_thread` runtime takes the
+    /// inline path (`block_in_place` would panic there — the flavor
+    /// guard is what this pins): the hook still fires exactly once
+    /// with the old segment's offset.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_completes_inline_on_a_current_thread_runtime() {
+        let in_first = WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 100,
+        };
+        let in_second = WalOffset {
+            segment: uuid::Uuid::from_u128(2),
+            byte: 40,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let pipeline = sequence_pipeline(
+            vec![in_first, in_second],
+            Box::new(move |_, mark| seen.lock().expect("lock").push(mark)),
+        );
+        pipeline.ingest(request()).await.expect("batch 1");
+        pipeline.ingest(request()).await.expect("batch 2");
+        assert_eq!(*calls.lock().expect("lock"), vec![in_first]);
     }
 
     /// A panicking hook must not unwind `ingest`: the batch is

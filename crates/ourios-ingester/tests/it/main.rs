@@ -45,3 +45,4 @@ mod rfc0030_tls;
 mod rfc0035_1_concurrent_determinism;
 mod rfc0035_2_encode_barrier;
 mod rfc0035_5_on_disk_equivalence;
+mod rfc0035_f2_miner_panic_salvage;

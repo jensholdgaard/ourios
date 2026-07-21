@@ -399,18 +399,22 @@ impl IngestPipeline {
                         // emit, so any of them still *buffered* is in the
                         // sink for `flush_all` to take, and the
                         // high-water is stamped only when both sinks
-                        // fully drained. What this pool barrier does NOT
-                        // cover is a record ≤ prev that an age-sweep
-                        // drained out of the buffers and is writing
-                        // off-lock while the hook runs — it is neither
-                        // buffered nor yet durable, and a crash after the
-                        // stamp but before its `write_ordered` completes
-                        // loses it (pre-existing window, tracked as
-                        // issue #578). A crash at any point before the
-                        // stamp loses only buffered Parquet, which WAL
-                        // replay above the (previous) high-water re-mines
-                        // (the §6.9 posture: the WAL is the durability of
-                        // record; a snapshot is a rebuildable cache).
+                        // fully drained. The one class this pool barrier
+                        // does not cover — a record ≤ prev that an
+                        // age-sweep drained out of the buffers and is
+                        // writing off-lock while the hook runs (neither
+                        // buffered nor yet durable) — is the *publish*
+                        // half of the barrier (issue #578): each sweep
+                        // drain holds the sink's in-flight publish guard,
+                        // and `flush_then_snapshot` quiesces those
+                        // publishes under this same miner lock before it
+                        // flushes and stamps. The class-by-class
+                        // coverage argument lives there. A crash at any
+                        // point before the stamp loses only buffered
+                        // Parquet, which WAL replay above the (previous)
+                        // high-water re-mines (the §6.9 posture: the WAL
+                        // is the durability of record; a snapshot is a
+                        // rebuildable cache).
                         //
                         // The drain can wait out seconds of queued
                         // encodes and the hook does blocking store I/O,

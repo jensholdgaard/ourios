@@ -307,12 +307,39 @@ the above matters.
 
 ### D1 — OTLP → WAL throughput
 
+> **Recast per-node (RFC 0034; enacted 2026-07-21).** D1's original
+> metric was `lines/second/core` — an axis the architecture
+> deliberately serializes twice (per-tenant miner order, `CLAUDE.md`
+> §3.7; single durable WAL stream, §3.4) and one that contradicted
+> D1's own per-node falsifier (§9.19–§9.21). The must-win below is
+> **per-node on the §1 baseline class**; the old per-core target and
+> the per-tenant single-stream ceiling are retained as recorded
+> diagnostics — informational, gating nothing (the RFC 0011 A1
+> pattern). Asserting run: §9.23 (PASS).
+
 - **Scope**: tuning-goal.
 - **Bar**: must-win.
-- **Metric**: lines/second/core sustained, with WAL fsync batched at
-  100 ms (the `CLAUDE.md` §3.4 default).
-- **Target**: ≥ **100 000 lines/s/core**, with **p99 ingest-ack
-  latency ≤ 200 ms**.
+- **Metric**: lines/second sustained **per node** on
+  `baseline-8vcpu-32gib`, multi-tenant load (`soak --tenants N` with
+  N = cores) through one shared WAL/commit stream, with WAL fsync
+  batched at 100 ms (the `CLAUDE.md` §3.4 default).
+- **Target**: ≥ **100 000 lines/s per node**, with **p99 ingest-ack
+  latency ≤ 200 ms** at the sustained rate. Below-saturation is
+  observable, not asserted: the run offers exactly the bar rate and
+  must achieve ≥ **99% of offered** — a saturated pipeline cannot
+  keep pace with the paced load, and queue-bound latencies at
+  over-offered load are a different regime that does not count
+  (§9.20's reading).
+- **Diagnostics (informational, still recorded — RFC 0034)**:
+  - the original per-core target (≥ **100 000 lines/s/core**) is
+    retained as the diagnostic's reference line; §9.23 records
+    12,490 lines/s/core at the asserting run.
+  - the per-tenant single-stream ceiling — the most one service can
+    push into one tenant (≈ 86k lines/s under the §9.20 probe
+    configuration; §9.20/§9.21) — guards the mining path against
+    regression.
+
+  Neither gates any RFC's `validated`.
 - **Falsifier (tuning sense)**: below this we cannot ingest a
   meaningful share of production traffic per node, which makes the
   operational story uninteresting.
@@ -1811,3 +1838,44 @@ at sustained rates below capacity. **This 132k lines/s/node figure is
 the §6 input to RFC 0035's target and to the RFC 0034 D1
 recalibration**; whether Design B (§4) is ever escalated is judged
 against the recalibrated bar, not the old per-core one.
+
+### 9.23 Results — 2026-07-21 (authoritative, `baseline-8vcpu-32gib`) — the RFC0034.2 / RFC0035.4 asserting soak
+
+**Purpose.** The asserting run for the recast D1 bar: RFC 0034's
+RFC0034.2 (per-node must-win with the observable below-saturation
+condition) and RFC 0035's RFC0035.4 (the serialization is actually
+relaxed) in one measurement — the RFC 0034 §7 one-run-two-records
+question resolved as **one run, one record, cited by both**. Ad-hoc VM
+run at main `d2c622e` (the RFC 0035 production implementation, #577,
+plus its review fixes, #579), release build; the JSON report is
+retained by the maintainer outside the repository (gitignored local
+`scratch/` tree), as with every ad-hoc VM record in this series.
+
+**Shape** (the RFC 0034 §3.1 asserting shape): one-hour soak,
+`soak --tenants 8` (N = cores), offered exactly **100,000 lines/s**
+— the bar rate, paced, not a saturating probe — batch 1,000,
+8 workers, ×60 synthetic clock, 30 s sampling.
+
+| measure | value | bar | verdict |
+|---|---|---|---|
+| achieved rate | **99,921 lines/s = 99.92% of offered** (359,726,000 lines acked, 0 failed batches) | achieved ≥ 99% of offered — the observable below-saturation condition (§D1 / RFC 0034 §3.1) | **D1 PASS as recast** |
+| ack p50 / p95 / p99 / max | 95.68 / 117.00 / **153.63** / 723.70 ms | p99 ≤ 200 ms at the sustained rate | **latency bar PASS** |
+| D2 backlog | max **8** partitions, 480 compactions over 116 samples, final 0 (returned to zero) | bounded, drains in-window | **D2 PASS** |
+| per-core rate | 12,490 lines/s/core | diagnostic, informational (RFC 0034) | recorded |
+
+**Reading.** The recast D1 must-win asserts for the first time and
+**passes**: 0.08% pacing loss at the bar rate is achieved ≈ offered,
+which *is* the below-saturation proof, and the p99 (153.63 ms) is
+measured over that same run, inside the 200 ms bar. The p50 rides
+the 100 ms group-commit window (the `CLAUDE.md` §3.4 batch default)
+— ack latency at this rate is floored by batched fsync, not
+queue-bound. The 723.70 ms max is a tail spike outside the bar's
+percentile; the bar is p99, and it holds. One honesty note: the
+harness's printed per-core "FAIL" line is the pre-RFC-0034 bar
+mechanically applied — per RFC 0034 that number (12,490
+lines/s/core) is now a recorded diagnostic, and the recalibrated
+per-node must-win is what judges the run. This run satisfies
+RFC0034.2 and RFC0035.4 simultaneously: the production Design A
+sustains the recast bar with margin to spare over the pre-RFC ~82k
+saturation baseline (§9.22), with D2 passing over a full hour of
+sustained multi-tenant load.

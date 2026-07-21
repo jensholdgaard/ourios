@@ -92,13 +92,13 @@ impl PublishCoordinator {
     /// or sees them counted in flight — never neither.
     #[must_use]
     pub fn drain_aged(&self) -> Drained {
-        let _guard = self.record.begin_publish();
+        let guard = self.record.begin_publish();
         let audit = self.audit.take_buffer();
         let records = self.record.drain_aged();
         Drained {
             audit,
             records,
-            _guard,
+            _guard: guard,
         }
     }
 
@@ -107,13 +107,13 @@ impl PublishCoordinator {
     /// [`Self::drain_aged`].
     #[must_use]
     pub fn drain_all(&self) -> Drained {
-        let _guard = self.record.begin_publish();
+        let guard = self.record.begin_publish();
         let audit = self.audit.take_buffer();
         let records = self.record.drain_all();
         Drained {
             audit,
             records,
-            _guard,
+            _guard: guard,
         }
     }
 

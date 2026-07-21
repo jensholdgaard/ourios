@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use ourios_core::record::{MinedRecord, RecordSink};
@@ -655,6 +655,45 @@ fn publish_partition(
     Ok(())
 }
 
+/// Outstanding off-lock publish accounting (issue #578), shared by every
+/// clone of one [`SharedParquetSink`]: how many drained-out-of-the-buffers
+/// snapshots ([`crate::publish::Drained`]) have not yet settled their
+/// off-lock write. Living in the sink's shared state — rather than on the
+/// [`crate::publish::PublishCoordinator`] — makes the count structurally
+/// unsplittable: any coordinator built over this sink, and any clone of it,
+/// feeds the same counter the stamping paths quiesce. Same shape as the
+/// encode pool's pending counter.
+#[derive(Debug)]
+struct InFlightPublishes {
+    count: Mutex<usize>,
+    settled: Condvar,
+}
+
+/// Settles one in-flight publish on drop — including during unwinding, so a
+/// panic mid-publish cannot strand [`SharedParquetSink::quiesce_publishes`],
+/// which waits under the pipeline's miner lock at rotation, where a wedge
+/// would halt all ingest (the same posture as the encode pool's
+/// `BatchGuard`). No publish path panics today (store and encode failures
+/// are `Result`s that requeue); the guard is the defence if one ever does.
+#[derive(Debug)]
+pub(crate) struct PublishGuard {
+    in_flight: Arc<InFlightPublishes>,
+}
+
+impl Drop for PublishGuard {
+    fn drop(&mut self) {
+        let mut count = self
+            .in_flight
+            .count
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.in_flight.settled.notify_all();
+        }
+    }
+}
+
 /// A cloneable handle to one shared [`ParquetRecordSink`].
 ///
 /// The ingest path has two writers to the same sink: the miner `emit`s mined
@@ -682,6 +721,7 @@ fn publish_partition(
 #[derive(Clone)]
 pub struct SharedParquetSink {
     inner: Arc<Mutex<ParquetRecordSink>>,
+    in_flight: Arc<InFlightPublishes>,
 }
 
 impl SharedParquetSink {
@@ -690,6 +730,60 @@ impl SharedParquetSink {
     pub fn new(sink: ParquetRecordSink) -> Self {
         Self {
             inner: Arc::new(Mutex::new(sink)),
+            in_flight: Arc::new(InFlightPublishes {
+                count: Mutex::new(0),
+                settled: Condvar::new(),
+            }),
+        }
+    }
+
+    /// Register one off-lock publish of records about to be drained out of
+    /// this sink's buffers (issue #578): the returned guard marks them in
+    /// flight until it drops. **Acquire before the drain, under the
+    /// pipeline's miner lock** — the same lock every `wal_high_water`
+    /// stamping path holds — so there is no instant at which drained records
+    /// exist outside both the buffers and the in-flight count.
+    #[must_use]
+    pub(crate) fn begin_publish(&self) -> PublishGuard {
+        *self
+            .in_flight
+            .count
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        PublishGuard {
+            in_flight: Arc::clone(&self.in_flight),
+        }
+    }
+
+    /// Block until no drained-but-unsettled off-lock publish is in flight —
+    /// the publish half of the RFC 0035 §3.1 barrier (issue #578).
+    ///
+    /// Every `wal_high_water` stamping path MUST call this (after quiescing
+    /// any encode pool, before the flush) with exclusive access to the
+    /// miner — the rotation hook and shutdown hold the pipeline's miner
+    /// lock; the post-recovery stamp runs before the pipeline (and its
+    /// mutex) exists, so exclusivity is by construction and no drain can
+    /// race it. Records the age sweep drained out of the buffers are neither
+    /// buffered (so `flush_all` cannot cover them) nor durable until their
+    /// off-lock `write_ordered` completes, and a mark stamped across that
+    /// window makes recovery skip the WAL frames that are their only
+    /// surviving copy — acked-data loss (`CLAUDE.md` §3.4). When this
+    /// returns, every such snapshot is either durable in the store or
+    /// requeued into the buffers (where the caller's flush covers it), and
+    /// the caller's miner exclusivity keeps the count at zero until the
+    /// stamp: every drain acquires its guard under the miner lock.
+    pub fn quiesce_publishes(&self) {
+        let mut count = self
+            .in_flight
+            .count
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *count > 0 {
+            count = self
+                .in_flight
+                .settled
+                .wait(count)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 

@@ -24,8 +24,15 @@ superseded-by: —
 > asserting shape (`--tenants 8`, offered 100k, p99 ack 153.63 ms, D2
 > PASS) versus the pre-RFC ~82k saturation baseline (§9.22) — the
 > serialization is relaxed in production, not just in the prototype.
-> Known open hazard outside this RFC's scope: the sweep-window issue
-> **#578**, tracked separately.
+> The sweep-window hazard **#578** (a rotation could stamp
+> `wal_high_water` while the age sweep's off-lock `write_ordered` was
+> still in flight — records out of the buffers, durable nowhere but the
+> WAL) is **fixed**: the coordinator's drains hold an in-flight publish
+> guard on the shared record sink, and every stamping path quiesces
+> those publishes in `flush_then_snapshot` before flushing + stamping —
+> the publish half of the §3.1 barrier, pinned by a mutation-checked
+> stamp-waits race arm and a `SIGKILL` mid-window replay arm alongside
+> the RFC0035.2 suites.
 >
 > **How to read this document.** A profile (`docs/benchmarks.md` §9.20/§9.21;
 > issue #571) showed the ingest hot path saturates ≈ 86k lines/s while

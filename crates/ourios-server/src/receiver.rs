@@ -90,6 +90,12 @@ fn flush_config() -> FlushConfig {
 /// before its template event is durable, and no concurrent `ingest` can split a
 /// record from its audit event across the drain. Stops when `shutdown` fires;
 /// the shutdown path then drains both sinks fully.
+///
+/// Each drained snapshot holds the record sink's in-flight publish guard
+/// until its off-lock write settles (issue #578), so a rotation or shutdown
+/// `wal_high_water` stamp racing the sweep waits it out in
+/// [`flush_then_snapshot`] rather than stamping over records that exist only
+/// in this task's memory.
 fn spawn_age_sweep(
     pipeline: SharedPipeline,
     coordinator: PublishCoordinator,
@@ -133,7 +139,8 @@ fn spawn_age_sweep(
     })
 }
 
-/// Flush the audit sink, then the record sink, then write the per-tenant miner
+/// Quiesce the age sweep's in-flight off-lock publishes (issue #578), flush
+/// the audit sink, then the record sink, then write the per-tenant miner
 /// snapshot **only if both sinks fully drained**.
 ///
 /// This is the no-loss invariant (`CLAUDE.md` §3.4) extended to the audit
@@ -173,6 +180,41 @@ fn flush_then_snapshot(
     high_water: Option<WalOffset>,
     cadence: &str,
 ) -> bool {
+    // The publish half of the RFC 0035 §3.1 barrier (issue #578). Every
+    // caller stamps `wal_high_water` from here with exclusive access to
+    // `miner` — the rotation hook and shutdown hold the pipeline's miner
+    // lock; the post-recovery call in `serve` runs before the pipeline
+    // (and its mutex) exists, so exclusivity is by construction. The stamp
+    // asserts every acked record at or below the mark is durably captured.
+    // At this point those records fall into three disjoint classes, and
+    // the quiesce order — encodes, then publishes, then flush, then stamp
+    // — covers each:
+    //
+    //  1. **In-flight encodes**: when an encode pool exists the caller
+    //     quiesced it first (the rotation branch in `pipeline.rs`,
+    //     `ReceiverHandle::shutdown`); the post-recovery call runs before
+    //     any pool is configured, so this class is empty there. Submission
+    //     is ingest-gate-ordered, so every frame ≤ mark has finished its
+    //     sink emit by then — its records are now buffered or already
+    //     published.
+    //  2. **Drained-in-flight publishes**: records the age sweep took *out*
+    //     of the buffers whose off-lock `write_ordered` has not settled are
+    //     exactly the coordinator's in-flight set — each drain acquires a
+    //     `PublishGuard` before the take, under this same miner lock.
+    //     `quiesce_publishes` waits until every such snapshot is durable in
+    //     the store or requeued into the buffers. Before this barrier, a
+    //     rotation could stamp across that window and a crash before the
+    //     sweep's store PUT completed lost the drained records (#578).
+    //  3. **Buffered records**: everything else is in the sinks; the flush
+    //     below either drains it or the stamp is skipped.
+    //
+    // Holding the miner lock keeps the in-flight count at zero from the wait
+    // until the stamp (no drain can begin without the lock), so no class-2
+    // record can reappear. Shutdown additionally joins the sweep task before
+    // it gets here (`flush_tick.await`), but the barrier must not rely on
+    // that ordering — this quiesce is what makes every stamping path safe by
+    // construction.
+    sink.quiesce_publishes();
     if !audit_sink.flush() {
         let audit_events = audit_sink.buffered_events();
         tracing::warn!(
@@ -304,7 +346,10 @@ impl ReceiverHandle {
             // listeners are stopped (every acked batch has submitted its
             // encodes), so draining the pool before the flush + snapshot
             // guarantees no record ≤ the stamped high-water is still
-            // in-flight or buffered-but-unflushed.
+            // in-flight or buffered-but-unflushed. The publish half of the
+            // barrier (issue #578) is `flush_then_snapshot`'s own
+            // `quiesce_publishes` — trivially settled here because the
+            // sweep task was joined above, but not reliant on that.
             self.pipeline.quiesce_encodes();
             self.pipeline.with_miner(|miner| {
                 flush_then_snapshot(
@@ -1148,6 +1193,145 @@ mod tests {
             "only batch B's record remains buffered — the hook's flush_all \
              drained batch A before the stamp",
         );
+        assert!(
+            !data_parquet_files(&store_root.join("data")).is_empty(),
+            "batch A's records are durably in the store",
+        );
+        let artefacts =
+            ourios_ingester::snapshot_store::load_all(&snapshots_root).expect("load snapshots");
+        assert_eq!(artefacts.len(), 1, "the rotation snapshot was stamped");
+        let state = ourios_miner::snapshot::load_snapshot(&artefacts[0].1).expect("known version");
+        let mark = state.wal_high_water.expect("stamped with a horizon");
+        assert_eq!(mark.segment, rotation_point.segment.to_string());
+        assert_eq!(mark.byte, rotation_point.byte);
+    }
+
+    /// A pooled pipeline over a real 1 s-age WAL, an **age-zero** record
+    /// sink (so `drain_aged` takes every partition — the sweep's view of an
+    /// aged one, without waiting out a real age), an audit sink, and the
+    /// production `rotation_snapshot_hook` (→ `flush_then_snapshot`).
+    fn sweep_race_pipeline(
+        wal_root: &Path,
+        store_root: &Path,
+        audit_root: &Path,
+        snapshots_root: &Path,
+    ) -> (SharedPipeline, SharedParquetSink, SharedParquetAuditSink) {
+        let wal = Wal::open(WalConfig {
+            segment_age_secs: 1,
+            ..test_wal_config(wal_root)
+        })
+        .expect("open WAL");
+        std::fs::create_dir_all(store_root).expect("store root");
+        let sink = SharedParquetSink::new(ParquetRecordSink::new(
+            Store::local(store_root).expect("local store"),
+            FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::ZERO,
+                ceiling_bytes: usize::MAX,
+            },
+        ));
+        let audit = audit_sink(audit_root);
+        let miner = MinerCluster::with_audit_sink(MinerConfig::default(), Box::new(audit.clone()))
+            .with_record_sink(Box::new(sink.clone()));
+        let coordinator =
+            CommitCoordinator::new(Box::new(wal), Duration::from_millis(100), 128 * 1024 * 1024);
+        let pipeline = Arc::new(
+            IngestPipeline::new(coordinator, miner, TenantRule::service_name())
+                .with_encode_pool(ourios_ingester::encode_pool::EncodePool::new(&sink, 2))
+                .with_rotation_hook(rotation_snapshot_hook(
+                    sink.clone(),
+                    audit.clone(),
+                    snapshots_root.to_path_buf(),
+                )),
+        );
+        (pipeline, sink, audit)
+    }
+
+    /// Issue #578 — the publish half of the RFC0035.2 barrier: a rotation
+    /// firing while the age sweep's off-lock `write_ordered` is in flight
+    /// must not stamp `wal_high_water` until that publish settles. The
+    /// in-flight publish is the sweep's own two steps run by hand with the
+    /// gap held open — the atomic drain under the miner lock, then (held
+    /// back by the test) the off-lock ordered write — the exact window a
+    /// slow S3 PUT opens. Mutation check: reverting the `quiesce_publishes`
+    /// in `flush_then_snapshot` makes the rotation stamp during the window
+    /// and the mid-window assertion fail deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rfc0035_2_rotation_stamp_waits_for_the_sweeps_in_flight_publish() {
+        let tmp = tempfile::TempDir::new().expect("temp");
+        let store_root = tmp.path().join("store");
+        let snapshots_root = tmp.path().join("snapshots");
+        let (pipeline, sink, audit) = sweep_race_pipeline(
+            &tmp.path().join("wal"),
+            &store_root,
+            &tmp.path().join("audit"),
+            &snapshots_root,
+        );
+
+        // Batch A: acked, encoded, buffered (no trigger flushes it).
+        pipeline
+            .ingest(export_request(
+                "checkout",
+                &["user 1 logged in", "user 2 logged in"],
+            ))
+            .await
+            .expect("batch A acks");
+        let rotation_point = pipeline.last_durable().expect("durable after batch A");
+        pipeline.quiesce_encodes();
+        assert_eq!(sink.buffered_records(), 2, "batch A is buffered");
+
+        // Sweep half 1: the atomic drain under the miner lock. Batch A's
+        // records now exist only in `drained` and the WAL — the #578 window.
+        let coordinator = PublishCoordinator::new(sink.clone(), audit.clone());
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let sweep_pipeline = pipeline.clone();
+        let sweep = std::thread::spawn(move || {
+            let drained = sweep_pipeline.with_miner(|_miner| coordinator.drain_aged());
+            assert!(!drained.is_empty(), "the sweep drained batch A");
+            drained_tx.send(()).expect("signal drained");
+            release_rx.recv().expect("hold the write in flight");
+            assert!(
+                coordinator.write_ordered(drained, "age"),
+                "the held-back publish lands",
+            );
+        });
+        drained_rx.recv().expect("sweep drained");
+        assert_eq!(
+            sink.buffered_records(),
+            0,
+            "batch A left the buffers — in flight, durable nowhere but the WAL",
+        );
+
+        // The rotation races the in-flight publish: batch B lands in a new
+        // segment and fires the production hook on the ingest path.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let rotate_pipeline = pipeline.clone();
+        let rotation = tokio::spawn(async move {
+            rotate_pipeline
+                .ingest(export_request("checkout", &["payment 9 settled"]))
+                .await
+                .expect("batch B acks")
+        });
+
+        // Mid-window: the hook must be waiting in `quiesce_publishes`, not
+        // stamping. Without the barrier the rotation completes within the
+        // ~100 ms commit window, far inside this 800 ms observation point.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let snapshot_written = std::fs::read_dir(&snapshots_root)
+            .ok()
+            .is_some_and(|mut d| d.next().is_some());
+        assert!(
+            !snapshot_written,
+            "the stamp waits while the sweep's publish is in flight (issue #578)",
+        );
+
+        release_tx.send(()).expect("release the publish");
+        sweep.join().expect("sweep thread");
+        assert_eq!(rotation.await.expect("rotation task"), 1, "batch B acked");
+
+        // The stamp landed only after the publish settled: batch A is
+        // durably in the store and the snapshot carries the rotation mark.
         assert!(
             !data_parquet_files(&store_root.join("data")).is_empty(),
             "batch A's records are durably in the store",

@@ -23,6 +23,13 @@
 //!    audit failure drops the audit batch and still publishes the records — the
 //!    documented degraded case (those templates render retained/empty).
 //!
+//! Between those two steps the drained records exist only in memory — out of
+//! the buffers, not yet durable — so the snapshot holds the record sink's
+//! in-flight publish guard from drain to settled write (issue #578): a
+//! rotation/shutdown `wal_high_water` stamp quiesces these publishes
+//! (`SharedParquetSink::quiesce_publishes`) before it can claim their WAL
+//! frames durably captured.
+//!
 //! Rotation / shutdown already drain audit-before-record under the miner lock
 //! (the receiver's `flush_then_snapshot`), and the inline size/ceiling publish
 //! is gated by the record sink's audit barrier (also under the miner lock), so
@@ -37,10 +44,17 @@ use crate::record_sink::SharedParquetSink;
 
 /// An atomic snapshot of both sinks' buffers, taken under the miner lock and
 /// written off-lock by [`PublishCoordinator::write_ordered`].
+///
+/// Carries the record sink's in-flight publish guard (issue #578): from the
+/// drain until this snapshot drops — the write completed, the records
+/// requeued, or an unwind — its records count as in flight, and every
+/// `wal_high_water` stamping path waits them out
+/// (`SharedParquetSink::quiesce_publishes`) before it stamps.
 #[derive(Debug)]
 pub struct Drained {
     audit: Vec<AuditEvent>,
     records: Vec<(PartitionKey, Vec<MinedRecord>)>,
+    _guard: crate::record_sink::PublishGuard,
 }
 
 impl Drained {
@@ -70,20 +84,37 @@ impl PublishCoordinator {
     /// cadence drain). **Must be called under the pipeline's miner lock** so the
     /// drain is atomic w.r.t. `ingest`; it does only cheap memory moves, never
     /// I/O, so the lock is held for microseconds.
+    ///
+    /// The miner lock is also what makes the returned snapshot's in-flight
+    /// guard sound (issue #578): the guard is acquired *before* the take,
+    /// under the same lock every `wal_high_water` stamping path holds, so a
+    /// concurrent rotation/shutdown either sees these records still buffered
+    /// or sees them counted in flight — never neither.
     #[must_use]
     pub fn drain_aged(&self) -> Drained {
+        let guard = self.record.begin_publish();
         let audit = self.audit.take_buffer();
         let records = self.record.drain_aged();
-        Drained { audit, records }
+        Drained {
+            audit,
+            records,
+            _guard: guard,
+        }
     }
 
     /// Atomically take the audit buffer + **all** record partitions (rotation /
-    /// shutdown). Same atomicity contract as [`Self::drain_aged`].
+    /// shutdown). Same atomicity + in-flight-guard contract as
+    /// [`Self::drain_aged`].
     #[must_use]
     pub fn drain_all(&self) -> Drained {
+        let guard = self.record.begin_publish();
         let audit = self.audit.take_buffer();
         let records = self.record.drain_all();
-        Drained { audit, records }
+        Drained {
+            audit,
+            records,
+            _guard: guard,
+        }
     }
 
     /// Write a `drained` snapshot to durability **off the lock**, audit-first:
@@ -96,6 +127,12 @@ impl PublishCoordinator {
     /// the records publish (degraded — those templates render retained/empty).
     /// Returns whether everything was published (no transient retention on
     /// either sink) — the caller's snapshot-gating signal (no-loss, §3.4).
+    ///
+    /// Consuming `drained` settles its in-flight publish guard on return
+    /// (issue #578) — on the success path once the records are durable, on
+    /// the transient-failure path once they are requeued into the buffers,
+    /// and on an unwind — which is what releases a stamping path waiting in
+    /// `SharedParquetSink::quiesce_publishes`.
     #[must_use]
     pub fn write_ordered(&self, drained: Drained, trigger: &'static str) -> bool {
         let audit_durable = self.audit.write_owned(drained.audit);

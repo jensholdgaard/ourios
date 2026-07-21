@@ -658,19 +658,130 @@ fn rfc0036_4_rebuild_byte_identity() {
     );
 }
 
+/// Whether each row group of a Parquet file declares `sorting_columns`,
+/// read from the footer — `true` for a declared sort, `false` for none.
+fn sorting_declared_per_row_group(bytes: &[u8]) -> Vec<bool> {
+    let meta = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.to_vec()))
+        .expect("open file")
+        .metadata()
+        .clone();
+    meta.row_groups()
+        .iter()
+        .map(|rg| rg.sorting_columns().is_some())
+        .collect()
+}
+
 /// Scenario RFC0036.5 — no read-path or schema regression.
 /// See `docs/rfcs/0036-write-side-layout.md` §5.
+///
+/// The load-bearing in-repo half: a pre-RFC-0036-shape file (the plain
+/// ingest-side `Writer`, which declares no `sorting_columns` and rotates
+/// row groups at the 128 MiB ingest threshold — byte-for-byte the
+/// read-path shape of an old compacted file) and a post-RFC compacted
+/// file (which declares `sorting_columns` on every row group) decode
+/// through the **same** [`Reader`] to the **same** row multiset. That is
+/// the no-migration proof: §3.4's `sorting_columns` is pure footer
+/// metadata with no schema change (`CLAUDE.md` §3.5), so the reader —
+/// which is driven entirely by the column schema and never consults the
+/// sort declaration — is inert to its presence or absence. Old files read
+/// without error or special-casing because none is needed.
+///
+/// The comparative half — B1/B2 and the frozen RFC 0031 L-gates rerun on
+/// a post-change store, confirming L1/L3/L4 are not degraded beyond the
+/// Loki-wobble band and query results are identical row-sets — runs
+/// through the `ourios-bench` RFC 0031 harness (`docs/benchmarks.md`), not
+/// a CI unit test: it is a paid `baseline-8vcpu-32gib` measurement,
+/// deferred to `validated`, exactly as RFC0036.2's comparative arm is.
 #[test]
-#[ignore = "RFC0036.5 stub — implemented in the compat green slice (pre-RFC fixture reads + B1/B2 + frozen-gate rerun)"]
 fn rfc0036_5_no_read_path_or_schema_regression() {
-    todo!(
-        "RFC0036.5 — stores built before and after the change: B1/B2 \
-         and the frozen RFC 0031 comparative gates run against the \
-         post-change store and every frozen gate still passes, with \
-         the L1/L3/L4 pairs not degraded beyond the documented \
-         Loki-wobble band and query results identical row-sets; a \
-         pre-RFC-0036 fixture file (no sorting_columns, 128 MiB row \
-         groups) reads without error or special-casing — no migration \
-         exists because none is needed (CLAUDE.md §3.5)"
+    const BODY_LEN: usize = 128;
+    let plan: [(&str, u64); 3] = [("svc-a", 40), ("svc-b", 25), ("svc-c", 10)];
+
+    // A known multi-service, per-service-ascending-time row set — the
+    // pre-RFC file's contents and the compaction's expected multiset alike.
+    let mut all_rows: Vec<MinedRecord> = Vec::new();
+    let mut id: u64 = 0;
+    for (svc_idx, (service, rows)) in plan.iter().enumerate() {
+        for i in 0..*rows {
+            id += 1;
+            let ts = HOUR10_START + i * 10_000_000 + u64::try_from(svc_idx).expect("small") * 77;
+            all_rows.push(rec(service, ts, id, payload(id, BODY_LEN)));
+        }
+    }
+    let part = PartitionKey::derive(&all_rows[0]).expect("derive partition");
+
+    // --- Old shape: one ingest-side file holding every row. The plain
+    // Writer declares no sorting_columns — the read-path shape of a
+    // pre-RFC-0036 file (§3.4). ---
+    let old_bucket = tempfile::TempDir::new().expect("temp old");
+    let old_store = Store::local(old_bucket.path()).expect("old store");
+    let (_, old_key) = write_input(&old_store, &part, &all_rows);
+    let old_bytes = old_store.get_blocking(&old_key).expect("get old file");
+    assert!(
+        sorting_declared_per_row_group(&old_bytes)
+            .iter()
+            .all(|d| !d),
+        "pre-RFC-0036 file declares no sorting_columns on any row group",
+    );
+    let old_rows = Reader::open_partition_bytes(Bytes::from(old_bytes), part.clone(), &old_key)
+        .expect("open pre-RFC file")
+        .read_all()
+        .expect("pre-RFC file reads without error or special-casing");
+
+    // --- New shape: two ingest inputs folded by compaction into one file
+    // that declares sorting_columns on every row group. ---
+    let new_bucket = tempfile::TempDir::new().expect("temp new");
+    let new_store = Store::local(new_bucket.path()).expect("new store");
+    let file_a: Vec<MinedRecord> = all_rows.iter().step_by(2).cloned().collect();
+    let file_b: Vec<MinedRecord> = all_rows.iter().skip(1).step_by(2).cloned().collect();
+    write_input(&new_store, &part, &file_a);
+    write_input(&new_store, &part, &file_b);
+    let committed = compact_partition(&new_store, &part)
+        .expect("compact")
+        .committed
+        .expect("≥2 inputs ⇒ a commit");
+    let new_bytes = consolidated_bytes(&new_store, &part, &committed.file);
+    assert!(
+        sorting_declared_per_row_group(&new_bytes)
+            .iter()
+            .all(|d| *d),
+        "post-RFC-0036 compacted file declares sorting_columns on every row group",
+    );
+    let new_rows =
+        Reader::open_partition_bytes(Bytes::from(new_bytes), part.clone(), &committed.file)
+            .expect("open post-RFC file")
+            .read_all()
+            .expect("post-RFC file reads without error or special-casing");
+
+    // The same reader decodes both shapes to the same row multiset — the
+    // no-migration proof: sorting_columns is inert footer metadata, so the
+    // old (no-sort) and new (sorted) files are identical on the read path.
+    assert_eq!(
+        old_rows.len(),
+        all_rows.len(),
+        "pre-RFC file conserves rows"
+    );
+    assert_eq!(
+        new_rows.len(),
+        all_rows.len(),
+        "compacted file conserves rows"
+    );
+    let mut old_sorted = old_rows;
+    let mut new_sorted = new_rows;
+    let mut expected = all_rows;
+    old_sorted.sort_by_key(sort_key);
+    new_sorted.sort_by_key(sort_key);
+    expected.sort_by_key(sort_key);
+    assert_eq!(
+        old_sorted, expected,
+        "pre-RFC file decodes to the full row-set",
+    );
+    assert_eq!(
+        new_sorted, expected,
+        "compacted file decodes to the same row-set",
+    );
+    assert_eq!(
+        old_sorted, new_sorted,
+        "identical row-sets from both layouts — same reader, no special-casing",
     );
 }

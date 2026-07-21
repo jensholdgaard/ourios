@@ -221,6 +221,17 @@ phases. Everything around the sort — manifest bootstrap, CAS
 commit, GC, the RFC0009.5 per-row partition validation at input
 open — is untouched.
 
+The one exception is the §7 **skip-spill** optimisation for small
+partitions: while the encoded input total stays within
+`in_memory_max_bytes` (one ingest seal target, default 256 MiB), all
+inputs are held decoded at once and sorted in place rather than
+spilled one at a time. That bound is one seal-target's worth of
+input — no larger than decoding a single worst-case input file — so
+the load-bearing claim holds *at the bound*, but the strict
+"one file at a time" residency is the spill path's, not the
+in-memory path's. RFC0036.3's memory test asserts the accurate
+bound for each path.
+
 ### 3.3 Compacted row-group threshold
 
 Compacted output rotates row groups at a **separate, smaller

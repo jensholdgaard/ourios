@@ -391,10 +391,17 @@ enum SortState {
 /// the §3.1 key, and emit every row into `writer` in that key order.
 /// Returns `(rows, input bytes read)`.
 ///
-/// Peak decoded memory is one input file in phase 1 (inputs are
-/// processed strictly one at a time) and — via [`reduce_runs`]'s
-/// fan-in cap — F × one decoded batch in phase 2, preserving the
-/// pre-sort one-input-file bound.
+/// Peak decoded-row residency depends on the path (see [`SortTuning`]):
+/// - **Spill path** (encoded input total > `in_memory_max_bytes`): one
+///   decoded input file during run formation (inputs are decoded
+///   strictly one at a time, then spilled), then — via [`reduce_runs`]'s
+///   fan-in cap F — F × one decoded batch during the merge. This
+///   preserves the pre-sort one-input-file bound.
+/// - **In-memory path** (encoded input total ≤ `in_memory_max_bytes`,
+///   default 256 MiB = one ingest seal target): all inputs' decoded
+///   rows are held at once to sort in place and skip spilling — bounded
+///   by one seal-target's worth of input, so no larger than decoding a
+///   single worst-case input file (the [`SortTuning`] tradeoff).
 fn sort_inputs_into(
     writer: &mut Writer,
     store: &Store,

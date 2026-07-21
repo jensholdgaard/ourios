@@ -103,7 +103,8 @@ fn sort_key(r: &MinedRecord) -> (Option<String>, u64, String) {
 }
 
 /// Write `records` as one committed ingest-side file, returning
-/// `(basename, absolute local path)`.
+/// `(basename, object key)` — the key is the store object key the
+/// writer published under, not a filesystem path.
 fn write_input(store: &Store, part: &PartitionKey, records: &[MinedRecord]) -> (String, String) {
     let mut w = Writer::open_in(store, part.clone()).expect("open writer");
     w.append_records(records).expect("append");

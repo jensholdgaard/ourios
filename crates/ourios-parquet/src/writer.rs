@@ -55,18 +55,21 @@ use crate::promoted::PromotedAttributes;
 use crate::record_batch::{BatchError, mined_records_to_batch_with_promoted};
 use crate::store::Store;
 
-/// RFC 0005 §3.5 — uncompressed bytes per row group, lower
-/// threshold. The writer flushes a row group when
-/// `ArrowWriter::in_progress_size` crosses this. Ingest-side files
-/// only; compacted output rotates at
-/// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (RFC 0036 §3.3).
+/// RFC 0005 §3.5 — row-group rotation threshold for ingest-side files.
+/// The writer rotates a row group when `ArrowWriter::in_progress_size`
+/// crosses this. That value is parquet-rs's own estimate of the
+/// buffered row-group bytes — dominated by already-encoded (compressed)
+/// page data rather than raw uncompressed input — so on-disk row-group
+/// size tracks it closely. Ingest-side files only; compacted output
+/// rotates at [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (RFC 0036 §3.3).
 pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
-/// RFC 0036 §3.3 — uncompressed bytes per **compacted** row group.
-/// Compacted output rotates at a smaller threshold than ingest-side
-/// files so the §3.1 clustering yields per-row-group statistics tight
-/// enough to prune; a distinct const so the §7 threshold sweep is a
-/// one-line change.
+/// RFC 0036 §3.3 — row-group rotation threshold for **compacted**
+/// output, smaller than ingest-side files so the §3.1 clustering yields
+/// per-row-group statistics tight enough to prune. Measured against the
+/// same `ArrowWriter::in_progress_size` buffered estimate as
+/// [`ROW_GROUP_FLUSH_BYTES`]; a distinct const so the §7 threshold
+/// sweep is a one-line change.
 pub const COMPACTED_ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// RFC 0005 §3.6 default ZSTD compression level for data files —

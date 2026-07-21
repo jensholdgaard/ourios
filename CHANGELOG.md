@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.4.0] - 2026-07-21
+
+### Added
+
+- Rfc 0035 green — receiver.encode_workers config + default pool wiring (468ecf7)
+- Rfc 0035 green — submission under the gate + encode-drain-and-flush barrier (ab4f8fc)
+- Rfc 0035 green — bounded encode pool + queue-depth instrument (cd036fc)
+- Rfc 0035 green — ordered-phase capture + concurrent sink emit (e8419b6)
+- In-process multi-tenant soak load (--tenants N) (#570) (bc92ce8)
+
+### Documentation
+
+- §9.23 asserting soak — enact rfc 0034 d1 recast, rfc 0035 green (#580) (b32edbc)
+- Unlink private append_off_lock from emit_concurrent rustdoc (a38a465)
+- Configuration — receiver.encode_workers (RFC 0035) (f2c85a9)
+- Rfc 0034 — status specified (follow-up to #575) (#576) (22d3bbd)
+- Rfc 0034 — d1 re-scope on measured premises (#575) (b6be711)
+- §9.21 + §9.22 — in-process ceiling, profile, design a a/b (#574) (5d1fbe2)
+- Rfc 0035 — name the bit-partitioned u64 as design b's cheaper shape (#573) (66d1ca3)
+- Rfc 0035 — ingest concurrency (relax global miner serialization) (#572) (9ad3158)
+
+### Fixed
+
+- Rfc 0035 review fixes — capture-slot unwind safety, honest barrier docs (#579) (d2c622e)
+
+### Tests
+
+- Rfc 0035 green — §5 acceptance suites (.1/.2/.5) (0b6f112)
+
 ## [0.3.0] - 2026-07-20
 
 ### Added

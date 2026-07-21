@@ -323,11 +323,12 @@ the above matters.
   `baseline-8vcpu-32gib`, multi-tenant load (`soak --tenants N` with
   N = cores) through one shared WAL/commit stream, with WAL fsync
   batched at 100 ms (the `CLAUDE.md` §3.4 default).
-- **Target**: ≥ **100 000 lines/s per node**, with **p99 ingest-ack
-  latency ≤ 200 ms** at the sustained rate. Below-saturation is
-  observable, not asserted: the run offers exactly the bar rate and
-  must achieve ≥ **99% of offered** — a saturated pipeline cannot
-  keep pace with the paced load, and queue-bound latencies at
+- **Target**: the asserting run offers exactly **100 000 lines/s per
+  node** and must achieve ≥ **99% of offered** (the single acceptance
+  rule — pacing loss up to 1% is within the bar), with **p99
+  ingest-ack latency ≤ 200 ms** over that same run. Achieved ≈
+  offered is also the below-saturation proof: a saturated pipeline
+  cannot keep pace with the paced load, and queue-bound latencies at
   over-offered load are a different regime that does not count
   (§9.20's reading).
 - **Diagnostics (informational, still recorded — RFC 0034)**:

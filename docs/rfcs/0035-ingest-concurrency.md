@@ -45,10 +45,9 @@ superseded-by: —
 > and changes nothing until
 > `red`→`green`. Per `docs/rfcs/README.md`, §§1–4 are the design
 > contract, §5 the acceptance criteria and §6 the testing strategy — all
-> written, which places this RFC at **`specified`**; this PR's review
-> confirms the criteria are testable, after which `red` (failing stubs)
-> begins. §7 lists what a prototype must still resolve before
-> implementation lands.
+> written; the implementation landed (#577, review fixes #579) and all
+> five §5 criteria pass — including RFC0035.4 on the §9.23 asserting
+> soak — which places this RFC at **`green`**.
 
 ## 1. Summary
 
@@ -361,7 +360,10 @@ before implementation proceeds.
 - [x] **Prototype the split and measure the serial fraction** (the §6
   measurement) at `red` — done, `benchmarks.md` §9.22: 82.1k → 132.3k
   lines/s on the baseline class (1.61×, residual serial fraction
-  ≈ 0.62). Design A clears the D1 must-win; Design B stays deferred.
+  ≈ 0.62) — the throughput/capacity gate (a saturating run; its
+  queue-bound latencies say nothing about the p99 bar). The full D1
+  must-win incl. p99 at the sustained rate is §9.23's asserting run;
+  Design B stays deferred.
 - [ ] **If Design B is ever escalated (§4):** settle bit-partitioned
   `u64` vs compound id first — the former may avoid the §3.5 migration
   entirely, but needs a durable tenant-ordinal map design and K-bit

@@ -147,7 +147,14 @@ cache hits are murderous. Operators see "query took 12 s on 4 GB of
 logs" and lose faith in the backend.
 
 **Mitigation.**
-- Target **row-group size 128 MB – 1 GB** inside each Parquet file.
+- Target **row-group size 128 MB – 1 GB** for **ingest-side** Parquet
+  files. Compacted files deliberately rotate row groups at a smaller
+  threshold (RFC 0036 §3.3, initially 32 MiB) — the pruning-granularity
+  knob: within one compacted file a smaller row group buys tighter
+  per-group min/max statistics (so a windowed query scans the groups
+  that hold its answer, not the whole hour) at the cost of a few more
+  footer entries. File economics are governed by the **file** band
+  below, which compaction leaves untouched.
 - Target **file size 256 MB – 2 GB** post-compaction.
 - Background compaction job per tenant; cadence is a tunable.
 - Compaction is required to keep the WAL backlog bounded under

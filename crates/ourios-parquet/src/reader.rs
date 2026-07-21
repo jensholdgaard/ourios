@@ -49,14 +49,18 @@ use crate::store::{Store, StoreError};
 /// Streaming Parquet reader for one data file.
 ///
 /// One [`Reader`] reads one file. Use [`Reader::read_all`] to
-/// pull every row into a `Vec<MinedRecord>` — sufficient for
-/// MVP corpus replay and bench measurements. A future
-/// streaming-iterator API can layer on once the bench has
-/// measurable patterns.
+/// pull every row into a `Vec<MinedRecord>`, or
+/// [`Reader::next_batch`] to stream one decoded batch at a time
+/// (the RFC 0036 §3.2 merge holds exactly one batch per sorted
+/// run through this entry point).
 pub struct Reader {
     inner: ParquetRecordBatchReader,
     partition: Option<PartitionKey>,
     file_path: PathBuf,
+    /// Stream-global index of the next batch's first row, so per-row
+    /// diagnostics report stable indices across [`Reader::next_batch`]
+    /// calls.
+    row_offset: usize,
 }
 
 impl Reader {
@@ -150,7 +154,59 @@ impl Reader {
             inner,
             partition: None,
             file_path,
+            row_offset: 0,
         })
+    }
+
+    /// Open a reader that streams batches from a local file handle
+    /// instead of fully-resident bytes — the compaction merge's
+    /// per-run reader (RFC 0036 §3.2): holding F sorted runs open
+    /// costs F × one decoded batch, not F × file bytes. Same §3.9
+    /// baseline-column check as [`Self::open_file`]; no row-vs-path
+    /// validation (runs hold rows already validated at input decode).
+    pub(crate) fn open_streaming_file(path: &Path) -> Result<Self, ReaderError> {
+        let file = std::fs::File::open(path).map_err(|source| ReaderError::Io {
+            op: "open",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).map_err(ReaderError::Parquet)?;
+        require_baseline_columns(builder.schema())?;
+        let inner = builder.build().map_err(ReaderError::Parquet)?;
+        Ok(Self {
+            inner,
+            partition: None,
+            file_path: path.to_path_buf(),
+            row_offset: 0,
+        })
+    }
+
+    /// Read the next decoded batch of rows, or `Ok(None)` at end of
+    /// file — the batched counterpart of [`Self::read_all`] (RFC 0036
+    /// §3.2: the sorted-run merge streams one batch per run). Applies
+    /// the same row-vs-path validation as [`Self::read_all`] when the
+    /// reader was opened under a [`PartitionKey`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::read_all`].
+    pub fn next_batch(&mut self) -> Result<Option<Vec<MinedRecord>>, ReaderError> {
+        // `ParquetRecordBatchReader` yields `ArrowError`;
+        // `From<ArrowError> for ParquetError` lets us
+        // route everything through the same variant.
+        let Some(batch) = self.inner.next() else {
+            return Ok(None);
+        };
+        let batch = batch.map_err(|e| ReaderError::Parquet(e.into()))?;
+        let records = batch_to_mined_records(&batch, self.row_offset, ShapeValidation::Enforce)?;
+        if let Some(p) = &self.partition {
+            for (idx_in_batch, r) in records.iter().enumerate() {
+                validate_row_vs_partition(r, p, self.row_offset + idx_in_batch, &self.file_path)?;
+            }
+        }
+        self.row_offset += batch.num_rows();
+        Ok(Some(records))
     }
 
     /// Read every row in the file as a `MinedRecord`. Applies
@@ -171,27 +227,9 @@ impl Reader {
     /// - [`ReaderError::PartitionMismatch`] when a row's
     ///   derived partition disagrees with the partition supplied to
     ///   [`Self::open_partition`] or [`Self::open_partition_bytes`].
-    pub fn read_all(self) -> Result<Vec<MinedRecord>, ReaderError> {
+    pub fn read_all(mut self) -> Result<Vec<MinedRecord>, ReaderError> {
         let mut out = Vec::new();
-        let partition = self.partition;
-        let file_path = self.file_path;
-        // Running file-level row offset so multi-batch files
-        // report stable row indices across batches in
-        // `PartitionMismatch` errors. Per-batch `enumerate()`
-        // would reset to 0 every batch.
-        let mut row_offset: usize = 0;
-        for batch in self.inner {
-            // `ParquetRecordBatchReader` yields `ArrowError`;
-            // `From<ArrowError> for ParquetError` lets us
-            // route everything through the same variant.
-            let batch = batch.map_err(|e| ReaderError::Parquet(e.into()))?;
-            let records = batch_to_mined_records(&batch, row_offset, ShapeValidation::Enforce)?;
-            if let Some(p) = &partition {
-                for (idx_in_batch, r) in records.iter().enumerate() {
-                    validate_row_vs_partition(r, p, row_offset + idx_in_batch, &file_path)?;
-                }
-            }
-            row_offset += batch.num_rows();
+        while let Some(records) = self.next_batch()? {
             out.extend(records);
         }
         Ok(out)

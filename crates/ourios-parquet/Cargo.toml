@@ -69,6 +69,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # is plain Arrow columns.
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# RFC 0036 §3.2 sorted-run scratch: spilled runs live in a `TempDir` on
+# local disk for the duration of one compaction call (cache, not truth —
+# CLAUDE.md §3.6; the drop guard reclaims them on success and error alike).
+tempfile = "=3.27.0"
 
 [dev-dependencies]
 # Miner tunables (RFC 0004), their own crate so config edits recompile narrowly (RFC 0028).
@@ -81,8 +85,6 @@ ourios-miner = { path = "../ourios-miner" }
 # RFC0021.4 view-representation test: cast a plain batch's string/binary
 # columns to Utf8View/BinaryView and prove the shared decoder reads both.
 arrow-cast = { version = "=58.3.0", default-features = false }
-# Used by tests that build `MinedRecord` fixtures.
-tempfile = "=3.27.0"
 # Property tests for the compaction row-conservation invariant
 # (RFC0009.2 / CLAUDE.md §6.2 — invariants get a property test).
 proptest = "=1.11.0"

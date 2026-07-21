@@ -11,18 +11,23 @@ superseded-by: —
 
 # RFC 0036 — Write-side layout
 
-> **Status note.** **`red`** (2026-07-21). The five §5 stubs are
-> landed `#[ignore]`d, each failing on `todo!()` when force-run:
-> RFC0036.1/.3/.4/.5 in
-> `crates/ourios-parquet/tests/it/rfc0036_write_side_layout.rs` with
-> the compaction machinery they gate, and RFC0036.2's in-repo slice in
-> `crates/ourios-querier/tests/it/rfc0036_window_materialization.rs`
-> beside the RFC 0016 counter assertions (its comparative arm runs
-> through the `ourios-bench` RFC 0031 harness, not a CI stub). Design
-> review is done — maintainer go, 2026-07-21. The §7 decisions marked
-> "at `red`" (the threshold sweep, the run format, the fan-in cap F,
-> the D2 band) are deferred to the green implementation, where they
-> are measured rather than guessed.
+> **Status note.** **`red`** (2026-07-21), with the sorted-compaction
+> slice landing green. Scenarios **RFC0036.1** (footer inspection —
+> compacted threshold, `sorting_columns`, per-group service min/max —
+> plus the §6 merge property) and **RFC0036.4** (shuffled-listing
+> byte-identity rebuild) are implemented and passing in
+> `crates/ourios-parquet/tests/it/rfc0036_write_side_layout.rs`; the
+> external merge sort (run formation → capped-fan-in k-way merge), the
+> `COMPACTED_ROW_GROUP_FLUSH_BYTES` threshold, and the §3.4
+> `sorting_columns` declaration are in `compaction.rs`/`writer.rs`.
+> **RFC0036.3** (D2 band + memory bound), **RFC0036.5** (compat +
+> frozen-gate rerun), and RFC0036.2's window-materialization bound stay
+> `#[ignore]`d stubs for their own slices. The RFC stays `red` until all
+> five discharge. Design review is done — maintainer go, 2026-07-21.
+> The remaining §7 "at `red`" decisions (the threshold sweep and the D2
+> band) are measured in the compaction-properties and window slices; the
+> run-format, fan-in-cap, and skip-spill decisions are made and recorded
+> below.
 >
 > **How to read this document.** This is the write-side layout lever
 > that `docs/benchmarks.md` §9.13 named and §9.24 left "parked on its
@@ -215,6 +220,17 @@ one decoded input file. The writer's in-memory output accumulation
 phases. Everything around the sort — manifest bootstrap, CAS
 commit, GC, the RFC0009.5 per-row partition validation at input
 open — is untouched.
+
+The one exception is the §7 **skip-spill** optimisation for small
+partitions: while the encoded input total stays within
+`in_memory_max_bytes` (one ingest seal target, default 256 MiB), all
+inputs are held decoded at once and sorted in place rather than
+spilled one at a time. That bound is one seal-target's worth of
+input — no larger than decoding a single worst-case input file — so
+the load-bearing claim holds *at the bound*, but the strict
+"one file at a time" residency is the spill path's, not the
+in-memory path's. RFC0036.3's memory test asserts the accurate
+bound for each path.
 
 ### 3.3 Compacted row-group threshold
 
@@ -466,12 +482,14 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   groups = more footer entries and more per-group index overhead).
   Decide at `red` from measurement, keep it tunable (an RFC 0004
   knob eventually, like the flush-policy constants).
-- [ ] **Sort-key stability definition — settled as lexicographic,
-  confirm no consumer assumes otherwise.** The §3.1 key is
-  lexicographic `service.name`, *not* first-seen/dictionary
-  ordinal (first-seen is interleaving-dependent and would break
-  RFC0036.4). Confirm nothing downstream (dictionary encoding
-  efficiency, RFC 0022 bloom sizing) prefers first-seen order.
+- [x] **Sort-key stability definition — settled as lexicographic.**
+  The §3.1 key is lexicographic `service.name`, *not*
+  first-seen/dictionary ordinal (first-seen is interleaving-dependent
+  and would break RFC0036.4). *Confirmed:* dictionary encoding of the
+  compacted `service.name` column is unaffected by row order (it keys
+  on the set of distinct values, not their arrival order), and RFC 0022
+  bloom sizing is per-value, not order-dependent — nothing downstream
+  prefers first-seen order.
 - [ ] **Unpromoted-attribute tenants.** No promoted `service.name`
   ⇒ time-only sort (§3.1). Still wins time-pruning granularity;
   confirm the `sorting_columns` declaration degrades to the
@@ -492,17 +510,23 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   for same-configuration rebuilds — §9.13's phrasing — not
   across config changes), and that sorting keys read the
   *current* promoted set, matching re-projection.
-- [ ] **Run format and fan-in cap F.** Sorted runs to local
-  scratch as Arrow IPC (cheap encode) vs Parquet (reuses the
-  reader); pick at `red`. F sizing (memory vs merge passes) and
-  whether small partitions skip spilling entirely (sort fully
-  in-memory when the partition fits the existing one-input
-  bound anyway).
-- [ ] **The H4 wording amendment** (§3.3): land the one-line
-  `docs/hazards.md` H4 edit (row-group band scoped to ingest-side
-  files; compacted threshold = pruning-granularity knob) with the
-  implementation PR, per the hazard's own "layout tuning → RFC"
-  escalation clause.
+- [x] **Run format and fan-in cap F.** *Decided:* sorted runs spill
+  as **Parquet** in the data schema with spill-oriented properties (no
+  dictionaries, no statistics, ZSTD-1), reusing the existing
+  `Reader`/writer rather than a parallel Arrow-IPC codec path — a run's
+  bytes influence the output only through its decoded rows, so IPC's
+  cheaper encode doesn't pay for a second read path. Fan-in **F = 64**
+  single-passes every realistic partition (§9.7's band-scale case held
+  32 inputs) while capping worst-case phase-2 residency at F × one
+  decoded batch. Small partitions **skip spilling** entirely: while
+  total encoded input stays ≤ **256 MiB** (`SINK_TARGET_BYTES`, the
+  ingest seal target), the sort runs fully in memory — no larger than
+  phase 1's existing one-input bound.
+- [x] **The H4 wording amendment** (§3.3): landed with this slice —
+  `docs/hazards.md` H4 scopes the 128 MB–1 GB row-group target to
+  ingest-side files and states the compacted threshold as the
+  pruning-granularity knob; the file band and H4.4 file-based detection
+  signals are unchanged.
 
 ## 8. References
 

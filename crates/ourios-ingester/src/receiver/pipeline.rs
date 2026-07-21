@@ -812,6 +812,31 @@ mod tests {
         assert_eq!(calls.lock().expect("lock").len(), 1);
     }
 
+    /// The rotation branch on a `current_thread` runtime takes the
+    /// inline path (`block_in_place` would panic there — the flavor
+    /// guard is what this pins): the hook still fires exactly once
+    /// with the old segment's offset.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_completes_inline_on_a_current_thread_runtime() {
+        let in_first = WalOffset {
+            segment: uuid::Uuid::from_u128(1),
+            byte: 100,
+        };
+        let in_second = WalOffset {
+            segment: uuid::Uuid::from_u128(2),
+            byte: 40,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let pipeline = sequence_pipeline(
+            vec![in_first, in_second],
+            Box::new(move |_, mark| seen.lock().expect("lock").push(mark)),
+        );
+        pipeline.ingest(request()).await.expect("batch 1");
+        pipeline.ingest(request()).await.expect("batch 2");
+        assert_eq!(*calls.lock().expect("lock"), vec![in_first]);
+    }
+
     /// A panicking hook must not unwind `ingest`: the batch is
     /// already durable, and the unwind would poison the shared
     /// miner mutex and halt all future ingestion over a

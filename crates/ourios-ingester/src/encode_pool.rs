@@ -31,6 +31,9 @@ use crate::record_sink::SharedParquetSink;
 /// Queue bound in batches per worker: deep enough to keep workers fed,
 /// shallow enough that the in-flight backlog stays a few batches per
 /// core (memory bound + backpressure to the gate).
+/// Upper bound on encode workers (see `new`): thread-budget +
+/// overflow safety for the queue-capacity multiplication.
+const MAX_WORKERS: usize = 256;
 const QUEUE_BATCHES_PER_WORKER: usize = 4;
 
 /// Outstanding-batch accounting shared between submitters, workers, and
@@ -86,7 +89,11 @@ impl EncodePool {
     /// and the rotation/shutdown drains see one buffer.
     #[must_use]
     pub fn new(sink: &SharedParquetSink, workers: usize) -> Self {
-        let workers = workers.max(1);
+        // Clamp to a sane OS-thread budget: a mistyped config value must
+        // not spawn thousands of threads or overflow the queue-capacity
+        // multiplication below. 256 is far above any per-node core count
+        // this targets while keeping capacity arithmetic trivially safe.
+        let workers = workers.clamp(1, MAX_WORKERS);
         let (tx, rx) = sync_channel::<Vec<MinedRecord>>(workers * QUEUE_BATCHES_PER_WORKER);
         // `mpsc::Receiver` is single-consumer; the mutex turns it into a
         // shared work queue — pickup serializes, the emit work does not.
@@ -133,6 +140,12 @@ impl EncodePool {
     /// Queue one batch's mined records for concurrent emit. Blocks when
     /// the queue is full — the backpressure to the caller (the ingest
     /// gate).
+    /// The number of OS worker threads actually spawned (post-clamp).
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
     pub fn submit(&self, batch: Vec<MinedRecord>) {
         if batch.is_empty() {
             return;
@@ -273,6 +286,24 @@ mod tests {
         pool.quiesce();
         assert_eq!(sink.buffered_records(), 0, "everything published");
         assert_eq!(sink.flushes(), 8, "one size-triggered publish per emit");
+    }
+
+    #[test]
+    fn worker_count_is_clamped_to_the_thread_budget() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::local(dir.path()).expect("local store");
+        let sink = SharedParquetSink::new(ParquetRecordSink::new(
+            store,
+            FlushConfig {
+                target_bytes: usize::MAX,
+                max_buffer_age: Duration::from_secs(86_400),
+                ceiling_bytes: usize::MAX,
+            },
+        ));
+        let pool = EncodePool::new(&sink, usize::MAX);
+        assert_eq!(pool.worker_count(), MAX_WORKERS);
+        let one = EncodePool::new(&sink, 0);
+        assert_eq!(one.worker_count(), 1);
     }
 
     #[test]

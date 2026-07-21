@@ -87,8 +87,9 @@ This RFC is that line.
 The layout facts, verified in code:
 
 - Ingest seals a partition buffer at a 256 MiB estimate target, a
-  1 GiB total ceiling, or 300 s of age (`receiver.rs:55–57`; these
-  are RFC 0014 §3 defaults, not yet RFC 0004 knobs — RFC 0014 §7).
+  1 GiB total ceiling, or 300 s of age
+  (`ourios-server/src/receiver.rs:55–57`; these are RFC 0014 §3
+  defaults, not yet RFC 0004 knobs — RFC 0014 §7).
 - The writer flushes a row group when `ArrowWriter::in_progress_size`
   — an **uncompressed** estimate — crosses 128 MiB
   (`writer.rs:60`, checked at `writer.rs:627` and `writer.rs:644`).
@@ -517,17 +518,19 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   leaves untouched; RFC0009.5 input validation; the D2/D3 measures
   RFC0036.3 re-asserts. **RFC 0022** — promoted attribute columns
   and the §3.4 re-projection pass clustering rides. **RFC 0014** —
-  the flush-policy defaults (`receiver.rs:55–57`) and their §7
-  knob deferral. **RFC 0035** — the ingest concurrency model §3.6
+  the flush-policy defaults (`ourios-server/src/receiver.rs:55–57`)
+  and their §7 knob deferral. **RFC 0035** — the ingest concurrency model §3.6
   keeps untouched, and RFC0035.5's intra-partition row-order
   disclaimer that forces §3.2's run-formation phase. **RFC 0005**
   §3.5 — the row-group and file bands this RFC re-scopes for
   compacted output. **RFC 0016** — the scanned/pruned counts
   RFC0036.2 asserts against.
-- Code: `writer.rs:60`, `writer.rs:627`, `writer.rs:644` (the
+- Code (paths under `crates/ourios-parquet/src/` unless noted):
+  `writer.rs:60`, `writer.rs:627`, `writer.rs:644` (the
   128 MiB uncompressed rotation; no `sorting_columns`, no
   `max_row_group_size` anywhere),
-  `receiver.rs:55–57` (seal policy), `partition.rs:29–43`
+  `crates/ourios-server/src/receiver.rs:55–57` (seal policy),
+  `partition.rs:29–43`
   (`PartitionKey` — no service dimension),
   `compaction.rs:184–308` (one-file-at-a-time streaming, the
   §3.2-preserved memory property at `compaction.rs:228–234`, sorted

@@ -91,7 +91,8 @@ The layout facts, verified in code:
   are RFC 0014 §3 defaults, not yet RFC 0004 knobs — RFC 0014 §7).
 - The writer flushes a row group when `ArrowWriter::in_progress_size`
   — an **uncompressed** estimate — crosses 128 MiB
-  (`writer.rs:60`, checked at `writer.rs:627` and `:644`). There is
+  (`writer.rs:60`, checked at `writer.rs:627` and `writer.rs:644`).
+  There is
   no `max_row_group_size` property and no `sorting_columns`
   declaration anywhere; rows are in append order.
 - `PartitionKey` is (tenant, year, month, day, hour) only
@@ -523,13 +524,14 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   §3.5 — the row-group and file bands this RFC re-scopes for
   compacted output. **RFC 0016** — the scanned/pruned counts
   RFC0036.2 asserts against.
-- Code: `writer.rs:60/:627` (the 128 MiB uncompressed rotation; no
-  `sorting_columns`, no `max_row_group_size` anywhere),
+- Code: `writer.rs:60`, `writer.rs:627`, `writer.rs:644` (the
+  128 MiB uncompressed rotation; no `sorting_columns`, no
+  `max_row_group_size` anywhere),
   `receiver.rs:55–57` (seal policy), `partition.rs:29–43`
   (`PartitionKey` — no service dimension),
   `compaction.rs:184–308` (one-file-at-a-time streaming, the
-  §3.2-preserved memory property at `:228–234`, sorted basenames
-  at `:267–268`), `reader.rs:57` (the streaming
+  §3.2-preserved memory property at `compaction.rs:228–234`, sorted
+  basenames at `compaction.rs:267–268`), `reader.rs:57` (the streaming
   `ParquetRecordBatchReader` §3.2's merge builds on).
 - `docs/hazards.md` **H4** — the small-file problem: the file band
   (unchanged), the row-group band (amended, §3.3), and the

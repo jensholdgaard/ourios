@@ -369,6 +369,67 @@ fn compact_sorted(
     })
 }
 
+/// Test-only decoded-row residency gauge (RFC 0036 §3.2 / RFC0036.3).
+/// Counts the `MinedRecord`s the sort holds decoded in RAM on the
+/// current thread, exposing the peak so the forced-spill memory test
+/// can assert the one-input-plus-`F × batch` bound rather than
+/// whole-partition residency (RFC 0036 §6, "an instrumentation counter
+/// inside `sort_inputs_into`/`merge_runs`"). Thread-local because a
+/// `compact_*` call runs entirely on its caller's thread (blocking I/O
+/// throughout), so parallel tests never pollute each other's peak — the
+/// property a process-global gauge (or a tracking allocator) cannot
+/// offer under `cargo test`'s in-process parallelism.
+#[cfg(test)]
+mod residency {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CURRENT: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Zero both the running count and the high-water mark before a
+    /// measured compaction.
+    pub(super) fn reset() {
+        CURRENT.with(|c| c.set(0));
+        PEAK.with(|p| p.set(0));
+    }
+
+    /// The peak concurrently-live decoded-row count since the last
+    /// [`reset`].
+    pub(super) fn peak() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    /// `n` decoded rows entered residency.
+    pub(super) fn add(n: usize) {
+        let now = CURRENT.with(|c| {
+            let now = c.get() + n;
+            c.set(now);
+            now
+        });
+        PEAK.with(|p| {
+            if now > p.get() {
+                p.set(now);
+            }
+        });
+    }
+
+    /// `n` decoded rows left residency (spilled and dropped, or emitted).
+    /// Underflow means the instrumentation's add/sub calls are unbalanced
+    /// — a bug in the gauge the RFC0036.3 bound relies on — so panic
+    /// rather than saturate and silently under-report the peak.
+    pub(super) fn sub(n: usize) {
+        CURRENT.with(|c| {
+            let now = c
+                .get()
+                .checked_sub(n)
+                .expect("residency gauge underflow: unbalanced add/sub");
+            c.set(now);
+        });
+    }
+}
+
 /// Where the RFC 0036 §3.2 sort currently holds the partition's rows:
 /// decoded in memory while the running encoded input total fits
 /// [`SortTuning::in_memory_max_bytes`], or spilled to local scratch as
@@ -422,6 +483,8 @@ fn sort_inputs_into(
         let reader = Reader::open_partition_bytes(Bytes::from(bytes), partition.clone(), input)
             .map_err(CompactionError::Read)?;
         let mut records = reader.read_all().map_err(CompactionError::Read)?;
+        #[cfg(test)]
+        residency::add(records.len());
         // `usize <= u64` on every supported target; saturate rather than panic
         // on a theoretically wider one.
         row_count = row_count.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
@@ -443,14 +506,20 @@ fn sort_inputs_into(
                 for mut prior in buffered {
                     sort_records(keys, &mut prior);
                     runs.push(spill_run(scratch.path(), runs.len(), &prior, promoted)?);
+                    #[cfg(test)]
+                    residency::sub(prior.len());
                 }
                 sort_records(keys, &mut records);
                 runs.push(spill_run(scratch.path(), runs.len(), &records, promoted)?);
+                #[cfg(test)]
+                residency::sub(records.len());
                 SortState::Spilling { scratch, runs }
             }
             SortState::Spilling { scratch, mut runs } => {
                 sort_records(keys, &mut records);
                 runs.push(spill_run(scratch.path(), runs.len(), &records, promoted)?);
+                #[cfg(test)]
+                residency::sub(records.len());
                 SortState::Spilling { scratch, runs }
             }
         };
@@ -467,6 +536,8 @@ fn sort_inputs_into(
             writer
                 .append_records(&rows)
                 .map_err(CompactionError::Write)?;
+            #[cfg(test)]
+            residency::sub(rows.len());
         }
         SortState::Spilling { scratch, runs } => {
             let runs = reduce_runs(scratch.path(), runs, tuning.fan_in, keys, promoted)?;
@@ -705,6 +776,14 @@ impl Eq for MergeEntry {}
 struct RunCursor {
     reader: Reader,
     batch: std::vec::IntoIter<MinedRecord>,
+    /// Rows in the batch this cursor currently holds decoded, for the
+    /// RFC0036.3 residency gauge: the merge keeps ≤ one batch resident
+    /// per open run, so the gauge peaks at `F × batch`, not the whole
+    /// partition. The count is charged for the whole batch's lifetime
+    /// (a small over-count as its rows drain into the merge heap), and
+    /// released when the next batch loads or the run is exhausted.
+    #[cfg(test)]
+    batch_len: usize,
 }
 
 impl RunCursor {
@@ -712,6 +791,8 @@ impl RunCursor {
         Ok(Self {
             reader: Reader::open_streaming_file(path).map_err(CompactionError::Read)?,
             batch: Vec::new().into_iter(),
+            #[cfg(test)]
+            batch_len: 0,
         })
     }
 
@@ -720,9 +801,21 @@ impl RunCursor {
             if let Some(record) = self.batch.next() {
                 return Ok(Some(record));
             }
-            match self.reader.next_batch().map_err(CompactionError::Read)? {
-                Some(batch) => self.batch = batch.into_iter(),
-                None => return Ok(None),
+            if let Some(batch) = self.reader.next_batch().map_err(CompactionError::Read)? {
+                #[cfg(test)]
+                {
+                    residency::sub(self.batch_len);
+                    residency::add(batch.len());
+                    self.batch_len = batch.len();
+                }
+                self.batch = batch.into_iter();
+            } else {
+                #[cfg(test)]
+                {
+                    residency::sub(self.batch_len);
+                    self.batch_len = 0;
+                }
+                return Ok(None);
             }
         }
     }
@@ -2272,6 +2365,121 @@ mod tests {
             times,
             vec![TS0, TS0 + 500, TS0 + 1_000],
             "time-only order ignores service values",
+        );
+    }
+
+    /// Build a `k`-file partition of `s` rows each, in [`partition`], with
+    /// rotating promoted `service.name` values and per-row-unique times so
+    /// the §3.1 sort has real work.
+    fn build_k_file_partition(store: &Store, k: u64, s: u64) {
+        let part = partition();
+        let mut id: u64 = 0;
+        for _ in 0..k {
+            let recs: Vec<MinedRecord> = (0..s)
+                .map(|_| {
+                    id += 1;
+                    let svc = ["svc-a", "svc-b", "svc-c"][usize::try_from(id % 3).expect("mod 3")];
+                    sort_rec(Some(svc), HOUR10_START + id, id)
+                })
+                .collect();
+            let mut w = Writer::open_in(store, part.clone()).expect("open writer");
+            w.append_records(&recs).expect("append");
+            w.close().expect("close");
+        }
+    }
+
+    /// RFC0036.3 (memory bound) — the load-bearing §3.2 claim. On a
+    /// partition of `K` inputs of `S` rows each, the forced-spill sort's
+    /// peak decoded-row residency is bounded by one input (phase 1,
+    /// inputs decoded strictly one at a time) plus `F × batch` (phase 2,
+    /// one streamed batch per open run) — it must NOT regress to holding
+    /// the whole `K × S` partition decoded, which is the whole reason the
+    /// external merge sort exists. The in-memory (skip-spill) path, by
+    /// contrast, deliberately holds the whole partition (§7 tradeoff,
+    /// bounded by `in_memory_max_bytes`); measuring both peaks on the
+    /// *same* fixture pins both halves of §3.2's accurate bound. The gauge
+    /// is thread-local (a `compact_*` call runs entirely on this thread),
+    /// so the assertion is immune to `cargo test`'s in-process parallelism.
+    /// See `docs/rfcs/0036-write-side-layout.md` §5 / §6.
+    #[test]
+    fn rfc0036_3_forced_spill_peak_far_below_whole_partition() {
+        // K inputs of S rows. The spill path's peak is dominated by
+        // phase-1's one fully decoded input (S rows, decoded strictly one
+        // at a time); phase-2 opens only K < F cursors — no hierarchical
+        // pass — each holding one small reader batch, well under S. So the
+        // peak sits at ~one input, an order of magnitude below the whole
+        // partition (K × S), making a whole-partition regression
+        // unambiguous. (The F × batch term in the RFC 0036 §3.2 bound is
+        // the worst case for F saturated runs; it does not bite here.)
+        const K: u64 = 6;
+        const S: u64 = 12_000;
+        let total = usize::try_from(K * S).expect("fits usize");
+        let fan_in = SortTuning::default().fan_in;
+
+        // --- Spill path: force it with in_memory_max_bytes = 0 so every
+        // input spills one at a time. ---
+        let bucket_spill = tempfile::tempdir().expect("temp spill");
+        let store_spill = store_at(bucket_spill.path());
+        build_k_file_partition(&store_spill, K, S);
+        residency::reset();
+        let spilled = compact_sorted(
+            &store_spill,
+            &partition(),
+            &PromotedAttributes::default(),
+            ClusterKeys::ServiceThenTime,
+            SortTuning {
+                in_memory_max_bytes: 0,
+                fan_in,
+            },
+        )
+        .expect("compact spilled");
+        let spill_peak = residency::peak();
+        assert!(spilled.committed.is_some(), "≥2 files ⇒ a commit");
+        assert_eq!(spilled.rows, K * S, "every row carried");
+
+        // RFC0036.3's property is an *upper* bound — "not whole-partition".
+        // The teeth: peak must stay far below the whole partition; this fails
+        // if the merge ever buffers everything decoded. We deliberately do
+        // NOT assert a lower bound near one input: a future formation that
+        // streams within an input could peak below S and still satisfy the
+        // RFC. `> 0` is only a gauge-liveness sanity (spilling decodes rows).
+        assert!(spill_peak > 0, "the residency gauge recorded nothing");
+        assert!(
+            spill_peak < total / 2,
+            "forced-spill peak {spill_peak} regressed toward whole-partition \
+             residency (total {total}) — the merge must not hold the partition decoded",
+        );
+
+        // --- In-memory path: same fixture, unbounded skip-spill window. ---
+        let bucket_mem = tempfile::tempdir().expect("temp mem");
+        let store_mem = store_at(bucket_mem.path());
+        build_k_file_partition(&store_mem, K, S);
+        residency::reset();
+        let in_memory = compact_sorted(
+            &store_mem,
+            &partition(),
+            &PromotedAttributes::default(),
+            ClusterKeys::ServiceThenTime,
+            SortTuning {
+                in_memory_max_bytes: u64::MAX,
+                fan_in,
+            },
+        )
+        .expect("compact in-memory");
+        let mem_peak = residency::peak();
+        assert_eq!(in_memory.rows, K * S, "every row carried");
+        assert_eq!(
+            mem_peak, total,
+            "the in-memory path holds the whole partition decoded (bounded by \
+             in_memory_max_bytes — the §7 skip-spill tradeoff)",
+        );
+
+        // The contrast is the point: the spill path holds a fraction of what
+        // the in-memory path holds on the identical partition.
+        assert!(
+            spill_peak * 4 < mem_peak,
+            "the spill path ({spill_peak}) must hold far less than the \
+             in-memory path ({mem_peak})",
         );
     }
 }

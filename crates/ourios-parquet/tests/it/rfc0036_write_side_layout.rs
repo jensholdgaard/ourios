@@ -434,22 +434,149 @@ mod rfc0036_1_merge_property {
     }
 }
 
+/// Names of the partition's live data files, per its `manifest.json`.
+fn live_manifest_files(store: &Store, part: &PartitionKey) -> Vec<String> {
+    let key = format!("{}/{MANIFEST_FILENAME}", partition_prefix(part));
+    let (manifest, _etag) = Manifest::read_with_etag(store, &key)
+        .expect("read manifest")
+        .expect("manifest present after a committed compaction");
+    manifest.files
+}
+
+/// Count committed `*.parquet` objects physically present under the
+/// partition prefix (what the H4 small-file detector counts).
+fn on_disk_parquet_count(store: &Store, part: &PartitionKey) -> usize {
+    // Mirror production `live_file_keys`: count only committed `.parquet`
+    // objects that are *immediate* children of the partition prefix.
+    // `Store::list*` walks the whole subtree, but a partition's files live
+    // directly under its prefix — a nested/sidecar object is not a
+    // partition file and must not inflate the H4 small-file count.
+    let prefix = partition_prefix(part);
+    store
+        .list_blocking(Some(&prefix))
+        .expect("list")
+        .into_iter()
+        .filter(|k| k.ends_with(".parquet") && is_immediate_child(k, &prefix))
+        .count()
+}
+
+/// True when `key` is an immediate child object of `prefix`
+/// (`<prefix>/<name>` with no further `/`), tolerant of a trailing slash
+/// on `prefix`. Mirrors `compaction::is_immediate_child`.
+fn is_immediate_child(key: &str, prefix: &str) -> bool {
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    key.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+}
+
 /// Scenario RFC0036.3 — compaction properties preserved (D2 / D3 / memory).
 /// See `docs/rfcs/0036-write-side-layout.md` §5.
+///
+/// This test pins the **D3-unchanged** half structurally: the sorted
+/// compaction still emits exactly one output file per partition and drives
+/// the H4 small-file *count* down to one — the file-band property D3
+/// measures, preserved across the RFC 0036 sort (the row-group threshold
+/// dropped, but the *file* band is untouched — §3.3). The absolute
+/// 256 MiB–2 GiB file-size band needs real corpus volume on
+/// `baseline-8vcpu-32gib` (`docs/benchmarks.md` §9.7 / §9.25), exactly as
+/// the `rfc0009_1_*` structural test defers it; a synthetic unit-scale run
+/// produces a sub-band file, so the size band is asserted in the bench, not
+/// here.
+///
+/// The other two halves live where their machinery is. The **memory
+/// bound** (forced-spill peak decoded residency = one input + F×batch,
+/// never whole-partition) is
+/// `compaction::tests::rfc0036_3_forced_spill_peak_is_one_input_not_whole_partition`,
+/// which needs the internal `SortTuning` spill seam. The **D2 throughput
+/// band** is a wall-clock measurement, recorded in the `ourios-bench`
+/// `compaction` bench and `docs/benchmarks.md` §9.25 (indicative) —
+/// deliberately *not* an in-repo gate (wall-clock gates flake; RFC 0036 §6).
 #[test]
-#[ignore = "RFC0036.3 stub — implemented in the compaction-properties green slice (D2 band + memory bound)"]
 fn rfc0036_3_compaction_properties_preserved() {
-    todo!(
-        "RFC0036.3 — §9.7-scale compaction workload (band-scale \
-         partition, tens of input files) run through the sorted \
-         compaction: D3 holds unchanged (one output file per \
-         partition, inside the 256 MiB – 2 GiB band, < 5% of live \
-         files below 128 MiB), D2 throughput stays within the band \
-         set from a first measurement and still ≫ the per-partition \
-         seal rate; a memory-bound test shows peak decoded-row \
-         residency of the order of one input file (phase 1) and \
-         F × batch (phase 2) — never whole-partition residency"
+    // A tens-of-files backlog (the §5 "tens of input files" shape) across
+    // three services with interleaved times, so the sorted compaction has
+    // real cross-file merge + clustering work.
+    const FILES: usize = 24;
+    const ROWS_PER_FILE: u64 = 40;
+    const BODY_LEN: usize = 256;
+    let services = ["svc-a", "svc-b", "svc-c"];
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let store = Store::local(bucket.path()).expect("local store");
+
+    let mut part: Option<PartitionKey> = None;
+    let mut id: u64 = 0;
+    let mut expected_rows = 0usize;
+    for _ in 0..FILES {
+        let recs: Vec<MinedRecord> = (0..ROWS_PER_FILE)
+            .map(|i| {
+                id += 1;
+                let svc = services[usize::try_from(id).expect("id fits usize") % services.len()];
+                // Interleave times across files so no input is self-sorted.
+                let ts = HOUR10_START + (i * u64::try_from(FILES).expect("small")) + id % 7;
+                rec(svc, ts, id, payload(id, BODY_LEN))
+            })
+            .collect();
+        let p = part
+            .get_or_insert_with(|| PartitionKey::derive(&recs[0]).expect("derive partition"))
+            .clone();
+        write_input(&store, &p, &recs);
+        expected_rows += recs.len();
+    }
+    let part = part.expect("at least one file");
+
+    let outcome = compact_partition(&store, &part).expect("compact");
+    let committed = outcome.committed.expect("tens of files ⇒ a commit");
+
+    // D3 (file band): one output file per partition, the small-file count
+    // collapsed to one — physically, not merely manifest-hidden.
+    assert_eq!(outcome.files_before, FILES, "every input was live");
+    assert_eq!(
+        outcome.rows,
+        u64::try_from(expected_rows).expect("row count"),
+        "compaction conserves every row across the collapse",
     );
+    assert_eq!(
+        live_manifest_files(&store, &part),
+        vec![committed.file.clone()],
+        "exactly one live file per partition (D3 unchanged)",
+    );
+    assert_eq!(outcome.gc_failures, 0, "every superseded input removed");
+    assert_eq!(
+        on_disk_parquet_count(&store, &part),
+        1,
+        "exactly one physical .parquet remains (H4 small-file count → 1)",
+    );
+
+    // The one output file is the sorted layout: every row group declares
+    // the §3.4 sorting_columns and decodes in §3.1 order (D3 preserving
+    // the RFC 0036 clustering, not reverting to append order).
+    let bytes = consolidated_bytes(&store, &part, &committed.file);
+    let meta = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.clone()))
+        .expect("open consolidated")
+        .metadata()
+        .clone();
+    for rg in meta.row_groups() {
+        assert!(
+            rg.sorting_columns().is_some(),
+            "compacted row groups still declare sorting_columns after the collapse",
+        );
+    }
+    let got = Reader::open_partition_bytes(Bytes::from(bytes), part.clone(), &committed.file)
+        .expect("open consolidated")
+        .read_all()
+        .expect("read consolidated");
+    assert_eq!(got.len(), expected_rows, "row count conserved on read-back");
+    for pair in got.windows(2) {
+        let (a, b) = (sort_key(&pair[0]), sort_key(&pair[1]));
+        assert!(
+            (a.0.as_deref(), a.1) <= (b.0.as_deref(), b.1),
+            "§3.1 key order preserved through compaction: {:?} then {:?}",
+            (a.0, a.1),
+            (b.0, b.1),
+        );
+    }
 }
 
 /// Scenario RFC0036.4 — determinism (the harness's contract).

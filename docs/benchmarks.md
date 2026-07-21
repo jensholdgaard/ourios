@@ -1971,3 +1971,63 @@ With this record the #498 authoritative-rerun checkbox — the last
 open decision on that scoreboard — is discharged. The remaining
 storage-side lever named in §9.13 (write-side layout, hazard #4)
 stays parked on its own line, unchanged by this run.
+
+### 9.25 Results — 2026-07-22 (indicative, local M-series) — D2 / D3 after the RFC 0036 sorted compaction
+
+**Purpose.** RFC 0036 slice B (RFC0036.3) makes compaction *sort* the
+partition by (promoted `service.name`, `time_unix_nano`) via the §3.2
+external merge sort and rotate compacted row groups at the smaller
+`COMPACTED_ROW_GROUP_FLUSH_BYTES` (32 MiB). §5 requires that D2/D3 —
+RFC 0009's compaction-throughput and file-band properties — survive
+the sort. This is the "first measurement" §7 asks for, at `red`: the
+band from which the sorted D2 is set. **Indicative, not
+authoritative** — the baseline-VM sorted-vs-unsorted rerun is deferred
+to `validated` (a paid, maintainer-opted run, per RFC 0031 §3.2 / the
+"bench on ci-runner first" discipline).
+
+**Hardware / run.** Local M-series developer machine (P-cores;
+`taskpolicy -B` to escape the Claude-Code background-QoS E-core
+throttle), release build at the slice-B head. The `ourios-bench`
+`compaction` bench, band-scale one-shot mode
+(`OURIOS_COMPACTION_BASELINE=1 FILES=32 ROWS=4800 BODY_BYTES=4096` —
+the **exact §9.7 shape**, ~453 MiB of input in one partition), plus
+the criterion micro-sweep to confirm the groups still execute with the
+sort in the path.
+
+| measure | result (sorted, this run) | §9.7 reference (unsorted, `baseline-8vcpu-32gib`) | verdict |
+|---|---|---|---|
+| **D2** compaction throughput | 32 files (452.9 MiB) → 1 in ~3.2 s = **~138 MiB/s** (137–144 over three runs); 153,600 rows conserved | 166.8 MiB/s | **keeps up** — ≫ any per-partition seal rate (≤ ~1 MiB/s/partition at the 256 MiB / 300 s seal cadence), so a backlog still drains |
+| **D3** small-file size band | output **452.7 MiB** — **IN** the 256 MiB–2 GiB band; **0%** of live files < 128 MiB (target < 5%) | 456.7 MiB, 0% < 128 MiB | **PASS (unchanged)** — still one file per partition, still in-band |
+
+**Reading — "sorting is not free," measured honestly.** Sorted D2 on
+this box is ~138 MiB/s against §9.7's 166.8 MiB/s unsorted. The two
+numbers are **not the same hardware** (local M-series vs the 8 vCPU
+EPYC-Milan baseline), so this is *not* a clean sorting-overhead delta —
+it is a fresh indicative measurement of the sorted path, plus the
+observation that adding a full external-merge-sort pass (decode →
+per-input stable sort → spill/merge, or the in-memory skip-spill
+short-circuit) to the rewrite lands in the **same order of magnitude**
+as the prior unsorted copy-through and comfortably clears "keeps up."
+The clean same-hardware sorted-vs-unsorted delta is a `validated`
+baseline-rerun item; it is deliberately not asserted here. **The D2
+band is set from this measurement (indicative floor ~120 MiB/s on this
+class) and is *not* an in-repo wall-clock gate** — wall-clock gates
+flake, so the in-repo RFC0036.3 assertion is structural (D3 file band +
+the §3.2 memory bound); the throughput lives here in §9 and in the
+bench (RFC 0036 §6).
+
+**Reading — D3 holds unchanged.** The headline: the sort did **not**
+touch the file band. Compaction still emits exactly one file per
+partition, 452.7 MiB, squarely in the H4 256 MiB–2 GiB target with
+zero sub-128 MiB files — the RFC 0036 §3.3 amendment drops the
+*compacted row-group* threshold (32 MiB, ~14 groups here) but leaves
+the *file* band untouched, and D3 measures files. The structural side
+(one output file, small-file count → 1, rows conserved, sorted layout
+declared) is pinned deterministically in `ourios-parquet`'s
+`rfc0036_3_compaction_properties_preserved` (tests/it) and the merge
+proptests; the §3.2 peak-memory bound (forced-spill residency = one
+input + F×batch, never whole-partition) in
+`rfc0036_3_forced_spill_peak_is_one_input_not_whole_partition`. These
+wall-clock figures are the indicative stamp; the authoritative sorted
+D2/D3 awaits the `validated` baseline rerun (RFC0036.5's frozen-gate
+pass will accompany it).

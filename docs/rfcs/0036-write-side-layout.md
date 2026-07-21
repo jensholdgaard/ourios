@@ -1,7 +1,7 @@
 ---
 rfc: 0036
 title: Write-side layout — compacted-partition clustering and row-group sizing
-status: specified
+status: red
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-21
@@ -11,13 +11,18 @@ superseded-by: —
 
 # RFC 0036 — Write-side layout
 
-> **Status note.** **`specified`** at draft: §§1–8 are written,
-> including the §5 acceptance criteria and §6 testing strategy, and
-> every hazard this RFC touches (H4; `CLAUDE.md` §3.5, §3.6) carries a
-> scenario. Per `docs/rfcs/README.md`, `specified` additionally
-> requires review to confirm the criteria are testable in principle —
-> this PR's review round is that confirmation; nothing in the codebase
-> changes until `red` → `green`.
+> **Status note.** **`red`** (2026-07-21). The five §5 stubs are
+> landed `#[ignore]`d, each failing on `todo!()` when force-run:
+> RFC0036.1/.3/.4/.5 in
+> `crates/ourios-parquet/tests/it/rfc0036_write_side_layout.rs` with
+> the compaction machinery they gate, and RFC0036.2's in-repo slice in
+> `crates/ourios-querier/tests/it/rfc0036_window_materialization.rs`
+> beside the RFC 0016 counter assertions (its comparative arm runs
+> through the `ourios-bench` RFC 0031 harness, not a CI stub). Design
+> review is done — maintainer go, 2026-07-21. The §7 decisions marked
+> "at `red`" (the threshold sweep, the run format, the fan-in cap F,
+> the D2 band) are deferred to the green implementation, where they
+> are measured rather than guessed.
 >
 > **How to read this document.** This is the write-side layout lever
 > that `docs/benchmarks.md` §9.13 named and §9.24 left "parked on its

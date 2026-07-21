@@ -1882,3 +1882,90 @@ RFC0034.2 and RFC0035.4 simultaneously: the production Design A
 sustains the recast bar with margin to spare over the pre-RFC ~82k
 saturation baseline (§9.22), with D2 passing over a full hour of
 sustained multi-tenant load.
+
+### 9.24 Results — 2026-07-21 (authoritative, `baseline-8vcpu-32gib`) — first authoritative comparative run: all frozen gates pass
+
+**Purpose.** The RFC 0031 comparative program's move from indicative
+to authoritative — the last open decision on the #498 scoreboard.
+Every number in the §9.13–§9.18 series was measured on `ci-runner`
+and labelled indicative; per RFC 0031 §3.2 the baseline-hardware run
+is a maintainer opt-in, and this one was. Ad-hoc VM run on the §1
+baseline class (8 dedicated vCPU / 32 GiB), not a workflow dispatch,
+but an **exact replica of the `comparative-bench.yml` dispatch
+recipe** at main `9deecb1`: frozen `corpus/otel-demo-v8` (4,948,596
+records), `grafana/loki:3.5.3` digest-pinned via Docker,
+`OURIOS_COMPARATIVE_CLASSES=all`, release build, every §7 FROZEN
+gate asserting. Run logs and the machine-readable
+`comparative-results.json` artifacts for both runs are retained by
+the maintainer outside the repository (the gitignored local
+`scratch/` tree), as with every ad-hoc VM record in this series.
+
+**Two runs, recorded honestly.** Run 1 (5,798 s) measured every
+pair and **passed every gate it printed** — L2 39.51× processed /
+1.275× storage floor, L1 97.56× storage, L4 84.93× processed /
+3.59× storage floor, both L6 latency floors — but **failed overall**:
+the L3 pair hit the known transient Loki-visibility flicker (`loki
+returned 0 of 9 expected rows … before timeout`), the same class the
+#490 flag fixes addressed and runs #11/#13/#21 hit before, so the
+harness hard-failed the run rather than salvage it. The decision
+rule applied: one deliberate, configuration-identical retry; had the
+flicker recurred, the next step would have been engineering, not
+rerolling. It did not recur. **Run 2 (5,556 s) is the counted
+authoritative run: exit 0, 1 passed / 0 failed, all 11 frozen gate
+decisions `Decided { pass: true }`, L3 measured cleanly**, RFC 0033
+acquisition warm on every body-rendering pair (one artifact GET,
+187,906 B compressed), equivalence held on every pair, and L4
+completeness 1147/1197 = 95.8% — inside the §7 0.90 margin and the
+§9.17 band (95.3–97.5%).
+
+**Run 2 — the counted numbers** (honest §3.6 totals; Loki bytes per
+channel; latency oriented loki_p50/ourios_p50, > 1 = Ourios faster):
+
+| pair | ourios bytes | loki storage / processed | gate verdicts | latency |
+|---|---|---|---|---|
+| L1 template (2 rows) | 1,032,727 | 101,021,242 / 2,397,510,168 | storage PRIMARY **97.82×** pass; processed 2,321.5× context | **90.44×** |
+| L3 trace (9 rows) | 4,486,712 | 101,021,242 / 2,397,510,168 | storage PRIMARY **22.52×** pass; processed 534.4× context | **77.99×** |
+| L2 severity (1 row) | 2,223,173 | 2,754,940 / 85,310,490 | processed PRIMARY **38.37×** pass; storage floor **1.239×** vs 11/10 pass | 3.77× |
+| L4 frequency (1,197 rows) | 47,995,205 | 172,776,288 / 4,086,073,975 | processed PRIMARY **85.14×** pass; storage floor **3.60×** vs 11/10 pass | — |
+| L6 window k=100 | 1,931,911 | 16,250 / 63,595 | latency floor **0.370** pass (≥ 1/3); storage-loss diagnostics published, not gated | 0.37 |
+| L6 window k=2000 | 4,202,473 | 72,524 / 1,809,523 | latency floor **4.341** pass | 4.34 |
+| selective-resource "ad" k=100 (diagnostic) | 1,431,533 | 31,657 / 239,072 | floor-reference pass (0.76) | 0.76 |
+
+**Reading 1 — the frozen-gate program confirms at authoritative
+class.** Every §7 FROZEN value asserted and passed on the baseline
+hardware with no recalibration. On the bytes channels the margins
+are equal or wider than the ci-runner series: L1 storage 97.82× vs
+the §9.13 calibration streak's 77.2–77.7× (and in the neighbourhood
+of the later asserting runs' 102–108×); L3 22.52× vs 21.2–21.9×; L2
+storage floor 1.239× inside its 1.05–1.49× history. L4's 3.60×
+storage floor sits a whisker below the §9.17 indicative band
+(3.69–3.73×) — Loki-side storage wobble scale (§9.13's determinism
+note), and more than 3× the frozen 1.1× floor either way; L4
+processed (85.14×) is inside its 84.9–87.1× history. Bytes-read
+being CPU-insensitive by construction (§9.13), agreement here is
+expected — but now it is measured, and the thesis's must-win claims
+are no longer resting on indicative hardware alone.
+
+**Reading 2 — the needle latency ratios compress on dedicated
+hardware, exactly as caveated.** L1 90.44× and L3 77.99× against
+the ci-runner indicative 308×/323×: Loki's corpus-wide needle scans
+drop from 23–24 s to ~10 s on the faster box while Ourios stays in
+its flat fixed-cost profile (57–129 ms warm p50 across every pair).
+This is §9.13's / #498's "a tuned environment compresses latency
+ratios; the structural asymmetries remain" caveat, now measured
+rather than hedged: the wall-clock gap on the needle classes is
+still interactive-vs-batch (~110–129 ms vs ~10 s), the L6 floors
+still hold (0.37 / 4.34 / 0.76 diagnostic), and the bytes
+asymmetry — the primary channel — did not compress. Quote the
+latency channel from this entry, not the indicative one.
+
+**Reading 3 — post-RFC-0035 code, gates held without
+recalibration.** `9deecb1` carries the RFC 0035 Design A ingest
+restructuring (#577/#581). Every read-path byte count and every
+frozen gate held with no adjustment, consistent with RFC0035.5's
+guarantee that the concurrency change alters no on-disk artifact.
+
+With this record the #498 authoritative-rerun checkbox — the last
+open decision on that scoreboard — is discharged. The remaining
+storage-side lever named in §9.13 (write-side layout, hazard #4)
+stays parked on its own line, unchanged by this run.

@@ -1255,7 +1255,9 @@ impl MinerCluster {
     /// The caller's batch is already WAL-durable (acked or about to
     /// be), so dropping a captured record with the unwind would lose it
     /// until a restart's replay — forward it now, and count the salvage
-    /// so the (expected-never) path is observable.
+    /// so the (expected-never) path is countable in-process via
+    /// [`Self::mined_capture_salvages_total`] — an assertion aid for
+    /// tests and debugging, not an exported telemetry instrument.
     fn salvage_mined_capture(&mut self) {
         if let Some(rec) = self.take_mined_capture() {
             self.mined_capture_salvages.fetch_add(1, Ordering::Relaxed);

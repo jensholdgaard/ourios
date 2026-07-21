@@ -2402,7 +2402,7 @@ mod tests {
     /// so the assertion is immune to `cargo test`'s in-process parallelism.
     /// See `docs/rfcs/0036-write-side-layout.md` §5 / §6.
     #[test]
-    fn rfc0036_3_forced_spill_peak_is_one_input_not_whole_partition() {
+    fn rfc0036_3_forced_spill_peak_far_below_whole_partition() {
         // K inputs of S rows. The spill path's peak is dominated by
         // phase-1's one fully decoded input (S rows, decoded strictly one
         // at a time); phase-2 opens only K < F cursors — no hierarchical
@@ -2414,7 +2414,6 @@ mod tests {
         const K: u64 = 6;
         const S: u64 = 12_000;
         let total = usize::try_from(K * S).expect("fits usize");
-        let one_input = usize::try_from(S).expect("fits usize");
         let fan_in = SortTuning::default().fan_in;
 
         // --- Spill path: force it with in_memory_max_bytes = 0 so every
@@ -2438,14 +2437,13 @@ mod tests {
         assert!(spilled.committed.is_some(), "≥2 files ⇒ a commit");
         assert_eq!(spilled.rows, K * S, "every row carried");
 
-        // Two-sided: formation must decode at least one full input (the
-        // floor), and the peak must stay far below the whole partition (the
-        // teeth — this fails if the merge ever buffers everything decoded).
-        assert!(
-            spill_peak >= one_input,
-            "forced-spill peak {spill_peak} is below one decoded input \
-             ({one_input}) — formation should hold a full input at its peak",
-        );
+        // RFC0036.3's property is an *upper* bound — "not whole-partition".
+        // The teeth: peak must stay far below the whole partition; this fails
+        // if the merge ever buffers everything decoded. We deliberately do
+        // NOT assert a lower bound near one input: a future formation that
+        // streams within an input could peak below S and still satisfy the
+        // RFC. `> 0` is only a gauge-liveness sanity (spilling decodes rows).
+        assert!(spill_peak > 0, "the residency gauge recorded nothing");
         assert!(
             spill_peak < total / 2,
             "forced-spill peak {spill_peak} regressed toward whole-partition \

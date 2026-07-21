@@ -11,8 +11,8 @@
 //! RFC 0016 counters) lives with the querier counter assertions in
 //! `ourios-querier/tests/it/rfc0036_window_materialization.rs`.
 
-/// Scenario RFC0036.1 — compacted layout (clustering + sizing +
-/// declaration). See `docs/rfcs/0036-write-side-layout.md` §5.
+/// Scenario RFC0036.1 — compacted layout (clustering + sizing + declaration).
+/// See `docs/rfcs/0036-write-side-layout.md` §5.
 #[test]
 #[ignore = "RFC0036.1 stub — implemented in the sorted-compaction green slice (run formation + merge + writer properties)"]
 fn rfc0036_1_compacted_layout() {
@@ -32,8 +32,8 @@ fn rfc0036_1_compacted_layout() {
     );
 }
 
-/// Scenario RFC0036.3 — compaction properties preserved (D2 / D3 /
-/// memory). See `docs/rfcs/0036-write-side-layout.md` §5.
+/// Scenario RFC0036.3 — compaction properties preserved (D2 / D3 / memory).
+/// See `docs/rfcs/0036-write-side-layout.md` §5.
 #[test]
 #[ignore = "RFC0036.3 stub — implemented in the compaction-properties green slice (D2 band + memory bound)"]
 fn rfc0036_3_compaction_properties_preserved() {

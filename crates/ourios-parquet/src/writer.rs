@@ -41,9 +41,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ourios_core::record::MinedRecord;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowSchemaConverter, ArrowWriter};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
+use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use uuid::Uuid;
@@ -56,8 +57,17 @@ use crate::store::Store;
 
 /// RFC 0005 §3.5 — uncompressed bytes per row group, lower
 /// threshold. The writer flushes a row group when
-/// `ArrowWriter::in_progress_size` crosses this.
+/// `ArrowWriter::in_progress_size` crosses this. Ingest-side files
+/// only; compacted output rotates at
+/// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (RFC 0036 §3.3).
 pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// RFC 0036 §3.3 — uncompressed bytes per **compacted** row group.
+/// Compacted output rotates at a smaller threshold than ingest-side
+/// files so the §3.1 clustering yields per-row-group statistics tight
+/// enough to prune; a distinct const so the §7 threshold sweep is a
+/// one-line change.
+pub const COMPACTED_ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// RFC 0005 §3.6 default ZSTD compression level for data files —
 /// chosen for write throughput on the ingest hot path. [`Writer::open`]
@@ -72,8 +82,43 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 /// threshold check stays well under RFC 0005 §3.5's hard 1 GiB
 /// upper bound: 1024 rows × ≤ 768 KiB per record ≈ 768 MiB,
 /// plus a 128 MiB pre-flushed buffer ≈ 896 MiB worst case, with
-/// the 1 GiB ceiling still uncrossed.
-const SUB_BATCH_ROWS: usize = 1024;
+/// the 1 GiB ceiling still uncrossed. Public: the fixed sub-batching
+/// is part of the RFC 0036 §3.5 determinism contract — the compaction
+/// merge emits in exactly these chunks so both §3.2 paths drive the
+/// Parquet writer with an identical call sequence.
+pub const SUB_BATCH_ROWS: usize = 1024;
+
+/// RFC 0036 §3.1 — the clustering key shape for compacted output:
+/// the promoted `service.name` then `time_unix_nano`, or time alone
+/// when `service.name` is not in the promoted set. Derived from the
+/// same [`PromotedAttributes`] the compaction rewrite re-projects
+/// under (§3.6), so the sort keys always read the *current* set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClusterKeys {
+    /// §3.1 keys 1–2: promoted `service.name` (lexicographic UTF-8
+    /// bytes, absent/null first), then `time_unix_nano` ascending.
+    ServiceThenTime,
+    /// §3.1 key 2 alone — the fallback for a promoted set without
+    /// `service.name`. Unreachable through [`ClusterKeys::for_promoted`]
+    /// today (RFC 0022 makes `service.name` implicit and
+    /// non-removable), so it is exercised via the internal seam until
+    /// a config can express such a set.
+    TimeOnly,
+}
+
+impl ClusterKeys {
+    pub(crate) fn for_promoted(promoted: &PromotedAttributes) -> Self {
+        if promoted
+            .resource_keys()
+            .iter()
+            .any(|k| k == crate::promoted::SERVICE_NAME_KEY)
+        {
+            Self::ServiceThenTime
+        } else {
+            Self::TimeOnly
+        }
+    }
+}
 
 /// Buffer-and-put Parquet writer for one partition's data file
 /// (RFC 0013 object-storage seam).
@@ -125,6 +170,11 @@ pub struct Writer {
     /// RFC 0022 promoted attribute set this writer projects; fixed at
     /// open time (the declared schema embeds its columns).
     promoted: PromotedAttributes,
+    /// In-progress bytes at which a row group seals:
+    /// [`ROW_GROUP_FLUSH_BYTES`] on the ingest side,
+    /// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] for compacted output
+    /// (RFC 0036 §3.3). Fixed at open time.
+    flush_bytes: usize,
     /// Set to `true` once any `ArrowWriter::write` /
     /// `ArrowWriter::flush` call returns `Err`. The underlying
     /// `ArrowWriter`'s buffer state is undefined after such a
@@ -249,6 +299,40 @@ impl Writer {
         zstd_level: i32,
         promoted: PromotedAttributes,
     ) -> Result<Self, WriterError> {
+        Self::open_in_inner(store, partition, zstd_level, promoted, None)
+    }
+
+    /// Open a **compacted-output** writer for `partition` (RFC 0036):
+    /// row groups rotate at [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (§3.3)
+    /// and the file declares the §3.4 `sorting_columns` for `keys`.
+    /// Compaction-only — ingest-side files keep the 128 MiB rotation
+    /// and declare no sort (their rows are genuinely unsorted,
+    /// RFC0035.5). The caller is responsible for appending rows in the
+    /// declared §3.1 order.
+    ///
+    /// # Errors
+    ///
+    /// See [`Writer::open_in_with_zstd_level`].
+    pub(crate) fn open_in_compacted(
+        store: &Store,
+        partition: PartitionKey,
+        zstd_level: i32,
+        promoted: PromotedAttributes,
+        keys: ClusterKeys,
+    ) -> Result<Self, WriterError> {
+        Self::open_in_inner(store, partition, zstd_level, promoted, Some(keys))
+    }
+
+    /// Shared body of [`Writer::open_in_with_promoted`] (ingest layout,
+    /// `compacted: None`) and [`Writer::open_in_compacted`]
+    /// (`Some(keys)` — RFC 0036 §3.3 threshold + §3.4 declaration).
+    fn open_in_inner(
+        store: &Store,
+        partition: PartitionKey,
+        zstd_level: i32,
+        promoted: PromotedAttributes,
+        compacted: Option<ClusterKeys>,
+    ) -> Result<Self, WriterError> {
         // Validate the codec level up front so invalid input fails fast. The
         // validated level flows into `writer_properties` so it isn't re-checked.
         let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
@@ -270,7 +354,14 @@ impl Writer {
         // path (readers address the file by `key`, surfaced in `WrittenFile`).
         let final_path = PathBuf::from(&key);
 
-        let props = writer_properties(zstd, &promoted);
+        let (sorting, flush_bytes) = match compacted {
+            Some(keys) => (
+                Some(sorting_columns(keys, &promoted)?),
+                COMPACTED_ROW_GROUP_FLUSH_BYTES,
+            ),
+            None => (None, ROW_GROUP_FLUSH_BYTES),
+        };
+        let props = writer_properties(zstd, &promoted, sorting);
         // Buffer-and-put: encode into memory; nothing hits the store
         // until `close`. A construction failure leaves no artifact.
         let inner = ArrowWriter::try_new(
@@ -289,6 +380,7 @@ impl Writer {
             final_path,
             num_rows: 0,
             promoted,
+            flush_bytes,
             poisoned: false,
         })
     }
@@ -397,7 +489,13 @@ impl Writer {
         // this same call). Either way a follow-up `append_records` is
         // safe — the contract is "writer remains usable", not "no rows
         // persisted".
-        let result = append_chunks(inner, records, &self.promoted, &mut self.num_rows);
+        let result = append_chunks(
+            inner,
+            records,
+            &self.promoted,
+            &mut self.num_rows,
+            self.flush_bytes,
+        );
         if matches!(result, Err(WriterError::Parquet(_))) {
             self.poisoned = true;
         }
@@ -605,13 +703,15 @@ impl std::error::Error for WriterError {
 /// `self.poisoned = true` after the borrow ends if this returns
 /// an `Err(WriterError::Parquet(_))`. Per the §3.5 row-group
 /// sizing rule, runs a `flush()` when the in-progress buffer
-/// crosses [`ROW_GROUP_FLUSH_BYTES`] (128 MiB). Symmetric helper
-/// to the audit writer's `append_chunks`.
+/// crosses `flush_bytes` ([`ROW_GROUP_FLUSH_BYTES`] on the ingest
+/// side, [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] for compacted output).
+/// Symmetric helper to the audit writer's `append_chunks`.
 fn append_chunks(
     inner: &mut ArrowWriter<Vec<u8>>,
     records: &[MinedRecord],
     promoted: &PromotedAttributes,
     num_rows: &mut i64,
+    flush_bytes: usize,
 ) -> Result<(), WriterError> {
     // Chunk into SUB_BATCH_ROWS-sized sub-batches and run a
     // flush-if-over-threshold check before every sub-batch.
@@ -624,7 +724,7 @@ fn append_chunks(
     //   bounded overshoot is intentional; unbounded overshoot
     //   is what the RFC prohibits.
     for chunk in records.chunks(SUB_BATCH_ROWS) {
-        if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+        if inner.in_progress_size() >= flush_bytes {
             inner.flush().map_err(WriterError::Parquet)?;
         }
         let batch =
@@ -641,10 +741,60 @@ fn append_chunks(
     }
     // Final post-write check so the next `append_records` call
     // doesn't inherit an over-threshold buffer.
-    if inner.in_progress_size() >= ROW_GROUP_FLUSH_BYTES {
+    if inner.in_progress_size() >= flush_bytes {
         inner.flush().map_err(WriterError::Parquet)?;
     }
     Ok(())
+}
+
+/// The RFC 0036 §3.4 `sorting_columns` declaration for `keys`: leaf
+/// indices into the Parquet schema derived from the promoted set —
+/// `resource.service.name` (ascending, nulls first, matching §3.1's
+/// absent-first key) then `time_unix_nano` (ascending, non-nullable),
+/// or the time key alone for [`ClusterKeys::TimeOnly`].
+fn sorting_columns(
+    keys: ClusterKeys,
+    promoted: &PromotedAttributes,
+) -> Result<Vec<SortingColumn>, WriterError> {
+    let schema = data_schema_with_promoted(promoted);
+    let descr = ArrowSchemaConverter::new()
+        .convert(&schema)
+        .map_err(WriterError::Parquet)?;
+    let leaf_idx = |name: &str| -> Result<i32, WriterError> {
+        descr
+            .columns()
+            .iter()
+            .position(|c| c.path().string() == name)
+            .and_then(|i| i32::try_from(i).ok())
+            .ok_or_else(|| {
+                WriterError::Parquet(ParquetError::General(format!(
+                    "sorting column `{name}` has no leaf in the data schema"
+                )))
+            })
+    };
+    let time = SortingColumn {
+        column_idx: leaf_idx(crate::columns::TIME_UNIX_NANO)?,
+        descending: false,
+        nulls_first: false,
+    };
+    match keys {
+        ClusterKeys::ServiceThenTime => {
+            let service = format!(
+                "{}{}",
+                crate::promoted::RESOURCE_PREFIX,
+                crate::promoted::SERVICE_NAME_KEY
+            );
+            Ok(vec![
+                SortingColumn {
+                    column_idx: leaf_idx(&service)?,
+                    descending: false,
+                    nulls_first: true,
+                },
+                time,
+            ])
+        }
+        ClusterKeys::TimeOnly => Ok(vec![time]),
+    }
 }
 
 /// Encode `records` to a complete in-memory Parquet file in one shot — the
@@ -674,7 +824,7 @@ pub fn encode_records_to_parquet_with_promoted(
     promoted: &PromotedAttributes,
 ) -> Result<Vec<u8>, WriterError> {
     let zstd = ZstdLevel::try_new(zstd_level).map_err(WriterError::Parquet)?;
-    let props = writer_properties(zstd, promoted);
+    let props = writer_properties(zstd, promoted, None);
     let mut writer =
         ArrowWriter::try_new(Vec::new(), data_schema_with_promoted(promoted), Some(props))
             .map_err(WriterError::Parquet)?;
@@ -699,9 +849,16 @@ pub fn encode_records_to_parquet_with_promoted(
 /// `zstd` is the already-validated compression level (the caller
 /// validates up front so invalid input fails before any
 /// filesystem work); production uses [`DEFAULT_ZSTD_LEVEL`], the
-/// bench may sweep it.
-fn writer_properties(zstd: ZstdLevel, promoted: &PromotedAttributes) -> WriterProperties {
+/// bench may sweep it. `sorting` is the RFC 0036 §3.4 declaration
+/// for compacted output; ingest-side writers pass `None` (declaring
+/// a sort their rows don't have would be a lie).
+fn writer_properties(
+    zstd: ZstdLevel,
+    promoted: &PromotedAttributes,
+    sorting: Option<Vec<SortingColumn>>,
+) -> WriterProperties {
     let mut builder = WriterProperties::builder()
+        .set_sorting_columns(sorting)
         .set_compression(Compression::ZSTD(zstd))
         // Dictionary on globally by default (most columns benefit
         // per §3.6); we opt out per-column below for the high-

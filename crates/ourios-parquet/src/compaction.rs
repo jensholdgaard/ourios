@@ -1,5 +1,9 @@
 //! Sealed-partition compaction (RFC 0009), through the object-storage
-//! [`Store`] seam (RFC 0019).
+//! [`Store`] seam (RFC 0019), with the RFC 0036 write-side layout:
+//! the consolidated file is clustered by the §3.1 key (promoted
+//! `service.name`, then `time_unix_nano`) via a bounded-memory
+//! external merge sort, rotates row groups at the §3.3 compacted
+//! threshold, and declares the §3.4 `sorting_columns`.
 //!
 //! [`compact_partition`] consolidates a partition's many small
 //! `*.parquet` objects into one, **preserving every stored row** (it
@@ -21,18 +25,29 @@
 //! structural (per-partition prefix) plus the row-vs-path validation, neither
 //! of which needs local-path canonicalisation.
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use chrono::NaiveDate;
+use ourios_core::record::MinedRecord;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
+use crate::data_schema_with_promoted;
 use crate::manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 use crate::partition::{PartitionKey, percent_encode_tenant};
-use crate::promoted::PromotedAttributes;
+use crate::promoted::{PromotedAttributes, SERVICE_NAME_KEY, project_string_value};
 use crate::reader::{Reader, ReaderError};
+use crate::record_batch::mined_records_to_batch_with_promoted;
 use crate::store::{Store, StoreError};
-use crate::writer::{DEFAULT_ZSTD_LEVEL, Writer, WriterError};
+use crate::writer::{
+    COMPACTED_ROW_GROUP_FLUSH_BYTES, ClusterKeys, DEFAULT_ZSTD_LEVEL, SUB_BATCH_ROWS, Writer,
+    WriterError,
+};
 
 /// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
 const HOUR_NANOS: u64 = 3_600_000_000_000;
@@ -186,16 +201,69 @@ pub fn compact_partition_with_promoted(
     partition: &PartitionKey,
     promoted: &PromotedAttributes,
 ) -> Result<CompactionOutcome, CompactionError> {
+    compact_sorted(
+        store,
+        partition,
+        promoted,
+        ClusterKeys::for_promoted(promoted),
+        SortTuning::default(),
+    )
+}
+
+/// RFC 0036 §3.2 sort tuning: the in-memory short-circuit bound and
+/// the merge fan-in cap F. Internal so unit tests can force the spill
+/// and hierarchical-merge paths at unit scale; production always runs
+/// the defaults.
+#[derive(Debug, Clone, Copy)]
+struct SortTuning {
+    /// Sort wholly in memory (no spill) while the partition's total
+    /// encoded input bytes stay within this bound. 256 MiB is the
+    /// ingest seal target (`SINK_TARGET_BYTES`, RFC 0014 §3): a
+    /// partition no larger than one worst-case input file costs no
+    /// more to hold decoded than phase 1's existing one-input bound.
+    in_memory_max_bytes: u64,
+    /// Fan-in cap F: more sorted runs than this merge hierarchically,
+    /// so phase-2 memory is ≤ F × one decoded batch regardless of
+    /// backlog. 64 single-passes every realistic partition (§9.7's
+    /// band-scale case held 32 input files) while capping worst-case
+    /// residency far below one decoded input file.
+    fan_in: usize,
+}
+
+impl Default for SortTuning {
+    fn default() -> Self {
+        Self {
+            in_memory_max_bytes: 256 * 1024 * 1024,
+            fan_in: 64,
+        }
+    }
+}
+
+/// [`compact_partition_with_promoted`] with the RFC 0036 §3.1 key
+/// shape and §3.2 tuning explicit — the seam unit tests use to drive
+/// the time-only key and the forced-spill / hierarchical-merge paths.
+fn compact_sorted(
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+    keys: ClusterKeys,
+    tuning: SortTuning,
+) -> Result<CompactionOutcome, CompactionError> {
     let key = manifest_key(partition);
     let (existing, etag) =
         match Manifest::read_with_etag(store, &key).map_err(CompactionError::Manifest)? {
             Some((manifest, etag)) => (Some(manifest), etag),
             None => (None, None),
         };
-    let inputs = live_file_keys(store, partition, existing.as_ref())?;
+    let mut inputs = live_file_keys(store, partition, existing.as_ref())?;
     if inputs.len() < 2 {
         return Ok(no_op_outcome(inputs.len()));
     }
+    // §3.1 tie-break: the input-file ordinal is sorted-basename order.
+    // The keys share one partition prefix, so sorting the full keys is
+    // basename order — and pins every later step to it, so the output
+    // is independent of the store's listing order (RFC0036.4).
+    inputs.sort();
 
     // Make the reader manifest-authoritative *before* the consolidated file
     // appears. With no prior manifest, a concurrent glob reader would otherwise
@@ -225,47 +293,41 @@ pub fn compact_partition_with_promoted(
         (1, read_manifest_etag(store, &key)?)
     };
 
-    // Stream the inputs into the consolidated file one at a time, so peak
-    // memory is bounded by a single input file's rows rather than the whole
-    // partition. `open_partition_bytes` validates each row's tenant + time
-    // bucket against this partition (RFC 0005 §3.9 / RFC0009.5), so a
-    // mis-partitioned input aborts the compaction instead of being silently
-    // merged. Row groups rotate at the RFC 0005 §3.5 threshold within the
-    // single output.
-    let mut writer = Writer::open_in_with_promoted(
+    // RFC 0036 §3.2 external merge sort into the consolidated file.
+    // Phase 1 decodes the inputs strictly one at a time, so its peak is
+    // one fully-decoded input — the same bound the pre-sort streaming
+    // loop had. `open_partition_bytes` validates each row's tenant +
+    // time bucket against this partition (RFC 0005 §3.9 / RFC0009.5),
+    // so a mis-partitioned input aborts the compaction instead of being
+    // silently merged. Row groups rotate at the §3.3 compacted
+    // threshold and the file declares the §3.4 `sorting_columns`.
+    let mut writer = Writer::open_in_compacted(
         store,
         partition.clone(),
         DEFAULT_ZSTD_LEVEL,
         promoted.clone(),
+        keys,
     )
     .map_err(CompactionError::Write)?;
-    let mut row_count: u64 = 0;
-    let mut bytes_read: u64 = 0;
-    for input in &inputs {
-        let bytes = store
-            .get_blocking(input)
-            .map_err(|e| store_io("get", input, e))?;
-        bytes_read = bytes_read.saturating_add(bytes.len() as u64);
-        let reader = Reader::open_partition_bytes(Bytes::from(bytes), partition.clone(), input)
-            .map_err(CompactionError::Read)?;
-        let records = reader.read_all().map_err(CompactionError::Read)?;
-        // `usize <= u64` on every supported target; saturate rather than panic
-        // on a theoretically wider one.
-        row_count = row_count.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
-        writer
-            .append_records(&records)
-            .map_err(CompactionError::Write)?;
-    }
+    let (row_count, bytes_read) = sort_inputs_into(
+        &mut writer,
+        store,
+        partition,
+        promoted,
+        keys,
+        tuning,
+        &inputs,
+    )?;
     let written = writer.close().map_err(CompactionError::Write)?;
     let bytes_written = written.bytes_written;
     let consolidated = basename(&written.key).to_owned();
 
     // Commit: swap the manifest to name only the consolidated file. The input
-    // names (the merged-away set) for the §3.6 audit event are captured here,
-    // sorted so the event is deterministic regardless of listing order.
+    // names (the merged-away set) for the §3.6 audit event are already sorted
+    // (the §3.1 tie-break order), so the event is deterministic regardless of
+    // listing order.
     let generation = base_generation.saturating_add(1);
-    let mut input_files = basenames(&inputs);
-    input_files.sort();
+    let input_files = basenames(&inputs);
     let commit = Manifest {
         generation,
         files: vec![consolidated.clone()],
@@ -305,6 +367,364 @@ pub fn compact_partition_with_promoted(
         bytes_read,
         bytes_written,
     })
+}
+
+/// Where the RFC 0036 §3.2 sort currently holds the partition's rows:
+/// decoded in memory while the running encoded input total fits
+/// [`SortTuning::in_memory_max_bytes`], or spilled to local scratch as
+/// sorted runs once it doesn't (scratch is cache, not truth —
+/// `CLAUDE.md` §3.6; the `TempDir` tears the runs down when the
+/// compaction call ends, success or error).
+enum SortState {
+    /// One decoded-row vec per input, in input-ordinal order.
+    Buffering(Vec<Vec<MinedRecord>>),
+    /// Sorted runs on scratch, one per input so far, in input-ordinal
+    /// order.
+    Spilling {
+        scratch: tempfile::TempDir,
+        runs: Vec<PathBuf>,
+    },
+}
+
+/// Phases 1–2 of the RFC 0036 §3.2 external merge sort: decode
+/// `inputs` (already in sorted-basename order) one at a time, sort by
+/// the §3.1 key, and emit every row into `writer` in that key order.
+/// Returns `(rows, input bytes read)`.
+///
+/// Peak decoded memory is one input file in phase 1 (inputs are
+/// processed strictly one at a time) and — via [`reduce_runs`]'s
+/// fan-in cap — F × one decoded batch in phase 2, preserving the
+/// pre-sort one-input-file bound.
+fn sort_inputs_into(
+    writer: &mut Writer,
+    store: &Store,
+    partition: &PartitionKey,
+    promoted: &PromotedAttributes,
+    keys: ClusterKeys,
+    tuning: SortTuning,
+    inputs: &[String],
+) -> Result<(u64, u64), CompactionError> {
+    let mut row_count: u64 = 0;
+    let mut bytes_read: u64 = 0;
+    let mut state = SortState::Buffering(Vec::new());
+    for input in inputs {
+        let bytes = store
+            .get_blocking(input)
+            .map_err(|e| store_io("get", input, e))?;
+        bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+        let reader = Reader::open_partition_bytes(Bytes::from(bytes), partition.clone(), input)
+            .map_err(CompactionError::Read)?;
+        let mut records = reader.read_all().map_err(CompactionError::Read)?;
+        // `usize <= u64` on every supported target; saturate rather than panic
+        // on a theoretically wider one.
+        row_count = row_count.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
+        state = match state {
+            SortState::Buffering(mut buffered) if bytes_read <= tuning.in_memory_max_bytes => {
+                buffered.push(records);
+                SortState::Buffering(buffered)
+            }
+            // Crossed the in-memory bound: spill mode from here on.
+            // Flush the inputs buffered so far as sorted runs first,
+            // preserving input-ordinal order (the §3.1 tie-break).
+            SortState::Buffering(buffered) => {
+                let scratch = tempfile::tempdir().map_err(|source| CompactionError::Io {
+                    op: "create scratch",
+                    path: PathBuf::from("<scratch>"),
+                    source,
+                })?;
+                let mut runs = Vec::with_capacity(inputs.len());
+                for mut prior in buffered {
+                    sort_records(keys, &mut prior);
+                    runs.push(spill_run(scratch.path(), runs.len(), &prior, promoted)?);
+                }
+                sort_records(keys, &mut records);
+                runs.push(spill_run(scratch.path(), runs.len(), &records, promoted)?);
+                SortState::Spilling { scratch, runs }
+            }
+            SortState::Spilling { scratch, mut runs } => {
+                sort_records(keys, &mut records);
+                runs.push(spill_run(scratch.path(), runs.len(), &records, promoted)?);
+                SortState::Spilling { scratch, runs }
+            }
+        };
+    }
+    match state {
+        // Whole partition within the one-input-file bound: sort in
+        // memory and skip spilling (§3.2 / §7). Concatenation order is
+        // (input ordinal, row ordinal), so the stable sort realises the
+        // §3.1 tie-break; the single `append_records` call sub-batches
+        // exactly as the merge path's chunked emit does (§3.5).
+        SortState::Buffering(buffered) => {
+            let mut rows: Vec<MinedRecord> = buffered.into_iter().flatten().collect();
+            sort_records(keys, &mut rows);
+            writer
+                .append_records(&rows)
+                .map_err(CompactionError::Write)?;
+        }
+        SortState::Spilling { scratch, runs } => {
+            let runs = reduce_runs(scratch.path(), runs, tuning.fan_in, keys, promoted)?;
+            merge_runs(&runs, keys, |chunk| {
+                writer.append_records(chunk).map_err(CompactionError::Write)
+            })?;
+            drop(scratch);
+        }
+    }
+    Ok((row_count, bytes_read))
+}
+
+/// Stable §3.1 sort of one input's decoded rows: promoted
+/// `service.name` value (lexicographic UTF-8 bytes, absent/null first)
+/// then `time_unix_nano` — stability preserves pre-sort row ordinals,
+/// the second half of the §3.1 tie-break.
+fn sort_records(keys: ClusterKeys, records: &mut [MinedRecord]) {
+    match keys {
+        ClusterKeys::ServiceThenTime => records.sort_by(|a, b| {
+            let ka = (
+                project_string_value(&a.resource_attributes, SERVICE_NAME_KEY),
+                a.time_unix_nano,
+            );
+            let kb = (
+                project_string_value(&b.resource_attributes, SERVICE_NAME_KEY),
+                b.time_unix_nano,
+            );
+            ka.cmp(&kb)
+        }),
+        ClusterKeys::TimeOnly => records.sort_by_key(|r| r.time_unix_nano),
+    }
+}
+
+/// A sorted run being written to local scratch (RFC 0036 §3.2): a
+/// Parquet file in the data schema with spill-oriented properties —
+/// no dictionaries, no statistics, light compression — since a run is
+/// write-once read-once cache whose bytes influence the output only
+/// through the decoded rows.
+struct RunWriter<'a> {
+    inner: ArrowWriter<File>,
+    promoted: &'a PromotedAttributes,
+}
+
+impl<'a> RunWriter<'a> {
+    fn create(path: &Path, promoted: &'a PromotedAttributes) -> Result<Self, CompactionError> {
+        let file = File::create(path).map_err(|source| CompactionError::Io {
+            op: "create run",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let zstd = ZstdLevel::try_new(1).map_err(parquet_write)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(zstd))
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let inner = ArrowWriter::try_new(file, data_schema_with_promoted(promoted), Some(props))
+            .map_err(parquet_write)?;
+        Ok(Self { inner, promoted })
+    }
+
+    fn append(&mut self, records: &[MinedRecord]) -> Result<(), CompactionError> {
+        for chunk in records.chunks(SUB_BATCH_ROWS) {
+            // Cap the buffered row group so writing an intermediate
+            // merge run never holds the whole merged output encoded in
+            // memory (the §3.2 phase-2 bound).
+            if self.inner.in_progress_size() >= COMPACTED_ROW_GROUP_FLUSH_BYTES {
+                self.inner.flush().map_err(parquet_write)?;
+            }
+            let batch = mined_records_to_batch_with_promoted(chunk, self.promoted)
+                .map_err(|e| CompactionError::Write(WriterError::Batch(e)))?;
+            self.inner.write(&batch).map_err(parquet_write)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), CompactionError> {
+        self.inner.close().map_err(parquet_write)?;
+        Ok(())
+    }
+}
+
+/// Write one input's sorted rows as run file `index` under `dir`.
+fn spill_run(
+    dir: &Path,
+    index: usize,
+    records: &[MinedRecord],
+    promoted: &PromotedAttributes,
+) -> Result<PathBuf, CompactionError> {
+    let path = dir.join(format!("run-{index:06}.parquet"));
+    let mut run = RunWriter::create(&path, promoted)?;
+    run.append(records)?;
+    run.finish()?;
+    Ok(path)
+}
+
+/// Collapse `runs` hierarchically until at most `fan_in` remain
+/// (RFC 0036 §3.2's cap F): each pass merges consecutive groups of
+/// `fan_in` runs into one intermediate run, preserving run order so
+/// the §3.1 tie-break (input ordinal) survives every level.
+fn reduce_runs(
+    scratch: &Path,
+    mut runs: Vec<PathBuf>,
+    fan_in: usize,
+    keys: ClusterKeys,
+    promoted: &PromotedAttributes,
+) -> Result<Vec<PathBuf>, CompactionError> {
+    let fan_in = fan_in.max(2);
+    let mut next_index = runs.len();
+    while runs.len() > fan_in {
+        let mut merged = Vec::with_capacity(runs.len().div_ceil(fan_in));
+        for group in runs.chunks(fan_in) {
+            if let [single] = group {
+                merged.push(single.clone());
+                continue;
+            }
+            let path = scratch.join(format!("run-{next_index:06}.parquet"));
+            next_index += 1;
+            let mut out = RunWriter::create(&path, promoted)?;
+            merge_runs(group, keys, |chunk| out.append(chunk))?;
+            out.finish()?;
+            merged.push(path);
+            for consumed in group {
+                // Best-effort: the TempDir reclaims scratch either way;
+                // early removal just bounds peak scratch-disk use.
+                let _ = std::fs::remove_file(consumed);
+            }
+        }
+        runs = merged;
+    }
+    Ok(runs)
+}
+
+/// K-way merge of sorted `runs` in §3.1 key order, emitting
+/// [`SUB_BATCH_ROWS`]-sized chunks to `emit` — exactly the
+/// sub-batching `Writer::append_records` applies itself, so the spill
+/// path and the in-memory path drive the Parquet writer with an
+/// identical call sequence (§3.5).
+///
+/// Peak memory is one decoded batch per run: each [`RunCursor`]
+/// streams its file batch-by-batch, and [`reduce_runs`] caps the run
+/// count at F, so this holds ≤ F × batch bytes no matter how many
+/// inputs the partition accrued — far below phase 1's
+/// one-decoded-input bound.
+fn merge_runs<F>(runs: &[PathBuf], keys: ClusterKeys, mut emit: F) -> Result<(), CompactionError>
+where
+    F: FnMut(&[MinedRecord]) -> Result<(), CompactionError>,
+{
+    let mut cursors = Vec::with_capacity(runs.len());
+    for path in runs {
+        cursors.push(RunCursor::open(path)?);
+    }
+    let mut heap = BinaryHeap::with_capacity(cursors.len());
+    for (run, cursor) in cursors.iter_mut().enumerate() {
+        if let Some(record) = cursor.next_record()? {
+            heap.push(Reverse(MergeEntry::new(keys, run, record)));
+        }
+    }
+    let mut out: Vec<MinedRecord> = Vec::with_capacity(SUB_BATCH_ROWS);
+    while let Some(Reverse(entry)) = heap.pop() {
+        let run = entry.run;
+        out.push(entry.record);
+        if out.len() == SUB_BATCH_ROWS {
+            emit(&out)?;
+            out.clear();
+        }
+        if let Some(record) = cursors[run].next_record()? {
+            heap.push(Reverse(MergeEntry::new(keys, run, record)));
+        }
+    }
+    if !out.is_empty() {
+        emit(&out)?;
+    }
+    Ok(())
+}
+
+/// One run's head row in the merge heap, ordered by (§3.1 key, run
+/// ordinal): equal-key rows pop in run order — which is input-ordinal
+/// order — and a run holds one input's equal-key rows in pre-sort row
+/// order (the stable phase-1 sort), so the pop sequence realises the
+/// full §3.1 tie-break.
+struct MergeEntry {
+    /// Promoted `service.name` value, precomputed once so heap
+    /// comparisons don't rescan `resource_attributes`. `None` under
+    /// [`ClusterKeys::TimeOnly`] regardless of the row.
+    service: Option<String>,
+    time: u64,
+    run: usize,
+    record: MinedRecord,
+}
+
+impl MergeEntry {
+    fn new(keys: ClusterKeys, run: usize, record: MinedRecord) -> Self {
+        let service = match keys {
+            ClusterKeys::ServiceThenTime => {
+                project_string_value(&record.resource_attributes, SERVICE_NAME_KEY)
+                    .map(str::to_owned)
+            }
+            ClusterKeys::TimeOnly => None,
+        };
+        Self {
+            service,
+            time: record.time_unix_nano,
+            run,
+            record,
+        }
+    }
+
+    fn key(&self) -> (Option<&str>, u64, usize) {
+        (self.service.as_deref(), self.time, self.run)
+    }
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for MergeEntry {}
+
+/// A sorted run streamed batch-by-batch off scratch — the phase-2
+/// merge holds exactly one decoded batch per open run.
+struct RunCursor {
+    reader: Reader,
+    batch: std::vec::IntoIter<MinedRecord>,
+}
+
+impl RunCursor {
+    fn open(path: &Path) -> Result<Self, CompactionError> {
+        Ok(Self {
+            reader: Reader::open_streaming_file(path).map_err(CompactionError::Read)?,
+            batch: Vec::new().into_iter(),
+        })
+    }
+
+    fn next_record(&mut self) -> Result<Option<MinedRecord>, CompactionError> {
+        loop {
+            if let Some(record) = self.batch.next() {
+                return Ok(Some(record));
+            }
+            match self.reader.next_batch().map_err(CompactionError::Read)? {
+                Some(batch) => self.batch = batch.into_iter(),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Map an `ArrowWriter` failure on a run file onto the same
+/// [`CompactionError::Write`] channel the consolidated writer uses.
+fn parquet_write(e: parquet::errors::ParquetError) -> CompactionError {
+    CompactionError::Write(WriterError::Parquet(e))
 }
 
 /// Commit `manifest` to `key` in `store` with the backend-appropriate atomic
@@ -1644,5 +2064,207 @@ mod tests {
 
         // Assert
         assert!(selected.is_empty());
+    }
+
+    // --- RFC 0036 §3.2 sorted-compaction internals ---
+
+    /// A record for the sort tests: `service` becomes the promoted
+    /// `service.name` resource attribute (`None` = absent, the §3.1
+    /// nulls-first case) and `id` a unique param payload so equal-key
+    /// rows stay distinguishable for tie-break assertions.
+    fn sort_rec(service: Option<&str>, ts_ns: u64, id: u64) -> MinedRecord {
+        let resource_attributes = match service {
+            Some(name) => vec![ourios_core::otlp::KeyValue {
+                key: SERVICE_NAME_KEY.to_string(),
+                value: Some(ourios_core::otlp::AnyValue {
+                    value: Some(ourios_core::otlp::any_value::Value::StringValue(
+                        name.to_string(),
+                    )),
+                }),
+                ..Default::default()
+            }],
+            None => Vec::new(),
+        };
+        MinedRecord {
+            resource_attributes,
+            params: vec![Param {
+                type_tag: ParamType::Num,
+                value: id.to_string(),
+            }],
+            ..rec(id, ts_ns)
+        }
+    }
+
+    /// Mirror partition `part`'s data files from `from` into `to`
+    /// byte-for-byte under the same names, so two stores hold the
+    /// RFC0036.4 "same bytes, same names" input set.
+    fn mirror_partition(from: &Store, to: &Store, part: &PartitionKey) {
+        for key in from
+            .list_blocking(Some(&partition_data_prefix(part)))
+            .expect("list source")
+        {
+            let bytes = from.get_blocking(&key).expect("get source");
+            to.put_blocking(&key, bytes).expect("put mirror");
+        }
+    }
+
+    /// Read the consolidated file's raw bytes after a committed
+    /// compaction.
+    fn consolidated_bytes(store: &Store, part: &PartitionKey, committed: &Committed) -> Vec<u8> {
+        let key = format!("{}/{}", partition_data_prefix(part), committed.file);
+        store.get_blocking(&key).expect("get consolidated")
+    }
+
+    proptest::proptest! {
+        // Each case compacts the same inputs through both §3.2 paths
+        // (in-memory and forced spill + fan-in-2 hierarchical merge),
+        // so keep the case count moderate.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// RFC0036.1 (§6 merge property, internal half) — for arbitrary
+        /// service/time/duplicate-key mixes, both §3.2 paths produce the
+        /// §3.1 total order: the multiset equals the inputs' union,
+        /// rows are (service, time)-sorted with absent-service first,
+        /// equal-key rows land in (sorted-basename input ordinal,
+        /// pre-sort row ordinal) tie-break order — and the spill path's
+        /// bytes are identical to the in-memory path's, which is the
+        /// §3.5 determinism argument across the §7 skip-spill fork.
+        /// See `docs/rfcs/0036-write-side-layout.md` §5 / §6.
+        #[test]
+        fn sorted_merge_realises_the_total_order_on_both_paths(
+            files in proptest::collection::vec(
+                proptest::collection::vec(
+                    // (service index; 0 = absent, times from a small
+                    // pool to force duplicate keys)
+                    (0usize..4, 0u64..6),
+                    1..=12usize,
+                ),
+                2..=5usize,
+            )
+        ) {
+            let services = [None, Some("svc-a"), Some("svc-b"), Some("svc-c")];
+            let bucket_a = tempfile::tempdir().expect("temp a");
+            let bucket_b = tempfile::tempdir().expect("temp b");
+            let store_a = store_at(bucket_a.path());
+            let store_b = store_at(bucket_b.path());
+            let part = partition();
+
+            let mut id: u64 = 0;
+            let mut inputs: Vec<(String, Vec<MinedRecord>)> = Vec::new();
+            for file in &files {
+                let recs: Vec<MinedRecord> = file
+                    .iter()
+                    .map(|(svc, toff)| {
+                        id += 1;
+                        sort_rec(services[*svc], HOUR10_START + toff * 1_000, id)
+                    })
+                    .collect();
+                let mut w = Writer::open_in(&store_a, part.clone()).expect("open writer");
+                w.append_records(&recs).expect("append");
+                let written = w.close().expect("close");
+                inputs.push((basename(&written.key).to_owned(), recs));
+            }
+            mirror_partition(&store_a, &store_b, &part);
+
+            // The §3.1 model order: concatenate in sorted-basename input
+            // order, then stable-sort by (service, time) — leaving
+            // equal-key rows in (input ordinal, row ordinal) order.
+            inputs.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut expected: Vec<MinedRecord> =
+                inputs.into_iter().flat_map(|(_, recs)| recs).collect();
+            sort_records(ClusterKeys::ServiceThenTime, &mut expected);
+
+            let in_memory = compact_partition(&store_a, &part).expect("compact in-memory");
+            let spilled = compact_sorted(
+                &store_b,
+                &part,
+                &PromotedAttributes::default(),
+                ClusterKeys::ServiceThenTime,
+                SortTuning {
+                    in_memory_max_bytes: 0,
+                    fan_in: 2,
+                },
+            )
+            .expect("compact spilled");
+            let in_memory = in_memory.committed.expect("in-memory commit");
+            let spilled = spilled.committed.expect("spill commit");
+
+            let bytes_a = consolidated_bytes(&store_a, &part, &in_memory);
+            let bytes_b = consolidated_bytes(&store_b, &part, &spilled);
+            proptest::prop_assert!(
+                bytes_a == bytes_b,
+                "in-memory and spill paths must emit byte-identical output \
+                 ({} vs {} bytes)",
+                bytes_a.len(),
+                bytes_b.len(),
+            );
+
+            let got = Reader::open_partition_bytes(
+                Bytes::from(bytes_a),
+                part.clone(),
+                &in_memory.file,
+            )
+            .expect("open consolidated")
+            .read_all()
+            .expect("read consolidated");
+            proptest::prop_assert_eq!(got, expected, "§3.1 total order realised");
+        }
+    }
+
+    /// RFC 0036 §3.1 / §7 — the time-only fallback. A promoted set
+    /// without `service.name` is unrepresentable today (RFC 0022 makes
+    /// the key implicit and non-removable), so the degradation is
+    /// driven through the internal seam: under `ClusterKeys::TimeOnly`
+    /// the consolidated rows sort by `time_unix_nano` alone (service
+    /// values deliberately anti-lexicographic to prove they are
+    /// ignored) and every row group declares the single time sorting
+    /// column.
+    #[test]
+    fn time_only_keys_sort_and_declare_time_alone() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
+        let part = partition();
+        write_file(&store, &[sort_rec(Some("zzz"), TS0, 1)]);
+        write_file(&store, &[sort_rec(Some("aaa"), TS0 + 1_000, 2)]);
+        write_file(&store, &[sort_rec(None, TS0 + 500, 3)]);
+
+        let outcome = compact_sorted(
+            &store,
+            &part,
+            &PromotedAttributes::default(),
+            ClusterKeys::TimeOnly,
+            SortTuning::default(),
+        )
+        .expect("compact");
+        let committed = outcome.committed.expect("committed");
+        let bytes = consolidated_bytes(&store, &part, &committed);
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.clone()))
+            .expect("open consolidated");
+        let meta = builder.metadata();
+        for rg in meta.row_groups() {
+            let declared = rg.sorting_columns().expect("sorting_columns declared");
+            assert_eq!(declared.len(), 1, "time-only declares a single key");
+            let leaf = usize::try_from(declared[0].column_idx).expect("leaf index");
+            assert_eq!(
+                rg.column(leaf).column_path().string(),
+                crate::columns::TIME_UNIX_NANO,
+                "the single key is time_unix_nano",
+            );
+            assert!(!declared[0].descending, "ascending");
+        }
+
+        let rows = Reader::open_partition_bytes(Bytes::from(bytes), part.clone(), &committed.file)
+            .expect("open")
+            .read_all()
+            .expect("read");
+        let times: Vec<u64> = rows.iter().map(|r| r.time_unix_nano).collect();
+        assert_eq!(
+            times,
+            vec![TS0, TS0 + 500, TS0 + 1_000],
+            "time-only order ignores service values",
+        );
     }
 }

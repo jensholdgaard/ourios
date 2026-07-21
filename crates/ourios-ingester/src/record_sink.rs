@@ -759,16 +759,19 @@ impl SharedParquetSink {
     /// the publish half of the RFC 0035 §3.1 barrier (issue #578).
     ///
     /// Every `wal_high_water` stamping path MUST call this (after quiescing
-    /// the encode pool, before the flush) while holding the pipeline's miner
-    /// lock: records the age sweep drained out of the buffers are neither
+    /// any encode pool, before the flush) with exclusive access to the
+    /// miner — the rotation hook and shutdown hold the pipeline's miner
+    /// lock; the post-recovery stamp runs before the pipeline (and its
+    /// mutex) exists, so exclusivity is by construction and no drain can
+    /// race it. Records the age sweep drained out of the buffers are neither
     /// buffered (so `flush_all` cannot cover them) nor durable until their
     /// off-lock `write_ordered` completes, and a mark stamped across that
     /// window makes recovery skip the WAL frames that are their only
     /// surviving copy — acked-data loss (`CLAUDE.md` §3.4). When this
     /// returns, every such snapshot is either durable in the store or
     /// requeued into the buffers (where the caller's flush covers it), and
-    /// holding the miner lock keeps the count at zero until the stamp: every
-    /// drain acquires its guard under that same lock.
+    /// the caller's miner exclusivity keeps the count at zero until the
+    /// stamp: every drain acquires its guard under the miner lock.
     pub fn quiesce_publishes(&self) {
         let mut count = self
             .in_flight

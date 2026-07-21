@@ -11,6 +11,23 @@ superseded-by: —
 
 # RFC 0034 — D1 re-scope
 
+> **Status note.** **`specified`**, with all three §5 criteria now in
+> force (2026-07-21); the terminal flip to `accepted` is the
+> maintainer's sign-off, not this note. RFC0034.1 is **enacted** by
+> this change: the `docs/benchmarks.md` § D1 block is recast per-node
+> (≥ 100 000 lines/s on `baseline-8vcpu-32gib`, multi-tenant, shared
+> commit stream, p99 ack ≤ 200 ms at the sustained rate) with the old
+> per-core target and the per-tenant single-stream ceiling retained as
+> recorded diagnostics, the RFC 0011 A1 pattern; the §7 gate table
+> lists only the five `[THESIS]` goals, so the annotation lives at the
+> § D1 block. RFC0034.2 is **satisfied** by §9.23 — RFC 0035 reached
+> `green` and the one-hour `--tenants 8` asserting soak achieved
+> 99.92% of the offered 100k lines/s (0 failed batches, p99 ack
+> 153.63 ms, D2 PASS). RFC0034.3 was **already satisfied** by the soak
+> harness's report format (aggregate + per-tenant + per-core fields,
+> #567/#570). The §7 one-run-two-records question resolved as one run,
+> one record (§9.23), cited by both this RFC and RFC 0035.
+>
 > **How to read this document.** A tuning RFC in the RFC 0011 mold: the
 > D1 gate, as written, measures a dimension the architecture deliberately
 > does not scale on, so the gate is reconciled with its own stated intent
@@ -116,8 +133,9 @@ directly, on the axis the architecture scales on after RFC 0035.
 ## 4. Alternatives considered
 
 - **Keep the per-core bar.** Rejected: it demands scaling on an axis the
-  architecture deliberately serializes twice (per-tenant miner order,
-  §3.7; single durable WAL stream, §3.4). A permanently-red gate whose
+  architecture deliberately serializes twice (sequential per-tenant
+  mining — §3.7-scoped trees with first-seen ids that must match
+  WAL-order replay, RFC 0001 §3.5.3; single durable WAL stream, §3.4). A permanently-red gate whose
   redness is unrelated to quality trains readers to ignore gates.
 - **Recast as per-node *multi-tenant scaling* (the refuted first
   draft).** Rejected by measurement: §9.21 showed node capacity flat
@@ -174,16 +192,17 @@ per-core fields, #567/#570) and pinned by its existing report tests.
 
 ## 7. Open questions
 
-- [ ] Whether the asserting run (RFC0034.2) doubles as RFC 0035's
-  RFC0035.4 measurement (same instrument, same hardware) — one run,
-  two records, or kept separate for independence.
+- [x] Whether the asserting run (RFC0034.2) doubles as RFC 0035's
+  RFC0035.4 measurement (same instrument, same hardware) — resolved
+  as **one run, one record** (`benchmarks.md` §9.23), cited by both.
 - [x] N for the asserting run: settled at **N = cores** (8 on the
   baseline class, the §9.22 shape) for determinism; a tenant-scaling
   curve remains a worthwhile *diagnostic* exploration but never moves
   the gate's N.
-- [ ] `benchmarks.md` § D1's prose retains the old per-core target as
-  the diagnostic's reference line (RFC 0011 did this for A1) — confirm
-  exact wording at enactment.
+- [x] `benchmarks.md` § D1's prose retains the old per-core target as
+  the diagnostic's reference line (RFC 0011 did this for A1) —
+  confirmed at enactment: the § D1 diagnostics bullet keeps the
+  ≥ 100 000 lines/s/core line, labelled informational.
 
 ## 8. References
 

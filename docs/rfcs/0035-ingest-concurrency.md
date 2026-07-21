@@ -1,7 +1,7 @@
 ---
 rfc: 0035
 title: Ingest concurrency — take the Parquet encode off the global commit gate
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-20
@@ -11,6 +11,22 @@ superseded-by: —
 
 # RFC 0035 — Ingest concurrency
 
+> **Status note.** **`green`** (2026-07-21). Design A is implemented and
+> its §5 criteria hold: RFC0035.1 (multi-tenant determinism
+> differential + proptest), RFC0035.2 (the encode-drain-and-flush
+> barrier, fault-injected), RFC0035.3 (WAL-before-ack suites unchanged)
+> and RFC0035.5 (decoded-row + query differential, no on-disk change)
+> are green in-repo — the #577 implementation suite plus the #579
+> review-fix round (capture-slot unwind safety, honest barrier docs,
+> each accepted fix carrying its test). RFC0035.4 is satisfied by
+> `docs/benchmarks.md` **§9.23**, the RFC0034.2/RFC0035.4 asserting
+> soak: **99,921 lines/s** sustained over one hour at the RFC 0034
+> asserting shape (`--tenants 8`, offered 100k, p99 ack 153.63 ms, D2
+> PASS) versus the pre-RFC ~82k saturation baseline (§9.22) — the
+> serialization is relaxed in production, not just in the prototype.
+> Known open hazard outside this RFC's scope: the sweep-window issue
+> **#578**, tracked separately.
+>
 > **How to read this document.** A profile (`docs/benchmarks.md` §9.20/§9.21;
 > issue #571) showed the ingest hot path saturates ≈ 86k lines/s while
 > using only ~1.2 of 8 cores — an ~85%-idle machine held back by a
@@ -29,10 +45,9 @@ superseded-by: —
 > and changes nothing until
 > `red`→`green`. Per `docs/rfcs/README.md`, §§1–4 are the design
 > contract, §5 the acceptance criteria and §6 the testing strategy — all
-> written, which places this RFC at **`specified`**; this PR's review
-> confirms the criteria are testable, after which `red` (failing stubs)
-> begins. §7 lists what a prototype must still resolve before
-> implementation lands.
+> written; the implementation landed (#577, review fixes #579) and all
+> five §5 criteria pass — including RFC0035.4 on the §9.23 asserting
+> soak — which places this RFC at **`green`**.
 
 ## 1. Summary
 
@@ -342,10 +357,13 @@ before implementation proceeds.
 
 ## 7. Open questions
 
-- [ ] **Prototype the split and measure the serial fraction** (the §6
-  measurement) at `red` — it decides whether Design A alone clears the D1
-  must-win or whether Design B (§4) must be escalated before
-  implementation proceeds.
+- [x] **Prototype the split and measure the serial fraction** (the §6
+  measurement) at `red` — done, `benchmarks.md` §9.22: 82.1k → 132.3k
+  lines/s on the baseline class (1.61×, residual serial fraction
+  ≈ 0.62) — the throughput/capacity gate (a saturating run; its
+  queue-bound latencies say nothing about the p99 bar). The full D1
+  must-win incl. p99 at the sustained rate is §9.23's asserting run;
+  Design B stays deferred.
 - [ ] **If Design B is ever escalated (§4):** settle bit-partitioned
   `u64` vs compound id first — the former may avoid the §3.5 migration
   entirely, but needs a durable tenant-ordinal map design and K-bit

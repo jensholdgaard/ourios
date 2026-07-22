@@ -103,7 +103,7 @@ fn payload(seed: u64, len: usize) -> String {
 fn leaf_index(rg: &RowGroupMetaData, name: &str) -> usize {
     (0..rg.num_columns())
         .find(|&i| rg.column(i).column_path().string() == name)
-        .unwrap_or_else(|| panic!("column `{name}` has a leaf"))
+        .unwrap_or_else(|| panic!("column `{name}` not found in the row group schema"))
 }
 
 /// A row group's `service.name` min/max statistics as UTF-8.

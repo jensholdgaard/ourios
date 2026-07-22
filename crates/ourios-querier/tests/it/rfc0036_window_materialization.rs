@@ -204,7 +204,8 @@ fn seed_and_compact(
 /// returns the identical answer on both.
 fn all_records(plan: &[(&str, u64)], body_len: usize, grid_ns: u64) -> Vec<MinedRecord> {
     let max_rows = plan.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
-    let mut records: Vec<MinedRecord> = Vec::new();
+    let total = usize::try_from(plan.iter().map(|&(_, rows)| rows).sum::<u64>()).expect("fits");
+    let mut records: Vec<MinedRecord> = Vec::with_capacity(total);
     let mut id: u64 = 0;
     for i in 0..max_rows {
         for &(service, rows) in plan {

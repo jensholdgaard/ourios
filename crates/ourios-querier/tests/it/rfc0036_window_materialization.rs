@@ -155,10 +155,14 @@ fn seed_and_compact(
     // Round-robin across services, alternately assigning to file A/B, so
     // neither input is service- or time-clustered on its own — and we
     // never materialise the whole corpus plus two clones (peak is the two
-    // files, not three copies). Compaction sorts globally, so the input
-    // distribution does not affect the compacted layout; every
-    // (service, time) key is unique, so payload length is fixed per row
-    // regardless of `id`, keeping the output byte-identical.
+    // files, not three copies). Compaction sorts globally and every
+    // (service, time) key is unique, so the sorted output order is fixed
+    // regardless of input distribution. Payloads are a fixed length of
+    // near-incompressible bytes, so per-row encoded size — and thus the
+    // row-group rotation boundaries and count the RFC0036.2 bound reads —
+    // is stable no matter which `id`/content a row carries (the exact
+    // bytes are not identical: content varies with `id`; B_sw and the
+    // bound are measured live from the footer).
     let max_rows = plan.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
     let mut file_a: Vec<MinedRecord> = Vec::new();
     let mut file_b: Vec<MinedRecord> = Vec::new();

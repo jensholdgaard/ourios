@@ -1,15 +1,16 @@
 name: dco
 
-# Developer Certificate of Origin gate. Every commit in a PR must carry a
-# `Signed-off-by:` trailer whose email matches the commit author (DCO 1.1,
-# https://developercertificate.org/) — separate from cryptographic signing,
-# which proves identity rather than certifying the right to submit.
+# Developer Certificate of Origin gate. Every non-merge commit in a PR must
+# carry a `Signed-off-by:` trailer whose email matches the commit author
+# (DCO 1.1, https://developercertificate.org/) — separate from cryptographic
+# signing, which proves identity rather than certifying the right to submit.
 #
 # Self-contained (no third-party action) to keep the supply-chain surface
-# minimal, mirroring the licenses gate. Bot authors (Renovate, Dependabot)
-# are exempt: their commits are governed by the bot's own terms and would
-# never carry a human sign-off, so gating them would break dependency
-# auto-merge.
+# minimal, mirroring the licenses gate. PRs *opened by* a bot actor
+# (Renovate, Dependabot) are exempted wholesale: their commits carry no human
+# sign-off and gating them would break dependency auto-merge. The exemption
+# keys off the trusted PR actor login, not commit author fields, so it can't
+# be bypassed by forging metadata.
 
 on:
   pull_request:

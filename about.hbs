@@ -1,0 +1,45 @@
+# Third-Party Licenses
+
+<!--
+  GENERATED FILE — DO NOT EDIT BY HAND.
+
+  Produced by `cargo about generate about.hbs > THIRD-PARTY-LICENSES.md`
+  (config: about.toml, template: about.hbs). The `.github/workflows/licenses.yml`
+  CI gate regenerates this file and fails on drift, so any dependency change
+  must land the refreshed attribution. The accepted-license set mirrors the
+  `[licenses]` allow-list in deny.toml; cargo-deny stays the enforcement gate.
+-->
+
+This inventory attributes the third-party Rust crates redistributed in the
+Ourios binaries, container images, and Helm chart. It is generated with
+[`cargo-about`](https://github.com/EmbarkStudios/cargo-about); dev-only
+dependencies (tests, benchmarks) are excluded because they are not shipped.
+
+## Summary
+
+| License | Crates |
+| --- | --- |
+{{#each overview}}| `{{{id}}}` | {{count}} |
+{{/each}}
+
+## Licenses
+
+{{#each licenses}}
+### {{{name}}} (`{{{id}}}`)
+
+Used by:
+
+{{#each used_by}}
+- `{{{crate.name}}}` {{{crate.version}}}{{#if crate.repository}} — <{{{crate.repository}}}>{{/if}}
+{{/each}}
+
+<details>
+<summary>Full license text</summary>
+
+```text
+{{{text}}}
+```
+
+</details>
+
+{{/each}}

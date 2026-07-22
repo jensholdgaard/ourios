@@ -1,0 +1,36 @@
+# cargo-about configuration — generates THIRD-PARTY-LICENSES.md, the
+# attribution inventory for the third-party crates Ourios ships (the two-role
+# binary + Docker images + Helm chart). `cargo about generate about.hbs`
+# renders the file; a CI no-diff gate (.github/workflows/licenses.yml)
+# regenerates it and fails on drift, so dependency changes must land the
+# refreshed attribution.
+#
+# `accepted` MIRRORS the `[licenses].allow` list in deny.toml — cargo-deny
+# stays the enforcement gate; this file only has to agree with it so the two
+# tools share one view of what is permissible. Keep the two lists in sync: a
+# new accepted license here without the matching deny.toml entry (or vice
+# versa) is drift.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+]
+
+# Dev-dependencies (test/bench/proptest-only crates) are never shipped, so
+# they are out of scope for a redistribution attribution. cargo-deny still
+# scans them, so a disallowed license reaching in through a dev-dep is caught
+# there — this only trims the shipped closure.
+ignore-dev-dependencies = true
+
+# Per-crate exception mirroring deny.toml's `[licenses].exceptions`: the
+# Mozilla CA-certificate *data* bundled by webpki-roots is CDLA-Permissive-2.0
+# (a permissive, attribution-free data license), accepted for this one crate
+# rather than allowed globally.
+[webpki-roots]
+accepted = ["CDLA-Permissive-2.0"]

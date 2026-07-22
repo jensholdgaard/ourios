@@ -524,7 +524,8 @@ async fn rfc0036_2_materialization_before_after() {
 
     // Integer ×100 ratio (avoids a float cast under clippy::pedantic); read
     // as `N.NNx`, e.g. 198 ⇒ before materialises 1.98× the after bytes.
-    let win_x100 = before_bytes * 100 / after_bytes.max(1);
+    // `u128` so the ×100 can't overflow if the fixture ever grows.
+    let win_x100 = u128::from(before_bytes) * 100 / u128::from(after_bytes.max(1));
     eprintln!(
         "RFC0036.2 before/after: uncompacted survivors {}/{} groups, {} bytes \
          (query scanned {}); compacted survivors {}/{} groups, {} bytes (query \

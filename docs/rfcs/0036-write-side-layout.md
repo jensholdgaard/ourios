@@ -46,8 +46,9 @@ superseded-by: —
 >   `validated` blocker (RFC0036.2 bytes is a §2.2 diagnostic, not a gate).
 > - **RFC0036.2 materialization before/after (§9.27, in-repo,
 >   deterministic).** Measured directly on a genuinely-compacted store:
->   the sort takes a one-service window from materialising the whole hour
->   (unsorted: 1/1 groups, 100.5 MB) to a contiguous minority (sorted:
+>   the sort takes a one-service window from materialising the whole file
+>   (unsorted: 1/1 groups, 100.5 MB — no row group prunes) to a contiguous
+>   minority (sorted:
 >   2/6 groups, 70.0 MB) for the identical answer — a **1.43×**
 >   materialization-bytes win, modest and honest (the compacted file is
 >   ~2× larger on disk; §2.2's registry floor is why the *gate* is the

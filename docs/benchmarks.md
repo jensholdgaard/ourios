@@ -2095,8 +2095,9 @@ window` scan cannot prune — from each file's footer.
 | **after** — compacted, §3.1-sorted (32 MiB groups) | 2 / 6 | 70,018,075 | 2 |
 
 **Reading.** Identical 100-row answer from both; the sort takes the
-window from materialising the **whole hour** (no row group prunes on
-an unsorted file) to a contiguous minority (2 of 6 groups) — a **1.43×
+window from materialising the **whole file** (the single-row-group
+unsorted ingest parquet — no row group prunes) to a contiguous minority
+(2 of 6 groups) — a **1.43×
 materialization-bytes win**. Modest by design, and honestly so: the
 compacted file is physically ~2× larger (six 32 MiB groups compress a
 little worse than one 128 MiB group — the RFC 0036 §3.3 pruning-

@@ -160,8 +160,10 @@ fn time_min_max(rg: &RowGroupMetaData, time_leaf: usize) -> (u64, u64) {
 
 /// The queried service's bytes within the window: the summed compressed sizes
 /// of the row groups a `service == target ∧ time ∈ window` scan can NOT prune.
-/// The RFC 0036 §9 materialization diagnostic (matches the querier test's
-/// `window_service_bytes`). Returns `(survivor indices, byte sum)`.
+/// The RFC 0036 §9 materialization diagnostic — the same shape as the querier
+/// test's `window_service_bytes`, but keyed on `effective_time_unix_nano` (the
+/// column the comparative store's querier prunes on) rather than
+/// `time_unix_nano`. Returns `(survivor indices, byte sum)`.
 fn window_service_bytes(
     meta: &ParquetMetaData,
     target: &str,

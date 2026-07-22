@@ -215,9 +215,14 @@ fn build_comparative_store_compacted_inner(
         .map_err(|e| BenchError::Pipeline {
             detail: format!("compact partition {partition:?}: {e}"),
         })?;
+        // A partition with ≥ 2 ingest files must consolidate; a partition
+        // that saw a single record has one file (round-robin can't split it)
+        // and legitimately no-ops, so guard on `files_before` rather than
+        // asserting every partition commits.
         debug_assert!(
-            outcome.committed.is_some(),
-            "each partition holds two ingest files, so compaction must consolidate",
+            outcome.committed.is_some() || outcome.files_before < 2,
+            "partition {partition:?} had {} ingest files but did not consolidate",
+            outcome.files_before,
         );
     }
 

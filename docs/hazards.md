@@ -98,7 +98,23 @@ compression claim evaporates for that workload.
 pre-redacts the offending field. Broad spike → revisit the limit
 (still ≤ 1 KiB). Anyone proposing > 1 KiB → RFC.
 
-**See also.** `CLAUDE.md` §3.2; RFC 0001 §6.5; benchmarks C4.
+**Structured bodies (RFC 0037).** The per-parameter byte limit above
+guards the *string* path only. A structured (non-string) body — a
+GenAI event's `gen_ai.input.messages` array, any `AnyValue`
+kvlist/array — is retained **whole** as canonical JSON in the `body`
+column and is **not** capped: truncating it would violate the
+bit-identical-reconstruction invariant (`CLAUDE.md` §3.3), and unlike
+a runaway `params` slot it never populated dictionary encoding to
+begin with (structured bodies are unique per record). The blowup risk
+here is raw storage size, not dictionary collapse, so it is guarded by
+**observation, not truncation**: the `structured_body_bytes` metric
+(dimensioned by service) plus a per-service alert flag oversized
+emitters, and RFC 0036's write-side row-group/file sizing bounds the
+on-disk footprint. The fix for an oversized structured body is at the
+emitter (redaction/truncation before export), not a store-side cap.
+
+**See also.** `CLAUDE.md` §3.2, §3.3; RFC 0001 §6.5; RFC 0037;
+benchmarks C4.
 
 ---
 

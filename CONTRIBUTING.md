@@ -52,7 +52,8 @@ Certificate of Origin](https://developercertificate.org/) (DCO 1.1). This is
 separate from the cryptographic signing above: signing proves *who* authored
 the commit, sign-off certifies you have the *right* to submit it under the
 project's license. Both are required, and CI enforces the sign-off (merge
-commits and bot-opened dependency PRs are exempt).
+commits and PRs opened by a bot actor — e.g. Renovate, Dependabot — are
+exempt).
 
 Add the trailer automatically with `-s`:
 

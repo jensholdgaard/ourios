@@ -61,48 +61,85 @@ use crate::store::Store;
 /// buffered row-group bytes — dominated by already-encoded (compressed)
 /// page data rather than raw uncompressed input — so on-disk row-group
 /// size tracks it closely. Ingest-side files only; compacted output
-/// rotates at [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (RFC 0036 §3.3).
+/// rotates at the RFC 0036 §3.3 **adaptive** threshold
+/// ([`adaptive_flush_bytes`]).
 pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 
-/// RFC 0036 §3.3 — row-group rotation threshold for **compacted**
-/// output, smaller than ingest-side files so the §3.1 clustering yields
-/// per-row-group statistics tight enough to prune. Measured against the
-/// same `ArrowWriter::in_progress_size` buffered estimate as
-/// [`ROW_GROUP_FLUSH_BYTES`]; a distinct const so the §7 threshold
-/// sweep is a one-line change.
-pub const COMPACTED_ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+/// RFC 0036 §3.3 — the target number of compacted row groups per
+/// partition. The adaptive rotation threshold ([`adaptive_flush_bytes`])
+/// divides a partition's estimated output size by this so a partition
+/// of any size lands on roughly `K` groups: enough to cluster services
+/// and give pruning granularity, not so many the footer/page-index
+/// overhead dominates. §9.28/§9.29 proved a *fixed* threshold is inert on
+/// the real v8 corpus — small hours (a few MiB) compact to one group and
+/// prune nothing — while fragmenting large hours; scaling with size fixes
+/// both ends.
+pub const TARGET_COMPACTED_ROW_GROUPS: u64 = 8;
+
+/// RFC 0036 §3.3 — the adaptive compacted-threshold **floor**. A tiny
+/// partition (estimate / `K` below this) still rotates at 1 MiB rather
+/// than collapsing to a single group — the lever that makes small real-v8
+/// hours prunable (§9.29). No sub-MiB fragmentation below it.
+pub const MIN_COMPACTED_RG_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// RFC 0036 §3.3 — the adaptive compacted-threshold **ceiling** (the old
+/// fixed `COMPACTED_ROW_GROUP_FLUSH_BYTES`). A huge partition gets *more*
+/// than `K` groups, each capped at this, so a compacted row group never
+/// grows back toward the 128 MiB ingest band. Measured against the same
+/// `ArrowWriter::in_progress_size` buffered estimate as
+/// [`ROW_GROUP_FLUSH_BYTES`].
+pub const MAX_COMPACTED_RG_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// RFC 0036 §3.3 — the adaptive compacted row-group rotation threshold
+/// for a partition whose live input files total `estimated_output_bytes`
+/// (the sorted output is re-compressed from the same rows, so the input
+/// total is a safe upper estimate of the output size). Targets
+/// [`TARGET_COMPACTED_ROW_GROUPS`] groups, clamped to
+/// [`MIN_COMPACTED_RG_BYTES`]…[`MAX_COMPACTED_RG_BYTES`]. Deterministic in
+/// its input, so the same partition compacts to byte-identical output
+/// (RFC0036.4).
+#[must_use]
+pub fn adaptive_flush_bytes(estimated_output_bytes: u64) -> usize {
+    let target = estimated_output_bytes / TARGET_COMPACTED_ROW_GROUPS;
+    // Saturate on a target wider than usize (unreachable on 64-bit) so the
+    // clamp still pins it to the ceiling rather than wrapping.
+    usize::try_from(target)
+        .unwrap_or(MAX_COMPACTED_RG_BYTES)
+        .clamp(MIN_COMPACTED_RG_BYTES, MAX_COMPACTED_RG_BYTES)
+}
 
 /// RFC 0036 §7 interim tunable: the environment variable that overrides
-/// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] for compacted-writer rotation. A
-/// byte count (e.g. `16777216` for 16 MiB). Read **once** per compacted
-/// writer at construction (`compacted_flush_bytes`); production leaves
-/// it unset and gets the const. This is the "keep it tunable (an RFC 0004
-/// knob eventually)" direction §7 records — a single interim knob for
-/// operators and the threshold sweep's production arm, never read on the
-/// per-row hot path. The sweep's *test* arm sets the threshold with an
-/// explicit argument instead (`Writer::open_in_compacted`'s
+/// the adaptive compacted-writer rotation threshold ([`adaptive_flush_bytes`]).
+/// A byte count (e.g. `16777216` for 16 MiB). Read **once** per compacted
+/// writer at construction; production leaves it unset and gets the
+/// adaptive value. This is the operator
+/// escape hatch (an RFC 0004 knob eventually) §7 records — never read on
+/// the per-row hot path. The threshold sweep's *test* arm sets the
+/// threshold with an explicit argument instead (`Writer::open_in_compacted`'s
 /// `flush_override`), because setting a process env var races libc
 /// `getenv` under `cargo test`'s in-process parallelism.
+///
+/// Precedence for the compacted rotation threshold: explicit
+/// `flush_override` &gt; this env var &gt; the adaptive value.
 pub const COMPACTED_RG_BYTES_ENV: &str = "OURIOS_COMPACTED_RG_BYTES";
 
-/// The compacted row-group rotation threshold: [`COMPACTED_RG_BYTES_ENV`]
-/// parsed as a positive byte count, or [`COMPACTED_ROW_GROUP_FLUSH_BYTES`]
-/// when unset/blank/unparsable. Read once at compacted-writer
-/// construction (never on the per-row path).
-fn compacted_flush_bytes() -> usize {
+/// The [`COMPACTED_RG_BYTES_ENV`] override as a positive byte count, or
+/// `None` when unset/blank/unparsable/zero — in which case the adaptive
+/// threshold applies. Read once at compacted-writer construction (never on
+/// the per-row path).
+fn env_compacted_flush_bytes() -> Option<usize> {
     parse_compacted_flush_bytes(std::env::var(COMPACTED_RG_BYTES_ENV).ok().as_deref())
 }
 
 /// Pure parse of the [`COMPACTED_RG_BYTES_ENV`] value, factored out so it
 /// is unit-testable without touching the process environment (setting env
 /// vars is unsound under parallel tests). `None`, empty, non-numeric, or
-/// zero all fall back to [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] — a
+/// zero all yield `None` (the adaptive threshold then applies) — a
 /// misconfigured knob must not silently produce a degenerate (0-byte
 /// rotation) layout.
-fn parse_compacted_flush_bytes(raw: Option<&str>) -> usize {
+fn parse_compacted_flush_bytes(raw: Option<&str>) -> Option<usize> {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(COMPACTED_ROW_GROUP_FLUSH_BYTES)
 }
 
 /// RFC 0005 §3.6 default ZSTD compression level for data files —
@@ -207,9 +244,9 @@ pub struct Writer {
     /// open time (the declared schema embeds its columns).
     promoted: PromotedAttributes,
     /// In-progress bytes at which a row group seals:
-    /// [`ROW_GROUP_FLUSH_BYTES`] on the ingest side,
-    /// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] for compacted output
-    /// (RFC 0036 §3.3). Fixed at open time.
+    /// [`ROW_GROUP_FLUSH_BYTES`] on the ingest side, the RFC 0036 §3.3
+    /// adaptive threshold ([`adaptive_flush_bytes`]) for compacted output.
+    /// Fixed at open time.
     flush_bytes: usize,
     /// Set to `true` once any `ArrowWriter::write` /
     /// `ArrowWriter::flush` call returns `Err`. The underlying
@@ -335,19 +372,21 @@ impl Writer {
         zstd_level: i32,
         promoted: PromotedAttributes,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(store, partition, zstd_level, promoted, None, None)
+        Self::open_in_inner(store, partition, zstd_level, promoted, None, None, 0)
     }
 
     /// Open a **compacted-output** writer for `partition` (RFC 0036):
-    /// row groups rotate at the compacted threshold (§3.3) and the file
-    /// declares the §3.4 `sorting_columns` for `keys`. `flush_override`
-    /// pins the rotation threshold explicitly — the RFC 0036 §7 threshold
-    /// sweep's deterministic seam; `None` takes the shipped
-    /// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (or the
-    /// [`COMPACTED_RG_BYTES_ENV`] override, read once here). Compaction-
-    /// only — ingest-side files keep the 128 MiB rotation and declare no
-    /// sort (their rows are genuinely unsorted, RFC0035.5). The caller is
-    /// responsible for appending rows in the declared §3.1 order.
+    /// row groups rotate at the §3.3 threshold and the file declares the
+    /// §3.4 `sorting_columns` for `keys`. The rotation threshold resolves,
+    /// in precedence: explicit `flush_override` (positive) — the RFC 0036
+    /// §7 threshold sweep's deterministic seam — then the
+    /// [`COMPACTED_RG_BYTES_ENV`] operator override, then the **adaptive**
+    /// value [`adaptive_flush_bytes`] derives from `estimated_output_bytes`
+    /// (the partition's summed live input file sizes; §3.3). All read once
+    /// here. Compaction-only — ingest-side files keep the 128 MiB rotation
+    /// and declare no sort (their rows are genuinely unsorted, RFC0035.5).
+    /// The caller is responsible for appending rows in the declared §3.1
+    /// order.
     ///
     /// # Errors
     ///
@@ -359,6 +398,7 @@ impl Writer {
         promoted: PromotedAttributes,
         keys: ClusterKeys,
         flush_override: Option<usize>,
+        estimated_output_bytes: u64,
     ) -> Result<Self, WriterError> {
         Self::open_in_inner(
             store,
@@ -367,13 +407,16 @@ impl Writer {
             promoted,
             Some(keys),
             flush_override,
+            estimated_output_bytes,
         )
     }
 
     /// Shared body of [`Writer::open_in_with_promoted`] (ingest layout,
     /// `compacted: None`) and [`Writer::open_in_compacted`]
     /// (`Some(keys)` — RFC 0036 §3.3 threshold + §3.4 declaration).
-    /// `flush_override` applies to the compacted branch only.
+    /// `flush_override` and `estimated_output_bytes` apply to the compacted
+    /// branch only (the ingest branch always rotates at
+    /// [`ROW_GROUP_FLUSH_BYTES`]).
     fn open_in_inner(
         store: &Store,
         partition: PartitionKey,
@@ -381,6 +424,7 @@ impl Writer {
         promoted: PromotedAttributes,
         compacted: Option<ClusterKeys>,
         flush_override: Option<usize>,
+        estimated_output_bytes: u64,
     ) -> Result<Self, WriterError> {
         // Validate the codec level up front so invalid input fails fast. The
         // validated level flows into `writer_properties` so it isn't re-checked.
@@ -406,13 +450,16 @@ impl Writer {
         let (sorting, flush_bytes) = match compacted {
             Some(keys) => (
                 Some(sorting_columns(keys, &promoted)?),
-                // Same positivity guard as the env path (`parse_compacted_flush_bytes`):
-                // a 0 override would make `in_progress_size() >= flush_bytes`
-                // always true (a degenerate per-sub-batch rotation), so fall
-                // back to the env/const default instead.
+                // Precedence (§3.3): explicit override > env override >
+                // adaptive. The positivity filter guards a 0 override, which
+                // would make `in_progress_size() >= flush_bytes` always true
+                // (a degenerate per-sub-batch rotation); `env_compacted_flush_bytes`
+                // guards the env path the same way. When neither is set the
+                // adaptive value scales with the partition's estimated output.
                 flush_override
                     .filter(|&n| n > 0)
-                    .unwrap_or_else(compacted_flush_bytes),
+                    .or_else(env_compacted_flush_bytes)
+                    .unwrap_or_else(|| adaptive_flush_bytes(estimated_output_bytes)),
             ),
             None => (None, ROW_GROUP_FLUSH_BYTES),
         };
@@ -759,7 +806,7 @@ impl std::error::Error for WriterError {
 /// an `Err(WriterError::Parquet(_))`. Per the §3.5 row-group
 /// sizing rule, runs a `flush()` when the in-progress buffer
 /// crosses `flush_bytes` ([`ROW_GROUP_FLUSH_BYTES`] on the ingest
-/// side, [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] for compacted output).
+/// side, the RFC 0036 §3.3 adaptive threshold for compacted output).
 /// Symmetric helper to the audit writer's `append_chunks`.
 fn append_chunks(
     inner: &mut ArrowWriter<Vec<u8>>,
@@ -1194,28 +1241,49 @@ mod tests {
         assert!(decoded.is_empty(), "no rows out for no rows in");
     }
 
-    /// The RFC 0036 §7 compacted-threshold override parses a positive
-    /// byte count and falls back to the shipped default on every
-    /// degenerate input — a misconfigured knob must never yield a 0-byte
-    /// (every-sub-batch) rotation. Exercised on the pure parse helper so
-    /// no process env var is touched (unsound under parallel tests).
+    /// The RFC 0036 §7 compacted-threshold env override parses a positive
+    /// byte count and yields `None` (so the adaptive threshold then
+    /// applies) on every degenerate input — a misconfigured knob must
+    /// never yield a 0-byte (every-sub-batch) rotation. Exercised on the
+    /// pure parse helper so no process env var is touched (unsound under
+    /// parallel tests).
     #[test]
     fn compacted_flush_override_parses_or_falls_back() {
         assert_eq!(
             parse_compacted_flush_bytes(Some("16777216")),
-            16 * 1024 * 1024
+            Some(16 * 1024 * 1024)
         );
         assert_eq!(
             parse_compacted_flush_bytes(Some("  67108864 ")),
-            64 * 1024 * 1024
+            Some(64 * 1024 * 1024)
         );
         for degenerate in [None, Some(""), Some("nope"), Some("0"), Some("-5")] {
             assert_eq!(
                 parse_compacted_flush_bytes(degenerate),
-                COMPACTED_ROW_GROUP_FLUSH_BYTES,
-                "degenerate override {degenerate:?} must fall back to the default",
+                None,
+                "degenerate override {degenerate:?} must fall back to the adaptive threshold",
             );
         }
+    }
+
+    /// RFC 0036 §3.3 — the adaptive compacted row-group threshold targets
+    /// [`TARGET_COMPACTED_ROW_GROUPS`] groups, clamped to the
+    /// floor/ceiling. The three worked examples from the RFC: a mid-size
+    /// hour lands between the bounds, a huge hour caps at the ceiling, a
+    /// tiny hour floors at the minimum.
+    #[test]
+    fn adaptive_flush_bytes_targets_k_groups_within_bounds() {
+        // 14 MB hour → 14/8 = 1.75 MB → between the 1 MiB floor and 32 MiB
+        // ceiling (≈ 8 groups).
+        assert_eq!(adaptive_flush_bytes(14_000_000), 14_000_000 / 8);
+        // 400 MB hour → 400/8 = 50 MB → capped to the 32 MiB ceiling
+        // (so > K groups, each ≤ 32 MiB).
+        assert_eq!(adaptive_flush_bytes(400_000_000), MAX_COMPACTED_RG_BYTES);
+        // 4 MB hour → 4/8 = 0.5 MB → floored to the 1 MiB minimum (so it
+        // still splits into a few groups rather than one).
+        assert_eq!(adaptive_flush_bytes(4_000_000), MIN_COMPACTED_RG_BYTES);
+        // Degenerate: a zero estimate still floors, never rotating at 0.
+        assert_eq!(adaptive_flush_bytes(0), MIN_COMPACTED_RG_BYTES);
     }
 
     /// An out-of-range zstd level fails up front (mirrors the file writer's

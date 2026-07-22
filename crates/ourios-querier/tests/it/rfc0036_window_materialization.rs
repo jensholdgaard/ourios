@@ -20,7 +20,7 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::promoted::{RESOURCE_PREFIX, SERVICE_NAME_KEY};
 use ourios_parquet::{
-    COMPACTED_ROW_GROUP_FLUSH_BYTES, PartitionKey, Store, Writer, columns, compact_partition,
+    PartitionKey, Store, Writer, adaptive_flush_bytes, columns, compact_partition,
     compact_partition_with_flush_threshold,
 };
 use ourios_querier::Querier;
@@ -31,6 +31,20 @@ use parquet::file::statistics::Statistics;
 /// 2026-04-02T10:00:00 UTC — every fixture time is an in-hour offset
 /// from this, so all records share one partition.
 const HOUR10_START: u64 = 1_775_124_000_000_000_000;
+
+/// Each service in a plan gets its own disjoint time band — its plan
+/// index × this width. Under the RFC 0036 §3.3 **adaptive** threshold the
+/// compacted file rotates into several fine row groups (not the old
+/// single coarse 32 MiB group), so a one-service window is a *contiguous*
+/// run of groups only when neighbouring services do not share its time
+/// span: otherwise the boundary row group joining two services (whose
+/// rows would otherwise both start at time 0) has a `time_unix_nano`
+/// min/max that spuriously overlaps the window and reads as a gap in the
+/// survivor run. Disjoint bands make the sorted-by-(service, time) layout
+/// genuinely time-clustered per service. 10 min ≫ any single service's
+/// span (≤ ~200 s at the 10 ms grid), leaving a clean inter-band gap; the
+/// three bands (≤ 30 min) stay inside the fixture hour.
+const SERVICE_BAND_NS: u64 = 600_000_000_000; // 10 min
 
 /// A `now` reference and default window comfortably covering the
 /// fixture hour, so the DSL `range(...)` is the only time bound that
@@ -145,14 +159,17 @@ fn write_input(store: &Store, part: &PartitionKey, records: &[MinedRecord]) {
 /// Seed a one-hour partition from `plan` (each `(service, rows)` pair's
 /// rows ascend on the `grid_ns` grid), split across two interleaved
 /// ingest-side files so neither is service- or time-clustered on its
-/// own, then compact. Returns the committed file's basename.
+/// own, then compact. Returns `(committed file basename, summed live input
+/// file bytes)` — the input total is the RFC 0036 §3.3
+/// `estimated_output_bytes` the writer scaled the adaptive threshold from,
+/// so callers recompute the exact `T` via [`adaptive_flush_bytes`].
 fn seed_and_compact(
     store: &Store,
     part: &PartitionKey,
     plan: &[(&str, u64)],
     body_len: usize,
     grid_ns: u64,
-) -> String {
+) -> (String, u64) {
     // Round-robin across services, alternately assigning to file A/B, so
     // neither input is service- or time-clustered on its own — and we
     // never materialise the whole corpus plus two clones (peak is the two
@@ -170,12 +187,13 @@ fn seed_and_compact(
     let mut id: u64 = 0;
     let mut to_a = true;
     for i in 0..max_rows {
-        for &(service, rows) in plan {
+        for (svc_idx, &(service, rows)) in plan.iter().enumerate() {
             if i < rows {
                 id += 1;
+                let band = u64::try_from(svc_idx).expect("plan index fits u64") * SERVICE_BAND_NS;
                 let r = rec(
                     service,
-                    HOUR10_START + i * grid_ns,
+                    HOUR10_START + band + i * grid_ns,
                     id,
                     payload(id, body_len),
                 );
@@ -190,11 +208,25 @@ fn seed_and_compact(
     }
     write_input(store, part, &file_a);
     write_input(store, part, &file_b);
-    compact_partition(store, part)
+    // The two live ingest files' total — the adaptive threshold's input,
+    // captured before compaction consumes them.
+    let prefix = part
+        .data_path(std::path::Path::new(""))
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let input_total: u64 = store
+        .list_with_sizes_blocking(Some(&prefix))
+        .expect("list input sizes")
+        .iter()
+        .filter(|(k, _)| k.ends_with(".parquet"))
+        .map(|(_, size)| *size)
+        .sum();
+    let committed = compact_partition(store, part)
         .expect("compact")
         .committed
         .expect("≥2 inputs ⇒ a commit")
-        .file
+        .file;
+    (committed, input_total)
 }
 
 /// The same one-hour corpus [`seed_and_compact`] builds, but as a
@@ -209,12 +241,13 @@ fn all_records(plan: &[(&str, u64)], body_len: usize, grid_ns: u64) -> Vec<Mined
     let mut records: Vec<MinedRecord> = Vec::with_capacity(total);
     let mut id: u64 = 0;
     for i in 0..max_rows {
-        for &(service, rows) in plan {
+        for (svc_idx, &(service, rows)) in plan.iter().enumerate() {
             if i < rows {
                 id += 1;
+                let band = u64::try_from(svc_idx).expect("plan index fits u64") * SERVICE_BAND_NS;
                 records.push(rec(
                     service,
-                    HOUR10_START + i * grid_ns,
+                    HOUR10_START + band + i * grid_ns,
                     id,
                     payload(id, body_len),
                 ));
@@ -258,15 +291,18 @@ fn window_service_bytes(
 ///
 /// A synthetic v8-shape hour (many services, promoted `service.name`)
 /// is compacted into one clustered, `sorting_columns`-declaring file
-/// whose row groups rotate at [`COMPACTED_ROW_GROUP_FLUSH_BYTES`]. The
-/// L6-shape query — one service, a k-row time window — then scans only
-/// the row groups that hold that service's window (plus at most two
-/// boundary groups), not the whole hour: the RFC 0016
-/// `row_groups_scanned` count is bounded by `ceil(B_sw / T) + 2`, with
-/// **B_sw** the queried service's bytes within the window (summed from
-/// the compacted footer: the §3.1 sort places one service's window in
-/// *contiguous* row groups) and **T** the compacted threshold. Both
-/// `B_sw` and T are read from the file/const, never hardcoded.
+/// whose row groups rotate at the RFC 0036 §3.3 **adaptive** threshold
+/// (`input_total` / K). The L6-shape query — one service, a k-row time
+/// window — then scans only the row groups that hold that service's
+/// window (plus at most two boundary groups), not the whole hour: the
+/// RFC 0016 `row_groups_scanned` count is bounded by `ceil(B_sw / T) + 2`,
+/// with **B_sw** the queried service's bytes within the window (summed
+/// from the compacted footer: the §3.1 sort places one service's window in
+/// *contiguous* row groups) and **T** the adaptive threshold the writer
+/// used ([`adaptive_flush_bytes`] of the input total `seed_and_compact`
+/// returns). Both `B_sw` and T are recomputed from the file/inputs, never
+/// hardcoded — so the bound tracks the layout the writer actually
+/// produced, whatever the threshold resolves to.
 ///
 /// This is the CI-testable half. The comparative arm — the same L6
 /// pair on the v8 corpus through the RFC 0031 dispatch, and the
@@ -278,13 +314,13 @@ fn window_service_bytes(
 #[tokio::test]
 async fn rfc0036_2_window_materialization_bound() {
     // A one-hour partition, three promoted services sized so the
-    // compacted file rotates into several row groups at the 32 MiB
-    // compacted threshold (BODY_LEN high-entropy, so encoded size
-    // tracks raw bytes — the RFC0036.1 size lever). `svc-m` is the
-    // queried service: it is fully contained in the a→z boundary row
-    // group, so a `service == "svc-m"` window query scans that one
-    // group and prunes the pure-`svc-a`/`svc-z` groups by the §3.1
-    // clustering's tight per-row-group `service.name` statistics.
+    // compacted file rotates into several row groups at the adaptive
+    // threshold (`input_total` / K, ~12 MiB here; BODY_LEN high-entropy, so
+    // encoded size tracks raw bytes — the RFC0036.1 size lever). `svc-m` is
+    // the queried service: it is fully contained in the a→z boundary row
+    // groups, so a `service == "svc-m"` window query scans those and
+    // prunes the pure-`svc-a`/`svc-z` groups by the §3.1 clustering's
+    // tight per-row-group `service.name` statistics.
     const BODY_LEN: usize = 4096;
     const TARGET: &str = "svc-m";
     /// The k-row window: `[HOUR10_START, HOUR10_START + WINDOW_NS)`.
@@ -296,7 +332,7 @@ async fn rfc0036_2_window_materialization_bound() {
     let store = Store::local(bucket.path()).expect("local store");
     let part = PartitionKey::derive(&rec(TARGET, HOUR10_START, 1, String::new()))
         .expect("derive partition");
-    let committed = seed_and_compact(&store, &part, &plan, BODY_LEN, GRID_NS);
+    let (committed, input_total) = seed_and_compact(&store, &part, &plan, BODY_LEN, GRID_NS);
 
     // --- Footer: B_sw (queried service's bytes in the window) and the
     // §3.1 contiguity of that service's clustered run ---
@@ -312,7 +348,11 @@ async fn rfc0036_2_window_materialization_bound() {
          window is a small fraction of the hour (got {total_row_groups})",
     );
 
-    let window = HOUR10_START..HOUR10_START + WINDOW_NS;
+    // `svc-m` is plan index 1, so its rows live in the second time band
+    // (`1 × SERVICE_BAND_NS` = 10 min in) — the window and the DSL
+    // `range(...)` below both target that band.
+    let window_start = HOUR10_START + SERVICE_BAND_NS;
+    let window = window_start..window_start + WINDOW_NS;
     let (overlapping, b_sw) = window_service_bytes(&meta, TARGET, &window);
     assert!(!overlapping.is_empty(), "the answer lives in ≥ 1 row group");
     // §3.1 contiguity: one service's window occupies a *contiguous* run
@@ -330,13 +370,15 @@ async fn rfc0036_2_window_materialization_bound() {
     );
 
     // --- The L6-shape query and the scanned-row-group bound ---
-    let t = u64::try_from(COMPACTED_ROW_GROUP_FLUSH_BYTES).expect("threshold fits u64");
+    // T is the adaptive threshold the writer used — recomputed from the
+    // same input total, so the bound moves with the layout (§3.3).
+    let t = u64::try_from(adaptive_flush_bytes(input_total)).expect("threshold fits u64");
     // ceil(B_sw / T) + 2: the groups that hold the answer, plus at most
     // two boundary groups.
     let bound = b_sw.div_ceil(t) + 2;
 
     let src =
-        format!("service == \"{TARGET}\" | range(2026-04-02T10:00:00Z, 2026-04-02T10:00:30Z)");
+        format!("service == \"{TARGET}\" | range(2026-04-02T10:10:00Z, 2026-04-02T10:10:30Z)");
     let query = ourios_querier::dsl::parse(&src).expect("parse");
     let r = Querier::new(bucket.path())
         .run_query(
@@ -432,8 +474,8 @@ async fn measure_window(
 ///   hour and every service, so nothing prunes: the window query
 ///   materialises the *entire* file (`scanned == total`).
 /// - **After** — the compacted, `sorting_columns`-declaring store
-///   ([`seed_and_compact`], 32 MiB [`COMPACTED_ROW_GROUP_FLUSH_BYTES`]
-///   row groups). The §3.1 clustering gives each row group tight
+///   ([`seed_and_compact`], adaptive-threshold row groups). The §3.1
+///   clustering gives each row group tight
 ///   `service.name`/`time` statistics, so the same query prunes away most
 ///   of its groups (`scanned < total`).
 ///
@@ -445,10 +487,11 @@ async fn measure_window(
 /// `row_groups_scanned` cross-checks that the engine prunes exactly as the
 /// footer predicts (before scans the whole file, after prunes to a subset).
 /// Row-group *counts* are not the honest axis: the ingest side rotates at
-/// 128 MiB and compaction at 32 MiB (RFC 0036 §3.3), so the compacted store
-/// deliberately holds more, smaller groups (and, at these sub-threshold
-/// sizes, a physically larger file — the smaller groups compress a little
-/// worse). The window still materialises fewer bytes on the compacted store
+/// 128 MiB and compaction at the adaptive threshold (`input_total` / K,
+/// RFC 0036 §3.3), so the compacted store deliberately holds more, smaller
+/// groups (and, at these sub-threshold sizes, a physically larger file —
+/// the smaller groups compress a little worse). The window still
+/// materialises fewer bytes on the compacted store
 /// because it prunes to a small survivor subset, so the assertion is
 /// `after_bytes < before_bytes` with **identical `rows`** (pruning changed
 /// the IO, not the answer). The full comparative bytes-vs-Loki arm (total
@@ -467,13 +510,17 @@ async fn rfc0036_2_materialization_before_after() {
     const GRID_NS: u64 = 10_000_000; // 10 ms between a service's rows
     let plan: [(&str, u64); 3] = [("svc-a", 20_000), (TARGET, 18_500), ("svc-z", 20_000)];
 
+    // `svc-m` is plan index 1 → its rows live in the second time band
+    // (`1 × SERVICE_BAND_NS` = 10 min in); the window and DSL `range(...)`
+    // target that band.
     let src =
-        format!("service == \"{TARGET}\" | range(2026-04-02T10:00:00Z, 2026-04-02T10:00:01Z)");
+        format!("service == \"{TARGET}\" | range(2026-04-02T10:10:00Z, 2026-04-02T10:10:01Z)");
     let query = ourios_querier::dsl::parse(&src).expect("parse");
     let part = PartitionKey::derive(&rec(TARGET, HOUR10_START, 1, String::new()))
         .expect("derive partition");
 
-    let window = HOUR10_START..HOUR10_START + WINDOW_NS;
+    let window_start = HOUR10_START + SERVICE_BAND_NS;
+    let window = window_start..window_start + WINDOW_NS;
 
     // --- Before: one unsorted ingest-side file, no manifest (glob path). The
     // materialization term (RFC 0036 §9) is the compressed column chunks of
@@ -518,7 +565,7 @@ async fn rfc0036_2_materialization_before_after() {
     // minority of the file's groups. ---
     let after_bucket = tempfile::TempDir::new().expect("temp");
     let after_store = Store::local(after_bucket.path()).expect("local store");
-    let committed = seed_and_compact(&after_store, &part, &plan, BODY_LEN, GRID_NS);
+    let (committed, _input_total) = seed_and_compact(&after_store, &part, &plan, BODY_LEN, GRID_NS);
     let after_path = part.data_path(after_bucket.path()).join(&committed);
     let (after_total, after_survivors, after_bytes, after) =
         measure_window(after_bucket.path(), &after_path, &query, TARGET, &window).await;
@@ -597,8 +644,8 @@ async fn rfc0036_2_materialization_before_after() {
 // RFC 0036 §7 — the compacted row-group threshold sweep (16 / 32 / 64 MiB).
 //
 // The `rfc0036_2_*` measurements above use a near-incompressible random
-// payload (chosen so few rows cross the 32 MiB threshold), which made the
-// compacted file read as ~2× *larger* on disk (§9.27). Real logs are
+// payload (chosen so few rows cross the row-group threshold), which made
+// the compacted file read as ~2× *larger* on disk (§9.27). Real logs are
 // compressible and have per-service locality — sorting by `service.name`
 // clusters similar lines, which should *improve* compression, not worsen
 // it. This sweep uses a **compressible, service-clustered** synthetic
@@ -613,7 +660,8 @@ async fn rfc0036_2_materialization_before_after() {
 // corpus and re-compacts it three times) — run explicitly to reproduce
 // §9.28, exactly as the RFC0005.6 sizing test is `#[ignore]`d. Not a CI
 // gate: the *gate* is `rfc0036_2_window_materialization_bound`, which
-// already tracks whatever `COMPACTED_ROW_GROUP_FLUSH_BYTES` ships.
+// already tracks whatever threshold the compacted writer resolves
+// (the adaptive default, or an explicit/env override).
 // ---------------------------------------------------------------------------
 
 /// One hour in nanoseconds — the sweep spreads each service's rows across

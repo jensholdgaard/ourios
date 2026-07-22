@@ -24,8 +24,8 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::promoted::{RESOURCE_PREFIX, SERVICE_NAME_KEY, project_string_value};
 use ourios_parquet::{
-    COMPACTED_ROW_GROUP_FLUSH_BYTES, MANIFEST_FILENAME, Manifest, PartitionKey, Reader,
-    SUB_BATCH_ROWS, Store, Writer, columns, compact_partition,
+    MANIFEST_FILENAME, Manifest, PartitionKey, Reader, SUB_BATCH_ROWS, Store, Writer,
+    adaptive_flush_bytes, columns, compact_partition,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData, SortingColumn};
@@ -134,6 +134,20 @@ fn partition_prefix(part: &PartitionKey) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
+/// Summed byte size of the partition's committed `*.parquet` objects — the
+/// RFC 0036 §3.3 `estimated_output_bytes` the adaptive threshold scales
+/// from. Called before compaction to recompute the exact `T` the writer
+/// derived from the same live inputs.
+fn ingest_parquet_bytes(store: &Store, part: &PartitionKey) -> u64 {
+    store
+        .list_with_sizes_blocking(Some(&partition_prefix(part)))
+        .expect("list input sizes")
+        .iter()
+        .filter(|(k, _)| k.ends_with(".parquet"))
+        .map(|(_, size)| *size)
+        .sum()
+}
+
 /// Leaf index of the named top-level column in the file's Parquet
 /// schema, from a row group's column-chunk paths.
 fn leaf_index(rg: &RowGroupMetaData, name: &str) -> usize {
@@ -209,10 +223,11 @@ fn seed_two_input_partition(
 fn rfc0036_1_compacted_layout() {
     // Three services sized so the *encoded* corpus (~53 MiB, the estimate
     // the rotation predicate actually watches — high-entropy bodies still
-    // ZSTD ~2.4×, so uncompressed is ~128 MiB) crosses the 32 MiB
-    // compacted threshold once: svc-a alone fills the first group, so the
-    // seal lands at the a→b boundary and every group's service min/max
-    // spans at most a boundary pair.
+    // ZSTD ~2.4×, so uncompressed is ~128 MiB) crosses the RFC 0036 §3.3
+    // adaptive compacted threshold several times: the adaptive value is
+    // input_total / K (K = 8), ~6.6 MiB here, so svc-a spans a run of pure
+    // groups, the seal lands at the a→b boundary, and every group's service
+    // min/max spans at most a boundary pair.
     const BODY_LEN: usize = 4096;
     let plan: [(&str, u64); 3] = [("svc-a", 18_500), ("svc-b", 13_500), ("svc-c", 900)];
 
@@ -220,6 +235,12 @@ fn rfc0036_1_compacted_layout() {
     let store = Store::local(bucket.path()).expect("local store");
     let (interleaved, part, key_a) = seed_two_input_partition(&store, &plan, BODY_LEN);
     let expected_rows = interleaved.len();
+
+    // The adaptive threshold the writer uses is a pure function of the live
+    // input file sizes (§3.3), so recompute it from the same inputs before
+    // compaction consumes them — this is the `T` the size bounds key on,
+    // exactly what the writer's `open_in_compacted` derived.
+    let adaptive_threshold = adaptive_flush_bytes(ingest_parquet_bytes(&store, &part));
 
     // §3.4: ingest-side files declare NOTHING.
     let input_bytes = store.get_blocking(&key_a).expect("get input");
@@ -247,8 +268,8 @@ fn rfc0036_1_compacted_layout() {
             .clone();
     assert!(
         meta.num_row_groups() >= 2,
-        "the corpus crosses the compacted threshold, so rotation must \
-         have produced multiple row groups (got {})",
+        "the corpus crosses the adaptive compacted threshold, so rotation \
+         must have produced multiple row groups (got {})",
         meta.num_row_groups(),
     );
 
@@ -287,7 +308,7 @@ fn rfc0036_1_compacted_layout() {
         .sum();
     let rows = u64::try_from(expected_rows).expect("row count");
     let sub_batch = u64::try_from(SUB_BATCH_ROWS).expect("sub-batch rows");
-    let threshold = u64::try_from(COMPACTED_ROW_GROUP_FLUSH_BYTES).expect("threshold");
+    let threshold = u64::try_from(adaptive_threshold).expect("threshold");
     let encoded_bound = threshold + 2 * sub_batch * (encoded_total / rows);
     let uncompressed_bound = threshold * uncompressed_total / encoded_total
         + 2 * sub_batch * (uncompressed_total / rows);

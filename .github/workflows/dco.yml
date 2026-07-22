@@ -1,0 +1,67 @@
+name: dco
+
+# Developer Certificate of Origin gate. Every commit in a PR must carry a
+# `Signed-off-by:` trailer whose email matches the commit author (DCO 1.1,
+# https://developercertificate.org/) — separate from cryptographic signing,
+# which proves identity rather than certifying the right to submit.
+#
+# Self-contained (no third-party action) to keep the supply-chain surface
+# minimal, mirroring the licenses gate. Bot authors (Renovate, Dependabot)
+# are exempt: their commits are governed by the bot's own terms and would
+# never carry a human sign-off, so gating them would break dependency
+# auto-merge.
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: sign-off (DCO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify every commit is signed off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for sha in $(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}"); do
+            author_email="$(git show -s --format='%ae' "$sha")"
+            author_name="$(git show -s --format='%an' "$sha")"
+            # Exempt bot authors — their commits carry no human sign-off and
+            # gating them would break Renovate/Dependabot auto-merge. The
+            # '[bot]' is quoted so the shell case treats it literally, not as
+            # a [bot] character class.
+            case "$author_email" in
+              *'[bot]'@users.noreply.github.com|*@renovate.whitesourcesoftware.com) continue ;;
+            esac
+            case "$author_name" in
+              *'[bot]') continue ;;
+            esac
+            # A matching Signed-off-by trailer: same email as the author.
+            if git show -s --format='%B' "$sha" \
+                | grep -i '^Signed-off-by:' | grep -qiF "<${author_email}>"; then
+              continue
+            fi
+            fail=1
+            echo "::error::commit ${sha} (${author_name} <${author_email}>) is missing a matching 'Signed-off-by: ${author_name} <${author_email}>' trailer"
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Sign off your commits with 'git commit -s' (or amend an existing"
+            echo "branch: 'git rebase --signoff ${BASE_SHA}'). See CONTRIBUTING.md."
+            exit 1
+          fi
+          echo "All commits are signed off."

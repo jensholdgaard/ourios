@@ -45,6 +45,31 @@ https://github.com/settings/ssh/new
 
 See: https://docs.github.com/authentication/managing-commit-signature-verification
 
+## Developer Certificate of Origin (sign-off)
+
+Every commit must be **signed off** with the [Developer Certificate of
+Origin](https://developercertificate.org/) (DCO 1.1). This is separate from
+the cryptographic signing above: signing proves *who* authored the commit,
+sign-off certifies you have the *right* to submit it under the project's
+licence. Both are required, and CI enforces the sign-off.
+
+Add the trailer automatically with `-s`:
+
+```bash
+git commit -s -m "feat(scope): summary"
+```
+
+which appends a line matching your commit author:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+Missed it? `git commit --amend -s --no-edit` (or `git rebase --signoff main`
+for a range) fixes a branch before pushing. AI-assisted commits keep their
+`Co-Authored-By:` trailer *and* carry the human contributor's `Signed-off-by:`
+— the human driver certifies origin.
+
 ## Conventions
 - Keep PRs small and focused.
 - Update `CHANGELOG.md` under `## [Unreleased]`.

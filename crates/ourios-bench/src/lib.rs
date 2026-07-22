@@ -67,7 +67,11 @@ pub use soak::{
     BacklogSample, D1Verdict, D2Verdict, LatencySummary, SoakConfig, SoakError, SoakReport,
     default_worker_threads, run_soak,
 };
-pub use store::{B1Store, BuiltStore, build_b1_store, build_comparative_store, build_query_store};
+pub use store::{
+    B1Store, BuiltStore, build_b1_store, build_comparative_store,
+    build_comparative_store_compacted, build_comparative_store_compacted_with_threshold,
+    build_query_store,
+};
 
 /// Configuration for one bench invocation.
 ///

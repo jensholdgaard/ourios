@@ -2199,3 +2199,89 @@ comparative gates); the default is **not** changed here — that is a
 maintainer decision on the authoritative numbers. The interim
 `OURIOS_COMPACTED_RG_BYTES` env knob (RFC 0036 §7) lets an operator retune
 without a rebuild in the meantime.
+
+### 9.29 Results — 2026-07-22 (indicative, local M-series, real-corpus subset, Ourios-only, no Loki) — RFC 0036 window-materialization before/after on the v8 capture
+
+**Purpose.** The real-otel-demo-corpus analogue of §9.27's *synthetic* 1.43×
+before/after — the piece §9.26 structurally could not produce (its
+single-file-per-partition harness no-ops `compact_partition`). This measures
+the RFC 0036 window-materialization win on the **actual v8 capture** (a
+subset), Ourios-only. **Indicative, not authoritative** — local hardware, a
+corpus subset, no Loki, no baseline VM; the authoritative full-v8 + Loki arm
+stays deferred (RFC0036.2 §5 / §9.26).
+
+**What made this measurable — the opt-in compacted harness path.** §9.26's
+finding was that `ourios-bench`'s `build_comparative_store` writes one ingest
+file per partition, so compaction no-ops and RFC 0036's sort never runs. This
+slice adds an **opt-in** builder,
+`build_comparative_store_compacted[_with_threshold]`, that round-robins each
+partition's rows across **two** interleaved ingest files, then calls
+`compact_partition` on every partition — so the consolidated file is
+§3.1-clustered by (`service.name`, time), rotates row groups, and declares
+`sorting_columns`. **The default `build_comparative_store` path — the frozen
+RFC 0031 dispatch's store — is byte-for-byte untouched** (a separate function;
+the frozen gates are *not* re-based).
+
+**Hardware / run.** Local M-series developer machine (P-cores; `taskpolicy -B`
+to escape the Claude-Code background-QoS E-core throttle), dev build.
+`ourios-bench`'s `rfc0036_realcorpus_window_materialization_before_after`
+(`tests/rfc0036_realcorpus.rs`, `#[ignore]`d, **skips with a clear message
+when the gitignored capture is absent** so CI/other machines never fail). The
+store is built two ways from the identical subset — **before** = default
+single-file `build_comparative_store` (no compaction), **after** =
+`build_comparative_store_compacted_with_threshold` — then the same L6-shape
+window query runs against each.
+
+**Corpus / query.** First **120,000 `LogsData` batches** of
+`otel-demo-v8/logs.jsonl` (513,752,573 B of the 2.96 GB capture, ~21 h of
+wall-time). The measurement picks the busiest compacted partition (most row
+groups), then the **most-prunable real service** in it — which resolves to
+**`ad`**, the lowest-volume otel-demo service and the exact §9.13 run #17 case
+— and the busy hour as the window: `service == "ad" | range(2026-07-07T08:00:00Z,
+2026-07-07T09:00:00Z)`. **Materialization bytes** = the footer survivor-chunk
+sum (the RFC 0036 §9 metric: compressed column chunks of the row groups a
+`service = ad ∧ time ∈ window` scan cannot prune, keyed on the
+`effective_time_unix_nano` column the querier prunes on — **not** the
+count-scan `stats.bytes_read`); the live query's `row_groups_scanned`
+cross-checks the footer prediction.
+
+| store | survivors / groups | materialization bytes | query scanned / pruned | rows |
+|---|---|---|---|---|
+| **before** — single unsorted ingest file | 1 / 1 | 3,806,306 | 1 / 0 (whole file) | 10,110 |
+| **after** — compacted, §3.1-sorted @ 2 MiB | 1 / 7 | 731,521 | 1 / 6 | 10,110 |
+
+**Reading — a 5.20× real-corpus materialization-bytes win, identical answer.**
+The sort takes the one-service window from materialising the **whole hour**
+(the single unsorted ingest row group — nothing prunes) to **one of seven**
+clustered row groups (`ad` lands in a single group; the other six prune on
+plain footer `service.name` statistics). Same 10,110-row answer; the live
+query confirms the footer prediction (before scans 1/1, after scans 1/7). This
+is **larger** than §9.27's synthetic 1.43× — and honestly so: §9.27's random
+payload was incompressible and forced the compacted file ~2× larger, whereas
+real logs compress and the §3.1 `service.name` sort clusters like lines, so
+finer clustered groups prune sharply (the §9.28 finding-2 mechanism, now on
+real data).
+
+**The threshold caveat — the shipped 32 MiB default does *not* prune a real
+hour (§9.28 finding 3 confirmed).** Real per-hour v8 volume (~a few MiB
+compressed) is **far below** the 32 MiB shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`,
+so at 32 MiB the busy hour compacts to a **single** row group and nothing
+prunes — the measurement *skips* with a "raise subset / lower threshold"
+message (verified). The win therefore requires a **finer** compacted threshold
+(2 MiB here) to rotate the real hour into the several service-clustered groups
+the pruning mechanism needs. This is not a defect of the layout — it is the
+same row-cap/volume reality §9.28 finding 3 documented on synthetic data, now
+reproduced on the real corpus: on realistic per-hour volumes the byte
+threshold must be finer than 32 MiB to bite. Indicative sensitivity on this
+subset: **2 MiB → 7 groups, 5.20×**; **4 MiB → 2 groups, 1.32×**; **32 MiB → 1
+group, no prune**. The finer the threshold, the sharper the window prune — the
+§9.28-flagged lever, confirmed on real data.
+
+**Disposition.** This complements §9.26 (no-regression, but structurally
+could not show the win) and §9.27 (synthetic 1.43×) with a **real-corpus**
+before/after (5.20× at 2 MiB). It is **indicative** (local, subset, Ourios-only,
+no Loki) — the authoritative full-v8 L6-scanned-bytes-vs-Loki arm, and the
+32/16 MiB threshold decision it informs, stay deferred to the paid
+`baseline-8vcpu-32gib` harness (RFC 0036 §7 / RFC0036.2). The shipped 32 MiB
+default is unchanged; the data continues to lean toward a **finer** compacted
+threshold as the authoritative-sweep candidate.

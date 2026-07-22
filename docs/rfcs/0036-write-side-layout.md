@@ -491,11 +491,16 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
 
 - [x] **The compacted row-group threshold — settled at 32 MiB for
   `green`; authoritative sweep deferred to `validated`.** The
-  scanned-count *gate* (RFC0036.2) is threshold-independent: it reads
-  the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES` from the const and
-  bounds scanned row groups by `ceil(B_sw / T) + 2`, so any threshold
-  passes by construction — the mechanism, not a magic number, is what
-  the gate pins. The *choice* of 32 MiB stands as the shipped default.
+  scanned-count *gate* (RFC0036.2) does not hard-code a threshold: it
+  reads the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES` from the const and
+  recomputes the bound `ceil(B_sw / T) + 2` from it, so retuning `T`
+  moves the bound with the layout instead of invalidating the test. It
+  is *not* auto-satisfied — the gate still fails if a `T` change
+  regresses the sort/pruning (e.g. the target service stops clustering
+  contiguously and extra groups are scanned). What it pins is the
+  mechanism (scan the groups holding the answer, not the hour), for
+  whatever `T` ships. The *choice* of 32 MiB stands as the shipped
+  default.
   The honest sweep (16/32/64 MiB against the L6-shape scanned-bytes
   curve *and* L1/L3 neutrality — more row groups = more footer entries
   and per-group index overhead) is a paid `baseline-8vcpu-32gib`

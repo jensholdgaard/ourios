@@ -189,9 +189,21 @@ fn window_service_bytes(
 
 /// Recursively collect committed `*.parquet` object paths under `root/data`.
 fn committed_parquet_files(root: &Path) -> Vec<PathBuf> {
+    // The manifest is the authoritative live set (RFC 0005 §3.9): physical
+    // enumeration can pick up orphaned superseded inputs (gc_failures) or a
+    // lost-CAS output and skew the "busiest" pick. Prefer the manifest's
+    // `files` when a partition dir has one; else (pre-compaction) fall back
+    // to physical `*.parquet`.
     let mut out = Vec::new();
     let mut stack = vec![root.join("data")];
     while let Some(dir) = stack.pop() {
+        let manifest = dir.join(ourios_parquet::MANIFEST_FILENAME);
+        if let Ok(bytes) = std::fs::read(&manifest)
+            && let Ok(m) = serde_json::from_slice::<ourios_parquet::Manifest>(&bytes)
+        {
+            out.extend(m.files.iter().map(|f| dir.join(f)));
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };

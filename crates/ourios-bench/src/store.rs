@@ -1203,9 +1203,22 @@ mod tests {
     /// Recursively collect the committed `*.parquet` object paths under
     /// `bucket_root/data` (excludes `*.parquet.tmp` and `manifest.json`).
     fn committed_parquet_files(bucket_root: &Path) -> Vec<std::path::PathBuf> {
+        // The manifest is the authoritative live set (RFC 0005 §3.9): a
+        // partition dir may hold orphaned superseded inputs (gc_failures) or a
+        // lost-CAS output next to the live consolidated file, so physical
+        // enumeration overcounts. When a dir has a manifest.json, use its
+        // `files`; a dir without one is a pre-compaction leaf (no manifest),
+        // so fall back to physical `*.parquet`.
         let mut out = Vec::new();
         let mut stack = vec![bucket_root.join("data")];
         while let Some(dir) = stack.pop() {
+            let manifest = dir.join(ourios_parquet::MANIFEST_FILENAME);
+            if let Ok(bytes) = std::fs::read(&manifest)
+                && let Ok(m) = serde_json::from_slice::<ourios_parquet::Manifest>(&bytes)
+            {
+                out.extend(m.files.iter().map(|f| dir.join(f)));
+                continue; // compacted leaf; the manifest is authoritative
+            }
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };

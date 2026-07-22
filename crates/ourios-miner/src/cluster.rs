@@ -1894,12 +1894,12 @@ impl MinerCluster {
         }
     }
 
-    /// `Body::Structured` short-circuit per RFC 0001 §6.2 step 0.
-    /// The tree is not walked; the per-tenant
-    /// `(severity_number, scope_name) → template_id` map is the
-    /// entire lookup. First observation of a tuple allocates;
-    /// subsequent records with the same tuple reuse. Structured
-    /// records never widen and never emit audit events.
+    /// `Body::Structured` short-circuit per RFC 0001 §6.2 step 0 as
+    /// extended by RFC 0037 §3.1. The tree is not walked; the
+    /// per-tenant `(severity_number, scope_name, event_name) →
+    /// template_id` map is the entire lookup. First observation of a
+    /// tuple allocates; subsequent records with the same tuple reuse.
+    /// Structured records never widen and never emit audit events.
     fn ingest_structured(
         &mut self,
         record: &OtlpLogRecord,
@@ -2461,6 +2461,7 @@ mod tests {
     use ourios_core::audit::SharedAuditSink;
     use ourios_core::otlp::{AnyValue, any_value::Value as AvValue};
     use ourios_core::record::SharedRecordSink;
+    use proptest::prelude::*;
 
     use crate::snapshot::{
         LeafRecord, ParamTypeRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
@@ -2527,6 +2528,46 @@ mod tests {
         let id_none = cluster.ingest(&no_event);
         assert_ne!(id_none, id_inference);
         assert_ne!(id_none, id_tool);
+    }
+
+    proptest! {
+        /// RFC0037.1 (property) — a structured record's `template_id` is a
+        /// pure function of exactly `(severity_number, scope_name,
+        /// event_name)`: equal tuples reuse an id, distinct tuples receive
+        /// distinct ids. Covers empty strings, `None`s, and repeated keys.
+        #[test]
+        fn rfc0037_1_structured_key_is_the_whole_template_identity(
+            keys in prop::collection::vec(
+                (
+                    any::<u8>(),
+                    prop::option::of("[a-z.]{0,8}"),
+                    prop::option::of("[a-z_.]{0,12}"),
+                ),
+                1..16,
+            )
+        ) {
+            let tenant = TenantId::new("t");
+            let mut cluster = MinerCluster::new(MinerConfig::default());
+            let mut ids: std::collections::HashMap<
+                (u8, Option<String>, Option<String>),
+                u64,
+            > = std::collections::HashMap::new();
+            for (severity, scope, event) in keys {
+                let mut rec = structured_record(&tenant, severity, scope.as_deref());
+                rec.event_name = event.clone();
+                let id = cluster.ingest(&rec);
+                let key = (severity, scope, event);
+                if let Some(&prev) = ids.get(&key) {
+                    prop_assert_eq!(id, prev, "equal structured key must reuse its template_id");
+                } else {
+                    prop_assert!(
+                        !ids.values().any(|&existing| existing == id),
+                        "a distinct structured key must receive a fresh template_id"
+                    );
+                    ids.insert(key, id);
+                }
+            }
+        }
     }
 
     /// Test helper — build a cluster wired to a [`SharedAuditSink`]

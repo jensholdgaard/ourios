@@ -68,10 +68,10 @@ pub struct SnapshotState {
     /// Every `Body::String` leaf in the tenant's tree.
     pub leaves: Vec<LeafRecord>,
     /// The §6.2 step-0 structured-template-id map: each
-    /// `(severity_number, scope_name)` tuple and the `template_id`
-    /// allocated on its first observation. The
-    /// `BodyKind::Structured` discriminator is implicit from the
-    /// map's identity (RFC 0001 §6.1).
+    /// `(severity_number, scope_name, event_name)` tuple (RFC 0037
+    /// §3.1) and the `template_id` allocated on its first
+    /// observation. The `BodyKind::Structured` discriminator is
+    /// implicit from the map's identity (RFC 0001 §6.1).
     pub structured_templates: Vec<StructuredTemplateRecord>,
     /// WAL high-water mark this snapshot's tree state reflects, or
     /// `None` if no offset was recorded. On the known-version
@@ -396,6 +396,22 @@ mod tests {
                 byte: 4096,
             }),
         }
+    }
+
+    #[test]
+    fn structured_template_record_without_event_name_restores_as_none() {
+        // RFC 0037 §3.1 migration: a structured-template record written
+        // before `event_name` was added has no such field. `#[serde(default)]`
+        // must restore it as `None` — the correct reading, since those
+        // templates were minted when the event dimension was absent. This
+        // pins the backward-compat guarantee across future codec refactors.
+        let pre_rfc0037 = r#"{"severity_number":17,"scope_name":"lib.payments","template_id":3}"#;
+        let record: StructuredTemplateRecord =
+            serde_json::from_str(pre_rfc0037).expect("pre-RFC0037 record must deserialize");
+        assert_eq!(record.event_name, None);
+        assert_eq!(record.severity_number, 17);
+        assert_eq!(record.scope_name.as_deref(), Some("lib.payments"));
+        assert_eq!(record.template_id, 3);
     }
 
     #[test]

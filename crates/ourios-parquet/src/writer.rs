@@ -406,7 +406,13 @@ impl Writer {
         let (sorting, flush_bytes) = match compacted {
             Some(keys) => (
                 Some(sorting_columns(keys, &promoted)?),
-                flush_override.unwrap_or_else(compacted_flush_bytes),
+                // Same positivity guard as the env path (`parse_compacted_flush_bytes`):
+                // a 0 override would make `in_progress_size() >= flush_bytes`
+                // always true (a degenerate per-sub-batch rotation), so fall
+                // back to the env/const default instead.
+                flush_override
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(compacted_flush_bytes),
             ),
             None => (None, ROW_GROUP_FLUSH_BYTES),
         };

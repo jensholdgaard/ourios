@@ -215,10 +215,11 @@ pub fn compact_partition_with_promoted(
 /// `COMPACTED_ROW_GROUP_FLUSH_BYTES` (32 MiB) / `OURIOS_COMPACTED_RG_BYTES`
 /// default — the deterministic seam for the RFC 0036 §7 threshold sweep
 /// (16 / 32 / 64 MiB). This is a **physical-layout knob**, not a schema
-/// or content change: the consolidated rows, their §3.1 order, the
-/// declared `sorting_columns`, and every column's encoding are identical
-/// for any threshold; only the row-group rotation boundaries (and hence
-/// group count, per-group statistics tightness, and on-disk size) move.
+/// or content change: the consolidated rows, their §3.1 order, and the
+/// declared `sorting_columns` are identical for any threshold. Only the
+/// row-group rotation boundaries move — and with them the group count,
+/// each group's statistics/dictionary/page encoding decisions, and the
+/// on-disk size (the whole point of the sweep).
 /// Production compacts via [`compact_partition`] (the env/const default);
 /// the sweep passes an explicit value here so it never sets a process env
 /// var (unsound under `cargo test`'s in-process parallelism — it races

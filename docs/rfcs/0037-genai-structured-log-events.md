@@ -101,7 +101,7 @@ recorded so the delta is unambiguous:
   `storage.promoted_attributes.{resource,log}` (RFC 0022), advertised in
   the `ourios://query-schema` resource (RFC 0032).
 
-### 3.1 Structured-template key includes `event_name` (gap 2)
+### 3.1 Structured-template key includes `event_name`
 
 Today `ingest_structured` keys the per-tenant structured-template map on
 `(severity_number, scope_name)`, so every GenAI event in one scope collapses
@@ -119,7 +119,7 @@ The `template_id` allocation stays deterministic and per-tenant; the
 `confidence = 1.0`, `lossy_flag = false`, empty-params invariants for
 structured records (RFC 0001 §6.1) are preserved.
 
-### 3.2 Bounding the structured body against hazard #2 (gap 1)
+### 3.2 Bounding the structured body against hazard #2
 
 Structured bodies must not be an unguarded ingress, but §3.3 forbids silent
 truncation and the structured body *is* the payload the operator wants back
@@ -129,29 +129,35 @@ by a cap.**
 - **No size cap, ever.** A structured body is retained whole regardless of
   size. Fidelity (§3.3) is never at risk, and `lossy_flag` stays `false`
   for the structured path (RFC 0001 §6.1).
-- **`structured_body_bytes` metric.** A histogram (OTel meter, per
-  [[telemetry-otel-meters-not-prometheus-client]]) observing the
+- **`structured_body_bytes` metric.** A histogram observing the
   canonical-JSON byte length of every structured body, dimensioned by
   service so an operator can see which service emits large bodies.
+  Instrumented via an OTel meter (Ourios's self-observability convention),
+  not a Prometheus client.
 - **Per-service alert** when the structured-body byte rate crosses a soft
   threshold, mirroring the existing §3.2 param-overflow-rate alert. This is
   the operational signal that a service is shipping oversized payloads —
   actionable at the source (the emitter), which is where the fix belongs.
 
-Rationale for no cap: structured bodies are unique per request, so they were
-never candidates for the dictionary encoding hazard #2 actually targets; the
-cost of a large body is raw storage size, which is an *operational* signal,
-not a correctness threat — and capping it would trade the operator's payload
-(the thing they most want) for bytes. The write-side layout work (RFC 0036)
-already governs file/row-group sizing, so large bodies are bounded at the
-*storage* layer without ever discarding data.
+Rationale for no cap: hazard #2's failure mode is *dictionary-encoding
+collapse* on a column of otherwise-repeating values, and the `body` column
+is **not** dictionary-encoded — the Parquet writer disables the dictionary
+on `body` by design (`crates/ourios-parquet/src/writer.rs` §3.6: bodies are
+unbounded, high-entropy, and dictionary encoding is the wrong choice for
+them). So a large structured body has no dictionary to collapse; the hazard
+is structurally absent for this column. The remaining cost of a large body
+is raw storage size — an *operational* signal, not a correctness threat —
+and capping it would trade the operator's payload (the thing they most want)
+for bytes. The write-side layout work (RFC 0036) already governs
+file/row-group sizing, so large bodies are bounded at the *storage* layer
+without ever discarding data.
 
 **`docs/hazards.md` §2 is amended** to state that structured bodies are
 retained whole and guarded by the `structured_body_bytes` metric + alert
 (not a length cap) — closing the current silent gap in the written
 invariant, which reads as if the `param_byte_limit` covers all bodies.
 
-### 3.3 Group a count by a promoted attribute column (gap 3)
+### 3.3 Group a count by a promoted attribute column
 
 Extend the `count … by` group surface so a `GroupTerm` may reference a
 **promoted** attribute column (`service` already works; generalize to
@@ -289,7 +295,7 @@ Two boundaries this set makes explicit:
 - **Group by non-promoted attributes too (JSON `LIKE` group key).**
   Rejected: no row-group pruning, unbounded scan, silently expensive —
   exactly the DSL footgun hazard #6 warns against. Promotion is the gate.
-- **A separate RFC per gap.** The three gaps share one workload, one
+- **A separate RFC per delta.** The three deltas share one workload, one
   corpus, and one test fixture; splitting them triples process overhead for
   changes that land together. Gap 3 is the most separable and could be
   peeled off if review prefers.
@@ -299,27 +305,42 @@ Two boundaries this set makes explicit:
 One scenario per invariant/hazard touched; each id is referenced from the
 test code so the mapping is greppable (`docs/verification.md` §2):
 
-- **RFC0037.1 (§3.1 event-keyed templates).** *Given* two structured
-  records in one `(tenant, severity, scope)` with different `event_name`s,
-  *when* mined, *then* they receive distinct `template_id`s, *and* a
-  `count by template_id` separates them.
-- **RFC0037.2 (§3.3 reconstruction fidelity).** *Given* a structured GenAI
-  body, *when* stored and rendered from Parquet, *then* the canonical JSON
-  round-trips byte-for-byte *and* `lossy_flag = false` (property test over
-  the GenAI fixture).
-- **RFC0037.3 (§3.2 fidelity + observability).** *Given* an arbitrarily
-  large structured body, *when* mined and stored, *then* it round-trips
-  byte-for-byte with `lossy_flag = false` (never truncated), *and* the
-  `structured_body_bytes` metric observes its canonical-JSON length
-  dimensioned by service.
-- **RFC0037.4 (§3.3 grouped count by promoted attr).** *Given*
-  `attr.gen_ai.request.model` promoted, *when*
-  `… | count by attr.gen_ai.request.model, bucket(1h)` runs, *then* the
-  `(bucket, model) → count` map matches a brute-force baseline, *and* the
-  same query against a non-promoted key is rejected with a promotion hint.
-- **RFC0037.5 (§3.5 absent-body event).** *Given* an event record with
-  `event_name` and attributes but no body, *when* stored, *then*
-  `body_kind = Absent`, `body = NULL` (RFC 0025 parity, unbroken).
+> **Scenario RFC0037.1 — event-keyed structured templates (§3.1).**
+> - **Given** two structured records in one `(tenant, severity_number,
+>   scope_name)` whose `event_name`s differ
+> - **When** they are mined
+> - **Then** they receive distinct `template_id`s
+> - **And** `… | count by template_id` separates them into distinct groups.
+
+> **Scenario RFC0037.2 — structured-body reconstruction fidelity (§3.3
+> invariant).**
+> - **Given** a structured GenAI body (an `AnyValue` array/kvlist)
+> - **When** it is stored and rendered back from Parquet
+> - **Then** the canonical JSON round-trips byte-for-byte
+> - **And** `lossy_flag = false` (a property test over generated bodies).
+
+> **Scenario RFC0037.3 — unbounded fidelity + observability (§3.2 /
+> hazard #2).**
+> - **Given** an arbitrarily large structured body
+> - **When** it is mined and stored
+> - **Then** it round-trips byte-for-byte and is never truncated
+>   (`lossy_flag = false`)
+> - **And** the `structured_body_bytes` metric observes its canonical-JSON
+>   length, dimensioned by service.
+
+> **Scenario RFC0037.4 — grouped count by a promoted attribute (§3.3 /
+> hazard #6).**
+> - **Given** `gen_ai.request.model` promoted to a column
+> - **When** `… | count by attr.gen_ai.request.model, bucket(1h)` runs
+> - **Then** the `(bucket, model) → count` map equals a brute-force baseline
+> - **And** the same query against a *non-promoted* key is rejected with a
+>   promotion hint (never a silent unpruned scan).
+
+> **Scenario RFC0037.5 — absent-body event parity (§3.5 / RFC 0025).**
+> - **Given** an event record with `event_name` and attributes but no body
+> - **When** it is stored
+> - **Then** `body_kind = Absent` and the `body` cell is `NULL`
+> - **And** RFC 0025's absent-body read-path parity is unbroken.
 
 ## 6. Testing strategy
 

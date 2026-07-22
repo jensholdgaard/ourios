@@ -98,20 +98,24 @@ compression claim evaporates for that workload.
 pre-redacts the offending field. Broad spike → revisit the limit
 (still ≤ 1 KiB). Anyone proposing > 1 KiB → RFC.
 
-**Structured bodies (RFC 0037).** The per-parameter byte limit above
-guards the *string* path only. A structured (non-string) body — a
-GenAI event's `gen_ai.input.messages` array, any `AnyValue`
-kvlist/array — is retained **whole** as canonical JSON in the `body`
-column and is **not** capped: truncating it would violate the
-bit-identical-reconstruction invariant (`CLAUDE.md` §3.3), and unlike
-a runaway `params` slot it never populated dictionary encoding to
-begin with (structured bodies are unique per record). The blowup risk
-here is raw storage size, not dictionary collapse, so it is guarded by
-**observation, not truncation**: the `structured_body_bytes` metric
-(dimensioned by service) plus a per-service alert flag oversized
-emitters, and RFC 0036's write-side row-group/file sizing bounds the
-on-disk footprint. The fix for an oversized structured body is at the
-emitter (redaction/truncation before export), not a store-side cap.
+**Structured bodies (RFC 0037, proposed mitigation — not yet
+implemented).** The per-parameter byte limit above guards the *string*
+path only. A structured (non-string) body — a GenAI event's
+`gen_ai.input.messages` array, any `AnyValue` kvlist/array — is
+retained **whole** as canonical JSON in the `body` column and is **not**
+capped: truncating it would violate the bit-identical-reconstruction
+invariant (`CLAUDE.md` §3.3). Crucially, this hazard's failure mode —
+dictionary-encoding collapse — does not apply to `body`: the Parquet
+writer **disables the dictionary on the `body` column by design**
+(`crates/ourios-parquet/src/writer.rs` §3.6 — bodies are unbounded and
+high-entropy), so a large structured body has no dictionary to collapse.
+The residual risk is raw storage size, not dictionary collapse, so
+RFC 0037 proposes to guard it by **observation, not truncation**: a
+`structured_body_bytes` metric (dimensioned by service) plus a
+per-service alert to flag oversized emitters, with RFC 0036's write-side
+row-group/file sizing bounding the on-disk footprint. The fix for an
+oversized structured body is at the emitter (redaction/truncation before
+export), not a store-side cap.
 
 **See also.** `CLAUDE.md` §3.2, §3.3; RFC 0001 §6.5; RFC 0037;
 benchmarks C4.

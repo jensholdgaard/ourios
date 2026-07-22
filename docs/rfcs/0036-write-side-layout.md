@@ -524,19 +524,36 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   mechanism (scan the groups holding the answer, not the hour), for
   whatever `T` ships. The *choice* of 32 MiB stands as the shipped
   default.
-  The honest sweep (16/32/64 MiB against the L6-shape scanned-bytes
-  curve *and* L1/L3 neutrality — more row groups = more footer entries
-  and per-group index overhead) is a paid `baseline-8vcpu-32gib`
-  `ourios-bench` measurement, deferred to `validated` and *not* a green
-  blocker (a full sweep is a bench/baseline concern, like RFC0036.5's
-  comparative half). **Indicative in-repo data point (32 MiB, the
-  RFC0036.2 synthetic hour, `ci-runner`):** a 58,500-row three-service
-  hour compacts to **4 row groups** (three ≈ 32 MiB + a small tail);
-  the one-service window query scans **1** of the 4 (`B_sw` = one
-  33,540,656 B group ≈ T, so `ceil(B_sw/T)+2 = 3`; measured scanned = 1,
-  pruned = 3) — the mechanism the sweep will tune, not gate. Kept
-  tunable (an RFC 0004 knob eventually, like the flush-policy
-  constants).
+  The **indicative** in-repo sweep is **done** (§9.28, local M-series,
+  synthetic-*compressible*, service-clustered corpus — the shape §9.27's
+  random payload was not); the authoritative 16/32/64 MiB sweep against the
+  L6-shape scanned-bytes curve *and* L1/L3 neutrality (more row groups =
+  more footer entries and per-group index overhead) stays a paid
+  `baseline-8vcpu-32gib` measurement deferred to the baseline harness and
+  *not* a green blocker. **§9.28 findings (2,160,000-row six-service hour,
+  7.20× compression):** (1) the compacted file does **not** grow as the
+  threshold shrinks — 32 and 64 MiB give a byte-identical file, 16 MiB is
+  larger by only **+0.80%** — so §9.27's "compacted file ~2× larger" was a
+  random-bytes artifact, **not** a real-log property; (2) a fixed
+  one-service window materialises **half** the bytes at 16 MiB (14.66 MiB)
+  vs 32/64 MiB (28.94 MiB), same answer, for that +0.80% disk cost — the
+  pruning-granularity trade is *good* on compressible data and improves as
+  T shrinks; (3) 32 and 64 MiB are indistinguishable because arrow's default
+  1,048,576-row group cap (the compacted writer sets no
+  `max_row_group_size`) trips before either byte threshold on the 2.16 M-row
+  corpus — so above ~16 MiB the **byte** threshold does not govern
+  granularity, the row cap does (a gap vs §3.3's byte-driven premise;
+  actionable follow-up: `set_max_row_group_size` on the compacted writer so
+  the byte threshold bites). **Disposition:** 32 MiB stands as the
+  shipped default (it already delivers the mechanism the RFC0036.2 gate
+  enforces); the data leans toward *smaller* thresholds, so **16 MiB is
+  flagged as a candidate for the authoritative sweep and a maintainer
+  decision** — the default is not changed on indicative numbers. Kept
+  tunable meanwhile via the interim `OURIOS_COMPACTED_RG_BYTES` env knob
+  (bytes, read once at compacted-writer construction), the RFC 0004 knob's
+  precursor; the sweep's own test arm sets T through the explicit
+  `compact_partition_with_flush_threshold` seam (setting a process env var
+  is unsound under `cargo test`'s parallelism).
 - [x] **Sort-key stability definition — settled as lexicographic.**
   The §3.1 key is lexicographic `service.name`, *not*
   first-seen/dictionary ordinal (first-seen is interleaving-dependent

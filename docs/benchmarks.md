@@ -2107,3 +2107,95 @@ exactly why the **gate** is the scanned-row-group bound (enforced by
 scan `stats.bytes_read` is *not* the materialization term — it reads
 only the small filter columns and points the wrong way; the footer
 survivor-chunk sum is the RFC §9 metric.
+
+### 9.28 Results — 2026-07-22 (indicative, local M-series, synthetic-compressible) — RFC 0036 §7 compacted row-group threshold sweep (16 / 32 / 64 MiB)
+
+**Purpose.** RFC 0036 §7's first open box defers the authoritative
+16/32/64 MiB compacted-threshold sweep to the paid `baseline-8vcpu-32gib`
+harness. This is the **in-repo, indicative** half. §9.27's before/after
+used a near-incompressible random payload (chosen to cross 32 MiB with few
+rows) and so read the compacted file as **~2× larger on disk** — a
+worst-case artifact of incompressible bytes, *not* what real logs do. Real
+logs are compressible and have per-service locality, and RFC 0036 sorts by
+`service.name`, which *clusters* similar lines. This sweep re-measures the
+trade on a **compressible, service-clustered** synthetic corpus to correct
+that impression and trace the actual curve. **Indicative, not
+authoritative** — local hardware, synthetic corpus; the v8-corpus
+L6-scanned-bytes-vs-L1/L3 sweep stays deferred to `validated` (RFC 0036 §7).
+
+**Hardware / run.** Local M-series developer machine (P-cores;
+`taskpolicy -B` to escape the Claude-Code background-QoS E-core throttle),
+dev build at the sweep head. `ourios-querier`'s
+`rfc0036_7_compacted_threshold_sweep` (tests/it, `#[ignore]`d like the
+RFC0005.6 sizing test — not a CI gate; the *gate* is
+`rfc0036_2_window_materialization_bound`). It drives the shipped compaction
+path with the new explicit-threshold seam
+(`compact_partition_with_flush_threshold`).
+
+**Corpus.** 6 promoted services, each with its own fixed log phrase
+(distinct vocabulary, so the §3.1 sort clusters like text) plus a handful of
+small varying fields — request id, user, amount, status/region enums, and 8
+hex chars of per-line entropy that hold ZSTD to a realistic ratio.
+2,160,000 rows (360,000/service), ~230–260 B bodies, **467,239,238 B
+(445.6 MiB) of raw body text**, written as two interleaved ingest files then
+compacted. **Measured compression: 7.20×** (raw body ÷ the 61.85 MiB
+compacted file) — squarely in the realistic 5–15× band, not the ~2.4× of
+random ASCII.
+
+| threshold | compacted file (on disk) | row groups | window materialization (survivors / bytes) | scanned / pruned | window rows |
+|---|---|---|---|---|---|
+| **16 MiB** | 65,376,242 B (62.35 MiB) | 5 | 1 / 15,370,891 B (14.66 MiB) | 1 / 4 | 3,000 |
+| **32 MiB** | 64,856,419 B (61.85 MiB) | 3 | 1 / 30,346,974 B (28.94 MiB) | 1 / 2 | 3,000 |
+| **64 MiB** | 64,856,419 B (61.85 MiB) | 3 | 1 / 30,346,974 B (28.94 MiB) | 1 / 2 | 3,000 |
+
+**Finding 1 — the ~2× on-disk bloat is a random-bytes artifact (the
+headline).** On compressible, service-clustered data the compacted file
+does **not** grow as the threshold shrinks. 32 and 64 MiB produce a
+*byte-identical* file; 16 MiB is larger by only **519,823 B (+0.80%)** — the
+cost of two extra row groups' footer/index entries and slightly-shorter
+compression windows. §9.27's "compacted file ~2× larger" was the
+incompressible payload amplifying that per-group overhead against near-zero
+codec gain; it does not generalise to real logs. The §3.1 service sort, if
+anything, *helps* compression by clustering like lines — the finer-threshold
+file barely moves.
+
+**Finding 2 — finer thresholds buy real pruning granularity, nearly free.**
+The same fixed 30 s one-service window materialises **14.66 MiB at 16 MiB vs
+28.94 MiB at 32/64 MiB** — the finer threshold **halves** (1.97×) the bytes a
+window browse must fetch, for a **+0.80%** file-size cost. The answer is
+identical (3,000 rows) at every threshold; only the IO changed. This is the
+pruning-granularity-over-bytes trade RFC 0036 §3.3 exists to make, now
+measured on realistic data: it is a good trade, and it gets *better* the
+finer the threshold, bounded only by footer/index overhead.
+
+**Finding 3 — 32 and 64 MiB are indistinguishable because arrow's default
+row-group *row* cap dominates, not the byte threshold.** The compacted
+writer sets no `max_row_group_size`, so parquet-rs's default **1,048,576-row**
+cap applies. On 2,160,000 rows that forces ~3 groups of ~1 M rows each
+*regardless* of a byte threshold ≳ 16 MiB: at 32 and 64 MiB the row cap
+trips before the byte threshold does (byte-identical 3-group files), and
+only 16 MiB (~590 k rows/group) is genuinely byte-capped. So above ~16 MiB
+the compacted **byte** threshold does not actually govern granularity on a
+high-row corpus — the row cap does, silently. This is a real gap versus
+RFC 0036 §3.3's byte-driven-rotation premise (pruning still works — the
+RFC0036.2 gate passes — just at coarser granularity than the byte threshold
+implies). **Actionable follow-up:** to let the byte threshold control
+rotation (and realise the finer pruning at 32 MiB, not only at 16 MiB),
+raise or remove the row cap (`WriterProperties::set_max_row_group_size`) on
+the compacted writer. Separating 32 from 64 MiB by *bytes* alone then needs
+the baseline corpus's volume too. What this run establishes regardless:
+**finer effective groups win the materialization trade at a sub-1% disk
+cost.**
+
+**Conclusion.** 32 MiB stays a reasonable, defensible shipped default (it
+already delivers the pruning mechanism the RFC0036.2 gate enforces). The
+compressible-data trade leans, if anywhere, toward **smaller** thresholds
+(16 MiB halves window materialization for +0.80% on disk) — the opposite of
+the "smaller = bloated file" worry §9.27's random payload suggested. **16 MiB
+is flagged as a candidate for the authoritative v8 sweep to evaluate against
+L1/L3 neutrality** (more, smaller row groups add footer/page-index bytes to
+every scan — the term this in-repo corpus is too small to price against the
+comparative gates); the default is **not** changed here — that is a
+maintainer decision on the authoritative numbers. The interim
+`OURIOS_COMPACTED_RG_BYTES` env knob (RFC 0036 §7) lets an operator retune
+without a rebuild in the meantime.

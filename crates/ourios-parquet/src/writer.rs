@@ -72,6 +72,39 @@ pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 /// sweep is a one-line change.
 pub const COMPACTED_ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
+/// RFC 0036 §7 interim tunable: the environment variable that overrides
+/// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] for compacted-writer rotation. A
+/// byte count (e.g. `16777216` for 16 MiB). Read **once** per compacted
+/// writer at construction (`compacted_flush_bytes`); production leaves
+/// it unset and gets the const. This is the "keep it tunable (an RFC 0004
+/// knob eventually)" direction §7 records — a single interim knob for
+/// operators and the threshold sweep's production arm, never read on the
+/// per-row hot path. The sweep's *test* arm sets the threshold with an
+/// explicit argument instead (`Writer::open_in_compacted`'s
+/// `flush_override`), because setting a process env var races libc
+/// `getenv` under `cargo test`'s in-process parallelism.
+pub const COMPACTED_RG_BYTES_ENV: &str = "OURIOS_COMPACTED_RG_BYTES";
+
+/// The compacted row-group rotation threshold: [`COMPACTED_RG_BYTES_ENV`]
+/// parsed as a positive byte count, or [`COMPACTED_ROW_GROUP_FLUSH_BYTES`]
+/// when unset/blank/unparsable. Read once at compacted-writer
+/// construction (never on the per-row path).
+fn compacted_flush_bytes() -> usize {
+    parse_compacted_flush_bytes(std::env::var(COMPACTED_RG_BYTES_ENV).ok().as_deref())
+}
+
+/// Pure parse of the [`COMPACTED_RG_BYTES_ENV`] value, factored out so it
+/// is unit-testable without touching the process environment (setting env
+/// vars is unsound under parallel tests). `None`, empty, non-numeric, or
+/// zero all fall back to [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] — a
+/// misconfigured knob must not silently produce a degenerate (0-byte
+/// rotation) layout.
+fn parse_compacted_flush_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(COMPACTED_ROW_GROUP_FLUSH_BYTES)
+}
+
 /// RFC 0005 §3.6 default ZSTD compression level for data files —
 /// chosen for write throughput on the ingest hot path. [`Writer::open`]
 /// uses it; [`Writer::open_with_zstd_level`] lets the bench sweep
@@ -302,16 +335,19 @@ impl Writer {
         zstd_level: i32,
         promoted: PromotedAttributes,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(store, partition, zstd_level, promoted, None)
+        Self::open_in_inner(store, partition, zstd_level, promoted, None, None)
     }
 
     /// Open a **compacted-output** writer for `partition` (RFC 0036):
-    /// row groups rotate at [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (§3.3)
-    /// and the file declares the §3.4 `sorting_columns` for `keys`.
-    /// Compaction-only — ingest-side files keep the 128 MiB rotation
-    /// and declare no sort (their rows are genuinely unsorted,
-    /// RFC0035.5). The caller is responsible for appending rows in the
-    /// declared §3.1 order.
+    /// row groups rotate at the compacted threshold (§3.3) and the file
+    /// declares the §3.4 `sorting_columns` for `keys`. `flush_override`
+    /// pins the rotation threshold explicitly — the RFC 0036 §7 threshold
+    /// sweep's deterministic seam; `None` takes the shipped
+    /// [`COMPACTED_ROW_GROUP_FLUSH_BYTES`] (or the
+    /// [`COMPACTED_RG_BYTES_ENV`] override, read once here). Compaction-
+    /// only — ingest-side files keep the 128 MiB rotation and declare no
+    /// sort (their rows are genuinely unsorted, RFC0035.5). The caller is
+    /// responsible for appending rows in the declared §3.1 order.
     ///
     /// # Errors
     ///
@@ -322,19 +358,29 @@ impl Writer {
         zstd_level: i32,
         promoted: PromotedAttributes,
         keys: ClusterKeys,
+        flush_override: Option<usize>,
     ) -> Result<Self, WriterError> {
-        Self::open_in_inner(store, partition, zstd_level, promoted, Some(keys))
+        Self::open_in_inner(
+            store,
+            partition,
+            zstd_level,
+            promoted,
+            Some(keys),
+            flush_override,
+        )
     }
 
     /// Shared body of [`Writer::open_in_with_promoted`] (ingest layout,
     /// `compacted: None`) and [`Writer::open_in_compacted`]
     /// (`Some(keys)` — RFC 0036 §3.3 threshold + §3.4 declaration).
+    /// `flush_override` applies to the compacted branch only.
     fn open_in_inner(
         store: &Store,
         partition: PartitionKey,
         zstd_level: i32,
         promoted: PromotedAttributes,
         compacted: Option<ClusterKeys>,
+        flush_override: Option<usize>,
     ) -> Result<Self, WriterError> {
         // Validate the codec level up front so invalid input fails fast. The
         // validated level flows into `writer_properties` so it isn't re-checked.
@@ -360,7 +406,13 @@ impl Writer {
         let (sorting, flush_bytes) = match compacted {
             Some(keys) => (
                 Some(sorting_columns(keys, &promoted)?),
-                COMPACTED_ROW_GROUP_FLUSH_BYTES,
+                // Same positivity guard as the env path (`parse_compacted_flush_bytes`):
+                // a 0 override would make `in_progress_size() >= flush_bytes`
+                // always true (a degenerate per-sub-batch rotation), so fall
+                // back to the env/const default instead.
+                flush_override
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(compacted_flush_bytes),
             ),
             None => (None, ROW_GROUP_FLUSH_BYTES),
         };
@@ -1140,6 +1192,30 @@ mod tests {
             .read_all()
             .expect("read_all");
         assert!(decoded.is_empty(), "no rows out for no rows in");
+    }
+
+    /// The RFC 0036 §7 compacted-threshold override parses a positive
+    /// byte count and falls back to the shipped default on every
+    /// degenerate input — a misconfigured knob must never yield a 0-byte
+    /// (every-sub-batch) rotation. Exercised on the pure parse helper so
+    /// no process env var is touched (unsound under parallel tests).
+    #[test]
+    fn compacted_flush_override_parses_or_falls_back() {
+        assert_eq!(
+            parse_compacted_flush_bytes(Some("16777216")),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_compacted_flush_bytes(Some("  67108864 ")),
+            64 * 1024 * 1024
+        );
+        for degenerate in [None, Some(""), Some("nope"), Some("0"), Some("-5")] {
+            assert_eq!(
+                parse_compacted_flush_bytes(degenerate),
+                COMPACTED_ROW_GROUP_FLUSH_BYTES,
+                "degenerate override {degenerate:?} must fall back to the default",
+            );
+        }
     }
 
     /// An out-of-range zstd level fails up front (mirrors the file writer's

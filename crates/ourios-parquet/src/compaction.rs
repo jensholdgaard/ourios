@@ -210,6 +210,42 @@ pub fn compact_partition_with_promoted(
     )
 }
 
+/// Like [`compact_partition`] but rotating compacted row groups at an
+/// explicit `flush_bytes` threshold instead of the shipped
+/// `COMPACTED_ROW_GROUP_FLUSH_BYTES` (32 MiB) / `OURIOS_COMPACTED_RG_BYTES`
+/// default — the deterministic seam for the RFC 0036 §7 threshold sweep
+/// (16 / 32 / 64 MiB). This is a **physical-layout knob**, not a schema
+/// or content change: the consolidated rows, their §3.1 order, and the
+/// declared `sorting_columns` are identical for any threshold. Only the
+/// row-group rotation boundaries move — and with them the group count,
+/// each group's statistics/dictionary/page encoding decisions, and the
+/// on-disk size (the whole point of the sweep).
+/// Production compacts via [`compact_partition`] (the env/const default);
+/// the sweep passes an explicit value here so it never sets a process env
+/// var (unsound under `cargo test`'s in-process parallelism — it races
+/// libc `getenv`).
+///
+/// # Errors
+///
+/// See [`compact_partition`].
+pub fn compact_partition_with_flush_threshold(
+    store: &Store,
+    partition: &PartitionKey,
+    flush_bytes: usize,
+) -> Result<CompactionOutcome, CompactionError> {
+    let promoted = PromotedAttributes::default();
+    compact_sorted(
+        store,
+        partition,
+        &promoted,
+        ClusterKeys::for_promoted(&promoted),
+        SortTuning {
+            compacted_flush_bytes: Some(flush_bytes),
+            ..SortTuning::default()
+        },
+    )
+}
+
 /// RFC 0036 §3.2 sort tuning: the in-memory short-circuit bound and
 /// the merge fan-in cap F. Internal so unit tests can force the spill
 /// and hierarchical-merge paths at unit scale; production always runs
@@ -228,6 +264,12 @@ struct SortTuning {
     /// band-scale case held 32 input files) while capping worst-case
     /// residency far below one decoded input file.
     fan_in: usize,
+    /// RFC 0036 §3.3 compacted row-group rotation threshold override.
+    /// `None` (production) takes the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`
+    /// / `OURIOS_COMPACTED_RG_BYTES` default; `Some(t)` pins it for the
+    /// §7 threshold sweep's deterministic seam
+    /// ([`compact_partition_with_flush_threshold`]).
+    compacted_flush_bytes: Option<usize>,
 }
 
 impl Default for SortTuning {
@@ -235,6 +277,7 @@ impl Default for SortTuning {
         Self {
             in_memory_max_bytes: 256 * 1024 * 1024,
             fan_in: 64,
+            compacted_flush_bytes: None,
         }
     }
 }
@@ -307,6 +350,7 @@ fn compact_sorted(
         DEFAULT_ZSTD_LEVEL,
         promoted.clone(),
         keys,
+        tuning.compacted_flush_bytes,
     )
     .map_err(CompactionError::Write)?;
     let (row_count, bytes_read) = sort_inputs_into(
@@ -2283,6 +2327,7 @@ mod tests {
                 SortTuning {
                     in_memory_max_bytes: 0,
                     fan_in: 2,
+                    ..SortTuning::default()
                 },
             )
             .expect("compact spilled");
@@ -2430,6 +2475,7 @@ mod tests {
             SortTuning {
                 in_memory_max_bytes: 0,
                 fan_in,
+                ..SortTuning::default()
             },
         )
         .expect("compact spilled");
@@ -2463,6 +2509,7 @@ mod tests {
             SortTuning {
                 in_memory_max_bytes: u64::MAX,
                 fan_in,
+                ..SortTuning::default()
             },
         )
         .expect("compact in-memory");

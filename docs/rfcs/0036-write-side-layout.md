@@ -1,7 +1,7 @@
 ---
 rfc: 0036
 title: Write-side layout — compacted-partition clustering and row-group sizing
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-21
@@ -11,9 +11,11 @@ superseded-by: —
 
 # RFC 0036 — Write-side layout
 
-> **Status note.** **`validated`** (2026-07-22) — all five §5 scenarios
-> green, plus the comparative evidence below. `accepted` is a maintainer
-> flip. **RFC0036.1** (footer inspection — compacted threshold,
+> **Status note.** **`accepted`** (2026-07-22, maintainer sign-off — the
+> terminal state). Reached `validated` the same day on all five §5
+> scenarios green plus the comparative evidence below; the §7 threshold
+> sweep (§9.28) and its row-cap finding landed with it.
+> **RFC0036.1** (footer inspection — compacted threshold,
 > `sorting_columns`, per-group service min/max — plus the §6 merge
 > property), **RFC0036.3** (D3 file-band + forced-spill memory bound),
 > **RFC0036.4** (shuffled-listing byte-identity rebuild), and
@@ -538,13 +540,14 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   one-service window materialises **half** the bytes at 16 MiB (14.66 MiB)
   vs 32/64 MiB (28.94 MiB), same answer, for that +0.80% disk cost — the
   pruning-granularity trade is *good* on compressible data and improves as
-  T shrinks; (3) 32 and 64 MiB are indistinguishable because arrow's default
-  1,048,576-row group cap (the compacted writer sets no
-  `max_row_group_size`) trips before either byte threshold on the 2.16 M-row
-  corpus — so above ~16 MiB the **byte** threshold does not govern
-  granularity, the row cap does (a gap vs §3.3's byte-driven premise;
-  actionable follow-up: `set_max_row_group_size` on the compacted writer so
-  the byte threshold bites). **Disposition:** 32 MiB stands as the
+  T shrinks; (3) 32 and 64 MiB are near-identical because arrow's default
+  1,048,576-row group cap (no `max_row_group_size` is set) fills a group at
+  ~30 MiB on this ~30 B/row corpus and so trips before either byte
+  threshold — a granularity *floor* finer than 32/64 MiB. It is **not** a
+  bug to "fix" by raising the cap: doing so would let 32/64 MiB coarsen (~2
+  groups), the wrong way for pruning. The pruning lever is a *smaller byte
+  threshold* (16 MiB, byte-governed → finer groups), the §7 sweep question —
+  not the row cap. **Disposition:** 32 MiB stands as the
   shipped default (it already delivers the mechanism the RFC0036.2 gate
   enforces); the data leans toward *smaller* thresholds, so **16 MiB is
   flagged as a candidate for the authoritative sweep and a maintainer

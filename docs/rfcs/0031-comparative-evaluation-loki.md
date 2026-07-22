@@ -1,7 +1,7 @@
 ---
 rfc: 0031
 title: Comparative evaluation against Grafana Loki
-status: validated
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-11
@@ -11,7 +11,8 @@ superseded-by: —
 
 # RFC 0031 — Comparative evaluation against Grafana Loki
 
-> **Status note.** **`validated`** (2026-07-21). The §7 gate set is
+> **Status note.** **`accepted`** (2026-07-22, maintainer sign-off — the
+> terminal state). Reached `validated` 2026-07-21: the §7 gate set is
 > frozen and CI-enforcing (`green` via the asserting ci-runner series,
 > §9.13–§9.18), and the first fully authoritative comparative run on
 > `baseline-8vcpu-32gib` (§9.24, PR #583) passed all 11 frozen gate

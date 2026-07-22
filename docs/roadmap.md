@@ -168,12 +168,12 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0028 | Build-feedback program (test-harness + workspace decomposition) | `green` |
 | 0029 | OIDC bearer layer (issuer-agnostic, Dex-validated) | `green` |
 | 0030 | TLS/mTLS on the data-plane listeners | `green` |
-| 0031 | Comparative evaluation against Grafana Loki | **`validated`** — all four must-win classes measured, §7 gates frozen and CI-enforcing; the first fully authoritative run (`benchmarks.md` §9.24, `baseline-8vcpu-32gib`) passed all 11 frozen gate decisions; losses published per §5 (L6 *storage* is a recorded diagnostic, not a win) |
+| 0031 | Comparative evaluation against Grafana Loki | **`accepted`** (2026-07-22) — all four must-win classes measured, §7 gates frozen and CI-enforcing; the first fully authoritative run (`benchmarks.md` §9.24, `baseline-8vcpu-32gib`) passed all 11 frozen gate decisions; losses published per §5 (L6 *storage* is a recorded diagnostic, not a win) |
 | 0032 | Query-schema and cost-model resource for the MCP surface | `green` |
 | 0033 | Cached template-map artifact | `green` |
-| 0034 | D1 re-scope: per-node ingest-throughput bar | `specified` — enacted: RFC0034.1–.3 satisfied by the §9.20–§9.23 measurement series; `accepted` is a maintainer flip |
+| 0034 | D1 re-scope: per-node ingest-throughput bar | **`accepted`** (2026-07-22) — enacted: RFC0034.1–.3 satisfied by the §9.20–§9.23 measurement series (a re-scope RFC with no thesis-gate of its own; `specified`→`accepted`) |
 | 0035 | Ingest concurrency (ordered mining, concurrent encode/publish) | `green` — §9.22 A/B plus the §9.23 asserting soak; the #578 sweep-publish durability window closed alongside |
-| 0036 | Write-side layout (compaction-time service/time sort) | `specified` — awaiting maintainer design review before `red` |
+| 0036 | Write-side layout (compaction-time service/time sort) | **`accepted`** (2026-07-22) — all five §5 green (real compaction); RFC0036.2 scanned-count gate + in-repo before/after (§9.27, 1.43×); baseline no-regression (§9.26) + §7 threshold sweep (§9.28); the comparative harness single-file limit + the row-cap interaction are documented follow-ups |
 
 **Crates — all ten product crates are implemented** (`ourios-core`,
 `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`, `-server`,

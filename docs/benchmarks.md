@@ -2168,24 +2168,28 @@ pruning-granularity-over-bytes trade RFC 0036 §3.3 exists to make, now
 measured on realistic data: it is a good trade, and it gets *better* the
 finer the threshold, bounded only by footer/index overhead.
 
-**Finding 3 — 32 and 64 MiB are indistinguishable because arrow's default
-row-group *row* cap dominates, not the byte threshold.** The compacted
-writer sets no `max_row_group_size`, so parquet-rs's default **1,048,576-row**
-cap applies. On 2,160,000 rows that forces ~3 groups of ~1 M rows each
-*regardless* of a byte threshold ≳ 16 MiB: at 32 and 64 MiB the row cap
-trips before the byte threshold does (byte-identical 3-group files), and
-only 16 MiB (~590 k rows/group) is genuinely byte-capped. So above ~16 MiB
-the compacted **byte** threshold does not actually govern granularity on a
-high-row corpus — the row cap does, silently. This is a real gap versus
-RFC 0036 §3.3's byte-driven-rotation premise (pruning still works — the
-RFC0036.2 gate passes — just at coarser granularity than the byte threshold
-implies). **Actionable follow-up:** to let the byte threshold control
-rotation (and realise the finer pruning at 32 MiB, not only at 16 MiB),
-raise or remove the row cap (`WriterProperties::set_max_row_group_size`) on
-the compacted writer. Separating 32 from 64 MiB by *bytes* alone then needs
-the baseline corpus's volume too. What this run establishes regardless:
-**finer effective groups win the materialization trade at a sub-1% disk
-cost.**
+**Finding 3 — 32 and 64 MiB are near-identical because arrow's default
+row-group *row* cap sets a ~30 MiB granularity floor, finer than either
+byte threshold.** The compacted writer sets no `max_row_group_size`, so
+parquet-rs's default **1,048,576-row** cap applies. At this corpus's ~30
+encoded bytes/row that cap fills a group at **~30 MiB**, which trips
+*before* the 32 MiB byte flush (and well before 64 MiB): so 32 and 64 MiB
+are both **row-capped** at ~3 groups of ~30 MiB (byte-identical files), and
+only 16 MiB (~590 k rows → ~15 MiB, under the cap) is genuinely
+byte-governed → 5 finer groups.
+
+**Correction to an earlier framing.** A prior draft of this finding called
+the row cap a "gap" and suggested raising `max_row_group_size` "so the byte
+threshold bites." That is backwards: raising the cap would let the 32/64 MiB
+byte flush govern and produce *fewer, coarser* groups (~2 of ~32 MiB) — the
+**wrong** direction for pruning. The row cap is a granularity *floor* that
+is currently *helping*. The lever that unambiguously improves window
+pruning is a **smaller byte threshold** (16 MiB halves window
+materialization here), the §7 authoritative-sweep question — not a larger
+row cap. Making group sizing byte-*uniform* (raising the cap) is a separate
+predictability choice, not a pruning win. Net: **finer effective groups win
+the materialization trade at sub-1% disk cost, and the byte-threshold
+*value* — not the row cap — is the lever.**
 
 **Conclusion.** 32 MiB stays a reasonable, defensible shipped default (it
 already delivers the pruning mechanism the RFC0036.2 gate enforces). The

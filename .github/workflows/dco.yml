@@ -34,34 +34,42 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # PR *actor* login from the trusted event payload — not forgeable
+          # commit metadata. This is the only bot-detection signal a
+          # contributor cannot spoof (setting user.name to `x[bot]` would).
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
+          # Exempt bot-opened PRs (Renovate/Dependabot) wholesale — their
+          # commits carry no human sign-off and gating them would break
+          # dependency auto-merge. Rooted in the GitHub-authenticated actor,
+          # so it cannot be bypassed by forging per-commit author fields.
+          case "$PR_AUTHOR" in
+            *'[bot]')
+              echo "PR opened by bot actor ${PR_AUTHOR}; DCO sign-off not required."
+              exit 0
+              ;;
+          esac
           fail=0
           for sha in $(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}"); do
             author_email="$(git show -s --format='%ae' "$sha")"
             author_name="$(git show -s --format='%an' "$sha")"
-            # Exempt bot authors — their commits carry no human sign-off and
-            # gating them would break Renovate/Dependabot auto-merge. The
-            # '[bot]' is quoted so the shell case treats it literally, not as
-            # a [bot] character class.
-            case "$author_email" in
-              *'[bot]'@users.noreply.github.com|*@renovate.whitesourcesoftware.com) continue ;;
-            esac
-            case "$author_name" in
-              *'[bot]') continue ;;
-            esac
             # A matching Signed-off-by trailer: same email as the author.
             if git show -s --format='%B' "$sha" \
                 | grep -i '^Signed-off-by:' | grep -qiF "<${author_email}>"; then
               continue
             fi
             fail=1
-            echo "::error::commit ${sha} (${author_name} <${author_email}>) is missing a matching 'Signed-off-by: ${author_name} <${author_email}>' trailer"
+            # Plain stderr, never a `::error::` workflow command: author_name /
+            # author_email are attacker-controlled on fork PRs and could carry
+            # newlines or %-escapes, enabling workflow-command injection.
+            printf 'missing sign-off: %s by %s <%s>\n' \
+              "$sha" "$author_name" "$author_email" >&2
           done
           if [ "$fail" -ne 0 ]; then
-            echo ""
-            echo "Sign off your commits with 'git commit -s' (or amend an existing"
-            echo "branch: 'git rebase --signoff ${BASE_SHA}'). See CONTRIBUTING.md."
+            echo "::error::One or more commits are missing a Developer Certificate of Origin sign-off."
+            echo "Sign off your commits with 'git commit -s' (or amend an existing" >&2
+            echo "branch: 'git rebase --signoff ${BASE_SHA}'). See CONTRIBUTING.md." >&2
             exit 1
           fi
-          echo "All commits are signed off."
+          echo "All non-merge commits are signed off."

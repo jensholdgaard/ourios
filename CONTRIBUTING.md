@@ -47,11 +47,12 @@ See: https://docs.github.com/authentication/managing-commit-signature-verificati
 
 ## Developer Certificate of Origin (sign-off)
 
-Every commit must be **signed off** with the [Developer Certificate of
-Origin](https://developercertificate.org/) (DCO 1.1). This is separate from
-the cryptographic signing above: signing proves *who* authored the commit,
-sign-off certifies you have the *right* to submit it under the project's
-licence. Both are required, and CI enforces the sign-off.
+Every non-merge commit in a PR must be **signed off** with the [Developer
+Certificate of Origin](https://developercertificate.org/) (DCO 1.1). This is
+separate from the cryptographic signing above: signing proves *who* authored
+the commit, sign-off certifies you have the *right* to submit it under the
+project's license. Both are required, and CI enforces the sign-off (merge
+commits and bot-opened dependency PRs are exempt).
 
 Add the trailer automatically with `-s`:
 
@@ -61,7 +62,7 @@ git commit -s -m "feat(scope): summary"
 
 which appends a line matching your commit author:
 
-```
+```text
 Signed-off-by: Your Name <you@example.com>
 ```
 

@@ -45,6 +45,35 @@ https://github.com/settings/ssh/new
 
 See: https://docs.github.com/authentication/managing-commit-signature-verification
 
+## Developer Certificate of Origin (sign-off)
+
+Every non-merge commit in a PR must be **signed off** with the [Developer
+Certificate of Origin](https://developercertificate.org/) (DCO 1.1). This is
+separate from the cryptographic signing above: signing proves *who* authored
+the commit, sign-off certifies you have the *right* to submit it under the
+project's license. Both are required, and CI enforces the sign-off (merge
+commits and PRs opened by a bot actor — e.g. Renovate, Dependabot — are
+exempt).
+
+Add the trailer automatically with `-s`:
+
+```bash
+git commit -s -m "feat(scope): summary"
+```
+
+which appends a line matching your commit author:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+Missed it? `git commit --amend -s --no-edit` fixes the tip commit, or
+`git rebase --signoff main` a whole range. If the branch is already pushed
+(the usual case when a PR is open), this rewrites history, so follow with
+`git push --force-with-lease`. AI-assisted commits keep their `Co-Authored-By:`
+trailer *and* carry the human contributor's `Signed-off-by:` — the human
+driver certifies origin.
+
 ## Conventions
 - Keep PRs small and focused.
 - Update `CHANGELOG.md` under `## [Unreleased]`.

@@ -196,6 +196,32 @@ fn seed_and_compact(
         .file
 }
 
+/// The same one-hour corpus [`seed_and_compact`] builds, but as a
+/// single flat Vec in ingest (round-robin) order — the shape a
+/// partition has *before* compaction: one unsorted ingest-side file, no
+/// `sorting_columns`, no per-service/-time clustering. Every `(service,
+/// time)` key matches the compacted store's, so the same window query
+/// returns the identical answer on both.
+fn all_records(plan: &[(&str, u64)], body_len: usize, grid_ns: u64) -> Vec<MinedRecord> {
+    let max_rows = plan.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
+    let mut records: Vec<MinedRecord> = Vec::new();
+    let mut id: u64 = 0;
+    for i in 0..max_rows {
+        for &(service, rows) in plan {
+            if i < rows {
+                id += 1;
+                records.push(rec(
+                    service,
+                    HOUR10_START + i * grid_ns,
+                    id,
+                    payload(id, body_len),
+                ));
+            }
+        }
+    }
+    records
+}
+
 /// The queried service's bytes within the window: the compressed sizes
 /// of the row groups a `service == target AND time ∈ window` scan can
 /// NOT prune (target within the group's `service.name` min/max AND the
@@ -353,5 +379,194 @@ async fn rfc0036_2_window_materialization_bound() {
         "the one-service window prunes strictly more than it scans — the \
          whole hour is not materialized; stats={:?}",
         r.stats,
+    );
+}
+
+/// Read `file_path`'s footer and run `query` against the store at
+/// `bucket_root`, returning `(row_group_total, window_survivors,
+/// survivor_bytes, result)`. The survivor set and bytes are the RFC 0036 §9
+/// materialization term ([`window_service_bytes`]); `result` carries the live
+/// `row_groups_scanned` that cross-checks the footer prediction.
+async fn measure_window(
+    bucket_root: &std::path::Path,
+    file_path: &std::path::Path,
+    query: &ourios_querier::dsl::Query,
+    target: &str,
+    window: &std::ops::Range<u64>,
+) -> (u64, Vec<usize>, u64, ourios_querier::QueryResult) {
+    let meta = ParquetRecordBatchReaderBuilder::try_new(File::open(file_path).expect("open file"))
+        .expect("read footer")
+        .metadata()
+        .clone();
+    let total = u64::try_from(meta.num_row_groups()).expect("count fits u64");
+    let (survivors, bytes) = window_service_bytes(&meta, target, window);
+    let result = Querier::new(bucket_root)
+        .run_query(
+            query,
+            &TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&ourios_core::alias::AliasMap::new()),
+        )
+        .await
+        .expect("run_query");
+    (total, survivors, bytes, result)
+}
+
+/// RFC0036.2 — the before/after materialization measurement (the "cheap
+/// A" for RFC 0036, per the maintainer decision recorded in the RFC's
+/// §9). The v8 comparative harness builds one ingest file per partition,
+/// so `compact_partition` no-ops there and RFC 0036's sort never runs —
+/// the baseline comparative run was byte-identical pre/post-0036, so the
+/// before/after must be measured in-repo on a genuinely-compacted store.
+///
+/// The **same** synthetic multi-service hour is materialised two ways
+/// and hit with the same L6-shape window query (one service, a narrow
+/// time range):
+///
+/// - **Before** — the uncompacted ingest-side store: every row in one
+///   flat, unsorted file at the 128 MiB [`ROW_GROUP_FLUSH_BYTES`]
+///   rotation, no `sorting_columns`. Every row group spans the whole
+///   hour and every service, so nothing prunes: the window query
+///   materialises the *entire* file (`scanned == total`).
+/// - **After** — the compacted, `sorting_columns`-declaring store
+///   ([`seed_and_compact`], 32 MiB [`COMPACTED_ROW_GROUP_FLUSH_BYTES`]
+///   row groups). The §3.1 clustering gives each row group tight
+///   `service.name`/`time` statistics, so the same query prunes away most
+///   of its groups (`scanned < total`).
+///
+/// The win is measured in **materialization bytes** — the RFC 0036 §9
+/// diagnostic: "the column chunks of the row groups that survive pruning."
+/// For each store that is the summed compressed size of the row groups a
+/// `service == TARGET AND time ∈ window` scan can NOT prune (`window_service_bytes`,
+/// the same footer computation the bound test trusts); the live query's
+/// `row_groups_scanned` cross-checks that the engine prunes exactly as the
+/// footer predicts (before scans the whole file, after prunes to a subset).
+/// Row-group *counts* are not the honest axis: the ingest side rotates at
+/// 128 MiB and compaction at 32 MiB (RFC 0036 §3.3), so the compacted store
+/// deliberately holds more, smaller groups (and, at these sub-threshold
+/// sizes, a physically larger file — the smaller groups compress a little
+/// worse). The window still materialises fewer bytes on the compacted store
+/// because it prunes to a small survivor subset, so the assertion is
+/// `after_bytes < before_bytes` with **identical `rows`** (pruning changed
+/// the IO, not the answer). The full comparative bytes-vs-Loki arm (total
+/// minus the RFC 0033 ~188 KB registry floor) stays the deferred
+/// `baseline-8vcpu-32gib` bench arm; this is the in-repo evidence the win is
+/// real.
+#[tokio::test]
+async fn rfc0036_2_materialization_before_after() {
+    const BODY_LEN: usize = 4096;
+    const TARGET: &str = "svc-m";
+    // A k=100-row window (1 s at the 10 ms grid), matching the RFC 0036 §9
+    // materialization illustration — a genuinely selective L6 "window browse",
+    // narrow enough that the compacted survivor set collapses to the single
+    // boundary row group holding svc-m's earliest rows.
+    const WINDOW_NS: u64 = 1_000_000_000; // 1 s
+    const GRID_NS: u64 = 10_000_000; // 10 ms between a service's rows
+    let plan: [(&str, u64); 3] = [("svc-a", 20_000), (TARGET, 18_500), ("svc-z", 20_000)];
+
+    let src =
+        format!("service == \"{TARGET}\" | range(2026-04-02T10:00:00Z, 2026-04-02T10:00:01Z)");
+    let query = ourios_querier::dsl::parse(&src).expect("parse");
+    let part = PartitionKey::derive(&rec(TARGET, HOUR10_START, 1, String::new()))
+        .expect("derive partition");
+
+    let window = HOUR10_START..HOUR10_START + WINDOW_NS;
+
+    // --- Before: one unsorted ingest-side file, no manifest (glob path). The
+    // materialization term (RFC 0036 §9) is the compressed column chunks of
+    // the row groups a `service == TARGET AND time ∈ window` scan can NOT
+    // prune; on the unsorted ingest file every row group spans the whole hour
+    // and every service, so none prune — the survivors are the *whole file*. ---
+    let before_bucket = tempfile::TempDir::new().expect("temp");
+    let before_store = Store::local(before_bucket.path()).expect("local store");
+    write_input(&before_store, &part, &all_records(&plan, BODY_LEN, GRID_NS));
+    let before_dir = part.data_path(before_bucket.path());
+    let before_path = std::fs::read_dir(&before_dir)
+        .expect("read partition dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .expect("one committed ingest file");
+    let (before_total, before_survivors, before_bytes, before) =
+        measure_window(before_bucket.path(), &before_path, &query, TARGET, &window).await;
+
+    // --- After: the compacted, sorted store (built exactly as the bound test).
+    // Same survivor computation: the §3.1 clustering gives each row group tight
+    // `service.name`/`time` statistics, so the survivors are a contiguous
+    // minority of the file's groups. ---
+    let after_bucket = tempfile::TempDir::new().expect("temp");
+    let after_store = Store::local(after_bucket.path()).expect("local store");
+    let committed = seed_and_compact(&after_store, &part, &plan, BODY_LEN, GRID_NS);
+    let after_path = part.data_path(after_bucket.path()).join(&committed);
+    let (after_total, after_survivors, after_bytes, after) =
+        measure_window(after_bucket.path(), &after_path, &query, TARGET, &window).await;
+
+    // Integer ×100 ratio (avoids a float cast under clippy::pedantic); read
+    // as `N.NNx`, e.g. 198 ⇒ before materialises 1.98× the after bytes.
+    let win_x100 = before_bytes * 100 / after_bytes.max(1);
+    eprintln!(
+        "RFC0036.2 before/after: uncompacted survivors {}/{} groups, {} bytes \
+         (query scanned {}); compacted survivors {}/{} groups, {} bytes (query \
+         scanned {}); rows {} (identical); materialization-bytes win {}.{:02}x",
+        before_survivors.len(),
+        before_total,
+        before_bytes,
+        before.stats.row_groups_scanned,
+        after_survivors.len(),
+        after_total,
+        after_bytes,
+        after.stats.row_groups_scanned,
+        after.rows,
+        win_x100 / 100,
+        win_x100 % 100,
+    );
+
+    // Identical answer — the layout change is transparent to the result.
+    assert_eq!(
+        before.rows, after.rows,
+        "before/after must return the same rows (correctness preserved)",
+    );
+    let expected_rows = WINDOW_NS.div_ceil(GRID_NS);
+    assert_eq!(
+        after.rows, expected_rows,
+        "the window selects k target rows"
+    );
+
+    // Before materialises the whole file: unsorted, every row group survives
+    // pruning (footer), and the live query confirms it scans them all.
+    assert_eq!(
+        u64::try_from(before_survivors.len()).expect("fits"),
+        before_total,
+        "uncompacted store has no prunable row group — the whole file is the \
+         window's materialization set (survivors {before_survivors:?} of {before_total})",
+    );
+    assert_eq!(
+        before.stats.row_groups_scanned, before_total,
+        "uncompacted query scans the whole file (no pruning); stats={:?}",
+        before.stats,
+    );
+    // After prunes: the survivor set is a strict minority of the compacted
+    // file's groups, and the live query confirms it skips the rest.
+    assert!(
+        !after_survivors.is_empty()
+            && u64::try_from(after_survivors.len()).expect("fits") < after_total,
+        "compacted store must prune to a subset (survivors {after_survivors:?} of {after_total})",
+    );
+    assert!(
+        after.stats.row_groups_scanned < after_total,
+        "compacted query must prune (scanned {} of {after_total} groups); stats={:?}",
+        after.stats.row_groups_scanned,
+        after.stats,
+    );
+    // The materialization win, measured: the same window's survivor set is
+    // strictly fewer compressed bytes on the compacted store than on the
+    // uncompacted whole-file scan. Bytes — not row-group *count* — is the
+    // honest axis: compaction rotates at 32 MiB vs the ingest side's 128 MiB
+    // (§3.3), so the compacted store deliberately holds more, smaller groups.
+    assert!(
+        after_bytes < before_bytes,
+        "compaction materialises fewer bytes for the same window \
+         (after {after_bytes} < before {before_bytes})",
     );
 }

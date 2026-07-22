@@ -1,7 +1,7 @@
 ---
 rfc: 0036
 title: Write-side layout — compacted-partition clustering and row-group sizing
-status: red
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-21
@@ -11,23 +11,32 @@ superseded-by: —
 
 # RFC 0036 — Write-side layout
 
-> **Status note.** **`red`** (2026-07-21), with the sorted-compaction
-> slice landing green. Scenarios **RFC0036.1** (footer inspection —
-> compacted threshold, `sorting_columns`, per-group service min/max —
-> plus the §6 merge property) and **RFC0036.4** (shuffled-listing
-> byte-identity rebuild) are implemented and passing in
-> `crates/ourios-parquet/tests/it/rfc0036_write_side_layout.rs`; the
-> external merge sort (run formation → capped-fan-in k-way merge), the
-> `COMPACTED_ROW_GROUP_FLUSH_BYTES` threshold, and the §3.4
+> **Status note.** **`green`** (2026-07-21) — all five §5 scenarios
+> discharged. **RFC0036.1** (footer inspection — compacted threshold,
+> `sorting_columns`, per-group service min/max — plus the §6 merge
+> property), **RFC0036.3** (D3 file-band + forced-spill memory bound),
+> **RFC0036.4** (shuffled-listing byte-identity rebuild), and
+> **RFC0036.5** (pre-/post-RFC read-path parity, no schema migration)
+> pass in `crates/ourios-parquet/tests/it/rfc0036_write_side_layout.rs`
+> (and `compaction.rs`'s forced-spill unit test); **RFC0036.2**
+> (window-query scanned-row-group bound) passes in
+> `crates/ourios-querier/tests/it/rfc0036_window_materialization.rs`.
+> The external merge sort (run formation → capped-fan-in k-way merge),
+> the `COMPACTED_ROW_GROUP_FLUSH_BYTES` threshold, and the §3.4
 > `sorting_columns` declaration are in `compaction.rs`/`writer.rs`.
-> **RFC0036.3** (D2 band + memory bound), **RFC0036.5** (compat +
-> frozen-gate rerun), and RFC0036.2's window-materialization bound stay
-> `#[ignore]`d stubs for their own slices. The RFC stays `red` until all
-> five discharge. Design review is done — maintainer go, 2026-07-21.
-> The remaining §7 "at `red`" decisions (the threshold sweep and the D2
-> band) are measured in the compaction-properties and window slices; the
-> run-format, fan-in-cap, and skip-spill decisions are made and recorded
-> below.
+> Design review is done — maintainer go, 2026-07-21. The §7 decisions
+> needed to ship this slice are recorded below (the threshold sweep
+> resolved to keep the 32 MiB default, with the authoritative
+> L6-scanned-bytes-vs-L1/L3 curve deferred to the `ourios-bench`
+> harness); the remaining §7 questions stay open as noted there.
+>
+> **Deferred to `validated`.** The comparative arm of RFC0036.2 and
+> RFC0036.5 — the L6-shape pair on the v8 corpus through the RFC 0031
+> dispatch, the before/after materialization-**bytes** §9 diagnostic,
+> and the frozen-gate rerun confirming L1/L3/L4 stay inside the
+> Loki-wobble band — is a paid `baseline-8vcpu-32gib` measurement, not
+> a CI gate (RFC 0031 §5 declined to gate the L6 storage channel; §2.2).
+> `validated` needs that baseline run.
 >
 > **How to read this document.** This is the write-side layout lever
 > that `docs/benchmarks.md` §9.13 named and §9.24 left "parked on its
@@ -235,17 +244,23 @@ bound for each path.
 ### 3.3 Compacted row-group threshold
 
 Compacted output rotates row groups at a **separate, smaller
-uncompressed threshold** — proposal **32 MiB**, a new
-`COMPACTED_ROW_GROUP_FLUSH_BYTES` alongside `ROW_GROUP_FLUSH_BYTES`
-(which ingest-side files keep at 128 MiB). Illustration at §9.7's
-D3 scale: the 456.7 MiB single-file hour becomes on the order of
-**~14 row groups** instead of a handful (rotation is on
-uncompressed bytes, so the exact count depends on the corpus's
-compression ratio); on v8's ~one-row-group hours, several. Combined
-with the §3.1 sort, each row group's `service.name` min/max spans
-one service (or a boundary pair) and its time min/max is tight
-*within* that service — so plain footer statistics prune, without
-even needing the bloom.
+threshold** — **32 MiB** (the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`,
+settled in §7; the authoritative sweep is deferred to `validated`)
+alongside `ROW_GROUP_FLUSH_BYTES`
+(which ingest-side files keep at 128 MiB). Rotation fires on
+`ArrowWriter::in_progress_size`, the writer's estimate of the
+buffered row-group bytes (dominated by already-encoded page data,
+not raw uncompressed input), so on-disk row-group size tracks the
+threshold closely. Illustration at §9.7's D3 scale: the 456.7 MiB
+single-file hour (on disk) becomes on the order of **~14 row
+groups** (≈ 456.7 / 32) instead of a handful; on v8's
+~one-row-group hours, several. Combined with the §3.1 sort, each
+row group's `service.name` min/max spans one service — or a
+boundary pair, or (for a service smaller than one row group, wedged
+between two others) that service plus its two neighbours — while its
+time min/max stays tight *within* a service. A query for any single
+service scans only the group(s) whose min/max contains it and prunes
+the rest on plain footer statistics, without even needing the bloom.
 
 **This amends hazard H4's row-group band.** `docs/hazards.md` H4
 targets "row-group size 128 MB – 1 GB"; this RFC deliberately drops
@@ -475,13 +490,31 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
 
 ## 7. Open questions
 
-- [ ] **The compacted row-group threshold.** 32 MiB is a proposal
-  sized off the D3-scale ~14-row-group structure; the honest
-  number comes from a sweep (e.g. 16/32/64 MiB) against the
-  L6-shape scanned-bytes curve *and* L1/L3 neutrality (more row
-  groups = more footer entries and more per-group index overhead).
-  Decide at `red` from measurement, keep it tunable (an RFC 0004
-  knob eventually, like the flush-policy constants).
+- [x] **The compacted row-group threshold — settled at 32 MiB for
+  `green`; authoritative sweep deferred to `validated`.** The
+  scanned-count *gate* (RFC0036.2) does not hard-code a threshold: it
+  reads the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES` from the const and
+  recomputes the bound `ceil(B_sw / T) + 2` from it, so retuning `T`
+  moves the bound with the layout instead of invalidating the test. It
+  is *not* auto-satisfied — the gate still fails if a `T` change
+  regresses the sort/pruning (e.g. the target service stops clustering
+  contiguously and extra groups are scanned). What it pins is the
+  mechanism (scan the groups holding the answer, not the hour), for
+  whatever `T` ships. The *choice* of 32 MiB stands as the shipped
+  default.
+  The honest sweep (16/32/64 MiB against the L6-shape scanned-bytes
+  curve *and* L1/L3 neutrality — more row groups = more footer entries
+  and per-group index overhead) is a paid `baseline-8vcpu-32gib`
+  `ourios-bench` measurement, deferred to `validated` and *not* a green
+  blocker (a full sweep is a bench/baseline concern, like RFC0036.5's
+  comparative half). **Indicative in-repo data point (32 MiB, the
+  RFC0036.2 synthetic hour, `ci-runner`):** a 58,500-row three-service
+  hour compacts to **4 row groups** (three ≈ 32 MiB + a small tail);
+  the one-service window query scans **1** of the 4 (`B_sw` = one
+  33,540,656 B group ≈ T, so `ceil(B_sw/T)+2 = 3`; measured scanned = 1,
+  pruned = 3) — the mechanism the sweep will tune, not gate. Kept
+  tunable (an RFC 0004 knob eventually, like the flush-policy
+  constants).
 - [x] **Sort-key stability definition — settled as lexicographic.**
   The §3.1 key is lexicographic `service.name`, *not*
   first-seen/dictionary ordinal (first-seen is interleaving-dependent

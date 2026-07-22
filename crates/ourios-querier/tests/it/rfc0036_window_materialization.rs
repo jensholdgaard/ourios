@@ -46,9 +46,11 @@ fn rec(service: &str, ts_ns: u64, id: u64, payload: String) -> MinedRecord {
         template_id: id,
         template_version: 1,
         severity_number: 9,
-        severity_text: Some("INFO".to_string()),
-        scope_name: Some("lib.cart".to_string()),
-        scope_version: Some("1.0.0".to_string()),
+        // Optional metadata the window query never touches — left None so
+        // ~58k fixture rows don't each allocate three identical strings.
+        severity_text: None,
+        scope_name: None,
+        scope_version: None,
         scope_attributes: Vec::new(),
         resource_schema_url: None,
         scope_schema_url: None,
@@ -150,21 +152,37 @@ fn seed_and_compact(
     body_len: usize,
     grid_ns: u64,
 ) -> String {
-    let mut all: Vec<MinedRecord> = Vec::new();
+    // Round-robin across services, alternately assigning to file A/B, so
+    // neither input is service- or time-clustered on its own — and we
+    // never materialise the whole corpus plus two clones (peak is the two
+    // files, not three copies). Compaction sorts globally, so the input
+    // distribution does not affect the compacted layout; every
+    // (service, time) key is unique, so payload length is fixed per row
+    // regardless of `id`, keeping the output byte-identical.
+    let max_rows = plan.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
+    let mut file_a: Vec<MinedRecord> = Vec::new();
+    let mut file_b: Vec<MinedRecord> = Vec::new();
     let mut id: u64 = 0;
-    for &(service, rows) in plan {
-        for i in 0..rows {
-            id += 1;
-            all.push(rec(
-                service,
-                HOUR10_START + i * grid_ns,
-                id,
-                payload(id, body_len),
-            ));
+    let mut to_a = true;
+    for i in 0..max_rows {
+        for &(service, rows) in plan {
+            if i < rows {
+                id += 1;
+                let r = rec(
+                    service,
+                    HOUR10_START + i * grid_ns,
+                    id,
+                    payload(id, body_len),
+                );
+                if to_a {
+                    file_a.push(r);
+                } else {
+                    file_b.push(r);
+                }
+                to_a = !to_a;
+            }
         }
     }
-    let file_a: Vec<MinedRecord> = all.iter().step_by(2).cloned().collect();
-    let file_b: Vec<MinedRecord> = all.iter().skip(1).step_by(2).cloned().collect();
     write_input(store, part, &file_a);
     write_input(store, part, &file_b);
     compact_partition(store, part)

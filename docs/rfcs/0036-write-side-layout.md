@@ -11,7 +11,7 @@ superseded-by: —
 
 # RFC 0036 — Write-side layout
 
-> **Status note.** **`green`** (2026-07-22) — all five §5 scenarios
+> **Status note.** **`green`** (2026-07-21) — all five §5 scenarios
 > discharged. **RFC0036.1** (footer inspection — compacted threshold,
 > `sorting_columns`, per-group service min/max — plus the §6 merge
 > property), **RFC0036.3** (D3 file-band + forced-spill memory bound),
@@ -24,10 +24,11 @@ superseded-by: —
 > The external merge sort (run formation → capped-fan-in k-way merge),
 > the `COMPACTED_ROW_GROUP_FLUSH_BYTES` threshold, and the §3.4
 > `sorting_columns` declaration are in `compaction.rs`/`writer.rs`.
-> Design review is done — maintainer go, 2026-07-21. All §7 decisions
-> are made and recorded below (the threshold sweep resolved to keep the
-> 32 MiB default, with the authoritative L6-scanned-bytes-vs-L1/L3
-> curve deferred to the `ourios-bench` harness).
+> Design review is done — maintainer go, 2026-07-21. The §7 decisions
+> needed to ship this slice are recorded below (the threshold sweep
+> resolved to keep the 32 MiB default, with the authoritative
+> L6-scanned-bytes-vs-L1/L3 curve deferred to the `ourios-bench`
+> harness); the remaining §7 questions stay open as noted there.
 >
 > **Deferred to `validated`.** The comparative arm of RFC0036.2 and
 > RFC0036.5 — the L6-shape pair on the v8 corpus through the RFC 0031

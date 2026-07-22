@@ -1,7 +1,7 @@
 ---
 rfc: 0036
 title: Write-side layout — compacted-partition clustering and row-group sizing
-status: green
+status: validated
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-21
@@ -11,8 +11,9 @@ superseded-by: —
 
 # RFC 0036 — Write-side layout
 
-> **Status note.** **`green`** (2026-07-21) — all five §5 scenarios
-> discharged. **RFC0036.1** (footer inspection — compacted threshold,
+> **Status note.** **`validated`** (2026-07-22) — all five §5 scenarios
+> green, plus the comparative evidence below. `accepted` is a maintainer
+> flip. **RFC0036.1** (footer inspection — compacted threshold,
 > `sorting_columns`, per-group service min/max — plus the §6 merge
 > property), **RFC0036.3** (D3 file-band + forced-spill memory bound),
 > **RFC0036.4** (shuffled-listing byte-identity rebuild), and
@@ -30,13 +31,34 @@ superseded-by: —
 > L6-scanned-bytes-vs-L1/L3 curve deferred to the `ourios-bench`
 > harness); the remaining §7 questions stay open as noted there.
 >
-> **Deferred to `validated`.** The comparative arm of RFC0036.2 and
-> RFC0036.5 — the L6-shape pair on the v8 corpus through the RFC 0031
-> dispatch, the before/after materialization-**bytes** §9 diagnostic,
-> and the frozen-gate rerun confirming L1/L3/L4 stay inside the
-> Loki-wobble band — is a paid `baseline-8vcpu-32gib` measurement, not
-> a CI gate (RFC 0031 §5 declined to gate the L6 storage channel; §2.2).
-> `validated` needs that baseline run.
+> **`validated` evidence (2026-07-22).** The deferred comparative arm
+> resolved in two parts, both recorded in `docs/benchmarks.md`:
+> - **RFC0036.5 no-regression (§9.26, authoritative
+>   `baseline-8vcpu-32gib`, HEAD `5e5aa66`).** The frozen RFC 0031
+>   dispatch reran on post-RFC-0036 `main`: every measured frozen gate
+>   passes in §9.24's band (L1 ~99×, L2 ~43× + floor 1.40, L4 ~85× +
+>   floor 3.62, L6 k=2000 latency 4.0). **Finding:** the comparative
+>   harness writes one ingest file per partition, so `compact_partition`
+>   no-ops and RFC 0036's sort never runs there — every `ourios_bytes_read`
+>   is byte-identical to §9.24. So the baseline run proves *no regression*
+>   but structurally cannot show RFC 0036's win; a multi-file-per-partition
+>   harness that re-bases the frozen-gate store is **future work**, not a
+>   `validated` blocker (RFC0036.2 bytes is a §2.2 diagnostic, not a gate).
+> - **RFC0036.2 materialization before/after (§9.27, in-repo,
+>   deterministic).** Measured directly on a genuinely-compacted store:
+>   the sort takes a one-service window from materialising the whole file
+>   (unsorted: 1/1 groups, 100.5 MB — no row group prunes) to a contiguous
+>   minority (sorted:
+>   2/6 groups, 70.0 MB) for the identical answer — a **1.43×**
+>   materialization-bytes win, modest and honest (the compacted file is
+>   ~2× larger on disk; §2.2's registry floor is why the *gate* is the
+>   scanned-row-group bound, which `rfc0036_2_window_materialization_bound`
+>   enforces).
+>
+> The scanned-row-group **gate** was always the load-bearing acceptance
+> criterion (RFC0036.2 §5, green in-repo); the v8-corpus comparative
+> materialization number remains desirable future work behind the harness
+> change above.
 >
 > **How to read this document.** This is the write-side layout lever
 > that `docs/benchmarks.md` §9.13 named and §9.24 left "parked on its

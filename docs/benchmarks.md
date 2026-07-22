@@ -2027,7 +2027,83 @@ declared) is pinned deterministically in `ourios-parquet`'s
 `rfc0036_3_compaction_properties_preserved` (tests/it) and the merge
 proptests; the §3.2 peak-memory bound (forced-spill residency = one
 input + F×batch, never whole-partition) in
-`rfc0036_3_forced_spill_peak_is_one_input_not_whole_partition`. These
+`rfc0036_3_forced_spill_peak_far_below_whole_partition`. These
 wall-clock figures are the indicative stamp; the authoritative sorted
 D2/D3 awaits the `validated` baseline rerun (RFC0036.5's frozen-gate
 pass will accompany it).
+
+### 9.26 Results — 2026-07-22 (authoritative, `baseline-8vcpu-32gib`) — RFC 0036 comparative rerun: no regression + the single-file-harness finding
+
+**Purpose.** RFC0036.5's deferred `validated` item: rerun the frozen
+RFC 0031 comparative dispatch at post-RFC-0036 `main` (HEAD `5e5aa66`)
+on baseline hardware, and confirm the frozen gates still pass on the
+sorted-compaction code. The v8 corpus (frozen `corpus/otel-demo-v8`
+release), one Loki container + one replay, same methodology as §9.24.
+
+**Hardware / run.** Fresh `ccx33` (8 dedicated vCPU EPYC-Milan /
+32 GiB = `baseline-8vcpu-32gib`), release build, Docker for the Loki
+testcontainer, box deleted on exit. ~75 min/attempt.
+
+**Result — every measured frozen gate passes, in §9.24's band (no
+regression):**
+
+| gate | this run (post-0036) | §9.24 (pre-0036) | verdict |
+|---|---|---|---|
+| L1 template storage (PRIMARY, margin 10) | 99.86× / 99.35× | 97.82× | PASS |
+| L2 severity processed (PRIMARY, margin 10) | 43.53× / 42.12× | 38.37× | PASS |
+| L2 storage floor (11/10) | 1.40× / 1.36× | 1.239× | PASS |
+| L4 frequency processed (PRIMARY, margin 10) | 85.41× / 85.52× | 85.14× | PASS |
+| L4 storage floor (11/10) | 3.62× / 3.63× | 3.60× | PASS |
+| L6 k=2000 latency floor (factor 3) | 4.09 / 3.98 | 4.341 | PASS |
+
+**The finding — RFC 0036 is not exercised by this harness, and the
+run proves it.** Every `ourios_bytes_read` came back **byte-for-byte
+identical to §9.24** (L1 1,032,727; L2 2,223,173; L4 47,995,205;
+L6 k=100 1,931,911; L6 k=2000 4,202,473). `build_comparative_store`
+writes exactly **one ingest file per partition** (`append_record` keeps
+one `Writer` per partition), so `compact_partition` no-ops (it needs
+≥ 2 files) and RFC 0036's compaction-time sort never runs. The
+comparative store is therefore identical pre/post-0036 — which is why
+the gates pass unchanged (no regression) *and* why this harness cannot
+measure RFC 0036's window-materialization win. Making it accrue
+multiple files per partition then compact would re-base RFC 0031's
+frozen-gate store; that is deferred as **future harness work**, not a
+`validated` blocker (the RFC0036.2 bytes channel is a §2.2 diagnostic,
+not a gate).
+
+**Two orthogonal noise items** (neither an RFC 0036 layout regression):
+attempt 1 measured L3 cleanly (21.6× storage) but landed the L6 k=100
+latency floor at 0.311 < 0.333 (marginal tiny-query noise; attempt 2
+passed it at 0.364); attempt 2 hit the known Loki L3 flicker (0/9 rows
+before timeout — the §9.13 class, #490). One justified retry per the
+retry-once rule; no third.
+
+### 9.27 Results — 2026-07-22 (in-repo, deterministic) — RFC0036.2 window-materialization before/after
+
+**Purpose.** The RFC0036.2 materialization diagnostic that §9.26's
+harness cannot produce, measured directly on a genuinely-compacted
+store. `ourios-querier`'s `rfc0036_2_materialization_before_after`
+(tests/it) runs the identical L6 k=100 window query (1 s at the 10 ms
+grid, one service) against two stores built from the same synthetic
+multi-service hour, and reads the **materialization bytes** — the
+compressed column chunks of the row groups a `service = target ∧ time ∈
+window` scan cannot prune — from each file's footer.
+
+| store | survivors / groups | materialization bytes | query scanned |
+|---|---|---|---|
+| **before** — one unsorted ingest file (128 MiB groups) | 1 / 1 | 100,520,155 | 1 (the whole file) |
+| **after** — compacted, §3.1-sorted (32 MiB groups) | 2 / 6 | 70,018,075 | 2 |
+
+**Reading.** Identical 100-row answer from both; the sort takes the
+window from materialising the **whole file** (the single-row-group
+unsorted ingest parquet — no row group prunes) to a contiguous minority
+(2 of 6 groups) — a **1.43×
+materialization-bytes win**. Modest by design, and honestly so: the
+compacted file is physically ~2× larger (six 32 MiB groups compress a
+little worse than one 128 MiB group — the RFC 0036 §3.3 pruning-
+granularity-over-bytes trade), and §2.2's ~188 KB registry floor is
+exactly why the **gate** is the scanned-row-group bound (enforced by
+`rfc0036_2_window_materialization_bound`), not a bytes ratio. `count`-
+scan `stats.bytes_read` is *not* the materialization term — it reads
+only the small filter columns and points the wrong way; the footer
+survivor-chunk sum is the RFC §9 metric.

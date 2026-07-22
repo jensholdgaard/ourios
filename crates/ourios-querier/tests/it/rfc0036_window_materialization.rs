@@ -483,12 +483,20 @@ async fn rfc0036_2_materialization_before_after() {
     let before_store = Store::local(before_bucket.path()).expect("local store");
     write_input(&before_store, &part, &all_records(&plan, BODY_LEN, GRID_NS));
     let before_dir = part.data_path(before_bucket.path());
-    let before_path = std::fs::read_dir(&before_dir)
+    let mut before_files: Vec<std::path::PathBuf> = std::fs::read_dir(&before_dir)
         .expect("read partition dir")
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .expect("one committed ingest file");
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    // One `write_input` ⇒ exactly one ingest file; assert it so a stray
+    // file can't silently make the measurement pick the wrong parquet.
+    assert_eq!(
+        before_files.len(),
+        1,
+        "the uncompacted store must hold exactly one ingest file, found {before_files:?}",
+    );
+    let before_path = before_files.pop().expect("one ingest file");
     let (before_total, before_survivors, before_bytes, before) =
         measure_window(before_bucket.path(), &before_path, &query, TARGET, &window).await;
 

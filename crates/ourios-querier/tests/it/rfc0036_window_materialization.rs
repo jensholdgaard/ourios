@@ -499,6 +499,17 @@ async fn rfc0036_2_materialization_before_after() {
     let before_path = before_files.pop().expect("one ingest file");
     let (before_total, before_survivors, before_bytes, before) =
         measure_window(before_bucket.path(), &before_path, &query, TARGET, &window).await;
+    // The "before materialises the whole file" claim below rests on the
+    // uncompacted ingest file being a single row group (this corpus is
+    // ~100 MB encoded, under the 128 MiB ingest rotation). Make that
+    // explicit: if the writer ever flushed multiple time-ordered groups
+    // here, time-pruning could kick in and this test would fail in a
+    // confusing way — assert the assumption so it fails loudly instead.
+    assert_eq!(
+        before_total, 1,
+        "the uncompacted before-store is expected to be a single row group \
+         (the whole-file-materialisation baseline); got {before_total}",
+    );
 
     // --- After: the compacted, sorted store (built exactly as the bound test).
     // Same survivor computation: the §3.1 clustering gives each row group tight

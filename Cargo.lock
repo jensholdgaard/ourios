@@ -3278,6 +3278,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "flate2",
  "opentelemetry-proto",
  "ourios-config",
  "ourios-core",

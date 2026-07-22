@@ -17,7 +17,10 @@ use std::path::Path;
 use ourios_core::audit::AuditEvent;
 use ourios_core::otlp::{Body, OtlpLogRecord, canonical};
 use ourios_core::record::MinedRecord;
-use ourios_parquet::{AuditWriter, PartitionKey, Writer, derive_audit_partition};
+use ourios_parquet::{
+    AuditWriter, PartitionKey, Store, Writer, compact_partition,
+    compact_partition_with_flush_threshold, derive_audit_partition,
+};
 
 use ourios_miner::cluster::NO_TEMPLATE;
 
@@ -115,6 +118,145 @@ pub fn build_comparative_store(
     Ok(store)
 }
 
+/// Opt-in RFC 0036 variant of [`build_comparative_store`] that produces a
+/// **multi-file-per-partition, compacted** store, so RFC 0036's
+/// compaction-time sort + row-group rotation actually run.
+///
+/// [`build_comparative_store`] writes exactly **one** ingest file per
+/// partition, so `compact_partition` no-ops (it needs ≥ 2 live files) and
+/// the RFC 0036 write-side layout is never exercised — every
+/// `ourios_bytes_read` came back byte-identical pre/post-RFC-0036
+/// (`docs/benchmarks.md` §9.26). This builder instead round-robins each
+/// partition's rows across **two** interleaved ingest files (RFC 0036 §3.2's
+/// run-formation shape), then calls `compact_partition` on every partition so
+/// the consolidated file is clustered by (promoted `service.name`,
+/// `time_unix_nano`), rotates row groups at the shipped compacted threshold,
+/// and declares Parquet `sorting_columns`.
+///
+/// The default [`build_comparative_store`] path is byte-for-byte untouched.
+/// This is a **separate opt-in seam** for the RFC 0036 §9.29 real-corpus
+/// materialization before/after; it MUST NOT be substituted for the frozen
+/// RFC 0031 comparative dispatch — doing so would re-base validated gates
+/// measured on the single-file store (§9.24).
+///
+/// # Errors
+///
+/// [`BenchError::Pipeline`] on any corpus / mine / Parquet / audit-write /
+/// compaction failure (the [`build_comparative_store`] surface plus the
+/// per-partition compaction).
+pub fn build_comparative_store_compacted(
+    corpus_dir: &Path,
+    bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
+) -> Result<BuiltStore, BenchError> {
+    build_comparative_store_compacted_inner(corpus_dir, bucket_root, txt_severity, None)
+}
+
+/// Like [`build_comparative_store_compacted`] but rotating the compacted row
+/// groups at an explicit `flush_bytes` threshold
+/// ([`compact_partition_with_flush_threshold`]) instead of the shipped
+/// `COMPACTED_ROW_GROUP_FLUSH_BYTES` default. The RFC 0036 §9.29 measurement
+/// uses this because real per-hour v8 volume is far below the 32 MiB default
+/// (the §9.28 finding-3 reality — a real hour compacts to a single 32 MiB row
+/// group, so nothing prunes); a finer threshold rotates the real busy hour
+/// into the several service-clustered groups the pruning mechanism needs.
+/// `None` is exactly [`build_comparative_store_compacted`].
+///
+/// # Errors
+///
+/// See [`build_comparative_store_compacted`].
+pub fn build_comparative_store_compacted_with_threshold(
+    corpus_dir: &Path,
+    bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
+    flush_bytes: Option<usize>,
+) -> Result<BuiltStore, BenchError> {
+    build_comparative_store_compacted_inner(corpus_dir, bucket_root, txt_severity, flush_bytes)
+}
+
+/// Shared body of the two compacted builders: mine with the two-file
+/// [`FileLayout::Pair`] layout, persist the audit stream, then compact every
+/// partition (at the shipped threshold when `flush_bytes` is `None`, else the
+/// explicit sweep threshold).
+fn build_comparative_store_compacted_inner(
+    corpus_dir: &Path,
+    bucket_root: &Path,
+    txt_severity: corpus::TxtSeverity,
+    flush_bytes: Option<usize>,
+) -> Result<BuiltStore, BenchError> {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    let core = build_store(
+        corpus_dir,
+        bucket_root,
+        txt_severity,
+        /* capture_audit */ true,
+        FileLayout::Pair,
+        |_input, emitted, _effective| {
+            *counts.entry(emitted.template_id).or_insert(0) += 1;
+            Ok(())
+        },
+    )?;
+    let partitions = core.partitions.clone();
+    write_audit_partition(bucket_root, core.audit_events)?;
+
+    // Compact every partition through the object-storage seam so RFC 0036's
+    // external merge sort clusters (service.name, time), rotates at the
+    // compacted threshold, and declares `sorting_columns`. The two ingest
+    // files per partition guarantee `compact_partition` has ≥ 2 inputs (it is
+    // otherwise a no-op).
+    let store = Store::local(bucket_root).map_err(|e| BenchError::Pipeline {
+        detail: format!("open local store for compaction: {e}"),
+    })?;
+    for partition in &partitions {
+        let outcome = match flush_bytes {
+            None => compact_partition(&store, partition),
+            Some(t) => compact_partition_with_flush_threshold(&store, partition, t),
+        }
+        .map_err(|e| BenchError::Pipeline {
+            detail: format!("compact partition {partition:?}: {e}"),
+        })?;
+        // A partition with ≥ 2 ingest files must consolidate; a partition
+        // that saw a single record has one file (round-robin can't split it)
+        // and legitimately no-ops, so guard on `files_before` rather than
+        // asserting every partition commits.
+        debug_assert!(
+            outcome.committed.is_some() || outcome.files_before < 2,
+            "partition {partition:?} had {} ingest files but did not consolidate",
+            outcome.files_before,
+        );
+    }
+
+    let (busiest_template_id, busiest_template_rows) = pick_busiest(&counts);
+    Ok(BuiltStore {
+        tenant: crate::corpus::BENCH_TENANT,
+        rows: core.rows,
+        // Post-compaction: one consolidated file per partition.
+        files: u64::try_from(partitions.len())
+            .expect("usize fits in u64 on every supported target"),
+        busiest_template_id,
+        busiest_template_rows,
+        min_effective_time_unix_nano: core.min_effective_time_unix_nano,
+        max_effective_time_unix_nano: core.max_effective_time_unix_nano,
+    })
+}
+
+/// The busiest **mined** template (ties → lowest id), skipping the
+/// `NO_TEMPLATE` parse-failure sentinel unless nothing mined at all — the
+/// deterministic B2 probe pick shared by [`build_query_store_inner`] and the
+/// compacted builder (RFC0006.7 needs bit-identical reruns).
+fn pick_busiest(counts: &HashMap<u64, u64>) -> (u64, u64) {
+    let busiest = |skip_sentinel: bool| {
+        counts
+            .iter()
+            .filter(|&(&id, _)| !skip_sentinel || id != NO_TEMPLATE)
+            .map(|(&id, &n)| (id, n))
+            .max_by_key(|&(id, n)| (n, std::cmp::Reverse(id)))
+    };
+    busiest(true)
+        .or_else(|| busiest(false))
+        .unwrap_or((NO_TEMPLATE, 0))
+}
+
 /// Shared body of [`build_query_store`] and [`build_comparative_store`]:
 /// mine the corpus into a queryable store and pick the busiest template,
 /// returning the [`BuiltStore`] plus the captured audit events (empty
@@ -132,30 +274,20 @@ fn build_query_store_inner(
         bucket_root,
         txt_severity,
         capture_audit,
+        FileLayout::Single,
         |_input, emitted, _effective| {
             *counts.entry(emitted.template_id).or_insert(0) += 1;
             Ok(())
         },
     )?;
 
-    // The busiest *mined* template: NO_TEMPLATE (the §6.3
-    // parse-failure class) is not a template, and on fragmentation-heavy
-    // corpora it dominates row counts — picking it would make the B2
-    // "template-exact" arm measure a body-class count instead (the
-    // §9.11 finding). Fall back to it only when nothing mined at all.
-    // Ties break toward the lowest id: HashMap iteration order is
-    // randomized, and the picked id forms the B2 query — RFC0006.7's
-    // bit-identical reruns need a deterministic choice.
-    let busiest = |skip_sentinel: bool| {
-        counts
-            .iter()
-            .filter(|&(&id, _)| !skip_sentinel || id != NO_TEMPLATE)
-            .map(|(&id, &n)| (id, n))
-            .max_by_key(|&(id, n)| (n, std::cmp::Reverse(id)))
-    };
-    let (busiest_template_id, busiest_template_rows) = busiest(true)
-        .or_else(|| busiest(false))
-        .unwrap_or((NO_TEMPLATE, 0));
+    // The busiest *mined* template: NO_TEMPLATE (the §6.3 parse-failure
+    // class) is not a template, and on fragmentation-heavy corpora it
+    // dominates row counts — picking it would make the B2 "template-exact"
+    // arm measure a body-class count instead (the §9.11 finding). Ties
+    // break toward the lowest id so RFC0006.7's bit-identical reruns pick
+    // deterministically (see [`pick_busiest`]).
+    let (busiest_template_id, busiest_template_rows) = pick_busiest(&counts);
 
     let store = BuiltStore {
         tenant: crate::corpus::BENCH_TENANT,
@@ -291,6 +423,7 @@ pub fn build_b1_store(
         bucket_root,
         txt_severity,
         /* capture_audit */ false,
+        FileLayout::Single,
         |input, emitted, effective| {
             if let Some(text) = &emitted.severity_text {
                 *severity_rows.entry(text.clone()).or_insert(0) += 1;
@@ -451,6 +584,25 @@ struct StoreCore {
     /// store persists it so the querier can derive the read-time template
     /// registry (RFC 0017) and reconstruct cleanly-mined string bodies.
     audit_events: Vec<AuditEvent>,
+    /// The distinct partitions written, chronological (oldest first) and
+    /// deduplicated — the work list the RFC 0036 compacted builder feeds to
+    /// `compact_partition`. Empty consumers (B1/B2) ignore it.
+    partitions: Vec<PartitionKey>,
+}
+
+/// How [`build_store`] lays a partition's rows onto ingest files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileLayout {
+    /// One [`Writer`] (one file) per partition — the frozen default every
+    /// public builder except the RFC 0036 compacted path uses. Byte-for-byte
+    /// the pre-RFC-0036 store the frozen RFC 0031 gates were measured on
+    /// (`docs/benchmarks.md` §9.24 / §9.26).
+    Single,
+    /// Round-robin each partition's rows across **two** interleaved ingest
+    /// files, so a later `compact_partition` has ≥ 2 inputs and RFC 0036's
+    /// compaction-time sort actually runs (RFC 0036 §3.2). Opt-in, used only
+    /// by [`build_comparative_store_compacted`].
+    Pair,
 }
 
 /// The shared load → mine → write pipeline behind
@@ -466,6 +618,7 @@ fn build_store(
     bucket_root: &Path,
     txt_severity: corpus::TxtSeverity,
     capture_audit: bool,
+    layout: FileLayout,
     mut observe: impl FnMut(&OtlpLogRecord, &MinedRecord, u64) -> Result<(), BenchError>,
 ) -> Result<StoreCore, BenchError> {
     // A reused bucket would let the querier enumerate a prior run's
@@ -490,7 +643,12 @@ fn build_store(
     // raw-byte dimension (the pre-collected file list is O(files)).
     let (stream, files_meta) = corpus::stream(corpus_dir, txt_severity)?;
 
-    let mut writers: HashMap<PartitionKey, Writer> = HashMap::new();
+    // Keyed by (partition, file slot). `FileLayout::Single` always uses slot
+    // 0 (one file per partition, byte-identical to the frozen store);
+    // `FileLayout::Pair` round-robins slot 0/1 so each partition ends with two
+    // ingest files for `compact_partition` to consolidate.
+    let mut writers: HashMap<(PartitionKey, u32), Writer> = HashMap::new();
+    let mut next_slot: HashMap<PartitionKey, u32> = HashMap::new();
     let mut rows: u64 = 0;
     // Track the corpus's *effective*-timestamp span so the benches can
     // pick a real time window — the query window filters the effective
@@ -506,7 +664,7 @@ fn build_store(
         /* capture_snapshots */ false,
         |input, emitted, _snap| {
             let effective = effective_nanos(emitted)?;
-            append_record(&mut writers, bucket_root, emitted)?;
+            append_record(&mut writers, &mut next_slot, bucket_root, emitted, layout)?;
             observe(input, emitted, effective)?;
             rows += 1;
             if effective != 0 {
@@ -523,7 +681,25 @@ fn build_store(
     }
 
     let files = u64::try_from(writers.len()).expect("usize fits in u64 on every supported target");
-    for (_partition, writer) in writers {
+    // The distinct partitions written (dedup across file slots), chronological
+    // so the compacted builder compacts oldest-first, deterministically.
+    let mut seen: std::collections::HashSet<PartitionKey> = std::collections::HashSet::new();
+    let mut partitions: Vec<PartitionKey> = Vec::new();
+    for (partition, _slot) in writers.keys() {
+        if seen.insert(partition.clone()) {
+            partitions.push(partition.clone());
+        }
+    }
+    partitions.sort_by(|a, b| {
+        (a.tenant_id.as_str(), a.year, a.month, a.day, a.hour).cmp(&(
+            b.tenant_id.as_str(),
+            b.year,
+            b.month,
+            b.day,
+            b.hour,
+        ))
+    });
+    for ((_partition, _slot), writer) in writers {
         writer.close().map_err(|e| BenchError::Pipeline {
             detail: format!("parquet close: {e}"),
         })?;
@@ -542,6 +718,7 @@ fn build_store(
         min_effective_time_unix_nano,
         max_effective_time_unix_nano,
         audit_events: harness_result.audit_events,
+        partitions,
     })
 }
 
@@ -564,16 +741,33 @@ fn effective_nanos(emitted: &MinedRecord) -> Result<u64, BenchError> {
 }
 
 /// Append one record into its partition's writer, opening one on the
-/// first record for a partition (mirrors `a1::A1Accumulator`).
+/// first record for a `(partition, slot)` (mirrors `a1::A1Accumulator`).
+/// Under [`FileLayout::Single`] every record lands in slot 0 (one file per
+/// partition — the frozen default). Under [`FileLayout::Pair`] the slot
+/// round-robins 0/1 per partition, so each partition accrues two interleaved
+/// ingest files (neither service- nor time-clustered on its own) for
+/// `compact_partition` to sort and consolidate (RFC 0036 §3.2).
 fn append_record(
-    writers: &mut HashMap<PartitionKey, Writer>,
+    writers: &mut HashMap<(PartitionKey, u32), Writer>,
+    next_slot: &mut HashMap<PartitionKey, u32>,
     bucket_root: &Path,
     emitted: &MinedRecord,
+    layout: FileLayout,
 ) -> Result<(), BenchError> {
     let partition = PartitionKey::derive(emitted).map_err(|e| BenchError::Pipeline {
         detail: format!("partition derive failed: {e}"),
     })?;
-    if let Some(writer) = writers.get_mut(&partition) {
+    let slot = match layout {
+        FileLayout::Single => 0,
+        FileLayout::Pair => {
+            let counter = next_slot.entry(partition.clone()).or_insert(0);
+            let slot = *counter % 2;
+            *counter += 1;
+            slot
+        }
+    };
+    let key = (partition, slot);
+    if let Some(writer) = writers.get_mut(&key) {
         return writer
             .append_records(std::slice::from_ref(emitted))
             .map_err(|e| BenchError::Pipeline {
@@ -581,7 +775,7 @@ fn append_record(
             });
     }
     let mut writer =
-        Writer::open(bucket_root, partition.clone()).map_err(|e| BenchError::Pipeline {
+        Writer::open(bucket_root, key.0.clone()).map_err(|e| BenchError::Pipeline {
             detail: format!("parquet open: {e}"),
         })?;
     writer
@@ -589,7 +783,7 @@ fn append_record(
         .map_err(|e| BenchError::Pipeline {
             detail: format!("parquet append_records: {e}"),
         })?;
-    writers.insert(partition, writer);
+    writers.insert(key, writer);
     Ok(())
 }
 
@@ -982,6 +1176,169 @@ mod tests {
         assert_eq!(
             built.max_effective_time_unix_nano, 0,
             "no non-zero timestamp → 0"
+        );
+    }
+
+    /// One OTLP `LogsData` line carrying a resource `service.name` and `n`
+    /// string-body records at `base + i·1000` ns (all inside one hour, so one
+    /// partition).
+    fn service_logs_data_line(service: &str, n: usize, base: u64) -> String {
+        let records: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    "{{\"timeUnixNano\":\"{}\",\"severityNumber\":9,\"severityText\":\"INFO\",\
+                     \"body\":{{\"stringValue\":\"{service} event {i}\"}}}}",
+                    base + 1_000 * u64::try_from(i).expect("usize fits in u64"),
+                )
+            })
+            .collect();
+        format!(
+            "{{\"resourceLogs\":[{{\"resource\":{{\"attributes\":[{{\"key\":\"service.name\",\
+             \"value\":{{\"stringValue\":\"{service}\"}}}}]}},\"scopeLogs\":[{{\"logRecords\":\
+             [{}]}}]}}]}}",
+            records.join(","),
+        )
+    }
+
+    /// Recursively collect the committed `*.parquet` object paths under
+    /// `bucket_root/data` (excludes `*.parquet.tmp` and `manifest.json`).
+    fn committed_parquet_files(bucket_root: &Path) -> Vec<std::path::PathBuf> {
+        // The manifest is the authoritative live set (RFC 0005 §3.9): a
+        // partition dir may hold orphaned superseded inputs (gc_failures) or a
+        // lost-CAS output next to the live consolidated file, so physical
+        // enumeration overcounts. When a dir has a manifest.json, use its
+        // `files`; a dir without one is a pre-compaction leaf (no manifest),
+        // so fall back to physical `*.parquet`.
+        let mut out = Vec::new();
+        let mut stack = vec![bucket_root.join("data")];
+        while let Some(dir) = stack.pop() {
+            let manifest = dir.join(ourios_parquet::MANIFEST_FILENAME);
+            if let Ok(bytes) = std::fs::read(&manifest)
+                && let Ok(m) = serde_json::from_slice::<ourios_parquet::Manifest>(&bytes)
+            {
+                out.extend(m.files.iter().map(|f| dir.join(f)));
+                continue; // compacted leaf; the manifest is authoritative
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "parquet") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The RFC 0036 opt-in compacted builder consolidates each partition's two
+    /// interleaved ingest files into **one** `sorting_columns`-declaring file,
+    /// preserving the row multiset — while the default
+    /// [`build_comparative_store`] stays one un-`sorting_columns` file per
+    /// partition. Specs the opt-in path exercised RFC 0036's compaction-time
+    /// sort (which the single-file frozen store never does, §9.26).
+    #[test]
+    fn compacted_builder_consolidates_and_sorts_each_partition() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let corpus = tempfile::TempDir::new().expect("corpus dir");
+        // Two services, six records each, all in one hour → one partition,
+        // twelve rows. `svc-a` sorts before `svc-b` (RFC 0036 §3.1 lexicographic).
+        let base = crate::corpus::TIME_BASELINE_NS;
+        let jsonl = format!(
+            "{}\n{}\n",
+            service_logs_data_line("svc-a", 6, base),
+            service_logs_data_line("svc-b", 6, base + 100_000),
+        );
+        std::fs::write(corpus.path().join("c.jsonl"), &jsonl).expect("write corpus");
+
+        // Default (frozen) path: one un-sorted file per partition.
+        let plain_bucket = tempfile::TempDir::new().expect("bucket dir");
+        let plain = build_comparative_store(
+            corpus.path(),
+            plain_bucket.path(),
+            corpus::TxtSeverity::Fixed,
+        )
+        .expect("plain build");
+        let plain_files = committed_parquet_files(plain_bucket.path());
+        assert_eq!(
+            plain_files.len(),
+            1,
+            "the default comparative store is one file per partition, got {plain_files:?}",
+        );
+        let plain_meta = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&plain_files[0]).expect("open plain file"),
+        )
+        .expect("plain footer")
+        .metadata()
+        .clone();
+        assert!(
+            plain_meta.row_group(0).sorting_columns().is_none(),
+            "the default single-file store declares no sorting_columns (ingest layout)",
+        );
+
+        // Opt-in compacted path: two ingest files per partition, consolidated.
+        let comp_bucket = tempfile::TempDir::new().expect("bucket dir");
+        let compacted = build_comparative_store_compacted(
+            corpus.path(),
+            comp_bucket.path(),
+            corpus::TxtSeverity::Fixed,
+        )
+        .expect("compacted build");
+        assert_eq!(
+            compacted.rows, plain.rows,
+            "compaction preserves the row multiset (12 records)",
+        );
+        assert_eq!(compacted.rows, 12, "two services × six records");
+
+        let comp_files = committed_parquet_files(comp_bucket.path());
+        assert_eq!(
+            comp_files.len(),
+            1,
+            "compaction consolidates the partition's two ingest files into one, got {comp_files:?}",
+        );
+        let comp_meta = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&comp_files[0]).expect("open compacted file"),
+        )
+        .expect("compacted footer")
+        .metadata()
+        .clone();
+        assert!(
+            comp_meta
+                .row_group(0)
+                .sorting_columns()
+                .is_some_and(|s| !s.is_empty()),
+            "the compacted file declares RFC 0036 §3.4 sorting_columns",
+        );
+
+        // Beyond row count: the footer must show BOTH services survive and are
+        // §3.1-sorted (min = svc-a, max = svc-b). A count-only check would pass
+        // if compaction dropped svc-b and duplicated svc-a (or reordered them).
+        let rg = comp_meta.row_group(0);
+        let svc_col = (0..rg.num_columns())
+            .find(|&i| {
+                rg.column(i)
+                    .column_path()
+                    .string()
+                    .ends_with("service.name")
+            })
+            .expect("service.name column present");
+        let parquet::file::statistics::Statistics::ByteArray(stats) = rg
+            .column(svc_col)
+            .statistics()
+            .expect("service.name statistics")
+        else {
+            panic!("service.name statistics are not a byte array");
+        };
+        let svc_min = stats.min_opt().expect("min").as_utf8().expect("utf8 min");
+        let svc_max = stats.max_opt().expect("max").as_utf8().expect("utf8 max");
+        assert_eq!(
+            (svc_min, svc_max),
+            ("svc-a", "svc-b"),
+            "compacted file's service.name min/max must span both services in §3.1 order",
         );
     }
 }

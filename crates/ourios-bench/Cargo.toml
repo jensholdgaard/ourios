@@ -122,6 +122,12 @@ proptest = "=1.11.0"
 # which is what B2's "median latency" target wants; ourios-querier (a
 # regular dependency above) is the unit under test.
 criterion = "=0.8.2"
+# The RFC 0036 §9.29 real-corpus measurement (tests/rfc0036_realcorpus.rs,
+# `#[ignore]`d) reads a subset of the gitignored `logs.jsonl.gz` v8 capture;
+# flate2 streams the gzip so the measurement doesn't need the 2.9 GB
+# uncompressed sidecar. Already in the workspace lock tree (transitive), so
+# no new vendored crate.
+flate2 = "=1.1.9"
 
 [[bench]]
 name = "b1"

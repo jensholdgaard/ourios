@@ -76,10 +76,14 @@ pub const ROW_GROUP_FLUSH_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 /// both ends.
 pub const TARGET_COMPACTED_ROW_GROUPS: u64 = 8;
 
-/// RFC 0036 §3.3 — the adaptive compacted-threshold **floor**. A tiny
-/// partition (estimate / `K` below this) still rotates at 1 MiB rather
-/// than collapsing to a single group — the lever that makes small real-v8
-/// hours prunable (§9.29). No sub-MiB fragmentation below it.
+/// RFC 0036 §3.3 — the adaptive compacted-threshold **floor**: the
+/// computed threshold (estimate / `K`) is clamped up to at least 1 MiB,
+/// so compaction never rotates pathologically often on a small partition.
+/// This bounds the *rotation threshold*, not the resulting group size — a
+/// partition that never reaches the threshold still produces a single row
+/// group, and the final remainder group can itself be smaller than 1 MiB.
+/// It is the lever that makes small real-v8 hours prunable once they
+/// exceed roughly `K ×` the floor (§9.29).
 pub const MIN_COMPACTED_RG_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// RFC 0036 §3.3 — the adaptive compacted-threshold **ceiling** (the old

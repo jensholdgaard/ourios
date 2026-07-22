@@ -59,7 +59,13 @@ jobs:
       - name: Verify attribution is in sync
         run: |
           set -euo pipefail
-          if ! git diff --exit-code THIRD-PARTY-LICENSES.md; then
-            echo "::error::THIRD-PARTY-LICENSES.md is out of date. Run 'cargo about generate about.hbs > THIRD-PARTY-LICENSES.md' and commit."
+          # `git status --porcelain` (not `git diff --exit-code`) so an
+          # *untracked* regenerated file — the case where the committed
+          # attribution was removed entirely — also fails, mirroring the
+          # semconv codegen gate. `git diff` ignores untracked files.
+          if [ -n "$(git status --porcelain THIRD-PARTY-LICENSES.md)" ]; then
+            echo "::error::THIRD-PARTY-LICENSES.md is out of date or untracked. Run 'cargo about generate about.hbs > THIRD-PARTY-LICENSES.md' and commit."
+            git status --porcelain THIRD-PARTY-LICENSES.md
+            git diff -- THIRD-PARTY-LICENSES.md || true
             exit 1
           fi

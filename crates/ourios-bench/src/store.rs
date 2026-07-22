@@ -1300,5 +1300,32 @@ mod tests {
                 .is_some_and(|s| !s.is_empty()),
             "the compacted file declares RFC 0036 §3.4 sorting_columns",
         );
+
+        // Beyond row count: the footer must show BOTH services survive and are
+        // §3.1-sorted (min = svc-a, max = svc-b). A count-only check would pass
+        // if compaction dropped svc-b and duplicated svc-a (or reordered them).
+        let rg = comp_meta.row_group(0);
+        let svc_col = (0..rg.num_columns())
+            .find(|&i| {
+                rg.column(i)
+                    .column_path()
+                    .string()
+                    .ends_with("service.name")
+            })
+            .expect("service.name column present");
+        let parquet::file::statistics::Statistics::ByteArray(stats) = rg
+            .column(svc_col)
+            .statistics()
+            .expect("service.name statistics")
+        else {
+            panic!("service.name statistics are not a byte array");
+        };
+        let svc_min = stats.min_opt().expect("min").as_utf8().expect("utf8 min");
+        let svc_max = stats.max_opt().expect("max").as_utf8().expect("utf8 max");
+        assert_eq!(
+            (svc_min, svc_max),
+            ("svc-a", "svc-b"),
+            "compacted file's service.name min/max must span both services in §3.1 order",
+        );
     }
 }

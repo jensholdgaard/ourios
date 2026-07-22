@@ -98,12 +98,22 @@ pub struct LeafRecord {
     pub slot_types: Vec<Vec<ParamTypeRecord>>,
 }
 
-/// One `(severity_number, scope_name) → template_id` entry of the
-/// structured-template-id map.
+/// One `(severity_number, scope_name, event_name) → template_id`
+/// entry of the structured-template-id map (RFC 0037 §3.1).
+///
+/// `event_name` carries `#[serde(default)]` so snapshots written
+/// before RFC 0037 (which keyed only on `(severity_number,
+/// scope_name)`) restore with `event_name = None` — the correct
+/// migration, since those templates were minted when the event
+/// dimension was absent, which is exactly the `event_name = None`
+/// class. No `SNAPSHOT_VERSION` bump is needed for this additive
+/// field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredTemplateRecord {
     pub severity_number: u8,
     pub scope_name: Option<String>,
+    #[serde(default)]
+    pub event_name: Option<String>,
     pub template_id: u64,
 }
 
@@ -378,6 +388,7 @@ mod tests {
             structured_templates: vec![StructuredTemplateRecord {
                 severity_number: 17,
                 scope_name: Some("lib.payments".to_string()),
+                event_name: Some("gen_ai.client.inference.operation.details".to_string()),
                 template_id: 3,
             }],
             wal_high_water: Some(WalHighWater {

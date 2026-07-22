@@ -1,7 +1,7 @@
 ---
 rfc: 0034
 title: D1 re-scope — ingest throughput is a per-node capacity on baseline hardware, not a per-core rate
-status: specified
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-20
@@ -11,9 +11,10 @@ superseded-by: —
 
 # RFC 0034 — D1 re-scope
 
-> **Status note.** **`specified`**, with all three §5 criteria now in
-> force (2026-07-21); the terminal flip to `accepted` is the
-> maintainer's sign-off, not this note. RFC0034.1 is **enacted** by
+> **Status note.** **`accepted`** (2026-07-22, maintainer sign-off — the
+> terminal state for this re-scope RFC, which has no thesis-gate of its
+> own to `validate`). All three §5 criteria were in force from
+> 2026-07-21. RFC0034.1 is **enacted** by
 > this change: the `docs/benchmarks.md` § D1 block is recast per-node
 > (≥ 100 000 lines/s on `baseline-8vcpu-32gib`, multi-tenant, shared
 > commit stream, p99 ack ≤ 200 ms at the sustained rate) with the old

@@ -244,8 +244,9 @@ bound for each path.
 ### 3.3 Compacted row-group threshold
 
 Compacted output rotates row groups at a **separate, smaller
-threshold** — proposal **32 MiB**, a new
-`COMPACTED_ROW_GROUP_FLUSH_BYTES` alongside `ROW_GROUP_FLUSH_BYTES`
+threshold** — **32 MiB** (the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`,
+settled in §7; the authoritative sweep is deferred to `validated`)
+alongside `ROW_GROUP_FLUSH_BYTES`
 (which ingest-side files keep at 128 MiB). Rotation fires on
 `ArrowWriter::in_progress_size`, the writer's estimate of the
 buffered row-group bytes (dominated by already-encoded page data,

@@ -317,10 +317,12 @@ async fn rfc0036_2_window_materialization_bound() {
         .await
         .expect("run_query");
 
-    // The window holds exactly the target service's first
-    // WINDOW_NS/GRID_NS rows (its rows ascend on the 10 ms grid from
-    // HOUR10_START).
-    let expected_rows = WINDOW_NS / GRID_NS;
+    // The window is the target service's rows on the 10 ms grid from
+    // HOUR10_START whose time falls in the half-open [start, start +
+    // WINDOW_NS) range: k·GRID_NS < WINDOW_NS for k = 0, 1, …, i.e.
+    // ceil(WINDOW_NS / GRID_NS) rows (div_ceil, not floor, so the count
+    // stays correct if the window ever stops being an exact grid multiple).
+    let expected_rows = WINDOW_NS.div_ceil(GRID_NS);
     assert_eq!(
         r.rows, expected_rows,
         "the window selects the target service's k rows",

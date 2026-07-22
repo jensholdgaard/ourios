@@ -2237,8 +2237,9 @@ window query runs against each.
 wall-time). The measurement picks the busiest compacted partition (most row
 groups), then the **most-prunable real service** in it — which resolves to
 **`ad`**, the lowest-volume otel-demo service and the exact §9.13 run #17 case
-— and the busy hour as the window: `service == "ad" | range(2026-07-07T08:00:00Z,
-2026-07-07T09:00:00Z)`. **Materialization bytes** = the footer survivor-chunk
+— and the busy hour as the window:
+`service == "ad" | range(2026-07-07T08:00:00Z, 2026-07-07T09:00:00Z)`.
+**Materialization bytes** = the footer survivor-chunk
 sum (the RFC 0036 §9 metric: compressed column chunks of the row groups a
 `service = ad ∧ time ∈ window` scan cannot prune, keyed on the
 `effective_time_unix_nano` column the querier prunes on — **not** the

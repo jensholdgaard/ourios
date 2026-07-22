@@ -67,10 +67,12 @@ which appends a line matching your commit author:
 Signed-off-by: Your Name <you@example.com>
 ```
 
-Missed it? `git commit --amend -s --no-edit` (or `git rebase --signoff main`
-for a range) fixes a branch before pushing. AI-assisted commits keep their
-`Co-Authored-By:` trailer *and* carry the human contributor's `Signed-off-by:`
-— the human driver certifies origin.
+Missed it? `git commit --amend -s --no-edit` fixes the tip commit, or
+`git rebase --signoff main` a whole range. If the branch is already pushed
+(the usual case when a PR is open), this rewrites history, so follow with
+`git push --force-with-lease`. AI-assisted commits keep their `Co-Authored-By:`
+trailer *and* carry the human contributor's `Signed-off-by:` — the human
+driver certifies origin.
 
 ## Conventions
 - Keep PRs small and focused.

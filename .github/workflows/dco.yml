@@ -35,6 +35,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           # PR *actor* login from the trusted event payload — not forgeable
           # commit metadata. This is the only bot-detection signal a
           # contributor cannot spoof (setting user.name to `x[bot]` would).
@@ -69,8 +70,11 @@ jobs:
           done
           if [ "$fail" -ne 0 ]; then
             echo "::error::One or more commits are missing a Developer Certificate of Origin sign-off."
-            echo "Sign off your commits with 'git commit -s' (or amend an existing" >&2
-            echo "branch: 'git rebase --signoff ${BASE_SHA}'). See CONTRIBUTING.md." >&2
+            echo "Sign off future commits with 'git commit -s'. To fix this branch," >&2
+            echo "add the trailers to existing commits and force-push:" >&2
+            echo "  git rebase --signoff ${BASE_REF}" >&2
+            echo "  git push --force-with-lease" >&2
+            echo "See CONTRIBUTING.md." >&2
             exit 1
           fi
           echo "All non-merge commits are signed off."

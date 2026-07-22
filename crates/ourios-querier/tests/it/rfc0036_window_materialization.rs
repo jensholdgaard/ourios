@@ -21,6 +21,7 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::promoted::{RESOURCE_PREFIX, SERVICE_NAME_KEY};
 use ourios_parquet::{
     COMPACTED_ROW_GROUP_FLUSH_BYTES, PartitionKey, Store, Writer, columns, compact_partition,
+    compact_partition_with_flush_threshold,
 };
 use ourios_querier::Querier;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -590,4 +591,293 @@ async fn rfc0036_2_materialization_before_after() {
         "compaction materialises fewer bytes for the same window \
          (after {after_bytes} < before {before_bytes})",
     );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0036 §7 — the compacted row-group threshold sweep (16 / 32 / 64 MiB).
+//
+// The `rfc0036_2_*` measurements above use a near-incompressible random
+// payload (chosen so few rows cross the 32 MiB threshold), which made the
+// compacted file read as ~2× *larger* on disk (§9.27). Real logs are
+// compressible and have per-service locality — sorting by `service.name`
+// clusters similar lines, which should *improve* compression, not worsen
+// it. This sweep uses a **compressible, service-clustered** synthetic
+// corpus to trace the actual trade curve across the three candidate
+// thresholds: file size, row-group count, and the L6-shape window query's
+// materialization bytes + scanned groups. It is the in-repo, indicative
+// half of RFC 0036 §7's first open box (the authoritative
+// `baseline-8vcpu-32gib` v8 sweep stays deferred); its numbers are
+// recorded in `docs/benchmarks.md` §9.28.
+//
+// `#[ignore]`d and heavy (it builds a multi-hundred-MiB compressible
+// corpus and re-compacts it three times) — run explicitly to reproduce
+// §9.28, exactly as the RFC0005.6 sizing test is `#[ignore]`d. Not a CI
+// gate: the *gate* is `rfc0036_2_window_materialization_bound`, which
+// already tracks whatever `COMPACTED_ROW_GROUP_FLUSH_BYTES` ships.
+// ---------------------------------------------------------------------------
+
+/// One hour in nanoseconds — the sweep spreads each service's rows across
+/// the whole partition hour so a fixed 30 s window is a small slice.
+const SWEEP_HOUR_NANOS: u64 = 3_600_000_000_000;
+
+/// The candidate thresholds, in MiB.
+const SWEEP_THRESHOLDS_MIB: [usize; 3] = [16, 32, 64];
+
+/// Distinct, lexicographically-ordered promoted services. Each carries its
+/// own template vocabulary ([`service_phrase`]) so the §3.1 sort clusters
+/// similar lines — the locality the on-disk compression trade turns on.
+const SWEEP_SERVICES: [&str; 6] = [
+    "svc-auth",
+    "svc-cart",
+    "svc-catalog",
+    "svc-payment",
+    "svc-search",
+    "svc-shipping",
+];
+
+/// The queried service for the window measurement — a mid-lexicographic
+/// service so its clustered run sits between neighbours (the general case,
+/// not a file-edge special case).
+const SWEEP_TARGET: &str = "svc-payment";
+
+/// A fixed, per-service log phrase: the compressible, clustered part of a
+/// line. Distinct wording per service so sorting by `service.name` groups
+/// like text together (better compression) rather than interleaving six
+/// vocabularies.
+fn service_phrase(service: &str) -> &'static str {
+    match service {
+        "svc-auth" => {
+            "user authentication session established via oauth provider realm tenant scope refresh grant issued"
+        }
+        "svc-cart" => {
+            "shopping cart line item quantity updated inventory reservation hold applied for checkout basket session"
+        }
+        "svc-catalog" => {
+            "product catalog entry rendered category taxonomy facet ranking price tier availability warehouse listing"
+        }
+        "svc-payment" => {
+            "payment intent captured gateway authorization settlement ledger posting currency conversion fee schedule"
+        }
+        "svc-search" => {
+            "search query executed index shard fanout relevance scoring recall precision suggestion completion tokens"
+        }
+        "svc-shipping" => {
+            "shipment dispatch label generated carrier route zone estimate tracking manifest customs declaration parcel"
+        }
+        other => panic!("no phrase for service `{other}`"),
+    }
+}
+
+/// A realistic, moderately-compressible app log line: the fixed
+/// per-service [`service_phrase`] followed by a handful of small varying
+/// fields — including 8 hex chars of per-line entropy that hold ZSTD to a
+/// realistic ratio rather than the pathological one a constant line would
+/// give. ~230–260 bytes.
+fn compressible_body(service: &str, id: u64) -> String {
+    const STATUS: [u16; 6] = [200, 201, 204, 400, 404, 500];
+    const REGION: [&str; 4] = ["us-east", "us-west", "eu-central", "ap-south"];
+    let phrase = service_phrase(service);
+    let status = STATUS[usize::try_from(id % 6).expect("0..6")];
+    let region = REGION[usize::try_from(id % 4).expect("0..4")];
+    let trace = id.wrapping_mul(2_654_435_761) & 0xffff_ffff;
+    format!(
+        "{phrase} request_id={id} user=u{user:06} amount={major}.{minor:02} \
+         status={status} latency_ms={lat} region={region} attempt={attempt} trace={trace:08x}",
+        user = id % 100_000,
+        major = id % 5_000,
+        minor = id % 100,
+        lat = id % 950,
+        attempt = id % 4,
+    )
+}
+
+/// Rows per service (tunable via `OURIOS_SWEEP_ROWS_PER_SERVICE` so the
+/// corpus can be resized to cross the thresholds on a given box without a
+/// recompile). The default is calibrated so the compacted file clears
+/// 64 MiB — several row groups even at the largest threshold.
+fn sweep_rows_per_service() -> u64 {
+    std::env::var("OURIOS_SWEEP_ROWS_PER_SERVICE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(360_000)
+}
+
+/// One threshold's measured row: the compacted file's on-disk size and
+/// row-group count, plus the window query's materialization term.
+struct SweepRow {
+    threshold_mib: usize,
+    file_bytes: u64,
+    row_groups: usize,
+    window_survivors: usize,
+    window_bytes: u64,
+    scanned: u64,
+    pruned: u64,
+    query_rows: u64,
+}
+
+/// Build the same compressible, service-clustered hour as two interleaved
+/// ingest files (so neither is service- or time-clustered on its own),
+/// then compact it at `threshold`. Returns the committed file name and the
+/// summed raw body bytes (the "log line" volume the compression ratio is
+/// measured against).
+fn seed_sweep(
+    store: &Store,
+    part: &PartitionKey,
+    rows_per_service: u64,
+    threshold: usize,
+) -> (String, u64) {
+    // Spread each service's rows across the whole hour so a fixed 30 s
+    // window selects a small, contiguous slice of the service's clustered run.
+    let grid_ns = (SWEEP_HOUR_NANOS / rows_per_service).max(1);
+    let mut file_a: Vec<MinedRecord> = Vec::new();
+    let mut file_b: Vec<MinedRecord> = Vec::new();
+    let mut raw_body_bytes: u64 = 0;
+    let mut id: u64 = 0;
+    let mut to_a = true;
+    for i in 0..rows_per_service {
+        for &service in &SWEEP_SERVICES {
+            id += 1;
+            let body = compressible_body(service, id);
+            raw_body_bytes += u64::try_from(body.len()).expect("body len fits u64");
+            let r = rec(service, HOUR10_START + i * grid_ns, id, body);
+            if to_a {
+                file_a.push(r);
+            } else {
+                file_b.push(r);
+            }
+            to_a = !to_a;
+        }
+    }
+    write_input(store, part, &file_a);
+    write_input(store, part, &file_b);
+    drop(file_a);
+    drop(file_b);
+    let committed = compact_partition_with_flush_threshold(store, part, threshold)
+        .expect("compact at threshold")
+        .committed
+        .expect("≥2 inputs ⇒ a commit")
+        .file;
+    (committed, raw_body_bytes)
+}
+
+/// RFC 0036 §7 — the compacted row-group threshold sweep on a compressible,
+/// service-clustered corpus. See the section banner above and
+/// `docs/rfcs/0036-write-side-layout.md` §7. Prints the trade table
+/// (threshold → file size, #groups, window materialization bytes, scanned
+/// groups) and the corpus's measured compression ratio for `docs/benchmarks.md`
+/// §9.28.
+/// A fixed 30 s window from the hour start — a narrow L6-shape browse.
+const SWEEP_WINDOW_NS: u64 = 30_000_000_000;
+
+#[ignore = "heavy RFC 0036 §7 threshold sweep — run manually to (re)produce docs/benchmarks.md §9.28"]
+#[tokio::test]
+async fn rfc0036_7_compacted_threshold_sweep() {
+    let rows_per_service = sweep_rows_per_service();
+    let total_rows = rows_per_service * u64::try_from(SWEEP_SERVICES.len()).expect("fits");
+    let window = HOUR10_START..HOUR10_START + SWEEP_WINDOW_NS;
+    let src = format!(
+        "service == \"{SWEEP_TARGET}\" | range(2026-04-02T10:00:00Z, 2026-04-02T10:00:30Z)"
+    );
+    let query = ourios_querier::dsl::parse(&src).expect("parse");
+    let part = PartitionKey::derive(&rec(SWEEP_TARGET, HOUR10_START, 1, String::new()))
+        .expect("derive partition");
+
+    let mut rows: Vec<SweepRow> = Vec::with_capacity(SWEEP_THRESHOLDS_MIB.len());
+    let mut raw_body_bytes = 0u64;
+    for threshold_mib in SWEEP_THRESHOLDS_MIB {
+        let threshold = threshold_mib * 1024 * 1024;
+        // A fresh store per threshold — compaction is destructive (one output
+        // file) and the corpus is identical, so each threshold sees the same rows.
+        let bucket = tempfile::TempDir::new().expect("temp");
+        let store = Store::local(bucket.path()).expect("local store");
+        let (committed, raw) = seed_sweep(&store, &part, rows_per_service, threshold);
+        raw_body_bytes = raw;
+        let path = part.data_path(bucket.path()).join(&committed);
+        let file_bytes = std::fs::metadata(&path).expect("stat compacted file").len();
+        let (total, survivors, window_bytes, result) =
+            measure_window(bucket.path(), &path, &query, SWEEP_TARGET, &window).await;
+        rows.push(SweepRow {
+            threshold_mib,
+            file_bytes,
+            row_groups: usize::try_from(total).expect("group count fits usize"),
+            window_survivors: survivors.len(),
+            window_bytes,
+            scanned: result.stats.row_groups_scanned,
+            pruned: result.stats.row_groups_pruned,
+            query_rows: result.rows,
+        });
+    }
+
+    // The trade table + the corpus compression ratio (raw log bytes ÷ the
+    // 32 MiB compacted file). ×100 integer ratios avoid a float cast under
+    // clippy::pedantic; read `NNN` as `N.NNx`.
+    let mid = rows
+        .iter()
+        .find(|r| r.threshold_mib == 32)
+        .expect("32 MiB row present");
+    let ratio_x100 = u128::from(raw_body_bytes) * 100 / u128::from(mid.file_bytes.max(1));
+    eprintln!(
+        "RFC0036.7 sweep — {} services × {rows_per_service} rows = {total_rows} rows; \
+         raw body {raw_body_bytes} B; compression (raw ÷ 32 MiB file) {}.{:02}x",
+        SWEEP_SERVICES.len(),
+        ratio_x100 / 100,
+        ratio_x100 % 100,
+    );
+    eprintln!(
+        "  threshold | file_bytes | #groups | win_survivors/#groups | win_bytes | scanned | pruned | rows"
+    );
+    for r in &rows {
+        eprintln!(
+            "  {:>3} MiB   | {:>10} | {:>7} | {:>10}/{:<7} | {:>9} | {:>7} | {:>6} | {}",
+            r.threshold_mib,
+            r.file_bytes,
+            r.row_groups,
+            r.window_survivors,
+            r.row_groups,
+            r.window_bytes,
+            r.scanned,
+            r.pruned,
+            r.query_rows,
+        );
+    }
+
+    // --- Sanity assertions (trade *shape*, not brittle absolute bytes) ---
+    // Every threshold rotates into multiple row groups, and the same
+    // narrow window returns the identical answer regardless of threshold —
+    // the layout knob changes IO, never the result.
+    let expected_rows = rows[0].query_rows;
+    for r in &rows {
+        assert!(
+            r.row_groups >= 2,
+            "{} MiB threshold produced only {} row group(s) — corpus too small to \
+             cross it (raise OURIOS_SWEEP_ROWS_PER_SERVICE)",
+            r.threshold_mib,
+            r.row_groups,
+        );
+        assert_eq!(
+            r.query_rows, expected_rows,
+            "the window answer must be identical across thresholds",
+        );
+        assert!(
+            r.scanned < total_u64(r.row_groups),
+            "{} MiB: the one-service window must prune (scanned {} of {} groups)",
+            r.threshold_mib,
+            r.scanned,
+            r.row_groups,
+        );
+    }
+    // The finer thresholds give strictly more row groups (16 > 64), the
+    // mechanism the pruning-granularity trade rests on.
+    let groups_16 = rows[0].row_groups;
+    let groups_64 = rows[2].row_groups;
+    assert!(
+        groups_16 > groups_64,
+        "smaller threshold must yield more row groups (16 MiB: {groups_16}, 64 MiB: {groups_64})",
+    );
+}
+
+/// `usize` row-group count as `u64` for the `scanned <` comparison.
+fn total_u64(n: usize) -> u64 {
+    u64::try_from(n).expect("row-group count fits u64")
 }

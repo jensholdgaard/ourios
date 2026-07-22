@@ -44,7 +44,8 @@ pub use audit_sink::ParquetAuditSink;
 pub use audit_writer::{AuditWriter, AuditWriterError, AuditWrittenFile, derive_audit_partition};
 pub use compaction::{
     Committed, CompactionError, CompactionOutcome, CompactionPolicy, OrphanGc, compact_partition,
-    compact_partition_with_promoted, gc_orphans, plan_candidates,
+    compact_partition_with_flush_threshold, compact_partition_with_promoted, gc_orphans,
+    plan_candidates,
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, ManifestError, Published};
 pub use partition::{
@@ -56,9 +57,9 @@ pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
 pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
 pub use store::{S3Config, Store, StoreConfig, StoreError};
 pub use writer::{
-    COMPACTED_ROW_GROUP_FLUSH_BYTES, DEFAULT_ZSTD_LEVEL, ROW_GROUP_FLUSH_BYTES, SUB_BATCH_ROWS,
-    Writer, WriterError, WrittenFile, encode_records_to_parquet,
-    encode_records_to_parquet_with_promoted,
+    COMPACTED_RG_BYTES_ENV, COMPACTED_ROW_GROUP_FLUSH_BYTES, DEFAULT_ZSTD_LEVEL,
+    ROW_GROUP_FLUSH_BYTES, SUB_BATCH_ROWS, Writer, WriterError, WrittenFile,
+    encode_records_to_parquet, encode_records_to_parquet_with_promoted,
 };
 
 use std::sync::Arc;

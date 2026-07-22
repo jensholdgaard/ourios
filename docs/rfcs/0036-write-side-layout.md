@@ -12,9 +12,18 @@ superseded-by: —
 # RFC 0036 — Write-side layout
 
 > **Status note.** **`accepted`** (2026-07-22, maintainer sign-off — the
-> terminal state). Reached `validated` the same day on all five §5
-> scenarios green plus the comparative evidence below; the §7 threshold
-> sweep (§9.28) and its row-cap finding landed with it.
+> terminal state), **amended 2026-07-22 with the §3.3 adaptive
+> compacted-threshold (target-K)**: the fixed 32 MiB threshold was
+> proven inert on real v8 (§9.28/§9.29 — a real hour compacts to one
+> group and prunes nothing) yet fragments large hours, so it is replaced
+> by `clamp(input_total / 8, 1 MiB, 32 MiB)` (accepted RFCs may be
+> amended — `docs/rfcs/README.md`; maintainer-approved 2026-07-22). §9.30
+> measures the win at the adaptive default (**7.61×** real-corpus
+> materialization-bytes win, 20 of 21 groups pruned, where the fixed
+> 32 MiB default had skipped).
+>
+> Reached `validated` on all five §5 scenarios green plus the comparative
+> evidence below.
 > **RFC0036.1** (footer inspection — compacted threshold,
 > `sorting_columns`, per-group service min/max — plus the §6 merge
 > property), **RFC0036.3** (D3 file-band + forced-spill memory bound),
@@ -25,13 +34,14 @@ superseded-by: —
 > (window-query scanned-row-group bound) passes in
 > `crates/ourios-querier/tests/it/rfc0036_window_materialization.rs`.
 > The external merge sort (run formation → capped-fan-in k-way merge),
-> the `COMPACTED_ROW_GROUP_FLUSH_BYTES` threshold, and the §3.4
+> the §3.3 adaptive threshold (`adaptive_flush_bytes`), and the §3.4
 > `sorting_columns` declaration are in `compaction.rs`/`writer.rs`.
 > Design review is done — maintainer go, 2026-07-21. The §7 decisions
-> needed to ship this slice are recorded below (the threshold sweep
-> resolved to keep the 32 MiB default, with the authoritative
-> L6-scanned-bytes-vs-L1/L3 curve deferred to the `ourios-bench`
-> harness); the remaining §7 questions stay open as noted there.
+> needed to ship this slice are recorded below (the threshold question is
+> now resolved by the §3.3 adaptive model; the authoritative
+> ceiling/target-K sweep against the L1/L3 curve stays deferred to the
+> `ourios-bench` harness); the remaining §7 questions stay open as noted
+> there.
 >
 > **`validated` evidence (2026-07-22).** The deferred comparative arm
 > resolved in two parts, both recorded in `docs/benchmarks.md`:
@@ -98,8 +108,10 @@ the **compacted** layout only: (1) compaction sorts the partition's
 rows by (promoted `service.name`, `time_unix_nano`) via a
 bounded-memory sort-run merge that preserves compaction's existing
 one-input-file peak-memory property; (2) compacted row groups rotate
-at a smaller uncompressed threshold (proposal ~32 MiB, tunable),
-giving time/service pruning its granularity back; (3) the writer
+at a smaller, **adaptive** threshold that scales with partition size
+(§3.3 — `clamp(input_total / 8, 1 MiB, 32 MiB)`, amended 2026-07-22),
+giving time/service pruning its granularity back on hours of any size;
+(3) the writer
 declares Parquet `sorting_columns` so order-aware readers can
 exploit the layout. No schema change, no migration, no ingest-path
 change, and byte-identical store rebuilds are preserved. The
@@ -169,7 +181,8 @@ L6 *storage-bytes* channel stays exactly what RFC 0031 made it — a
 published diagnostic, not a gate (RFC 0031 §5 declined to gate it;
 the §7 frozen L6 gate is the latency floor, which already passes:
 0.370 / 4.341 on §9.24). Illustrative arithmetic, not a promise:
-with the hour clustered by (service, time) and rotated at ~32 MiB, a
+with the hour clustered by (service, time) and rotated at the §3.3
+adaptive threshold, a
 one-service k=100 window's answer lives in one or two small row
 groups; the materialization term drops from ~1.74 MB toward the size
 of those chunks' matched columns, leaving total bytes dominated by
@@ -265,26 +278,76 @@ the load-bearing claim holds *at the bound*, but the strict
 in-memory path's. RFC0036.3's memory test asserts the accurate
 bound for each path.
 
-### 3.3 Compacted row-group threshold
+### 3.3 Compacted row-group threshold — adaptive (target-K)
 
-Compacted output rotates row groups at a **separate, smaller
-threshold** — **32 MiB** (the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`,
-settled in §7; the authoritative sweep is deferred to `validated`)
-alongside `ROW_GROUP_FLUSH_BYTES`
-(which ingest-side files keep at 128 MiB). Rotation fires on
-`ArrowWriter::in_progress_size`, the writer's estimate of the
-buffered row-group bytes (dominated by already-encoded page data,
+> **Amended 2026-07-22.** This section originally shipped a **fixed**
+> 32 MiB compacted threshold. §9.28/§9.29 proved that value is *inert*
+> on the real v8 corpus: a real per-hour partition is only a few MiB
+> compressed — far below 32 MiB — so it compacts to a **single** row
+> group and prunes nothing (§9.29 skipped at the 32 MiB default), while
+> the same fixed value fragments large hours. The threshold is therefore
+> replaced by an **adaptive** one that scales with partition size, so a
+> partition of *any* size lands on roughly a target group count. The
+> fixed value is retained as the ceiling. Maintainer-approved design
+> decision, 2026-07-22.
+
+Compacted output rotates row groups at an **adaptive, per-partition
+threshold** (ingest-side files keep the fixed 128 MiB
+`ROW_GROUP_FLUSH_BYTES`):
+
+```text
+adaptive_flush_bytes = clamp(
+    estimated_output_bytes / TARGET_COMPACTED_ROW_GROUPS,
+    MIN_COMPACTED_RG_BYTES,
+    MAX_COMPACTED_RG_BYTES,
+)
+```
+
+- **`TARGET_COMPACTED_ROW_GROUPS = 8`** — the group-count target: enough
+  to cluster services and give pruning granularity, not so many the
+  per-group footer/page-index overhead dominates.
+- **`MIN_COMPACTED_RG_BYTES = 1 MiB`** — the floor. It clamps the
+  computed *rotation threshold* (`estimate / K`) up to at least 1 MiB, so
+  compaction never rotates pathologically often on a small partition. It
+  bounds the **threshold, not the resulting group size**: a partition that
+  never crosses the threshold is a single row group, the final remainder
+  group can itself be < 1 MiB, and whether the partition rotates at all
+  depends on the writer's `in_progress_size` crossing the threshold — not
+  a fixed size rule. Its role is that a small-but-not-tiny hour — a few
+  MiB compressed — rotates into several groups instead of one, **the lever
+  that makes small real-v8 hours prunable** (§9.29/§9.30).
+- **`MAX_COMPACTED_RG_BYTES = 32 MiB`** — the ceiling (the old fixed
+  `COMPACTED_ROW_GROUP_FLUSH_BYTES` value). A huge partition gets *more*
+  than K groups, each capped at 32 MiB, so a compacted row group never
+  grows back toward the 128 MiB ingest band.
+- **`estimated_output_bytes`** is the sum of the partition's **live
+  input file sizes**, read from the store during compaction (the inputs
+  are already listed in `compact_sorted`). The sorted output is the same
+  rows re-compressed — ≈ or a little smaller — so the input total is a
+  safe upper estimate. The function is deterministic in its input, so
+  the same partition compacts to byte-identical output (§3.5 / RFC0036.4).
+
+Worked examples: a **14 MB** hour → 14/8 = 1.75 MB flush → ~8 groups
+(pruning works); a **400 MB** hour → 400/8 = 50 MB, capped to 32 MB →
+~13 groups, each ≤ 32 MB; a **4 MB** hour → 4/8 = 0.5 MB, floored to
+1 MiB → ~4 groups (instead of the single group the fixed 32 MiB gave).
+
+**Precedence.** An explicit `compact_partition_with_flush_threshold`
+argument (the §7 sweep seam / tests) wins over the
+`OURIOS_COMPACTED_RG_BYTES` env override (the operator escape hatch),
+which wins over the adaptive value. Production sets neither and gets the
+adaptive threshold.
+
+Rotation fires on `ArrowWriter::in_progress_size`, the writer's estimate
+of the buffered row-group bytes (dominated by already-encoded page data,
 not raw uncompressed input), so on-disk row-group size tracks the
-threshold closely. Illustration at §9.7's D3 scale: the 456.7 MiB
-single-file hour (on disk) becomes on the order of **~14 row
-groups** (≈ 456.7 / 32) instead of a handful; on v8's
-~one-row-group hours, several. Combined with the §3.1 sort, each
-row group's `service.name` min/max spans one service — or a
-boundary pair, or (for a service smaller than one row group, wedged
-between two others) that service plus its two neighbours — while its
-time min/max stays tight *within* a service. A query for any single
-service scans only the group(s) whose min/max contains it and prunes
-the rest on plain footer statistics, without even needing the bloom.
+threshold closely. Combined with the §3.1 sort, each row group's
+`service.name` min/max spans one service — or a boundary pair, or (for a
+service smaller than one row group, wedged between two others) that
+service plus its two neighbours — while its time min/max stays tight
+*within* a service. A query for any single service scans only the
+group(s) whose min/max contains it and prunes the rest on plain footer
+statistics, without even needing the bloom.
 
 **This amends hazard H4's row-group band.** `docs/hazards.md` H4
 targets "row-group size 128 MB – 1 GB"; this RFC deliberately drops
@@ -514,18 +577,24 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
 
 ## 7. Open questions
 
-- [x] **The compacted row-group threshold — settled at 32 MiB for
-  `green`; authoritative sweep deferred to `validated`.** The
-  scanned-count *gate* (RFC0036.2) does not hard-code a threshold: it
-  reads the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES` from the const and
-  recomputes the bound `ceil(B_sw / T) + 2` from it, so retuning `T`
-  moves the bound with the layout instead of invalidating the test. It
-  is *not* auto-satisfied — the gate still fails if a `T` change
-  regresses the sort/pruning (e.g. the target service stops clustering
-  contiguously and extra groups are scanned). What it pins is the
-  mechanism (scan the groups holding the answer, not the hour), for
-  whatever `T` ships. The *choice* of 32 MiB stands as the shipped
-  default.
+- [x] **The compacted row-group threshold — RESOLVED 2026-07-22 by the
+  §3.3 adaptive amendment (target-K).** Originally settled at a *fixed*
+  32 MiB; the amendment replaces it with `adaptive_flush_bytes =
+  clamp(estimated_output_bytes / 8, 1 MiB, 32 MiB)`, keeping the 32 MiB
+  value as the ceiling. **Why the fixed value had to go:** §9.28/§9.29
+  proved it *inert* on the real v8 corpus — a real per-hour partition is
+  a few MiB compressed, so at 32 MiB it compacts to one row group and
+  prunes nothing (§9.29 skipped at the 32 MiB default), while the same
+  fixed value fragments large hours. The adaptive floor (1 MiB) is what
+  rotates a small real hour into several service-clustered groups; the
+  ceiling (32 MiB) caps huge hours. §9.30 measures the win at the
+  adaptive default (no longer inert). The scanned-count *gate*
+  (RFC0036.2) does not hard-code a threshold: it recomputes `T =
+  adaptive_flush_bytes(input_total)` — exactly what the writer derived —
+  and the bound `ceil(B_sw / T) + 2` from it, so the gate moves with
+  whatever the layout produces. It is *not* auto-satisfied — the gate
+  still fails if the target service stops clustering contiguously and
+  extra groups are scanned.
   The **indicative** in-repo sweep is **done** (§9.28, local M-series,
   synthetic-*compressible*, service-clustered corpus — the shape §9.27's
   random payload was not); the authoritative 16/32/64 MiB sweep against the
@@ -547,16 +616,19 @@ Mapped to `CLAUDE.md` §6.2; techniques per §5 scenario id:
   bug to "fix" by raising the cap: doing so would let 32/64 MiB coarsen (~2
   groups), the wrong way for pruning. The pruning lever is a *smaller byte
   threshold* (16 MiB, byte-governed → finer groups), the §7 sweep question —
-  not the row cap. **Disposition:** 32 MiB stands as the
-  shipped default (it already delivers the mechanism the RFC0036.2 gate
-  enforces); the data leans toward *smaller* thresholds, so **16 MiB is
-  flagged as a candidate for the authoritative sweep and a maintainer
-  decision** — the default is not changed on indicative numbers. Kept
-  tunable meanwhile via the interim `OURIOS_COMPACTED_RG_BYTES` env knob
-  (bytes, read once at compacted-writer construction), the RFC 0004 knob's
-  precursor; the sweep's own test arm sets T through the explicit
-  `compact_partition_with_flush_threshold` seam (setting a process env var
-  is unsound under `cargo test`'s parallelism).
+  not the row cap. **Disposition (superseded 2026-07-22):** these
+  indicative numbers showed the trade leans toward *smaller* thresholds
+  and, together with §9.29's finding that a *fixed* 32 MiB is inert on
+  real per-hour v8 volume, motivated the §3.3 **adaptive** amendment: the
+  threshold now scales as `input_total / 8`, floored at 1 MiB and capped
+  at 32 MiB, so small hours get the finer groups §9.28 favoured (down to
+  the 1 MiB floor) and large hours stay capped. §9.30 confirms the win at
+  the adaptive default. The authoritative full-v8 sweep of the *ceiling
+  and target-K* against L1/L3 neutrality stays deferred to
+  `baseline-8vcpu-32gib`. Still tunable via the `OURIOS_COMPACTED_RG_BYTES`
+  env knob (overrides the adaptive value) and the explicit
+  `compact_partition_with_flush_threshold` seam (the sweep's test arm;
+  setting a process env var is unsound under `cargo test`'s parallelism).
 - [x] **Sort-key stability definition — settled as lexicographic.**
   The §3.1 key is lexicographic `service.name`, *not*
   first-seen/dictionary ordinal (first-seen is interleaving-dependent

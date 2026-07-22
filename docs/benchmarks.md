@@ -1977,7 +1977,8 @@ stays parked on its own line, unchanged by this run.
 **Purpose.** RFC 0036 slice B (RFC0036.3) makes compaction *sort* the
 partition by (promoted `service.name`, `time_unix_nano`) via the §3.2
 external merge sort and rotate compacted row groups at the smaller
-`COMPACTED_ROW_GROUP_FLUSH_BYTES` (32 MiB). §5 requires that D2/D3 —
+compacted threshold (the fixed 32 MiB in effect at this run; later
+adaptive — §9.30). §5 requires that D2/D3 —
 RFC 0009's compaction-throughput and file-band properties — survive
 the sort. This is the "first measurement" §7 asks for, at `red`: the
 band from which the sorted D2 is set. **Indicative, not
@@ -2267,9 +2268,11 @@ real logs compress and the §3.1 `service.name` sort clusters like lines, so
 finer clustered groups prune sharply (the §9.28 finding-2 mechanism, now on
 real data).
 
-**The threshold caveat — the shipped 32 MiB default does *not* prune a real
-hour (§9.28 finding 3 confirmed).** Real per-hour v8 volume (~a few MiB
-compressed) is **far below** the 32 MiB shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`,
+**The threshold caveat — the then-fixed 32 MiB default did *not* prune a
+real hour (§9.28 finding 3 confirmed; fixed by the §9.30 adaptive
+amendment).** Real per-hour v8 volume (~a few MiB compressed) is **far
+below** the fixed 32 MiB `MAX_COMPACTED_RG_BYTES` (the old
+`COMPACTED_ROW_GROUP_FLUSH_BYTES`),
 so at 32 MiB the busy hour compacts to a **single** row group and nothing
 prunes — the measurement *skips* with a "raise subset / lower threshold"
 message (verified). The win therefore requires a **finer** compacted threshold
@@ -2282,11 +2285,80 @@ subset: **2 MiB → 7 groups, 5.20×**; **4 MiB → 2 groups, 1.32×**; **32 MiB
 group, no prune**. The finer the threshold, the sharper the window prune — the
 §9.28-flagged lever, confirmed on real data.
 
-**Disposition.** This complements §9.26 (no-regression, but structurally
-could not show the win) and §9.27 (synthetic 1.43×) with a **real-corpus**
-before/after (5.20× at 2 MiB). It is **indicative** (local, subset, Ourios-only,
-no Loki) — the authoritative full-v8 L6-scanned-bytes-vs-Loki arm, and the
-32/16 MiB threshold decision it informs, stay deferred to the paid
-`baseline-8vcpu-32gib` harness (RFC 0036 §7 / RFC0036.2). The shipped 32 MiB
-default is unchanged; the data continues to lean toward a **finer** compacted
-threshold as the authoritative-sweep candidate.
+**Disposition (superseded 2026-07-22 — see §9.30).** This complements
+§9.26 (no-regression, but structurally could not show the win) and §9.27
+(synthetic 1.43×) with a **real-corpus** before/after (5.20× at an
+*explicit* 2 MiB threshold). Its central finding — that the **fixed
+32 MiB shipped default is inert on a real per-hour v8 hour** (compacts to
+one group, prunes nothing, the measurement *skipped*), and the win only
+appears at a hand-set finer threshold — is exactly what motivated the
+**RFC 0036 §3.3 adaptive-threshold amendment** (2026-07-22): the
+threshold now scales as `clamp(input_total / 8, 1 MiB, 32 MiB)`, so a
+small real hour floors at 1 MiB and prunes without any operator tuning.
+§9.30 re-runs this same measurement at the **adaptive default** and
+records the win there. The authoritative full-v8 L6-scanned-bytes-vs-Loki
+arm, and the ceiling/target-K sweep, stay deferred to the paid
+`baseline-8vcpu-32gib` harness (RFC 0036 §7 / RFC0036.2).
+
+### 9.30 Results — 2026-07-22 (indicative, local M-series, real-corpus subset, Ourios-only, no Loki) — RFC 0036 window-materialization at the ADAPTIVE default
+
+**Purpose.** §9.28/§9.29 established that a **fixed** compacted row-group
+threshold is the wrong shape: 32 MiB is inert on a real per-hour v8 hour
+(a few MiB compressed → one row group → nothing prunes; §9.29 *skipped*
+at the 32 MiB default), while the same fixed value fragments large hours.
+The **RFC 0036 §3.3 adaptive amendment** (2026-07-22, maintainer-approved)
+replaces it with `adaptive_flush_bytes = clamp(estimated_output_bytes / 8,
+1 MiB, 32 MiB)` — target ~8 groups per partition, floored at 1 MiB (the
+lever for small hours) and capped at 32 MiB (the old fixed value, now the
+ceiling for huge hours). This run is the decisive check: re-run §9.29's
+real-corpus before/after at the **adaptive default** (`OURIOS_V8_COMPACTED_RG_BYTES`
+unset) and confirm the win now appears at the shipped default — not only
+under a hand-set threshold. **Indicative** (local, subset, Ourios-only, no
+Loki), same caveats as §9.29.
+
+**Hardware / run.** Local M-series developer machine (P-cores;
+`taskpolicy -B`), dev build.
+`ourios-bench`'s `rfc0036_realcorpus_window_materialization_before_after`
+(`tests/rfc0036_realcorpus.rs`, `#[ignore]`d), threshold env **unset** so
+the adaptive default governs. Same corpus and same **selection
+procedure** as §9.29 (not a fixed query — the harness derives the
+target/window from the data): the first 120,000 `LogsData` batches
+(513,752,573 B) of `otel-demo-v8/logs.jsonl`, then it dynamically picks
+the busiest compacted partition (most row groups), the most-prunable real
+service in it — which again resolves to **`ad`** (lowest-volume otel-demo
+service, the §9.13 run #17 case) — and that partition's own time span as
+the window. Here the selected partition is the 07:00–08:00 hour, so the
+query is
+`service == "ad" | range(2026-07-07T07:00:00Z, 2026-07-07T08:00:00Z)`
+(a *different* hour from §9.29's dynamically-selected 08:00–09:00 —
+expected, since the partition is re-chosen from the store the adaptive
+build produced, not hard-coded). **Materialization bytes** = the footer
+survivor-chunk sum (RFC 0036 §9 metric, keyed on
+`effective_time_unix_nano`); the live query's `row_groups_scanned`
+cross-checks the footer prediction.
+
+| store | survivors / groups | materialization bytes | query scanned / pruned | rows |
+|---|---|---|---|---|
+| **before** — single unsorted ingest file | 1 / 1 | 3,812,581 | 1 / 0 (whole file) | 9,984 |
+| **after** — compacted, §3.1-sorted @ adaptive (floored to 1 MiB) | 1 / 21 | 500,537 | 1 / 20 | 9,984 |
+
+**Reading — a 7.61× real-corpus materialization-bytes win at the shipped
+default, identical answer.** With the threshold unset, the adaptive value
+floors at 1 MiB for this small real hour and rotates it into **21**
+service-clustered row groups; the `ad` window lands in a **single** group
+and the other **20 prune** on plain footer `service.name`/time statistics.
+The sort takes the one-service window from materialising the whole hour
+(3,812,581 B, one unsorted group) to one clustered group (500,537 B) for
+the identical 9,984-row answer — the live query confirms the footer
+prediction (before scans 1/1, after scans 1/21). This is the point of the
+amendment: **the win now appears at the shipped default**, where the fixed
+32 MiB threshold had *skipped* (§9.29). It is even sharper than §9.29's
+explicit-2 MiB 5.20× — the 1 MiB adaptive floor is finer still, so it
+clusters into more, tighter groups.
+
+**Disposition.** The adaptive default makes RFC 0036 **non-inert on real
+v8** — the fix §9.28/§9.29 pointed at, now measured. The `rfc0036_2_*`
+in-repo gates recompute `T = adaptive_flush_bytes(input_total)` and track
+the layout whatever it resolves to. The authoritative full-v8
+L6-scanned-bytes-vs-Loki arm and the ceiling/target-K sweep stay deferred
+to the paid `baseline-8vcpu-32gib` harness (RFC 0036 §7 / RFC0036.2).

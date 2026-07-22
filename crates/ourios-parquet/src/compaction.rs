@@ -45,8 +45,7 @@ use crate::reader::{Reader, ReaderError};
 use crate::record_batch::mined_records_to_batch_with_promoted;
 use crate::store::{Store, StoreError};
 use crate::writer::{
-    COMPACTED_ROW_GROUP_FLUSH_BYTES, ClusterKeys, DEFAULT_ZSTD_LEVEL, SUB_BATCH_ROWS, Writer,
-    WriterError,
+    ClusterKeys, DEFAULT_ZSTD_LEVEL, MAX_COMPACTED_RG_BYTES, SUB_BATCH_ROWS, Writer, WriterError,
 };
 
 /// One hour in nanoseconds — the span a `…/hour=HH/` partition covers.
@@ -211,19 +210,21 @@ pub fn compact_partition_with_promoted(
 }
 
 /// Like [`compact_partition`] but rotating compacted row groups at an
-/// explicit `flush_bytes` threshold instead of the shipped
-/// `COMPACTED_ROW_GROUP_FLUSH_BYTES` (32 MiB) / `OURIOS_COMPACTED_RG_BYTES`
-/// default — the deterministic seam for the RFC 0036 §7 threshold sweep
-/// (16 / 32 / 64 MiB). This is a **physical-layout knob**, not a schema
-/// or content change: the consolidated rows, their §3.1 order, and the
-/// declared `sorting_columns` are identical for any threshold. Only the
-/// row-group rotation boundaries move — and with them the group count,
-/// each group's statistics/dictionary/page encoding decisions, and the
-/// on-disk size (the whole point of the sweep).
-/// Production compacts via [`compact_partition`] (the env/const default);
-/// the sweep passes an explicit value here so it never sets a process env
-/// var (unsound under `cargo test`'s in-process parallelism — it races
-/// libc `getenv`).
+/// explicit `flush_bytes` threshold instead of the RFC 0036 §3.3
+/// **adaptive** default (`OURIOS_COMPACTED_RG_BYTES` env, else the value
+/// [`adaptive_flush_bytes`](crate::adaptive_flush_bytes) derives from the
+/// partition's input size) — the deterministic seam for the RFC 0036 §7
+/// threshold sweep (16 / 32 / 64 MiB). An explicit threshold wins over
+/// both the env override and the adaptive value. This is a
+/// **physical-layout knob**, not a schema or content change: the
+/// consolidated rows, their §3.1 order, and the declared `sorting_columns`
+/// are identical for any threshold. Only the row-group rotation boundaries
+/// move — and with them the group count, each group's
+/// statistics/dictionary/page encoding decisions, and the on-disk size
+/// (the whole point of the sweep). Production compacts via
+/// [`compact_partition`] (the adaptive default); the sweep passes an
+/// explicit value here so it never sets a process env var (unsound under
+/// `cargo test`'s in-process parallelism — it races libc `getenv`).
 ///
 /// # Errors
 ///
@@ -265,10 +266,10 @@ struct SortTuning {
     /// residency far below one decoded input file.
     fan_in: usize,
     /// RFC 0036 §3.3 compacted row-group rotation threshold override.
-    /// `None` (production) takes the shipped `COMPACTED_ROW_GROUP_FLUSH_BYTES`
-    /// / `OURIOS_COMPACTED_RG_BYTES` default; `Some(t)` pins it for the
-    /// §7 threshold sweep's deterministic seam
-    /// ([`compact_partition_with_flush_threshold`]).
+    /// `None` (production) takes the adaptive default (`OURIOS_COMPACTED_RG_BYTES`
+    /// env, else [`adaptive_flush_bytes`](crate::adaptive_flush_bytes) of the
+    /// partition's input size); `Some(t)` pins it for the §7 threshold
+    /// sweep's deterministic seam ([`compact_partition_with_flush_threshold`]).
     compacted_flush_bytes: Option<usize>,
 }
 
@@ -336,6 +337,15 @@ fn compact_sorted(
         (1, read_manifest_etag(store, &key)?)
     };
 
+    // RFC 0036 §3.3 adaptive row-group threshold: estimate the output size
+    // as the sum of the live input files' sizes (the sorted output is the
+    // same rows re-compressed, so this is a safe upper estimate), and let
+    // the writer scale the rotation threshold to ~K groups from it. An
+    // explicit `tuning.compacted_flush_bytes` (the sweep seam) or the
+    // `OURIOS_COMPACTED_RG_BYTES` env override takes precedence over the
+    // adaptive value (resolved in `open_in_compacted`).
+    let estimated_output_bytes = sum_input_sizes(store, partition, &inputs)?;
+
     // RFC 0036 §3.2 external merge sort into the consolidated file.
     // Phase 1 decodes the inputs strictly one at a time, so its peak is
     // one fully-decoded input — the same bound the pre-sort streaming
@@ -351,6 +361,7 @@ fn compact_sorted(
         promoted.clone(),
         keys,
         tuning.compacted_flush_bytes,
+        estimated_output_bytes,
     )
     .map_err(CompactionError::Write)?;
     let (row_count, bytes_read) = sort_inputs_into(
@@ -647,8 +658,10 @@ impl<'a> RunWriter<'a> {
         for chunk in records.chunks(SUB_BATCH_ROWS) {
             // Cap the buffered row group so writing an intermediate
             // merge run never holds the whole merged output encoded in
-            // memory (the §3.2 phase-2 bound).
-            if self.inner.in_progress_size() >= COMPACTED_ROW_GROUP_FLUSH_BYTES {
+            // memory (the §3.2 phase-2 bound). Intermediate runs are
+            // write-once scratch, so the fixed ceiling is fine here — the
+            // adaptive threshold governs only the final consolidated file.
+            if self.inner.in_progress_size() >= MAX_COMPACTED_RG_BYTES {
                 self.inner.flush().map_err(parquet_write)?;
             }
             let batch = mined_records_to_batch_with_promoted(chunk, self.promoted)
@@ -1163,6 +1176,32 @@ fn live_file_keys(
         .into_iter()
         .filter(|k| is_committed_parquet(k) && is_immediate_child(k, &prefix))
         .collect())
+}
+
+/// Sum the on-disk byte sizes of the partition's live input files — the
+/// RFC 0036 §3.3 `estimated_output_bytes` the adaptive row-group threshold
+/// scales from (the sorted output re-compresses the same rows, so the
+/// input total is a safe upper estimate). One `list_with_sizes` over the
+/// partition prefix (the same call `is_candidate` uses to size small-file
+/// candidates), summing only the keys named in `inputs`. An input absent
+/// from the listing (a listing that raced a delete omits the key entirely)
+/// simply isn't summed — the estimate only steers the threshold within its
+/// clamp, so an under-count at worst floors it, never mis-sizes upward.
+fn sum_input_sizes(
+    store: &Store,
+    partition: &PartitionKey,
+    inputs: &[String],
+) -> Result<u64, CompactionError> {
+    let prefix = partition_data_prefix(partition);
+    let wanted: HashSet<&str> = inputs.iter().map(String::as_str).collect();
+    let entries = store
+        .list_with_sizes_blocking(Some(&prefix))
+        .map_err(|e| store_io("list", &prefix, e))?;
+    Ok(entries
+        .iter()
+        .filter(|(key, _)| wanted.contains(key.as_str()))
+        .map(|(_, size)| *size)
+        .sum())
 }
 
 /// Read the partition's `manifest.json` through the [`Store`], discarding the

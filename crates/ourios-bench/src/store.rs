@@ -154,13 +154,13 @@ pub fn build_comparative_store_compacted(
 
 /// Like [`build_comparative_store_compacted`] but rotating the compacted row
 /// groups at an explicit `flush_bytes` threshold
-/// ([`compact_partition_with_flush_threshold`]) instead of the shipped
-/// `COMPACTED_ROW_GROUP_FLUSH_BYTES` default. The RFC 0036 §9.29 measurement
-/// uses this because real per-hour v8 volume is far below the 32 MiB default
-/// (the §9.28 finding-3 reality — a real hour compacts to a single 32 MiB row
-/// group, so nothing prunes); a finer threshold rotates the real busy hour
-/// into the several service-clustered groups the pruning mechanism needs.
-/// `None` is exactly [`build_comparative_store_compacted`].
+/// ([`compact_partition_with_flush_threshold`]) instead of the RFC 0036 §3.3
+/// **adaptive** default. `Some(t)` pins the threshold (the §9.29 threshold
+/// sensitivity sweep uses this); `None` is exactly
+/// [`build_comparative_store_compacted`] — the adaptive default, which on a
+/// small real-v8 hour floors at 1 MiB and so rotates the hour into the
+/// several service-clustered groups the pruning mechanism needs (§9.30,
+/// where the fixed 32 MiB default was inert — §9.28/§9.29).
 ///
 /// # Errors
 ///

@@ -1,19 +1,25 @@
-//! RFC 0036 §9.29 — real-corpus window-materialization before/after
-//! (indicative, local, Ourios-only, no Loki).
+//! RFC 0036 §9.30 — real-corpus window-materialization before/after at the
+//! **adaptive** default (indicative, local, Ourios-only, no Loki).
 //!
 //! §9.26 proved the frozen RFC 0031 comparative harness writes one ingest
 //! file per partition, so `compact_partition` no-ops and RFC 0036's sort never
 //! runs there — every `ourios_bytes_read` was byte-identical pre/post-0036.
-//! §9.27 measured the before/after on a *synthetic* hour (1.43×). This test is
-//! the real-otel-demo-corpus analogue: it builds the store two ways from a
-//! **subset** of the v8 capture —
+//! §9.27 measured the before/after on a *synthetic* hour (1.43×). §9.29 first
+//! measured the real corpus but only with an *explicit* finer threshold,
+//! because the then-fixed 32 MiB default compacted a real hour to one group
+//! and pruned nothing. This test is the real-otel-demo-corpus analogue run at
+//! the RFC 0036 §3.3 **adaptive** default (threshold env unset → the adaptive
+//! value, which floors at 1 MiB for a small real hour): the point being that
+//! the win now appears at the shipped default, not only under a hand-set
+//! threshold. It builds the store two ways from a **subset** of the v8
+//! capture —
 //!
 //! - **before**: the default single-file [`build_comparative_store`] (no
 //!   compaction — the frozen store shape);
 //! - **after**: the opt-in [`build_comparative_store_compacted_with_threshold`]
 //!   (two ingest files per partition, then `compact_partition` sorts by
-//!   (`service.name`, time), rotates row groups, and declares
-//!   `sorting_columns`) —
+//!   (`service.name`, time), rotates row groups at the adaptive threshold, and
+//!   declares `sorting_columns`) —
 //!
 //! then runs one L6-shape window query (one service, a narrow time window in
 //! the busiest hour) against each and reads the **materialization bytes** (the
@@ -22,7 +28,8 @@
 //!
 //! `#[ignore]`d and heavy (mines a real-corpus subset twice). It **skips with
 //! a clear message** when the gitignored v8 capture is absent, so it never
-//! fails CI or another machine. Run manually to (re)produce §9.29:
+//! fails CI or another machine. Run manually to (re)produce §9.30 (adaptive
+//! default — do NOT set `OURIOS_V8_COMPACTED_RG_BYTES`):
 //!
 //! ```text
 //! OURIOS_V8_CORPUS=scratch/baseline/otel-demo-v8/logs.jsonl.gz \
@@ -31,12 +38,14 @@
 //!
 //! Knobs (env): `OURIOS_V8_CORPUS` (path to `logs.jsonl`/`.jsonl.gz`),
 //! `OURIOS_V8_SUBSET_LINES` (default `120_000` `LogsData` batches),
-//! `OURIOS_V8_COMPACTED_RG_BYTES` (compacted row-group threshold, default
-//! 2 MiB — real per-hour v8 volume is far below the 32 MiB shipped default, so
-//! a finer threshold is what rotates the real busy hour into the several
-//! service-clustered groups the pruning mechanism needs; §9.28 finding 3. At
-//! the shipped 32 MiB a real hour compacts to a single group and the test
-//! skips with a "raise subset / lower threshold" message).
+//! `OURIOS_V8_COMPACTED_RG_BYTES` (compacted row-group threshold — **unset
+//! by default**, so compaction runs at the RFC 0036 §3.3 **adaptive**
+//! threshold, which floors at 1 MiB for a small real-v8 hour and so
+//! rotates the busy hour into the several service-clustered groups the
+//! pruning mechanism needs; §9.30. Set it to a byte count to pin an
+//! explicit threshold for the §9.29 sensitivity sweep. The old *fixed*
+//! 32 MiB default was inert on real v8 — a real hour compacted to one
+//! group and nothing pruned; the adaptive default is what fixes that).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -55,7 +64,6 @@ use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
 const DEFAULT_SUBSET_LINES: usize = 120_000;
-const DEFAULT_COMPACTED_RG_BYTES: usize = 2 * 1024 * 1024;
 const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// Resolve the v8 corpus path: `OURIOS_V8_CORPUS` first, else the default
@@ -326,19 +334,41 @@ fn env_usize(key: &str, default: usize) -> usize {
 // feeds the next, so factoring them into helpers would only scatter the
 // data-flow; the length is inherent to a self-contained before/after.
 #[allow(clippy::too_many_lines)]
-#[ignore = "heavy RFC 0036 §9.29 real-corpus measurement — run manually with the v8 capture present"]
+#[ignore = "heavy RFC 0036 §9.30 real-corpus measurement — run manually with the v8 capture present"]
 #[tokio::test]
 async fn rfc0036_realcorpus_window_materialization_before_after() {
     let Some(corpus_src) = resolve_corpus() else {
         eprintln!(
-            "RFC0036 §9.29: SKIP — v8 capture not found. Set OURIOS_V8_CORPUS to a \
+            "RFC0036 §9.30: SKIP — v8 capture not found. Set OURIOS_V8_CORPUS to a \
              logs.jsonl[.gz], or place it under scratch/baseline/otel-demo-v8/. \
              (The corpus is gitignored; this measurement is indicative and manual.)"
         );
         return;
     };
     let subset_lines = env_usize("OURIOS_V8_SUBSET_LINES", DEFAULT_SUBSET_LINES);
-    let threshold = env_usize("OURIOS_V8_COMPACTED_RG_BYTES", DEFAULT_COMPACTED_RG_BYTES);
+    // Unset ⇒ `None` ⇒ the RFC 0036 §3.3 adaptive threshold (the default the
+    // §9.30 measurement runs at); an explicit positive value pins the
+    // threshold for the sensitivity sweep.
+    let threshold: Option<usize> = std::env::var("OURIOS_V8_COMPACTED_RG_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    // The adaptive branch demonstrates the *true default*. The library's own
+    // `OURIOS_COMPACTED_RG_BYTES` (note: no `V8_`) overrides `compact_partition`'s
+    // adaptive threshold, so if it is set here it would silently confound the
+    // measurement — fail loud rather than mislabel the run "adaptive".
+    assert!(
+        !(threshold.is_none()
+            && std::env::var_os(ourios_parquet::COMPACTED_RG_BYTES_ENV).is_some()),
+        "the adaptive §9.30 measurement (OURIOS_V8_COMPACTED_RG_BYTES unset) requires the library \
+         override {} to be UNSET — it would override the adaptive threshold and confound the run; \
+         unset it, or set OURIOS_V8_COMPACTED_RG_BYTES to pin an explicit threshold instead",
+        ourios_parquet::COMPACTED_RG_BYTES_ENV,
+    );
+    let threshold_label = match threshold {
+        Some(t) => format!("{t} B (explicit)"),
+        None => "adaptive (RFC 0036 §3.3, floors at 1 MiB)".to_string(),
+    };
 
     // --- Subset the capture into a temp corpus dir ---
     let corpus_dir = tempfile::TempDir::new().expect("corpus dir");
@@ -346,8 +376,8 @@ async fn rfc0036_realcorpus_window_materialization_before_after() {
     let lines = write_subset(&corpus_src, &subset_path, subset_lines).expect("write subset");
     let subset_bytes = std::fs::metadata(&subset_path).expect("stat subset").len();
     eprintln!(
-        "RFC0036 §9.29: corpus {} — subset {lines} LogsData batches ({subset_bytes} B); \
-         compacted row-group threshold {threshold} B",
+        "RFC0036 §9.30: corpus {} — subset {lines} LogsData batches ({subset_bytes} B); \
+         compacted row-group threshold {threshold_label}",
         corpus_src.display(),
     );
 
@@ -362,7 +392,7 @@ async fn rfc0036_realcorpus_window_materialization_before_after() {
         corpus_dir.path(),
         after_bucket.path(),
         TxtSeverity::Fixed,
-        Some(threshold),
+        threshold,
     )
     .expect("after build (multi-file, compacted)");
     assert_eq!(
@@ -374,9 +404,9 @@ async fn rfc0036_realcorpus_window_materialization_before_after() {
     // --- Pick the busiest compacted partition (most row groups) ---
     let Some((after_path, after_groups)) = busiest_multigroup_file(after_bucket.path()) else {
         eprintln!(
-            "RFC0036 §9.29: SKIP — no compacted partition rotated into ≥ 2 row groups at \
-             threshold {threshold} B on this {lines}-batch subset (real per-hour v8 volume is \
-             small; §9.28 finding 3). Raise OURIOS_V8_SUBSET_LINES or lower \
+            "RFC0036 §9.30: SKIP — no compacted partition rotated into ≥ 2 row groups at \
+             threshold {threshold_label} on this {lines}-batch subset (real per-hour v8 volume \
+             is small; §9.28 finding 3). Raise OURIOS_V8_SUBSET_LINES or set a finer \
              OURIOS_V8_COMPACTED_RG_BYTES."
         );
         return;
@@ -431,10 +461,10 @@ async fn rfc0036_realcorpus_window_materialization_before_after() {
     // `NNN` as `N.NNx`. `u128` so the ×100 can't overflow at corpus scale.
     let win_x100 = u128::from(before_bytes) * 100 / u128::from(after_bytes.max(1));
     eprintln!(
-        "RFC0036 §9.29 before/after (query `{src}`, target service `{target}`):\n  \
+        "RFC0036 §9.30 before/after (query `{src}`, target service `{target}`):\n  \
          before  — uncompacted single file: survivors {}/{} groups, {} materialization bytes \
          (query scanned {before_scanned}, pruned {before_pruned}), rows {before_rows}\n  \
-         after   — compacted @ {threshold} B: survivors {}/{} groups, {} materialization bytes \
+         after   — compacted @ {threshold_label}: survivors {}/{} groups, {} materialization bytes \
          (query scanned {after_scanned}, pruned {after_pruned}), rows {after_rows}\n  \
          materialization-bytes win {}.{:02}x",
         before_survivors.len(),

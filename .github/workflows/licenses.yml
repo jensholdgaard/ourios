@@ -1,0 +1,65 @@
+name: licenses
+
+# Third-party license attribution gate. Regenerates THIRD-PARTY-LICENSES.md
+# with cargo-about and fails on drift — the same no-diff pattern as the semconv
+# codegen gate in ci.yml. Dependency changes are what move the attribution, so
+# it is path-filtered to the files that can change the shipped license set.
+#
+# cargo-about's `accepted` set (about.toml) MIRRORS the deny.toml allow-list;
+# cargo-deny (the `deny` job in ci.yml) stays the enforcement gate. A new
+# dependency under a non-accepted license fails `cargo about generate` outright,
+# and `--fail` also errors on any crate whose license can't be resolved — a
+# second license signal alongside cargo-deny.
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - about.toml
+      - about.hbs
+      - THIRD-PARTY-LICENSES.md
+      - .github/workflows/licenses.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - about.toml
+      - about.hbs
+      - THIRD-PARTY-LICENSES.md
+      - .github/workflows/licenses.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  licenses:
+    name: cargo about (no-diff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (pinned); channel via toolchain input
+        with:
+          toolchain: stable
+      # Pin cargo-about so the attribution is reproducible and the no-diff gate
+      # can't flake on a new release changing output; bump deliberately
+      # alongside any about.toml / about.hbs change.
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: cargo-about@0.9.1
+      - name: Regenerate THIRD-PARTY-LICENSES.md
+        run: cargo about generate --fail about.hbs > THIRD-PARTY-LICENSES.md
+      - name: Verify attribution is in sync
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code THIRD-PARTY-LICENSES.md; then
+            echo "::error::THIRD-PARTY-LICENSES.md is out of date. Run 'cargo about generate about.hbs > THIRD-PARTY-LICENSES.md' and commit."
+            exit 1
+          fi

@@ -353,6 +353,18 @@ async fn rfc0036_realcorpus_window_materialization_before_after() {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0);
+    // The adaptive branch demonstrates the *true default*. The library's own
+    // `OURIOS_COMPACTED_RG_BYTES` (note: no `V8_`) overrides `compact_partition`'s
+    // adaptive threshold, so if it is set here it would silently confound the
+    // measurement — fail loud rather than mislabel the run "adaptive".
+    assert!(
+        !(threshold.is_none()
+            && std::env::var_os(ourios_parquet::COMPACTED_RG_BYTES_ENV).is_some()),
+        "the adaptive §9.30 measurement (OURIOS_V8_COMPACTED_RG_BYTES unset) requires the library \
+         override {} to be UNSET — it would override the adaptive threshold and confound the run; \
+         unset it, or set OURIOS_V8_COMPACTED_RG_BYTES to pin an explicit threshold instead",
+        ourios_parquet::COMPACTED_RG_BYTES_ENV,
+    );
     let threshold_label = match threshold {
         Some(t) => format!("{t} B (explicit)"),
         None => "adaptive (RFC 0036 §3.3, floors at 1 MiB)".to_string(),

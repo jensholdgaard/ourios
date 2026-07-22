@@ -20,7 +20,7 @@ use ourios_core::record::{BodyKind, MinedRecord, Param};
 use ourios_core::tenant::TenantId;
 use ourios_parquet::promoted::{RESOURCE_PREFIX, SERVICE_NAME_KEY};
 use ourios_parquet::{
-    PartitionKey, Store, Writer, adaptive_flush_bytes, columns, compact_partition,
+    PartitionKey, Store, Writer, adaptive_flush_bytes, columns,
     compact_partition_with_flush_threshold,
 };
 use ourios_querier::Querier;
@@ -221,11 +221,19 @@ fn seed_and_compact(
         .filter(|(k, _)| k.ends_with(".parquet"))
         .map(|(_, size)| *size)
         .sum();
-    let committed = compact_partition(store, part)
-        .expect("compact")
-        .committed
-        .expect("≥2 inputs ⇒ a commit")
-        .file;
+    // Compact through the EXPLICIT-threshold seam at exactly the adaptive
+    // value, not the default `compact_partition`: the bound below keys on
+    // `adaptive_flush_bytes(input_total)`, and pinning the threshold here
+    // makes the measurement env-independent (a stray `OURIOS_COMPACTED_RG_BYTES`
+    // can't make compaction rotate at a value the bound didn't expect). The
+    // adaptive *default wiring* is covered by the writer unit tests and the
+    // v8 §9.30 measurement, not this synthetic bound.
+    let committed =
+        compact_partition_with_flush_threshold(store, part, adaptive_flush_bytes(input_total))
+            .expect("compact")
+            .committed
+            .expect("≥2 inputs ⇒ a commit")
+            .file;
     (committed, input_total)
 }
 

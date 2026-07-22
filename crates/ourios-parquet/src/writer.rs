@@ -1248,7 +1248,7 @@ mod tests {
     /// pure parse helper so no process env var is touched (unsound under
     /// parallel tests).
     #[test]
-    fn compacted_flush_override_parses_or_falls_back() {
+    fn compacted_flush_env_parses_positive_else_none() {
         assert_eq!(
             parse_compacted_flush_bytes(Some("16777216")),
             Some(16 * 1024 * 1024)
@@ -1284,6 +1284,36 @@ mod tests {
         assert_eq!(adaptive_flush_bytes(4_000_000), MIN_COMPACTED_RG_BYTES);
         // Degenerate: a zero estimate still floors, never rotating at 0.
         assert_eq!(adaptive_flush_bytes(0), MIN_COMPACTED_RG_BYTES);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// RFC 0036 §3.3 — `adaptive_flush_bytes` invariants over the whole
+        /// `u64` estimate domain: the result is always inside the
+        /// [`MIN_COMPACTED_RG_BYTES`, `MAX_COMPACTED_RG_BYTES`] clamp, and it
+        /// is monotonic non-decreasing in the estimate (a larger partition
+        /// never gets a *smaller* row-group threshold). Together these pin
+        /// the "target-K, clamped" contract the worked-example test samples.
+        #[test]
+        fn adaptive_flush_bytes_is_clamped_and_monotonic(
+            a in proptest::prelude::any::<u64>(),
+            b in proptest::prelude::any::<u64>(),
+        ) {
+            for est in [a, b] {
+                let t = adaptive_flush_bytes(est);
+                proptest::prop_assert!(
+                    (MIN_COMPACTED_RG_BYTES..=MAX_COMPACTED_RG_BYTES).contains(&t),
+                    "adaptive_flush_bytes({est}) = {t} outside [{MIN_COMPACTED_RG_BYTES}, \
+                     {MAX_COMPACTED_RG_BYTES}]",
+                );
+            }
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            proptest::prop_assert!(
+                adaptive_flush_bytes(lo) <= adaptive_flush_bytes(hi),
+                "non-monotonic: f({lo}) > f({hi})",
+            );
+        }
     }
 
     /// An out-of-range zstd level fails up front (mirrors the file writer's

@@ -295,7 +295,7 @@ Compacted output rotates row groups at an **adaptive, per-partition
 threshold** (ingest-side files keep the fixed 128 MiB
 `ROW_GROUP_FLUSH_BYTES`):
 
-```
+```text
 adaptive_flush_bytes = clamp(
     estimated_output_bytes / TARGET_COMPACTED_ROW_GROUPS,
     MIN_COMPACTED_RG_BYTES,
@@ -306,10 +306,14 @@ adaptive_flush_bytes = clamp(
 - **`TARGET_COMPACTED_ROW_GROUPS = 8`** — the group-count target: enough
   to cluster services and give pruning granularity, not so many the
   per-group footer/page-index overhead dominates.
-- **`MIN_COMPACTED_RG_BYTES = 1 MiB`** — the floor. A tiny partition
-  (estimate / K below 1 MiB) still splits into a few groups rather than
-  collapsing to one; **this is the lever that makes small real-v8 hours
-  prunable** (§9.29/§9.30). No sub-MiB fragmentation below it.
+- **`MIN_COMPACTED_RG_BYTES = 1 MiB`** — the floor. It bounds the
+  *minimum* row-group size and so prevents sub-MiB fragmentation; it does
+  **not** force multiple groups. A partition whose total is below the
+  floor is still a single row group (there is nothing to split), and a
+  partition splits into two only once it exceeds ~2× the floor. Its role
+  is that a small-but-not-tiny hour — a few MiB compressed — rotates into
+  several ~1 MiB groups instead of one, **the lever that makes small
+  real-v8 hours prunable** (§9.29/§9.30).
 - **`MAX_COMPACTED_RG_BYTES = 32 MiB`** — the ceiling (the old fixed
   `COMPACTED_ROW_GROUP_FLUSH_BYTES` value). A huge partition gets *more*
   than K groups, each capped at 32 MiB, so a compacted row group never

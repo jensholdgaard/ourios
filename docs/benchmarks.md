@@ -2320,15 +2320,22 @@ Loki), same caveats as §9.29.
 `taskpolicy -B`), dev build.
 `ourios-bench`'s `rfc0036_realcorpus_window_materialization_before_after`
 (`tests/rfc0036_realcorpus.rs`, `#[ignore]`d), threshold env **unset** so
-the adaptive default governs. Same corpus/query selection as §9.29: the
-first 120,000 `LogsData` batches (513,752,573 B) of `otel-demo-v8/logs.jsonl`,
-busiest compacted partition, most-prunable real service — which again
-resolves to **`ad`** (lowest-volume otel-demo service, the §9.13 run #17
-case) — and the busy hour as the window:
-`service == "ad" | range(2026-07-07T07:00:00Z, 2026-07-07T08:00:00Z)`.
-**Materialization bytes** = the footer survivor-chunk sum (RFC 0036 §9
-metric, keyed on `effective_time_unix_nano`); the live query's
-`row_groups_scanned` cross-checks the footer prediction.
+the adaptive default governs. Same corpus and same **selection
+procedure** as §9.29 (not a fixed query — the harness derives the
+target/window from the data): the first 120,000 `LogsData` batches
+(513,752,573 B) of `otel-demo-v8/logs.jsonl`, then it dynamically picks
+the busiest compacted partition (most row groups), the most-prunable real
+service in it — which again resolves to **`ad`** (lowest-volume otel-demo
+service, the §9.13 run #17 case) — and that partition's own time span as
+the window. Here the selected partition is the 07:00–08:00 hour, so the
+query is
+`service == "ad" | range(2026-07-07T07:00:00Z, 2026-07-07T08:00:00Z)`
+(a *different* hour from §9.29's dynamically-selected 08:00–09:00 —
+expected, since the partition is re-chosen from the store the adaptive
+build produced, not hard-coded). **Materialization bytes** = the footer
+survivor-chunk sum (RFC 0036 §9 metric, keyed on
+`effective_time_unix_nano`); the live query's `row_groups_scanned`
+cross-checks the footer prediction.
 
 | store | survivors / groups | materialization bytes | query scanned / pruned | rows |
 |---|---|---|---|---|

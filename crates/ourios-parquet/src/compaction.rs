@@ -1183,9 +1183,10 @@ fn live_file_keys(
 /// scales from (the sorted output re-compresses the same rows, so the
 /// input total is a safe upper estimate). One `list_with_sizes` over the
 /// partition prefix (the same call `is_candidate` uses to size small-file
-/// candidates), summing only the keys named in `inputs`. A missing size
-/// (a listing that raced a delete) contributes 0 — the estimate only steers
-/// the threshold within its clamp, so a low estimate at worst floors it.
+/// candidates), summing only the keys named in `inputs`. An input absent
+/// from the listing (a listing that raced a delete omits the key entirely)
+/// simply isn't summed — the estimate only steers the threshold within its
+/// clamp, so an under-count at worst floors it, never mis-sizes upward.
 fn sum_input_sizes(
     store: &Store,
     partition: &PartitionKey,

@@ -25,7 +25,7 @@ use ourios_core::tenant::TenantId;
 use ourios_parquet::promoted::{RESOURCE_PREFIX, SERVICE_NAME_KEY, project_string_value};
 use ourios_parquet::{
     MANIFEST_FILENAME, Manifest, PartitionKey, Reader, SUB_BATCH_ROWS, Store, Writer,
-    adaptive_flush_bytes, columns, compact_partition,
+    adaptive_flush_bytes, columns, compact_partition, compact_partition_with_flush_threshold,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData, SortingColumn};
@@ -255,7 +255,13 @@ fn rfc0036_1_compacted_layout() {
         );
     }
 
-    let outcome = compact_partition(&store, &part).expect("compact");
+    // Compact through the EXPLICIT-threshold seam at exactly the adaptive
+    // value the writer would derive, so the size bounds below key on the
+    // same `T` regardless of any `OURIOS_COMPACTED_RG_BYTES` in the
+    // environment (the default adaptive wiring is covered by the writer
+    // unit tests and the v8 §9.30 measurement).
+    let outcome =
+        compact_partition_with_flush_threshold(&store, &part, adaptive_threshold).expect("compact");
     let committed = outcome.committed.expect("committed");
     let bytes = consolidated_bytes(&store, &part, &committed.file);
 

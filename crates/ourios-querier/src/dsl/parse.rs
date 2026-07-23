@@ -1044,7 +1044,10 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RParen, "')' to close bucket(...)")?;
                 Ok(GroupTerm::Bucket(width))
             }
-            _ => Ok(GroupTerm::Field(self.parse_field()?)),
+            // A bare field, or (RFC 0037 §3.3) a `resource.`/`attr.` path —
+            // `parse_path` accepts both; the compiler gates the path forms on
+            // the key being a promoted column.
+            _ => Ok(GroupTerm::Field(self.parse_path()?)),
         }
     }
 

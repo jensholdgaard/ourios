@@ -10,6 +10,11 @@
 #   count by attr.model       — calls per model      (from api_request events)
 #   count by attr.tool_name   — tool-use distribution (from tool_decision events)
 #   count by attr.decision    — accept/deny mix       (from tool_decision events)
+# These are Claude Code's *actual* (flat) attribute keys, verified against its
+# OTLP output — not the OTel GenAI semantic-convention dotted form
+# (gen_ai.request.model, gen_ai.tool.name, …), which Claude Code does not emit;
+# promoting those would make always-null columns. A semconv-conformant source,
+# or a Collector+OTTL remap to the dotted names, would promote those instead.
 # Promotion is a write-side projection, so it applies to telemetry captured
 # *after* the server starts with this config.
 #

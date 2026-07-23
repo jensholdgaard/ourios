@@ -1,7 +1,7 @@
 ---
 rfc: 0037
 title: GenAI / structured-event log handling
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-22
@@ -11,12 +11,17 @@ superseded-by: —
 
 # RFC 0037 — GenAI / structured-event log handling
 
-> **Status: `specified`.** §§1–4 and §§7–8 are filled; §5 acceptance
-> criteria are frozen below (2026-07-23) and confirmed testable in
-> principle — the gate for `specified`. Implementation proceeds in slices
-> (§3.1 event-keyed templates, §3.2 fidelity + `structured_body_bytes`
-> observability, §3.3 group-by-promoted-attribute), each turning its §5
-> scenario green; `validated` waits on the v9 corpus (§3.4).
+> **Status: `green` (2026-07-23).** All five §5 acceptance scenarios pass.
+> Implementation landed in three slices — §3.1 event-keyed templates (#599),
+> §3.2 fidelity + `structured_body_bytes` observability (#600), §3.3
+> group-by-promoted-attribute (#601) — carrying **RFC0037.1** (miner
+> `rfc0037_1_*` example + property tests), **RFC0037.3** (miner
+> `rfc0037_3_*` unit + `tests/rfc0037_structured_body.rs` integration), and
+> **RFC0037.4** (`ourios-querier` `rfc0037_4_count_by_promoted_attribute`).
+> **RFC0037.2** (structured-body reconstruction) and **RFC0037.5**
+> (absent-body parity) are covered by the standing reconstruction property
+> (RFC 0024 generates structured bodies) and `rfc0025_absent_body.rs`
+> respectively — see §6. `validated` waits on the v9 corpus (§3.4).
 >
 > **Direction resolved 2026-07-22 (maintainer): the §3.2 fork is decided
 > — Option A (full fidelity + observability).** Structured bodies are never
@@ -344,24 +349,38 @@ test code so the mapping is greppable (`docs/verification.md` §2):
 
 ## 6. Testing strategy
 
-- **§3.1 / §3.5:** unit + corpus tests in `ourios-miner` over the GenAI
-  fixture; assert template-id distinctness and the RFC 0025 absent-body
-  parity. Corpus metrics (template count, merge rate) re-baselined for the
-  fixture per CLAUDE.md §6.2.
-- **§3.3 reconstruction:** `proptest` over generated structured `AnyValue`
-  bodies — render-from-store equals canonical JSON byte-for-byte or the
-  record is flagged lossy (the standing reconstruction property, extended
-  to the structured path).
-- **§3.2 fidelity + observability:** a `proptest` that a structured body of
-  any size round-trips byte-for-byte and stays non-lossy; a unit test that
-  the `structured_body_bytes` metric records the canonical-JSON length; a
-  `criterion` guard that large structured bodies do not regress the
-  WAL→Parquet hot path.
-- **§3.3 grouped count:** querier integration test asserting the
-  `(bucket, group_key)` map equals a brute-force count, plus a rejection
-  test for the non-promoted key. Reuses the RFC 0031 L4 comparison unit.
-- **Calibration:** on v9, RFC 0024 manifest regenerated; C1/C2 per-service
-  reconstruction over the GenAI corpus.
+Each scenario maps to a greppable test (`docs/verification.md` §2):
+
+- **RFC0037.1 (§3.1):** `ourios-miner` `cluster.rs`
+  `rfc0037_1_event_name_distinguishes_structured_templates` (example) and
+  `rfc0037_1_structured_key_is_the_whole_template_identity` (`proptest` over
+  arbitrary `(severity, scope, event_name)` tuples), plus
+  `snapshot.rs` `structured_template_record_without_event_name_restores_as_none`
+  (the `#[serde(default)]` migration).
+- **RFC0037.2 (structured-body reconstruction):** covered by the standing
+  reconstruction property — RFC 0024's `ourios-*` property tests generate
+  structured `AnyValue` bodies and assert render-from-store equals canonical
+  JSON byte-for-byte (or lossy) — plus the miner RFC0001.9 canonical-body
+  round-trip (`rfc_internal.rs`) and the Parquet Structured-row round-trips
+  in `rfc0025_absent_body.rs` / `rfc0021_arrow_upgrade.rs`. The byte-for-byte
+  retention is pinned directly by `rfc0037_3_structured_body_retained_byte_for_byte`.
+- **RFC0037.3 (§3.2 fidelity + observability):** `ourios-miner` `cluster.rs`
+  `rfc0037_3_structured_body_retained_byte_for_byte` (colocated unit, byte
+  identity + non-lossy) and `tests/rfc0037_structured_body.rs`
+  `rfc0037_3_structured_body_unbounded_fidelity_and_observability` (the
+  `structured_body_bytes` histogram records the canonical-JSON length under
+  the required `ourios.tenant` + `ourios.service` attribute set, via the
+  in-memory meter).
+- **RFC0037.4 (§3.3 grouped count):** `ourios-querier`
+  `tests/it/rfc0002_dsl.rs` `rfc0037_4_count_by_promoted_attribute` — the
+  `(bucket, model) → count` map equals a brute-force oracle (RFC 0031 L4
+  shape); the non-promoted key is rejected with a hint naming the raw config
+  key + sublist.
+- **RFC0037.5 (absent-body parity):** covered by RFC 0025's
+  `rfc0025_absent_body.rs` (`body_kind = Absent`, `body` cell `NULL`).
+- **Calibration (deferred to v9):** RFC 0024 manifest regenerated; C1/C2
+  per-service reconstruction over the GenAI corpus. This is the remaining
+  work for `validated`.
 
 ## 7. Open questions
 

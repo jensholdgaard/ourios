@@ -244,8 +244,9 @@ pub struct QueryResult {
 pub struct AggregateGroup {
     /// The group-key values, one per `by` term in query order: a field or
     /// `param(n)` as its stored string form, `bucket(width)` as the RFC 3339
-    /// UTC start of the half-open window `[k·width, (k+1)·width)`. Empty for
-    /// a bare `count`.
+    /// UTC start of the half-open window `[k·width, (k+1)·width)`. Empty for a
+    /// bare aggregation with no `by` — a `count` or a scalar `sum`/`min`/`max`/
+    /// `avg` (the single group folding every matching row).
     pub key: Vec<String>,
     /// The number of matching rows in this group (always populated — a scalar
     /// aggregate also carries its group's `COUNT(*)`).

@@ -659,7 +659,8 @@ pub(crate) struct LogQueryResponse {
 
 #[derive(Serialize)]
 struct AggregateGroupDto {
-    /// One entry per `by` term in query order; empty for a bare `count`.
+    /// One entry per `by` term in query order; empty for a bare aggregation
+    /// with no `by` (a `count` or a scalar `sum`/`min`/`max`/`avg`).
     key: Vec<String>,
     count: u64,
     /// The scalar aggregate result (`sum`/`min`/`max`/`avg`). Nested so the

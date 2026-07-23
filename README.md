@@ -52,29 +52,23 @@ modes of template mining rather than pretending they don't exist.
 
 ---
 
-## Why another logs backend?
+## What Ourios is for
 
-Existing backends optimise for different things:
-
-- **Loki** optimises for cheap ingest; queries grep bytes and scale by
-  throwing containers at them.
-- **ClickHouse** optimises for general analytical SQL; logs are one
-  workload among many.
-- **Elasticsearch** optimises for full-text search with inverted indexes;
-  storage cost and operational burden are the price.
-
-Ourios optimises for **logs specifically** by exploiting two facts about
-logs that other backends ignore:
+Ourios is built for **logs specifically**, by leaning on two facts about
+how logs behave:
 
 1. Log lines are generated from a small number of `printf` templates.
    Mine the template once, key every occurrence by a small, stable
    `template_id`, and selective queries prune to the row groups that
    can contain their answer.
 2. The most common log query shape is "filter by time + attributes, fetch
-   a bounded result." This is exactly what Parquet + DataFusion is
-   already good at when the file layout is right.
+   a bounded result" — exactly what Parquet + DataFusion is already good
+   at when the file layout is right.
 
-## Two features nobody else has
+If your logs and queries look like that, it may be a good fit. The
+workload-fit section below is the honest version of when it isn't.
+
+## What the template model makes possible
 
 - **Template-exact queries.** `template_id == 42` filters by the mined
   template, not by string match — "every occurrence of the login-error

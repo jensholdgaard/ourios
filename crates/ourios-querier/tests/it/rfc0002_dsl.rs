@@ -1864,9 +1864,16 @@ async fn rfc0037_4_count_by_promoted_attribute() {
         )
         .await
         .expect_err("grouping by a non-promoted attribute must be rejected");
+    let msg = err.to_string();
+    // The hint names the raw config key (no `attr.` prefix) and the sublist to
+    // add it under, not just the derived column name.
     assert!(
-        err.to_string().contains("promote"),
-        "the rejection hints at promotion; got: {err}"
+        msg.contains("gen_ai.request.model"),
+        "the rejection names the raw config key; got: {msg}"
+    );
+    assert!(
+        msg.contains("storage.promoted_attributes.log"),
+        "the rejection names the config sublist; got: {msg}"
     );
 }
 

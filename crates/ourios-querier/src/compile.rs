@@ -444,10 +444,18 @@ fn group_by_promoted(column: &str, key: &str, df: &DataFrame) -> Result<Expr, Qu
     if has_column(df, &name) {
         Ok(Expr::Column(Column::new_unqualified(name)))
     } else {
+        // Name the raw config key (no `attr.`/`resource.` prefix) and the
+        // sublist it belongs under, so the hint points at the exact string to
+        // add rather than the derived column name.
+        let sublist = if column == columns::RESOURCE_ATTRIBUTES {
+            "resource"
+        } else {
+            "log"
+        };
         Err(QueryError::InvalidQuery {
             detail: format!(
-                "grouping by '{name}' requires it to be a promoted attribute column present in \
-                 the queried range; promote the key via storage.promoted_attributes"
+                "grouping by '{name}' requires the attribute to be promoted to a column present \
+                 in the queried range; add '{key}' to storage.promoted_attributes.{sublist}"
             ),
         })
     }

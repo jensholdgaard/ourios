@@ -662,10 +662,15 @@ struct AggregateGroupDto {
     /// One entry per `by` term in query order; empty for a bare `count`.
     key: Vec<String>,
     count: u64,
-    /// The scalar aggregate result (`sum`/`min`/`max`/`avg`); omitted for a
-    /// bare `count` query, where only `count` is meaningful.
+    /// The scalar aggregate result (`sum`/`min`/`max`/`avg`). Nested so the
+    /// two facts stay distinct on the wire: outer `None` (a bare `count`) skips
+    /// the field entirely; `Some(None)` (a scalar whose inputs were all NULL)
+    /// serializes as `value: null`; `Some(Some(v))` as the number.
+    // The nested Option is load-bearing: the three wire states above are
+    // exactly absent / null / number, which a flat Option cannot express.
+    #[allow(clippy::option_option)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<f64>,
+    value: Option<Option<f64>>,
 }
 
 impl From<&AggregateGroup> for AggregateGroupDto {

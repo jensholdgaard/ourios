@@ -250,10 +250,18 @@ pub struct AggregateGroup {
     /// The number of matching rows in this group (always populated — a scalar
     /// aggregate also carries its group's `COUNT(*)`).
     pub count: u64,
-    /// The scalar aggregate result (`sum`/`min`/`max`/`avg`) for this group,
-    /// `None` for a bare `count` query. `f64` — a `Utf8` promoted column is
-    /// cast to `Float64`, so this type is not `Eq` (RFC0002.17).
-    pub value: Option<f64>,
+    /// The scalar aggregate outcome for this group. The two nested `Option`s
+    /// carry two distinct facts the result surface must keep apart
+    /// (RFC0002.18 / RFC0002.20):
+    /// - `None` — a bare `count` query; no scalar was requested (the surface
+    ///   omits the field entirely).
+    /// - `Some(None)` — a `sum`/`min`/`max`/`avg` whose inputs were all NULL /
+    ///   unparseable, so the scalar itself is NULL (surfaced as `null`).
+    /// - `Some(Some(v))` — the scalar value.
+    ///
+    /// `f64` (a `Utf8` promoted column is cast to `Float64`), so this type is
+    /// not `Eq`.
+    pub value: Option<Option<f64>>,
 }
 
 /// Errors from [`Querier::run`]. Ourios-owned — no
@@ -492,7 +500,9 @@ fn empty_result(aggregate: Option<&compile::Aggregate>) -> QueryResult {
             vec![AggregateGroup {
                 key: Vec::new(),
                 count: 0,
-                value: None,
+                // A bare scalar over an empty scan is NULL (`Some(None)`); a
+                // bare `count` has no scalar (`None`).
+                value: agg.scalar.is_some().then_some(None),
             }]
         } else {
             Vec::new()
@@ -579,7 +589,9 @@ fn decode_aggregate(
                 .collect::<Result<Option<Vec<String>>, QueryError>>()?;
             match key {
                 Some(key) => {
-                    let value = values.and_then(|v| (!v.is_null(row)).then(|| v.value(row)));
+                    // `None` ⇒ no scalar requested; `Some(None)` ⇒ scalar is
+                    // NULL (every input cast to NULL); `Some(Some(v))` ⇒ value.
+                    let value = values.map(|v| (!v.is_null(row)).then(|| v.value(row)));
                     groups.push(AggregateGroup { key, count, value });
                 }
                 None => {

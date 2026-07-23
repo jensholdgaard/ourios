@@ -377,7 +377,8 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > (`sum`/`min`/`max`/`avg`).** RFC0002.17–.20 below discharge the "later
 > obligation" the 2026-07-15 amendment left open: they lift
 > `compile::validate`'s rejection of the `agg_fn` stages for scalar
-> aggregation over a **promoted** attribute. The value is read by CAST to
+> aggregation over a **promoted** attribute — a log attribute (`attr.<k>`)
+> or a resource attribute (`resource.<k>`). The value is read by CAST to
 > `Float64` (promoted columns are Utf8, §6.1) — the pragmatic path, chosen
 > over typed promoted columns (an RFC 0022 / RFC 0005 schema change with a
 > migration); an unparseable value casts to NULL and is excluded from the

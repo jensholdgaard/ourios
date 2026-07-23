@@ -1596,7 +1596,12 @@ fn value_cents(
         .as_ref()
         .expect("an aggregation query returns the grouped map")
         .iter()
-        .map(|g| (g.key.clone(), g.value.map(|v| (v * 100.0).round() as i64)))
+        .map(|g| {
+            (
+                g.key.clone(),
+                g.value.flatten().map(|v| (v * 100.0).round() as i64),
+            )
+        })
         .collect()
 }
 
@@ -1691,7 +1696,7 @@ async fn rfc0002_17_scalar_aggregates_match_oracle() {
     let total: f64 = rows.iter().map(|(_, c)| c).sum();
     let group = &bare.aggregate.as_ref().expect("map")[0];
     assert_eq!(
-        group.value.map(|v| (v * 100.0).round() as i64),
+        group.value.flatten().map(|v| (v * 100.0).round() as i64),
         Some((total * 100.0).round() as i64)
     );
     assert_eq!(
@@ -1702,8 +1707,9 @@ async fn rfc0002_17_scalar_aggregates_match_oracle() {
 }
 
 /// Scenario RFC0002.18 — an unparseable / NULL value is excluded from the
-/// scalar (CAST → NULL, skipped) but still counts. See §5 (amendment
-/// 2026-07-23).
+/// scalar (CAST → NULL, skipped) but still counts; a group whose inputs are
+/// *all* non-numeric carries `value = null` (`Some(None)`), distinct from a
+/// bare `count`'s omitted value (`None`). See §5 (amendment 2026-07-23).
 // Cent rounding on a small fixture — exact at this scale.
 #[allow(clippy::cast_possible_truncation)]
 #[tokio::test]
@@ -1711,15 +1717,21 @@ async fn rfc0002_18_unparseable_value_excluded_from_scalar() {
     use crate::common::{TS0, kv, rec_with_attrs, write_all_with_promoted};
     use ourios_parquet::PromotedAttributes;
 
-    // opus: 1.50, 2.50, and a junk "N/A" — the junk drops out of the sum.
-    let recs: Vec<_> = ["1.50", "2.50", "N/A"]
+    // opus: two numeric + one junk (partial); haiku: only junk (all-NULL group).
+    let rows: &[(&str, &str)] = &[
+        ("opus", "1.50"),
+        ("opus", "2.50"),
+        ("opus", "N/A"),
+        ("haiku", "junk"),
+    ];
+    let recs: Vec<_> = rows
         .iter()
-        .map(|cost| {
+        .map(|(model, cost)| {
             rec_with_attrs(
                 "a",
                 TS0,
                 vec![kv("service.name", "agent")],
-                vec![kv("model", "opus"), kv("cost", cost)],
+                vec![kv("model", model), kv("cost", cost)],
             )
         })
         .collect();
@@ -1733,15 +1745,46 @@ async fn rfc0002_18_unparseable_value_excluded_from_scalar() {
         "template_id == 1 | sum(attr.cost) by attr.model",
     )
     .await;
-    let group = &result.aggregate.as_ref().expect("map")[0];
+    let by_model: std::collections::BTreeMap<_, _> = result
+        .aggregate
+        .as_ref()
+        .expect("map")
+        .iter()
+        .map(|g| (g.key[0].clone(), (g.value, g.count)))
+        .collect();
+
+    // opus: the junk row drops out of the sum (1.50 + 2.50) but still counts.
+    let (opus_value, opus_count) = by_model["opus"];
     assert_eq!(
-        group.value.map(|v| (v * 100.0).round() as i64),
+        opus_value.flatten().map(|v| (v * 100.0).round() as i64),
         Some(400),
-        "the junk row is excluded: 1.50 + 2.50",
+        "junk excluded from the sum",
     );
     assert_eq!(
-        group.count, 3,
+        opus_count, 3,
         "but the junk row still counts toward COUNT(*)"
+    );
+
+    // haiku: every input is non-numeric ⇒ the scalar is NULL, surfaced as
+    // `Some(None)` (present, null) — NOT `None` (which means "no scalar").
+    let (haiku_value, haiku_count) = by_model["haiku"];
+    assert_eq!(
+        haiku_value,
+        Some(None),
+        "an all-NULL group carries value = null"
+    );
+    assert_eq!(haiku_count, 1, "the all-junk group still counts");
+
+    // Contrast: a bare `count` query carries no scalar at all (`None`).
+    let counted = run_dsl(bucket.path(), "template_id == 1 | count by attr.model").await;
+    assert!(
+        counted
+            .aggregate
+            .as_ref()
+            .expect("map")
+            .iter()
+            .all(|g| g.value.is_none()),
+        "a count query requests no scalar: value is None, not Some(None)",
     );
 }
 

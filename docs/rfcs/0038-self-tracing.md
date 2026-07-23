@@ -1,7 +1,7 @@
 ---
 rfc: 0038
 title: Self-tracing — the OTel traces signal, disciplined to request scope
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-23
@@ -11,8 +11,11 @@ superseded-by: —
 
 # RFC 0038 — Self-tracing — the OTel traces signal, disciplined to request scope
 
-> **Status: `drafted` (2026-07-23).** Sections §§1–4 complete; §5 acceptance
-> criteria are the contract, not yet green. No implementation has landed.
+> **Status: `specified` (2026-07-23).** Sections §§1–4 and the §5 acceptance
+> criteria are complete — every hazard/invariant the RFC touches carries a
+> scenario, testable in principle (per the `docs/rfcs/README.md` lifecycle,
+> a written §5 is the `specified` stage). No implementation has landed — not
+> yet `red`/`green`.
 
 ## 1. Summary
 
@@ -219,9 +222,9 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > **When** the sampler is left unset, set to `parentbased_traceidratio` at a
 > ratio, and disabled (`traces.enabled: false`),
 > **Then** the default samples (root) traces, the ratio sampler exports the
-> configured fraction deterministically, and disabling restores the exact
-> logs-plus-metrics-only behaviour (no tracer installed, no `trace_id` on
-> logs, no throughput or dependency change).
+> configured fraction deterministically, and disabling installs **no** tracer
+> and stamps **no** `trace_id`/`span_id` on log records — the observable,
+> runtime logs-plus-metrics-only behaviour (no throughput change).
 
 > **Scenario RFC0038.5 — no telemetry-induced-telemetry loop.**
 > **Given** the OTLP span exporter's own transport stack (`tonic`/`hyper`/…)

@@ -472,16 +472,16 @@ async fn handle_query(
     let started = Instant::now();
     match statement {
         Statement::Logs(mut query) => {
-            // `count [by …]` and `limit` are mutually exclusive
-            // (`compile::validate` rejects the combination, RFC 0002
-            // amendment 2026-07-15) — an aggregation query answers with
-            // its grouped-count map, not a capped row set, so the §7
-            // default/cap limit is meaningless for it and must not be
-            // injected.
+            // An aggregation — `count [by …]` or a scalar `sum`/`min`/`max`/
+            // `avg` — and `limit` are mutually exclusive (`compile::validate`
+            // rejects the combination, RFC 0002 amendments 2026-07-15 and
+            // 2026-07-23): the query answers with its grouped map, not a
+            // capped row set, so the §7 default/cap limit is meaningless for
+            // it and must not be injected.
             let is_aggregation = query
                 .stages
                 .iter()
-                .any(|s| matches!(s, Stage::Count { .. }));
+                .any(|s| matches!(s, Stage::Count { .. } | Stage::Agg { .. }));
             if !is_aggregation {
                 apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
             }
@@ -659,9 +659,19 @@ pub(crate) struct LogQueryResponse {
 
 #[derive(Serialize)]
 struct AggregateGroupDto {
-    /// One entry per `by` term in query order; empty for a bare `count`.
+    /// One entry per `by` term in query order; empty for a bare aggregation
+    /// with no `by` (a `count` or a scalar `sum`/`min`/`max`/`avg`).
     key: Vec<String>,
     count: u64,
+    /// The scalar aggregate result (`sum`/`min`/`max`/`avg`). Nested so the
+    /// two facts stay distinct on the wire: outer `None` (a bare `count`) skips
+    /// the field entirely; `Some(None)` (a scalar whose inputs were all NULL)
+    /// serializes as `value: null`; `Some(Some(v))` as the number.
+    // The nested Option is load-bearing: the three wire states above are
+    // exactly absent / null / number, which a flat Option cannot express.
+    #[allow(clippy::option_option)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Option<f64>>,
 }
 
 impl From<&AggregateGroup> for AggregateGroupDto {
@@ -669,6 +679,7 @@ impl From<&AggregateGroup> for AggregateGroupDto {
         Self {
             key: g.key.clone(),
             count: g.count,
+            value: g.value,
         }
     }
 }

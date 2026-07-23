@@ -215,13 +215,16 @@ fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
     Ok(tenant)
 }
 
-/// Apply the tool's row `cap` to `stages`, unless the statement is a `count
-/// [by …]` aggregation. `count` and `limit` are mutually exclusive
-/// (`compile::validate`) — an aggregation answers with its grouped-count map,
-/// not a capped row set, so injecting the cap would reject the query. Mirrors
-/// the JSON API's guard (`querier::handle_query`).
+/// Apply the tool's row `cap` to `stages`, unless the statement is an
+/// aggregation — `count [by …]` or a scalar `sum`/`min`/`max`/`avg`. An
+/// aggregation and `limit` are mutually exclusive (`compile::validate`): it
+/// answers with its grouped map, not a capped row set, so injecting the cap
+/// would reject the query. Mirrors the JSON API's guard
+/// (`querier::handle_query`).
 fn cap_rows_unless_aggregation(stages: &mut Vec<Stage>, cap: u64) {
-    let is_aggregation = stages.iter().any(|s| matches!(s, Stage::Count { .. }));
+    let is_aggregation = stages
+        .iter()
+        .any(|s| matches!(s, Stage::Count { .. } | Stage::Agg { .. }));
     if !is_aggregation {
         apply_limit(stages, cap, cap);
     }

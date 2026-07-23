@@ -164,6 +164,24 @@ groups:
       - ref: ourios.service
         requirement_level: recommended
 
+  - id: metric.ourios.miner.structured_body.size
+    type: metric
+    metric_name: ourios.miner.structured_body.size
+    stability: development
+    brief: >-
+      Canonical-JSON byte length of each structured (non-string) log body
+      (RFC 0037 §3.2). Structured bodies are retained whole and never capped;
+      this histogram is the hazard-#2 guard — an operator watches its
+      per-service distribution to spot services emitting oversized payloads,
+      the fix belonging at the emitter rather than a store-side truncation.
+    instrument: histogram
+    unit: "By"
+    attributes:
+      - ref: ourios.tenant
+        requirement_level: required
+      - ref: ourios.service
+        requirement_level: recommended
+
   - id: metric.ourios.miner.duration
     type: metric
     metric_name: ourios.miner.duration

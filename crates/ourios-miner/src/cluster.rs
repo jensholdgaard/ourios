@@ -1972,6 +1972,13 @@ impl MinerCluster {
         // rather than swallowing a `Result` we never inspect.
         let bytes = ourios_core::otlp::canonical::encode_any_value(any_value)
             .expect("RFC 0005 §3.3 encoder is infallible for any spec-compliant AnyValue");
+        // RFC 0037 §3.2 (hazard #2 guard): observe the canonical-JSON body
+        // size before `bytes` is moved into the record. Structured bodies are
+        // never capped, so this histogram is the only guard against oversized
+        // payloads — it makes the size visible per service without discarding
+        // the operator's payload.
+        self.metrics
+            .record_structured_body_bytes(&record.tenant_id, service, bytes.len() as u64);
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;

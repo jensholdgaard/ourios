@@ -188,6 +188,81 @@ release version:
     echo "Tagged v$version locally (NOT pushed). Review the commit, then fire the"
     echo "release: git push --follow-tags origin main"
 
+# Run ourios-server locally as an OTLP **log** sink for dogfooding — point any
+# OTLP log source (Claude Code, Copilot CLI, an OpenTelemetry Collector) at it
+# and query the ingested telemetry back. Since Ourios *is* an OTLP log
+# receiver, no Collector or container is needed. Open receiver (no auth section
+# → open, per RFC 0026), local filesystem store + WAL under scratch/dogfood/
+# (gitignored). Ports: 4318 OTLP/HTTP, 4317 OTLP/gRPC, 4319 query API. Ctrl-C
+# to stop; `just dogfood-clean` to wipe the captured store.
+#
+# Run `just dogfood-env` in the other terminal for the source-side env block.
+dogfood-server:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p scratch/dogfood/store scratch/dogfood/wal
+    echo "OTLP logs → http://127.0.0.1:4318 (HTTP) · 127.0.0.1:4317 (gRPC)"
+    echo "query API → http://127.0.0.1:4319  ·  store → scratch/dogfood/"
+    # Bind to loopback only: the receiver is unauthenticated here, so binding
+    # ourios-server's 0.0.0.0 defaults would expose open OTLP ingest + query to
+    # the LAN (e.g. on public Wi-Fi). Localhost keeps it to this machine.
+    OURIOS_STORAGE_BACKEND=local \
+    OURIOS_BUCKET_ROOT="$(pwd)/scratch/dogfood/store" \
+    OURIOS_WAL_ROOT="$(pwd)/scratch/dogfood/wal" \
+    OURIOS_RECEIVER_ENABLED=1 \
+    OURIOS_RECEIVER_GRPC_ADDR=127.0.0.1:4317 \
+    OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:4318 \
+    OURIOS_QUERIER_ENABLED=1 \
+    OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
+    cargo run -p ourios-server
+
+# Print the env block that points a source's OTLP telemetry at the local
+# `dogfood-server`. The `OTEL_*` block is source-agnostic (Ourios is logs-only
+# per CLAUDE.md §1, so metrics/traces are disabled); the *enable* flag is
+# tool-specific and is printed as a per-tool comment rather than hard-coded, so
+# the same block works for Claude Code, Copilot CLI, or any OTLP source.
+# Telemetry is read at process startup, so `export` these and start a NEW
+# session of the source. Content capture (prompts/tool output) is opt-in and
+# off by default — that is where the wordy structured bodies live, so enable it
+# only on data you're willing to retain, and scrub before freezing a corpus.
+# Prints the telemetry env block for the local dogfood-server.
+dogfood-env:
+    #!/usr/bin/env bash
+    cat <<'ENV'
+    export OTEL_LOGS_EXPORTER=otlp
+    export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only
+    export OTEL_TRACES_EXPORTER=none
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+    export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant
+    # then enable telemetry on the source (per-tool flag):
+    #   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1
+    #   Copilot CLI:  export COPILOT_OTEL_ENABLED=true
+    # opt-in content capture (privacy: retains prompts/tool output):
+    #   Claude Code:  export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1
+    # query it (the query API needs x-ourios-tenant; tenant == service.name):
+    #   curl -sS http://127.0.0.1:4319/v1/query \
+    #     -H 'x-ourios-tenant: agent-dogfood' \
+    #     -H 'content-type: text/plain' \
+    #     --data 'severity >= trace | range(-1h, now) | limit 20'
+    ENV
+
+# Wipe the local dogfood store + WAL (the captured telemetry). Refuses while
+# `dogfood-server` is still listening on 4318, so a `rm -rf` can't race the
+# server mid-write and corrupt the capture. Stop the server first.
+dogfood-clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Fail hard if lsof is missing rather than silently skip the guard (a failed
+    # `if` condition is not caught by `set -e`), so a missing tool can't let the
+    # wipe race a running server.
+    command -v lsof >/dev/null || { echo "error: lsof not found — can't verify the server is stopped; stop dogfood-server, then 'rm -rf scratch/dogfood' by hand." >&2; exit 1; }
+    if lsof -nP -iTCP:4318 -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "127.0.0.1:4318 is in use (dogfood-server still running?); stop it before cleaning." >&2
+        exit 1
+    fi
+    rm -rf scratch/dogfood
+
 # Clean build artefacts (cargo target + mdBook output).
 clean:
     cargo clean || true

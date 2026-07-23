@@ -362,12 +362,14 @@ async fn rfc0027_3_query_logs() {
     );
 }
 
-/// Scenario RFC0027.3 (regression) — `query_logs` answers a `count [by …]`
-/// aggregation. The tool auto-attaches its row cap, but `count` and `limit`
-/// are mutually exclusive (`compile::validate`), so the cap must be skipped
-/// for aggregations — mirroring the JSON API's `is_aggregation` guard.
-/// Before the fix the tool rejected every `count by` with "does not support
-/// `limit`", so no aggregation could run through the MCP surface.
+/// Scenario RFC0027.3 — `query_logs`: equivalence with the JSON API.
+///
+/// Regression facet: a `count [by …]` aggregation. The tool auto-attaches
+/// its row cap, but `count` and `limit` are mutually exclusive
+/// (`compile::validate`), so the cap must be skipped for aggregations —
+/// mirroring the JSON API's `is_aggregation` guard. Before the fix the tool
+/// rejected every `count by` with "does not support `limit`", so no
+/// aggregation could run through the MCP surface.
 /// See `docs/rfcs/0027-mcp-query-surface.md` §5.
 #[tokio::test]
 async fn rfc0027_3_query_logs_count_aggregation() {

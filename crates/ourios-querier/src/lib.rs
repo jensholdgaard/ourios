@@ -591,8 +591,16 @@ fn decode_aggregate(
             match key {
                 Some(key) => {
                     // `None` ⇒ no scalar requested; `Some(None)` ⇒ scalar is
-                    // NULL (every input cast to NULL); `Some(Some(v))` ⇒ value.
-                    let value = values.map(|v| (!v.is_null(row)).then(|| v.value(row)));
+                    // NULL; `Some(Some(v))` ⇒ a finite value. A non-finite
+                    // result (NaN/±inf — from a crafted `"NaN"`/`"inf"` input,
+                    // or `sum` overflow) is degraded to NULL: JSON cannot
+                    // represent it, so serializing it would 500 the whole query
+                    // (`serde_json`). NULL matches the RFC0002.18 skip.
+                    let value = values.map(|v| {
+                        (!v.is_null(row))
+                            .then(|| v.value(row))
+                            .filter(|x| x.is_finite())
+                    });
                     groups.push(AggregateGroup { key, count, value });
                 }
                 None => {

@@ -409,7 +409,10 @@ surface? Perses+OTel query conventions?) are folded into §9.
     equals the oracle over the numeric rows alone, and a group all of whose
     values are non-numeric carries `value = null`. The query never fails on
     dirty data, and those rows still count toward the group's `COUNT(*)` and
-    the query total (matching a plain count).
+    the query total (matching a plain count). A **non-finite** scalar result —
+    `NaN`/`±inf` from a crafted `"NaN"`/`"inf"` input or from `sum` overflow —
+    is likewise degraded to `value = null`: JSON has no representation for it,
+    so surfacing it would fail serialization and 500 the whole query.
 
 - **RFC0002.19 — a non-promoted or non-attribute aggregate path is a specific compile-time error `[§6.3]`**
   - **Given** (i) `sum(attr.<k>)` where `<k>` is **not** promoted in the

@@ -1717,12 +1717,15 @@ async fn rfc0002_18_unparseable_value_excluded_from_scalar() {
     use crate::common::{TS0, kv, rec_with_attrs, write_all_with_promoted};
     use ourios_parquet::PromotedAttributes;
 
-    // opus: two numeric + one junk (partial); haiku: only junk (all-NULL group).
+    // opus: two numeric + one junk (partial); haiku: only junk (all-NULL group);
+    // big: two values that overflow the sum to +inf (a non-finite result).
     let rows: &[(&str, &str)] = &[
         ("opus", "1.50"),
         ("opus", "2.50"),
         ("opus", "N/A"),
         ("haiku", "junk"),
+        ("big", "1e308"),
+        ("big", "1e308"),
     ];
     let recs: Vec<_> = rows
         .iter()
@@ -1774,6 +1777,16 @@ async fn rfc0002_18_unparseable_value_excluded_from_scalar() {
         "an all-NULL group carries value = null"
     );
     assert_eq!(haiku_count, 1, "the all-junk group still counts");
+
+    // big: the sum overflows to +inf; a non-finite result is degraded to NULL
+    // so it stays JSON-safe (serializing NaN/inf would 500 the whole query).
+    let (big_value, big_count) = by_model["big"];
+    assert_eq!(
+        big_value,
+        Some(None),
+        "an overflow (non-finite) result is nulled, not surfaced as inf"
+    );
+    assert_eq!(big_count, 2, "the overflow group still counts its rows");
 
     // Contrast: a bare `count` query carries no scalar at all (`None`).
     let counted = run_dsl(bucket.path(), "template_id == 1 | count by attr.model").await;

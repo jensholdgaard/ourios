@@ -64,6 +64,7 @@
 - [RFC 0035 — Ingest concurrency](./rfcs/0035-ingest-concurrency.md)
 - [RFC 0036 — Write-side layout](./rfcs/0036-write-side-layout.md)
 - [RFC 0037 — GenAI / structured-event logs](./rfcs/0037-genai-structured-log-events.md)
+- [RFC 0038 — Self-tracing](./rfcs/0038-self-tracing.md)
 
 # Talks
 

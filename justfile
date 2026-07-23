@@ -201,37 +201,54 @@ dogfood-server:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p scratch/dogfood/store scratch/dogfood/wal
-    echo "OTLP logs → http://localhost:4318 (HTTP) · localhost:4317 (gRPC)"
-    echo "query API → http://localhost:4319   ·   store → scratch/dogfood/"
+    echo "OTLP logs → http://127.0.0.1:4318 (HTTP) · 127.0.0.1:4317 (gRPC)"
+    echo "query API → http://127.0.0.1:4319  ·  store → scratch/dogfood/"
+    # Bind to loopback only: the receiver is unauthenticated here, so binding
+    # ourios-server's 0.0.0.0 defaults would expose open OTLP ingest + query to
+    # the LAN (e.g. on public Wi-Fi). Localhost keeps it to this machine.
     OURIOS_STORAGE_BACKEND=local \
     OURIOS_BUCKET_ROOT="$(pwd)/scratch/dogfood/store" \
     OURIOS_WAL_ROOT="$(pwd)/scratch/dogfood/wal" \
     OURIOS_RECEIVER_ENABLED=1 \
+    OURIOS_RECEIVER_GRPC_ADDR=127.0.0.1:4317 \
+    OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:4318 \
     OURIOS_QUERIER_ENABLED=1 \
+    OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
     cargo run -p ourios-server
 
 # Print the env block that points a source's OTLP telemetry at the local
-# `dogfood-server`. Ourios is logs-only (CLAUDE.md §1), so metrics/traces are
-# disabled. Telemetry is read at process startup, so `export` these and start a
-# NEW session of the source (e.g. a fresh `claude`). Content capture
-# (prompts/tool output) is opt-in and off by default — that is where the wordy
-# structured bodies live, so enable it only on data you're willing to retain,
-# and scrub before freezing any of it as a corpus.
+# `dogfood-server`. The `OTEL_*` block is source-agnostic (Ourios is logs-only
+# per CLAUDE.md §1, so metrics/traces are disabled); the *enable* flag is
+# tool-specific and is printed as a per-tool comment rather than hard-coded, so
+# the same block works for Claude Code, Copilot CLI, or any OTLP source.
+# Telemetry is read at process startup, so `export` these and start a NEW
+# session of the source. Content capture (prompts/tool output) is opt-in and
+# off by default — that is where the wordy structured bodies live, so enable it
+# only on data you're willing to retain, and scrub before freezing a corpus.
 # Prints the telemetry env block for the local dogfood-server.
 dogfood-env:
-    @echo 'export CLAUDE_CODE_ENABLE_TELEMETRY=1'
     @echo 'export OTEL_LOGS_EXPORTER=otlp'
     @echo 'export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only'
     @echo 'export OTEL_TRACES_EXPORTER=none'
     @echo 'export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf'
-    @echo 'export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318'
-    @echo 'export OTEL_SERVICE_NAME=claude-code     # -> the Ourios tenant'
+    @echo 'export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318'
+    @echo 'export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant'
+    @echo '# then enable telemetry on the source (per-tool flag):'
+    @echo '#   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1'
+    @echo '#   Copilot CLI:  export COPILOT_OTEL_ENABLED=true'
     @echo '# opt-in content capture (privacy: retains prompts/tool output):'
-    @echo '# export OTEL_LOG_USER_PROMPTS=1'
-    @echo '# export OTEL_LOG_TOOL_DETAILS=1'
+    @echo '#   Claude Code:  export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1'
 
-# Wipe the local dogfood store + WAL (the captured telemetry).
+# Wipe the local dogfood store + WAL (the captured telemetry). Refuses while
+# `dogfood-server` is still listening on 4318, so a `rm -rf` can't race the
+# server mid-write and corrupt the capture. Stop the server first.
 dogfood-clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if lsof -nP -iTCP:4318 -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "dogfood-server is running (127.0.0.1:4318 in use); stop it before cleaning." >&2
+        exit 1
+    fi
     rm -rf scratch/dogfood
 
 # Clean build artefacts (cargo target + mdBook output).

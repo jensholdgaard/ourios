@@ -117,6 +117,23 @@ async fn rfc0037_3_structured_body_unbounded_fidelity_and_observability() {
             })
         })
         .expect("a data point carrying ourios.service = checkout");
+    // Validate the full required attribute set: the registry marks
+    // ourios.tenant `required` and ourios.service `recommended`, so both must
+    // ride the data point — asserting only service would still pass if tenant
+    // were accidentally dropped.
+    let has_attr = |key: &str, value: &str| {
+        point
+            .attributes()
+            .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+    };
+    assert!(
+        has_attr(ourios_semconv::OURIOS_TENANT, "genai-tenant"),
+        "the required ourios.tenant attribute must ride the data point"
+    );
+    assert!(
+        has_attr(ourios_semconv::OURIOS_SERVICE, "checkout"),
+        "the ourios.service attribute must ride the data point"
+    );
     assert_eq!(point.count(), 1, "exactly one structured body observed");
     assert_eq!(
         point.sum(),

@@ -25,7 +25,7 @@ setting ([RFC 0022](../rfcs/0022-queryable-attribute-columns.md)). Write an
 storage:
   backend: local
   local:
-    bucket_root: /var/lib/ourios/data
+    bucket_root: /var/lib/ourios/store
   # Claude Code emits these as flat log-attribute keys (not the OTel
   # GenAI semantic-convention dotted names); promote the ones you want to
   # group or sum by.
@@ -81,7 +81,8 @@ export CLAUDE_CODE_ENABLE_TELEMETRY=1      # Claude Code
 
 The **tenant** is the telemetry's `service.name` — `OTEL_SERVICE_NAME`
 sets it; if an agent overrides it with its own default, that default is
-the tenant instead (check with `ls` under `bucket_root/data/`).
+the tenant instead. The tenants that exist show up as directories under
+`bucket_root/data/` — e.g. `/var/lib/ourios/store/data/tenant_id=my-agent/`.
 
 Prompt and tool bodies are **not** captured by default. Turn them on only
 on data you're willing to retain — this is the sensitive part:
@@ -101,21 +102,27 @@ claude mcp add --transport http ourios http://127.0.0.1:4319/mcp
 Now ask the agent about itself in plain language — it reads the
 `ourios://query-schema` resource and composes the query:
 
-> How much have I cost this session, by model? Use the ourios tools; my
-> tenant is `my-agent`.
+> What has `my-agent` cost so far, by model? Use the ourios tools.
 
-Or query the DSL directly. Aggregations answer with a grouped map:
+Queries are scoped by **tenant**, which is the whole `my-agent`
+`service.name`, not a single run — so this reports every session that
+shared that tenant, not just the current one (see the last note below).
+
+Or query the DSL directly. First find your templates — the
+`list_templates` MCP tool (or just ask the agent) lists each
+`template_id` with its rendered text; note the id of the
+`claude_code.api_request` template. Then:
 
 ```sh
-# find your event templates (api_request, tool_decision, …)
+# your tool-use distribution
 curl -s http://127.0.0.1:4319/v1/query \
   -H 'X-Ourios-Tenant: my-agent' -H 'Content-Type: text/plain' \
   -d 'true | count by attr.tool_name'
 
-# total spend per model (over the api_request template you found above)
+# total spend per model — substitute the api_request template id for <ID>
 curl -s http://127.0.0.1:4319/v1/query \
   -H 'X-Ourios-Tenant: my-agent' -H 'Content-Type: text/plain' \
-  -d 'template_id == 17 | sum(attr.cost_usd) by attr.model'
+  -d 'template_id == <ID> | sum(attr.cost_usd) by attr.model'
 ```
 
 ## Things that will trip you up
@@ -133,6 +140,11 @@ curl -s http://127.0.0.1:4319/v1/query \
   `attr.model` column to group on.
 - **`CLAUDE_CODE_ENABLE_TELEMETRY=1` alone exports nothing** — the
   `OTEL_LOGS_EXPORTER`/endpoint block in step 2 is what ships the logs.
+- **Queries are tenant-wide, not per-session.** The tenant is the whole
+  `service.name`, so every session that used that name aggregates
+  together. To scope to one run, promote `session.id` (add it to
+  `promoted_attributes.log`) and filter on it — e.g.
+  `attr.session.id == "…" | sum(attr.cost_usd) by attr.model`.
 
 ## Where to next
 

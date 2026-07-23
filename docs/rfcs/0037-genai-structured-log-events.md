@@ -337,7 +337,8 @@ test code so the mapping is greppable (`docs/verification.md` §2):
 > hazard #6).**
 > - **Given** `gen_ai.request.model` promoted to a column
 > - **When** `… | count by attr.gen_ai.request.model, bucket(1h)` runs
-> - **Then** the `(bucket, model) → count` map equals a brute-force baseline
+> - **Then** the `(model, bucket) → count` map (keys in by-list order) equals
+>   a brute-force baseline
 > - **And** the same query against a *non-promoted* key is rejected with a
 >   promotion hint (never a silent unpruned scan).
 
@@ -372,13 +373,13 @@ Each scenario maps to a greppable test (`docs/verification.md` §2):
   identity + non-lossy) and `tests/rfc0037_structured_body.rs`
   `rfc0037_3_structured_body_unbounded_fidelity_and_observability` (the
   `structured_body_bytes` histogram records the canonical-JSON length under
-  the required `ourios.tenant` + `ourios.service` attribute set, via the
-  in-memory meter).
+  the required `ourios.tenant`, plus the recommended `ourios.service` present
+  for this service-bearing record, via the in-memory meter).
 - **RFC0037.4 (§3.3 grouped count):** `ourios-querier`
   `tests/it/rfc0002_dsl.rs` `rfc0037_4_count_by_promoted_attribute` — the
-  `(bucket, model) → count` map equals a brute-force oracle (RFC 0031 L4
-  shape); the non-promoted key is rejected with a hint naming the raw config
-  key + sublist.
+  `(model, bucket) → count` map (keys in by-list order) equals a brute-force
+  oracle (RFC 0031 L4 shape); the non-promoted key is rejected with a hint
+  naming the raw config key + sublist.
 - **RFC0037.5 (absent-body parity):** covered by RFC 0025's
   `rfc0025_absent_body.rs` (`body_kind = Absent`, `body` cell `NULL`).
 - **Calibration (deferred to v9):** RFC 0024 manifest regenerated; C1/C2

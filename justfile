@@ -227,17 +227,25 @@ dogfood-server:
 # only on data you're willing to retain, and scrub before freezing a corpus.
 # Prints the telemetry env block for the local dogfood-server.
 dogfood-env:
-    @echo 'export OTEL_LOGS_EXPORTER=otlp'
-    @echo 'export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only'
-    @echo 'export OTEL_TRACES_EXPORTER=none'
-    @echo 'export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf'
-    @echo 'export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318'
-    @echo 'export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant'
-    @echo '# then enable telemetry on the source (per-tool flag):'
-    @echo '#   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1'
-    @echo '#   Copilot CLI:  export COPILOT_OTEL_ENABLED=true'
-    @echo '# opt-in content capture (privacy: retains prompts/tool output):'
-    @echo '#   Claude Code:  export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1'
+    #!/usr/bin/env bash
+    cat <<'ENV'
+    export OTEL_LOGS_EXPORTER=otlp
+    export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only
+    export OTEL_TRACES_EXPORTER=none
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+    export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant
+    # then enable telemetry on the source (per-tool flag):
+    #   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1
+    #   Copilot CLI:  export COPILOT_OTEL_ENABLED=true
+    # opt-in content capture (privacy: retains prompts/tool output):
+    #   Claude Code:  export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1
+    # query it (the query API needs x-ourios-tenant; tenant == service.name):
+    #   curl -sS http://127.0.0.1:4319/v1/query \
+    #     -H 'x-ourios-tenant: agent-dogfood' \
+    #     -H 'content-type: text/plain' \
+    #     --data 'severity >= trace | range(-1h, now) | limit 20'
+    ENV
 
 # Wipe the local dogfood store + WAL (the captured telemetry). Refuses while
 # `dogfood-server` is still listening on 4318, so a `rm -rf` can't race the

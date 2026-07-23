@@ -357,13 +357,16 @@ Each scenario maps to a greppable test (`docs/verification.md` §2):
   arbitrary `(severity, scope, event_name)` tuples), plus
   `snapshot.rs` `structured_template_record_without_event_name_restores_as_none`
   (the `#[serde(default)]` migration).
-- **RFC0037.2 (structured-body reconstruction):** covered by the standing
-  reconstruction property — RFC 0024's `ourios-*` property tests generate
-  structured `AnyValue` bodies and assert render-from-store equals canonical
-  JSON byte-for-byte (or lossy) — plus the miner RFC0001.9 canonical-body
-  round-trip (`rfc_internal.rs`) and the Parquet Structured-row round-trips
-  in `rfc0025_absent_body.rs` / `rfc0021_arrow_upgrade.rs`. The byte-for-byte
-  retention is pinned directly by `rfc0037_3_structured_body_retained_byte_for_byte`.
+- **RFC0037.2 (structured-body reconstruction):** RFC 0024's `ourios-*`
+  property tests generate structured `AnyValue` bodies and assert they
+  round-trip **canonical-JSON equal** — `canonical::decode_any_value` on the
+  rebuilt bytes equals the original `AnyValue` (decoded value equality;
+  string bodies round-trip bit-identically, structured bodies by decoded
+  equality). **Byte-for-byte** retention of the stored canonical JSON is
+  pinned directly by `rfc0037_3_structured_body_retained_byte_for_byte`
+  (slice B). Plus the miner RFC0001.9 canonical-body round-trip
+  (`rfc_internal.rs`) and the Parquet Structured-row round-trips in
+  `rfc0025_absent_body.rs` / `rfc0021_arrow_upgrade.rs`.
 - **RFC0037.3 (§3.2 fidelity + observability):** `ourios-miner` `cluster.rs`
   `rfc0037_3_structured_body_retained_byte_for_byte` (colocated unit, byte
   identity + non-lossy) and `tests/rfc0037_structured_body.rs`

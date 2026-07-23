@@ -203,24 +203,16 @@ dogfood-server:
     mkdir -p scratch/dogfood/store scratch/dogfood/wal
     echo "OTLP logs → http://127.0.0.1:4318 (HTTP) · 127.0.0.1:4317 (gRPC)"
     echo "query API → http://127.0.0.1:4319  ·  MCP → http://127.0.0.1:4319/mcp"
-    echo "store     → scratch/dogfood/"
-    # Bind to loopback only: the receiver is unauthenticated here, so binding
-    # ourios-server's 0.0.0.0 defaults would expose open OTLP ingest + query to
-    # the LAN (e.g. on public Wi-Fi). Localhost keeps it to this machine.
-    #
-    # MCP is enabled so a source can query its own captured telemetry back
-    # through Ourios (RFC 0027). Open mode takes the tenant as a tool argument
-    # (no bearer); safe here only because we're loopback-bound.
-    OURIOS_STORAGE_BACKEND=local \
-    OURIOS_BUCKET_ROOT="$(pwd)/scratch/dogfood/store" \
-    OURIOS_WAL_ROOT="$(pwd)/scratch/dogfood/wal" \
-    OURIOS_RECEIVER_ENABLED=1 \
-    OURIOS_RECEIVER_GRPC_ADDR=127.0.0.1:4317 \
-    OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:4318 \
-    OURIOS_QUERIER_ENABLED=1 \
-    OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
-    OURIOS_QUERIER_MCP_ENABLED=1 \
-    cargo run -p ourios-server
+    echo "store     → scratch/dogfood/  ·  promoting attr.{model,tool_name,decision}"
+    # All settings live in dogfood-config.yaml (RFC 0020 file front-end), not
+    # OURIOS_* env vars: `--config` is the *sole* config source, and
+    # storage.promoted_attributes (RFC 0022) — which promotes the GenAI
+    # attributes so a source can aggregate its own telemetry natively (e.g.
+    # `count by attr.model`) — has no env-var form. The config binds loopback
+    # only and runs open (no auth) + MCP on; safe only because it's local.
+    # The file's paths resolve from ${env:OURIOS_DOGFOOD_ROOT}.
+    export OURIOS_DOGFOOD_ROOT="$(pwd)/scratch/dogfood"
+    cargo run -p ourios-server -- --config dogfood-config.yaml
 
 # Print the env block that points a source's OTLP telemetry at the local
 # `dogfood-server`. The `OTEL_*` block is source-agnostic (Ourios is logs-only

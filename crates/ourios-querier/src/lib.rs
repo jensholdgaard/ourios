@@ -239,7 +239,7 @@ pub struct QueryResult {
 ///
 /// Marked `#[non_exhaustive]` so further additive fields stay
 /// non-breaking, matching `QueryResult`/`QueryStats`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AggregateGroup {
     /// The group-key values, one per `by` term in query order: a field or
@@ -247,8 +247,13 @@ pub struct AggregateGroup {
     /// UTC start of the half-open window `[k·width, (k+1)·width)`. Empty for
     /// a bare `count`.
     pub key: Vec<String>,
-    /// The number of matching rows in this group.
+    /// The number of matching rows in this group (always populated — a scalar
+    /// aggregate also carries its group's `COUNT(*)`).
     pub count: u64,
+    /// The scalar aggregate result (`sum`/`min`/`max`/`avg`) for this group,
+    /// `None` for a bare `count` query. `f64` — a `Utf8` promoted column is
+    /// cast to `Float64`, so this type is not `Eq` (RFC0002.17).
+    pub value: Option<f64>,
 }
 
 /// Errors from [`Querier::run`]. Ourios-owned — no
@@ -487,6 +492,7 @@ fn empty_result(aggregate: Option<&compile::Aggregate>) -> QueryResult {
             vec![AggregateGroup {
                 key: Vec::new(),
                 count: 0,
+                value: None,
             }]
         } else {
             Vec::new()
@@ -517,9 +523,11 @@ struct DecodedAggregate {
 fn decode_aggregate(
     batches: &[RecordBatch],
     n_terms: usize,
+    has_value: bool,
 ) -> Result<DecodedAggregate, QueryError> {
+    use datafusion::arrow::array::Float64Array;
     let bad = |detail: String| QueryError::Storage {
-        detail: format!("count aggregate: {detail}"),
+        detail: format!("aggregate: {detail}"),
     };
     let mut groups = Vec::new();
     let mut rows: u64 = 0;
@@ -531,6 +539,21 @@ fn decode_aggregate(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| bad("count column is not Int64".to_string()))?;
+        // The scalar-aggregate column is present iff the stage carried a
+        // sum/min/max/avg; a group whose values were all NULL (every cast
+        // failed) aggregates to NULL ⇒ `value: None` for that group.
+        let values = if has_value {
+            Some(
+                batch
+                    .column_by_name(compile::VALUE_COLUMN)
+                    .ok_or_else(|| bad("result is missing the value column".to_string()))?
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| bad("value column is not Float64".to_string()))?,
+            )
+        } else {
+            None
+        };
         let key_columns = (0..n_terms)
             .map(|i| {
                 let name = compile::group_column_name(i);
@@ -555,7 +578,10 @@ fn decode_aggregate(
                 .map(|column| group_key_string(column.as_ref(), row))
                 .collect::<Result<Option<Vec<String>>, QueryError>>()?;
             match key {
-                Some(key) => groups.push(AggregateGroup { key, count }),
+                Some(key) => {
+                    let value = values.and_then(|v| (!v.is_null(row)).then(|| v.value(row)));
+                    groups.push(AggregateGroup { key, count, value });
+                }
                 None => {
                     excluded = excluded
                         .checked_add(count)
@@ -1357,12 +1383,14 @@ impl Querier {
             .filter(col(columns::TENANT_ID).eq(lit(tenant.as_str())))
             .map_err(storage_err)?;
         let group_exprs = compile::group_exprs(&agg.by, &df)?;
-        let aggregated = df
-            .aggregate(
-                group_exprs,
-                vec![count(lit(1_i64)).alias(compile::COUNT_COLUMN)],
-            )
-            .map_err(storage_err)?;
+        // Always compute COUNT(*); add the scalar aggregate (sum/min/max/avg of
+        // the CAST-to-Float64 promoted column) when the stage carries one.
+        let mut aggr_exprs = vec![count(lit(1_i64)).alias(compile::COUNT_COLUMN)];
+        if let Some((func, path)) = &agg.scalar {
+            aggr_exprs
+                .push(compile::scalar_agg_expr(*func, path, &df)?.alias(compile::VALUE_COLUMN));
+        }
+        let aggregated = df.aggregate(group_exprs, aggr_exprs).map_err(storage_err)?;
         let plan = aggregated
             .create_physical_plan()
             .await
@@ -1371,7 +1399,7 @@ impl Querier {
             .await
             .map_err(storage_err)?;
         let scan = scan_stats(plan.as_ref());
-        let decoded = decode_aggregate(&batches, agg.by.len())?;
+        let decoded = decode_aggregate(&batches, agg.by.len(), agg.scalar.is_some())?;
         Ok(QueryResult {
             rows: decoded.rows,
             stats: QueryStats {

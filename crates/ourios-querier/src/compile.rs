@@ -61,15 +61,17 @@ use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::dataframe::DataFrame;
 use datafusion::functions::expr_fn::{coalesce, get_field, regexp_like, starts_with};
+use datafusion::functions_aggregate::expr_fn::{avg, max, min, sum};
 use datafusion::functions_nested::expr_fn::array_element;
-use datafusion::logical_expr::{Expr, cast, not};
+use datafusion::logical_expr::{Expr, cast, not, try_cast};
 use datafusion::prelude::{col, lit};
 
 use ourios_core::alias::AliasMap;
 use ourios_core::tenant::TenantId;
 
 use crate::dsl::ir::{
-    Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityValue, Stage, Time, Value,
+    AggFn, Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityValue, Stage, Time,
+    Value,
 };
 use crate::{QueryError, has_column, time_bound_scalar};
 use ourios_parquet::{columns, promoted};
@@ -92,14 +94,18 @@ pub(crate) struct Plan {
     pub(crate) aggregate: Option<Aggregate>,
 }
 
-/// A validated `count [by …]` stage (RFC 0002 §6.3/§6.5 amendment
-/// 2026-07-15): the group terms, already checked against the pinning rule,
-/// the positive-bucket-width rule, and the duplicate-term rules. Only the
-/// `count` family executes in this slice; `sum`/`min`/`max`/`avg` keep
-/// their explicit rejection.
+/// A validated aggregation stage (RFC 0002 §6.3/§6.5 amendment 2026-07-15 for
+/// `count`; the 2026-07-23 amendment RFC0002.17 for `sum`/`min`/`max`/`avg`):
+/// the group terms, already checked against the pinning rule, the
+/// positive-bucket-width rule, and the duplicate-term rules.
 #[derive(Debug, Clone)]
 pub(crate) struct Aggregate {
     pub(crate) by: Vec<GroupTerm>,
+    /// The scalar aggregate `func(path)` for a `sum`/`min`/`max`/`avg` stage;
+    /// `None` for the bare `count` family. The path is a promoted attribute
+    /// read as `Float64` — `Utf8` promoted columns are cast at query time, so
+    /// an unparseable value reads as NULL and is excluded (RFC0002.17).
+    pub(crate) scalar: Option<(AggFn, Field)>,
 }
 
 /// The alias each grouping expression carries in the aggregation plan
@@ -111,6 +117,10 @@ pub(crate) fn group_column_name(i: usize) -> String {
 
 /// The alias of the aggregation plan's count column.
 pub(crate) const COUNT_COLUMN: &str = "n";
+
+/// The alias of the aggregation plan's scalar-value column (`sum`/`min`/`max`/
+/// `avg`), present only when the stage carries a scalar aggregate.
+pub(crate) const VALUE_COLUMN: &str = "v";
 
 /// [`validate`]'s output: the resolved window and limit (as before) plus the
 /// validated aggregation stage, if any.
@@ -138,12 +148,12 @@ pub(crate) fn validate(
     now_unix_nano: u64,
     default_window_nanos: u64,
 ) -> Result<Validated, QueryError> {
-    // This slice executes the `range` (time window), `limit`, and — per the
-    // RFC 0002 amendment 2026-07-15 (RFC0002.12) — `count [by …]` stages.
-    // The remaining aggregation / sort / projection / render stages parse
-    // into a valid IR but are not yet wired to execution; reject them
-    // explicitly so a query asking for one fails fast rather than silently
-    // returning a plain filtered row set.
+    // This slice executes `range` (time window), `limit`, `count [by …]`
+    // (RFC 0002 amendment 2026-07-15), and the `sum`/`min`/`max`/`avg` scalar
+    // aggregates (RFC0002.17, 2026-07-23). The remaining sort / projection /
+    // render stages parse into a valid IR but are not yet wired to execution;
+    // reject them explicitly so a query asking for one fails fast rather than
+    // silently returning a plain filtered row set.
     let mut aggregate = None;
     for stage in &query.stages {
         let unsupported = match stage {
@@ -155,10 +165,26 @@ pub(crate) fn validate(
             }
             Stage::Count { by } => {
                 validate_group_terms(by, &query.predicate)?;
-                aggregate = Some(Aggregate { by: by.clone() });
+                aggregate = Some(Aggregate {
+                    by: by.clone(),
+                    scalar: None,
+                });
                 None
             }
-            Stage::Agg { .. } => Some("aggregation"),
+            Stage::Agg { .. } if aggregate.is_some() => {
+                return Err(QueryError::InvalidQuery {
+                    detail: "a query takes at most one aggregation stage".to_string(),
+                });
+            }
+            Stage::Agg { func, path, by } => {
+                validate_group_terms(by, &query.predicate)?;
+                validate_agg_path(path)?;
+                aggregate = Some(Aggregate {
+                    by: by.clone(),
+                    scalar: Some((*func, path.clone())),
+                });
+                None
+            }
             Stage::Sort { .. } => Some("sort"),
             Stage::Project(_) => Some("project"),
             Stage::Render => Some("render"),
@@ -490,6 +516,51 @@ fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
                 Ok(col(column))
             }
         }
+    }
+}
+
+/// Compile a `sum`/`min`/`max`/`avg(path)` scalar aggregate to its `DataFusion`
+/// `Expr` (RFC0002.17). The path is a promoted attribute column, resolved like
+/// a group key ([`group_by_promoted`] — same presence check and promotion-hint
+/// error), then `try_cast` to `Float64` so a `Utf8` promoted column aggregates
+/// numerically. `try_cast` (not `cast`) is deliberate: an unparseable value
+/// yields NULL rather than erroring the query, and the aggregate skips NULLs,
+/// so a dirty value neither fails the query nor contributes (RFC0002.18).
+pub(crate) fn scalar_agg_expr(
+    func: AggFn,
+    path: &Field,
+    df: &DataFrame,
+) -> Result<Expr, QueryError> {
+    let column = match path {
+        Field::Attr(key) => group_by_promoted(columns::ATTRIBUTES, key, df)?,
+        Field::Resource(key) => group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, df)?,
+        _ => return Err(agg_path_error()),
+    };
+    let numeric = try_cast(column, DataType::Float64);
+    Ok(match func {
+        AggFn::Sum => sum(numeric),
+        AggFn::Min => min(numeric),
+        AggFn::Max => max(numeric),
+        AggFn::Avg => avg(numeric),
+    })
+}
+
+/// The structural check (in [`validate`], before the union schema is known):
+/// a scalar aggregate path must be a promoted attribute (`attr.<k>` /
+/// `resource.<k>`). The promoted-presence check happens later in
+/// [`scalar_agg_expr`], once the scanned schema is known.
+fn validate_agg_path(path: &Field) -> Result<(), QueryError> {
+    match path {
+        Field::Attr(_) | Field::Resource(_) => Ok(()),
+        _ => Err(agg_path_error()),
+    }
+}
+
+fn agg_path_error() -> QueryError {
+    QueryError::InvalidQuery {
+        detail: "sum/min/max/avg require a promoted attribute path \
+                 (attr.<key> or resource.<key>)"
+            .to_string(),
     }
 }
 

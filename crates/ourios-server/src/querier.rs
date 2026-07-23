@@ -481,7 +481,7 @@ async fn handle_query(
             let is_aggregation = query
                 .stages
                 .iter()
-                .any(|s| matches!(s, Stage::Count { .. }));
+                .any(|s| matches!(s, Stage::Count { .. } | Stage::Agg { .. }));
             if !is_aggregation {
                 apply_limit(&mut query.stages, DEFAULT_LIMIT, MAX_LIMIT);
             }
@@ -662,6 +662,10 @@ struct AggregateGroupDto {
     /// One entry per `by` term in query order; empty for a bare `count`.
     key: Vec<String>,
     count: u64,
+    /// The scalar aggregate result (`sum`/`min`/`max`/`avg`); omitted for a
+    /// bare `count` query, where only `count` is meaningful.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
 }
 
 impl From<&AggregateGroup> for AggregateGroupDto {
@@ -669,6 +673,7 @@ impl From<&AggregateGroup> for AggregateGroupDto {
         Self {
             key: g.key.clone(),
             count: g.count,
+            value: g.value,
         }
     }
 }

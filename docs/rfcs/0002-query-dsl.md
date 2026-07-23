@@ -305,9 +305,8 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > stubs in `crates/ourios-querier/tests/it/rfc0002_dsl.rs`) and turn
 > green in the implementing slices;
 > the status note's `green` refers to RFC0002.1–.11. Execution of the
-> `sum`/`min`/`max`/`avg` stages remains a later obligation — their
-> stages keep the explicit rejection until a future amendment adds
-> their criteria.
+> `sum`/`min`/`max`/`avg` stages is discharged by the 2026-07-23
+> amendment (RFC0002.17–.20) below.
 
 - **RFC0002.12 — `count [by …]` executes end-to-end and matches a naive oracle `[§6.5]`**
   - **Given** a populated tenant store and a query
@@ -373,6 +372,62 @@ surface? Perses+OTel query conventions?) are folded into §9.
     the template-map-acquisition component
     (`registry_bytes_read`) is zero (nothing is rendered). This is
     the pruning claim RFC0031.5 divides against Loki.
+
+> **Amendment 2026-07-23 — scalar aggregation execution
+> (`sum`/`min`/`max`/`avg`).** RFC0002.17–.20 below discharge the "later
+> obligation" the 2026-07-15 amendment left open: they lift
+> `compile::validate`'s rejection of the `agg_fn` stages for scalar
+> aggregation over a **promoted** attribute. The value is read by CAST to
+> `Float64` (promoted columns are Utf8, §6.1) — the pragmatic path, chosen
+> over typed promoted columns (an RFC 0022 / RFC 0005 schema change with a
+> migration); an unparseable value casts to NULL and is excluded from the
+> scalar, so the aggregate never errors on dirty data. Grouping, the window,
+> the single-template `param(n)` pinning rule, and the honest-bytes
+> accounting are inherited unchanged from RFC0002.12–.16.
+
+- **RFC0002.17 — `sum`/`min`/`max`/`avg(attr.<k>) [by …]` executes end-to-end and matches a naive oracle `[§6.5]`**
+  - **Given** a populated tenant store, `<k>` promoted (RFC 0022), and a
+    query `<predicate> | range(…) | <fn>(attr.<k>) [by <field, …>]` for
+    `<fn>` in `{sum, min, max, avg}` — grouped and bare (no `by`)
+  - **When** the querier executes it
+  - **Then** the result is the `group_key → value` map (bare: the single
+    scalar over all matching rows), each `value` the `<fn>` of the row values
+    parsed as `Float64`, equal to a naive oracle computed outside the query
+    path over the same rows; each group also carries its `COUNT(*)`, and the
+    `agg_fn` stage is no longer rejected by `compile::validate`.
+
+- **RFC0002.18 — unparseable / NULL values are excluded from the scalar, not errored `[§6.1]`**
+  - **Given** rows of the grouped set whose promoted `attr.<k>` value is
+    absent, NULL, or not a base-10 number, alongside rows carrying a numeric
+    value
+  - **When** `<fn>(attr.<k>)` executes
+  - **Then** the non-numeric rows contribute to **no** scalar (the CAST to
+    `Float64` yields NULL and the aggregate skips NULLs); the returned `value`
+    equals the oracle over the numeric rows alone, and a group all of whose
+    values are non-numeric carries `value = null`. The query never fails on
+    dirty data, and those rows still count toward the group's `COUNT(*)` and
+    the query total (matching a plain count).
+
+- **RFC0002.19 — a non-promoted or non-attribute aggregate path is a specific compile-time error `[§6.3]`**
+  - **Given** (i) `sum(attr.<k>)` where `<k>` is **not** promoted in the
+    scanned range, (ii) `sum(body)` / `sum(ts)` / `sum(param(0))` (a
+    non-attribute path), and (iii) two aggregation stages in one pipeline
+  - **When** each is compiled
+  - **Then** each fails with a specific, leak-free error (RFC0002.8): (i)
+    names the key and the `storage.promoted_attributes` sublist to add
+    (identical to the group-by hint), (ii) states scalar aggregates require a
+    promoted attribute path, (iii) states a query takes at most one
+    aggregation stage. No query reaches execution.
+
+- **RFC0002.20 — the aggregation result surface carries the scalar value `[§6.4; RFC 0016]`**
+  - **Given** a `<fn>(attr.<k>)` query answered over the JSON `/v1/query` and
+    the MCP `query_logs` surfaces
+  - **When** the response is serialized
+  - **Then** each group carries `{key, count, value}` with `value` the scalar
+    (a JSON number), and a bare `count` query omits `value`; the two surfaces
+    answer identically (the MCP adapter adds only the protocol), and
+    `count`/aggregate queries continue to reject a trailing `limit`
+    (group-limiting is still unimplemented).
 
 ## 6. Design
 

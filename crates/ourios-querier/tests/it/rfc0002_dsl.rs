@@ -852,8 +852,13 @@ async fn rfc0002_6_unsupported_stage_rejected() {
     // `range` + `limit` stay supported, and — per the 2026-07-15 amendment
     // (RFC0002.12) — `count` now executes rather than erroring (its own
     // acceptance test below); the rest must error, not no-op.
+    // `sum`/`min`/`max`/`avg` are supported as of RFC0002.17 (2026-07-23);
+    // `sum(confidence)` is now rejected for its *path* (a first-class field, not
+    // a promoted attribute) rather than as an unsupported stage — its full
+    // rejection coverage lives in rfc0002_19. `sort`/`project`/`render` remain
+    // genuinely unsupported.
     let cases: &[(&str, &str)] = &[
-        ("body == \"x\" | sum(confidence)", "aggregation"),
+        ("body == \"x\" | sum(confidence)", "promoted attribute path"),
         ("body == \"x\" | sort ts", "sort"),
         ("body == \"x\" | project body", "project"),
         ("body == \"x\" | render", "render"),
@@ -1577,6 +1582,212 @@ fn group_map(result: &ourios_querier::QueryResult) -> std::collections::BTreeMap
         .iter()
         .map(|g| (g.key.clone(), g.count))
         .collect()
+}
+
+/// The executed scalar-aggregate map as `key → value(¢)`, rounded to cents so
+/// the `f64` oracle comparison is exact.
+// Cent rounding: the fixture values are small and exact at this scale.
+#[allow(clippy::cast_possible_truncation)]
+fn value_cents(
+    result: &ourios_querier::QueryResult,
+) -> std::collections::BTreeMap<Vec<String>, Option<i64>> {
+    result
+        .aggregate
+        .as_ref()
+        .expect("an aggregation query returns the grouped map")
+        .iter()
+        .map(|g| (g.key.clone(), g.value.map(|v| (v * 100.0).round() as i64)))
+        .collect()
+}
+
+/// Run a query expected to fail at parse/compile, returning the error string.
+async fn run_dsl_err(bucket: &std::path::Path, dsl: &str) -> String {
+    use crate::common::{DEFAULT_WINDOW_NS, NOW, no_aliases};
+    let query = ourios_querier::dsl::parse(dsl).expect("parse DSL");
+    ourios_querier::Querier::new(bucket)
+        .run_query(
+            &query,
+            &ourios_core::tenant::TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&no_aliases()),
+        )
+        .await
+        .expect_err("expected a query error")
+        .to_string()
+}
+
+/// Scenario RFC0002.17 — `sum`/`min`/`max`/`avg(attr.<k>)` execute end-to-end
+/// and match a naive oracle. See `docs/rfcs/0002-query-dsl.md` §5 (amendment
+/// 2026-07-23).
+// Oracle arithmetic on small fixed fixtures — the cent rounding and the
+// u64→f64 average divisor are exact at this scale.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#[tokio::test]
+async fn rfc0002_17_scalar_aggregates_match_oracle() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{TS0, kv, rec_with_attrs, write_all_with_promoted};
+    use ourios_parquet::PromotedAttributes;
+
+    // (model, cost) rows: opus {1.50, 2.50}, haiku {0.25}.
+    let rows: &[(&str, f64)] = &[("opus", 1.50), ("opus", 2.50), ("haiku", 0.25)];
+    let recs: Vec<_> = rows
+        .iter()
+        .map(|(model, cost)| {
+            rec_with_attrs(
+                "a",
+                TS0,
+                vec![kv("service.name", "agent")],
+                vec![kv("model", model), kv("cost", &format!("{cost}"))],
+            )
+        })
+        .collect();
+    let promoted =
+        PromotedAttributes::new(Vec::<String>::new(), vec!["model".into(), "cost".into()]);
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all_with_promoted(bucket.path(), &recs, &promoted);
+
+    // Per-model oracles.
+    let mut sums: BTreeMap<String, f64> = BTreeMap::new();
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut mins: BTreeMap<String, f64> = BTreeMap::new();
+    let mut maxs: BTreeMap<String, f64> = BTreeMap::new();
+    for (model, cost) in rows {
+        *sums.entry((*model).into()).or_default() += cost;
+        *counts.entry((*model).into()).or_default() += 1;
+        mins.entry((*model).into())
+            .and_modify(|m| *m = f64::min(*m, *cost))
+            .or_insert(*cost);
+        maxs.entry((*model).into())
+            .and_modify(|m| *m = f64::max(*m, *cost))
+            .or_insert(*cost);
+    }
+    let avgs: BTreeMap<String, f64> = sums
+        .iter()
+        .map(|(k, s)| (k.clone(), s / counts[k] as f64))
+        .collect();
+
+    for (func, oracle) in [
+        ("sum", &sums),
+        ("min", &mins),
+        ("max", &maxs),
+        ("avg", &avgs),
+    ] {
+        let dsl = format!("template_id == 1 | {func}(attr.cost) by attr.model");
+        let got = value_cents(&run_dsl(bucket.path(), &dsl).await);
+        let want: BTreeMap<Vec<String>, Option<i64>> = oracle
+            .iter()
+            .map(|(k, v)| (vec![k.clone()], Some((v * 100.0).round() as i64)))
+            .collect();
+        assert_eq!(
+            got, want,
+            "{func}(attr.cost) by attr.model matches the oracle"
+        );
+    }
+
+    // A bare scalar (no `by`) folds every matching row into one group.
+    let bare = run_dsl(bucket.path(), "template_id == 1 | sum(attr.cost)").await;
+    let total: f64 = rows.iter().map(|(_, c)| c).sum();
+    let group = &bare.aggregate.as_ref().expect("map")[0];
+    assert_eq!(
+        group.value.map(|v| (v * 100.0).round() as i64),
+        Some((total * 100.0).round() as i64)
+    );
+    assert_eq!(
+        group.count,
+        rows.len() as u64,
+        "the bare group counts every row"
+    );
+}
+
+/// Scenario RFC0002.18 — an unparseable / NULL value is excluded from the
+/// scalar (CAST → NULL, skipped) but still counts. See §5 (amendment
+/// 2026-07-23).
+// Cent rounding on a small fixture — exact at this scale.
+#[allow(clippy::cast_possible_truncation)]
+#[tokio::test]
+async fn rfc0002_18_unparseable_value_excluded_from_scalar() {
+    use crate::common::{TS0, kv, rec_with_attrs, write_all_with_promoted};
+    use ourios_parquet::PromotedAttributes;
+
+    // opus: 1.50, 2.50, and a junk "N/A" — the junk drops out of the sum.
+    let recs: Vec<_> = ["1.50", "2.50", "N/A"]
+        .iter()
+        .map(|cost| {
+            rec_with_attrs(
+                "a",
+                TS0,
+                vec![kv("service.name", "agent")],
+                vec![kv("model", "opus"), kv("cost", cost)],
+            )
+        })
+        .collect();
+    let promoted =
+        PromotedAttributes::new(Vec::<String>::new(), vec!["model".into(), "cost".into()]);
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all_with_promoted(bucket.path(), &recs, &promoted);
+
+    let result = run_dsl(
+        bucket.path(),
+        "template_id == 1 | sum(attr.cost) by attr.model",
+    )
+    .await;
+    let group = &result.aggregate.as_ref().expect("map")[0];
+    assert_eq!(
+        group.value.map(|v| (v * 100.0).round() as i64),
+        Some(400),
+        "the junk row is excluded: 1.50 + 2.50",
+    );
+    assert_eq!(
+        group.count, 3,
+        "but the junk row still counts toward COUNT(*)"
+    );
+}
+
+/// Scenario RFC0002.19 — a non-promoted / non-attribute aggregate path, or a
+/// second aggregation stage, is a specific compile-time error. See §5
+/// (amendment 2026-07-23).
+#[tokio::test]
+async fn rfc0002_19_scalar_aggregate_path_errors() {
+    use crate::common::{TS0, kv, rec_with_attrs, write_all};
+    use ourios_parquet::PromotedAttributes;
+
+    let recs = [rec_with_attrs(
+        "a",
+        TS0,
+        vec![kv("service.name", "agent")],
+        vec![kv("cost", "1.0")],
+    )];
+
+    // (i) `cost` present but NOT promoted → promotion hint, never a silent scan.
+    let unpromoted = tempfile::TempDir::new().expect("temp");
+    write_all(unpromoted.path(), &recs);
+    let err = run_dsl_err(unpromoted.path(), "template_id == 1 | sum(attr.cost)").await;
+    assert!(
+        err.contains("storage.promoted_attributes"),
+        "promotion hint for a non-promoted path: {err}",
+    );
+
+    // A store that DID promote it, reused for the structural rejections below
+    // (they fail in `validate`, before the scan, so the store is incidental).
+    let promoted = PromotedAttributes::new(Vec::<String>::new(), vec!["cost".into()]);
+    let store = tempfile::TempDir::new().expect("temp");
+    crate::common::write_all_with_promoted(store.path(), &recs, &promoted);
+
+    // (ii) non-attribute path.
+    let err = run_dsl_err(store.path(), "true | sum(body)").await;
+    assert!(
+        err.contains("promoted attribute path"),
+        "non-attribute path rejected: {err}",
+    );
+
+    // (iii) two aggregation stages.
+    let err = run_dsl_err(store.path(), "template_id == 1 | count | sum(attr.cost)").await;
+    assert!(
+        err.contains("at most one aggregation stage"),
+        "double aggregation rejected: {err}",
+    );
 }
 
 /// Scenario RFC0002.12 — `count [by …]` executes end-to-end and matches a

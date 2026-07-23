@@ -27,6 +27,7 @@ use ourios_core::tenant::TenantId;
 use ourios_ingester::receiver::{AuthBinding, AuthResolver};
 use ourios_parquet::PromotedAttributes;
 use ourios_querier::Querier;
+use ourios_querier::dsl::ir::Stage;
 use ourios_querier::dsl::{self, Statement};
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
@@ -294,9 +295,19 @@ impl OuriosMcp {
         };
         // The tool argument is a hard cap, not just a default: a DSL
         // `limit` stage inside the statement clamps to it, so the
-        // documented "maximum rendered rows" contract holds.
-        let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        apply_limit(&mut query.stages, cap, cap);
+        // documented "maximum rendered rows" contract holds. A `count [by
+        // …]` aggregation answers with its grouped-count map, not a capped
+        // row set — `count` and `limit` are mutually exclusive
+        // (`compile::validate`), so injecting the cap there rejects the
+        // query. Mirror the JSON API's guard (`handle_query`).
+        let is_aggregation = query
+            .stages
+            .iter()
+            .any(|s| matches!(s, Stage::Count { .. }));
+        if !is_aggregation {
+            let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+            apply_limit(&mut query.stages, cap, cap);
+        }
         let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let result = self

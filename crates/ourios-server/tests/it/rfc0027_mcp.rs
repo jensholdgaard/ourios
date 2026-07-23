@@ -362,6 +362,54 @@ async fn rfc0027_3_query_logs() {
     );
 }
 
+/// Scenario RFC0027.3 (regression) — `query_logs` answers a `count [by …]`
+/// aggregation. The tool auto-attaches its row cap, but `count` and `limit`
+/// are mutually exclusive (`compile::validate`), so the cap must be skipped
+/// for aggregations — mirroring the JSON API's `is_aggregation` guard.
+/// Before the fix the tool rejected every `count by` with "does not support
+/// `limit`", so no aggregation could run through the MCP surface.
+/// See `docs/rfcs/0027-mcp-query-surface.md` §5.
+#[tokio::test]
+async fn rfc0027_3_query_logs_count_aggregation() {
+    let bucket = tempfile::tempdir().expect("temp");
+    crate::rfc0016_query_endpoint::seed_two_records(bucket.path());
+
+    let router = ourios_server::querier::router_with_mcp(
+        bucket.path().to_path_buf(),
+        crate::rfc0016_query_endpoint::SHARED_HUGE_WINDOW,
+        ourios_ingester::receiver::AuthResolver::static_only(None),
+        true,
+    );
+    let query = "template_id == 1 | count by template_id";
+    // A non-null `limit` is passed on purpose: the fix must ignore it for an
+    // aggregation rather than inject it and reject the query.
+    let body = mcp_tool_call(
+        &router,
+        None,
+        "query_logs",
+        serde_json::json!({"tenant": "acme", "query": query, "limit": 10}),
+    )
+    .await;
+    let mcp_payload = tool_text(&body);
+    assert!(
+        mcp_payload["aggregate"]
+            .as_array()
+            .is_some_and(|groups| !groups.is_empty()),
+        "the count aggregation returns a non-empty grouped-count map, not a tool error: {body}",
+    );
+
+    // Identical to the JSON API for the same statement — the adapter adds
+    // nothing but the protocol, aggregations included.
+    let (status, json_payload) =
+        crate::rfc0016_query_endpoint::post_for_equivalence(bucket.path(), Some("acme"), query)
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        mcp_payload, json_payload,
+        "MCP and JSON API agree on the aggregation",
+    );
+}
+
 /// Scenario RFC0027.4 — `list_templates` matches the RFC 0017 registry.
 /// See `docs/rfcs/0027-mcp-query-surface.md` §5.
 #[tokio::test]

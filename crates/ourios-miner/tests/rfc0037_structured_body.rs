@@ -56,10 +56,14 @@ async fn rfc0037_3_structured_body_unbounded_fidelity_and_observability() {
 
     let tenant = TenantId::new("genai-tenant");
     let body_av = big_structured_body(200);
-    // The exact bytes the metric must observe = the canonical-JSON length.
-    let expected_bytes = ourios_core::otlp::canonical::encode_any_value(&body_av)
-        .expect("canonical encode is infallible")
-        .len() as u64;
+    // The exact canonical JSON the record must retain, and its byte length —
+    // what the metric must observe.
+    let expected_body = String::from_utf8(
+        ourios_core::otlp::canonical::encode_any_value(&body_av)
+            .expect("canonical encode is infallible"),
+    )
+    .expect("canonical JSON is UTF-8");
+    let expected_bytes = expected_body.len() as u64;
 
     let record = OtlpLogRecord {
         tenant_id: tenant.clone(),
@@ -79,9 +83,9 @@ async fn rfc0037_3_structured_body_unbounded_fidelity_and_observability() {
     assert_eq!(mined.len(), 1, "one record emitted");
     let rec = &mined[0];
     assert_eq!(
-        rec.body.as_ref().map(|b| b.len() as u64),
-        Some(expected_bytes),
-        "the structured body must be retained whole, never truncated"
+        rec.body.as_deref(),
+        Some(expected_body.as_str()),
+        "the structured body must be retained byte-for-byte, never truncated"
     );
     assert!(
         !rec.lossy_flag,

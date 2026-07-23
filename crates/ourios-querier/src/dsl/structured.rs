@@ -467,19 +467,15 @@ impl RawGroupTerm {
             Self::Bucket(RawBucketTerm { bucket }) => {
                 Ok(GroupTerm::Bucket(parse_duration_lexeme_pub(&bucket)?))
             }
-            // The string DSL's `group_term = field` production (§7 v1.1)
-            // only accepts a bare top-level field — `resource.`/`attr.`
-            // paths are rejected there (see `parse_field`'s error message).
-            // A `{resource|attr}` object here would let the structured
-            // surface express a `by`-list the string grammar cannot, so it
-            // is rejected at the same boundary rather than reaching the
-            // planner (RFC0002.2).
-            Self::Field(RawField::Object(_)) => Err(DslError::new(
-                "a by-list field must be a bare field name (resource./attr. paths \
-                 are not allowed here)"
-                    .to_string(),
-            )),
-            Self::Field(field @ RawField::Name(_)) => Ok(GroupTerm::Field(field.into_ir()?)),
+            // RFC 0037 §3.3: a `by`-list field is a bare top-level field or a
+            // `resource.`/`attr.` path (the `{resource|attr}` object form).
+            // Both surfaces admit the same set — the string grammar's
+            // `parse_group_term` now routes through `parse_path` — and the
+            // compiler gates the path forms on the key being a promoted
+            // column.
+            Self::Field(field @ (RawField::Object(_) | RawField::Name(_))) => {
+                Ok(GroupTerm::Field(field.into_ir()?))
+            }
         }
     }
 }
@@ -639,7 +635,7 @@ fn parse_time(s: &str) -> Result<Time, DslError> {
 #[cfg(test)]
 mod tests {
     use super::parse_structured;
-    use crate::dsl::ir::{Call, CmpOp, Field, OrdOp, Predicate, Stage, Value};
+    use crate::dsl::ir::{Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Stage, Value};
 
     #[test]
     fn parses_comparison_with_attr_object() {
@@ -826,25 +822,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_resource_and_attr_group_terms() {
-        // The string DSL's `group_term = field` production (§7 v1.1) is
-        // bare-field-only; a structured `{resource|attr}` by-element would
-        // let this surface express a query the string grammar cannot
-        // (RFC0002.2), so it is rejected here rather than reaching the
-        // planner.
-        for req in [
-            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"resource":"k8s.pod.name"}]}}]}"#,
-            r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"attr":"http.status_code"}]}}]}"#,
-            r#"{"predicate":{"const":true},"stages":[{"avg":"confidence","by":[{"attr":"k"}]}]}"#,
-        ] {
-            let err = parse_structured(req).unwrap_err();
-            assert!(
-                err.message().contains("bare field"),
-                "{}: {}",
-                req,
-                err.message()
-            );
+    fn accepts_resource_and_attr_group_terms() {
+        // RFC 0037 §3.3 extends the by-list to `resource.`/`attr.` paths on
+        // both surfaces — the string grammar's `parse_group_term` now routes
+        // through `parse_path`, so the two surfaces still admit the same set.
+        // The compiler gates the path forms on the key being a promoted
+        // column; parsing accepts them. (Previously this surface rejected them
+        // to stay within the older bare-field-only string grammar.)
+        let count_cases: &[(&str, GroupTerm)] = &[
+            (
+                r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"resource":"k8s.pod.name"}]}}]}"#,
+                GroupTerm::Field(Field::Resource("k8s.pod.name".into())),
+            ),
+            (
+                r#"{"predicate":{"const":true},"stages":[{"count":{"by":[{"attr":"http.status_code"}]}}]}"#,
+                GroupTerm::Field(Field::Attr("http.status_code".into())),
+            ),
+        ];
+        for (req, expected) in count_cases {
+            let query = parse_structured(req).expect("resource/attr count group terms now parse");
+            let Some(Stage::Count { by }) = query.stages.first() else {
+                panic!("{req}: expected a count stage");
+            };
+            assert_eq!(by.len(), 1, "{req}: one group term");
+            assert_eq!(&by[0], expected, "{req}");
         }
+
+        // The relaxation applies to any grouped aggregate (they share
+        // `group_terms_to_ir`), e.g. `avg … by attr.k`.
+        assert!(
+            parse_structured(
+                r#"{"predicate":{"const":true},"stages":[{"avg":"confidence","by":[{"attr":"k"}]}]}"#
+            )
+            .is_ok(),
+            "avg grouped by a resource/attr path also parses now"
+        );
     }
 
     #[test]

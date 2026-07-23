@@ -434,6 +434,33 @@ pub(crate) fn group_exprs(by: &[GroupTerm], df: &DataFrame) -> Result<Vec<Expr>,
         .collect()
 }
 
+/// Lower a group-by on a promoted attribute column (RFC 0037 §3.3). Groups on
+/// the promoted `resource.<key>` / `attr.<key>` column when it is present in
+/// the scanned union schema; otherwise rejects with a hint pointing at
+/// promotion, so grouping never silently degrades to a single NULL bucket or
+/// an unpruned JSON scan.
+fn group_by_promoted(column: &str, key: &str, df: &DataFrame) -> Result<Expr, QueryError> {
+    let name = promoted_column_name(column, key);
+    if has_column(df, &name) {
+        Ok(Expr::Column(Column::new_unqualified(name)))
+    } else {
+        // Name the raw config key (no `attr.`/`resource.` prefix) and the
+        // sublist it belongs under, so the hint points at the exact string to
+        // add rather than the derived column name.
+        let sublist = if column == columns::RESOURCE_ATTRIBUTES {
+            "resource"
+        } else {
+            "log"
+        };
+        Err(QueryError::InvalidQuery {
+            detail: format!(
+                "grouping by '{name}' requires the attribute to be promoted to a column present \
+                 in the queried range; add '{key}' to storage.promoted_attributes.{sublist}"
+            ),
+        })
+    }
+}
+
 fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
     match field {
         Field::Service => {
@@ -445,13 +472,16 @@ fn field_group_expr(field: &Field, df: &DataFrame) -> Result<Expr, QueryError> {
                 Ok(lit(ScalarValue::Utf8(None)))
             }
         }
-        // §7 confines `by`-list fields to the bare set, so these are only
-        // reachable from a hand-built IR — reject rather than group over the
-        // JSON-encoded attribute columns.
-        Field::Resource(_) | Field::Attr(_) => Err(QueryError::InvalidQuery {
-            detail: "grouping by resource/attr attributes is not supported in this query surface"
-                .to_string(),
-        }),
+        // RFC 0037 §3.3: group by a *promoted* attribute column. The column
+        // is present in the scanned union schema exactly when ≥ 1 scanned
+        // file promoted the key (DataFusion supplies per-file NULLs for any
+        // pre-promotion partitions within a mixed scan — the typed-NULL
+        // fallback happens for free). Absent from every scanned file, the key
+        // is not a usable group key here: reject with a promotion hint rather
+        // than collapse every row into one NULL bucket or group over an
+        // unpruned JSON scan (hazard #6).
+        Field::Resource(key) => group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, df),
+        Field::Attr(key) => group_by_promoted(columns::ATTRIBUTES, key, df),
         _ => {
             let (column, optional) = column_of(field);
             if optional && !has_column(df, column) {

@@ -1775,6 +1775,108 @@ async fn rfc0002_13_count_by_param_bucket_grouped_map() {
     );
 }
 
+/// Scenario RFC0037.4 — `count … by` a *promoted* attribute column
+/// (`attr.gen_ai.request.model`) matches a brute-force `(bucket, model) →
+/// count` oracle; the same query against a *non-promoted* key is rejected
+/// with a promotion hint. See `docs/rfcs/0037-genai-structured-log-events.md`
+/// §3.3.
+#[tokio::test]
+async fn rfc0037_4_count_by_promoted_attribute() {
+    use std::collections::BTreeMap;
+
+    use crate::common::{
+        DEFAULT_WINDOW_NS, NOW, TS0, kv, no_aliases, rec_with_attrs, write_all,
+        write_all_with_promoted,
+    };
+    use ourios_core::tenant::TenantId;
+    use ourios_parquet::PromotedAttributes;
+
+    const SECOND_NS: u64 = 1_000_000_000;
+    const WIDTH_NS: u64 = 300 * SECOND_NS; // 5m
+
+    // Rows carrying a `gen_ai.request.model` log attribute across two models
+    // and two 5-minute windows.
+    let rows: &[(&str, u64)] = &[
+        ("gpt-4", TS0),
+        ("gpt-4", TS0 + 100 * SECOND_NS),
+        ("claude", TS0 + 150 * SECOND_NS),
+        ("gpt-4", TS0 + 400 * SECOND_NS),
+    ];
+    let recs: Vec<_> = rows
+        .iter()
+        .map(|(model, ts)| {
+            rec_with_attrs(
+                "a",
+                *ts,
+                vec![kv("service.name", "checkout")],
+                vec![kv("gen_ai.request.model", model)],
+            )
+        })
+        .collect();
+
+    // Promote the log key so it gets a dedicated, groupable column.
+    let promoted = PromotedAttributes::new(
+        Vec::<String>::new(),
+        vec!["gen_ai.request.model".to_string()],
+    );
+
+    let bucket = tempfile::TempDir::new().expect("temp");
+    write_all_with_promoted(bucket.path(), &recs, &promoted);
+
+    // Brute-force oracle: (model, bucket_key) → count.
+    let bucket_key = |ts: u64| {
+        let start = ts / WIDTH_NS * WIDTH_NS;
+        chrono::DateTime::from_timestamp_nanos(i64::try_from(start).expect("fixture ns"))
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    };
+    let mut oracle: BTreeMap<Vec<String>, u64> = BTreeMap::new();
+    for (model, ts) in rows {
+        *oracle
+            .entry(vec![(*model).to_string(), bucket_key(*ts)])
+            .or_default() += 1;
+    }
+
+    let result = run_dsl(
+        bucket.path(),
+        "template_id == 1 | range(2026-04-02T10:00:00Z, 2026-04-02T12:00:00Z) \
+         | count by attr.gen_ai.request.model, bucket(5m)",
+    )
+    .await;
+    assert_eq!(
+        group_map(&result),
+        oracle,
+        "grouped count over the promoted attribute matches the brute-force map"
+    );
+
+    // Rejection: the identical grouping over a store that did NOT promote the
+    // key is rejected with a promotion hint — never a silent unpruned scan.
+    let unpromoted = tempfile::TempDir::new().expect("temp");
+    write_all(unpromoted.path(), &recs);
+    let query = ourios_querier::dsl::parse("template_id == 1 | count by attr.gen_ai.request.model")
+        .expect("parse");
+    let err = ourios_querier::Querier::new(unpromoted.path())
+        .run_query(
+            &query,
+            &TenantId::new("a"),
+            NOW,
+            DEFAULT_WINDOW_NS,
+            Some(&no_aliases()),
+        )
+        .await
+        .expect_err("grouping by a non-promoted attribute must be rejected");
+    let msg = err.to_string();
+    // The hint names the raw config key (no `attr.` prefix) and the sublist to
+    // add it under, not just the derived column name.
+    assert!(
+        msg.contains("gen_ai.request.model"),
+        "the rejection names the raw config key; got: {msg}"
+    );
+    assert!(
+        msg.contains("storage.promoted_attributes.log"),
+        "the rejection names the config sublist; got: {msg}"
+    );
+}
+
 /// Scenario RFC0002.14 — `param(n)` misuse is a specific compile-time
 /// error. See `docs/rfcs/0002-query-dsl.md` §5 (amendment 2026-07-15).
 #[tokio::test]

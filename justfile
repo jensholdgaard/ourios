@@ -193,8 +193,8 @@ release version:
 # and query the ingested telemetry back. Since Ourios *is* an OTLP log
 # receiver, no Collector or container is needed. Open receiver (no auth section
 # → open, per RFC 0026), local filesystem store + WAL under scratch/dogfood/
-# (gitignored). Ports: 4318 OTLP/HTTP, 4317 OTLP/gRPC, 4319 query API. Ctrl-C
-# to stop; `just dogfood-clean` to wipe the captured store.
+# (gitignored). Ports: 4318 OTLP/HTTP, 4317 OTLP/gRPC, 4319 query API + /mcp.
+# Ctrl-C to stop; `just dogfood-clean` to wipe the captured store.
 #
 # Run `just dogfood-env` in the other terminal for the source-side env block.
 dogfood-server:
@@ -202,10 +202,15 @@ dogfood-server:
     set -euo pipefail
     mkdir -p scratch/dogfood/store scratch/dogfood/wal
     echo "OTLP logs → http://127.0.0.1:4318 (HTTP) · 127.0.0.1:4317 (gRPC)"
-    echo "query API → http://127.0.0.1:4319  ·  store → scratch/dogfood/"
+    echo "query API → http://127.0.0.1:4319  ·  MCP → http://127.0.0.1:4319/mcp"
+    echo "store     → scratch/dogfood/"
     # Bind to loopback only: the receiver is unauthenticated here, so binding
     # ourios-server's 0.0.0.0 defaults would expose open OTLP ingest + query to
     # the LAN (e.g. on public Wi-Fi). Localhost keeps it to this machine.
+    #
+    # MCP is enabled so a source can query its own captured telemetry back
+    # through Ourios (RFC 0027). Open mode takes the tenant as a tool argument
+    # (no bearer); safe here only because we're loopback-bound.
     OURIOS_STORAGE_BACKEND=local \
     OURIOS_BUCKET_ROOT="$(pwd)/scratch/dogfood/store" \
     OURIOS_WAL_ROOT="$(pwd)/scratch/dogfood/wal" \
@@ -214,6 +219,7 @@ dogfood-server:
     OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:4318 \
     OURIOS_QUERIER_ENABLED=1 \
     OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:4319 \
+    OURIOS_QUERIER_MCP_ENABLED=1 \
     cargo run -p ourios-server
 
 # Print the env block that points a source's OTLP telemetry at the local
@@ -240,11 +246,15 @@ dogfood-env:
     #   Copilot CLI:  export COPILOT_OTEL_ENABLED=true
     # opt-in content capture (privacy: retains prompts/tool output):
     #   Claude Code:  export OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1
-    # query it (the query API needs x-ourios-tenant; tenant == service.name):
+    # query it over HTTP (needs x-ourios-tenant; tenant == service.name):
     #   curl -sS http://127.0.0.1:4319/v1/query \
     #     -H 'x-ourios-tenant: agent-dogfood' \
     #     -H 'content-type: text/plain' \
     #     --data 'severity >= trace | range(-1h, now) | limit 20'
+    # close the loop — let the source query its own telemetry via Ourios's MCP
+    # (open mode takes the tenant as a tool argument, no bearer):
+    #   Claude Code:  claude mcp add --transport http ourios http://127.0.0.1:4319/mcp
+    #   then ask it to read ourios://query-schema and query tenant "agent-dogfood"
     ENV
 
 # Wipe the local dogfood store + WAL (the captured telemetry). Refuses while

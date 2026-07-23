@@ -140,4 +140,20 @@ async fn rfc0037_3_structured_body_unbounded_fidelity_and_observability() {
         expected_bytes,
         "histogram sum equals the canonical-JSON byte length"
     );
+
+    // Byte-scale bucket boundaries (RFC 0037 §3.2): the histogram must use the
+    // explicit byte buckets, not the SDK's default ~10 000-max boundaries —
+    // otherwise every structured body over ~10 KiB collapses into one +Inf
+    // bucket and the size distribution is unreadable. A 16 MiB top boundary is
+    // the distinguishing marker.
+    let bounds: Vec<f64> = point.bounds().collect();
+    assert_eq!(
+        bounds.last().copied(),
+        Some(16_777_216.0),
+        "byte-scale buckets (16 MiB top boundary), not the SDK duration-scale defaults; got {bounds:?}"
+    );
+    assert!(
+        bounds.contains(&1_048_576.0),
+        "buckets resolve the MiB range; got {bounds:?}"
+    );
 }

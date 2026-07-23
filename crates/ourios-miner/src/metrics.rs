@@ -74,6 +74,26 @@ const RESOURCE_SERVICE_NAME: &str = "service.name";
 /// state).
 const RESERVOIR_CAP: usize = 1024;
 
+/// Explicit bucket boundaries (bytes) for the `ourios.miner.structured_body.size`
+/// histogram (RFC 0037 §3.2). The SDK's default boundaries top out near 10 000,
+/// which for a byte measure collapses every structured body over ~10 KiB into
+/// one `+Inf` bucket — useless for the metric's purpose (seeing where large
+/// structured bodies sit). These span the structured-body range from the
+/// `param_byte_limit` reference (256 B) to 16 MiB, so an operator can actually
+/// tell a 50 KiB chat history from a multi-MiB one. Bytes are `u64` at the
+/// record site; the boundaries API takes `f64` (exact for every value here).
+const STRUCTURED_BODY_SIZE_BUCKETS: [f64; 9] = [
+    256.0,        // param_byte_limit reference
+    1_024.0,      // 1 KiB
+    4_096.0,      // 4 KiB
+    16_384.0,     // 16 KiB
+    65_536.0,     // 64 KiB
+    262_144.0,    // 256 KiB
+    1_048_576.0,  // 1 MiB
+    4_194_304.0,  // 4 MiB
+    16_777_216.0, // 16 MiB
+];
+
 /// Read the source `service.name` from a record's
 /// `resource_attributes`, returning `None` when it is absent, empty,
 /// or non-string. The proto `KeyValue` carries
@@ -367,6 +387,7 @@ impl MinerMetrics {
         let structured_body_size = meter
             .u64_histogram(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE)
             .with_unit("By")
+            .with_boundaries(STRUCTURED_BODY_SIZE_BUCKETS.to_vec())
             .build();
 
         let observable_gauges = Self::register_observable_gauges(&meter, &state);

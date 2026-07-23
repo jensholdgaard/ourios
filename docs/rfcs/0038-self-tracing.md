@@ -159,6 +159,46 @@ file front-end — the **first** telemetry config section (telemetry is env-only
 today). Traces can be disabled wholesale (`traces.enabled: false`), which
 restores today's logs-plus-metrics posture exactly.
 
+**Precedence and failure (the sampler resolution is authoritative and
+fail-fast):**
+
+- `telemetry.traces.sample_ratio`, when set in the config file, **selects and
+  configures** a `parentbased_traceidratio` sampler at that ratio — it does not
+  merely tune an already-chosen one. It **takes precedence** over the env
+  sampler (RFC 0020: the file is authoritative when `--config` is given). The
+  file surface is a ratio only, which maps unambiguously to that one sampler.
+- When the file sets no ratio, the standard OTel `OTEL_TRACES_SAMPLER` /
+  `OTEL_TRACES_SAMPLER_ARG` env vars resolve the sampler (the SDK's own
+  handling — any standard sampler name). When neither file nor env sets one,
+  the default is `parentbased_always_on`.
+- **Validation.** Ourios validates its own file value: `traces.sample_ratio`
+  must be a number in `[0.0, 1.0]`; out-of-range or non-numeric **rejects
+  startup** with a config error, consistent with Ourios's fail-fast validation
+  of every other config field. The OTel env vars stay the SDK's domain — an
+  invalid `OTEL_TRACES_SAMPLER`/`_ARG` is logged and ignored by the SDK, which
+  falls back to its default; Ourios does not alter that behaviour.
+
+### 3.5 Span names and attributes
+
+Names are fixed here (low cardinality, ids as attributes not names, per OTel's
+span-naming guidance) so the §5 contract is complete:
+
+| Operation | Span name | Kind |
+|---|---|---|
+| Logs query | `POST /v1/query` (HTTP `{method} {route}`) | `SERVER` |
+| MCP tool call | `ourios.mcp.query_logs` / `.list_templates` / `.template_drift` | `INTERNAL` (child of rmcp `serve_inner`) |
+| OTLP Export batch | `ourios.ingest.batch` | `SERVER` |
+| WAL group-commit | `ourios.wal.commit` | `INTERNAL` (child of the batch) |
+| Compaction sweep | `ourios.compaction.sweep` | `INTERNAL` |
+
+Required attributes are low-cardinality and set at span start (so they are
+available to sampling): the query and MCP spans carry `ourios.tenant` (the
+query span also the standard `http.request.method` / `http.route` /
+`http.response.status_code`); the ingest-batch span carries the batch's record
+count and the number of distinct tenants it fanned out to (counts, not ids);
+the sweep span carries the partitions/files swept. Tenant and other identifiers
+are **attributes**, never part of the span name, keeping names low-cardinality.
+
 ## 4. Alternatives considered
 
 **Correlation-only (a tracer that generates ids but exports no spans).** The
@@ -216,15 +256,21 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > trace — verified by asserting the emitted log's `trace_id` equals the span's
 > (the `tokio::spawn` context-loss trap is closed).
 
-> **Scenario RFC0038.4 — sampling is configurable and defaults sane.**
+> **Scenario RFC0038.4 — sampling is configurable, resolves by a defined
+> precedence, and defaults sane.**
 > **Given** the standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`
-> knobs (and the config-file equivalent),
-> **When** the sampler is left unset, set to `parentbased_traceidratio` at a
-> ratio, and disabled (`traces.enabled: false`),
-> **Then** the default samples (root) traces, the ratio sampler exports the
-> configured fraction deterministically, and disabling installs **no** tracer
-> and stamps **no** `trace_id`/`span_id` on log records — the observable,
-> runtime logs-plus-metrics-only behaviour (no throughput change).
+> knobs and the config file's `telemetry.traces.{enabled,sample_ratio}`,
+> **When** the sampler is left unset; set via env `parentbased_traceidratio`
+> at a ratio; set via the file `sample_ratio` *and* a conflicting env sampler;
+> given an out-of-range file `sample_ratio`; and disabled
+> (`traces.enabled: false`),
+> **Then** the default samples (root) traces; the env ratio sampler exports the
+> configured fraction deterministically; the **file `sample_ratio` wins** over
+> the env sampler, selecting `parentbased_traceidratio` at that ratio (§3.4
+> precedence); an out-of-range file `sample_ratio` **rejects startup** with a
+> config error; and disabling installs **no** tracer and stamps **no**
+> `trace_id`/`span_id` on log records — the observable, runtime
+> logs-plus-metrics-only behaviour (no throughput change).
 
 > **Scenario RFC0038.5 — no telemetry-induced-telemetry loop.**
 > **Given** the OTLP span exporter's own transport stack (`tonic`/`hyper`/…)
@@ -256,16 +302,14 @@ Mapped to `CLAUDE.md` §6.2:
   (`OTLP → WAL`, `WAL → Parquet`) hot-path benchmarks confirming no
   per-record tracing cost — a regression there blocks merge (§6.2 benchmarks).
 - **RFC0038.4** — unit/integration over the sampler configuration surface:
-  default, ratio (deterministic fraction over a fixed set of trace-ids), and
-  the `traces.enabled: false` disable path (asserting no tracer and no
-  `trace_id` on logs).
+  default; ratio (deterministic fraction over a fixed set of trace-ids); the
+  §3.4 precedence (file `sample_ratio` overriding a conflicting env sampler);
+  invalid-value rejection (an out-of-range file `sample_ratio` fails config
+  validation at startup); and the `traces.enabled: false` disable path
+  (asserting no tracer and no `trace_id` on logs).
 
 ## 7. Open questions
 
-- [ ] Span/attribute **naming**: adopt HTTP server semconv for the query/MCP
-      spans (`{method} {route}`) and a bespoke `ourios.ingest.batch` /
-      `ourios.compaction.sweep` for the internal ones? Confirm attribute set
-      (tenant, template counts) against semconv cardinality guidance.
 - [ ] Should the per-Export-batch span live on `ingest_bound` (single choke
       point, preferred) or on each transport handler (`export`/`handle_logs`)?
       §3.3 prefers the former; confirm no transport-specific attributes are

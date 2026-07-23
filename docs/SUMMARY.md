@@ -9,6 +9,7 @@
 - [Docker](./guides/docker.md)
 - [Kubernetes (Helm)](./guides/kubernetes.md)
 - [Authentication](./guides/authentication.md)
+- [Observe your coding agent](./guides/agent-telemetry.md)
 
 # Architecture
 

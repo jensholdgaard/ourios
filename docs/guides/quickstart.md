@@ -150,3 +150,6 @@ specified in [RFC 0002](../rfcs/0002-query-dsl.md).
   Protocol) rides the querier at `/mcp` — enable with
   `OURIOS_QUERIER_MCP_ENABLED=1`
   ([RFC 0027](../rfcs/0027-mcp-query-surface.md)).
+- [Observe your coding agent](./agent-telemetry.md) — point Claude Code
+  or Copilot CLI at Ourios and query its own cost and tool use back
+  through the MCP surface, all on your machine.

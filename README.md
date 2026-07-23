@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/brand/ourios-mark.svg" alt="The Ourios mark: log lines streaming into a sail" width="120" />
+</p>
+
 # Ourios
 
 [![CI](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml/badge.svg)](https://github.com/jensholdgaard/ourios/actions/workflows/ci.yml)

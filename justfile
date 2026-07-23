@@ -188,6 +188,52 @@ release version:
     echo "Tagged v$version locally (NOT pushed). Review the commit, then fire the"
     echo "release: git push --follow-tags origin main"
 
+# Run ourios-server locally as an OTLP **log** sink for dogfooding — point any
+# OTLP log source (Claude Code, Copilot CLI, an OpenTelemetry Collector) at it
+# and query the ingested telemetry back. Since Ourios *is* an OTLP log
+# receiver, no Collector or container is needed. Open receiver (no auth section
+# → open, per RFC 0026), local filesystem store + WAL under scratch/dogfood/
+# (gitignored). Ports: 4318 OTLP/HTTP, 4317 OTLP/gRPC, 4319 query API. Ctrl-C
+# to stop; `just dogfood-clean` to wipe the captured store.
+#
+# Run `just dogfood-env` in the other terminal for the source-side env block.
+dogfood-server:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p scratch/dogfood/store scratch/dogfood/wal
+    echo "OTLP logs → http://localhost:4318 (HTTP) · localhost:4317 (gRPC)"
+    echo "query API → http://localhost:4319   ·   store → scratch/dogfood/"
+    OURIOS_STORAGE_BACKEND=local \
+    OURIOS_BUCKET_ROOT="$(pwd)/scratch/dogfood/store" \
+    OURIOS_WAL_ROOT="$(pwd)/scratch/dogfood/wal" \
+    OURIOS_RECEIVER_ENABLED=1 \
+    OURIOS_QUERIER_ENABLED=1 \
+    cargo run -p ourios-server
+
+# Print the env block that points a source's OTLP telemetry at the local
+# `dogfood-server`. Ourios is logs-only (CLAUDE.md §1), so metrics/traces are
+# disabled. Telemetry is read at process startup, so `export` these and start a
+# NEW session of the source (e.g. a fresh `claude`). Content capture
+# (prompts/tool output) is opt-in and off by default — that is where the wordy
+# structured bodies live, so enable it only on data you're willing to retain,
+# and scrub before freezing any of it as a corpus.
+# Prints the telemetry env block for the local dogfood-server.
+dogfood-env:
+    @echo 'export CLAUDE_CODE_ENABLE_TELEMETRY=1'
+    @echo 'export OTEL_LOGS_EXPORTER=otlp'
+    @echo 'export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only'
+    @echo 'export OTEL_TRACES_EXPORTER=none'
+    @echo 'export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf'
+    @echo 'export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318'
+    @echo 'export OTEL_SERVICE_NAME=claude-code     # -> the Ourios tenant'
+    @echo '# opt-in content capture (privacy: retains prompts/tool output):'
+    @echo '# export OTEL_LOG_USER_PROMPTS=1'
+    @echo '# export OTEL_LOG_TOOL_DETAILS=1'
+
+# Wipe the local dogfood store + WAL (the captured telemetry).
+dogfood-clean:
+    rm -rf scratch/dogfood
+
 # Clean build artefacts (cargo target + mdBook output).
 clean:
     cargo clean || true

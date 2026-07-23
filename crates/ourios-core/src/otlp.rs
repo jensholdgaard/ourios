@@ -1330,14 +1330,14 @@ mod tests {
         // non-finite token counts (upstream opentelemetry-rust#3603). An
         // empty *string*, by contrast, is a SET value the spec says MUST
         // be stored — so the relaxation must strip the former without
-        // touching the latter. One doc exercises both through the retry.
+        // touching the latter. One doc exercises both. `from_slice`
+        // (not `from_slice_flagged`) so this stays a pure behaviour test:
+        // it asserts the decoded result, not which path produced it, and
+        // so keeps passing once the upstream fix makes the direct parse
+        // succeed. (The lenient-flag assertion — the flip signal — lives
+        // in the ingester's equivalence test.)
         let doc = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"intValue":null},"attributes":[{"key":"tokens","value":{"doubleValue":null}},{"key":"note","value":{"stringValue":""}}]}]}]}]}"#;
-        let (parsed, lenient): (LogsData, bool) =
-            lenient_json::from_slice_flagged(doc.as_bytes()).expect("lenient parse");
-        assert!(
-            lenient,
-            "the null fields only parse via the lenient retry today"
-        );
+        let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("parse");
         let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
         let unset = |v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>| {
             v.as_ref().and_then(|av| av.value.as_ref()).is_none()

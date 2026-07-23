@@ -331,8 +331,10 @@ fn rfc0003_6_unset_any_value_decodes_equivalently_across_transports() {
     assert_eq!(pb_rec.event_name, js_rec.event_name);
 }
 
-/// RFC0003.6 companion — a `null`-valued `AnyValue` *field*
-/// (`{"intValue":null}` / `{"doubleValue":null}`) is proto3-JSON's
+/// Scenario RFC0003.6 — a `null`-valued `AnyValue` field decodes via
+/// the lenient shim. See `docs/rfcs/0003-otlp-receiver.md` §5.
+///
+/// `{"intValue":null}` / `{"doubleValue":null}` is proto3-JSON's
 /// encoding of a field default (for a `oneof`, unset). Real exporters
 /// emit it: the Vercel AI SDK writes `doubleValue: null` for non-finite
 /// token counts (upstream opentelemetry-rust#3603) — exactly the

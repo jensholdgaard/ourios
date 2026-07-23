@@ -378,10 +378,12 @@ surface? Perses+OTel query conventions?) are folded into §9.
 > obligation" the 2026-07-15 amendment left open: they lift
 > `compile::validate`'s rejection of the `agg_fn` stages for scalar
 > aggregation over a **promoted** attribute — a log attribute (`attr.<k>`)
-> or a resource attribute (`resource.<k>`). The value is read by CAST to
-> `Float64` (promoted columns are Utf8, §6.1) — the pragmatic path, chosen
+> or a resource attribute (`resource.<k>`). The value is read by `try_cast`
+> to `Float64` (promoted columns are Utf8, §6.1) — the pragmatic path, chosen
 > over typed promoted columns (an RFC 0022 / RFC 0005 schema change with a
-> migration); an unparseable value casts to NULL and is excluded from the
+> migration). `try_cast` (not `cast`, which errors) is required so an
+> unparseable value yields NULL rather than failing the query; it is excluded
+> from the
 > scalar, so the aggregate never errors on dirty data. Grouping, the window,
 > the single-template `param(n)` pinning rule, and the honest-bytes
 > accounting are inherited unchanged from RFC0002.12–.16.
@@ -402,8 +404,8 @@ surface? Perses+OTel query conventions?) are folded into §9.
     absent, NULL, or not a base-10 number, alongside rows carrying a numeric
     value
   - **When** `<fn>(attr.<k>)` executes
-  - **Then** the non-numeric rows contribute to **no** scalar (the CAST to
-    `Float64` yields NULL and the aggregate skips NULLs); the returned `value`
+  - **Then** the non-numeric rows contribute to **no** scalar (the `try_cast`
+    to `Float64` yields NULL and the aggregate skips NULLs); the returned `value`
     equals the oracle over the numeric rows alone, and a group all of whose
     values are non-numeric carries `value = null`. The query never fails on
     dirty data, and those rows still count toward the group's `COUNT(*)` and

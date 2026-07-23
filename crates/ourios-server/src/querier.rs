@@ -472,12 +472,12 @@ async fn handle_query(
     let started = Instant::now();
     match statement {
         Statement::Logs(mut query) => {
-            // `count [by …]` and `limit` are mutually exclusive
-            // (`compile::validate` rejects the combination, RFC 0002
-            // amendment 2026-07-15) — an aggregation query answers with
-            // its grouped-count map, not a capped row set, so the §7
-            // default/cap limit is meaningless for it and must not be
-            // injected.
+            // An aggregation — `count [by …]` or a scalar `sum`/`min`/`max`/
+            // `avg` — and `limit` are mutually exclusive (`compile::validate`
+            // rejects the combination, RFC 0002 amendments 2026-07-15 and
+            // 2026-07-23): the query answers with its grouped map, not a
+            // capped row set, so the §7 default/cap limit is meaningless for
+            // it and must not be injected.
             let is_aggregation = query
                 .stages
                 .iter()

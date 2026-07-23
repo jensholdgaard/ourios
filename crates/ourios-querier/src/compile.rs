@@ -158,9 +158,11 @@ pub(crate) fn validate(
     for stage in &query.stages {
         let unsupported = match stage {
             Stage::Range(..) | Stage::Limit(_) => None,
-            Stage::Count { .. } if aggregate.is_some() => {
+            // A second aggregation stage of either family — the first may have
+            // been a `count` or a scalar `sum`/`min`/`max`/`avg` (RFC0002.19).
+            Stage::Count { .. } | Stage::Agg { .. } if aggregate.is_some() => {
                 return Err(QueryError::InvalidQuery {
-                    detail: "a query takes at most one `count` stage".to_string(),
+                    detail: "a query takes at most one aggregation stage".to_string(),
                 });
             }
             Stage::Count { by } => {
@@ -170,11 +172,6 @@ pub(crate) fn validate(
                     scalar: None,
                 });
                 None
-            }
-            Stage::Agg { .. } if aggregate.is_some() => {
-                return Err(QueryError::InvalidQuery {
-                    detail: "a query takes at most one aggregation stage".to_string(),
-                });
             }
             Stage::Agg { func, path, by } => {
                 validate_group_terms(by, &query.predicate)?;

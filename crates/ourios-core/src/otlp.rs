@@ -957,14 +957,21 @@ impl Default for TenantId {
 }
 
 /// Lenient OTLP/JSON parsing: a workaround for `opentelemetry-proto`'s
-/// `with-serde` deserialiser rejecting proto3-JSON's two valid
-/// encodings of an **unset** `AnyValue` — `{}` (a message with no
-/// fields set; the `OTel` Collector's file exporter emits it for
-/// empty-body event records) and `null` (what `with-serde`'s own
-/// serialiser emits for `value: None`) — with "Invalid data for
-/// Value, no known keys found". Tracked upstream; until the fix
-/// ships, both OTLP/JSON entry points (the receiver's
-/// `application/json` transport and the bench corpus loader) parse
+/// `with-serde` deserialiser rejecting proto3-JSON's valid encodings
+/// of an **unset** `AnyValue` — `{}` (a message with no fields set;
+/// the `OTel` Collector's file exporter emits it for empty-body event
+/// records), `null` (what `with-serde`'s own serialiser emits for
+/// `value: None`), and a field set to `null` such as
+/// `{"intValue":null}` / `{"doubleValue":null}` (proto3-JSON maps a
+/// `null` field to its default — for a `oneof`, unset; real exporters
+/// emit this, e.g. the Vercel AI SDK for non-finite token counts,
+/// upstream opentelemetry-rust#3603). The broken deserialiser fails
+/// all three with "Invalid data for Value, no known keys found" (or,
+/// for the null field, an untagged-enum-variant error). Tracked
+/// upstream (opentelemetry-rust#3595 for `{}`, #3603 for the null
+/// field); until both ship, both OTLP/JSON entry points (the
+/// receiver's `application/json` transport and the bench corpus
+/// loader) parse
 /// through here.
 ///
 /// Semantics: the direct parse runs first, so the hot path is
@@ -1031,8 +1038,10 @@ pub mod lenient_json {
     }
 
     /// Remove `"body"` / `"value"` keys whose value encodes an unset
-    /// `AnyValue` (`{}` or `null`), recursively. Returns whether the
-    /// tree changed. The two key names are unambiguous in the OTLP/JSON
+    /// `AnyValue` — `null`, the empty object `{}`, or an object whose
+    /// recognised field is `null` (`{"intValue":null}`) — recursively.
+    /// Returns whether the tree changed. The two key names are
+    /// unambiguous in the OTLP/JSON
     /// log tree: user data only ever appears as the *values of* `key` /
     /// `value` / `body` fields, never as sibling object keys, so no
     /// user-controlled content can be misread as one of these
@@ -1044,7 +1053,38 @@ pub mod lenient_json {
                 for slot in ["body", "value"] {
                     let is_unset = match map.get(slot) {
                         Some(serde_json::Value::Null) => true,
-                        Some(serde_json::Value::Object(inner)) => inner.is_empty(),
+                        // An `AnyValue` object is unset when every entry is a
+                        // *recognised* `oneof` field name whose value is `null`
+                        // — proto3-JSON maps a `null` field to its default, and
+                        // for a `oneof` that is unset. `{"intValue":null}` /
+                        // `{"doubleValue":null}` (real exporter traffic — the
+                        // Vercel AI SDK emits the latter for non-finite token
+                        // counts). `all` over an empty map is vacuously true, so
+                        // this subsumes `{}`. The recognised-key requirement is
+                        // load-bearing: it keeps the strip narrow so it only
+                        // ever removes what is genuinely an unset value, never
+                        // papering over a malformed one. Two things stay
+                        // untouched: a present non-null value like
+                        // `{"stringValue":""}` (an empty string is a set value
+                        // the spec says MUST be stored), and an *unknown* key
+                        // even with a null value like `{"bogusValue":null}`
+                        // (which stays a parse error — the unknown-key rejection
+                        // the direct parse already enforces).
+                        Some(serde_json::Value::Object(inner)) => {
+                            inner.iter().all(|(key, value)| {
+                                value.is_null()
+                                    && matches!(
+                                        key.as_str(),
+                                        "stringValue"
+                                            | "boolValue"
+                                            | "intValue"
+                                            | "doubleValue"
+                                            | "bytesValue"
+                                            | "arrayValue"
+                                            | "kvlistValue"
+                                    )
+                            })
+                        }
                         _ => false,
                     };
                     if is_unset {
@@ -1252,11 +1292,21 @@ mod tests {
     fn lenient_json_does_not_loosen_unknown_key_rejection() {
         use opentelemetry_proto::tonic::logs::v1::LogsData;
         // An AnyValue object with keys — just no KNOWN key — stays an
-        // error: the retry only rewrites genuinely EMPTY encodings, it
-        // must not paper over malformed values.
-        let doc =
-            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":1}}]}]}]}"#;
-        assert!(lenient_json::from_slice::<LogsData>(doc.as_bytes()).is_err());
+        // error: the retry only rewrites genuinely unset encodings, it
+        // must not paper over malformed values. This holds whether the
+        // unknown key's value is non-null (`{"bogusValue":1}`) OR null
+        // (`{"bogusValue":null}`) — the null-field relaxation only
+        // strips objects whose keys are all *recognised* oneof fields,
+        // so an unknown key stays a parse error even when null-valued.
+        for doc in [
+            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":1}}]}]}]}"#,
+            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":null}}]}]}]}"#,
+        ] {
+            assert!(
+                lenient_json::from_slice::<LogsData>(doc.as_bytes()).is_err(),
+                "unknown key must stay an error: {doc}"
+            );
+        }
     }
 
     #[test]
@@ -1269,5 +1319,40 @@ mod tests {
             record.body.as_ref().and_then(|b| b.value.as_ref()),
             Some(AvValue::StringValue(s)) if s == "hello"
         ));
+    }
+
+    #[test]
+    fn lenient_json_strips_a_null_field_but_keeps_a_meaningful_empty_string() {
+        use opentelemetry_proto::tonic::logs::v1::LogsData;
+        // A recognised AnyValue field set to `null` — proto3-JSON's
+        // "null = field default" (for a `oneof`, unset). Real exporters
+        // emit this: the Vercel AI SDK writes `doubleValue: null` for
+        // non-finite token counts (upstream opentelemetry-rust#3603). An
+        // empty *string*, by contrast, is a SET value the spec says MUST
+        // be stored — so the relaxation must strip the former without
+        // touching the latter. One doc exercises both. `from_slice`
+        // (not `from_slice_flagged`) so this stays a pure behaviour test:
+        // it asserts the decoded result, not which path produced it, and
+        // so keeps passing once the upstream fix makes the direct parse
+        // succeed. (The lenient-flag assertion — the flip signal — lives
+        // in the ingester's equivalence test.)
+        let doc = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"intValue":null},"attributes":[{"key":"tokens","value":{"doubleValue":null}},{"key":"note","value":{"stringValue":""}}]}]}]}]}"#;
+        let parsed: LogsData = lenient_json::from_slice(doc.as_bytes()).expect("parse");
+        let record = &parsed.resource_logs[0].scope_logs[0].log_records[0];
+        let unset = |v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>| {
+            v.as_ref().and_then(|av| av.value.as_ref()).is_none()
+        };
+        assert!(unset(&record.body), "null intValue field -> unset body");
+        assert!(
+            unset(&record.attributes[0].value),
+            "null doubleValue field -> unset value"
+        );
+        assert!(
+            matches!(
+                record.attributes[1].value.as_ref().and_then(|v| v.value.as_ref()),
+                Some(AvValue::StringValue(s)) if s.is_empty()
+            ),
+            "an empty string is a SET value and must survive the null-field strip"
+        );
     }
 }

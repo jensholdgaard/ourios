@@ -330,3 +330,36 @@ fn rfc0003_6_unset_any_value_decodes_equivalently_across_transports() {
     }
     assert_eq!(pb_rec.event_name, js_rec.event_name);
 }
+
+/// Scenario RFC0003.6 — a `null`-valued `AnyValue` field decodes via
+/// the lenient shim. See `docs/rfcs/0003-otlp-receiver.md` §5.
+///
+/// `{"intValue":null}` / `{"doubleValue":null}` is proto3-JSON's
+/// encoding of a field default (for a `oneof`, unset). Real exporters
+/// emit it: the Vercel AI SDK writes `doubleValue: null` for non-finite
+/// token counts (upstream opentelemetry-rust#3603) — exactly the
+/// AI-agent traffic RFC 0037 targets. The production JSON receive path
+/// (`decode_json`) must accept it via the lenient shim rather than
+/// reject the whole batch, decoding it to the same absent state as `{}`.
+/// This is also the null-field arm of the shim-retirement flip signal:
+/// removal needs BOTH #3595 (`{}`) and #3603 (the null field) released.
+#[test]
+fn rfc0003_6_null_valued_anyvalue_field_decodes_via_lenient_shim() {
+    let json = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"severityNumber":9,"body":{"intValue":null},"attributes":[{"key":"gen_ai.usage.output_tokens","value":{"doubleValue":null}}],"eventName":"gen_ai.client.inference.operation.details"}]}]}]}"#;
+    let (decoded, lenient) =
+        decode_json(json).expect("a null-field unset AnyValue must decode, not reject the batch");
+    assert!(
+        lenient,
+        "the null field only parses via the lenient retry today — the null-field arm of \
+         the flip signal (direct parse succeeding makes this false; needs upstream #3603)",
+    );
+    let rec = &decoded.resource_logs[0].scope_logs[0].log_records[0];
+    assert_eq!(
+        rec.body, None,
+        "a null intValue field decodes to an absent body"
+    );
+    assert_eq!(
+        rec.attributes[0].value, None,
+        "a null doubleValue field decodes to an absent value",
+    );
+}

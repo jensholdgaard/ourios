@@ -245,8 +245,12 @@ dogfood-env:
 dogfood-clean:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Fail hard if lsof is missing rather than silently skip the guard (a failed
+    # `if` condition is not caught by `set -e`), so a missing tool can't let the
+    # wipe race a running server.
+    command -v lsof >/dev/null || { echo "error: lsof not found — can't verify the server is stopped; stop dogfood-server, then 'rm -rf scratch/dogfood' by hand." >&2; exit 1; }
     if lsof -nP -iTCP:4318 -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "dogfood-server is running (127.0.0.1:4318 in use); stop it before cleaning." >&2
+        echo "127.0.0.1:4318 is in use (dogfood-server still running?); stop it before cleaning." >&2
         exit 1
     fi
     rm -rf scratch/dogfood

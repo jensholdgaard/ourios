@@ -215,6 +215,18 @@ fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
     Ok(tenant)
 }
 
+/// Apply the tool's row `cap` to `stages`, unless the statement is a `count
+/// [by …]` aggregation. `count` and `limit` are mutually exclusive
+/// (`compile::validate`) — an aggregation answers with its grouped-count map,
+/// not a capped row set, so injecting the cap would reject the query. Mirrors
+/// the JSON API's guard (`querier::handle_query`).
+fn cap_rows_unless_aggregation(stages: &mut Vec<Stage>, cap: u64) {
+    let is_aggregation = stages.iter().any(|s| matches!(s, Stage::Count { .. }));
+    if !is_aggregation {
+        apply_limit(stages, cap, cap);
+    }
+}
+
 impl OuriosMcp {
     /// RFC 0026 per-call tenant binding: re-resolve the request's bearer
     /// (rmcp forwards the HTTP parts into the tool context) and require
@@ -295,19 +307,9 @@ impl OuriosMcp {
         };
         // The tool argument is a hard cap, not just a default: a DSL
         // `limit` stage inside the statement clamps to it, so the
-        // documented "maximum rendered rows" contract holds. A `count [by
-        // …]` aggregation answers with its grouped-count map, not a capped
-        // row set — `count` and `limit` are mutually exclusive
-        // (`compile::validate`), so injecting the cap there rejects the
-        // query. Mirror the JSON API's guard (`handle_query`).
-        let is_aggregation = query
-            .stages
-            .iter()
-            .any(|s| matches!(s, Stage::Count { .. }));
-        if !is_aggregation {
-            let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-            apply_limit(&mut query.stages, cap, cap);
-        }
+        // documented "maximum rendered rows" contract holds.
+        let cap = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        cap_rows_unless_aggregation(&mut query.stages, cap);
         let tenant = TenantId::new(tenant_arg);
         let started = std::time::Instant::now();
         let result = self
@@ -636,7 +638,45 @@ mod tests {
     use ourios_querier::dsl::ir::SeverityName;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    use super::{GRAMMAR_SECTION, query_schema_document};
+    use super::{GRAMMAR_SECTION, Stage, query_schema_document};
+
+    /// Parse a logs DSL statement to its stage list (guard-test helper).
+    fn logs_stages(query: &str) -> Vec<Stage> {
+        match super::dsl::parse_statement(query).expect("valid dsl") {
+            super::Statement::Logs(q) => q.stages,
+            super::Statement::Drift(_) => panic!("expected a logs query, not a drift statement"),
+        }
+    }
+
+    /// `cap_rows_unless_aggregation`: a row query gets the tool's cap
+    /// injected as a `limit` stage — the "maximum rendered rows" contract.
+    #[test]
+    fn row_query_gets_the_row_cap() {
+        let mut stages = logs_stages("template_id == 1");
+        super::cap_rows_unless_aggregation(&mut stages, 10);
+        assert!(
+            stages.iter().any(|s| matches!(s, Stage::Limit(10))),
+            "a non-aggregation gets the cap injected: {stages:?}",
+        );
+    }
+
+    /// A `count [by …]` aggregation is left uncapped — `count` and `limit`
+    /// are mutually exclusive, so injecting the cap would reject the query
+    /// (the bug this guard fixes). Covers both bare `count` and `count by`.
+    #[test]
+    fn count_aggregation_is_left_uncapped() {
+        for query in [
+            "template_id == 1 | count",
+            "template_id == 1 | count by template_id",
+        ] {
+            let mut stages = logs_stages(query);
+            super::cap_rows_unless_aggregation(&mut stages, 10);
+            assert!(
+                !stages.iter().any(|s| matches!(s, Stage::Limit(_))),
+                "an aggregation keeps no limit stage ({query}): {stages:?}",
+            );
+        }
+    }
 
     /// The extraction invariants RFC0027.6 leans on: heading-first,
     /// non-empty, and bounded before the next top-level section.

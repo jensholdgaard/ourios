@@ -1053,19 +1053,37 @@ pub mod lenient_json {
                 for slot in ["body", "value"] {
                     let is_unset = match map.get(slot) {
                         Some(serde_json::Value::Null) => true,
-                        // An `AnyValue` object is unset when it carries no set
-                        // field: the empty object `{}`, or one whose recognised
-                        // field is `null` (proto3-JSON maps `null` on any field
-                        // to that field's default — for a `oneof`, unset), e.g.
-                        // `{"intValue":null}` / `{"doubleValue":null}` (real
-                        // exporter traffic — the Vercel AI SDK emits the latter
-                        // for non-finite token counts). `all` over an empty map
-                        // is vacuously true, so this subsumes `{}`. A present,
-                        // non-null value like `{"stringValue":""}` is NOT unset
-                        // (the empty string is a meaningful value the spec says
-                        // MUST be stored) and is left intact.
+                        // An `AnyValue` object is unset when every entry is a
+                        // *recognised* `oneof` field name whose value is `null`
+                        // — proto3-JSON maps a `null` field to its default, and
+                        // for a `oneof` that is unset. `{"intValue":null}` /
+                        // `{"doubleValue":null}` (real exporter traffic — the
+                        // Vercel AI SDK emits the latter for non-finite token
+                        // counts). `all` over an empty map is vacuously true, so
+                        // this subsumes `{}`. The recognised-key requirement is
+                        // load-bearing: it keeps the strip narrow so it only
+                        // ever removes what is genuinely an unset value, never
+                        // papering over a malformed one. Two things stay
+                        // untouched: a present non-null value like
+                        // `{"stringValue":""}` (an empty string is a set value
+                        // the spec says MUST be stored), and an *unknown* key
+                        // even with a null value like `{"bogusValue":null}`
+                        // (which stays a parse error — the unknown-key rejection
+                        // the direct parse already enforces).
                         Some(serde_json::Value::Object(inner)) => {
-                            inner.values().all(serde_json::Value::is_null)
+                            inner.iter().all(|(key, value)| {
+                                value.is_null()
+                                    && matches!(
+                                        key.as_str(),
+                                        "stringValue"
+                                            | "boolValue"
+                                            | "intValue"
+                                            | "doubleValue"
+                                            | "bytesValue"
+                                            | "arrayValue"
+                                            | "kvlistValue"
+                                    )
+                            })
                         }
                         _ => false,
                     };
@@ -1274,11 +1292,21 @@ mod tests {
     fn lenient_json_does_not_loosen_unknown_key_rejection() {
         use opentelemetry_proto::tonic::logs::v1::LogsData;
         // An AnyValue object with keys — just no KNOWN key — stays an
-        // error: the retry only rewrites genuinely EMPTY encodings, it
-        // must not paper over malformed values.
-        let doc =
-            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":1}}]}]}]}"#;
-        assert!(lenient_json::from_slice::<LogsData>(doc.as_bytes()).is_err());
+        // error: the retry only rewrites genuinely unset encodings, it
+        // must not paper over malformed values. This holds whether the
+        // unknown key's value is non-null (`{"bogusValue":1}`) OR null
+        // (`{"bogusValue":null}`) — the null-field relaxation only
+        // strips objects whose keys are all *recognised* oneof fields,
+        // so an unknown key stays a parse error even when null-valued.
+        for doc in [
+            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":1}}]}]}]}"#,
+            r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"bogusValue":null}}]}]}]}"#,
+        ] {
+            assert!(
+                lenient_json::from_slice::<LogsData>(doc.as_bytes()).is_err(),
+                "unknown key must stay an error: {doc}"
+            );
+        }
     }
 
     #[test]

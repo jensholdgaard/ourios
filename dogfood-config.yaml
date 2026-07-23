@@ -1,0 +1,35 @@
+# Local dogfood config for `just dogfood-server` (RFC 0020 file front-end).
+#
+# Loopback-only and unauthenticated (open mode) — the justfile recipe explains
+# why that is safe for a local dev capture. This file exists (rather than the
+# recipe's OURIOS_* env vars) because `--config` is the *sole* config source and
+# `storage.promoted_attributes` (RFC 0022) has no env-var form.
+#
+# It promotes the Claude Code / agent GenAI attributes to columns so a source
+# can aggregate its own telemetry natively (RFC 0022 + RFC 0037 §3.3), e.g.
+#   count by attr.model       — calls per model      (from api_request events)
+#   count by attr.tool_name   — tool-use distribution (from tool_decision events)
+#   count by attr.decision    — accept/deny mix       (from tool_decision events)
+# Promotion is a write-side projection, so it applies to telemetry captured
+# *after* the server starts with this config.
+#
+# Paths resolve from ${env:OURIOS_DOGFOOD_ROOT}, exported by the recipe.
+storage:
+  backend: local
+  local:
+    bucket_root: ${env:OURIOS_DOGFOOD_ROOT}/store
+  promoted_attributes:
+    log:
+      - model
+      - tool_name
+      - decision
+receiver:
+  enabled: true
+  grpc_addr: "127.0.0.1:4317"
+  http_addr: "127.0.0.1:4318"
+  wal_root: ${env:OURIOS_DOGFOOD_ROOT}/wal
+querier:
+  enabled: true
+  http_addr: "127.0.0.1:4319"
+  mcp:
+    enabled: true

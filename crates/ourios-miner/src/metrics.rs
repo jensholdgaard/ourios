@@ -310,6 +310,7 @@ pub(crate) struct MinerMetrics {
     template_version_changes_total: Counter<u64>,
     confidence: Histogram<f64>,
     miner_duration: Histogram<f64>,
+    structured_body_size: Histogram<u64>,
     /// The observable gauges are held for the [`MinerMetrics`]'s
     /// lifetime so their collection callbacks stay registered with
     /// the meter — dropping a handle deregisters its callback, after
@@ -363,6 +364,10 @@ impl MinerMetrics {
             .f64_histogram(semconv::OURIOS_MINER_DURATION)
             .with_unit("s")
             .build();
+        let structured_body_size = meter
+            .u64_histogram(semconv::OURIOS_MINER_STRUCTURED_BODY_SIZE)
+            .with_unit("By")
+            .build();
 
         let observable_gauges = Self::register_observable_gauges(&meter, &state);
 
@@ -374,6 +379,7 @@ impl MinerMetrics {
             template_version_changes_total,
             confidence,
             miner_duration,
+            structured_body_size,
             _observable_gauges: observable_gauges,
         }
     }
@@ -543,6 +549,23 @@ impl MinerMetrics {
                 tenant.as_str().to_owned(),
             )],
         );
+    }
+
+    /// Observe one structured (non-string) body's canonical-JSON byte
+    /// length (RFC 0037 §3.2, `ourios.miner.structured_body.size`).
+    /// Structured bodies are retained whole and never capped; this
+    /// histogram is the hazard-#2 guard — an operator watches its
+    /// per-`(tenant, service)` distribution to spot services emitting
+    /// oversized payloads (the fix belongs at the emitter, not a
+    /// store-side truncation).
+    pub(crate) fn record_structured_body_bytes(
+        &self,
+        tenant: &TenantId,
+        service: Option<&str>,
+        bytes: u64,
+    ) {
+        self.structured_body_size
+            .record(bytes, &service_attrs(tenant, service));
     }
 
     /// Record `count` per-parameter overflow events on one line for

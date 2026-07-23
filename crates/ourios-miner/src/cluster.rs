@@ -1972,6 +1972,13 @@ impl MinerCluster {
         // rather than swallowing a `Result` we never inspect.
         let bytes = ourios_core::otlp::canonical::encode_any_value(any_value)
             .expect("RFC 0005 §3.3 encoder is infallible for any spec-compliant AnyValue");
+        // RFC 0037 §3.2 (hazard #2 guard): observe the canonical-JSON body
+        // size before `bytes` is moved into the record. Structured bodies are
+        // never capped, so this histogram is the only guard against oversized
+        // payloads — it makes the size visible per service without discarding
+        // the operator's payload.
+        self.metrics
+            .record_structured_body_bytes(&record.tenant_id, service, bytes.len() as u64);
         let mut rec = Self::record_envelope(record, BodyKind::Structured);
         rec.template_id = template_id;
         rec.template_version = 1;
@@ -2459,7 +2466,7 @@ fn positions_to_u16(positions: &[usize]) -> Vec<u16> {
 mod tests {
     use super::*;
     use ourios_core::audit::SharedAuditSink;
-    use ourios_core::otlp::{AnyValue, any_value::Value as AvValue};
+    use ourios_core::otlp::{AnyValue, ArrayValue, any_value::Value as AvValue};
     use ourios_core::record::SharedRecordSink;
     use proptest::prelude::*;
 
@@ -2568,6 +2575,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// RFC0037.3 (unit) — the structured-body branch retains the body's
+    /// canonical JSON byte-for-byte and never flags it lossy (§3.2 fidelity),
+    /// colocated with `ingest_structured`. The per-service metric emission is
+    /// covered end-to-end in `tests/rfc0037_structured_body.rs`.
+    #[test]
+    fn rfc0037_3_structured_body_retained_byte_for_byte() {
+        let tenant = TenantId::new("t");
+        let sink = SharedRecordSink::new();
+        let mut cluster =
+            MinerCluster::new(MinerConfig::default()).with_record_sink(Box::new(sink.clone()));
+
+        let body_av = AnyValue {
+            value: Some(AvValue::ArrayValue(ArrayValue {
+                values: vec![
+                    AnyValue {
+                        value: Some(AvValue::StringValue("user turn".to_string())),
+                    },
+                    AnyValue {
+                        value: Some(AvValue::StringValue("assistant turn".to_string())),
+                    },
+                ],
+            })),
+        };
+        let expected = String::from_utf8(
+            ourios_core::otlp::canonical::encode_any_value(&body_av)
+                .expect("canonical encode is infallible"),
+        )
+        .expect("canonical JSON is UTF-8");
+
+        let mut record = structured_record(&tenant, 9, Some("lib.agent"));
+        record.event_name = Some("gen_ai.client.inference.operation.details".to_string());
+        record.body = Some(Body::Structured(body_av));
+        cluster.ingest(&record);
+
+        let mined = sink.drain();
+        assert_eq!(mined.len(), 1);
+        assert_eq!(mined[0].body_kind, BodyKind::Structured);
+        assert_eq!(
+            mined[0].body.as_deref(),
+            Some(expected.as_str()),
+            "the structured body is retained as canonical JSON, byte-for-byte"
+        );
+        assert!(!mined[0].lossy_flag, "a structured body is never lossy");
     }
 
     /// Test helper — build a cluster wired to a [`SharedAuditSink`]

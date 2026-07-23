@@ -109,6 +109,9 @@ pub const OURIOS_MINER_PARAMS_OVERFLOW_UTILIZATION: &str =
 /// `ourios.miner.parse_failures` (counter, unit `{failure}`).
 pub const OURIOS_MINER_PARSE_FAILURES: &str = "ourios.miner.parse_failures";
 
+/// `ourios.miner.structured_body.size` (histogram, unit `By`).
+pub const OURIOS_MINER_STRUCTURED_BODY_SIZE: &str = "ourios.miner.structured_body.size";
+
 /// `ourios.miner.template.count` (gauge, unit `{template}`).
 pub const OURIOS_MINER_TEMPLATE_COUNT: &str = "ourios.miner.template.count";
 

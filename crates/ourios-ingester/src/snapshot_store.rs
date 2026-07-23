@@ -164,6 +164,7 @@ mod tests {
             structured_templates: vec![StructuredTemplateRecord {
                 severity_number: 17,
                 scope_name: None,
+                event_name: None,
                 template_id: template_id + 1,
             }],
             wal_high_water: Some(WalHighWater {

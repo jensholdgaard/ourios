@@ -211,11 +211,15 @@ enum MinedCapture {
 ///
 /// `structured_templates` is the §6.2 step-0 short-circuit map
 /// for `Body::Structured` records: each
-/// `(severity_number, scope_name)` tuple shares one `template_id`
-/// per RFC 0001 §6.1 *Template-key composition* (the
-/// `BodyKind::Structured` discriminator is implicit from the map
-/// itself). The map's value is the `template_id` allocated on
-/// first observation of that tuple.
+/// `(severity_number, scope_name, event_name)` tuple shares one
+/// `template_id` per RFC 0001 §6.1 *Template-key composition* as
+/// extended by RFC 0037 §3.1 (the `BodyKind::Structured`
+/// discriminator is implicit from the map itself). Including
+/// `event_name` in the key means distinct event types — e.g. a
+/// `gen_ai.client.inference.operation.details` inference event
+/// versus a tool-call event in the same scope — get distinct
+/// `template_id`s instead of collapsing to one. The map's value is
+/// the `template_id` allocated on first observation of that tuple.
 ///
 /// `template_id` allocation lives on [`MinerCluster`], not here
 /// — see the `next_template_id` comment there for why.
@@ -230,7 +234,7 @@ enum MinedCapture {
 /// cache.
 struct TenantState {
     tree: Tree,
-    structured_templates: HashMap<(u8, Option<String>), u64>,
+    structured_templates: HashMap<(u8, Option<String>, Option<String>), u64>,
     template_count: usize,
     /// Drain-tree leaves only (excludes structured-template
     /// entries) — the quantity RFC 0023 §3.1's `max_templates`
@@ -1151,8 +1155,9 @@ impl MinerCluster {
     ///   path. Clean attaches (sim == 1.0) emit no audit event.
     /// - `Body::Structured(_)` — short-circuit. The `AnyValue`
     ///   tree is **not** walked; the template id is keyed on
-    ///   `(severity_number, scope_name, BodyKind::Structured)`
-    ///   per §6.1, and the same tuple reuses the same id on
+    ///   `(severity_number, scope_name, event_name)` per §6.1 as
+    ///   extended by RFC 0037 §3.1 (`BodyKind::Structured` is
+    ///   implicit), and the same tuple reuses the same id on
     ///   subsequent records. Structured records never widen and
     ///   never emit audit events.
     /// - `None` — the wire delivered no body. Returns
@@ -1889,19 +1894,23 @@ impl MinerCluster {
         }
     }
 
-    /// `Body::Structured` short-circuit per RFC 0001 §6.2 step 0.
-    /// The tree is not walked; the per-tenant
-    /// `(severity_number, scope_name) → template_id` map is the
-    /// entire lookup. First observation of a tuple allocates;
-    /// subsequent records with the same tuple reuse. Structured
-    /// records never widen and never emit audit events.
+    /// `Body::Structured` short-circuit per RFC 0001 §6.2 step 0 as
+    /// extended by RFC 0037 §3.1. The tree is not walked; the
+    /// per-tenant `(severity_number, scope_name, event_name) →
+    /// template_id` map is the entire lookup. First observation of a
+    /// tuple allocates; subsequent records with the same tuple reuse.
+    /// Structured records never widen and never emit audit events.
     fn ingest_structured(
         &mut self,
         record: &OtlpLogRecord,
         service: Option<&str>,
         any_value: &ourios_core::otlp::AnyValue,
     ) -> u64 {
-        let key = (record.severity_number, record.scope_name.clone());
+        let key = (
+            record.severity_number,
+            record.scope_name.clone(),
+            record.event_name.clone(),
+        );
         // Same pre-compute pattern as `create_new_leaf`: resolve
         // effective config before the mutable borrow on
         // `self.tenants`.
@@ -2062,13 +2071,14 @@ impl MinerCluster {
         let mut structured_templates: Vec<StructuredTemplateRecord> = state
             .structured_templates
             .iter()
-            .map(
-                |((severity_number, scope_name), template_id)| StructuredTemplateRecord {
+            .map(|((severity_number, scope_name, event_name), template_id)| {
+                StructuredTemplateRecord {
                     severity_number: *severity_number,
                     scope_name: scope_name.clone(),
+                    event_name: event_name.clone(),
                     template_id: *template_id,
-                },
-            )
+                }
+            })
             .collect();
         structured_templates.sort_by_key(|record| record.template_id);
 
@@ -2193,7 +2203,11 @@ impl MinerCluster {
                     detail: format!("template_id {} appears more than once", record.template_id),
                 });
             }
-            let key = (record.severity_number, record.scope_name.clone());
+            let key = (
+                record.severity_number,
+                record.scope_name.clone(),
+                record.event_name.clone(),
+            );
             if tenant
                 .structured_templates
                 .insert(key, record.template_id)
@@ -2201,8 +2215,8 @@ impl MinerCluster {
             {
                 return Err(RestoreError::Inconsistent {
                     detail: format!(
-                        "structured key (severity {}, scope {:?}) appears more than once",
-                        record.severity_number, record.scope_name,
+                        "structured key (severity {}, scope {:?}, event {:?}) appears more than once",
+                        record.severity_number, record.scope_name, record.event_name,
                     ),
                 });
             }
@@ -2447,6 +2461,7 @@ mod tests {
     use ourios_core::audit::SharedAuditSink;
     use ourios_core::otlp::{AnyValue, any_value::Value as AvValue};
     use ourios_core::record::SharedRecordSink;
+    use proptest::prelude::*;
 
     use crate::snapshot::{
         LeafRecord, ParamTypeRecord, SnapshotState, StructuredTemplateRecord, TokenRecord,
@@ -2475,6 +2490,83 @@ mod tests {
                 value: Some(AvValue::IntValue(0)),
             })),
             ..Default::default()
+        }
+    }
+
+    /// RFC0037.1 — a structured record's `event_name` participates in
+    /// the template key, so distinct event types in one
+    /// `(severity, scope)` get distinct `template_id`s (and identical
+    /// ones share) instead of collapsing to a single sentinel. This is
+    /// the mechanism behind `… | count by template_id` separating event
+    /// types (asserted at the query layer once the ids differ).
+    #[test]
+    fn rfc0037_1_event_name_distinguishes_structured_templates() {
+        let tenant = TenantId::new("tenant-genai");
+        let mut cluster = MinerCluster::new(MinerConfig::default());
+
+        let mut inference = structured_record(&tenant, 9, Some("lib.agent"));
+        inference.event_name = Some("gen_ai.client.inference.operation.details".to_string());
+        let mut tool_call = structured_record(&tenant, 9, Some("lib.agent"));
+        tool_call.event_name = Some("gen_ai.execute_tool".to_string());
+
+        let id_inference = cluster.ingest(&inference);
+        let id_tool = cluster.ingest(&tool_call);
+        assert_ne!(
+            id_inference, id_tool,
+            "distinct event_name in one (severity, scope) must yield distinct template_ids"
+        );
+
+        // Same (severity, scope, event_name) shares its id.
+        assert_eq!(
+            id_inference,
+            cluster.ingest(&inference),
+            "identical structured key must share one template_id"
+        );
+
+        // A record with no event_name is its own class, distinct from both.
+        let no_event = structured_record(&tenant, 9, Some("lib.agent"));
+        let id_none = cluster.ingest(&no_event);
+        assert_ne!(id_none, id_inference);
+        assert_ne!(id_none, id_tool);
+    }
+
+    proptest! {
+        /// RFC0037.1 (property) — a structured record's `template_id` is a
+        /// pure function of exactly `(severity_number, scope_name,
+        /// event_name)`: equal tuples reuse an id, distinct tuples receive
+        /// distinct ids. Covers empty strings, `None`s, and repeated keys.
+        #[test]
+        fn rfc0037_1_structured_key_is_the_whole_template_identity(
+            keys in prop::collection::vec(
+                (
+                    any::<u8>(),
+                    prop::option::of("[a-z.]{0,8}"),
+                    prop::option::of("[a-z_.]{0,12}"),
+                ),
+                1..16,
+            )
+        ) {
+            let tenant = TenantId::new("t");
+            let mut cluster = MinerCluster::new(MinerConfig::default());
+            let mut ids: std::collections::HashMap<
+                (u8, Option<String>, Option<String>),
+                u64,
+            > = std::collections::HashMap::new();
+            for (severity, scope, event) in keys {
+                let mut rec = structured_record(&tenant, severity, scope.as_deref());
+                rec.event_name = event.clone();
+                let id = cluster.ingest(&rec);
+                let key = (severity, scope, event);
+                if let Some(&prev) = ids.get(&key) {
+                    prop_assert_eq!(id, prev, "equal structured key must reuse its template_id");
+                } else {
+                    prop_assert!(
+                        !ids.values().any(|&existing| existing == id),
+                        "a distinct structured key must receive a fresh template_id"
+                    );
+                    ids.insert(key, id);
+                }
+            }
         }
     }
 
@@ -2746,6 +2838,7 @@ mod tests {
             structured_templates: vec![StructuredTemplateRecord {
                 severity_number: 9,
                 scope_name: None,
+                event_name: None,
                 template_id: 7,
             }],
             wal_high_water: None,
@@ -2765,20 +2858,23 @@ mod tests {
 
     #[test]
     fn restore_rejects_duplicate_structured_key() {
-        // The structured map keys on (severity, scope); a duplicate
-        // key would silently drop one entry while template_count
-        // counted both.
+        // The structured map keys on (severity, scope, event_name); a
+        // duplicate key would silently drop one entry while
+        // template_count counted both. Both records share the same
+        // (9, "lib.a", None) key, so restore must reject them.
         let state = SnapshotState {
             leaves: vec![],
             structured_templates: vec![
                 StructuredTemplateRecord {
                     severity_number: 9,
                     scope_name: Some("lib.a".to_string()),
+                    event_name: None,
                     template_id: 1,
                 },
                 StructuredTemplateRecord {
                     severity_number: 9,
                     scope_name: Some("lib.a".to_string()),
+                    event_name: None,
                     template_id: 2,
                 },
             ],

@@ -59,7 +59,7 @@ pub struct TelemetryConfig {
     /// (`http://localhost:4317` for gRPC), so the `OTEL_EXPORTER_*`
     /// environment overrides still apply. The periodic-reader export
     /// interval is the standard `OTEL_METRIC_EXPORT_INTERVAL` env var
-    /// (default 60 s), resolved by the SDK — not a field here.
+    /// — **milliseconds**, default `60000` (60 s) — resolved by the SDK, not a field here.
     pub otlp_endpoint: Option<String>,
     /// Dogfood the traces signal (RFC 0038). `true` installs a
     /// `TracerProvider` + `tracing-opentelemetry` layer, so `tracing`
@@ -76,7 +76,7 @@ impl TelemetryConfig {
     /// Config for `service_name` with spec defaults (default endpoint,
     /// traces on). The metric export interval and the trace sampler both
     /// come from the SDK's own env resolution (`OTEL_METRIC_EXPORT_INTERVAL`
-    /// default 60 s; `OTEL_TRACES_SAMPLER` default `parentbased_always_on`).
+    /// default `60000` ms; `OTEL_TRACES_SAMPLER` default `parentbased_always_on`).
     #[must_use]
     pub fn new(service_name: impl Into<String>) -> Self {
         Self {
@@ -253,7 +253,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     let exporter = builder.build()?;
 
     // No `.with_interval(...)`: the SDK's periodic reader resolves the interval
-    // from the standard `OTEL_METRIC_EXPORT_INTERVAL` env var (default 60 s), so
+    // from the standard `OTEL_METRIC_EXPORT_INTERVAL` env var (milliseconds, default 60000 = 60 s), so
     // operators use the universal OTel knob rather than a bespoke Ourios field.
     let reader = PeriodicReader::builder(exporter).build();
 

@@ -33,14 +33,21 @@
 use std::time::Duration;
 
 use opentelemetry::global;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
+
+/// The instrumentation-scope name for the tracer that opens Ourios's own
+/// spans (RFC 0038). The library crates create instruments through
+/// `global::meter("ourios.<subsystem>")`; spans go through this one tracer.
+const TRACER_SCOPE: &str = "ourios";
 
 /// Default OTLP export interval. The OpenTelemetry spec's default
 /// periodic-reader interval is 60 s; we follow it unless a deployment
@@ -61,17 +68,30 @@ pub struct TelemetryConfig {
     pub otlp_endpoint: Option<String>,
     /// Periodic-reader export interval ([`DEFAULT_EXPORT_INTERVAL`]).
     pub export_interval: Duration,
+    /// Dogfood the traces signal (RFC 0038). `true` installs a
+    /// `TracerProvider` + `tracing-opentelemetry` layer, so `tracing`
+    /// spans become `OTel` spans and every log record carries the active
+    /// span's `trace_id`/`span_id`. `false` restores the logs+metrics-only
+    /// posture (no tracer, no `trace_id` on logs).
+    pub traces_enabled: bool,
+    /// Trace sampler (RFC 0038 §3.4). `None` → `parentbased_always_on`
+    /// (the `OTel` default; the disciplined span count sits far below the
+    /// ~1000 traces/sec threshold `OTel` says to sample at). `Some(r)` →
+    /// `parentbased_traceidratio` at ratio `r` in `[0.0, 1.0]`.
+    pub trace_sample_ratio: Option<f64>,
 }
 
 impl TelemetryConfig {
     /// Config for `service_name` with spec defaults (default endpoint,
-    /// [`DEFAULT_EXPORT_INTERVAL`]).
+    /// [`DEFAULT_EXPORT_INTERVAL`], traces on, always-on sampler).
     #[must_use]
     pub fn new(service_name: impl Into<String>) -> Self {
         Self {
             service_name: service_name.into(),
             otlp_endpoint: None,
             export_interval: DEFAULT_EXPORT_INTERVAL,
+            traces_enabled: true,
+            trace_sample_ratio: None,
         }
     }
 }
@@ -123,6 +143,9 @@ pub struct TelemetryGuard {
     provider: SdkMeterProvider,
     /// `None` on the metrics-only paths ([`init_in_memory`], tests).
     logger: Option<SdkLoggerProvider>,
+    /// `None` when traces are disabled (`traces_enabled: false`) or on the
+    /// metrics-only paths.
+    tracer: Option<SdkTracerProvider>,
 }
 
 impl TelemetryGuard {
@@ -139,7 +162,11 @@ impl TelemetryGuard {
             Some(logger) => logger.shutdown().map_err(TelemetryError::Shutdown),
             None => Ok(()),
         };
-        metrics.and(logs)
+        let traces = match &self.tracer {
+            Some(tracer) => tracer.shutdown().map_err(TelemetryError::Shutdown),
+            None => Ok(()),
+        };
+        metrics.and(logs).and(traces)
     }
 
     /// Export pending metrics now, without tearing the pipeline down —
@@ -164,6 +191,9 @@ impl Drop for TelemetryGuard {
         if let Some(logger) = &self.logger {
             let _ = logger.shutdown();
         }
+        if let Some(tracer) = &self.tracer {
+            let _ = tracer.shutdown();
+        }
     }
 }
 
@@ -171,6 +201,37 @@ fn resource(service_name: &str) -> Resource {
     Resource::builder()
         .with_service_name(service_name.to_owned())
         .build()
+}
+
+/// A boxed subscriber layer over the root `Registry`, so a conditionally-built
+/// layer (the traces layer, absent when traces are disabled) can be stored in a
+/// binding before entering the subscriber chain.
+type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// A `RUST_LOG`-honouring filter with the telemetry-induced-telemetry loop
+/// guard applied (`CLAUDE.md` §6.3): the OTLP exporters are themselves
+/// tonic/hyper clients, so their own `tracing` events **and spans** must be
+/// muted, or every export would generate more telemetry to export. The `off`
+/// directives win over `RUST_LOG`. Shared by the logs appender bridge and the
+/// traces layer. Directives are compile-time constants; an unparsable one is
+/// skipped rather than panicking.
+fn guarded_env_filter() -> EnvFilter {
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    for directive in [
+        "hyper=off",
+        "tonic=off",
+        "h2=off",
+        "tower=off",
+        "reqwest=off",
+        "opentelemetry=off",
+        "opentelemetry_sdk=off",
+        "opentelemetry_otlp=off",
+    ] {
+        if let Ok(directive) = directive.parse() {
+            filter = filter.add_directive(directive);
+        }
+    }
+    filter
 }
 
 /// Build the OTLP push `MeterProvider` **and** the OTLP `LoggerProvider`
@@ -223,37 +284,62 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     let log_exporter = builder.build()?;
     let logger = SdkLoggerProvider::builder()
         .with_batch_exporter(log_exporter)
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .build();
 
-    global::set_meter_provider(provider.clone());
+    // Traces (RFC 0038): a `TracerProvider` over the OTLP batch span
+    // exporter, whose tracer feeds a `tracing-opentelemetry` layer — so
+    // `tracing` spans become OTel spans and their ids reach every log
+    // record through the appender bridge. Also built before installing any
+    // global (the span exporter is the last fallible step). `None` when
+    // traces are disabled, which keeps today's logs+metrics posture exactly.
+    // The sampler is `parentbased_always_on` by default, or
+    // `parentbased_traceidratio` when a ratio is configured (RFC 0038 §3.4).
+    let (tracer, otel_layer): (Option<SdkTracerProvider>, Option<BoxedLayer>) =
+        if config.traces_enabled {
+            let mut builder = SpanExporter::builder().with_tonic();
+            if let Some(endpoint) = &config.otlp_endpoint {
+                builder = builder.with_endpoint(endpoint.clone());
+            }
+            let span_exporter = builder.build()?;
+            let sampler = match config.trace_sample_ratio {
+                // Clamp defensively to the documented `[0.0, 1.0]`. The
+                // RFC 0038 §3.4 config-file layer rejects an out-of-range
+                // ratio at startup before it reaches here; this only guards a
+                // direct library caller from a surprising sampler.
+                Some(ratio) => Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+                    ratio.clamp(0.0, 1.0),
+                ))),
+                None => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+            };
+            let tracer_provider = SdkTracerProvider::builder()
+                .with_batch_exporter(span_exporter)
+                .with_sampler(sampler)
+                .with_resource(resource)
+                .build();
+            let layer = tracing_opentelemetry::layer()
+                .with_tracer(tracer_provider.tracer(TRACER_SCOPE))
+                .with_filter(guarded_env_filter())
+                .boxed();
+            (Some(tracer_provider), Some(layer))
+        } else {
+            (None, None)
+        };
 
-    // The bridge honours `RUST_LOG` (default `info`) like the stderr copy,
-    // so exported volume can be turned down (`warn`) or up (`debug`) the
-    // same way. On top of that sits the telemetry-induced-telemetry loop
-    // guard (OTel self-observability guidelines): the OTLP exporter is
-    // itself a tonic/hyper client, so its internal `tracing` events must
-    // not re-enter the bridge or every failed export would emit records
-    // that trigger more exports — the guard's `off` directives always win,
-    // whatever `RUST_LOG` says. The directives are compile-time constants;
-    // an unparsable one is skipped rather than panicking.
-    let mut bridge_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    for directive in [
-        "hyper=off",
-        "tonic=off",
-        "h2=off",
-        "tower=off",
-        "reqwest=off",
-        "opentelemetry=off",
-        "opentelemetry_sdk=off",
-        "opentelemetry_otlp=off",
-    ] {
-        if let Ok(directive) = directive.parse() {
-            bridge_filter = bridge_filter.add_directive(directive);
-        }
-    }
-    let bridge = OpenTelemetryTracingBridge::new(&logger).with_filter(bridge_filter);
+    global::set_meter_provider(provider.clone());
+    // The global tracer provider is set *after* `try_init` confirms the traces
+    // layer is wired (below) — not here. Setting it before would, on a lost
+    // subscriber-install race, leave the global pointing at a provider this
+    // function then shuts down (the metrics global is safe to set early: it is
+    // kept regardless of the subscriber outcome).
+
+    // The appender bridge and the traces layer both honour `RUST_LOG`
+    // (default `info`) with the telemetry-induced-telemetry loop guard
+    // applied (`guarded_env_filter`): the OTLP exporters are tonic/hyper
+    // clients, so their internal events *and spans* must not re-enter the
+    // pipeline or every failed export would emit more telemetry to export —
+    // the guard's `off` directives always win over `RUST_LOG`.
+    let bridge = OpenTelemetryTracingBridge::new(&logger).with_filter(guarded_env_filter());
     // Human-readable copy on stderr — stdout is reserved for the
     // binary's machine-parsed start-up lines (bound-port announcements).
     // `RUST_LOG` overrides the default `info`.
@@ -263,22 +349,36 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // `try_init` (not `init`): a process can only ever have one global
     // subscriber. If one is already installed (a test harness), keep it —
     // metrics still work and the caller's logs still go wherever that
-    // subscriber sends them. In that case the bridge was not wired, so
-    // tear the logger pipeline down rather than keep an idle batch
-    // processor alive for the process lifetime.
-    let logger = if tracing_subscriber::registry()
+    // subscriber sends them. In that case the bridge/traces layer were not
+    // wired, so tear the logger and tracer pipelines down rather than keep
+    // idle batch processors alive for the process lifetime.
+    let installed = tracing_subscriber::registry()
+        .with(otel_layer)
         .with(bridge)
         .with(fmt)
         .try_init()
-        .is_ok()
-    {
-        Some(logger)
+        .is_ok();
+    let (logger, tracer) = if installed {
+        // The subscriber — and its traces layer — is live, so register the
+        // tracer provider globally now (any direct `global::tracer(...)` use
+        // resolves against a running pipeline).
+        if let Some(tracer_provider) = &tracer {
+            global::set_tracer_provider(tracer_provider.clone());
+        }
+        (Some(logger), tracer)
     } else {
         let _ = logger.shutdown();
-        None
+        if let Some(tracer_provider) = &tracer {
+            let _ = tracer_provider.shutdown();
+        }
+        (None, None)
     };
 
-    Ok(TelemetryGuard { provider, logger })
+    Ok(TelemetryGuard {
+        provider,
+        logger,
+        tracer,
+    })
 }
 
 /// Build an in-memory metrics pipeline for tests: a `MeterProvider`
@@ -318,6 +418,7 @@ pub fn init_in_memory(
         TelemetryGuard {
             provider,
             logger: None,
+            tracer: None,
         },
         exporter,
     )
@@ -346,6 +447,7 @@ mod tests {
         let guard = TelemetryGuard {
             provider,
             logger: None,
+            tracer: None,
         };
 
         // Act.
@@ -400,6 +502,53 @@ mod tests {
                     .is_some_and(|b| format!("{b:?}").contains("compaction sweep finished"))
             }),
             "the tracing event should surface as an OTel log record, got {records:?}",
+        );
+    }
+
+    // Scenario RFC0038.1 (unit slice): with the traces layer and the appender
+    // bridge on the same subscriber, a `tracing::info!` emitted *inside* a
+    // `tracing` span carries that span's (non-zero) `trace_id`/`span_id` on the
+    // resulting OTel log record — the correlation the reported gap was about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn rfc0038_1_log_within_a_span_carries_trace_context() {
+        use opentelemetry::trace::{SpanId, TraceId};
+        use opentelemetry_sdk::logs::InMemoryLogExporter;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        // Arrange — a tracer + logger over in-memory exporters, wired through
+        // the same two bridges `init` installs.
+        let span_exporter = InMemorySpanExporter::default();
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(span_exporter)
+            .with_resource(resource("ourios-test"))
+            .build();
+        let log_exporter = InMemoryLogExporter::default();
+        let logger = SdkLoggerProvider::builder()
+            .with_simple_exporter(log_exporter.clone())
+            .with_resource(resource("ourios-test"))
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer(TRACER_SCOPE)))
+            .with(OpenTelemetryTracingBridge::new(&logger));
+
+        // Act — emit a log *inside* an entered span.
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("ourios.test.request");
+            let _enter = span.enter();
+            tracing::info!("a log emitted within the span");
+        });
+        logger.force_flush().expect("logs flush");
+
+        // Assert — the log carries a non-zero trace context.
+        let records = log_exporter.get_emitted_logs().expect("logs exported");
+        let correlated = records.iter().any(|log| {
+            log.record
+                .trace_context()
+                .is_some_and(|tc| tc.trace_id != TraceId::INVALID && tc.span_id != SpanId::INVALID)
+        });
+        assert!(
+            correlated,
+            "a log emitted inside a span should carry a non-zero trace_id/span_id, got {records:?}",
         );
     }
 }

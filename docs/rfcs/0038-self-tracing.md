@@ -1,7 +1,7 @@
 ---
 rfc: 0038
 title: Self-tracing — the OTel traces signal, disciplined to request scope
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-23
@@ -11,11 +11,15 @@ superseded-by: —
 
 # RFC 0038 — Self-tracing — the OTel traces signal, disciplined to request scope
 
-> **Status: `specified` (2026-07-23).** Sections §§1–4 and the §5 acceptance
-> criteria are complete — every hazard/invariant the RFC touches carries a
-> scenario, testable in principle (per the `docs/rfcs/README.md` lifecycle,
-> a written §5 is the `specified` stage). No implementation has landed — not
-> yet `red`/`green`.
+> **Status: `green` (2026-07-24).** All six §5 acceptance criteria are
+> implemented and pass: RFC0038.1 (request-scope spans + log correlation,
+> #614/#615/#616/#617), RFC0038.2 (ingest O(1), #615), RFC0038.3 (spawn-boundary
+> context, #617), RFC0038.4 (traces configured via the universal OTel SDK env
+> vars — no bespoke Ourios surface — with the `OTEL_TRACES_EXPORTER=none`
+> disable mapping tested), RFC0038.5 (loop guard, #614), RFC0038.6 (flush on
+> shutdown, #614). §3.4 was amended to lean on the universal OTel env vars
+> instead of a bespoke config-file sampler surface (maintainer decision,
+> 2026-07-24).
 
 ## 1. Summary
 
@@ -151,32 +155,29 @@ volume-sensitive span is the per-Export-batch one under heavy ingest, and the
 standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` knob (e.g.
 `parentbased_traceidratio` at `0.1`) is the operator's lever for exactly that —
 Export batches are independent root traces, so ratio-sampling them loses no
-cross-request correlation. `TelemetryConfig` gains `traces_enabled: bool`
-(default on) and an optional sample ratio; a new `telemetry.*` section in the
-RFC 0020 config file
-(`traces.enabled`, `traces.sample_ratio`, `otlp.endpoint`) exposes it in the
-file front-end — the **first** telemetry config section (telemetry is env-only
-today). Traces can be disabled wholesale (`traces.enabled: false`), which
-restores today's logs-plus-metrics posture exactly.
+cross-request correlation.
 
-**Precedence and failure (the sampler resolution is authoritative and
-fail-fast):**
+**Lean on the universal OTel SDK env vars — no bespoke Ourios config.** These
+env vars are the config contract operators already know; inventing a parallel
+Ourios surface for the same thing is drift and a second way to configure one
+knob. So Ourios configures traces entirely through the standard SDK vars and
+does not couple a unique config to them:
 
-- `telemetry.traces.sample_ratio`, when set in the config file, **selects and
-  configures** a `parentbased_traceidratio` sampler at that ratio — it does not
-  merely tune an already-chosen one. It **takes precedence** over the env
-  sampler (RFC 0020: the file is authoritative when `--config` is given). The
-  file surface is a ratio only, which maps unambiguously to that one sampler.
-- When the file sets no ratio, the standard OTel `OTEL_TRACES_SAMPLER` /
-  `OTEL_TRACES_SAMPLER_ARG` env vars resolve the sampler (the SDK's own
-  handling — any standard sampler name). When neither file nor env sets one,
-  the default is `parentbased_always_on`.
-- **Validation.** Ourios validates its own file value: `traces.sample_ratio`
-  must be a number in `[0.0, 1.0]`; out-of-range or non-numeric **rejects
-  startup** with a config error, consistent with Ourios's fail-fast validation
-  of every other config field. The OTel env vars stay the SDK's domain — an
-  invalid `OTEL_TRACES_SAMPLER`/`_ARG` is logged and ignored by the SDK, which
-  falls back to its default; Ourios does not alter that behaviour.
+- **Sampler:** Ourios does **not** call `.with_sampler(...)`. The SDK resolves
+  the sampler from `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` (any
+  standard sampler name; default `parentbased_always_on`). Invalid values are
+  logged and ignored by the SDK per the env-var spec — Ourios does not add its
+  own validation or precedence layer.
+- **Disable:** the standard per-signal switch `OTEL_TRACES_EXPORTER=none` turns
+  the traces pipeline off, restoring today's logs-plus-metrics posture exactly
+  (no tracer, no `trace_id` on logs). The server maps it to
+  `TelemetryConfig.traces_enabled` (default on), the one programmatic flag the
+  library keeps; `OTEL_SDK_DISABLED` still disables all three signals together.
+- **Endpoint / transport:** `OTEL_EXPORTER_OTLP_ENDPOINT` and the other
+  `OTEL_EXPORTER_OTLP_*` vars, already read by the SDK exporter.
+
+There is no `telemetry.traces.*` config-file section and no file-vs-env
+precedence: the SDK's own env resolution is authoritative.
 
 ### 3.5 Span names and attributes
 
@@ -262,21 +263,21 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > trace — verified by asserting the emitted log's `trace_id` equals the span's
 > (the `tokio::spawn` context-loss trap is closed).
 
-> **Scenario RFC0038.4 — sampling is configurable, resolves by a defined
-> precedence, and defaults sane.**
-> **Given** the standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`
-> knobs and the config file's `telemetry.traces.{enabled,sample_ratio}`,
-> **When** the sampler is left unset; set via env `parentbased_traceidratio`
-> at a ratio; set via the file `sample_ratio` *and* a conflicting env sampler;
-> given an out-of-range file `sample_ratio`; and disabled
-> (`traces.enabled: false`),
-> **Then** the default samples (root) traces; the env ratio sampler exports the
-> configured fraction deterministically; the **file `sample_ratio` wins** over
-> the env sampler, selecting `parentbased_traceidratio` at that ratio (§3.4
-> precedence); an out-of-range file `sample_ratio` **rejects startup** with a
-> config error; and disabling installs **no** tracer and stamps **no**
-> `trace_id`/`span_id` on log records — the observable, runtime
-> logs-plus-metrics-only behaviour (no throughput change).
+> **Scenario RFC0038.4 — traces configure through the universal OTel SDK env
+> vars, and disabling is the standard per-signal switch.**
+> **Given** the standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` and
+> `OTEL_TRACES_EXPORTER` env vars (no bespoke Ourios config surface),
+> **When** the sampler is left unset; set via env `parentbased_traceidratio` at
+> a ratio; and `OTEL_TRACES_EXPORTER=none`,
+> **Then** the default samples (root) traces (`parentbased_always_on`, the SDK
+> default — Ourios does **not** override the sampler); the env ratio sampler
+> exports the configured fraction (the SDK's own resolution, which Ourios does
+> not alter); and `OTEL_TRACES_EXPORTER=none` maps to `traces_enabled=false`, so
+> **no** tracer is installed and **no** `trace_id`/`span_id` is stamped on log
+> records — the observable, runtime logs-plus-metrics-only behaviour (no
+> throughput change). (Sampler resolution and invalid-value handling are the
+> SDK's universal, upstream-tested behaviour; Ourios tests only its own mapping
+> of `OTEL_TRACES_EXPORTER=none` to the disable path.)
 
 > **Scenario RFC0038.5 — no telemetry-induced-telemetry loop.**
 > **Given** the OTLP span exporter's own transport stack (`tonic`/`hyper`/…)
@@ -307,12 +308,11 @@ Mapped to `CLAUDE.md` §6.2:
   (spans are O(1) in N), plus a `criterion` guard on the ingest
   (`OTLP → WAL`, `WAL → Parquet`) hot-path benchmarks confirming no
   per-record tracing cost — a regression there blocks merge (§6.2 benchmarks).
-- **RFC0038.4** — unit/integration over the sampler configuration surface:
-  default; ratio (deterministic fraction over a fixed set of trace-ids); the
-  §3.4 precedence (file `sample_ratio` overriding a conflicting env sampler);
-  invalid-value rejection (an out-of-range file `sample_ratio` fails config
-  validation at startup); and the `traces.enabled: false` disable path
-  (asserting no tracer and no `trace_id` on logs).
+- **RFC0038.4** — a unit test over Ourios's own mapping: `OTEL_TRACES_EXPORTER`
+  → whether the traces pipeline installs (`none` → off; unset / `otlp` / any
+  other → on). Sampler resolution (`OTEL_TRACES_SAMPLER`/`_ARG`) is the SDK's
+  universal, upstream-tested behaviour that Ourios no longer overrides — there
+  is nothing Ourios-specific left to test there.
 
 ## 7. Open questions
 

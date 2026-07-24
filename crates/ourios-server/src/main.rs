@@ -780,6 +780,16 @@ fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
+/// Map the standard `OTEL_TRACES_EXPORTER` selector to whether the traces
+/// pipeline is installed: `none` disables it (the OTel-standard per-signal
+/// off switch), anything else — including unset, i.e. the default `otlp` —
+/// leaves it on. We lean on this universal env var rather than a bespoke
+/// Ourios config knob (RFC 0038 §3.4); the sampler is likewise the standard
+/// `OTEL_TRACES_SAMPLER`, resolved by the SDK.
+fn traces_enabled(otel_traces_exporter: Option<&str>) -> bool {
+    !otel_traces_exporter.is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
@@ -800,8 +810,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Boot OpenTelemetry first so the compactor's instruments export
     // (RFC 0001 §6.8). The guard flushes pending metrics on shutdown;
-    // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
-    let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
+    // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter, and
+    // OTEL_TRACES_SAMPLER/_ARG tune the trace sampler (both read by the SDK).
+    let mut telemetry_config = TelemetryConfig::new("ourios-server");
+    telemetry_config.traces_enabled =
+        traces_enabled(std::env::var("OTEL_TRACES_EXPORTER").ok().as_deref());
+    let telemetry = ourios_telemetry::init(&telemetry_config)?;
 
     #[cfg(unix)]
     let sigterm = startup_guards(&config);
@@ -932,6 +946,19 @@ mod tests {
     use super::*;
 
     use ourios_server::config::file::parse;
+
+    /// RFC0038.4 — the `OTEL_TRACES_EXPORTER` selector maps to trace install:
+    /// `none` (any casing/whitespace) is the only value that disables; unset
+    /// and the default `otlp` (and any other exporter) leave traces on.
+    #[test]
+    fn rfc0038_4_otel_traces_exporter_none_disables_traces() {
+        assert!(traces_enabled(None), "unset → default otlp → on");
+        assert!(traces_enabled(Some("otlp")), "otlp → on");
+        assert!(traces_enabled(Some("otlp,console")), "a real exporter → on");
+        assert!(!traces_enabled(Some("none")), "none → off");
+        assert!(!traces_enabled(Some("  none  ")), "trimmed none → off");
+        assert!(!traces_enabled(Some("None")), "case-insensitive none → off");
+    }
 
     /// A `local` [`StoreConfig`] for `path`, the common test fixture.
     fn local(path: &str) -> StoreConfig {

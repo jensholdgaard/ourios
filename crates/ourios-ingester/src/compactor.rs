@@ -551,13 +551,14 @@ mod tests {
         provider.force_flush().expect("spans flush");
 
         let spans = exporter.get_finished_spans().expect("spans exported");
-        let sweep: Vec<_> = spans
-            .iter()
-            .filter(|s| s.name.as_ref() == "sweep partitions")
-            .collect();
-        assert_eq!(sweep.len(), 1, "exactly one sweep span, got {spans:?}");
+        // The sweep path is our code only (filesystem + Parquet, no async
+        // runtime / DataFusion), so the whole sweep emits exactly this one
+        // span — asserting the total count catches any accidental extra
+        // instrumentation (the "one span per sweep" contract, RFC0038.2).
+        assert_eq!(spans.len(), 1, "exactly one span total, got {spans:?}");
+        assert_eq!(spans[0].name.as_ref(), "sweep partitions");
         assert_eq!(
-            sweep[0].span_kind,
+            spans[0].span_kind,
             SpanKind::Internal,
             "sweep partitions is an INTERNAL span",
         );

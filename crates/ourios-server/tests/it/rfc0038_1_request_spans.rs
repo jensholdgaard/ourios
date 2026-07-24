@@ -20,7 +20,7 @@
 use axum::body::Body;
 use axum::http::{Request, header};
 use opentelemetry::trace::{SpanKind, TracerProvider as _};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use tower::ServiceExt as _;
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
@@ -47,18 +47,14 @@ fn scoped_tracer() -> (
     (exporter, provider, subscriber)
 }
 
-fn spans_named<'a>(spans: &'a [SpanData], name: &str) -> Vec<&'a SpanData> {
-    spans.iter().filter(|s| s.name.as_ref() == name).collect()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn rfc0038_1_query_emits_one_server_span() {
     let bucket = tempfile::tempdir().expect("temp");
     let app = ourios_server::querier::router(bucket.path().to_path_buf(), WINDOW_NANOS);
     let (exporter, provider, subscriber) = scoped_tracer();
 
-    // An empty store is enough — the span is opened at handler entry
-    // regardless of whether the query matches anything.
+    // A well-formed query against a valid (empty) tenant is a success with
+    // an empty result — the span opens at handler entry regardless.
     let request = Request::builder()
         .method("POST")
         .uri("/v1/query")
@@ -66,23 +62,34 @@ async fn rfc0038_1_query_emits_one_server_span() {
         .header("X-Ourios-Tenant", "acme")
         .body(Body::from("template_id == 1"))
         .expect("build request");
-    let _ = app
+    let response = app
         .oneshot(request)
         .with_subscriber(subscriber)
         .await
         .expect("oneshot");
+    // Assert the request actually succeeded, so a routing/auth/parse
+    // regression can't pass just because the handler opened a span.
+    assert!(
+        response.status().is_success(),
+        "query request should succeed, got {}",
+        response.status(),
+    );
 
     provider.force_flush().expect("spans flush");
     let spans = exporter.get_finished_spans().expect("spans exported");
-    let query = spans_named(&spans, "POST /v1/query");
+    // Exactly one span, and it is the query server span — asserting the total
+    // count catches accidental extra instrumentation (the "one span per
+    // operation" contract). The query path emits no other span: the miner /
+    // DataFusion inner work stays span-free (RFC0038.2).
     assert_eq!(
-        query.len(),
+        spans.len(),
         1,
-        "exactly one query span, got {:?}",
+        "exactly one span total, got {:?}",
         spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
+    assert_eq!(spans[0].name.as_ref(), "POST /v1/query");
     assert_eq!(
-        query[0].span_kind,
+        spans[0].span_kind,
         SpanKind::Server,
         "POST /v1/query is a SERVER span",
     );

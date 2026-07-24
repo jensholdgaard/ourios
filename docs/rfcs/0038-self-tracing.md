@@ -192,7 +192,7 @@ GenAI-aware backends. So the §5 contract is complete:
 | Operation | Span name | Kind |
 |---|---|---|
 | Logs query | `POST /v1/query` (HTTP `{method} {route}`) | `SERVER` |
-| MCP tool call | `execute_tool query_logs` / `… list_templates` / `… template_drift` (GenAI `execute_tool {tool.name}`) | `INTERNAL` (child of rmcp `serve_inner`) |
+| MCP tool call | `execute_tool query_logs` / `execute_tool list_templates` / `execute_tool template_drift` (GenAI `execute_tool {tool.name}`) | `INTERNAL` (child of rmcp `serve_inner`) |
 | OTLP Export batch | `ingest logs` | `SERVER` |
 | WAL group-commit | `commit wal` | `INTERNAL` (child of the batch) |
 | Compaction sweep | `sweep partitions` | `INTERNAL` |

@@ -20,7 +20,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 | License | Crates |
 | --- | --- |
 | `Apache-2.0` | 336 |
-| `MIT` | 71 |
+| `MIT` | 72 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 8 |
 | `ISC` | 4 |
@@ -8506,6 +8506,7 @@ Used by:
 
 - `tracing-attributes` 0.1.31 — <https://github.com/tokio-rs/tracing>
 - `tracing-core` 0.1.36 — <https://github.com/tokio-rs/tracing>
+- `tracing-opentelemetry` 0.33.0 — <https://github.com/tokio-rs/tracing-opentelemetry>
 - `tracing-subscriber` 0.3.23 — <https://github.com/tokio-rs/tracing>
 - `tracing` 0.1.44 — <https://github.com/tokio-rs/tracing>
 

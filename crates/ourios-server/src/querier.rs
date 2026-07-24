@@ -407,12 +407,36 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
 /// `POST /v1/query` handler (RFC 0016 §3.3–§3.5).
 // RFC 0038: one request-scoped server span per query (low frequency, an ideal
 // span root). `skip_all` keeps the headers/body off the span.
-#[tracing::instrument(skip_all, name = "POST /v1/query", fields(otel.kind = "server"))]
+#[tracing::instrument(
+    skip_all,
+    name = "POST /v1/query",
+    fields(
+        otel.kind = "server",
+        http.request.method = "POST",
+        http.route = "/v1/query",
+        ourios.tenant = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+    )
+)]
 async fn handle_query(
     State(state): State<QuerierState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Record the outgoing status across every early-return path at the one
+    // exit; the RFC 0016 flow lives in the inner fn, which runs inside this
+    // span so its `ourios.tenant` record lands on it. Record as `i64`:
+    // `tracing-opentelemetry` stringifies `u64` (OTel has no unsigned type),
+    // but semconv types `http.response.status_code` as an int.
+    let response = handle_query_inner(state, headers, body).await;
+    tracing::Span::current().record(
+        "http.response.status_code",
+        i64::from(response.status().as_u16()),
+    );
+    response
+}
+
+async fn handle_query_inner(state: QuerierState, headers: HeaderMap, body: Bytes) -> Response {
     // RFC 0026 §3.3: authentication precedes everything, including the
     // tenant check — 401 before 400 before 403, so an unauthenticated
     // probe learns nothing about the tenant contract. One undifferentiated
@@ -447,6 +471,7 @@ async fn handle_query(
             "the X-Ourios-Tenant header is required and must be non-empty",
         );
     };
+    tracing::Span::current().record("ourios.tenant", tenant.as_str());
 
     // RFC 0026 §3.3: a well-formed tenant outside the authenticated token's
     // set is 403 — enforcement composes with (never replaces) the

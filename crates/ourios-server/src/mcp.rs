@@ -215,6 +215,20 @@ fn normalize_tenant(raw: &str) -> Result<&str, ErrorData> {
     Ok(tenant)
 }
 
+/// The MCP session id from the request's `mcp-session-id` header — rmcp
+/// forwards the HTTP parts into the tool context (the same handle
+/// `check_tenant` reads). Absent only on a pre-session call; the
+/// `mcp.session.id` span field stays unset then (it is conditionally
+/// required, so an unset value is conformant, not a gap).
+fn mcp_session_id(ctx: &rmcp::service::RequestContext<rmcp::RoleServer>) -> Option<&str> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()?
+        .headers
+        .get("mcp-session-id")?
+        .to_str()
+        .ok()
+}
+
 /// Apply the tool's row `cap` to `stages`, unless the statement is an
 /// aggregation — `count [by …]` or a scalar `sum`/`min`/`max`/`avg`. An
 /// aggregation and `limit` are mutually exclusive (`compile::validate`): it
@@ -305,12 +319,25 @@ impl OuriosMcp {
         self.query_logs_traced(Parameters(args), ctx).await
     }
 
-    #[tracing::instrument(skip_all, name = "execute_tool query_logs", fields(otel.kind = "internal"))]
+    #[tracing::instrument(
+        skip_all,
+        name = "execute_tool query_logs",
+        fields(
+            otel.kind = "internal",
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = "query_logs",
+            mcp.method.name = "tools/call",
+            mcp.session.id = tracing::field::Empty,
+        )
+    )]
     async fn query_logs_traced(
         &self,
         Parameters(args): Parameters<QueryLogsArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(session) = mcp_session_id(&ctx) {
+            tracing::Span::current().record("mcp.session.id", session);
+        }
         let tenant_arg = normalize_tenant(&args.tenant)?;
         self.check_tenant(&ctx, tenant_arg)?;
         let statement = dsl::parse_statement(&args.query)
@@ -375,12 +402,25 @@ impl OuriosMcp {
         self.list_templates_traced(Parameters(args), ctx).await
     }
 
-    #[tracing::instrument(skip_all, name = "execute_tool list_templates", fields(otel.kind = "internal"))]
+    #[tracing::instrument(
+        skip_all,
+        name = "execute_tool list_templates",
+        fields(
+            otel.kind = "internal",
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = "list_templates",
+            mcp.method.name = "tools/call",
+            mcp.session.id = tracing::field::Empty,
+        )
+    )]
     async fn list_templates_traced(
         &self,
         Parameters(args): Parameters<ListTemplatesArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(session) = mcp_session_id(&ctx) {
+            tracing::Span::current().record("mcp.session.id", session);
+        }
         let tenant_arg = normalize_tenant(&args.tenant)?;
         self.check_tenant(&ctx, tenant_arg)?;
         let tenant = TenantId::new(tenant_arg);
@@ -434,12 +474,25 @@ impl OuriosMcp {
         self.template_drift_traced(Parameters(args), ctx).await
     }
 
-    #[tracing::instrument(skip_all, name = "execute_tool template_drift", fields(otel.kind = "internal"))]
+    #[tracing::instrument(
+        skip_all,
+        name = "execute_tool template_drift",
+        fields(
+            otel.kind = "internal",
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = "template_drift",
+            mcp.method.name = "tools/call",
+            mcp.session.id = tracing::field::Empty,
+        )
+    )]
     async fn template_drift_traced(
         &self,
         Parameters(args): Parameters<TemplateDriftArgs>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(session) = mcp_session_id(&ctx) {
+            tracing::Span::current().record("mcp.session.id", session);
+        }
         let tenant_arg = normalize_tenant(&args.tenant)?;
         self.check_tenant(&ctx, tenant_arg)?;
         // One grammar, one boundary rule: the drift window parses through

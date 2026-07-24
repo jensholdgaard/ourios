@@ -366,6 +366,7 @@ jobs:
           OURIOS_RECEIVER_HTTP_ADDR=127.0.0.1:24418 \
           OURIOS_QUERIER_ENABLED=1 \
           OURIOS_QUERIER_HTTP_ADDR=127.0.0.1:24419 \
+          OURIOS_QUERIER_MCP_ENABLED=1 \
           OURIOS_COMPACTION_ENABLED=0 \
           OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24317 \
           OTEL_BLRP_SCHEDULE_DELAY=500 \
@@ -389,6 +390,29 @@ jobs:
             kill -TERM "$server_pid" || true
             exit 1
           fi
+          # Drive one MCP tools/call so the `execute_tool` span — and its
+          # canonical gen_ai.*/mcp.* attributes (RFC0038.7) — flows to weaver;
+          # the query probe above only exercises the HTTP path. Best-effort
+          # (the gate is weaver's report, not curl): a handshake hiccup must not
+          # spuriously fail the job, but in the happy path this is what makes the
+          # attribute-emission conformance (and the genai-relocation exemption)
+          # actually exercised in CI.
+          mcp_h='Content-Type: application/json'
+          mcp_a='Accept: application/json, text/event-stream'
+          mcp_init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci-live-check","version":"0"}}}'
+          mcp_session="$(curl -sf --max-time 10 -D - -o /dev/null -X POST 'http://127.0.0.1:24419/mcp' \
+            -H "$mcp_h" -H "$mcp_a" -H 'Host: 127.0.0.1' --data "$mcp_init" \
+            | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')" || true
+          if [ -n "${mcp_session:-}" ]; then
+            curl -sf --max-time 10 -X POST 'http://127.0.0.1:24419/mcp' \
+              -H "$mcp_h" -H "$mcp_a" -H 'Host: 127.0.0.1' -H "mcp-session-id: $mcp_session" \
+              --data '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null || true
+            curl -sf --max-time 10 -X POST 'http://127.0.0.1:24419/mcp' \
+              -H "$mcp_h" -H "$mcp_a" -H 'Host: 127.0.0.1' -H "mcp-session-id: $mcp_session" \
+              --data '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_templates","arguments":{"tenant":"t"}}}' > /dev/null || true
+          else
+            echo "::warning::MCP session not established; execute_tool span not exercised in live-check"
+          fi
           sleep 1
           # Best-effort: the server may already have exited; the wait +
           # status check below is what enforces the clean exit.
@@ -405,14 +429,40 @@ jobs:
           curl -sf -X POST 'http://127.0.0.1:24320/stop' > /dev/null || true
           weaver_status=0
           wait "$weaver_pid" || weaver_status=$?
-          if [ "$weaver_status" -ne 0 ]; then
-            echo "::error::weaver live-check found violations — emitted telemetry drifts from semconv/registry/"
-            cat "$workdir/report/live_check.json" || true
+          report="$workdir/report/live_check.json"
+          # Gate on the report's *filtered* violation count, not weaver's raw
+          # exit code. RFC 0038 emits the canonical GenAI/MCP span attributes
+          # (gen_ai.*/mcp.*), which semconv v1.42 marks deprecated — "Moved to
+          # the OpenTelemetry GenAI semantic conventions repository" — so weaver
+          # reports each as a `violation`. weaver cannot take a second registry
+          # dependency ("Multiple dependencies is not supported yet"), so we
+          # exempt exactly that one relocation advisory for those two namespaces
+          # and gate on every other violation. Tracking: #622 (collapse to a
+          # single genai dependency once upstream deletes its v1.42 stubs).
+          if [ ! -s "$report" ]; then
+            echo "::error::weaver live-check produced no report (status $weaver_status)"
+            exit 1
+          fi
+          entities="$(jq '.statistics.total_entities // 0' "$report")"
+          if [ "$entities" -eq 0 ]; then
+            echo "::error::weaver live-check ingested no telemetry — the server's OTLP export never reached it"
+            cat "$report" || true
+            exit 1
+          fi
+          unexpected="$(jq '[.. | objects
+            | select(.type? == "PolicyFinding" and .level? == "violation")
+            | select(( (.id == "deprecated")
+                and ((.context.attribute_name // "") | test("^(gen_ai|mcp)\\."))
+                and ((.context.deprecation_note // "") | contains("semantic-conventions-genai")) ) | not)
+            ] | length' "$report")"
+          if [ "$unexpected" -ne 0 ]; then
+            echo "::error::weaver live-check found $unexpected non-exempt violation(s) — emitted telemetry drifts from semconv/registry/"
+            cat "$report" || true
           fi
           if [ "$server_status" -ne 0 ]; then
             echo "::error::ourios-server exited with status $server_status"
           fi
-          [ "$weaver_status" -eq 0 ] && [ "$server_status" -eq 0 ]
+          [ "$unexpected" -eq 0 ] && [ "$server_status" -eq 0 ]
       - name: Upload live-check report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

@@ -226,13 +226,24 @@ fn resource(service_name: &str) -> Resource {
 /// binding before entering the subscriber chain.
 type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
 
-/// A `RUST_LOG`-honouring filter with the telemetry-induced-telemetry loop
-/// guard applied (`CLAUDE.md` §6.3): the OTLP exporters are themselves
-/// tonic/hyper clients, so their own `tracing` events **and spans** must be
-/// muted, or every export would generate more telemetry to export. The `off`
-/// directives win over `RUST_LOG`. Shared by the logs appender bridge and the
-/// traces layer. Directives are compile-time constants; an unparsable one is
-/// skipped rather than panicking.
+/// A `RUST_LOG`-honouring filter that mutes third-party crates whose internal
+/// `tracing` output is not Ourios's own signal. Two reasons, both wanting the
+/// crate silenced in the exported stream:
+///
+/// - **Telemetry-induced-telemetry loop guard** (`CLAUDE.md` §6.3): the OTLP
+///   exporters are themselves tonic/hyper clients, so their own events **and
+///   spans** must be muted, or every export would generate more telemetry to
+///   export.
+/// - **Transport-library internals**: `rmcp` (the MCP server SDK) instruments
+///   its own session/notification handling with bare, non-semconv fields
+///   (`session_id`, `peer_info`, `notification`). Exporting those would drift
+///   the telemetry from `semconv/registry/` (the live-check gate) while adding
+///   no Ourios-level signal — Ourios's own `execute_tool` span (target
+///   `ourios_server::mcp`, untouched by this directive) is the signal.
+///
+/// The `off` directives win over `RUST_LOG`. Shared by the logs appender bridge
+/// and the traces layer. Directives are compile-time constants; an unparsable
+/// one is skipped rather than panicking.
 fn guarded_env_filter() -> EnvFilter {
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     for directive in [
@@ -244,6 +255,7 @@ fn guarded_env_filter() -> EnvFilter {
         "opentelemetry=off",
         "opentelemetry_sdk=off",
         "opentelemetry_otlp=off",
+        "rmcp=off",
     ] {
         if let Ok(directive) = directive.parse() {
             filter = filter.add_directive(directive);

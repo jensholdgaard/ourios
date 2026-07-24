@@ -118,4 +118,36 @@ async fn rfc0038_1_mcp_tool_emits_one_internal_span() {
         SpanKind::Internal,
         "`execute_tool list_templates` is an INTERNAL span",
     );
+
+    // RFC0038.7 — the span carries the canonical GenAI/MCP semconv attributes
+    // (the agent-observability payload): the tool-execution operation, the
+    // tool name, the MCP method, and the caller's session id.
+    let attr = |key: &str| -> Option<String> {
+        mcp[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.as_str().into_owned())
+    };
+    assert_eq!(
+        attr("gen_ai.operation.name").as_deref(),
+        Some("execute_tool"),
+        "gen_ai.operation.name = execute_tool; attrs = {:?}",
+        mcp[0].attributes,
+    );
+    assert_eq!(
+        attr("gen_ai.tool.name").as_deref(),
+        Some("list_templates"),
+        "gen_ai.tool.name names the invoked tool",
+    );
+    assert_eq!(
+        attr("mcp.method.name").as_deref(),
+        Some("tools/call"),
+        "mcp.method.name = tools/call",
+    );
+    assert_eq!(
+        attr("mcp.session.id").as_deref(),
+        Some(session.as_str()),
+        "mcp.session.id carries the caller's session, correlating its tool calls",
+    );
 }

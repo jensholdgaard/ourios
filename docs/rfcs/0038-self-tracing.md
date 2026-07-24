@@ -11,15 +11,16 @@ superseded-by: —
 
 # RFC 0038 — Self-tracing — the OTel traces signal, disciplined to request scope
 
-> **Status: `green` (2026-07-24).** All six §5 acceptance criteria are
+> **Status: `green` (2026-07-24).** All seven §5 acceptance criteria are
 > implemented and pass: RFC0038.1 (request-scope spans + log correlation,
 > #614/#615/#616/#617), RFC0038.2 (ingest O(1), #615), RFC0038.3 (spawn-boundary
 > context, #617), RFC0038.4 (traces configured via the universal OTel SDK env
 > vars — no bespoke Ourios surface — with the `OTEL_TRACES_EXPORTER=none`
 > disable mapping tested), RFC0038.5 (loop guard, #614), RFC0038.6 (flush on
-> shutdown, #614). §3.4 was amended to lean on the universal OTel env vars
-> instead of a bespoke config-file sampler surface (maintainer decision,
-> 2026-07-24).
+> shutdown, #614), RFC0038.7 (canonical GenAI/MCP span attributes with the
+> genai-relocation live-check exemption, §3.6; exemption tracked by #622). §3.4
+> was amended to lean on the universal OTel env vars instead of a bespoke
+> config-file sampler surface (maintainer decision, 2026-07-24).
 
 ## 1. Summary
 
@@ -208,6 +209,37 @@ count and the number of distinct tenants it fanned out to (counts, not ids);
 the sweep span carries the partitions/files swept. Tenant and other identifiers
 are **attributes**, never part of the span name, keeping names low-cardinality.
 
+### 3.6 GenAI/MCP semantic-convention attributes on the tool spans
+
+The MCP tool spans are Ourios's agent-observability surface: an agent driving
+the `/mcp` tools should see them exactly as it sees any GenAI tool call. Each
+`execute_tool {tool}` span therefore carries the canonical OTel attributes —
+`gen_ai.operation.name = execute_tool`, `gen_ai.tool.name` (the tool), and
+`mcp.method.name = tools/call`, plus `mcp.session.id` recorded from the
+forwarded `mcp-session-id` header so an agent's calls within one session
+correlate. The span name is the derived `{gen_ai.operation.name}
+{gen_ai.tool.name}` pair, not a duplicate source of truth.
+
+These four attributes **moved** out of core semantic-conventions to the separate
+[`semantic-conventions-genai`](https://github.com/open-telemetry/semantic-conventions-genai)
+registry; in our pinned dependency (semconv v1.42.0) they survive only as
+**deprecated** "Moved to …" stubs, which `weaver registry live-check` reports as
+`violation`s. weaver cannot take a second registry dependency (`not yet
+implemented: Multiple dependencies is not supported yet`), and v1.42.0 still
+ships the `gen-ai`/`mcp` model besides — so a second dependency would also
+collide on group ids. The live-check job therefore gates on a **filtered**
+violation count that exempts *only* the genai-relocation deprecation for the
+`gen_ai.*`/`mcp.*` namespaces; every other violation (including any other
+deprecation on those keys) still fails. Issue #622 tracks collapsing this into a
+single genai dependency once upstream deletes its v1.42 copies.
+
+Driving an MCP call through live-check also surfaces `rmcp`'s **own** internal
+instrumentation (bare `session_id` / `peer_info` / `notification` fields on
+events at `rmcp` source lines) — non-semconv third-party noise, not Ourios
+signal. That is muted at the source, alongside the export-stack loop guard, in
+`ourios-telemetry`'s `guarded_env_filter` (`rmcp=off`); Ourios's own
+`execute_tool` span (target `ourios_server::mcp`) is unaffected.
+
 ## 4. Alternatives considered
 
 **Correlation-only (a tracer that generates ids but exports no spans).** The
@@ -296,6 +328,18 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > **Then** the tracer provider is flushed alongside the logger and meter
 > providers, and no acknowledged-window span is dropped on a clean exit.
 
+> **Scenario RFC0038.7 — MCP tool spans carry the canonical GenAI/MCP
+> attributes, and only their relocation is exempted from live-check.**
+> **Given** the `/mcp` tool surface with traces enabled,
+> **When** an agent invokes a tool over an established MCP session,
+> **Then** the `execute_tool {tool}` span carries `gen_ai.operation.name =
+> execute_tool`, `gen_ai.tool.name` (the invoked tool), `mcp.method.name =
+> tools/call`, and `mcp.session.id` (the caller's session), **And**
+> `weaver registry live-check` over the emitted telemetry reports no violation
+> other than the sanctioned "moved to semantic-conventions-genai" deprecation
+> for the `gen_ai.*`/`mcp.*` namespaces — every other drift still fails the gate
+> (§3.6; the exemption's removal is tracked by #622).
+
 ## 6. Testing strategy
 
 Mapped to `CLAUDE.md` §6.2:
@@ -315,6 +359,11 @@ Mapped to `CLAUDE.md` §6.2:
   other → on). Sampler resolution (`OTEL_TRACES_SAMPLER`/`_ARG`) is the SDK's
   universal, upstream-tested behaviour that Ourios no longer overrides — there
   is nothing Ourios-specific left to test there.
+- **RFC0038.7** — the `ourios-server` MCP-span integration test asserts the
+  `gen_ai.*`/`mcp.*` attributes (including the session id) on the emitted span;
+  the `live-check` CI job proves emission-time semconv conformance, gating on
+  the genai-relocation-filtered violation count so a real drift on any other
+  attribute still fails (§3.6).
 
 ## 7. Open questions
 

@@ -780,10 +780,12 @@ fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
-/// Map the standard `OTEL_TRACES_EXPORTER` selector to whether the traces
-/// pipeline is installed: `none` disables it (the OTel-standard per-signal
-/// off switch), anything else — including unset, i.e. the default `otlp` —
-/// leaves it on. We lean on this universal env var rather than a bespoke
+/// Honor `OTEL_TRACES_EXPORTER` as an on/off switch: `none` disables the
+/// traces pipeline (the OTel-standard per-signal off switch); any other value,
+/// including unset, leaves it on. Ourios does **not** implement the full
+/// exporter *selector* — when traces are on it always exports over OTLP, so
+/// e.g. `OTEL_TRACES_EXPORTER=console` is treated as "on" (OTLP), not as a
+/// console exporter. We lean on this universal env var rather than a bespoke
 /// Ourios config knob (RFC 0038 §3.4); the sampler is likewise the standard
 /// `OTEL_TRACES_SAMPLER`, resolved by the SDK.
 fn traces_enabled(otel_traces_exporter: Option<&str>) -> bool {
@@ -947,14 +949,18 @@ mod tests {
 
     use ourios_server::config::file::parse;
 
-    /// RFC0038.4 — the `OTEL_TRACES_EXPORTER` selector maps to trace install:
-    /// `none` (any casing/whitespace) is the only value that disables; unset
-    /// and the default `otlp` (and any other exporter) leave traces on.
+    /// RFC0038.4 — `OTEL_TRACES_EXPORTER` is honored as an on/off switch, not a
+    /// full exporter selector: `none` (any casing/whitespace) is the only value
+    /// that disables; unset and every other value (`otlp`, `console`, …) leave
+    /// traces on — always exported over OTLP.
     #[test]
     fn rfc0038_4_otel_traces_exporter_none_disables_traces() {
-        assert!(traces_enabled(None), "unset → default otlp → on");
+        assert!(traces_enabled(None), "unset → on (OTLP)");
         assert!(traces_enabled(Some("otlp")), "otlp → on");
-        assert!(traces_enabled(Some("otlp,console")), "a real exporter → on");
+        assert!(
+            traces_enabled(Some("console")),
+            "unsupported selector → still on (OTLP), not off",
+        );
         assert!(!traces_enabled(Some("none")), "none → off");
         assert!(!traces_enabled(Some("  none  ")), "trimmed none → off");
         assert!(!traces_enabled(Some("None")), "case-insensitive none → off");

@@ -16,21 +16,26 @@ path = "src/lib.rs"
 # The OTel metrics API. Library crates depend only on this (via
 # `global::meter`); this crate is the one place the heavy SDK +
 # exporter live (RFC 0001 §6.8 "Export architecture").
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
-# The SDK: MeterProvider + periodic reader (metrics) and LoggerProvider +
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+# The SDK: MeterProvider + periodic reader (metrics), LoggerProvider +
 # batch processor (logs — the CLAUDE.md §6.3 dogfooding path: Ourios's
-# own logs ship as the OTel Logs signal). `rt-tokio` drives the periodic
-# export on the tokio runtime the server already runs.
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "logs", "rt-tokio"] }
-# The OTLP push exporter over gRPC (tonic), both signals. This is the
+# own logs ship as the OTel Logs signal), and TracerProvider + batch span
+# processor (traces — RFC 0038, request-scoped self-tracing). `rt-tokio`
+# drives the periodic/batch export on the tokio runtime the server runs.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "logs", "trace", "rt-tokio"] }
+# The OTLP push exporter over gRPC (tonic), all three signals. This is the
 # export path pinned by the §6.8 amendment — push over OTLP, not a
 # scrape endpoint (and for logs, not plain stderr).
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "logs", "grpc-tonic"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "logs", "trace", "grpc-tonic"] }
 # The OTel-recommended Rust logging bridge: `tracing` events become OTel
 # log records through this appender (Rust has no end-user OTel logging
 # API; `tracing` is the front-end).
 opentelemetry-appender-tracing = { version = "0.32", default-features = false }
-# The subscriber stack the bridge plugs into: `registry` composes layers,
+# The OTel-recommended Rust *tracing* bridge (RFC 0038): `tracing` spans
+# become OTel spans through this layer, and the appender above then stamps
+# the active span's trace/span ids onto every log record it emits.
+tracing-opentelemetry = { version = "0.33", default-features = false }
+# The subscriber stack the bridges plug into: `registry` composes layers,
 # `env-filter` gives RUST_LOG-style filtering (and the loop guard muting
 # the exporter's own tonic/hyper internals), `fmt` is the human-readable
 # stderr copy.
@@ -43,9 +48,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 testing = ["opentelemetry_sdk/testing"]
 
 [dev-dependencies]
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "logs", "trace", "testing"] }
 tokio = { version = "=1.53.0", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
-# Emit `tracing` events in the bridge test.
+# Emit `tracing` events + spans in the bridge / correlation tests.
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 
 [lints]

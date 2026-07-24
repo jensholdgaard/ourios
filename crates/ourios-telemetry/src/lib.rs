@@ -303,7 +303,13 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
             }
             let span_exporter = builder.build()?;
             let sampler = match config.trace_sample_ratio {
-                Some(ratio) => Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio))),
+                // Clamp defensively to the documented `[0.0, 1.0]`. The
+                // RFC 0038 §3.4 config-file layer rejects an out-of-range
+                // ratio at startup before it reaches here; this only guards a
+                // direct library caller from a surprising sampler.
+                Some(ratio) => Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+                    ratio.clamp(0.0, 1.0),
+                ))),
                 None => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
             };
             let tracer_provider = SdkTracerProvider::builder()
@@ -321,9 +327,11 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         };
 
     global::set_meter_provider(provider.clone());
-    if let Some(tracer_provider) = &tracer {
-        global::set_tracer_provider(tracer_provider.clone());
-    }
+    // The global tracer provider is set *after* `try_init` confirms the traces
+    // layer is wired (below) — not here. Setting it before would, on a lost
+    // subscriber-install race, leave the global pointing at a provider this
+    // function then shuts down (the metrics global is safe to set early: it is
+    // kept regardless of the subscriber outcome).
 
     // The appender bridge and the traces layer both honour `RUST_LOG`
     // (default `info`) with the telemetry-induced-telemetry loop guard
@@ -351,6 +359,12 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         .try_init()
         .is_ok();
     let (logger, tracer) = if installed {
+        // The subscriber — and its traces layer — is live, so register the
+        // tracer provider globally now (any direct `global::tracer(...)` use
+        // resolves against a running pipeline).
+        if let Some(tracer_provider) = &tracer {
+            global::set_tracer_provider(tracer_provider.clone());
+        }
         (Some(logger), tracer)
     } else {
         let _ = logger.shutdown();

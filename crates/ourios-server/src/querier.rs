@@ -405,6 +405,9 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
 }
 
 /// `POST /v1/query` handler (RFC 0016 §3.3–§3.5).
+// RFC 0038: one request-scoped server span per query (low frequency, an ideal
+// span root). `skip_all` keeps the headers/body off the span.
+#[tracing::instrument(skip_all, name = "POST /v1/query", fields(otel.kind = "server"))]
 async fn handle_query(
     State(state): State<QuerierState>,
     headers: HeaderMap,

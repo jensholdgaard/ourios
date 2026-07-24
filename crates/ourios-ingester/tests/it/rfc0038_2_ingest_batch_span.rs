@@ -12,7 +12,7 @@
 //! `tests/README.md` on the global-installer exclusions).
 
 use crate::ingest_support::{open_pipeline, request, resource_logs};
-use opentelemetry::trace::{SpanId, TracerProvider as _};
+use opentelemetry::trace::{SpanId, SpanKind, TracerProvider as _};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
@@ -84,6 +84,20 @@ async fn rfc0038_2_ingest_batch_emits_one_span_with_a_wal_commit_child() {
         commit[0].parent_span_id,
         batch[0].span_context.span_id(),
         "wal.commit nests under ingest.batch",
+    );
+
+    // The §3.5 kind contract: the batch is a SERVER span (it answers an OTLP
+    // Export RPC), its WAL commit an INTERNAL child. `otel.kind` on the
+    // `#[instrument]`/`info_span!` fields must survive export as the span kind.
+    assert_eq!(
+        batch[0].span_kind,
+        SpanKind::Server,
+        "ingest.batch is a SERVER span",
+    );
+    assert_eq!(
+        commit[0].span_kind,
+        SpanKind::Internal,
+        "wal.commit is an INTERNAL span",
     );
 }
 

@@ -37,6 +37,7 @@ use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportCo
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -314,6 +315,12 @@ fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) 
 /// be constructed.
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let resource = resource(&config.service_name);
+
+    // RFC 0039 §3.1: the W3C trace-context propagator, installed
+    // unconditionally. It is stateless and cheap, and extraction is inert when
+    // no traces pipeline is running — installing it regardless keeps the
+    // ingress code uniform (no "is tracing on?" branch at every ingress).
+    global::set_text_map_propagator(TraceContextPropagator::new());
 
     // Per-signal install decisions honor the universal OTel env vars directly —
     // `ourios-telemetry` plays the "autoconfigure" role Go's `autoexport` /

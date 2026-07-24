@@ -151,8 +151,19 @@ ourios-testgen = { path = "../ourios-testgen" }
 # Stand up an in-memory MeterProvider to assert the compaction metric
 # stream; `testing` exposes `init_in_memory`.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-# The SDK data types (`ResourceMetrics` etc.) the metrics test reads.
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+# The SDK data types (`ResourceMetrics` etc.) the metrics test reads;
+# `trace` adds the `InMemorySpanExporter`/`SdkTracerProvider` the RFC0038.2
+# request-span test collects the ingest batch span through.
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
+# RFC0038.2: the `TracerProvider::tracer` trait method + `SpanId`/`TraceId`
+# the batch-span assertions read (the crate's non-dev dep is metrics-only).
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+# RFC0038.2: bridge the ingest path's `#[tracing::instrument]` spans onto
+# the in-memory span exporter — matches ourios-telemetry's pinned layer.
+tracing-opentelemetry = { version = "0.33", default-features = false }
+# The scoped `registry().with(layer)` subscriber the batch-span test drives
+# ingest under (`WithSubscriber`), so no process-global tracer is installed.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 # The metrics test collects via the in-memory reader's periodic-export
 # path, which needs a multi-thread runtime; `test-util` gives the RFC0008.8
 # latency test a paused virtual clock for deterministic, jitter-free timing.

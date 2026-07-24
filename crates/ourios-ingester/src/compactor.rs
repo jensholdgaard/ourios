@@ -172,6 +172,14 @@ pub fn run_sweep(
 /// # Errors
 ///
 /// See [`run_sweep`].
+// RFC 0038: one span per compaction sweep — coarse and periodic. Opened inside
+// the callee (the tick `spawn_blocking`s this), and the per-tenant / per-file
+// loops below stay span-free.
+#[tracing::instrument(
+    skip_all,
+    name = "ourios.compaction.sweep",
+    fields(otel.kind = "internal")
+)]
 pub fn run_sweep_with_promoted(
     store: &Store,
     now_unix_nanos: u64,

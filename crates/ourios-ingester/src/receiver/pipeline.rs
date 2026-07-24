@@ -25,6 +25,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use ourios_miner::cluster::MinerCluster;
 use ourios_wal::{FrameKind, Wal, WalOffset};
 use prost::Message;
+use tracing::Instrument as _;
 
 use crate::metrics::IngestMetrics;
 use crate::receiver::commit::CommitCoordinator;
@@ -281,6 +282,22 @@ impl IngestPipeline {
     ///   write (RFC0003.4).
     /// - [`ReceiveError::WalAppend`] / [`ReceiveError::WalSync`] if
     ///   persistence fails; the batch is **not** acked.
+    // RFC 0038: one span per OTLP `Export` batch — the correct coarse
+    // granularity (never per record; the miner/encode/sink loops below stay
+    // span-free). Opened *inside* this callee, not at the `tokio::spawn` site
+    // in the gRPC/HTTP handlers, so the span is created within the spawned task
+    // (span context does not cross `tokio::spawn` — RFC0038.3). `skip_all`
+    // keeps the whole `ExportLogsServiceRequest` off the span.
+    #[tracing::instrument(
+        skip_all,
+        name = "ourios.ingest.batch",
+        fields(otel.kind = "server")
+    )]
+    // The linear ingest orchestrator (authz → encode → fan-out → commit → miner
+    // hand-off → metrics); the RFC 0038 batch + wal.commit spans nudged it one
+    // step over 100. Splitting a straight-line sequence to satisfy the lint
+    // would hurt readability more than the length does.
+    #[allow(clippy::too_many_lines)]
     pub async fn ingest_bound(
         &self,
         request: ExportLogsServiceRequest,
@@ -333,7 +350,18 @@ impl IngestPipeline {
         // fsync (RFC0008.8). The frame's append `seq` orders the miner
         // hand-off below.
         let commit_start = Instant::now();
-        let outcome = self.coordinator.commit(&payload).await;
+        // RFC 0038: a child span for the WAL group-commit — the one genuinely
+        // I/O-bound, latency-bearing step (a durationful op is a span, not an
+        // event). Nests under the batch span; `.instrument` (not an entered
+        // guard) carries it across the await cleanly.
+        let outcome = self
+            .coordinator
+            .commit(&payload)
+            .instrument(tracing::info_span!(
+                "ourios.wal.commit",
+                otel.kind = "internal"
+            ))
+            .await;
         // The WAL-before-ack latency: time until the batch is durable
         // (includes the group-commit window + fsync). Recorded below only
         // on a successful, acked commit.

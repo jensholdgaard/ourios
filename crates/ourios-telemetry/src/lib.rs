@@ -137,10 +137,12 @@ impl From<opentelemetry_otlp::ExporterBuildError> for TelemetryError {
     }
 }
 
-/// Owns the installed [`SdkMeterProvider`] (and, from [`init`], the
-/// [`SdkLoggerProvider`] behind the `tracing` bridge). Hold it for the
-/// process lifetime; dropping it (or calling
-/// [`TelemetryGuard::shutdown`]) flushes any telemetry not yet exported.
+/// Owns whichever signal providers [`init`] installed — the meter provider,
+/// the [`SdkLoggerProvider`] behind the `tracing` bridge, and/or the tracer.
+/// With per-signal disable (`OTEL_{METRICS,LOGS,TRACES}_EXPORTER=none`, or
+/// `OTEL_SDK_DISABLED=true` for all), any or all of them may be absent — each
+/// field is [`Option`]. Hold it for the process lifetime; dropping it (or
+/// calling [`TelemetryGuard::shutdown`]) flushes any telemetry not yet exported.
 #[must_use = "dropping the guard immediately tears the telemetry pipeline back down"]
 pub struct TelemetryGuard {
     /// `None` when metrics are disabled (`metrics_enabled: false`).
@@ -247,9 +249,18 @@ fn guarded_env_filter() -> EnvFilter {
     filter
 }
 
-/// Build the OTLP push `MeterProvider` **and** the OTLP `LoggerProvider`
-/// with its `tracing` bridge, install them process-globally, and return
-/// the [`TelemetryGuard`] that owns them.
+/// The standard `OTEL_SDK_DISABLED` boolean kill-switch: `true`
+/// (case-insensitive) selects a no-op SDK for **all** signals; any other value
+/// or absence leaves the SDK enabled (per the `OTel` env-var spec).
+fn otel_sdk_disabled() -> bool {
+    std::env::var("OTEL_SDK_DISABLED").is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Build the enabled signals' OTLP pipelines — the push `MeterProvider`, the
+/// `LoggerProvider` with its `tracing` bridge, and the tracer — install them
+/// process-globally, and return the [`TelemetryGuard`] that owns them. Each
+/// signal is skipped when disabled (`OTEL_{METRICS,LOGS,TRACES}_EXPORTER=none`
+/// per-signal, or `OTEL_SDK_DISABLED=true` for all), so the guard may own none.
 ///
 /// Call this **once**, at process start-up: it is the bootstrap entry
 /// point, not a reconfiguration API. OpenTelemetry's `set_meter_provider` is
@@ -268,12 +279,21 @@ fn guarded_env_filter() -> EnvFilter {
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let resource = resource(&config.service_name);
 
+    // The standard global kill-switch: `OTEL_SDK_DISABLED=true` forces every
+    // signal off (a no-op SDK), overriding the per-signal flags — so we build
+    // no providers at all. Universal OTel knob, honored here rather than
+    // reinvented (#618).
+    let sdk_disabled = otel_sdk_disabled();
+    let metrics_enabled = config.metrics_enabled && !sdk_disabled;
+    let logs_enabled = config.logs_enabled && !sdk_disabled;
+    let traces_enabled = config.traces_enabled && !sdk_disabled;
+
     // Metrics: `None` when disabled (`OTEL_METRICS_EXPORTER=none` → the server
-    // clears `metrics_enabled`), so instruments resolve to the global no-op and
-    // nothing exports. No `.with_interval(...)`: the SDK's periodic reader
-    // resolves the interval from the standard `OTEL_METRIC_EXPORT_INTERVAL` env
-    // var (milliseconds, default 60000 = 60 s).
-    let provider: Option<SdkMeterProvider> = if config.metrics_enabled {
+    // clears `metrics_enabled`; or `OTEL_SDK_DISABLED=true`), so instruments
+    // resolve to the global no-op and nothing exports. No `.with_interval(...)`:
+    // the SDK's periodic reader resolves the interval from the standard
+    // `OTEL_METRIC_EXPORT_INTERVAL` env var (milliseconds, default 60000 = 60 s).
+    let provider: Option<SdkMeterProvider> = if metrics_enabled {
         let mut builder = MetricExporter::builder().with_tonic();
         if let Some(endpoint) = &config.otlp_endpoint {
             builder = builder.with_endpoint(endpoint.clone());
@@ -298,7 +318,7 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // `init` cannot leave a live pipeline behind that the caller has no
     // guard to shut down. `None` when disabled (`OTEL_LOGS_EXPORTER=none`);
     // the stderr `fmt` layer stays, so only the OTel Logs signal is dropped.
-    let logger: Option<SdkLoggerProvider> = if config.logs_enabled {
+    let logger: Option<SdkLoggerProvider> = if logs_enabled {
         let mut builder = LogExporter::builder().with_tonic();
         if let Some(endpoint) = &config.otlp_endpoint {
             builder = builder.with_endpoint(endpoint.clone());
@@ -326,36 +346,35 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // universal OTel knob instead of a bespoke Ourios one (RFC 0038 §3.4). The
     // disciplined span count sits far below the ~1000 traces/sec threshold
     // OTel says to sample at, so the always-on default is the right baseline.
-    let (tracer, otel_layer): (Option<SdkTracerProvider>, Option<BoxedLayer>) =
-        if config.traces_enabled {
-            let mut builder = SpanExporter::builder().with_tonic();
-            if let Some(endpoint) = &config.otlp_endpoint {
-                builder = builder.with_endpoint(endpoint.clone());
-            }
-            let span_exporter = builder.build()?;
-            let tracer_provider = SdkTracerProvider::builder()
-                .with_batch_exporter(span_exporter)
-                .with_resource(resource)
-                .build();
-            // Strip `tracing`'s synthetic per-span attributes: `busy_ns`/`idle_ns`
-            // (tracked inactivity) and `target` carry no semconv namespace, and
-            // `with_location` emits `code.module.name`, which collides with the
-            // upstream `code` namespace — all four fail `weaver registry
-            // live-check`. They are instrumentation-source metadata, not domain
-            // telemetry; our spans carry their identity in the span name plus the
-            // attributes we add deliberately. `thread.{id,name}` are valid semconv
-            // (kept by leaving `with_threads` at its default).
-            let layer = tracing_opentelemetry::layer()
-                .with_tracer(tracer_provider.tracer(TRACER_SCOPE))
-                .with_tracked_inactivity(false)
-                .with_location(false)
-                .with_target(false)
-                .with_filter(guarded_env_filter())
-                .boxed();
-            (Some(tracer_provider), Some(layer))
-        } else {
-            (None, None)
-        };
+    let (tracer, otel_layer): (Option<SdkTracerProvider>, Option<BoxedLayer>) = if traces_enabled {
+        let mut builder = SpanExporter::builder().with_tonic();
+        if let Some(endpoint) = &config.otlp_endpoint {
+            builder = builder.with_endpoint(endpoint.clone());
+        }
+        let span_exporter = builder.build()?;
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_batch_exporter(span_exporter)
+            .with_resource(resource)
+            .build();
+        // Strip `tracing`'s synthetic per-span attributes: `busy_ns`/`idle_ns`
+        // (tracked inactivity) and `target` carry no semconv namespace, and
+        // `with_location` emits `code.module.name`, which collides with the
+        // upstream `code` namespace — all four fail `weaver registry
+        // live-check`. They are instrumentation-source metadata, not domain
+        // telemetry; our spans carry their identity in the span name plus the
+        // attributes we add deliberately. `thread.{id,name}` are valid semconv
+        // (kept by leaving `with_threads` at its default).
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer_provider.tracer(TRACER_SCOPE))
+            .with_tracked_inactivity(false)
+            .with_location(false)
+            .with_target(false)
+            .with_filter(guarded_env_filter())
+            .boxed();
+        (Some(tracer_provider), Some(layer))
+    } else {
+        (None, None)
+    };
 
     if let Some(provider) = &provider {
         global::set_meter_provider(provider.clone());

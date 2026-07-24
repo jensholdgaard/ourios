@@ -217,8 +217,12 @@ the `/mcp` tools should see them exactly as it sees any GenAI tool call. Each
 `gen_ai.operation.name = execute_tool`, `gen_ai.tool.name` (the tool), and
 `mcp.method.name = tools/call`, plus `mcp.session.id` recorded from the
 forwarded `mcp-session-id` header so an agent's calls within one session
-correlate. The span name is the derived `{gen_ai.operation.name}
-{gen_ai.tool.name}` pair, not a duplicate source of truth.
+correlate. The span name follows the GenAI `{gen_ai.operation.name}
+{gen_ai.tool.name}` form (`execute_tool query_logs` etc.); because
+`#[tracing::instrument]` requires a static name literal, the name and the two
+attributes are written separately per tool rather than one derived from the
+other, so the MCP-span unit test asserts **both** the name and the attribute
+values together — a drift between them fails the test.
 
 These four attributes **moved** out of core semantic-conventions to the separate
 [`semantic-conventions-genai`](https://github.com/open-telemetry/semantic-conventions-genai)

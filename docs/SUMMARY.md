@@ -65,6 +65,8 @@
 - [RFC 0036 — Write-side layout](./rfcs/0036-write-side-layout.md)
 - [RFC 0037 — GenAI / structured-event logs](./rfcs/0037-genai-structured-log-events.md)
 - [RFC 0038 — Self-tracing](./rfcs/0038-self-tracing.md)
+- [RFC 0039 — Inbound trace-context propagation](./rfcs/0039-inbound-trace-context-propagation.md)
+- [RFC 0040 — DataFusion operator instrumentation](./rfcs/0040-datafusion-operator-instrumentation.md)
 
 # Talks
 

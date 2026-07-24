@@ -19,6 +19,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, header};
+use opentelemetry::Value;
 use opentelemetry::trace::{SpanKind, TracerProvider as _};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use tower::ServiceExt as _;
@@ -92,5 +93,33 @@ async fn rfc0038_1_query_emits_one_server_span() {
         spans[0].span_kind,
         SpanKind::Server,
         "POST /v1/query is a SERVER span",
+    );
+
+    // §3.5 — the query span carries the standard HTTP server attributes plus
+    // the tenant it scoped to (a successful query against tenant `acme`).
+    let attr = |key: &str| {
+        spans[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.clone())
+    };
+    assert!(
+        matches!(attr("http.request.method"), Some(Value::String(s)) if s.as_str() == "POST"),
+        "http.request.method = POST; attrs = {:?}",
+        spans[0].attributes,
+    );
+    assert!(
+        matches!(attr("http.route"), Some(Value::String(s)) if s.as_str() == "/v1/query"),
+        "http.route = /v1/query",
+    );
+    assert!(
+        matches!(attr("ourios.tenant"), Some(Value::String(s)) if s.as_str() == "acme"),
+        "ourios.tenant carries the query's scoped tenant",
+    );
+    assert!(
+        matches!(attr("http.response.status_code"), Some(Value::I64(200))),
+        "http.response.status_code = 200, got {:?}",
+        attr("http.response.status_code"),
     );
 }

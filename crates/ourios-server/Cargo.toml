@@ -106,7 +106,13 @@ tower = { version = "=0.5.3", default-features = false, features = ["util"] }
 # In-memory metric exporter for the RFC0016.6 query-metrics test: install a
 # global meter provider and read the exported stream (the ingester pattern).
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
+# RFC0038.1 request-span tests: capture the query/MCP spans on a scoped
+# `InMemorySpanExporter` (no process-global tracer), matching the ingester's
+# slice-2 pattern. `opentelemetry` `trace` supplies `SpanKind`/`TracerProvider`.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 # RFC 0019 server-level S3 integration tests (rfc0019_storage_backend): spin
 # LocalStack (S3-compatible, Apache-2.0) via testcontainers, spawn the server
 # pointed at it through the endpoint override, and assert bucket contents via a

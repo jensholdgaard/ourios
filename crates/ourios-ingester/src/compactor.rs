@@ -177,7 +177,7 @@ pub fn run_sweep(
 // loops below stay span-free.
 #[tracing::instrument(
     skip_all,
-    name = "ourios.compaction.sweep",
+    name = "sweep partitions",
     fields(otel.kind = "internal")
 )]
 pub fn run_sweep_with_promoted(
@@ -522,6 +522,45 @@ mod tests {
     fn write_sealed_candidate(store: &Store, tenant: &str) {
         write_file(store, tenant, 1, TS0);
         write_file(store, tenant, 2, TS0 + 1_000_000);
+    }
+
+    /// RFC0038.1 — one `sweep partitions` INTERNAL span per sweep.
+    /// `run_sweep` is the sync body `spawn_blocking`ed in production; a scoped
+    /// `with_default` subscriber captures the span it opens internally (the
+    /// per-tenant / per-file loops below it stay span-free — RFC0038.2).
+    #[test]
+    fn rfc0038_1_sweep_emits_one_internal_span() {
+        use opentelemetry::trace::{SpanKind, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+
+        let bucket = tempfile::tempdir().expect("temp");
+        let store = store_at(bucket.path());
+        write_sealed_candidate(&store, "a");
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ourios-test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            run_sweep(&store, NOW_SEALED, &CompactionPolicy::default()).expect("sweep");
+        });
+        provider.force_flush().expect("spans flush");
+
+        let spans = exporter.get_finished_spans().expect("spans exported");
+        let sweep: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name.as_ref() == "sweep partitions")
+            .collect();
+        assert_eq!(sweep.len(), 1, "exactly one sweep span, got {spans:?}");
+        assert_eq!(
+            sweep[0].span_kind,
+            SpanKind::Internal,
+            "sweep partitions is an INTERNAL span",
+        );
     }
 
     #[test]

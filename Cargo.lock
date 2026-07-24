@@ -3484,6 +3484,8 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

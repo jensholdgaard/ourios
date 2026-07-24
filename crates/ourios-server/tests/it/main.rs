@@ -24,3 +24,4 @@ mod rfc0027_mcp;
 mod rfc0029_oidc;
 mod rfc0030_tls;
 mod rfc0032_query_schema;
+mod rfc0038_1_request_spans;

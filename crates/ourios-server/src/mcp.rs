@@ -305,7 +305,7 @@ impl OuriosMcp {
         self.query_logs_traced(Parameters(args), ctx).await
     }
 
-    #[tracing::instrument(skip_all, name = "ourios.mcp.query_logs", fields(otel.kind = "internal"))]
+    #[tracing::instrument(skip_all, name = "execute_tool query_logs", fields(otel.kind = "internal"))]
     async fn query_logs_traced(
         &self,
         Parameters(args): Parameters<QueryLogsArgs>,
@@ -375,7 +375,7 @@ impl OuriosMcp {
         self.list_templates_traced(Parameters(args), ctx).await
     }
 
-    #[tracing::instrument(skip_all, name = "ourios.mcp.list_templates", fields(otel.kind = "internal"))]
+    #[tracing::instrument(skip_all, name = "execute_tool list_templates", fields(otel.kind = "internal"))]
     async fn list_templates_traced(
         &self,
         Parameters(args): Parameters<ListTemplatesArgs>,
@@ -434,7 +434,7 @@ impl OuriosMcp {
         self.template_drift_traced(Parameters(args), ctx).await
     }
 
-    #[tracing::instrument(skip_all, name = "ourios.mcp.template_drift", fields(otel.kind = "internal"))]
+    #[tracing::instrument(skip_all, name = "execute_tool template_drift", fields(otel.kind = "internal"))]
     async fn template_drift_traced(
         &self,
         Parameters(args): Parameters<TemplateDriftArgs>,

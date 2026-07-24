@@ -84,7 +84,7 @@ convention blesses one "Receive/Process" span for a whole batch); it encloses
 fan-out + WAL commit + miner hand-off **as a whole**, at zero per-record cost.
 Within it, the WAL **group-commit** — the one genuinely I/O-bound,
 latency-bearing step (a batched fsync; hazard §3.4 WAL durability-vs-latency) —
-gets a single **child** span (`ourios.wal.commit`, `INTERNAL` kind). It has
+gets a single **child** span (`commit wal`, `INTERNAL` kind). It has
 duration and a meaningful boundary, which OTel's guidance says makes it a span
 rather than an event (an event is a point in time and cannot carry the commit
 *latency*, which is the whole reason to instrument it). This is the trace's one
@@ -180,16 +180,22 @@ fail-fast):**
 
 ### 3.5 Span names and attributes
 
-Names are fixed here (low cardinality, ids as attributes not names, per OTel's
-span-naming guidance) so the §5 contract is complete:
+Names are fixed here (low cardinality, ids as attributes not names) and follow
+OTel's span-naming guidance: the `{action} {target}` pattern, no static
+namespace prefix in the name (the `ourios.*` dotted style is for *metrics*, not
+spans; a span's origin is the `service.name` resource attribute, so an
+`ourios.` prefix would be exactly the redundant static text the spec says to
+drop). The MCP tool spans adopt the GenAI convention's `execute_tool
+{tool.name}` form, so Ourios's own agent-facing tool calls interoperate with
+GenAI-aware backends. So the §5 contract is complete:
 
 | Operation | Span name | Kind |
 |---|---|---|
 | Logs query | `POST /v1/query` (HTTP `{method} {route}`) | `SERVER` |
-| MCP tool call | `ourios.mcp.query_logs` / `.list_templates` / `.template_drift` | `INTERNAL` (child of rmcp `serve_inner`) |
-| OTLP Export batch | `ourios.ingest.batch` | `SERVER` |
-| WAL group-commit | `ourios.wal.commit` | `INTERNAL` (child of the batch) |
-| Compaction sweep | `ourios.compaction.sweep` | `INTERNAL` |
+| MCP tool call | `execute_tool query_logs` / `… list_templates` / `… template_drift` (GenAI `execute_tool {tool.name}`) | `INTERNAL` (child of rmcp `serve_inner`) |
+| OTLP Export batch | `ingest logs` | `SERVER` |
+| WAL group-commit | `commit wal` | `INTERNAL` (child of the batch) |
+| Compaction sweep | `sweep partitions` | `INTERNAL` |
 
 Required attributes are low-cardinality and set at span start (so they are
 available to sampling): the query and MCP spans carry `ourios.tenant` (the
@@ -234,7 +240,7 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > **Then** each produces the expected span(s): one server span for the query,
 > one child-of-`serve_inner` span for the MCP call, one internal span for the
 > sweep, and — for the Export — one server batch span with a single
-> `ourios.wal.commit` child span (and no further sub-spans), **And** any log
+> `commit wal` child span (and no further sub-spans), **And** any log
 > record emitted within that operation carries the operation's
 > `trace_id`/`span_id` (the correlation the reported gap was about).
 

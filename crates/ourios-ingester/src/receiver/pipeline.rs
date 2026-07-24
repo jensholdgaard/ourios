@@ -290,7 +290,7 @@ impl IngestPipeline {
     // keeps the whole `ExportLogsServiceRequest` off the span.
     #[tracing::instrument(
         skip_all,
-        name = "ourios.ingest.batch",
+        name = "ingest logs",
         fields(otel.kind = "server")
     )]
     // The linear ingest orchestrator (authz → encode → fan-out → commit → miner
@@ -357,10 +357,7 @@ impl IngestPipeline {
         let outcome = self
             .coordinator
             .commit(&payload)
-            .instrument(tracing::info_span!(
-                "ourios.wal.commit",
-                otel.kind = "internal"
-            ))
+            .instrument(tracing::info_span!("commit wal", otel.kind = "internal"))
             .await;
         // The WAL-before-ack latency: time until the batch is durable
         // (includes the group-commit window + fsync). Recorded below only

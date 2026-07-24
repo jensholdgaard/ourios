@@ -3,7 +3,7 @@
 //! The ingest hot path must never mint a span per record: that would both
 //! strangle throughput and flood the trace backend, defeating the whole
 //! sampling discipline of RFC 0038 §3. One OTLP Export batch yields exactly
-//! one `ourios.ingest.batch` span with a single `ourios.wal.commit` child,
+//! one `ingest logs` span with a single `commit wal` child,
 //! whether the batch carries one record or many. See `docs/rfcs/0038-self-tracing.md`.
 //!
 //! The subscriber is installed *scoped* to the driven future
@@ -62,17 +62,17 @@ fn spans_named<'a>(spans: &'a [SpanData], name: &str) -> Vec<&'a SpanData> {
 async fn rfc0038_2_ingest_batch_emits_one_span_with_a_wal_commit_child() {
     let spans = ingest_and_collect_spans(1).await;
 
-    let batch = spans_named(&spans, "ourios.ingest.batch");
-    let commit = spans_named(&spans, "ourios.wal.commit");
+    let batch = spans_named(&spans, "ingest logs");
+    let commit = spans_named(&spans, "commit wal");
     assert_eq!(
         batch.len(),
         1,
-        "exactly one ingest.batch span, got {spans:?}"
+        "exactly one ingest-logs span, got {spans:?}"
     );
     assert_eq!(
         commit.len(),
         1,
-        "exactly one wal.commit span, got {spans:?}"
+        "exactly one commit-wal span, got {spans:?}"
     );
 
     assert_ne!(
@@ -83,7 +83,7 @@ async fn rfc0038_2_ingest_batch_emits_one_span_with_a_wal_commit_child() {
     assert_eq!(
         commit[0].parent_span_id,
         batch[0].span_context.span_id(),
-        "wal.commit nests under ingest.batch",
+        "commit-wal nests under ingest-logs",
     );
 
     // The §3.5 kind contract: the batch is a SERVER span (it answers an OTLP
@@ -92,12 +92,12 @@ async fn rfc0038_2_ingest_batch_emits_one_span_with_a_wal_commit_child() {
     assert_eq!(
         batch[0].span_kind,
         SpanKind::Server,
-        "ingest.batch is a SERVER span",
+        "the ingest-logs batch span is SERVER",
     );
     assert_eq!(
         commit[0].span_kind,
         SpanKind::Internal,
-        "wal.commit is an INTERNAL span",
+        "commit-wal is INTERNAL",
     );
 }
 
@@ -118,7 +118,7 @@ async fn rfc0038_2_span_count_is_constant_in_record_count() {
     assert_eq!(
         many.len(),
         2,
-        "batch + wal.commit only, got {:?}",
+        "ingest-logs + commit-wal only, got {:?}",
         many.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
 }

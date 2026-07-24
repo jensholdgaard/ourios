@@ -129,19 +129,37 @@ and the no-match representation are fixed):
 
 | Attribute | Type / unit | Source (`MetricValue`) |
 |---|---|---|
-| `…output_rows` | int, rows | `OutputRows` |
-| `…elapsed_compute` | int, **nanoseconds** | `ElapsedCompute` (`Time::value()` is ns) |
-| `…output_bytes` | int, bytes | `OutputBytes` |
-| `…row_groups_pruned` | int, count | scan `PruningMetrics::pruned()` |
-| `…row_groups_matched` | int, count | scan `PruningMetrics::matched()` |
+| `datafusion.operator.output_rows` | int, rows | `OutputRows` |
+| `datafusion.operator.elapsed_compute` | int, **nanoseconds** | `ElapsedCompute` (`Time::value()` is ns) |
+| `datafusion.operator.output_bytes` | int, bytes | `OutputBytes` |
+| `datafusion.operator.row_groups_pruned` | int, count | scan `PruningMetrics::pruned()` |
+| `datafusion.operator.row_groups_matched` | int, count | scan `PruningMetrics::matched()` |
 
 Pruning is emitted as the two **counts**, never a ratio — a ratio is undefined
 when `matched == 0` (a fully-pruned or non-scanning node); a consumer derives the
 ratio if it wants one. An attribute whose metric a node does not report is
-**omitted**, not zero-filled, so presence is meaningful. Names follow an existing
-OTel convention where one applies, else an `ourios.query.operator.*` /
-`datafusion.*` namespace — **the exact names clear the OTel MCP + weaver
-registry** (`CLAUDE.md` alignment rule) before landing; §7 tracks it.
+**omitted**, not zero-filled, so presence is meaningful.
+
+**Why a `datafusion.*` namespace and not `db.*` (OTel MCP consultation,
+2026-07-25).** The OTel semantic conventions define **no** convention for
+query-plan or per-operator spans: the whole `db.*` span convention describes a
+**database client** span — one application→database operation — not
+sub-operations inside an engine. Two consequences:
+
+- Reusing `db.response.returned_rows` for a plan node's output rows would
+  **collide** with its normative meaning ("the number of rows returned by the
+  database operation as observed at the time the span ends") — an operator's
+  output rows are not the operation's returned rows. Per the project's
+  no-collision rule, these attributes take a distinct namespace.
+- `datafusion.operator.*` (not `ourios.*`) because the semantics are
+  DataFusion's, not Ourios's — the crate is built to be extracted
+  (§3.5), and an `ourios.`-prefixed attribute would be wrong the moment another
+  project uses it. The prefix is the instrumented library, per OTel's guidance on
+  naming for third-party/library-specific attributes.
+
+Ourios-side attributes (e.g. `ourios.tenant`) stay in the Ourios registry on the
+Ourios-owned spans, not on these. The `datafusion.operator.*` names still go
+through the weaver registry before landing (§7) so live-check validates them.
 
 ### 3.4 Parenting into the query span
 
@@ -279,19 +297,23 @@ Mapped to `CLAUDE.md` §6.2:
   benchmark confirming no regression on the traces-off / unsampled path; a unit
   test that the walk is skipped when the parent context is not sampled.
 - Attribute-name conformance rides the existing `weaver registry live-check`
-  gate once the `ourios.query.operator.*` / `datafusion.*` names are registered
+  gate once the five `datafusion.operator.*` names are registered
   (§3.3, §7).
 - `ourios-df-otel` unit tests over hand-built `MetricsSet`s: the
   `MetricValue → attribute` mapping, and the timestamp reduction.
 
 ## 7. Open questions
 
-- [ ] **Attribute names.** `output_rows`/`elapsed_compute`/`output_bytes`/pruning
-      — which map to existing OTel semconv (there is a nascent `db.*` /
-      query-engine convention to check via the OTel MCP), which become an
-      `ourios.query.operator.*` registry namespace, and which a neutral
-      `datafusion.*` set for the extractable crate. Must clear the OTel MCP +
-      weaver registry before implementation (`CLAUDE.md` OTel-alignment rule).
+- [x] **Attribute names — SETTLED via the OTel MCP (2026-07-25).** There is no
+      OTel convention for query-plan / per-operator spans; `db.*` describes
+      database **client** spans (one app→DB operation). Reusing
+      `db.response.returned_rows` per plan node would collide with its normative
+      meaning, so the operator attributes take the `datafusion.operator.*`
+      namespace (the instrumented library, not `ourios.*` — the crate is built to
+      be extracted). Fixed in §3.3. Remaining mechanical step: register the five
+      names in `semconv/registry/` + weaver generate, so live-check validates
+      them (see the RFC0038.7 precedent for how out-of-registry attributes fail
+      the gate).
 - [ ] **Crate name / extraction.** `ourios-df-otel` in-repo, targeting
       `datafusion-opentelemetry` upstream — confirm no such crate already exists
       in `datafusion-contrib` (adopt/align if so). Keep the public surface
@@ -301,11 +323,19 @@ Mapped to `CLAUDE.md` §6.2:
       or should the parent context be threaded from `ourios-server` to keep the
       querier trace-dep-free? Trade-off: threading a `Context` param vs. a dep.
 - [ ] **The "show the query" attribute.** Separately from the operator tree,
-      should the query span carry the DSL statement (scrubbed, H6) and/or the
-      `displayable(plan)` text as a supplementary attribute — the direct
-      `db.query.text` analogue? It interacts with the `skip_all` PII decision
-      (RFC 0038 §3.5) and deserves its own note; possibly a small follow-up
-      rather than part of this RFC.
+      should the query span carry the DSL statement and/or the
+      `displayable(plan)` text? The OTel MCP consultation settles the *naming* if
+      we do: `db.query.text` (stable) for the statement — carrying an explicit
+      normative **sanitization** requirement ("non-parameterized query text
+      SHOULD NOT be collected by default unless there is sanitization that
+      excludes sensitive data, e.g. redacting literal values") — and
+      `db.query.summary` (stable, explicitly a *low-cardinality grouping key*)
+      for a redacted shape. Note these are defined on database **client** spans
+      while ours is a SERVER span, so the fit needs a deliberate call. Because
+      the DSL can carry user literals, this interacts directly with the
+      `skip_all` PII decision (RFC 0038 §3.5) and the H6 scrubbing rule — it
+      stays **out** of this RFC and deserves its own (a sanitizing
+      `db.query.summary` is the likely shape).
 - [ ] **Live spans (option b).** Left as the next increment of the extractable
       crate if intra-operator concurrency detail is ever needed.
 

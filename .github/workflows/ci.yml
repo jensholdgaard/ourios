@@ -449,6 +449,16 @@ jobs:
             cat "$report" || true
             exit 1
           fi
+          # Coverage visibility: the MCP handshake above is best-effort (its
+          # curls are `|| true`), so confirm the `execute_tool` span actually
+          # reached weaver — otherwise the gen_ai.*/mcp.* attribute path (and its
+          # exemption) went unexercised this run. A miss is a coverage gap, not a
+          # binary fault (the HTTP path still validated everything else), so warn
+          # loudly rather than fail on a transient handshake hiccup.
+          mcp_seen="$(jq '[.. | objects | select(.name? == "gen_ai.operation.name")] | length' "$report")"
+          if [ "$mcp_seen" -eq 0 ]; then
+            echo "::warning::MCP execute_tool span not observed in live-check — the gen_ai.*/mcp.* attribute + exemption path was not exercised this run (the best-effort MCP handshake likely failed)"
+          fi
           unexpected="$(jq '[.. | objects
             | select(.type? == "PolicyFinding" and .level? == "violation")
             | select(( (.id == "deprecated")

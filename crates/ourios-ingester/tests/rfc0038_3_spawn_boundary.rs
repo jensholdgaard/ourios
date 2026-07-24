@@ -66,11 +66,17 @@ async fn rfc0038_3_span_context_survives_spawn_boundaries() {
         .expect("export acks");
 
     // --- Boundary 2: the compactor's `spawn_blocking`ed sweep (compactor.rs). ---
-    // An empty store still emits the sweep span (instrument-on-entry); a short
-    // interval fires the first tick promptly. The daemon loops until aborted.
+    // An empty store still emits the sweep span (instrument-on-entry). The
+    // daemon's `tokio::time::interval` fires its first tick immediately, so a
+    // long interval yields exactly one sweep before the abort — no second tick,
+    // no span pile-up.
     let sweep_tmp = tempfile::tempdir().expect("temp");
     let store = Store::local(sweep_tmp.path()).expect("local store");
-    let compactor = Compactor::new(store, CompactionPolicy::default(), Duration::from_millis(5));
+    let compactor = Compactor::new(
+        store,
+        CompactionPolicy::default(),
+        Duration::from_secs(3600),
+    );
     let (tx, rx) = mpsc::channel();
     let daemon = tokio::spawn(compactor.run(move |result| {
         let _ = tx.send(result.is_ok());
@@ -110,12 +116,13 @@ async fn rfc0038_3_span_context_survives_spawn_boundaries() {
         "child and batch share one trace",
     );
 
-    // Boundary 2 assertion — the sweep span crossed `spawn_blocking` (the
-    // daemon may tick more than once before the abort lands).
+    // Boundary 2 assertion — exactly one `sweep partitions` span crossed
+    // `spawn_blocking` (the long interval means a single tick before abort).
     let sweep = spans_named(&spans, "sweep partitions");
-    assert!(
-        !sweep.is_empty(),
-        "at least one `sweep partitions` span survived spawn_blocking, got {:?}",
+    assert_eq!(
+        sweep.len(),
+        1,
+        "one `sweep partitions` span survived spawn_blocking, got {:?}",
         spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
     );
 }

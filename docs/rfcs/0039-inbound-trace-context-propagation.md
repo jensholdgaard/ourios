@@ -18,8 +18,10 @@ Ourios's request-scoped SERVER spans (RFC 0038) are currently created as trace
 caller's trace stops at the Ourios boundary. This RFC installs a global
 `TraceContextPropagator` and, at each ingress, extracts the caller's
 `opentelemetry::Context` from the request carrier (HTTP headers / gRPC metadata)
-and attaches it as the span's parent via `OpenTelemetrySpanExt::set_parent`. The
-observable result: the `ingest logs`, `POST /v1/query`, and MCP tool spans join
+and attaches it as the **current** context around the span-producing future
+(`FutureExt::with_context`), so the root span inherits it as parent — not via
+`set_parent`, which fails on an already-entered `#[tracing::instrument]` span.
+The observable result: the `ingest logs`, `POST /v1/query`, and MCP tool spans join
 the caller's distributed trace instead of starting a disconnected one, and a
 `parentbased` sampler honours the caller's sampling decision. No new signal, no
 schema change — this completes the traces pillar that RFC 0038 established.
@@ -61,80 +63,82 @@ propagation is out of scope (§7).
 
 ### 3.2 The ingress map
 
-Five span sites open on the request path. The carrier — where the incoming
-`traceparent` lives — is not always co-located with the span:
+**Four** ingress categories open a span on the request path — six span-producing
+functions in all, since the MCP category is three tool functions. The count is
+stated so test coverage (RFC0039.1/.3/.6) omits no site. The carrier — where the
+incoming `traceparent` lives — is not always co-located with the span:
 
 | # | Span | Site (file:line) | Carrier & where it is reachable |
 |---|---|---|---|
-| A | `ingest logs` (gRPC) | span in `ingest_bound` (`pipeline.rs:291`); entry `LogsReceiver::export` (`grpc.rs:152`) | tonic `MetadataMap` via `request.metadata()` (`grpc.rs:159`), or raw `http::HeaderMap` in the tower auth layer `AuthService::call` (`grpc.rs:102`) |
+| A | `ingest logs` (gRPC) | span in `ingest_bound` (`pipeline.rs:291`); entry `LogsReceiver::export` (`grpc.rs:152`) | raw `http::HeaderMap` in the tower auth layer `AuthService::call` (`grpc.rs:102`, already reads `request.headers()`) |
 | B | `ingest logs` (HTTP) | span in `ingest_bound`; entry `handle_logs` (`http.rs:95`) | axum `HeaderMap` (`http.rs:95`) |
-| C | `POST /v1/query` | `handle_query` (`querier.rs:421`) | axum `HeaderMap` (`querier.rs:423`) — same fn as the span |
-| D | `execute_tool <tool>` | the three `_traced` fns (`mcp.rs:333/416/488`) | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` already reads, `mcp.rs:223`) |
+| C | `POST /v1/query` | `handle_query` (`querier.rs:421`) | axum `HeaderMap` (`querier.rs:423`) |
+| D | `execute_tool <tool>` (×3) | the three `_traced` fns (`mcp.rs:333/416/488`), each via a thin `#[tool]` delegate | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` reads, `mcp.rs:223`) |
 
-For **C** and **D** the carrier and the span live in the same function:
-extract and `set_parent` at the top of the instrumented fn.
+The mechanism is uniform (§3.3): extract the caller's `opentelemetry::Context`
+and make it the **current** context around the span-producing future, so the
+span — a tracing root — inherits it as its OTel parent.
 
-### 3.3 The `tokio::spawn` boundary (ingest)
+### 3.3 The mechanism: attach the context, do not `set_parent`
 
-The ingest span is the hard case. For **A** and **B** the `ingest logs` span is
-created inside `ingest_bound`, which runs inside a freshly `tokio::spawn`ed task
-(`grpc.rs:167`, `http.rs:146`) — the same spawn boundary RFC 0038.3 is about.
-The carrier is only reachable in the handler **before** the spawn; the span is
-born **after** it, in a different task. Ambient current-context does not cross
-`tokio::spawn`.
+`OpenTelemetrySpanExt::set_parent` must be called *before* the span is entered.
+On an already-entered span — which every `#[tracing::instrument]` span is, for
+its whole body — it returns `SetParentError::AlreadyStarted` and the parent is
+**silently not set**. So propagation cannot `set_parent` from inside an
+instrumented fn. Instead it makes the extracted context **current** *before* the
+span is built; `tracing-opentelemetry` then parents a root span to
+`Context::current()`. The idiom is
+`opentelemetry::trace::FutureExt::with_context(future, cx)` — run the
+span-producing future under the extracted context. One contract, every site:
 
-Therefore the fix cannot rely on context flow. The handler must:
+- **Query (C) and HTTP ingest (B):** a tower `PropagationLayer` on the axum
+  router extracts `cx` from the request `HeaderMap` and runs the downstream as
+  `next.run(req).with_context(cx)`. `handle_query`'s root span inherits `cx`; the
+  handler is unchanged.
+- **gRPC ingest (A):** the same extraction in the existing tower auth layer
+  (`AuthService::call`, `grpc.rs:102`), stashing `cx` in the request extensions
+  beside the auth binding.
+- **The `tokio::spawn` boundary (A/B):** the `ingest logs` span is born inside
+  `ingest_bound`, *after* the spawn (`grpc.rs:167`, `http.rs:146`), which a
+  layer's `with_context` does not cross. So the handler reads `cx` (from the
+  extension for A, extracts directly for B), moves it into the spawned closure,
+  and runs `ingest_bound(...).with_context(cx).await`. The span, first polled
+  under `cx`, inherits it — **no `ingest_bound` signature change, no
+  `set_parent`.**
+- **MCP (D):** the un-instrumented `#[tool]` delegate extracts `cx` from `ctx`'s
+  forwarded headers and runs `self.<tool>_traced(...).with_context(cx).await`;
+  the `_traced` span inherits `cx` across rmcp's own dispatch spawn.
 
-1. Extract `let cx = propagator.extract(&carrier);` **before** the spawn (where
-   the `MetadataMap`/`HeaderMap` is in scope).
-2. Move `cx` into the spawned closure and hand it to `ingest_bound` as an
-   explicit parameter (`parent: opentelemetry::Context`).
-3. Inside `ingest_bound`, after the span is entered, call
-   `tracing::Span::current().set_parent(cx)`.
+This is the same discipline RFC 0038.3 uses to carry work across `tokio::spawn`,
+applied here to the parent context — and it is one uniform contract, resolving
+the earlier draft's split between an explicit parameter and a request extension.
 
-This mirrors how RFC 0038.3 already moves *span* context across the same
-boundary via `.instrument(Span::current())`; here it is the extracted *parent*
-context that is moved. `ingest_bound`'s signature gains one parameter; the two
-call sites (`grpc.rs`, `http.rs`) each extract before spawning.
-
-### 3.4 The extractor shims
+### 3.4 The extractor shim
 
 `opentelemetry::propagation::Extractor` is a two-method trait (`get`, `keys`).
-Two thin adapters are needed:
+One adapter suffices: `struct HeaderExtractor<'a>(&'a http::HeaderMap)`, since
+`http::HeaderMap` is the carrier for **every** site — the gRPC path extracts from
+the raw HTTP headers at the tower auth layer (`grpc.rs:102`), so no tonic
+`MetadataMap` adapter is needed. Extraction goes through the propagator installed
+in §3.1: `global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)))`.
+`opentelemetry-http` ships an equivalent `HeaderExtractor`; the ~10-line local
+one avoids a dependency (revisit if a metadata extractor is ever needed).
 
-- **axum `HeaderMap`** — `opentelemetry-http` provides `HeaderExtractor`, but to
-  avoid a new dependency a ~10-line local `struct HeaderExtractor<'a>(&'a
-  HeaderMap)` is equivalent (the C/D sites and the HTTP ingest site B).
-- **tonic `MetadataMap`** — a `struct MetadataExtractor<'a>(&'a MetadataMap)`
-  reading ASCII metadata keys (site A, if extracting from gRPC metadata rather
-  than the raw HTTP headers at the tower layer).
+### 3.5 Dependency promotion (the one production-surface change)
 
-Both live in `ourios-ingester`'s receiver module (and re-used by
-`ourios-server`), or in a small shared helper. The RFC prefers extracting site A
-from the **tower auth layer's raw `http::HeaderMap`** (`grpc.rs:102`), so a
-single `HeaderExtractor` covers A/B/C/D and no tonic-metadata adapter is needed —
-the auth layer already reads `request.headers()` and inserts into extensions, so
-the extracted `Context` can ride the same request-extensions channel the auth
-binding uses (`grpc.rs:119`), reaching `ingest_bound` without a signature change.
-This is the preferred shape; §7 leaves the exact carry-channel (explicit
-parameter vs. request extension) to implementation review.
-
-### 3.5 Dependency promotion (the non-obvious cost)
-
-Today the trace-capable OTel crates are `[dev-dependencies]` only in
-`ourios-ingester` and `ourios-server` — their production `[dependencies]` carry
-`opentelemetry` with the **`metrics`** feature alone. The `otel.kind` string
-fields on the instrument macros work without them because the tracing→OTel
-bridge lives in `ourios-telemetry`. Propagation needs real types in production
-code (`TraceContextPropagator`, `Context`, `OpenTelemetrySpanExt::set_parent`),
-so this RFC promotes to `[dependencies]` in both crates:
-
-- `opentelemetry` (add the `trace` feature),
-- `opentelemetry_sdk` (`trace` feature, for `TraceContextPropagator`),
-- `tracing-opentelemetry` (for `OpenTelemetrySpanExt`).
-
-This is a real compile-surface and build-time cost and is called out here so it
-is a conscious choice, not a surprise in the diff.
+The ingress code needs `opentelemetry` types in production
+(`Context`, `propagation::Extractor`, `trace::FutureExt::with_context`,
+`global::get_text_map_propagator`), but `opentelemetry` is a production
+dependency of `ourios-ingester`/`ourios-server` today only with the
+**`metrics`** feature. This RFC adds the **`trace`** feature to that existing
+dependency in both crates. The propagator *install*
+(`opentelemetry_sdk::propagation::TraceContextPropagator`, §3.1) stays in
+`ourios-telemetry`, which already depends on `opentelemetry_sdk`; and because the
+parenting is via the current-context bridge the `tracing-opentelemetry` layer
+already provides (not a `set_parent` call), **`tracing-opentelemetry` is not
+needed in the ingress crates at all**. So the whole production-surface cost is
+one added feature flag on a crate already depended on — smaller than a
+`set_parent` design would have required.
 
 ### 3.6 Sampling interplay
 
@@ -148,13 +152,14 @@ consistent end-to-end. This is desirable and is the reason to prefer a
 A request with no incoming context falls back to the root sampling rule
 unchanged (backward-compatible).
 
-### 3.7 `set_parent`'s `Result`
+### 3.7 Traces disabled
 
-`tracing-opentelemetry` 0.33's `set_parent` returns `Result<(),
-SetParentError>`. A failure means the span had no OTel layer (traces disabled) —
-expected and non-fatal. The call ignores the error (`let _ = …`) or matches it
-away; it is never a request-affecting error (no `unwrap`/`expect`, per
-`CLAUDE.md`).
+`with_context` merely attaches an `opentelemetry::Context` for the duration of a
+future; it has no fallible surface and no `Result` to handle (contrast the
+`set_parent` design, which returned `SetParentError` — one reason to prefer the
+attach idiom). When traces are disabled the span carries no OTel layer, the
+attached context is inert, and nothing is exported — a no-op, not an error. No
+`unwrap`/`expect` is introduced (`CLAUDE.md` §6.1).
 
 ## 4. Alternatives considered
 
@@ -168,13 +173,18 @@ the carrier does not reach `ingest_bound` (its signature has no request), and
 `tokio::spawn` severs ambient context (§3.3). Extraction must happen in the
 handler.
 
-**A tower/tonic middleware layer that extracts and injects context for all
-routes.** Cleaner in principle (one layer, no per-handler code), and worth
-revisiting — but the ingest span is born *after* the spawn inside `ingest_bound`,
-so a middleware that sets the current context still would not reach that span
-without the same explicit hand-off. A layer would help sites B/C/D but not the
-hard site A/ingest; this RFC does the explicit extraction uniformly and leaves a
-middleware refactor as a follow-up once the pattern is proven.
+**A single `set_parent` call inside each instrumented fn.** The obvious first
+design, and what an earlier draft proposed — but it does not work:
+`OpenTelemetrySpanExt::set_parent` returns `AlreadyStarted` on an entered span,
+and every `#[tracing::instrument]` span is entered for its body, so the parent is
+silently dropped (§3.3). The attach-the-context idiom (`with_context`) is the
+correct primitive and is what §3.3 adopts.
+
+**Per-handler extraction with no shared layer.** Workable but repetitive: each
+handler would extract and wrap. The `PropagationLayer` (§3.3) centralises the
+request-local sites (B/C); only the spawn-crossed span (A/B's `ingest_bound`) and
+MCP (D, behind rmcp's dispatch) need the explicit `with_context` hand-off, which
+no layer can do for them anyway.
 
 **Adopt `opentelemetry-http`'s `HeaderExtractor` as a dependency.** Reasonable,
 but it is one more crate for a ~10-line shim; the RFC inlines the extractor. If
@@ -250,14 +260,12 @@ Mapped to `CLAUDE.md` §6.2:
 
 ## 7. Open questions
 
-- [ ] Carry-channel for the ingest parent context: explicit `ingest_bound`
-      parameter vs. a request-extension (the auth layer already inserts into
-      `request.extensions_mut()`; the extracted `Context` could ride the same
-      channel with no signature change). §3.4 prefers the extension; confirm on
-      review.
-- [ ] Should site A extract from the tower auth layer's raw `http::HeaderMap`
-      (one `HeaderExtractor` for all sites, no tonic-metadata adapter) or from
-      tonic's `MetadataMap` in `export`? The former is preferred (§3.4).
+- [ ] Confirm `FutureExt::with_context` correctly re-attaches the extracted
+      context inside the spawned `ingest_bound` task (§3.3) — the spawn-boundary
+      test (RFC0039.3) is the check. (The carry-channel and site-A/metadata-vs-
+      header questions the earlier draft left open are now settled by §3.3/§3.4:
+      one `HeaderExtractor` over the raw `http::HeaderMap`, `cx` in the request
+      extension across the spawn, no `ingest_bound` signature change.)
 - [ ] MCP tool spans are `otel.kind = "internal"` and lack an enclosing Ourios
       SERVER span for `/mcp` (rmcp's `serve_inner` is muted by the `rmcp=off`
       loop-guard, RFC0038.7). An INTERNAL span continuing a *remote* parent is
@@ -277,6 +285,8 @@ Mapped to `CLAUDE.md` §6.2:
   RFC 0038), §6.1 (no `unwrap`/`expect` in non-test code).
 - W3C Trace Context — <https://www.w3.org/TR/trace-context/>.
 - OpenTelemetry — [context propagation](https://opentelemetry.io/docs/specs/otel/context/api-propagators/);
-  [`OpenTelemetrySpanExt::set_parent`](https://docs.rs/tracing-opentelemetry/0.33.0/tracing_opentelemetry/trait.OpenTelemetrySpanExt.html).
+  [`FutureExt::with_context`](https://docs.rs/opentelemetry/0.32.0/opentelemetry/trace/trait.FutureExt.html)
+  (the attach idiom this RFC uses; note `OpenTelemetrySpanExt::set_parent`
+  returns `AlreadyStarted` on an entered span, which is why it is *not* used).
 - Pinned: `opentelemetry` 0.32.0, `opentelemetry_sdk` 0.32.1,
   `tracing-opentelemetry` 0.33.0.

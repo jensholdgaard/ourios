@@ -86,12 +86,17 @@ single entry point:
 
 ```rust
 // ourios-df-otel
-pub fn record_plan_spans(
+pub fn record_plan_spans<T: opentelemetry::trace::Tracer>(
     plan: &dyn ExecutionPlan,
     parent: &opentelemetry::Context,
-    tracer: &dyn opentelemetry::trace::Tracer,
+    tracer: &T,
 );
 ```
+
+The tracer is a generic `T: Tracer`, not `&dyn Tracer`: the `Tracer` trait has an
+associated `Span` type and is not object-safe as a bare trait object. Callers pass
+the global tracer (`opentelemetry::global::tracer("ourios-df-otel")`, a
+`BoxedTracer`) or any concrete tracer.
 
 It walks `plan`, and for each node with `StartTimestamp`+`EndTimestamp` builds a
 child span (parent = its plan-parent's span, root = `parent`) named by
@@ -101,26 +106,42 @@ low-cardinality, the operator kind).
 ### 3.3 Span emission — the raw OTel span builder (not `#[instrument]`)
 
 Backdated spans cannot come from `#[tracing::instrument]` (it starts "now"). The
-crate uses the OTel SDK span builder directly:
+crate uses the OTel SDK span builder directly. `with_start_time` and
+`end_with_timestamp` take `std::time::SystemTime`, so the node's
+`DateTime<Utc>` timestamps convert via `SystemTime::from`; `end_with_timestamp`
+takes `&mut self`:
 
 ```rust
-let span = tracer
+let start: SystemTime = node_start.into();     // DateTime<Utc> -> SystemTime
+let end:   SystemTime = node_end.into();
+let mut span = tracer
     .span_builder(node.name().to_string())
     .with_kind(SpanKind::Internal)
-    .with_start_time(start)                    // real StartTimestamp
-    .with_attributes(node_attributes(metrics)) // rows, elapsed, bytes, pruning
-    .start_with_context(tracer, &parent_cx);
-// … recurse into children with this span's context as their parent …
-span.end_with_timestamp(end);                  // real EndTimestamp
+    .with_start_time(start)
+    .with_attributes(node_attributes(&metrics))
+    .start_with_context(tracer, parent_cx);    // parent_cx = this node's parent span's context
+// … recurse into children, passing this span's context as their parent …
+span.end_with_timestamp(end);                  // &mut self; real EndTimestamp
 ```
 
-Attributes are drawn from the same `MetricValue` variants `fold_metrics` reads,
-plus the general ones: `output_rows`, `elapsed_compute` (as a duration/ns),
-`output_bytes`, and the pruning ratio (`row_groups_pruned`/`matched`). Names
-follow OTel conventions where one exists and an `ourios.query.operator.*` /
-`datafusion.*` namespace otherwise — **the exact attribute names go through the
-OTel MCP + weaver registry** (`CLAUDE.md` OTel-alignment rule) before landing;
-§7 tracks it.
+**Attributes are normative** — the span contract is deterministic (types, units,
+and the no-match representation are fixed):
+
+| Attribute | Type / unit | Source (`MetricValue`) |
+|---|---|---|
+| `…output_rows` | int, rows | `OutputRows` |
+| `…elapsed_compute` | int, **nanoseconds** | `ElapsedCompute` (`Time::value()` is ns) |
+| `…output_bytes` | int, bytes | `OutputBytes` |
+| `…row_groups_pruned` | int, count | scan `PruningMetrics::pruned()` |
+| `…row_groups_matched` | int, count | scan `PruningMetrics::matched()` |
+
+Pruning is emitted as the two **counts**, never a ratio — a ratio is undefined
+when `matched == 0` (a fully-pruned or non-scanning node); a consumer derives the
+ratio if it wants one. An attribute whose metric a node does not report is
+**omitted**, not zero-filled, so presence is meaningful. Names follow an existing
+OTel convention where one applies, else an `ourios.query.operator.*` /
+`datafusion.*` namespace — **the exact names clear the OTel MCP + weaver
+registry** (`CLAUDE.md` alignment rule) before landing; §7 tracks it.
 
 ### 3.4 Parenting into the query span
 
@@ -152,11 +173,14 @@ spans."
 
 The reconstruction is **O(plan nodes)** — a handful per query — and runs **once
 per query**, after execution. It is not per-record and not per-batch (RFC
-0038.2's invariant). It is gated on traces being enabled *and* the query span
-being sampled: an unsampled query skips the walk entirely (check the parent
-context's `is_sampled()` before walking), so the cost is zero on the sampled-out
-path and bounded-tiny on the sampled path. A `criterion` guard confirms no
-query-latency regression on the sampled-out path (the default).
+0038.2's invariant). It is gated on the query span being **recording and
+sampled**: before walking, check
+`parent.span().span_context().is_sampled()` (the parent `Context`'s active span's
+`SpanContext`), which is `false` both when traces are disabled (no OTel layer →
+an invalid, unsampled `SpanContext`) and when the sampler dropped this trace. An
+unsampled query skips the walk entirely, so the cost is zero on the sampled-out
+path (the default) and bounded-tiny on the sampled path. A `criterion` guard
+confirms no query-latency regression on the sampled-out path.
 
 ## 4. Alternatives considered
 

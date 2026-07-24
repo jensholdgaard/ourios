@@ -30,8 +30,6 @@
 
 #![deny(unsafe_code)]
 
-use std::time::Duration;
-
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -49,11 +47,6 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 /// `global::meter("ourios.<subsystem>")`; spans go through this one tracer.
 const TRACER_SCOPE: &str = "ourios";
 
-/// Default OTLP export interval. The OpenTelemetry spec's default
-/// periodic-reader interval is 60 s; we follow it unless a deployment
-/// overrides.
-pub const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Bootstrap configuration for the metrics pipeline.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
@@ -64,10 +57,10 @@ pub struct TelemetryConfig {
     pub service_name: String,
     /// OTLP collector endpoint. `None` uses the exporter's default
     /// (`http://localhost:4317` for gRPC), so the `OTEL_EXPORTER_*`
-    /// environment overrides still apply.
+    /// environment overrides still apply. The periodic-reader export
+    /// interval is the standard `OTEL_METRIC_EXPORT_INTERVAL` env var
+    /// — **milliseconds**, default `60000` (60 s) — resolved by the SDK, not a field here.
     pub otlp_endpoint: Option<String>,
-    /// Periodic-reader export interval ([`DEFAULT_EXPORT_INTERVAL`]).
-    pub export_interval: Duration,
     /// Dogfood the traces signal (RFC 0038). `true` installs a
     /// `TracerProvider` + `tracing-opentelemetry` layer, so `tracing`
     /// spans become `OTel` spans and every log record carries the active
@@ -81,14 +74,14 @@ pub struct TelemetryConfig {
 
 impl TelemetryConfig {
     /// Config for `service_name` with spec defaults (default endpoint,
-    /// [`DEFAULT_EXPORT_INTERVAL`], traces on; the sampler comes from the
-    /// SDK's `OTEL_TRACES_SAMPLER` env resolution, default `parentbased_always_on`).
+    /// traces on). The metric export interval and the trace sampler both
+    /// come from the SDK's own env resolution (`OTEL_METRIC_EXPORT_INTERVAL`
+    /// default `60000` ms; `OTEL_TRACES_SAMPLER` default `parentbased_always_on`).
     #[must_use]
     pub fn new(service_name: impl Into<String>) -> Self {
         Self {
             service_name: service_name.into(),
             otlp_endpoint: None,
-            export_interval: DEFAULT_EXPORT_INTERVAL,
             traces_enabled: true,
         }
     }
@@ -259,9 +252,10 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     }
     let exporter = builder.build()?;
 
-    let reader = PeriodicReader::builder(exporter)
-        .with_interval(config.export_interval)
-        .build();
+    // No `.with_interval(...)`: the SDK's periodic reader resolves the interval
+    // from the standard `OTEL_METRIC_EXPORT_INTERVAL` env var (milliseconds, default 60000 = 60 s), so
+    // operators use the universal OTel knob rather than a bespoke Ourios field.
+    let reader = PeriodicReader::builder(exporter).build();
 
     let provider = SdkMeterProvider::builder()
         .with_reader(reader)

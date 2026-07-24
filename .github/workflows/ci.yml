@@ -469,6 +469,15 @@ jobs:
             echo "::error::weaver live-check found $unexpected non-exempt violation(s) — emitted telemetry drifts from semconv/registry/"
             cat "$report" || true
           fi
+          # The exempted gen_ai.*/mcp.* violations make weaver exit non-zero on
+          # every clean run, so a non-zero status alone is not a signal. But a
+          # non-zero status with *zero* violations in the report means weaver
+          # failed for a non-policy reason (internal error) after writing a
+          # report — which the filtered gate would otherwise mask. Surface it.
+          total_viol="$(jq '[.. | objects | select(.type? == "PolicyFinding" and .level? == "violation")] | length' "$report")"
+          if [ "$weaver_status" -ne 0 ] && [ "$total_viol" -eq 0 ]; then
+            echo "::warning::weaver exited $weaver_status but reported no violation — a non-policy failure (internal error?) the filtered gate would otherwise mask"
+          fi
           if [ "$server_status" -ne 0 ]; then
             echo "::error::ourios-server exited with status $server_status"
           fi

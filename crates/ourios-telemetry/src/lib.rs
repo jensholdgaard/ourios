@@ -468,6 +468,29 @@ mod tests {
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::{ResourceMetrics, ScopeMetrics};
 
+    /// RFC0038.4 / #618 — a disabled signal installs no pipeline. With every
+    /// signal off, `init` succeeds and the guard holds no meter/logger/tracer
+    /// provider, so instruments/spans resolve to the global no-op and nothing
+    /// exports. Each provider is built *inside* its `if <signal>_enabled` block,
+    /// so a regression that installed a disabled pipeline fails this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn init_with_signals_disabled_installs_no_pipelines() {
+        let guard = init(&TelemetryConfig {
+            service_name: "ourios-test-disabled".into(),
+            otlp_endpoint: None,
+            traces_enabled: false,
+            metrics_enabled: false,
+            logs_enabled: false,
+        })
+        .expect("init succeeds with every signal disabled");
+        assert!(
+            guard.provider.is_none(),
+            "no meter provider when metrics disabled",
+        );
+        assert!(guard.logger.is_none(), "no logger when logs disabled");
+        assert!(guard.tracer.is_none(), "no tracer when traces disabled");
+    }
+
     // Build a provider over an in-memory exporter (no global state, no
     // OTLP endpoint), wrap it in a guard, and assert that the guard's
     // `force_flush` exports the recorded instrument.

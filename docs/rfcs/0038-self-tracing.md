@@ -170,9 +170,11 @@ does not couple a unique config to them:
   own validation or precedence layer.
 - **Disable:** the standard per-signal switch `OTEL_TRACES_EXPORTER=none` turns
   the traces pipeline off, restoring today's logs-plus-metrics posture exactly
-  (no tracer, no `trace_id` on logs). The server maps it to
-  `TelemetryConfig.traces_enabled` (default on), the one programmatic flag the
-  library keeps; `OTEL_SDK_DISABLED` still disables all three signals together.
+  (no tracer, no `trace_id` on logs). `init()` reads it directly — Ourios plays
+  the "autoconfigure" role Go's `autoexport` / Java's autoconfigure play, since
+  the Rust SDK's manual exporter construction reads no exporter-selector var
+  (#618). `TelemetryConfig.traces_enabled` (default on) remains a programmatic
+  override on top; `OTEL_SDK_DISABLED=true` disables all three signals together.
 - **Endpoint / transport:** `OTEL_EXPORTER_OTLP_ENDPOINT` and the other
   `OTEL_EXPORTER_OTLP_*` vars, already read by the SDK exporter.
 
@@ -272,8 +274,8 @@ Collector expects, and Ourios's whole posture is OTel-native.
 > **Then** the default samples (root) traces (`parentbased_always_on`, the SDK
 > default — Ourios does **not** override the sampler); the env ratio sampler
 > exports the configured fraction (the SDK's own resolution, which Ourios does
-> not alter); and `OTEL_TRACES_EXPORTER=none` maps to `traces_enabled=false`, so
-> **no** tracer is installed and **no** `trace_id`/`span_id` is stamped on log
+> not alter); and `OTEL_TRACES_EXPORTER=none` (honored by `init()`) installs
+> **no** tracer and stamps **no** `trace_id`/`span_id` on log
 > records — the observable, runtime logs-plus-metrics-only behaviour (no
 > throughput change). (Sampler resolution and invalid-value handling are the
 > SDK's universal, upstream-tested behaviour; Ourios tests only its own mapping

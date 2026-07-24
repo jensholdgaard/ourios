@@ -65,20 +65,23 @@ pub struct TelemetryConfig {
     /// `TracerProvider` + `tracing-opentelemetry` layer, so `tracing`
     /// spans become `OTel` spans and every log record carries the active
     /// span's `trace_id`/`span_id`. `false` restores the logs+metrics-only
-    /// posture (no tracer, no `trace_id` on logs). Operators disable via the
-    /// standard `OTEL_TRACES_EXPORTER=none` (mapped to this flag by the
-    /// server); the trace **sampler** is the standard `OTEL_TRACES_SAMPLER`
-    /// env var, resolved by the SDK — not a field here (RFC 0038 §3.4).
+    /// posture (no tracer, no `trace_id` on logs). This is a **programmatic
+    /// override**: operators disable via the standard `OTEL_TRACES_EXPORTER=none`
+    /// (or `OTEL_SDK_DISABLED=true`), which [`init`] honors on top of this flag.
+    /// The trace **sampler** is likewise the standard `OTEL_TRACES_SAMPLER` env
+    /// var, resolved by the SDK — not a field here (RFC 0038 §3.4).
     pub traces_enabled: bool,
-    /// Install the metrics pipeline (`true`) or not. `false` installs no
-    /// meter provider, so instruments resolve to the global no-op and nothing
-    /// exports. Operators disable via the standard `OTEL_METRICS_EXPORTER=none`
-    /// (mapped to this flag by the server).
+    /// Install the metrics pipeline (`true`) or not. `false` installs no meter
+    /// provider, so instruments resolve to the global no-op and nothing exports.
+    /// A **programmatic override**: operators disable via the standard
+    /// `OTEL_METRICS_EXPORTER=none` (or `OTEL_SDK_DISABLED=true`), honored by
+    /// [`init`] on top of this flag.
     pub metrics_enabled: bool,
-    /// Install the logs pipeline (`true`) or not. `false` skips the OTLP
-    /// logger + the `tracing`→OTel-logs bridge (the stderr `fmt` layer stays),
-    /// so Ourios's own logs no longer ship as the `OTel` Logs signal. Operators
-    /// disable via the standard `OTEL_LOGS_EXPORTER=none` (mapped by the server).
+    /// Install the logs pipeline (`true`) or not. `false` skips the OTLP logger +
+    /// the `tracing`→OTel-logs bridge (the stderr `fmt` layer stays), so Ourios's
+    /// own logs no longer ship as the `OTel` Logs signal. A **programmatic
+    /// override**: operators disable via the standard `OTEL_LOGS_EXPORTER=none`
+    /// (or `OTEL_SDK_DISABLED=true`), honored by [`init`] on top of this flag.
     pub logs_enabled: bool,
 }
 
@@ -256,6 +259,27 @@ fn otel_sdk_disabled() -> bool {
     std::env::var("OTEL_SDK_DISABLED").is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
+/// Interpret a standard `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` selector value as
+/// install-or-not: `none` (any casing/whitespace) is the only value that turns
+/// the signal off; unset and every other value (`otlp`, `console`, …) leave it
+/// on. Ourios always exports over OTLP when a signal is on — it does not
+/// implement the full exporter *selector*, so a non-`none` value just means
+/// "on" (OTLP). We honor this universal var here (the SDK's manual-construction
+/// path doesn't read it — there is no Rust `autoexport`), so the operator never
+/// needs a bespoke Ourios knob (#618).
+fn exporter_selected(otel_signal_exporter: Option<&str>) -> bool {
+    !otel_signal_exporter.is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+}
+
+/// Whether the signal exporting to `exporter_var` (e.g. `OTEL_TRACES_EXPORTER`)
+/// is enabled: the programmatic `config` flag AND not globally disabled AND the
+/// selector env var is not `none`.
+fn signal_enabled(config_enabled: bool, sdk_disabled: bool, exporter_var: &str) -> bool {
+    config_enabled
+        && !sdk_disabled
+        && exporter_selected(std::env::var(exporter_var).ok().as_deref())
+}
+
 /// Build the enabled signals' OTLP pipelines — the push `MeterProvider`, the
 /// `LoggerProvider` with its `tracing` bridge, and the tracer — install them
 /// process-globally, and return the [`TelemetryGuard`] that owns them. Each
@@ -279,14 +303,23 @@ fn otel_sdk_disabled() -> bool {
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let resource = resource(&config.service_name);
 
-    // The standard global kill-switch: `OTEL_SDK_DISABLED=true` forces every
-    // signal off (a no-op SDK), overriding the per-signal flags — so we build
-    // no providers at all. Universal OTel knob, honored here rather than
-    // reinvented (#618).
+    // Per-signal install decisions honor the universal OTel env vars directly —
+    // `ourios-telemetry` plays the "autoconfigure" role Go's `autoexport` /
+    // Java's `sdk-extension-autoconfigure` play, since the Rust SDK's manual
+    // exporter construction reads neither `OTEL_{TRACES,METRICS,LOGS}_EXPORTER`
+    // nor `OTEL_SDK_DISABLED` (#618). The `config.*_enabled` flags are a
+    // programmatic override on top (default on), so a signal is installed only
+    // when the flag, the global kill-switch, and the per-signal selector all
+    // agree.
     let sdk_disabled = otel_sdk_disabled();
-    let metrics_enabled = config.metrics_enabled && !sdk_disabled;
-    let logs_enabled = config.logs_enabled && !sdk_disabled;
-    let traces_enabled = config.traces_enabled && !sdk_disabled;
+    let metrics_enabled = signal_enabled(
+        config.metrics_enabled,
+        sdk_disabled,
+        "OTEL_METRICS_EXPORTER",
+    );
+    let logs_enabled = signal_enabled(config.logs_enabled, sdk_disabled, "OTEL_LOGS_EXPORTER");
+    let traces_enabled =
+        signal_enabled(config.traces_enabled, sdk_disabled, "OTEL_TRACES_EXPORTER");
 
     // Metrics: `None` when disabled (`OTEL_METRICS_EXPORTER=none` → the server
     // clears `metrics_enabled`; or `OTEL_SDK_DISABLED=true`), so instruments
@@ -508,6 +541,26 @@ mod tests {
         );
         assert!(guard.logger.is_none(), "no logger when logs disabled");
         assert!(guard.tracer.is_none(), "no tracer when traces disabled");
+    }
+
+    /// #618 — `exporter_selected` reads an `OTEL_{TRACES,METRICS,LOGS}_EXPORTER`
+    /// value as an on/off switch, not a full selector: `none` (any
+    /// casing/whitespace) is the only value that turns the signal off; unset and
+    /// every other value (`otlp`, `console`, …) leave it on (always OTLP).
+    #[test]
+    fn exporter_selected_treats_none_as_off() {
+        assert!(exporter_selected(None), "unset → on (OTLP)");
+        assert!(exporter_selected(Some("otlp")), "otlp → on");
+        assert!(
+            exporter_selected(Some("console")),
+            "unsupported selector → still on (OTLP), not off",
+        );
+        assert!(!exporter_selected(Some("none")), "none → off");
+        assert!(!exporter_selected(Some("  none  ")), "trimmed none → off");
+        assert!(
+            !exporter_selected(Some("None")),
+            "case-insensitive none → off"
+        );
     }
 
     // Build a provider over an in-memory exporter (no global state, no

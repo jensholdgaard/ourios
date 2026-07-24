@@ -780,16 +780,17 @@ fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
-/// Honor `OTEL_TRACES_EXPORTER` as an on/off switch: `none` disables the
-/// traces pipeline (the OTel-standard per-signal off switch); any other value,
-/// including unset, leaves it on. Ourios does **not** implement the full
-/// exporter *selector* — when traces are on it always exports over OTLP, so
-/// e.g. `OTEL_TRACES_EXPORTER=console` is treated as "on" (OTLP), not as a
-/// console exporter. We lean on this universal env var rather than a bespoke
-/// Ourios config knob (RFC 0038 §3.4); the sampler is likewise the standard
-/// `OTEL_TRACES_SAMPLER`, resolved by the SDK.
-fn traces_enabled(otel_traces_exporter: Option<&str>) -> bool {
-    !otel_traces_exporter.is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+/// Honor a standard `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` selector as an on/off
+/// switch: `none` disables that signal's pipeline (the OTel-standard per-signal
+/// off switch); any other value, including unset, leaves it on. Ourios does
+/// **not** implement the full exporter *selector* — when a signal is on it
+/// always exports over OTLP, so e.g. `…_EXPORTER=console` is treated as "on"
+/// (OTLP), not as a console exporter. We lean on these universal env vars
+/// rather than bespoke Ourios config knobs (RFC 0038 §3.4 for traces; #618 for
+/// metrics/logs); the trace sampler + metric interval are likewise the standard
+/// `OTEL_TRACES_SAMPLER` / `OTEL_METRIC_EXPORT_INTERVAL`, resolved by the SDK.
+fn signal_enabled(otel_signal_exporter: Option<&str>) -> bool {
+    !otel_signal_exporter.is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
 }
 
 #[tokio::main]
@@ -816,7 +817,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // OTEL_TRACES_SAMPLER/_ARG tune the trace sampler (both read by the SDK).
     let mut telemetry_config = TelemetryConfig::new("ourios-server");
     telemetry_config.traces_enabled =
-        traces_enabled(std::env::var("OTEL_TRACES_EXPORTER").ok().as_deref());
+        signal_enabled(std::env::var("OTEL_TRACES_EXPORTER").ok().as_deref());
+    telemetry_config.metrics_enabled =
+        signal_enabled(std::env::var("OTEL_METRICS_EXPORTER").ok().as_deref());
+    telemetry_config.logs_enabled =
+        signal_enabled(std::env::var("OTEL_LOGS_EXPORTER").ok().as_deref());
     let telemetry = ourios_telemetry::init(&telemetry_config)?;
 
     #[cfg(unix)]
@@ -949,21 +954,22 @@ mod tests {
 
     use ourios_server::config::file::parse;
 
-    /// RFC0038.4 — `OTEL_TRACES_EXPORTER` is honored as an on/off switch, not a
-    /// full exporter selector: `none` (any casing/whitespace) is the only value
-    /// that disables; unset and every other value (`otlp`, `console`, …) leave
-    /// traces on — always exported over OTLP.
+    /// RFC0038.4 / #618 — a standard `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` value
+    /// is honored as an on/off switch, not a full exporter selector: `none`
+    /// (any casing/whitespace) is the only value that disables; unset and every
+    /// other value (`otlp`, `console`, …) leave the signal on — always exported
+    /// over OTLP. The three signals share this one mapping.
     #[test]
-    fn rfc0038_4_otel_traces_exporter_none_disables_traces() {
-        assert!(traces_enabled(None), "unset → on (OTLP)");
-        assert!(traces_enabled(Some("otlp")), "otlp → on");
+    fn signal_enabled_maps_otel_exporter_none_to_off() {
+        assert!(signal_enabled(None), "unset → on (OTLP)");
+        assert!(signal_enabled(Some("otlp")), "otlp → on");
         assert!(
-            traces_enabled(Some("console")),
+            signal_enabled(Some("console")),
             "unsupported selector → still on (OTLP), not off",
         );
-        assert!(!traces_enabled(Some("none")), "none → off");
-        assert!(!traces_enabled(Some("  none  ")), "trimmed none → off");
-        assert!(!traces_enabled(Some("None")), "case-insensitive none → off");
+        assert!(!signal_enabled(Some("none")), "none → off");
+        assert!(!signal_enabled(Some("  none  ")), "trimmed none → off");
+        assert!(!signal_enabled(Some("None")), "case-insensitive none → off");
     }
 
     /// A `local` [`StoreConfig`] for `path`, the common test fixture.

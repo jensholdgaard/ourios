@@ -70,6 +70,16 @@ pub struct TelemetryConfig {
     /// server); the trace **sampler** is the standard `OTEL_TRACES_SAMPLER`
     /// env var, resolved by the SDK — not a field here (RFC 0038 §3.4).
     pub traces_enabled: bool,
+    /// Install the metrics pipeline (`true`) or not. `false` installs no
+    /// meter provider, so instruments resolve to the global no-op and nothing
+    /// exports. Operators disable via the standard `OTEL_METRICS_EXPORTER=none`
+    /// (mapped to this flag by the server).
+    pub metrics_enabled: bool,
+    /// Install the logs pipeline (`true`) or not. `false` skips the OTLP
+    /// logger + the `tracing`→OTel-logs bridge (the stderr `fmt` layer stays),
+    /// so Ourios's own logs no longer ship as the `OTel` Logs signal. Operators
+    /// disable via the standard `OTEL_LOGS_EXPORTER=none` (mapped by the server).
+    pub logs_enabled: bool,
 }
 
 impl TelemetryConfig {
@@ -83,6 +93,8 @@ impl TelemetryConfig {
             service_name: service_name.into(),
             otlp_endpoint: None,
             traces_enabled: true,
+            metrics_enabled: true,
+            logs_enabled: true,
         }
     }
 }
@@ -131,8 +143,10 @@ impl From<opentelemetry_otlp::ExporterBuildError> for TelemetryError {
 /// [`TelemetryGuard::shutdown`]) flushes any telemetry not yet exported.
 #[must_use = "dropping the guard immediately tears the telemetry pipeline back down"]
 pub struct TelemetryGuard {
-    provider: SdkMeterProvider,
-    /// `None` on the metrics-only paths ([`init_in_memory`], tests).
+    /// `None` when metrics are disabled (`metrics_enabled: false`).
+    provider: Option<SdkMeterProvider>,
+    /// `None` when logs are disabled (`logs_enabled: false`), on the
+    /// subscriber-already-installed path, or the metrics-only test paths.
     logger: Option<SdkLoggerProvider>,
     /// `None` when traces are disabled (`traces_enabled: false`) or on the
     /// metrics-only paths.
@@ -148,7 +162,10 @@ impl TelemetryGuard {
     /// Returns [`TelemetryError::Shutdown`] if the meter or logger
     /// provider fails to flush or shut down.
     pub fn shutdown(&self) -> Result<(), TelemetryError> {
-        let metrics = self.provider.shutdown().map_err(TelemetryError::Shutdown);
+        let metrics = match &self.provider {
+            Some(provider) => provider.shutdown().map_err(TelemetryError::Shutdown),
+            None => Ok(()),
+        };
         let logs = match &self.logger {
             Some(logger) => logger.shutdown().map_err(TelemetryError::Shutdown),
             None => Ok(()),
@@ -169,7 +186,10 @@ impl TelemetryGuard {
     /// Returns [`TelemetryError::Flush`] if the meter provider fails to
     /// export.
     pub fn force_flush(&self) -> Result<(), TelemetryError> {
-        self.provider.force_flush().map_err(TelemetryError::Flush)
+        match &self.provider {
+            Some(provider) => provider.force_flush().map_err(TelemetryError::Flush),
+            None => Ok(()),
+        }
     }
 }
 
@@ -178,7 +198,9 @@ impl Drop for TelemetryGuard {
         // Best-effort final flush; `shutdown()` is the path that can
         // report failure. A second shutdown (after an explicit one) is
         // a no-op we deliberately ignore.
-        let _ = self.provider.shutdown();
+        if let Some(provider) = &self.provider {
+            let _ = provider.shutdown();
+        }
         if let Some(logger) = &self.logger {
             let _ = logger.shutdown();
         }
@@ -246,21 +268,27 @@ fn guarded_env_filter() -> EnvFilter {
 pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let resource = resource(&config.service_name);
 
-    let mut builder = MetricExporter::builder().with_tonic();
-    if let Some(endpoint) = &config.otlp_endpoint {
-        builder = builder.with_endpoint(endpoint.clone());
-    }
-    let exporter = builder.build()?;
-
-    // No `.with_interval(...)`: the SDK's periodic reader resolves the interval
-    // from the standard `OTEL_METRIC_EXPORT_INTERVAL` env var (milliseconds, default 60000 = 60 s), so
-    // operators use the universal OTel knob rather than a bespoke Ourios field.
-    let reader = PeriodicReader::builder(exporter).build();
-
-    let provider = SdkMeterProvider::builder()
-        .with_reader(reader)
-        .with_resource(resource.clone())
-        .build();
+    // Metrics: `None` when disabled (`OTEL_METRICS_EXPORTER=none` → the server
+    // clears `metrics_enabled`), so instruments resolve to the global no-op and
+    // nothing exports. No `.with_interval(...)`: the SDK's periodic reader
+    // resolves the interval from the standard `OTEL_METRIC_EXPORT_INTERVAL` env
+    // var (milliseconds, default 60000 = 60 s).
+    let provider: Option<SdkMeterProvider> = if config.metrics_enabled {
+        let mut builder = MetricExporter::builder().with_tonic();
+        if let Some(endpoint) = &config.otlp_endpoint {
+            builder = builder.with_endpoint(endpoint.clone());
+        }
+        let exporter = builder.build()?;
+        let reader = PeriodicReader::builder(exporter).build();
+        Some(
+            SdkMeterProvider::builder()
+                .with_reader(reader)
+                .with_resource(resource.clone())
+                .build(),
+        )
+    } else {
+        None
+    };
 
     // Logs (CLAUDE.md §6.3 dogfooding): `tracing` events → OTel log
     // records → the OTLP batch exporter. The batch (not simple)
@@ -268,16 +296,23 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // inside tonic request contexts. Built *before* the meter provider is
     // installed globally: every fallible step happens first, so a failed
     // `init` cannot leave a live pipeline behind that the caller has no
-    // guard to shut down.
-    let mut builder = LogExporter::builder().with_tonic();
-    if let Some(endpoint) = &config.otlp_endpoint {
-        builder = builder.with_endpoint(endpoint.clone());
-    }
-    let log_exporter = builder.build()?;
-    let logger = SdkLoggerProvider::builder()
-        .with_batch_exporter(log_exporter)
-        .with_resource(resource.clone())
-        .build();
+    // guard to shut down. `None` when disabled (`OTEL_LOGS_EXPORTER=none`);
+    // the stderr `fmt` layer stays, so only the OTel Logs signal is dropped.
+    let logger: Option<SdkLoggerProvider> = if config.logs_enabled {
+        let mut builder = LogExporter::builder().with_tonic();
+        if let Some(endpoint) = &config.otlp_endpoint {
+            builder = builder.with_endpoint(endpoint.clone());
+        }
+        let log_exporter = builder.build()?;
+        Some(
+            SdkLoggerProvider::builder()
+                .with_batch_exporter(log_exporter)
+                .with_resource(resource.clone())
+                .build(),
+        )
+    } else {
+        None
+    };
 
     // Traces (RFC 0038): a `TracerProvider` over the OTLP batch span
     // exporter, whose tracer feeds a `tracing-opentelemetry` layer — so
@@ -322,7 +357,9 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
             (None, None)
         };
 
-    global::set_meter_provider(provider.clone());
+    if let Some(provider) = &provider {
+        global::set_meter_provider(provider.clone());
+    }
     // The global tracer provider is set *after* `try_init` confirms the traces
     // layer is wired (below) — not here. Setting it before would, on a lost
     // subscriber-install race, leave the global pointing at a provider this
@@ -335,7 +372,9 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // clients, so their internal events *and spans* must not re-enter the
     // pipeline or every failed export would emit more telemetry to export —
     // the guard's `off` directives always win over `RUST_LOG`.
-    let bridge = OpenTelemetryTracingBridge::new(&logger).with_filter(guarded_env_filter());
+    let bridge = logger
+        .as_ref()
+        .map(|logger| OpenTelemetryTracingBridge::new(logger).with_filter(guarded_env_filter()));
     // Human-readable copy on stderr — stdout is reserved for the
     // binary's machine-parsed start-up lines (bound-port announcements).
     // `RUST_LOG` overrides the default `info`.
@@ -361,9 +400,11 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
         if let Some(tracer_provider) = &tracer {
             global::set_tracer_provider(tracer_provider.clone());
         }
-        (Some(logger), tracer)
+        (logger, tracer)
     } else {
-        let _ = logger.shutdown();
+        if let Some(logger) = &logger {
+            let _ = logger.shutdown();
+        }
         if let Some(tracer_provider) = &tracer {
             let _ = tracer_provider.shutdown();
         }
@@ -412,7 +453,7 @@ pub fn init_in_memory(
     global::set_meter_provider(provider.clone());
     (
         TelemetryGuard {
-            provider,
+            provider: Some(provider),
             logger: None,
             tracer: None,
         },
@@ -441,7 +482,7 @@ mod tests {
         let meter = provider.meter("ourios.compaction");
         let counter = meter.u64_counter("ourios.compaction.sweeps").build();
         let guard = TelemetryGuard {
-            provider,
+            provider: Some(provider),
             logger: None,
             tracer: None,
         };

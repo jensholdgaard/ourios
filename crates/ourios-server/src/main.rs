@@ -780,6 +780,18 @@ fn resolve_config(config_path: Option<&Path>) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
+/// Honor `OTEL_TRACES_EXPORTER` as an on/off switch: `none` disables the
+/// traces pipeline (the OTel-standard per-signal off switch); any other value,
+/// including unset, leaves it on. Ourios does **not** implement the full
+/// exporter *selector* — when traces are on it always exports over OTLP, so
+/// e.g. `OTEL_TRACES_EXPORTER=console` is treated as "on" (OTLP), not as a
+/// console exporter. We lean on this universal env var rather than a bespoke
+/// Ourios config knob (RFC 0038 §3.4); the sampler is likewise the standard
+/// `OTEL_TRACES_SAMPLER`, resolved by the SDK.
+fn traces_enabled(otel_traces_exporter: Option<&str>) -> bool {
+    !otel_traces_exporter.is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // `--config <path>` selects the RFC 0020 file front-end; without it the
@@ -800,8 +812,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Boot OpenTelemetry first so the compactor's instruments export
     // (RFC 0001 §6.8). The guard flushes pending metrics on shutdown;
-    // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter.
-    let telemetry = ourios_telemetry::init(&TelemetryConfig::new("ourios-server"))?;
+    // OTEL_EXPORTER_OTLP_ENDPOINT et al. tune the exporter, and
+    // OTEL_TRACES_SAMPLER/_ARG tune the trace sampler (both read by the SDK).
+    let mut telemetry_config = TelemetryConfig::new("ourios-server");
+    telemetry_config.traces_enabled =
+        traces_enabled(std::env::var("OTEL_TRACES_EXPORTER").ok().as_deref());
+    let telemetry = ourios_telemetry::init(&telemetry_config)?;
 
     #[cfg(unix)]
     let sigterm = startup_guards(&config);
@@ -932,6 +948,23 @@ mod tests {
     use super::*;
 
     use ourios_server::config::file::parse;
+
+    /// RFC0038.4 — `OTEL_TRACES_EXPORTER` is honored as an on/off switch, not a
+    /// full exporter selector: `none` (any casing/whitespace) is the only value
+    /// that disables; unset and every other value (`otlp`, `console`, …) leave
+    /// traces on — always exported over OTLP.
+    #[test]
+    fn rfc0038_4_otel_traces_exporter_none_disables_traces() {
+        assert!(traces_enabled(None), "unset → on (OTLP)");
+        assert!(traces_enabled(Some("otlp")), "otlp → on");
+        assert!(
+            traces_enabled(Some("console")),
+            "unsupported selector → still on (OTLP), not off",
+        );
+        assert!(!traces_enabled(Some("none")), "none → off");
+        assert!(!traces_enabled(Some("  none  ")), "trimmed none → off");
+        assert!(!traces_enabled(Some("None")), "case-insensitive none → off");
+    }
 
     /// A `local` [`StoreConfig`] for `path`, the common test fixture.
     fn local(path: &str) -> StoreConfig {

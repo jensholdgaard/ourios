@@ -39,7 +39,7 @@ use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportCo
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
@@ -72,18 +72,17 @@ pub struct TelemetryConfig {
     /// `TracerProvider` + `tracing-opentelemetry` layer, so `tracing`
     /// spans become `OTel` spans and every log record carries the active
     /// span's `trace_id`/`span_id`. `false` restores the logs+metrics-only
-    /// posture (no tracer, no `trace_id` on logs).
+    /// posture (no tracer, no `trace_id` on logs). Operators disable via the
+    /// standard `OTEL_TRACES_EXPORTER=none` (mapped to this flag by the
+    /// server); the trace **sampler** is the standard `OTEL_TRACES_SAMPLER`
+    /// env var, resolved by the SDK — not a field here (RFC 0038 §3.4).
     pub traces_enabled: bool,
-    /// Trace sampler (RFC 0038 §3.4). `None` → `parentbased_always_on`
-    /// (the `OTel` default; the disciplined span count sits far below the
-    /// ~1000 traces/sec threshold `OTel` says to sample at). `Some(r)` →
-    /// `parentbased_traceidratio` at ratio `r` in `[0.0, 1.0]`.
-    pub trace_sample_ratio: Option<f64>,
 }
 
 impl TelemetryConfig {
     /// Config for `service_name` with spec defaults (default endpoint,
-    /// [`DEFAULT_EXPORT_INTERVAL`], traces on, always-on sampler).
+    /// [`DEFAULT_EXPORT_INTERVAL`], traces on; the sampler comes from the
+    /// SDK's `OTEL_TRACES_SAMPLER` env resolution, default `parentbased_always_on`).
     #[must_use]
     pub fn new(service_name: impl Into<String>) -> Self {
         Self {
@@ -91,7 +90,6 @@ impl TelemetryConfig {
             otlp_endpoint: None,
             export_interval: DEFAULT_EXPORT_INTERVAL,
             traces_enabled: true,
-            trace_sample_ratio: None,
         }
     }
 }
@@ -293,8 +291,12 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
     // record through the appender bridge. Also built before installing any
     // global (the span exporter is the last fallible step). `None` when
     // traces are disabled, which keeps today's logs+metrics posture exactly.
-    // The sampler is `parentbased_always_on` by default, or
-    // `parentbased_traceidratio` when a ratio is configured (RFC 0038 §3.4).
+    // We deliberately do NOT set a sampler: the SDK resolves it from the
+    // standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` env vars
+    // (default `parentbased_always_on`), so operators tune sampling with the
+    // universal OTel knob instead of a bespoke Ourios one (RFC 0038 §3.4). The
+    // disciplined span count sits far below the ~1000 traces/sec threshold
+    // OTel says to sample at, so the always-on default is the right baseline.
     let (tracer, otel_layer): (Option<SdkTracerProvider>, Option<BoxedLayer>) =
         if config.traces_enabled {
             let mut builder = SpanExporter::builder().with_tonic();
@@ -302,19 +304,8 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
                 builder = builder.with_endpoint(endpoint.clone());
             }
             let span_exporter = builder.build()?;
-            let sampler = match config.trace_sample_ratio {
-                // Clamp defensively to the documented `[0.0, 1.0]`. The
-                // RFC 0038 §3.4 config-file layer rejects an out-of-range
-                // ratio at startup before it reaches here; this only guards a
-                // direct library caller from a surprising sampler.
-                Some(ratio) => Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-                    ratio.clamp(0.0, 1.0),
-                ))),
-                None => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
-            };
             let tracer_provider = SdkTracerProvider::builder()
                 .with_batch_exporter(span_exporter)
-                .with_sampler(sampler)
                 .with_resource(resource)
                 .build();
             // Strip `tracing`'s synthetic per-span attributes: `busy_ns`/`idle_ns`

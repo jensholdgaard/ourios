@@ -317,8 +317,19 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
                 .with_sampler(sampler)
                 .with_resource(resource)
                 .build();
+            // Strip `tracing`'s synthetic per-span attributes: `busy_ns`/`idle_ns`
+            // (tracked inactivity) and `target` carry no semconv namespace, and
+            // `with_location` emits `code.module.name`, which collides with the
+            // upstream `code` namespace — all four fail `weaver registry
+            // live-check`. They are instrumentation-source metadata, not domain
+            // telemetry; our spans carry their identity in the span name plus the
+            // attributes we add deliberately. `thread.{id,name}` are valid semconv
+            // (kept by leaving `with_threads` at its default).
             let layer = tracing_opentelemetry::layer()
                 .with_tracer(tracer_provider.tracer(TRACER_SCOPE))
+                .with_tracked_inactivity(false)
+                .with_location(false)
+                .with_target(false)
                 .with_filter(guarded_env_filter())
                 .boxed();
             (Some(tracer_provider), Some(layer))

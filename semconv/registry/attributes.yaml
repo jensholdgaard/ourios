@@ -320,3 +320,49 @@ groups:
           `ourios.receiver.tls.reload_failures` counter's cause
           dimension). The listener keeps the last good certificate in
           both cases (RFC0030.6).
+
+  # `datafusion.*` — deliberately not `ourios.*` (RFC 0040 §3.3): these
+  # describe semantics owned by `DataFusion`'s execution-plan model, not
+  # Ourios's, on the `ourios-df-otel` operator-span tree. The crate is
+  # built to be extracted to a standalone `datafusion-contrib` component,
+  # so an `ourios.`-prefixed name would be wrong the moment another
+  # project uses it. `db.*` is not reused: that namespace's normative
+  # meaning is a database *client* span (one app-to-database operation),
+  # not per-operator sub-spans inside a query engine (OTel MCP
+  # consultation, 2026-07-25).
+  - id: registry.datafusion
+    type: attribute_group
+    display_name: DataFusion operator attributes
+    brief: >-
+      Attributes on the per-operator spans `ourios-df-otel` reconstructs
+      from a finished `DataFusion` physical plan (RFC 0040).
+    attributes:
+      - id: datafusion.operator.output_rows
+        type: int
+        stability: development
+        brief: The number of rows the operator emitted (`MetricValue::OutputRows`).
+      - id: datafusion.operator.elapsed_compute
+        type: int
+        stability: development
+        brief: >-
+          The operator's CPU-busy time, in nanoseconds
+          (`MetricValue::ElapsedCompute`) — an attribute, never the
+          span's own start/end timeline (RFC 0040 §3.1).
+      - id: datafusion.operator.output_bytes
+        type: int
+        stability: development
+        brief: The number of bytes the operator emitted (`MetricValue::OutputBytes`).
+      - id: datafusion.operator.row_groups_pruned
+        type: int
+        stability: development
+        brief: >-
+          Parquet row groups this scan skipped via statistics/partition
+          pruning (`PruningMetrics::pruned`) — the B1 numerator.
+      - id: datafusion.operator.row_groups_matched
+        type: int
+        stability: development
+        brief: >-
+          Parquet row groups this scan read (`PruningMetrics::matched`) —
+          the B1 denominator. Reported as a raw count alongside
+          `row_groups_pruned`, never as a ratio (undefined when
+          `matched == 0`); a consumer derives the ratio if it wants one.

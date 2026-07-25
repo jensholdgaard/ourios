@@ -162,6 +162,21 @@ pub const OURIOS_WAL_APPEND_DURATION: &str = "ourios.wal.append.duration";
 
 // Attribute keys.
 
+/// `datafusion.operator.elapsed_compute` attribute key.
+pub const DATAFUSION_OPERATOR_ELAPSED_COMPUTE: &str = "datafusion.operator.elapsed_compute";
+
+/// `datafusion.operator.output_bytes` attribute key.
+pub const DATAFUSION_OPERATOR_OUTPUT_BYTES: &str = "datafusion.operator.output_bytes";
+
+/// `datafusion.operator.output_rows` attribute key.
+pub const DATAFUSION_OPERATOR_OUTPUT_ROWS: &str = "datafusion.operator.output_rows";
+
+/// `datafusion.operator.row_groups_matched` attribute key.
+pub const DATAFUSION_OPERATOR_ROW_GROUPS_MATCHED: &str = "datafusion.operator.row_groups_matched";
+
+/// `datafusion.operator.row_groups_pruned` attribute key.
+pub const DATAFUSION_OPERATOR_ROW_GROUPS_PRUNED: &str = "datafusion.operator.row_groups_pruned";
+
 /// `ourios.audit_sink.flush.outcome` attribute key.
 pub const OURIOS_AUDIT_SINK_FLUSH_OUTCOME: &str = "ourios.audit_sink.flush.outcome";
 

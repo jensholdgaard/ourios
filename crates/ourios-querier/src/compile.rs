@@ -758,6 +758,11 @@ fn combine(
     })
 }
 
+/// `SEVERITY_NUMBER_UNSPECIFIED` — the `OTel` logs data model's "no severity
+/// here", which real sources emit (Claude Code's `GenAI` events, ETW's
+/// `LOG_ALWAYS`, Google Cloud's `DEFAULT`).
+const SEVERITY_UNSPECIFIED: i64 = 0;
+
 fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
     // `severity_number` is REQUIRED (always present), so no absent-column
     // guard is needed. Compare as i64; DataFusion coerces against UInt8.
@@ -766,6 +771,10 @@ fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
     // membership (`==`/`!=`) is a range test, not a single-value compare. A
     // numeric RHS is exact, and ordering ops use the band floor either way
     // (RFC0002.5: ordering compares against the floor of the named band).
+    let threshold = match value {
+        SeverityValue::Name(name) => name.floor(),
+        SeverityValue::Number(n) => *n,
+    };
     let expr = match (value, op) {
         (SeverityValue::Name(name), OrdOp::Eq) => sev()
             .gt_eq(lit(name.floor()))
@@ -773,8 +782,31 @@ fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
         (SeverityValue::Name(name), OrdOp::Ne) => {
             sev().lt(lit(name.floor())).or(sev().gt(lit(name.ceil())))
         }
-        (SeverityValue::Name(name), _) => ord_expr(sev(), op, lit(name.floor())),
-        (SeverityValue::Number(n), _) => ord_expr(sev(), op, lit(*n)),
+        // RFC0002.21 — a minimum-severity floor (`>=`/`>`) does not filter out
+        // records whose severity is *unspecified*. This mirrors the OTel Logs
+        // SDK, whose `minimum_severity` drops a record only when its
+        // SeverityNumber "is specified (i.e. not 0)"; unspecified records
+        // "bypass minimum severity filtering". The data model sanctions the
+        // special case explicitly ("Special handling MAY be given to
+        // SeverityNumber=0 ... in less-than / greater-than comparisons").
+        //
+        // Written as a disjunction rather than a post-filter on purpose: the
+        // `= 0` arm keeps row-group pruning correct for free, because a group
+        // whose severity range includes 0 can no longer be proven non-matching.
+        // A post-filter would leave the old pruning in place and silently skip
+        // whole files of unspecified rows.
+        (_, OrdOp::Ge | OrdOp::Gt) if threshold > SEVERITY_UNSPECIFIED => sev()
+            .eq(lit(SEVERITY_UNSPECIFIED))
+            .or(ord_expr(sev(), op, lit(threshold))),
+        // The ceiling side must *exclude* unspecified, or the bypass above
+        // would make a row match both `>= X` and `< X` — `0 < 17` is true
+        // numerically, but a record with no severity is not "below error".
+        // Excluding it here keeps a predicate and its negation a partition,
+        // which is the property a query language cannot give up.
+        (_, OrdOp::Lt | OrdOp::Le) if threshold > SEVERITY_UNSPECIFIED => sev()
+            .not_eq(lit(SEVERITY_UNSPECIFIED))
+            .and(ord_expr(sev(), op, lit(threshold))),
+        _ => ord_expr(sev(), op, lit(threshold)),
     };
     PredExpr::Filter(expr)
 }

@@ -19,6 +19,7 @@ mod forward_compat;
 mod manifest;
 mod rfc0001_query_semantics;
 mod rfc0001_time_preserved;
+mod rfc0002_21_unspecified_severity;
 mod rfc0002_dsl;
 mod rfc0005_13;
 mod rfc0005_14_alias_derivation;

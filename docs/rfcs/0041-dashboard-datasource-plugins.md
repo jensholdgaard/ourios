@@ -33,7 +33,9 @@ Working spikes exist for **both** Grafana and Perses. Each renders real
 ingested logs in a real dashboard against the live querier. The Ourios-side
 work (query shape, field mapping, time-range injection) is identical across
 them and took ~20 minutes to port; effectively all the cost is in each host's
-plugin system. Measured effort: **1–2 days for Grafana, 3–5 for Perses.**
+plugin system. Measured effort **at log parity**: 1–2 days for Grafana, 3–5
+for Perses — and Grafana's figure already includes time series, which Perses
+would need a further plugin for (§3.1).
 
 ## 2. Motivation
 
@@ -72,15 +74,23 @@ and were driven to a rendered dashboard via headless Chromium.
 | | Grafana | Perses |
 |---|---|---|
 | Renders Ourios log lines | ✅ | ✅ |
-| Time series from `count by bucket(w)` | ✅ | not built (needs a third plugin) |
-| Plugins to write | 1 datasource | 2 (`Datasource` + `LogQuery`) |
+| Time series from `count by bucket(w)` | ✅ (same plugin) | not built |
+| Plugins for logs | 1 datasource | 2 (`Datasource` + `LogQuery`) |
+| Plugins for logs **and** time series | still 1 | 3 (adds `TimeSeriesQuery`) |
 | Backend language | **none** (data proxy) | none (frontend + CUE) |
 | Schema language | none | **CUE, mandatory** |
 | Config validated | at render | **at write time** |
-| Measured effort | **1–2 days** | **3–5 days** |
+| Measured effort (log parity) | **1–2 days** | **3–5 days** |
 
 Findings that shape any real implementation:
 
+- **Grafana needs one plugin for every frame type; Perses needs one per
+  query kind.** A single Grafana datasource returns logs, time series and
+  tables — the response shape picks the frame. Perses splits `LogQuery` from
+  `TimeSeriesQuery`, so the same coverage is a third plugin. The spikes built
+  logs on both and time series on Grafana only, which is why the effort figures
+  below are not directly comparable at equal scope: Perses at *log parity* is
+  3–5 days; adding its time-series plugin is more.
 - **No backend component is required on either host.** Grafana's data proxy
   (`plugin.json` `routes`) and Perses's datasource proxy both forward
   server-side, injecting `x-ourios-tenant` from datasource config. This

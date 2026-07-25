@@ -6743,19 +6743,19 @@ limitations under the License.
 
 Used by:
 
-- `ourios-bench` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-config` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-core` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-df-otel` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-ingester` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-miner` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-parquet` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-querier` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-semconv` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-server` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-telemetry` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-testgen` 0.4.0 — <https://github.com/jensholdgaard/ourios>
-- `ourios-wal` 0.4.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-bench` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-config` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-core` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-df-otel` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-ingester` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-miner` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-parquet` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-querier` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-semconv` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-server` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-telemetry` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-testgen` 0.5.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-wal` 0.5.0 — <https://github.com/jensholdgaard/ourios>
 - `allocator-api2` 0.2.21 — <https://github.com/zakarumych/allocator-api2>
 - `android_system_properties` 0.1.5 — <https://github.com/nical/android_system_properties>
 - `anyhow` 1.0.103 — <https://github.com/dtolnay/anyhow>

@@ -107,6 +107,7 @@ release version:
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
+    command -v cargo-about >/dev/null || { echo "error: cargo-about not installed (cargo install cargo-about)"; exit 1; }
     # Refresh remote refs so the checks below see the real state of origin.
     git fetch --quiet --tags origin
     # Release only from a `main` that exactly matches `origin/main` — never a
@@ -179,7 +180,11 @@ release version:
     # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
     # commit — cargo-dist reads it for the GitHub Release body (release.yml).
     git-cliff --tag "v$version" --output CHANGELOG.md
-    git add Cargo.toml Cargo.lock CHANGELOG.md "$chart_yaml"
+    # THIRD-PARTY-LICENSES.md embeds every workspace crate's version, so the
+    # bump above staled it and CI's `cargo about (no-diff)` gate would fail on
+    # the release commit (it did for v0.5.0). Regenerate it in the same commit.
+    cargo about generate --fail about.hbs > THIRD-PARTY-LICENSES.md
+    git add Cargo.toml Cargo.lock CHANGELOG.md THIRD-PARTY-LICENSES.md "$chart_yaml"
     git commit -m "chore(release): v$version"
     git tag -a "v$version" -m "v$version"
     # Success: disarm the rollback trap.

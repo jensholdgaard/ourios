@@ -232,8 +232,9 @@ thirteenth, `-testgen`, is dev-only):
   against a real Loki container.
 - **`ourios-df-otel`** — RFC 0040 `green`: a post-hoc `ExecutionPlan` →
   OTel span-tree walk, backdating each operator span from its
-  `BaselineMetrics` timestamps. Depends only on `datafusion` +
-  `opentelemetry` so it stays extractable as an upstream contribution.
+  `BaselineMetrics` timestamps. Its *runtime* dependencies are `datafusion`
+  and `opentelemetry` alone — no `ourios-*` crate among them — so it stays
+  extractable as an upstream contribution.
 - **`ourios-core`** / **`-config`** / **`-semconv`** / **`-telemetry`** /
   **`-server`** — shared types + tenancy + record/audit shapes; the RFC
   0004 miner tunables (split out per RFC 0028 §3.2); the
@@ -386,7 +387,7 @@ table below records what shipped and what's still genuinely open.
 | **Write-ahead log** (`ourios-wal`) | Corpus replay is bounded and reproducible; durability is irrelevant for thesis-proving | **Landed** — RFC 0008 `accepted`: append/sync, real-SIGKILL crash recovery, snapshot-restore, group-commit batched fsync |
 | **OTLP wire endpoints** (gRPC + HTTP listeners) | Bench reads OTLP from disk, not the network — see Phase 3 | **Landed** — RFC 0003 `green`: gRPC + HTTP receivers, WAL-before-ack, per-`ResourceLogs` tenant derivation |
 | **Snapshot mechanism** (RFC 0001 §6.9) | Corpus runs from cold start; replay budget moot | **Landed** — part of RFC 0008 (`accepted`), v2 restore format |
-| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0018 `green`); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). Traces deliberately deferred |
+| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0018 `green`); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). **Traces landed too** (2026-07-24/25): RFC 0038 `green` gives request-scoped spans on ingest/query/`/mcp`/sweep, RFC 0039 `green` continues an inbound caller's trace rather than starting a new one, and RFC 0040 `green` adds a DataFusion operator span tree under a query. All three signals are now configured through the standard `OTEL_*` env vars |
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `green`, including the `param(n)`/`bucket(width)` aggregation amendment |
 | **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding shipped (RFC 0026 `accepted`); rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9) |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |

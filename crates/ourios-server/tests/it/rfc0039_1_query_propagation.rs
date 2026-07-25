@@ -24,14 +24,22 @@ const WINDOW_NANOS: u64 = 3_600_000_000_000;
 const CALLER_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 const CALLER_SPAN: &str = "00f067aa0ba902b7";
 
+/// Install the global propagator exactly once for this test binary. The tests
+/// below run in parallel, so writing the process-global propagator per call
+/// would mean concurrent writes to shared state; `Once` makes it a single
+/// install that all of them observe.
+fn install_propagator() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    });
+}
+
 /// Drive one query through the real router, optionally carrying `traceparent`,
 /// and return the exported spans.
 async fn query_spans(traceparent: Option<&str>) -> Vec<opentelemetry_sdk::trace::SpanData> {
-    // The global propagator is what `extract_context` consults, so install it
-    // for the process. `set_text_map_propagator` is idempotent-safe: repeated
-    // installs of an equivalent propagator are harmless, which matters because
-    // sibling tests in this binary may also install one.
-    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    // The global propagator is what `extract_context` consults.
+    install_propagator();
 
     let bucket = tempfile::tempdir().expect("temp");
     let app = ourios_server::querier::router(bucket.path().to_path_buf(), WINDOW_NANOS);

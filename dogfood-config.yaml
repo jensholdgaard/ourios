@@ -26,20 +26,26 @@
 # A source that wants no trace viewer can still skip the Collector and point
 # straight at these ports.
 #
-# **The loopback bind constrains the Collector fan-out to Docker runtimes
-# that route `host.docker.internal` through a VM** — macOS (colima, Docker
-# Desktop), where the verification for this setup was done. On **native
-# Linux** `host-gateway` resolves to the docker bridge address, which cannot
-# reach a service bound to `127.0.0.1`, so the fan-out silently drops logs
-# (the Collector logs an export error; traces to Jaeger are unaffected).
-# Deliberately not "fixed" by binding `0.0.0.0`: this receiver runs in RFC
-# 0026 open mode (no auth), so a non-loopback bind would accept telemetry
-# from any reachable peer. On Linux either accept that trade-off knowingly
-# on a trusted network, or give the Collector `network_mode: host` and point
-# the exporter at `127.0.0.1:24317`. The interop test
-# (`crates/ourios-server/tests/it/collector_interop.rs`) binds `0.0.0.0` for
-# this same container->host reason, but it is a sandboxed CI fixture behind
-# TLS + OIDC, not a long-lived local capture.
+# **The Collector's log fan-out depends on the Docker runtime.** It reaches
+# this receiver via `host.docker.internal`, which routes through a VM on
+# macOS (colima, Docker Desktop) — where this setup was verified — and so
+# reaches the loopback bind. On **native Linux** `host-gateway` resolves to
+# the docker bridge address, which cannot reach `127.0.0.1`, and the fan-out
+# drops logs (the Collector logs an export error; traces to Jaeger are
+# unaffected). The bind stays loopback regardless: this receiver runs in RFC
+# 0026 open mode (no auth), so a non-loopback bind accepts telemetry from any
+# peer that can reach it.
+#
+# The portable answer needs no container->host networking at all — send each
+# signal to the process that owns it, via the per-signal endpoint overrides
+# (`just dogfood-env` prints this variant):
+#
+#   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318    # straight here
+#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318   # Collector -> Jaeger
+#
+# The interop test (`crates/ourios-server/tests/it/collector_interop.rs`)
+# does bind `0.0.0.0` for the same container->host reason, but it is a
+# sandboxed CI fixture behind TLS + OIDC, not a long-lived open capture.
 storage:
   backend: local
   local:

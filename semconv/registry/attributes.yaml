@@ -357,12 +357,12 @@ groups:
         stability: development
         brief: >-
           Parquet row groups this scan skipped via statistics/partition
-          pruning (`PruningMetrics::pruned`) — the B1 numerator.
+          pruning (`PruningMetrics::pruned`).
       - id: datafusion.operator.row_groups_matched
         type: int
         stability: development
         brief: >-
-          Parquet row groups this scan read (`PruningMetrics::matched`) —
-          the B1 denominator. Reported as a raw count alongside
-          `row_groups_pruned`, never as a ratio (undefined when
-          `matched == 0`); a consumer derives the ratio if it wants one.
+          Parquet row groups this scan read (`PruningMetrics::matched`).
+          Reported as a raw count alongside `row_groups_pruned`, never as
+          a ratio (undefined when `matched == 0`); a consumer derives the
+          ratio if it wants one.

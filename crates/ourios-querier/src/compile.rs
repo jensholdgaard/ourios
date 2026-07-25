@@ -1224,6 +1224,7 @@ fn ord_expr(lhs: Expr, op: OrdOp, rhs: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ir::SeverityName;
 
     /// RFC0002.21 lowering: a floor admits unspecified, a ceiling excludes it,
     /// and an explicit `0` threshold does neither. Asserted on the lowered
@@ -1266,17 +1267,38 @@ mod tests {
         }
     }
 
-    /// Band membership (`==`/`!=`) is unchanged by RFC0002.21 — it is a range
-    /// test, not a floor, so unspecified gets no special treatment there.
+    /// Membership (`==`/`!=`) is unchanged by RFC0002.21 — it is a range or
+    /// equality test, not a minimum-severity floor, so unspecified gets no
+    /// special treatment. Covers the bare-name band (`error` ⇒ 17..=20), which
+    /// is the form the DSL actually encourages, as well as the exact numeric
+    /// form.
     #[test]
-    fn severity_band_membership_is_untouched_by_the_unspecified_rule() {
-        let PredExpr::Filter(e) = compile_severity(OrdOp::Eq, &SeverityValue::Number(17)) else {
-            panic!("expected a Filter");
+    fn severity_membership_is_untouched_by_the_unspecified_rule() {
+        let rendered = |op, value| match compile_severity(op, &value) {
+            PredExpr::Filter(e) => format!("{e}"),
+            _ => panic!("expected a Filter for a severity predicate"),
         };
-        let rendered = format!("{e}");
+
+        for (label, value) in [
+            ("named band", SeverityValue::Name(SeverityName::Error)),
+            ("exact number", SeverityValue::Number(17)),
+        ] {
+            for op in [OrdOp::Eq, OrdOp::Ne] {
+                let e = rendered(op, value.clone());
+                assert!(
+                    !e.contains("severity_number = Int64(0)")
+                        && !e.contains("severity_number != Int64(0)"),
+                    "{label} {op:?} must not gain the unspecified special case: {e}"
+                );
+            }
+        }
+
+        // And the band really is a range, so the test above is exercising the
+        // band path rather than silently lowering like an exact compare.
+        let band = rendered(OrdOp::Eq, SeverityValue::Name(SeverityName::Error));
         assert!(
-            !rendered.contains("severity_number = Int64(0)"),
-            "an exact-value comparison must not gain the unspecified disjunct: {rendered}"
+            band.contains("Int64(17)") && band.contains("Int64(20)"),
+            "`== error` must lower to the 17..=20 band: {band}"
         );
     }
 

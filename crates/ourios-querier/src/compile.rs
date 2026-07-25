@@ -758,9 +758,9 @@ fn combine(
     })
 }
 
-/// `SEVERITY_NUMBER_UNSPECIFIED` — the `OTel` logs data model's "no severity
-/// here", which real sources emit (Claude Code's `GenAI` events, ETW's
-/// `LOG_ALWAYS`, Google Cloud's `DEFAULT`).
+/// The `OTel` logs data model's "no severity here" — the value its proto enum
+/// spells `SEVERITY_NUMBER_UNSPECIFIED`. Real sources emit it (Claude Code's
+/// `GenAI` events, ETW's `LOG_ALWAYS`, Google Cloud's `DEFAULT`).
 const SEVERITY_UNSPECIFIED: i64 = 0;
 
 fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
@@ -1224,6 +1224,61 @@ fn ord_expr(lhs: Expr, op: OrdOp, rhs: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC0002.21 lowering: a floor admits unspecified, a ceiling excludes it,
+    /// and an explicit `0` threshold does neither. Asserted on the lowered
+    /// predicate rather than end-to-end, so a regression is caught at the
+    /// compile step even if no fixture happens to contain a `0` row.
+    #[test]
+    fn severity_lowering_special_cases_unspecified_only_above_zero() {
+        let lowered = |dsl_op, value| match compile_severity(dsl_op, &value) {
+            PredExpr::Filter(e) => format!("{e}"),
+            _ => panic!("expected a Filter for a severity predicate"),
+        };
+
+        // Floors admit unspecified: the lowered predicate carries the `= 0`
+        // disjunct that both matches those rows and defeats min/max pruning.
+        for op in [OrdOp::Ge, OrdOp::Gt] {
+            let e = lowered(op, SeverityValue::Number(17));
+            assert!(
+                e.contains("severity_number = Int64(0)") && e.contains(" OR "),
+                "{op:?} against a positive threshold must be a disjunction with `= 0`: {e}"
+            );
+        }
+
+        // Ceilings exclude it, so a predicate and its negation still partition.
+        for op in [OrdOp::Lt, OrdOp::Le] {
+            let e = lowered(op, SeverityValue::Number(17));
+            assert!(
+                e.contains("severity_number != Int64(0)") && e.contains(" AND "),
+                "{op:?} against a positive threshold must exclude unspecified: {e}"
+            );
+        }
+
+        // A `0` threshold is a question *about* unspecified, not a floor, so
+        // `severity > 0` keeps meaning "has a specified severity".
+        for op in [OrdOp::Ge, OrdOp::Gt, OrdOp::Lt, OrdOp::Le] {
+            let e = lowered(op, SeverityValue::Number(0));
+            assert!(
+                !e.contains(" OR ") && !e.contains(" AND "),
+                "{op:?} against a 0 threshold must lower to a plain comparison: {e}"
+            );
+        }
+    }
+
+    /// Band membership (`==`/`!=`) is unchanged by RFC0002.21 — it is a range
+    /// test, not a floor, so unspecified gets no special treatment there.
+    #[test]
+    fn severity_band_membership_is_untouched_by_the_unspecified_rule() {
+        let PredExpr::Filter(e) = compile_severity(OrdOp::Eq, &SeverityValue::Number(17)) else {
+            panic!("expected a Filter");
+        };
+        let rendered = format!("{e}");
+        assert!(
+            !rendered.contains("severity_number = Int64(0)"),
+            "an exact-value comparison must not gain the unspecified disjunct: {rendered}"
+        );
+    }
 
     #[test]
     fn duration_nanos_covers_all_units() {

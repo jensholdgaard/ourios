@@ -3434,6 +3434,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ourios-config",
  "ourios-core",
+ "ourios-df-otel",
  "ourios-miner",
  "ourios-parquet",
  "ourios-semconv",
@@ -3448,6 +3449,9 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "zstd",
 ]
 

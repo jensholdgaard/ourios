@@ -62,8 +62,19 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # RFC 0033 §3.7 — the template-map lookup/publish instruments. API crate
 # only: they resolve through the process-global meter (RFC 0001 §6.8
 # API/SDK split — the SDK + OTLP exporter live in ourios-telemetry) and
-# are no-ops until a provider is installed.
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# are no-ops until a provider is installed. RFC 0040 §3.4 adds the `trace`
+# feature: `record_operator_spans` reads the current span's `Context` and
+# resolves the process-global tracer to hand `ourios-df-otel`.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+# RFC 0040 §3.4 — `tracing::Span::current().context()` (`OpenTelemetrySpanExt`)
+# is how the querier reaches the `POST /v1/query` span's OTel `Context`
+# without threading one through every call site by hand (mirrors RFC 0039's
+# dep-promotion precedent in `ourios-server`).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+# RFC 0040 — the post-hoc `ExecutionPlan` -> OTel operator-span-tree crate.
+# `datafusion` + `opentelemetry` only, no `ourios-*` deps of its own.
+ourios-df-otel = { path = "../ourios-df-otel" }
 # Generated semantic-convention name constants (`semconv/registry/` via
 # weaver) — instrument and attribute names are never hand-written.
 ourios-semconv = { path = "../ourios-semconv" }
@@ -92,7 +103,10 @@ ourios-config = { path = "../ourios-config" }
 # pipeline (`init_in_memory` installs the global provider) plus the SDK's
 # exported-data types the assertions read.
 ourios-telemetry = { path = "../ourios-telemetry", features = ["testing"] }
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["metrics", "trace", "testing"] }
+# RFC 0040 — the scoped `InMemorySpanExporter` test harness (mirrors
+# `ourios-server`'s `rfc0039_1_query_propagation.rs`).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 # RFC0002.7 — the parse/serialise round-trip is a property test over
 # generated well-formed queries.
 proptest = "=1.11.0"

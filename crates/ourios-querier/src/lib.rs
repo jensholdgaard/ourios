@@ -700,6 +700,24 @@ fn scan_stats(plan: &dyn ExecutionPlan) -> QueryStats {
     stats
 }
 
+/// Reconstruct the operator span tree for the just-executed `plan` under the
+/// current tracing span (RFC 0040), once `collect()` has returned so every
+/// node's `BaselineMetrics` timestamps are final. A no-op when no `OTel` layer
+/// is installed or the current span isn't sampled — see
+/// [`ourios_df_otel::record_plan_spans`]'s own gate.
+///
+/// Resolves the process-global tracer (mirrors the RFC 0033 §3.7 meter
+/// pattern): this crate has no `TracerProvider` of its own to hand out, and
+/// the installed global is what every OTel-instrumented path in the binary
+/// already resolves through.
+fn record_operator_spans(plan: &dyn ExecutionPlan) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let cx = tracing::Span::current().context();
+    let tracer = opentelemetry::global::tracer("ourios-df-otel");
+    ourios_df_otel::record_plan_spans(plan, &cx, &tracer);
+}
+
 fn accumulate_scan_stats(plan: &dyn ExecutionPlan, stats: &mut QueryStats) {
     if let Some(metrics) = plan.metrics() {
         // `aggregate_by_name` sums each metric across the scan's
@@ -1353,6 +1371,7 @@ impl Querier {
             .map_err(storage_err)?;
         let rows = count_value(&batches)?;
         let stats = scan_stats(plan.as_ref());
+        record_operator_spans(plan.as_ref());
 
         // RFC 0017 §3.3/§3.4 — when a `row_limit` is requested, materialise the
         // matching rows (the same filtered frame, capped at the limit), decode
@@ -1420,6 +1439,7 @@ impl Querier {
             .await
             .map_err(storage_err)?;
         let scan = scan_stats(plan.as_ref());
+        record_operator_spans(plan.as_ref());
         let decoded = decode_aggregate(&batches, agg.by.len(), agg.scalar.is_some())?;
         Ok(QueryResult {
             rows: decoded.rows,
@@ -1490,6 +1510,7 @@ impl Querier {
             .await
             .map_err(storage_err)?;
         let scan = scan_stats(plan.as_ref());
+        record_operator_spans(plan.as_ref());
         // The single RFC 0005 decode path (RFC 0021 §3.1 / RFC0021.4):
         // `ShapeValidation::Skip` because `render_log_body` handles every
         // record shape safely — this path renders rather than rejects

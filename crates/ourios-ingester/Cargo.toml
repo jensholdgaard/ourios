@@ -73,8 +73,10 @@ ourios-parquet = { path = "../ourios-parquet" }
 tokio = { version = "1", default-features = false, features = ["rt", "time", "macros", "sync"] }
 # Telemetry: the lightweight OTel metrics API only (RFC 0001 §6.8 — the
 # heavy SDK/OTLP live in ourios-telemetry; library crates resolve
-# instruments through the global meter).
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# instruments through the global meter). `trace` is the API half only —
+# `Context` + `propagation::Extractor` for inbound trace-context extraction
+# (RFC 0039 §3.5); the SDK's propagator install stays in ourios-telemetry.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 # Generated metric/attribute name constants (RFC 0009 §3.6); a leaf,
 # zero-dep crate.
 ourios-semconv = { path = "../ourios-semconv" }

@@ -31,7 +31,9 @@ ourios-parquet = { path = "../ourios-parquet" }
 ourios-telemetry = { path = "../ourios-telemetry" }
 # OTel meter API for the querier role's metrics (RFC 0016 §3.6); the SDK
 # lives in ourios-telemetry, library code resolves against the global meter.
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+# `trace` is the API half only — `Context` + `FutureExt::with_context` for
+# inbound trace-context propagation (RFC 0039 §3.5).
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 # Generated semantic-convention name constants for the query metrics.
 ourios-semconv = { path = "../ourios-semconv" }
 # The receiver role's durable WAL + miner + miner config (one pipeline

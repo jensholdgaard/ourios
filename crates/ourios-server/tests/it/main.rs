@@ -27,3 +27,4 @@ mod rfc0029_oidc;
 mod rfc0030_tls;
 mod rfc0032_query_schema;
 mod rfc0038_1_request_spans;
+mod rfc0039_1_query_propagation;

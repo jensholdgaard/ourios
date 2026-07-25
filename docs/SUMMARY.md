@@ -67,6 +67,7 @@
 - [RFC 0038 — Self-tracing](./rfcs/0038-self-tracing.md)
 - [RFC 0039 — Inbound trace-context propagation](./rfcs/0039-inbound-trace-context-propagation.md)
 - [RFC 0040 — DataFusion operator instrumentation](./rfcs/0040-datafusion-operator-instrumentation.md)
+- [RFC 0041 — Dashboard datasource plugins](./rfcs/0041-dashboard-datasource-plugins.md)
 
 # Talks
 

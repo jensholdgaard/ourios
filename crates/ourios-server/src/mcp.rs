@@ -723,7 +723,9 @@ async fn mcp_server_span(request: Request<Body>, next: Next) -> Response {
         // serves POST (JSON-RPC), GET (the SSE stream) and DELETE (session
         // teardown). `otel.name` is how a computed name reaches the exported
         // span, since the macro's own `name` must be a literal.
-        otel.name = %format!("{method} /mcp"),
+        // `format_args!`, not `format!`: the recorder only needs `Display`, so
+        // the name never needs its own heap allocation.
+        otel.name = %format_args!("{method} /mcp"),
         otel.kind = "server",
         http.request.method = %method,
         http.route = "/mcp",

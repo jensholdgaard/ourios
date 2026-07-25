@@ -74,8 +74,8 @@ and were driven to a rendered dashboard via headless Chromium.
 | Renders Ourios log lines | ✅ | ✅ |
 | Time series from `count by bucket(w)` | ✅ | not built (needs a third plugin) |
 | Plugins to write | 1 datasource | 2 (`Datasource` + `LogQuery`) |
-| Backend language | **none** (data proxy) | none (frontend + Cue) |
-| Schema language | none | **Cuelang, mandatory** |
+| Backend language | **none** (data proxy) | none (frontend + CUE) |
+| Schema language | none | **CUE, mandatory** |
 | Config validated | at render | **at write time** |
 | Measured effort | **1–2 days** | **3–5 days** |
 
@@ -109,9 +109,17 @@ This is the portable half — identical in both spikes:
 | `aggregate[]` with other keys | table |
 | `stats.bytes_read` | query stats (Perses only) |
 
-The dashboard time range becomes a `range(...)` stage. **A range the user
-wrote by hand wins** — silently overriding it would make the editor lie about
-what ran.
+The dashboard time range becomes a `range(...)` stage. Two properties a plugin
+author needs and should not have to infer:
+
+- **The window is half-open.** RFC 0002 §6.2 fixes `range(from, to)` as
+  `from <= effective < to`, matching RFC 0010's `[from, to)`. Both Grafana's
+  and Perses's pickers hand over an inclusive-looking `to`, so a row exactly on
+  the upper bound is *excluded* — worth stating, because the alternative is
+  each plugin quietly guessing and drifting apart.
+- **A range the user wrote by hand wins.** The injected stage is skipped
+  entirely when the query already contains a `range(...)`; silently overriding
+  it would make the editor lie about what ran.
 
 ### 3.3 Where the plugin lives
 
@@ -168,7 +176,7 @@ reordering of a documented plan.
 validates dashboards at write time, and surfaces pruning stats natively. But
 it is 2–3× the effort, and `percli`'s scaffolding is currently **broken for
 query plugins**: it cannot generate a `LogQuery` at all, omits `#kind`/
-`#selector` from the datasource schema, and pins a Cue module
+`#selector` from the datasource schema, and pins a CUE module
 (`perses/perses/cue`) that does not define `#datasourceSelector`, while the
 shipped plugins use a different one (`perses/shared/cue`). Each of those is a
 silent failure a newcomer loses hours to. The spike documents the fixes.

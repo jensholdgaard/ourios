@@ -286,6 +286,11 @@ dogfood-clean:
 # which colima honours the same way Docker Desktop does) — logs are dropped
 # with a Collector-side export error if `dogfood-server` isn't running, which
 # is the intended failure mode: the viewer stays useful on its own.
+#
+# **macOS-verified; on native Linux the log fan-out needs one extra step** —
+# `host-gateway` there is the docker bridge address, which cannot reach
+# `dogfood-server`'s loopback bind. See the note in `dogfood-config.yaml` for
+# the two remedies. Traces to Jaeger work on every runtime either way.
 # Materialises the compose file + Collector config into gitignored
 # `scratch/observability/` (this recipe is the source of truth; the scratch
 # copy is disposable).

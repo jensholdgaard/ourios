@@ -25,6 +25,21 @@
 # points at, and fans out from there (traces -> Jaeger, logs -> back here).
 # A source that wants no trace viewer can still skip the Collector and point
 # straight at these ports.
+#
+# **The loopback bind constrains the Collector fan-out to Docker runtimes
+# that route `host.docker.internal` through a VM** — macOS (colima, Docker
+# Desktop), where the verification for this setup was done. On **native
+# Linux** `host-gateway` resolves to the docker bridge address, which cannot
+# reach a service bound to `127.0.0.1`, so the fan-out silently drops logs
+# (the Collector logs an export error; traces to Jaeger are unaffected).
+# Deliberately not "fixed" by binding `0.0.0.0`: this receiver runs in RFC
+# 0026 open mode (no auth), so a non-loopback bind would accept telemetry
+# from any reachable peer. On Linux either accept that trade-off knowingly
+# on a trusted network, or give the Collector `network_mode: host` and point
+# the exporter at `127.0.0.1:24317`. The interop test
+# (`crates/ourios-server/tests/it/collector_interop.rs`) binds `0.0.0.0` for
+# this same container->host reason, but it is a sandboxed CI fixture behind
+# TLS + OIDC, not a long-lived local capture.
 storage:
   backend: local
   local:

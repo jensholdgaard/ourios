@@ -153,8 +153,8 @@ GenAI events carry `severity_number: 0`, below `trace`, so every row group
 pruned. Through a dashboard that looks like a broken datasource.
 
 Storing the `0` was never in question — it is what the source sent, and
-`project_otlp-fidelity-paramount`'s preserve/flag/never-correct rule applies.
-What was wrong was the **comparison**. The OTel Logs SDK drops a record on
+RFC 0018's rule governs: the backend is a *faithful witness, not a
+corrector*. What was wrong was the **comparison**. The OTel Logs SDK drops a record on
 `minimum_severity` only when its SeverityNumber "is specified (i.e. not `0`)";
 unspecified records "bypass minimum severity filtering". Ourios did the
 inverse. The data model sanctions the special case explicitly: "Special
@@ -231,10 +231,10 @@ Deliberately empty at `drafted`. See §5.
 
 - [ ] **Is this worth doing now?** The honest framing: this is a client for a
       stable API, not engine work. Nothing in `CLAUDE.md` §2 moves. Competing
-      calls on the same time include RFC 0036's implementation (the remaining
-      storage lever against hazard #4), the RFC 0009 D1/D2 soak cadence, and
-      the agent-observability/FinOps direction. **Answer this before the
-      others.**
+      calls on the same time include the recurring RFC 0009 D1/D2 soak
+      cadence now that the harness has shipped, RFC 0021's phase 2 (gated on
+      upstream DataFusion 55), and the agent-observability/FinOps direction.
+      **Answer this before the others.**
 - [ ] **Which host — Grafana, Perses, or both?** §4 lays out the trade;
       §3.1 gives measured effort for each.
 - [x] **§3.4 severity — RESOLVED (RFC0002.21, PR #641).** Ourios's floor

@@ -387,4 +387,103 @@ mod tests {
             "skipping CooperativeExec re-parents its child to the root, not a phantom parent",
         );
     }
+
+    /// An `ExecutionPlan` whose `metrics()`/`children()` panic if called —
+    /// RFC0040.6's guarantee ("the plan walk does not run" on the unsampled
+    /// path) proven directly: if `record_plan_spans` ever regressed to
+    /// touching the plan before checking `is_sampled()`, this test would
+    /// panic, not merely run slow.
+    #[derive(Debug)]
+    struct PanicsIfTouched {
+        properties: Arc<datafusion::physical_plan::PlanProperties>,
+    }
+
+    impl PanicsIfTouched {
+        fn new() -> Self {
+            use datafusion::arrow::datatypes::Schema;
+            use datafusion::physical_expr::EquivalenceProperties;
+            use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+            use datafusion::physical_plan::{Partitioning, PlanProperties};
+
+            let schema = Arc::new(Schema::empty());
+            let properties = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+            Self { properties }
+        }
+    }
+
+    impl datafusion::physical_plan::DisplayAs for PanicsIfTouched {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "PanicsIfTouched")
+        }
+    }
+
+    impl ExecutionPlan for PanicsIfTouched {
+        fn name(&self) -> &'static str {
+            "PanicsIfTouched"
+        }
+
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            panic!("record_plan_spans must not walk the plan on the unsampled path")
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _task_ctx: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream>
+        {
+            unimplemented!("never executed — this double is metrics()/name()/children() only")
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            panic!("record_plan_spans must not walk the plan on the unsampled path")
+        }
+    }
+
+    /// RFC0040.6 (unit half) — an unsampled parent context means no span is
+    /// emitted and the plan is never touched at all, proven by a plan double
+    /// that panics if `metrics()`/`children()` are called.
+    #[test]
+    fn record_plan_spans_never_touches_the_plan_when_unsampled() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+
+        // An empty `Context` carries no span, so `.span()` resolves to a
+        // placeholder whose `SpanContext` is invalid — `is_sampled()` is
+        // `false`, exactly the "traces off" / unsampled default (§3.6).
+        let unsampled_cx = Context::new();
+        let plan = PanicsIfTouched::new();
+
+        record_plan_spans(&plan, &unsampled_cx, &tracer);
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        assert!(
+            spans.is_empty(),
+            "no span should be emitted on the unsampled path, got {spans:?}"
+        );
+    }
 }

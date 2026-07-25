@@ -19,6 +19,40 @@
 # *after* the server starts with this config.
 #
 # Paths resolve from ${env:OURIOS_DOGFOOD_ROOT}, exported by the recipe.
+#
+# The receiver listens on 24317/24318, not the standard 4317/4318: `just
+# jaeger-up`'s Collector claims those, so that a source pointing at the
+# conventional OTLP port reaches the Collector.
+#
+# That does NOT mean every signal goes through it. `just dogfood-env` — the
+# default — sends **logs straight to these ports** and routes only **traces**
+# to the Collector (which forwards them to Jaeger), via the per-signal
+# `OTEL_EXPORTER_OTLP_{LOGS,TRACES}_ENDPOINT` overrides. Nothing crosses the
+# container->host boundary on that path, so it behaves identically on every
+# Docker runtime. Sending everything to the Collector and letting it fan logs
+# back here is the *single-endpoint variant*, for sources that cannot set
+# per-signal vars — see the runtime caveat below.
+#
+# **The Collector's log fan-out depends on the Docker runtime.** It reaches
+# this receiver via `host.docker.internal`, which routes through a VM on
+# macOS (colima, Docker Desktop) — where this setup was verified — and so
+# reaches the loopback bind. On **native Linux** `host-gateway` resolves to
+# the docker bridge address, which cannot reach `127.0.0.1`, and the fan-out
+# drops logs (the Collector logs an export error; traces to Jaeger are
+# unaffected). The bind stays loopback regardless: this receiver runs in RFC
+# 0026 open mode (no auth), so a non-loopback bind accepts telemetry from any
+# peer that can reach it.
+#
+# The portable answer needs no container->host networking at all — send each
+# signal to the process that owns it, via the per-signal endpoint overrides
+# (`just dogfood-env` prints this variant):
+#
+#   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318    # straight here
+#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318   # Collector -> Jaeger
+#
+# The interop test (`crates/ourios-server/tests/it/collector_interop.rs`)
+# does bind `0.0.0.0` for the same container->host reason, but it is a
+# sandboxed CI fixture behind TLS + OIDC, not a long-lived open capture.
 storage:
   backend: local
   local:
@@ -30,8 +64,8 @@ storage:
       - decision
 receiver:
   enabled: true
-  grpc_addr: "127.0.0.1:4317"
-  http_addr: "127.0.0.1:4318"
+  grpc_addr: "127.0.0.1:24317"
+  http_addr: "127.0.0.1:24318"
   wal_root: ${env:OURIOS_DOGFOOD_ROOT}/wal
 querier:
   enabled: true

@@ -3329,6 +3329,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ourios-df-otel"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "datafusion",
+ "opentelemetry",
+ "opentelemetry_sdk",
+]
+
+[[package]]
 name = "ourios-ingester"
 version = "0.4.0"
 dependencies = [

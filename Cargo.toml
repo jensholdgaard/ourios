@@ -4,6 +4,7 @@ members = [
     "crates/ourios-bench",
     "crates/ourios-config",
     "crates/ourios-core",
+    "crates/ourios-df-otel",
     "crates/ourios-ingester",
     "crates/ourios-miner",
     "crates/ourios-parquet",

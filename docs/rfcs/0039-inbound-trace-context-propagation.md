@@ -39,9 +39,21 @@ in the traces signal: correlation-within-Ourios works (RFC 0038), but
 correlation-across-the-boundary does not.
 
 This is deliberately a small, bounded change at the ingress layer. It touches
-the traces pillar (hence an RFC), but it adds no new spans, no new attributes of
-consequence, and no on-disk change — it only sets the *parent* of spans that
-already exist.
+the traces pillar (hence an RFC), and for the ingest and query arms it adds no
+new spans, no new attributes of consequence, and no on-disk change — it only
+sets the *parent* of spans that already exist.
+
+> **Amendment (slice 3).** The paragraph above originally promised "no new
+> spans" for *every* arm. That does not survive contact with the MCP arm: the
+> only spans `/mcp` had were the `execute_tool <tool>` spans, which are
+> `INTERNAL` — a kind the spec defines as an operation "as opposed to an
+> operations with **remote parents** or children". Parenting them straight to
+> the caller, as §7 originally deferred, would contradict their own kind, and MCP
+> `tools/call` is JSON-RPC over HTTP, where both conventions require the inbound
+> server span's kind to be `SERVER`. So the MCP arm adds **one** span — a
+> `SERVER` span for the inbound `/mcp` request — with the tool spans nesting
+> locally beneath it. No on-disk change; §3.3 bullet D and §3.5 carry the
+> details, and this closes §7's second open question.
 
 ## 3. Proposed design
 
@@ -63,10 +75,11 @@ propagation is out of scope (§7).
 
 ### 3.2 The ingress map
 
-**Four** ingress categories open a span on the request path — six span-producing
-functions in all, since the MCP category is three tool functions. The count is
-stated so test coverage (RFC0039.1/.3/.6) omits no site. The carrier — where the
-incoming `traceparent` lives — is not always co-located with the span:
+**Four** ingress categories open a span on the request path — seven
+span-producing functions in all, since the MCP category is three tool functions
+plus the `/mcp` server span slice 3 adds (§3.3 bullet D). The count is stated so
+test coverage (RFC0039.1/.3/.6) omits no site. The carrier — where the incoming
+`traceparent` lives — is not always co-located with the span:
 
 Sites are named by file and function, deliberately without line numbers — those
 rot on every touch of the surrounding code and have already been corrected twice
@@ -77,7 +90,8 @@ in review.
 | A | `ingest logs` (gRPC) | span in `IngestPipeline::ingest_bound` (`pipeline.rs`); entry `LogsReceiver::export` (`grpc.rs`) | tonic `MetadataMap`, on the request in `export` itself (§3.4) |
 | B | `ingest logs` (HTTP) | span in `ingest_bound`; entry `handle_logs` (`http.rs`) | axum `HeaderMap`, a `handle_logs` extractor |
 | C | `POST /v1/query` | `handle_query_traced`, behind the `handle_query` wrapper (`querier.rs`) | axum `HeaderMap`, a `handle_query` extractor |
-| D | `execute_tool <tool>` (×3) | the three `_traced` fns (`mcp.rs`), each via a thin `#[tool]` delegate | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` reads) |
+| D1 | `{method} /mcp` (`SERVER`) | `mcp_server_span_traced`, behind the `mcp_server_span` layer (`mcp.rs`) | axum `HeaderMap`, in the layer — the remote carrier for the whole MCP category |
+| D2 | `execute_tool <tool>` (×3, `INTERNAL`) | the three `_traced` fns (`mcp.rs`), each via a thin `#[tool]` delegate | *not* the remote carrier: `McpTraceContext` in `parts.extensions`, the D1 span's own context (§3.3 bullet D) |
 
 The mechanism is uniform (§3.3): extract the caller's `opentelemetry::Context`
 and make it the **current** context around the span-producing future, so the
@@ -130,9 +144,22 @@ span-producing future under the extracted context. One contract, every site:
 > and the OTel Demo's own C++ gRPC service does exactly this with a
 > `GrpcServerCarrier` over `client_metadata()`. The cost of the correction is
 > the ~15-line `MetadataExtractor` that §3.4 had hoped to avoid.
-- **MCP (D):** the un-instrumented `#[tool]` delegate extracts `cx` from `ctx`'s
-  forwarded headers and runs `self.<tool>_traced(...).with_context(cx).await`;
-  the `_traced` span inherits `cx` across rmcp's own dispatch spawn.
+- **MCP (D):** two spans, because one cannot honestly do both jobs. A
+  `mcp_server_span` layer, outermost on the `/mcp` router so it also covers an
+  auth rejection, extracts the caller's `cx` from the request headers and opens a
+  **`SERVER`** span under it (D1) — named `{method} /mcp` via `otel.name`, since
+  `/mcp` serves POST, GET and DELETE and the macro's static `name` cannot vary.
+  That span then publishes **its own** context as `McpTraceContext` in the
+  request extensions, and each un-instrumented `#[tool]` delegate reads it back
+  and runs `self.<tool>_traced(...).with_context(parent).await` (D2).
+
+  Two details are load-bearing. The delegates attach the **server span's**
+  context, *not* the extracted remote one: that is what makes the tool spans
+  children of a local span, keeping them legitimately `INTERNAL`. And the channel
+  is the request extensions rather than ambient context, because rmcp dispatches
+  the tool on a `tokio::spawn`ed task — verified, not assumed: with the hand-off
+  removed the tool span lands in a freshly minted trace. The extensions are known
+  to survive that hop because `AuthBinding` already travels the same route.
 
 This is the same discipline RFC 0038.3 uses to carry work across `tokio::spawn`,
 applied here to the parent context — and it is one uniform contract, resolving
@@ -165,12 +192,25 @@ dependency of `ourios-ingester`/`ourios-server` today only with the
 **`metrics`** feature. This RFC adds the **`trace`** feature to that existing
 dependency in both crates. The propagator *install*
 (`opentelemetry_sdk::propagation::TraceContextPropagator`, §3.1) stays in
-`ourios-telemetry`, which already depends on `opentelemetry_sdk`; and because the
-parenting is via the current-context bridge the `tracing-opentelemetry` layer
-already provides (not a `set_parent` call), **`tracing-opentelemetry` is not
-needed in the ingress crates at all**. So the whole production-surface cost is
-one added feature flag on a crate already depended on — smaller than a
-`set_parent` design would have required.
+`ourios-telemetry`, which already depends on `opentelemetry_sdk`.
+
+For the ingest and query arms that is the whole production-surface cost — one
+added feature flag on a crate already depended on — because the parenting rides
+the current-context bridge the `tracing-opentelemetry` layer already provides,
+with no `set_parent` call.
+
+> **Amendment (slice 3).** This section originally concluded that
+> "`tracing-opentelemetry` is not needed in the ingress crates at all". True of
+> the ingest and query arms; not of MCP. The `/mcp` SERVER span must hand *its
+> own* context to the tool handlers across rmcp's dispatch spawn (§3.3 bullet D),
+> and reading a tracing span's OTel context requires
+> `OpenTelemetrySpanExt::context()`. So `ourios-server` gains
+> `tracing-opentelemetry` as a production dependency — at the same 0.33 pin
+> `ourios-telemetry` already uses, so no new version enters the tree. The
+> alternative was building the `/mcp` span through the raw OTel API, which hands
+> back a `Context` directly and needs no new dependency, but would have made it
+> the one Ourios span that is not a `tracing` span (no log correlation, and a
+> pattern break — `CLAUDE.md` §5.4).
 
 ### 3.6 Sampling interplay
 
@@ -265,12 +305,17 @@ a tonic-metadata extractor is later needed, revisit.
 > **Then** extraction yields an empty context, the span becomes a fresh root
 > (as RFC0039.2), and no panic or request error occurs.
 
-> **Scenario RFC0039.6 — the MCP tool span joins the caller's trace.**
-> **Given** an MCP `tools/call` over `/mcp` carrying `traceparent` for trace `T`,
+> **Scenario RFC0039.6 — the MCP tool call joins the caller's trace, correctly
+> shaped.**
+> **Given** an MCP `tools/call` over `/mcp` carrying `traceparent` for trace `T`
+> span `S`,
 > **When** the tool executes,
-> **Then** the `execute_tool <tool>` span resolves to `trace_id == T`, parented
-> to the caller — so an agent driving Ourios's tools sees the tool execution
-> inside its own trace.
+> **Then** a `{method} /mcp` span of kind **`SERVER`** resolves to
+> `trace_id == T` with parent span id `== S`; **and** the `execute_tool <tool>`
+> span resolves to `trace_id == T` with its parent being that **local** server
+> span — retaining kind `INTERNAL`, which the spec reserves for operations
+> without remote parents. So an agent driving Ourios's tools sees the whole
+> exchange inside its own trace, without either span misrepresenting its kind.
 
 ## 6. Testing strategy
 
@@ -282,10 +327,18 @@ Mapped to `CLAUDE.md` §6.2:
   MCP arm) an MCP `tools/call`, each with an injected `traceparent` header, then
   assert `SpanData.span_context.trace_id()` / `.parent_span_id()`. The
   no-context and malformed-context cases assert a fresh, valid root and no error.
-- **RFC0039.3** — extends the RFC0038.3 spawn-boundary harness
-  (`rfc0038_3_spawn_boundary.rs`, global tracer): call `LogsReceiver::export`
-  directly with a `traceparent` in the request metadata/headers and assert the
-  `ingest logs` + `commit wal` spans carry the injected `trace_id`.
+- **RFC0039.3** — `rfc0039_3_ingest_propagation.rs` (its own global-tracer
+  binary, per RFC0028.2): call `LogsReceiver::export` and the HTTP router
+  directly with a `traceparent`, and assert the `ingest logs` + `commit wal`
+  spans carry the injected `trace_id`. It gets a binary of its own rather than
+  extending `rfc0038_3_spawn_boundary.rs` — a process holds one tracer install,
+  and that file owns the no-inbound-context case, so extending it would have
+  meant editing a passing test's assertions (`CLAUDE.md` §6.2).
+- **RFC0039.6** — `rfc0039_6_mcp_propagation.rs` (likewise its own binary):
+  handshake **without** a `traceparent`, then one `tools/call` **with** one, so a
+  single run covers both the propagated and the root case. Asserts the `SERVER`
+  kind and remote parent of the `/mcp` span, and that the `execute_tool` span is
+  `INTERNAL` with that server span as its *local* parent.
 - **RFC0039.4** — a sampler test: with `OTEL_TRACES_SAMPLER=parentbased_always_on`
   (default), inject `-00` vs `-01` traceparents and assert exported-span presence.
   The parent-based resolution itself is upstream SDK behaviour; the test covers
@@ -302,11 +355,17 @@ Mapped to `CLAUDE.md` §6.2:
       reverted. Site A's carrier is the tonic `MetadataMap`, read in `export`
       (§3.4 amendment); no request extension and no `ingest_bound` signature
       change are involved.
-- [ ] MCP tool spans are `otel.kind = "internal"` and lack an enclosing Ourios
-      SERVER span for `/mcp` (rmcp's `serve_inner` is muted by the `rmcp=off`
-      loop-guard, RFC0038.7). An INTERNAL span continuing a *remote* parent is
-      valid but slightly unusual — is a dedicated `/mcp` SERVER span warranted
-      instead? Deferred; RFC0039.6 parents the INTERNAL span directly for now.
+- [x] **Resolved (slice 3): yes, the dedicated `/mcp` SERVER span is warranted —
+      and required.** This question framed an INTERNAL span with a remote parent
+      as "valid but slightly unusual". It is not valid: the tracing API defines
+      `INTERNAL` as an operation "as opposed to an operations with **remote
+      parents** or children", and the concepts doc as one that "does not cross a
+      process boundary". Meanwhile `tools/call` is JSON-RPC over HTTP, and both
+      the RPC and HTTP conventions state the inbound server span's kind **MUST**
+      be `SERVER`. So `/mcp` gains a SERVER span (§3.3 bullet D), the tool spans
+      nest locally under it, and both kinds stay honest. Consequences recorded as
+      amendments in §2 (the "no new spans" promise) and §3.5 (the
+      `tracing-opentelemetry` dependency).
 - [ ] `tracestate` and `baggage`: `tracestate` rides along with `TraceContext`
       automatically; `baggage` propagation is explicitly out of scope here.
 - [ ] Response-side **injection** (Ourios as a client to object storage / a

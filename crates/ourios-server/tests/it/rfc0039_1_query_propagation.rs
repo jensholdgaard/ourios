@@ -4,9 +4,16 @@
 //!
 //! Uses the same scoped-`WithSubscriber` harness as
 //! `rfc0038_1_request_spans.rs` (no process-global tracer, so it stays in the
-//! consolidated `it` binary). The propagator is passed explicitly rather than
-//! relying on the global one that `ourios_telemetry::init` installs: these tests
-//! must not depend on another test having initialised telemetry first.
+//! consolidated `it` binary).
+//!
+//! The **propagator**, unlike the tracer, has to be the process-global one:
+//! `extract_context` (the code under test) resolves through
+//! `global::get_text_map_propagator`, so these tests install it themselves —
+//! once, via [`install_propagator`] — rather than depending on
+//! `ourios_telemetry::init` having run in some sibling test. The one exception is
+//! [`caller_traceparent_names_the_expected_remote_span`], which builds a
+//! `TraceContextPropagator` directly because it is checking the carrier's
+//! meaning, not the handler's wiring.
 
 use axum::body::Body;
 use axum::http::{Request, header};

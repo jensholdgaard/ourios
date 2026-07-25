@@ -194,4 +194,26 @@ mod tests {
             );
         }
     }
+
+    /// The gRPC carrier rejects a malformed `traceparent` the same way the
+    /// `HeaderMap` one does (RFC0039.5, gRPC arm). Worth asserting separately:
+    /// the two carriers reach the propagator through different `Extractor`
+    /// impls, so a carrier-specific parsing difference would otherwise let a
+    /// bogus parent through on one transport only.
+    #[test]
+    fn malformed_traceparent_in_grpc_metadata_is_treated_as_absent() {
+        use opentelemetry::propagation::TextMapPropagator as _;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use tonic::metadata::MetadataMap;
+
+        for bad in ["not-a-traceparent", "00-tooshort-00f067aa0ba902b7-01", ""] {
+            let mut metadata = MetadataMap::new();
+            metadata.insert("traceparent", bad.parse().expect("valid metadata value"));
+            let cx = TraceContextPropagator::new().extract(&super::MetadataExtractor(&metadata));
+            assert!(
+                !cx.span().span_context().is_valid(),
+                "malformed traceparent {bad:?} must not yield a parent over gRPC",
+            );
+        }
+    }
 }

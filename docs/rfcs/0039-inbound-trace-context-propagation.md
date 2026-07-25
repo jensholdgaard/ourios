@@ -68,12 +68,16 @@ functions in all, since the MCP category is three tool functions. The count is
 stated so test coverage (RFC0039.1/.3/.6) omits no site. The carrier — where the
 incoming `traceparent` lives — is not always co-located with the span:
 
-| # | Span | Site (file:line) | Carrier & where it is reachable |
+Sites are named by file and function, deliberately without line numbers — those
+rot on every touch of the surrounding code and have already been corrected twice
+in review.
+
+| # | Span | Site | Carrier & where it is reachable |
 |---|---|---|---|
-| A | `ingest logs` (gRPC) | span in `ingest_bound` (`pipeline.rs:291`); entry `LogsReceiver::export` (`grpc.rs:152`) | tonic `MetadataMap`, on the request in `export` itself (§3.4) |
-| B | `ingest logs` (HTTP) | span in `ingest_bound`; entry `handle_logs` (`http.rs:95`) | axum `HeaderMap` (`http.rs:95`) |
-| C | `POST /v1/query` | `handle_query` (`querier.rs:421`) | axum `HeaderMap` (`querier.rs:423`) |
-| D | `execute_tool <tool>` (×3) | the three `_traced` fns (`mcp.rs:333/416/488`), each via a thin `#[tool]` delegate | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` reads, `mcp.rs:223`) |
+| A | `ingest logs` (gRPC) | span in `IngestPipeline::ingest_bound` (`pipeline.rs`); entry `LogsReceiver::export` (`grpc.rs`) | tonic `MetadataMap`, on the request in `export` itself (§3.4) |
+| B | `ingest logs` (HTTP) | span in `ingest_bound`; entry `handle_logs` (`http.rs`) | axum `HeaderMap`, a `handle_logs` extractor |
+| C | `POST /v1/query` | `handle_query_traced`, behind the `handle_query` wrapper (`querier.rs`) | axum `HeaderMap`, a `handle_query` extractor |
+| D | `execute_tool <tool>` (×3) | the three `_traced` fns (`mcp.rs`), each via a thin `#[tool]` delegate | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` reads) |
 
 The mechanism is uniform (§3.3): extract the caller's `opentelemetry::Context`
 and make it the **current** context around the span-producing future, so the
@@ -91,10 +95,12 @@ span is built; `tracing-opentelemetry` then parents a root span to
 `opentelemetry::trace::FutureExt::with_context(future, cx)` — run the
 span-producing future under the extracted context. One contract, every site:
 
-- **Query (C) and HTTP ingest (B):** a tower `PropagationLayer` on the axum
-  router extracts `cx` from the request `HeaderMap` and runs the downstream as
-  `next.run(req).with_context(cx)`. `handle_query`'s root span inherits `cx`; the
-  handler is unchanged.
+- **Query (C):** an un-instrumented `handle_query` wrapper extracts `cx` from the
+  request `HeaderMap` and awaits the instrumented `handle_query_traced` under it
+  — `handle_query_traced(..).with_context(cx).await`. No tower layer: an earlier
+  revision of this bullet proposed a shared `PropagationLayer`, but neither ingest
+  arm can use one (their span is born past a `tokio::spawn`, below), which would
+  leave the query arm as its sole beneficiary — see §4.
 - **gRPC ingest (A):** extraction happens in `LogsService::export` itself, from
   the request's tonic `MetadataMap` (§3.4) — *not* in the tower auth layer, as
   an earlier revision of this section proposed. Extraction belongs with the
@@ -104,7 +110,7 @@ span-producing future under the extracted context. One contract, every site:
   layer-extracted context would leave the extraction itself uncovered. See the
   amendment note below.
 - **The `tokio::spawn` boundary (A/B):** the `ingest logs` span is born inside
-  `ingest_bound`, *after* the spawn (`grpc.rs:167`, `http.rs:146`), which
+  `ingest_bound`, *after* the spawn in `export` / `handle_logs`, which
   ambient context does not cross. So the handler extracts `cx` from its own
   carrier before the spawn, moves it into the spawned closure, and attaches it
   to the **whole** spawned block — `async move { ingest_bound(...).await

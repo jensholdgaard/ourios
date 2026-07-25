@@ -113,7 +113,7 @@ release version:
     # failure this regeneration exists to prevent. Read the pin out of the
     # workflow rather than duplicating it, so the two cannot drift apart.
     command -v cargo-about >/dev/null || { echo "error: cargo-about not installed (cargo install cargo-about)"; exit 1; }
-    about_pin="$(sed -nE 's/.*tool: cargo-about@([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' .github/workflows/licenses.yml | head -1)"
+    about_pin="$(sed -nE '/tool: cargo-about@/{s/.*cargo-about@([0-9]+\.[0-9]+\.[0-9]+).*/\1/p;q;}' .github/workflows/licenses.yml)"
     [ -n "$about_pin" ] || { echo "error: could not read the cargo-about pin from .github/workflows/licenses.yml"; exit 1; }
     about_have="$(cargo about --version 2>/dev/null | awk '{print $2}')"
     [ "$about_have" = "$about_pin" ] || { echo "error: cargo-about $about_have is installed but CI pins $about_pin; the attribution would not be byte-identical. Run: cargo install cargo-about --version $about_pin --locked"; exit 1; }

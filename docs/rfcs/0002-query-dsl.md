@@ -435,6 +435,39 @@ surface? Perses+OTel query conventions?) are folded into §9.
     `count`/aggregate queries continue to reject a trailing `limit`
     (group-limiting is still unimplemented).
 
+> **§6.1 amendment (2026-07-25) — unspecified severity in ordering
+> comparisons.** `SeverityNumber = 0` is the OTel logs data model's
+> *unspecified* severity, and real sources emit it (Claude Code's GenAI
+> events, ETW `LOG_ALWAYS`, Google Cloud `DEFAULT`). Ourios previously
+> compiled `severity` ordering to a bare numeric comparison, so a
+> minimum-severity floor such as `severity >= trace` **excluded** those
+> records — the inverse of the OTel Logs SDK, whose `minimum_severity` drops a
+> record only when its SeverityNumber "is specified (i.e. not 0)", leaving
+> unspecified records to "bypass minimum severity filtering". The data model
+> sanctions the special case directly: "Special handling MAY be given to
+> `SeverityNumber=0` when it is used to represent an unspecified severity" in
+> less-than / greater-than comparisons. Being the inverse of the reference SDK
+> is not defensible for a backend that presents itself as OTLP-native, so the
+> floor semantics change to match. RFC0002.21 pins the result.
+
+- **RFC0002.21 — unspecified severity bypasses a minimum-severity floor `[§6.1 amendment]`**
+  - **Given** rows whose `severity_number` is `0` (unspecified) alongside
+    rows with specified severities
+  - **When** a floor (`>=` / `>`) is applied with a threshold above `0`
+  - **Then** the unspecified rows **match** — aligning with the OTel Logs
+    SDK's `minimum_severity`, which unspecified records bypass
+  - **And** a ceiling (`<` / `<=`) with a threshold above `0` **excludes**
+    them, so a predicate and its negation still partition the rows (without
+    this, `0 < 17` would make an unspecified row match both `>= error` and
+    `< error`)
+  - **And** an explicit threshold of `0` keeps ordinary numeric semantics, so
+    `severity > 0` still means "has a specified severity" rather than matching
+    rows that have none
+  - **And** the rule is compiled into the predicate rather than applied after
+    the scan, so a row group whose severity range is entirely `0` is **not
+    pruned** by a floor — a post-filter would leave the old min/max pruning in
+    place and silently skip whole files of unspecified rows
+
 ## 6. Design
 
 ### 6.1 Predicate sublanguage (Branch B)

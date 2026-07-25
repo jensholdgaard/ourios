@@ -327,7 +327,12 @@ mod umbrella {
         let mut probes = vec![
             (
                 "severity >= 17".to_string(),
-                Box::new(|r: &MinedRecord| r.severity_number >= 17)
+                // RFC0002.21: a minimum-severity floor also admits rows whose
+                // severity is *unspecified* (0), matching the OTel Logs SDK's
+                // `minimum_severity`. Adversarial mode generates such rows, so
+                // the oracle must encode the amended contract or it asserts
+                // the pre-amendment semantics.
+                Box::new(|r: &MinedRecord| r.severity_number == 0 || r.severity_number >= 17)
                     as Box<dyn Fn(&MinedRecord) -> bool>,
             ),
             (

@@ -38,9 +38,14 @@ run_url="${GITHUB_SERVER_URL:-https://github.com}/${repo}/actions/runs/${GITHUB_
 # The open tracking issue for this signature, if any. Scanned locally rather
 # than with `--search`: the search index lags issue creation by seconds to
 # minutes, which is exactly the window two consecutive canary runs land in.
+#
+# The limit is set far above the two issues this label should ever hold at once
+# (one per signal) rather than at a tight bound: if the scan were ever truncated
+# it would silently miss the marker and file a duplicate, which is the one
+# failure mode this function exists to prevent.
 existing="$(
     gh issue list --repo "$repo" --label "$label" --state open \
-        --limit 100 --json number,body |
+        --limit 1000 --json number,body |
         jq -r --arg marker "$marker" \
             '[.[] | select(.body != null and (.body | contains($marker)))] | .[0].number // empty'
 )"

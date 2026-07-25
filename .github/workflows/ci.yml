@@ -577,9 +577,24 @@ jobs:
   hygiene-report:
     name: hygiene canary report
     needs: [clippy, deny]
+    # `github.ref` is checked, not just the event: a `workflow_dispatch` can
+    # target any branch, and a reporter running there would file an issue whose
+    # body claims `main` is broken on the strength of a feature branch's clippy
+    # result. The tracking issue describes `main`, so only `main` may file it.
+    #
+    # That ref check also closes the one path where two reporters could race the
+    # dedupe. The workflow-level `concurrency` group above keys on
+    # `github.ref`, so same-ref runs already queue rather than overlap
+    # (`cancel-in-progress` is false on `main`) — but two *different* refs would
+    # not have. The job-level group below is belt-and-braces, so a future change
+    # to the workflow-level key cannot silently reopen the race.
+    concurrency:
+      group: ci-hygiene-issue-reporter
+      cancel-in-progress: false
     if: >-
       always()
       && github.repository == 'jensholdgaard/ourios'
+      && github.ref == 'refs/heads/main'
       && vars.CI_HYGIENE_ISSUES != 'false'
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest

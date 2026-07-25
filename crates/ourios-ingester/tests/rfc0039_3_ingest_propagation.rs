@@ -12,10 +12,13 @@
 //! and the `commit wal` child minted under it, land in the *caller's* trace
 //! rather than a fresh one.
 //!
-//! The two arms carry **different** traces so a single exporter can hold both
-//! and each span still be attributed unambiguously.
-//! `rfc0038_3_spawn_boundary.rs` covers this same boundary with no inbound
-//! context (the root case, RFC0039.2) and is deliberately left untouched.
+//! The two propagated arms carry **different** traces so a single exporter can
+//! hold both and each span still be attributed unambiguously. A third arm sends
+//! no `traceparent` at all and asserts that batch is a fresh, valid root —
+//! RFC0039.2 for the ingest path, which propagation must leave exactly as it
+//! was. `rfc0038_3_spawn_boundary.rs` also exercises the untraced path, but
+//! asserts only that the spans survive the spawn, not their parentage; it is
+//! deliberately left untouched.
 
 #[path = "it/ingest_support/mod.rs"]
 mod ingest_support;
@@ -138,9 +141,52 @@ async fn rfc0039_3_extracted_context_survives_the_ingest_spawn() {
         response.status(),
     );
 
+    // --- Arm C (RFC0039.2, ingest): no traceparent at all. ---
+    let root_tmp = tempfile::tempdir().expect("temp");
+    LogsReceiver::new(shared_wal_pipeline(root_tmp.path()))
+        .export(tonic::Request::new(request(vec![resource_logs(
+            "billing",
+            &["delta"],
+        )])))
+        .await
+        .expect("export acks");
+
     provider.force_flush().expect("spans flush");
     let spans = exporter.get_finished_spans().expect("spans exported");
 
     assert_batch_joined_caller_trace(&spans, GRPC_TRACE, GRPC_SPAN, "gRPC");
     assert_batch_joined_caller_trace(&spans, HTTP_TRACE, HTTP_SPAN, "HTTP");
+
+    // The untraced batch is a fresh, valid root — the pre-RFC behaviour, which
+    // propagation must leave alone (RFC0039.2). Asserted explicitly rather than
+    // inferred from "no traceparent was sent": a bug that invented a parent, or
+    // one that dropped the trace id, would look identical from the outside.
+    let rooted: Vec<_> = spans
+        .iter()
+        .filter(|s| {
+            s.name.as_ref() == "ingest logs" && {
+                let trace = s.span_context.trace_id().to_string();
+                trace != GRPC_TRACE && trace != HTTP_TRACE
+            }
+        })
+        .collect();
+    assert_eq!(
+        rooted.len(),
+        1,
+        "one `ingest logs` span outside both callers' traces, got {:?}",
+        spans
+            .iter()
+            .map(|s| (s.name.clone(), s.span_context.trace_id().to_string()))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        rooted[0].parent_span_id,
+        opentelemetry::trace::SpanId::INVALID,
+        "a batch with no inbound context has no parent",
+    );
+    assert_ne!(
+        rooted[0].span_context.trace_id(),
+        opentelemetry::trace::TraceId::INVALID,
+        "and still gets a real trace id of its own",
+    );
 }

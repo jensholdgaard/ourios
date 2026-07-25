@@ -2,6 +2,84 @@
 
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · SemVer.
+## [0.5.0] - 2026-07-25
+
+### Added
+
+- Wire ourios-df-otel at the scan_stats call sites (RFC 0040 slice 3) (#634) (dc7eab8)
+- Register datafusion.operator.* attributes (RFC 0040 slice 2) (#633) (e7b0617)
+- Post-hoc ExecutionPlan -> OTel operator span crate (RFC 0040 slice 1) (#632) (f14e2cc)
+- Give /mcp a SERVER span that continues the caller's trace (RFC 0039 slice 3) (#629) (e73b810)
+- Continue the caller's trace across the ingest spawn (RFC 0039 slice 2) (#628) (e5b9e6e)
+- Continue the caller's trace on the query span (RFC 0039 slice 1) (#627) (8b4edd7)
+- Standard HTTP + tenant attributes on the query span (§3.5) (#625) (f4da161)
+- Canonical gen_ai.*/mcp.* attributes on MCP tool spans (RFC0038.7) (#623) (ada046b)
+- **BREAKING** Per-signal disable via universal OTEL_*_EXPORTER env vars (closes #618) (#621) (a214f5e)
+- **BREAKING** Metric export interval via OTEL_METRIC_EXPORT_INTERVAL (part of #618) (#620) (577b8ff)
+- **BREAKING** Configure traces via universal OTel env vars (RFC 0038 slice 4 → green) (#619) (abc60a2)
+- Align span names to OTel idiom + query/sweep span tests (RFC 0038 slice 3) (#616) (0b1cac4)
+- Request-scoped spans on ingest, query, mcp, sweep (RFC 0038 slice 2) (#615) (7332fd3)
+- Tracer foundation for self-tracing (RFC 0038 slice 1) (#614) (d431653)
+- Sum/min/max/avg scalar aggregation (RFC0002.17-.20) (#609) (702477a)
+- Group count by a promoted attribute column (RFC 0037 §3.3) (#601) (3b474d1)
+- Observe structured-body size via a histogram (RFC 0037 §3.2) (#600) (be6cbb0)
+- Key structured templates on event_name (RFC 0037 §3.1) (#599) (109933a)
+- Rfc0036 adaptive compacted row-group threshold (target-K) (#595) (6a4655f)
+- Rfc 0036 real-corpus window-materialization before/after (§9.29) (#594) (e52ace7)
+- Rfc0036 §7 compacted-threshold tunable seam + sweep (#592) (09cdbb7)
+- Rfc 0036 green — window-materialization scanned-count bound (.2) (#590) (5e5aa66)
+- Rfc 0036 sorted compaction — run spill + capped k-way merge (.1/.4) (#587) (8329469)
+
+### CI
+
+- Nightly hygiene canary for clippy + advisory drift (#631) (47f6565)
+
+### Changed
+
+- Extract the trace-viewing stack to dev/observability/ (#638) (cbf497c)
+- Make the Collector the single OTLP front door (#637) (22ebb05)
+
+### Chore
+
+- Add jaeger-up/jaeger-down/jaeger-env for local trace viewing (#635) (07214fa)
+- Promote GenAI attributes in dogfood for native count-by aggregation (#608) (5dd9b93)
+- Enable Ourios MCP in dogfood so a source can query its own telemetry (#606) (c411840)
+- Just recipes to dogfood OTLP telemetry into a local server (#605) (b1d0fc8)
+- Third-party license attribution via cargo-about (#596) (8458bfc)
+
+### Documentation
+
+- Specify RFC 0039 (inbound trace propagation) + 0040 (DataFusion operators) (#626) (66336eb)
+- RFC 0038 — self-tracing (specified) (#613) (60f33bb)
+- Add 'Observe your coding agent' — the telemetry → MCP loop (#612) (c711799)
+- Brand on workload fit, not on being better than others (#611) (de863a3)
+- Show the Ourios brand mark at the top (#610) (a60390d)
+- RFC 0037 → green — all five §5 scenarios pass (#602) (fcea44a)
+- Specify RFC 0037 — GenAI / structured-event log handling (#598) (a117d59)
+- Adopt DCO sign-off + enforcing CI gate (#597) (028d369)
+- Accept RFC 0031/0034/0036 + correct the §9.28 row-cap finding (#593) (d3b4324)
+- Validate — in-repo before/after (1.43×) + baseline no-regression (§9.26/§9.27) (#591) (b402ce5)
+- Roadmap to 2026-07-21 (rfc 0034-0036) + rfc 0031 validated (#585) (e4112e2)
+- RFC 0036 — write-side layout: compacted clustering + row-group sizing (#584) (5f5af1b)
+- §9.24 — authoritative comparative rerun, all frozen gates pass (#583) (cc8e3dd)
+- Adopt the e2 mark — sail + mirrored log-line wind (favicon, landing page) (#582) (380661c)
+
+### Fixed
+
+- Let the MCP query_logs tool run count aggregations (#607) (e7d941f)
+- Lenient shim strips null-valued AnyValue fields (upstream #3603 case) (#604) (e8d26e8)
+- Byte-scale bucket boundaries for structured-body-size histogram (#603) (743b6cc)
+- Quiesce in-flight sweep publishes before stamping the high-water (#578) (#581) (9deecb1)
+
+### Tests
+
+- RFC0040.6 unsampled-path guard + flip RFC 0040 to green (#636) (84c8a42)
+- Assert the caller's sampling decision governs (RFC 0039 slice 4) (#630) (7e89677)
+- Global-tracer span tests for RFC0038.1 MCP arm + RFC0038.3 (#617) (59f718c)
+- Rfc 0036 green — no read-path or schema regression (.5) (#589) (b5def9b)
+- Rfc 0036 green — compaction properties preserved (.3) (#588) (02de0fe)
+- Red — all five §5 stubs land, status specified→red (#586) (d99e5fd)
+
 ## [0.4.0] - 2026-07-21
 
 ### Added

@@ -90,7 +90,15 @@ fn unsampled_walk(c: &mut Criterion) {
 
     c.bench_function("record_plan_spans/unsampled", |b| {
         b.iter(|| {
-            ourios_df_otel::record_plan_spans(black_box(&plan), &unsampled_cx, &tracer);
+            // Every argument goes through `black_box`, the context especially:
+            // without it the optimizer can constant-fold `is_sampled()` to
+            // `false`, prove the body unreachable, and elide the call — leaving
+            // the bench measuring an empty loop rather than the guard.
+            ourios_df_otel::record_plan_spans(
+                black_box(&plan),
+                black_box(&unsampled_cx),
+                black_box(&tracer),
+            );
         });
     });
 }

@@ -19,7 +19,7 @@ superseded-by: —
 > the crate level against a real `CooperativeExec`), RFC0040.5 (span count
 > tracks plan shape, not row count), RFC0040.6 (zero cost when unsampled — a
 > plan double that panics if touched proves the walk never runs, both as a
-> unit test and a `criterion` bench measuring ~250 ps/call). Landed across four
+> unit test and a `criterion` bench measuring ~530 ps/call). Landed across four
 > slices: `ourios-df-otel` crate (#632), the `datafusion.operator.*` weaver
 > registry entries (#633), `ourios-querier` wiring + integration tests (#634),
 > and the RFC0040.6 guard (this slice). No thesis-gate applies (this RFC

@@ -9,6 +9,27 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The CI-hygiene canary. Two things here rot without anyone touching the
+  # code: `rust-toolchain.toml` is `channel = "stable"` (unpinned) while
+  # `clippy::pedantic` warnings are errors (CLAUDE.md §6.1), so every ~6-week
+  # Rust release can turn this red; and a new RustSec advisory fails
+  # `cargo deny` the same way. Both otherwise surface as a surprise red check
+  # on whatever unrelated PR comes next.
+  #
+  # The canary is *this* workflow on a timer, not a second workflow: only the
+  # two hermetic jobs (`clippy`, `deny`) run on a `schedule` event, and every
+  # other job carries `if: github.event_name != 'schedule'`. That way the
+  # canary can never drift from what PR CI actually checks — a copied
+  # `cargo clippy` invocation in a separate file inevitably would.
+  #
+  # NEW JOBS: add the `if: github.event_name != 'schedule'` guard unless the
+  # job is hermetic (no containers, no network flakes) and worth canarying.
+  # The scheduled run must stay flake-free, or it files noise.
+  schedule:
+    - cron: "11 5 * * *"
+  # Also a "run the whole suite now" button; unlike `schedule`, a manual
+  # dispatch runs every job.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,6 +42,8 @@ permissions:
 jobs:
   fmt:
     name: cargo fmt
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -44,6 +67,8 @@ jobs:
 
   docs:
     name: cargo doc
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,6 +88,8 @@ jobs:
 
   test:
     name: cargo test
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -108,6 +135,8 @@ jobs:
   # credentials. A required check (in `ci-success`'s `needs`).
   s3-integration:
     name: s3 integration (localstack)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: test
@@ -166,6 +195,8 @@ jobs:
   # `needs`).
   dex-oidc:
     name: dex oidc (testcontainers)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -182,6 +213,8 @@ jobs:
 
   collector-interop:
     name: collector interop (testcontainers)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -208,6 +241,8 @@ jobs:
   # frozen-corpus dispatch runs in, on the dispatch's exact Loki flags.
   loki-interop:
     name: loki interop (testcontainers)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -232,6 +267,8 @@ jobs:
 
   book:
     name: mdbook build
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -251,6 +288,8 @@ jobs:
   # §3.6). A required check (in `ci-success`'s `needs`).
   semconv:
     name: semconv (weaver)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     env:
       WEAVER_VERSION: v0.23.0
@@ -310,6 +349,8 @@ jobs:
   # `needs`).
   live-check:
     name: live-check (weaver)
+    # Not part of the scheduled hygiene canary (see `on:`).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     env:
       WEAVER_VERSION: v0.23.0
@@ -525,6 +566,50 @@ jobs:
   # under llvm-cov instrumentation, duplicating the gating `test` job for a
   # report that is published from main anyway. Keeping it main-only drops
   # that duplicate PR run while preserving the gate and the badge.
+  # Tracking-issue reporter for the scheduled hygiene canary (see `on:`).
+  # Turns "the canary went red overnight" into one deduplicated open issue, and
+  # closes it again on the next green run. Gated to the canary events, so a PR
+  # can never file an issue.
+  #
+  # Kill switch: set the repo variable CI_HYGIENE_ISSUES to `false`. It is
+  # scoped to *this* job deliberately — the canary lives inside CI now, so
+  # disabling the workflow would take PR CI down with it.
+  hygiene-report:
+    name: hygiene canary report
+    needs: [clippy, deny]
+    if: >-
+      always()
+      && github.repository == 'jensholdgaard/ourios'
+      && vars.CI_HYGIENE_ISSUES != 'false'
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      # One tracking issue per signal: a lint break and a new advisory are
+      # different work, and folding them together would close the wrong thing
+      # when only one of them clears. Results ride in via env rather than
+      # `${{ }}` inside the command, so nothing from the context is ever
+      # interpolated into a shell string.
+      - name: Report clippy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESULT: ${{ needs.clippy.result }}
+        run: >-
+          .github/scripts/ci-hygiene-issue.sh clippy "$RESULT"
+          "CI hygiene: cargo clippy is failing on main"
+      - name: Report advisories
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESULT: ${{ needs.deny.result }}
+        run: >-
+          .github/scripts/ci-hygiene-issue.sh deny "$RESULT"
+          "CI hygiene: cargo deny is failing on main"
+
   coverage:
     name: coverage (informational)
     runs-on: ubuntu-latest
@@ -577,7 +662,10 @@ jobs:
     name: CI Success
     runs-on: ubuntu-latest
     needs: [fmt, clippy, docs, test, book, semconv, live-check, deny, s3-integration, dex-oidc, collector-interop, loki-interop]
-    if: always()
+    # Excluded from the canary too: with ten of twelve `needs` skipped it would
+    # report "all required checks passed" off two jobs, which reads as a much
+    # stronger claim than it is. `hygiene-report` is the canary's signal.
+    if: always() && github.event_name != 'schedule'
     steps:
       - name: Verify required checks
         run: |

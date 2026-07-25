@@ -112,10 +112,41 @@ passing `--config` to the binary. The file is the authoritative source of
 Ourios's data-plane configuration (storage, roles, compaction); the `values.yaml`
 settings map onto it. Object-store credentials are **not** written into the file
 — they appear as `${env:OURIOS_S3_*}` references resolved from the `Secret` via
-`envFrom` (see [Credentials](#credentials)). The self-telemetry `OTEL_*` endpoint
+`envFrom` (see [Credentials](#credentials)). The self-telemetry `OTEL_*` settings
 and the AWS SDK region stay plain environment variables — those are read by their
 own SDKs, never modelled in the config (RFC 0020 §3.8). A `checksum/config` pod
 annotation rolls the workloads when the rendered config changes.
+
+## Self-telemetry
+
+Ourios is a telemetry backend, so it is instrumented as one (`CLAUDE.md` §6.3).
+`otel.exporterEndpoint` carries **three** signals, not just metrics:
+
+| Signal | What it carries |
+|---|---|
+| Metrics | the per-subsystem meters — miner counters, ingest/query latency, pruning |
+| Logs | Ourios's own structured logs, bridged to OTLP |
+| Traces | request-scoped spans on ingest, query, `/mcp` and sweep (RFC 0038), continuing an inbound caller's trace (RFC 0039), with a DataFusion operator span tree under a query (RFC 0040) |
+
+Two things worth setting deliberately before running this in anger:
+
+- **Sampling.** The SDK default is `parentbased_always_on`, so *every* request
+  is traced. Spans are request-scoped and never per log record, so the volume
+  tracks request rate rather than ingest rate — but a receiver taking large
+  OTLP batches at a high rate will still produce a lot. Set
+  `otel.traces.sampler: parentbased_traceidratio` with
+  `otel.traces.samplerArg: "0.01"` to trim it. Because it is *parent*-based, a
+  caller that already sampled its trace still gets its Ourios spans — RFC 0039
+  keeps the caller's decision authoritative.
+- **Don't self-export directly.** Pointing `exporterEndpoint` at this same
+  release's receiver is a feedback loop: ingesting a batch emits logs and spans
+  about ingesting it, which are then ingested. Dogfooding is supported and
+  intended — route it through a Collector, and drop or sample Ourios's own
+  telemetry there.
+
+Every knob maps 1:1 onto a standard `OTEL_*` variable; Ourios models no bespoke
+telemetry config. Anything not in the table (per-signal endpoints, headers,
+`OTEL_SDK_DISABLED`, protocol) can be set verbatim through `extraEnv`.
 
 ## Credentials
 
@@ -304,7 +335,12 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `<role>.serviceAccount.create` | `false` | Role-scoped ServiceAccount for `receiver`/`querier`/`compactor` — the least-privilege IAM seam ("Per-role IAM" above). `false` falls back to the shared `serviceAccount`. |
 | `<role>.serviceAccount.annotations` | `{}` | The role's own IRSA `role-arn` (querier read-only, receiver no-delete, compactor sole delete-holder). |
 | `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<fullname>-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
-| `otel.exporterEndpoint` | `""` | OTLP endpoint for Ourios's own self-telemetry. |
+| `otel.exporterEndpoint` | `""` | `OTEL_EXPORTER_OTLP_ENDPOINT` — where Ourios exports **all three** of its own signals (metrics, logs, traces). Per-signal endpoints go in `extraEnv`. |
+| `otel.traces.enabled` | `true` | `false` renders `OTEL_TRACES_EXPORTER=none`. |
+| `otel.traces.sampler` / `.samplerArg` | `""` | `OTEL_TRACES_SAMPLER` / `_ARG`. Empty keeps the SDK default `parentbased_always_on` — **every** served request is sampled; see "Self-telemetry" below. |
+| `otel.metrics.enabled` | `true` | `false` renders `OTEL_METRICS_EXPORTER=none`. |
+| `otel.metrics.exportInterval` | `""` | `OTEL_METRIC_EXPORT_INTERVAL` in ms. Empty = SDK default `60000`. |
+| `otel.logs.enabled` | `true` | `false` renders `OTEL_LOGS_EXPORTER=none`; Ourios's logs stay on stderr. |
 | `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |
 
 The image runs as nonroot (uid 65532) with a read-only root filesystem; the

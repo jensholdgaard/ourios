@@ -178,7 +178,9 @@ compaction:
 
 {{/*
 Env common to every workload. The data-plane config is the mounted --config file
-(RFC 0020); the only env vars are the self-telemetry OTLP endpoint, the AWS SDK
+(RFC 0020); the only env vars are the self-telemetry OTLP settings (endpoint
+plus the per-signal traces/metrics/logs knobs, each a standard OTEL_* name —
+Ourios models no bespoke telemetry config), the AWS SDK
 region (which drives the credential chain for s3), and any extraEnv — OTEL_* /
 AWS_* are read directly by their SDKs, never modeled in the config (RFC 0020
 §3.8). May render empty (the workloads guard the `env:` block). The dedicated
@@ -196,6 +198,30 @@ receiver/querier), so it must be enabled.
 {{- with .Values.otel.exporterEndpoint }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ . | quote }}
+{{- end }}
+{{- if not .Values.otel.traces.enabled }}
+- name: OTEL_TRACES_EXPORTER
+  value: "none"
+{{- end }}
+{{- with .Values.otel.traces.sampler }}
+- name: OTEL_TRACES_SAMPLER
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.otel.traces.samplerArg }}
+- name: OTEL_TRACES_SAMPLER_ARG
+  value: {{ . | quote }}
+{{- end }}
+{{- if not .Values.otel.metrics.enabled }}
+- name: OTEL_METRICS_EXPORTER
+  value: "none"
+{{- end }}
+{{- with .Values.otel.metrics.exportInterval }}
+- name: OTEL_METRIC_EXPORT_INTERVAL
+  value: {{ . | quote }}
+{{- end }}
+{{- if not .Values.otel.logs.enabled }}
+- name: OTEL_LOGS_EXPORTER
+  value: "none"
 {{- end }}
 {{- with .Values.extraEnv }}
 {{- toYaml . }}

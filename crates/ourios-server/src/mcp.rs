@@ -23,8 +23,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use opentelemetry::context::FutureExt as _;
 use ourios_core::tenant::TenantId;
-use ourios_ingester::receiver::{AuthBinding, AuthResolver};
+use ourios_ingester::receiver::{AuthBinding, AuthResolver, extract_context};
 use ourios_parquet::PromotedAttributes;
 use ourios_querier::Querier;
 use ourios_querier::dsl::ir::Stage;
@@ -40,6 +41,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 use rmcp::{ErrorData, tool, tool_handler, tool_router};
 use serde::Deserialize;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::querier::{DEFAULT_LIMIT, LogQueryResponse, MAX_LIMIT, apply_limit};
 
@@ -314,9 +316,14 @@ impl OuriosMcp {
     ) -> Result<CallToolResult, ErrorData> {
         // RFC 0038: the span lives on a private delegate, not here —
         // `#[tracing::instrument]` on a `#[tool]` method drops the doc-comment
-        // tool description the rmcp macro derives (RFC0027.7 / RFC0032.5). The
-        // span is still a child of rmcp's `serve_inner`, one per tool call.
-        self.query_logs_traced(Parameters(args), ctx).await
+        // tool description the rmcp macro derives (RFC0027.7 / RFC0032.5).
+        // RFC0039.6: this un-instrumented delegate is also where the `/mcp`
+        // SERVER span's context is re-attached, since rmcp dispatched us past a
+        // `tokio::spawn` that ambient context does not cross.
+        let parent = mcp_parent_context(&ctx);
+        self.query_logs_traced(Parameters(args), ctx)
+            .with_context(parent)
+            .await
     }
 
     #[tracing::instrument(
@@ -399,7 +406,12 @@ impl OuriosMcp {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         // RFC 0038: span on the private delegate — see `query_logs`.
-        self.list_templates_traced(Parameters(args), ctx).await
+        // RFC0039.6, as in `query_logs`: re-attach the SERVER span's context
+        // across rmcp's dispatch spawn.
+        let parent = mcp_parent_context(&ctx);
+        self.list_templates_traced(Parameters(args), ctx)
+            .with_context(parent)
+            .await
     }
 
     #[tracing::instrument(
@@ -471,7 +483,12 @@ impl OuriosMcp {
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         // RFC 0038: span on the private delegate — see `query_logs`.
-        self.template_drift_traced(Parameters(args), ctx).await
+        // RFC0039.6, as in `query_logs`: re-attach the SERVER span's context
+        // across rmcp's dispatch spawn.
+        let parent = mcp_parent_context(&ctx);
+        self.template_drift_traced(Parameters(args), ctx)
+            .with_context(parent)
+            .await
     }
 
     #[tracing::instrument(
@@ -656,6 +673,83 @@ async fn require_bearer(auth: AuthResolver, mut request: Request<Body>, next: Ne
     next.run(request).await
 }
 
+/// The `/mcp` SERVER span's trace context, carried into the tool handlers.
+///
+/// rmcp dispatches a tool call on a `tokio::spawn`ed task, which ambient
+/// context does not cross, and the request extensions are the one channel that
+/// reaches the handler — rmcp forwards them as `http::request::Parts`, the same
+/// route [`AuthBinding`] already travels. Carrying the SERVER span's context
+/// here is what lets `execute_tool <tool>` nest *locally* under it, which is
+/// what keeps that span honestly `INTERNAL`: the spec defines that kind as an
+/// operation "as opposed to an operations \[sic] with remote parents or
+/// children" (quoted verbatim; the grammar slip is upstream's), so parenting it
+/// straight to the remote caller would contradict its own kind
+/// (RFC 0039 §3.3 bullet D).
+#[derive(Clone)]
+struct McpTraceContext(opentelemetry::Context);
+
+/// The `/mcp` SERVER span's context, or an empty one when the span is absent
+/// (traces disabled, or a handler reached outside the layer — tests).
+fn mcp_parent_context(
+    ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+) -> opentelemetry::Context {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<McpTraceContext>())
+        .map_or_else(opentelemetry::Context::new, |carried| carried.0.clone())
+}
+
+/// The inbound `/mcp` request span (RFC0039.6).
+///
+/// MCP `tools/call` is JSON-RPC over HTTP, and both the RPC and HTTP semantic
+/// conventions require the inbound server span's kind to be `SERVER`. This is
+/// that span — the `/mcp` surface had none of its own, since rmcp's internal
+/// `serve_inner` span is muted by the RFC0038.7 loop-guard. It continues the
+/// caller's trace, so an agent driving these tools sees the whole exchange
+/// inside its own trace.
+async fn mcp_server_span(request: Request<Body>, next: Next) -> Response {
+    let parent = extract_context(request.headers());
+    let method = request.method().clone();
+    mcp_server_span_traced(method, request, next)
+        .with_context(parent)
+        .await
+}
+
+#[tracing::instrument(
+    skip_all,
+    name = "mcp request",
+    fields(
+        // The HTTP convention's span name is `{method} {route}`, and `/mcp`
+        // serves POST (JSON-RPC), GET (the SSE stream) and DELETE (session
+        // teardown). `otel.name` is how a computed name reaches the exported
+        // span, since the macro's own `name` must be a literal.
+        // `format_args!`, not `format!`: the recorder only needs `Display`, so
+        // the name never needs its own heap allocation.
+        otel.name = %format_args!("{method} /mcp"),
+        otel.kind = "server",
+        http.request.method = %method,
+        http.route = "/mcp",
+        http.response.status_code = tracing::field::Empty,
+    )
+)]
+async fn mcp_server_span_traced(
+    method: axum::http::Method,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    request
+        .extensions_mut()
+        .insert(McpTraceContext(tracing::Span::current().context()));
+    let response = next.run(request).await;
+    // `i64`, not `u16`: the bridge stringifies `u64`-valued fields, which would
+    // export `String("200")` where the convention wants an integer.
+    tracing::Span::current().record(
+        "http.response.status_code",
+        i64::from(response.status().as_u16()),
+    );
+    response
+}
+
 /// Build the `/mcp` sub-router: the streamable-HTTP MCP service behind
 /// the RFC 0026 bearer layer. Nested by `querier::router` only when
 /// `querier.mcp.enabled` is set (RFC0027.1).
@@ -712,6 +806,10 @@ pub(crate) fn mcp_router(
         .layer(middleware::from_fn(move |request, next| {
             require_bearer(auth.clone(), request, next)
         }))
+        // Outermost, so the SERVER span covers the whole server-side handling
+        // of the request — including an auth rejection, which is part of what
+        // the caller experienced (RFC0039.6).
+        .layer(middleware::from_fn(mcp_server_span))
 }
 
 #[cfg(test)]

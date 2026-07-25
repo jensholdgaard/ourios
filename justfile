@@ -291,104 +291,20 @@ dogfood-clean:
     done
     rm -rf scratch/dogfood
 
-# Start a local OTel Collector + Jaeger v2 (docker compose) — the trace
-# destination: spans sent here land in Jaeger (browse at
-# http://localhost:16686). `ourios-server`'s own self-tracing (RFC
-# 0038/0039/0040) points here too. See `dogfood-env` for the source-side
-# block, which sends traces here and logs straight to `dogfood-server`.
+# Start the local trace-viewing stack (OTel Collector + Jaeger v2) defined in
+# `dev/observability/`. Spans sent to the Collector land in Jaeger — browse at
+# http://localhost:16686. `ourios-server`'s own self-tracing (RFC
+# 0038/0039/0040) points here too. See `dogfood-env` for the source-side block.
 #
-# The Collector *can* also be the single endpoint for both signals — its logs
-# pipeline fans out to `dogfood-server` — but that path crosses the
-# container→host boundary and so is macOS-only; `dogfood-env` documents it as
-# the fallback for sources that cannot set per-signal endpoints.
-#
-# Claims the standard 4317 (OTLP gRPC) / 4318 (OTLP HTTP); `dogfood-server`
-# moved to 24317/24318 to free them. The log fan-out reaches the host-side
-# `dogfood-server` via `host.docker.internal` (mapped to `host-gateway` below,
-# which colima honours the same way Docker Desktop does) — logs are dropped
-# with a Collector-side export error if `dogfood-server` isn't running, which
-# is the intended failure mode: the viewer stays useful on its own.
-#
-# **macOS-verified; on native Linux the log fan-out needs a non-loopback
-# receiver bind** — `host-gateway` there is the docker bridge address, which
-# cannot reach `dogfood-server`'s `127.0.0.1`. See `dogfood-config.yaml` for
-# the trade-off and the options. Traces to Jaeger work on every runtime
-# either way, so the viewer half of this recipe is portable as-is.
-# Materialises the compose file + Collector config into gitignored
-# `scratch/observability/` (this recipe is the source of truth; the scratch
-# copy is disposable).
+# The Collector claims the conventional 4317 (gRPC) / 4318 (HTTP); that is why
+# `dogfood-server` listens on 24317/24318. Its logs pipeline can also forward
+# on to `dogfood-server`, but that path crosses the container->host boundary
+# and is macOS-only — `dogfood-env` sends logs straight there instead, and
+# `dogfood-config.yaml` explains the trade-off. The traces half is portable.
 jaeger-up:
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p scratch/observability
-    cat > scratch/observability/otel-collector-config.yaml <<'YAML'
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: 0.0.0.0:4317
-          http:
-            endpoint: 0.0.0.0:4318
-    processors:
-      batch:
-    exporters:
-      otlp/jaeger:
-        endpoint: jaeger:4317
-        tls:
-          insecure: true
-      otlp/ourios:
-        endpoint: host.docker.internal:24317
-        tls:
-          insecure: true
-      debug:
-        verbosity: basic
-    service:
-      pipelines:
-        traces:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [otlp/jaeger, debug]
-        metrics:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [debug]
-        logs:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [otlp/ourios, debug]
-    YAML
-    cat > scratch/observability/docker-compose.yaml <<'YAML'
-    services:
-      jaeger:
-        image: jaegertracing/jaeger:2.20.0
-        container_name: ourios-jaeger
-        ports:
-          - "127.0.0.1:16686:16686" # Jaeger UI — loopback only, unauthenticated
-        networks:
-          - otel
-      otel-collector:
-        image: otel/opentelemetry-collector-contrib:0.157.0
-        container_name: ourios-otel-collector
-        command: ["--config=/etc/otelcol/config.yaml"]
-        volumes:
-          - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
-        ports:
-          # Loopback only — an unauthenticated OTLP receiver on a LAN
-          # interface would accept trace/log ingestion from any reachable peer.
-          - "127.0.0.1:4317:4317" # OTLP gRPC — point OTEL_EXPORTER_OTLP_ENDPOINT here
-          - "127.0.0.1:4318:4318" # OTLP HTTP
-        extra_hosts:
-          # Lets the log fan-out reach `dogfood-server` on the host.
-          - "host.docker.internal:host-gateway"
-        depends_on:
-          - jaeger
-        networks:
-          - otel
-    networks:
-      otel:
-        driver: bridge
-    YAML
-    docker compose -f scratch/observability/docker-compose.yaml up -d
+    docker compose -f dev/observability/docker-compose.yaml up -d
     echo "Jaeger UI  → http://localhost:16686"
     echo ""
     echo "OTLP in — the endpoint URL and the protocol must agree:"
@@ -398,18 +314,10 @@ jaeger-up:
     echo "Run 'just dogfood-env' for the source-side env block (traces here, logs"
     echo "straight to dogfood-server — start that too)."
 
-# Stop the Jaeger + Collector stack `jaeger-up` started. A no-op (not an
-# error) if `jaeger-up` was never run or `scratch/observability` was cleaned
-# — `docker compose down` on a nonexistent compose file is the failure mode
-# this guards, so teardown stays safe to run unconditionally.
+# Stop the stack `jaeger-up` started. Safe to run unconditionally: `down` on an
+# already-stopped stack is a no-op.
 jaeger-down:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -f scratch/observability/docker-compose.yaml ]; then
-        docker compose -f scratch/observability/docker-compose.yaml down
-    else
-        echo "nothing to stop (scratch/observability/docker-compose.yaml not found)"
-    fi
+    docker compose -f dev/observability/docker-compose.yaml down
 
 # Print a **traces-only** env block for Claude Code: spans go to Jaeger, and
 # `OTEL_LOGS_EXPORTER=none` keeps prompts/tool output off disk entirely — the

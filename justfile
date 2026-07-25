@@ -107,6 +107,16 @@ release version:
     [ -z "$(git status --porcelain)" ] || { echo "error: working tree is not clean"; exit 1; }
     [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "error: release from main"; exit 1; }
     command -v git-cliff >/dev/null || { echo "error: git-cliff not installed (brew install git-cliff)"; exit 1; }
+    # cargo-about must match the version CI pins: the no-diff gate compares
+    # byte-for-byte, and a different generator version can emit a different
+    # file — re-breaking the gate on the release commit, which is the whole
+    # failure this regeneration exists to prevent. Read the pin out of the
+    # workflow rather than duplicating it, so the two cannot drift apart.
+    command -v cargo-about >/dev/null || { echo "error: cargo-about not installed (cargo install cargo-about)"; exit 1; }
+    about_pin="$(sed -nE '/tool: cargo-about@/{s/.*cargo-about@([0-9]+\.[0-9]+\.[0-9]+).*/\1/p;q;}' .github/workflows/licenses.yml)"
+    [ -n "$about_pin" ] || { echo "error: could not read the cargo-about pin from .github/workflows/licenses.yml"; exit 1; }
+    about_have="$(cargo about --version 2>/dev/null | awk '{print $2}')"
+    [ "$about_have" = "$about_pin" ] || { echo "error: cargo-about $about_have is installed but CI pins $about_pin; the attribution would not be byte-identical. Run: cargo install cargo-about --version $about_pin --locked"; exit 1; }
     # Refresh remote refs so the checks below see the real state of origin.
     git fetch --quiet --tags origin
     # Release only from a `main` that exactly matches `origin/main` — never a
@@ -179,7 +189,11 @@ release version:
     # Regenerate the changelog so the new [X.Y.Z] section exists at the tagged
     # commit — cargo-dist reads it for the GitHub Release body (release.yml).
     git-cliff --tag "v$version" --output CHANGELOG.md
-    git add Cargo.toml Cargo.lock CHANGELOG.md "$chart_yaml"
+    # THIRD-PARTY-LICENSES.md embeds every workspace crate's version, so the
+    # bump above staled it and CI's `cargo about (no-diff)` gate would fail on
+    # the release commit (it did for v0.5.0). Regenerate it in the same commit.
+    cargo about generate --fail about.hbs > THIRD-PARTY-LICENSES.md
+    git add Cargo.toml Cargo.lock CHANGELOG.md THIRD-PARTY-LICENSES.md "$chart_yaml"
     git commit -m "chore(release): v$version"
     git tag -a "v$version" -m "v$version"
     # Success: disarm the rollback trap.

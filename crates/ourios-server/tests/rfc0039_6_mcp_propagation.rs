@@ -12,13 +12,14 @@
 //!   inbound server span to be `SERVER`.
 //! - `execute_tool <tool>` — kind `INTERNAL`, nested **locally** under that
 //!   server span. The spec defines `INTERNAL` as an operation "as opposed to
-//!   an operations with remote parents or children", so parenting it straight
-//!   to the remote caller would contradict its own kind. Its parent must be
-//!   the local `SERVER` span, and its trace the caller's.
+//!   an operations \[sic] with remote parents or children" (quoted verbatim;
+//!   the grammar slip is upstream's), so parenting it straight to the remote
+//!   caller would contradict its own kind. Its parent must be the local
+//!   `SERVER` span, and its trace the caller's.
 //!
-//! Only the `tools/call` request carries a `traceparent`; the handshake
-//! requests deliberately do not, so the same run also covers the no-inbound
-//! -context case for `/mcp` (RFC0039.2).
+//! Only the `tools/call` request carries a `traceparent`; the handshake requests
+//! deliberately do not, so the same run also covers the no-inbound-context case
+//! for `/mcp` (RFC0039.2).
 
 use axum::Router;
 use axum::body::{Body, to_bytes};

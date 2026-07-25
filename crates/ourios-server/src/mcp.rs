@@ -681,8 +681,9 @@ async fn require_bearer(auth: AuthResolver, mut request: Request<Body>, next: Ne
 /// route [`AuthBinding`] already travels. Carrying the SERVER span's context
 /// here is what lets `execute_tool <tool>` nest *locally* under it, which is
 /// what keeps that span honestly `INTERNAL`: the spec defines that kind as an
-/// operation "as opposed to an operations with remote parents or children", so
-/// parenting it straight to the remote caller would contradict its own kind
+/// operation "as opposed to an operations \[sic] with remote parents or
+/// children" (quoted verbatim; the grammar slip is upstream's), so parenting it
+/// straight to the remote caller would contradict its own kind
 /// (RFC 0039 §3.3 bullet D).
 #[derive(Clone)]
 struct McpTraceContext(opentelemetry::Context);

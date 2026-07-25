@@ -46,8 +46,9 @@ sets the *parent* of spans that already exist.
 > **Amendment (slice 3).** The paragraph above originally promised "no new
 > spans" for *every* arm. That does not survive contact with the MCP arm: the
 > only spans `/mcp` had were the `execute_tool <tool>` spans, which are
-> `INTERNAL` — a kind the spec defines as an operation "as opposed to an
-> operations with **remote parents** or children". Parenting them straight to
+> `INTERNAL` — a kind the [tracing API][spankind] defines as an operation "as
+> opposed to an operations \[sic] with **remote parents** or children" (the
+> grammar slip is upstream's; quoted verbatim). Parenting them straight to
 > the caller, as §7 originally deferred, would contradict their own kind, and MCP
 > `tools/call` is JSON-RPC over HTTP, where both conventions require the inbound
 > server span's kind to be `SERVER`. So the MCP arm adds **one** span — a
@@ -357,10 +358,12 @@ Mapped to `CLAUDE.md` §6.2:
       change are involved.
 - [x] **Resolved (slice 3): yes, the dedicated `/mcp` SERVER span is warranted —
       and required.** This question framed an INTERNAL span with a remote parent
-      as "valid but slightly unusual". It is not valid: the tracing API defines
-      `INTERNAL` as an operation "as opposed to an operations with **remote
-      parents** or children", and the concepts doc as one that "does not cross a
-      process boundary". Meanwhile `tools/call` is JSON-RPC over HTTP, and both
+      as "valid but slightly unusual". It is not valid: the [tracing
+      API][spankind] defines `INTERNAL` as an operation "as opposed to an
+      operations \[sic] with **remote parents** or children", and the concepts
+      doc as one that "does not cross a process boundary" (both quoted verbatim —
+      the grammar slip is upstream's). Meanwhile `tools/call` is JSON-RPC over
+      HTTP, and both
       the RPC and HTTP conventions state the inbound server span's kind **MUST**
       be `SERVER`. So `/mcp` gains a SERVER span (§3.3 bullet D), the tool spans
       nest locally under it, and both kinds stay honest. Consequences recorded as
@@ -383,5 +386,12 @@ Mapped to `CLAUDE.md` §6.2:
   [`FutureExt::with_context`](https://docs.rs/opentelemetry/0.32.0/opentelemetry/trace/trait.FutureExt.html)
   (the attach idiom this RFC uses; note `OpenTelemetrySpanExt::set_parent`
   returns `AlreadyStarted` on an entered span, which is why it is *not* used).
+- OpenTelemetry span kinds — [`SpanKind`][spankind] (the normative definition of
+  `INTERNAL` that §7's second question turned on), and the
+  [RPC](https://opentelemetry.io/docs/specs/semconv/rpc/rpc-spans/#rpc-server-span)
+  / [HTTP](https://opentelemetry.io/docs/specs/semconv/http/http-spans/#http-server-span)
+  server-span conventions, both of which state the kind **MUST** be `SERVER`.
 - Pinned: `opentelemetry` 0.32.0, `opentelemetry_sdk` 0.32.1,
   `tracing-opentelemetry` 0.33.0.
+
+[spankind]: https://opentelemetry.io/docs/specs/otel/trace/api/#spankind

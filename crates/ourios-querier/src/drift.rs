@@ -37,8 +37,8 @@ use ourios_parquet::audit_columns;
 
 use crate::dsl::DriftQuery;
 use crate::{
-    QueryError, QueryStats, StoreRef, audit_scan, audit_table_urls, scan_stats, storage_err,
-    time_bound_scalar,
+    QueryError, QueryStats, StoreRef, audit_scan, audit_table_urls, record_operator_spans,
+    scan_stats, storage_err, time_bound_scalar,
 };
 
 /// One drift row: a template that gained at least one version in the queried
@@ -189,6 +189,7 @@ pub(crate) async fn run_drift(
         .map_err(storage_err)?;
     let rows = decode_drift_rows(&batches)?;
     let stats = scan_stats(plan.as_ref());
+    record_operator_spans(plan.as_ref());
     Ok(DriftResult { rows, stats })
 }
 

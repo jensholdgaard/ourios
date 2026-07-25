@@ -21,10 +21,17 @@
 # Paths resolve from ${env:OURIOS_DOGFOOD_ROOT}, exported by the recipe.
 #
 # The receiver listens on 24317/24318, not the standard 4317/4318: `just
-# jaeger-up`'s Collector claims those as the single OTLP front door a source
-# points at, and fans out from there (traces -> Jaeger, logs -> back here).
-# A source that wants no trace viewer can still skip the Collector and point
-# straight at these ports.
+# jaeger-up`'s Collector claims those, so that a source pointing at the
+# conventional OTLP port reaches the Collector.
+#
+# That does NOT mean every signal goes through it. `just dogfood-env` — the
+# default — sends **logs straight to these ports** and routes only **traces**
+# to the Collector (which forwards them to Jaeger), via the per-signal
+# `OTEL_EXPORTER_OTLP_{LOGS,TRACES}_ENDPOINT` overrides. Nothing crosses the
+# container->host boundary on that path, so it behaves identically on every
+# Docker runtime. Sending everything to the Collector and letting it fan logs
+# back here is the *single-endpoint variant*, for sources that cannot set
+# per-signal vars — see the runtime caveat below.
 #
 # **The Collector's log fan-out depends on the Docker runtime.** It reaches
 # this receiver via `host.docker.internal`, which routes through a VM on

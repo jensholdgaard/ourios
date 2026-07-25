@@ -191,9 +191,9 @@ release version:
 # Run ourios-server locally as an OTLP **log** sink for dogfooding — point any
 # OTLP log source (Claude Code, Copilot CLI, an OpenTelemetry Collector) at it
 # and query the ingested telemetry back. Since Ourios *is* an OTLP log
-# receiver, a Collector is optional — but `just jaeger-up` runs one as the
-# single front door (traces → Jaeger, logs → here), which is what
-# `dogfood-env` prints. Open receiver (no auth section → open, per RFC 0026),
+# receiver, a Collector is optional — `dogfood-env` sends logs straight here
+# and only traces through `jaeger-up`'s Collector (which routes them to
+# Jaeger). Open receiver (no auth section → open, per RFC 0026),
 # local filesystem store + WAL under scratch/dogfood/ (gitignored).
 # Ports: 24318 OTLP/HTTP, 24317 OTLP/gRPC — NOT the standard 4317/4318, which
 # the Collector claims — and 4319 query API + /mcp.
@@ -263,13 +263,16 @@ dogfood-env:
     #   then ask it to read ourios://query-schema and query tenant "agent-dogfood"
     # no trace viewer wanted? drop the traces line and set:
     #   export OTEL_TRACES_EXPORTER=none
-    # single-endpoint source (can't set per-signal vars)? point it all at the
-    # Collector and let it fan logs out — macOS only, see dogfood-config.yaml:
+    # single-endpoint source (can't set per-signal vars)? send everything to
+    # the Collector and let it fan logs out to dogfood-server. The per-signal
+    # vars take precedence over the general one, so they must be UNSET, not
+    # just overridden — and the fan-out is macOS-only (see dogfood-config.yaml):
+    #   unset OTEL_EXPORTER_OTLP_LOGS_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
     #   export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
     ENV
 
 # Wipe the local dogfood store + WAL (the captured telemetry). Refuses while
-# `dogfood-server` is still listening on 24318, so a `rm -rf` can't race the
+# `dogfood-server` is still listening on 24317/24318, so a `rm -rf` can't race the
 # server mid-write and corrupt the capture. Stop the server first.
 dogfood-clean:
     #!/usr/bin/env bash
@@ -278,17 +281,26 @@ dogfood-clean:
     # `if` condition is not caught by `set -e`), so a missing tool can't let the
     # wipe race a running server.
     command -v lsof >/dev/null || { echo "error: lsof not found — can't verify the server is stopped; stop dogfood-server, then 'rm -rf scratch/dogfood' by hand." >&2; exit 1; }
-    if lsof -nP -iTCP:24318 -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "127.0.0.1:24318 is in use (dogfood-server still running?); stop it before cleaning." >&2
-        exit 1
-    fi
+    # Guard BOTH receiver ports: a server listening on either one is live and
+    # could be mid-write, and a config could disable one listener.
+    for port in 24317 24318; do
+        if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "127.0.0.1:$port is in use (dogfood-server still running?); stop it before cleaning." >&2
+            exit 1
+        fi
+    done
     rm -rf scratch/dogfood
 
-# Start a local OTel Collector + Jaeger v2 (docker compose) as the single OTLP
-# front door: a source points one endpoint here and the Collector fans out —
-# traces → Jaeger (browse at http://localhost:16686), logs → `dogfood-server`
-# (queryable as data). `ourios-server`'s own self-tracing (RFC 0038/0039/0040)
-# points here too. See `dogfood-env` for the source-side block.
+# Start a local OTel Collector + Jaeger v2 (docker compose) — the trace
+# destination: spans sent here land in Jaeger (browse at
+# http://localhost:16686). `ourios-server`'s own self-tracing (RFC
+# 0038/0039/0040) points here too. See `dogfood-env` for the source-side
+# block, which sends traces here and logs straight to `dogfood-server`.
+#
+# The Collector *can* also be the single endpoint for both signals — its logs
+# pipeline fans out to `dogfood-server` — but that path crosses the
+# container→host boundary and so is macOS-only; `dogfood-env` documents it as
+# the fallback for sources that cannot set per-signal endpoints.
 #
 # Claims the standard 4317 (OTLP gRPC) / 4318 (OTLP HTTP); `dogfood-server`
 # moved to 24317/24318 to free them. The log fan-out reaches the host-side

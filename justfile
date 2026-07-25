@@ -265,6 +265,123 @@ dogfood-clean:
     fi
     rm -rf scratch/dogfood
 
+# Start a local OTel Collector + Jaeger v2 (docker compose) for *visualizing*
+# traces — a different concern from `dogfood-server` above, which *ingests*
+# a source's logs as queryable data. This is just a viewer: point any OTLP
+# trace source (`ourios-server`'s own self-tracing, RFC 0038/0039/0040, or
+# Claude Code's — see `jaeger-env`) at the Collector and browse spans at
+# http://localhost:16686.
+#
+# Ports are 14317 (OTLP gRPC) / 14318 (OTLP HTTP) — NOT the standard
+# 4317/4318 — because `dogfood-server` already listens there for its own,
+# unrelated purpose (ingesting a source's *logs*). Materialises the compose
+# file + Collector config into gitignored `scratch/observability/` (this
+# recipe is the source of truth; the scratch copy is disposable).
+jaeger-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p scratch/observability
+    cat > scratch/observability/otel-collector-config.yaml <<'YAML'
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch:
+    exporters:
+      otlp/jaeger:
+        endpoint: jaeger:4317
+        tls:
+          insecure: true
+      debug:
+        verbosity: basic
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlp/jaeger, debug]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+    YAML
+    cat > scratch/observability/docker-compose.yaml <<'YAML'
+    services:
+      jaeger:
+        image: jaegertracing/jaeger:2.20.0
+        container_name: ourios-jaeger
+        ports:
+          - "127.0.0.1:16686:16686" # Jaeger UI — loopback only, unauthenticated
+        networks:
+          - otel
+      otel-collector:
+        image: otel/opentelemetry-collector-contrib:0.157.0
+        container_name: ourios-otel-collector
+        command: ["--config=/etc/otelcol/config.yaml"]
+        volumes:
+          - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+        ports:
+          # Loopback only — an unauthenticated OTLP receiver on a LAN
+          # interface would accept trace ingestion from any reachable peer.
+          - "127.0.0.1:14317:4317" # OTLP gRPC — point OTEL_EXPORTER_OTLP_ENDPOINT here
+          - "127.0.0.1:14318:4318" # OTLP HTTP
+        depends_on:
+          - jaeger
+        networks:
+          - otel
+    networks:
+      otel:
+        driver: bridge
+    YAML
+    docker compose -f scratch/observability/docker-compose.yaml up -d
+    echo "Jaeger UI                 → http://localhost:16686"
+    echo "OTLP endpoint (gRPC, :14317 — use as-is for OTEL_EXPORTER_OTLP_ENDPOINT)"
+    echo "OTLP endpoint (HTTP, :14318 — browsable-looking but still OTLP, not a UI)"
+    echo "Run 'just jaeger-env' for the Claude Code trace-export env block."
+
+# Stop the Jaeger + Collector stack `jaeger-up` started. A no-op (not an
+# error) if `jaeger-up` was never run or `scratch/observability` was cleaned
+# — `docker compose down` on a nonexistent compose file is the failure mode
+# this guards, so teardown stays safe to run unconditionally.
+jaeger-down:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f scratch/observability/docker-compose.yaml ]; then
+        docker compose -f scratch/observability/docker-compose.yaml down
+    else
+        echo "nothing to stop (scratch/observability/docker-compose.yaml not found)"
+    fi
+
+# Print the env block that points Claude Code's *own* traces (not logs — see
+# `dogfood-env` for that) at the `jaeger-up` Collector. Traces are a Claude
+# Code beta signal: both `CLAUDE_CODE_ENABLE_TELEMETRY` and the enhanced-beta
+# flag are required, or no spans are emitted at all. Export these and start a
+# NEW `claude` session (telemetry config is read at process startup).
+jaeger-env:
+    #!/usr/bin/env bash
+    cat <<'ENV'
+    export CLAUDE_CODE_ENABLE_TELEMETRY=1
+    export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1   # required — traces are opt-in beta
+    export OTEL_TRACES_EXPORTER=otlp
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:14317
+    export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+    export OTEL_SERVICE_NAME=claude-code
+    # ourios-server's own self-tracing (RFC 0038/0039/0040) can point at the
+    # same Collector to see both streams in one Jaeger — it just needs the
+    # standard var, no beta flag:
+    #   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:14317 just dogfood-server
+    # then browse both at http://localhost:16686 (separate traces — no shared
+    # trace context between the two processes, just the same backend).
+    ENV
+
 # Clean build artefacts (cargo target + mdBook output).
 clean:
     cargo clean || true

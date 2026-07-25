@@ -316,21 +316,23 @@ jaeger-up:
     cat > scratch/observability/docker-compose.yaml <<'YAML'
     services:
       jaeger:
-        image: jaegertracing/jaeger:latest
+        image: jaegertracing/jaeger:2.20.0
         container_name: ourios-jaeger
         ports:
-          - "16686:16686" # Jaeger UI
+          - "127.0.0.1:16686:16686" # Jaeger UI — loopback only, unauthenticated
         networks:
           - otel
       otel-collector:
-        image: otel/opentelemetry-collector-contrib:latest
+        image: otel/opentelemetry-collector-contrib:0.157.0
         container_name: ourios-otel-collector
         command: ["--config=/etc/otelcol/config.yaml"]
         volumes:
           - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
         ports:
-          - "14317:4317" # OTLP gRPC — point OTEL_EXPORTER_OTLP_ENDPOINT here
-          - "14318:4318" # OTLP HTTP
+          # Loopback only — an unauthenticated OTLP receiver on a LAN
+          # interface would accept trace ingestion from any reachable peer.
+          - "127.0.0.1:14317:4317" # OTLP gRPC — point OTEL_EXPORTER_OTLP_ENDPOINT here
+          - "127.0.0.1:14318:4318" # OTLP HTTP
         depends_on:
           - jaeger
         networks:
@@ -340,13 +342,23 @@ jaeger-up:
         driver: bridge
     YAML
     docker compose -f scratch/observability/docker-compose.yaml up -d
-    echo "Jaeger UI       → http://localhost:16686"
-    echo "OTLP gRPC/HTTP  → http://localhost:14317 / http://localhost:14318"
+    echo "Jaeger UI                 → http://localhost:16686"
+    echo "OTLP endpoint (gRPC, :14317 — use as-is for OTEL_EXPORTER_OTLP_ENDPOINT)"
+    echo "OTLP endpoint (HTTP, :14318 — browsable-looking but still OTLP, not a UI)"
     echo "Run 'just jaeger-env' for the Claude Code trace-export env block."
 
-# Stop the Jaeger + Collector stack `jaeger-up` started.
+# Stop the Jaeger + Collector stack `jaeger-up` started. A no-op (not an
+# error) if `jaeger-up` was never run or `scratch/observability` was cleaned
+# — `docker compose down` on a nonexistent compose file is the failure mode
+# this guards, so teardown stays safe to run unconditionally.
 jaeger-down:
-    docker compose -f scratch/observability/docker-compose.yaml down
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f scratch/observability/docker-compose.yaml ]; then
+        docker compose -f scratch/observability/docker-compose.yaml down
+    else
+        echo "nothing to stop (scratch/observability/docker-compose.yaml not found)"
+    fi
 
 # Print the env block that points Claude Code's *own* traces (not logs — see
 # `dogfood-env` for that) at the `jaeger-up` Collector. Traces are a Claude

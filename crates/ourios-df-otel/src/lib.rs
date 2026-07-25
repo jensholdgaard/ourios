@@ -211,6 +211,38 @@ mod tests {
     }
 
     #[test]
+    fn timed_bounds_none_when_end_precedes_start() {
+        let set = ExecutionPlanMetricsSet::new();
+
+        let start = Timestamp::new();
+        start.set(chrono::DateTime::from_timestamp(1_000, 0).expect("valid"));
+        MetricBuilder::new(&set).build(MetricValue::StartTimestamp(start));
+
+        let end = Timestamp::new();
+        end.set(chrono::DateTime::from_timestamp(999, 0).expect("valid"));
+        MetricBuilder::new(&set).build(MetricValue::EndTimestamp(end));
+
+        let aggregated = set.clone_inner().aggregate_by_name();
+        assert!(
+            timed_bounds(&aggregated).is_none(),
+            "an inverted end < start must be treated as untimed, not emitted"
+        );
+    }
+
+    #[test]
+    fn attr_omits_on_i64_overflow_rather_than_wrapping() {
+        assert!(
+            attr("test.key", usize::MAX).is_none(),
+            "a value beyond i64::MAX must be omitted, not silently wrapped negative"
+        );
+        assert_eq!(
+            attr("test.key", 42).map(|kv| kv.value),
+            Some(42_i64.into()),
+            "an in-range value still converts normally"
+        );
+    }
+
+    #[test]
     fn node_attributes_maps_every_normative_metric() {
         let aggregated = scan_like_metrics().aggregate_by_name();
         let attrs = node_attributes(&aggregated);

@@ -1,0 +1,39 @@
+# Local trace-viewing stack for `just jaeger-up` — a development convenience,
+# NOT a deployment artefact (that's `deploy/helm/`). Image versions are pinned
+# and live here rather than inside the justfile so Renovate's docker-compose
+# manager keeps them current.
+#
+# Every published port binds 127.0.0.1: both the Collector's OTLP receivers
+# and the Jaeger UI are unauthenticated, so a LAN-reachable bind would accept
+# telemetry from — and expose retained spans to — any peer on the network.
+services:
+  jaeger:
+    image: jaegertracing/jaeger:2.20.0
+    container_name: ourios-jaeger
+    ports:
+      - "127.0.0.1:16686:16686" # Jaeger UI
+    networks:
+      - otel
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.157.0
+    container_name: ourios-otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      # The conventional OTLP ports: a source pointing at the default endpoint
+      # reaches the Collector. `dogfood-server` moved to 24317/24318.
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+    extra_hosts:
+      # Lets the logs pipeline reach a `dogfood-server` running on the host.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - jaeger
+    networks:
+      - otel
+
+networks:
+  otel:
+    driver: bridge

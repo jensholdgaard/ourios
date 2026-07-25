@@ -1,0 +1,48 @@
+# OTel Collector config for the local trace-viewing stack (`just jaeger-up`).
+# Local development only — never a deployment artefact (that's `deploy/`).
+#
+# Traces go to Jaeger. Logs are forwarded on to a host-side `dogfood-server`,
+# which is the fallback path for sources that cannot set per-signal endpoints;
+# `just dogfood-env` defaults to sending logs straight there instead, so this
+# exporter is usually idle. It errors harmlessly when nothing is listening.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  # `host.docker.internal` resolves via the `host-gateway` mapping in
+  # docker-compose.yaml. On macOS (colima, Docker Desktop) that routes through
+  # a VM and reaches `dogfood-server`'s loopback bind; on native Linux it is
+  # the docker bridge address and cannot — see `dogfood-config.yaml`.
+  otlp/ourios:
+    endpoint: host.docker.internal:24317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/ourios, debug]

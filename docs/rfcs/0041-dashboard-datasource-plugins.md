@@ -17,7 +17,9 @@ superseded-by: —
 > *how* to build this but *whether it is worth building and where*. Both
 > options were spiked to a rendered dashboard before this was written (§3.1),
 > so the estimates here are measured rather than guessed. **This RFC asks for
-> a decision, not for implementation.**
+> a decision, not for implementation.** One finding the spikes surfaced has
+> already been decided and shipped on its own (§3.4 severity → RFC0002.21);
+> everything else is open.
 
 ## 1. Summary
 
@@ -119,57 +121,39 @@ should therefore live in **its own repository**, not in `crates/`. That keeps
 this repo's toolchain single-language and lets the plugin version against its
 host rather than against Ourios releases.
 
-### 3.4 The severity gap (needs a decision either way)
+### 3.4 The severity gap — RESOLVED, shipped separately
 
-Confirmed live: a natural first query — `severity >= trace` — returns **zero
-rows** against real agent telemetry, because Claude Code's GenAI events carry
-`severity_number: 0`, below `trace`, so every row group prunes. Through a
-dashboard this looks like a broken datasource with no explanation.
+This began as the one finding here that touched Ourios rather than a plugin,
+and it has since been decided and merged on its own: **RFC0002.21** (RFC 0002
+§6.1 amendment, PR #641). It is recorded here because the spike is what
+surfaced it, and because it is the clearest example of the kind of defect only
+a dashboard client exposes.
 
-Storing the `0` is correct — it is what the source sent, and
+Confirmed live during the spike: a natural first query — `severity >= trace` —
+returned **zero rows** against real agent telemetry, because Claude Code's
+GenAI events carry `severity_number: 0`, below `trace`, so every row group
+pruned. Through a dashboard that looks like a broken datasource.
+
+Storing the `0` was never in question — it is what the source sent, and
 `project_otlp-fidelity-paramount`'s preserve/flag/never-correct rule applies.
-The question is what a **comparison** should do with it, and the OTel logs
-data model addresses that directly (consultation, 2026-07-25):
+What was wrong was the **comparison**. The OTel Logs SDK drops a record on
+`minimum_severity` only when its SeverityNumber "is specified (i.e. not `0`)";
+unspecified records "bypass minimum severity filtering". Ourios did the
+inverse. The data model sanctions the special case explicitly: "Special
+handling MAY be given to `SeverityNumber=0` when it is used to represent an
+unspecified severity."
 
-> In the contexts where severity participates in less-than / greater-than
-> comparisons `SeverityNumber` field should be used. **Special handling MAY be
-> given to `SeverityNumber=0` when it is used to represent an unspecified
-> severity.**
-> — [Logs Data Model, *Comparing Severity*](https://opentelemetry.io/docs/specs/otel/logs/data-model/#comparing-severity)
+Shipped semantics: a floor (`>=` / `>`) above `0` admits unspecified rows; a
+ceiling (`<` / `<=`) excludes them, so a predicate and its negation still
+partition; an explicit `0` threshold keeps ordinary numeric meaning, so
+`severity > 0` still means "has a specified severity". The rule is compiled
+into the predicate rather than applied after the scan, because it is a
+**pruning-correctness** matter and not only a UX one — a post-filter would have
+left the old min/max pruning in place and silently skipped whole files of
+unspecified rows.
 
-So the spec anticipates exactly this case and leaves the handling to us. Three
-options, each with upstream precedent:
-
-1. **Unspecified bypasses severity filters.** This is what OTel's *own* SDK
-   does: "If a log record's `SeverityNumber` is specified (i.e. not `0`) and is
-   less than the configured `minimum_severity`, the log record MUST be dropped
-   … Log records with an unspecified severity (i.e. `0`) are **not affected by
-   this parameter and therefore bypass minimum severity filtering**"
-   ([Logs SDK, `LoggerConfig`](https://opentelemetry.io/docs/specs/otel/logs/sdk/#loggerconfig)).
-   Under this reading `severity >= trace` would *return* the GenAI events —
-   the current behaviour is the inverse of the SDK's. Most spec-aligned;
-   changes existing query semantics, so it is a DSL contract change (RFC 0002).
-2. **Interpret unspecified as INFO (9).** Explicitly permitted: "Backend and UI
-   … may interpret log records with missing `SeverityNumber` and `SeverityText`
-   fields as if the `SeverityNumber` was set equal to INFO (numeric value of
-   9)" ([Logs Data Model, *Severity Fields*](https://opentelemetry.io/docs/specs/otel/logs/data-model/#severity-fields)).
-   Simplest to explain; but it invents a severity the source did not send,
-   which sits badly against the fidelity rule if applied at **storage** time.
-   Applied only at **query** time it is defensible.
-3. **Make it explicit at the query surface.** The Collector's
-   `attributesprocessor` takes this route with a `match_undefined` boolean —
-   "controls whether logs with 'undefined' severity matches". A DSL equivalent
-   keeps today's default, makes the choice visible, and does not silently
-   change results.
-
-Option 1 is the most spec-faithful and option 3 the most conservative; option 2
-is a middle path but should be query-time only. **Note this is a pruning
-correctness question, not only a UX one**: whichever semantics win, the
-row-group pruning must agree with them, or a filter will skip files that
-contain matching rows.
-
-This wants deciding regardless of which host wins — it is the one finding here
-that touches Ourios rather than a plugin.
+**Nothing here blocks or depends on the plugin decision**, and the fix stands
+whether or not this RFC is ever implemented — which is why it shipped first.
 
 ## 4. Alternatives considered
 
@@ -218,7 +202,8 @@ option, not a strawman — see §7.
 
 Deliberately empty at `drafted`. To be written when §7's first question is
 answered; a plugin in its own repository (§3.3) would carry its own criteria,
-with only the §3.4 severity decision landing against this repo.
+the §3.4 severity decision having already landed against this repo
+(RFC0002.21).
 
 ## 6. Testing strategy
 
@@ -234,15 +219,11 @@ Deliberately empty at `drafted`. See §5.
       others.**
 - [ ] **Which host — Grafana, Perses, or both?** §4 lays out the trade;
       §3.1 gives measured effort for each.
-- [ ] **§3.4 severity — which of the three options?** `severity >= trace`
-      returning nothing against real agent telemetry is Ourios-side and wants a
-      decision whether or not a plugin is built. The OTel spec explicitly
-      permits special handling of `SeverityNumber=0` in comparisons, and OTel's
-      own SDK filter lets unspecified records *bypass* severity filtering —
-      i.e. today's behaviour is the inverse of the SDK's. Options 1 and 3 in
-      §3.4 change DSL semantics and so need an RFC 0002 amendment; option 2 is
-      query-time only. Whichever wins, row-group pruning must be made to agree
-      with it (a pruning-correctness issue, not just UX).
+- [x] **§3.4 severity — RESOLVED (RFC0002.21, PR #641).** Ourios's floor
+      semantics were the inverse of the OTel Logs SDK's; floors now admit
+      unspecified severity, ceilings exclude it, and the rule is compiled into
+      the predicate so row-group pruning agrees with it. Shipped independently
+      of this RFC's decision.
 - [ ] **Repository placement.** §3.3 argues for a separate repo. If it lives
       here instead, that is a `CLAUDE.md` §7 layout change and needs a `meta:`
       RFC.

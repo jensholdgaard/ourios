@@ -30,9 +30,11 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use opentelemetry::context::FutureExt as _;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
 use ourios_ingester::receiver::auth::{AuthBinding, AuthResolver};
+use ourios_ingester::receiver::extract_context;
 use ourios_ingester::receiver::tls::{ALPN_HTTP, TlsSettings};
 use ourios_ingester::receiver::tls_serve::{LISTENER_QUERIER, TlsListener, reloading_acceptor};
 use serde::Serialize;
@@ -405,6 +407,23 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
 }
 
 /// `POST /v1/query` handler (RFC 0016 §3.3–§3.5).
+///
+/// RFC 0039: the caller's trace context is extracted here, in the
+/// **un-instrumented** wrapper, and the span-producing future runs under it, so
+/// the server span below is parented to the caller instead of rooting a new
+/// trace. It cannot be done inside the instrumented fn: `set_parent` on an
+/// already-entered span fails with `AlreadyStarted` (§3.3).
+async fn handle_query(
+    State(state): State<QuerierState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let parent = extract_context(&headers);
+    handle_query_traced(state, headers, body)
+        .with_context(parent)
+        .await
+}
+
 // RFC 0038: one request-scoped server span per query (low frequency, an ideal
 // span root). `skip_all` keeps the headers/body off the span.
 #[tracing::instrument(
@@ -418,11 +437,7 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
         http.response.status_code = tracing::field::Empty,
     )
 )]
-async fn handle_query(
-    State(state): State<QuerierState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn handle_query_traced(state: QuerierState, headers: HeaderMap, body: Bytes) -> Response {
     // Record the outgoing status across every early-return path at the one
     // exit; the RFC 0016 flow lives in the inner fn, which runs inside this
     // span so its `ourios.tenant` record lands on it. Record as `i64`:

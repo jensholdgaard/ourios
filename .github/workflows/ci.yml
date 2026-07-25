@@ -27,8 +27,10 @@ on:
   # The scheduled run must stay flake-free, or it files noise.
   schedule:
     - cron: "11 5 * * *"
-  # Also a "run the whole suite now" button; unlike `schedule`, a manual
-  # dispatch runs every job.
+  # Also a "run it now" button: a manual dispatch runs the jobs the canary
+  # skips, so it is the way to shake this out. It is *not* literally every job
+  # — `coverage` additionally requires a `push` to main, and `hygiene-report`
+  # requires `main` whatever the event.
   workflow_dispatch:
 
 concurrency:

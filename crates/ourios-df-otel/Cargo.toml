@@ -22,6 +22,12 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 [dev-dependencies]
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "testing"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# RFC0040.6 — the unsampled-path cost guard.
+criterion = "=0.8.2"
+
+[[bench]]
+name = "unsampled_walk"
+harness = false
 
 [lints]
 workspace = true

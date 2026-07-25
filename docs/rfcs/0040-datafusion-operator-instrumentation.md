@@ -1,7 +1,7 @@
 ---
 rfc: 0040
 title: DataFusion → OTel operator instrumentation — the query span as an operator tree
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -10,6 +10,26 @@ superseded-by: —
 ---
 
 # RFC 0040 — DataFusion → OTel operator instrumentation
+
+> **Status: `green` (2026-07-25).** All six §5 acceptance criteria are
+> implemented and pass: RFC0040.1 (operator span tree, transitively parented to
+> the query span), RFC0040.2 (real, non-inverted wall-clock bounds), RFC0040.3
+> (normative `datafusion.operator.*` attributes, asserted as typed
+> `Value::I64`), RFC0040.4 (untimed nodes skipped and re-parented, covered at
+> the crate level against a real `CooperativeExec`), RFC0040.5 (span count
+> tracks plan shape, not row count), RFC0040.6 (zero cost when unsampled — a
+> plan double that panics if touched proves the walk never runs, both as a
+> unit test and a `criterion` bench measuring ~530 ps/call). Landed across four
+> slices: `ourios-df-otel` crate (#632), the `datafusion.operator.*` weaver
+> registry entries (#633), `ourios-querier` wiring + integration tests (#634),
+> and the RFC0040.6 guard (this slice). No thesis-gate applies (this RFC
+> doesn't touch a `benchmarks.md` §7 pillar), so `green` is the RFC's terminal
+> pre-`accepted` stage — maintainer flip is the only remaining step.
+>
+> Verified live end-to-end against real ingested data (not just the test
+> suite): a real query through `ourios-server` → a local OTel Collector →
+> Jaeger v2 rendered the full 8-span operator tree with real
+> `row_groups_pruned`/`elapsed_compute`/`output_rows` values.
 
 ## 1. Summary
 

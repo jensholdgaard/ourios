@@ -90,13 +90,21 @@ pub fn record_plan_spans<T: opentelemetry::trace::Tracer>(
     plan: &dyn ExecutionPlan,
     parent: &opentelemetry::Context,
     tracer: &T,
-);
+)
+where
+    T::Span: Send + Sync + 'static;
 ```
 
 The tracer is a generic `T: Tracer`, not `&dyn Tracer`: the `Tracer` trait has an
 associated `Span` type and is not object-safe as a bare trait object. Callers pass
 the global tracer (`opentelemetry::global::tracer("ourios-df-otel")`, a
 `BoxedTracer`) or any concrete tracer.
+
+The `where T::Span: Send + Sync + 'static` bound is load-bearing, not decoration:
+threading a child span as the parent `Context` for recursion goes through
+`Context::with_span`, which requires it. Every real tracer (`BoxedTracer`, the SDK
+tracer) satisfies it, so no caller is affected — but the bare `T: Tracer` bound
+does not compile without it.
 
 It walks `plan`, and for each node with `StartTimestamp`+`EndTimestamp` builds a
 child span (parent = its plan-parent's span, root = `parent`) named by
@@ -160,6 +168,23 @@ sub-operations inside an engine. Two consequences:
 Ourios-side attributes (e.g. `ourios.tenant`) stay in the Ourios registry on the
 Ourios-owned spans, not on these. The `datafusion.operator.*` names still go
 through the weaver registry before landing (§7) so live-check validates them.
+
+**Backdated timestamps and `SpanKind::Internal` are spec-sanctioned, not a
+workaround (OTel MCP consultation, 2026-07-25).** The trace API defines an
+explicit start-timestamp parameter precisely for spans "created" after their
+logical start already passed, and an explicit end timestamp likewise — the
+mechanism §3.3 uses (`with_start_time`/`end_with_timestamp`) is the documented
+path, not an abuse of the API. `SpanKind::Internal` is correct because these
+spans never cross a process boundary — doubly confirming the `db.*` rejection
+above, since the database CLIENT span kind is specifically for calls to a
+*remote* database process, which per-operator spans inside one query engine are
+not. One caution the same guidance surfaces and worth naming rather than
+silently overriding: OTel's general span-authoring guidance discourages full
+spans for operations that don't cross a process boundary and are individually
+short (suggesting span events instead), which is exactly what most operator
+nodes are. The decomposition itself — seeing *where in the plan* time went — is
+the stated goal of this RFC (§2), so the exception is deliberate, not an
+oversight.
 
 ### 3.4 Parenting into the query span
 
@@ -314,14 +339,24 @@ Mapped to `CLAUDE.md` §6.2:
       names in `semconv/registry/` + weaver generate, so live-check validates
       them (see the RFC0038.7 precedent for how out-of-registry attributes fail
       the gate).
-- [ ] **Crate name / extraction.** `ourios-df-otel` in-repo, targeting
-      `datafusion-opentelemetry` upstream — confirm no such crate already exists
-      in `datafusion-contrib` (adopt/align if so). Keep the public surface
-      (`record_plan_spans`) Ourios-free from day one.
-- [ ] **Querier OTel deps.** §3.4 adds `tracing-opentelemetry` +
-      `opentelemetry`(trace) to `ourios-querier`. Acceptable (mirrors RFC 0039),
-      or should the parent context be threaded from `ourios-server` to keep the
-      querier trace-dep-free? Trade-off: threading a `Context` param vs. a dep.
+- [x] **Crate name / extraction — SETTLED via a working prototype of each
+      (2026-07-25).** `datafusion-contrib/datafusion-tracing` does exist and was
+      spiked directly rather than judged from its docs. It is alternative (b)
+      (live spans via a `PhysicalOptimizerRule`), and on Ourios's real
+      multi-partition plans it has a production-blocking bug: `RepartitionExec`'s
+      internal `tokio` spawns are not covered by the crate's join-set tracer hook
+      (DataFusion 54.0.0), so every operator span is silently dropped unless
+      `target_partitions(1)` — not viable in production. Its attributes are also
+      pretty-printed strings (`"150.71µs"`, `"64.0 KB"`) and a combined
+      `datafusion.node` text dump, not the normative typed `datafusion.operator.*`
+      table. The post-hoc `ourios-df-otel` design was spiked in parallel and
+      passed all four of RFC0040.1–.4 against real multi-partition query plans
+      with correctly-typed attributes. Building in-repo, per §3, is confirmed as
+      the right call — not merely the absence of a competitor.
+- [x] **Querier OTel deps — SETTLED.** §3.4's `tracing-opentelemetry` +
+      `opentelemetry`(trace) additions to `ourios-querier` are confirmed (mirrors
+      RFC 0039's dep-promotion precedent exactly); no `Context`-threading
+      alternative needed.
 - [ ] **The "show the query" attribute.** Separately from the operator tree,
       should the query span carry the DSL statement and/or the
       `displayable(plan)` text? The OTel MCP consultation settles the *naming* if

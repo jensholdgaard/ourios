@@ -1,0 +1,27 @@
+[package]
+name = "ourios-df-otel"
+version.workspace = true
+description = "Post-hoc DataFusion ExecutionPlan -> OpenTelemetry operator span tree (RFC 0040)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ourios_df_otel"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned to the same DataFusion 54 the rest of the workspace runs (RFC 0021).
+# No `ourios-*` dep — deliberate, so this lifts cleanly to a standalone
+# `datafusion-contrib` crate (RFC 0040 §3.5).
+datafusion = { version = "54", default-features = false, features = ["parquet"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "testing"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

@@ -19,7 +19,7 @@ dependencies (tests, benchmarks) are excluded because they are not shipped.
 
 | License | Crates |
 | --- | --- |
-| `Apache-2.0` | 336 |
+| `Apache-2.0` | 337 |
 | `MIT` | 72 |
 | `Unicode-3.0` | 19 |
 | `BSD-3-Clause` | 8 |
@@ -6746,6 +6746,7 @@ Used by:
 - `ourios-bench` 0.4.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-config` 0.4.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-core` 0.4.0 — <https://github.com/jensholdgaard/ourios>
+- `ourios-df-otel` 0.4.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-ingester` 0.4.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-miner` 0.4.0 — <https://github.com/jensholdgaard/ourios>
 - `ourios-parquet` 0.4.0 — <https://github.com/jensholdgaard/ourios>

@@ -83,50 +83,71 @@ where
 /// `SystemTime` for the span builder. `None` if either is missing — a node
 /// with only one of the two (shouldn't happen in practice, `BaselineMetrics`
 /// always records both) is treated the same as having neither: skipped.
+/// Reduces explicitly via earliest-start / latest-end (RFC0040.2) rather than
+/// trusting a single `MetricsSet` entry per name, and treats an inverted
+/// `end < start` the same as missing bounds — an untimed node, not a span
+/// with an invented, backwards timeline.
 fn timed_bounds(aggregated: &MetricsSet) -> Option<(SystemTime, SystemTime)> {
     let mut start = None;
     let mut end = None;
     for metric in aggregated.iter() {
         match metric.value() {
-            MetricValue::StartTimestamp(ts) => start = ts.value(),
-            MetricValue::EndTimestamp(ts) => end = ts.value(),
+            MetricValue::StartTimestamp(ts) => {
+                if let Some(v) = ts.value() {
+                    start = Some(match start {
+                        Some(cur) if cur < v => cur,
+                        _ => v,
+                    });
+                }
+            }
+            MetricValue::EndTimestamp(ts) => {
+                if let Some(v) = ts.value() {
+                    end = Some(match end {
+                        Some(cur) if cur > v => cur,
+                        _ => v,
+                    });
+                }
+            }
             _ => {}
         }
     }
-    Some((SystemTime::from(start?), SystemTime::from(end?)))
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end => {
+            Some((SystemTime::from(start), SystemTime::from(end)))
+        }
+        _ => None,
+    }
+}
+
+/// The node's `usize` metric value converted to `OTel`'s `i64` attribute type.
+/// `None` on overflow rather than a wrapped (and silently negative) value —
+/// row/byte/duration counts never realistically approach `i64::MAX`, but an
+/// attribute that's missing is honest; one that's wrapped is not.
+fn attr(key: &'static str, value: usize) -> Option<KeyValue> {
+    i64::try_from(value).ok().map(|v| KeyValue::new(key, v))
 }
 
 /// The RFC 0040 §3.3 normative attribute table. Omits a metric the node
 /// doesn't report rather than zero-filling, so presence stays meaningful.
-// Row/byte/duration counts never approach `i64::MAX` (2^63 rows, bytes, or
-// nanoseconds) for any real query plan; OTel's integer attribute value is
-// `i64`, so the `usize` metric values need this conversion regardless.
-#[allow(clippy::cast_possible_wrap)]
 fn node_attributes(aggregated: &MetricsSet) -> Vec<KeyValue> {
     let mut attrs = Vec::new();
     for metric in aggregated.iter() {
         match metric.value() {
             MetricValue::OutputRows(count) => {
-                attrs.push(KeyValue::new(ATTR_OUTPUT_ROWS, count.value() as i64));
+                attrs.extend(attr(ATTR_OUTPUT_ROWS, count.value()));
             }
             MetricValue::ElapsedCompute(time) => {
-                attrs.push(KeyValue::new(ATTR_ELAPSED_COMPUTE, time.value() as i64));
+                attrs.extend(attr(ATTR_ELAPSED_COMPUTE, time.value()));
             }
             MetricValue::OutputBytes(count) => {
-                attrs.push(KeyValue::new(ATTR_OUTPUT_BYTES, count.value() as i64));
+                attrs.extend(attr(ATTR_OUTPUT_BYTES, count.value()));
             }
             MetricValue::PruningMetrics {
                 name,
                 pruning_metrics,
             } if name == ROW_GROUPS_PRUNED_STATISTICS => {
-                attrs.push(KeyValue::new(
-                    ATTR_ROW_GROUPS_PRUNED,
-                    pruning_metrics.pruned() as i64,
-                ));
-                attrs.push(KeyValue::new(
-                    ATTR_ROW_GROUPS_MATCHED,
-                    pruning_metrics.matched() as i64,
-                ));
+                attrs.extend(attr(ATTR_ROW_GROUPS_PRUNED, pruning_metrics.pruned()));
+                attrs.extend(attr(ATTR_ROW_GROUPS_MATCHED, pruning_metrics.matched()));
             }
             _ => {}
         }
@@ -289,7 +310,11 @@ mod tests {
         use datafusion::physical_plan::coop::CooperativeExec;
 
         let exporter = InMemorySpanExporter::default();
+        // Explicit sampler, not the SDK default: `record_plan_spans` gates on
+        // the parent span being sampled (§3.6), so a default change here
+        // would make this test flaky rather than exercising the walk logic.
         let provider = SdkTracerProvider::builder()
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
             .with_simple_exporter(exporter.clone())
             .build();
         let tracer = provider.tracer("test");

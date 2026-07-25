@@ -26,6 +26,11 @@ one-per-binary:
   a global (not scoped) tracer is required to capture the `ingest logs` /
   `sweep partitions` spans across the receiver's `tokio::spawn` and the
   compactor's `spawn_blocking` (RFC0038.3).
+- `rfc0039_3_ingest_propagation.rs` — the same global **tracer** need, for the
+  inbound-`traceparent` half: that the batch span joins the *caller's* trace
+  across that spawn, on both OTLP transports (RFC0039.3). Separate from
+  `rfc0038_3` because a process holds one tracer install and that file owns
+  the no-inbound-context (root) case.
 
 `fixtures/` holds the crash-fixture **`[[bin]]` targets** (SIGKILL'd by
 harness tests via `CARGO_BIN_EXE_*`), not test binaries.

@@ -48,5 +48,7 @@ pub use commit::CommitCoordinator;
 pub use decode::{DecodeError, decode_json, decode_protobuf};
 pub use materialize::{materialize_record, materialize_resource_logs};
 pub use pipeline::{IngestPipeline, Journal, ReceiveError, SharedPipeline};
-pub use propagation::{HeaderExtractor, extract_context};
+pub use propagation::{
+    HeaderExtractor, MetadataExtractor, extract_context, extract_context_from_metadata,
+};
 pub use tenant::{TenantResolutionError, TenantRule, fan_out};

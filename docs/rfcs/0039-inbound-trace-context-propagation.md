@@ -68,12 +68,16 @@ functions in all, since the MCP category is three tool functions. The count is
 stated so test coverage (RFC0039.1/.3/.6) omits no site. The carrier — where the
 incoming `traceparent` lives — is not always co-located with the span:
 
-| # | Span | Site (file:line) | Carrier & where it is reachable |
+Sites are named by file and function, deliberately without line numbers — those
+rot on every touch of the surrounding code and have already been corrected twice
+in review.
+
+| # | Span | Site | Carrier & where it is reachable |
 |---|---|---|---|
-| A | `ingest logs` (gRPC) | span in `ingest_bound` (`pipeline.rs:291`); entry `LogsReceiver::export` (`grpc.rs:152`) | raw `http::HeaderMap` in the tower auth layer `AuthService::call` (`grpc.rs:102`, already reads `request.headers()`) |
-| B | `ingest logs` (HTTP) | span in `ingest_bound`; entry `handle_logs` (`http.rs:95`) | axum `HeaderMap` (`http.rs:95`) |
-| C | `POST /v1/query` | `handle_query` (`querier.rs:421`) | axum `HeaderMap` (`querier.rs:423`) |
-| D | `execute_tool <tool>` (×3) | the three `_traced` fns (`mcp.rs:333/416/488`), each via a thin `#[tool]` delegate | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` reads, `mcp.rs:223`) |
+| A | `ingest logs` (gRPC) | span in `IngestPipeline::ingest_bound` (`pipeline.rs`); entry `LogsReceiver::export` (`grpc.rs`) | tonic `MetadataMap`, on the request in `export` itself (§3.4) |
+| B | `ingest logs` (HTTP) | span in `ingest_bound`; entry `handle_logs` (`http.rs`) | axum `HeaderMap`, a `handle_logs` extractor |
+| C | `POST /v1/query` | `handle_query_traced`, behind the `handle_query` wrapper (`querier.rs`) | axum `HeaderMap`, a `handle_query` extractor |
+| D | `execute_tool <tool>` (×3) | the three `_traced` fns (`mcp.rs`), each via a thin `#[tool]` delegate | `ctx.extensions.get::<axum::http::request::Parts>()?.headers` (as `mcp_session_id` reads) |
 
 The mechanism is uniform (§3.3): extract the caller's `opentelemetry::Context`
 and make it the **current** context around the span-producing future, so the
@@ -91,20 +95,41 @@ span is built; `tracing-opentelemetry` then parents a root span to
 `opentelemetry::trace::FutureExt::with_context(future, cx)` — run the
 span-producing future under the extracted context. One contract, every site:
 
-- **Query (C) and HTTP ingest (B):** a tower `PropagationLayer` on the axum
-  router extracts `cx` from the request `HeaderMap` and runs the downstream as
-  `next.run(req).with_context(cx)`. `handle_query`'s root span inherits `cx`; the
-  handler is unchanged.
-- **gRPC ingest (A):** the same extraction in the existing tower auth layer
-  (`AuthService::call`, `grpc.rs:102`), stashing `cx` in the request extensions
-  beside the auth binding.
+- **Query (C):** an un-instrumented `handle_query` wrapper extracts `cx` from the
+  request `HeaderMap` and awaits the instrumented `handle_query_traced` under it
+  — `handle_query_traced(..).with_context(cx).await`. No tower layer: an earlier
+  revision of this bullet proposed a shared `PropagationLayer`, but neither ingest
+  arm can use one (their span is born past a `tokio::spawn`, below), which would
+  leave the query arm as its sole beneficiary — see §4.
+- **gRPC ingest (A):** extraction happens in `LogsService::export` itself, from
+  the request's tonic `MetadataMap` (§3.4) — *not* in the tower auth layer, as
+  an earlier revision of this section proposed. Extraction belongs with the
+  handler that receives the call, which is both what OpenTelemetry prescribes
+  for a service receiving upstream calls and what makes it testable: the
+  RFC0039.3 harness drives `export` directly (no tower stack), so a
+  layer-extracted context would leave the extraction itself uncovered. See the
+  amendment note below.
 - **The `tokio::spawn` boundary (A/B):** the `ingest logs` span is born inside
-  `ingest_bound`, *after* the spawn (`grpc.rs:167`, `http.rs:146`), which a
-  layer's `with_context` does not cross. So the handler reads `cx` (from the
-  extension for A, extracts directly for B), moves it into the spawned closure,
-  and runs `ingest_bound(...).with_context(cx).await`. The span, first polled
-  under `cx`, inherits it — **no `ingest_bound` signature change, no
-  `set_parent`.**
+  `ingest_bound`, *after* the spawn in `export` / `handle_logs`, which
+  ambient context does not cross. So the handler extracts `cx` from its own
+  carrier before the spawn, moves it into the spawned closure, and attaches it
+  to the **whole** spawned block — `async move { ingest_bound(...).await
+  }.with_context(cx)` — rather than to `ingest_bound`'s future alone. Wrapping
+  the block is deliberate: it holds whether `#[tracing::instrument]` mints its
+  span at call time or on first poll, so the span cannot be created outside
+  `cx`. **No `ingest_bound` signature change, no `set_parent`.**
+
+> **Amendment (slice 2).** §3.3's gRPC bullet and §3.4 originally routed
+> extraction through the tower auth layer into a request extension. That was
+> withdrawn during implementation for two reasons: it contradicted §6, whose
+> RFC0039.3 test calls `export` directly and so would have exercised only the
+> spawn hand-off and never the extraction; and it put a propagation concern
+> inside a layer named for authentication. The OTel guidance is explicit that a
+> service receiving upstream calls extracts in the receiving handler ("the one
+> context on the wire becomes the parent of the new span the library creates"),
+> and the OTel Demo's own C++ gRPC service does exactly this with a
+> `GrpcServerCarrier` over `client_metadata()`. The cost of the correction is
+> the ~15-line `MetadataExtractor` that §3.4 had hoped to avoid.
 - **MCP (D):** the un-instrumented `#[tool]` delegate extracts `cx` from `ctx`'s
   forwarded headers and runs `self.<tool>_traced(...).with_context(cx).await`;
   the `_traced` span inherits `cx` across rmcp's own dispatch spawn.
@@ -116,13 +141,20 @@ the earlier draft's split between an explicit parameter and a request extension.
 ### 3.4 The extractor shim
 
 `opentelemetry::propagation::Extractor` is a two-method trait (`get`, `keys`).
-One adapter suffices: `struct HeaderExtractor<'a>(&'a http::HeaderMap)`, since
-`http::HeaderMap` is the carrier for **every** site — the gRPC path extracts from
-the raw HTTP headers at the tower auth layer (`grpc.rs:102`), so no tonic
-`MetadataMap` adapter is needed. Extraction goes through the propagator installed
-in §3.1: `global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)))`.
-`opentelemetry-http` ships an equivalent `HeaderExtractor`; the ~10-line local
-one avoids a dependency (revisit if a metadata extractor is ever needed).
+**Two** adapters are needed, both in `receiver/propagation.rs`:
+
+- `HeaderExtractor<'a>(&'a http::HeaderMap)` — the axum-side ingresses (OTLP/HTTP,
+  the query API, the MCP tools), whose carrier is an `http::HeaderMap`.
+- `MetadataExtractor<'a>(&'a tonic::metadata::MetadataMap)` — the OTLP/gRPC
+  ingress. gRPC metadata *is* HTTP/2 headers, but tonic models it as
+  `HeaderMap<MetadataValue>`, not `http::HeaderMap`, and exposes no cheap
+  `&HeaderMap` view, so it needs its own carrier. `keys()` offers only the ascii
+  half: a binary (`-bin`) key can never resolve as a text-map entry.
+
+Both resolve through the propagator installed in §3.1, e.g.
+`global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)))`.
+`opentelemetry-http` ships an equivalent `HeaderExtractor`; the local pair avoids
+that dependency and keeps both carriers described in one place.
 
 ### 3.5 Dependency promotion (the one production-surface change)
 
@@ -180,11 +212,14 @@ and every `#[tracing::instrument]` span is entered for its body, so the parent i
 silently dropped (§3.3). The attach-the-context idiom (`with_context`) is the
 correct primitive and is what §3.3 adopts.
 
-**Per-handler extraction with no shared layer.** Workable but repetitive: each
-handler would extract and wrap. The `PropagationLayer` (§3.3) centralises the
-request-local sites (B/C); only the spawn-crossed span (A/B's `ingest_bound`) and
-MCP (D, behind rmcp's dispatch) need the explicit `with_context` hand-off, which
-no layer can do for them anyway.
+**A shared `PropagationLayer` instead of per-handler extraction.** Attractive on
+paper — one layer for every axum-side ingress — but it buys less than it looks.
+Neither ingest arm can use it: their span is born past a `tokio::spawn`, so they
+need the explicit `with_context` hand-off regardless (§3.3), and a layer that
+extracted for them would only duplicate what the handler must do anyway. That
+leaves the query arm as the sole beneficiary of a whole tower layer, for the two
+lines it already spends extracting directly. Per-handler extraction also keeps
+each site's carrier visible at the site, which is where OTel puts it.
 
 **Adopt `opentelemetry-http`'s `HeaderExtractor` as a dependency.** Reasonable,
 but it is one more crate for a ~10-line shim; the RFC inlines the extractor. If
@@ -260,12 +295,13 @@ Mapped to `CLAUDE.md` §6.2:
 
 ## 7. Open questions
 
-- [ ] Confirm `FutureExt::with_context` correctly re-attaches the extracted
-      context inside the spawned `ingest_bound` task (§3.3) — the spawn-boundary
-      test (RFC0039.3) is the check. (The carry-channel and site-A/metadata-vs-
-      header questions the earlier draft left open are now settled by §3.3/§3.4:
-      one `HeaderExtractor` over the raw `http::HeaderMap`, `cx` in the request
-      extension across the spawn, no `ingest_bound` signature change.)
+- [x] **Resolved (slice 2).** `FutureExt::with_context` does re-attach the
+      extracted context inside the spawned `ingest_bound` task, on both
+      transports — `rfc0039_3_ingest_propagation.rs` passes, and fails with
+      each arm's span in a freshly minted trace when the two handler changes are
+      reverted. Site A's carrier is the tonic `MetadataMap`, read in `export`
+      (§3.4 amendment); no request extension and no `ingest_bound` signature
+      change are involved.
 - [ ] MCP tool spans are `otel.kind = "internal"` and lack an enclosing Ourios
       SERVER span for `/mcp` (rmcp's `serve_inner` is muted by the `rmcp=off`
       loop-guard, RFC0038.7). An INTERNAL span continuing a *remote* parent is

@@ -24,9 +24,12 @@ use axum::routing::post;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
 use prost::Message;
 
+use opentelemetry::context::FutureExt as _;
+
 use crate::receiver::auth::AuthResolver;
 use crate::receiver::decode::{decode_json, decode_protobuf};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
+use crate::receiver::propagation::extract_context;
 
 /// OTLP/HTTP listener configuration.
 #[derive(Debug, Clone)]
@@ -142,12 +145,19 @@ async fn handle_logs(State(state): State<AppState>, headers: HeaderMap, body: By
     // handler just awaits. Run it on its own task so a panic in the
     // pipeline/miner is contained as a 500 (the handler promises not to
     // panic) rather than aborting the connection.
+    // RFC 0039 §3.3: as on the gRPC arm, the `ingest logs` span is created
+    // inside `ingest_bound` past this spawn, so the caller's context is
+    // extracted from the request headers here and re-attached inside the task.
+    let parent = extract_context(&headers);
     let pipeline = state.pipeline.clone();
-    match tokio::spawn(async move {
-        pipeline
-            .ingest_bound(request, binding.as_ref(), lenient_json)
-            .await
-    })
+    match tokio::spawn(
+        async move {
+            pipeline
+                .ingest_bound(request, binding.as_ref(), lenient_json)
+                .await
+        }
+        .with_context(parent),
+    )
     .await
     {
         Ok(Ok(_)) => success_response(format),

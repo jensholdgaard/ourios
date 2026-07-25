@@ -389,11 +389,14 @@ jaeger-up:
         driver: bridge
     YAML
     docker compose -f scratch/observability/docker-compose.yaml up -d
-    echo "Jaeger UI                 → http://localhost:16686"
-    echo "OTLP endpoint (gRPC, :4317 — use as-is for OTEL_EXPORTER_OTLP_ENDPOINT)"
-    echo "OTLP endpoint (HTTP, :4318 — browsable-looking but still OTLP, not a UI)"
-    echo "Logs fan out to dogfood-server on :24317 — start it too, or they're dropped."
-    echo "Run 'just dogfood-env' for the source-side env block."
+    echo "Jaeger UI  → http://localhost:16686"
+    echo ""
+    echo "OTLP in — the endpoint URL and the protocol must agree:"
+    echo "  http/protobuf → http://127.0.0.1:4318   (what 'just dogfood-env' uses)"
+    echo "  grpc          → http://127.0.0.1:4317   (also set OTEL_EXPORTER_OTLP_PROTOCOL=grpc)"
+    echo ""
+    echo "Run 'just dogfood-env' for the source-side env block (traces here, logs"
+    echo "straight to dogfood-server — start that too)."
 
 # Stop the Jaeger + Collector stack `jaeger-up` started. A no-op (not an
 # error) if `jaeger-up` was never run or `scratch/observability` was cleaned

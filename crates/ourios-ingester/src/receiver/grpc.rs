@@ -29,8 +29,11 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 };
 use tonic::{Request, Response, Status};
 
+use opentelemetry::context::FutureExt as _;
+
 use crate::receiver::auth::{AuthBinding, AuthResolver};
 use crate::receiver::pipeline::{ReceiveError, SharedPipeline};
+use crate::receiver::propagation::extract_context_from_metadata;
 
 /// The authentication gate for the gRPC listener (RFC 0026 §3.2 /
 /// RFC 0029 §3.3), applied as a tower layer on the tonic server. A tower
@@ -153,6 +156,12 @@ impl LogsService for LogsReceiver {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        // RFC 0039 §3.3: the `ingest logs` span is born inside `ingest_bound`,
+        // past the `tokio::spawn` below — which ambient context does not cross.
+        // So the caller's context is extracted here, while the request (and its
+        // metadata) is still in hand, and re-attached inside the task where the
+        // span is actually created.
+        let parent = extract_context_from_metadata(request.metadata());
         // The [`AuthInterceptor`]'s binding, when auth is enabled — the
         // pipeline enforces the §3.2 tenant binding against it.
         let binding = request.extensions().get::<AuthBinding>().cloned();
@@ -165,7 +174,8 @@ impl LogsService for LogsReceiver {
         // so this is `spawn`, not `spawn_blocking`.
         let pipeline = self.pipeline.clone();
         match tokio::spawn(
-            async move { pipeline.ingest_bound(export, binding.as_ref(), false).await },
+            async move { pipeline.ingest_bound(export, binding.as_ref(), false).await }
+                .with_context(parent),
         )
         .await
         {

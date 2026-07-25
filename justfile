@@ -217,12 +217,14 @@ dogfood-server:
     export OURIOS_DOGFOOD_ROOT="$(pwd)/scratch/dogfood"
     cargo run -p ourios-server -- --config dogfood-config.yaml
 
-# Print the env block that points a source's OTLP telemetry at the Collector
-# (`jaeger-up`), which fans out: logs → `dogfood-server` (queryable as data),
-# traces → Jaeger (browsable as spans). One endpoint covers both signals.
-# Start both `jaeger-up` and `dogfood-server` first. The *enable* flag is
-# tool-specific and printed as a per-tool comment rather than hard-coded, so
-# the same block works for Claude Code, Copilot CLI, or any OTLP source; a
+# Print the env block that wires a source into both halves of the local
+# setup: logs → `dogfood-server` (queryable as data), traces → the Collector
+# → Jaeger (browsable as spans). Uses the **per-signal** endpoint overrides
+# so each signal goes straight to the process that owns it — nothing crosses
+# the container→host boundary, so it behaves the same on macOS and native
+# Linux. Start both `jaeger-up` and `dogfood-server` first. The *enable* flag
+# is tool-specific and printed as a per-tool comment rather than hard-coded,
+# so the same block works for Claude Code, Copilot CLI, or any OTLP source; a
 # source with no traces signal simply sends none, and its logs still flow.
 # Telemetry is read at process startup, so `export` these and start a NEW
 # session of the source. Content capture (prompts/tool output) is opt-in and
@@ -233,12 +235,15 @@ dogfood-env:
     cat <<'ENV'
     export OTEL_LOGS_EXPORTER=otlp
     export OTEL_METRICS_EXPORTER=none        # Ourios is logs-only (CLAUDE.md §1)
-    export OTEL_TRACES_EXPORTER=otlp         # Collector routes these to Jaeger
+    export OTEL_TRACES_EXPORTER=otlp
     # http/protobuf, matching docs/guides/agent-telemetry.md — the broadly
-    # compatible default (not every source speaks OTLP/gRPC). The Collector
-    # accepts both; :4318 is its HTTP port, :4317 its gRPC one.
+    # compatible default (not every source speaks OTLP/gRPC).
     export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-    export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+    # Per-signal endpoints: each signal goes straight to the process that owns
+    # it, so no telemetry crosses the container->host boundary and this works
+    # identically on macOS and native Linux (see dogfood-config.yaml).
+    export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318   # -> dogfood-server
+    export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318  # -> Collector -> Jaeger
     export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant
     # then enable telemetry on the source (per-tool flag):
     #   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1
@@ -256,9 +261,11 @@ dogfood-env:
     # (open mode takes the tenant as a tool argument, no bearer):
     #   Claude Code:  claude mcp add --transport http ourios http://127.0.0.1:4319/mcp
     #   then ask it to read ourios://query-schema and query tenant "agent-dogfood"
-    # no Collector? point straight at dogfood-server (logs only, no trace viewer):
+    # no trace viewer wanted? drop the traces line and set:
     #   export OTEL_TRACES_EXPORTER=none
-    #   export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318
+    # single-endpoint source (can't set per-signal vars)? point it all at the
+    # Collector and let it fan logs out — macOS only, see dogfood-config.yaml:
+    #   export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
     ENV
 
 # Wipe the local dogfood store + WAL (the captured telemetry). Refuses while

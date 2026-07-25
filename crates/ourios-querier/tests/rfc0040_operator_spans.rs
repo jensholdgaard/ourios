@@ -86,6 +86,26 @@ fn write_all(bucket: &Path, recs: &[MinedRecord]) {
     }
 }
 
+fn has_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> bool {
+    span.attributes.iter().any(|kv| kv.key.as_str() == key)
+}
+
+/// Asserts `span` carries `key` as an actual `Value::I64` (RFC0040.3's
+/// normative attribute type), not merely present under the right key.
+fn assert_i64_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) {
+    let kv = span
+        .attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .unwrap_or_else(|| panic!("{:?} must carry {key}", span.name));
+    assert!(
+        matches!(kv.value, opentelemetry::Value::I64(_)),
+        "{:?}'s {key} must be Value::I64, got {:?}",
+        span.name,
+        kv.value,
+    );
+}
+
 fn req(tenant: &str, template_id: u64, limit: usize) -> QueryRequest {
     QueryRequest {
         tenant: TenantId::new(tenant),
@@ -201,37 +221,21 @@ async fn assert_operator_span_tree() {
     }
 
     // RFC0040.3 — attribute shape for a scan-shaped node (pruning counts)
-    // and a non-scan node (rows/bytes/elapsed_compute only).
+    // and a non-scan node (rows/bytes/elapsed_compute only), each an actual
+    // `Value::I64`, not merely present under the right key.
     let scan = operator_spans
         .iter()
-        .find(|s| {
-            s.attributes
-                .iter()
-                .any(|kv| kv.key.as_str() == "datafusion.operator.row_groups_matched")
-        })
+        .find(|s| has_attr(s, "datafusion.operator.row_groups_matched"))
         .unwrap_or_else(|| panic!("expected a scan node reporting pruning counts among {names:?}"));
-    assert!(
-        scan.attributes
-            .iter()
-            .any(|kv| kv.key.as_str() == "datafusion.operator.row_groups_pruned"),
-        "the scan node must also report row_groups_pruned"
-    );
+    assert_i64_attr(scan, "datafusion.operator.row_groups_matched");
+    assert_i64_attr(scan, "datafusion.operator.row_groups_pruned");
     let non_scan = operator_spans
         .iter()
         .find(|s| {
-            !s.attributes
-                .iter()
-                .any(|kv| kv.key.as_str() == "datafusion.operator.row_groups_matched")
-                && !s.attributes.is_empty()
+            !has_attr(s, "datafusion.operator.row_groups_matched") && !s.attributes.is_empty()
         })
         .unwrap_or_else(|| panic!("expected a non-scan node with attributes among {names:?}"));
-    assert!(
-        non_scan
-            .attributes
-            .iter()
-            .any(|kv| kv.key.as_str() == "datafusion.operator.output_rows"),
-        "a non-scan node must still report output_rows"
-    );
+    assert_i64_attr(non_scan, "datafusion.operator.output_rows");
 
     // RFC0040.2 — real wall-clock bounds, never inverted.
     for op in &operator_spans {

@@ -6,12 +6,14 @@
 //! only this harness's module-path prefix (RFC0028.1). The served-binary
 //! suites spawn the `ourios-server` **child** process
 //! (`CARGO_BIN_EXE_ourios-server`), never mutating their own — harness-
-//! safe. Two binaries stay exempt (RFC0028.2), each installing a
+//! safe. Three binaries stay exempt (RFC0028.2), each installing a
 //! process-global `OTel` provider that cannot share a process with another
 //! installer: `rfc0016_6_query_metrics.rs` (the global meter via
-//! `init_in_memory`) and `rfc0038_1_mcp_span.rs` (a global tracer — rmcp
-//! `tokio::spawn`s the tool dispatch, so a scoped subscriber can't capture
-//! the `execute_tool <tool>` span; RFC0038.1 MCP arm).
+//! `init_in_memory`), and two global-*tracer* installers, because rmcp
+//! `tokio::spawn`s the tool dispatch and a scoped subscriber cannot capture
+//! the `execute_tool <tool>` span across it — `rfc0038_1_mcp_span.rs`
+//! (RFC0038.1 MCP arm) and `rfc0039_6_mcp_propagation.rs` (RFC0039.6, the
+//! same span joining the caller's trace under a `/mcp` SERVER span).
 
 mod collector_interop;
 mod rfc0003_16_served_binary;
@@ -28,3 +30,4 @@ mod rfc0030_tls;
 mod rfc0032_query_schema;
 mod rfc0038_1_request_spans;
 mod rfc0039_1_query_propagation;
+mod rfc0039_4_sampling;

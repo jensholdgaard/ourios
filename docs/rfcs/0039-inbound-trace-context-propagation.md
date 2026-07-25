@@ -1,7 +1,7 @@
 ---
 rfc: 0039
 title: Inbound trace-context propagation — SERVER spans continue the caller's trace
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -10,6 +10,15 @@ superseded-by: —
 ---
 
 # RFC 0039 — Inbound trace-context propagation
+
+> **Status: `green`** — all six §5 scenarios have asserting tests, landed over
+> four slices: the query arm and the propagator install (#627), the ingest spawn
+> boundary on both OTLP transports (#628), the `/mcp` SERVER span with the tool
+> spans nesting locally beneath it (#629), and the sampling regime (this slice).
+> Two §3 design decisions were withdrawn during implementation and amended in
+> place rather than silently followed — gRPC extraction moved out of the tower
+> auth layer into the receiving handler (§3.3/§3.4), and the MCP arm gained a
+> span, which §2's original "no new spans" promise had ruled out.
 
 ## 1. Summary
 

@@ -758,6 +758,11 @@ fn combine(
     })
 }
 
+/// The `OTel` logs data model's "no severity here" — the value its proto enum
+/// spells `SEVERITY_NUMBER_UNSPECIFIED`. Real sources emit it (Claude Code's
+/// `GenAI` events, ETW's `LOG_ALWAYS`, Google Cloud's `DEFAULT`).
+const SEVERITY_UNSPECIFIED: i64 = 0;
+
 fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
     // `severity_number` is REQUIRED (always present), so no absent-column
     // guard is needed. Compare as i64; DataFusion coerces against UInt8.
@@ -766,6 +771,10 @@ fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
     // membership (`==`/`!=`) is a range test, not a single-value compare. A
     // numeric RHS is exact, and ordering ops use the band floor either way
     // (RFC0002.5: ordering compares against the floor of the named band).
+    let threshold = match value {
+        SeverityValue::Name(name) => name.floor(),
+        SeverityValue::Number(n) => *n,
+    };
     let expr = match (value, op) {
         (SeverityValue::Name(name), OrdOp::Eq) => sev()
             .gt_eq(lit(name.floor()))
@@ -773,8 +782,31 @@ fn compile_severity(op: OrdOp, value: &SeverityValue) -> PredExpr {
         (SeverityValue::Name(name), OrdOp::Ne) => {
             sev().lt(lit(name.floor())).or(sev().gt(lit(name.ceil())))
         }
-        (SeverityValue::Name(name), _) => ord_expr(sev(), op, lit(name.floor())),
-        (SeverityValue::Number(n), _) => ord_expr(sev(), op, lit(*n)),
+        // RFC0002.21 — a minimum-severity floor (`>=`/`>`) does not filter out
+        // records whose severity is *unspecified*. This mirrors the OTel Logs
+        // SDK, whose `minimum_severity` drops a record only when its
+        // SeverityNumber "is specified (i.e. not 0)"; unspecified records
+        // "bypass minimum severity filtering". The data model sanctions the
+        // special case explicitly ("Special handling MAY be given to
+        // SeverityNumber=0 ... in less-than / greater-than comparisons").
+        //
+        // Written as a disjunction rather than a post-filter on purpose: the
+        // `= 0` arm keeps row-group pruning correct for free, because a group
+        // whose severity range includes 0 can no longer be proven non-matching.
+        // A post-filter would leave the old pruning in place and silently skip
+        // whole files of unspecified rows.
+        (_, OrdOp::Ge | OrdOp::Gt) if threshold > SEVERITY_UNSPECIFIED => sev()
+            .eq(lit(SEVERITY_UNSPECIFIED))
+            .or(ord_expr(sev(), op, lit(threshold))),
+        // The ceiling side must *exclude* unspecified, or the bypass above
+        // would make a row match both `>= X` and `< X` — `0 < 17` is true
+        // numerically, but a record with no severity is not "below error".
+        // Excluding it here keeps a predicate and its negation a partition,
+        // which is the property a query language cannot give up.
+        (_, OrdOp::Lt | OrdOp::Le) if threshold > SEVERITY_UNSPECIFIED => sev()
+            .not_eq(lit(SEVERITY_UNSPECIFIED))
+            .and(ord_expr(sev(), op, lit(threshold))),
+        _ => ord_expr(sev(), op, lit(threshold)),
     };
     PredExpr::Filter(expr)
 }
@@ -1192,6 +1224,146 @@ fn ord_expr(lhs: Expr, op: OrdOp, rhs: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ir::SeverityName;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::Operator;
+
+    /// Structural helpers: assert on the lowered `Expr` tree rather than its
+    /// `Display` output. `DataFusion`'s rendering is not a stable API and this
+    /// workspace tracks `DataFusion` upgrades (RFC 0021), so a formatting change
+    /// must not be able to fail these tests without a semantic change.
+    fn top_operator(e: &Expr) -> Option<Operator> {
+        match e {
+            Expr::BinaryExpr(b) => Some(b.op),
+            _ => None,
+        }
+    }
+
+    /// True when `e` is exactly `severity_number <op> 0`.
+    fn is_severity_vs_unspecified(e: &Expr, want: Operator) -> bool {
+        let Expr::BinaryExpr(b) = e else {
+            return false;
+        };
+        if b.op != want {
+            return false;
+        }
+        let lhs_is_severity =
+            matches!(b.left.as_ref(), Expr::Column(c) if c.name == columns::SEVERITY_NUMBER);
+        let rhs_is_zero = matches!(
+            b.right.as_ref(),
+            Expr::Literal(ScalarValue::Int64(Some(0)), ..)
+        );
+        lhs_is_severity && rhs_is_zero
+    }
+
+    fn lowered(op: OrdOp, value: &SeverityValue) -> Expr {
+        match compile_severity(op, value) {
+            PredExpr::Filter(e) => e,
+            _ => panic!("expected a Filter for a severity predicate"),
+        }
+    }
+
+    /// RFC0002.21 lowering: a floor admits unspecified, a ceiling excludes it,
+    /// and an explicit `0` threshold does neither. Asserted on the lowered
+    /// predicate rather than end-to-end, so a regression is caught at the
+    /// compile step even if no fixture happens to contain a `0` row.
+    #[test]
+    fn severity_lowering_special_cases_unspecified_only_above_zero() {
+        // Floors admit unspecified: the lowered predicate is a disjunction
+        // whose left arm is `= 0`. That arm is also what defeats min/max
+        // pruning, so this doubles as the pruning-correctness guard.
+        for op in [OrdOp::Ge, OrdOp::Gt] {
+            let e = lowered(op, &SeverityValue::Number(17));
+            assert_eq!(
+                top_operator(&e),
+                Some(Operator::Or),
+                "{op:?} against a positive threshold must lower to a disjunction"
+            );
+            let Expr::BinaryExpr(b) = &e else {
+                panic!("checked above")
+            };
+            assert!(
+                is_severity_vs_unspecified(b.left.as_ref(), Operator::Eq),
+                "{op:?} must carry a `severity_number = 0` arm"
+            );
+        }
+
+        // Ceilings exclude it, so a predicate and its negation still partition.
+        for op in [OrdOp::Lt, OrdOp::Le] {
+            let e = lowered(op, &SeverityValue::Number(17));
+            assert_eq!(
+                top_operator(&e),
+                Some(Operator::And),
+                "{op:?} against a positive threshold must lower to a conjunction"
+            );
+            let Expr::BinaryExpr(b) = &e else {
+                panic!("checked above")
+            };
+            assert!(
+                is_severity_vs_unspecified(b.left.as_ref(), Operator::NotEq),
+                "{op:?} must carry a `severity_number != 0` arm"
+            );
+        }
+
+        // A `0` threshold is a question *about* unspecified, not a floor, so
+        // `severity > 0` keeps meaning "has a specified severity".
+        for op in [OrdOp::Ge, OrdOp::Gt, OrdOp::Lt, OrdOp::Le] {
+            let e = lowered(op, &SeverityValue::Number(0));
+            let top = top_operator(&e);
+            assert!(
+                top != Some(Operator::Or) && top != Some(Operator::And),
+                "{op:?} against a 0 threshold must lower to a plain comparison, got {top:?}"
+            );
+        }
+    }
+
+    /// Membership (`==`/`!=`) is unchanged by RFC0002.21 — it is a range or
+    /// equality test, not a minimum-severity floor, so unspecified gets no
+    /// special treatment. Covers the bare-name band (`error` ⇒ 17..=20), which
+    /// is the form the DSL actually encourages, as well as the exact numeric
+    /// form.
+    #[test]
+    fn severity_membership_is_untouched_by_the_unspecified_rule() {
+        for (label, value) in [
+            ("named band", SeverityValue::Name(SeverityName::Error)),
+            ("exact number", SeverityValue::Number(17)),
+        ] {
+            for op in [OrdOp::Eq, OrdOp::Ne] {
+                let e = lowered(op, &value);
+                // No arm anywhere in the tree may test against unspecified.
+                let mut carries_unspecified = false;
+                e.apply(|node| {
+                    if is_severity_vs_unspecified(node, Operator::Eq)
+                        || is_severity_vs_unspecified(node, Operator::NotEq)
+                    {
+                        carries_unspecified = true;
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walk");
+                assert!(
+                    !carries_unspecified,
+                    "{label} {op:?} must not gain the unspecified special case"
+                );
+            }
+        }
+
+        // And the band really is a range, so the loop above exercises the band
+        // path rather than silently lowering like an exact compare.
+        let band = lowered(OrdOp::Eq, &SeverityValue::Name(SeverityName::Error));
+        let mut bounds = Vec::new();
+        band.apply(|node| {
+            if let Expr::Literal(ScalarValue::Int64(Some(v)), ..) = node {
+                bounds.push(*v);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walk");
+        assert!(
+            bounds.contains(&17) && bounds.contains(&20),
+            "`== error` must lower to the 17..=20 band, got literals {bounds:?}"
+        );
+    }
 
     #[test]
     fn duration_nanos_covers_all_units() {

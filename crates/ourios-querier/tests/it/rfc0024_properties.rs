@@ -141,7 +141,10 @@ impl Pred {
         match self {
             Self::TemplateEq(n) => r.template_id == *n,
             Self::SeverityEq(n) => r.severity_number == *n,
-            Self::SeverityGe(n) => r.severity_number >= *n,
+            // RFC0002.21 — a floor admits unspecified severity (0) as well,
+            // mirroring the OTel Logs SDK's `minimum_severity`. An explicit
+            // threshold of 0 keeps ordinary semantics.
+            Self::SeverityGe(n) => (*n > 0 && r.severity_number == 0) || r.severity_number >= *n,
             Self::AttrEq { key, value } => attr_first_string(r, key) == Some(value.as_str()),
             Self::Window { .. } => true,
         }

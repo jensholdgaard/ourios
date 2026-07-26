@@ -119,6 +119,14 @@ receiver:
   resources: {}
   podAnnotations: {}
   podLabels: {}
+  # Role-only env, appended verbatim AFTER the global extraEnv — Kubernetes
+  # takes the last occurrence, so a duplicate name here wins and each role can
+  # carry its own value for the same variable. The natural home for per-role
+  # OTEL_RESOURCE_ATTRIBUTES (format: key=value,key2=value2 — see the general
+  # SDK env-var list on the global extraEnv above).
+  extraEnv: []
+    # - name: OTEL_RESOURCE_ATTRIBUTES
+    #   value: deployment.environment.name=production,service.namespace=ourios
 
 # Querier role (RFC 0016): a stateless Deployment that reads the configured store
 # (local or s3) and scales freely.
@@ -139,6 +147,14 @@ querier:
   resources: {}
   podAnnotations: {}
   podLabels: {}
+  # Role-only env, appended verbatim AFTER the global extraEnv — Kubernetes
+  # takes the last occurrence, so a duplicate name here wins and each role can
+  # carry its own value for the same variable. The natural home for per-role
+  # OTEL_RESOURCE_ATTRIBUTES (format: key=value,key2=value2 — see the general
+  # SDK env-var list on the global extraEnv above).
+  extraEnv: []
+    # - name: OTEL_RESOURCE_ATTRIBUTES
+    #   value: deployment.environment.name=production,service.namespace=ourios
 
 # Background compactor (RFC 0009). The single sweeper: the receiver and querier
 # workloads set OURIOS_COMPACTION_ENABLED=0, so only this Deployment compacts.
@@ -157,54 +173,72 @@ compactor:
   resources: {}
   podAnnotations: {}
   podLabels: {}
+  # Role-only env, appended verbatim AFTER the global extraEnv — Kubernetes
+  # takes the last occurrence, so a duplicate name here wins and each role can
+  # carry its own value for the same variable. The natural home for per-role
+  # OTEL_RESOURCE_ATTRIBUTES (format: key=value,key2=value2 — see the general
+  # SDK env-var list on the global extraEnv above).
+  extraEnv: []
+    # - name: OTEL_RESOURCE_ATTRIBUTES
+    #   value: deployment.environment.name=production,service.namespace=ourios
 
 # Ourios's own self-telemetry: the OTLP endpoint every signal it emits is
-# exported to. That is now three signals, not just the meter — metrics
+# exported to. That is three signals, not just the meter — metrics
 # (CLAUDE.md §6.3), logs, and, since RFC 0038/0039/0040, traces (request-scoped
 # spans on ingest/query/MCP/sweep, continuing an inbound caller's trace, with
 # DataFusion operator spans under a query).
 #
-# Every key below maps 1:1 onto a standard OTEL_* env var: Ourios models no
-# bespoke telemetry config, it reads the SDK's own variables (RFC 0038 slice
-# 4). Anything not modeled here can still be set verbatim via extraEnv.
+# The endpoint is the ONLY OTel knob the chart models: it is deployment
+# topology (where this release sends its telemetry), which the chart owns.
+# Everything about how the SDK behaves — samplers, export intervals,
+# per-signal disable — is the OpenTelemetry SDK's own env-var contract
+# (OTEL_TRACES_SAMPLER, OTEL_METRIC_EXPORT_INTERVAL,
+# OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none, ...) and is set verbatim through
+# extraEnv below. The chart deliberately does not wrap that vocabulary in
+# values keys: Ourios itself models no bespoke telemetry config (RFC 0038),
+# and the chart re-modeling the SDK's variables would couple it to a naming
+# contract it does not own. See the README's "Self-telemetry" section.
 #
 # Pointing this at Ourios's own receiver is the intended dogfood setup, but
 # send it through a Collector rather than directly: Ourios emits logs *about*
 # ingesting, so a direct self-export is a feedback loop.
 otel:
   # OTEL_EXPORTER_OTLP_ENDPOINT — all three signals. Empty leaves it unset.
-  # Per-signal endpoints (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT and friends) go
-  # in extraEnv.
   exporterEndpoint: ""
 
-  traces:
-    # false renders OTEL_TRACES_EXPORTER=none — the span pipeline is not built.
-    enabled: true
-    # OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG. Empty keeps the SDK
-    # default, parentbased_always_on: every request Ourios serves is sampled.
-    # Spans are request-scoped, never per log record (RFC 0038 §3), so this is
-    # bounded by request rate — but on a busy receiver prefer
-    # parentbased_traceidratio with samplerArg: "0.01".
-    sampler: ""
-    samplerArg: ""
-
-  metrics:
-    # false renders OTEL_METRICS_EXPORTER=none.
-    enabled: true
-    # OTEL_METRIC_EXPORT_INTERVAL, in milliseconds. Empty = SDK default 60000.
-    exportInterval: ""
-
-  logs:
-    # false renders OTEL_LOGS_EXPORTER=none. Ourios's own structured logs are
-    # bridged to OTLP; disabling this leaves them on stderr only.
-    enabled: true
-
-# Extra environment variables appended verbatim to every container (e.g. OTEL_*
-# overrides). Do NOT put object-store credentials here as plaintext — use
-# storage.s3.existingSecret above.
+# Extra environment variables appended verbatim to every container. Entries
+# are Kubernetes EnvVar objects, so valueFrom works too. Per-role additions go
+# in receiver/querier/compactor .extraEnv and land after these, so a
+# role-level name wins over a global one. Do NOT put object-store credentials
+# here as plaintext — use storage.s3.existingSecret above.
+#
+# This is where the OpenTelemetry SDK is configured. OTel's env-var contract
+# is its own, universal, and already known to its users, so the chart passes
+# it through verbatim instead of wrapping it in chart-specific keys. The
+# spec-defined variables (all honoured by Ourios's SDK):
+#
+#   General SDK  https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
+#     OTEL_SDK_DISABLED             kill-switch for all signals ("true")
+#     OTEL_RESOURCE_ATTRIBUTES      key=value,... resource attributes
+#     OTEL_SERVICE_NAME             service.name (wins over the same key above)
+#     OTEL_TRACES_SAMPLER           default parentbased_always_on — every
+#                                   served request is sampled; on a busy
+#                                   receiver prefer parentbased_traceidratio
+#     OTEL_TRACES_SAMPLER_ARG       e.g. "0.01" for traceidratio samplers
+#     OTEL_{TRACES,METRICS,LOGS}_EXPORTER
+#                                   "none" disables that signal's pipeline
+#     OTEL_METRIC_EXPORT_INTERVAL   milliseconds, default 60000
+#
+#   OTLP exporter  https://opentelemetry.io/docs/specs/otel/protocol/exporter/
+#     OTEL_EXPORTER_OTLP_PROTOCOL   grpc | http/protobuf
+#     OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT
+#                                   per-signal endpoint overrides
+#     OTEL_EXPORTER_OTLP_HEADERS / _TIMEOUT / _COMPRESSION ...
 extraEnv: []
-  # - name: OTEL_EXPORTER_OTLP_PROTOCOL
-  #   value: http/protobuf
+  # - name: OTEL_TRACES_SAMPLER
+  #   value: parentbased_traceidratio
+  # - name: OTEL_TRACES_SAMPLER_ARG
+  #   value: "0.01"
 
 # The shared ServiceAccount, used by every role that does not define its own
 # role-scoped one (receiver/querier/compactor .serviceAccount, above).

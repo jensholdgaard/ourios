@@ -128,25 +128,57 @@ Ourios is a telemetry backend, so it is instrumented as one (`CLAUDE.md` §6.3).
 | Logs | Ourios's own structured logs, bridged to OTLP |
 | Traces | request-scoped spans on ingest, query, `/mcp` and sweep (RFC 0038), continuing an inbound caller's trace (RFC 0039), with a DataFusion operator span tree under a query (RFC 0040) |
 
+The endpoint is the **only** OTel knob the chart models — it is deployment
+topology, which the chart owns. Everything about how the SDK *behaves* is the
+OpenTelemetry SDK's own env-var contract, which its users already know, so the
+chart passes it through verbatim in `extraEnv` (globally and per role) instead
+of wrapping it in chart-specific keys. The authoritative lists:
+
+- [General SDK configuration](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/)
+  — `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER`,
+  `OTEL_{TRACES,METRICS,LOGS}_EXPORTER`, `OTEL_METRIC_EXPORT_INTERVAL`,
+  `OTEL_SDK_DISABLED`, …
+- [OTLP exporter configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/)
+  — `OTEL_EXPORTER_OTLP_PROTOCOL`, per-signal `_ENDPOINT` overrides,
+  `_HEADERS`, `_TIMEOUT`, `_COMPRESSION`, …
+
 Two things worth setting deliberately before running this in anger:
 
 - **Sampling.** The SDK default is `parentbased_always_on`, so *every* request
   is traced. Spans are request-scoped and never per log record, so the volume
   tracks request rate rather than ingest rate — but a receiver taking large
-  OTLP batches at a high rate will still produce a lot. Set
-  `otel.traces.sampler: parentbased_traceidratio` with
-  `otel.traces.samplerArg: "0.01"` to trim it. Because it is *parent*-based, a
-  caller that already sampled its trace still gets its Ourios spans — RFC 0039
-  keeps the caller's decision authoritative.
+  OTLP batches at a high rate will still produce a lot. Trim it in `extraEnv`:
+
+  ```yaml
+  extraEnv:
+    - name: OTEL_TRACES_SAMPLER
+      value: parentbased_traceidratio
+    - name: OTEL_TRACES_SAMPLER_ARG
+      value: "0.01"
+  ```
+
+  Because it is *parent*-based, a caller that already sampled its trace still
+  gets its Ourios spans — RFC 0039 keeps the caller's decision authoritative.
 - **Don't self-export directly.** Pointing `exporterEndpoint` at this same
   release's receiver is a feedback loop: ingesting a batch emits logs and spans
   about ingesting it, which are then ingested. Dogfooding is supported and
   intended — route it through a Collector, and drop or sample Ourios's own
   telemetry there.
 
-Every knob maps 1:1 onto a standard `OTEL_*` variable; Ourios models no bespoke
-telemetry config. Anything not in the table (per-signal endpoints, headers,
-`OTEL_SDK_DISABLED`, protocol) can be set verbatim through `extraEnv`.
+Each role also takes its own `extraEnv`, appended after the global one —
+Kubernetes resolves a duplicate name to the last entry, so the receiver and
+querier can carry *different* values for the same variable:
+
+```yaml
+receiver:
+  extraEnv:
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: deployment.environment.name=production,service.namespace=ingest
+querier:
+  extraEnv:
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: deployment.environment.name=production,service.namespace=query
+```
 
 ## Credentials
 
@@ -335,13 +367,9 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `<role>.serviceAccount.create` | `false` | Role-scoped ServiceAccount for `receiver`/`querier`/`compactor` — the least-privilege IAM seam ("Per-role IAM" above). `false` falls back to the shared `serviceAccount`. |
 | `<role>.serviceAccount.annotations` | `{}` | The role's own IRSA `role-arn` (querier read-only, receiver no-delete, compactor sole delete-holder). |
 | `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<fullname>-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
-| `otel.exporterEndpoint` | `""` | `OTEL_EXPORTER_OTLP_ENDPOINT` — where Ourios exports **all three** of its own signals (metrics, logs, traces). Per-signal endpoints go in `extraEnv`. |
-| `otel.traces.enabled` | `true` | `false` renders `OTEL_TRACES_EXPORTER=none`. |
-| `otel.traces.sampler` / `.samplerArg` | `""` | `OTEL_TRACES_SAMPLER` / `_ARG`. Empty keeps the SDK default `parentbased_always_on` — **every** served request is sampled; see [Self-telemetry](#self-telemetry). |
-| `otel.metrics.enabled` | `true` | `false` renders `OTEL_METRICS_EXPORTER=none`. |
-| `otel.metrics.exportInterval` | `""` | `OTEL_METRIC_EXPORT_INTERVAL` in ms. Empty = SDK default `60000`. |
-| `otel.logs.enabled` | `true` | `false` renders `OTEL_LOGS_EXPORTER=none`; Ourios's logs stay on stderr. |
-| `extraEnv` | `[]` | Extra env vars (e.g. `OTEL_*`). No plaintext creds. |
+| `otel.exporterEndpoint` | `""` | `OTEL_EXPORTER_OTLP_ENDPOINT` — where Ourios exports **all three** of its own signals (metrics, logs, traces). The only OTel knob the chart models; SDK behaviour is configured through the standard `OTEL_*` variables in `extraEnv` — see [Self-telemetry](#self-telemetry). |
+| `extraEnv` | `[]` | Env vars appended verbatim to every container (the place for `OTEL_*`). No plaintext creds. |
+| `<role>.extraEnv` | `[]` | Role-only env, appended after the global `extraEnv` (a duplicate name resolves to the role's value) — e.g. per-role `OTEL_RESOURCE_ATTRIBUTES`. |
 
 The image runs as nonroot (uid 65532) with a read-only root filesystem; the
 chart sets `fsGroup` so the process can write the WAL PVC.

@@ -2,7 +2,25 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-07-21** — the comparative program closed and
+> Last updated: **2026-07-25** — the self-observability arc landed and
+> the RFC 0036 arc closed. RFC 0038 (self-tracing), RFC 0039 (inbound
+> trace-context propagation) and RFC 0040 (DataFusion operator
+> instrumentation) are all `green`: Ourios continues a caller's trace
+> instead of starting its own, and a finished physical plan is
+> reconstructed post-hoc into a span tree by `ourios-df-otel` — a
+> crate carrying only `datafusion` + `opentelemetry`, kept extractable
+> for upstream. RFC 0037 (GenAI / structured-event logs) is `green`.
+> **v0.5.0** shipped. §3's ladder now covers RFC 0001 through RFC 0041.
+> RFC 0041 (dashboard datasource plugins) is `drafted` with §5/§6
+> deliberately empty — its §7 asks whether the work is worth doing at
+> all, and that question is the deliverable, not the design.
+>
+> One **unreleased breaking change** sits on `main` behind v0.5.0:
+> RFC0002.21 (#641) aligns unspecified severity (`SeverityNumber=0`)
+> with the OTel SDK — it now bypasses a minimum-severity floor rather
+> than being pruned out by it. The next tag is not a patch.
+>
+> Prior entry — 2026-07-21: the comparative program closed and
 > the ingest-capacity arc landed; §3's ladder now covers RFC 0001
 > through RFC 0036. RFC 0031's first fully authoritative comparative
 > run (`baseline-8vcpu-32gib`, `benchmarks.md` §9.24) passed all 11
@@ -16,7 +34,8 @@
 > lines/s per node (99.92% achieved, p99 153.63 ms) on the baseline
 > hardware. RFC 0036 (`specified`) opens the next arc: write-side
 > layout (compaction-time service/time sort), the remaining storage
-> lever against hazard #4.
+> lever against hazard #4. *(That arc has since closed — see the
+> current entry.)*
 >
 > Prior entry — 2026-07-15: a month of post-MVP shipping work
 > landed since the prior entry below; §3's RFC ladder now covers
@@ -116,7 +135,7 @@ goals, or post-MVP shipping concerns.
 
 ---
 
-## 3. Current state (as of 2026-07-21)
+## 3. Current state (as of 2026-07-25)
 
 **The thesis is proven on representative corpora.** All four gating
 thesis-gates pass authoritatively on the `benchmarks.md` §1 baseline
@@ -174,10 +193,16 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0034 | D1 re-scope: per-node ingest-throughput bar | **`accepted`** (2026-07-22) — enacted: RFC0034.1–.3 satisfied by the §9.20–§9.23 measurement series (a re-scope RFC with no thesis-gate of its own; `specified`→`accepted`) |
 | 0035 | Ingest concurrency (ordered mining, concurrent encode/publish) | `green` — §9.22 A/B plus the §9.23 asserting soak; the #578 sweep-publish durability window closed alongside |
 | 0036 | Write-side layout (compaction-time service/time sort) | **`accepted`** (2026-07-22) — all five §5 green (real compaction); RFC0036.2 scanned-count gate + in-repo before/after (§9.27, 1.43×); baseline no-regression (§9.26) + §7 threshold sweep (§9.28); the comparative harness single-file limit + the row-cap interaction are documented follow-ups |
+| 0037 | GenAI / structured-event log support | `green` |
+| 0038 | Self-tracing (OTel traces for Ourios itself) | `green` — request-scoped spans on ingest, query, MCP and sweep (never per-record); traces configured through the **universal** `OTEL_*` env vars, not bespoke config |
+| 0039 | Inbound trace-context propagation | `green` — all four §5 arms; the caller's trace continues across the ingest spawn and into `/mcp`, and the caller's sampling decision governs |
+| 0040 | DataFusion operator instrumentation | **`green`** — `ourios-df-otel` walks a finished `ExecutionPlan` and backdates one span per operator from `BaselineMetrics`; build-vs-adopt was spiked both ways before committing (`datafusion-tracing` drops every operator span on multi-partition plans). `accepted` is a maintainer flip |
+| 0041 | Dashboard datasource plugins (Grafana / Perses) | `drafted` — §§1–4 + §7–8 only; §5/§6 deliberately empty pending the §7 "is this worth doing now?" call |
 
-**Crates — all ten product crates are implemented** (`ourios-core`,
-`-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`, `-server`,
-`-bench`, `-semconv`, `-telemetry`):
+**Crates — all twelve product crates are implemented** (`ourios-core`,
+`-config`, `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`,
+`-server`, `-bench`, `-semconv`, `-telemetry`, `-df-otel`; a
+thirteenth, `-testgen`, is dev-only):
 
 - **`ourios-miner`** — the Drain-derived miner, RFC 0001 `accepted`:
   `(severity, scope)` keying, three-zone confidence, widening +
@@ -205,11 +230,18 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
   measurements over OTLP-Demo + LogHub corpora, records results to
   `benchmarks.md` §9, and (RFC 0031) runs the comparative dispatch
   against a real Loki container.
-- **`ourios-core`** / **`-semconv`** / **`-telemetry`** / **`-server`** —
-  shared types + tenancy + record/audit shapes; the weaver-generated OTel
-  name constants; the OTel metrics/export surface (RFC 0018); the
-  two-role binary, now with TLS/mTLS (RFC 0030), an OIDC bearer layer
-  (RFC 0029), and the S3-native Helm chart, deploy-validated on kind.
+- **`ourios-df-otel`** — RFC 0040 `green`: a post-hoc `ExecutionPlan` →
+  OTel span-tree walk, backdating each operator span from its
+  `BaselineMetrics` timestamps. Its *runtime* dependencies are `datafusion`
+  and `opentelemetry` alone — no `ourios-*` crate among them — so it stays
+  extractable as an upstream contribution.
+- **`ourios-core`** / **`-config`** / **`-semconv`** / **`-telemetry`** /
+  **`-server`** — shared types + tenancy + record/audit shapes; the RFC
+  0004 miner tunables (split out per RFC 0028 §3.2); the
+  weaver-generated OTel name constants; the OTel export surface —
+  metrics (RFC 0018) and, since RFC 0038/0039, traces; the two-role
+  binary, now with TLS/mTLS (RFC 0030), an OIDC bearer layer (RFC 0029),
+  and the S3-native Helm chart, deploy-validated on kind.
 
 The full `cargo test --all-features` suite is green in CI — the `cargo
 test` job gates every PR on the exact head; the coverage job runs
@@ -221,11 +253,12 @@ and the shipping milestone that followed (WAL, wire endpoints, DSL,
 auth, S3, Helm — the whole §5 table below except Perses) is
 substantially done. What's actually open:
 
-- **RFC 0036 implementation** — write-side layout (`specified`);
-  maintainer design review gates `red`. The remaining storage lever
-  against hazard #4's small-file/row-group bands.
-- **The Perses datasource plugin** — deliberately deferred (§5), not
-  started. Its stated prerequisite (RFC 0031 close-out) is now met.
+- **Dashboard datasource plugins** — RFC 0041 is `drafted` and the
+  *first* open question is whether to build them at all; §5's Perses
+  row has been the standing deferral, and the RFC now scopes Grafana
+  alongside it with measured effort for each. Decide §7 before §5/§6
+  get written.
+- **RFC 0040 → `accepted`** — a maintainer flip; the ladder is `green`.
 - Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.
   the recurring D1/D2 soak cadence now that the harness has shipped
   (§9.19/§9.23), RFC 0021's phase 2 gated on upstream DataFusion 55,
@@ -354,11 +387,11 @@ table below records what shipped and what's still genuinely open.
 | **Write-ahead log** (`ourios-wal`) | Corpus replay is bounded and reproducible; durability is irrelevant for thesis-proving | **Landed** — RFC 0008 `accepted`: append/sync, real-SIGKILL crash recovery, snapshot-restore, group-commit batched fsync |
 | **OTLP wire endpoints** (gRPC + HTTP listeners) | Bench reads OTLP from disk, not the network — see Phase 3 | **Landed** — RFC 0003 `green`: gRPC + HTTP receivers, WAL-before-ack, per-`ResourceLogs` tenant derivation |
 | **Snapshot mechanism** (RFC 0001 §6.9) | Corpus runs from cold start; replay budget moot | **Landed** — part of RFC 0008 (`accepted`), v2 restore format |
-| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0018 `green`); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). Traces deliberately deferred |
+| **Full §6.8 telemetry surface** | One or two metrics suffice for the bench; the §3.1.2 mandatory set is a production observability concern | **Landed** — OTel meters + OTLP metric exporter (RFC 0018 `green`); Ourios's own logs ship via its own OTLP exporter (dogfooded: one deployment ingests another's telemetry). **Traces landed too** (2026-07-24/25): RFC 0038 `green` gives request-scoped spans on ingest/query/`/mcp`/sweep, RFC 0039 `green` continues an inbound caller's trace rather than starting a new one, and RFC 0040 `green` adds a DataFusion operator span tree under a query. All three signals are now configured through the standard `OTEL_*` env vars |
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `green`, including the `param(n)`/`bucket(width)` aggregation amendment |
 | **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding shipped (RFC 0026 `accepted`); rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9) |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
-| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
+| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. That prerequisite is now met, and **RFC 0041** (`drafted`, 2026-07-25) works the question up: it spikes both hosts, measures the effort (one Grafana datasource plugin vs. two–three Perses plugins at log parity), and leaves §5/§6 empty pending a decision on whether to build either. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
 
 **Note on OTLP scope (historical).** The pre-amendment roadmap
 listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.

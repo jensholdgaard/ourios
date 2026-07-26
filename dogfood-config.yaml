@@ -7,9 +7,10 @@
 #
 # It promotes the Claude Code / agent GenAI attributes to columns so a source
 # can aggregate its own telemetry natively (RFC 0022 + RFC 0037 §3.3), e.g.
-#   count by attr.model       — calls per model      (from api_request events)
-#   count by attr.tool_name   — tool-use distribution (from tool_decision events)
-#   count by attr.decision    — accept/deny mix       (from tool_decision events)
+#   count by attr.model             — calls per model     (api_request events)
+#   count by attr.tool_name         — tool-use distribution (tool_decision)
+#   count by attr.decision          — accept/deny mix       (tool_decision)
+#   sum(attr.cost_usd) by attr.model — spend per model     (api_request)
 # These are Claude Code's *actual* (flat) attribute keys, verified against its
 # OTLP output — not the OTel GenAI semantic-convention dotted form
 # (gen_ai.request.model, gen_ai.tool.name, …), which Claude Code does not emit;
@@ -62,6 +63,18 @@ storage:
       - model
       - tool_name
       - decision
+      # The FinOps loop (sum/avg over spend and usage, RFC0002.17 +
+      # RFC 0042): typed classes matching the AnyValue variants Claude
+      # Code actually emits, verified against captured api_request
+      # events — cost_usd is a doubleValue, the token counts intValues.
+      # A bare (string-class) promotion of these keys would project
+      # always-NULL columns (RFC 0022 §3.1 string-only rule) and
+      # sum(attr.cost_usd) would silently return empty:
+      #   sum(attr.cost_usd) by attr.model
+      #   sum(attr.output_tokens) by attr.model
+      - { key: cost_usd, type: f64 }
+      - { key: input_tokens, type: i64 }
+      - { key: output_tokens, type: i64 }
 receiver:
   enabled: true
   grpc_addr: "127.0.0.1:24317"

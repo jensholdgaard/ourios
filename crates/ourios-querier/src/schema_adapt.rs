@@ -43,6 +43,23 @@ fn is_promoted_name(name: &str) -> bool {
     name.starts_with(promoted::RESOURCE_PREFIX) || name.starts_with(promoted::ATTR_PREFIX)
 }
 
+/// Do two Arrow types carry the same RFC 0042 promotion class? The
+/// view/plain string and binary representations are the same *class* —
+/// `Utf8View` vs `Utf8` is a memory-layout choice `DataFusion` makes at
+/// scan time (RFC 0021 / RFC0021.4), not a §3.3 type mismatch — so a
+/// view-vs-plain difference falls through to the default adapter's
+/// benign representation cast, never the read-as-absent rule.
+fn same_promoted_class(a: &DataType, b: &DataType) -> bool {
+    fn canonical(t: &DataType) -> DataType {
+        match t {
+            DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
+            DataType::BinaryView | DataType::LargeBinary => DataType::Binary,
+            other => other.clone(),
+        }
+    }
+    canonical(a) == canonical(b)
+}
+
 /// The declared class's Arrow type for a promoted column name, if the
 /// name is in the declared set.
 fn declared_type(declared: &PromotedAttributes, name: &str) -> Option<DataType> {
@@ -162,7 +179,7 @@ impl PhysicalExprAdapter for PromotedNoCoercion {
                     // fill is already the §3.3 behaviour.
                     return Ok(Transformed::no(e));
                 };
-                if logical.data_type() == physical.data_type() {
+                if same_promoted_class(logical.data_type(), physical.data_type()) {
                     return Ok(Transformed::no(e));
                 }
                 let null = ScalarValue::Null.cast_to(logical.data_type())?;

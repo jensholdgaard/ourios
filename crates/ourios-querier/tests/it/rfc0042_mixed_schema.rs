@@ -146,16 +146,37 @@ async fn rfc0042_5_undeclared_conflict_resolves_to_utf8() {
         &PromotedAttributes::new_typed([], [typed_i64("input_tokens")]),
     );
 
-    let query = ourios_querier::dsl::parse("template_id == 1 | count").expect("parse DSL");
-    let result = ourios_querier::Querier::new(bucket.path())
-        .run_query(
-            &query,
-            &ourios_core::tenant::TenantId::new("a"),
-            NOW,
-            DEFAULT_WINDOW_NS,
-            Some(&crate::common::no_aliases()),
-        )
-        .await
-        .expect("undeclared conflict must not error the scan");
+    let querier = ourios_querier::Querier::new(bucket.path());
+    let run = |dsl: &'static str| {
+        let querier = &querier;
+        async move {
+            let query = ourios_querier::dsl::parse(dsl).expect("parse DSL");
+            querier
+                .run_query(
+                    &query,
+                    &ourios_core::tenant::TenantId::new("a"),
+                    NOW,
+                    DEFAULT_WINDOW_NS,
+                    Some(&crate::common::no_aliases()),
+                )
+                .await
+                .expect("undeclared conflict must not error the scan")
+        }
+    };
+    let result = run("template_id == 1 | count").await;
     assert_eq!(result.rows, 2);
+
+    // Distinguish the Utf8 union from a wrong numeric one: under Utf8,
+    // the string file's "junk" cell try_casts to NULL and the i64
+    // file's Int64 column is type-mismatched (reads as absent), so the
+    // sum is an all-NULL group. A numeric union would have let the i64
+    // file contribute 40.
+    let sum = run("template_id == 1 | sum(attr.input_tokens)").await;
+    let group = &sum.aggregate.as_ref().expect("aggregate map")[0];
+    assert_eq!(
+        group.value.flatten(),
+        None,
+        "Utf8 union: no file contributes a numeric value"
+    );
+    assert_eq!(group.count, 2, "both rows still count");
 }

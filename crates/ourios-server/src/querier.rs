@@ -271,7 +271,7 @@ pub fn router_with_mcp_promoted(
     promoted: &PromotedAttributes,
 ) -> Router {
     router_from_querier(
-        Querier::new(bucket_root),
+        Querier::new(bucket_root).with_promoted_attributes(promoted.clone()),
         default_window_nanos,
         auth,
         mcp_enabled,
@@ -353,7 +353,8 @@ pub async fn serve(config: QuerierConfig) -> Result<QuerierHandle, String> {
             .map_err(|e| format!("create store root {}: {e}", root.display()))?;
     }
     let querier = Querier::from_store_config(&config.store)
-        .map_err(|e| format!("build querier store: {e}"))?;
+        .map_err(|e| format!("build querier store: {e}"))?
+        .with_promoted_attributes(config.promoted.clone());
 
     let listener = TcpListener::bind(config.http_addr)
         .await

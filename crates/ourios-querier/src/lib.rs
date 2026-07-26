@@ -43,6 +43,7 @@ mod compile;
 mod drift;
 pub mod dsl;
 mod log_row;
+mod schema_adapt;
 mod template_map;
 mod template_registry;
 
@@ -905,6 +906,12 @@ impl Backend {
 #[derive(Debug, Clone)]
 pub struct Querier {
     backend: Backend,
+    /// The deployment's declared promoted set (RFC 0042 §3.3): drives
+    /// the scan schema's type for declared promoted columns, so files
+    /// written under other declarations read those columns as absent.
+    /// Defaults to the implicit-`service.name`-only set, under which
+    /// the scan stays purely schema-driven (the RFC 0022 behaviour).
+    promoted: ourios_parquet::PromotedAttributes,
 }
 
 /// The object-store URL scheme/authority the S3 scan registers its
@@ -979,7 +986,23 @@ impl Querier {
     pub fn new(bucket_root: impl Into<PathBuf>) -> Self {
         Self {
             backend: Backend::Local(bucket_root.into()),
+            promoted: ourios_parquet::PromotedAttributes::default(),
         }
+    }
+
+    /// Declare the deployment's promoted set (RFC 0042 §3.3): a
+    /// declared key's class fixes its scan-schema column type, so
+    /// files written under a different declaration read that column
+    /// as absent instead of erroring the scan or coercing values.
+    /// Without this, the scan is purely schema-driven (the RFC 0022
+    /// behaviour, and the default for tests/dev).
+    #[must_use]
+    pub fn with_promoted_attributes(
+        mut self,
+        promoted: ourios_parquet::PromotedAttributes,
+    ) -> Self {
+        self.promoted = promoted;
+        self
     }
 
     /// Create a querier from a resolved [`StoreConfig`] (RFC 0019 §3.2)
@@ -1002,7 +1025,10 @@ impl Querier {
                 Backend::Remote(store)
             }
         };
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            promoted: ourios_parquet::PromotedAttributes::default(),
+        })
     }
 
     /// Execute `request` against the RFC 0005 store with predicate
@@ -1289,15 +1315,19 @@ impl Querier {
                 .map_err(storage_err)?;
             schemas.push(schema.as_ref().clone());
         }
-        let file_schema =
-            datafusion::arrow::datatypes::Schema::try_merge(schemas).map_err(|e| {
-                QueryError::Storage {
-                    detail: format!("merging scanned file schemas: {e}"),
-                }
-            })?;
+        // RFC 0042 §3.3: a declared promoted key's class fixes its
+        // union-schema type; an undeclared promoted-column conflict
+        // resolves to Utf8; the per-file expression adapter reads a
+        // type-mismatched promoted column as absent (typed NULL) —
+        // DataFusion's default adapter would cast, and Arrow's safe
+        // Utf8→Int64 cast *parses* string content, the coercion §3.3
+        // forbids.
+        let file_schema = schema_adapt::merge_scanned_schemas(schemas, &self.promoted)
+            .map_err(|detail| QueryError::Storage { detail })?;
         let config = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(options)
-            .with_schema(Arc::new(file_schema));
+            .with_schema(Arc::new(file_schema))
+            .with_expr_adapter_factory(Arc::new(schema_adapt::PromotedNoCoercionFactory));
         let table = ListingTable::try_new(config).map_err(storage_err)?;
         ctx.register_table("logs", Arc::new(table))
             .map_err(storage_err)?;

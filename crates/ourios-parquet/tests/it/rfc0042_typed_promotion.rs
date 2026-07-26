@@ -207,6 +207,19 @@ fn rfc0042_1_typed_projection() {
     );
 }
 
+/// The NaN edge, deterministically (the property covers it only when
+/// the generator draws a NaN): a NaN double passes through the f64
+/// projection as NaN, and projects `NULL` under `i64`.
+#[test]
+fn rfc0042_2_nan_passes_through_f64() {
+    let nan = kv_double("k", f64::NAN);
+    assert!(
+        ourios_parquet::promoted::f64_value(&nan).is_some_and(f64::is_nan),
+        "NaN is a value, not an absence"
+    );
+    assert_eq!(ourios_parquet::promoted::i64_value(&nan), None);
+}
+
 /// Any-variant generator covering every `AnyValue` shape a promoted
 /// key can meet, including the absent-value forms.
 fn arb_any_value() -> impl Strategy<Value = Option<any_value::Value>> {
@@ -247,7 +260,14 @@ proptest! {
         };
 
         prop_assert_eq!(ourios_parquet::promoted::i64_value(&attrs[0]), expect_i64);
-        prop_assert_eq!(ourios_parquet::promoted::f64_value(&attrs[0]), expect_f64);
+        // Bit-level comparison: the f64 projection is pass-through (and
+        // int-widening is deterministic), so exact bits are the contract —
+        // and NaN != NaN under IEEE `==` would falsely fail the property
+        // when `any::<f64>()` generates one of its NaN special values.
+        prop_assert_eq!(
+            ourios_parquet::promoted::f64_value(&attrs[0]).map(f64::to_bits),
+            expect_f64.map(f64::to_bits)
+        );
         prop_assert_eq!(
             ourios_parquet::promoted::string_value(&attrs[0]).map(str::to_string),
             expect_str

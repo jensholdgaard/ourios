@@ -43,13 +43,15 @@ ints — verified against captured `api_request` events). Under RFC
 
 1. **Aggregation is impossible.** RFC0002.17 scalar aggregates
    (`sum`/`avg`/`min`/`max`) require a promoted column and `try_cast`
-   `Utf8` → `Float64`. A numeric `AnyValue` projects `NULL` (§3.1), so
+   `Utf8` → `Float64`. A numeric `AnyValue` projects `NULL` (RFC 0022
+   §3.1), so
    the column a numeric key would get is always-`NULL` and the
    aggregate silently returns nothing. The FinOps loop — a source
    querying its own spend back through the RFC 0027 MCP surface — dies
    on exactly this.
 2. **Ordering never matches.** `attr.http.status_code >= 500` is
-   typed-arm-only (§3.3); on a `NULL`-projected column it matches no
+   typed-arm-only (RFC 0022 §3.3); on a `NULL`-projected column it
+   matches no
    rows, silently.
 
 The responsibility split this serves (maintainer direction,
@@ -80,7 +82,8 @@ Each promoted key carries a **class**, declared in config (§3.2):
   narrow doubles — no silent truncation.
 - **String-encoded numbers do not parse.** A string `"500"` under an
   `i64` class projects `NULL`. Parsing would smuggle in coercion
-  ambiguity (`"500"` vs `"5e2"` vs `" 500"`) that §3.1's "byte-faithful
+  ambiguity (`"500"` vs `"5e2"` vs `" 500"`) that RFC 0022 §3.1's
+  "byte-faithful
   or `NULL`" rule exists to keep out; a source that stamps numbers as
   strings gets the `string` class and lexicographic semantics,
   documented as such.
@@ -119,7 +122,8 @@ historically, re-declared `i64` today — or vice versa).
 
 **Rule: a file whose column type differs from the currently declared
 class is read as if the column were absent from that file.** This is
-the same class of behaviour §3.3 assigns to pre-amendment files —
+the same class of behaviour RFC 0022 §3.3 assigns to pre-amendment
+files —
 column reads `NULL`, `==`/`!=` fall through to the JSON arm where one
 exists, ordering and aggregation exclude those rows — so re-typing
 degrades exactly as adding a promotion does, and compaction converges
@@ -128,7 +132,8 @@ history toward the current declaration as a side effect (§3.5).
 Implementation note (binding): the scan must map per-file schemas onto
 the declared scan schema — DataFusion's schema-adapter seam — casting
 nothing. A mismatched column is projected as `NULL`, never coerced;
-coercion would reintroduce the string-parse ambiguity §3.1 rejects.
+coercion would reintroduce the string-parse ambiguity this RFC's §3.1
+rejects.
 
 ### 3.4 Predicate compilation (RFC 0022 §3.3 amendment)
 
@@ -189,7 +194,8 @@ consumes them — OTLP fidelity untouched.
 
 - **Stringify numerics into the existing `Utf8` columns.** No schema
   change, `sum` works via the existing `try_cast`. Rejected: float
-  formatting makes `==` unreliable (the exact reason §3.1 projects
+  formatting makes `==` unreliable (the exact reason RFC 0022 §3.1
+  projects
   `NULL` today), lexicographic min/max statistics cannot prune numeric
   ordering (`"9" > "10"`), and the cast burns per-row CPU at query
   time forever.
@@ -199,7 +205,8 @@ consumes them — OTLP fidelity untouched.
   variant — untestable by exhaustion over variants.
 - **Type-suffixed column names** (`attr.cost_usd#f64`) to make
   re-typing conflicts structurally impossible. Rejected: leaks the
-  class into the on-disk schema forever and doubles the §3.3 fallback
+  class into the on-disk schema forever and doubles the RFC 0022 §3.3
+  fallback
   surface; the schema-adapter rule handles the rare conflict without
   permanent naming debt.
 - **Automatic type inference from observed values.** Rejected:

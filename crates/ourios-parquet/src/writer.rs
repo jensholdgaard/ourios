@@ -188,7 +188,7 @@ impl ClusterKeys {
         if promoted
             .resource_keys()
             .iter()
-            .any(|k| k == crate::promoted::SERVICE_NAME_KEY)
+            .any(|k| k.key == crate::promoted::SERVICE_NAME_KEY)
         {
             Self::ServiceThenTime
         } else {
@@ -1084,11 +1084,17 @@ fn writer_properties(
 
     // RFC 0022 §3.1: promoted attribute columns are the attribute
     // predicate-pushdown surface — bloom filter each (dictionary and
-    // page-level statistics are already the global defaults). A
-    // promoted column name is a single schema leaf whose name contains
-    // literal dots, so the ColumnPath is one part, not a nested path.
-    for name in promoted.column_names() {
-        let path = ColumnPath::new(vec![name]);
+    // page-level statistics are already the global defaults), EXCEPT
+    // f64-class columns (RFC 0042 §3.5: float equality is typed-arm-only
+    // and discouraged, so a bloom would be dead weight; ordering prunes
+    // via statistics). A promoted column name is a single schema leaf
+    // whose name contains literal dots, so the ColumnPath is one part,
+    // not a nested path.
+    for field in promoted.fields() {
+        if *field.data_type() == arrow_schema::DataType::Float64 {
+            continue;
+        }
+        let path = ColumnPath::new(vec![field.name().clone()]);
         builder = builder.set_column_bloom_filter_enabled(path, true);
     }
 

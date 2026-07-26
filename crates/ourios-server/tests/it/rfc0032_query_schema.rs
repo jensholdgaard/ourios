@@ -161,12 +161,24 @@ async fn rfc0032_2_content_matches_running_config() {
     let doc = read_query_schema(&configured).await;
     assert_eq!(
         doc["promoted_attributes"]["resource"],
-        serde_json::json!(promoted.resource_keys()),
+        serde_json::json!(
+            promoted
+                .resource_keys()
+                .iter()
+                .map(|k| k.key.as_str())
+                .collect::<Vec<_>>()
+        ),
         "the effective resource keys, verbatim: {doc}",
     );
     assert_eq!(
         doc["promoted_attributes"]["log"],
-        serde_json::json!(promoted.log_keys()),
+        serde_json::json!(
+            promoted
+                .log_keys()
+                .iter()
+                .map(|k| k.key.as_str())
+                .collect::<Vec<_>>()
+        ),
         "the effective log keys, verbatim: {doc}",
     );
     assert_eq!(

@@ -27,9 +27,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, GenericListBuilder,
-    Int32Builder, StringBuilder, StructBuilder, TimestampNanosecondBuilder, UInt8Builder,
-    UInt32Builder, UInt64Builder,
+    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
+    GenericListBuilder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
+    TimestampNanosecondBuilder, UInt8Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field};
@@ -95,15 +95,55 @@ pub fn mined_records_to_batch_with_promoted(
     RecordBatch::try_new(data_schema_with_promoted(promoted), arrays).map_err(BatchError::Arrow)
 }
 
+/// One promoted column under construction, dispatched by its key's
+/// RFC 0042 §3.1 class. Each variant appends via that class's
+/// projection ([`promoted::string_value`] / [`promoted::i64_value`] /
+/// [`promoted::f64_value`]) — a variant outside the class's row is a
+/// `NULL` cell, never a parse or coercion.
+enum PromotedBuilder {
+    Str(StringBuilder),
+    I64(Int64Builder),
+    F64(Float64Builder),
+}
+
+impl PromotedBuilder {
+    fn for_class(class: promoted::PromotedClass, capacity: usize) -> Self {
+        match class {
+            promoted::PromotedClass::String => Self::Str(StringBuilder::with_capacity(capacity, 0)),
+            promoted::PromotedClass::I64 => Self::I64(Int64Builder::with_capacity(capacity)),
+            promoted::PromotedClass::F64 => Self::F64(Float64Builder::with_capacity(capacity)),
+        }
+    }
+
+    /// Append the class projection of `kv` (`None` = key absent on
+    /// this record → `NULL`).
+    fn append(&mut self, kv: Option<&KeyValue>) {
+        match self {
+            Self::Str(b) => append_option_str(b, kv.and_then(promoted::string_value)),
+            Self::I64(b) => b.append_option(kv.and_then(promoted::i64_value)),
+            Self::F64(b) => b.append_option(kv.and_then(promoted::f64_value)),
+        }
+    }
+
+    fn finish(self) -> ArrayRef {
+        match self {
+            Self::Str(mut b) => Arc::new(b.finish()),
+            Self::I64(mut b) => Arc::new(b.finish()),
+            Self::F64(mut b) => Arc::new(b.finish()),
+        }
+    }
+}
+
 /// Materialise the promoted columns of one attribute-list family
 /// (resource or log) in key order, visiting each record's attribute
 /// list once rather than once per key. The first occurrence of a
-/// promoted key decides its cell — [`promoted::string_value`] or a
-/// `NULL` for a non-string — matching
-/// [`promoted::project_string_value`] per column.
+/// promoted key decides its cell, projected by the key's class
+/// (RFC 0022 §3.1 / RFC 0042 §3.1) — matching
+/// [`promoted::project_string_value`]'s first-match semantics per
+/// column.
 fn project_promoted_columns(
     records: &[MinedRecord],
-    keys: &[String],
+    keys: &[promoted::PromotedKey],
     attrs_of: impl Fn(&MinedRecord) -> &[KeyValue],
 ) -> Vec<ArrayRef> {
     if keys.is_empty() {
@@ -112,30 +152,27 @@ fn project_promoted_columns(
     let index: HashMap<&str, usize> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| (k.as_str(), i))
+        .map(|(i, k)| (k.key.as_str(), i))
         .collect();
-    let mut builders: Vec<StringBuilder> = keys
+    let mut builders: Vec<PromotedBuilder> = keys
         .iter()
-        .map(|_| StringBuilder::with_capacity(records.len(), 0))
+        .map(|k| PromotedBuilder::for_class(k.class, records.len()))
         .collect();
-    let mut cells: Vec<Option<Option<&str>>> = vec![None; keys.len()];
+    let mut cells: Vec<Option<&KeyValue>> = vec![None; keys.len()];
     for r in records {
         cells.fill(None);
         for kv in attrs_of(r) {
             if let Some(&i) = index.get(kv.key.as_str())
                 && cells[i].is_none()
             {
-                cells[i] = Some(promoted::string_value(kv));
+                cells[i] = Some(kv);
             }
         }
         for (b, cell) in builders.iter_mut().zip(&cells) {
-            append_option_str(b, cell.flatten());
+            b.append(*cell);
         }
     }
-    builders
-        .into_iter()
-        .map(|mut b| Arc::new(b.finish()) as ArrayRef)
-        .collect()
+    builders.into_iter().map(PromotedBuilder::finish).collect()
 }
 
 /// Errors produced by [`mined_records_to_batch`].

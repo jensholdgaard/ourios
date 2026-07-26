@@ -21,6 +21,7 @@ mod rfc0022_promoted_columns;
 mod rfc0024_properties;
 mod rfc0025_absent_body;
 mod rfc0036_write_side_layout;
+mod rfc0042_typed_promotion;
 mod round_trip;
 mod row_vs_path_validation;
 mod schema_pin;

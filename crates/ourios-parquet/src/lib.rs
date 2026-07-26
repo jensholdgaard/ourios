@@ -52,7 +52,7 @@ pub use partition::{
     PartitionKey, TimestampOverflowError, effective_time_unix_nano, hour_partition_in_window,
     percent_decode_tenant, percent_encode_tenant,
 };
-pub use promoted::{PromotedAttributes, SERVICE_NAME_KEY};
+pub use promoted::{PromotedAttributes, PromotedClass, PromotedKey, SERVICE_NAME_KEY};
 pub use reader::{Reader, ReaderError, ShapeValidation, batch_to_mined_records};
 pub use record_batch::{BatchError, mined_records_to_batch, mined_records_to_batch_with_promoted};
 pub use store::{S3Config, Store, StoreConfig, StoreError};

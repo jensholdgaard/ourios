@@ -127,8 +127,8 @@ fn query_schema_document(promoted: &PromotedAttributes) -> serde_json::Value {
             "names": severity_names
         },
         "promoted_attributes": {
-            "resource": promoted.resource_keys(),
-            "log": promoted.log_keys()
+            "resource": promoted.resource_keys().iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
+            "log": promoted.log_keys().iter().map(|k| k.key.as_str()).collect::<Vec<_>>()
         },
         "cost_model": {
             "tiers": ["index_backed", "pruned", "scan"],
@@ -937,12 +937,16 @@ mod tests {
             scope_schema_url: None,
             time_unix_nano: 1_775_127_480_000_000_000,
             observed_time_unix_nano: None,
-            attributes: promoted.log_keys().iter().map(|k| kv(k, "v")).collect(),
+            attributes: promoted
+                .log_keys()
+                .iter()
+                .map(|k| kv(&k.key, "v"))
+                .collect(),
             dropped_attributes_count: 0,
             resource_attributes: promoted
                 .resource_keys()
                 .iter()
-                .map(|k| kv(k, "v"))
+                .map(|k| kv(&k.key, "v"))
                 .collect(),
             trace_id: Some([0xAB; 16]),
             span_id: Some([0xCD; 8]),

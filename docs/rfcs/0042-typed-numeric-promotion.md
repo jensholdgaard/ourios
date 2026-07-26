@@ -1,7 +1,7 @@
 ---
 rfc: 0042
 title: Typed numeric attribute promotion (RFC 0022 amendment)
-status: drafted
+status: specified
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-26

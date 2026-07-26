@@ -68,6 +68,7 @@
 - [RFC 0039 — Inbound trace-context propagation](./rfcs/0039-inbound-trace-context-propagation.md)
 - [RFC 0040 — DataFusion operator instrumentation](./rfcs/0040-datafusion-operator-instrumentation.md)
 - [RFC 0041 — Dashboard datasource plugins](./rfcs/0041-dashboard-datasource-plugins.md)
+- [RFC 0042 — Typed numeric attribute promotion](./rfcs/0042-typed-numeric-promotion.md)
 
 # Talks
 

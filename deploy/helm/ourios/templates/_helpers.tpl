@@ -195,31 +195,40 @@ receiver/querier), so it must be enabled.
 - name: AWS_DEFAULT_REGION
   value: {{ .Values.storage.s3.region | quote }}
 {{- end }}
-{{- with .Values.otel.exporterEndpoint }}
+{{- with dig "exporterEndpoint" "" (default (dict) .Values.otel) }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ . | quote }}
 {{- end }}
-{{- if not .Values.otel.traces.enabled }}
+{{- /*
+  Read the per-signal keys with `dig` rather than direct traversal: `helm
+  upgrade --reuse-values` from a release predating them carries forward the
+  OLD chart's `otel` map (endpoint only) without merging the new defaults, so
+  `.Values.otel.traces.enabled` nil-pointers. `dig` keys off *existence*, not
+  emptiness, so an explicit `enabled: false` survives where `default true`
+  would silently flip it back on.
+*/}}
+{{- $otel := default (dict) .Values.otel }}
+{{- if not (dig "traces" "enabled" true $otel) }}
 - name: OTEL_TRACES_EXPORTER
   value: "none"
 {{- end }}
-{{- with .Values.otel.traces.sampler }}
+{{- with dig "traces" "sampler" "" $otel }}
 - name: OTEL_TRACES_SAMPLER
   value: {{ . | quote }}
 {{- end }}
-{{- with .Values.otel.traces.samplerArg }}
+{{- with dig "traces" "samplerArg" "" $otel }}
 - name: OTEL_TRACES_SAMPLER_ARG
   value: {{ . | quote }}
 {{- end }}
-{{- if not .Values.otel.metrics.enabled }}
+{{- if not (dig "metrics" "enabled" true $otel) }}
 - name: OTEL_METRICS_EXPORTER
   value: "none"
 {{- end }}
-{{- with .Values.otel.metrics.exportInterval }}
+{{- with dig "metrics" "exportInterval" "" $otel }}
 - name: OTEL_METRIC_EXPORT_INTERVAL
   value: {{ . | quote }}
 {{- end }}
-{{- if not .Values.otel.logs.enabled }}
+{{- if not (dig "logs" "enabled" true $otel) }}
 - name: OTEL_LOGS_EXPORTER
   value: "none"
 {{- end }}

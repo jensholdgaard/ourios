@@ -174,7 +174,7 @@ pub struct PromotedAttributesSection {
 /// One `storage.promoted_attributes` list entry: the RFC 0022 bare key
 /// (string class) or the RFC 0042 §3.2 typed mapping `{ key, type }`.
 /// The class stays its raw string at this layer — the RFC 0020 file
-/// model is string-typed throughout ([`Scalar`]) — and is validated
+/// model is string-typed throughout (the `Scalar` capture) — and is validated
 /// into a `PromotedClass` at startup alongside the key rules
 /// (RFC0042.6), so an unknown `type` fails loudly there, after
 /// `${env:…}` substitution has run on both fields.

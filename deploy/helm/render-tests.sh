@@ -11,73 +11,108 @@ set -euo pipefail
 CHART="$(cd "$(dirname "${BASH_SOURCE[0]}")/ourios" && pwd)"
 failures=0
 
-# Rendered OTEL_* env as "NAME=value" lines, deduplicated across the three
-# workloads (they share ourios.commonEnv, so identical output is expected).
-otel_env() {
-  # Pair each `- name: OTEL_X` with the `value:` line that follows it. POSIX
-  # sed only (no gawk 3-arg match, no BSD-hostile paste) so this runs the same
-  # on a maintainer's macOS and on the Linux runner.
-  helm template t "$CHART" "$@" \
-    | sed -n '/^ *- name: OTEL_/{N;s/^ *- name: \(OTEL_[A-Z_]*\)\n *value: "\(.*\)"$/\1=\2/p;}' \
-    | sort -u
+# Rendered env of one workload, as "NAME=value" lines in DOCUMENT ORDER
+# (order is part of the contract: k8s resolves duplicate env names to the
+# last entry, which is how a role-level extraEnv overrides a global one).
+# POSIX sed only, so this runs the same on a maintainer's macOS and on the
+# Linux runner.
+workload_env() {
+  local template="$1"; shift
+  helm template t "$CHART" --show-only "templates/$template" "$@" \
+    | sed -n '/^ *- name: /{N;s/^ *- name: \([A-Z0-9_]*\)\n *value: "\{0,1\}\([^"]*\)"\{0,1\}$/\1=\2/p;}'
 }
 
-expect() {
-  local desc="$1" want="$2"; shift 2
-  local got
-  if ! got="$(otel_env "$@" 2>&1)"; then
-    printf 'FAIL  %s\n      render error: %s\n' "$desc" "$got"
-    failures=$((failures + 1))
-    return
-  fi
+# Rendered envFrom source names of one workload, in document order.
+workload_envfrom() {
+  local template="$1"; shift
+  helm template t "$CHART" --show-only "templates/$template" "$@" \
+    | sed -n '/^ *envFrom:/,/^ *[a-z]*:$/p' \
+    | sed -n 's/^ *name: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p'
+}
+
+check() {
+  local desc="$1" want="$2" got="$3"
   if [[ "$got" == "$want" ]]; then
     printf 'ok    %s\n' "$desc"
   else
-    printf 'FAIL  %s\n      want: %s\n      got:  %s\n' "$desc" "${want:-<empty>}" "${got:-<empty>}"
+    printf 'FAIL  %s\n      want: %s\n      got:  %s\n' \
+      "$desc" "$(printf '%s' "$want" | tr '\n' '|')" "$(printf '%s' "$got" | tr '\n' '|')"
     failures=$((failures + 1))
   fi
 }
 
-# Defaults must add no OTEL_* env at all, so installing this chart version
-# over an older one changes nothing unless the operator asks for it.
-expect "defaults render no OTEL_* env" ""
+# --- OTEL_* env -------------------------------------------------------------
 
-# Regression: `helm upgrade --reuse-values` from a release predating the
-# per-signal keys carries forward the OLD chart's `otel` map (endpoint only)
-# without merging new defaults. Direct traversal nil-pointered here.
-expect "upgrade path: per-signal maps absent" \
-  'OTEL_EXPORTER_OTLP_ENDPOINT=http://old:4317' \
-  --set otel.traces=null --set otel.metrics=null --set otel.logs=null \
-  --set otel.exporterEndpoint=http://old:4317
+# Defaults must add no OTEL_* env at all: the SDK's behaviour is configured
+# through its own OTEL_* variables via extraEnv, never through chart defaults.
+check "defaults render no OTEL_* env" "" \
+  "$(workload_env receiver-statefulset.yaml | grep '^OTEL_' || true)"
 
-expect "upgrade path: whole otel map absent" "" --set otel=null
+# The endpoint is the one OTel knob the chart models (deployment topology).
+check "exporterEndpoint renders" \
+  "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317" \
+  "$(workload_env querier-deployment.yaml --set otel.exporterEndpoint=http://collector:4317 | grep '^OTEL_')"
 
-# `default true X` would flip an explicit false back on; `dig` keys off
-# existence, so it must not.
-expect "explicit enabled=false is honoured" \
-  'OTEL_LOGS_EXPORTER=none
-OTEL_METRICS_EXPORTER=none
-OTEL_TRACES_EXPORTER=none' \
-  --set otel.traces.enabled=false \
-  --set otel.metrics.enabled=false \
-  --set otel.logs.enabled=false
+# Regression (#644): `helm upgrade --reuse-values` from an older release can
+# carry an `otel` shape without current keys — or no `otel` at all. Renders
+# must not nil-pointer.
+check "upgrade path: whole otel map absent" "" \
+  "$(workload_env receiver-statefulset.yaml --set otel=null | grep '^OTEL_' || true)"
 
-expect "sampler and export interval map to standard names" \
-  'OTEL_METRIC_EXPORT_INTERVAL=15000
-OTEL_TRACES_SAMPLER=parentbased_traceidratio
-OTEL_TRACES_SAMPLER_ARG=0.01' \
-  --set otel.traces.sampler=parentbased_traceidratio \
-  --set otel.traces.samplerArg=0.01 \
-  --set otel.metrics.exportInterval=15000
+# --- extraEnv passthrough ---------------------------------------------------
 
-# Go templates treat numeric 0 as empty, so a `with`-guarded field drops it.
-# `samplerArg: 0` is meaningful — traceidratio 0 samples nothing the caller
-# has not already sampled — so it has to survive.
-expect "numeric zero samplerArg is not dropped" \
-  'OTEL_TRACES_SAMPLER=traceidratio
-OTEL_TRACES_SAMPLER_ARG=0' \
-  --set otel.traces.sampler=traceidratio \
-  --set otel.traces.samplerArg=0
+check "global extraEnv passes through verbatim" \
+  "OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.01" \
+  "$(workload_env compactor-deployment.yaml \
+      --set 'extraEnv[0].name=OTEL_TRACES_SAMPLER' \
+      --set 'extraEnv[0].value=parentbased_traceidratio' \
+      --set 'extraEnv[1].name=OTEL_TRACES_SAMPLER_ARG' \
+      --set-string 'extraEnv[1].value=0.01' | grep '^OTEL_')"
+
+# A role's extraEnv lands only on that role's workload.
+check "role extraEnv is scoped to its workload (present on querier)" \
+  "OTEL_RESOURCE_ATTRIBUTES=service.namespace=query" \
+  "$(workload_env querier-deployment.yaml \
+      --set 'querier.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
+      --set 'querier.extraEnv[0].value=service.namespace=query' | grep '^OTEL_')"
+check "role extraEnv is scoped to its workload (absent on receiver)" "" \
+  "$(workload_env receiver-statefulset.yaml \
+      --set 'querier.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
+      --set 'querier.extraEnv[0].value=service.namespace=query' | grep '^OTEL_' || true)"
+
+# Two roles setting DIFFERENT values for the SAME key must not interfere,
+# and a role entry must render AFTER the global one (k8s: last entry wins),
+# so a role-level value overrides a global default for the same name.
+dup_args=(
+  --set 'extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES'
+  --set 'extraEnv[0].value=deployment.environment.name=dev'
+  --set 'receiver.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES'
+  --set 'receiver.extraEnv[0].value=deployment.environment.name=ingest'
+  --set 'querier.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES'
+  --set 'querier.extraEnv[0].value=deployment.environment.name=query'
+)
+check "duplicate key: receiver's own value renders after the global" \
+  "OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=dev
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=ingest" \
+  "$(workload_env receiver-statefulset.yaml "${dup_args[@]}" | grep '^OTEL_')"
+check "duplicate key: querier's own value renders after the global" \
+  "OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=dev
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=query" \
+  "$(workload_env querier-deployment.yaml "${dup_args[@]}" | grep '^OTEL_')"
+check "duplicate key: compactor gets only the global" \
+  "OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=dev" \
+  "$(workload_env compactor-deployment.yaml "${dup_args[@]}" | grep '^OTEL_')"
+
+# The s3 credentials envFrom is deliberately outside this feature's scope —
+# assert the per-role env work left it exactly as it was.
+check "s3 existingSecret envFrom is untouched" \
+  "s3-creds" \
+  "$(workload_envfrom receiver-statefulset.yaml \
+      --set storage.backend=s3 --set storage.s3.bucket=b \
+      --set storage.s3.existingSecret=s3-creds \
+      --set 'receiver.extraEnv[0].name=OTEL_RESOURCE_ATTRIBUTES' \
+      --set 'receiver.extraEnv[0].value=x=y')"
 
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2

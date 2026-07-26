@@ -58,7 +58,7 @@ spec:
           args:
             - --config
             - /etc/ourios/config.yaml
-          {{- $env := include "ourios.commonEnv" . | trim }}
+          {{- $env := include "ourios.workloadEnv" (dict "root" $ "role" "compactor") | trim }}
           {{- if $env }}
           env:
             {{- $env | nindent 12 }}

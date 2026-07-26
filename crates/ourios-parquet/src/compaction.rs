@@ -1418,6 +1418,104 @@ mod tests {
         );
     }
 
+    /// RFC0042.8 — compaction re-projects under the *current* typed
+    /// declaration, across a re-typing: inputs whose files promoted the
+    /// key as `string` (or not at all) consolidate into an `Int64`
+    /// column projected from JSON truth, and the rewrite is
+    /// deterministic — byte-identical across two identical runs, the
+    /// RFC0036.4 property under a fixed config.
+    /// See `docs/rfcs/0042-typed-numeric-promotion.md` §5.
+    #[test]
+    fn rfc0042_8_compaction_reprojects_across_a_retyping() {
+        use arrow_array::Array as _;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+
+        let kv_int = |key: &str, value: i64| ourios_core::otlp::KeyValue {
+            key: key.to_string(),
+            value: Some(ourios_core::otlp::AnyValue {
+                value: Some(ourios_core::otlp::any_value::Value::IntValue(value)),
+            }),
+            ..Default::default()
+        };
+        let with_tokens = |template_id: u64, ts_ns: u64, tokens: i64| MinedRecord {
+            attributes: vec![kv_int("input_tokens", tokens)],
+            ..rec(template_id, ts_ns)
+        };
+        let string_class =
+            PromotedAttributes::new(Vec::<String>::new(), vec!["input_tokens".to_string()]);
+        let typed = PromotedAttributes::new_typed(
+            [],
+            [crate::promoted::PromotedKey {
+                key: "input_tokens".into(),
+                class: crate::promoted::PromotedClass::I64,
+            }],
+        );
+
+        let compact_once = || {
+            let bucket = tempfile::TempDir::new().expect("temp");
+            let store = store_at(bucket.path());
+            // File 1: the key promoted under the STRING class (its Utf8
+            // cells are NULL — the values are ints — but the epoch's
+            // *type* is the point).
+            let mut w = Writer::open_in_with_promoted(
+                &store,
+                partition(),
+                DEFAULT_ZSTD_LEVEL,
+                string_class.clone(),
+            )
+            .expect("open writer");
+            w.append_records(&[with_tokens(1, TS0, 7)]).expect("append");
+            w.close().expect("close");
+            // File 2: not promoted at all.
+            write_file(&store, &[with_tokens(2, TS0 + 1_000, 40)]);
+
+            let outcome =
+                compact_partition_with_promoted(&store, &partition(), &typed).expect("compact");
+            let committed = outcome.committed.expect("committed");
+            let key = format!("{}/{}", partition_data_prefix(&partition()), committed.file);
+            store.get_blocking(&key).expect("get consolidated file")
+        };
+
+        let bytes = compact_once();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            Bytes::from(bytes.clone()),
+        )
+        .expect("open consolidated file");
+        let schema = reader.schema().clone();
+        let field = schema
+            .fields()
+            .iter()
+            .find(|f| f.name() == "attr.input_tokens")
+            .expect("re-typed column present");
+        assert_eq!(
+            *field.data_type(),
+            arrow_schema::DataType::Int64,
+            "the current declaration's class wins on rewrite"
+        );
+        let batches: Vec<_> = reader
+            .build()
+            .expect("reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("batches");
+        let mut values: Vec<Option<i64>> = Vec::new();
+        for batch in &batches {
+            let idx = batch.schema().index_of("attr.input_tokens").expect("col");
+            let arr = batch.column(idx).as_primitive::<Int64Type>();
+            values.extend((0..arr.len()).map(|i| (!arr.is_null(i)).then(|| arr.value(i))));
+        }
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            [Some(7), Some(40)],
+            "cells are projected from JSON truth, both epochs included"
+        );
+
+        // Determinism (the RFC0036.4 property under a fixed config): a
+        // second identical run produces byte-identical output.
+        assert_eq!(bytes, compact_once(), "rewrite is byte-identical");
+    }
+
     /// Seed a manifest at the partition's manifest key (the test equivalent of
     /// the pre-RFC-0019 `write_atomic`, but through the store seam).
     fn seed_manifest(store: &Store, part: &PartitionKey, manifest: &Manifest) {

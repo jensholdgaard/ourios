@@ -68,8 +68,9 @@ storage:
       # Code actually emits, verified against captured api_request
       # events — cost_usd is a doubleValue, the token counts intValues.
       # A bare (string-class) promotion of these keys would project
-      # always-NULL columns (RFC 0022 §3.1 string-only rule) and
-      # sum(attr.cost_usd) would silently return empty:
+      # always-NULL columns (RFC 0022 §3.1 string-only rule), and
+      # sum(attr.cost_usd) would yield a NULL aggregate — every input
+      # excluded, value null — with no hint that the class was wrong:
       #   sum(attr.cost_usd) by attr.model
       #   sum(attr.output_tokens) by attr.model
       - { key: cost_usd, type: f64 }

@@ -158,18 +158,89 @@ pub struct StorageSection {
 }
 
 /// `storage.promoted_attributes.*` — the RFC 0022 §3.2 promoted attribute
-/// key sets. Keys are plain attribute-key strings, taken literally (no
-/// globbing); the implicit `service.name` promotion never needs listing.
-/// Defaults: empty — promotion beyond `service.name` is opt-in.
+/// key sets, with RFC 0042 §3.2 typed entries. Keys are plain
+/// attribute-key strings, taken literally (no globbing); the implicit
+/// `service.name` promotion never needs listing. Defaults: empty —
+/// promotion beyond `service.name` is opt-in.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromotedAttributesSection {
     /// Resource-attribute keys to promote (`resource.<key>` columns).
-    #[serde(deserialize_with = "scalar_vec")]
-    pub resource: Vec<String>,
+    pub resource: Vec<PromotedEntry>,
     /// Log-attribute keys to promote (`attr.<key>` columns).
-    #[serde(deserialize_with = "scalar_vec")]
-    pub log: Vec<String>,
+    pub log: Vec<PromotedEntry>,
+}
+
+/// One `storage.promoted_attributes` list entry: the RFC 0022 bare key
+/// (string class) or the RFC 0042 §3.2 typed mapping `{ key, type }`.
+/// The class stays its raw string at this layer — the RFC 0020 file
+/// model is string-typed throughout ([`Scalar`]) — and is validated
+/// into a `PromotedClass` at startup alongside the key rules
+/// (RFC0042.6), so an unknown `type` fails loudly there, after
+/// `${env:…}` substitution has run on both fields.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PromotedEntry {
+    /// The attribute key.
+    pub key: String,
+    /// The declared class token (`string` / `i64` / `f64`); `None` for
+    /// the bare spelling, which is the string class.
+    pub class: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PromotedEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The mapping spelling, strict: `key` required, `type`
+        /// optional (absent = the bare spelling's string class),
+        /// anything else rejected.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TypedEntry {
+            key: Scalar,
+            #[serde(default, rename = "type")]
+            r#type: Option<Scalar>,
+        }
+
+        struct EntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = PromotedEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an attribute key, or a `{ key, type }` mapping (RFC 0042 §3.2)")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PromotedEntry, E> {
+                Ok(PromotedEntry {
+                    key: v.to_owned(),
+                    class: None,
+                })
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<PromotedEntry, E> {
+                Ok(PromotedEntry {
+                    key: v,
+                    class: None,
+                })
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<PromotedEntry, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let typed =
+                    TypedEntry::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(PromotedEntry {
+                    key: typed.key.0,
+                    class: typed.r#type.map(|s| s.0),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(EntryVisitor)
+    }
 }
 
 /// `storage.s3.*` — S3 addressing and (env-only) credentials (RFC 0019 §3.4).
@@ -536,8 +607,11 @@ impl PromotedAttributesSection {
         &mut self,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), MalformedReference> {
-        for key in self.resource.iter_mut().chain(self.log.iter_mut()) {
-            *key = env_subst::resolve(key, lookup)?;
+        for entry in self.resource.iter_mut().chain(self.log.iter_mut()) {
+            entry.key = env_subst::resolve(&entry.key, lookup)?;
+            if let Some(class) = entry.class.as_mut() {
+                *class = env_subst::resolve(class, lookup)?;
+            }
         }
         Ok(())
     }
@@ -745,11 +819,81 @@ storage:
     log: [http.route]
 ";
         let cfg = parse(yaml, &lookup).expect("valid");
+        let keys = |entries: &[super::PromotedEntry]| {
+            entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        };
         assert_eq!(
-            cfg.storage.promoted_attributes.resource,
+            keys(&cfg.storage.promoted_attributes.resource),
             ["k8s.namespace.name", "cloud.region"]
         );
-        assert_eq!(cfg.storage.promoted_attributes.log, ["http.route"]);
+        assert_eq!(keys(&cfg.storage.promoted_attributes.log), ["http.route"]);
+        assert!(
+            cfg.storage
+                .promoted_attributes
+                .resource
+                .iter()
+                .chain(&cfg.storage.promoted_attributes.log)
+                .all(|e| e.class.is_none()),
+            "bare entries carry no class token"
+        );
+    }
+
+    /// RFC 0042 §3.2 — a list entry may be the typed mapping
+    /// `{ key, type }`; both fields get the scalar treatment (so
+    /// `${env:…}` substitution applies to each), `type` is optional
+    /// (absent = the bare spelling), and an unknown field inside the
+    /// mapping is rejected by the strict schema. The class token stays a
+    /// raw string here — startup validation owns the vocabulary
+    /// (RFC0042.6).
+    #[test]
+    fn promoted_typed_entries_parse_and_substitute() {
+        let lookup = env(&[("COST_KEY", "cost_usd"), ("COST_TYPE", "f64")]);
+        let yaml = "
+storage:
+  promoted_attributes:
+    log:
+      - model
+      - { key: input_tokens, type: i64 }
+      - key: ${env:COST_KEY}
+        type: ${env:COST_TYPE}
+      - { key: verbatim, type: not-a-class }
+";
+        let cfg = parse(yaml, &lookup).expect("valid");
+        let entries = &cfg.storage.promoted_attributes.log;
+        let shape: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|e| (e.key.as_str(), e.class.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("model", None),
+                ("input_tokens", Some("i64")),
+                ("cost_usd", Some("f64")),
+                // The file layer does not police the vocabulary —
+                // startup does, so the token passes through verbatim.
+                ("verbatim", Some("not-a-class")),
+            ]
+        );
+    }
+
+    /// RFC 0042 §3.2 — an unknown field inside a typed entry mapping is
+    /// a parse error (strict schema, same posture as every section).
+    #[test]
+    fn promoted_typed_entry_unknown_field_rejected() {
+        let lookup = env(&[]);
+        let yaml = "
+storage:
+  promoted_attributes:
+    log:
+      - { key: cost_usd, type: f64, bloom: true }
+";
+        let err = parse(yaml, &lookup).expect_err("unknown field must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bloom"),
+            "error names the offending field: {msg}"
+        );
     }
 
     /// RFC 0022 §3.2 — the section defaults to empty key sets when omitted

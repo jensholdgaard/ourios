@@ -45,7 +45,7 @@ use ourios_ingester::receiver::tls::TlsSettings;
 use ourios_parquet::{
     CompactionPolicy, ParquetAuditSink, PromotedAttributes, S3Config, StoreConfig,
 };
-use ourios_server::config::file::{FileConfig, TlsSection};
+use ourios_server::config::file::{FileConfig, PromotedEntry, TlsSection};
 use ourios_telemetry::TelemetryConfig;
 use ourios_wal::WalConfig;
 
@@ -536,30 +536,73 @@ fn build_config(
     })
 }
 
-/// Resolve `storage.promoted_attributes` (RFC 0022 §3.2) into the effective
-/// promoted set. Keys are taken literally (no globbing), so a key that is
-/// empty or carries surrounding whitespace — e.g. an `${env:…}` reference
-/// that resolved to nothing, or a quoted `" key"` — is a config error rather
-/// than a silently never-matching promoted column. Deduplication and the
-/// implicit `service.name` are [`PromotedAttributes::new`]'s contract.
+/// Resolve `storage.promoted_attributes` (RFC 0022 §3.2 / RFC 0042 §3.2)
+/// into the effective promoted set. Keys are taken literally (no
+/// globbing), so a key that is empty or carries surrounding whitespace —
+/// e.g. an `${env:…}` reference that resolved to nothing, or a quoted
+/// `" key"` — is a config error rather than a silently never-matching
+/// promoted column. RFC0042.6 makes the remaining offences loud at
+/// startup rather than silently collapsed: an unknown `type` token, a
+/// key listed twice within a family (whatever spelling each occurrence
+/// uses), and a re-typed `service.name`.
 fn build_promoted_attributes(
-    resource: &[String],
-    log: &[String],
+    resource: &[PromotedEntry],
+    log: &[PromotedEntry],
 ) -> Result<PromotedAttributes, String> {
-    if resource
-        .iter()
-        .chain(log)
-        .any(|k| k.is_empty() || k.trim() != k)
-    {
-        return Err(
-            "storage.promoted_attributes keys must be non-empty attribute names \
-                    without surrounding whitespace"
-                .to_string(),
-        );
+    fn family(
+        which: &str,
+        entries: &[PromotedEntry],
+    ) -> Result<Vec<ourios_parquet::PromotedKey>, String> {
+        let mut seen = std::collections::HashSet::new();
+        entries
+            .iter()
+            .map(|e| {
+                if e.key.is_empty() || e.key.trim() != e.key {
+                    return Err(format!(
+                        "storage.promoted_attributes.{which} keys must be non-empty \
+                         attribute names without surrounding whitespace"
+                    ));
+                }
+                if !seen.insert(e.key.as_str()) {
+                    return Err(format!(
+                        "storage.promoted_attributes.{which} lists {:?} more than once \
+                         — one declaration per key",
+                        e.key
+                    ));
+                }
+                let class = match e.class.as_deref() {
+                    None | Some("string") => ourios_parquet::PromotedClass::String,
+                    Some("i64") => ourios_parquet::PromotedClass::I64,
+                    Some("f64") => ourios_parquet::PromotedClass::F64,
+                    Some(other) => {
+                        return Err(format!(
+                            "storage.promoted_attributes.{which} key {:?} declares unknown \
+                             type {other:?} — expected \"string\", \"i64\", or \"f64\" \
+                             (RFC 0042 §3.2)",
+                            e.key
+                        ));
+                    }
+                };
+                if which == "resource"
+                    && e.key == ourios_parquet::SERVICE_NAME_KEY
+                    && class != ourios_parquet::PromotedClass::String
+                {
+                    return Err(format!(
+                        "storage.promoted_attributes.resource cannot re-type \
+                         {:?}: the implicit promotion is string-class (RFC 0042 §3.2)",
+                        ourios_parquet::SERVICE_NAME_KEY
+                    ));
+                }
+                Ok(ourios_parquet::PromotedKey {
+                    key: e.key.clone(),
+                    class,
+                })
+            })
+            .collect()
     }
-    Ok(PromotedAttributes::new(
-        resource.iter().cloned(),
-        log.iter().cloned(),
+    Ok(PromotedAttributes::new_typed(
+        family("resource", resource)?,
+        family("log", log)?,
     ))
 }
 
@@ -1307,15 +1350,77 @@ auth:
             server_config("storage:\n  local:\n    bucket_root: /store\n").expect("valid");
         assert_eq!(defaulted.promoted, PromotedAttributes::default());
 
-        let err = build_promoted_attributes(&["k8s.namespace.name".to_string()], &[String::new()])
+        let bare = |key: &str| PromotedEntry {
+            key: key.to_string(),
+            class: None,
+        };
+        let typed = |key: &str, class: &str| PromotedEntry {
+            key: key.to_string(),
+            class: Some(class.to_string()),
+        };
+
+        let err = build_promoted_attributes(&[bare("k8s.namespace.name")], &[bare("")])
             .expect_err("empty key");
         assert!(err.contains("non-empty"), "the error names the rule: {err}");
         // Surrounding whitespace would mint a promoted column whose name can
         // never match the intended attribute key — rejected, not normalised.
-        build_promoted_attributes(&[" k8s.namespace.name".to_string()], &[])
+        build_promoted_attributes(&[bare(" k8s.namespace.name")], &[])
             .expect_err("whitespace-padded key");
-        build_promoted_attributes(&[], &["http.route ".to_string()])
+        build_promoted_attributes(&[], &[bare("http.route ")])
             .expect_err("trailing-whitespace key");
+
+        // RFC0042.6 — typed entries build the classed set; `string` is the
+        // bare spelling's explicit form.
+        let set = build_promoted_attributes(
+            &[],
+            &[
+                bare("model"),
+                typed("cost_usd", "f64"),
+                typed("input_tokens", "i64"),
+                typed("decision", "string"),
+            ],
+        )
+        .expect("typed set");
+        assert_eq!(
+            set.log_keys()
+                .iter()
+                .map(|k| (k.key.as_str(), k.class))
+                .collect::<Vec<_>>(),
+            [
+                ("model", ourios_parquet::PromotedClass::String),
+                ("cost_usd", ourios_parquet::PromotedClass::F64),
+                ("input_tokens", ourios_parquet::PromotedClass::I64),
+                ("decision", ourios_parquet::PromotedClass::String),
+            ]
+        );
+
+        // RFC0042.6 — the three loud startup offences, each error naming
+        // its offence.
+        let err = build_promoted_attributes(&[], &[typed("cost_usd", "float")])
+            .expect_err("unknown type");
+        assert!(
+            err.contains("unknown") && err.contains("float") && err.contains("cost_usd"),
+            "names the token and the key: {err}"
+        );
+        let err = build_promoted_attributes(&[], &[bare("cost_usd"), typed("cost_usd", "f64")])
+            .expect_err("duplicate across spellings");
+        assert!(
+            err.contains("more than once") && err.contains("cost_usd"),
+            "names the duplicated key: {err}"
+        );
+        let err = build_promoted_attributes(&[typed("service.name", "i64")], &[])
+            .expect_err("re-typed service.name");
+        assert!(
+            err.contains("service.name") && err.contains("string-class"),
+            "names the implicit promotion rule: {err}"
+        );
+        // A string-class service.name declaration is redundant but legal.
+        build_promoted_attributes(&[typed("service.name", "string")], &[])
+            .expect("explicit string service.name collapses");
+        // service.name under `log` is an ordinary key (the implicit
+        // promotion is the *resource* family), so an i64 there is legal.
+        build_promoted_attributes(&[], &[typed("service.name", "i64")])
+            .expect("log-family service.name is not the implicit promotion");
     }
 
     #[test]

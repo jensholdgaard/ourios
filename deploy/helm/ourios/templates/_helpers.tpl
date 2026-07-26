@@ -177,40 +177,46 @@ compaction:
 {{- end }}
 
 {{/*
-Env for one workload; pass (dict "root" $ "role" "<role>"). The data-plane
-config is the mounted --config file (RFC 0020); the only env vars are the
-self-telemetry OTLP endpoint, the AWS SDK region (which drives the credential
-chain for s3), and the extraEnv passthroughs — OTEL_* / AWS_* are read
-directly by their SDKs, never modeled in the config (RFC 0020 §3.8), and the
-chart deliberately models no OTel SDK knob beyond the endpoint: that
+Env common to every workload. The data-plane config is the mounted --config file
+(RFC 0020); the only env vars are the self-telemetry OTLP endpoint, the AWS SDK
+region (which drives the credential chain for s3), and any extraEnv — OTEL_* /
+AWS_* are read directly by their SDKs, never modeled in the config (RFC 0020
+§3.8). The chart deliberately models no OTel SDK knob beyond the endpoint: that
 vocabulary is the SDK's env-var contract, not ours, so it is set verbatim in
-extraEnv (see values.yaml). Order is the global extraEnv then the role's, so
-two roles can carry different values for the same name (e.g. per-role
-OTEL_RESOURCE_ATTRIBUTES) and a duplicate resolves to the role's entry —
-Kubernetes takes the last occurrence. May render empty (the workloads guard
-the `env:` block). The dedicated compactor is the only sweeper (the per-role
-config disables compaction on the receiver/querier), so it must be enabled.
+extraEnv (see values.yaml). May render empty (the workloads guard the `env:`
+block). The dedicated compactor is the only sweeper (the per-role config
+disables compaction on the receiver/querier), so it must be enabled.
 */}}
-{{- define "ourios.workloadEnv" -}}
-{{- $root := .root }}
-{{- if not $root.Values.compactor.enabled }}
+{{- define "ourios.commonEnv" -}}
+{{- if not .Values.compactor.enabled }}
 {{- fail "compactor.enabled=false leaves the deployment with no sweeper: the receiver and querier disable compaction in their config, so the dedicated compactor is the chart's only compactor. Set compactor.enabled=true (small files accumulate otherwise — hazard #4)." }}
 {{- end }}
-{{- if and (eq $root.Values.storage.backend "s3") $root.Values.storage.s3.region }}
+{{- if and (eq .Values.storage.backend "s3") .Values.storage.s3.region }}
 - name: AWS_DEFAULT_REGION
-  value: {{ $root.Values.storage.s3.region | quote }}
+  value: {{ .Values.storage.s3.region | quote }}
 {{- end }}
-{{- /* dig: `helm upgrade --reuse-values` may carry an older values shape. */}}
-{{- with dig "exporterEndpoint" "" (default (dict) $root.Values.otel) }}
+{{- with dig "exporterEndpoint" "" (default (dict) .Values.otel) }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ . | quote }}
 {{- end }}
-{{- with $root.Values.extraEnv }}
-{{- toYaml . | nindent 0 }}
+{{- with .Values.extraEnv }}
+{{- toYaml . }}
 {{- end }}
-{{- /* index-then-dig: dig cannot traverse the typed .Values root. */}}
-{{- with dig "extraEnv" (list) (index $root.Values .role | default (dict)) }}
-{{- toYaml . | nindent 0 }}
+{{- end }}
+
+{{/*
+Env for one workload; pass (dict "root" $ "role" "<role>"): the common env
+above plus the role's own extraEnv. The role list renders AFTER the global
+one, so two roles can carry different values for the same name (e.g. per-role
+OTEL_RESOURCE_ATTRIBUTES) and a duplicate resolves to the role's entry —
+Kubernetes takes the last occurrence.
+*/}}
+{{- define "ourios.workloadEnv" -}}
+{{- include "ourios.commonEnv" .root }}
+{{- /* index-then-dig: dig cannot traverse the typed .Values root, and the
+role key may be absent under `helm upgrade --reuse-values`. */}}
+{{- with dig "extraEnv" (list) (index .root.Values .role | default (dict)) }}
+{{ toYaml . }}
 {{- end }}
 {{- end }}
 

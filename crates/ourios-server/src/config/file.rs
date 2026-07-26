@@ -212,6 +212,10 @@ impl<'de> Deserialize<'de> for PromotedEntry {
                 f.write_str("an attribute key, or a `{ key, type }` mapping (RFC 0042 §3.2)")
             }
 
+            // The bare spelling takes the full scalar treatment (RFC
+            // 0020 §3.3 rule 7, as `Scalar` renders): a bare boolean
+            // or numeric key is captured as its string form, exactly
+            // as the pre-RFC-0042 `scalar_vec` model did.
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PromotedEntry, E> {
                 Ok(PromotedEntry {
                     key: v.to_owned(),
@@ -224,6 +228,22 @@ impl<'de> Deserialize<'de> for PromotedEntry {
                     key: v,
                     class: None,
                 })
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<PromotedEntry, E> {
+                self.visit_string(v.to_string())
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PromotedEntry, E> {
+                self.visit_string(v.to_string())
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PromotedEntry, E> {
+                self.visit_string(v.to_string())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<PromotedEntry, E> {
+                self.visit_string(v.to_string())
             }
 
             fn visit_map<A>(self, map: A) -> Result<PromotedEntry, A::Error>
@@ -875,6 +895,31 @@ storage:
                 ("verbatim", Some("not-a-class")),
             ]
         );
+    }
+
+    /// RFC 0020 §3.3 rule 7 — a bare entry keeps the full scalar
+    /// treatment: an unquoted numeric or boolean key is captured as its
+    /// string form, exactly as the pre-RFC-0042 `scalar_vec` model did.
+    #[test]
+    fn promoted_bare_entries_keep_the_scalar_model() {
+        let lookup = env(&[]);
+        let yaml = "
+storage:
+  promoted_attributes:
+    log:
+      - 404
+      - true
+      - 1.5
+";
+        let cfg = parse(yaml, &lookup).expect("valid");
+        let keys: Vec<&str> = cfg
+            .storage
+            .promoted_attributes
+            .log
+            .iter()
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(keys, ["404", "true", "1.5"]);
     }
 
     /// RFC 0042 §3.2 — an unknown field inside a typed entry mapping is

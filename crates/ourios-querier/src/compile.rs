@@ -541,7 +541,9 @@ pub(crate) fn scalar_agg_expr(
     };
     // RFC 0042 §3.5 / RFC0042.3: a numeric-class column aggregates
     // directly — no parse-shaped `try_cast`. `Int64` takes a plain
-    // numeric `cast` to the Float64 output type (exact widening, the
+    // numeric `cast` to the Float64 output type (exact for |v| ≤ 2^53
+    // — RFC 0042 §3.1's stated bound; a key expected to exceed it
+    // belongs in i64 and loses precision here if summed anyway — the
     // same rule as the write-side projection); a `Utf8` promoted column
     // keeps the RFC0002.17 `try_cast` (unparseable → NULL → excluded).
     let numeric = match column_type(df, &name) {

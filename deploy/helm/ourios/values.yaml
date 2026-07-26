@@ -158,12 +158,46 @@ compactor:
   podAnnotations: {}
   podLabels: {}
 
-# Ourios's own self-telemetry (RFC 0001 §6.8): the OTLP endpoint its meter
-# exports to. Empty leaves the OpenTelemetry SDK default
-# (OTEL_EXPORTER_OTLP_ENDPOINT unset). Standard OTEL_* env can also be set via
-# extraEnv.
+# Ourios's own self-telemetry: the OTLP endpoint every signal it emits is
+# exported to. That is now three signals, not just the meter — metrics
+# (CLAUDE.md §6.3), logs, and, since RFC 0038/0039/0040, traces (request-scoped
+# spans on ingest/query/MCP/sweep, continuing an inbound caller's trace, with
+# DataFusion operator spans under a query).
+#
+# Every key below maps 1:1 onto a standard OTEL_* env var: Ourios models no
+# bespoke telemetry config, it reads the SDK's own variables (RFC 0038 slice
+# 4). Anything not modeled here can still be set verbatim via extraEnv.
+#
+# Pointing this at Ourios's own receiver is the intended dogfood setup, but
+# send it through a Collector rather than directly: Ourios emits logs *about*
+# ingesting, so a direct self-export is a feedback loop.
 otel:
+  # OTEL_EXPORTER_OTLP_ENDPOINT — all three signals. Empty leaves it unset.
+  # Per-signal endpoints (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT and friends) go
+  # in extraEnv.
   exporterEndpoint: ""
+
+  traces:
+    # false renders OTEL_TRACES_EXPORTER=none — the span pipeline is not built.
+    enabled: true
+    # OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG. Empty keeps the SDK
+    # default, parentbased_always_on: every request Ourios serves is sampled.
+    # Spans are request-scoped, never per log record (RFC 0038 §3), so this is
+    # bounded by request rate — but on a busy receiver prefer
+    # parentbased_traceidratio with samplerArg: "0.01".
+    sampler: ""
+    samplerArg: ""
+
+  metrics:
+    # false renders OTEL_METRICS_EXPORTER=none.
+    enabled: true
+    # OTEL_METRIC_EXPORT_INTERVAL, in milliseconds. Empty = SDK default 60000.
+    exportInterval: ""
+
+  logs:
+    # false renders OTEL_LOGS_EXPORTER=none. Ourios's own structured logs are
+    # bridged to OTLP; disabling this leaves them on stderr only.
+    enabled: true
 
 # Extra environment variables appended verbatim to every container (e.g. OTEL_*
 # overrides). Do NOT put object-store credentials here as plaintext — use

@@ -178,7 +178,9 @@ compaction:
 
 {{/*
 Env common to every workload. The data-plane config is the mounted --config file
-(RFC 0020); the only env vars are the self-telemetry OTLP endpoint, the AWS SDK
+(RFC 0020); the only env vars are the self-telemetry OTLP settings (endpoint
+plus the per-signal traces/metrics/logs knobs, each a standard OTEL_* name —
+Ourios models no bespoke telemetry config), the AWS SDK
 region (which drives the credential chain for s3), and any extraEnv — OTEL_* /
 AWS_* are read directly by their SDKs, never modeled in the config (RFC 0020
 §3.8). May render empty (the workloads guard the `env:` block). The dedicated
@@ -193,9 +195,50 @@ receiver/querier), so it must be enabled.
 - name: AWS_DEFAULT_REGION
   value: {{ .Values.storage.s3.region | quote }}
 {{- end }}
-{{- with .Values.otel.exporterEndpoint }}
+{{- with dig "exporterEndpoint" "" (default (dict) .Values.otel) }}
 - name: OTEL_EXPORTER_OTLP_ENDPOINT
   value: {{ . | quote }}
+{{- end }}
+{{- /*
+  Read the per-signal keys with `dig` rather than direct traversal: `helm
+  upgrade --reuse-values` from a release predating them carries forward the
+  OLD chart's `otel` map (endpoint only) without merging the new defaults, so
+  `.Values.otel.traces.enabled` nil-pointers. `dig` keys off *existence*, not
+  emptiness, so an explicit `enabled: false` survives where `default true`
+  would silently flip it back on.
+*/}}
+{{- $otel := default (dict) .Values.otel }}
+{{- if not (dig "traces" "enabled" true $otel) }}
+- name: OTEL_TRACES_EXPORTER
+  value: "none"
+{{- end }}
+{{- /*
+  Compare against "" rather than using `with`: Go templates treat numeric 0 as
+  empty, and `samplerArg: 0` is a legitimate setting (traceidratio 0 = sample
+  nothing the caller has not already sampled). `with` would drop it silently.
+*/}}
+{{- $sampler := toString (dig "traces" "sampler" "" $otel) }}
+{{- if ne $sampler "" }}
+- name: OTEL_TRACES_SAMPLER
+  value: {{ $sampler | quote }}
+{{- end }}
+{{- $samplerArg := toString (dig "traces" "samplerArg" "" $otel) }}
+{{- if ne $samplerArg "" }}
+- name: OTEL_TRACES_SAMPLER_ARG
+  value: {{ $samplerArg | quote }}
+{{- end }}
+{{- if not (dig "metrics" "enabled" true $otel) }}
+- name: OTEL_METRICS_EXPORTER
+  value: "none"
+{{- end }}
+{{- $exportInterval := toString (dig "metrics" "exportInterval" "" $otel) }}
+{{- if ne $exportInterval "" }}
+- name: OTEL_METRIC_EXPORT_INTERVAL
+  value: {{ $exportInterval | quote }}
+{{- end }}
+{{- if not (dig "logs" "enabled" true $otel) }}
+- name: OTEL_LOGS_EXPORTER
+  value: "none"
 {{- end }}
 {{- with .Values.extraEnv }}
 {{- toYaml . }}

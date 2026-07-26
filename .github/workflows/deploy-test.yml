@@ -48,6 +48,11 @@ jobs:
       - name: helm lint
         run: helm lint deploy/helm/ourios
 
+      # Rendered-output assertions for the values combinations the kind
+      # install below does not reach (upgrade paths, per-signal toggles).
+      - name: chart render assertions
+        run: bash deploy/helm/render-tests.sh
+
       # Build the amd64 image from the current Dockerfile (the runner is amd64;
       # the multi-arch release path is image.yml's job, not this smoke test).
       - name: Build image

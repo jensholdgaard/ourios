@@ -11,6 +11,15 @@ superseded-by: —
 
 # RFC 0042 — Typed numeric attribute promotion (RFC 0022 amendment)
 
+> **Status note (2026-07-27):** RFC0042.1–.8 are green in-repo across
+> the implementation slices (#649 writer, #650 config, #651 scan +
+> no-coercion adapter, #652 predicates + aggregation, and the
+> compaction re-typing test). The one outstanding criterion is
+> **RFC0042.9** — the dogfood corpus gate — which needs a fresh agent
+> capture under the typed promotion set (PR #646); the status flips to
+> `green` when that query returns real spend. Until then this RFC
+> stays `specified` with the implementation ahead of the flip.
+
 > Enacts RFC 0022 §7.1, whose deferral clause — "deferred until a
 > consumer demands it" — has been met: the agent-FinOps loop's headline
 > query is `sum(attr.cost_usd) by attr.model`, and `cost_usd` arrives

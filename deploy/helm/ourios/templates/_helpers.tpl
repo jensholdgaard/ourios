@@ -212,21 +212,29 @@ receiver/querier), so it must be enabled.
 - name: OTEL_TRACES_EXPORTER
   value: "none"
 {{- end }}
-{{- with dig "traces" "sampler" "" $otel }}
+{{- /*
+  Compare against "" rather than using `with`: Go templates treat numeric 0 as
+  empty, and `samplerArg: 0` is a legitimate setting (traceidratio 0 = sample
+  nothing the caller has not already sampled). `with` would drop it silently.
+*/}}
+{{- $sampler := toString (dig "traces" "sampler" "" $otel) }}
+{{- if ne $sampler "" }}
 - name: OTEL_TRACES_SAMPLER
-  value: {{ . | quote }}
+  value: {{ $sampler | quote }}
 {{- end }}
-{{- with dig "traces" "samplerArg" "" $otel }}
+{{- $samplerArg := toString (dig "traces" "samplerArg" "" $otel) }}
+{{- if ne $samplerArg "" }}
 - name: OTEL_TRACES_SAMPLER_ARG
-  value: {{ . | quote }}
+  value: {{ $samplerArg | quote }}
 {{- end }}
 {{- if not (dig "metrics" "enabled" true $otel) }}
 - name: OTEL_METRICS_EXPORTER
   value: "none"
 {{- end }}
-{{- with dig "metrics" "exportInterval" "" $otel }}
+{{- $exportInterval := toString (dig "metrics" "exportInterval" "" $otel) }}
+{{- if ne $exportInterval "" }}
 - name: OTEL_METRIC_EXPORT_INTERVAL
-  value: {{ . | quote }}
+  value: {{ $exportInterval | quote }}
 {{- end }}
 {{- if not (dig "logs" "enabled" true $otel) }}
 - name: OTEL_LOGS_EXPORTER

@@ -337,7 +337,7 @@ is intentionally out of scope. Tune the cadence via `compactor.intervalSecs`.
 | `<role>.serviceAccount.name` | `""` | With `create=true`: overrides the rendered `<fullname>-<role>` name. With `create=false`: binds an **existing** ServiceAccount of that name (managed out-of-band). |
 | `otel.exporterEndpoint` | `""` | `OTEL_EXPORTER_OTLP_ENDPOINT` — where Ourios exports **all three** of its own signals (metrics, logs, traces). Per-signal endpoints go in `extraEnv`. |
 | `otel.traces.enabled` | `true` | `false` renders `OTEL_TRACES_EXPORTER=none`. |
-| `otel.traces.sampler` / `.samplerArg` | `""` | `OTEL_TRACES_SAMPLER` / `_ARG`. Empty keeps the SDK default `parentbased_always_on` — **every** served request is sampled; see "Self-telemetry" below. |
+| `otel.traces.sampler` / `.samplerArg` | `""` | `OTEL_TRACES_SAMPLER` / `_ARG`. Empty keeps the SDK default `parentbased_always_on` — **every** served request is sampled; see [Self-telemetry](#self-telemetry). |
 | `otel.metrics.enabled` | `true` | `false` renders `OTEL_METRICS_EXPORTER=none`. |
 | `otel.metrics.exportInterval` | `""` | `OTEL_METRIC_EXPORT_INTERVAL` in ms. Empty = SDK default `60000`. |
 | `otel.logs.enabled` | `true` | `false` renders `OTEL_LOGS_EXPORTER=none`; Ourios's logs stay on stderr. |

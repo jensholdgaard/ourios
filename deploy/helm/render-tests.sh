@@ -70,6 +70,15 @@ OTEL_TRACES_SAMPLER_ARG=0.01' \
   --set otel.traces.samplerArg=0.01 \
   --set otel.metrics.exportInterval=15000
 
+# Go templates treat numeric 0 as empty, so a `with`-guarded field drops it.
+# `samplerArg: 0` is meaningful — traceidratio 0 samples nothing the caller
+# has not already sampled — so it has to survive.
+expect "numeric zero samplerArg is not dropped" \
+  'OTEL_TRACES_SAMPLER=traceidratio
+OTEL_TRACES_SAMPLER_ARG=0' \
+  --set otel.traces.sampler=traceidratio \
+  --set otel.traces.samplerArg=0
+
 if ((failures)); then
   printf '\n%d assertion(s) failed\n' "$failures" >&2
   exit 1

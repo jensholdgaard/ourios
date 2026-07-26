@@ -23,6 +23,16 @@ fn kv_int(key: &str, value: i64) -> KeyValue {
     }
 }
 
+fn kv_double(key: &str, value: f64) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(AvValue::DoubleValue(value)),
+        }),
+        ..Default::default()
+    }
+}
+
 fn typed_i64(key: &str) -> PromotedKey {
     PromotedKey {
         key: key.into(),
@@ -114,6 +124,185 @@ async fn rfc0042_5_mixed_schema_scan() {
         "sum covers the declared-class file only (no string parsing)"
     );
     assert_eq!(group.count, 4, "every row still counts");
+}
+
+/// Scenarios RFC0042.4 (ordering + typed arm) and the `==` JSON-arm
+/// half of RFC0042.5, over the same three-file fixture; plus RFC0042.7
+/// compile errors. See `docs/rfcs/0042-typed-numeric-promotion.md` §5.
+#[tokio::test]
+async fn rfc0042_4_7_numeric_predicates() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    let a = vec![rec_with_attrs(
+        "a",
+        TS0,
+        vec![kv("service.name", "agent")],
+        vec![kv_int("input_tokens", 7)],
+    )];
+    write_all_with_promoted(bucket.path(), &a, &PromotedAttributes::default());
+    let b = vec![rec_with_attrs(
+        "a",
+        TS0 + 1_000,
+        vec![kv("service.name", "agent")],
+        vec![kv("input_tokens", "1000")],
+    )];
+    write_all_with_promoted(
+        bucket.path(),
+        &b,
+        &PromotedAttributes::new(Vec::<String>::new(), vec!["input_tokens".to_string()]),
+    );
+    let c = vec![
+        rec_with_attrs(
+            "a",
+            TS0 + 2_000,
+            vec![kv("service.name", "agent")],
+            vec![kv_int("input_tokens", 40)],
+        ),
+        rec_with_attrs(
+            "a",
+            TS0 + 3_000,
+            vec![kv("service.name", "agent")],
+            vec![kv_int("input_tokens", 2)],
+        ),
+    ];
+    let i64_class = PromotedAttributes::new_typed([], [typed_i64("input_tokens")]);
+    write_all_with_promoted(bucket.path(), &c, &i64_class);
+
+    let querier = ourios_querier::Querier::new(bucket.path()).with_promoted_attributes(i64_class);
+    let run = |dsl: String| {
+        let querier = &querier;
+        async move {
+            let query = ourios_querier::dsl::parse(&dsl).expect("parse DSL");
+            querier
+                .run_query(
+                    &query,
+                    &ourios_core::tenant::TenantId::new("a"),
+                    NOW,
+                    DEFAULT_WINDOW_NS,
+                    Some(&crate::common::no_aliases()),
+                )
+                .await
+        }
+    };
+
+    // Ordering: typed arm only — matches file C's 40 row and nothing
+    // from the absent / mismatched files (RFC0042.4).
+    let ord = run("attr.input_tokens >= 10 | count".into())
+        .await
+        .expect("ordering");
+    assert_eq!(ord.rows, 1, "ordering covers the declared-class file only");
+
+    // == reaches file A through the JSON fallback arm (its column is
+    // absent; the stored canonical form is intValue "7") — the ==
+    // half of RFC0042.5.
+    let eq_json = run("attr.input_tokens == 7 | count".into())
+        .await
+        .expect("== json arm");
+    assert_eq!(
+        eq_json.rows, 1,
+        "== answers pre-declaration files via the JSON arm"
+    );
+    let eq_typed = run("attr.input_tokens == 40 | count".into())
+        .await
+        .expect("== typed arm");
+    assert_eq!(
+        eq_typed.rows, 1,
+        "== answers the typed file via the typed arm"
+    );
+
+    // != requires key-present-with-different-value: A's 7 (JSON arm) and
+    // C's 2 (typed arm). B's stringValue-encoded key has no intValue
+    // presence, and absent keys never match.
+    let ne = run("attr.input_tokens != 40 | count".into())
+        .await
+        .expect("!=");
+    assert_eq!(ne.rows, 2, "!= spans both arms, absent keys excluded");
+
+    // RFC0042.7 — compile errors naming the declared class.
+    for (dsl, what) in [
+        ("attr.input_tokens == \"x\" | count", "string literal"),
+        ("attr.input_tokens == 1.5 | count", "float on i64"),
+        ("attr.input_tokens =~ \"4.*\" | count", "regex"),
+    ] {
+        let err = run(dsl.to_string()).await.expect_err(what);
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("i64") && msg.contains("RFC 0042"),
+            "{what}: error names the class: {msg}"
+        );
+    }
+}
+
+/// The `f64` half of RFC0042.4/.7: equality is typed-arm-only, int
+/// literals widen, and a string literal is a compile error.
+#[tokio::test]
+async fn rfc0042_4_f64_predicates() {
+    let bucket = tempfile::TempDir::new().expect("temp");
+    // Pre-declaration file carrying the value only in JSON.
+    let a = vec![rec_with_attrs(
+        "a",
+        TS0,
+        vec![kv("service.name", "agent")],
+        vec![kv_double("cost_usd", 0.5)],
+    )];
+    write_all_with_promoted(bucket.path(), &a, &PromotedAttributes::default());
+    let f64_class = PromotedAttributes::new_typed(
+        [],
+        [PromotedKey {
+            key: "cost_usd".into(),
+            class: PromotedClass::F64,
+        }],
+    );
+    let c = vec![
+        rec_with_attrs(
+            "a",
+            TS0 + 1_000,
+            vec![kv("service.name", "agent")],
+            vec![kv_double("cost_usd", 0.5)],
+        ),
+        rec_with_attrs(
+            "a",
+            TS0 + 2_000,
+            vec![kv("service.name", "agent")],
+            vec![kv_int("cost_usd", 2)],
+        ),
+    ];
+    write_all_with_promoted(bucket.path(), &c, &f64_class);
+
+    let querier = ourios_querier::Querier::new(bucket.path()).with_promoted_attributes(f64_class);
+    let run = |dsl: String| {
+        let querier = &querier;
+        async move {
+            let query = ourios_querier::dsl::parse(&dsl).expect("parse DSL");
+            querier
+                .run_query(
+                    &query,
+                    &ourios_core::tenant::TenantId::new("a"),
+                    NOW,
+                    DEFAULT_WINDOW_NS,
+                    Some(&crate::common::no_aliases()),
+                )
+                .await
+        }
+    };
+
+    // Float equality: typed arm only — the pre-declaration file's 0.5
+    // is NOT matched (documented §3.4 consequence).
+    let eq = run("attr.cost_usd == 0.5 | count".into())
+        .await
+        .expect("f64 ==");
+    assert_eq!(eq.rows, 1, "f64 equality never reaches pre-amendment files");
+
+    // Ordering with an int literal widening into f64: 0.5 and 2.0 both
+    // exceed 0, only the typed file's rows match.
+    let ord = run("attr.cost_usd > 0 | count".into())
+        .await
+        .expect("f64 ordering");
+    assert_eq!(ord.rows, 2, "int literal widens; typed file only");
+
+    let err = run("attr.cost_usd == \"0.5\" | count".into())
+        .await
+        .expect_err("string literal on f64");
+    assert!(format!("{err:?}").contains("f64"), "error names the class");
 }
 
 /// The undeclared-conflict half of §3.3: with NO declaration for the

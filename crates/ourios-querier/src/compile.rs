@@ -73,7 +73,7 @@ use crate::dsl::ir::{
     AggFn, Call, CmpOp, Field, GroupTerm, OrdOp, Predicate, Query, SeverityValue, Stage, Time,
     Value,
 };
-use crate::{QueryError, has_column, time_bound_scalar};
+use crate::{QueryError, column_type, has_column, time_bound_scalar};
 use ourios_parquet::{columns, promoted};
 
 /// A compiled query: the resolved time window (drives both the
@@ -528,12 +528,27 @@ pub(crate) fn scalar_agg_expr(
     path: &Field,
     df: &DataFrame,
 ) -> Result<Expr, QueryError> {
-    let column = match path {
-        Field::Attr(key) => group_by_promoted(columns::ATTRIBUTES, key, df)?,
-        Field::Resource(key) => group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, df)?,
+    let (column, name) = match path {
+        Field::Attr(key) => (
+            group_by_promoted(columns::ATTRIBUTES, key, df)?,
+            promoted_column_name(columns::ATTRIBUTES, key),
+        ),
+        Field::Resource(key) => (
+            group_by_promoted(columns::RESOURCE_ATTRIBUTES, key, df)?,
+            promoted_column_name(columns::RESOURCE_ATTRIBUTES, key),
+        ),
         _ => return Err(agg_path_error()),
     };
-    let numeric = try_cast(column, DataType::Float64);
+    // RFC 0042 §3.5 / RFC0042.3: a numeric-class column aggregates
+    // directly — no parse-shaped `try_cast`. `Int64` takes a plain
+    // numeric `cast` to the Float64 output type (exact widening, the
+    // same rule as the write-side projection); a `Utf8` promoted column
+    // keeps the RFC0002.17 `try_cast` (unparseable → NULL → excluded).
+    let numeric = match column_type(df, &name) {
+        Some(DataType::Float64) => column,
+        Some(DataType::Int64) => cast(column, DataType::Float64),
+        _ => try_cast(column, DataType::Float64),
+    };
     Ok(match func {
         AggFn::Sum => sum(numeric),
         AggFn::Min => min(numeric),
@@ -1032,12 +1047,24 @@ fn attr_match(
     if !has_column(df, column) {
         return Ok(PredExpr::None);
     }
+    let promoted_name = promoted_column_name(column, key);
+    // RFC 0042 §3.4: the union schema's type for the promoted column is
+    // the declared class's type (`schema_adapt::merge_scanned_schemas`),
+    // so a numeric column type routes to the numeric-class compilation.
+    match column_type(df, &promoted_name) {
+        Some(DataType::Int64) => {
+            return numeric_attr_match(column, key, &promoted_name, op, value, NumericClass::I64);
+        }
+        Some(DataType::Float64) => {
+            return numeric_attr_match(column, key, &promoted_name, op, value, NumericClass::F64);
+        }
+        _ => {}
+    }
     let Value::Str(v) = value else {
         return Err(QueryError::InvalidQuery {
             detail: "attribute comparisons take a string value in this query surface".to_string(),
         });
     };
-    let promoted_name = promoted_column_name(column, key);
     // `col()` parses dotted names as qualified references, so the promoted
     // column (literally named `resource.<k>` / `attr.<k>`) must be addressed
     // as an unqualified `Column` built directly.
@@ -1101,6 +1128,104 @@ fn attr_match(
             .or(p.is_null().and(json))
     };
     Ok(PredExpr::Filter(expr))
+}
+
+/// The numeric promotion class of a key, as read off the union schema
+/// (RFC 0042 §3.4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumericClass {
+    I64,
+    F64,
+}
+
+impl NumericClass {
+    fn name(self) -> &'static str {
+        match self {
+            Self::I64 => "i64",
+            Self::F64 => "f64",
+        }
+    }
+}
+
+/// RFC 0042 §3.4 — predicate compilation for a numeric-class promoted key.
+///
+/// - The literal must be numeric: an int for `i64`; an int or float for
+///   `f64` (ints widen, matching the write-side projection). A string
+///   literal or a float against `i64` is a compile error naming the
+///   declared class.
+/// - Ordering is typed-arm-only, prunable via numeric min/max statistics.
+/// - `==`/`!=` on `i64` carry the JSON fallback arm for files where the
+///   column is absent or type-mismatched — canonical integer formatting
+///   is unique (the stored form is `"intValue":"<decimal>"`, RFC 0005
+///   §3.3 / proto3-JSON's string-encoded i64), so the fragment is exact.
+/// - `==`/`!=` on `f64` are typed-arm-only: JSON text has no canonical
+///   float formatting, so a fallback arm would be wrong both ways.
+/// - Regex is a compile error — a category the string class serves.
+fn numeric_attr_match(
+    column: &str,
+    key: &str,
+    promoted_name: &str,
+    op: CmpOp,
+    value: &Value,
+    class: NumericClass,
+) -> Result<PredExpr, QueryError> {
+    let class_err = |what: &str| {
+        Err(QueryError::InvalidQuery {
+            detail: format!(
+                "'{promoted_name}' is promoted as {}: {what} (RFC 0042 §3.4)",
+                class.name()
+            ),
+        })
+    };
+    let p = Expr::Column(Column::new_unqualified(promoted_name.to_string()));
+    // The typed literal. i64 == keeps the exact integer for the JSON arm.
+    let (typed_lit, int_for_json) = match (class, value) {
+        (NumericClass::I64, Value::Int(i)) => (lit(*i), Some(*i)),
+        (NumericClass::F64, Value::Int(i)) => {
+            #[allow(clippy::cast_precision_loss)] // §3.1: int widening is the contract
+            (lit(*i as f64), None)
+        }
+        (NumericClass::F64, Value::Float(f)) => (lit(*f), None),
+        (NumericClass::I64, Value::Float(_)) => {
+            return class_err("compare it with an integer literal, not a float");
+        }
+        _ => {
+            return class_err("compare it with a numeric literal, not a string");
+        }
+    };
+    match op {
+        CmpOp::Match | CmpOp::NotMatch => class_err("regex applies to string-class keys only"),
+        CmpOp::Ord(OrdOp::Eq | OrdOp::Ne) => {
+            let eq = matches!(op, CmpOp::Ord(OrdOp::Eq));
+            let typed = if eq {
+                p.clone().eq(typed_lit)
+            } else {
+                // Presence explicit, as in the string two-arm form.
+                p.clone().is_not_null().and(p.clone().not_eq(typed_lit))
+            };
+            let Some(i) = int_for_json else {
+                // f64 equality: typed arm only (§3.4). Pre-amendment /
+                // mismatched files never match — documented consequence.
+                return Ok(PredExpr::Filter(typed));
+            };
+            // The canonical stored fragment for an integer attribute:
+            // {"key":"<k>","value":{"intValue":"<decimal>"}}.
+            let needle_key = serde_json::to_string(key).map_err(|e| QueryError::InvalidQuery {
+                detail: format!("attribute key is not encodable: {e}"),
+            })?;
+            let fragment = format!("{{\"key\":{needle_key},\"value\":{{\"intValue\":\"{i}\"}}}}");
+            let value_match = col(column).like(lit(format!("%{}%", like_escape(&fragment))));
+            let json = if eq {
+                value_match
+            } else {
+                let key_present = format!("{{\"key\":{needle_key},\"value\":{{\"intValue\":\"");
+                let presence = col(column).like(lit(format!("%{}%", like_escape(&key_present))));
+                presence.and(not(value_match))
+            };
+            Ok(PredExpr::Filter(typed.or(p.is_null().and(json))))
+        }
+        CmpOp::Ord(ord) => Ok(PredExpr::Filter(ord_expr(p, ord, typed_lit))),
+    }
 }
 
 /// The RFC 0022 promoted column name for an attribute key: the literal DSL

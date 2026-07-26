@@ -791,6 +791,21 @@ fn has_column(df: &datafusion::dataframe::DataFrame, column: &str) -> bool {
     df.schema().fields().iter().any(|f| f.name() == column)
 }
 
+/// The (post-union) type of `column`, when present. Since RFC 0042 the
+/// promoted columns' union type is the declared class's type
+/// ([`schema_adapt::merge_scanned_schemas`]), so this is how the DSL
+/// compiler learns a key's class.
+fn column_type(
+    df: &datafusion::dataframe::DataFrame,
+    column: &str,
+) -> Option<datafusion::arrow::datatypes::DataType> {
+    df.schema()
+        .fields()
+        .iter()
+        .find(|f| f.name() == column)
+        .map(|f| f.data_type().clone())
+}
+
 /// The row-level time-window filter `[start, end)` over the **effective**
 /// timestamp (RFC 0002 §6.2 / RFC 0005 §3.2, amendment 2026-06-11), with the
 /// §3.9 rule-2 carve-out for files that predate the

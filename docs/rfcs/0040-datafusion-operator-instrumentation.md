@@ -1,7 +1,7 @@
 ---
 rfc: 0040
 title: DataFusion → OTel operator instrumentation — the query span as an operator tree
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -11,6 +11,12 @@ superseded-by: —
 
 # RFC 0040 — DataFusion → OTel operator instrumentation
 
+> **Status: `accepted` (2026-07-28, maintainer sign-off).** Terminal. No
+> thesis-gate applies, so `validated` is vacuous (precedent: RFC 0008) and
+> `green` was the last verification stage; the flip records maintainer
+> approval of the design as binding. The `ourios-df-otel` crate remains
+> deliberately extractable for upstream.
+>
 > **Status: `green` (2026-07-25).** All six §5 acceptance criteria are
 > implemented and pass: RFC0040.1 (operator span tree, transitively parented to
 > the query span), RFC0040.2 (real, non-inverted wall-clock bounds), RFC0040.3

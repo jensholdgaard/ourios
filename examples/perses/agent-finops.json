@@ -131,7 +131,7 @@
                 "plugin": {
                   "kind": "OuriosLogQuery",
                   "spec": {
-                    "query": "severity >= trace | limit 100"
+                    "query": "scope == \"com.anthropic.claude_code.events\" and severity >= trace | limit 100"
                   }
                 }
               }

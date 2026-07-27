@@ -18,9 +18,9 @@ own telemetry.
 ## Import
 
 ```sh
-# adjust url + tenant header for your deployment first
-percli apply -f datasource.example.json
-percli apply -f agent-finops.json
+# from the repository root; adjust url + tenant header for your deployment first
+percli apply -f examples/perses/datasource.example.json
+percli apply -f examples/perses/agent-finops.json
 ```
 
 `datasource.example.json` proxies `POST /v1/query` (panel queries) and

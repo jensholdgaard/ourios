@@ -402,5 +402,5 @@ output-token throughput (Int64 class, ~40K/h peaks), tool-decision mix,
 and the event log (RFC0002.21 floor admitting unspecified-severity GenAI
 events). Idle hours draw as gaps, not zeros — the RFC 0042
 null-propagation contract on screen. The panel time range arrives as a
-DSL `range(...)` stage (the request body is strictly `{"query"}`),
-confirming the §3.2 mapping.
+DSL `range(...)` stage (the request body carries only the `query`
+field), confirming the §3.2 mapping.

@@ -2,15 +2,16 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-07-27** — the typed-promotion arc landed end to
-> end and the dashboard decision is made. **RFC 0042** (typed numeric
+> Last updated: **2026-07-27** — the typed-promotion arc landed
+> end-to-end and the dashboard decision is made. **RFC 0042** (typed numeric
 > promotion, RFC 0022 §7.1 enacted) went spec → `green` in two days
 > (#647–#653), closing with RFC0042.9 verified on live telemetry: the
 > agent queried its own spend over MCP — the
 > `sum(attr.cost_usd) by attr.model` query returned 35.28 USD across
-> 10 requests from the typed `Float64` column. Getting the capture to flow fixed a latent env bug (#654:
-> per-signal OTLP endpoints are used as-is per spec, so the dogfood
-> env now carries explicit `/v1/<signal>` paths). **RFC 0041** flipped
+> 10 requests from the typed `Float64` column. Getting the capture
+> to flow fixed a latent env bug (#654: per-signal OTLP endpoints are
+> used as-is per spec, so the dogfood env now carries explicit
+> `/v1/<signal>` paths). **RFC 0041** flipped
 > to `specified`: build now, **Perses first**, three plugins in the
 > dedicated `ourios-perses-plugin` repository, with the committed
 > FinOps dashboard as the capstone (RFC0041.6); Grafana remains an

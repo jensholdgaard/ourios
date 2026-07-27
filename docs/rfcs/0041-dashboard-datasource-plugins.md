@@ -33,8 +33,11 @@ superseded-by: —
 Ourios answers queries over HTTP (`POST /v1/query`, RFC 0016) in a logs DSL
 (RFC 0002) that was designed with dashboard authors as its primary audience.
 Neither Grafana nor Perses can consume it today: each needs a datasource
-plugin. This RFC proposes writing one — and asks which host, or whether the
-work belongs in this cycle at all.
+plugin. At `drafted` this RFC asked which host — or whether the work belongs
+in this cycle at all; at `specified` both questions are resolved (§7):
+build now, **Perses first** — three plugins in the dedicated
+`ourios-perses-plugin` repository, capped by the committed FinOps dashboard
+(RFC0041.6) — with the Grafana datasource an ungated later follow-up.
 
 Working spikes exist for **both** Grafana and Perses. Each renders real
 ingested logs in a real dashboard against the live querier. The Ourios-side

@@ -1,0 +1,189 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "agent-finops",
+    "project": "ourios"
+  },
+  "spec": {
+    "display": {
+      "name": "Agent FinOps \u2014 Ourios dogfood"
+    },
+    "duration": "24h",
+    "panels": {
+      "spend": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Spend by model (USD)",
+            "description": "sum(attr.cost_usd) from the RFC 0042 typed Float64 column; NULL aggregates render as gaps, never zeros"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "position": "bottom"
+              },
+              "visual": {
+                "connectNulls": false
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "OuriosTimeSeriesQuery",
+                  "spec": {
+                    "query": "scope == \"com.anthropic.claude_code.events\" | sum(attr.cost_usd) by attr.model, bucket(1h)"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "tokens": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Output tokens",
+            "description": "sum(attr.output_tokens) from the typed Int64 column"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "position": "bottom"
+              },
+              "visual": {
+                "connectNulls": false
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "OuriosTimeSeriesQuery",
+                  "spec": {
+                    "query": "scope == \"com.anthropic.claude_code.events\" | sum(attr.output_tokens) by bucket(1h)"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "decisions": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Tool decisions",
+            "description": "count by the promoted decision attribute"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "position": "bottom"
+              },
+              "visual": {
+                "connectNulls": false
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "OuriosTimeSeriesQuery",
+                  "spec": {
+                    "query": "scope == \"com.anthropic.claude_code.events\" | count by attr.decision, bucket(1h)"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "events": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Recent agent events",
+            "description": "RFC0002.21: the severity floor admits unspecified-severity GenAI events"
+          },
+          "plugin": {
+            "kind": "LogsTable",
+            "spec": {
+              "allowWrap": true,
+              "enableDetails": true,
+              "showTime": true
+            }
+          },
+          "queries": [
+            {
+              "kind": "LogQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "OuriosLogQuery",
+                  "spec": {
+                    "query": "severity >= trace | limit 100"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/spend"
+              }
+            },
+            {
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/tokens"
+              }
+            },
+            {
+              "x": 0,
+              "y": 10,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/decisions"
+              }
+            },
+            {
+              "x": 12,
+              "y": 10,
+              "width": 12,
+              "height": 10,
+              "content": {
+                "$ref": "#/spec/panels/events"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

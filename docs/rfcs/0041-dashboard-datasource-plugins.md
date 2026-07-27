@@ -373,3 +373,34 @@ the plugin builds on.
   [frontend data proxy](https://grafana.com/developers/plugin-tools/how-to-guides/data-source-plugins/fetch-data-from-frontend).
 - Perses — [plugin creation](https://perses.dev/perses/docs/plugins/creation/);
   the bundled `Loki` plugin is the reference for a `LogQuery` implementation.
+
+## 9. Verification record
+
+### 9.1 RFC0041.1–.5 — plugin repository (2026-07-27)
+
+Delivered in [`ourios-perses-plugin`](https://github.com/jensholdgaard/ourios-perses-plugin)
+PRs #1–#6: `OuriosDatasource` + `OuriosLogQuery` (.1/.2, unit + container
+e2e with the RFC 0026 auth matrix — 401 and 403 classified distinctly),
+`OuriosTimeSeriesQuery` (.3 — bucket detection positional, NULL scalar
+renders as a gap and never zero, series identity keyed on the group tuple),
+runtime schema suggestions over the MCP resource (.4, degrading to a plain
+field when unreachable). `.5` is deliberately partial: `0.5.0` is the
+declared minimum and is what CI exercises; the `latest` leg and wire-level
+`sum` e2e land with the next server release, which is the first to carry
+RFC 0042 typed columns.
+
+### 9.2 RFC0041.6 — the committed dashboard renders (2026-07-27)
+
+`examples/perses/agent-finops.json` imported unmodified (`percli`-shaped
+API upsert) into Perses 0.53.1 with the built plugin archive installed,
+against the live dogfood capture (tenant `agent-dogfood`, RFC 0042
+promotions from `dogfood-config.yaml`). All four panels rendered from the
+capture with no edits to the definition: spend by model
+(`sum(attr.cost_usd) by attr.model, bucket(1h)` — two series,
+`claude-fable-5` plus `claude-haiku-4-5`, ~$391 across the day's buckets),
+output-token throughput (Int64 class, ~40K/h peaks), tool-decision mix,
+and the event log (RFC0002.21 floor admitting unspecified-severity GenAI
+events). Idle hours draw as gaps, not zeros — the RFC 0042
+null-propagation contract on screen. The panel time range arrives as a
+DSL `range(...)` stage (the request body is strictly `{"query"}`),
+confirming the §3.2 mapping.

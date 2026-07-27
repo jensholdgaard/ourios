@@ -11,16 +11,23 @@ superseded-by: —
 
 # RFC 0041 — Dashboard datasource plugins
 
-> **Status: `specified` (2026-07-27).** The decision this RFC asked for has
-> been made (maintainer, same date): **build it now, Perses first, three
-> plugins, in the dedicated
+> **Status: `green` (2026-07-27, maintainer flip).** RFC0041.1–.4 and the
+> .6 capstone are verified — the plugins shipped in
 > [`ourios-perses-plugin`](https://github.com/jensholdgaard/ourios-perses-plugin)
-> repository** — with the FinOps dashboard as the capstone artifact and the
-> Grafana datasource an ungated later follow-up. What changed since
-> `drafted`: RFC 0042 landed typed numeric promotion and verified live spend
-> aggregation (RFC0042.9), so a dashboard now charts *money* — the plugin
-> became the demo artifact for the agent-FinOps direction rather than a
-> generic API client. §5/§6 are now written; §7 records the resolutions.
+> PRs #1–#6, and the committed FinOps dashboard (`examples/perses/`, #661)
+> rendered unmodified against the live dogfood capture (§9). **One recorded
+> deferral: RFC0041.5 is deliberately partial** — `0.5.0` is the declared
+> minimum and the version CI exercises; the `latest` matrix leg and the
+> wire-level `sum` e2e land with the next server release, the first to
+> carry RFC 0042 typed columns (precedent for a recorded deferral at
+> green: RFC 0005's `#[ignore]`d sizing criterion). The Grafana datasource
+> remains an ungated later follow-up.
+>
+> *(`specified`, same date: build now, Perses first, three plugins,
+> separate repo — the maintainer decision this RFC asked for. What changed
+> since `drafted`: RFC 0042 verified live spend aggregation (RFC0042.9), so
+> a dashboard now charts* money *— the plugin became the demo artifact for
+> the agent-FinOps direction rather than a generic API client.)*
 >
 > *(Original `drafted` framing, 2026-07-25: §5/§6 were deliberately empty
 > because the open question was not* how *but* whether and where*; both
@@ -277,7 +284,8 @@ this repository. The RFC ladder here tracks their aggregate state.
   - **Then** field and promoted-attribute suggestions (severity band
     names included) derive from that document, not from names hardcoded
     in the plugin.
-- **RFC0041.5 — compatibility declaration, CI-exercised**
+- **RFC0041.5 — compatibility declaration, CI-exercised** *(partial at
+  `green` — recorded deferral, see banner + §9.1)*
   - **Given** plugin release metadata declaring its minimum
     `ourios-server` version
   - **When** the plugin repository's CI runs

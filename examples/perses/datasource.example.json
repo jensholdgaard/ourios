@@ -1,0 +1,34 @@
+{
+  "kind": "Datasource",
+  "metadata": {
+    "name": "ourios-ds",
+    "project": "ourios"
+  },
+  "spec": {
+    "default": true,
+    "plugin": {
+      "kind": "OuriosDatasource",
+      "spec": {
+        "proxy": {
+          "kind": "HTTPProxy",
+          "spec": {
+            "allowedEndpoints": [
+              {
+                "endpointPattern": "/v1/query",
+                "method": "POST"
+              },
+              {
+                "endpointPattern": "/mcp",
+                "method": "POST"
+              }
+            ],
+            "headers": {
+              "x-ourios-tenant": "agent-dogfood"
+            },
+            "url": "http://127.0.0.1:4319"
+          }
+        }
+      }
+    }
+  }
+}

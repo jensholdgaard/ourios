@@ -234,43 +234,64 @@ plugin repository's CI (run against the released `ourios-server` container
 image, the collector-interop pattern inverted); RFC0041.6 by an artifact in
 this repository. The RFC ladder here tracks their aggregate state.
 
-- **RFC0041.1 (datasource).** Given a Perses instance with the
-  `OuriosDatasource` plugin configured against a running `ourios-server`
-  container, when the datasource health/connection path runs, then it
-  succeeds with and without an RFC 0026 bearer token per the server's mode,
-  and a wrong-tenant token is surfaced as the API's 403, not swallowed.
-- **RFC0041.2 (log query).** Given ingested fixture records, when a Perses
-  log panel runs an RFC 0002 DSL statement through `OuriosLogQuery`, then
-  the rendered rows equal the RFC 0016 response (body, timestamp, severity,
-  service mapped per §3.2), and a DSL error surfaces as the panel's error
-  state carrying the API's message.
-- **RFC0041.3 (time series).** Given fixture records spanning multiple
-  bucket windows — including records exactly on a window boundary — when
-  a time-series panel runs `count by bucket(w)` and
-  `sum(attr.<k>) by attr.<group_k>, bucket(w)` (aggregated numeric key
-  `<k>`, series-label group key `<group_k>`) through
-  `OuriosTimeSeriesQuery`, then the series match the API's aggregate
-  groups under RFC 0002 §6.3's bucket semantics — half-open,
-  epoch-aligned UTC windows `[k·w, (k+1)·w)`, a boundary record landing
-  in the *later* bucket, keys the window **start** — with bucket keys as
-  timestamps, group keys as series labels, and NULL aggregate values as
-  gaps (never zeros — the RFC 0042 §3.5 rule shown, not re-derived).
-- **RFC0041.4 (runtime schema).** Given a deployment's RFC 0032
-  `ourios://query-schema` document, when the query editors initialize, then
-  field and promoted-attribute suggestions derive from that document, not
-  from names hardcoded in the plugin (severity band names included).
-- **RFC0041.5 (compatibility declaration).** Given the plugin release
-  metadata declaring its minimum `ourios-server` version, when the plugin
-  repository's CI runs, then the e2e suite executes against exactly that
-  image tag alongside `latest`, and a contract break fails the plugin's
-  gate — not a user's dashboard.
-- **RFC0041.6 (the FinOps dashboard).** Given the committed Perses
-  dashboard definition in this repository — agent spend by model over
-  time (`sum(attr.cost_usd)`), token throughput, and tool-decision mix —
-  and a dogfood capture served by the local stack, when the dashboard is
-  imported into a Perses instance with the plugins installed, then every
-  panel renders from the capture with no manual edits to the definition.
-  This is the demo artifact the host decision was made for.
+- **RFC0041.1 — datasource connection across both auth modes `[RFC 0026]`**
+  - **Given** a Perses instance with the `OuriosDatasource` plugin
+    configured against a running `ourios-server` container
+  - **When** the datasource health/connection path runs against a server
+    in **open mode** (no `auth` section)
+  - **Then** it succeeds with no credential configured
+  - **When** it runs against a server with RFC 0026 **enforcement on**
+  - **Then** a datasource carrying a valid bearer token for the
+    configured tenant succeeds; one carrying **no** token surfaces the
+    API's **401**; and one whose token does not cover the configured
+    tenant surfaces the API's **403** — each as a distinct, visible
+    datasource error, never swallowed into a generic failure.
+- **RFC0041.2 — log-panel parity with the RFC 0016 response**
+  - **Given** ingested fixture records
+  - **When** a Perses log panel runs an RFC 0002 DSL statement through
+    `OuriosLogQuery`
+  - **Then** the rendered rows equal the RFC 0016 response — body,
+    timestamp, severity, and service mapped per §3.2
+  - **And** a DSL error surfaces as the panel's error state carrying the
+    API's own message.
+- **RFC0041.3 — time-series mapping under §6.3 bucket semantics `[RFC 0002 §6.3, RFC 0042 §3.5]`**
+  - **Given** fixture records spanning multiple bucket windows,
+    including a record exactly on a window boundary
+  - **When** a time-series panel runs `count by bucket(w)` and
+    `sum(attr.<k>) by attr.<group_k>, bucket(w)` (aggregated numeric key
+    `<k>`, series-label group key `<group_k>`) through
+    `OuriosTimeSeriesQuery`
+  - **Then** the series match the API's aggregate groups under RFC 0002
+    §6.3's bucket semantics — half-open, epoch-aligned UTC windows
+    `[k·w, (k+1)·w)`, the boundary record landing in the *later* bucket,
+    keys the window **start**
+  - **And** bucket keys render as timestamps, group keys as series
+    labels, and NULL aggregate values as **gaps** — never zeros (the
+    RFC 0042 §3.5 rule shown, not re-derived).
+- **RFC0041.4 — query editors adapt via the runtime schema `[RFC 0032]`**
+  - **Given** a deployment's `ourios://query-schema` document
+  - **When** the query editors initialize
+  - **Then** field and promoted-attribute suggestions (severity band
+    names included) derive from that document, not from names hardcoded
+    in the plugin.
+- **RFC0041.5 — compatibility declaration, CI-exercised**
+  - **Given** plugin release metadata declaring its minimum
+    `ourios-server` version
+  - **When** the plugin repository's CI runs
+  - **Then** the e2e suite executes against exactly that image tag
+    alongside `latest`
+  - **And** a contract break fails the plugin's gate — not a user's
+    dashboard.
+- **RFC0041.6 — the committed FinOps dashboard renders `[capstone]`**
+  - **Given** the committed Perses dashboard definition in this
+    repository — agent spend by model over time (`sum(attr.cost_usd)`),
+    token throughput, and tool-decision mix — and a dogfood capture
+    served by the local stack
+  - **When** the dashboard is imported into a Perses instance with the
+    plugins installed
+  - **Then** every panel renders from the capture with no manual edits
+    to the definition. This is the demo artifact the host decision was
+    made for.
 
 ## 6. Testing strategy
 

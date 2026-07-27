@@ -274,12 +274,12 @@ and the shipping milestone that followed (WAL, wire endpoints, DSL,
 auth, S3, Helm — the whole §5 table below except Perses) is
 substantially done. What's actually open:
 
-- **The Perses plugins** — RFC 0041 is `green` (2026-07-27): all three
-  plugins shipped in `ourios-perses-plugin`, the RFC0041.6 dashboard is
-  committed in this repo and verified rendering. What remains is
-  RFC0041.5's recorded deferral (the `latest` e2e leg + wire-level
-  `sum`, unblocked by the next server release) and the Grafana
-  datasource as an ungated follow-up.
+- **The Perses plugins** — RFC 0041 is `accepted` (2026-07-28,
+  terminal): all three plugins shipped in `ourios-perses-plugin`, the
+  RFC0041.6 dashboard is committed in this repo and verified rendering.
+  What remains is RFC0041.5's recorded deferral (the `latest` e2e leg +
+  wire-level `sum`, unblocked by the next server release, tracked in
+  the plugin repo) and the Grafana datasource as an ungated follow-up.
 - ~~RFC 0040 → `accepted`~~ — done (2026-07-28), alongside RFC 0041 and
   RFC 0042: all three flipped `accepted` on maintainer sign-off.
 - Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.

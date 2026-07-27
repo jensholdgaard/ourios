@@ -216,9 +216,9 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0037 | GenAI / structured-event log support | `green` |
 | 0038 | Self-tracing (OTel traces for Ourios itself) | `green` — request-scoped spans on ingest, query, MCP and sweep (never per-record); traces configured through the **universal** `OTEL_*` env vars, not bespoke config |
 | 0039 | Inbound trace-context propagation | `green` — all four §5 arms; the caller's trace continues across the ingest spawn and into `/mcp`, and the caller's sampling decision governs |
-| 0040 | DataFusion operator instrumentation | **`green`** — `ourios-df-otel` walks a finished `ExecutionPlan` and backdates one span per operator from `BaselineMetrics`; build-vs-adopt was spiked both ways before committing (`datafusion-tracing` drops every operator span on multi-partition plans). `accepted` is a maintainer flip |
-| 0041 | Dashboard datasource plugins (Grafana / Perses) | `green` (2026-07-27) — three plugins shipped in `ourios-perses-plugin` (PRs #1–#6); RFC0041.6 FinOps dashboard committed (`examples/perses/`, #661) and rendered from the live capture; RFC0041.5 partial by recorded deferral until the next server release; Grafana an ungated follow-up |
-| 0042 | Typed numeric promotion (RFC 0022 amendment) | **`green`** (2026-07-27) — all nine §5 incl. RFC0042.9 verified on live spend (`sum(attr.cost_usd)` = 35.28 USD over MCP from the typed column); `accepted` is a maintainer flip |
+| 0040 | DataFusion operator instrumentation | **`accepted`** (2026-07-28) TERMINAL — `ourios-df-otel` walks a finished `ExecutionPlan` and backdates one span per operator from `BaselineMetrics`; build-vs-adopt was spiked both ways before committing (`datafusion-tracing` drops every operator span on multi-partition plans) |
+| 0041 | Dashboard datasource plugins (Grafana / Perses) | **`accepted`** (2026-07-28) TERMINAL — three plugins shipped in `ourios-perses-plugin` (PRs #1–#6); RFC0041.6 FinOps dashboard committed (`examples/perses/`, #661) and rendered from the live capture; RFC0041.5's recorded deferral tracks in the plugin repo until the next server release; Grafana an ungated follow-up |
+| 0042 | Typed numeric promotion (RFC 0022 amendment) | **`accepted`** (2026-07-28) TERMINAL — all nine §5 incl. RFC0042.9 verified on live spend (`sum(attr.cost_usd)` = 35.28 USD over MCP from the typed column) |
 
 **Crates — all twelve product crates are implemented** (`ourios-core`,
 `-config`, `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`,
@@ -280,7 +280,8 @@ substantially done. What's actually open:
   RFC0041.5's recorded deferral (the `latest` e2e leg + wire-level
   `sum`, unblocked by the next server release) and the Grafana
   datasource as an ungated follow-up.
-- **RFC 0040 → `accepted`** — a maintainer flip; the ladder is `green`.
+- ~~RFC 0040 → `accepted`~~ — done (2026-07-28), alongside RFC 0041 and
+  RFC 0042: all three flipped `accepted` on maintainer sign-off.
 - Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.
   the recurring D1/D2 soak cadence now that the harness has shipped
   (§9.19/§9.23), RFC 0021's phase 2 gated on upstream DataFusion 55,

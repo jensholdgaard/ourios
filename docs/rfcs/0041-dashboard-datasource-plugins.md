@@ -1,7 +1,7 @@
 ---
 rfc: 0041
 title: Dashboard datasource plugins — Ourios as a Grafana / Perses source
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -11,6 +11,13 @@ superseded-by: —
 
 # RFC 0041 — Dashboard datasource plugins
 
+> **Status: `accepted` (2026-07-28, maintainer sign-off).** Terminal. No
+> thesis-gate applies (`validated` vacuous, RFC 0008 precedent). The
+> RFC0041.5 recorded deferral survives acceptance unchanged — the `latest`
+> e2e leg and wire-level `sum` land in the plugin repository when the next
+> server release ships typed columns (tracked there, not by reopening this
+> RFC). The Grafana datasource remains an ungated follow-up.
+>
 > **Status: `green` (2026-07-27, maintainer flip).** RFC0041.1–.4 and the
 > .6 capstone are verified — the plugins shipped in
 > [`ourios-perses-plugin`](https://github.com/jensholdgaard/ourios-perses-plugin)

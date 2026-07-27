@@ -1,7 +1,7 @@
 ---
 rfc: 0042
 title: Typed numeric attribute promotion (RFC 0022 amendment)
-status: green
+status: accepted
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-26
@@ -11,6 +11,10 @@ superseded-by: —
 
 # RFC 0042 — Typed numeric attribute promotion (RFC 0022 amendment)
 
+> **Status: `accepted` (2026-07-28, maintainer sign-off).** Terminal. No
+> thesis-gate applies (`validated` vacuous, RFC 0008 precedent);
+> RFC0042.9's live verification on real spend was the closing evidence.
+>
 > **Status note (2026-07-27, green):** RFC0042.1–.8 landed across the
 > implementation slices (#649 writer, #650 config, #651 scan +
 > no-coercion adapter, #652 predicates + aggregation, #653 compaction

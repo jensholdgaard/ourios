@@ -48,8 +48,11 @@
 # signal to the process that owns it, via the per-signal endpoint overrides
 # (`just dogfood-env` prints this variant):
 #
-#   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318    # straight here
-#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318   # Collector -> Jaeger
+#   OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318/v1/logs      # straight here
+#   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces   # Collector -> Jaeger
+# (the /v1/<signal> paths are required: per-signal endpoints are used AS-IS
+# by spec-compliant exporters; a pathless value 404s silently — see the
+# dogfood-env recipe's comment)
 #
 # The interop test (`crates/ourios-server/tests/it/collector_interop.rs`)
 # does bind `0.0.0.0` for the same container->host reason, but it is a

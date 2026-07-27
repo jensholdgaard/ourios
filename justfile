@@ -256,8 +256,16 @@ dogfood-env:
     # Per-signal endpoints: each signal goes straight to the process that owns
     # it, so no telemetry crosses the container->host boundary and this works
     # identically on macOS and native Linux (see dogfood-config.yaml).
-    export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318   # -> dogfood-server
-    export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318  # -> Collector -> Jaeger
+    #
+    # The /v1/<signal> paths are REQUIRED here: the OTLP exporter spec uses a
+    # per-signal endpoint AS-IS (no path appended — only the base
+    # OTEL_EXPORTER_OTLP_ENDPOINT gets /v1/<signal> added), so a pathless
+    # value POSTs to "/" and 404s silently. Some SDK versions papered over
+    # this by appending anyway (Claude Code <= 2.1.218 delivered with
+    # pathless values; 2.1.220 went spec-compliant and every export vanished
+    # into a 404). Explicit paths are correct under both behaviours.
+    export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:24318/v1/logs     # -> dogfood-server
+    export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces  # -> Collector -> Jaeger
     export OTEL_SERVICE_NAME=agent-dogfood   # your source identity -> the Ourios tenant
     # then enable telemetry on the source (per-tool flag):
     #   Claude Code:  export CLAUDE_CODE_ENABLE_TELEMETRY=1

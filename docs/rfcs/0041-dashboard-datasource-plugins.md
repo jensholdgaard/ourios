@@ -1,7 +1,7 @@
 ---
 rfc: 0041
 title: Dashboard datasource plugins — Ourios as a Grafana / Perses source
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-25
@@ -26,7 +26,7 @@ superseded-by: —
 > *(`specified`, same date: build now, Perses first, three plugins,
 > separate repo — the maintainer decision this RFC asked for. What changed
 > since `drafted`: RFC 0042 verified live spend aggregation (RFC0042.9), so
-> a dashboard now charts* money *— the plugin became the demo artifact for
+> a dashboard now charts money — the plugin became the demo artifact for
 > the agent-FinOps direction rather than a generic API client.)*
 >
 > *(Original `drafted` framing, 2026-07-25: §5/§6 were deliberately empty

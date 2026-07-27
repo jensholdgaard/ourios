@@ -245,25 +245,32 @@ this repository. The RFC ladder here tracks their aggregate state.
   service mapped per §3.2), and a DSL error surfaces as the panel's error
   state carrying the API's message.
 - **RFC0041.3 (time series).** Given fixture records spanning multiple
-  bucket windows, when a time-series panel runs `count by bucket(w)` and
-  `sum(attr.<f64 key>) by attr.<key>, bucket(w)` through
+  bucket windows — including records exactly on a window boundary — when
+  a time-series panel runs `count by bucket(w)` and
+  `sum(attr.<k>) by attr.<group_k>, bucket(w)` (aggregated numeric key
+  `<k>`, series-label group key `<group_k>`) through
   `OuriosTimeSeriesQuery`, then the series match the API's aggregate
-  groups — bucket keys as timestamps, group keys as series labels, NULL
-  aggregate values as gaps (never zeros — the RFC 0042 §3.5 rule shown,
-  not re-derived).
+  groups under RFC 0002 §6.3's bucket semantics — half-open,
+  epoch-aligned UTC windows `[k·w, (k+1)·w)`, a boundary record landing
+  in the *later* bucket, keys the window **start** — with bucket keys as
+  timestamps, group keys as series labels, and NULL aggregate values as
+  gaps (never zeros — the RFC 0042 §3.5 rule shown, not re-derived).
 - **RFC0041.4 (runtime schema).** Given a deployment's RFC 0032
   `ourios://query-schema` document, when the query editors initialize, then
   field and promoted-attribute suggestions derive from that document, not
   from names hardcoded in the plugin (severity band names included).
-- **RFC0041.5 (compatibility declaration).** The plugin release metadata
-  declares its minimum `ourios-server` version, and CI exercises exactly
-  that image tag alongside `latest` — a contract break fails the plugin's
-  gate, not a user's dashboard.
-- **RFC0041.6 (the FinOps dashboard).** This repository carries a committed
-  Perses dashboard definition — agent spend by model over time
-  (`sum(attr.cost_usd)`), token throughput, and tool-decision mix — that
-  renders against the dogfood capture with no manual edits. This is the
-  demo artifact the host decision was made for.
+- **RFC0041.5 (compatibility declaration).** Given the plugin release
+  metadata declaring its minimum `ourios-server` version, when the plugin
+  repository's CI runs, then the e2e suite executes against exactly that
+  image tag alongside `latest`, and a contract break fails the plugin's
+  gate — not a user's dashboard.
+- **RFC0041.6 (the FinOps dashboard).** Given the committed Perses
+  dashboard definition in this repository — agent spend by model over
+  time (`sum(attr.cost_usd)`), token throughput, and tool-decision mix —
+  and a dogfood capture served by the local stack, when the dashboard is
+  imported into a Perses instance with the plugins installed, then every
+  panel renders from the capture with no manual edits to the definition.
+  This is the demo artifact the host decision was made for.
 
 ## 6. Testing strategy
 

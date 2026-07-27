@@ -2,7 +2,23 @@
 
 > Living document. Refreshed at phase boundaries (§4) and whenever
 > a merged PR materially changes the *current state* in §3.
-> Last updated: **2026-07-25** — the self-observability arc landed and
+> Last updated: **2026-07-27** — the typed-promotion arc landed end to
+> end and the dashboard decision is made. **RFC 0042** (typed numeric
+> promotion, RFC 0022 §7.1 enacted) went spec → `green` in two days
+> (#647–#653), closing with RFC0042.9 verified on live telemetry: the
+> agent queried its own spend over MCP — `sum(attr.cost_usd) by
+> attr.model` → 35.28 USD / 10 requests from the typed `Float64`
+> column. Getting the capture to flow fixed a latent env bug (#654:
+> per-signal OTLP endpoints are used as-is per spec, so the dogfood
+> env now carries explicit `/v1/<signal>` paths). **RFC 0041** flipped
+> to `specified`: build now, **Perses first**, three plugins in the
+> dedicated `ourios-perses-plugin` repository, with the committed
+> FinOps dashboard as the capstone (RFC0041.6); Grafana remains an
+> ungated follow-up. The unreleased breaking changes on `main` since
+> v0.5.0: #641 (RFC0002.21 severity) and #645 (Helm otel values) —
+> the next tag is not a patch.
+>
+> Prior entry — 2026-07-25: the self-observability arc landed and
 > the RFC 0036 arc closed. RFC 0038 (self-tracing), RFC 0039 (inbound
 > trace-context propagation) and RFC 0040 (DataFusion operator
 > instrumentation) are all `green`: Ourios continues a caller's trace
@@ -11,14 +27,14 @@
 > crate carrying only `datafusion` + `opentelemetry`, kept extractable
 > for upstream. RFC 0037 (GenAI / structured-event logs) is `green`.
 > **v0.5.0** shipped. §3's ladder now covers RFC 0001 through RFC 0041.
-> RFC 0041 (dashboard datasource plugins) is `drafted` with §5/§6
-> deliberately empty — its §7 asks whether the work is worth doing at
-> all, and that question is the deliverable, not the design.
+> RFC 0041 (dashboard datasource plugins) was `drafted` with §5/§6
+> deliberately empty — its §7 asked whether the work is worth doing at
+> all. *(Resolved in the current entry: yes, Perses first.)*
 >
-> One **unreleased breaking change** sits on `main` behind v0.5.0:
-> RFC0002.21 (#641) aligns unspecified severity (`SeverityNumber=0`)
-> with the OTel SDK — it now bypasses a minimum-severity floor rather
-> than being pruned out by it. The next tag is not a patch.
+> One **unreleased breaking change** sat on `main` behind v0.5.0 at
+> this entry: RFC0002.21 (#641), unspecified severity aligned with the
+> OTel SDK. *(The current entry tracks the full unreleased-breaking
+> list.)*
 >
 > Prior entry — 2026-07-21: the comparative program closed and
 > the ingest-capacity arc landed; §3's ladder now covers RFC 0001
@@ -197,7 +213,8 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0038 | Self-tracing (OTel traces for Ourios itself) | `green` — request-scoped spans on ingest, query, MCP and sweep (never per-record); traces configured through the **universal** `OTEL_*` env vars, not bespoke config |
 | 0039 | Inbound trace-context propagation | `green` — all four §5 arms; the caller's trace continues across the ingest spawn and into `/mcp`, and the caller's sampling decision governs |
 | 0040 | DataFusion operator instrumentation | **`green`** — `ourios-df-otel` walks a finished `ExecutionPlan` and backdates one span per operator from `BaselineMetrics`; build-vs-adopt was spiked both ways before committing (`datafusion-tracing` drops every operator span on multi-partition plans). `accepted` is a maintainer flip |
-| 0041 | Dashboard datasource plugins (Grafana / Perses) | `drafted` — §§1–4 + §7–8 only; §5/§6 deliberately empty pending the §7 "is this worth doing now?" call |
+| 0041 | Dashboard datasource plugins (Grafana / Perses) | `specified` (2026-07-27) — build now, Perses first, three plugins in the dedicated `ourios-perses-plugin` repo; RFC0041.6's committed FinOps dashboard is the capstone; Grafana an ungated follow-up |
+| 0042 | Typed numeric promotion (RFC 0022 amendment) | **`green`** (2026-07-27) — all nine §5 incl. RFC0042.9 verified on live spend (`sum(attr.cost_usd)` = 35.28 USD over MCP from the typed column); `accepted` is a maintainer flip |
 
 **Crates — all twelve product crates are implemented** (`ourios-core`,
 `-config`, `-miner`, `-wal`, `-parquet`, `-ingester`, `-querier`,
@@ -253,11 +270,11 @@ and the shipping milestone that followed (WAL, wire endpoints, DSL,
 auth, S3, Helm — the whole §5 table below except Perses) is
 substantially done. What's actually open:
 
-- **Dashboard datasource plugins** — RFC 0041 is `drafted` and the
-  *first* open question is whether to build them at all; §5's Perses
-  row has been the standing deferral, and the RFC now scopes Grafana
-  alongside it with measured effort for each. Decide §7 before §5/§6
-  get written.
+- **The Perses plugins** — RFC 0041 is `specified` (2026-07-27):
+  three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) in the
+  dedicated `ourios-perses-plugin` repository, capped by RFC0041.6's
+  committed FinOps dashboard in this repo. Implementation is the
+  active workstream; the Grafana datasource is an ungated follow-up.
 - **RFC 0040 → `accepted`** — a maintainer flip; the ladder is `green`.
 - Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.
   the recurring D1/D2 soak cadence now that the harness has shipped
@@ -391,7 +408,7 @@ table below records what shipped and what's still genuinely open.
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `green`, including the `param(n)`/`bucket(width)` aggregation amendment |
 | **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding shipped (RFC 0026 `accepted`); rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9) |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
-| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. That prerequisite is now met, and **RFC 0041** (`drafted`, 2026-07-25) works the question up: it spikes both hosts, measures the effort (one Grafana datasource plugin vs. two–three Perses plugins at log parity), and leaves §5/§6 empty pending a decision on whether to build either. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
+| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. That prerequisite is now met, and **RFC 0041** (`specified`, 2026-07-27) resolved it: **build now, Perses first** — three plugins in the dedicated `ourios-perses-plugin` repository, with the committed FinOps dashboard (RFC0041.6) as the capstone; both hosts were spiked and measured first. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
 
 **Note on OTLP scope (historical).** The pre-amendment roadmap
 listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.

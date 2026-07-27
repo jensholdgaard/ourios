@@ -398,11 +398,12 @@ or it doesn't.
 
 Each item is a real production concern. The reason it was deferred
 *for MVP* is *"answering 'does the thesis hold?' doesn't require
-it,"* not *"we don't think it matters."* As of this entry, six of
-the eight original rows have shipped outright, one (multi-tenancy
-at runtime) is partially landed, and one (Perses) is still fully
-deferred, as part of the post-MVP shipping milestone (§3); the
-table below records what shipped and what's still genuinely open.
+it,"* not *"we don't think it matters."* As of this entry, seven of
+the eight original rows have shipped outright — the Perses row's
+plugin half landed with RFC 0041 `green` (CRDs/operator stay
+ungated) — and one (multi-tenancy at runtime) is partially landed,
+as part of the post-MVP shipping milestone (§3); the table below
+records what shipped and what's still genuinely open.
 
 | Capability | Why deferred for MVP | Status |
 |---|---|---|

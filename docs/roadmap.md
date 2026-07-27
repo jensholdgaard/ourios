@@ -11,11 +11,14 @@
 > 10 requests from the typed `Float64` column. Getting the capture
 > to flow fixed a latent env bug (#654: per-signal OTLP endpoints are
 > used as-is per spec, so the dogfood env now carries explicit
-> `/v1/<signal>` paths). **RFC 0041** flipped
-> to `specified`: build now, **Perses first**, three plugins in the
-> dedicated `ourios-perses-plugin` repository, with the committed
-> FinOps dashboard as the capstone (RFC0041.6); Grafana remains an
-> ungated follow-up. The unreleased breaking changes on `main` since
+> `/v1/<signal>` paths). **RFC 0041** went `specified` → **`green`**
+> the same date: build now, **Perses first** — the three plugins shipped
+> in the dedicated `ourios-perses-plugin` repository (PRs #1–#6), and
+> the capstone FinOps dashboard (RFC0041.6, `examples/perses/`, #661)
+> rendered unmodified against the live dogfood capture. One recorded
+> deferral: RFC0041.5's `latest` matrix leg waits for the next server
+> release (the first with typed columns); Grafana remains an ungated
+> follow-up. The unreleased breaking changes on `main` since
 > v0.5.0: #641 (RFC0002.21 severity) and #645 (Helm otel values) —
 > the next tag is not a patch.
 >
@@ -214,7 +217,7 @@ captured by B1/B2 (see `benchmarks.md` §2 / §7).
 | 0038 | Self-tracing (OTel traces for Ourios itself) | `green` — request-scoped spans on ingest, query, MCP and sweep (never per-record); traces configured through the **universal** `OTEL_*` env vars, not bespoke config |
 | 0039 | Inbound trace-context propagation | `green` — all four §5 arms; the caller's trace continues across the ingest spawn and into `/mcp`, and the caller's sampling decision governs |
 | 0040 | DataFusion operator instrumentation | **`green`** — `ourios-df-otel` walks a finished `ExecutionPlan` and backdates one span per operator from `BaselineMetrics`; build-vs-adopt was spiked both ways before committing (`datafusion-tracing` drops every operator span on multi-partition plans). `accepted` is a maintainer flip |
-| 0041 | Dashboard datasource plugins (Grafana / Perses) | `specified` (2026-07-27) — build now, Perses first, three plugins in the dedicated `ourios-perses-plugin` repo; RFC0041.6's committed FinOps dashboard is the capstone; Grafana an ungated follow-up |
+| 0041 | Dashboard datasource plugins (Grafana / Perses) | `green` (2026-07-27) — three plugins shipped in `ourios-perses-plugin` (PRs #1–#6); RFC0041.6 FinOps dashboard committed (`examples/perses/`, #661) and rendered from the live capture; RFC0041.5 partial by recorded deferral until the next server release; Grafana an ungated follow-up |
 | 0042 | Typed numeric promotion (RFC 0022 amendment) | **`green`** (2026-07-27) — all nine §5 incl. RFC0042.9 verified on live spend (`sum(attr.cost_usd)` = 35.28 USD over MCP from the typed column); `accepted` is a maintainer flip |
 
 **Crates — all twelve product crates are implemented** (`ourios-core`,
@@ -271,11 +274,12 @@ and the shipping milestone that followed (WAL, wire endpoints, DSL,
 auth, S3, Helm — the whole §5 table below except Perses) is
 substantially done. What's actually open:
 
-- **The Perses plugins** — RFC 0041 is `specified` (2026-07-27):
-  three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) in the
-  dedicated `ourios-perses-plugin` repository, capped by RFC0041.6's
-  committed FinOps dashboard in this repo. Implementation is the
-  active workstream; the Grafana datasource is an ungated follow-up.
+- **The Perses plugins** — RFC 0041 is `green` (2026-07-27): all three
+  plugins shipped in `ourios-perses-plugin`, the RFC0041.6 dashboard is
+  committed in this repo and verified rendering. What remains is
+  RFC0041.5's recorded deferral (the `latest` e2e leg + wire-level
+  `sum`, unblocked by the next server release) and the Grafana
+  datasource as an ungated follow-up.
 - **RFC 0040 → `accepted`** — a maintainer flip; the ladder is `green`.
 - Scattered §7/§9 open items on already-`green`/`validated` RFCs (e.g.
   the recurring D1/D2 soak cadence now that the harness has shipped
@@ -394,11 +398,12 @@ or it doesn't.
 
 Each item is a real production concern. The reason it was deferred
 *for MVP* is *"answering 'does the thesis hold?' doesn't require
-it,"* not *"we don't think it matters."* As of this entry, six of
-the eight original rows have shipped outright, one (multi-tenancy
-at runtime) is partially landed, and one (Perses) is still fully
-deferred, as part of the post-MVP shipping milestone (§3); the
-table below records what shipped and what's still genuinely open.
+it,"* not *"we don't think it matters."* As of this entry, seven of
+the eight original rows have shipped outright — the Perses row's
+plugin half landed with RFC 0041 `green` (CRDs/operator stay
+ungated) — and one (multi-tenancy at runtime) is partially landed,
+as part of the post-MVP shipping milestone (§3); the table below
+records what shipped and what's still genuinely open.
 
 | Capability | Why deferred for MVP | Status |
 |---|---|---|
@@ -409,7 +414,7 @@ table below records what shipped and what's still genuinely open.
 | **Query DSL** (RFC 0002) | Raw SQL through DataFusion serves the bench; DSL is operator UX | **Landed** — RFC 0002 `green`, including the `param(n)`/`bucket(width)` aggregation amendment |
 | **Multi-tenancy at runtime** (rate limits, eviction, lifecycle) | Bench uses one tenant; the type is in place but no orchestration around it | **Partially landed** — authentication + enforced tenant binding shipped (RFC 0026 `accepted`); rate-limit/eviction/lifecycle orchestration is still open, tied to an operator-console RFC that hasn't been drafted (RFC 0001 §9) |
 | **`ourios-server` binary + Helm chart** | Bench is a binary in `ourios-bench`; full deployment shape is shipping concern | **Landed** — two-role binary with TLS/mTLS (RFC 0030) + OIDC (RFC 0029); S3-native Helm chart shipped and deploy-validated on kind |
-| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Still deferred, not started.** The query API is now stable (RFC 0002 `green`, RFC 0016 `green`), so the plugin's prerequisite is clear; scoping discussion revisited 2026-07-14 and intentionally left for after RFC 0031 (comparative validation) closes out. That prerequisite is now met, and **RFC 0041** (`specified`, 2026-07-27) resolved it: **build now, Perses first** — three plugins in the dedicated `ourios-perses-plugin` repository, with the committed FinOps dashboard (RFC0041.6) as the capstone; both hosts were spiked and measured first. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
+| **Perses dashboard integration** (datasource plugin + possible CRDs) | The data plane has to work first — a Perses plugin queries a query interface that doesn't exist yet. A native datasource plugin is small and downstream-friendly *once* the query API is stable; CRDs / operator (`PersesDashboard`-style declarative pipeline + miner config) would extend Ourios into managed-service territory, which contradicts `CLAUDE.md` §1's "Not a managed service" line | **Landed** (the plugin half) — **RFC 0041 `green`** (2026-07-27): three plugins (`Datasource`, `LogQuery`, `TimeSeriesQuery`) shipped in the dedicated `ourios-perses-plugin` repository, and the committed FinOps dashboard (RFC0041.6, `examples/perses/`) rendered unmodified against the live dogfood capture. Both hosts were spiked and measured first; RFC0041.5 carries a recorded deferral until the next server release; the Grafana datasource is an ungated follow-up. CRDs/operator still requires a `meta:` RFC against `CLAUDE.md` §1 first, no commitment to land |
 
 **Note on OTLP scope (historical).** The pre-amendment roadmap
 listed "OTLP receiver (gRPC + HTTP)" as a single post-MVP item.

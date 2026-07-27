@@ -1,7 +1,7 @@
 ---
 rfc: 0042
 title: Typed numeric attribute promotion (RFC 0022 amendment)
-status: specified
+status: green
 author: Jens Holdgaard Pedersen <jens@holdgaard.org>
 drafting-assistance: Claude
 created: 2026-07-26
@@ -11,14 +11,20 @@ superseded-by: —
 
 # RFC 0042 — Typed numeric attribute promotion (RFC 0022 amendment)
 
-> **Status note (2026-07-27):** RFC0042.1–.8 are green in-repo across
-> the implementation slices (#649 writer, #650 config, #651 scan +
-> no-coercion adapter, #652 predicates + aggregation, and the
-> compaction re-typing test). The one outstanding criterion is
-> **RFC0042.9** — the dogfood corpus gate — which needs a fresh agent
-> capture under the typed promotion set (PR #646); the status flips to
-> `green` when that query returns real spend. Until then this RFC
-> stays `specified` with the implementation ahead of the flip.
+> **Status note (2026-07-27, green):** RFC0042.1–.8 landed across the
+> implementation slices (#649 writer, #650 config, #651 scan +
+> no-coercion adapter, #652 predicates + aggregation, #653 compaction
+> re-typing). **RFC0042.9 verified live the same day**: with the
+> dogfood promotion set (#646) active, a fresh Claude Code capture
+> (10 `api_request` events) answered
+> `sum(attr.cost_usd) by attr.model` over the RFC 0027 MCP surface
+> with real per-model spend from the typed `Float64` column
+> (`claude-fable-5`: 35.27878 USD / 10 requests, one row group
+> scanned), and `sum(attr.output_tokens)` exercised the `Int64` class
+> alongside (2,881 tokens). Getting the capture to flow also surfaced
+> and fixed a latent env bug (#654): per-signal OTLP endpoints are
+> used as-is per spec, so the dogfood env needed explicit
+> `/v1/<signal>` paths. `accepted` is a maintainer flip.
 
 > Enacts RFC 0022 §7.1, whose deferral clause — "deferred until a
 > consumer demands it" — has been met: the agent-FinOps loop's headline
